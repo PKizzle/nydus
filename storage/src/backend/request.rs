@@ -399,8 +399,10 @@ mod tests {
 
     #[test]
     fn test_parse_custom_headers_from_env() {
-        std::env::set_var("NYDUS_HEADER_X-TEST-PROXY-1", "value1");
-        std::env::set_var("NYDUS_HEADER_X-TEST-PROXY-2", "value2");
+        unsafe {
+            std::env::set_var("NYDUS_HEADER_X-TEST-PROXY-1", "value1");
+            std::env::set_var("NYDUS_HEADER_X-TEST-PROXY-2", "value2");
+        }
 
         let headers = parse_custom_headers_from_env();
 
@@ -417,8 +419,10 @@ mod tests {
             &HeaderValue::from_str("value2").unwrap()
         );
 
-        std::env::remove_var("NYDUS_HEADER_X-TEST-PROXY-1");
-        std::env::remove_var("NYDUS_HEADER_X-TEST-PROXY-2");
+        unsafe {
+            std::env::remove_var("NYDUS_HEADER_X-TEST-PROXY-1");
+            std::env::remove_var("NYDUS_HEADER_X-TEST-PROXY-2");
+        }
     }
 
     #[test]
@@ -549,7 +553,7 @@ mod tests {
 
     #[test]
     fn test_call_injects_custom_headers() {
-        std::env::set_var("NYDUS_HEADER_X-TEST-INJECT", "injected");
+        unsafe { std::env::set_var("NYDUS_HEADER_X-TEST-INJECT", "injected") };
         let req = make_request("", "");
         let mut headers = HeaderMap::new();
         let mut ctx = BackendContext::default();
@@ -570,7 +574,7 @@ mod tests {
         assert_eq!(headers.get("X-TEST-INJECT").unwrap(), "injected");
         assert_eq!(headers.get("User-Agent").unwrap(), "nydusd/1.0.0");
 
-        std::env::remove_var("NYDUS_HEADER_X-TEST-INJECT");
+        unsafe { std::env::remove_var("NYDUS_HEADER_X-TEST-INJECT") };
     }
 
     #[test]

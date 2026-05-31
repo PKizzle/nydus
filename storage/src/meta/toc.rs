@@ -36,7 +36,7 @@ pub const TOC_ENTRY_BLOB_DIGEST: &str = "blob.digest";
 pub const TOC_ENTRY_BLOB_TOC: &str = "rafs.blob.toc";
 
 bitflags! {
-    #[derive(Serialize)]
+    #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
     /// Feature flags for ToC entry.
     pub struct TocEntryFlags: u32 {
         /// Entry data is not compressed.

@@ -81,12 +81,7 @@ impl BlobReader for LocalDiskBlob {
             .ok_or(LocalDiskError::ReadBlob(msg))?;
         let len = std::cmp::min(self.blob_length - offset, buf.len() as u64) as usize;
 
-        uio::pread(
-            self.device_file.as_raw_fd(),
-            &mut buf[..len],
-            actual_offset as i64,
-        )
-        .map_err(|e| {
+        uio::pread(&self.device_file, &mut buf[..len], actual_offset as i64).map_err(|e| {
             let msg = format!(
                 "localdisk: failed to read data from blob {}, {}",
                 self.blob_id, e
@@ -270,7 +265,12 @@ impl LocalDisk {
     fn scan_blobs_by_gpt(&mut self) -> Result<()> {
         // Open disk image.
         let cfg = gpt::GptConfig::new().writable(false);
-        let disk = cfg.open(&self.device_path)?;
+        let disk = cfg.open(&self.device_path).map_err(|e| {
+            eio!(format!(
+                "localdisk: failed to open GPT on {}, {}",
+                self.device_path, e
+            ))
+        })?;
         let partitions = disk.partitions();
         let sector_size = gpt::disk::DEFAULT_SECTOR_SIZE;
         info!(

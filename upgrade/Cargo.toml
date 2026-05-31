@@ -6,11 +6,11 @@ authors = ["The Nydus Developers"]
 license = "Apache-2.0"
 homepage = "https://nydus.dev/"
 repository = "https://github.com/dragonflyoss/nydus"
-edition = "2021"
+edition = "2024"
 
 [dependencies]
 sendfd = "0.4.3"
 dbs-snapshot = "1.5.2"
-thiserror = "1"
+thiserror = "2.0.18"
 versionize_derive = "0.1.6"
 versionize = "0.2.0"

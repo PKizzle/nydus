@@ -6,7 +6,7 @@ authors = ["The Nydus Developers"]
 license = "Apache-2.0"
 homepage = "https://nydus.dev/"
 repository = "https://github.com/dragonflyoss/nydus"
-edition = "2021"
+edition = "2024"
 resolver = "2"
 
 [dependencies]
@@ -16,15 +16,15 @@ flume = "0.12"
 fuse-backend-rs = { workspace = true, features = ["persist"] }
 libc = "0.2"
 log = "0.4.8"
-mio = { version = "0.8", features = ["os-poll", "os-ext"] }
-nix = "0.24.0"
-rust-fsm = "0.6.0"
+mio = { version = "1.2", features = ["os-poll", "os-ext"] }
+nix = "0.31.3"
+rust-fsm = "0.8.0"
 sendfd = "0.4"
 serde = { version = "1.0.110", features = ["serde_derive", "rc"] }
 serde_json = "1.0.51"
 serde_repr = "0.1"
-thiserror = "1.0"
-time = { version = "0.3.14", features = ["serde-human-readable"] }
+thiserror = "2.0.18"
+time = { version = "0.3.47", features = ["serde-human-readable"] }
 tokio = { version = "1.24", features = ["macros"] }
 versionize_derive = "0.1.6"
 versionize = "0.2.0"
@@ -42,7 +42,7 @@ virtio-queue = { workspace = true, optional = true }
 vm-memory = { workspace = true, features = ["backend-mmap"], optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-tokio-uring = "0.4"
+tokio-uring = "0.5.0"
 
 [dev-dependencies]
 vmm-sys-util = { workspace = true }

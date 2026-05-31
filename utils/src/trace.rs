@@ -27,7 +27,7 @@ impl Display for TraceClass {
 macro_rules! enum_str {
     ($m:meta
     pub enum $name:ident {
-        $($variant:ident = $val:expr),*,
+        $($variant:ident = $val:expr_2021),*,
     }) => {
         #[$m]
         pub enum $name {
@@ -185,17 +185,17 @@ macro_rules! timing_tracer {
                     .unwrap()
             })
     };
-    ($f:block, $key:expr) => {
+    ($f:block, $key:expr_2021) => {
         $crate::trace::trace_timing($key, timing_tracer!(), || $f)
     };
-    ($f:block, $key:expr, $t:ty) => {
+    ($f:block, $key:expr_2021, $t:ty) => {
         $crate::trace::trace_timing::<_, $t>($key, timing_tracer!(), || $f)
     };
 }
 
 #[macro_export]
 macro_rules! register_tracer {
-    ($class:expr, $r:ty) => {
+    ($class:expr_2021, $r:ty) => {
         root_tracer!().register($class, std::sync::Arc::new(<$r>::default()));
     };
 }
@@ -212,17 +212,17 @@ macro_rules! event_tracer {
                     .unwrap()
             })
     };
-    ($event:expr, $desc:expr) => {
+    ($event:expr_2021, $desc:expr_2021) => {
         event_tracer!().events.write().unwrap().insert(
             $event.to_string(),
             $crate::trace::TraceEvent::Fixed($desc as u64),
         )
     };
-    ($event:expr, +$value:expr) => {
+    ($event:expr_2021, +$value:expr_2021) => {
         let mut new: bool = true;
 
         if let Some(t) = event_tracer!() {
-            if let Some($crate::trace::TraceEvent::Counter(ref e)) =
+            if let Some($crate::trace::TraceEvent::Counter(e)) =
                 t.events.read().unwrap().get($event)
             {
                 e.fetch_add($value as u64, std::sync::atomic::Ordering::Relaxed);
@@ -233,7 +233,7 @@ macro_rules! event_tracer {
                 // Double check to close the race that another thread has already inserted.
                 // Cast integer to u64 should be reliable for most cases.
                 if let Ok(ref mut guard) = t.events.write() {
-                    if let Some($crate::trace::TraceEvent::Counter(ref e)) = guard.get($event) {
+                    if let Some($crate::trace::TraceEvent::Counter(e)) = guard.get($event) {
                         e.fetch_add($value as u64, std::sync::atomic::Ordering::Relaxed);
                     } else {
                         guard.insert(
@@ -247,7 +247,7 @@ macro_rules! event_tracer {
             }
         }
     };
-    ($event:expr, $format:expr, $value:expr) => {
+    ($event:expr_2021, $format:expr_2021, $value:expr_2021) => {
         if let Some(t) = event_tracer!() {
             if let Ok(ref mut guard) = t.events.write() {
                 guard.insert(

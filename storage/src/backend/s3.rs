@@ -10,7 +10,7 @@ use std::fmt::Debug;
 use std::io::Result;
 use std::sync::Arc;
 
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use http::Uri;
 use nydus_api::S3Config;
 use nydus_utils::metrics::BackendMetrics;
@@ -235,7 +235,9 @@ impl ObjectStorageState for S3State {
 fn sha256_hash(data: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(data);
-    format!("{:x}", hasher.finalize())
+    let digest = hasher.finalize();
+    let digest: &[u8] = digest.as_ref();
+    hex::encode(digest)
 }
 
 // modified based on https://github.com/minio/minio-rs/blob/5fea81d68d381fd2a4c27e4d259f7012de08ab77/src/s3/signer.rs#L25-L29

@@ -73,6 +73,11 @@ pub(crate) fn mode_bits(mode: libc::mode_t) -> u32 {
     u32::from(mode)
 }
 
+pub(crate) fn sha256_digest_hex(digest: sha2::digest::Output<sha2::Sha256>) -> String {
+    let digest: &[u8] = digest.as_ref();
+    hex::encode(digest)
+}
+
 fn build_bootstrap(
     ctx: &mut BuildContext,
     bootstrap_mgr: &mut BootstrapManager,
@@ -111,7 +116,7 @@ fn dump_bootstrap(
                 // Set special blob id for blob with inlined meta.
                 blob_ctx.blob_id = "x".repeat(64);
             } else {
-                blob_ctx.blob_id = format!("{:x}", blob_ctx.blob_hash.clone().finalize());
+                blob_ctx.blob_id = sha256_digest_hex(blob_ctx.blob_hash.clone().finalize());
             }
         }
         if !ctx.conversion_type.is_to_ref() {
@@ -220,7 +225,7 @@ fn finalize_blob(
 
         let hash = blob_ctx.blob_hash.clone().finalize();
         let blob_meta_id = if ctx.blob_id.is_empty() {
-            format!("{:x}", hash)
+            sha256_digest_hex(hash)
         } else {
             assert!(!ctx.conversion_type.is_to_ref() || is_tarfs);
             ctx.blob_id.clone()
@@ -235,13 +240,13 @@ fn finalize_blob(
                     blob_ctx.compressed_blob_size = reader.get_data_size();
                     if blob_ctx.blob_id.is_empty() {
                         let hash = reader.get_data_digest();
-                        blob_ctx.blob_id = format!("{:x}", hash.finalize());
+                        blob_ctx.blob_id = sha256_digest_hex(hash.finalize());
                     }
                 } else if let Some(tar_reader) = &ctx.blob_tar_reader {
                     blob_ctx.compressed_blob_size = tar_reader.position();
                     if blob_ctx.blob_id.is_empty() {
                         let hash = tar_reader.get_hash_object();
-                        blob_ctx.blob_id = format!("{:x}", hash.finalize());
+                        blob_ctx.blob_id = sha256_digest_hex(hash.finalize());
                     }
                 }
             }

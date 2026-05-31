@@ -1,6 +1,6 @@
 //! DNS resolution via the [hickory-resolver](https://github.com/hickory-dns/hickory-dns) crate
 
-use hickory_resolver::{config::LookupIpStrategy, ResolveError, TokioResolver};
+use hickory_resolver::{config::LookupIpStrategy, TokioResolver};
 use once_cell::sync::OnceCell;
 use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 use tokio::sync::RwLock;
@@ -63,7 +63,7 @@ struct SocketAddrs {
 }
 
 #[derive(Debug)]
-struct HickoryDnsSystemConfError(ResolveError);
+struct HickoryDnsSystemConfError(Box<dyn std::error::Error + Send + Sync>);
 
 impl Resolve for HickoryDnsResolver {
     fn resolve(&self, name: Name) -> Resolving {
@@ -176,10 +176,13 @@ impl Iterator for SocketAddrs {
 /// overridden to look up for both IPv4 and IPv6 addresses
 /// to work with "happy eyeballs" algorithm.
 fn new_resolver_state() -> Result<ResolverState, HickoryDnsSystemConfError> {
-    let mut builder = TokioResolver::builder_tokio().map_err(HickoryDnsSystemConfError)?;
+    let mut builder =
+        TokioResolver::builder_tokio().map_err(|e| HickoryDnsSystemConfError(Box::new(e)))?;
     let opts = builder.options_mut();
     opts.ip_strategy = LookupIpStrategy::Ipv4thenIpv6;
-    let resolver = builder.build();
+    let resolver = builder
+        .build()
+        .map_err(|e| HickoryDnsSystemConfError(Box::new(e)))?;
     Ok(ResolverState {
         resolver,
         cache: RwLock::new(HashMap::new()),
@@ -195,7 +198,7 @@ impl fmt::Display for HickoryDnsSystemConfError {
 
 impl std::error::Error for HickoryDnsSystemConfError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        Some(&self.0)
+        Some(&*self.0)
     }
 }
 
