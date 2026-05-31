@@ -13,7 +13,7 @@
 use std::any::Any;
 use std::fs::{self, OpenOptions};
 use std::io::{Error, Result};
-use std::os::fd::{AsRawFd, FromRawFd, RawFd};
+use std::os::fd::{AsRawFd, RawFd};
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -22,9 +22,11 @@ use bytes::{Buf, BufMut};
 use mio::Waker;
 use nydus_api::{BlobCacheEntry, BuildTimeInfo};
 use nydus_storage::utils::alloc_buf;
-use tokio::sync::broadcast::{channel, Sender};
-use compio::buf::IoBuf;
+use async_broadcast::{broadcast, Sender};
+use compio::buf::{BufResult, IntoInner, IoBuf};
+use compio::io::{AsyncRead, AsyncWriteExt};
 use compio::net::UnixStream;
+use futures_util::{select, FutureExt};
 
 use crate::blob_cache::{generate_blob_key, BlobCacheMgr};
 use crate::block_device::BlockDevice;
@@ -55,8 +57,12 @@ const NBD_EIO: u32 = 5;
 const NBD_EINVAL: u32 = 22;
 
 fn nbd_ioctl(fd: RawFd, cmd: u32, arg: u64) -> nix::Result<libc::c_int> {
-    let code = nix::request_code_none!(0xab, cmd);
-    unsafe { nix::convert_ioctl_res!(libc::ioctl(fd, code, arg)) }
+    // `_IO(0xab, cmd)`: direction NONE and size 0, so the request code reduces
+    // to `(type << _IOC_NRBITS) | nr` == `(0xab << 8) | cmd`. nix 0.31 dropped
+    // the `request_code_none!`/`convert_ioctl_res!` macros, so compute the code
+    // directly and map the result through `Errno::result`.
+    let code = ((0xab_u32 << 8) | cmd) as libc::c_ulong;
+    nix::errno::Errno::result(unsafe { libc::ioctl(fd, code, arg) })
 }
 
 /// Network Block Device server to expose RAFSv6 images as block devices.
@@ -93,7 +99,13 @@ impl NbdService {
             (NBD_FLAG_HAS_FLAGS | NBD_FLAG_READ_ONLY | NBD_FLAG_CAN_MULTI_CONN) as u64,
         )?;
 
-        let (sender, _receiver) = channel(4);
+        // Shutdown notification: a single value broadcast to every worker so
+        // they wake from `select!` and re-check `active`. Overflow mode keeps
+        // `try_broadcast` non-blocking and infallible even if the (bounded)
+        // queue is full or no worker has subscribed yet.
+        let (mut sender, receiver) = broadcast(4);
+        sender.set_overflow(true);
+        drop(receiver);
 
         Ok(NbdService {
             active: Arc::new(AtomicBool::new(true)),
@@ -131,7 +143,7 @@ impl NbdService {
     pub fn run(&self) -> Result<()> {
         let _ = nbd_ioctl(self.nbd_dev.as_raw_fd(), NBD_DO_IT, 0);
         self.active.store(false, Ordering::Release);
-        let _ = self.sender.send(1);
+        let _ = self.sender.try_broadcast(1);
         let _ = nbd_ioctl(self.nbd_dev.as_raw_fd(), NBD_CLEAR_SOCK, 0);
 
         Ok(())
@@ -140,7 +152,7 @@ impl NbdService {
     /// Shutdown the NBD session and send exit notification to workers.
     pub fn stop(&self) {
         self.active.store(false, Ordering::Release);
-        let _ = self.sender.send(0);
+        let _ = self.sender.try_broadcast(0);
         //let _ = nbd_ioctl(self.nbd_dev.as_raw_fd(), NBD_DISCONNECT, 0);
         let _ = nbd_ioctl(self.nbd_dev.as_raw_fd(), NBD_CLEAR_SOCK, 0);
     }
@@ -173,39 +185,62 @@ impl NbdWorker {
                 }
             };
 
-        // Safe because the RawFd is valid during the lifetime of run().
-        let mut sock = unsafe { UnixStream::from_raw_fd(self.sock_user.as_raw_fd()) };
-        let mut receiver = self.sender.subscribe();
+        // Wrap a *duplicate* of the user-side socket fd in a compio stream. The
+        // original `self.sock_user` stays owned by `self` (still used by
+        // `handle_request` via `&self`), so compio must not take ownership of the
+        // same fd — otherwise both close it on drop and trip the IO-safety
+        // double-close abort. The dup is owned solely by `sock`.
+        let mut sock = match self.sock_user.try_clone().and_then(UnixStream::from_std) {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(
+                    "block_nbd: failed to wrap user socket for {}, {}",
+                    self.blob_id, e
+                );
+                return;
+            }
+        };
+        let mut receiver = self.sender.new_receiver();
         let mut buf = vec![0u8; NBD_REQUEST_HEADER_SIZE];
         let mut pos = 0;
 
         while self.active.load(Ordering::Acquire) {
-            tokio::select! {
-                (res, s) = sock.read(buf.slice(pos..)) => {
-                    match res {
-                        Err(e) => {
-                            warn!("block_nbd: failed to get request from kernel for {}, {}", self.blob_id, e);
-                            break;
-                        }
-                        Ok(sz) => {
-                            buf = s.into_inner();
-                            pos += sz;
-                            if pos == NBD_REQUEST_HEADER_SIZE {
-                                match self.handle_request(&buf, &mut sock, &device).await {
-                                    Ok(true) => {}
-                                    Ok(false) => break,
-                                    Err(e) => {
-                                        warn!("block_nbd: failed to handle request for {}, {}", self.blob_id, e);
-                                        break;
-                                    }
-                                }
-                                pos = 0;
+            // Wait for either the next kernel request bytes or a shutdown
+            // broadcast. The branch futures borrow `sock`/`receiver`, so resolve
+            // them in an inner scope to `Some(read)`/`None` and drop them before
+            // touching `sock` again in `handle_request`.
+            let read = {
+                let read_fut = sock.read(buf.slice(pos..)).fuse();
+                let shutdown_fut = receiver.recv().fuse();
+                futures_util::pin_mut!(read_fut, shutdown_fut);
+                select! {
+                    res = read_fut => Some(res),
+                    _ = shutdown_fut => None,
+                }
+            };
+            let BufResult(res, s) = match read {
+                Some(res) => res,
+                None => break,
+            };
+            match res {
+                Err(e) => {
+                    warn!("block_nbd: failed to get request from kernel for {}, {}", self.blob_id, e);
+                    break;
+                }
+                Ok(sz) => {
+                    buf = s.into_inner();
+                    pos += sz;
+                    if pos == NBD_REQUEST_HEADER_SIZE {
+                        match self.handle_request(&buf, &mut sock, &device).await {
+                            Ok(true) => {}
+                            Ok(false) => break,
+                            Err(e) => {
+                                warn!("block_nbd: failed to handle request for {}, {}", self.blob_id, e);
+                                break;
                             }
                         }
+                        pos = 0;
                     }
-                }
-                _ = receiver.recv() => {
-                   break;
                 }
             }
         }
@@ -303,7 +338,15 @@ impl NbdDaemon {
         let blob_id = generate_blob_key(&blob_entry.domain_id, &blob_entry.blob_id);
         let cache_mgr = Arc::new(BlobCacheMgr::new());
         cache_mgr.add_blob_entry(&blob_entry)?;
-        let block_device = BlockDevice::new_with_cache_manager(blob_id.clone(), cache_mgr.clone())?;
+        // `BlockDevice::new_with_cache_manager` opens blob files via compio and
+        // is async; run it to completion on a transient compio runtime since
+        // this daemon constructor is synchronous.
+        let block_device = compio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(BlockDevice::new_with_cache_manager(
+                blob_id.clone(),
+                cache_mgr.clone(),
+            ))?;
         #[allow(clippy::arc_with_non_send_sync)]
         let nbd_service = NbdService::new(Arc::new(block_device), nbd_path)?;
 
@@ -613,12 +656,12 @@ mod tests {
             let worker1 = nbd.create_worker().unwrap();
             let worker2 = nbd.create_worker().unwrap();
 
-            compio::runtime::spawn(async move { worker1.run().await });
-            compio::runtime::spawn(async move { worker2.run().await });
+            compio::runtime::spawn(async move { worker1.run().await }).detach();
+            compio::runtime::spawn(async move { worker2.run().await }).detach();
             std::thread::spawn(move || {
                 nbd2.run().unwrap();
             });
-            tokio::time::sleep(Duration::from_micros(100000)).await;
+            compio::runtime::time::sleep(Duration::from_micros(100000)).await;
             nbd.stop();
         })
     }

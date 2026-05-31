@@ -30,7 +30,7 @@
 
 use std::any::Any;
 use std::io::{Error, Result};
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixListener;
 use std::os::unix::net::UnixStream as StdUnixStream;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
@@ -42,9 +42,10 @@ use mio::Waker;
 use nydus_api::{BlobCacheEntry, BuildTimeInfo};
 use nydus_storage::utils::alloc_buf;
 use sendfd::{RecvWithFd, SendWithFd};
-use tokio::io::unix::AsyncFd;
-use tokio::sync::broadcast::Sender;
+use async_broadcast::Sender;
+use compio::runtime::fd::PollFd;
 use compio::runtime::{spawn_blocking, ResumeUnwind};
+use futures_util::{select, FutureExt};
 
 use crate::blob_cache::{generate_blob_key, BlobCacheMgr};
 use crate::block_device::BlockDevice;
@@ -589,11 +590,69 @@ impl UffdCore {
     }
 }
 
+/// Bundles an owned Unix socket with a compio [`PollFd`] for readiness.
+///
+/// The block-uffd protocol passes file descriptors over the socket via
+/// `SCM_RIGHTS`, which we perform with the `sendfd` crate's raw `recvmsg`/
+/// `sendmsg` on the owned [`StdUnixStream`]. compio's completion reactor only
+/// needs to wait for readiness, so a `PollFd` built from a duplicated fd drives
+/// the readiness waits through io_uring while the original stream keeps doing
+/// the safe, audited ancillary-data I/O. This replaces tokio's `AsyncFd`
+/// without reintroducing hand-rolled `cmsg` handling (variable-count
+/// `SCM_RIGHTS` does not map onto compio's fixed-size ancillary API).
+struct AsyncSock {
+    stream: StdUnixStream,
+    poll: PollFd<OwnedFd>,
+}
+
+impl AsyncSock {
+    fn new(stream: StdUnixStream) -> Result<Self> {
+        let dup = stream
+            .as_fd()
+            .try_clone_to_owned()
+            .map_err(|e| eother!(format!("Failed to dup sock fd for PollFd: {}", e)))?;
+        let poll = PollFd::new(dup)
+            .map_err(|e| eother!(format!("Failed to create PollFd for sock: {}", e)))?;
+        Ok(Self { stream, poll })
+    }
+
+    /// Borrow the underlying stream for raw `recvmsg`/`sendmsg`.
+    fn get_ref(&self) -> &StdUnixStream {
+        &self.stream
+    }
+
+    /// Wait until the socket is readable.
+    async fn readable(&self) -> Result<()> {
+        self.poll
+            .read_ready()
+            .await
+            .map_err(|e| eother!(format!("sock readable: {e}")))
+    }
+
+    /// Wait until the socket is writable.
+    async fn writable(&self) -> Result<()> {
+        self.poll
+            .write_ready()
+            .await
+            .map_err(|e| eother!(format!("sock writable: {e}")))
+    }
+}
+
 /// Connection state after handshake.
 struct ConnState {
     vma_regions: Vec<VmaRegion>,
     policy: FaultPolicy,
-    uffd_async: AsyncFd<OwnedFd>,
+    uffd_poll: PollFd<OwnedFd>,
+}
+
+/// Which event woke the connection event loop.
+enum Wakeup {
+    /// The client socket is readable.
+    Sock,
+    /// The uffd is readable (page-fault events queued).
+    Uffd,
+    /// A shutdown broadcast was received.
+    Shutdown,
 }
 
 /// A worker to handle uffd connections in asynchronous mode.
@@ -628,26 +687,38 @@ impl UffdWorker {
                 }
             };
 
-        let mut receiver = self.sender.subscribe();
+        let mut receiver = self.sender.new_receiver();
         loop {
             if !self.active.load(Ordering::Acquire) {
                 break;
             }
-            tokio::select! {
-                Ok(stream) = self.conn_receiver.recv_async() => {
-                    stream.set_nonblocking(true).expect("failed to set nonblocking");
-                    let active = self.active.clone();
-                    let active_conns = self.active_conns.clone();
-                    let device = device.clone();
-                    let sender = self.sender.clone();
-                    compio::runtime::spawn(async move {
-                        if let Err(e) = Self::handle_conn(active, active_conns, device, stream, sender).await {
-                            warn!("block_uffd: connection handler exited with error: {e}");
-                        }
-                    }).detach();
+            // Accept the next client connection or break on a shutdown
+            // broadcast. The branch futures borrow `self`/`receiver`, so resolve
+            // them in an inner scope and drop them before spawning the handler.
+            let stream = {
+                let conn_fut = self.conn_receiver.recv_async().fuse();
+                let shutdown_fut = receiver.recv().fuse();
+                futures_util::pin_mut!(conn_fut, shutdown_fut);
+                select! {
+                    res = conn_fut => res,
+                    _ = shutdown_fut => break,
                 }
-                _ = receiver.recv() => break,
-            }
+            };
+            let stream = match stream {
+                Ok(stream) => stream,
+                // All connection senders dropped: the session is tearing down.
+                Err(_) => break,
+            };
+            stream.set_nonblocking(true).expect("failed to set nonblocking");
+            let active = self.active.clone();
+            let active_conns = self.active_conns.clone();
+            let device = device.clone();
+            let sender = self.sender.clone();
+            compio::runtime::spawn(async move {
+                if let Err(e) = Self::handle_conn(active, active_conns, device, stream, sender).await {
+                    warn!("block_uffd: connection handler exited with error: {e}");
+                }
+            }).detach();
         }
 
         info!("block_uffd: worker {} exit!", self.name);
@@ -667,44 +738,66 @@ impl UffdWorker {
         // Register fd so stop() can shutdown this socket.
         active_conns.lock().unwrap().push(fd);
 
-        let sock_async = AsyncFd::new(stream)
-            .map_err(|e| eother!(format!("Failed to create AsyncFd for sock: {}", e)))?;
+        let sock_async = AsyncSock::new(stream)?;
 
-        let mut receiver = sender.subscribe();
+        let mut receiver = sender.new_receiver();
         let device_size = device.blocks_to_size(device.blocks());
         let block_size = device.block_size();
         let core = UffdCore::new(device);
         let mut conn_state: Option<ConnState> = None;
         while active.load(Ordering::Acquire) {
-            tokio::select! {
-                res = sock_async.readable() => {
-                    let mut guard = res.map_err(|e| eother!(format!("sock readable: {e}")))?;
-                    let msg = Self::try_recv_from_sock(guard.get_inner());
-                    guard.clear_ready();
-                    match msg {
-                        Ok(None) => continue,
-                        Err(e) => {
-                            warn!("block_uffd: sock recv error: {e}");
-                            break;
-                        }
-                        Ok(Some((json_val, fds, msg_type))) => {
-                            Self::dispatch_message(
-                                msg_type, json_val, fds,
-                                &sock_async, &core, &mut conn_state,
-                                device_size, block_size,
-                            ).await?;
-                        }
+            // Wait for one of: socket readable, uffd readable (only once
+            // handshaked), or a shutdown broadcast. The branch futures borrow
+            // `sock_async`/`conn_state`/`receiver`, so resolve them to a small
+            // `Wakeup` in an inner scope and drop them before the handlers,
+            // which need `&mut conn_state` and re-borrow the socket.
+            let wakeup = {
+                let sock_fut = sock_async.readable().fuse();
+                let uffd_fut = async {
+                    if let Some(ref state) = conn_state {
+                        state.uffd_poll.read_ready().await
+                    } else {
+                        std::future::pending::<Result<()>>().await
                     }
                 }
-
-                res = async {
-                    if let Some(ref state) = conn_state {
-                        state.uffd_async.readable().await
-                    } else {
-                        std::future::pending().await
+                .fuse();
+                let shutdown_fut = receiver.recv().fuse();
+                futures_util::pin_mut!(sock_fut, uffd_fut, shutdown_fut);
+                select! {
+                    res = sock_fut => {
+                        res?;
+                        Wakeup::Sock
                     }
-                } => {
-                    let mut guard = res.map_err(|e| eother!(format!("uffd readable: {e}")))?;
+                    res = uffd_fut => {
+                        res.map_err(|e| eother!(format!("uffd readable: {e}")))?;
+                        Wakeup::Uffd
+                    }
+                    _ = shutdown_fut => Wakeup::Shutdown,
+                }
+            };
+
+            match wakeup {
+                Wakeup::Sock => match Self::try_recv_from_sock(sock_async.get_ref()) {
+                    Ok(None) => continue,
+                    Err(e) => {
+                        warn!("block_uffd: sock recv error: {e}");
+                        break;
+                    }
+                    Ok(Some((json_val, fds, msg_type))) => {
+                        Self::dispatch_message(
+                            msg_type,
+                            json_val,
+                            fds,
+                            &sock_async,
+                            &core,
+                            &mut conn_state,
+                            device_size,
+                            block_size,
+                        )
+                        .await?;
+                    }
+                },
+                Wakeup::Uffd => {
                     let state = conn_state.as_ref().unwrap();
                     if let Err(e) = Self::handle_uffd_event(state, &core, &sock_async).await {
                         // A page fault could not be resolved. Leaving it pending
@@ -714,10 +807,8 @@ impl UffdWorker {
                         warn!("block_uffd: tearing down connection, unresolved page fault: {e}");
                         break;
                     }
-                    guard.clear_ready();
                 }
-
-                _ = receiver.recv() => {
+                Wakeup::Shutdown => {
                     info!("block_uffd: conn receive exit signal");
                     break;
                 }
@@ -737,7 +828,7 @@ impl UffdWorker {
         msg_type: MessageType,
         json_val: serde_json::Value,
         fds: Vec<RawFd>,
-        sock_async: &AsyncFd<StdUnixStream>,
+        sock_async: &AsyncSock,
         core: &UffdCore,
         conn_state: &mut Option<ConnState>,
         device_size: u64,
@@ -775,7 +866,7 @@ impl UffdWorker {
     fn handle_handshake(
         json_val: serde_json::Value,
         fds: Vec<RawFd>,
-        sock_async: &AsyncFd<StdUnixStream>,
+        sock_async: &AsyncSock,
         core: &UffdCore,
     ) -> Result<ConnState> {
         let request: HandshakeRequest = match if json_val.is_array() {
@@ -832,12 +923,12 @@ impl UffdWorker {
         }
 
         let owned_fd = unsafe { OwnedFd::from_raw_fd(fd) };
-        let uffd_async = AsyncFd::new(owned_fd)
-            .map_err(|e| eother!(format!("Failed to create AsyncFd for uffd: {}", e)))?;
+        let uffd_poll = PollFd::new(owned_fd)
+            .map_err(|e| eother!(format!("Failed to create PollFd for uffd: {}", e)))?;
         let state = ConnState {
             vma_regions: request.regions.clone(),
             policy: request.policy,
-            uffd_async,
+            uffd_poll,
         };
 
         // Spawn pre-fault task if enabled and policy is zerocopy
@@ -866,7 +957,7 @@ impl UffdWorker {
 
     /// Handle stat request from client.
     async fn handle_stat_request(
-        sock_async: &AsyncFd<StdUnixStream>,
+        sock_async: &AsyncSock,
         device_size: u64,
         block_size: u64,
     ) -> Result<()> {
@@ -878,17 +969,17 @@ impl UffdWorker {
 
     /// Handle uffd page fault events.
     ///
-    /// `AsyncFd` registers the uffd fd in edge-triggered mode, so a single
-    /// readiness notification can cover several queued events. We must drain the
-    /// fd until it returns `WouldBlock` (`read_uffd_msg` -> `Ok(None)`); otherwise
-    /// a second simultaneously-queued page fault stays unread and its faulting
-    /// thread stalls until an unrelated fault happens to re-trigger the fd.
+    /// A single `PollFd` readiness notification can cover several queued uffd
+    /// events, so we must drain the fd until it returns `WouldBlock`
+    /// (`read_uffd_msg` -> `Ok(None)`); otherwise a second simultaneously-queued
+    /// page fault stays unread and its faulting thread stalls until an unrelated
+    /// fault happens to re-trigger the fd.
     async fn handle_uffd_event(
         state: &ConnState,
         core: &UffdCore,
-        sock_async: &AsyncFd<StdUnixStream>,
+        sock_async: &AsyncSock,
     ) -> Result<()> {
-        let uffd_fd = state.uffd_async.get_ref().as_raw_fd();
+        let uffd_fd = state.uffd_poll.as_raw_fd();
         loop {
             let msg = match read_uffd_msg(uffd_fd)? {
                 Some(m) => m,
@@ -966,10 +1057,11 @@ impl UffdWorker {
         }
     }
 
-    /// Send data with fd asynchronously using tokio's try_io pattern.
-    /// This avoids spawn_blocking by using the async socket's readiness notification.
+    /// Send data with fd asynchronously. Avoids spawn_blocking by retrying the
+    /// non-blocking `sendmsg` and awaiting the socket's compio `PollFd`
+    /// readiness notification between `WouldBlock` attempts.
     async fn async_send_with_fd(
-        sock: &AsyncFd<StdUnixStream>,
+        sock: &AsyncSock,
         data: &[u8],
         fds: &[RawFd],
     ) -> Result<()> {
@@ -977,12 +1069,10 @@ impl UffdWorker {
             match sock.get_ref().send_with_fd(data, fds) {
                 Ok(_) => return Ok(()),
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    // Wait for socket to become writable
-                    let mut guard = sock
-                        .writable()
-                        .await
-                        .map_err(|e| eother!(format!("socket writable failed: {}", e)))?;
-                    guard.clear_ready();
+                    // Wait for the socket to become writable, then retry. compio's
+                    // PollFd is one-shot per call, so there is no readiness guard
+                    // to clear: the next `writable()` re-arms the poll.
+                    sock.writable().await?;
                 }
                 Err(e) => return Err(eother!(format!("send_with_fd failed: {}", e))),
             }
@@ -991,7 +1081,7 @@ impl UffdWorker {
 
     /// Send a batch of page fault responses with blob fds to client. Zerocopy only
     async fn send_batch_response(
-        stream: &AsyncFd<StdUnixStream>,
+        stream: &AsyncSock,
         batch: &[(RawFd, u64, usize, u64)],
     ) -> Result<()> {
         let response = PageFaultResponse {
@@ -1018,8 +1108,7 @@ impl UffdWorker {
         stream: StdUnixStream,
         vma_regions: Vec<VmaRegion>,
     ) -> Result<()> {
-        let stream = AsyncFd::new(stream)
-            .map_err(|e| eother!(format!("Failed to create AsyncFd for pre-fault: {}", e)))?;
+        let stream = AsyncSock::new(stream)?;
         let core = UffdCore::new(device);
         let ranges = core.prefault_ranges(&vma_regions).await?;
         for chunk in ranges.chunks(MAX_RANGES_PER_MSG) {
@@ -1047,7 +1136,12 @@ impl UffdService {
     /// It accepts unix sockets from `uds_path` and receives uffd fd and VMA info
     /// from clients to monitor for page faults.
     pub fn new(device: Arc<BlockDevice>, uds_path: String) -> Result<Self> {
-        let (sender, _receiver) = tokio::sync::broadcast::channel(4);
+        // Shutdown notification broadcast to every worker/connection so they
+        // wake from `select!` and re-check `active`. Overflow mode keeps
+        // `try_broadcast` non-blocking and infallible regardless of subscribers.
+        let (mut sender, receiver) = async_broadcast::broadcast(4);
+        sender.set_overflow(true);
+        drop(receiver);
 
         Ok(UffdService {
             active: Arc::new(AtomicBool::new(true)),
@@ -1134,7 +1228,7 @@ impl UffdService {
         }
 
         self.active.store(false, Ordering::Release);
-        let _ = self.sender.send(1);
+        let _ = self.sender.try_broadcast(1);
         loop {
             let handle = self.worker_threads.lock().unwrap().pop();
             if let Some(handle) = handle {
@@ -1163,7 +1257,7 @@ impl UffdService {
     /// wake up the accept loop.
     pub fn stop(&self) {
         self.active.store(false, Ordering::Release);
-        let _ = self.sender.send(0);
+        let _ = self.sender.try_broadcast(0);
         // Shutdown all active client sockets so handle_conn tasks exit.
         let conns = self.active_conns.lock().unwrap();
         for &fd in conns.iter() {
@@ -1889,7 +1983,7 @@ mod tests {
     fn test_send_batch_response() {
         compio::runtime::Runtime::new().unwrap().block_on(async {
             let (sock1, sock2) = std::os::unix::net::UnixStream::pair().unwrap();
-            let sock_async = AsyncFd::new(sock1).unwrap();
+            let sock_async = AsyncSock::new(sock1).unwrap();
 
             // Create a mock batch response
             let batch = vec![
@@ -1924,7 +2018,7 @@ mod tests {
         compio::runtime::Runtime::new().unwrap().block_on(async {
             let (sock1, sock2) = std::os::unix::net::UnixStream::pair().unwrap();
             sock2.set_nonblocking(true).unwrap();
-            let sock_async = AsyncFd::new(sock1).unwrap();
+            let sock_async = AsyncSock::new(sock1).unwrap();
 
             let tmpdir = TempDir::new().unwrap();
             let device = create_block_device(tmpdir.as_path().to_path_buf()).unwrap();
@@ -1953,7 +2047,7 @@ mod tests {
         compio::runtime::Runtime::new().unwrap().block_on(async {
             let (sock1, _sock2) = std::os::unix::net::UnixStream::pair().unwrap();
             sock1.set_nonblocking(true).unwrap();
-            let sock_async = AsyncFd::new(sock1).unwrap();
+            let sock_async = AsyncSock::new(sock1).unwrap();
 
             let tmpdir = TempDir::new().unwrap();
             let device = create_block_device(tmpdir.as_path().to_path_buf()).unwrap();
@@ -1981,7 +2075,7 @@ mod tests {
         compio::runtime::Runtime::new().unwrap().block_on(async {
             let (sock1, _sock2) = std::os::unix::net::UnixStream::pair().unwrap();
             sock1.set_nonblocking(true).unwrap();
-            let sock_async = AsyncFd::new(sock1).unwrap();
+            let sock_async = AsyncSock::new(sock1).unwrap();
 
             let tmpdir = TempDir::new().unwrap();
             let device = create_block_device(tmpdir.as_path().to_path_buf()).unwrap();
@@ -1991,11 +2085,11 @@ mod tests {
             let (uffd_sock, _) = std::os::unix::net::UnixStream::pair().unwrap();
             uffd_sock.set_nonblocking(true).unwrap();
             let uffd_fd = unsafe { OwnedFd::from_raw_fd(uffd_sock.as_raw_fd()) };
-            let uffd_async = AsyncFd::new(uffd_fd).unwrap();
+            let uffd_poll = PollFd::new(uffd_fd).unwrap();
             let mut conn_state: Option<ConnState> = Some(ConnState {
                 vma_regions: vec![VmaRegion::new(0x1000, 0x2000, 0, 4096)],
                 policy: FaultPolicy::Zerocopy,
-                uffd_async,
+                uffd_poll,
             });
 
             let json_val = serde_json::to_value(HandshakeRequest {
@@ -2031,7 +2125,7 @@ mod tests {
         compio::runtime::Runtime::new().unwrap().block_on(async {
             let (sock1, sock2) = std::os::unix::net::UnixStream::pair().unwrap();
             sock1.set_nonblocking(true).unwrap();
-            let sock_async = AsyncFd::new(sock1).unwrap();
+            let sock_async = AsyncSock::new(sock1).unwrap();
 
             let res = UffdWorker::handle_stat_request(&sock_async, 1024 * 1024, 4096).await;
             assert!(res.is_ok());
@@ -2064,7 +2158,7 @@ mod tests {
 
             let (sock1, _sock2) = std::os::unix::net::UnixStream::pair().unwrap();
             sock1.set_nonblocking(true).unwrap();
-            let sock_async = AsyncFd::new(sock1).unwrap();
+            let sock_async = AsyncSock::new(sock1).unwrap();
 
             let uffd_fd = create_userfaultfd_for_test().unwrap();
 
@@ -2093,7 +2187,7 @@ mod tests {
 
             let (sock1, _sock2) = std::os::unix::net::UnixStream::pair().unwrap();
             sock1.set_nonblocking(true).unwrap();
-            let sock_async = AsyncFd::new(sock1).unwrap();
+            let sock_async = AsyncSock::new(sock1).unwrap();
 
             let json_val = serde_json::to_value(HandshakeRequest {
                 r#type: MessageType::Handshake,
@@ -2118,7 +2212,7 @@ mod tests {
 
             let (sock1, _sock2) = std::os::unix::net::UnixStream::pair().unwrap();
             sock1.set_nonblocking(true).unwrap();
-            let sock_async = AsyncFd::new(sock1).unwrap();
+            let sock_async = AsyncSock::new(sock1).unwrap();
 
             let uffd_fd = create_userfaultfd_for_test().unwrap();
 
@@ -2146,7 +2240,7 @@ mod tests {
 
             let (sock1, _sock2) = std::os::unix::net::UnixStream::pair().unwrap();
             sock1.set_nonblocking(true).unwrap();
-            let sock_async = AsyncFd::new(sock1).unwrap();
+            let sock_async = AsyncSock::new(sock1).unwrap();
 
             let uffd_fd = create_userfaultfd_for_test().unwrap();
             let json_val = serde_json::to_value(HandshakeRequest {
@@ -2167,7 +2261,7 @@ mod tests {
         compio::runtime::Runtime::new().unwrap().block_on(async {
             let (sock1, _sock2) = std::os::unix::net::UnixStream::pair().unwrap();
             sock1.set_nonblocking(true).unwrap();
-            let sock_async = AsyncFd::new(sock1).unwrap();
+            let sock_async = AsyncSock::new(sock1).unwrap();
 
             let tmpdir = TempDir::new().unwrap();
             let device = create_block_device(tmpdir.as_path().to_path_buf()).unwrap();
@@ -2240,7 +2334,7 @@ mod tests {
         compio::runtime::Runtime::new().unwrap().block_on(async {
             let (sock1, sock2) = std::os::unix::net::UnixStream::pair().unwrap();
             sock1.set_nonblocking(true).unwrap();
-            let sock_async = AsyncFd::new(sock1).unwrap();
+            let sock_async = AsyncSock::new(sock1).unwrap();
 
             let data = b"hello world";
             let res = UffdWorker::async_send_with_fd(&sock_async, data, &[]).await;
@@ -2324,7 +2418,7 @@ mod tests {
             client_sock.set_nonblocking(true).unwrap();
             server_sock.set_nonblocking(true).unwrap();
 
-            let client_async = AsyncFd::new(client_sock).unwrap();
+            let client_async = AsyncSock::new(client_sock).unwrap();
 
             let (uffd_fd, addr, mmap_size) = setup_uffd_region(4096).unwrap();
 
@@ -2345,7 +2439,9 @@ mod tests {
 
             // Spawn handle_conn with broadcast sender for graceful shutdown
             let active = Arc::new(AtomicBool::new(true));
-            let (sender, _receiver) = tokio::sync::broadcast::channel(4);
+            let (mut sender, receiver) = async_broadcast::broadcast(4);
+            sender.set_overflow(true);
+            drop(receiver);
             let sender = Arc::new(sender);
             let sender_clone = sender.clone();
             let handle = compio::runtime::spawn(async move {
@@ -2359,13 +2455,11 @@ mod tests {
                 .await
             });
 
-            // Yield to let the runtime process the handshake
-            for _ in 0..10 {
-                tokio::task::yield_now().await;
-            }
+            // Give the spawned handle_conn task time to process the handshake.
+            compio::runtime::time::sleep(Duration::from_millis(50)).await;
 
             // Graceful shutdown via broadcast signal
-            let _ = sender.send(0);
+            let _ = sender.try_broadcast(0);
 
             // Only unmap the memory region; do NOT close uffd_fd since
             // ownership was transferred to handle_conn via SCM_RIGHTS.
@@ -2373,7 +2467,7 @@ mod tests {
                 libc::munmap(addr as *mut _, mmap_size);
             }
 
-            let result = tokio::time::timeout(Duration::from_secs(2), handle).await;
+            let result = compio::runtime::time::timeout(Duration::from_secs(2), handle).await;
             assert!(result.is_ok(), "handle_conn did not exit within timeout");
         });
     }
@@ -2390,7 +2484,7 @@ mod tests {
             // Create sockets for communication
             let (sock1, _sock2) = std::os::unix::net::UnixStream::pair().unwrap();
             sock1.set_nonblocking(true).unwrap();
-            let sock_async = AsyncFd::new(sock1).unwrap();
+            let sock_async = AsyncSock::new(sock1).unwrap();
 
             // Setup uffd region - OwnedFd takes ownership of uffd_fd
             let (uffd_fd, addr, mmap_size) = setup_uffd_region(4096).unwrap();
@@ -2398,7 +2492,7 @@ mod tests {
             let state = ConnState {
                 vma_regions,
                 policy: FaultPolicy::Zerocopy,
-                uffd_async: AsyncFd::new(unsafe { OwnedFd::from_raw_fd(uffd_fd) }).unwrap(),
+                uffd_poll: PollFd::new(unsafe { OwnedFd::from_raw_fd(uffd_fd) }).unwrap(),
             };
 
             // Call handle_uffd_event without triggering a page fault.
