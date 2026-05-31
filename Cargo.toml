@@ -58,9 +58,6 @@ serde_json = "1.0.150"
 tar = "0.4.46"
 tokio = { version = "1.52.3", features = ["macros"] }
 
-# Build static linked openssl library
-openssl = { version = '0.10.80', features = ["vendored"] }
-
 nydus-api = { version = "0.4.1", path = "api", features = [
     "error-backtrace",
     "handler",
