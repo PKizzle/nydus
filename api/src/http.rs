@@ -11,7 +11,7 @@ use serde::Deserialize;
 use serde_json::Error as SerdeError;
 use thiserror::Error;
 
-use crate::BlobCacheEntry;
+use crate::{BlobCacheEntry, ConfigV2};
 
 /// Errors related to Metrics.
 #[derive(Error, Debug)]
@@ -113,6 +113,8 @@ pub enum ApiRequest {
     GetConfig(Option<String>),
     /// Update global configuration.
     UpdateConfig(Option<String>, Config),
+    /// Update global configuration from a structured ConfigV2 document.
+    UpdateConfigV2(Option<String>, Box<ConfigV2>),
 
     // Nydus API v2
     /// Get daemon information excluding filesystem backends.

@@ -20,7 +20,7 @@ use nix::sys::signal;
 use rlimit::Resource;
 
 use nydus::{dump_program_info, get_build_time_info, setup_logging, SubCmdArgs};
-use nydus_api::{BuildTimeInfo, ConfigV2};
+use nydus_api::{BlobCacheList, BuildTimeInfo, ConfigV2};
 use nydus_service::daemon::DaemonController;
 use nydus_service::{
     create_daemon, create_fuse_daemon, create_vfs_backend, validate_threads_configuration,
@@ -225,7 +225,7 @@ fn prepare_commandline_options() -> Command {
             Arg::new("config")
                 .long("config")
                 .short('C')
-                .help("Path to the Nydus daemon configuration file")
+                .help("Path to the Nydus daemon configuration file (JSON, TOML or YAML)")
                 .required(false)
                 .global(true),
         )
@@ -563,9 +563,13 @@ fn process_singleton_arguments(
     let config = match subargs.value_of("config") {
         None => None,
         Some(path) => {
-            let config = std::fs::read_to_string(path)?;
-            let config: serde_json::Value = serde_json::from_str(&config)
-                .map_err(|_e| einval!("invalid configuration file"))?;
+            let config = BlobCacheList::from_file(path)?;
+            let config = serde_json::to_value(config).map_err(|e| {
+                Error::new(
+                    ErrorKind::InvalidInput,
+                    format!("invalid blob cache configuration file: {e}"),
+                )
+            })?;
             Some(config)
         }
     };

@@ -6,7 +6,9 @@
 
 //! Nydus API v2.
 
-use crate::BlobCacheEntry;
+use std::str::{self, FromStr};
+
+use crate::{BlobCacheEntry, ConfigV2};
 use dbs_uhttp::{Method, Request, Response};
 
 use crate::http::{
@@ -32,6 +34,10 @@ fn convert_to_response<O: FnOnce(ApiError) -> HttpError>(api_resp: ApiResponse, 
             use ApiResponsePayload::*;
             match r {
                 Empty => success_response(None),
+                Config(conf) => {
+                    let json = serde_json::to_string(&conf).unwrap_or_else(|_| "{}".to_string());
+                    success_response(Some(json))
+                }
                 DaemonInfo(d) => success_response(Some(d)),
                 BlobObjectList(d) => success_response(Some(d)),
                 _ => panic!("Unexpected response message from API service"),
@@ -40,6 +46,38 @@ fn convert_to_response<O: FnOnce(ApiError) -> HttpError>(api_resp: ApiResponse, 
         Err(e) => {
             let status_code = translate_status_code(&e);
             error_response(op(e), status_code)
+        }
+    }
+}
+
+fn parse_config_v2_body(body: &dbs_uhttp::Body) -> std::result::Result<Box<ConfigV2>, HttpError> {
+    let body = str::from_utf8(body.raw()).map_err(|_| HttpError::BadRequest)?;
+    ConfigV2::from_str(body)
+        .map(Box::new)
+        .map_err(|_| HttpError::BadRequest)
+}
+
+/// Get/update dynamic daemon configuration from a structured ConfigV2 document.
+pub struct ConfigV2Handler {}
+impl EndpointHandler for ConfigV2Handler {
+    fn handle_request(
+        &self,
+        req: &Request,
+        kicker: &dyn Fn(ApiRequest) -> ApiResponse,
+    ) -> HttpResult {
+        match (req.method(), req.body.as_ref()) {
+            (Method::Get, None) => {
+                let id = extract_query_part(req, "id");
+                let r = kicker(ApiRequest::GetConfig(id));
+                Ok(convert_to_response(r, HttpError::Configure))
+            }
+            (Method::Put, Some(body)) => {
+                let conf = parse_config_v2_body(body)?;
+                let id = extract_query_part(req, "id");
+                let r = kicker(ApiRequest::UpdateConfigV2(id, conf));
+                Ok(convert_to_response(r, HttpError::Configure))
+            }
+            _ => Err(HttpError::BadRequest),
         }
     }
 }
@@ -236,6 +274,39 @@ mod tests {
         let req = get_req("http://localhost/api/v2/daemon");
         // kicker returns error → handler still returns Ok(error_response)
         let result = handler.handle_request(&req, &|_| Err(ApiError::ResponsePayloadType));
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_config_v2_handler_put_yaml() {
+        let handler = ConfigV2Handler {};
+        let body = r#"version: 2
+id: yaml-test
+backend:
+    type: registry
+    registry:
+        host: localhost
+        repo: library/test
+        auth: dXNlcjpwYXNz
+cache:
+    type: filecache
+    filecache:
+        work_dir: /tmp
+rafs:
+    mode: direct
+"#;
+        let req = put_req_body("http://localhost/api/v2/config", body);
+        let result = handler.handle_request(&req, &|_| ok_empty());
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_config_v2_handler_get() {
+        let handler = ConfigV2Handler {};
+        let req = get_req("http://localhost/api/v2/config?id=test");
+        let result = handler.handle_request(&req, &|_| {
+            Ok(ApiResponsePayload::Config(std::collections::HashMap::new()))
+        });
         assert!(result.is_ok());
     }
 }

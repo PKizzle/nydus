@@ -15,7 +15,7 @@ use std::sync::Arc;
 use serde::Deserialize;
 use serde_json::Value;
 
-/// Configuration file format version 2, based on Toml.
+/// Configuration file format version 2, supporting JSON, TOML and YAML.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ConfigV2 {
     /// Configuration file format version number, must be 2.
@@ -250,6 +250,13 @@ impl FromStr for ConfigV2 {
                 Err(Error::new(ErrorKind::InvalidInput, "invalid configuration"))
             };
         }
+        if let Ok(v) = serde_yaml::from_str::<ConfigV2>(s) {
+            return if v.validate() {
+                Ok(v)
+            } else {
+                Err(Error::new(ErrorKind::InvalidInput, "invalid configuration"))
+            };
+        }
         if let Ok(v) = toml::from_str::<ConfigV2>(s) {
             return if v.validate() {
                 Ok(v)
@@ -258,6 +265,13 @@ impl FromStr for ConfigV2 {
             };
         }
         if let Ok(v) = serde_json::from_str::<RafsConfig>(s) {
+            if let Ok(v) = ConfigV2::try_from(v) {
+                if v.validate() {
+                    return Ok(v);
+                }
+            }
+        }
+        if let Ok(v) = serde_yaml::from_str::<RafsConfig>(s) {
             if let Ok(v) = ConfigV2::try_from(v) {
                 if v.validate() {
                     return Ok(v);
@@ -1037,6 +1051,13 @@ impl FromStr for BlobCacheEntryConfigV2 {
                 Err(Error::new(ErrorKind::InvalidInput, "invalid configuration"))
             };
         }
+        if let Ok(v) = serde_yaml::from_str::<BlobCacheEntryConfigV2>(s) {
+            return if v.validate() {
+                Ok(v)
+            } else {
+                Err(Error::new(ErrorKind::InvalidInput, "invalid configuration"))
+            };
+        }
         if let Ok(v) = toml::from_str::<BlobCacheEntryConfigV2>(s) {
             return if v.validate() {
                 Ok(v)
@@ -1205,6 +1226,13 @@ impl FromStr for BlobCacheEntry {
                 Err(Error::new(ErrorKind::InvalidInput, "invalid configuration"))
             };
         }
+        if let Ok(v) = serde_yaml::from_str::<BlobCacheEntry>(s) {
+            return if v.validate() {
+                Ok(v)
+            } else {
+                Err(Error::new(ErrorKind::InvalidInput, "invalid configuration"))
+            };
+        }
         if let Ok(v) = toml::from_str::<BlobCacheEntry>(s) {
             return if v.validate() {
                 Ok(v)
@@ -1224,6 +1252,50 @@ impl FromStr for BlobCacheEntry {
 pub struct BlobCacheList {
     /// List of blob configuration information.
     pub blobs: Vec<BlobCacheEntry>,
+}
+
+impl BlobCacheList {
+    /// Read blob cache list configuration from a file.
+    pub fn from_file<P: AsRef<Path>>(path: P) -> Result<Self> {
+        let md = fs::metadata(path.as_ref())?;
+        if md.len() > 0x100000 {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "configuration file size is too big",
+            ));
+        }
+        let content = fs::read_to_string(path)?;
+        Self::from_str(&content)
+    }
+
+    fn prepare_and_validate(mut self) -> Result<Self> {
+        for blob in self.blobs.iter_mut() {
+            if !blob.prepare_configuration_info() || !blob.validate() {
+                return Err(Error::new(ErrorKind::InvalidInput, "invalid configuration"));
+            }
+        }
+        Ok(self)
+    }
+}
+
+impl FromStr for BlobCacheList {
+    type Err = Error;
+
+    fn from_str(s: &str) -> Result<BlobCacheList> {
+        if let Ok(v) = serde_json::from_str::<BlobCacheList>(s) {
+            return v.prepare_and_validate();
+        }
+        if let Ok(v) = serde_yaml::from_str::<BlobCacheList>(s) {
+            return v.prepare_and_validate();
+        }
+        if let Ok(v) = toml::from_str::<BlobCacheList>(s) {
+            return v.prepare_and_validate();
+        }
+        Err(Error::new(
+            ErrorKind::InvalidInput,
+            "failed to parse configuration information",
+        ))
+    }
 }
 
 fn redact_sensitive_map(map: &mut HashMap<String, String>) {
@@ -1886,6 +1958,99 @@ mod tests {
         let config: ConfigV2 = toml::from_str(content).unwrap();
         assert_eq!(config.version, 2);
         assert!(config.backend.is_none());
+    }
+
+    #[test]
+    fn test_v2_yaml_config() {
+        let content = r#"version: 2
+id: yaml-test
+backend:
+  type: registry
+  registry:
+    host: registry.example.com
+    repo: library/test
+    auth: dXNlcjpwYXNz
+    registry_token: bearer-token
+cache:
+  type: filecache
+  filecache:
+    work_dir: /tmp
+    encryption_key: secret-key
+rafs:
+  mode: direct
+external_backends:
+  - type: registry
+    patch:
+      auth: should-clear
+    config:
+      access_key_secret: should-clear
+      regular_key: keep
+"#;
+        let config = ConfigV2::from_str(content).unwrap();
+        assert_eq!(config.version, 2);
+        assert_eq!(config.id, "yaml-test");
+        assert_eq!(
+            config
+                .backend
+                .as_ref()
+                .unwrap()
+                .registry
+                .as_ref()
+                .unwrap()
+                .auth
+                .as_deref(),
+            Some("dXNlcjpwYXNz")
+        );
+
+        let redacted = config.clone_without_secrets();
+        let registry = redacted
+            .backend
+            .as_ref()
+            .unwrap()
+            .registry
+            .as_ref()
+            .unwrap();
+        assert!(registry.auth.is_none());
+        assert!(registry.registry_token.is_none());
+        assert!(redacted
+            .cache
+            .as_ref()
+            .unwrap()
+            .file_cache
+            .as_ref()
+            .unwrap()
+            .encryption_key
+            .is_empty());
+        assert_eq!(redacted.external_backends[0].patch["auth"], "");
+        assert_eq!(
+            redacted.external_backends[0].config["access_key_secret"],
+            ""
+        );
+        assert_eq!(redacted.external_backends[0].config["regular_key"], "keep");
+    }
+
+    #[test]
+    fn test_blob_cache_list_yaml_config() {
+        let content = r#"blobs:
+  - type: bootstrap
+    id: blob1
+    domain_id: domain1
+    config_v2:
+      version: 2
+      id: cache1
+      backend:
+        type: localfs
+        localfs:
+          dir: /tmp
+      cache:
+        type: filecache
+        filecache:
+          work_dir: /tmp
+      metadata_path: /tmp/bootstrap
+"#;
+        let list = BlobCacheList::from_str(content).unwrap();
+        assert_eq!(list.blobs.len(), 1);
+        assert!(list.blobs[0].blob_config.is_some());
     }
 
     #[test]

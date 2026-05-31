@@ -27,7 +27,9 @@ use crate::http_endpoint_v1::{
     ConfigHandler, FsBackendInfo, InfoHandler, MetricsFsAccessPatternHandler,
     MetricsFsFilesHandler, MetricsFsGlobalHandler, MetricsFsInflightHandler, HTTP_ROOT_V1,
 };
-use crate::http_endpoint_v2::{BlobObjectListHandlerV2, InfoV2Handler, HTTP_ROOT_V2};
+use crate::http_endpoint_v2::{
+    BlobObjectListHandlerV2, ConfigV2Handler, InfoV2Handler, HTTP_ROOT_V2,
+};
 
 const EXIT_TOKEN: Token = Token(usize::MAX);
 const REQUEST_TOKEN: Token = Token(1);
@@ -123,13 +125,13 @@ pub struct HttpRoutes {
 }
 
 macro_rules! endpoint_v1 {
-    ($path:expr) => {
+    ($path:expr_2021) => {
         format!("{}{}", HTTP_ROOT_V1, $path)
     };
 }
 
 macro_rules! endpoint_v2 {
-    ($path:expr) => {
+    ($path:expr_2021) => {
         format!("{}{}", HTTP_ROOT_V2, $path)
     };
 }
@@ -162,6 +164,7 @@ lazy_static! {
 
         // Nydus API, v2
         r.routes.insert(endpoint_v2!("/daemon"), Box::new(InfoV2Handler{}));
+        r.routes.insert(endpoint_v2!("/config"), Box::new(ConfigV2Handler{}));
         r.routes.insert(endpoint_v2!("/blobs"), Box::new(BlobObjectListHandlerV2{}));
 
         r
@@ -354,6 +357,7 @@ mod tests {
     #[test]
     fn test_http_api_routes_v2() {
         assert!(HTTP_ROUTES.routes.contains_key("/api/v2/daemon"));
+        assert!(HTTP_ROUTES.routes.contains_key("/api/v2/config"));
         assert!(HTTP_ROUTES.routes.contains_key("/api/v2/blobs"));
     }
 
