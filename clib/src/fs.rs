@@ -113,7 +113,7 @@ fn do_nydus_open_rafs(bootstrap: &str, config: &str) -> NydusFsHandle {
 /// # Safety
 /// Caller needs to ensure `bootstrap` and `config` are valid, otherwise it may cause memory access
 /// violation.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn nydus_open_rafs(
     bootstrap: *const c_char,
     config: *const c_char,
@@ -135,7 +135,7 @@ pub unsafe extern "C" fn nydus_open_rafs(
 /// # Safety
 /// Caller needs to ensure `bootstrap` and `dir_path` are valid, otherwise it may cause memory
 /// access violation.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn nydus_open_rafs_default(
     bootstrap: *const c_char,
     dir_path: *const c_char,
@@ -171,7 +171,7 @@ pub unsafe extern "C" fn nydus_open_rafs_default(
 ///
 /// # Safety
 /// Caller needs to ensure `handle` is valid, otherwise it may cause memory access violation.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn nydus_close_rafs(handle: NydusFsHandle) {
     let mut fs = Box::from_raw(handle as *mut FileSystemState);
     assert_eq!(fs.magic, NYDUS_FS_HANDLE_MAGIC);

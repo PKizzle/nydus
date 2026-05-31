@@ -904,7 +904,7 @@ impl Node {
         Ok(())
     }
 
-    fn meta(&self) -> Result<impl MetadataExt> {
+    fn meta(&self) -> Result<impl MetadataExt + use<>> {
         self.path()
             .symlink_metadata()
             .with_context(|| format!("failed to get metadata of {}", self.path().display()))

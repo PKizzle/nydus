@@ -492,7 +492,7 @@ impl StargzBuilder {
             }
         }
 
-        for (size, ref mut chunks) in self.file_chunk_map.values_mut() {
+        for (size, chunks) in self.file_chunk_map.values_mut() {
             Self::sort_and_validate_chunks(chunks, *size)?;
         }
 
@@ -793,7 +793,7 @@ impl StargzBuilder {
             .walk_bfs(true, &mut |n| {
                 let mut node = n.borrow_mut_node();
                 let node_path = node.path();
-                if let Some((size, ref mut chunks)) = self.file_chunk_map.get_mut(node_path) {
+                if let Some((size, chunks)) = self.file_chunk_map.get_mut(node_path) {
                     node.inode.set_size(*size);
                     node.inode.set_child_count(chunks.len() as u32);
                     node.chunks = chunks.to_vec();
