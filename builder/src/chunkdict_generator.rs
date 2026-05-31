@@ -81,7 +81,7 @@ impl Generator {
         Self::validate_tree(&tree)?;
 
         // Build bootstrap.
-        let mut bootstrap_ctx = bootstrap_mgr.create_ctx()?;
+        let mut bootstrap_ctx = bootstrap_mgr.create_ctx(ctx.v6_block_size())?;
         let mut bootstrap = Bootstrap::new(tree)?;
         bootstrap.build(ctx, &mut bootstrap_ctx)?;
 

@@ -38,8 +38,8 @@ use nydus_utils::{digest::RafsDigest, div_round_up, round_up};
 
 use crate::metadata::layout::v5::RafsV5ChunkInfo;
 use crate::metadata::layout::v6::{
-    rafsv6_load_blob_extra_info, recover_namespace, RafsV6BlobTable, RafsV6Dirent,
-    RafsV6InodeChunkAddr, RafsV6InodeCompact, RafsV6InodeExtended, RafsV6OndiskInode,
+    block_size_from_bits, rafsv6_load_blob_extra_info, recover_namespace, RafsV6BlobTable,
+    RafsV6Dirent, RafsV6InodeChunkAddr, RafsV6InodeCompact, RafsV6InodeExtended, RafsV6OndiskInode,
     RafsV6XattrEntry, RafsV6XattrIbodyHeader, EROFS_BLOCK_BITS_9, EROFS_BLOCK_SIZE_4096,
     EROFS_BLOCK_SIZE_512, EROFS_INODE_CHUNK_BASED, EROFS_INODE_FLAT_INLINE, EROFS_INODE_FLAT_PLAIN,
     EROFS_INODE_SLOT_SIZE, EROFS_I_DATALAYOUT_BITS, EROFS_I_VERSION_BIT, EROFS_I_VERSION_BITS,
@@ -87,7 +87,10 @@ impl DirectMappingState {
         if self.is_tarfs() {
             EROFS_BLOCK_SIZE_512
         } else {
-            EROFS_BLOCK_SIZE_4096
+            // Honour the superblock's recorded block size so 16 KiB / 64 KiB-page hosts
+            // can mount bootstraps built for their page size. Falls back to 4 KiB for
+            // images that predate variable-block-size support (blkszbits == 0).
+            block_size_from_bits(self.meta.blkszbits).unwrap_or(EROFS_BLOCK_SIZE_4096)
         }
     }
 }
@@ -727,7 +730,7 @@ impl OndiskInodeWrapper {
             .get_entry(state, inode, block_index, 0)
             .map_err(err_invalidate_data)?;
         let name_offset = head_entry.e_nameoff as usize;
-        if name_offset as u64 >= EROFS_BLOCK_SIZE_4096
+        if name_offset as u64 >= state.block_size()
             || !name_offset.is_multiple_of(size_of::<RafsV6Dirent>())
         {
             Err(enoent!(format!(
@@ -747,7 +750,7 @@ impl RafsInode for OndiskInodeWrapper {
         let max_inode = self.mapping.get_max_ino();
 
         if self.ino() > max_inode
-            || self.offset > (u32::MAX as usize) * EROFS_BLOCK_SIZE_4096 as usize
+            || self.offset > (u32::MAX as usize) * state.block_size() as usize
             || inode.nlink() == 0
             || self.get_name_size() as usize > (RAFS_MAX_NAME + 1)
         {
@@ -1082,7 +1085,7 @@ impl RafsInode for OndiskInodeWrapper {
     fn get_symlink(&self) -> Result<OsString> {
         let state = self.state();
         let inode = self.disk_inode(&state);
-        if inode.size() > EROFS_BLOCK_SIZE_4096 {
+        if inode.size() > state.block_size() {
             return Err(einval!(format!(
                 "v6: invalid symlink size {}",
                 inode.size()

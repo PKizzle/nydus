@@ -13,9 +13,9 @@ use std::sync::Arc;
 use anyhow::{bail, ensure, Context, Result};
 use nydus_rafs::metadata::chunk::ChunkWrapper;
 use nydus_rafs::metadata::layout::v6::{
-    align_offset, calculate_nid, new_v6_inode, RafsV6BlobTable, RafsV6Device, RafsV6Dirent,
-    RafsV6InodeChunkAddr, RafsV6InodeChunkHeader, RafsV6OndiskInode, RafsV6SuperBlock,
-    RafsV6SuperBlockExt, EROFS_BLOCK_BITS_9, EROFS_BLOCK_SIZE_4096, EROFS_BLOCK_SIZE_512,
+    align_offset, block_bits_from_size, calculate_nid, new_v6_inode, RafsV6BlobTable, RafsV6Device,
+    RafsV6Dirent, RafsV6InodeChunkAddr, RafsV6InodeChunkHeader, RafsV6OndiskInode,
+    RafsV6SuperBlock, RafsV6SuperBlockExt, EROFS_BLOCK_BITS_9, EROFS_BLOCK_SIZE_512,
     EROFS_DEVTABLE_OFFSET, EROFS_INODE_CHUNK_BASED, EROFS_INODE_FLAT_INLINE,
     EROFS_INODE_FLAT_PLAIN, EROFS_INODE_SLOT_SIZE, EROFS_SUPER_BLOCK_SIZE, EROFS_SUPER_OFFSET,
 };
@@ -28,7 +28,6 @@ use super::chunk_dict::DigestWithBlobIndex;
 use super::node::Node;
 use crate::{Bootstrap, BootstrapContext, BuildContext, ConversionType, Tree};
 
-const WRITE_PADDING_DATA: [u8; 4096] = [0u8; 4096];
 const V6_BLOCK_SEG_ALIGNMENT: u64 = 0x8_0000;
 
 // Rafs v6 dedicated methods
@@ -568,7 +567,10 @@ impl BuildContext {
             // Tar stream is 512-byte aligned.
             EROFS_BLOCK_SIZE_512
         } else {
-            EROFS_BLOCK_SIZE_4096
+            // Honor the build-time `--block-size` selection (defaults to 4 KiB). The whole v6
+            // layout must use this block size consistently so it matches the `s_blkszbits`
+            // stamped into the superblock; otherwise 16 K/64 K images would be corrupt.
+            self.blob_block_size
         }
     }
 
@@ -647,7 +649,7 @@ impl Bootstrap {
         let blob_table_size = blob_table.size() as u64;
         let blob_table_offset = align_offset(
             (EROFS_DEVTABLE_OFFSET as u64) + devtable_len as u64,
-            EROFS_BLOCK_SIZE_4096,
+            block_size,
         );
         let blob_table_entries = blobs.len();
         assert!(blob_table_entries < u8::MAX as usize);
@@ -679,11 +681,11 @@ impl Bootstrap {
         // the root directory will not be shown by glibc's getdents/readdir.
         // Because in some OS, ino == 0 represents corresponding file is deleted.
         let root_node_offset = self.tree.borrow_mut_node().v6_offset;
-        let orig_meta_addr = root_node_offset - EROFS_BLOCK_SIZE_4096;
+        let orig_meta_addr = root_node_offset - block_size;
         let meta_addr = if blob_table_size > 0 {
             align_offset(
                 blob_table_offset + blob_table_size + prefetch_table_size as u64,
-                EROFS_BLOCK_SIZE_4096,
+                block_size,
             )
         } else {
             orig_meta_addr
@@ -724,7 +726,7 @@ impl Bootstrap {
             },
             "dump_bootstrap"
         )?;
-        Self::v6_align_to_4k(bootstrap_ctx)?;
+        Self::v6_align_to_block(bootstrap_ctx, block_size)?;
 
         // `Node` offset might be updated during above inodes dumping. So `get_prefetch_table` after it.
         if prefetch_table_size > 0 {
@@ -760,7 +762,7 @@ impl Bootstrap {
             "chunk_table offset {} size {}",
             chunk_table_offset, chunk_table_size
         );
-        Self::v6_align_to_4k(bootstrap_ctx)?;
+        Self::v6_align_to_block(bootstrap_ctx, block_size)?;
 
         // Prepare device slots.
         let mut pos = bootstrap_ctx
@@ -812,6 +814,8 @@ impl Bootstrap {
         let mut sb = RafsV6SuperBlock::new();
         if ctx.conversion_type == ConversionType::TarToTarfs {
             sb.set_block_bits(EROFS_BLOCK_BITS_9);
+        } else if let Some(bits) = block_bits_from_size(ctx.blob_block_size) {
+            sb.set_block_bits(bits);
         }
         sb.set_inos(bootstrap_ctx.get_next_ino() - 1);
         sb.set_blocks(block_count);
@@ -865,7 +869,7 @@ impl Bootstrap {
         Ok(())
     }
 
-    fn v6_align_to_4k(bootstrap_ctx: &mut BootstrapContext) -> Result<()> {
+    fn v6_align_to_block(bootstrap_ctx: &mut BootstrapContext, block_size: u64) -> Result<()> {
         bootstrap_ctx
             .writer
             .flush()
@@ -874,10 +878,11 @@ impl Bootstrap {
             .writer
             .seek_to_end()
             .context("failed to seek to bootstrap's end for chunk table")?;
-        let padding = align_offset(pos, EROFS_BLOCK_SIZE_4096) - pos;
+        let padding = align_offset(pos, block_size) - pos;
+        let zeros = vec![0u8; padding as usize];
         bootstrap_ctx
             .writer
-            .write_all(&WRITE_PADDING_DATA[0..padding as usize])
+            .write_all(&zeros)
             .context("failed to write 0 to padding of bootstrap's end for chunk table")?;
         bootstrap_ctx
             .writer
@@ -905,7 +910,9 @@ impl Bootstrap {
 mod tests {
     use super::*;
     use crate::{ArtifactStorage, BootstrapContext, Overlay};
-    use nydus_rafs::metadata::layout::v6::{EROFS_INODE_CHUNK_BASED, EROFS_INODE_SLOT_SIZE};
+    use nydus_rafs::metadata::layout::v6::{
+        EROFS_BLOCK_SIZE_4096, EROFS_INODE_CHUNK_BASED, EROFS_INODE_SLOT_SIZE,
+    };
     use nydus_rafs::metadata::{RafsVersion, RAFS_DEFAULT_CHUNK_SIZE};
     use std::fs::File;
     use vmm_sys_util::{tempdir::TempDir, tempfile::TempFile};
@@ -928,7 +935,8 @@ mod tests {
 
         let bootstrap_path = TempFile::new().unwrap();
         let storage = ArtifactStorage::SingleFile(bootstrap_path.as_path().to_path_buf());
-        let mut bootstrap_ctx = BootstrapContext::new(Some(storage), false).unwrap();
+        let mut bootstrap_ctx =
+            BootstrapContext::new(Some(storage), false, EROFS_BLOCK_SIZE_4096).unwrap();
         bootstrap_ctx.offset = 0;
 
         // reg file.

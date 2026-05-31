@@ -304,6 +304,14 @@ fn prepare_cmd_args(bti_string: &'static str) -> App {
                         .required(false),
                 )
                 .arg(
+                    Arg::new("block-size")
+                        .long("block-size")
+                        .help("EROFS/RAFS v6 logical block size in bytes; must match the consumer host's page size. Supported: 4096, 16384, 65536. Default: 4096.")
+                        .required(false)
+                        .value_parser(["4096", "16384", "65536"])
+                        .default_value("4096"),
+                )
+                .arg(
                     Arg::new("batch-size")
                         .long("batch-size")
                         .help("Set the batch size to merge small chunks, must be power of two, between 0x1000-0x1000000 or be zero:")
@@ -1013,6 +1021,7 @@ impl Command {
         let version = Self::get_fs_version(matches)?;
         let chunk_size = Self::get_chunk_size(matches, conversion_type)?;
         let batch_size = Self::get_batch_size(matches, version, conversion_type, chunk_size)?;
+        let block_size = Self::get_block_size(matches)?;
         let blob_cache_storage = Self::get_blob_cache_storage(matches, conversion_type)?;
         // blob-cache-dir and blob-dir/blob are a set of mutually exclusive functions,
         // the former is used to generate blob cache, nydusd is directly started through blob cache,
@@ -1277,6 +1286,7 @@ impl Command {
         build_ctx.set_fs_version(version);
         build_ctx.set_chunk_size(chunk_size);
         build_ctx.set_batch_size(batch_size);
+        build_ctx.set_blob_block_size(block_size);
 
         let blob_cache_generator = match blob_cache_storage {
             Some(storage) => Some(BlobCacheGenerator::new(storage)?),
@@ -2127,6 +2137,24 @@ impl Command {
                 Ok(chunk_size)
             }
         }
+    }
+
+    /// Parse the optional `--block-size` flag into a validated EROFS block size in bytes.
+    fn get_block_size(matches: &ArgMatches) -> Result<u64> {
+        let raw = matches
+            .get_one::<String>("block-size")
+            .map(|s| s.as_str())
+            .unwrap_or("4096");
+        let size: u64 = raw
+            .parse()
+            .with_context(|| format!("invalid block size {}", raw))?;
+        if nydus_rafs::metadata::layout::v6::block_bits_from_size(size).is_none() {
+            bail!(
+                "unsupported --block-size {}; supported values: 4096, 16384, 65536",
+                size
+            );
+        }
+        Ok(size)
     }
 
     fn get_batch_size(

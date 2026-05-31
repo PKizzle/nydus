@@ -33,6 +33,7 @@ impl RafsSuper {
         self.meta.magic = sb.magic();
         self.meta.meta_blkaddr = sb.meta_addr();
         self.meta.root_nid = sb.root_nid();
+        self.meta.blkszbits = sb.blkszbits();
         self.meta.blob_device_table_count = sb.extra_devices() as u32;
         self.meta.blob_device_table_offset = sb.device_table_offset();
 

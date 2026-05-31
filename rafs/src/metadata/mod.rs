@@ -288,7 +288,7 @@ pub trait RafsStore {
 
 bitflags! {
     /// Rafs filesystem feature flags.
-    #[derive(Serialize)]
+    #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
     pub struct RafsSuperFlags: u64 {
         /// Data chunks are not compressed.
         const COMPRESSION_NONE = 0x0000_0001;
@@ -529,6 +529,9 @@ pub struct RafsSuperMeta {
     pub chunk_table_offset: u64,
     /// Size  of the chunk table for RAFS v6.
     pub chunk_table_size: u64,
+    /// RAFS v6 / EROFS block-size bits (`s_blkszbits`); 12 = 4 KiB, 14 = 16 KiB, 16 = 64 KiB,
+    /// 9 = 512 B (tarfs mode). Defaults to 12 for v5 and freshly initialised metas.
+    pub blkszbits: u8,
 }
 
 impl RafsSuperMeta {
@@ -631,6 +634,7 @@ impl Default for RafsSuperMeta {
             is_chunk_dict: false,
             chunk_table_offset: 0,
             chunk_table_size: 0,
+            blkszbits: crate::metadata::layout::v6::EROFS_BLOCK_BITS_12,
         }
     }
 }

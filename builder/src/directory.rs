@@ -161,7 +161,7 @@ impl DirectoryBuilder {
         tree: Tree,
     ) -> Result<BuildOutput> {
         // Build bootstrap
-        let mut bootstrap_ctx = bootstrap_mgr.create_ctx()?;
+        let mut bootstrap_ctx = bootstrap_mgr.create_ctx(ctx.v6_block_size())?;
         let mut bootstrap = timing_tracer!(
             { build_bootstrap(ctx, bootstrap_mgr, &mut bootstrap_ctx, blob_mgr, tree) },
             "build_bootstrap"

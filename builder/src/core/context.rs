@@ -29,7 +29,7 @@ use nydus_api::ConfigV2;
 use nydus_rafs::metadata::chunk::ChunkWrapper;
 use nydus_rafs::metadata::layout::v5::RafsV5BlobTable;
 use nydus_rafs::metadata::layout::v6::{
-    RafsV6BlobTable, EROFS_BLOCK_SIZE_4096, EROFS_INODE_SLOT_SIZE,
+    RafsV6BlobTable, EROFS_BLOCK_SIZE_4096, EROFS_BLOCK_SIZE_65536, EROFS_INODE_SLOT_SIZE,
 };
 use nydus_rafs::metadata::layout::RafsBlobTable;
 use nydus_rafs::metadata::{Inode, RAFS_DEFAULT_CHUNK_SIZE};
@@ -1233,7 +1233,10 @@ pub struct BootstrapContext {
 
 impl BootstrapContext {
     /// Create a new instance of [BootstrapContext].
-    pub fn new(storage: Option<ArtifactStorage>, layered: bool) -> Result<Self> {
+    ///
+    /// `block_size` is the RAFS v6 logical block size (4 K / 16 K / 64 K). The first logical
+    /// block is reserved for the superblock, so metadata starts at `block_size`.
+    pub fn new(storage: Option<ArtifactStorage>, layered: bool, block_size: u64) -> Result<Self> {
         let writer = if let Some(storage) = storage {
             Box::new(ArtifactFileWriter(ArtifactWriter::new(storage)?)) as Box<dyn RafsIoWrite>
         } else {
@@ -1244,11 +1247,14 @@ impl BootstrapContext {
             layered,
             inode_map: HashMap::new(),
             next_ino: 1,
-            offset: EROFS_BLOCK_SIZE_4096,
+            offset: block_size,
             writer,
+            // Sized for the largest supported block size (64 KiB) so the per-tail-size slot index
+            // used by `allocate_available_block`/`append_available_block` (up to block_size /
+            // EROFS_INODE_SLOT_SIZE) never overflows for 16 KiB / 64 KiB bootstraps.
             v6_available_blocks: vec![
                 VecDeque::new();
-                EROFS_BLOCK_SIZE_4096 as usize / EROFS_INODE_SLOT_SIZE
+                EROFS_BLOCK_SIZE_65536 as usize / EROFS_INODE_SLOT_SIZE
             ],
         })
     }
@@ -1325,9 +1331,13 @@ impl BootstrapManager {
         }
     }
 
-    /// Create a new instance of [BootstrapContext]
-    pub fn create_ctx(&self) -> Result<BootstrapContext> {
-        BootstrapContext::new(self.bootstrap_storage.clone(), self.f_parent_path.is_some())
+    /// Create a new instance of [BootstrapContext] for the given RAFS v6 `block_size`.
+    pub fn create_ctx(&self, block_size: u64) -> Result<BootstrapContext> {
+        BootstrapContext::new(
+            self.bootstrap_storage.clone(),
+            self.f_parent_path.is_some(),
+            block_size,
+        )
     }
 }
 
@@ -1356,6 +1366,12 @@ pub struct BuildContext {
     pub chunk_size: u32,
     /// Batch chunk data size.
     pub batch_size: u32,
+    /// EROFS / RAFS v6 logical block size in bytes (4 KiB, 16 KiB or 64 KiB).
+    ///
+    /// The kernel EROFS driver requires this to match the host page size when mounting,
+    /// so cross-architecture image producers should set it to the consumer's page size.
+    /// Defaults to 4096 for backward compatibility.
+    pub blob_block_size: u64,
     /// Version number of output metadata and data blob.
     pub fs_version: RafsVersion,
     /// Whether any directory/file has extended attributes.
@@ -1445,6 +1461,7 @@ impl BuildContext {
 
             chunk_size: RAFS_DEFAULT_CHUNK_SIZE as u32,
             batch_size: 0,
+            blob_block_size: EROFS_BLOCK_SIZE_4096,
             fs_version: RafsVersion::default(),
 
             conversion_type,
@@ -1481,6 +1498,17 @@ impl BuildContext {
         self.batch_size = batch_size;
     }
 
+    /// Set the RAFS v6 logical block size. Panics if `size` is not one of the supported
+    /// EROFS block sizes (4096, 16384, 65536, or 512 for tarfs mode).
+    pub fn set_blob_block_size(&mut self, size: u64) {
+        assert!(
+            nydus_rafs::metadata::layout::v6::block_bits_from_size(size).is_some(),
+            "unsupported RAFS v6 block size {}",
+            size
+        );
+        self.blob_block_size = size;
+    }
+
     pub fn set_configuration(&mut self, config: Arc<ConfigV2>) {
         self.configuration = config;
     }
@@ -1505,6 +1533,7 @@ impl Default for BuildContext {
 
             chunk_size: RAFS_DEFAULT_CHUNK_SIZE as u32,
             batch_size: 0,
+            blob_block_size: EROFS_BLOCK_SIZE_4096,
             fs_version: RafsVersion::default(),
 
             conversion_type: ConversionType::default(),

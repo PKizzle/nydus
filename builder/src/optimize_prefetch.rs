@@ -137,7 +137,7 @@ impl OptimizePrefetch {
         blob_table: &mut RafsBlobTable,
         prefetch_files: Vec<PrefetchFileInfo>,
     ) -> Result<BlobManager> {
-        let mut bootstrap_ctx = bootstrap_mgr.create_ctx()?;
+        let mut bootstrap_ctx = bootstrap_mgr.create_ctx(ctx.v6_block_size())?;
         let mut bootstrap = Bootstrap::new(tree.clone())?;
 
         // Build bootstrap

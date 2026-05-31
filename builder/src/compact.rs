@@ -184,7 +184,7 @@ impl ChunkSet {
             new_blob_ctx.current_uncompressed_offset += aligned_size;
             new_blob_ctx.uncompressed_blob_size += aligned_size;
         }
-        new_blob_ctx.blob_id = format!("{:x}", new_blob_ctx.blob_hash.clone().finalize());
+        new_blob_ctx.blob_id = crate::sha256_digest_hex(new_blob_ctx.blob_hash.clone().finalize());
 
         // dump blob meta for v6
         Blob::dump_meta_data(build_ctx, new_blob_ctx, &mut blob_writer)?;
@@ -628,7 +628,7 @@ impl BlobCompactor {
         );
         let mut bootstrap_mgr =
             BootstrapManager::new(Some(ArtifactStorage::SingleFile(d_bootstrap)), None);
-        let mut bootstrap_ctx = bootstrap_mgr.create_ctx()?;
+        let mut bootstrap_ctx = bootstrap_mgr.create_ctx(build_ctx.v6_block_size())?;
         let mut ori_blob_mgr = BlobManager::new(rs.meta.get_digester(), false);
         ori_blob_mgr.extend_from_blob_table(&build_ctx, rs.superblock.get_blob_infos())?;
         if let Some(dict) = chunk_dict {

@@ -30,13 +30,52 @@ use crate::{impl_bootstrap_converter, impl_pub_getter_setter, RafsIoReader, Rafs
 
 /// EROFS metadata slot size.
 pub const EROFS_INODE_SLOT_SIZE: usize = 1 << EROFS_INODE_SLOT_BITS;
-/// Bits of EROFS logical block size.
+/// Bits of EROFS logical block size (4 KiB).
 pub const EROFS_BLOCK_BITS_12: u8 = 12;
-/// EROFS logical block size.
+/// EROFS logical block size (4 KiB), legacy alias retained for compatibility.
 pub const EROFS_BLOCK_SIZE_4096: u64 = 1u64 << EROFS_BLOCK_BITS_12;
+/// Bits of EROFS logical block size (512 B), used in tarfs mode.
 pub const EROFS_BLOCK_BITS_9: u8 = 9;
-/// EROFS logical block size.
+/// EROFS logical block size (512 B).
 pub const EROFS_BLOCK_SIZE_512: u64 = 1u64 << EROFS_BLOCK_BITS_9;
+/// Bits of EROFS logical block size (16 KiB), required for hosts with 16 KiB pages
+/// (e.g. Apple Silicon, Raspberry Pi 5 when configured with 16 KiB page size).
+pub const EROFS_BLOCK_BITS_14: u8 = 14;
+/// EROFS logical block size (16 KiB).
+pub const EROFS_BLOCK_SIZE_16384: u64 = 1u64 << EROFS_BLOCK_BITS_14;
+/// Bits of EROFS logical block size (64 KiB), required for hosts with 64 KiB pages
+/// (e.g. some aarch64 / ppc64le distributions).
+pub const EROFS_BLOCK_BITS_16: u8 = 16;
+/// EROFS logical block size (64 KiB).
+pub const EROFS_BLOCK_SIZE_65536: u64 = 1u64 << EROFS_BLOCK_BITS_16;
+
+/// Convert an EROFS `s_blkszbits` value to its byte block size.
+///
+/// Returns `None` for unsupported bit values. The kernel EROFS driver requires the
+/// filesystem block size to equal the host page size, so callers building bootstraps
+/// for a specific target host should pick the bit value matching that host's page size.
+#[inline]
+pub fn block_size_from_bits(bits: u8) -> Option<u64> {
+    match bits {
+        EROFS_BLOCK_BITS_9 => Some(EROFS_BLOCK_SIZE_512),
+        EROFS_BLOCK_BITS_12 => Some(EROFS_BLOCK_SIZE_4096),
+        EROFS_BLOCK_BITS_14 => Some(EROFS_BLOCK_SIZE_16384),
+        EROFS_BLOCK_BITS_16 => Some(EROFS_BLOCK_SIZE_65536),
+        _ => None,
+    }
+}
+
+/// Convert a byte block size back to its EROFS `s_blkszbits` encoding.
+#[inline]
+pub fn block_bits_from_size(size: u64) -> Option<u8> {
+    match size {
+        EROFS_BLOCK_SIZE_512 => Some(EROFS_BLOCK_BITS_9),
+        EROFS_BLOCK_SIZE_4096 => Some(EROFS_BLOCK_BITS_12),
+        EROFS_BLOCK_SIZE_16384 => Some(EROFS_BLOCK_BITS_14),
+        EROFS_BLOCK_SIZE_65536 => Some(EROFS_BLOCK_BITS_16),
+        _ => None,
+    }
+}
 
 /// Offset of EROFS super block.
 pub const EROFS_SUPER_OFFSET: u16 = 1024;
@@ -156,17 +195,18 @@ impl RafsV6SuperBlock {
 
     /// Validate the Rafs v6 super block.
     pub fn validate(&self, meta_size: u64) -> Result<()> {
-        if meta_size < EROFS_BLOCK_SIZE_4096 {
+        let block_size = block_size_from_bits(self.s_blkszbits).ok_or_else(|| {
+            einval!(format!(
+                "unsupported block size bits {} in Rafsv6 superblock",
+                self.s_blkszbits
+            ))
+        })?;
+        if meta_size < block_size {
             return Err(einval!(format!(
                 "invalid Rafs v6 metadata size: {}",
                 meta_size
             )));
         }
-        let block_size = if self.s_blkszbits == EROFS_BLOCK_BITS_9 {
-            EROFS_BLOCK_SIZE_512
-        } else {
-            EROFS_BLOCK_SIZE_4096
-        };
         if meta_size & (block_size - 1) != 0 {
             return Err(einval!(format!(
                 "invalid Rafs v6 metadata size: bootstrap size {} is not aligned",
@@ -192,13 +232,6 @@ impl RafsV6SuperBlock {
             return Err(einval!(format!(
                 "invalid checksum {} in Rafsv6 superblock",
                 u32::from_le(self.s_checksum)
-            )));
-        }
-
-        if self.s_blkszbits != EROFS_BLOCK_BITS_12 && self.s_blkszbits != EROFS_BLOCK_BITS_9 {
-            return Err(einval!(format!(
-                "invalid block size bits {} in Rafsv6 superblock",
-                self.s_blkszbits
             )));
         }
 
@@ -306,15 +339,28 @@ impl RafsV6SuperBlock {
 
     /// Set EROFS meta block address.
     pub fn set_meta_addr(&mut self, meta_addr: u64) {
-        if self.s_blkszbits == EROFS_BLOCK_BITS_12 {
-            assert!((meta_addr / EROFS_BLOCK_SIZE_4096) <= u32::MAX as u64);
-            self.s_meta_blkaddr = u32::to_le((meta_addr / EROFS_BLOCK_SIZE_4096) as u32);
-        } else if self.s_blkszbits == EROFS_BLOCK_BITS_9 {
-            assert!((meta_addr / EROFS_BLOCK_SIZE_512) <= u32::MAX as u64);
-            self.s_meta_blkaddr = u32::to_le((meta_addr / EROFS_BLOCK_SIZE_512) as u32);
-        } else {
-            error!("v6: unsupported block bits {}", self.s_blkszbits);
+        match block_size_from_bits(self.s_blkszbits) {
+            Some(block_size) => {
+                assert!((meta_addr / block_size) <= u32::MAX as u64);
+                self.s_meta_blkaddr = u32::to_le((meta_addr / block_size) as u32);
+            }
+            None => error!("v6: unsupported block bits {}", self.s_blkszbits),
         }
+    }
+
+    /// Get the filesystem block size in bytes, derived from `s_blkszbits`.
+    ///
+    /// Returns `None` if the superblock encodes an unsupported block size; callers
+    /// should treat that as a corrupt/unsupported image.
+    #[inline]
+    pub fn block_size(&self) -> Option<u64> {
+        block_size_from_bits(self.s_blkszbits)
+    }
+
+    /// Get the raw `s_blkszbits` field (12 = 4 KiB, 14 = 16 KiB, 16 = 64 KiB, 9 = 512 B).
+    #[inline]
+    pub fn blkszbits(&self) -> u8 {
+        self.s_blkszbits
     }
 
     /// Get device table offset.
@@ -322,9 +368,14 @@ impl RafsV6SuperBlock {
         u16::from_le(self.s_devt_slotoff) as u64 * size_of::<RafsV6Device>() as u64
     }
 
-    /// Set bits of block size.
+    /// Set bits of block size. Panics if `block_bits` does not encode a supported
+    /// EROFS block size (see `block_size_from_bits`).
     pub fn set_block_bits(&mut self, block_bits: u8) {
-        assert!(block_bits == EROFS_BLOCK_BITS_12 || block_bits == EROFS_BLOCK_BITS_9);
+        assert!(
+            block_size_from_bits(block_bits).is_some(),
+            "unsupported EROFS block size bits {}",
+            block_bits
+        );
         self.s_blkszbits = block_bits;
     }
 
@@ -443,9 +494,14 @@ impl RafsV6SuperBlockExt {
             )));
         }
 
+        // Metadata tables (blob/chunk/prefetch) are laid out on logical-block boundaries, so
+        // validation must use the image's actual block size rather than assuming 4 KiB —
+        // otherwise 16 KiB / 64 KiB images are rejected here.
+        let block_size = block_size_from_bits(meta.blkszbits).unwrap_or(EROFS_BLOCK_SIZE_4096);
+
         let chunk_size = u32::from_le(self.s_chunk_size) as u64;
         if !chunk_size.is_power_of_two()
-            || !(EROFS_BLOCK_SIZE_4096..=RAFS_MAX_CHUNK_SIZE).contains(&chunk_size)
+            || !(block_size..=RAFS_MAX_CHUNK_SIZE).contains(&chunk_size)
         {
             return Err(einval!("invalid chunk size in Rafs v6 extended superblock"));
         }
@@ -454,8 +510,8 @@ impl RafsV6SuperBlockExt {
 
         let blob_offset = self.blob_table_offset();
         let blob_size = self.blob_table_size() as u64;
-        if blob_offset & (EROFS_BLOCK_SIZE_4096 - 1) != 0
-            || blob_offset < EROFS_BLOCK_SIZE_4096
+        if blob_offset & (block_size - 1) != 0
+            || blob_offset < block_size
             || blob_offset < devslot_end
             || !blob_size.is_multiple_of(size_of::<RafsV6Blob>() as u64)
             || blob_offset.checked_add(blob_size).is_none()
@@ -472,8 +528,8 @@ impl RafsV6SuperBlockExt {
         if self.chunk_table_size() > 0 {
             let chunk_tbl_offset = self.chunk_table_offset();
             let chunk_tbl_size = self.chunk_table_size();
-            if chunk_tbl_offset < EROFS_BLOCK_SIZE_4096
-                || !chunk_tbl_offset.is_multiple_of(EROFS_BLOCK_SIZE_4096)
+            if chunk_tbl_offset < block_size
+                || !chunk_tbl_offset.is_multiple_of(block_size)
                 || chunk_tbl_offset < devslot_end
                 || !chunk_tbl_size.is_multiple_of(size_of::<RafsV5ChunkInfo>() as u64)
                 || chunk_tbl_offset.checked_add(chunk_tbl_size).is_none()
@@ -498,7 +554,7 @@ impl RafsV6SuperBlockExt {
         if self.prefetch_table_size() > 0 && self.prefetch_table_offset() != 0 {
             let tbl_offset = self.prefetch_table_offset();
             let tbl_size = self.prefetch_table_size() as u64;
-            if tbl_offset < EROFS_BLOCK_SIZE_4096
+            if tbl_offset < block_size
                 || !tbl_size.is_multiple_of(size_of::<u32>() as u64)
                 || tbl_offset < devslot_end
                 || tbl_offset.checked_add(tbl_size).is_none()
@@ -1149,14 +1205,18 @@ impl RafsV6InodeChunkHeader {
     /// Otherwise `chunk_size` is set to RAFS filesystem's chunk size.
     pub fn new(chunk_size: u64, block_size: u64) -> Self {
         assert!(chunk_size.is_power_of_two());
-        assert!(block_size == EROFS_BLOCK_SIZE_4096 || block_size == EROFS_BLOCK_SIZE_512);
+        // EROFS encodes the chunk size as `log2(chunk_size) - log2(block_size)`, so any
+        // supported block size (512 B / 4 K / 16 K / 64 K) works as long as the chunk is at
+        // least one block large and the encoded delta fits in `EROFS_CHUNK_FORMAT_SIZE_MASK`.
+        let block_bits = block_bits_from_size(block_size).unwrap_or_else(|| {
+            panic!(
+                "unsupported EROFS block size {} for chunk header",
+                block_size
+            )
+        }) as u16;
         let chunk_bits = chunk_size.trailing_zeros() as u16;
-        assert!(chunk_bits >= EROFS_BLOCK_BITS_12 as u16);
-        let chunk_bits = if block_size == EROFS_BLOCK_SIZE_4096 {
-            chunk_bits - EROFS_BLOCK_BITS_12 as u16
-        } else {
-            chunk_bits - EROFS_BLOCK_BITS_9 as u16
-        };
+        assert!(chunk_bits >= block_bits);
+        let chunk_bits = chunk_bits - block_bits;
         assert!(chunk_bits <= EROFS_CHUNK_FORMAT_SIZE_MASK);
         let format = EROFS_CHUNK_FORMAT_INDEXES_FLAG | chunk_bits;
 
@@ -2309,6 +2369,51 @@ mod tests {
     }
 
     #[test]
+    fn test_rafs_v6_chunk_header_block_sizes() {
+        // A 1 MiB chunk (20 bits) must encode `log2(chunk) - log2(block)` for every supported
+        // EROFS block size without panicking — this guards the 16 KiB / 64 KiB build path.
+        let chunk_size: u64 = 1024 * 1024;
+        for (block_size, block_bits) in [
+            (EROFS_BLOCK_SIZE_512, EROFS_BLOCK_BITS_9),
+            (EROFS_BLOCK_SIZE_4096, EROFS_BLOCK_BITS_12),
+            (EROFS_BLOCK_SIZE_16384, EROFS_BLOCK_BITS_14),
+            (EROFS_BLOCK_SIZE_65536, EROFS_BLOCK_BITS_16),
+        ] {
+            let header = RafsV6InodeChunkHeader::new(chunk_size, block_size);
+            let target = EROFS_CHUNK_FORMAT_INDEXES_FLAG | (20 - block_bits as u16);
+            assert_eq!(
+                u16::from_le(header.format),
+                target,
+                "unexpected chunk format for block size {}",
+                block_size
+            );
+        }
+    }
+
+    #[test]
+    fn test_rafs_v6_super_block_block_sizes() {
+        // The superblock must round-trip its block-size encoding and validate for 4 K / 16 K / 64 K.
+        for (block_size, block_bits) in [
+            (EROFS_BLOCK_SIZE_4096, EROFS_BLOCK_BITS_12),
+            (EROFS_BLOCK_SIZE_16384, EROFS_BLOCK_BITS_14),
+            (EROFS_BLOCK_SIZE_65536, EROFS_BLOCK_BITS_16),
+        ] {
+            let mut sb = RafsV6SuperBlock::new();
+            sb.set_block_bits(block_bits);
+            assert_eq!(sb.blkszbits(), block_bits);
+            assert_eq!(sb.block_size(), Some(block_size));
+
+            // A bootstrap must be at least one logical block; a sub-block size is rejected up
+            // front, using the image's real block size rather than a hardcoded 4 KiB.
+            assert!(
+                sb.validate(block_size - 1).is_err(),
+                "sub-block metadata size must be rejected for block size {}",
+                block_size
+            );
+        }
+    }
+
+    #[test]
     fn test_rafs_v6_chunk_addr() {
         let temp = TempFile::new().unwrap();
         let w = OpenOptions::new()
@@ -2727,7 +2832,7 @@ mod tests {
             10,
             0,
             0,
-            RafsSuperFlags { bits: 0 },
+            RafsSuperFlags::empty(),
             [0; 32],
             [0; 32],
             0,
@@ -2770,7 +2875,7 @@ mod tests {
             10,
             0,
             0,
-            RafsSuperFlags { bits: 0 },
+            RafsSuperFlags::empty(),
             [0; 32],
             [0; 32],
             0,
