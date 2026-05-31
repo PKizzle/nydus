@@ -1,0 +1,54 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "nydus-snapshotter.fullname" . }}-config
+  labels:
+    {{- include "nydus-snapshotter.labels" . | nindent 4 }}
+data:
+  config.toml: |
+    # Unified nydus snapshotter config (rendered by Helm). See snapshotter/src/config/.
+    [snapshotter]
+    root = {{ .Values.config.root | quote }}
+    address = {{ .Values.config.address | quote }}
+    fs_driver_policy = "auto"
+
+    [snapshotter.daemon]
+    recover_policy = "failover"
+    log_level = {{ .Values.config.logLevel | quote }}
+
+    [snapshotter.cache]
+    work_dir = {{ .Values.config.cacheWorkDir | quote }}
+
+    [snapshotter.features]
+    referrer_detect = {{ .Values.config.features.referrerDetect }}
+    prefetch = {{ .Values.config.features.prefetch }}
+    metrics = {{ .Values.config.features.metrics }}
+
+    {{- range .Values.config.fsDrivers }}
+    [[snapshotter.fs_drivers]]
+    type = {{ .type | quote }}
+    {{- if .minKernel }}
+    min_kernel = {{ .minKernel | quote }}
+    {{- end }}
+    {{- if .mode }}
+    mode = {{ .mode | quote }}
+    {{- end }}
+    {{- with .requireCaps }}
+    require_caps = [{{ range $i, $c := . }}{{ if $i }}, {{ end }}{{ $c | quote }}{{ end }}]
+    {{- end }}
+    {{- end }}
+
+    {{- if .Values.config.localAccel.enable }}
+    # Node-local zran acceleration (snapshotter/src/local_accel.rs). The Prepare/commit lifecycle
+    # wiring that activates this config is not merged yet, so it is emitted commented-out: the
+    # binaries (nydus-image) are bundled in the image at {{ .Values.config.localAccel.nydusImage }};
+    # uncomment once the snapshotter consumes [snapshotter.local_accel].
+    # [snapshotter.local_accel]
+    # enable = true
+    # nydus_image = {{ .Values.config.localAccel.nydusImage | quote }}
+    {{- end }}
+
+    {{- with .Values.config.extraToml }}
+    # ---- extraToml ----
+    {{ . | nindent 4 }}
+    {{- end }}

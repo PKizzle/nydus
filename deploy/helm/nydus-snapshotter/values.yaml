@@ -1,0 +1,132 @@
+# Default values for nydus-snapshotter.
+# The chart deploys a privileged DaemonSet running `containerd-nydus`. By design it does NOT
+# edit host containerd config (see `containerd.install`) — that one-time, node-local step is
+# unavoidable (containerd loads snapshotters from static config at startup; there is no runtime
+# registration API) and is left to you unless you explicitly opt in.
+
+image:
+  # Image must bundle: containerd-nydus, nydus-image, nydusify (see deploy/docker/Dockerfile).
+  repository: ghcr.io/dragonflyoss/nydus-snapshotter
+  tag: ""            # defaults to .Chart.appVersion
+  pullPolicy: IfNotPresent
+imagePullSecrets: []
+
+nameOverride: ""
+fullnameOverride: ""
+
+daemonset:
+  # The snapshotter MUST be privileged: mountPropagation Bidirectional + mount(2) + fanotify
+  # FAN_CLASS_PRE_CONTENT all require it on stable Kubernetes/k3s today (userns/KEP-127 does not
+  # lift this; PR kubernetes#117812 for unprivileged Bidirectional propagation was closed unmerged).
+  privileged: true
+  hostPID: true
+  hostNetwork: false
+  priorityClassName: "system-node-critical"
+  # OOM protection for the node-critical daemon.
+  oomScoreAdj: -999
+  updateStrategy:
+    type: RollingUpdate
+  nodeSelector: {}
+  tolerations:
+    - operator: Exists      # run on every node, including control-plane/tainted
+  affinity: {}
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      memory: 1Gi
+  # Extra env for the container (e.g. RUST_LOG).
+  env: []
+
+# Host paths. These are the contract with the host kernel/containerd and the persistence store.
+hostPaths:
+  # Directory holding the gRPC socket + the runtime mounts the kernel must see (Bidirectional).
+  run: /run/containerd-nydus
+  # Persistent snapshotter state: metadata.fjall, snapshots/, daemons/<slug>/mnt, cache/.
+  root: /var/lib/containerd-nydus
+  # Host containerd control socket (so the snapshotter can talk to containerd's content store).
+  containerdSock: /run/k3s/containerd/containerd.sock
+  # /dev/fuse device for the fusedev fallback driver.
+  devFuse: /dev/fuse
+
+# Snapshotter unified TOML config (rendered into a ConfigMap, mounted at /etc/nydus/config.toml).
+# Only the most relevant knobs are surfaced; `config.extraToml` is appended verbatim for the rest.
+config:
+  # gRPC proxy-plugin socket — MUST match the `address` in containerd's [proxy_plugins."nydus"].
+  address: /run/containerd-nydus/containerd-nydus-grpc.sock
+  root: /var/lib/containerd-nydus
+  logLevel: info
+  cacheWorkDir: /var/lib/containerd-nydus/cache
+  # Ordered fallback chain; the probe picks the first viable driver. fanotify needs kernel >= 6.14.
+  fsDrivers:
+    - { type: fanotify, minKernel: "6.14", requireCaps: ["CAP_SYS_ADMIN"] }
+    - { type: blockdev, mode: loop, requireCaps: ["CAP_SYS_ADMIN"] }
+    - { type: fusedev }
+  features:
+    referrerDetect: true
+    prefetch: true
+    metrics: true
+  # Node-local zran acceleration (transparent, no tag change). Binaries are bundled in the image.
+  localAccel:
+    enable: true
+    nydusImage: /usr/local/bin/nydus-image
+  # Any extra TOML appended to the generated config (backends, auto_zran, cgroup, sysctl, ...).
+  extraToml: ""
+
+# --- Workload routing (opt-in, your preferred model) ---------------------------------------------
+# RuntimeClass `nydus` routes only pods that reference it to the nydus snapshotter, via a containerd
+# runtime handler with `snapshotter = "nydus"` (see README node-prep). Default snapshotter is
+# untouched for everything else.
+runtimeClass:
+  create: true
+  name: nydus
+  handler: nydus     # must match the containerd runtime handler name in your node-prep config
+
+# How the nydus snapshotter is selected for workloads:
+#   runtime-handler -> a containerd `nydus` runtime handler with snapshotter=nydus, picked per-pod
+#                      via `runtimeClassName: nydus` (isolated; default snapshotter untouched).
+#                      This is the more isolated / best-practice option.
+#   global-default  -> the CRI GLOBAL default snapshotter is set to nydus (every pull uses it, with
+#                      overlay fallback). This is what SOCI's official docs do. No RuntimeClass used.
+snapshotterMode: runtime-handler
+
+# Optional cluster/namespace-wide default of runtimeClassName via a mutating admission policy.
+# Kubernetes has no native "default RuntimeClass", so a policy engine injects it. Only relevant in
+# snapshotterMode=runtime-handler. Disabled by default; pick the engine already running on the
+# cluster. Requires that engine (Kyverno or OPA Gatekeeper) to be installed.
+defaultRuntimeClass:
+  enable: false
+  engine: kyverno            # "kyverno" | "gatekeeper"
+  # Only pods in namespaces with this label get runtimeClassName injected (empty = all namespaces).
+  namespaceSelectorLabel: "nydus.dragonflyoss.io/accelerate"
+  namespaceSelectorValue: "true"
+
+# --- Optional turnkey containerd config installer (OFF by default; you said config edits are unsafe)
+# When enabled, a privileged init step writes an ADDITIVE proxy_plugins + nydus runtime handler into
+# the host containerd config and restarts it. Supports k3s (config-v3.toml.tmpl) and vanilla
+# containerd (imports drop-in). Review README before enabling.
+containerd:
+  install:
+    enable: false
+    # "auto" detects the distro+containerd version from the host and adapts the target file, the CRI
+    # TOML path (config v2 vs v3), and the restart unit. Override with k3s|rke2|containerd if needed.
+    # Bottlerocket / EKS-managed / GKE / AKS are detected as NOT installable -> the init prints
+    # manual guidance and exits 0 (no crash-loop).
+    runtime: auto
+    # Override the auto-detected target template/file (leave empty to auto-derive per distro).
+    k3sTemplatePath: ""        # default /var/lib/rancher/k3s/agent/etc/containerd/config-v3.toml.tmpl
+    rke2TemplatePath: ""       # default /var/lib/rancher/rke2/agent/etc/containerd/config-v3.toml.tmpl
+    containerdConfigPath: ""   # default /etc/containerd/config.toml
+    # Restart the runtime after writing config. SAFETY: off by default (writes config, prints the
+    # restart command). Set autoRestart=true to have the init restart it via nsenter to host PID 1.
+    autoRestart: false
+    # systemd unit to restart; empty -> auto-derive per distro (k3s/k3s-agent, rke2-*, containerd).
+    restartUnit: ""
+
+serviceAccount:
+  create: true
+  name: ""
+
+podAnnotations: {}
+podLabels: {}

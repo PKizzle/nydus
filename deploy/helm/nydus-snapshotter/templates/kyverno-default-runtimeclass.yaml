@@ -1,0 +1,36 @@
+{{- if and .Values.defaultRuntimeClass.enable (eq .Values.defaultRuntimeClass.engine "kyverno") (eq .Values.snapshotterMode "runtime-handler") }}
+# Kubernetes has no native "default RuntimeClass". This Kyverno policy injects
+# `runtimeClassName: {{ .Values.runtimeClass.name }}` so workloads use the nydus snapshotter without
+# opting in individually. Requires Kyverno. Scope with the namespace label (empty value = all ns).
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: {{ include "nydus-snapshotter.fullname" . }}-default-runtimeclass
+  labels:
+    {{- include "nydus-snapshotter.labels" . | nindent 4 }}
+  annotations:
+    policies.kyverno.io/description: >-
+      Inject runtimeClassName={{ .Values.runtimeClass.name }} into pods that have not set one.
+spec:
+  background: false
+  rules:
+    - name: add-nydus-runtimeclass
+      match:
+        any:
+          - resources:
+              kinds: ["Pod"]
+              {{- if .Values.defaultRuntimeClass.namespaceSelectorLabel }}
+              namespaceSelector:
+                matchLabels:
+                  {{ .Values.defaultRuntimeClass.namespaceSelectorLabel }}: {{ .Values.defaultRuntimeClass.namespaceSelectorValue | quote }}
+              {{- end }}
+      preconditions:
+        all:
+          - key: "{{`{{ request.object.spec.runtimeClassName || '' }}`}}"
+            operator: Equals
+            value: ""
+      mutate:
+        patchStrategicMerge:
+          spec:
+            runtimeClassName: {{ .Values.runtimeClass.name }}
+{{- end }}

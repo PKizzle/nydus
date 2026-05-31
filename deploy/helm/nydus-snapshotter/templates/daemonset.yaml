@@ -1,0 +1,145 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: {{ include "nydus-snapshotter.fullname" . }}
+  labels:
+    {{- include "nydus-snapshotter.labels" . | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "nydus-snapshotter.selectorLabels" . | nindent 6 }}
+  updateStrategy:
+    {{- toYaml .Values.daemonset.updateStrategy | nindent 4 }}
+  template:
+    metadata:
+      labels:
+        {{- include "nydus-snapshotter.selectorLabels" . | nindent 8 }}
+        {{- with .Values.podLabels }}{{- toYaml . | nindent 8 }}{{- end }}
+      annotations:
+        # Roll the pods when the config changes.
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- with .Values.podAnnotations }}{{- toYaml . | nindent 8 }}{{- end }}
+    spec:
+      serviceAccountName: {{ include "nydus-snapshotter.serviceAccountName" . }}
+      hostPID: {{ .Values.daemonset.hostPID }}
+      hostNetwork: {{ .Values.daemonset.hostNetwork }}
+      {{- if .Values.daemonset.hostNetwork }}
+      dnsPolicy: ClusterFirstWithHostNet
+      {{- end }}
+      priorityClassName: {{ .Values.daemonset.priorityClassName | quote }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.daemonset.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.daemonset.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.daemonset.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+
+      {{- if .Values.containerd.install.enable }}
+      # OPT-IN: additive containerd config (proxy_plugins + nydus runtime handler) + restart.
+      # Disabled by default — see README. Runs once per node, idempotent.
+      initContainers:
+        - name: containerd-config-installer
+          image: {{ include "nydus-snapshotter.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            privileged: true     # needs nsenter to host PID 1 to restart containerd/k3s
+          command: ["/bin/sh", "/installer/install.sh"]
+          env:
+            - { name: RUNTIME, value: "{{ .Values.containerd.install.runtime }}" }
+            - { name: SNAPSHOTTER_MODE, value: "{{ .Values.snapshotterMode }}" }
+            - { name: SNAPSHOTTER_ADDRESS, value: "{{ .Values.config.address }}" }
+            - { name: RUNTIME_HANDLER, value: "{{ .Values.runtimeClass.handler }}" }
+            - { name: AUTO_RESTART, value: "{{ .Values.containerd.install.autoRestart }}" }
+            - { name: RESTART_UNIT, value: "{{ .Values.containerd.install.restartUnit }}" }
+            - { name: K3S_TEMPLATE, value: "{{ .Values.containerd.install.k3sTemplatePath }}" }
+            - { name: RKE2_TEMPLATE, value: "{{ .Values.containerd.install.rke2TemplatePath }}" }
+            - { name: CONTAINERD_CONFIG, value: "{{ .Values.containerd.install.containerdConfigPath }}" }
+          volumeMounts:
+            - { name: installer, mountPath: /installer }
+            - { name: host-k3s, mountPath: /host/k3s }       # /var/lib/rancher/k3s
+            - { name: host-rke2, mountPath: /host/rke2 }     # /var/lib/rancher/rke2
+            - { name: host-etc, mountPath: /host/etc }       # /etc (os-release, containerd/config.toml)
+      {{- end }}
+
+      containers:
+        - name: containerd-nydus
+          image: {{ include "nydus-snapshotter.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["/usr/local/bin/containerd-nydus"]
+          args:
+            - "--config=/etc/nydus/config.toml"
+            - "--log-level={{ .Values.config.logLevel }}"
+          securityContext:
+            # REQUIRED. Bidirectional mount propagation + mount(2) + fanotify FAN_CLASS_PRE_CONTENT
+            # all need a privileged container on stable k8s/k3s; userns does not lift this today.
+            privileged: {{ .Values.daemonset.privileged }}
+          {{- with .Values.daemonset.env }}
+          env:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          resources:
+            {{- toYaml .Values.daemonset.resources | nindent 12 }}
+          volumeMounts:
+            - name: config
+              mountPath: /etc/nydus
+              readOnly: true
+            # gRPC socket + runtime mounts the host kernel/containerd must see -> Bidirectional.
+            - name: nydus-run
+              mountPath: {{ .Values.hostPaths.run }}
+              mountPropagation: Bidirectional
+            # Persistent state AND the EROFS/RAFS mounts under daemons/<slug>/mnt -> Bidirectional.
+            - name: nydus-root
+              mountPath: {{ .Values.hostPaths.root }}
+              mountPropagation: Bidirectional
+            # Talk to host containerd's content store (node-local accel reads gzip layers here).
+            - name: containerd-sock
+              mountPath: {{ .Values.hostPaths.containerdSock }}
+            # fusedev fallback device.
+            - name: dev-fuse
+              mountPath: {{ .Values.hostPaths.devFuse }}
+          # No preStop hook: with hostPID the container shares the host PID namespace, so signalling
+          # PID 1 would hit the host's init. Kubernetes SIGTERMs the container's main process on stop;
+          # containerd-nydus unmounts on graceful shutdown (recover_policy=failover re-attaches on
+          # restart, so live container rootfs mounts survive a snapshotter bounce).
+      terminationGracePeriodSeconds: 30
+      volumes:
+        - name: config
+          configMap:
+            name: {{ include "nydus-snapshotter.fullname" . }}-config
+        - name: nydus-run
+          hostPath:
+            path: {{ .Values.hostPaths.run }}
+            type: DirectoryOrCreate
+        - name: nydus-root
+          hostPath:
+            path: {{ .Values.hostPaths.root }}
+            type: DirectoryOrCreate
+        - name: containerd-sock
+          hostPath:
+            path: {{ .Values.hostPaths.containerdSock }}
+            type: Socket
+        - name: dev-fuse
+          hostPath:
+            path: {{ .Values.hostPaths.devFuse }}
+            type: CharDevice
+        {{- if .Values.containerd.install.enable }}
+        - name: installer
+          configMap:
+            name: {{ include "nydus-snapshotter.fullname" . }}-installer
+        - name: host-k3s
+          hostPath: { path: /var/lib/rancher/k3s, type: DirectoryOrCreate }
+        - name: host-rke2
+          hostPath: { path: /var/lib/rancher/rke2, type: DirectoryOrCreate }
+        - name: host-etc
+          hostPath: { path: /etc, type: Directory }
+        {{- end }}

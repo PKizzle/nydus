@@ -1,0 +1,24 @@
+nydus-snapshotter ({{ .Chart.AppVersion }}) installed as DaemonSet "{{ include "nydus-snapshotter.fullname" . }}".
+
+1. The snapshotter gRPC socket is at: {{ .Values.config.address }}
+
+{{ if not .Values.containerd.install.enable -}}
+2. ACTION REQUIRED — one-time node prep (this chart did NOT edit containerd config):
+   Add the nydus proxy_plugins + `nydus` runtime handler to your runtime config and restart it.
+   See the chart README "One-time node prep" section for the exact k3s / containerd snippet.
+   (Or re-install with --set containerd.install.enable=true --set containerd.install.restartUnit=<unit>.)
+{{- else -}}
+2. The opt-in installer ran. If containerd.install.restartUnit was empty, restart the runtime
+   manually (systemctl restart {{ .Values.containerd.install.runtime }}) for the change to take effect.
+{{- end }}
+
+3. Route a workload through nydus (opt-in):
+     spec.runtimeClassName: {{ .Values.runtimeClass.name }}
+{{ if .Values.defaultRuntimeClass.enable -}}
+   Default runtimeClassName injection is ENABLED via {{ .Values.defaultRuntimeClass.engine }} for
+   namespaces labelled {{ .Values.defaultRuntimeClass.namespaceSelectorLabel }}={{ .Values.defaultRuntimeClass.namespaceSelectorValue }}.
+{{- end }}
+
+4. Verify:
+     k3s ctr plugin ls | grep nydus
+     kubectl -n {{ .Release.Namespace }} logs ds/{{ include "nydus-snapshotter.fullname" . }}
