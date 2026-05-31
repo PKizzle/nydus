@@ -19,7 +19,7 @@ use nydus::daemon::NydusDaemon;
 use nydus::{FsBackendMountCmd, FsBackendType, FsBackendUmountCmd, FsService};
 use nydus_api::{
     start_http_thread, ApiError, ApiMountCmd, ApiRequest, ApiResponse, ApiResponsePayload,
-    ApiResult, BlobCacheEntry, BlobCacheObjectId, Config, DaemonConf, DaemonErrorKind,
+    ApiResult, BlobCacheEntry, BlobCacheObjectId, Config, ConfigV2, DaemonConf, DaemonErrorKind,
     MetricsErrorKind,
 };
 use nydus_utils::metrics;
@@ -61,10 +61,11 @@ impl ApiServer {
             ApiRequest::ExportFsInflightMetrics => self.export_inflight_metrics(),
             ApiRequest::GetConfig(id) => self.get_config(id),
             ApiRequest::UpdateConfig(id, config) => self.update_config(id, config),
+            ApiRequest::UpdateConfigV2(id, config) => self.update_config_v2(id, &config),
 
             // Nydus API v2
             ApiRequest::GetDaemonInfoV2 => self.daemon_info(false),
-            ApiRequest::GetBlobObject(_param) => todo!(),
+            ApiRequest::GetBlobObject(param) => self.list_blob_cache_entries(&param),
             ApiRequest::CreateBlobObject(entry) => self.create_blob_cache_entry(&entry),
             ApiRequest::DeleteBlobObject(param) => self.remove_blob_cache_entry(&param),
             ApiRequest::DeleteBlobFile(blob_id) => self.blob_cache_gc(blob_id),
@@ -279,6 +280,21 @@ impl ApiServer {
     }
 
     // HTTP API v2
+    fn list_blob_cache_entries(&self, param: &BlobCacheObjectId) -> ApiResponse {
+        match DAEMON_CONTROLLER.get_blob_cache_mgr() {
+            None => Err(ApiError::DaemonAbnormal(DaemonErrorKind::Unsupported)),
+            Some(mgr) => match mgr.list_blob_entries(param) {
+                Ok(entries) => serde_json::to_string(&entries)
+                    .map(ApiResponsePayload::BlobObjectList)
+                    .map_err(|e| ApiError::DaemonAbnormal(DaemonErrorKind::Serde(e))),
+                Err(e) => Err(ApiError::DaemonAbnormal(DaemonErrorKind::Other(format!(
+                    "{}",
+                    e
+                )))),
+            },
+        }
+    }
+
     fn create_blob_cache_entry(&self, entry: &BlobCacheEntry) -> ApiResponse {
         match DAEMON_CONTROLLER.get_blob_cache_mgr() {
             None => Err(ApiError::DaemonAbnormal(DaemonErrorKind::Unsupported)),
@@ -392,6 +408,67 @@ impl ApiServer {
             }
         }
         Ok(ApiResponsePayload::Empty)
+    }
+
+    fn update_config_v2(&self, id: Option<String>, config: &ConfigV2) -> ApiResponse {
+        let use_id = id
+            .as_deref()
+            .filter(|id| !id.is_empty())
+            .unwrap_or(config.id.as_str());
+
+        if let Some(backend) = config.backend.as_ref() {
+            match backend.backend_type.as_str() {
+                "registry" => {
+                    if let Some(registry) = backend.registry.as_ref() {
+                        if let Some(auth) = registry.auth.as_ref() {
+                            nydus_utils::config::set(
+                                use_id,
+                                &nydus_utils::config::Keys::RegistryAuth,
+                                auth.clone(),
+                            );
+                        }
+                        Self::update_proxy_runtime_config(use_id, &registry.proxy);
+                    }
+                }
+                "oss" => {
+                    if let Some(oss) = backend.oss.as_ref() {
+                        Self::update_proxy_runtime_config(use_id, &oss.proxy);
+                    }
+                }
+                "s3" => {
+                    if let Some(s3) = backend.s3.as_ref() {
+                        Self::update_proxy_runtime_config(use_id, &s3.proxy);
+                    }
+                }
+                "http-proxy" => {
+                    if let Some(proxy) = backend.http_proxy.as_ref() {
+                        if !proxy.addr.is_empty() {
+                            nydus_utils::config::set(
+                                use_id,
+                                &nydus_utils::config::Keys::ProxyURL,
+                                proxy.addr.clone(),
+                            );
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        Ok(ApiResponsePayload::Empty)
+    }
+
+    fn update_proxy_runtime_config(id: &str, proxy: &nydus_api::ProxyConfig) {
+        if !proxy.url.is_empty() {
+            nydus_utils::config::set(id, &nydus_utils::config::Keys::ProxyURL, proxy.url.clone());
+        }
+        if !proxy.dragonfly_scheduler_endpoint.is_empty() {
+            nydus_utils::config::set(
+                id,
+                &nydus_utils::config::Keys::DragonflySchedulerEndpoint,
+                proxy.dragonfly_scheduler_endpoint.clone(),
+            );
+        }
     }
 
     fn get_config(&self, id: Option<String>) -> ApiResponse {

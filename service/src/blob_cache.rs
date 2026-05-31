@@ -21,6 +21,7 @@ use nydus_rafs::metadata::{RafsBlobExtraInfo, RafsSuper, RafsSuperFlags};
 use nydus_storage::cache::BlobCache;
 use nydus_storage::device::BlobInfo;
 use nydus_storage::factory::BLOB_FACTORY;
+use serde::Serialize;
 use tokio_uring::buf::BoundedBufMut;
 use tokio_uring::fs::File;
 
@@ -33,6 +34,28 @@ pub fn generate_blob_key(domain_id: &str, blob_id: &str) -> String {
     } else {
         format!("{}{}{}", domain_id, ID_SPLITTER, blob_id)
     }
+}
+
+/// Public, non-secret view of a blob cache object.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct BlobCacheObjectInfo {
+    /// Type of blob object, bootstrap or data blob.
+    #[serde(rename = "type")]
+    pub blob_type: String,
+    /// Domain id used to group cached blobs.
+    pub domain_id: String,
+    /// Blob id without domain scoping.
+    #[serde(rename = "id")]
+    pub blob_id: String,
+    /// Number of active references to the blob object.
+    pub ref_count: u32,
+}
+
+/// Public list response for cached blob objects.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
+pub struct BlobCacheObjectList {
+    /// Matching blob objects.
+    pub blobs: Vec<BlobCacheObjectInfo>,
 }
 
 /// Configuration information for a cached metadata blob.
@@ -164,6 +187,23 @@ impl BlobConfig {
             BlobConfig::DataBlob(_o) => None,
         }
     }
+
+    fn to_object_info(&self, domain_id: &str) -> BlobCacheObjectInfo {
+        match self {
+            BlobConfig::MetaBlob(o) => BlobCacheObjectInfo {
+                blob_type: BLOB_CACHE_TYPE_META_BLOB.to_string(),
+                domain_id: domain_id.to_string(),
+                blob_id: o.blob_id.clone(),
+                ref_count: 1,
+            },
+            BlobConfig::DataBlob(o) => BlobCacheObjectInfo {
+                blob_type: BLOB_CACHE_TYPE_DATA_BLOB.to_string(),
+                domain_id: domain_id.to_string(),
+                blob_id: o.blob_info.blob_id(),
+                ref_count: o.ref_count.load(Ordering::Acquire),
+            },
+        }
+    }
 }
 
 #[derive(Default)]
@@ -241,6 +281,44 @@ impl BlobCacheState {
     fn get(&self, key: &str) -> Option<BlobConfig> {
         self.id_to_config_map.get(key).cloned()
     }
+
+    fn list(&self, param: &BlobCacheObjectId) -> Result<BlobCacheObjectList> {
+        if param.domain_id.is_empty() {
+            return Err(einval!("blob_cache: missing domain id"));
+        }
+
+        if !param.blob_id.is_empty() {
+            let scoped_blob_id = generate_blob_key(&param.domain_id, &param.blob_id);
+            let entry = self
+                .id_to_config_map
+                .get(&scoped_blob_id)
+                .ok_or_else(|| enoent!("blob_cache: cache entry not found"))?;
+            return Ok(BlobCacheObjectList {
+                blobs: vec![entry.to_object_info(&param.domain_id)],
+            });
+        }
+
+        let scoped_blob_prefix = format!("{}{}", param.domain_id, ID_SPLITTER);
+        let mut blobs: Vec<BlobCacheObjectInfo> = self
+            .id_to_config_map
+            .iter()
+            .filter_map(|(key, entry)| {
+                if key.starts_with(&scoped_blob_prefix) {
+                    Some(entry.to_object_info(&param.domain_id))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        blobs.sort_by(|a, b| {
+            a.blob_type
+                .cmp(&b.blob_type)
+                .then_with(|| a.blob_id.cmp(&b.blob_id))
+        });
+
+        Ok(BlobCacheObjectList { blobs })
+    }
 }
 
 /// Structure to manage and cache RAFS meta/data blob objects.
@@ -303,6 +381,11 @@ impl BlobCacheMgr {
     /// Remove a meta/data blob object from the cache manager.
     pub fn remove_blob_entry(&self, param: &BlobCacheObjectId) -> Result<()> {
         self.get_state().remove(param)
+    }
+
+    /// List cached blob objects matching the requested domain and optional blob id.
+    pub fn list_blob_entries(&self, param: &BlobCacheObjectId) -> Result<BlobCacheObjectList> {
+        self.get_state().list(param)
     }
 
     /// Get configuration information of the cached blob with specified `key`.

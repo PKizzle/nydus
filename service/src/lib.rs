@@ -38,7 +38,7 @@ mod fusedev;
 mod singleton;
 pub mod upgrade;
 
-pub use blob_cache::BlobCacheMgr;
+pub use blob_cache::{BlobCacheMgr, BlobCacheObjectInfo, BlobCacheObjectList};
 pub use fs_service::{FsBackendCollection, FsBackendMountCmd, FsBackendUmountCmd, FsService};
 pub use fusedev::{create_fuse_daemon, create_vfs_backend, FusedevDaemon};
 pub use singleton::create_daemon;
@@ -249,6 +249,21 @@ pub trait ServiceArgs {
 mod blob_cache {
     use super::*;
 
+    #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+    pub struct BlobCacheObjectInfo {
+        #[serde(rename = "type")]
+        pub blob_type: String,
+        pub domain_id: String,
+        #[serde(rename = "id")]
+        pub blob_id: String,
+        pub ref_count: u32,
+    }
+
+    #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
+    pub struct BlobCacheObjectList {
+        pub blobs: Vec<BlobCacheObjectInfo>,
+    }
+
     pub struct BlobCacheMgr {}
 
     impl Default for BlobCacheMgr {
@@ -271,6 +286,13 @@ mod blob_cache {
         }
 
         pub fn remove_blob_entry(&self, _param: &nydus_api::BlobCacheObjectId) -> Result<()> {
+            unimplemented!()
+        }
+
+        pub fn list_blob_entries(
+            &self,
+            _param: &nydus_api::BlobCacheObjectId,
+        ) -> io::Result<BlobCacheObjectList> {
             unimplemented!()
         }
     }
