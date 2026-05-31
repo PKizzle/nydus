@@ -419,9 +419,10 @@ mod tests {
                     }
                 },
                 "cache": {
-                    "type": "fscache",
-                    "fscache": {
-                        "work_dir": "/tmp/nydus"
+                    "type": "fanotify",
+                    "fanotify": {
+                        "work_dir": "/tmp/nydus",
+                        "mountpoint": "/tmp/nydus/mount"
                     }
                 },
                 "metadata_path": "/tmp/nydus/bootstrap1"
@@ -436,7 +437,7 @@ mod tests {
                 prefetch_files: Some(vec!["testfile".to_string()]),
             },
         );
-        assert!(r.is_ok(), "failed to add backend collection");
+        assert!(r.is_ok(), "failed to add backend collection: {:?}", r);
 
         assert_eq!(col.0.len(), 1);
 
@@ -539,38 +540,40 @@ mod tests {
 
     #[test]
     fn it_should_create_rafs_backend() {
-        let config = r#"
-        {
-            "device": {
-              "backend": {
-                "type": "oss",
-                "config": {
-                  "endpoint": "test",
-                  "access_key_id": "test",
-                  "access_key_secret": "test",
-                  "bucket_name": "antsys-nydus",
-                  "object_prefix":"nydus_v2/",
-                  "scheme": "http"
+        let blob_dir = "../tests/texture/blobs";
+        let config = r#"{
+                "device": {
+                    "backend": {
+                        "type": "localfs",
+                        "config": {
+                            "dir": "BLOB_DIR"
+                        }
+                    },
+                    "cache": {
+                        "type": "blobcache",
+                        "config": {
+                            "work_dir": "BLOB_DIR"
+                        }
+                    }
+                },
+                "mode": "direct",
+                "digest_validate": false,
+                "enable_xattr": true,
+                "fs_prefetch": {
+                    "enable": true,
+                    "threads_count": 10,
+                    "merging_size": 131072,
+                    "bandwidth_rate": 10485760
                 }
-              }
-            },
-            "mode": "direct",
-            "digest_validate": false,
-            "enable_xattr": true,
-            "fs_prefetch": {
-              "enable": true,
-              "threads_count": 10,
-              "merging_size": 131072,
-              "bandwidth_rate": 10485760
-            }
-          }"#;
-        let bootstrap = "../tests/texture/bootstrap/nydusd_daemon_test_bootstrap";
+            }"#
+        .replace("BLOB_DIR", blob_dir);
+        let bootstrap = "../tests/texture/bootstrap/rafs-v6-2.2.boot";
         if fs_backend_factory(&FsBackendMountCmd {
             fs_type: FsBackendType::Rafs,
-            config: config.to_string(),
+            config,
             mountpoint: "testmountpoint".to_string(),
             source: bootstrap.to_string(),
-            prefetch_files: Some(vec!["/testfile".to_string()]),
+            prefetch_files: None,
         })
         .unwrap()
         .as_any()

@@ -204,8 +204,8 @@ pub trait NydusDaemon: DaemonStateMachineSubscriber + Send + Sync {
 //   done yet. It relies on `fuse-rs` to tell if capability negotiation is done.
 // - `Die` state means the whole nydusd process is going to die.
 state_machine! {
-    derive(Debug, Clone)
-    pub DaemonStateMachine(Init)
+    #[derive(Debug, Clone)]
+    pub daemon_state_machine(Init)
 
     Init => {
         Mount => Ready,
@@ -221,6 +221,11 @@ state_machine! {
         Stop => Ready [TerminateService],
     },
 }
+
+pub use daemon_state_machine::{
+    Impl as DaemonStateMachine, Input as DaemonStateMachineInput,
+    Output as DaemonStateMachineOutput,
+};
 
 /// An implementation of the state machine defined by [`DaemonStateMachine`].
 pub struct DaemonStateMachineContext {
@@ -343,7 +348,7 @@ pub trait DaemonStateMachineSubscriber {
     fn on_event(&self, event: DaemonStateMachineInput) -> Result<()>;
 }
 
-/// Controller to manage registered filesystem/blobcache/fscache services.
+/// Controller to manage registered filesystem/blobcache/fanotify services.
 pub struct DaemonController {
     active: AtomicBool,
     singleton_mode: AtomicBool,

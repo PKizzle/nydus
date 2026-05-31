@@ -68,11 +68,11 @@ impl<T> Channel<T> {
             // Make sure that no wakeup is lost if we get `None` from `try_recv`.
             future.as_mut().enable();
 
-            if let Some(msg) = self.try_recv() {
+            match self.try_recv() { Some(msg) => {
                 return Ok(msg);
-            } else if self.closed.load(Ordering::Acquire) {
+            } _ => if self.closed.load(Ordering::Acquire) {
                 return Err(Error::new(ErrorKind::BrokenPipe, "channel has been closed"));
-            }
+            }}
 
             // Wait for a call to `notify_one`.
             //

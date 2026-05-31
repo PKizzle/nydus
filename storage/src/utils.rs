@@ -17,7 +17,7 @@ use nydus_utils::{
 use std::alloc::{alloc, handle_alloc_error, Layout};
 use std::cmp::{self, min};
 use std::io::{ErrorKind, IoSliceMut, Result};
-use std::os::fd::{AsFd, AsRawFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
 use std::os::unix::io::RawFd;
 #[cfg(target_os = "linux")]
 use std::path::PathBuf;
@@ -30,6 +30,12 @@ use crate::{StorageError, StorageResult};
 
 /// Just a simple wrapper for posix `preadv`. Provide a slice of `IoVec` as input.
 pub fn readv(fd: RawFd, iovec: &mut [IoSliceMut], offset: u64) -> Result<usize> {
+    if iovec.is_empty() {
+        return Ok(0);
+    }
+
+    // SAFETY: callers pass a live fd and this borrowed fd is used only during each preadv call.
+    let fd = unsafe { BorrowedFd::borrow_raw(fd) };
     loop {
         match preadv(fd, iovec, offset as off64_t).map_err(|_| last_error!()) {
             Ok(ret) => return Ok(ret),
@@ -122,9 +128,9 @@ pub fn copy_file_range(
 
     while len > 0 {
         let ret = nix::fcntl::copy_file_range(
-            src.as_fd().as_raw_fd(),
+            src.as_fd(),
             Some(&mut src_off),
-            dst.as_fd().as_raw_fd(),
+            dst.as_fd(),
             Some(&mut dst_off),
             len,
         )?;
@@ -151,7 +157,7 @@ pub fn copy_file_range(
     while len > 0 {
         let bytes_to_read = buf_size.min(len);
         let read_bytes = nix::sys::uio::pread(
-            src.as_fd().as_raw_fd(),
+            src.as_fd(),
             &mut buf[..bytes_to_read],
             src_off as libc::off_t,
         )?;
@@ -160,11 +166,8 @@ pub fn copy_file_range(
             return Err(eio!("reach end of file when read in copy_file_range"));
         }
 
-        let write_bytes = nix::sys::uio::pwrite(
-            dst.as_fd().as_raw_fd(),
-            &buf[..read_bytes],
-            dst_off as libc::off_t,
-        )?;
+        let write_bytes =
+            nix::sys::uio::pwrite(dst.as_fd(), &buf[..read_bytes], dst_off as libc::off_t)?;
         if write_bytes == 0 {
             return Err(eio!("reach end of file when write in copy_file_range"));
         }

@@ -31,13 +31,13 @@ pub fn make_error(
 /// Define error macro like `x!()` or `x!(err)`.
 /// Note: The `x!()` macro will convert any origin error (Os, Simple, Custom) to Custom error.
 macro_rules! define_error_macro {
-    ($fn:ident, $err:expr) => {
+    ($fn:ident, $err:expr_2021) => {
         #[macro_export]
         macro_rules! $fn {
             () => {
                 std::io::Error::new($err.kind(), format!("{}: {}:{}", $err, file!(), line!()))
             };
-            ($raw:expr) => {
+            ($raw:expr_2021) => {
                 $crate::error::make_error($err, &$raw, file!(), line!())
             };
         }

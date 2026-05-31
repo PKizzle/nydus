@@ -3,10 +3,10 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-//! Common cached file object for `FileCacheMgr` and `FsCacheMgr`.
+//! Common cached file object for blob cache managers.
 //!
 //! The `FileCacheEntry` manages local cached blob objects from remote backends to improve
-//! performance. It may be used by both the userspace `FileCacheMgr` or the `FsCacheMgr` based
+//! performance. It may be used by the userspace `FileCacheMgr` or other cache managers based
 //! on the in-kernel fscache system.
 
 use std::collections::HashSet;
@@ -332,10 +332,8 @@ impl FileCacheEntry {
     }
 
     fn persist_cached_data(file: &Arc<File>, offset: u64, buffer: &[u8]) -> Result<()> {
-        let fd = file.as_raw_fd();
-
         let n = loop {
-            let ret = uio::pwrite(fd, buffer, offset as i64).map_err(|_| last_error!());
+            let ret = uio::pwrite(file.as_ref(), buffer, offset as i64).map_err(|_| last_error!());
             match ret {
                 Ok(nr_write) => {
                     trace!("write {}(offset={}) bytes to cache file", nr_write, offset);
@@ -1600,8 +1598,8 @@ impl DataBuffer {
 
     fn mut_slice(&mut self) -> &mut [u8] {
         match self {
-            Self::Reuse(ref mut data) => data.as_mut_slice(),
-            Self::Allocated(ref mut data) => data.as_mut_slice(),
+            Self::Reuse(data) => data.as_mut_slice(),
+            Self::Allocated(data) => data.as_mut_slice(),
         }
     }
 

@@ -6,20 +6,20 @@ authors = ["The Nydus Developers"]
 license = "Apache-2.0"
 homepage = "https://nydus.dev/"
 repository = "https://github.com/dragonflyoss/nydus"
-edition = "2021"
+edition = "2024"
 
 [dependencies]
 anyhow = "1.0.35"
-base64 = "0.21"
+base64 = "0.22.1"
 hex = "0.4.3"
 indexmap = "2"
 libc = "0.2"
 log = "0.4"
-nix = "0.24"
+nix = "0.31.3"
 serde = { version = "1.0.110", features = ["serde_derive", "rc"] }
 serde_json = "1.0.53"
-sha2 = "0.10.2"
-tar = "0.4.40"
+sha2 = "0.11.0"
+tar = "0.4.46"
 vmm-sys-util = { workspace = true }
 xattr = "1.0.1"
 parse-size = "1.1.0"
@@ -28,7 +28,7 @@ nydus-api = { version = "0.4.1", path = "../api" }
 nydus-rafs = { version = "0.4.1", path = "../rafs" }
 nydus-storage = { version = "0.7.2", path = "../storage", features = ["backend-localfs"] }
 nydus-utils = { version = "0.5.1", path = "../utils" }
-gix-attributes = "0.25.0"
+gix-attributes = "0.33.1"
 
 [package.metadata.docs.rs]
 all-features = true

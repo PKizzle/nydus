@@ -10,7 +10,7 @@ use r2d2::{Pool, PooledConnection};
 use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::{Connection, DropBehavior, OpenFlags, OptionalExtension, Transaction};
 
-use super::Result;
+use super::{CasError, Result};
 
 pub struct CasDb {
     pool: Pool<SqliteConnectionManager>,
@@ -60,7 +60,7 @@ impl CasDb {
         let sql = "SELECT BlobId FROM Blobs WHERE FilePath = ?";
 
         if let Some(id) = tran
-            .query_row(sql, [blob], |row| row.get::<usize, u64>(0))
+            .query_row(sql, [blob], |row| Self::row_u64(row, 0))
             .optional()?
         {
             return Ok(Some(id));
@@ -74,7 +74,7 @@ impl CasDb {
 
         if let Some(id) = self
             .get_connection()?
-            .query_row(sql, [blob], |row| row.get::<usize, u64>(0))
+            .query_row(sql, [blob], |row| Self::row_u64(row, 0))
             .optional()?
         {
             return Ok(Some(id));
@@ -85,6 +85,7 @@ impl CasDb {
 
     pub fn get_blob_path(&self, id: u64) -> Result<Option<String>> {
         let sql = "SELECT FilePath FROM Blobs WHERE BlobId = ?";
+        let id = Self::sql_i64(id)?;
 
         if let Some(path) = self
             .get_connection()?
@@ -100,7 +101,7 @@ impl CasDb {
     pub fn get_all_blobs(&self) -> Result<Vec<(u64, String)>> {
         let conn = self.get_connection()?;
         let mut stmt = conn.prepare_cached("SELECT BlobId, FilePath FROM Blobs")?;
-        let rows = stmt.query_map([], |row| Ok((row.get::<usize, u64>(0)?, row.get(1)?)))?;
+        let rows = stmt.query_map([], |row| Ok((Self::row_u64(row, 0)?, row.get(1)?)))?;
         let mut results: Vec<(u64, String)> = Vec::new();
         for row in rows {
             results.push(row?);
@@ -127,7 +128,7 @@ impl CasDb {
         let sql = "INSERT OR IGNORE INTO Blobs (FilePath) VALUES (?1)";
         let conn = self.get_connection()?;
         conn.execute(sql, [blob])?;
-        Ok(conn.last_insert_rowid() as u64)
+        Self::i64_to_u64(conn.last_insert_rowid(), 0).map_err(Into::into)
     }
 
     pub fn delete_blobs(&self, blobs: &[String]) -> Result<()> {
@@ -138,6 +139,7 @@ impl CasDb {
 
         for blob in blobs {
             if let Some(id) = Self::get_blob_id_with_tx(&tran, blob)? {
+                let id = Self::sql_i64(id)?;
                 if let Err(e) = tran.execute(delete_chunks_sql, [id]) {
                     return Err(e.into());
                 }
@@ -161,7 +163,7 @@ impl CasDb {
         if let Some((new_blob_id, chunk_info)) = self
             .get_connection()?
             .query_row(sql, [chunk_id], |row| {
-                Ok((row.get(0)?, row.get::<usize, u64>(1)?))
+                Ok((row.get(0)?, Self::row_u64(row, 1)?))
             })
             .optional()?
         {
@@ -180,7 +182,9 @@ impl CasDb {
             match Self::get_blob_id_with_tx(&tran, &chunk.2) {
                 Err(e) => return Err(e),
                 Ok(id) => {
-                    if let Err(e) = tran.execute(sql, (&chunk.0, &chunk.1, id)) {
+                    let chunk_offset = Self::sql_i64(chunk.1)?;
+                    let id = id.map(Self::sql_i64).transpose()?;
+                    if let Err(e) = tran.execute(sql, (&chunk.0, chunk_offset, id)) {
                         return Err(e.into());
                     }
                 }
@@ -199,6 +203,8 @@ impl CasDb {
         match Self::get_blob_id_with_tx(&tran, blob_id) {
             Err(e) => return Err(e),
             Ok(id) => {
+                let chunk_offset = Self::sql_i64(chunk_offset)?;
+                let id = id.map(Self::sql_i64).transpose()?;
                 if let Err(e) = tran.execute(sql, (chunk_id, chunk_offset, id)) {
                     return Err(e.into());
                 }
@@ -221,6 +227,24 @@ impl CasDb {
         let conn = self.pool.get()?;
         conn.busy_handler(Some(|_v| true))?;
         Ok(conn)
+    }
+
+    fn row_u64(row: &rusqlite::Row<'_>, idx: usize) -> rusqlite::Result<u64> {
+        let value = row.get::<usize, i64>(idx)?;
+        Self::i64_to_u64(value, idx)
+    }
+
+    fn i64_to_u64(value: i64, idx: usize) -> rusqlite::Result<u64> {
+        u64::try_from(value).map_err(|_| rusqlite::Error::IntegralValueOutOfRange(idx, value))
+    }
+
+    fn sql_i64(value: u64) -> Result<i64> {
+        i64::try_from(value).map_err(|_| {
+            CasError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("integer value {} exceeds SQLite INTEGER range", value),
+            ))
+        })
     }
 }
 

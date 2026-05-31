@@ -9,6 +9,7 @@ use std::fmt;
 use std::fmt::Debug;
 use std::io::ErrorKind;
 use std::io::Read;
+use std::os::fd::BorrowedFd;
 
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -97,6 +98,8 @@ impl Crc32 {
     pub fn from_raw_fd(&self, fd: i32, offset: u64, size: u64) -> std::io::Result<u32> {
         let mut digester = self.crc.digest();
         let mut buf = vec![0u8; 1024 * 1024];
+        // SAFETY: the caller owns `fd` for the duration of this synchronous read loop.
+        let fd = unsafe { BorrowedFd::borrow_raw(fd) };
         let mut total_read: u64 = 0;
         loop {
             if total_read >= size {

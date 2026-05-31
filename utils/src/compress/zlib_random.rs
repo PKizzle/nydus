@@ -760,7 +760,7 @@ extern "C" fn zfree(_ptr: *mut c_void, address: *mut c_void) {
     }
 }
 
-extern "system" {
+unsafe extern "system" {
     pub fn inflateGetDictionary(
         strm: *mut z_stream,
         dictionary: *mut u8,

@@ -243,9 +243,9 @@ impl BackendError {
 }
 
 fn random_duration(min_millis: u64, max_millis: u64) -> Duration {
-    use rand::Rng;
-    let mut rng = rand::thread_rng();
-    Duration::from_millis(rng.gen_range(min_millis..=max_millis))
+    use rand::RngExt;
+    let mut rng = rand::rng();
+    Duration::from_millis(rng.random_range(min_millis..=max_millis))
 }
 
 /// Proxy-aware retry loop for backend read operations.

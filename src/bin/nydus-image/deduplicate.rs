@@ -47,6 +47,22 @@ impl From<rusqlite::Error> for DatabaseError {
     }
 }
 
+fn row_u64(row: &rusqlite::Row<'_>, idx: usize) -> rusqlite::Result<u64> {
+    let value = row.get::<usize, i64>(idx)?;
+    u64::try_from(value).map_err(|_| rusqlite::Error::IntegralValueOutOfRange(idx, value))
+}
+
+fn sql_i64(value: u64) -> std::result::Result<i64, DatabaseError> {
+    i64::try_from(value).map_err(|_| {
+        DatabaseError::SqliteError(rusqlite::Error::ToSqlConversionFailure(Box::new(
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("integer value {} exceeds SQLite INTEGER range", value),
+            ),
+        )))
+    })
+}
+
 pub trait Database {
     /// Creates a new chunk in the database.
     fn create_chunk_table(&self) -> Result<()>;
@@ -984,8 +1000,8 @@ impl ChunkTable {
                 chunk_crc32: row.get(5)?,
                 chunk_compressed_size: row.get(6)?,
                 chunk_uncompressed_size: row.get(7)?,
-                chunk_compressed_offset: row.get(8)?,
-                chunk_uncompressed_offset: row.get(9)?,
+                chunk_compressed_offset: row_u64(row, 8)?,
+                chunk_uncompressed_offset: row_u64(row, 9)?,
             })
         })?;
         let mut chunks = Vec::new();
@@ -1093,6 +1109,9 @@ impl Table<ChunkdictChunkInfo, DatabaseError> for ChunkTable {
     }
 
     fn insert(&self, chunk: &ChunkdictChunkInfo) -> Result<(), DatabaseError> {
+        let chunk_compressed_offset = sql_i64(chunk.chunk_compressed_offset)?;
+        let chunk_uncompressed_offset = sql_i64(chunk.chunk_uncompressed_offset)?;
+
         self.conn
             .lock()
             .map_err(|e| DatabaseError::PoisonError(e.to_string()))?
@@ -1118,8 +1137,8 @@ impl Table<ChunkdictChunkInfo, DatabaseError> for ChunkTable {
                     chunk.chunk_crc32,
                     chunk.chunk_compressed_size,
                     chunk.chunk_uncompressed_size,
-                    chunk.chunk_compressed_offset,
-                    chunk.chunk_uncompressed_offset,
+                    chunk_compressed_offset,
+                    chunk_uncompressed_offset,
                 ],
             )
             .map_err(DatabaseError::SqliteError)?;
@@ -1168,8 +1187,8 @@ impl Table<ChunkdictChunkInfo, DatabaseError> for ChunkTable {
                 chunk_crc32: row.get(5)?,
                 chunk_compressed_size: row.get(6)?,
                 chunk_uncompressed_size: row.get(7)?,
-                chunk_compressed_offset: row.get(8)?,
-                chunk_uncompressed_offset: row.get(9)?,
+                chunk_compressed_offset: row_u64(row, 8)?,
+                chunk_uncompressed_offset: row_u64(row, 9)?,
             })
         })?;
         let mut chunks = Vec::new();
@@ -1211,12 +1230,12 @@ impl BlobTable {
         let mut blob_iterator = stmt.query_map([blob_id], |row| {
             Ok(ChunkdictBlobInfo {
                 blob_id: row.get(0)?,
-                blob_compressed_size: row.get(1)?,
-                blob_uncompressed_size: row.get(2)?,
+                blob_compressed_size: row_u64(row, 1)?,
+                blob_uncompressed_size: row_u64(row, 2)?,
                 blob_compressor: row.get(3)?,
-                blob_meta_ci_compressed_size: row.get(4)?,
-                blob_meta_ci_uncompressed_size: row.get(5)?,
-                blob_meta_ci_offset: row.get(6)?,
+                blob_meta_ci_compressed_size: row_u64(row, 4)?,
+                blob_meta_ci_uncompressed_size: row_u64(row, 5)?,
+                blob_meta_ci_offset: row_u64(row, 6)?,
             })
         })?;
 
@@ -1262,6 +1281,12 @@ impl Table<ChunkdictBlobInfo, DatabaseError> for BlobTable {
     }
 
     fn insert(&self, blob: &ChunkdictBlobInfo) -> Result<(), DatabaseError> {
+        let blob_compressed_size = sql_i64(blob.blob_compressed_size)?;
+        let blob_uncompressed_size = sql_i64(blob.blob_uncompressed_size)?;
+        let blob_meta_ci_compressed_size = sql_i64(blob.blob_meta_ci_compressed_size)?;
+        let blob_meta_ci_uncompressed_size = sql_i64(blob.blob_meta_ci_uncompressed_size)?;
+        let blob_meta_ci_offset = sql_i64(blob.blob_meta_ci_offset)?;
+
         self.conn
             .lock()
             .map_err(|e| DatabaseError::PoisonError(e.to_string()))?
@@ -1279,12 +1304,12 @@ impl Table<ChunkdictBlobInfo, DatabaseError> for BlobTable {
                 ",
                 rusqlite::params![
                     blob.blob_id,
-                    blob.blob_compressed_size,
-                    blob.blob_uncompressed_size,
+                    blob_compressed_size,
+                    blob_uncompressed_size,
                     blob.blob_compressor,
-                    blob.blob_meta_ci_compressed_size,
-                    blob.blob_meta_ci_uncompressed_size,
-                    blob.blob_meta_ci_offset,
+                    blob_meta_ci_compressed_size,
+                    blob_meta_ci_uncompressed_size,
+                    blob_meta_ci_offset,
                 ],
             )
             .map_err(DatabaseError::SqliteError)?;
@@ -1321,12 +1346,12 @@ impl Table<ChunkdictBlobInfo, DatabaseError> for BlobTable {
         let blob_iterator = stmt.query_map(params![limit, offset], |row| {
             Ok(ChunkdictBlobInfo {
                 blob_id: row.get(0)?,
-                blob_compressed_size: row.get(1)?,
-                blob_uncompressed_size: row.get(2)?,
+                blob_compressed_size: row_u64(row, 1)?,
+                blob_uncompressed_size: row_u64(row, 2)?,
                 blob_compressor: row.get(3)?,
-                blob_meta_ci_compressed_size: row.get(4)?,
-                blob_meta_ci_uncompressed_size: row.get(5)?,
-                blob_meta_ci_offset: row.get(6)?,
+                blob_meta_ci_compressed_size: row_u64(row, 4)?,
+                blob_meta_ci_uncompressed_size: row_u64(row, 5)?,
+                blob_meta_ci_offset: row_u64(row, 6)?,
             })
         })?;
         let mut blobs = Vec::new();

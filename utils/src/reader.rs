@@ -5,6 +5,7 @@
 use std::fs::File;
 use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::marker::PhantomData;
+use std::os::fd::BorrowedFd;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::sync::{Arc, Mutex};
 
@@ -35,7 +36,10 @@ impl FileRangeReader<'_> {
 impl Read for FileRangeReader<'_> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         let size = std::cmp::min(self.size as usize, buf.len());
-        let nr_read = nix::sys::uio::pread(self.fd, &mut buf[0..size], self.offset as i64)
+        // SAFETY: `FileRangeReader` is created from a live `File`, and this borrowed fd is
+        // used only for the duration of this synchronous read call.
+        let fd = unsafe { BorrowedFd::borrow_raw(self.fd) };
+        let nr_read = nix::sys::uio::pread(fd, &mut buf[0..size], self.offset as i64)
             .map_err(|_| last_error!())?;
         self.offset += nr_read as u64;
         self.size -= nr_read as u64;
