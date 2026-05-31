@@ -1,0 +1,34 @@
+{{- if and .Values.defaultRuntimeClass.enable (eq .Values.defaultRuntimeClass.engine "gatekeeper") (eq .Values.snapshotterMode "runtime-handler") }}
+# OPA Gatekeeper equivalent of the Kyverno policy: an Assign mutator that sets
+# `runtimeClassName: {{ .Values.runtimeClass.name }}` on pods that do not already declare one.
+# Requires Gatekeeper with the mutation feature enabled. Scope with the namespace label below.
+apiVersion: mutations.gatekeeper.sh/v1
+kind: Assign
+metadata:
+  name: {{ include "nydus-snapshotter.fullname" . }}-default-runtimeclass
+  labels:
+    {{- include "nydus-snapshotter.labels" . | nindent 4 }}
+spec:
+  applyTo:
+    - groups: [""]
+      kinds: ["Pod"]
+      versions: ["v1"]
+  match:
+    scope: Namespaced
+    kinds:
+      - apiGroups: [""]
+        kinds: ["Pod"]
+    {{- if .Values.defaultRuntimeClass.namespaceSelectorLabel }}
+    namespaceSelector:
+      matchLabels:
+        {{ .Values.defaultRuntimeClass.namespaceSelectorLabel }}: {{ .Values.defaultRuntimeClass.namespaceSelectorValue | quote }}
+    {{- end }}
+  location: "spec.runtimeClassName"
+  parameters:
+    assign:
+      value: {{ .Values.runtimeClass.name }}
+    # Only assign when the pod has not already chosen a runtime class.
+    pathTests:
+      - subPath: "spec.runtimeClassName"
+        condition: MustNotExist
+{{- end }}

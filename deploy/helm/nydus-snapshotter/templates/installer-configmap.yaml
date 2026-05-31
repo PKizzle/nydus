@@ -1,0 +1,195 @@
+{{- if .Values.containerd.install.enable }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "nydus-snapshotter.fullname" . }}-installer
+  labels:
+    {{- include "nydus-snapshotter.labels" . | nindent 4 }}
+data:
+  install.sh: |
+    #!/bin/sh
+    # OPT-IN containerd config installer. Detects the distro + containerd config-schema version and
+    # writes an ADDITIVE, marker-guarded block registering the nydus proxy_plugin (+ either a per-
+    # runtime handler or the global default snapshotter). Idempotent. Restarts only if AUTO_RESTART
+    # is true (otherwise prints the command). Distros it cannot safely configure (Bottlerocket, EKS-
+    # managed, GKE/AKS) are detected and print manual guidance with exit 0 — never crash-loop.
+    set -eu
+    BEGIN='# BEGIN nydus-snapshotter (managed by helm)'
+    END='# END nydus-snapshotter (managed by helm)'
+    : "${RUNTIME:=auto}"
+    : "${SNAPSHOTTER_MODE:=runtime-handler}"
+    : "${AUTO_RESTART:=false}"
+    : "${RESTART_UNIT:=}"
+    : "${RUNTIME_HANDLER:=nydus}"
+    : "${SNAPSHOTTER_ADDRESS:?SNAPSHOTTER_ADDRESS is required}"
+    : "${K3S_TEMPLATE:=}"
+    : "${RKE2_TEMPLATE:=}"
+    : "${CONTAINERD_CONFIG:=}"
+    HOST_K3S=/host/k3s            # -> /var/lib/rancher/k3s
+    HOST_RKE2=/host/rke2          # -> /var/lib/rancher/rke2
+    HOST_ETC=/host/etc           # -> /etc
+    OSREL="$HOST_ETC/os-release"
+
+    nsenter_host() { nsenter -t 1 -m -u -i -n -p -- "$@"; }
+
+    detect_distro() {
+      [ "$RUNTIME" != auto ] && { echo "$RUNTIME"; return; }
+      [ -d "$HOST_K3S/agent/etc/containerd" ]  && { echo k3s; return; }
+      [ -d "$HOST_RKE2/agent/etc/containerd" ] && { echo rke2; return; }
+      if [ -f "$OSREL" ]; then
+        grep -qi 'bottlerocket' "$OSREL" && { echo bottlerocket; return; }
+        grep -qiE 'gke|cos_|container-optimized' "$OSREL" && { echo managed; return; }
+      fi
+      { [ -d "$HOST_ETC/eks" ] || grep -qi 'amazon linux' "$OSREL" 2>/dev/null; } && { echo eks; return; }
+      { [ -d "$HOST_ETC/containerd" ] || nsenter_host test -S /run/containerd/containerd.sock 2>/dev/null; } \
+        && { echo containerd; return; }
+      echo unknown
+    }
+
+    # Map containerd version -> config schema version. 1.x => v2, 2.x+ => v3. Default v3.
+    detect_cfgver() {
+      v="$(nsenter_host containerd --version 2>/dev/null | grep -oE 'v?[0-9]+\.[0-9]+' | head -1 | tr -d v)"
+      case "$v" in
+        1.*) echo 2 ;;
+        2.*|3.*|4.*) echo 3 ;;
+        *)   echo 3 ;;
+      esac
+    }
+
+    # CRI TOML table headers by config-schema version (research decision table).
+    cri_runtime_table() { # per-runtime handler
+      if [ "$1" = 2 ]; then echo "[plugins.\"io.containerd.grpc.v1.cri\".containerd.runtimes.$RUNTIME_HANDLER]"
+      else echo "[plugins.'io.containerd.cri.v1.runtime'.containerd.runtimes.$RUNTIME_HANDLER]"; fi
+    }
+    cri_default_table() {  # global default snapshotter
+      if [ "$1" = 2 ]; then echo "[plugins.\"io.containerd.grpc.v1.cri\".containerd]"
+      else echo "[plugins.'io.containerd.cri.v1.images']"; fi
+    }
+
+    emit_proxy() {  # proxy_plugins is top-level and identical across config v2/v3
+      echo "[proxy_plugins.nydus]"
+      echo "  type = \"snapshot\""
+      echo "  address = \"$SNAPSHOTTER_ADDRESS\""
+    }
+    emit_runtime() { # $1 cfgver — per-runtime handler (selected by RuntimeClass)
+      h="$(cri_runtime_table "$1")"
+      echo "$h"
+      echo "  runtime_type = \"io.containerd.runc.v2\""
+      echo "  snapshotter = \"nydus\""
+      # options is a sub-table: the ".options" key must go INSIDE the brackets, not after them.
+      echo "${h%]}.options]"
+      echo "  SystemdCgroup = true"
+    }
+    emit_default() { echo "$(cri_default_table "$1")"; echo "  snapshotter = \"nydus\""; }
+
+    # Generic (non-template) block for plain containerd / EKS.
+    block() { # $1 cfgver
+      echo "$BEGIN"; emit_proxy; echo ""
+      if [ "$SNAPSHOTTER_MODE" = global-default ]; then emit_default "$1"; else emit_runtime "$1"; fi
+      echo "$END"
+    }
+    # k3s/rke2 block. In global-default mode the native `--snapshotter=nydus` flag already sets the
+    # CRI default and exposes `.NodeConfig.AgentConfig.Snapshotter`; we only register the proxy
+    # plugin, gated on that value so it is inert unless nydus is actually selected.
+    block_rancher() { # $1 cfgver
+      echo "$BEGIN"
+      if [ "$SNAPSHOTTER_MODE" = global-default ]; then
+        echo '{{`{{- if eq .NodeConfig.AgentConfig.Snapshotter "nydus" }}`}}'
+        emit_proxy
+        echo '{{`{{- end }}`}}'
+      else
+        emit_proxy; echo ""; emit_runtime "$1"
+      fi
+      echo "$END"
+    }
+
+    upsert() { # $1 target file, $2 cfgver, $3 block function
+      tgt="$1"; cfgver="$2"; bf="$3"
+      mkdir -p "$(dirname "$tgt")"
+      [ -f "$tgt" ] || : > "$tgt"
+      if grep -qF "$BEGIN" "$tgt"; then
+        awk -v b="$BEGIN" -v e="$END" '$0==b{skip=1} !skip{print} $0==e{skip=0; next}' \
+          "$tgt" > "$tgt.nydus.tmp"
+        mv "$tgt.nydus.tmp" "$tgt"
+      fi
+      { printf '\n'; "$bf" "$cfgver"; } >> "$tgt"
+    }
+
+    # k3s/rke2 templates must begin by including the base template, or they REPLACE the config.
+    ensure_base_template() {
+      tgt="$1"
+      mkdir -p "$(dirname "$tgt")"
+      if [ ! -f "$tgt" ]; then
+        printf '%s\n' '{{`{{ template "base" . }}`}}' > "$tgt"
+      elif ! grep -qF 'template "base"' "$tgt"; then
+        printf '%s\n%s' '{{`{{ template "base" . }}`}}' "$(cat "$tgt")" > "$tgt.nydus.tmp"
+        mv "$tgt.nydus.tmp" "$tgt"
+      fi
+    }
+
+    do_restart() { # $1 = default unit
+      unit="${RESTART_UNIT:-$1}"
+      # SAFETY: in global-default mode, restarting before the snapshotter is reachable routes ALL
+      # pulls to an unavailable snapshotter (node-level failure). Never auto-restart here.
+      if [ "$SNAPSHOTTER_MODE" = global-default ]; then
+        echo "!! global-default: NOT auto-restarting (bootstrap-ordering hazard)."
+        echo "!! containerd will use nydus for EVERY pull after the restart, so the nydus snapshotter"
+        echo "!! MUST be running and its socket reachable first, or pod/image ops (incl. the nydus"
+        echo "!! pod itself) will fail. After confirming it is Ready, restart on the host:"
+        echo "!!   systemctl restart $unit"
+        echo "!! For DaemonSet deployments prefer snapshotterMode=runtime-handler (no ordering hazard)."
+        return 0
+      fi
+      if [ "$AUTO_RESTART" != true ]; then
+        echo ">> Config written. autoRestart=false -> NOT restarting the runtime."
+        echo ">> Apply on the host:  systemctl restart $unit"
+        return 0
+      fi
+      echo ">> Restarting host unit: $unit"
+      nsenter_host systemctl restart "$unit"
+    }
+
+    DISTRO="$(detect_distro)"
+    CFGVER="$(detect_cfgver)"
+    echo ">> nydus installer: distro=$DISTRO  config-schema=v$CFGVER  mode=$SNAPSHOTTER_MODE"
+
+    case "$DISTRO" in
+      k3s)
+        T="${K3S_TEMPLATE:-$HOST_K3S/agent/etc/containerd/config-v3.toml.tmpl}"
+        ensure_base_template "$T"; upsert "$T" "$CFGVER" block_rancher
+        echo ">> wrote $T"
+        [ "$SNAPSHOTTER_MODE" = global-default ] && \
+          echo ">> Also set 'snapshotter: nydus' in /etc/rancher/k3s/config.yaml (or --snapshotter=nydus)."
+        do_restart k3s ;;
+      rke2)
+        T="${RKE2_TEMPLATE:-$HOST_RKE2/agent/etc/containerd/config-v3.toml.tmpl}"
+        ensure_base_template "$T"; upsert "$T" "$CFGVER" block_rancher
+        echo ">> wrote $T"
+        [ "$SNAPSHOTTER_MODE" = global-default ] && \
+          echo ">> Also set 'snapshotter: nydus' in /etc/rancher/rke2/config.yaml."
+        do_restart rke2-server ;;
+      containerd)
+        T="${CONTAINERD_CONFIG:-$HOST_ETC/containerd/config.toml}"
+        upsert "$T" "$CFGVER" block
+        echo ">> wrote $T"; do_restart containerd ;;
+      eks)
+        # EKS AL2023: /etc/containerd/config.toml is editable; the DaemonSet edit works for the life
+        # of the node. The durable, node-replacement-safe path is nodeadm NodeConfig in user-data.
+        T="${CONTAINERD_CONFIG:-$HOST_ETC/containerd/config.toml}"
+        upsert "$T" "$CFGVER" block
+        echo ">> wrote $T (EKS AL2023)."
+        echo ">> NOTE: this in-place edit is LOST when the node is replaced. For durable config put"
+        echo ">> the same block under spec.containerd.config of a nodeadm NodeConfig in the launch"
+        echo ">> template user-data. See awslabs.github.io/amazon-eks-ami/nodeadm/."
+        do_restart containerd ;;
+      bottlerocket)
+        echo ">> Bottlerocket detected: containerd config is settings-API only and does NOT support"
+        echo ">> arbitrary proxy_plugins (only overlayfs/soci). nydus requires a custom OS variant;"
+        echo ">> it cannot be installed from a DaemonSet here. Skipping."; exit 0 ;;
+      managed|unknown|*)
+        echo ">> Distro '$DISTRO' is managed/locked or unrecognized; not auto-configuring containerd."
+        echo ">> Add this to the node's containerd config (schema v$CFGVER) and restart the runtime:"
+        block "$CFGVER"; exit 0 ;;
+    esac
+    echo ">> nydus containerd integration installed."
+{{- end }}

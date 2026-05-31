@@ -1,0 +1,12 @@
+{{- if and .Values.runtimeClass.create (eq .Values.snapshotterMode "runtime-handler") }}
+# Opt-in routing: pods that set `runtimeClassName: {{ .Values.runtimeClass.name }}` are scheduled
+# onto the containerd runtime handler "{{ .Values.runtimeClass.handler }}", which your node-prep
+# configures with `snapshotter = "nydus"`. The cluster's default snapshotter stays untouched.
+apiVersion: node.k8s.io/v1
+kind: RuntimeClass
+metadata:
+  name: {{ .Values.runtimeClass.name }}
+  labels:
+    {{- include "nydus-snapshotter.labels" . | nindent 4 }}
+handler: {{ .Values.runtimeClass.handler }}
+{{- end }}
