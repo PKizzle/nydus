@@ -339,9 +339,9 @@ fn prepare_cmd_args(bti_string: &'static str) -> App {
                     Arg::new("fs-version")
                         .long("fs-version")
                         .short('v')
-                        .help("Set RAFS format version number:")
+                        .help("Set RAFS format version number (new builds support RAFS v6 only):")
                         .default_value("6")
-                        .value_parser(["5", "6"]),
+                        .value_parser(["6"]),
                 )
                 .arg(
                     Arg::new("features")
@@ -2229,7 +2229,7 @@ impl Command {
             Some(v) => {
                 let version: u32 = v.parse().context(format!("invalid fs-version: {}", v))?;
                 if version == 5 {
-                    Ok(RafsVersion::V5)
+                    bail!("RAFS v5 image creation is no longer supported; use `--fs-version 6`");
                 } else if version == 6 {
                     Ok(RafsVersion::V6)
                 } else {

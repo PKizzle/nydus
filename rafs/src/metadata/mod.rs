@@ -643,9 +643,9 @@ impl Default for RafsSuperMeta {
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub enum RafsVersion {
     /// RAFS v5
-    #[default]
     V5,
     /// RAFS v6
+    #[default]
     V6,
 }
 
