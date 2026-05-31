@@ -1202,6 +1202,7 @@ impl BlobMetaChunkArray {
         compressed: bool,
         encrypted: bool,
         has_crc32: bool,
+        has_xxh3: bool,
         is_batch: bool,
         data: u64,
     ) {
@@ -1215,6 +1216,7 @@ impl BlobMetaChunkArray {
                 meta.set_compressed(compressed);
                 meta.set_encrypted(encrypted);
                 meta.set_has_crc32(has_crc32);
+                meta.set_has_xxh3(has_xxh3);
                 meta.set_batch(is_batch);
                 meta.set_data(data);
                 v.push(meta);
@@ -1409,10 +1411,24 @@ impl BlobMetaChunkArray {
         }
     }
 
+    fn has_xxh3(&self, index: usize) -> bool {
+        match self {
+            BlobMetaChunkArray::V1(v) => v[index].has_xxh3(),
+            BlobMetaChunkArray::V2(v) => v[index].has_xxh3(),
+        }
+    }
+
     fn crc32(&self, index: usize) -> u32 {
         match self {
             BlobMetaChunkArray::V1(v) => v[index].crc32(),
             BlobMetaChunkArray::V2(v) => v[index].crc32(),
+        }
+    }
+
+    fn xxh3(&self, index: usize) -> u64 {
+        match self {
+            BlobMetaChunkArray::V1(v) => v[index].xxh3(),
+            BlobMetaChunkArray::V2(v) => v[index].xxh3(),
         }
     }
 
@@ -1920,6 +1936,14 @@ impl BlobChunkInfo for BlobMetaChunk {
         self.meta.chunk_info_array.crc32(self.chunk_index)
     }
 
+    fn has_xxh3(&self) -> bool {
+        self.meta.chunk_info_array.has_xxh3(self.chunk_index)
+    }
+
+    fn xxh3(&self) -> u64 {
+        self.meta.chunk_info_array.xxh3(self.chunk_index)
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -2022,6 +2046,16 @@ pub trait BlobMetaChunkInfo {
     /// Get CRC32 of the chunk.
     fn crc32(&self) -> u32;
 
+    /// Check whether the chunk has XXH3-64 checksum or not.
+    fn has_xxh3(&self) -> bool {
+        false
+    }
+
+    /// Get XXH3-64 checksum of the chunk.
+    fn xxh3(&self) -> u64 {
+        0
+    }
+
     /// Get data associated with the entry. V2 only, V1 just returns zero.
     fn get_data(&self) -> u64;
 
@@ -2085,7 +2119,6 @@ pub(crate) mod tests {
     use nydus_utils::digest::{self, DigestHasher};
     use nydus_utils::metrics::BackendMetrics;
     use std::fs::File;
-    use std::os::unix::io::AsRawFd;
     use std::path::PathBuf;
 
     pub(crate) struct DummyBlobReader {
@@ -2099,7 +2132,7 @@ pub(crate) mod tests {
         }
 
         fn try_read(&self, buf: &mut [u8], offset: u64) -> BackendResult<usize> {
-            let ret = uio::pread(self.file.as_raw_fd(), buf, offset as i64).unwrap();
+            let ret = uio::pread(&self.file, buf, offset as i64).unwrap();
             Ok(ret)
         }
 

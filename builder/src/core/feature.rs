@@ -14,6 +14,10 @@ const ERR_UNSUPPORTED_FEATURE: &str = "unsupported feature";
 pub enum Feature {
     /// Append a Table Of Content footer to RAFS v6 data blob, to help locate data sections.
     BlobToc,
+    /// Emit XXH3 chunk integrity metadata. Enabled by default for new builds.
+    Xxh3,
+    /// Disable XXH3 chunk integrity metadata for compatibility testing.
+    NoXxh3,
 }
 
 impl TryFrom<&str> for Feature {
@@ -22,6 +26,8 @@ impl TryFrom<&str> for Feature {
     fn try_from(f: &str) -> Result<Self> {
         match f {
             "blob-toc" => Ok(Self::BlobToc),
+            "xxh3" => Ok(Self::Xxh3),
+            "no-xxh3" => Ok(Self::NoXxh3),
             _ => bail!(
                 "{} `{}`, please try upgrading to the latest nydus-image",
                 ERR_UNSUPPORTED_FEATURE,
@@ -75,6 +81,8 @@ mod tests {
     #[test]
     fn test_feature() {
         assert_eq!(Feature::try_from("blob-toc").unwrap(), Feature::BlobToc);
+        assert_eq!(Feature::try_from("xxh3").unwrap(), Feature::Xxh3);
+        assert_eq!(Feature::try_from("no-xxh3").unwrap(), Feature::NoXxh3);
         Feature::try_from("unknown-feature-bit").unwrap_err();
     }
 

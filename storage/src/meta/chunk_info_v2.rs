@@ -20,7 +20,8 @@ const CHUNK_V2_FLAG_ZRAN: u64 = 0x2 << 56;
 const CHUNK_V2_FLAG_BATCH: u64 = 0x4 << 56;
 const CHUNK_V2_FLAG_ENCRYPTED: u64 = 0x8 << 56;
 const CHUNK_V2_FLAG_HAS_CRC32: u64 = 0x10 << 56;
-const CHUNK_V2_FLAG_VALID: u64 = 0x1f << 56;
+const CHUNK_V2_FLAG_HAS_XXH3: u64 = 0x20 << 56;
+const CHUNK_V2_FLAG_VALID: u64 = 0x3f << 56;
 
 static LAST_WARNED_FLAGS: AtomicU8 = AtomicU8::new(0xFF);
 
@@ -58,6 +59,14 @@ impl BlobChunkInfoV2Ondisk {
             self.uncomp_info |= u64::to_le(CHUNK_V2_FLAG_HAS_CRC32);
         } else {
             self.uncomp_info &= u64::to_le(!CHUNK_V2_FLAG_HAS_CRC32);
+        }
+    }
+
+    pub(crate) fn set_has_xxh3(&mut self, has_xxh3: bool) {
+        if has_xxh3 {
+            self.uncomp_info |= u64::to_le(CHUNK_V2_FLAG_HAS_XXH3);
+        } else {
+            self.uncomp_info &= u64::to_le(!CHUNK_V2_FLAG_HAS_XXH3);
         }
     }
 
@@ -177,6 +186,10 @@ impl BlobMetaChunkInfo for BlobChunkInfoV2Ondisk {
         u64::from_le(self.uncomp_info) & CHUNK_V2_FLAG_HAS_CRC32 != 0
     }
 
+    fn has_xxh3(&self) -> bool {
+        u64::from_le(self.uncomp_info) & CHUNK_V2_FLAG_HAS_XXH3 != 0
+    }
+
     fn is_zran(&self) -> bool {
         u64::from_le(self.uncomp_info) & CHUNK_V2_FLAG_ZRAN != 0
     }
@@ -219,6 +232,10 @@ impl BlobMetaChunkInfo for BlobChunkInfoV2Ondisk {
         u64::from_le(self.data) as u32
     }
 
+    fn xxh3(&self) -> u64 {
+        u64::from_le(self.data)
+    }
+
     fn get_data(&self) -> u64 {
         u64::from_le(self.data)
     }
@@ -248,6 +265,12 @@ impl BlobMetaChunkInfo for BlobChunkInfoV2Ondisk {
                     self.has_crc32(),
                     self.crc32(),
                 ),
+            ));
+        }
+
+        if self.has_xxh3() && (self.has_crc32() || self.is_batch() || self.is_zran()) {
+            return Err(Error::other(
+                "invalid chunk flags: XXH3 shares the v2 data field with CRC32, batch and ZRan",
             ));
         }
 

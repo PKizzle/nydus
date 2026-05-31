@@ -804,7 +804,9 @@ impl BlobContext {
                         self.blob_meta_info.add_v2_info(info);
                     } else {
                         let mut data: u64 = 0;
-                        if chunk.has_crc32() {
+                        if chunk.has_xxh3() {
+                            data = chunk.xxh3();
+                        } else if chunk.has_crc32() {
                             data = chunk.crc32() as u64;
                         }
                         self.blob_meta_info.add_v2(
@@ -815,6 +817,7 @@ impl BlobContext {
                             chunk.is_compressed(),
                             chunk.is_encrypted(),
                             chunk.has_crc32(),
+                            chunk.has_xxh3(),
                             chunk.is_batch(),
                             data,
                         );
@@ -1357,6 +1360,8 @@ pub struct BuildContext {
     pub digester: digest::Algorithm,
     /// Blob encryption algorithm flag.
     pub cipher: crypt::Algorithm,
+    /// Enable XXH3-64 chunk integrity for new RAFS v6 builds.
+    pub xxh3_chunk_integrity: bool,
     pub crc32_algorithm: crc32::Algorithm,
     /// Save host uid gid in each inode.
     pub explicit_uidgid: bool,
@@ -1447,7 +1452,8 @@ impl BuildContext {
             crypt::Algorithm::None
         };
 
-        let crc32_algorithm = crc32::Algorithm::Crc32Iscsi;
+        let crc32_algorithm = crc32::Algorithm::None;
+        let xxh3_chunk_integrity = !features.is_enabled(Feature::NoXxh3);
         BuildContext {
             blob_id,
             aligned_chunk,
@@ -1455,6 +1461,7 @@ impl BuildContext {
             compressor,
             digester,
             cipher,
+            xxh3_chunk_integrity,
             crc32_algorithm,
             explicit_uidgid,
             whiteout_spec,
@@ -1527,6 +1534,7 @@ impl Default for BuildContext {
             compressor: compress::Algorithm::default(),
             digester: digest::Algorithm::default(),
             cipher: crypt::Algorithm::None,
+            xxh3_chunk_integrity: true,
             crc32_algorithm: crc32::Algorithm::default(),
             explicit_uidgid: true,
             whiteout_spec: WhiteoutSpec::default(),

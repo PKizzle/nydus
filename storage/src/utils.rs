@@ -358,6 +358,11 @@ pub fn check_crc(data: &[u8], crc_digest: u32) -> bool {
     crc_digest == crc32::Crc32::new(crc32::Algorithm::Crc32Iscsi).from_buf(data)
 }
 
+/// Check XXH3-64 checksum of data matches provided one.
+pub fn check_xxh3(data: &[u8], xxh3_digest: u64) -> bool {
+    nydus_utils::xxh3::verify(data, xxh3_digest)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

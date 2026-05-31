@@ -38,6 +38,7 @@ pub mod singleflight;
 pub mod trace;
 pub mod types;
 pub mod verity;
+pub mod xxh3;
 
 /// Round up and divide the value `n` by `d`.
 pub fn div_round_up(n: u64, d: u64) -> u64 {

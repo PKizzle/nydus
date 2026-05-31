@@ -4,7 +4,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::fmt::{self, Debug, Display, Formatter};
-use std::ops::Deref;
+use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -20,13 +20,76 @@ use crate::metadata::layout::v5::RafsV5ChunkInfo;
 use crate::metadata::{RafsStore, RafsVersion};
 use crate::RafsIoWrite;
 
+/// RAFS v6 chunk information used as builder/runtime intermediate representation.
+///
+/// RAFS v6 reuses the RAFS v5 chunk fields for common offsets and sizes, but the v6 blob-meta
+/// chunk-info format has a 64-bit `data` slot. Keep the extra XXH3 checksum out of
+/// `RafsV5ChunkInfo` so RAFS v5 runtime compatibility and on-disk layout stay unchanged.
+#[derive(Clone, Default, Debug)]
+pub struct RafsV6ChunkInfo {
+    inner: RafsV5ChunkInfo,
+    xxh3: u64,
+}
+
+impl RafsV6ChunkInfo {
+    fn from_blob_chunk(chunk: &dyn BlobChunkInfo) -> Self {
+        let mut info = Self::from(to_rafs_v5_chunk_info(as_blob_v5_chunk_info(chunk)));
+        if chunk.has_xxh3() {
+            info.set_xxh3(chunk.xxh3());
+        }
+        info
+    }
+
+    fn set_xxh3(&mut self, xxh3: u64) {
+        self.inner.flags.set(BlobChunkFlags::HAS_XXH3, true);
+        self.xxh3 = xxh3;
+    }
+
+    fn clear_xxh3(&mut self) {
+        self.inner.flags.set(BlobChunkFlags::HAS_XXH3, false);
+        self.xxh3 = 0;
+    }
+
+    fn has_xxh3(&self) -> bool {
+        self.inner.flags.contains(BlobChunkFlags::HAS_XXH3)
+    }
+
+    fn xxh3(&self) -> u64 {
+        if self.has_xxh3() {
+            self.xxh3
+        } else {
+            0
+        }
+    }
+}
+
+impl From<RafsV5ChunkInfo> for RafsV6ChunkInfo {
+    fn from(inner: RafsV5ChunkInfo) -> Self {
+        Self { inner, xxh3: 0 }
+    }
+}
+
+impl Deref for RafsV6ChunkInfo {
+    type Target = RafsV5ChunkInfo;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+impl DerefMut for RafsV6ChunkInfo {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.inner
+    }
+}
+
 /// A wrapper to encapsulate different versions of chunk information objects.
 #[derive(Clone)]
 pub enum ChunkWrapper {
     /// Chunk info for RAFS v5.
     V5(RafsV5ChunkInfo),
     /// Chunk info RAFS v6, reuse `RafsV5ChunkInfo` as IR for v6.
-    V6(RafsV5ChunkInfo),
+    V6(RafsV6ChunkInfo),
     /// Reference to a `BlobChunkInfo` object.
     Ref(Arc<dyn BlobChunkInfo>),
 }
@@ -60,6 +123,8 @@ impl Display for ChunkWrapper {
 
         let full_format = if self.has_crc32() {
             format!("{}, crc32 {:#x}", base_format, self.crc32())
+        } else if self.has_xxh3() {
+            format!("{}, xxh3 {:#x}", base_format, self.xxh3())
         } else {
             base_format
         };
@@ -72,7 +137,7 @@ impl ChunkWrapper {
     pub fn new(version: RafsVersion) -> Self {
         match version {
             RafsVersion::V5 => ChunkWrapper::V5(RafsV5ChunkInfo::default()),
-            RafsVersion::V6 => ChunkWrapper::V6(RafsV5ChunkInfo::default()),
+            RafsVersion::V6 => ChunkWrapper::V6(RafsV6ChunkInfo::default()),
         }
     }
 
@@ -326,6 +391,34 @@ impl ChunkWrapper {
         }
     }
 
+    /// Set xxh3 checksum of chunk data.
+    pub fn set_xxh3(&mut self, xxh3: u64) {
+        self.ensure_owned();
+        match self {
+            ChunkWrapper::V5(c) => c.flags.set(BlobChunkFlags::HAS_XXH3, false),
+            ChunkWrapper::V6(c) => c.set_xxh3(xxh3),
+            ChunkWrapper::Ref(_c) => panic!("unexpected"),
+        }
+    }
+
+    /// Get xxh3 checksum of chunk data.
+    pub fn xxh3(&self) -> u64 {
+        match self {
+            ChunkWrapper::V5(_c) => 0,
+            ChunkWrapper::V6(c) => c.xxh3(),
+            ChunkWrapper::Ref(c) => c.xxh3(),
+        }
+    }
+
+    /// Check whether the chunk has XXH3 checksum or not.
+    pub fn has_xxh3(&self) -> bool {
+        match self {
+            ChunkWrapper::V5(_c) => false,
+            ChunkWrapper::V6(c) => c.has_xxh3(),
+            ChunkWrapper::Ref(c) => c.has_xxh3(),
+        }
+    }
+
     /// Set flag for whether chunk has CRC.
     pub fn set_has_crc32(&mut self, has_crc: bool) {
         self.ensure_owned();
@@ -398,13 +491,16 @@ impl ChunkWrapper {
         match (self, other) {
             (ChunkWrapper::V5(s), ChunkWrapper::V5(o)) => s.clone_from(o),
             (ChunkWrapper::V6(s), ChunkWrapper::V6(o)) => s.clone_from(o),
-            (ChunkWrapper::V5(s), ChunkWrapper::V6(o)) => s.clone_from(o),
-            (ChunkWrapper::V6(s), ChunkWrapper::V5(o)) => s.clone_from(o),
+            (ChunkWrapper::V5(s), ChunkWrapper::V6(o)) => s.clone_from(&o.inner),
+            (ChunkWrapper::V6(s), ChunkWrapper::V5(o)) => {
+                s.inner.clone_from(o);
+                s.clear_xxh3();
+            }
             (ChunkWrapper::V5(s), ChunkWrapper::Ref(o)) => {
                 s.clone_from(&to_rafs_v5_chunk_info(as_blob_v5_chunk_info(o.deref())))
             }
             (ChunkWrapper::V6(s), ChunkWrapper::Ref(o)) => {
-                s.clone_from(&to_rafs_v5_chunk_info(as_blob_v5_chunk_info(o.deref())))
+                s.clone_from(&RafsV6ChunkInfo::from_blob_chunk(o.deref()))
             }
             (ChunkWrapper::Ref(_s), ChunkWrapper::V5(_o)) => panic!("unexpected"),
             (ChunkWrapper::Ref(_s), ChunkWrapper::V6(_o)) => panic!("unexpected"),
@@ -427,11 +523,11 @@ impl ChunkWrapper {
     fn ensure_owned(&mut self) {
         if let Self::Ref(cki) = self {
             if let Some(cki_v6) = cki.as_any().downcast_ref::<BlobMetaChunk>() {
-                *self = Self::V6(to_rafs_v5_chunk_info(cki_v6));
+                *self = Self::V6(RafsV6ChunkInfo::from_blob_chunk(cki_v6));
             } else if let Some(cki_v6) = cki.as_any().downcast_ref::<DirectChunkInfoV6>() {
-                *self = Self::V6(to_rafs_v5_chunk_info(cki_v6));
+                *self = Self::V6(RafsV6ChunkInfo::from_blob_chunk(cki_v6));
             } else if let Some(cki_v6) = cki.as_any().downcast_ref::<TarfsChunkInfoV6>() {
-                *self = Self::V6(to_rafs_v5_chunk_info(cki_v6));
+                *self = Self::V6(RafsV6ChunkInfo::from_blob_chunk(cki_v6));
             } else if let Some(cki_v5) = cki.as_any().downcast_ref::<CachedChunkInfoV5>() {
                 *self = Self::V5(to_rafs_v5_chunk_info(cki_v5));
             } else if let Some(cki_v5) = cki.as_any().downcast_ref::<DirectChunkInfoV5>() {

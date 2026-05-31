@@ -346,8 +346,7 @@ fn prepare_cmd_args(bti_string: &'static str) -> App {
                 .arg(
                     Arg::new("features")
                         .long("features")
-                        .value_parser(["blob-toc"])
-                        .help("Enable/disable features")
+                        .help("Enable/disable comma-separated features: blob-toc, xxh3, no-xxh3. XXH3 chunk integrity is enabled by default.")
                 )
                 .arg(
                     arg_chunk_dict.clone(),
@@ -1060,6 +1059,9 @@ impl Command {
                 .map(|s| s.as_str())
                 .unwrap_or_default(),
         )?;
+        if features.is_enabled(Feature::Xxh3) && features.is_enabled(Feature::NoXxh3) {
+            bail!("features `xxh3` and `no-xxh3` conflict");
+        }
         let encrypt = matches.get_flag("encrypt");
         match conversion_type {
             ConversionType::DirectoryToRafs => {
