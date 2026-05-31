@@ -94,7 +94,7 @@ use_http = false
 
 
 [cache]
-# Type of blob cache: "blobcache", "filecache", "fscache", "dummycache" or ""
+# Type of blob cache: "blobcache", "filecache", "fanotify", "dummycache" or ""
 type = "filecache"
 # Whether to cache compressed or uncompressed data.
 compressed = true
@@ -110,7 +110,7 @@ encryption_key = "fc4a7db5614afc2f400e9478bebed1aefdbc9d7cd03210b84f144683a7a6fd
 [cache.filecache]
 work_dir = "."
 
-[cache.fscache]
+[cache.fanotify]
 work_dir = "."
 
 [cache.prefetch]

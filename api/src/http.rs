@@ -125,6 +125,12 @@ pub enum ApiRequest {
     DeleteBlobObject(BlobCacheObjectId),
     /// Delete a blob cache file
     DeleteBlobFile(String),
+    /// Create a fanotify handler for on-demand EROFS loading.
+    /// Parameters: (image_id, blob_dir, mountpoint, threads)
+    CreateFanotifyHandler(String, String, String, usize),
+    /// Delete a fanotify handler.
+    /// Parameters: (image_id)
+    DeleteFanotifyHandler(String),
 }
 
 /// Kinds for daemon related error messages.

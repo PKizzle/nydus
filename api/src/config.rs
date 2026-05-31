@@ -149,8 +149,8 @@ impl ConfigV2 {
             if let Some(c) = cache.file_cache.as_ref() {
                 return Ok(c.work_dir.clone());
             }
-        } else if cache.is_fscache() {
-            if let Some(c) = cache.fs_cache.as_ref() {
+        } else if cache.is_fanotify() {
+            if let Some(c) = cache.fanotify.as_ref() {
                 return Ok(c.work_dir.clone());
             }
         }
@@ -184,6 +184,19 @@ impl ConfigV2 {
                 registry_cfg.auth = None;
                 registry_cfg.registry_token = None;
             }
+            if let Some(s3_cfg) = backend_cfg.s3.as_mut() {
+                s3_cfg.access_key_id = String::new();
+                s3_cfg.access_key_secret = String::new();
+            }
+        }
+        if let Some(cache_cfg) = cfg.cache.as_mut() {
+            if let Some(file_cache_cfg) = cache_cfg.file_cache.as_mut() {
+                file_cache_cfg.encryption_key = String::new();
+            }
+        }
+        for external_backend in cfg.external_backends.iter_mut() {
+            redact_sensitive_map(&mut external_backend.patch);
+            redact_sensitive_map(&mut external_backend.config);
         }
 
         cfg
@@ -205,10 +218,10 @@ impl ConfigV2 {
         validation
     }
 
-    /// Check whether fscache is enabled or not.
-    pub fn is_fs_cache(&self) -> bool {
+    /// Check whether fanotify pre-content cache is enabled.
+    pub fn is_fanotify_cache(&self) -> bool {
         if let Some(cache) = self.cache.as_ref() {
-            cache.fs_cache.is_some()
+            cache.fanotify.is_some()
         } else {
             false
         }
@@ -641,7 +654,7 @@ pub struct RegistryConfig {
 /// Configuration information for blob cache manager.
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct CacheConfigV2 {
-    /// Type of blob cache: "blobcache", "fscache" or "dummy"
+    /// Type of blob cache: "blobcache", "filecache" or "dummy"
     #[serde(default, rename = "type")]
     pub cache_type: String,
     /// Whether the data from the cache is compressed, not used anymore.
@@ -656,9 +669,9 @@ pub struct CacheConfigV2 {
     /// Configuration information for file cache
     #[serde(rename = "filecache")]
     pub file_cache: Option<FileCacheConfig>,
-    #[serde(rename = "fscache")]
-    /// Configuration information for fscache
-    pub fs_cache: Option<FsCacheConfig>,
+    #[serde(rename = "fanotify")]
+    /// Configuration information for fanotify pre-content hooks
+    pub fanotify: Option<FanotifyConfig>,
 }
 
 impl CacheConfigV2 {
@@ -674,8 +687,12 @@ impl CacheConfigV2 {
                     return false;
                 }
             }
-            "fscache" => {
-                if let Some(c) = self.fs_cache.as_ref() {
+            "" | "dummycache" => {}
+            "fanotify" => {
+                if let Some(c) = self.fanotify.as_ref() {
+                    // Only `work_dir` is part of the blob-cache entry; the EROFS `mountpoint` is a
+                    // daemon-level mount target supplied separately to `FanotifyHandler` (via the
+                    // `--fanotify-mountpoint` CLI flag), so it is optional here.
                     if c.work_dir.is_empty() {
                         return false;
                     }
@@ -683,7 +700,6 @@ impl CacheConfigV2 {
                     return false;
                 }
             }
-            "" | "dummycache" => {}
             _ => return false,
         }
 
@@ -704,14 +720,10 @@ impl CacheConfigV2 {
         self.cache_type == "blobcache" || self.cache_type == "filecache"
     }
 
-    /// Check whether the cache type is `fscache`
-    pub fn is_fscache(&self) -> bool {
-        self.cache_type == "fscache"
-    }
-
     /// Get configuration information for file cache.
     pub fn get_filecache_config(&self) -> Result<&FileCacheConfig> {
-        if self.is_filecache() {
+        // `fanotify` reuses the file-cache backing store, so it also exposes a `FileCacheConfig`.
+        if self.is_filecache() || self.is_fanotify() {
             self.file_cache.as_ref().ok_or_else(|| {
                 Error::new(
                     ErrorKind::InvalidInput,
@@ -726,19 +738,24 @@ impl CacheConfigV2 {
         }
     }
 
-    /// Get configuration information for fscache.
-    pub fn get_fscache_config(&self) -> Result<&FsCacheConfig> {
-        if self.is_fscache() {
-            self.fs_cache.as_ref().ok_or_else(|| {
+    /// Check whether the cache type is `fanotify`
+    pub fn is_fanotify(&self) -> bool {
+        self.cache_type == "fanotify"
+    }
+
+    /// Get configuration information for fanotify.
+    pub fn get_fanotify_config(&self) -> Result<&FanotifyConfig> {
+        if self.is_fanotify() {
+            self.fanotify.as_ref().ok_or_else(|| {
                 Error::new(
                     ErrorKind::InvalidData,
-                    "no configuration information for fscache",
+                    "no configuration information for fanotify",
                 )
             })
         } else {
             Err(Error::new(
                 ErrorKind::InvalidInput,
-                "cache type is not 'fscache'",
+                "cache type is not 'fanotify'",
             ))
         }
     }
@@ -788,15 +805,22 @@ impl FileCacheConfig {
     }
 }
 
-/// Configuration information for fscache.
+/// Configuration information for fanotify pre-content hooks.
+///
+/// The fanotify cache backend replaces the deprecated fscache backend (Linux ≥ 6.14).
+/// Blob files are placed in `work_dir`; the daemon mounts the EROFS filesystem at
+/// `mountpoint` and serves on-demand reads via `FAN_PRE_ACCESS` events.
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
-pub struct FsCacheConfig {
-    /// Working directory to store state and cached files.
+pub struct FanotifyConfig {
+    /// Working directory containing bootstrap + sparse blob files.
     #[serde(default = "default_work_dir")]
     pub work_dir: String,
+    /// Mountpoint for the EROFS filesystem.
+    #[serde(default)]
+    pub mountpoint: String,
 }
 
-impl FsCacheConfig {
+impl FanotifyConfig {
     /// Get the working directory.
     pub fn get_work_dir(&self) -> Result<&str> {
         let path = fs::metadata(&self.work_dir)
@@ -805,7 +829,7 @@ impl FsCacheConfig {
                 fs::metadata(&self.work_dir)
             })
             .map_err(|e| {
-                log::error!("fail to stat fscache work_dir {}: {}", self.work_dir, e);
+                log::error!("fail to stat fanotify work_dir {}: {}", self.work_dir, e);
                 e
             })?;
 
@@ -814,7 +838,7 @@ impl FsCacheConfig {
         } else {
             Err(Error::new(
                 ErrorKind::NotFound,
-                format!("fscache work_dir {} is not a directory", self.work_dir),
+                format!("fanotify work_dir {} is not a directory", self.work_dir),
             ))
         }
     }
@@ -985,6 +1009,21 @@ impl BlobCacheEntryConfigV2 {
         let config: ConfigV2 = self.into();
         config.validate()
     }
+
+    /// Clone the object with all secrets removed.
+    pub fn clone_without_secrets(&self) -> Self {
+        let mut config: ConfigV2 = self.into();
+        config = config.clone_without_secrets();
+
+        BlobCacheEntryConfigV2 {
+            version: self.version,
+            id: self.id.clone(),
+            backend: config.backend.unwrap_or_default(),
+            external_backends: config.external_backends,
+            cache: config.cache.unwrap_or_default(),
+            metadata_path: self.metadata_path.clone(),
+        }
+    }
 }
 
 impl FromStr for BlobCacheEntryConfigV2 {
@@ -1103,6 +1142,25 @@ impl BlobCacheEntry {
             Some(cfg) => cfg.cache.validate() && cfg.backend.validate(),
         }
     }
+
+    /// Clone the object with all secrets removed from embedded configuration.
+    pub fn clone_without_secrets(&self) -> Self {
+        let mut entry = self.clone();
+
+        if entry.blob_config.is_none() {
+            if let Some(legacy) = self.blob_config_legacy.as_ref() {
+                if let Ok(config) = legacy.try_into() {
+                    entry.blob_config = Some(config);
+                }
+            }
+        }
+        entry.blob_config_legacy = None;
+        if let Some(config) = entry.blob_config.as_mut() {
+            *config = config.clone_without_secrets();
+        }
+
+        entry
+    }
 }
 
 impl BlobCacheEntry {
@@ -1166,6 +1224,21 @@ impl FromStr for BlobCacheEntry {
 pub struct BlobCacheList {
     /// List of blob configuration information.
     pub blobs: Vec<BlobCacheEntry>,
+}
+
+fn redact_sensitive_map(map: &mut HashMap<String, String>) {
+    for (key, value) in map.iter_mut() {
+        let key = key.to_ascii_lowercase();
+        if key.contains("auth")
+            || key.contains("password")
+            || key.contains("secret")
+            || key.contains("token")
+            || key.contains("access_key")
+            || key.contains("encryption_key")
+        {
+            value.clear();
+        }
+    }
 }
 
 fn default_true() -> bool {
@@ -1273,13 +1346,13 @@ impl TryFrom<&BackendConfig> for BackendConfigV2 {
 /// Configuration information for blob cache manager.
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 struct CacheConfig {
-    /// Type of blob cache: "blobcache", "fscache" or ""
+    /// Type of blob cache: "blobcache", "filecache" or ""
     #[serde(default, rename = "type")]
     pub cache_type: String,
     /// Whether the data from the cache is compressed, not used anymore.
     #[serde(default, rename = "compressed")]
     pub cache_compressed: bool,
-    /// Blob cache manager specific configuration: FileCacheConfig, FsCacheConfig.
+    /// Blob cache manager specific configuration: FileCacheConfig, FanotifyConfig.
     #[serde(default, rename = "config")]
     pub cache_config: Value,
     /// Whether to validate data read from the cache.
@@ -1313,15 +1386,20 @@ impl TryFrom<&CacheConfig> for CacheConfigV2 {
             cache_validate: v.cache_validate,
             prefetch: (&v.prefetch_config).into(),
             file_cache: None,
-            fs_cache: None,
+            fanotify: None,
         };
 
         match v.cache_type.as_str() {
             "blobcache" | "filecache" => {
                 config.file_cache = Some(serde_json::from_value(v.cache_config.clone())?);
             }
-            "fscache" => {
-                config.fs_cache = Some(serde_json::from_value(v.cache_config.clone())?);
+            "fanotify" => {
+                // The fanotify pre-content path reuses the file-cache machinery for its on-disk
+                // blob cache (each blob's `.blob.data` file *is* the EROFS device). Populate
+                // `file_cache` as well — it's structurally compatible (both carry `work_dir`) — so
+                // `FileCacheMgr`/`get_filecache_config()` work. `fanotify` keeps the EROFS mountpoint.
+                config.fanotify = Some(serde_json::from_value(v.cache_config.clone())?);
+                config.file_cache = Some(serde_json::from_value(v.cache_config.clone())?);
             }
             "" | "dummycache" => {}
             t => {
@@ -1512,11 +1590,11 @@ pub(crate) struct BlobCacheEntryConfig {
     external_backends: Vec<ExternalBackendConfig>,
     /// Type of blob cache, corresponding to `FactoryConfig::CacheConfig::cache_type`.
     ///
-    /// Possible value: "fscache", "filecache".
+    /// Possible value: "filecache", "filecache".
     cache_type: String,
     /// Configuration for blob cache, corresponding to `FactoryConfig::CacheConfig::cache_config`.
     ///
-    /// Possible value: `FileCacheConfig`, `FsCacheConfig`.
+    /// Possible value: `FileCacheConfig`, `FanotifyConfig`.
     cache_config: Value,
     /// Configuration for data prefetch.
     #[serde(default)]
@@ -1615,7 +1693,7 @@ mod tests {
 
     #[test]
     fn test_fs_cache_config() {
-        let config: FsCacheConfig = serde_json::from_str("{}").unwrap();
+        let config: FanotifyConfig = serde_json::from_str("{}").unwrap();
         assert_eq!(&config.work_dir, ".");
 
         let config: FileCacheConfig = serde_json::from_str("{\"work_dir\":\"/tmp\"}").unwrap();
@@ -1636,7 +1714,7 @@ mod tests {
                 "id": "cache1",
                 "backend_type": "localfs",
                 "backend_config": {},
-                "cache_type": "fscache",
+                "cache_type": "filecache",
                 "cache_config": {},
                 "prefetch_config": {
                     "enable": true,
@@ -1656,7 +1734,7 @@ mod tests {
         let blob_config = config.blob_config_legacy.as_ref().unwrap();
         assert_eq!(blob_config.id, "cache1");
         assert_eq!(blob_config.backend_type, "localfs");
-        assert_eq!(blob_config.cache_type, "fscache");
+        assert_eq!(blob_config.cache_type, "filecache");
         assert!(blob_config.cache_config.is_object());
         assert!(blob_config.prefetch_config.enable);
         assert_eq!(blob_config.prefetch_config.threads_count, 2);
@@ -1669,8 +1747,8 @@ mod tests {
         let blob_config: BlobCacheEntryConfigV2 = blob_config.try_into().unwrap();
         assert_eq!(blob_config.id, "cache1");
         assert_eq!(blob_config.backend.backend_type, "localfs");
-        assert_eq!(blob_config.cache.cache_type, "fscache");
-        assert!(blob_config.cache.fs_cache.is_some());
+        assert_eq!(blob_config.cache.cache_type, "filecache");
+        assert!(blob_config.cache.file_cache.is_some());
         assert!(blob_config.cache.prefetch.enable);
         assert_eq!(blob_config.cache.prefetch.threads_count, 2);
         assert_eq!(blob_config.cache.prefetch.batch_size, 4);
@@ -1686,7 +1764,7 @@ mod tests {
                 "id": "cache1",
                 "backend_type": "localfs",
                 "backend_config": {},
-                "cache_type": "fscache",
+                "cache_type": "filecache",
                 "cache_config": {},
                 "metadata_path": "/tmp/metadata1"
             },
@@ -1964,8 +2042,9 @@ mod tests {
         validate = true
         [cache.filecache]
         work_dir = "/tmp"
-        [cache.fscache]
+        [cache.fanotify]
         work_dir = "./"
+        mountpoint = "/mnt"
         [cache.prefetch]
         enable = true
         threads = 8
@@ -1984,8 +2063,8 @@ mod tests {
         assert!(cache.cache_validate);
         let filecache = cache.file_cache.as_ref().unwrap();
         assert_eq!(&filecache.work_dir, "/tmp");
-        let fscache = cache.fs_cache.as_ref().unwrap();
-        assert_eq!(&fscache.work_dir, "./");
+        let fanotify = cache.fanotify.as_ref().unwrap();
+        assert_eq!(&fanotify.work_dir, "./");
 
         let prefetch = &cache.prefetch;
         assert!(prefetch.enable);
@@ -2224,8 +2303,8 @@ mod tests {
 
         let content = r#"version=2
             [cache]
-            type = "fscache"
-            [cache.fscache]
+            type = "filecache"
+            [cache.filecache]
             work_dir = "./foo"
         "#;
         let cfg: ConfigV2 = toml::from_str(content).unwrap();
@@ -2321,7 +2400,7 @@ mod tests {
         assert!(!cfg.validate());
 
         let cfg = CacheConfigV2 {
-            cache_type: "fscache".to_string(),
+            cache_type: "filecache".to_string(),
             ..Default::default()
         };
         assert!(!cfg.validate());
@@ -2340,16 +2419,16 @@ mod tests {
     }
 
     #[test]
-    fn test_get_fscache_config() {
+    fn test_get_filecache_config() {
         let mut cfg = CacheConfigV2::default();
-        assert!(cfg.get_fscache_config().is_err());
-        cfg.cache_type = "fscache".to_string();
-        assert!(cfg.get_fscache_config().is_err());
+        assert!(cfg.get_filecache_config().is_err());
+        cfg.cache_type = "filecache".to_string();
+        assert!(cfg.get_filecache_config().is_err());
     }
 
     #[test]
-    fn test_fscache_get_work_dir() {
-        let mut cfg = FsCacheConfig::default();
+    fn test_fanotify_get_work_dir() {
+        let mut cfg = FanotifyConfig::default();
         assert!(cfg.get_work_dir().is_err());
         cfg.work_dir = ".".to_string();
         assert!(cfg.get_work_dir().is_ok());
@@ -2487,7 +2566,7 @@ mod tests {
                 "id": "cache1",
                 "backend_type": "localfs",
                 "backend_config": {},
-                "cache_type": "fscache",
+                "cache_type": "filecache",
                 "cache_config": {},
                 "metadata_path": "/tmp/metadata1"
             },
@@ -2511,7 +2590,7 @@ mod tests {
                 "id": "cache1",
                 "backend_type": "localfs",
                 "backend_config": {},
-                "cache_type": "fscache",
+                "cache_type": "filecache",
                 "cache_config": {},
                 "metadata_path": "/tmp/metadata1"
             },
@@ -2539,7 +2618,7 @@ mod tests {
                 "id": "cache1",
                 "backend_type": "localfs",
                 "backend_config": {},
-                "cache_type": "fscache",
+                "cache_type": "filecache",
                 "cache_config": {},
                 "metadata_path": "/tmp/metadata1"
             },
@@ -2657,22 +2736,23 @@ mod tests {
     }
 
     #[test]
-    fn test_is_fs_cache() {
+    fn test_is_fanotify_cache() {
         // No cache → false.
         let cfg = ConfigV2::new("id1");
-        assert!(!cfg.is_fs_cache());
+        assert!(!cfg.is_fanotify_cache());
 
-        // Cache with fscache sub-config → true.
+        // Cache with fanotify sub-config → true.
         let content = r#"version=2
         [cache]
-        type = "fscache"
-        [cache.fscache]
+        type = "fanotify"
+        [cache.fanotify]
         work_dir = "/tmp"
+        mountpoint = "/mnt"
         "#;
         let cfg: ConfigV2 = toml::from_str(content).unwrap();
-        assert!(cfg.is_fs_cache());
+        assert!(cfg.is_fanotify_cache());
 
-        // Cache with only filecache sub-config → false.
+        // Cache with filecache sub-config → false.
         let content = r#"version=2
         [cache]
         type = "filecache"
@@ -2680,7 +2760,7 @@ mod tests {
         work_dir = "/tmp"
         "#;
         let cfg: ConfigV2 = toml::from_str(content).unwrap();
-        assert!(!cfg.is_fs_cache());
+        assert!(!cfg.is_fanotify_cache());
     }
 
     #[test]
@@ -2693,10 +2773,10 @@ mod tests {
         let cfg: ConfigV2 = toml::from_str(content).unwrap();
         assert!(cfg.get_cache_working_directory().is_err());
 
-        // fscache type but no [cache.fscache] section → error.
+        // filecache type but no [cache.filecache] section → error.
         let content = r#"version=2
         [cache]
-        type = "fscache"
+        type = "filecache"
         "#;
         let cfg: ConfigV2 = toml::from_str(content).unwrap();
         assert!(cfg.get_cache_working_directory().is_err());

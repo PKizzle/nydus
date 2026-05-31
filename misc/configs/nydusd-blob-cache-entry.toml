@@ -100,7 +100,7 @@ check_interval = 5
 use_http = false
 
 [config_v2.cache]
-# Type of blob cache: "blobcache", "filecache", "fscache", "dummycache" or ""
+# Type of blob cache: "blobcache", "filecache", "fanotify", "dummycache" or ""
 type = "filecache"
 # Whether to cache compressed or uncompressed data.
 compressed = true
@@ -110,7 +110,7 @@ validate = true
 [config_v2.cache.filecache]
 work_dir = "."
 
-[config_v2.cache.fscache]
+[config_v2.cache.fanotify]
 work_dir = "."
 
 [config_v2.cache.prefetch]

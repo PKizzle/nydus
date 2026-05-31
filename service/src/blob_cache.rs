@@ -310,6 +310,21 @@ impl BlobCacheMgr {
         self.get_state().get(key)
     }
 
+    /// Collect the configuration of every managed data blob.
+    ///
+    /// Used by the fanotify on-demand handler to build the set of [`DataBlob`] objects whose
+    /// sparse backing files it must populate when the kernel raises `FAN_PRE_ACCESS` events.
+    pub fn get_all_data_blobs(&self) -> Vec<Arc<DataBlobConfig>> {
+        self.get_state()
+            .id_to_config_map
+            .values()
+            .filter_map(|c| match c {
+                BlobConfig::DataBlob(d) => Some(d.clone()),
+                BlobConfig::MetaBlob(_) => None,
+            })
+            .collect()
+    }
+
     #[inline]
     fn get_state(&self) -> MutexGuard<'_, BlobCacheState> {
         self.state.lock().unwrap()
@@ -346,9 +361,9 @@ impl BlobCacheMgr {
         }
 
         // Validate type of backend and cache.
-        if config.cache.is_fscache() {
-            // Validate the working directory for fscache
-            let cache_config = config.cache.get_fscache_config()?;
+        if config.cache.is_filecache() {
+            // Validate the working directory for filecache
+            let cache_config = config.cache.get_filecache_config()?;
             let path2 = Path::new(&cache_config.work_dir);
             let path2 = path2
                 .canonicalize()
@@ -358,9 +373,9 @@ impl BlobCacheMgr {
                     "blob_cache: `config.cache_config.work_dir` is not a directory"
                 ));
             }
-        } else if config.cache.is_filecache() {
-            // Validate the working directory for filecache
-            let cache_config = config.cache.get_filecache_config()?;
+        } else if config.cache.is_fanotify() {
+            // Validate the working directory for fanotify
+            let cache_config = config.cache.get_fanotify_config()?;
             let path2 = Path::new(&cache_config.work_dir);
             let path2 = path2
                 .canonicalize()
@@ -604,7 +619,7 @@ mod tests {
                 "backend_config": {
                     "dir": "/tmp/nydus"
                 },
-                "cache_type": "fscache",
+                "cache_type": "fanotify",
                 "cache_config": {
                     "work_dir": "/tmp/nydus"
                 },
@@ -637,10 +652,10 @@ mod tests {
         assert_eq!(&entry.domain_id, "userid1");
         assert_eq!(&blob_config.id, "factory1");
         assert_eq!(&blob_config.backend.backend_type, "localfs");
-        assert_eq!(&blob_config.cache.cache_type, "fscache");
+        assert_eq!(&blob_config.cache.cache_type, "fanotify");
         assert!(blob_config.metadata_path.is_some());
         assert!(blob_config.backend.localfs.is_some());
-        assert!(blob_config.cache.fs_cache.is_some());
+        assert!(blob_config.cache.fanotify.is_some());
 
         let mgr = BlobCacheMgr::new();
         let (path, config) = mgr.get_meta_info(&entry).unwrap();
@@ -649,7 +664,7 @@ mod tests {
         assert_eq!(path, tmpdir.as_path().join("bootstrap1"));
         assert_eq!(&config.id, "factory1");
         assert_eq!(&backend_cfg.backend_type, "localfs");
-        assert_eq!(&cache_cfg.cache_type, "fscache");
+        assert_eq!(&cache_cfg.cache_type, "fanotify");
 
         let blob = MetaBlobConfig {
             blob_id: "123456789-123".to_string(),
@@ -693,7 +708,7 @@ mod tests {
                         "backend_config": {
                             "dir": "/tmp/nydus"
                         },
-                        "cache_type": "fscache",
+                        "cache_type": "fanotify",
                         "cache_config": {
                             "work_dir": "/tmp/nydus"
                         },
@@ -710,7 +725,7 @@ mod tests {
                         "backend_config": {
                             "dir": "/tmp/nydus"
                         },
-                        "cache_type": "fscache",
+                        "cache_type": "fanotify",
                         "cache_config": {
                             "work_dir": "/tmp/nydus"
                         },
@@ -728,7 +743,7 @@ mod tests {
         let blob_config = &list.blobs[0].blob_config.as_ref().unwrap();
         assert_eq!(&blob_config.id, "factory1");
         assert_eq!(&blob_config.backend.backend_type, "localfs");
-        assert_eq!(&blob_config.cache.cache_type, "fscache");
+        assert_eq!(&blob_config.cache.cache_type, "fanotify");
         assert_eq!(&list.blobs[1].blob_type, "bootstrap");
         assert_eq!(&list.blobs[1].blob_id, "bootstrap2");
     }
@@ -755,8 +770,8 @@ mod tests {
                     }
                 },
                 "cache": {
-                    "type": "fscache",
-                    "fscache": {
+                    "type": "fanotify",
+                    "fanotify": {
                         "work_dir": "/tmp/nydus"
                     }
                 },
@@ -862,8 +877,8 @@ mod tests {
                     }
                 },
                 "cache": {
-                    "type": "fscache",
-                    "fscache": {
+                    "type": "fanotify",
+                    "fanotify": {
                         "work_dir": "/tmp/nydus"
                     }
                 },

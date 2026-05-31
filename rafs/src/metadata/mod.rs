@@ -817,7 +817,7 @@ impl RafsSuper {
             }
         }
 
-        if !config.is_fs_cache()
+        if !config.is_fanotify_cache()
             && blob_accessible
             && (validate_digest || config.is_chunk_validation_enabled())
             && rs.meta.has_inlined_chunk_digest()
