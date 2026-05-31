@@ -9,8 +9,6 @@ use std::io::Result;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, RwLock};
 
-use tokio::runtime::Runtime;
-
 use nydus_api::CacheConfigV2;
 use nydus_utils::crypt;
 use nydus_utils::metrics::BlobcacheMetrics;
@@ -38,7 +36,6 @@ pub struct FileCacheMgr {
     backend: Arc<dyn BlobBackend>,
     metrics: Arc<BlobcacheMetrics>,
     prefetch_config: Arc<AsyncPrefetchConfig>,
-    runtime: Arc<Runtime>,
     worker_mgr: Arc<AsyncWorkerMgr>,
     work_dir: String,
     validate: bool,
@@ -56,7 +53,6 @@ impl FileCacheMgr {
     pub fn new(
         config: &CacheConfigV2,
         backend: Arc<dyn BlobBackend>,
-        runtime: Arc<Runtime>,
         id: &str,
         user_io_batch_size: u32,
     ) -> Result<FileCacheMgr> {
@@ -71,7 +67,6 @@ impl FileCacheMgr {
             backend,
             metrics,
             prefetch_config,
-            runtime,
             worker_mgr: Arc::new(worker_mgr),
             work_dir: work_dir.to_owned(),
             disable_indexed_map: blob_cfg.disable_indexed_map,
@@ -101,7 +96,6 @@ impl FileCacheMgr {
             self,
             blob.clone(),
             self.prefetch_config.clone(),
-            self.runtime.clone(),
             self.worker_mgr.clone(),
         )?;
         let entry = Arc::new(entry);
@@ -184,7 +178,6 @@ impl FileCacheEntry {
         mgr: &FileCacheMgr,
         blob_info: Arc<BlobInfo>,
         prefetch_config: Arc<AsyncPrefetchConfig>,
-        runtime: Arc<Runtime>,
         workers: Arc<AsyncWorkerMgr>,
     ) -> Result<Self> {
         let is_separate_meta = blob_info.has_feature(BlobFeatures::SEPARATE);
@@ -290,7 +283,6 @@ impl FileCacheEntry {
                     blob_file_path,
                     blob_info.clone(),
                     Some(blob_meta_reader),
-                    Some(runtime.clone()),
                     false,
                     load_chunk_digest,
                 )?;
@@ -357,7 +349,6 @@ impl FileCacheEntry {
             metrics: mgr.metrics.clone(),
             prefetch_state: Arc::new(AtomicU32::new(0)),
             reader,
-            runtime,
             workers,
 
             blob_compressed_size,
