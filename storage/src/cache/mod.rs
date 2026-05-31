@@ -290,6 +290,57 @@ pub trait BlobCache: Send + Sync {
         Ok(ChunkDecompressState::new(blob_offset, self, chunks, c_buf))
     }
 
+    /// Async version of `read_chunks_from_backend` for the P5 storage I/O
+    /// migration. Remote backends can override `BlobReader::read_with_source_async`
+    /// to avoid blocking storage worker threads on network I/O.
+    ///
+    // The returned future is intentionally `!Send`: this path runs on the
+    // `current_thread` tokio-uring runtime (`BlockDevice` is `!Send`), so the
+    // compiler's suggested `-> impl Future + Send` desugar does not apply. The
+    // trait is internal to nydus, so suppressing the auto-trait lint is correct.
+    #[allow(async_fn_in_trait)]
+    async fn read_chunks_from_backend_async<'a, 'b>(
+        &'a self,
+        blob_offset: u64,
+        blob_size: usize,
+        chunks: &'b [Arc<dyn BlobChunkInfo>],
+        prefetch: bool,
+    ) -> Result<ChunkDecompressState<'a, 'b>>
+    where
+        Self: Sized,
+    {
+        let mut c_buf = alloc_buf(blob_size);
+        let start = Instant::now();
+        let source = if prefetch {
+            RequestSource::Prefetch
+        } else {
+            RequestSource::OnDemand
+        };
+        let nr_read = self
+            .reader()
+            .read_with_source_async(c_buf.as_mut_slice(), blob_offset, source)
+            .await
+            .map_err(|e| eio!(e))?;
+        if nr_read != blob_size {
+            return Err(eio!(format!(
+                "request for {} bytes but got {} bytes",
+                blob_size, nr_read
+            )));
+        }
+        let duration = Instant::now().duration_since(start).as_millis();
+        debug!(
+            "read_chunks_from_backend_async: {} {} {} bytes at {}, duration {}ms",
+            std::thread::current().name().unwrap_or_default(),
+            if prefetch { "prefetch" } else { "fetch" },
+            blob_size,
+            blob_offset,
+            duration
+        );
+
+        let chunks = chunks.iter().map(|v| v.as_ref()).collect();
+        Ok(ChunkDecompressState::new(blob_offset, self, chunks, c_buf))
+    }
+
     /// Read a whole chunk directly from the storage backend.
     ///
     /// The fetched chunk data may be compressed or encrypted or not, which depends on chunk information

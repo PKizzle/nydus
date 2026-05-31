@@ -1178,6 +1178,7 @@ impl BlobIoRange {
 /// A `BlobPrefetchControl` object advises to prefetch data range [offset, offset + len) from
 /// blob `blob_id`. The prefetch operation should be asynchronous, and cache hit for filesystem
 /// read operations should validate data integrity.
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BlobPrefetchRequest {
     /// The ID of the blob to prefetch data for.
     pub blob_id: String,
@@ -1396,6 +1397,18 @@ impl BlobDevice {
         }
 
         Ok(())
+    }
+
+    /// Fetch specified blob data on a blocking pool.
+    ///
+    /// This is the compatibility bridge for the P5 async I/O migration: callers
+    /// can await blob-stream prefetch work without blocking a Tokio reactor while
+    /// individual cache backends are converted to native async I/O incrementally.
+    pub async fn fetch_range_async(&self, prefetches: Vec<BlobPrefetchRequest>) -> io::Result<()> {
+        let device = self.clone();
+        tokio::task::spawn_blocking(move || device.fetch_range_synchronous(&prefetches))
+            .await
+            .map_err(|e| Error::other(format!("async blob fetch task failed: {e}")))?
     }
 
     /// Check all chunks related to the blob io vector are ready.
