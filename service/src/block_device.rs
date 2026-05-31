@@ -30,7 +30,7 @@ use nydus_storage::utils::alloc_buf;
 use nydus_utils::digest::{self, RafsDigest};
 use nydus_utils::round_up;
 use nydus_utils::verity::VerityGenerator;
-use tokio_uring::buf::IoBufMut;
+use tokio_uring::buf::{BoundedBuf, IoBufMut};
 
 use crate::blob_cache::{generate_blob_key, BlobCacheMgr, BlobConfig, DataBlob, MetaBlob};
 
@@ -637,6 +637,7 @@ impl BlockDevice {
             }
             let (res, buf2) = output_file
                 .write_at(buf, block_device.blocks_to_size(pos))
+                .submit()
                 .await;
             let sz1 = res?;
             if sz1 != sz {

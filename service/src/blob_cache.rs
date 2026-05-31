@@ -21,7 +21,7 @@ use nydus_rafs::metadata::{RafsBlobExtraInfo, RafsSuper, RafsSuperFlags};
 use nydus_storage::cache::BlobCache;
 use nydus_storage::device::BlobInfo;
 use nydus_storage::factory::BLOB_FACTORY;
-use tokio_uring::buf::IoBufMut;
+use tokio_uring::buf::BoundedBufMut;
 use tokio_uring::fs::File;
 
 const ID_SPLITTER: &str = "/";
@@ -483,7 +483,7 @@ impl MetaBlob {
     }
 
     /// Read data from the cached metadata blob in asynchronous mode.
-    pub async fn async_read<T: IoBufMut>(&self, pos: u64, buf: T) -> (Result<usize>, T) {
+    pub async fn async_read<T: BoundedBufMut>(&self, pos: u64, buf: T) -> (Result<usize>, T) {
         self.file.read_at(buf, pos).await
     }
 
@@ -516,7 +516,16 @@ impl DataBlob {
 
         match blob.get_blob_object() {
             Some(obj) => {
-                let fd = nix::unistd::dup(obj.as_raw_fd())?;
+                // Duplicate the blob object's backing fd. `libc::dup` keeps the simple
+                // `RawFd -> RawFd` contract; nix 0.31's `dup` switched to `AsFd`/`OwnedFd`.
+                let fd = unsafe { libc::dup(obj.as_raw_fd()) };
+                if fd < 0 {
+                    return Err(eio!(format!(
+                        "blob_cache: failed to dup fd for blob {}: {}",
+                        blob_id,
+                        std::io::Error::last_os_error()
+                    )));
+                }
                 // Safe because the `fd` is valid.
                 let file = unsafe { File::from_raw_fd(fd) };
                 Ok(DataBlob {
@@ -557,7 +566,7 @@ impl DataBlob {
     }
 
     /// Read data from the cached data blob in asynchronous mode.
-    pub async fn async_read<T: IoBufMut>(&self, pos: u64, buf: T) -> (Result<usize>, T) {
+    pub async fn async_read<T: BoundedBufMut>(&self, pos: u64, buf: T) -> (Result<usize>, T) {
         let len = buf.bytes_total();
         match self.async_fetch(pos, len).await {
             Ok(()) => self.file.read_at(buf, pos).await,

@@ -62,6 +62,14 @@ use super::uffd_proto::*;
 
 /// UFFD event type for page fault (from linux/userfaultfd.h).
 pub const UFFD_EVENT_PAGEFAULT: u8 = 0x12;
+/// UFFD non-pagefault event types (only delivered when the client registered the
+/// uffd with the matching `UFFD_FEATURE_EVENT_*` flags; unused by the block-device
+/// protocol, but handled defensively so a stray event cannot leak fds or leave the
+/// server acting on a stale VMA mapping).
+pub const UFFD_EVENT_FORK: u8 = 0x13;
+pub const UFFD_EVENT_REMAP: u8 = 0x14;
+pub const UFFD_EVENT_REMOVE: u8 = 0x15;
+pub const UFFD_EVENT_UNMAP: u8 = 0x16;
 
 /// Maximum number of ranges (and fds) per message.
 const MAX_RANGES_PER_MSG: usize = 16;
@@ -136,6 +144,67 @@ pub enum PageFaultResult {
     Copy,
     /// Not a page-fault event, or address not in any VMA region.
     Noop,
+}
+
+fn checked_vma_end(region: &VmaRegion) -> Result<u64> {
+    region
+        .base_host_virt_addr
+        .checked_add(region.size as u64)
+        .ok_or_else(|| eother!("uffd: VMA host address range overflows u64"))
+}
+
+fn checked_vma_device_end(region: &VmaRegion) -> Result<u64> {
+    region
+        .offset
+        .checked_add(region.size as u64)
+        .ok_or_else(|| eother!("uffd: VMA block-device range overflows u64"))
+}
+
+fn checked_vma_addr(region: &VmaRegion, block_offset: u64) -> Result<u64> {
+    let relative = block_offset
+        .checked_sub(region.offset)
+        .ok_or_else(|| eother!("uffd: block offset is before VMA region offset"))?;
+    region
+        .base_host_virt_addr
+        .checked_add(relative)
+        .ok_or_else(|| eother!("uffd: translated VMA address overflows u64"))
+}
+
+fn validate_vma_region(region: &VmaRegion, block_size: u64) -> Result<()> {
+    if region.size == 0 {
+        return Err(eother!("uffd: VMA region size must be non-zero"));
+    }
+    if region.page_size == 0 {
+        return Err(eother!("uffd: VMA page_size must be non-zero"));
+    }
+
+    let page_size = region.page_size as u64;
+    if !region.page_size.is_power_of_two() {
+        return Err(eother!("uffd: VMA page_size must be a power of two"));
+    }
+    if page_size < block_size || page_size % block_size != 0 {
+        return Err(eother!(format!(
+            "uffd: VMA page_size {} must be a multiple of block size {}",
+            page_size, block_size
+        )));
+    }
+
+    checked_vma_end(region)?;
+    checked_vma_device_end(region)?;
+    Ok(())
+}
+
+fn validate_vma_regions(regions: &[VmaRegion], block_size: u64) -> Result<()> {
+    if regions.is_empty() {
+        return Err(eother!(
+            "uffd: handshake must contain at least one VMA region"
+        ));
+    }
+
+    for region in regions {
+        validate_vma_region(region, block_size)?;
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -289,8 +358,31 @@ impl UffdCore {
         uffd_fd: RawFd,
     ) -> Result<PageFaultResult> {
         if msg.event != UFFD_EVENT_PAGEFAULT {
-            warn!("uffd_core: unexpected uffd event: {}", msg.event);
-            return Ok(PageFaultResult::Noop);
+            match msg.event {
+                UFFD_EVENT_FORK => {
+                    // The fork union carries a brand-new uffd fd for the child
+                    // process (aliased onto the first u64 of the pagefault union).
+                    // This server cannot serve the child, so close the fd rather
+                    // than leak it.
+                    let child_fd = msg.pagefault.flags as u32 as RawFd;
+                    warn!("uffd_core: ignoring UFFD_EVENT_FORK, closing child uffd fd {child_fd}");
+                    unsafe { libc::close(child_fd) };
+                    return Ok(PageFaultResult::Noop);
+                }
+                UFFD_EVENT_REMAP | UFFD_EVENT_REMOVE | UFFD_EVENT_UNMAP => {
+                    // These events invalidate the VMA layout captured at handshake;
+                    // continuing would resolve faults against stale addresses, so
+                    // surface an error and let the caller tear the connection down.
+                    return Err(eother!(format!(
+                        "uffd_core: VMA-invalidating event 0x{:x} not supported",
+                        msg.event
+                    )));
+                }
+                _ => {
+                    warn!("uffd_core: unexpected uffd event: {}", msg.event);
+                    return Ok(PageFaultResult::Noop);
+                }
+            }
         }
 
         let fault_addr = msg.pagefault.address;
@@ -300,8 +392,9 @@ impl UffdCore {
         );
 
         let vma_region = match vma_regions.iter().find(|v| {
-            fault_addr >= v.base_host_virt_addr
-                && fault_addr < v.base_host_virt_addr + v.size as u64
+            checked_vma_end(v)
+                .map(|end| fault_addr >= v.base_host_virt_addr && fault_addr < end)
+                .unwrap_or(false)
         }) {
             Some(v) => v,
             None => {
@@ -309,19 +402,28 @@ impl UffdCore {
                 return Ok(PageFaultResult::Noop);
             }
         };
+        validate_vma_region(vma_region, self.block_size)?;
 
         let fetch_size = vma_region.page_size as u64;
-        let fault_block_offset = vma_region.offset + (fault_addr - vma_region.base_host_virt_addr);
-        let region_offset_end = vma_region.offset + vma_region.size as u64;
+        let fault_block_offset = vma_region
+            .offset
+            .checked_add(fault_addr - vma_region.base_host_virt_addr)
+            .ok_or_else(|| eother!("uffd_core: fault block offset overflows u64"))?;
+        let region_offset_end = checked_vma_device_end(vma_region)?;
         let aligned_start = (fault_block_offset / fetch_size) * fetch_size;
         let fetch_start = std::cmp::max(aligned_start, vma_region.offset);
-        let fetch_end = std::cmp::min(fetch_start + fetch_size, region_offset_end);
+        let fetch_end = std::cmp::min(
+            fetch_start
+                .checked_add(fetch_size)
+                .ok_or_else(|| eother!("uffd_core: fetch range overflows u64"))?,
+            region_offset_end,
+        );
 
         // Handle range beyond device bounds with UFFDIO_ZEROPAGE.
         if fetch_end > self.device_size {
             let zero_start = std::cmp::max(fetch_start, self.device_size);
             let zero_len = fetch_end - zero_start;
-            let zero_addr = vma_region.base_host_virt_addr + (zero_start - vma_region.offset);
+            let zero_addr = checked_vma_addr(vma_region, zero_start)?;
             uffdio_zeropage(uffd_fd, zero_addr, zero_len).await?;
         }
 
@@ -346,8 +448,7 @@ impl UffdCore {
                 if fetch_start < self.device_size {
                     let data_end = std::cmp::min(fetch_end, self.device_size);
                     let data_len = data_end - fetch_start;
-                    let data_addr =
-                        vma_region.base_host_virt_addr + (fetch_start - vma_region.offset);
+                    let data_addr = checked_vma_addr(vma_region, fetch_start)?;
                     self.resolve_copy(fetch_start, data_len, data_addr, uffd_fd)
                         .await?;
                 }
@@ -379,28 +480,33 @@ impl UffdCore {
         }
 
         let mut current_offset = block_offset;
-        let end_offset = block_offset + len;
+        let end_offset = block_offset
+            .checked_add(len)
+            .ok_or_else(|| eother!("uffd_core: zerocopy range overflows u64"))?;
         let mut data_ranges: Vec<(RawFd, u64, usize, u64)> = Vec::new();
 
         for (blob_fd, blob_offset, blob_len, range_offset) in ranges {
             if range_offset > current_offset {
                 let hole_len = range_offset - current_offset;
-                let target_addr =
-                    vma_region.base_host_virt_addr + (current_offset - vma_region.offset);
+                let target_addr = checked_vma_addr(vma_region, current_offset)?;
                 uffdio_zeropage(uffd_fd, target_addr, hole_len).await?;
             }
 
             if blob_len > 0 && range_offset < end_offset {
-                let actual_len =
-                    std::cmp::min(range_offset + blob_len as u64, end_offset) - range_offset;
+                let range_end = range_offset
+                    .checked_add(blob_len as u64)
+                    .ok_or_else(|| eother!("uffd_core: blob range overflows u64"))?;
+                let actual_len = std::cmp::min(range_end, end_offset) - range_offset;
                 data_ranges.push((blob_fd, blob_offset, actual_len as usize, range_offset));
-                current_offset = range_offset + actual_len;
+                current_offset = range_offset
+                    .checked_add(actual_len)
+                    .ok_or_else(|| eother!("uffd_core: current offset overflows u64"))?;
             }
         }
 
         if current_offset < end_offset {
             let hole_len = end_offset - current_offset;
-            let target_addr = vma_region.base_host_virt_addr + (current_offset - vma_region.offset);
+            let target_addr = checked_vma_addr(vma_region, current_offset)?;
             uffdio_zeropage(uffd_fd, target_addr, hole_len).await?;
         }
 
@@ -442,8 +548,12 @@ impl UffdCore {
         let mut all_ranges: Vec<(RawFd, u64, usize, u64)> = Vec::new();
 
         for vma_region in vma_regions.iter() {
+            if let Err(e) = validate_vma_region(vma_region, self.block_size) {
+                warn!("uffd_core: skip invalid pre-fault VMA region: {}", e);
+                continue;
+            }
             let region_start = vma_region.offset;
-            let region_end = vma_region.offset + vma_region.size as u64;
+            let region_end = checked_vma_device_end(vma_region)?;
             if region_start >= self.device_size {
                 continue;
             }
@@ -575,7 +685,7 @@ impl UffdWorker {
                         }
                         Ok(Some((json_val, fds, msg_type))) => {
                             Self::dispatch_message(
-                                msg_type, json_val, &fds,
+                                msg_type, json_val, fds,
                                 &sock_async, &core, &mut conn_state,
                                 device_size, block_size,
                             ).await?;
@@ -593,7 +703,12 @@ impl UffdWorker {
                     let mut guard = res.map_err(|e| eother!(format!("uffd readable: {e}")))?;
                     let state = conn_state.as_ref().unwrap();
                     if let Err(e) = Self::handle_uffd_event(state, &core, &sock_async).await {
-                        warn!("block_uffd: failed to handle page fault: {e}");
+                        // A page fault could not be resolved. Leaving it pending
+                        // would hang the faulting thread forever, so tear the
+                        // connection down: dropping `conn_state` closes the uffd
+                        // fd, which releases every thread blocked on this region.
+                        warn!("block_uffd: tearing down connection, unresolved page fault: {e}");
+                        break;
                     }
                     guard.clear_ready();
                 }
@@ -617,7 +732,7 @@ impl UffdWorker {
     async fn dispatch_message(
         msg_type: MessageType,
         json_val: serde_json::Value,
-        fds: &[RawFd],
+        fds: Vec<RawFd>,
         sock_async: &AsyncFd<StdUnixStream>,
         core: &UffdCore,
         conn_state: &mut Option<ConnState>,
@@ -628,14 +743,23 @@ impl UffdWorker {
             MessageType::Handshake => {
                 if conn_state.is_some() {
                     warn!("block_uffd: received handshake but already handshaked");
+                    Self::close_fds(&fds);
                     return Ok(());
                 }
                 *conn_state = Some(Self::handle_handshake(json_val, fds, sock_async, core)?);
             }
             MessageType::Stat => {
+                if !fds.is_empty() {
+                    warn!("block_uffd: received stat request with unexpected fds");
+                    Self::close_fds(&fds);
+                }
                 Self::handle_stat_request(sock_async, device_size, block_size).await?;
             }
             other => {
+                if !fds.is_empty() {
+                    warn!("block_uffd: closing fds from unexpected message type: {other:?}");
+                    Self::close_fds(&fds);
+                }
                 warn!("block_uffd: unexpected message type: {other:?}");
             }
         }
@@ -646,39 +770,50 @@ impl UffdWorker {
     /// Also accepts Firecracker-compatible bare array of regions.
     fn handle_handshake(
         json_val: serde_json::Value,
-        fds: &[RawFd],
+        fds: Vec<RawFd>,
         sock_async: &AsyncFd<StdUnixStream>,
         core: &UffdCore,
     ) -> Result<ConnState> {
-        let request: HandshakeRequest = if json_val.is_array() {
+        let request: HandshakeRequest = match if json_val.is_array() {
             // Firecracker-compatible: bare array of regions, all defaults
-            let regions: Vec<VmaRegion> = serde_json::from_value(json_val)
-                .map_err(|e| eother!(format!("Invalid region array: {}", e)))?;
-            HandshakeRequest {
-                r#type: MessageType::Handshake,
-                regions,
-                policy: FaultPolicy::default(),
-                enable_prefault: false,
-            }
+            serde_json::from_value(json_val)
+                .map(|regions| HandshakeRequest {
+                    r#type: MessageType::Handshake,
+                    regions,
+                    policy: FaultPolicy::default(),
+                    enable_prefault: false,
+                })
+                .map_err(|e| eother!(format!("Invalid region array: {}", e)))
         } else {
             serde_json::from_value(json_val)
-                .map_err(|e| eother!(format!("Invalid HandshakeRequest: {}", e)))?
+                .map_err(|e| eother!(format!("Invalid HandshakeRequest: {}", e)))
+        } {
+            Ok(request) => request,
+            Err(e) => {
+                Self::close_fds(&fds);
+                return Err(e);
+            }
         };
+
+        if let Err(e) = validate_vma_regions(&request.regions, core.block_size) {
+            Self::close_fds(&fds);
+            return Err(e);
+        }
 
         info!(
             "block_uffd: handshake successful, {} regions, {} uffd fds, policy {:?}, enable_prefault={}",
             request.regions.len(), fds.len(), request.policy, request.enable_prefault
         );
 
-        let fd = fds
-            .first()
-            .copied()
-            .ok_or_else(|| eother!("No uffd fd received during handshake"))?;
+        let mut fds = fds;
+        let fd = if fds.is_empty() {
+            return Err(eother!("No uffd fd received during handshake"));
+        } else {
+            fds.remove(0)
+        };
 
         // Close extra fds beyond the first one
-        for &extra_fd in &fds[1..] {
-            unsafe { libc::close(extra_fd) };
-        }
+        Self::close_fds(&fds);
 
         // Set uffd fd to non-blocking mode
         let flags = unsafe { libc::fcntl(fd, libc::F_GETFL, 0) };
@@ -737,32 +872,38 @@ impl UffdWorker {
         Self::async_send_with_fd(sock_async, &json_data, &[]).await
     }
 
-    /// Handle uffd page fault event.
+    /// Handle uffd page fault events.
+    ///
+    /// `AsyncFd` registers the uffd fd in edge-triggered mode, so a single
+    /// readiness notification can cover several queued events. We must drain the
+    /// fd until it returns `WouldBlock` (`read_uffd_msg` -> `Ok(None)`); otherwise
+    /// a second simultaneously-queued page fault stays unread and its faulting
+    /// thread stalls until an unrelated fault happens to re-trigger the fd.
     async fn handle_uffd_event(
         state: &ConnState,
         core: &UffdCore,
         sock_async: &AsyncFd<StdUnixStream>,
     ) -> Result<()> {
         let uffd_fd = state.uffd_async.get_ref().as_raw_fd();
-        let msg = match read_uffd_msg(uffd_fd)? {
-            Some(m) => m,
-            None => return Ok(()),
-        };
+        loop {
+            let msg = match read_uffd_msg(uffd_fd)? {
+                Some(m) => m,
+                None => return Ok(()),
+            };
 
-        let result = core
-            .handle_page_fault(&msg, &state.vma_regions, state.policy, uffd_fd)
-            .await?;
+            let result = core
+                .handle_page_fault(&msg, &state.vma_regions, state.policy, uffd_fd)
+                .await?;
 
-        match result {
-            PageFaultResult::Zerocopy(zr) => {
-                for chunk in zr.ranges.chunks(MAX_RANGES_PER_MSG) {
-                    Self::send_batch_response(sock_async, chunk).await?;
+            match result {
+                PageFaultResult::Zerocopy(zr) => {
+                    for chunk in zr.ranges.chunks(MAX_RANGES_PER_MSG) {
+                        Self::send_batch_response(sock_async, chunk).await?;
+                    }
                 }
+                PageFaultResult::Copy | PageFaultResult::Noop => {}
             }
-            PageFaultResult::Copy | PageFaultResult::Noop => {}
         }
-
-        Ok(())
     }
 
     fn close_fds(fds: &[i32]) {
@@ -954,12 +1095,18 @@ impl UffdService {
     pub fn run(&self) -> Result<()> {
         info!("block_uffd: service start!");
 
+        let worker_num = self.worker_threads.lock().unwrap().len();
+        if worker_num == 0 {
+            return Err(einval!(
+                "block_uffd: at least one worker thread is required"
+            ));
+        }
+
         let _ = std::fs::remove_file(&self.uds_path);
         let listener = UnixListener::bind(&self.uds_path)?;
         listener.set_nonblocking(true)?;
 
         let mut curr_worker = 0;
-        let worker_num = self.worker_threads.lock().unwrap().len();
         while self.active.load(Ordering::Acquire) {
             match listener.accept() {
                 Ok((stream, _addr)) => {
@@ -1225,6 +1372,12 @@ pub fn create_uffd_daemon(
     supervisor: Option<String>,
     waker: Arc<Waker>,
 ) -> Result<Arc<dyn NydusDaemon>> {
+    if threads == 0 {
+        return Err(einval!(
+            "block_uffd: at least one worker thread is required"
+        ));
+    }
+
     let blob_id = generate_blob_key(&blob_entry.domain_id, &blob_entry.blob_id);
     let cache_mgr = Arc::new(BlobCacheMgr::new());
     cache_mgr.add_blob_entry(&blob_entry)?;
@@ -1776,7 +1929,7 @@ mod tests {
             let res = UffdWorker::dispatch_message(
                 MessageType::Stat,
                 json_val,
-                &[],
+                Vec::new(),
                 &sock_async,
                 &core,
                 &mut conn_state,
@@ -1805,7 +1958,7 @@ mod tests {
             let res = UffdWorker::dispatch_message(
                 MessageType::PageFault,
                 json_val,
-                &[],
+                Vec::new(),
                 &sock_async,
                 &core,
                 &mut conn_state,
@@ -1850,7 +2003,7 @@ mod tests {
             let res = UffdWorker::dispatch_message(
                 MessageType::Handshake,
                 json_val,
-                &[],
+                Vec::new(),
                 &sock_async,
                 &core,
                 &mut conn_state,
@@ -1917,7 +2070,7 @@ mod tests {
             })
             .unwrap();
 
-            let result = UffdWorker::handle_handshake(json_val, &[uffd_fd], &sock_async, &core);
+            let result = UffdWorker::handle_handshake(json_val, vec![uffd_fd], &sock_async, &core);
             assert!(result.is_ok());
             let state = result.unwrap();
             assert_eq!(state.vma_regions.len(), 1);
@@ -1945,7 +2098,7 @@ mod tests {
             .unwrap();
 
             // No uffd fd provided — should fail
-            let result = UffdWorker::handle_handshake(json_val, &[], &sock_async, &core);
+            let result = UffdWorker::handle_handshake(json_val, Vec::new(), &sock_async, &core);
             assert!(result.is_err());
         });
     }
@@ -1971,10 +2124,74 @@ mod tests {
             })
             .unwrap();
 
-            let result = UffdWorker::handle_handshake(json_val, &[uffd_fd], &sock_async, &core);
+            let result = UffdWorker::handle_handshake(json_val, vec![uffd_fd], &sock_async, &core);
             assert!(result.is_ok());
             let state = result.unwrap();
             assert_eq!(state.policy, FaultPolicy::Copy);
+        });
+    }
+
+    #[test]
+    fn test_handle_handshake_rejects_invalid_vma() {
+        tokio_uring::start(async {
+            let tmpdir = TempDir::new().unwrap();
+            let device = create_block_device(tmpdir.as_path().to_path_buf()).unwrap();
+            let core = UffdCore::new(device);
+
+            let (sock1, _sock2) = std::os::unix::net::UnixStream::pair().unwrap();
+            sock1.set_nonblocking(true).unwrap();
+            let sock_async = AsyncFd::new(sock1).unwrap();
+
+            let uffd_fd = create_userfaultfd_for_test().unwrap();
+            let json_val = serde_json::to_value(HandshakeRequest {
+                r#type: MessageType::Handshake,
+                regions: vec![VmaRegion::new(0x1000, 0x2000, 0, 0)],
+                policy: FaultPolicy::Zerocopy,
+                enable_prefault: false,
+            })
+            .unwrap();
+
+            let result = UffdWorker::handle_handshake(json_val, vec![uffd_fd], &sock_async, &core);
+            assert!(result.is_err());
+        });
+    }
+
+    #[test]
+    fn test_dispatch_message_closes_unexpected_fds() {
+        tokio_uring::start(async {
+            let (sock1, _sock2) = std::os::unix::net::UnixStream::pair().unwrap();
+            sock1.set_nonblocking(true).unwrap();
+            let sock_async = AsyncFd::new(sock1).unwrap();
+
+            let tmpdir = TempDir::new().unwrap();
+            let device = create_block_device(tmpdir.as_path().to_path_buf()).unwrap();
+            let core = UffdCore::new(device);
+            let mut conn_state: Option<ConnState> = None;
+
+            let mut pipe_fds: [libc::c_int; 2] = [-1, -1];
+            let ret = unsafe { libc::pipe(pipe_fds.as_mut_ptr()) };
+            assert_eq!(ret, 0);
+            let read_fd = pipe_fds[0];
+            let write_fd = pipe_fds[1];
+
+            let json_val = serde_json::json!({"type": 99});
+            let res = UffdWorker::dispatch_message(
+                MessageType::PageFault,
+                json_val,
+                vec![read_fd],
+                &sock_async,
+                &core,
+                &mut conn_state,
+                1024 * 1024,
+                4096,
+            )
+            .await;
+            assert!(res.is_ok());
+
+            let flags = unsafe { libc::fcntl(read_fd, libc::F_GETFD) };
+            assert_eq!(flags, -1);
+
+            unsafe { libc::close(write_fd) };
         });
     }
 
@@ -1997,6 +2214,17 @@ mod tests {
         assert_eq!(service.worker_senders.lock().unwrap().len(), 1);
 
         service.stop();
+    }
+
+    #[test]
+    fn test_uffd_service_run_without_workers_fails() {
+        let tmpdir = TempDir::new().unwrap();
+        let device = create_block_device(tmpdir.as_path().to_path_buf()).unwrap();
+        let sock_path = format!("{}/test_no_workers.sock", tmpdir.as_path().display());
+        let service = UffdService::new(device, sock_path).unwrap();
+
+        let result = service.run();
+        assert!(result.is_err());
     }
 
     // --- async_send_with_fd test ---
@@ -2287,6 +2515,75 @@ mod tests {
                 .unwrap();
             assert!(matches!(result, PageFaultResult::Noop));
         });
+    }
+
+    #[test]
+    fn test_handle_page_fault_vma_invalidating_event_errors() {
+        // REMAP/REMOVE/UNMAP invalidate the cached VMA layout; the handler must surface an error
+        // so the connection tears down rather than resolving faults against stale addresses.
+        let tmpdir = TempDir::new().unwrap();
+        let device = create_block_device(tmpdir.as_path().to_path_buf()).unwrap();
+        let core = UffdCore::new(device);
+        let vma_regions = vec![VmaRegion::new(0x1000, 0x2000, 0, 4096)];
+
+        for event in [UFFD_EVENT_REMAP, UFFD_EVENT_REMOVE, UFFD_EVENT_UNMAP] {
+            let msg = UffdMsg {
+                event,
+                _reserved1: [0; 3],
+                _reserved2: 0,
+                pagefault: UffdPagefault {
+                    flags: 0,
+                    address: 0x1000,
+                    feat: 0,
+                },
+            };
+            tokio_uring::start(async {
+                let result = core
+                    .handle_page_fault(&msg, &vma_regions, FaultPolicy::Copy, -1)
+                    .await;
+                assert!(
+                    result.is_err(),
+                    "event 0x{event:x} should error, got {result:?}"
+                );
+            });
+        }
+    }
+
+    #[test]
+    fn test_handle_page_fault_fork_closes_child_fd() {
+        // A FORK event carries a brand-new child uffd fd in the first u64 of the union; the handler
+        // must close it (returning Noop) instead of leaking it.
+        let tmpdir = TempDir::new().unwrap();
+        let device = create_block_device(tmpdir.as_path().to_path_buf()).unwrap();
+        let core = UffdCore::new(device);
+        let vma_regions = vec![VmaRegion::new(0x1000, 0x2000, 0, 4096)];
+
+        // A real fd we expect the handler to close.
+        let child_fd = unsafe { libc::dup(0) };
+        assert!(child_fd >= 0, "failed to set up a child fd for the test");
+
+        let msg = UffdMsg {
+            event: UFFD_EVENT_FORK,
+            _reserved1: [0; 3],
+            _reserved2: 0,
+            pagefault: UffdPagefault {
+                flags: child_fd as u64,
+                address: 0,
+                feat: 0,
+            },
+        };
+
+        tokio_uring::start(async {
+            let result = core
+                .handle_page_fault(&msg, &vma_regions, FaultPolicy::Copy, -1)
+                .await
+                .unwrap();
+            assert!(matches!(result, PageFaultResult::Noop));
+        });
+
+        // The child fd must now be closed: F_GETFD should fail with EBADF.
+        let still_open = unsafe { libc::fcntl(child_fd, libc::F_GETFD) };
+        assert_eq!(still_open, -1, "FORK child fd was leaked, not closed");
     }
 
     #[test]

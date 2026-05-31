@@ -20,6 +20,7 @@ use std::thread::sleep;
 use std::time::SystemTime;
 use std::{sync::Arc, time::Duration};
 
+use async_trait::async_trait;
 use fuse_backend_rs::file_buf::FileVolatileSlice;
 use nydus_utils::metrics::{BackendMetrics, ERROR_HOLDER};
 
@@ -380,6 +381,7 @@ where
     }
 }
 
+#[async_trait]
 pub trait BlobReader: Send + Sync {
     /// Get size of the blob file.
     fn blob_size(&self) -> BackendResult<u64>;
@@ -450,6 +452,20 @@ pub trait BlobReader: Send + Sync {
             }
             Ok(size)
         })
+    }
+
+    /// Native async variant of [`BlobReader::read_with_source`].
+    ///
+    /// Backends should override this to perform non-blocking network I/O.
+    /// The default keeps existing local/blocking backends working while remote
+    /// backends are migrated one by one.
+    async fn read_with_source_async(
+        &self,
+        buf: &mut [u8],
+        offset: u64,
+        source: RequestSource,
+    ) -> BackendResult<usize> {
+        self.read_with_source(buf, offset, source)
     }
 
     /// Read as much as possible data into buffer.
