@@ -1,6 +1,6 @@
 # Nydus Failover and Hot Upgrade
 
-Currently, nydusd supports failover and hot upgrade under fusedev and fscache modes, specifically:
+Currently, nydusd supports failover and hot upgrade under fusedev and fanotify modes, specifically:
 
 - Nydusd can automatically recover from crashes and continue serving container I/O operations.
 - Users can upgrade nydusd without disrupting container I/O operations, once the old nydusd process exits and the new one starts, it can immediately serve container I/O.
@@ -51,7 +51,7 @@ When an external controller (such as nydus-snapshotter) performs failover or hot
 
 #### State Information to be Saved and Recovered
 
-1. File handler. In fusedev mode, it's the fuse file; in fscache mode, it's the file handler which is used to cooperate with the linux fscache driver to manage cached blob objects.
+1. File handler. In fusedev mode, it's the fuse file; in fanotify mode, it's the file handler which is used to cooperate with the linux fanotify driver to manage cached blob objects.
 
 2. State of the backend filesystem. For example, the VFS state in fusedev mode, etc.
 

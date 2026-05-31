@@ -32,6 +32,7 @@ page fault → userfaultfd ──→ resolve fault
 - Linux kernel with `CONFIG_USERFAULTFD=y` (5.10+ recommended)
 - RAFS v6 filesystem image (built with `nydus-image create --fs-version 6`)
 - `nydusd` compiled with `--features block-uffd`
+- A VM/VMM-side fault handler that can create and register a `userfaultfd`, then send the uffd fd and VMA regions to `nydusd` over the Unix socket.
 
 ## Quick Start
 
@@ -50,7 +51,7 @@ nydusd uffd \
 nydusd uffd \
   --sock /tmp/uffd.sock \
   --bootstrap /path/to/image.boot \
-  --config /path/to/config.json
+  --config /path/to/config.yaml
 ```
 
 ## Command Line Options
@@ -59,9 +60,31 @@ nydusd uffd \
 |--------|-------|----------|-------------|
 | `--sock` | `-S` | Yes | Path to the UFFD service Unix socket |
 | `--bootstrap` | `-B` | Yes | Path to the RAFS v6 bootstrap file |
-| `--config` | `-C` | No | Path to ConfigV2 JSON file (mutually exclusive with `--localfs-dir`) |
+| `--config` | `-C` | No | Path to a ConfigV2 JSON, TOML, or YAML file (mutually exclusive with `--localfs-dir`) |
 | `--localfs-dir` | `-D` | No | Path to localfs working directory (mutually exclusive with `--config`) |
 | `--threads` | | No | Number of worker threads (default: 4) |
+
+Global `nydusd` flags such as `--apisock`, `--id`, `--supervisor`, `--log-level`, `--log-file`, and `--rlimit-nofile` are also accepted by the `uffd` subcommand.
+
+## Kata / VM Handoff Configuration
+
+`nydusd uffd` is the host-side service. The hypervisor or runtime-side UFFD handler remains responsible for creating the guest-visible pmem/DAX address space, registering it with `userfaultfd`, and sending the uffd fd plus VMA metadata to `nydusd`.
+
+| Layer | Configuration | Purpose |
+|-------|---------------|---------|
+| `nydusd` | `uffd --sock /run/nydus/uffd.sock` | Unix socket used by the VMM/runtime-side fault handler |
+| `nydusd` | `--bootstrap /path/to/bootstrap` | RAFS v6 metadata to expose as a block-addressed image |
+| `nydusd` | `--localfs-dir /path/to/blobs` | Local blob directory for simple deployments |
+| `nydusd` | `--config /path/to/config.{json,toml,yaml}` | ConfigV2 backend/cache configuration for registry, OSS, S3, HTTP proxy, or localfs backends |
+| `nydusd` | `--threads <N>` | Number of UFFD worker threads; must be at least 1 |
+| VMM/runtime handler | send `HandshakeRequest` + uffd fd via `SCM_RIGHTS` | Registers one or more VMA regions with the service |
+| Handshake | `policy: 0` | Zerocopy: `nydusd` returns blob fds and ranges; the client maps them |
+| Handshake | `policy: 1` | Copy: `nydusd` resolves faults with `UFFDIO_COPY` / `UFFDIO_ZEROPAGE` |
+| Handshake | `enable_prefault: true` | Proactively returns already-cached ranges to reduce page-fault round trips |
+| Handshake | `regions[].page_size` | Fault-resolution granularity in bytes; must be non-zero and a power-of-two multiple of the block size |
+| Handshake | `regions[].offset` / `size` | Block-device byte range represented by the VMA |
+
+For Kata-style pmem handoff, use the socket path as the host/runtime boundary. The concrete VMM flag is VMM-specific: Firecracker-compatible handlers can send the bare VMA array shown below, while Cloud Hypervisor-style pmem wiring is expected to pass the same socket as an uffd backend.
 
 ## Protocol
 
@@ -180,16 +203,16 @@ nydusd uffd \
 
 ### Config File Backend
 
-For more complex backends (registry, OSS, etc.), use a ConfigV2 JSON file:
+For more complex backends (registry, OSS, S3, HTTP proxy, etc.), use a ConfigV2 JSON, TOML, or YAML file:
 
 ```bash
 nydusd uffd \
   --sock /tmp/uffd.sock \
   --bootstrap /path/to/image.boot \
-  --config /path/to/config.json
+  --config /path/to/config.toml
 ```
 
-The config file format is the same as the [FUSE mode configuration](nydusd.md), with `backend` and `cache` sections.
+The config file format is the same as the [FUSE mode configuration](nydusd.md), with `backend` and `cache` sections. `IMAGE_PULL_AUTH` may be used to inject registry credentials at process startup without storing them in the config file.
 
 ## Architecture
 

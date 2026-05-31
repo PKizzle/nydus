@@ -91,6 +91,20 @@ mount -t virtiofs nydus /mnt
 
 We are working on enabling cloud-hypervisor support for nydus.
 
+### Run With UFFD Block Device
+
+For Kata/pmem-style VM handoff, `nydusd` can expose a RAFS v6 image as a block-addressed image through `userfaultfd` when built with the `block-uffd` feature:
+
+```shell
+sudo nydusd uffd \
+  --sock /run/nydus/uffd.sock \
+  --bootstrap /path/to/bootstrap \
+  --localfs-dir /var/lib/nydus/blobs \
+  --threads 4
+```
+
+The VMM or runtime-side fault handler connects to the socket, sends the uffd fd and VMA regions via `SCM_RIGHTS`, and then maps returned blob ranges on demand. See [nydus-uffd.md](nydus-uffd.md) for protocol details and the full Kata/VM configuration matrix.
+
 ### Nydus Configuration
 
 #### Common Fields In Config
