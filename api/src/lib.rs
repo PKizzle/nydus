@@ -30,6 +30,8 @@ pub(crate) mod http_endpoint_v1;
 pub(crate) mod http_endpoint_v2;
 #[cfg(feature = "handler")]
 pub(crate) mod http_handler;
+#[cfg(feature = "handler")]
+pub(crate) mod http_prometheus;
 
 #[cfg(feature = "handler")]
 pub use http_handler::{

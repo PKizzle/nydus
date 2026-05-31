@@ -30,6 +30,7 @@ use crate::http_endpoint_v1::{
 use crate::http_endpoint_v2::{
     BlobObjectListHandlerV2, ConfigV2Handler, InfoV2Handler, HTTP_ROOT_V2,
 };
+use crate::http_prometheus::{PrometheusMetricsHandler, PROMETHEUS_METRICS_PATH};
 
 const EXIT_TOKEN: Token = Token(usize::MAX);
 const REQUEST_TOKEN: Token = Token(1);
@@ -161,6 +162,7 @@ lazy_static! {
         r.routes.insert(endpoint_v1!("/metrics/inflight"), Box::new(MetricsFsInflightHandler{}));
         r.routes.insert(endpoint_v1!("/metrics/pattern"), Box::new(MetricsFsAccessPatternHandler{}));
         r.routes.insert(endpoint_v1!("/config"), Box::new(ConfigHandler{}));
+        r.routes.insert(PROMETHEUS_METRICS_PATH.to_string(), Box::new(PrometheusMetricsHandler{}));
 
         // Nydus API, v2
         r.routes.insert(endpoint_v2!("/daemon"), Box::new(InfoV2Handler{}));
@@ -218,11 +220,17 @@ fn handle_http_request(
 
     // Micro http should ensure that req path is legal.
     let uri_parsed = request.uri().get_abs_path().parse::<Uri>();
+    let mut content_type = MediaType::ApplicationJson;
     let mut response = match uri_parsed {
         Ok(uri) => match HTTP_ROUTES.routes.get(uri.path()) {
-            Some(route) => route
-                .handle_request(request, &|r| kick_api_server(to_api, from_api, r))
-                .unwrap_or_else(|err| error_response(err, StatusCode::BadRequest)),
+            Some(route) => {
+                if uri.path() == PROMETHEUS_METRICS_PATH {
+                    content_type = MediaType::PlainText;
+                }
+                route
+                    .handle_request(request, &|r| kick_api_server(to_api, from_api, r))
+                    .unwrap_or_else(|err| error_response(err, StatusCode::BadRequest))
+            }
             None => error_response(HttpError::NoRoute, StatusCode::NotFound),
         },
         Err(e) => {
@@ -231,7 +239,7 @@ fn handle_http_request(
         }
     };
     response.set_server("Nydus API");
-    response.set_content_type(MediaType::ApplicationJson);
+    response.set_content_type(content_type);
 
     trace_api_end(&response, request.method(), begin_time);
 
@@ -352,6 +360,7 @@ mod tests {
         assert!(HTTP_ROUTES.routes.contains_key("/api/v1/metrics/backend"));
         assert!(HTTP_ROUTES.routes.contains_key("/api/v1/metrics/blobcache"));
         assert!(HTTP_ROUTES.routes.contains_key("/api/v1/metrics/inflight"));
+        assert!(HTTP_ROUTES.routes.contains_key("/metrics"));
     }
 
     #[test]
@@ -463,6 +472,36 @@ mod tests {
 
         let resp_no_body = success_response(None);
         assert_eq!(resp_no_body.status(), StatusCode::NoContent);
+    }
+
+    #[test]
+    fn test_prometheus_metrics_content_type() {
+        let (to_api, from_route) = channel();
+        let (to_route, from_api) = channel();
+        let req = Request::try_from(
+            b"GET http://localhost/metrics HTTP/1.0\r\n\r\n".as_slice(),
+            None,
+        )
+        .unwrap();
+        let thread = thread::spawn(move || handle_http_request(&req, &to_api, &from_api));
+
+        for _ in 0..4 {
+            let request = from_route.recv().unwrap().unwrap();
+            let response = match request {
+                ApiRequest::ExportFsGlobalMetrics(_)
+                | ApiRequest::ExportBackendMetrics(_)
+                | ApiRequest::ExportBlobcacheMetrics(_) => Err(ApiError::Metrics(
+                    MetricsErrorKind::Stats(MetricsError::NoCounter),
+                )),
+                ApiRequest::ExportFsInflightMetrics => Ok(crate::ApiResponsePayload::Empty),
+                _ => panic!("unexpected request"),
+            };
+            to_route.send(response).unwrap();
+        }
+
+        let resp = thread.join().unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.content_type(), MediaType::PlainText);
     }
 
     #[test]
