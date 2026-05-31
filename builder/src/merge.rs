@@ -329,7 +329,8 @@ impl Merger {
             Ok(())
         })?;
 
-        let mut bootstrap_ctx = BootstrapContext::new(Some(target.clone()), false)?;
+        let mut bootstrap_ctx =
+            BootstrapContext::new(Some(target.clone()), false, ctx.v6_block_size())?;
         let mut bootstrap = Bootstrap::new(tree)?;
         bootstrap.build(ctx, &mut bootstrap_ctx)?;
         let blob_table = used_blob_mgr.to_blob_table(ctx)?;

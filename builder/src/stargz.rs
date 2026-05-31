@@ -843,7 +843,7 @@ impl Builder for StargzBuilder {
         } else {
             Box::<NoopArtifactWriter>::default()
         };
-        let mut bootstrap_ctx = bootstrap_mgr.create_ctx()?;
+        let mut bootstrap_ctx = bootstrap_mgr.create_ctx(ctx.v6_block_size())?;
         let layer_idx = u16::from(bootstrap_ctx.layered);
 
         // Build filesystem tree from the stargz TOC.

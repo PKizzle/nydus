@@ -580,7 +580,7 @@ impl Builder for TarballBuilder {
         bootstrap_mgr: &mut BootstrapManager,
         blob_mgr: &mut BlobManager,
     ) -> Result<BuildOutput> {
-        let mut bootstrap_ctx = bootstrap_mgr.create_ctx()?;
+        let mut bootstrap_ctx = bootstrap_mgr.create_ctx(ctx.v6_block_size())?;
         let layer_idx = u16::from(bootstrap_ctx.layered);
         let mut blob_writer: Box<dyn Artifact> = match self.ty {
             ConversionType::EStargzToRafs
