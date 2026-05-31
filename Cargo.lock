@@ -4108,11 +4108,13 @@ dependencies = [
 name = "nydus-service"
 version = "0.4.0"
 dependencies = [
+ "async-broadcast",
  "bytes",
  "compio",
  "dbs-allocator",
  "flume",
  "fuse-backend-rs",
+ "futures-util",
  "libc",
  "log",
  "mio 1.2.0",
@@ -4130,7 +4132,6 @@ dependencies = [
  "serde_repr",
  "thiserror 2.0.18",
  "time",
- "tokio",
  "versionize",
  "versionize_derive",
  "vhost 0.16.0",
