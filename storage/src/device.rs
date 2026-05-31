@@ -1386,14 +1386,13 @@ impl BlobDevice {
 
     /// Fetch specified blob data on a blocking pool.
     ///
-    /// This is the compatibility bridge for the P5 async I/O migration: callers
-    /// can await blob-stream prefetch work without blocking a Tokio reactor while
+    /// This is the compatibility bridge for the async I/O migration: callers can
+    /// await blob-stream prefetch work without blocking the reactor while
     /// individual cache backends are converted to native async I/O incrementally.
+    /// Uses the runtime-agnostic `blocking` pool so it works on any executor.
     pub async fn fetch_range_async(&self, prefetches: Vec<BlobPrefetchRequest>) -> io::Result<()> {
         let device = self.clone();
-        tokio::task::spawn_blocking(move || device.fetch_range_synchronous(&prefetches))
-            .await
-            .map_err(|e| Error::other(format!("async blob fetch task failed: {e}")))?
+        blocking::unblock(move || device.fetch_range_synchronous(&prefetches)).await
     }
 
     /// Check all chunks related to the blob io vector are ready.

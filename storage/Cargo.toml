@@ -10,8 +10,16 @@ edition = "2024"
 
 [dependencies]
 arc-swap = "1.5"
+async-lock = "3.4"
 async-trait = "0.1"
 blocking = "1.6"
+compio = { version = "0.19", default-features = false, features = [
+    "runtime",
+    "time",
+    "io-uring",
+    "polling",
+] }
+governor = "0.10"
 base64 = { version = "0.22.1", optional = true }
 bitflags = { version = "2.11.1", features = ["serde"] }
 hex = "0.4.3"

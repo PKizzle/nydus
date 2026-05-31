@@ -16,7 +16,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use lazy_static::lazy_static;
 #[cfg(feature = "backend-http-proxy")]
 use nydus_api::HttpProxyConfig;
 #[cfg(feature = "backend-localdisk")]
@@ -30,8 +29,6 @@ use nydus_api::RegistryConfig;
 #[cfg(feature = "backend-s3")]
 use nydus_api::S3Config;
 use nydus_api::{default_user_io_batch_size, BackendConfigV2, ConfigV2};
-use tokio::runtime::{Builder, Runtime};
-use tokio::time;
 
 #[cfg(feature = "backend-http-proxy")]
 use crate::backend::http_proxy;
@@ -48,22 +45,6 @@ use crate::backend::s3;
 use crate::backend::BlobBackend;
 use crate::cache::{BlobCache, BlobCacheMgr, DummyCacheMgr, FileCacheMgr};
 use crate::device::BlobInfo;
-
-lazy_static! {
-    pub static ref ASYNC_RUNTIME: Arc<Runtime> = {
-        let runtime = Builder::new_multi_thread()
-                .worker_threads(1) // Limit the number of worker thread to 1 since this runtime is generally used to do blocking IO.
-                .thread_keep_alive(Duration::from_secs(10))
-                .max_blocking_threads(8)
-                .thread_name("cache-flusher")
-                .enable_all()
-                .build();
-        match runtime {
-            Ok(v) => Arc::new(v),
-            Err(e) => panic!("failed to create tokio async runtime, {}", e),
-        }
-    };
-}
 
 #[derive(Eq, PartialEq)]
 struct BlobCacheMgrKey {
@@ -112,13 +93,15 @@ impl BlobFactory {
         {
             return;
         }
-        ASYNC_RUNTIME.spawn(async {
-            let mut interval = time::interval(Duration::from_secs(5));
-            loop {
-                interval.tick().await;
+        // Periodic cache-stat poll. This was a tokio task on the shared
+        // ASYNC_RUNTIME; a plain thread avoids needing any async runtime here.
+        std::thread::Builder::new()
+            .name("cache-stat-checker".to_string())
+            .spawn(|| loop {
+                std::thread::sleep(Duration::from_secs(5));
                 BLOB_FACTORY.check_cache_stat();
-            }
-        });
+            })
+            .expect("storage: failed to spawn cache-stat checker thread");
     }
 
     /// Create a blob cache object for a blob with specified configuration.

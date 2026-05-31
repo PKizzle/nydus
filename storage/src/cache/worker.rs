@@ -4,20 +4,36 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::io::Result;
+use std::num::NonZeroU32;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Once};
 use std::thread;
 use std::time::{Duration, SystemTime};
 
+use async_lock::Semaphore;
+use governor::{DefaultDirectRateLimiter, Quota, RateLimiter};
 use nydus_api::PrefetchConfigV2;
-use nydus_utils::async_helper::with_runtime;
 use nydus_utils::metrics::{BlobcacheMetrics, Metric};
 use nydus_utils::mpmc::Channel;
-use tokio::runtime::Runtime;
-use tokio::sync::Semaphore;
 
 use crate::cache::{BlobCache, BlobIoRange};
-use crate::factory::ASYNC_RUNTIME;
+
+thread_local! {
+    /// Per-worker-thread compio runtime. compio is thread-per-core (its
+    /// `Runtime` is `!Send`), so each prefetch worker thread owns its own
+    /// runtime and drives its event loop with `block_on`. This replaces the
+    /// shared tokio runtime (`with_runtime` + `ASYNC_RUNTIME`).
+    static WORKER_RUNTIME: compio::runtime::Runtime =
+        compio::runtime::Runtime::new().expect("storage: failed to create compio worker runtime");
+}
+
+/// Prefetch bandwidth limiter: a governor token bucket (byte-cells) plus its
+/// burst capacity. governor rejects `until_n_ready(n)` when `n` exceeds the
+/// burst, so callers clamp the requested amount to `burst`.
+struct PrefetchLimiter {
+    limiter: DefaultDirectRateLimiter,
+    burst: u32,
+}
 
 /// Configuration information for asynchronous workers.
 pub(crate) struct AsyncPrefetchConfig {
@@ -86,7 +102,7 @@ pub(crate) struct AsyncWorkerMgr {
     prefetch_delayed: AtomicU64,
     prefetch_inflight: AtomicU32,
     prefetch_consumed: AtomicUsize,
-    prefetch_limiter: Option<Arc<leaky_bucket::RateLimiter>>,
+    prefetch_limiter: Option<Arc<PrefetchLimiter>>,
 }
 
 impl AsyncWorkerMgr {
@@ -101,13 +117,19 @@ impl AsyncWorkerMgr {
                 // If the given value is less than maximum blob chunk size, it exceeds burst size of the
                 // limiter ending up with throttling all throughput, so ensure bandwidth is bigger than
                 // the maximum chunk size.
+                // Port the old leaky-bucket config onto a governor token bucket of
+                // byte-cells: rate == bucket capacity == `limit` bytes/s, starting
+                // full. This mirrors leaky-bucket's `refill(limit/10 per 100ms)` ==
+                // `limit`/s with `initial(limit)` (its balance was capped at the
+                // initial). governor starts the bucket full, matching `initial`.
                 let limit = std::cmp::max(crate::RAFS_MAX_CHUNK_SIZE as usize, v as usize);
-                let limiter = leaky_bucket::RateLimiter::builder()
-                    .initial(limit)
-                    .refill(limit / 10)
-                    .interval(Duration::from_millis(100))
-                    .build();
-                Some(Arc::new(limiter))
+                let limit = limit.min(u32::MAX as usize) as u32;
+                // SAFETY: limit >= RAFS_MAX_CHUNK_SIZE > 0.
+                let quota = Quota::per_second(NonZeroU32::new(limit).unwrap());
+                Some(Arc::new(PrefetchLimiter {
+                    limiter: RateLimiter::direct(quota),
+                    burst: limit,
+                }))
             }
         };
 
@@ -204,8 +226,8 @@ impl AsyncWorkerMgr {
                         .prefetch_workers
                         .fetch_add(1, Ordering::Relaxed);
 
-                    with_runtime(|rt| {
-                        rt.block_on(Self::handle_prefetch_requests(mgr2.clone(), rt));
+                    WORKER_RUNTIME.with(|rt| {
+                        rt.block_on(Self::handle_prefetch_requests(mgr2.clone()));
                     });
 
                     mgr2.metrics
@@ -227,7 +249,7 @@ impl AsyncWorkerMgr {
         Ok(())
     }
 
-    async fn handle_prefetch_requests(mgr: Arc<AsyncWorkerMgr>, rt: &Runtime) {
+    async fn handle_prefetch_requests(mgr: Arc<AsyncWorkerMgr>) {
         mgr.begin_timing_once.call_once(|| {
             let now = SystemTime::now()
                 .duration_since(SystemTime::UNIX_EPOCH)
@@ -248,11 +270,9 @@ impl AsyncWorkerMgr {
 
             match msg {
                 AsyncPrefetchMessage::BlobPrefetch(blob_cache, offset, size, begin_time) => {
-                    let token = Semaphore::acquire_owned(mgr2.prefetch_sema.clone())
-                        .await
-                        .unwrap();
+                    let token = mgr2.prefetch_sema.acquire_arc().await;
                     if blob_cache.is_prefetch_active() {
-                        rt.spawn_blocking(move || {
+                        blocking::unblock(move || {
                             let _ = Self::handle_blob_prefetch_request(
                                 mgr2.clone(),
                                 blob_cache,
@@ -261,16 +281,15 @@ impl AsyncWorkerMgr {
                                 begin_time,
                             );
                             drop(token);
-                        });
+                        })
+                        .detach();
                     }
                 }
                 AsyncPrefetchMessage::FsPrefetch(blob_cache, req, begin_time) => {
-                    let token = Semaphore::acquire_owned(mgr2.prefetch_sema.clone())
-                        .await
-                        .unwrap();
+                    let token = mgr2.prefetch_sema.acquire_arc().await;
 
                     if blob_cache.is_prefetch_active() {
-                        rt.spawn_blocking(move || {
+                        blocking::unblock(move || {
                             let _ = Self::handle_fs_prefetch_request(
                                 mgr2.clone(),
                                 blob_cache,
@@ -278,7 +297,8 @@ impl AsyncWorkerMgr {
                                 begin_time,
                             );
                             drop(token)
-                        });
+                        })
+                        .detach();
                     }
                 }
                 AsyncPrefetchMessage::Ping => {
@@ -316,13 +336,21 @@ impl AsyncWorkerMgr {
             if size > 0 {
                 let size = (self.prefetch_consumed.swap(0, Ordering::AcqRel))
                     .saturating_add(size as usize);
-                let max = limiter.max();
-                let size = std::cmp::min(size, max.saturating_add(max));
-                let cap = limiter.balance();
-                if cap < size {
-                    self.prefetch_delayed.fetch_add(1, Ordering::Relaxed);
+                // Clamp to the burst capacity so governor accepts the request
+                // (`until_n_ready` rejects amounts larger than the burst).
+                let size = std::cmp::min(size, limiter.burst as usize) as u32;
+                if let Some(n) = NonZeroU32::new(size) {
+                    // `check_n` consumes the budget if available right now; if not,
+                    // the request is delayed, so count it and wait. Either path
+                    // consumes `n` byte-cells exactly once.
+                    match limiter.limiter.check_n(n) {
+                        Ok(Ok(())) => {}
+                        _ => {
+                            self.prefetch_delayed.fetch_add(1, Ordering::Relaxed);
+                            let _ = limiter.limiter.until_n_ready(n).await;
+                        }
+                    }
                 }
-                limiter.acquire(size).await;
             }
         }
     }
@@ -355,8 +383,8 @@ impl AsyncWorkerMgr {
             if let Err(_e) = obj.fetch_range_compressed(offset, size, true) {
                 if mgr.retry_times.load(Ordering::Relaxed) > 0 {
                     mgr.retry_times.fetch_sub(1, Ordering::Relaxed);
-                    ASYNC_RUNTIME.spawn(async move {
-                        tokio::time::sleep(Duration::from_secs(1)).await;
+                    thread::spawn(move || {
+                        thread::sleep(Duration::from_secs(1));
                         let msg =
                             AsyncPrefetchMessage::new_blob_prefetch(cache.clone(), offset, size);
                         let _ = mgr.send_prefetch_message(msg);
@@ -564,7 +592,11 @@ mod tests {
             .is_ok());
         assert!(mgr.prefetch_inflight.load(Ordering::Acquire) <= 3);
         assert!(mgr.prefetch_inflight.load(Ordering::Acquire) >= 1);
-        thread::sleep(Duration::from_secs(3));
+        // Each oversized request clamps to the 16M bucket capacity and drains the
+        // 16M/s budget. The bucket starts full, so one request passes immediately
+        // and the remaining two are throttled over ~2s. Check mid-throttle (1s)
+        // that work is still in-flight and that requests were delayed.
+        thread::sleep(Duration::from_secs(1));
         assert!(mgr.prefetch_inflight.load(Ordering::Acquire) >= 1);
         assert!(mgr.prefetch_delayed.load(Ordering::Acquire) >= 1);
 
