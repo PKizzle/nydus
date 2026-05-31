@@ -42,7 +42,7 @@ pub(crate) struct FileState {
 /// # Safety
 /// Caller needs to ensure `fs_handle` and `path` are valid, otherwise it may cause memory access
 /// violation.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn nydus_fopen(
     fs_handle: NydusFsHandle,
     path: *const c_char,
@@ -77,7 +77,7 @@ pub unsafe extern "C" fn nydus_fopen(
 ///
 /// # Safety
 /// Caller needs to ensure `fs_handle` is valid, otherwise it may cause memory access violation.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn nydus_fclose(handle: NydusFileHandle) {
     let mut file = Box::from_raw(handle as *mut FileState);
     assert_eq!(file.magic, NYDUS_FILE_HANDLE_MAGIC);
