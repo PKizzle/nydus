@@ -18,7 +18,10 @@ libc = "0.2"
 log = "0.4"
 lz4-sys = "1.9.4"
 lz4 = "1.24.0"
-openssl = { version = "0.10.80", features = ["vendored"], optional = true }
+aes = { version = "0.8", optional = true }
+aes-gcm = { version = "0.10", optional = true }
+xts-mode = { version = "0.5", optional = true }
+getrandom = { version = "0.3", optional = true }
 serde = { version = ">=1.0.27", features = ["serde_derive", "rc"] }
 serde_json = ">=1.0.9"
 sha2 = "0.11.0"
@@ -47,7 +50,7 @@ tokio = { version = "1.52.3", features = ["macros", "rt-multi-thread", "time"] }
 
 [features]
 zran = ["libz-sys"]
-encryption = ["openssl"]
+encryption = ["aes", "aes-gcm", "xts-mode", "getrandom"]
 
 [package.metadata.docs.rs]
 all-features = true

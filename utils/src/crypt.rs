@@ -2,7 +2,6 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-use std::alloc::{alloc, Layout};
 use std::borrow::Cow;
 use std::convert::TryFrom;
 use std::fmt::{self, Debug, Formatter};
@@ -10,7 +9,17 @@ use std::io::Error;
 use std::str::FromStr;
 use std::sync::Arc;
 
-use openssl::{rand, symm};
+use aes::cipher::generic_array::typenum::{U12, U16};
+use aes::cipher::generic_array::GenericArray;
+use aes::cipher::{BlockCipher, BlockDecrypt, BlockEncrypt, KeyInit};
+use aes::{Aes128, Aes256};
+use aes_gcm::aead::AeadInPlace;
+use aes_gcm::AesGcm;
+use xts_mode::Xts128;
+
+/// AES-256-GCM with a 16-byte IV and 12-byte tag, matching the sizes nydus
+/// historically used with OpenSSL's `aes-256-gcm`.
+type Aes256GcmCipher = AesGcm<Aes256, U16, U12>;
 
 // The length of the data unit to be encrypted.
 pub const DATA_UNIT_LENGTH: usize = 16;
@@ -56,18 +65,9 @@ impl Algorithm {
     pub fn new_cipher(&self) -> Result<Cipher, Error> {
         match self {
             Algorithm::None => Ok(Cipher::None),
-            Algorithm::Aes128Xts => {
-                let cipher = symm::Cipher::aes_128_xts();
-                Ok(Cipher::Aes128Xts(cipher))
-            }
-            Algorithm::Aes256Xts => {
-                let cipher = symm::Cipher::aes_256_xts();
-                Ok(Cipher::Aes256Xts(cipher))
-            }
-            Algorithm::Aes256Gcm => {
-                let cipher = symm::Cipher::aes_256_gcm();
-                Ok(Cipher::Aes256Gcm(cipher))
-            }
+            Algorithm::Aes128Xts => Ok(Cipher::Aes128Xts),
+            Algorithm::Aes256Xts => Ok(Cipher::Aes256Xts),
+            Algorithm::Aes256Gcm => Ok(Cipher::Aes256Gcm),
         }
     }
 
@@ -164,22 +164,22 @@ impl TryFrom<u64> for Algorithm {
 }
 
 /// Cipher object to encrypt/decrypt data.
-#[derive(Default)]
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
 pub enum Cipher {
     #[default]
     None,
-    Aes128Xts(symm::Cipher),
-    Aes256Xts(symm::Cipher),
-    Aes256Gcm(symm::Cipher),
+    Aes128Xts,
+    Aes256Xts,
+    Aes256Gcm,
 }
 
 impl Debug for Cipher {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
             Cipher::None => write!(f, "cipher: none"),
-            Cipher::Aes128Xts(_) => write!(f, "cypher: aes128_xts"),
-            Cipher::Aes256Xts(_) => write!(f, "cypher: aes256_xts"),
-            Cipher::Aes256Gcm(_) => write!(f, "cipher: aes256_gcm"),
+            Cipher::Aes128Xts => write!(f, "cypher: aes128_xts"),
+            Cipher::Aes256Xts => write!(f, "cypher: aes256_xts"),
+            Cipher::Aes256Gcm => write!(f, "cipher: aes256_gcm"),
         }
     }
 }
@@ -197,7 +197,7 @@ impl Cipher {
     ) -> Result<Cow<'a, [u8]>, Error> {
         match self {
             Cipher::None => Ok(Cow::from(data)),
-            Cipher::Aes128Xts(cipher) => {
+            Cipher::Aes128Xts => {
                 assert_eq!(key.len(), AES_128_XTS_KEY_LENGTH);
                 let mut buf;
                 let data = if data.len() >= DATA_UNIT_LENGTH {
@@ -212,11 +212,9 @@ impl Cipher {
                     buf[DATA_UNIT_LENGTH..PADDING_LENGTH].copy_from_slice(&PADDING_MAGIC_END);
                     &buf
                 };
-                Self::cipher(*cipher, symm::Mode::Encrypt, key, iv, data)
-                    .map(Cow::from)
-                    .map_err(|e| eother!(format!("failed to encrypt data, {}", e)))
+                Self::xts_crypt::<Aes128>(key, iv, data, true).map(Cow::from)
             }
-            Cipher::Aes256Xts(cipher) => {
+            Cipher::Aes256Xts => {
                 assert_eq!(key.len(), AES_256_XTS_KEY_LENGTH);
                 let mut buf;
                 let data = if data.len() >= DATA_UNIT_LENGTH {
@@ -228,13 +226,9 @@ impl Cipher {
                     buf[DATA_UNIT_LENGTH..PADDING_LENGTH].copy_from_slice(&PADDING_MAGIC_END);
                     &buf
                 };
-                Self::cipher(*cipher, symm::Mode::Encrypt, key, iv, data)
-                    .map(Cow::from)
-                    .map_err(|e| eother!(format!("failed to encrypt data, {}", e)))
+                Self::xts_crypt::<Aes256>(key, iv, data, true).map(Cow::from)
             }
-            Cipher::Aes256Gcm(_cipher) => {
-                Err(einval!("Cipher::encrypt() doesn't support Aes256Gcm"))
-            }
+            Cipher::Aes256Gcm => Err(einval!("Cipher::encrypt() doesn't support Aes256Gcm")),
         }
     }
 
@@ -242,13 +236,9 @@ impl Cipher {
     pub fn decrypt(&self, key: &[u8], iv: Option<&[u8]>, data: &[u8]) -> Result<Vec<u8>, Error> {
         let mut data = match self {
             Cipher::None => Ok(data.to_vec()),
-            Cipher::Aes128Xts(cipher) => Self::cipher(*cipher, symm::Mode::Decrypt, key, iv, data)
-                .map_err(|e| eother!(format!("failed to decrypt data, {}", e))),
-            Cipher::Aes256Xts(cipher) => Self::cipher(*cipher, symm::Mode::Decrypt, key, iv, data)
-                .map_err(|e| eother!(format!("failed to decrypt data, {}", e))),
-            Cipher::Aes256Gcm(_cipher) => {
-                Err(einval!("Cipher::decrypt() doesn't support Aes256Gcm"))
-            }
+            Cipher::Aes128Xts => Self::xts_crypt::<Aes128>(key, iv, data, false),
+            Cipher::Aes256Xts => Self::xts_crypt::<Aes256>(key, iv, data, false),
+            Cipher::Aes256Gcm => Err(einval!("Cipher::decrypt() doesn't support Aes256Gcm")),
         }?;
 
         // Trim possible padding.
@@ -278,8 +268,7 @@ impl Cipher {
         tag: &mut [u8],
     ) -> Result<Vec<u8>, Error> {
         match self {
-            Cipher::Aes256Gcm(cipher) => symm::encrypt_aead(*cipher, key, iv, &[], data, tag)
-                .map_err(|e| eother!(format!("failed to encrypt data, {}", e))),
+            Cipher::Aes256Gcm => Self::gcm_encrypt(key, iv, data, tag),
             _ => Err(einval!("invalid algorithm for encrypt_aead()")),
         }
     }
@@ -293,8 +282,7 @@ impl Cipher {
         tag: &[u8],
     ) -> Result<Vec<u8>, Error> {
         match self {
-            Cipher::Aes256Gcm(cipher) => symm::decrypt_aead(*cipher, key, iv, &[], data, tag)
-                .map_err(|e| eother!(format!("failed to encrypt data, {}", e))),
+            Cipher::Aes256Gcm => Self::gcm_decrypt(key, iv, data, tag),
             _ => Err(einval!("invalid algorithm for decrypt_aead()")),
         }
     }
@@ -302,7 +290,7 @@ impl Cipher {
     /// Get size of tag associated with encrypted data.
     pub fn tag_size(&self) -> usize {
         match self {
-            Cipher::Aes256Gcm(_) => 12,
+            Cipher::Aes256Gcm => 12,
             _ => 0,
         }
     }
@@ -311,14 +299,14 @@ impl Cipher {
     pub fn encrypted_size(&self, plaintext_size: usize) -> usize {
         match self {
             Cipher::None => plaintext_size,
-            Cipher::Aes128Xts(_) | Cipher::Aes256Xts(_) => {
+            Cipher::Aes128Xts | Cipher::Aes256Xts => {
                 if plaintext_size < DATA_UNIT_LENGTH {
                     DATA_UNIT_LENGTH
                 } else {
                     plaintext_size
                 }
             }
-            Cipher::Aes256Gcm(_) => {
+            Cipher::Aes256Gcm => {
                 assert!(plaintext_size.checked_add(12).is_some());
                 plaintext_size + 12
             }
@@ -341,41 +329,104 @@ impl Cipher {
         }
     }
 
-    fn cipher(
-        t: symm::Cipher,
-        mode: symm::Mode,
+    /// AES-XTS encrypt/decrypt a single data unit, using `iv` as the 16-byte tweak.
+    ///
+    /// Matches OpenSSL's `aes-128-xts` / `aes-256-xts` EVP ciphers: the key is split into two
+    /// equal halves (data key || tweak key), the IV is the raw tweak, and inputs whose length is
+    /// not a multiple of the 16-byte block use IEEE P1619 ciphertext stealing (handled by
+    /// `xts-mode`). Compatibility with the previous OpenSSL output is pinned by the known-answer
+    /// tests in this module.
+    fn xts_crypt<C>(
         key: &[u8],
         iv: Option<&[u8]>,
         data: &[u8],
+        encrypt: bool,
+    ) -> Result<Vec<u8>, Error>
+    where
+        C: KeyInit + BlockEncrypt + BlockDecrypt + BlockCipher,
+    {
+        let iv = iv.ok_or_else(|| einval!("XTS mode requires an IV"))?;
+        let tweak: [u8; AES_XTS_IV_LENGTH] = iv
+            .try_into()
+            .map_err(|_| einval!(format!("XTS IV must be {} bytes", AES_XTS_IV_LENGTH)))?;
+        let half = key.len() / 2;
+        let cipher_1 =
+            C::new_from_slice(&key[..half]).map_err(|_| einval!("invalid XTS key length"))?;
+        let cipher_2 =
+            C::new_from_slice(&key[half..]).map_err(|_| einval!("invalid XTS key length"))?;
+        let xts = Xts128::new(cipher_1, cipher_2);
+        let mut buf = data.to_vec();
+        if encrypt {
+            xts.encrypt_sector(&mut buf, tweak);
+        } else {
+            xts.decrypt_sector(&mut buf, tweak);
+        }
+        Ok(buf)
+    }
+
+    fn gcm_encrypt(
+        key: &[u8],
+        iv: Option<&[u8]>,
+        data: &[u8],
+        tag: &mut [u8],
     ) -> Result<Vec<u8>, Error> {
-        let mut c = symm::Crypter::new(t, mode, key, iv)?;
-        let mut out = alloc_buf(data.len() + t.block_size());
-        let count = c.update(data, &mut out)?;
-        let rest = c.finalize(&mut out[count..])?;
-        out.truncate(count + rest);
-        Ok(out)
+        let iv = iv.ok_or_else(|| einval!("GCM mode requires an IV"))?;
+        if iv.len() != AES_XTS_IV_LENGTH {
+            return Err(einval!(format!("GCM IV must be {} bytes", AES_XTS_IV_LENGTH)));
+        }
+        let nonce = GenericArray::<u8, U16>::from_slice(iv);
+        let cipher =
+            Aes256GcmCipher::new_from_slice(key).map_err(|_| einval!("invalid GCM key length"))?;
+        let mut buf = data.to_vec();
+        let out_tag = cipher
+            .encrypt_in_place_detached(nonce, &[], &mut buf)
+            .map_err(|e| eother!(format!("failed to encrypt data, {}", e)))?;
+        if tag.len() != out_tag.len() {
+            return Err(einval!(format!(
+                "GCM tag buffer must be {} bytes",
+                out_tag.len()
+            )));
+        }
+        tag.copy_from_slice(out_tag.as_slice());
+        Ok(buf)
+    }
+
+    fn gcm_decrypt(
+        key: &[u8],
+        iv: Option<&[u8]>,
+        data: &[u8],
+        tag: &[u8],
+    ) -> Result<Vec<u8>, Error> {
+        let iv = iv.ok_or_else(|| einval!("GCM mode requires an IV"))?;
+        if iv.len() != AES_XTS_IV_LENGTH {
+            return Err(einval!(format!("GCM IV must be {} bytes", AES_XTS_IV_LENGTH)));
+        }
+        if tag.len() != 12 {
+            return Err(einval!("GCM tag must be 12 bytes"));
+        }
+        let nonce = GenericArray::<u8, U16>::from_slice(iv);
+        let tag = GenericArray::<u8, U12>::from_slice(tag);
+        let cipher =
+            Aes256GcmCipher::new_from_slice(key).map_err(|_| einval!("invalid GCM key length"))?;
+        let mut buf = data.to_vec();
+        cipher
+            .decrypt_in_place_detached(nonce, &[], &mut buf, tag)
+            .map_err(|e| eother!(format!("failed to decrypt data, {}", e)))?;
+        Ok(buf)
     }
 
     pub fn generate_random_key(cipher_algo: Algorithm) -> Result<Vec<u8>, Error> {
         let length = cipher_algo.key_length();
         let mut buf = vec![0u8; length];
-        if let Err(e) = rand::rand_bytes(&mut buf) {
-            Err(eother!(format!(
-                "failed to generate key for {}, {}",
-                cipher_algo, e
-            )))
-        } else {
-            Ok(Self::tweak_key_for_xts(&buf).to_vec())
-        }
+        getrandom::fill(&mut buf)
+            .map_err(|e| eother!(format!("failed to generate key for {}, {}", cipher_algo, e)))?;
+        Ok(Self::tweak_key_for_xts(&buf).to_vec())
     }
 
     pub fn generate_random_iv() -> Result<Vec<u8>, Error> {
         let mut buf = vec![0u8; AES_XTS_IV_LENGTH];
-        if let Err(e) = rand::rand_bytes(&mut buf) {
-            Err(eother!(format!("failed to generate iv, {}", e)))
-        } else {
-            Ok(buf)
-        }
+        getrandom::fill(&mut buf).map_err(|e| eother!(format!("failed to generate iv, {}", e)))?;
+        Ok(buf)
     }
 }
 
@@ -439,16 +490,6 @@ impl CipherContext {
     pub fn get_cipher_meta(&self) -> (&[u8], &[u8]) {
         (&self.key, &self.iv)
     }
-}
-
-/// A customized buf allocator that avoids zeroing
-fn alloc_buf(size: usize) -> Vec<u8> {
-    assert!(size < isize::MAX as usize);
-    let layout = Layout::from_size_align(size, 0x1000)
-        .unwrap()
-        .pad_to_align();
-    let ptr = unsafe { alloc(layout) };
-    unsafe { Vec::from_raw_parts(ptr, size, layout.size()) }
 }
 
 // Encrypt data with Cipher and CipherContext.
@@ -805,5 +846,81 @@ mod tests {
     fn test_generate_cipher_meta() {
         test_gen_key(true);
         test_gen_key(false);
+    }
+
+    fn unhex(s: &str) -> Vec<u8> {
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
+    /// Known-answer tests pinning byte-for-byte compatibility with the previous OpenSSL
+    /// implementation. The expected ciphertexts/tags were captured from OpenSSL 0.10.80
+    /// (aes-128-xts / aes-256-xts / aes-256-gcm) for these exact key/iv/data inputs, so any
+    /// divergence in the RustCrypto (aes/xts-mode/aes-gcm) output — tweak handling, ciphertext
+    /// stealing, or GCM J0/tag derivation — fails here and prevents shipping an incompatible
+    /// change that would make existing encrypted blobs undecryptable.
+    #[test]
+    fn test_openssl_known_answer_vectors() {
+        let mut k128 = [0xcu8; 32];
+        k128[31] = 0xa;
+        let c = Algorithm::Aes128Xts.new_cipher().unwrap();
+        // padded short input, exact block, and ciphertext-stealing (17B) cases.
+        assert_eq!(
+            c.encrypt(&k128, Some(&[0u8; 16]), b"1").unwrap().as_ref(),
+            unhex("1df853e84717cce491f7bcb79c9edfb42ed2").as_slice()
+        );
+        assert_eq!(
+            c.encrypt(&k128, Some(&[0u8; 16]), b"helloworldtest!!")
+                .unwrap()
+                .as_ref(),
+            unhex("4a55f66681c93e363de843b3016c5ea1").as_slice()
+        );
+        assert_eq!(
+            c.encrypt(&k128, Some(&[0u8; 16]), b"11111111111111111")
+                .unwrap()
+                .as_ref(),
+            unhex("67a2d8fcc3beed670bb626feab5a03f295").as_slice()
+        );
+        assert_eq!(
+            c.encrypt(&k128, Some(&[1u8; 16]), b"11111111111111111")
+                .unwrap()
+                .as_ref(),
+            unhex("8c944448ca484c752ad2b850951cf3ed81").as_slice()
+        );
+        // old ciphertext must still decrypt to the original plaintext.
+        assert_eq!(
+            c.decrypt(&k128, Some(&[0u8; 16]), &unhex("67a2d8fcc3beed670bb626feab5a03f295"))
+                .unwrap(),
+            b"11111111111111111"
+        );
+
+        let mut k256 = [0xcu8; 64];
+        k256[31] = 0xa;
+        let c = Algorithm::Aes256Xts.new_cipher().unwrap();
+        assert_eq!(
+            c.encrypt(&k256, Some(&[0u8; 16]), b"1").unwrap().as_ref(),
+            unhex("e27081f539a4bd9caa803848b553ff7bffd3").as_slice()
+        );
+        assert_eq!(
+            c.encrypt(&k256, Some(&[0u8; 16]), b"11111111111111111")
+                .unwrap()
+                .as_ref(),
+            unhex("34110f1b1bb3f5017c53c162ff1aa1dd17").as_slice()
+        );
+
+        let kg = [0xcu8; 32];
+        let c = Algorithm::Aes256Gcm.new_cipher().unwrap();
+        let mut tag = vec![0u8; 12];
+        let ct = c
+            .encrypt_aead(&kg, Some(&[0u8; 16]), b"11111111111111111", &mut tag)
+            .unwrap();
+        assert_eq!(ct.as_slice(), unhex("e31df8f1a318235602196b2472bceb58b9").as_slice());
+        assert_eq!(tag.as_slice(), unhex("c812164983ddf058f424c99e").as_slice());
+        let pt = c
+            .decrypt_aead(&kg, Some(&[0u8; 16]), &ct, &tag)
+            .unwrap();
+        assert_eq!(pt, b"11111111111111111");
     }
 }
