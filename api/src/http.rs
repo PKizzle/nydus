@@ -261,6 +261,8 @@ pub enum HttpError {
     InflightMetrics(ApiError),
     /// Failed to get filesystem file access trace.
     Pattern(ApiError),
+    /// Failed to get Prometheus metrics.
+    PrometheusMetrics(ApiError),
 
     // Blob cache management related errors (v2)
     /// Failed to create blob object
