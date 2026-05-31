@@ -564,7 +564,7 @@ impl InodeWrapper {
     pub fn create_chunk(&self) -> ChunkWrapper {
         match self {
             InodeWrapper::V5(_) => ChunkWrapper::V5(RafsV5ChunkInfo::new()),
-            InodeWrapper::V6(_) => ChunkWrapper::V6(RafsV5ChunkInfo::new()),
+            InodeWrapper::V6(_) => ChunkWrapper::V6(RafsV5ChunkInfo::new().into()),
             InodeWrapper::Ref(_i) => unimplemented!(),
         }
     }
@@ -741,6 +741,7 @@ impl From<&dyn RafsInodeExt> for RafsV6Inode {
 }
 
 bitflags! {
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     /// Rafs v5 inode flags.
     pub struct RafsInodeFlags: u64 {
         /// Inode is a symlink.

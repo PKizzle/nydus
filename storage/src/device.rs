@@ -48,6 +48,7 @@ pub(crate) const BLOB_FEATURE_INCOMPAT_MASK: u32 = 0x0000_ffff;
 pub(crate) const BLOB_FEATURE_INCOMPAT_VALUE: u32 = 0x0000_0fff;
 
 bitflags! {
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     /// Features bits for blob management.
     pub struct BlobFeatures: u32 {
         /// Uncompressed chunk data is aligned.
@@ -108,8 +109,7 @@ impl TryFrom<u32> for BlobFeatures {
         {
             Err(einval!(format!("invalid blob features: 0x{:x}", value)))
         } else {
-            // Safe because we have just validated feature flags.
-            Ok(unsafe { BlobFeatures::from_bits_unchecked(value) })
+            Ok(BlobFeatures::from_bits_retain(value))
         }
     }
 }
@@ -637,6 +637,7 @@ impl BlobInfo {
 }
 
 bitflags! {
+    #[derive(Clone, Copy, Eq, PartialEq)]
     /// Blob chunk flags.
     pub struct BlobChunkFlags: u32 {
         /// Chunk data is compressed.
@@ -649,6 +650,44 @@ bitflags! {
         const BATCH = 0x0000_0008;
         /// Chunk data includes a CRC checksum.
         const HAS_CRC32 = 0x0000_0010;
+        /// Chunk data includes an XXH3-64 checksum.
+        const HAS_XXH3 = 0x0000_0020;
+    }
+}
+
+impl Debug for BlobChunkFlags {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        if self.is_empty() {
+            return write!(f, "(empty)");
+        }
+
+        let mut first = true;
+        for (flag, name) in [
+            (BlobChunkFlags::COMPRESSED, "COMPRESSED"),
+            (BlobChunkFlags::_HOLECHUNK, "_HOLECHUNK"),
+            (BlobChunkFlags::ENCRYPTED, "ENCRYPTED"),
+            (BlobChunkFlags::BATCH, "BATCH"),
+            (BlobChunkFlags::HAS_CRC32, "HAS_CRC32"),
+            (BlobChunkFlags::HAS_XXH3, "HAS_XXH3"),
+        ] {
+            if self.contains(flag) {
+                if !first {
+                    write!(f, " | ")?;
+                }
+                write!(f, "{}", name)?;
+                first = false;
+            }
+        }
+
+        let unknown = self.bits() & !BlobChunkFlags::all().bits();
+        if unknown != 0 {
+            if !first {
+                write!(f, " | ")?;
+            }
+            write!(f, "0x{:x}", unknown)?;
+        }
+
+        Ok(())
     }
 }
 
@@ -722,6 +761,16 @@ pub trait BlobChunkInfo: Any + Sync + Send {
     /// Get the crc32 checksum of the chunk.
     fn crc32(&self) -> u32;
 
+    /// Check whether the chunk has XXH3-64 checksum or not.
+    fn has_xxh3(&self) -> bool {
+        false
+    }
+
+    /// Get the XXH3-64 checksum of the chunk.
+    fn xxh3(&self) -> u64 {
+        0
+    }
+
     fn as_any(&self) -> &dyn Any;
 }
 
@@ -785,6 +834,14 @@ impl BlobChunkInfo for BlobIoChunk {
 
     fn crc32(&self) -> u32 {
         self.0.crc32()
+    }
+
+    fn has_xxh3(&self) -> bool {
+        self.0.has_xxh3()
+    }
+
+    fn xxh3(&self) -> u64 {
+        self.0.xxh3()
     }
 
     fn as_any(&self) -> &dyn Any {

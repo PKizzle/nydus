@@ -446,18 +446,21 @@ impl StargzBuilder {
                     .block_id()
                     .context("stargz: failed to get chunk digest")?;
                 // blob_index, index and compressed_size will be fixed later
-                let chunk_info = ChunkWrapper::V6(RafsV5ChunkInfo {
-                    block_id,
-                    blob_index: 0,
-                    flags: BlobChunkFlags::COMPRESSED,
-                    compressed_size: 0,
-                    uncompressed_size: uncompress_size as u32,
-                    compressed_offset: entry.offset,
-                    uncompressed_offset: self.uncompressed_offset,
-                    file_offset: entry.chunk_offset,
-                    index: 0,
-                    crc32: 0,
-                });
+                let chunk_info = ChunkWrapper::V6(
+                    RafsV5ChunkInfo {
+                        block_id,
+                        blob_index: 0,
+                        flags: BlobChunkFlags::COMPRESSED,
+                        compressed_size: 0,
+                        uncompressed_size: uncompress_size as u32,
+                        compressed_offset: entry.offset,
+                        uncompressed_offset: self.uncompressed_offset,
+                        file_offset: entry.chunk_offset,
+                        index: 0,
+                        crc32: 0,
+                    }
+                    .into(),
+                );
                 let chunk = NodeChunk {
                     source: ChunkSource::Build,
                     inner: Arc::new(chunk_info),

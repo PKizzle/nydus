@@ -32,7 +32,7 @@ use crate::device::{
     BlobChunkInfo, BlobInfo, BlobIoDesc, BlobIoRange, BlobIoVec, BlobObject, BlobPrefetchRequest,
 };
 use crate::meta::BlobCompressionContextInfo;
-use crate::utils::{alloc_buf, check_crc, check_hash};
+use crate::utils::{alloc_buf, check_crc, check_hash, check_xxh3};
 use crate::{StorageResult, RAFS_MAX_CHUNK_SIZE};
 
 mod cachedfile;
@@ -389,7 +389,10 @@ pub trait BlobCache: Send + Sync {
         let d_size = chunk.uncompressed_size() as usize;
         if buffer.len() != d_size {
             Err(eio!("uncompressed size and buffer size doesn't match"))
-        } else if (self.need_validation() || chunk.has_crc32() || force_validation)
+        } else if (self.need_validation()
+            || chunk.has_xxh3()
+            || chunk.has_crc32()
+            || force_validation)
             && !self.is_legacy_stargz()
             && !self.check_digest(chunk, buffer)
         {
@@ -403,7 +406,9 @@ pub trait BlobCache: Send + Sync {
     }
 
     fn check_digest(&self, chunk: &dyn BlobChunkInfo, buffer: &[u8]) -> bool {
-        if chunk.has_crc32() {
+        if chunk.has_xxh3() {
+            check_xxh3(buffer, chunk.xxh3())
+        } else if chunk.has_crc32() {
             check_crc(buffer, chunk.crc32())
         } else {
             check_hash(buffer, chunk.chunk_id(), self.blob_digester())

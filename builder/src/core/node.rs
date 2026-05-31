@@ -25,7 +25,7 @@ use nydus_rafs::metadata::{Inode, RafsVersion};
 use nydus_storage::device::BlobFeatures;
 use nydus_storage::meta::{BlobChunkInfoV2Ondisk, BlobMetaChunkInfo};
 use nydus_utils::digest::{DigestHasher, RafsDigest};
-use nydus_utils::{compress, crc32, crypt};
+use nydus_utils::{compress, crc32, crypt, xxh3};
 use nydus_utils::{div_round_up, event_tracer, root_tracer, try_round_up_4k, ByteSize};
 use parse_size::parse_size;
 use sha2::digest::Digest;
@@ -335,9 +335,7 @@ impl Node {
                 external_compressed_offset += compressed_size as u64;
                 external_blob_ctx.chunk_size = external_chunk_size as u32;
 
-                if ctx.crc32_algorithm != crc32::Algorithm::None {
-                    self.set_external_chunk_crc32(ctx, &mut chunk, i)?
-                }
+                self.set_external_chunk_integrity(ctx, &mut chunk, i)?;
 
                 if let Some(h) = inode_hasher.as_mut() {
                     h.digest_update(chunk.id().as_ref());
@@ -429,13 +427,25 @@ impl Node {
         Ok(blob_size)
     }
 
-    fn set_external_chunk_crc32(
+    fn set_external_chunk_integrity(
         &self,
         ctx: &BuildContext,
         chunk: &mut ChunkWrapper,
         i: u32,
     ) -> Result<()> {
-        if let Some(crcs) = ctx.attributes.get_crcs(self.target()) {
+        if let Some(xxh3s) = ctx.attributes.get_xxh3s(self.target()) {
+            if xxh3s.is_empty() {
+                return Ok(());
+            }
+            if (i as usize) >= xxh3s.len() {
+                return Err(anyhow!(
+                    "invalid xxh3 index {} for file {}",
+                    i,
+                    self.target().display()
+                ));
+            }
+            chunk.set_xxh3(xxh3s[i as usize]);
+        } else if let Some(crcs) = ctx.attributes.get_crcs(self.target()) {
             if (i as usize) >= crcs.len() {
                 return Err(anyhow!(
                     "invalid crc index {} for file {}",
@@ -491,7 +501,9 @@ impl Node {
         // For tar-tarfs case, no need to compute chunk id.
         if ctx.conversion_type != ConversionType::TarToTarfs && !external {
             chunk.set_id(RafsDigest::from_buf(buf, ctx.digester));
-            if ctx.crc32_algorithm != crc32::Algorithm::None {
+            if ctx.xxh3_chunk_integrity && ctx.fs_version.is_v6() {
+                chunk.set_xxh3(xxh3::checksum(buf));
+            } else if ctx.crc32_algorithm != crc32::Algorithm::None {
                 chunk.set_has_crc32(true);
                 chunk.set_crc32(crc32::Crc32::new(ctx.crc32_algorithm).from_buf(buf));
             }
@@ -1236,10 +1248,10 @@ mod tests {
     }
 
     #[test]
-    fn test_set_external_chunk_crc32() {
+    fn test_set_external_chunk_integrity() {
         let mut ctx = BuildContext {
-            crc32_algorithm: crc32::Algorithm::Crc32Iscsi,
             attributes: Attributes {
+                xxh3s: HashMap::new(),
                 crcs: HashMap::new(),
                 ..Default::default()
             },
@@ -1247,11 +1259,14 @@ mod tests {
         };
         let target = PathBuf::from("/test_file");
         ctx.attributes
+            .xxh3s
+            .insert(target.clone(), vec![0x123456789abcdef0, 0xfedcba9876543210]);
+        ctx.attributes
             .crcs
             .insert(target.clone(), vec![0x12345678, 0x87654321]);
 
         let node = Node::new(
-            InodeWrapper::new(RafsVersion::V5),
+            InodeWrapper::new(RafsVersion::V6),
             NodeInfo {
                 path: target.clone(),
                 target: target.clone(),
@@ -1262,15 +1277,25 @@ mod tests {
 
         let mut chunk = node.inode.create_chunk();
         print!("target: {}", node.target().display());
-        let result = node.set_external_chunk_crc32(&ctx, &mut chunk, 1);
+        let result = node.set_external_chunk_integrity(&ctx, &mut chunk, 1);
+        assert!(result.is_ok());
+        assert_eq!(chunk.xxh3(), 0xfedcba9876543210);
+        assert!(chunk.has_xxh3());
+        assert!(!chunk.has_crc32());
+
+        // test invalid xxh3 index
+        let result = node.set_external_chunk_integrity(&ctx, &mut chunk, 2);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("invalid xxh3 index 2 for file /test_file"));
+
+        // test legacy crc32 fallback when xxh3s are not available
+        ctx.attributes.xxh3s.remove(&target);
+        let mut chunk = node.inode.create_chunk();
+        let result = node.set_external_chunk_integrity(&ctx, &mut chunk, 1);
         assert!(result.is_ok());
         assert_eq!(chunk.crc32(), 0x87654321);
         assert!(chunk.has_crc32());
-
-        // test invalid crc index
-        let result = node.set_external_chunk_crc32(&ctx, &mut chunk, 2);
-        assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
-        assert!(err.contains("invalid crc index 2 for file /test_file"));
+        assert!(!chunk.has_xxh3());
     }
 }

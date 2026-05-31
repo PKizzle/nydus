@@ -12,6 +12,7 @@ use gix_attributes::parse::Kind;
 
 const KEY_TYPE: &str = "type";
 const KEY_CRCS: &str = "crcs";
+const KEY_XXH3S: &str = "xxh3s";
 const VAL_EXTERNAL: &str = "external";
 
 pub struct Parser {}
@@ -25,6 +26,7 @@ pub struct Item {
 #[derive(Clone, Debug, Eq, PartialEq, Default)]
 pub struct Attributes {
     pub items: HashMap<PathBuf, HashMap<String, String>>,
+    pub xxh3s: HashMap<PathBuf, Vec<u64>>,
     pub crcs: HashMap<PathBuf, Vec<u32>>,
 }
 
@@ -35,6 +37,7 @@ impl Attributes {
         let _items = parse(&content);
 
         let mut items = HashMap::new();
+        let mut xxh3s = HashMap::new();
         let mut crcs = HashMap::new();
         for _item in _items {
             let _item = _item?;
@@ -46,6 +49,7 @@ impl Attributes {
                 let mut current_path = path.clone();
                 let mut attributes = HashMap::new();
                 let mut _type = String::new();
+                let mut _xxh3s = vec![];
                 let mut _crcs = vec![];
                 for line in _item.1 {
                     let line = line?;
@@ -69,8 +73,24 @@ impl Attributes {
                             })
                             .collect::<Result<Vec<u32>, _>>()?;
                     }
+                    if name == KEY_XXH3S {
+                        _xxh3s = state
+                            .to_string()
+                            .split(',')
+                            .map(|s| {
+                                let trimmed = s.trim();
+                                let hex_str = if let Some(stripped) = trimmed.strip_prefix("0x") {
+                                    stripped
+                                } else {
+                                    trimmed
+                                };
+                                u64::from_str_radix(hex_str, 16).map_err(|e| anyhow::anyhow!(e))
+                            })
+                            .collect::<Result<Vec<u64>, _>>()?;
+                    }
                     attributes.insert(name.to_string(), state.to_string());
                 }
+                xxh3s.insert(path.clone(), _xxh3s);
                 crcs.insert(path.clone(), _crcs);
                 items.insert(path, attributes);
 
@@ -89,7 +109,7 @@ impl Attributes {
             }
         }
 
-        Ok(Attributes { items, crcs })
+        Ok(Attributes { items, xxh3s, crcs })
     }
 
     fn check_external(&self, attributes: &HashMap<String, String>) -> bool {
@@ -123,6 +143,10 @@ impl Attributes {
     pub fn get_crcs<P: AsRef<Path>>(&self, path: P) -> Option<&Vec<u32>> {
         self.crcs.get(path.as_ref())
     }
+
+    pub fn get_xxh3s<P: AsRef<Path>>(&self, path: P) -> Option<&Vec<u64>> {
+        self.xxh3s.get(path.as_ref())
+    }
 }
 
 #[cfg(test)]
@@ -137,7 +161,7 @@ mod tests {
         let file = TempFile::new().unwrap();
         fs::write(
             file.as_path(),
-            "/foo type=external crcs=0x1234,0x5678
+            "/foo type=external xxh3s=0x123456789abcdef0,0xfedcba9876543210 crcs=0x1234,0x5678
             /bar type=external crcs=0x1234,0x5678
             /models/foo/bar type=external",
         )
@@ -149,6 +173,17 @@ mod tests {
                 .iter()
                 .cloned()
                 .collect();
+        let _attributes_with_xxh3: HashMap<String, String> = [
+            ("type".to_string(), "external".to_string()),
+            (
+                "xxh3s".to_string(),
+                "0x123456789abcdef0,0xfedcba9876543210".to_string(),
+            ),
+            ("crcs".to_string(), "0x1234,0x5678".to_string()),
+        ]
+        .iter()
+        .cloned()
+        .collect();
         let _attributes: HashMap<String, String> = [
             ("type".to_string(), "external".to_string()),
             ("crcs".to_string(), "0x1234,0x5678".to_string()),
@@ -160,7 +195,7 @@ mod tests {
         let items_map: HashMap<PathBuf, HashMap<String, String>> = vec![
             Item {
                 pattern: PathBuf::from("/foo"),
-                attributes: _attributes.clone(),
+                attributes: _attributes_with_xxh3.clone(),
             },
             Item {
                 pattern: PathBuf::from("/bar"),
@@ -184,6 +219,10 @@ mod tests {
         .collect();
 
         assert_eq!(attributes.items, items_map);
+        assert_eq!(
+            attributes.get_xxh3s("/foo"),
+            Some(&vec![0x123456789abcdef0, 0xfedcba9876543210])
+        );
         assert_eq!(attributes.get_crcs("/foo"), Some(&vec![0x1234, 0x5678]))
     }
 
