@@ -144,20 +144,12 @@ impl BlobFactory {
         }
         let backend = Self::new_backend(backend_cfg, id)?;
         let mgr = match cache_cfg.cache_type.as_str() {
-            "blobcache" | "filecache" => {
+            // `fanotify` is the on-demand pre-content path: it requires a real on-disk file cache
+            // because each blob's `.blob.data` file *is* the EROFS device the kernel reads from.
+            // Without this it would fall through to `DummyCacheMgr` (no `get_blob_object`, no
+            // backing file) and every pre-access event would read zeros.
+            "blobcache" | "filecache" | "fanotify" => {
                 let mgr = FileCacheMgr::new(
-                    cache_cfg,
-                    backend,
-                    ASYNC_RUNTIME.clone(),
-                    &config.id,
-                    user_io_batch_size,
-                )?;
-                mgr.init()?;
-                Arc::new(mgr) as Arc<dyn BlobCacheMgr>
-            }
-            #[cfg(target_os = "linux")]
-            "fscache" => {
-                let mgr = crate::cache::FsCacheMgr::new(
                     cache_cfg,
                     backend,
                     ASYNC_RUNTIME.clone(),

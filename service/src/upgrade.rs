@@ -9,10 +9,11 @@ use std::collections::HashMap;
 use std::convert::{TryFrom, TryInto};
 use std::fs::File;
 use std::io;
-use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::path::PathBuf;
+use std::str::FromStr;
 
-use nydus_api::BlobCacheEntry;
+use nydus_api::{BlobCacheEntry, ConfigV2};
 use nydus_upgrade::backend::unix_domain_socket::UdsStorageBackend;
 use nydus_upgrade::backend::{StorageBackend, StorageBackendErr};
 
@@ -36,8 +37,8 @@ pub enum UpgradeMgrError {
     Deserialize(io::Error),
     #[error("failed to clone file, {0}")]
     CloneFile(io::Error),
-    #[error("failed to initialize fscache driver, {0}")]
-    InitializeFscache(io::Error),
+    #[error("failed to initialize fanotify driver, {0}")]
+    InitializeFanotify(io::Error),
 }
 
 impl From<UpgradeMgrError> for Error {
@@ -78,10 +79,25 @@ impl TryFrom<&String> for FailoverPolicy {
     }
 }
 
-struct FscacheState {
-    blob_entry_map: HashMap<String, BlobCacheEntry>,
+/// Per-handler state needed to rebuild a [`crate::fanotify::FanotifyHandler`] around a fanotify
+/// group fd preserved across a hot upgrade. One entry per registered EROFS mount.
+#[derive(Clone, Debug)]
+struct FanotifyHandlerState {
+    image_id: String,
+    blob_dir: String,
+    mountpoint: String,
     threads: usize,
-    path: String,
+}
+
+/// State for fanotify pre-content backend (replaces the deprecated fscache backend).
+///
+/// `blob_entry_map` is the set of blob-cache entries to re-add on takeover; `handlers` records,
+/// per mount, where to re-derive device files. The preserved fanotify group fds themselves travel
+/// out-of-band as `SCM_RIGHTS` ancillary data (see [`UpgradeManager::fanotify_files`]); the i-th
+/// fd corresponds to `handlers[i]`.
+struct FanotifyState {
+    blob_entry_map: HashMap<String, BlobCacheEntry>,
+    handlers: Vec<FanotifyHandlerState>,
 }
 
 #[derive(Versionize, Clone, Debug)]
@@ -96,11 +112,27 @@ struct FusedevState {
     fuse_conn_id: u64,
 }
 
+fn redact_mount_cmd_secrets(mut cmd: FsBackendMountCmd) -> FsBackendMountCmd {
+    if matches!(&cmd.fs_type, crate::FsBackendType::Rafs) {
+        if let Ok(config) = ConfigV2::from_str(&cmd.config) {
+            match serde_json::to_string(&config.clone_without_secrets()) {
+                Ok(redacted) => cmd.config = redacted,
+                Err(e) => warn!("failed to redact mount configuration: {}", e),
+            }
+        }
+    }
+    cmd
+}
+
 /// Online upgrade manager.
 pub struct UpgradeManager {
-    fscache_deamon_stat: FscacheState,
+    fanotify_deamon_stat: FanotifyState,
     fuse_deamon_stat: FusedevState,
     file: Option<File>,
+    /// Fanotify group fds preserved across a hot upgrade, in the same order as
+    /// `fanotify_deamon_stat.handlers`. Held only between `save()` and process exit (the predecessor)
+    /// or between `restore()` and handler reconstruction (the successor).
+    fanotify_files: Vec<File>,
     backend: Box<dyn StorageBackend>,
 }
 
@@ -108,10 +140,9 @@ impl UpgradeManager {
     /// Create a new instance of [UpgradeManager].
     pub fn new(socket_path: PathBuf) -> Self {
         UpgradeManager {
-            fscache_deamon_stat: FscacheState {
+            fanotify_deamon_stat: FanotifyState {
                 blob_entry_map: HashMap::new(),
-                threads: 1,
-                path: "".to_string(),
+                handlers: Vec::new(),
             },
             fuse_deamon_stat: FusedevState {
                 fs_mount_cmd_map: HashMap::new(),
@@ -119,6 +150,7 @@ impl UpgradeManager {
                 fuse_conn_id: 0,
             },
             file: None,
+            fanotify_files: Vec::new(),
             backend: Box::new(UdsStorageBackend::new(socket_path)),
         }
     }
@@ -127,9 +159,9 @@ impl UpgradeManager {
         blob_state_id.push('/');
         blob_state_id.push_str(&entry.blob_id);
 
-        self.fscache_deamon_stat
+        self.fanotify_deamon_stat
             .blob_entry_map
-            .insert(blob_state_id, entry);
+            .insert(blob_state_id, entry.clone_without_secrets());
     }
 
     pub fn remove_blob_entry_state(&mut self, domain_id: &str, blob_id: &str) {
@@ -143,7 +175,7 @@ impl UpgradeManager {
         }
 
         if self
-            .fscache_deamon_stat
+            .fanotify_deamon_stat
             .blob_entry_map
             .remove(&blob_state_id)
             .is_none()
@@ -152,9 +184,32 @@ impl UpgradeManager {
         }
     }
 
-    pub fn save_fscache_states(&mut self, threads: usize, path: String) {
-        self.fscache_deamon_stat.path = path;
-        self.fscache_deamon_stat.threads = threads;
+    /// Persist fanotify daemon state plus the preserved group fds to the upgrade backend.
+    ///
+    /// `files` are dup'd fanotify group fds (one per handler, in `handlers` order); they are kept
+    /// alive in `self.fanotify_files` until the backend has transferred them via `SCM_RIGHTS`.
+    fn save_fanotify(&mut self, files: Vec<File>, data: &[u8]) -> Result<()> {
+        self.fanotify_files = files;
+        let fds: Vec<RawFd> = self.fanotify_files.iter().map(|f| f.as_raw_fd()).collect();
+        self.backend
+            .save(&fds, data)
+            .map_err(UpgradeMgrError::StorageBackendError)?;
+        Ok(())
+    }
+
+    /// Restore the preserved fanotify group fds and serialized daemon state from the backend.
+    ///
+    /// Returns the fds (as owning `File`s, in `handlers` order) and the serialized state blob.
+    fn restore_fanotify(&mut self) -> Result<(Vec<File>, Vec<u8>)> {
+        let (fds, state_data) = self
+            .backend
+            .restore()
+            .map_err(UpgradeMgrError::StorageBackendError)?;
+        let files = fds
+            .into_iter()
+            .map(|fd| unsafe { File::from_raw_fd(fd) })
+            .collect();
+        Ok((files, state_data))
     }
 
     pub fn save_fuse_cid(&mut self, fuse_conn_id: u64) {
@@ -173,7 +228,7 @@ impl UpgradeManager {
     /// Add a filesystem instance into the upgrade manager.
     pub fn add_mounts_state(&mut self, cmd: FsBackendMountCmd, vfs_index: u8) {
         let cmd_wrapper = MountStateWrapper {
-            cmd: cmd.clone(),
+            cmd: redact_mount_cmd_secrets(cmd.clone()),
             vfs_index,
         };
         self.fuse_deamon_stat
@@ -189,7 +244,7 @@ impl UpgradeManager {
             .get_mut(&cmd.mountpoint)
         {
             Some(cmd_wrapper) => {
-                cmd_wrapper.cmd = cmd;
+                cmd_wrapper.cmd = redact_mount_cmd_secrets(cmd);
                 Ok(())
             }
             None => Err(Error::NotFound),
@@ -260,8 +315,8 @@ impl UpgradeManager {
     }
 }
 #[cfg(target_os = "linux")]
-/// Online upgrade utilities for fscache daemon.
-pub mod fscache_upgrade {
+/// Online upgrade utilities for fanotify daemon.
+pub mod fanotify_upgrade {
     use std::convert::TryFrom;
     use std::str::FromStr;
 
@@ -277,42 +332,59 @@ pub mod fscache_upgrade {
         json_str: String,
     }
 
+    /// Versionize mirror of [`FanotifyHandlerState`] for the upgrade backend.
     #[derive(Versionize, Clone, Default, Debug)]
-    pub struct FscacheBackendState {
-        blob_entry_list: Vec<(String, BlobCacheEntryState)>,
+    pub struct FanotifyHandlerStateV {
+        image_id: String,
+        blob_dir: String,
+        mountpoint: String,
         threads: usize,
-        path: String,
     }
 
-    impl Snapshotter for FscacheBackendState {
+    #[derive(Versionize, Clone, Default, Debug)]
+    pub struct FanotifyBackendState {
+        blob_entry_list: Vec<(String, BlobCacheEntryState)>,
+        handlers: Vec<FanotifyHandlerStateV>,
+    }
+
+    impl Snapshotter for FanotifyBackendState {
         fn get_versions() -> Vec<HashMap<TypeId, u16>> {
             vec![
                 // version 1
-                HashMap::from([(FscacheBackendState::type_id(), 1)]),
+                HashMap::from([(FanotifyBackendState::type_id(), 1)]),
                 // more versions for the future
             ]
         }
     }
 
-    impl TryFrom<&FscacheBackendState> for FscacheState {
+    impl TryFrom<&FanotifyBackendState> for FanotifyState {
         type Error = std::io::Error;
-        fn try_from(backend_stat: &FscacheBackendState) -> std::result::Result<Self, Self::Error> {
+        fn try_from(backend_stat: &FanotifyBackendState) -> std::result::Result<Self, Self::Error> {
             let mut map = HashMap::new();
             for (id, entry_stat) in &backend_stat.blob_entry_list {
                 let entry = BlobCacheEntry::from_str(&entry_stat.json_str)?;
                 map.insert(id.to_string(), entry);
             }
-            Ok(FscacheState {
+            let handlers = backend_stat
+                .handlers
+                .iter()
+                .map(|h| FanotifyHandlerState {
+                    image_id: h.image_id.clone(),
+                    blob_dir: h.blob_dir.clone(),
+                    mountpoint: h.mountpoint.clone(),
+                    threads: h.threads,
+                })
+                .collect();
+            Ok(FanotifyState {
                 blob_entry_map: map,
-                threads: backend_stat.threads,
-                path: backend_stat.path.clone(),
+                handlers,
             })
         }
     }
 
-    impl TryFrom<&FscacheState> for FscacheBackendState {
+    impl TryFrom<&FanotifyState> for FanotifyBackendState {
         type Error = std::io::Error;
-        fn try_from(stat: &FscacheState) -> std::result::Result<Self, Self::Error> {
+        fn try_from(stat: &FanotifyState) -> std::result::Result<Self, Self::Error> {
             let mut list = Vec::new();
             for (id, entry) in &stat.blob_entry_map {
                 let entry_stat = serde_json::to_string(&entry)?;
@@ -323,36 +395,74 @@ pub mod fscache_upgrade {
                     },
                 ));
             }
-            Ok(FscacheBackendState {
+            let handlers = stat
+                .handlers
+                .iter()
+                .map(|h| FanotifyHandlerStateV {
+                    image_id: h.image_id.clone(),
+                    blob_dir: h.blob_dir.clone(),
+                    mountpoint: h.mountpoint.clone(),
+                    threads: h.threads,
+                })
+                .collect();
+            Ok(FanotifyBackendState {
                 blob_entry_list: list,
-                threads: stat.threads,
-                path: stat.path.clone(),
+                handlers,
             })
         }
     }
 
+    /// Save fanotify daemon state for a hot upgrade.
+    ///
+    /// Snapshots the live handlers (image_id, blob_dir, mountpoint, threads) and hands their
+    /// fanotify group fds — which carry the live `FAN_PRE_ACCESS` marks — to the successor via the
+    /// upgrade backend's `SCM_RIGHTS` channel. The EROFS mounts stay up throughout, so workloads
+    /// keep reading while the daemon is replaced.
     pub fn save(daemon: &ServiceController) -> Result<()> {
         if let Some(mut mgr) = daemon.upgrade_mgr() {
-            let backend_stat = FscacheBackendState::try_from(&mgr.fscache_deamon_stat)
+            // Snapshot live handlers + dup'd group fds in a single, consistent order.
+            let live = daemon
+                .collect_fanotify_upgrade_state()
+                .map_err(UpgradeMgrError::CloneFile)?;
+            let mut handlers = Vec::with_capacity(live.len());
+            let mut files = Vec::with_capacity(live.len());
+            for (image_id, blob_dir, mountpoint, threads, file) in live {
+                handlers.push(FanotifyHandlerState {
+                    image_id,
+                    blob_dir,
+                    mountpoint,
+                    threads,
+                });
+                files.push(file);
+            }
+            mgr.fanotify_deamon_stat.handlers = handlers;
+
+            let backend_stat = FanotifyBackendState::try_from(&mgr.fanotify_deamon_stat)
                 .map_err(UpgradeMgrError::Serialize)?;
             let stat = backend_stat.save().map_err(UpgradeMgrError::Serialize)?;
-            mgr.save(&stat)?;
+            mgr.save_fanotify(files, &stat)?;
         }
         Ok(())
     }
 
+    /// Restore fanotify daemon state after a hot upgrade / takeover.
+    ///
+    /// Re-adds the blob-cache entries, then rebuilds every handler around its preserved fanotify fd
+    /// (no re-arm, no re-mount — the marks and mount survived) and starts its workers, so the new
+    /// daemon resumes serving the still-mounted EROFS filesystems.
     pub fn restore(daemon: &ServiceController) -> Result<()> {
         if let Some(mut mgr) = daemon.upgrade_mgr() {
             if let Some(blob_mgr) = daemon.get_blob_cache_mgr() {
-                // restore the mgr state via the backend in the mgr
-                let mut state_data = mgr.restore()?;
+                // restore the preserved fds + serialized state via the backend in the mgr
+                let (files, mut state_data) = mgr.restore_fanotify()?;
 
-                let backend_stat = FscacheBackendState::restore(&mut state_data)
+                let backend_stat = FanotifyBackendState::restore(&mut state_data)
                     .map_err(UpgradeMgrError::Deserialize)?;
 
                 let stat =
-                    FscacheState::try_from(&backend_stat).map_err(UpgradeMgrError::Deserialize)?;
-                // restore blob entry
+                    FanotifyState::try_from(&backend_stat).map_err(UpgradeMgrError::Deserialize)?;
+
+                // Re-add blob entries first so handler reconstruction sees a populated cache.
                 stat.blob_entry_map
                     .iter()
                     .try_for_each(|(_, entry)| -> Result<()> {
@@ -362,15 +472,29 @@ pub mod fscache_upgrade {
                         Ok(())
                     })?;
 
-                // init fscache daemon with restored fd
-                if let Some(f) = mgr.return_file() {
-                    daemon
-                        .initialize_fscache_service(None, stat.threads, &stat.path, Some(&f))
-                        .map_err(UpgradeMgrError::InitializeFscache)?;
+                if files.len() != stat.handlers.len() {
+                    warn!(
+                        "fanotify upgrade: {} preserved fds but {} handler records; reconstructing the overlap only",
+                        files.len(),
+                        stat.handlers.len()
+                    );
                 }
 
-                //restore upgrade manager fscache stat
-                mgr.fscache_deamon_stat = stat;
+                // Rebuild each handler from its preserved group fd (fds[i] <-> handlers[i]).
+                for (desc, file) in stat.handlers.iter().zip(files) {
+                    daemon
+                        .restore_fanotify_handler(
+                            &desc.image_id,
+                            &desc.blob_dir,
+                            &desc.mountpoint,
+                            desc.threads,
+                            file,
+                        )
+                        .map_err(UpgradeMgrError::InitializeFanotify)?;
+                }
+
+                // Restore upgrade manager state
+                mgr.fanotify_deamon_stat = stat;
                 return Ok(());
             }
         }
@@ -514,7 +638,7 @@ mod tests {
     use super::*;
     use crate::fs_service::{FsBackendMountCmd, FsBackendUmountCmd};
     #[cfg(target_os = "linux")]
-    use crate::upgrade::fscache_upgrade::FscacheBackendState;
+    use crate::upgrade::fanotify_upgrade::FanotifyBackendState;
     use crate::upgrade::fusedev_upgrade::FusedevBackendState;
     use crate::FsBackendType;
     use nydus_upgrade::persist::Snapshotter;
@@ -564,48 +688,109 @@ mod tests {
 
     #[test]
     #[cfg(target_os = "linux")]
-    fn test_upgrade_manager_for_fscache() {
+    fn test_upgrade_manager_for_fanotify() {
         let mut upgrade_mgr = UpgradeManager::new("dummy_socket".into());
 
         let content = r#"{
             "type": "bootstrap",
             "id": "blob1",
-            "config": {
+            "config_v2": {
+                "version": 2,
                 "id": "cache1",
-                "backend_type": "localfs",
-                "backend_config": {},
-                "cache_type": "fscache",
-                "cache_config": {},
+                "backend": {
+                    "type": "localfs",
+                    "localfs": { "dir": "/tmp/nydus" }
+                },
+                "cache": {
+                    "type": "fanotify",
+                    "fanotify": { "work_dir": "/tmp" }
+                },
                 "metadata_path": "/tmp/metadata1"
             },
             "domain_id": "domain1"
         }"#;
         let entry: BlobCacheEntry = serde_json::from_str(content).unwrap();
-        upgrade_mgr.save_fscache_states(4, "/tmp/fscache_dir".to_string());
-        assert_eq!(upgrade_mgr.fscache_deamon_stat.threads, 4);
-        assert_eq!(upgrade_mgr.fscache_deamon_stat.path, "/tmp/fscache_dir");
+        upgrade_mgr.fanotify_deamon_stat.handlers = vec![FanotifyHandlerState {
+            image_id: "_cli".to_string(),
+            blob_dir: "/tmp/fanotify_dir".to_string(),
+            mountpoint: "/tmp/fanotify_mnt".to_string(),
+            threads: 4,
+        }];
 
         upgrade_mgr.add_blob_entry_state(entry);
         assert!(upgrade_mgr
-            .fscache_deamon_stat
+            .fanotify_deamon_stat
             .blob_entry_map
             .contains_key("domain1/blob1"));
 
-        assert!(FscacheBackendState::try_from(&upgrade_mgr.fscache_deamon_stat).is_ok());
+        assert!(FanotifyBackendState::try_from(&upgrade_mgr.fanotify_deamon_stat).is_ok());
 
-        let backend_stat = FscacheBackendState::try_from(&upgrade_mgr.fscache_deamon_stat).unwrap();
+        let backend_stat =
+            FanotifyBackendState::try_from(&upgrade_mgr.fanotify_deamon_stat).unwrap();
         assert!(backend_stat.save().is_ok());
-        assert!(FscacheState::try_from(&backend_stat).is_ok());
-        let stat = FscacheState::try_from(&backend_stat).unwrap();
-        assert_eq!(stat.path, upgrade_mgr.fscache_deamon_stat.path);
-        assert_eq!(stat.threads, upgrade_mgr.fscache_deamon_stat.threads);
+        assert!(FanotifyState::try_from(&backend_stat).is_ok());
+        let stat = FanotifyState::try_from(&backend_stat).unwrap();
+        assert_eq!(stat.handlers.len(), 1);
+        assert_eq!(stat.handlers[0].image_id, "_cli");
+        assert_eq!(stat.handlers[0].blob_dir, "/tmp/fanotify_dir");
+        assert_eq!(stat.handlers[0].mountpoint, "/tmp/fanotify_mnt");
+        assert_eq!(stat.handlers[0].threads, 4);
         assert!(stat.blob_entry_map.contains_key("domain1/blob1"));
 
         upgrade_mgr.remove_blob_entry_state("domain1", "blob1");
         assert!(!upgrade_mgr
-            .fscache_deamon_stat
+            .fanotify_deamon_stat
             .blob_entry_map
             .contains_key("domain1/blob1"));
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_upgrade_manager_redacts_fanotify_blob_entry_secrets() {
+        let mut upgrade_mgr = UpgradeManager::new("dummy_socket".into());
+        let content = r#"{
+            "type": "bootstrap",
+            "id": "blob1",
+            "config_v2": {
+                "version": 2,
+                "id": "cache1",
+                "backend": {
+                    "type": "registry",
+                    "registry": {
+                        "host": "registry.example.com",
+                        "repo": "library/test",
+                        "auth": "dXNlcjpwYXNz",
+                        "registry_token": "bearer-token"
+                    }
+                },
+                "cache": {
+                    "type": "filecache",
+                    "filecache": {
+                        "work_dir": "/tmp"
+                    }
+                },
+                "metadata_path": "/tmp/bootstrap"
+            },
+            "domain_id": "domain1"
+        }"#;
+        let entry: BlobCacheEntry = serde_json::from_str(content).unwrap();
+
+        upgrade_mgr.add_blob_entry_state(entry);
+        let saved = upgrade_mgr
+            .fanotify_deamon_stat
+            .blob_entry_map
+            .get("domain1/blob1")
+            .unwrap();
+        let registry = saved
+            .blob_config
+            .as_ref()
+            .unwrap()
+            .backend
+            .registry
+            .as_ref()
+            .unwrap();
+        assert!(registry.auth.is_none());
+        assert!(registry.registry_token.is_none());
     }
 
     #[test]
@@ -622,8 +807,8 @@ mod tests {
                 }
             },
             "cache": {
-                "type": "fscache",
-                "fscache": {
+                "type": "filecache",
+                "filecache": {
                     "work_dir": "/tmp/nydus"
                 }
             },
@@ -661,6 +846,65 @@ mod tests {
             .fuse_deamon_stat
             .fs_mount_cmd_map
             .contains_key("testmonutount"));
+    }
+
+    #[test]
+    fn test_upgrade_manager_redacts_fusedev_mount_config_secrets() {
+        let mut upgrade_mgr = UpgradeManager::new("dummy_socket".into());
+
+        let config = r#"{
+            "version": 2,
+            "id": "factory1",
+            "backend": {
+                "type": "registry",
+                "registry": {
+                    "host": "registry.example.com",
+                    "repo": "library/test",
+                    "auth": "dXNlcjpwYXNz",
+                    "registry_token": "bearer-token"
+                }
+            },
+            "cache": {
+                "type": "filecache",
+                "filecache": {
+                    "work_dir": "/tmp",
+                    "encryption_key": "secret-key"
+                }
+            }
+        }"#;
+        let cmd = FsBackendMountCmd {
+            fs_type: FsBackendType::Rafs,
+            config: config.to_string(),
+            mountpoint: "testmount".to_string(),
+            source: "testsource".to_string(),
+            prefetch_files: None,
+        };
+
+        upgrade_mgr.add_mounts_state(cmd, 1);
+        let saved = upgrade_mgr
+            .fuse_deamon_stat
+            .fs_mount_cmd_map
+            .get("testmount")
+            .unwrap();
+        let redacted = ConfigV2::from_str(&saved.cmd.config).unwrap();
+        let registry = redacted
+            .backend
+            .as_ref()
+            .unwrap()
+            .registry
+            .as_ref()
+            .unwrap();
+        assert!(registry.auth.is_none());
+        assert!(registry.registry_token.is_none());
+        assert!(redacted
+            .cache
+            .as_ref()
+            .unwrap()
+            .file_cache
+            .as_ref()
+            .unwrap()
+            .encryption_key
+            .is_empty());
     }
 
     #[test]

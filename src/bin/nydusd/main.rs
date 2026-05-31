@@ -168,24 +168,23 @@ fn append_virtiofs_subcmd_options(cmd: Command) -> Command {
     cmd.subcommand(subcmd)
 }
 
-fn append_fscache_options(app: Command) -> Command {
+fn append_fanotify_options(app: Command) -> Command {
     app.arg(
-        Arg::new("fscache")
-            .long("fscache")
-            .short('F')
-            .help("Working directory for Linux fscache driver to store cache files"),
+        Arg::new("fanotify")
+            .long("fanotify")
+            .help("Directory with bootstrap + sparse blob files for fanotify-based on-demand access. Requires Linux ≥ 6.14."),
     )
     .arg(
-        Arg::new("fscache-tag")
-            .long("fscache-tag")
-            .help("Tag to identify the fscache daemon instance")
-            .requires("fscache"),
+        Arg::new("fanotify-mountpoint")
+            .long("fanotify-mountpoint")
+            .help("Mountpoint for the EROFS filesystem served via fanotify")
+            .requires("fanotify"),
     )
     .arg(
-        Arg::new("fscache-threads")
-            .long("fscache-threads")
+        Arg::new("fanotify-threads")
+            .long("fanotify-threads")
             .default_value("4")
-            .help("Number of working threads to serve fscache requests")
+            .help("Number of working threads to serve fanotify pre-content events")
             .required(false)
             .value_parser(thread_validator),
     )
@@ -193,8 +192,8 @@ fn append_fscache_options(app: Command) -> Command {
 
 fn append_singleton_subcmd_options(cmd: Command) -> Command {
     let subcmd = Command::new("singleton")
-        .about("Run the Nydus daemon to host multiple blobcache/fscache/fuse/virtio-fs services");
-    let subcmd = append_fscache_options(subcmd);
+        .about("Run the Nydus daemon to host multiple blobcache/fanotify/fuse/virtio-fs services");
+    let subcmd = append_fanotify_options(subcmd);
 
     // TODO: enable support of fuse service
     /*
@@ -213,7 +212,7 @@ fn append_singleton_subcmd_options(cmd: Command) -> Command {
 
 fn prepare_commandline_options() -> Command {
     let cmdline = Command::new("nydusd")
-        .about("Nydus daemon to provide BlobCache, FsCache, FUSE, Virtio-fs and container image services")
+        .about("Nydus daemon to provide BlobCache, Fanotify, FUSE, Virtio-fs and container image services")
         .arg(
             Arg::new("apisock")
                 .long("apisock")
@@ -297,7 +296,7 @@ fn prepare_commandline_options() -> Command {
     let cmdline = append_virtiofs_subcmd_options(cmdline);
     #[cfg(feature = "block-nbd")]
     let cmdline = self::nbd::append_nbd_subcmd_options(cmdline);
-    #[cfg(feature = "block-uffd")]
+    #[cfg(all(target_os = "linux", feature = "block-uffd"))]
     let cmdline = self::uffd::append_uffd_subcmd_options(cmdline);
     append_singleton_subcmd_options(cmdline)
 }
@@ -570,16 +569,16 @@ fn process_singleton_arguments(
             Some(config)
         }
     };
-    let fscache = subargs.value_of("fscache").map(|s| s.as_str());
-    let tag = subargs.value_of("fscache-tag").map(|s| s.as_str());
-    let threads = subargs.value_of("fscache-threads").map(|s| s.as_str());
+    let fanotify_blob_dir = subargs.value_of("fanotify").map(|s| s.as_str());
+    let fanotify_mountpoint = subargs.value_of("fanotify-mountpoint").map(|s| s.as_str());
+    let fanotify_threads = subargs.value_of("fanotify-threads").map(|s| s.as_str());
     info!("Start Nydus daemon in singleton mode!");
     let daemon = create_daemon(
         id,
         supervisor,
-        fscache,
-        tag,
-        threads,
+        fanotify_blob_dir,
+        fanotify_mountpoint,
+        fanotify_threads,
         config,
         bti,
         DAEMON_CONTROLLER.alloc_waker(),
@@ -729,7 +728,7 @@ mod nbd {
     }
 }
 
-#[cfg(feature = "block-uffd")]
+#[cfg(all(target_os = "linux", feature = "block-uffd"))]
 mod uffd {
     use super::*;
     use nydus_api::BlobCacheEntry;
@@ -966,7 +965,7 @@ fn main() -> Result<()> {
             let subargs = SubCmdArgs::new(&args, subargs);
             self::nbd::process_nbd_service(subargs, bti, apisock)?;
         }
-        #[cfg(feature = "block-uffd")]
+        #[cfg(all(target_os = "linux", feature = "block-uffd"))]
         Some("uffd") => {
             // Safe to unwrap because the subcommand is `uffd`.
             let subargs = args.subcommand_matches("uffd").unwrap();

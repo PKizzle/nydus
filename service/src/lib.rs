@@ -9,7 +9,7 @@
 //!   filesystem can be mounted by EROFS inside guest.
 //! - `blockdev`: compose processed RAFS metadata/data as a block device, so it can be used as
 //!   backend for virtio-blk.
-//! - `fscache`: cooperate Linux fscache subsystem to mount RAFS filesystems by EROFS.
+//! - `fanotify`: mount RAFS filesystems using EROFS + fanotify pre-content hooks (Linux ≥ 6.14).
 //! - `fuse`: mount RAFS filesystems as FUSE filesystems.
 
 #[macro_use]
@@ -42,6 +42,7 @@ pub use blob_cache::BlobCacheMgr;
 pub use fs_service::{FsBackendCollection, FsBackendMountCmd, FsBackendUmountCmd, FsService};
 pub use fusedev::{create_fuse_daemon, create_vfs_backend, FusedevDaemon};
 pub use singleton::create_daemon;
+pub use singleton::ServiceController;
 
 #[cfg(target_os = "linux")]
 pub mod blob_cache;
@@ -52,12 +53,14 @@ pub mod block_nbd;
 #[cfg(all(target_os = "linux", feature = "block-uffd"))]
 pub mod block_uffd;
 #[cfg(target_os = "linux")]
-mod fs_cache;
+pub mod fanotify;
+#[cfg(target_os = "linux")]
+mod fanotify_sys;
 #[cfg(all(target_os = "linux", feature = "block-uffd"))]
 pub mod uffd_proto;
 
 #[cfg(target_os = "linux")]
-pub use fs_cache::FsCacheHandler;
+pub use fanotify::FanotifyHandler;
 
 /// Error code related to Nydus library.
 #[derive(thiserror::Error, Debug)]

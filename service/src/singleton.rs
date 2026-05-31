@@ -2,12 +2,12 @@
 //
 // SPDX-License-Identifier: (Apache-2.0 AND BSD-3-Clause)
 
-//! Nydus daemon to host multiple services, including fscache and fusedev.
+//! Nydus daemon to host multiple services, including fanotify and fusedev.
 
 use std::any::Any;
-use std::fs::metadata;
 #[cfg(target_os = "linux")]
-use std::fs::{File, OpenOptions};
+use std::collections::HashMap;
+use std::fs::metadata;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
@@ -23,8 +23,6 @@ use crate::daemon::{
     NydusDaemon,
 };
 use crate::fs_service::FsService;
-#[cfg(target_os = "linux")]
-use crate::upgrade;
 use crate::upgrade::UpgradeManager;
 use crate::{BlobCacheMgr, Error, Result};
 
@@ -40,35 +38,26 @@ pub struct ServiceController {
 
     blob_cache_mgr: Arc<BlobCacheMgr>,
     upgrade_mgr: Option<Mutex<UpgradeManager>>,
-    fscache_enabled: AtomicBool,
+    fanotify_enabled: AtomicBool,
+    /// Maps image_id -> FanotifyHandler. Supports multiple concurrent fanotify
+    /// mounts served by a single daemon (one handler per image).
     #[cfg(target_os = "linux")]
-    fscache: Mutex<Option<Arc<crate::fs_cache::FsCacheHandler>>>,
+    fanotify: Mutex<HashMap<String, Arc<crate::fanotify::FanotifyHandler>>>,
 }
 
 impl ServiceController {
     /// Start all enabled services.
+    ///
+    /// Fanotify handlers own their full lifecycle (spawn workers + `arm()` +
+    /// `mount()`) inside [`register_fanotify_handler`], which is the only place
+    /// that inserts into the `fanotify` map: both the CLI path (before the
+    /// `Start` event) and the runtime HTTP path. Re-spawning/re-mounting them
+    /// here would double the worker count (breaking `FanotifyHandler`'s
+    /// `Barrier::new(threads + 1)` on shutdown) and call `mount(2)` twice on the
+    /// same target (EBUSY). So this hook must not touch already-registered
+    /// handlers.
     fn start_services(&self) -> std::io::Result<()> {
         info!("Starting all Nydus services...");
-
-        #[cfg(target_os = "linux")]
-        if self.fscache_enabled.load(Ordering::Acquire) {
-            if let Some(fscache) = self.fscache.lock().unwrap().clone() {
-                for _ in 0..fscache.working_threads() {
-                    let fscache2 = fscache.clone();
-                    let waker = self.waker.clone();
-                    std::thread::spawn(move || {
-                        if let Err(e) = fscache2.run_loop() {
-                            error!("Failed to run fscache service loop, {}", e);
-                        }
-                        // Notify the global service controller that one working thread is exiting.
-                        if let Err(err) = waker.wake() {
-                            error!("fail to exit daemon, error: {:?}", err);
-                        }
-                    });
-                }
-            }
-        }
-
         Ok(())
     }
 
@@ -77,9 +66,11 @@ impl ServiceController {
         info!("Stopping all Nydus services...");
 
         #[cfg(target_os = "linux")]
-        if self.fscache_enabled.load(Ordering::Acquire) {
-            if let Some(fscache) = self.fscache.lock().unwrap().take() {
-                fscache.stop();
+        {
+            let mut handlers = self.fanotify.lock().unwrap();
+            for (image_id, fanotify) in handlers.drain() {
+                info!("Stopping fanotify handler for {}", image_id);
+                fanotify.stop();
             }
         }
     }
@@ -103,64 +94,178 @@ impl ServiceController {
     }
 }
 
+/// Snapshot of one live fanotify handler for a hot upgrade:
+/// `(image_id, blob_dir, mountpoint, threads, preserved fanotify group fd)`.
+#[cfg(target_os = "linux")]
+type FanotifyHandlerSnapshot = (String, String, String, usize, std::fs::File);
+
 #[cfg(target_os = "linux")]
 impl ServiceController {
-    pub fn initialize_fscache_service(
+    /// Initialize the fanotify-based on-demand service from command-line arguments.
+    ///
+    /// `blob_dir` must contain a `bootstrap` file and sparse `blob_<sha256>` files
+    /// produced by `nydus-image`. `mountpoint` is where the EROFS filesystem will
+    /// be mounted. `threads` controls the number of worker threads polling fanotify events.
+    pub fn initialize_fanotify_service(
         &self,
-        tag: Option<&str>,
+        blob_dir: &str,
+        mountpoint: &str,
         threads: usize,
-        path: &str,
-        file: Option<&File>,
     ) -> std::io::Result<()> {
-        // Validate --fscache option value is an existing directory.
-        let p = match std::path::Path::new(&path).canonicalize() {
-            Err(e) => {
-                error!("--fscache option needs a directory to cache files");
-                return Err(e);
-            }
-            Ok(v) => {
-                if !v.is_dir() {
-                    error!("--fscache options needs a directory to cache files");
-                    return Err(einval!("--fscache options is not a directory"));
-                }
-                v
-            }
-        };
-        let p = match p.to_str() {
-            Some(v) => v,
-            None => {
-                error!("--fscache option contains invalid characters");
-                return Err(einval!("--fscache option contains invalid characters"));
-            }
-        };
+        self.register_fanotify_handler("_cli", blob_dir, mountpoint, threads)
+    }
 
+    /// Register a new fanotify handler for an image.
+    ///
+    /// This creates a `FanotifyHandler`, places fanotify marks on the blob files,
+    /// mounts the EROFS filesystem, and starts worker threads.
+    /// The `image_id` is used as a unique key to identify this handler.
+    pub fn register_fanotify_handler(
+        &self,
+        image_id: &str,
+        blob_dir: &str,
+        mountpoint: &str,
+        threads: usize,
+    ) -> std::io::Result<()> {
         info!(
-            "Create fscache instance at {} with tag {}, {} working threads",
-            p,
-            tag.unwrap_or("<none>"),
-            threads
+            "Register fanotify handler for image {} at {} mountpoint {}, {} working threads",
+            image_id, blob_dir, mountpoint, threads
         );
-        let fscache = crate::fs_cache::FsCacheHandler::new(
-            "/dev/cachefiles",
-            p,
-            tag,
+        let fanotify = Arc::new(crate::fanotify::FanotifyHandler::new(
+            blob_dir,
+            mountpoint,
             self.blob_cache_mgr.clone(),
             threads,
-            file,
-        )?;
-        *self.fscache.lock().unwrap() = Some(Arc::new(fscache));
-        self.fscache_enabled.store(true, Ordering::Release);
+        )?);
+
+        // Start worker threads BEFORE mounting. The EROFS mount opens and reads the marked blob
+        // (and bootstrap) device files, which raises FAN_OPEN_PERM / FAN_PRE_ACCESS events that
+        // must be answered by a draining worker. If we mounted first, `mount(2)` would block in
+        // the kernel waiting for a response that no running thread could provide -> deadlock
+        // (the daemon hangs in uninterruptible `D` state and the mount never appears).
+        self.spawn_fanotify_workers(image_id, &fanotify);
+
+        // Arm the marks now that workers are draining, then mount. Pre-content events raised by the
+        // EROFS reads that follow the mount are served by the workers spawned above.
+        fanotify.arm()?;
+        fanotify.mount()?;
+
+        let mut handlers = self.fanotify.lock().unwrap();
+        handlers.insert(image_id.to_string(), fanotify);
+        self.fanotify_enabled.store(true, Ordering::Release);
 
         Ok(())
     }
 
-    fn get_fscache_file(&self) -> std::io::Result<File> {
-        if let Some(fscache) = self.fscache.lock().unwrap().clone() {
-            let f = fscache.get_file().try_clone()?;
-            Ok(f)
-        } else {
-            Err(einval!("fscache file not init"))
+    /// Spawn `working_threads()` worker threads to drain events for `fanotify`.
+    ///
+    /// Shared by the fresh-registration path ([`register_fanotify_handler`]) and the hot-upgrade
+    /// reconstruction path ([`restore_fanotify_handler`]). Each worker wakes the daemon's mio loop
+    /// on exit so a crashed worker can tear the daemon down.
+    fn spawn_fanotify_workers(
+        &self,
+        image_id: &str,
+        fanotify: &Arc<crate::fanotify::FanotifyHandler>,
+    ) {
+        for _ in 0..fanotify.working_threads() {
+            let f2 = fanotify.clone();
+            let waker = self.waker.clone();
+            let id = image_id.to_string();
+            std::thread::spawn(move || {
+                if let Err(e) = f2.run_loop() {
+                    error!("Failed to run fanotify service loop for {}: {}", id, e);
+                }
+                if let Err(err) = waker.wake() {
+                    error!("fanotify: fail to exit daemon, error: {:?}", err);
+                }
+            });
         }
+    }
+
+    /// Rebuild a fanotify handler from a fanotify group fd preserved across a hot upgrade.
+    ///
+    /// The marks and EROFS mount survived the daemon swap (the fd kept the group alive), so this
+    /// reconstructs the in-memory handler around the inherited fd and starts its workers **without**
+    /// re-arming marks or re-mounting. Workers start before insertion so any faults queued during
+    /// the daemon gap are drained immediately.
+    pub fn restore_fanotify_handler(
+        &self,
+        image_id: &str,
+        blob_dir: &str,
+        mountpoint: &str,
+        threads: usize,
+        fan_file: std::fs::File,
+    ) -> std::io::Result<()> {
+        info!(
+            "Restore fanotify handler for image {} at {} mountpoint {}, {} working threads",
+            image_id, blob_dir, mountpoint, threads
+        );
+        let fanotify = Arc::new(crate::fanotify::FanotifyHandler::from_restored_fd(
+            blob_dir,
+            mountpoint,
+            self.blob_cache_mgr.clone(),
+            threads,
+            fan_file,
+        )?);
+
+        self.spawn_fanotify_workers(image_id, &fanotify);
+
+        let mut handlers = self.fanotify.lock().unwrap();
+        handlers.insert(image_id.to_string(), fanotify);
+        self.fanotify_enabled.store(true, Ordering::Release);
+
+        Ok(())
+    }
+
+    /// Snapshot the live fanotify handlers for a hot upgrade.
+    ///
+    /// Returns, per handler, the metadata needed to rebuild it plus a dup of its fanotify group fd
+    /// (the dup keeps the group, and its marks, alive after this daemon exits and until the
+    /// backend transfers it). Order is stable so it lines up with the serialized handler list.
+    pub fn collect_fanotify_upgrade_state(&self) -> std::io::Result<Vec<FanotifyHandlerSnapshot>> {
+        let handlers = self.fanotify.lock().unwrap();
+        let mut out = Vec::with_capacity(handlers.len());
+        for (image_id, fanotify) in handlers.iter() {
+            let file = fanotify.get_file()?;
+            out.push((
+                image_id.clone(),
+                fanotify.blob_dir().to_string_lossy().into_owned(),
+                fanotify.mountpoint().to_string_lossy().into_owned(),
+                fanotify.working_threads(),
+                file,
+            ));
+        }
+        Ok(out)
+    }
+
+    /// Unregister a fanotify handler for an image.
+    ///
+    /// This stops the worker threads and unmounts the EROFS filesystem.
+    pub fn unregister_fanotify_handler(&self, image_id: &str) -> std::io::Result<()> {
+        info!("Unregister fanotify handler for image {}", image_id);
+        let mut handlers = self.fanotify.lock().unwrap();
+        let mut is_empty = handlers.is_empty();
+        if let Some(fanotify) = handlers.remove(image_id) {
+            is_empty = handlers.is_empty();
+            fanotify.stop();
+            // Unmount the EROFS filesystem
+            let mountpoint = fanotify.mountpoint().to_path_buf();
+            drop(handlers); // Release lock before unmounting
+            let mnt_cstr = std::ffi::CString::new(mountpoint.as_os_str().as_encoded_bytes())
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+            let ret = unsafe { libc::umount(mnt_cstr.as_ptr()) };
+            if ret != 0 {
+                let err = std::io::Error::last_os_error();
+                warn!(
+                    "Failed to unmount fanotify EROFS at {:?}: {}",
+                    mountpoint, err
+                );
+            }
+        }
+        if is_empty {
+            self.fanotify_enabled.store(false, Ordering::Release);
+        }
+        Ok(())
     }
 }
 
@@ -205,16 +310,24 @@ impl NydusDaemon for ServiceController {
 
     fn save(&self) -> Result<()> {
         #[cfg(target_os = "linux")]
-        return upgrade::fscache_upgrade::save(self);
-        #[cfg(target_os = "macos")]
-        return Ok(());
+        {
+            crate::upgrade::fanotify_upgrade::save(self)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            Ok(())
+        }
     }
 
     fn restore(&self) -> Result<()> {
         #[cfg(target_os = "linux")]
-        return upgrade::fscache_upgrade::restore(self);
-        #[cfg(target_os = "macos")]
-        return Ok(());
+        {
+            crate::upgrade::fanotify_upgrade::restore(self)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            Ok(())
+        }
     }
 
     fn upgrade_mgr(&self) -> Option<MutexGuard<'_, UpgradeManager>> {
@@ -230,14 +343,7 @@ impl NydusDaemon for ServiceController {
     }
 
     fn delete_blob(&self, _blob_id: String) -> Result<()> {
-        #[cfg(target_os = "linux")]
-        if self.fscache_enabled.load(Ordering::Acquire) {
-            if let Some(fscache) = self.fscache.lock().unwrap().clone() {
-                return fscache
-                    .cull_cache(_blob_id)
-                    .map_err(|e| Error::StartService(format!("{}", e)));
-            }
-        }
+        // TODO: implement blob deletion for fanotify path
         Err(Error::Unsupported)
     }
 }
@@ -266,36 +372,24 @@ fn is_sock_residual(sock: impl AsRef<Path>) -> bool {
 
     false
 }
-/// When nydusd starts, it checks that whether a previous nydusd died unexpected by:
-///     1. Checking whether /dev/cachefiles can be opened.
-///     2. Checking whether the API socket exists and the connection can established or not.
+/// When nydusd starts, it checks whether a previous nydusd died unexpected by
+/// checking whether the API socket exists and the connection can be established.
 fn is_crashed(_sock: &impl AsRef<Path>) -> Result<bool> {
-    #[cfg(target_os = "linux")]
-    if let Err(_e) = OpenOptions::new()
-        .write(true)
-        .read(true)
-        .create(false)
-        .open("/dev/cachefiles")
-    {
-        warn!("cachefiles devfd can not open, the devfd may hold by supervisor or another daemon.");
-        if is_sock_residual(_sock) {
-            warn!("A previous daemon crashed! Try to failover later.");
-            return Ok(true);
-        }
-        warn!("another daemon is running, will exit!");
-        return Err(Error::Unsupported);
+    if is_sock_residual(_sock) {
+        warn!("A previous daemon crashed! Try to failover later.");
+        return Ok(true);
     }
     Ok(false)
 }
 
-/// Create and start a Nydus daemon to host fscache and fusedev services.
+/// Create and start a Nydus daemon to host fanotify and fusedev services.
 #[allow(clippy::too_many_arguments, unused)]
 pub fn create_daemon(
     id: Option<String>,
     supervisor: Option<String>,
-    fscache: Option<&str>,
-    tag: Option<&str>,
-    threads: Option<&str>,
+    fanotify_blob_dir: Option<&str>,
+    fanotify_mountpoint: Option<&str>,
+    fanotify_threads: Option<&str>,
     config: Option<serde_json::Value>,
     bti: BuildTimeInfo,
     waker: Arc<Waker>,
@@ -319,9 +413,9 @@ pub fn create_daemon(
 
         blob_cache_mgr: Arc::new(BlobCacheMgr::new()),
         upgrade_mgr,
-        fscache_enabled: AtomicBool::new(false),
+        fanotify_enabled: AtomicBool::new(false),
         #[cfg(target_os = "linux")]
-        fscache: Mutex::new(None),
+        fanotify: Mutex::new(HashMap::new()),
     };
 
     service_controller.initialize_blob_cache(&config)?;
@@ -330,27 +424,17 @@ pub fn create_daemon(
     let machine = DaemonStateMachineContext::new(daemon.clone(), from_client, to_client);
     machine.kick_state_machine()?;
 
-    // Without api socket, nydusd can't do neither live-upgrade nor failover, so the helper
-    // finding a victim is not necessary.
     if (api_sock.as_ref().is_some() && !upgrade && !is_crashed(api_sock.as_ref().unwrap())?)
         || api_sock.is_none()
     {
         #[cfg(target_os = "linux")]
-        if let Some(path) = fscache {
-            let threads = if let Some(threads_value) = threads {
+        if let (Some(blob_dir), Some(mountpoint)) = (fanotify_blob_dir, fanotify_mountpoint) {
+            let threads = if let Some(threads_value) = fanotify_threads {
                 crate::validate_threads_configuration(threads_value).map_err(|err| einval!(err))?
             } else {
                 1usize
             };
-            daemon.initialize_fscache_service(tag, threads, path, None)?;
-            let f = daemon.get_fscache_file()?;
-            if let Some(mut mgr_guard) = daemon.upgrade_mgr() {
-                mgr_guard.hold_file(&f).map_err(|e| {
-                    error!("Failed to hold fscache fd, {:?}", e);
-                    eother!(e)
-                })?;
-                mgr_guard.save_fscache_states(threads, path.to_string());
-            }
+            daemon.register_fanotify_handler("_cli", blob_dir, mountpoint, threads)?;
         }
 
         daemon
@@ -398,127 +482,9 @@ mod tests {
             waker: Arc::new(waker),
             blob_cache_mgr: Arc::new(BlobCacheMgr::new()),
             upgrade_mgr: None,
-            fscache_enabled: AtomicBool::new(false),
-            fscache: Mutex::new(None),
+            fanotify_enabled: AtomicBool::new(false),
+            fanotify: Mutex::new(HashMap::new()),
         }
-    }
-
-    #[test]
-    fn test_initialize_fscache_service() {
-        let service_controller = create_service_controller();
-
-        assert!(service_controller
-            .initialize_fscache_service(None, 1, "some path", None)
-            .is_err());
-
-        let mut p = std::env::current_dir().unwrap();
-        p.push("Cargo.toml");
-        assert!(service_controller
-            .initialize_fscache_service(None, 1, p.to_str().unwrap(), None)
-            .is_err());
-
-        // skip test if user is not root
-        if !nix::unistd::Uid::effective().is_root() {
-            println!("Skip test_initialize_fscache_service, not root");
-            return;
-        }
-
-        // skip test if kernel is older than 5.19
-        if Version::current().unwrap() < Version::from_str("5.19.0").unwrap() {
-            println!("Skip test_initialize_fscache_service, kernel version is older than 5.19");
-            return;
-        }
-
-        // skip test if /dev/cachefiles does not exist
-        if !std::path::Path::new("/dev/cachefiles").exists() {
-            println!("Skip test_initialize_fscache_service, /dev/cachefiles does not exist");
-            return;
-        }
-
-        let tmp_dir = TempDir::new().unwrap();
-        let dir = tmp_dir.as_path().to_str().unwrap();
-        assert!(service_controller
-            .initialize_fscache_service(None, 1, dir, None)
-            .is_ok());
-
-        assert_eq!(service_controller.id(), Some(String::from("id")));
-        assert_eq!(
-            service_controller.version().build_time,
-            String::from("build_time")
-        );
-        assert_eq!(
-            service_controller.supervisor(),
-            Some(String::from("supervisor"))
-        );
-    }
-
-    fn create_factory_config() -> String {
-        let config = r#"{
-            "blobs": [{
-                "type": "bootstrap",
-                "id": "rafs-v6",
-                "domain_id": "domain2",
-                "config_v2": {
-                    "version": 2,
-                    "id": "factory1",
-                    "backend": {
-                        "type": "localfs",
-                        "localfs": {
-                            "dir": "/tmp/nydus"
-                        }
-                    },
-                    "cache": {
-                        "type": "fscache",
-                        "fscache": {
-                            "work_dir": "/tmp/nydus"
-                        }
-                    },
-                    "metadata_path": "RAFS_V5"
-                }
-            }]
-        }"#;
-        config.to_string()
-    }
-
-    #[test]
-    fn test_initialize_blob_cache() {
-        let service_controller = create_service_controller();
-        let blob_cache_mgr = service_controller.get_blob_cache_mgr().unwrap();
-        let content = create_factory_config();
-        let key = generate_blob_key("domain2", "rafs-v6");
-
-        // test first if
-        assert!(service_controller.initialize_blob_cache(&None).is_ok());
-        assert!(blob_cache_mgr.get_config(&key).is_none());
-
-        //test second if
-        let config = serde_json::Value::Null;
-        assert!(service_controller
-            .initialize_blob_cache(&Some(config))
-            .is_ok());
-        assert!(blob_cache_mgr.get_config(&key).is_none());
-
-        // test third if
-        let cfg = content.replace("blobs", "blob");
-        let config: serde_json::Value = serde_json::from_str(&cfg).unwrap();
-        assert!(service_controller
-            .initialize_blob_cache(&Some(config))
-            .is_ok());
-        assert!(blob_cache_mgr.get_config(&key).is_none());
-
-        //test fourth if
-        let tmp_dir = TempDir::new().unwrap();
-        let root_dir = &std::env::var("CARGO_MANIFEST_DIR").expect("$CARGO_MANIFEST_DIR");
-        let mut source_path = std::path::PathBuf::from(root_dir);
-        source_path.push("../tests/texture/bootstrap/rafs-v6-2.2.boot");
-        let cfg = content
-            .replace("/tmp/nydus", tmp_dir.as_path().to_str().unwrap())
-            .replace("RAFS_V5", &source_path.display().to_string());
-        let config: serde_json::Value = serde_json::from_str(&cfg).unwrap();
-        assert!(service_controller
-            .initialize_blob_cache(&Some(config))
-            .is_ok());
-        assert!(blob_cache_mgr.get_config(&key).is_some());
     }
 
     #[test]
@@ -544,36 +510,6 @@ mod tests {
         assert_eq!(service_controller.get_state(), DaemonState::READY);
         service_controller.set_state(DaemonState::RUNNING);
         assert_eq!(service_controller.get_state(), DaemonState::RUNNING);
-    }
-
-    #[test]
-    fn test_delete_blob_fscache_disabled() {
-        let service_controller = create_service_controller();
-        // fscache_enabled defaults to false, so delete_blob should return Unsupported
-        let result = service_controller.delete_blob("some-blob-id".to_string());
-        assert!(result.is_err());
-        assert!(matches!(result, Err(Error::Unsupported)));
-    }
-
-    #[test]
-    fn test_delete_blob_fscache_enabled_but_not_initialized() {
-        let service_controller = create_service_controller();
-        // Enable fscache_enabled but leave fscache as None
-        service_controller
-            .fscache_enabled
-            .store(true, std::sync::atomic::Ordering::Release);
-        let result = service_controller.delete_blob("some-blob-id".to_string());
-        // fscache is None, so should still return Unsupported
-        assert!(result.is_err());
-        assert!(matches!(result, Err(Error::Unsupported)));
-    }
-
-    #[test]
-    fn test_get_fscache_file_not_initialized() {
-        let service_controller = create_service_controller();
-        // fscache mutex holds None by default, so should return an error
-        let result = service_controller.get_fscache_file();
-        assert!(result.is_err());
     }
 
     #[test]
@@ -603,7 +539,7 @@ mod tests {
     #[test]
     fn test_umount_returns_ok() {
         let service_controller = create_service_controller();
-        // stop_services does nothing when fscache_enabled=false
+        // stop_services does nothing when fanotify_enabled=false
         assert!(service_controller.umount().is_ok());
     }
 }

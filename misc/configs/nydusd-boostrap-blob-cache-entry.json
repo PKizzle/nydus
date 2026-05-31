@@ -8,7 +8,7 @@
     "backend_config": {
       "dir": "/tmp/nydus"
     },
-    "cache_type": "fscache",
+    "cache_type": "fanotify",
     "cache_config": {
       "work_dir": "/tmp/nydus"
     },

@@ -24,7 +24,6 @@ use std::collections::hash_map::Drain;
 use std::collections::HashMap;
 use std::convert::TryFrom;
 use std::fmt::{Debug, Formatter};
-use std::fs::File;
 use std::io::{self, Error};
 use std::ops::Deref;
 use std::os::unix::io::AsRawFd;
@@ -170,8 +169,6 @@ pub struct BlobInfo {
     // Size of blob ToC content, it's zero for blobs with inlined-meta.
     blob_toc_size: u32,
 
-    /// V6: support fs-cache mode
-    fs_cache_file: Option<Arc<File>>,
     /// V6: support inlined-meta
     meta_path: Arc<Mutex<String>>,
     /// V6: support data encryption.
@@ -220,7 +217,6 @@ impl BlobInfo {
             blob_meta_size: 0,
             blob_toc_size: 0,
 
-            fs_cache_file: None,
             meta_path: Arc::new(Mutex::new(String::new())),
             cipher_object: Default::default(),
             cipher_ctx: None,
@@ -478,17 +474,6 @@ impl BlobInfo {
     /// Check whether compression metadata is available.
     pub fn meta_ci_is_valid(&self) -> bool {
         self.meta_ci_compressed_size != 0 && self.meta_ci_uncompressed_size != 0
-    }
-
-    /// Set the associated `File` object provided by Linux fscache subsystem.
-    pub fn set_fscache_file(&mut self, file: Option<Arc<File>>) {
-        self.fs_cache_file = file;
-    }
-
-    #[cfg(target_os = "linux")]
-    /// Get the associated `File` object provided by Linux fscache subsystem.
-    pub(crate) fn get_fscache_file(&self) -> Option<Arc<File>> {
-        self.fs_cache_file.clone()
     }
 
     /// Get blob features.

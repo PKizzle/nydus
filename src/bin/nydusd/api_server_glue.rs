@@ -68,6 +68,10 @@ impl ApiServer {
             ApiRequest::CreateBlobObject(entry) => self.create_blob_cache_entry(&entry),
             ApiRequest::DeleteBlobObject(param) => self.remove_blob_cache_entry(&param),
             ApiRequest::DeleteBlobFile(blob_id) => self.blob_cache_gc(blob_id),
+            ApiRequest::CreateFanotifyHandler(image_id, blob_dir, mountpoint, threads) => {
+                self.create_fanotify_handler(image_id, blob_dir, mountpoint, threads)
+            }
+            ApiRequest::DeleteFanotifyHandler(image_id) => self.delete_fanotify_handler(image_id),
         };
 
         self.respond(resp);
@@ -319,6 +323,54 @@ impl ApiServer {
             .delete_blob(blob_id)
             .map_err(|e| ApiError::DaemonAbnormal(e.into()))
             .map(|_| ApiResponsePayload::Empty)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn create_fanotify_handler(
+        &self,
+        image_id: String,
+        blob_dir: String,
+        mountpoint: String,
+        threads: usize,
+    ) -> ApiResponse {
+        let daemon = self.get_daemon_object()?;
+        let controller = daemon
+            .as_any()
+            .downcast_ref::<nydus_service::ServiceController>()
+            .ok_or(ApiError::DaemonAbnormal(DaemonErrorKind::Unsupported))?;
+        controller
+            .register_fanotify_handler(&image_id, &blob_dir, &mountpoint, threads)
+            .map(|_| ApiResponsePayload::Empty)
+            .map_err(|e| ApiError::DaemonAbnormal(DaemonErrorKind::Other(format!("{}", e))))
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn create_fanotify_handler(
+        &self,
+        _image_id: String,
+        _blob_dir: String,
+        _mountpoint: String,
+        _threads: usize,
+    ) -> ApiResponse {
+        Err(ApiError::DaemonAbnormal(DaemonErrorKind::Unsupported))
+    }
+
+    #[cfg(target_os = "linux")]
+    fn delete_fanotify_handler(&self, image_id: String) -> ApiResponse {
+        let daemon = self.get_daemon_object()?;
+        let controller = daemon
+            .as_any()
+            .downcast_ref::<nydus_service::ServiceController>()
+            .ok_or(ApiError::DaemonAbnormal(DaemonErrorKind::Unsupported))?;
+        controller
+            .unregister_fanotify_handler(&image_id)
+            .map(|_| ApiResponsePayload::Empty)
+            .map_err(|e| ApiError::DaemonAbnormal(DaemonErrorKind::Other(format!("{}", e))))
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn delete_fanotify_handler(&self, _image_id: String) -> ApiResponse {
+        Err(ApiError::DaemonAbnormal(DaemonErrorKind::Unsupported))
     }
 
     fn do_start(&self) -> ApiResponse {
