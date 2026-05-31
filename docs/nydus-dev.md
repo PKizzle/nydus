@@ -14,7 +14,7 @@ To ease crate publishing process and avoid frequent dependency failures, please 
 
 
 ## Storage Subsystem
-The storage subsystem is the core of [Nydus Image Service](https://nydus.dev/) project, which caches data fetched from storage backends and provides data services to rafs, blobfs and fscache etc.
+The storage subsystem is the core of [Nydus Image Service](https://nydus.dev/) project, which caches data fetched from storage backends and provides data services to rafs, blobfs and fanotify etc.
 The storage subsystem contains several sub-modules:
 - API Layer: define external APIs for clients.
   - [BlobFactory](https://docs.rs/nydus-storage/latest/nydus_storage/factory/struct.BlobFactory.html): create and garbage-collect cached blob objects.
@@ -25,7 +25,6 @@ The storage subsystem contains several sub-modules:
   - [BlobCache](https://docs.rs/nydus-storage/latest/nydus_storage/cache/trait.BlobCache.html): define the core interface to access cached blob object.
   - [DummyCacheMgr](https://docs.rs/nydus-storage/latest/nydus_storage/cache/struct.DummyCacheMgr.html): a dummy cache manager to fetch data from storage backend on demand and never caches data locally.
   - [FileCacheMgr](https://docs.rs/nydus-storage/latest/nydus_storage/cache/struct.FileCacheMgr.html): a generic cache manager to cache data fetched from storage backend by using local files.
-  - [FsCacheMgr](https://docs.rs/nydus-storage/latest/nydus_storage/cache/struct.FsCacheMgr.html): a special cache manager to cooperate Linux fscache driver to cache data from storage backend by using local files.
   - [BlobMetaInfo](https://docs.rs/nydus-storage/latest/nydus_storage/meta/struct.BlobMetaInfo.html): blob metadata to support fetch, decompress and decrypt blob data on demand.
 - Cache State Layer: track status of local cached blob data.
   - [ChunkMap](https://docs.rs/nydus-storage/latest/nydus_storage/cache/state/trait.ChunkMap.html): maintain data cache status for data chunks.

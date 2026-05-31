@@ -44,10 +44,29 @@ endif
 endif
 RUST_TARGET_STATIC ?= $(STATIC_TARGET)
 
+# --- Relocate the build directory for checkouts whose path contains spaces ---
+# OpenSSL's vendored build (the openssl-src crate, pulled in by `static-release`)
+# runs perl `Configure` and `make` inside Cargo's OUT_DIR, which lives under the
+# target directory. OpenSSL cannot be configured/built from a path containing a
+# space, so a checkout under e.g. ".../Source Code/nydus" makes vendored builds
+# fail with "cp: ... Not a directory". When the repo path contains a space (and
+# the caller has not already chosen a target dir), relocate Cargo's target dir to
+# a space-free, checkout-specific location so the vendored OpenSSL build succeeds.
+# Only the build *output* moves; the sources stay in place.
+empty :=
+space := $(empty) $(empty)
+ifeq ($(CARGO_TARGET_DIR),)
+ifneq ($(findstring $(space),$(CURDIR)),)
+export CARGO_TARGET_DIR := /tmp/nydus-build-$(shell echo '$(CURDIR)' | cksum | cut -d' ' -f1)/target
+$(info Makefile: repo path contains spaces; relocating CARGO_TARGET_DIR to $(CARGO_TARGET_DIR))
+endif
+endif
+TARGET_DIR := $(if $(CARGO_TARGET_DIR),$(CARGO_TARGET_DIR),$(CURDIR)/target)
+
 NYDUSIFY_PATH = contrib/nydusify
 NYDUS-OVERLAYFS_PATH = contrib/nydus-overlayfs
 LLVM_PROFILE_FILE := $(PWD)/coverage/nydus-%p-%m.profraw
-DEBUG_BINARY_DIR := $(PWD)/target/debug/
+DEBUG_BINARY_DIR := $(TARGET_DIR)/debug/
 GRCOV_ARGS := --binary-path ${DEBUG_BINARY_DIR} -s . \
 	      --branch --ignore-not-existing \
 	      --ignore '*/.rustup/*' --ignore '*/rustup/*' \

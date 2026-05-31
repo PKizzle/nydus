@@ -2,6 +2,7 @@
 **/*.rs.bk
 **/.vscode
 .idea
+.claude/
 .cargo
 **/.pyc
 __pycache__
@@ -11,5 +12,11 @@ dist/
 nydus-static/
 .goreleaser.yml
 metadata.db
+metadata.fjall
 coverage/
 tests/texture/zran/233c72f2b6b698c07021c4da367cfe2dff4f049efbaa885ca0ff760ea297865a
+
+# Go module download caches (created by Go tooling in workspace root or
+# subdirectories when go.work or IDE language servers resolve dependencies).
+api/pkg/
+pkg/

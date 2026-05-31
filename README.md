@@ -4,7 +4,7 @@
 [**[🤓 Quick Start (nerdctl)**]](https://github.com/containerd/nerdctl/blob/master/docs/nydus.md)
 [**[❓ FAQs & Troubleshooting]**](https://github.com/dragonflyoss/nydus/wiki/FAQ)
 
-# Nydus: Dragonfly Container Image Service
+# Nydus: Container Image Acceleration Service
 
 <p><img src="misc/logo.svg" width="170"></p>
 
@@ -50,7 +50,7 @@ The following Benchmarking results demonstrate that Nydus images significantly o
 
 | Tool                                                                                         | Description                                                                                                                                                |
 | -------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| [nydusd](https://github.com/dragonflyoss/nydus/blob/master/docs/nydusd.md)                   | Nydus user-space daemon, it processes all fscache/FUSE messages from the kernel and parses Nydus images to fullfil those requests                          |
+| [nydusd](https://github.com/dragonflyoss/nydus/blob/master/docs/nydusd.md)                   | Nydus user-space daemon, it processes all fanotify/FUSE messages from the kernel and parses Nydus images to fullfil those requests                          |
 | [nydus-image](https://github.com/dragonflyoss/nydus/blob/master/docs/nydus-image.md)         | Convert a single layer of OCI format container image into a nydus format container image generating meta part file and data part file respectively         |
 | [nydusify](https://github.com/dragonflyoss/nydus/blob/master/docs/nydusify.md)               | It pulls OCI image down and unpack it, invokes `nydus-image create` to convert image and then pushes the converted image back to registry and data storage |
 | [nydusctl](https://github.com/dragonflyoss/nydus/blob/master/docs/nydus-image.md)            | Nydusd CLI client (`nydus-image inspect`), query daemon's working status/metrics and configure it                                                          |
@@ -119,9 +119,9 @@ Run Nydusd Daemon to serve Nydus image: [Nydusd](./docs/nydusd.md).
 
 In-kernel EROFS has been fully compatible with RAFS v6 image format since Linux 5.16. In other words, uncompressed RAFS v6 images can be mounted over block devices since then.
 
-Since [Linux 5.19](https://lwn.net/Articles/896140), EROFS has added a new file-based caching (fscache) backend. In this way, compressed RAFS v6 images can be mounted directly with fscache subsystem, even such images are partially available. `estargz` can be converted on the fly and mounted in this way too.
+Since Linux 6.14, Nydus serves compressed RAFS v6 images on demand by mounting them as in-kernel EROFS filesystems and filling blob data lazily through `fanotify` pre-content hooks, even when such images are only partially available. This replaces the deprecated EROFS + `fscache` (`cachefiles`) on-demand path, which has been removed.
 
-Guide to running Nydus with fscache: [Nydus-fscache](./docs/nydus-fscache.md)
+Guide to running Nydus with fanotify: [Nydus-fanotify](./docs/nydus-fanotify.md)
 
 ### Run Nydus with Dragonfly P2P system
 

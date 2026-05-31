@@ -2,7 +2,7 @@
 
 # I. High Level Design
 ##    0. Overview
-Dragonfly image service is named as `nydus`, [GitHub repo](https://github.com/dragonflyoss/nydus)
+Nydus is a container image acceleration service, [GitHub repo](https://github.com/dragonflyoss/nydus)
 
 Nydus consists of two parts,
 * a userspace filesystem called `rafs` on top of a container image format
@@ -17,11 +17,11 @@ Its key features include:
 * Only usable image data is downloaded when running a container
 * End-to-end image data integrity
 * Compatible with the OCI artifacts spec and distribution spec
-* Integrated with existing CNCF project Dragonfly to support image distribution in large clusters
+* Optional integration with P2P distribution systems (e.g. Dragonfly) for image distribution in large clusters
 * Different container image storage backends are supported
 
 ##     1. Architecture
-Nydus takes in either [FUSE](https://www.kernel.org/doc/html/latest/filesystems/fuse.html) or [virtiofs](https://virtio-fs.gitlab.io/) protocol to service POD created by conventional runc containers or vm-based [Kata Containers](https://katacontainers.io/). It supports pulling container image data from container image registry, [OSS](https://www.alibabacloud.com/product/oss), NAS, as well as Dragonfly supernode and node peers. It can also optionally use a local directory to cache all container image data to speed up future container creation.
+Nydus takes in either [FUSE](https://www.kernel.org/doc/html/latest/filesystems/fuse.html) or [virtiofs](https://virtio-fs.gitlab.io/) protocol to service POD created by conventional runc containers or vm-based [Kata Containers](https://katacontainers.io/). It supports pulling container image data from container image registry, [OSS](https://www.alibabacloud.com/product/oss), NAS, as well as P2P supernodes and node peers (e.g. via Dragonfly). It can also optionally use a local directory to cache all container image data to speed up future container creation.
 
 ![architecture](images/nydusd-arch.png)
 

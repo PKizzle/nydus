@@ -20,7 +20,7 @@ You're supposed to know that `nydusd` running as daemon to expose a [FUSE](https
 - Only usable image data is downloaded when running a container
 - End-to-end image data integrity
 - Compatible with the OCI artifacts spec and distribution spec
-- Integrated with existing CNCF project Dragonfly to support image distribution in large clusters
+- Optional integration with P2P distribution systems (e.g. Dragonfly) for image distribution in large clusters
 - Different container image storage backends are supported
 
 If you want to use these features as native in your project without preparing and invoking `nydusd` deliberately, `nydus-service` is just born for this.
