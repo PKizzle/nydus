@@ -75,12 +75,12 @@ run_nydus_snapshotter() {
     "backend_config": {
       "scheme": "https"
     },
-    "cache_type": "fscache"
+    "cache_type": "fanotify"
   }
 }
 EOF
   containerd-nydus-grpc --config-path /tmp/nydus-erofs-config.json --daemon-mode shared \
-    --fs-driver fscache --root /var/lib/containerd/io.containerd.snapshotter.v1.nydus \
+    --fs-driver fanotify --root /var/lib/containerd/io.containerd.snapshotter.v1.nydus \
     --address /run/containerd/containerd-nydus-grpc.sock --nydusd /usr/local/bin/nydusd \
     --log-to-stdout > $nydus_snapshotter_logfile 2>&1 &
 }

@@ -20,8 +20,8 @@ teardown() {
 	if ps -ef | grep containerd-nydus-grpc | grep -v grep; then
 		ps -ef | grep containerd-nydus-grpc | grep -v grep | awk '{print $2}' | xargs kill -9
 	fi
-	if ps -ef | grep nydusd | grep fscache; then
-		ps -ef | grep nydusd | grep fscache | awk '{print $2}' | xargs kill -9
+	if ps -ef | grep nydusd | grep fanotify; then
+		ps -ef | grep nydusd | grep fanotify | awk '{print $2}' | xargs kill -9
 	fi
 	if mount | grep 'erofs on'; then
 		mount | grep 'erofs on' | awk '{print $3}' | xargs umount
