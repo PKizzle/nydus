@@ -44,7 +44,7 @@ use nydus_storage::utils::alloc_buf;
 use sendfd::{RecvWithFd, SendWithFd};
 use tokio::io::unix::AsyncFd;
 use tokio::sync::broadcast::Sender;
-use tokio::task::spawn_blocking;
+use compio::runtime::{spawn_blocking, ResumeUnwind};
 
 use crate::blob_cache::{generate_blob_key, BlobCacheMgr};
 use crate::block_device::BlockDevice;
@@ -258,7 +258,8 @@ pub async fn uffdio_zeropage(uffd_fd: RawFd, start_addr: u64, len: u64) -> Resul
         Ok(())
     })
     .await
-    .map_err(|e| eother!(format!("join error: {e}")))?
+    .resume_unwind()
+    .unwrap_or_else(|| Err(eother!("uffd ioctl task was cancelled")))
 }
 
 /// Perform UFFDIO_COPY ioctl asynchronously.
@@ -284,7 +285,8 @@ pub async fn uffdio_copy(uffd_fd: RawFd, dst: u64, buf: Vec<u8>, len: u64) -> Re
         Ok(())
     })
     .await
-    .map_err(|e| eother!(format!("join error: {e}")))?
+    .resume_unwind()
+    .unwrap_or_else(|| Err(eother!("uffd ioctl task was cancelled")))
 }
 
 /// Perform UFFDIO_WAKE ioctl asynchronously.
@@ -311,7 +313,8 @@ pub async fn uffdio_wake(uffd_fd: RawFd, start_addr: u64, len: u64) -> Result<()
         Ok(())
     })
     .await
-    .map_err(|e| eother!(format!("join error: {e}")))?
+    .resume_unwind()
+    .unwrap_or_else(|| Err(eother!("uffd ioctl task was cancelled")))
 }
 
 // ---------------------------------------------------------------------------
@@ -321,7 +324,7 @@ pub async fn uffdio_wake(uffd_fd: RawFd, start_addr: u64, len: u64) -> Result<()
 /// Core UFFD page fault resolution engine.
 ///
 /// Holds a `BlockDevice` reference and provides methods to resolve page faults.
-/// Must be used within a tokio_uring runtime (BlockDevice is !Send).
+/// Must be used within a compio runtime (BlockDevice is !Send).
 pub struct UffdCore {
     device: Arc<BlockDevice>,
     device_size: u64,
@@ -604,7 +607,7 @@ struct UffdWorker {
     name: String,
 }
 
-// BlockDevice uses tokio-uring (single-threaded) and is not Send+Sync,
+// BlockDevice uses compio (single-threaded) and is not Send+Sync,
 // but Arc is needed for sharing across async tasks within the same thread.
 #[allow(clippy::arc_with_non_send_sync)]
 impl UffdWorker {
@@ -613,6 +616,7 @@ impl UffdWorker {
 
         let device =
             match BlockDevice::new_with_cache_manager(self.blob_id.clone(), self.cache_mgr.clone())
+                .await
             {
                 Ok(v) => Arc::new(v),
                 Err(e) => {
@@ -636,11 +640,11 @@ impl UffdWorker {
                     let active_conns = self.active_conns.clone();
                     let device = device.clone();
                     let sender = self.sender.clone();
-                    tokio_uring::spawn(async move {
+                    compio::runtime::spawn(async move {
                         if let Err(e) = Self::handle_conn(active, active_conns, device, stream, sender).await {
                             warn!("block_uffd: connection handler exited with error: {e}");
                         }
-                    });
+                    }).detach();
                 }
                 _ = receiver.recv() => break,
             }
@@ -848,13 +852,13 @@ impl UffdWorker {
 
             let device_prefault = core.device().clone();
             let regions_prefault = request.regions;
-            tokio_uring::spawn(async move {
+            compio::runtime::spawn(async move {
                 if let Err(e) =
                     Self::do_prefault(device_prefault, stream_prefault, regions_prefault).await
                 {
                     warn!("block_uffd: pre-fault task error: {}", e);
                 }
-            });
+            }).detach();
         }
 
         Ok(state)
@@ -1075,7 +1079,7 @@ impl UffdService {
         let thread: std::thread::JoinHandle<Result<()>> = std::thread::Builder::new()
             .name(name)
             .spawn(move || {
-                tokio_uring::start(async move {
+                compio::runtime::Runtime::new().unwrap().block_on(async move {
                     worker.run().await;
                     // Notify the daemon controller that one working thread has exited.
                     if let Err(err) = waker.wake() {
@@ -1381,7 +1385,9 @@ pub fn create_uffd_daemon(
     let blob_id = generate_blob_key(&blob_entry.domain_id, &blob_entry.blob_id);
     let cache_mgr = Arc::new(BlobCacheMgr::new());
     cache_mgr.add_blob_entry(&blob_entry)?;
-    let block_device = BlockDevice::new_with_cache_manager(blob_id.clone(), cache_mgr.clone())?;
+    let block_device = compio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(BlockDevice::new_with_cache_manager(blob_id.clone(), cache_mgr.clone()))?;
     let service = Arc::new(UffdService::new(Arc::new(block_device), sock)?);
 
     let (trigger, events_rx) = std::sync::mpsc::channel::<DaemonStateMachineInput>();
@@ -1560,7 +1566,7 @@ mod tests {
         assert!(mgr.get_config(&key).is_some());
 
         let mgr = Arc::new(mgr);
-        let device = BlockDevice::new_with_cache_manager(blob_id.clone(), mgr).unwrap();
+        let device = compio::runtime::Runtime::new().unwrap().block_on(BlockDevice::new_with_cache_manager(blob_id.clone(), mgr)).unwrap();
 
         Ok(Arc::new(device))
     }
@@ -1834,7 +1840,7 @@ mod tests {
 
     #[test]
     fn test_do_prefault() {
-        tokio_uring::start(async {
+        compio::runtime::Runtime::new().unwrap().block_on(async {
             let tmpdir = TempDir::new().unwrap();
             let device = create_block_device(tmpdir.as_path().to_path_buf()).unwrap();
             let (sock1, sock2) = std::os::unix::net::UnixStream::pair().unwrap();
@@ -1848,7 +1854,7 @@ mod tests {
             )];
 
             // Run do_prefault in background
-            let prefault_task = tokio_uring::spawn(async move {
+            let prefault_task = compio::runtime::spawn(async move {
                 UffdWorker::do_prefault(device, sock2, vma_regions).await
             });
 
@@ -1881,7 +1887,7 @@ mod tests {
 
     #[test]
     fn test_send_batch_response() {
-        tokio_uring::start(async {
+        compio::runtime::Runtime::new().unwrap().block_on(async {
             let (sock1, sock2) = std::os::unix::net::UnixStream::pair().unwrap();
             let sock_async = AsyncFd::new(sock1).unwrap();
 
@@ -1915,7 +1921,7 @@ mod tests {
 
     #[test]
     fn test_dispatch_message_stat() {
-        tokio_uring::start(async {
+        compio::runtime::Runtime::new().unwrap().block_on(async {
             let (sock1, sock2) = std::os::unix::net::UnixStream::pair().unwrap();
             sock2.set_nonblocking(true).unwrap();
             let sock_async = AsyncFd::new(sock1).unwrap();
@@ -1944,7 +1950,7 @@ mod tests {
 
     #[test]
     fn test_dispatch_message_unexpected_type() {
-        tokio_uring::start(async {
+        compio::runtime::Runtime::new().unwrap().block_on(async {
             let (sock1, _sock2) = std::os::unix::net::UnixStream::pair().unwrap();
             sock1.set_nonblocking(true).unwrap();
             let sock_async = AsyncFd::new(sock1).unwrap();
@@ -1972,7 +1978,7 @@ mod tests {
 
     #[test]
     fn test_dispatch_message_handshake_already_handshaked() {
-        tokio_uring::start(async {
+        compio::runtime::Runtime::new().unwrap().block_on(async {
             let (sock1, _sock2) = std::os::unix::net::UnixStream::pair().unwrap();
             sock1.set_nonblocking(true).unwrap();
             let sock_async = AsyncFd::new(sock1).unwrap();
@@ -2022,7 +2028,7 @@ mod tests {
 
     #[test]
     fn test_handle_stat_request() {
-        tokio_uring::start(async {
+        compio::runtime::Runtime::new().unwrap().block_on(async {
             let (sock1, sock2) = std::os::unix::net::UnixStream::pair().unwrap();
             sock1.set_nonblocking(true).unwrap();
             let sock_async = AsyncFd::new(sock1).unwrap();
@@ -2051,7 +2057,7 @@ mod tests {
 
     #[test]
     fn test_handle_handshake_with_uffd_fd() {
-        tokio_uring::start(async {
+        compio::runtime::Runtime::new().unwrap().block_on(async {
             let tmpdir = TempDir::new().unwrap();
             let device = create_block_device(tmpdir.as_path().to_path_buf()).unwrap();
             let core = UffdCore::new(device);
@@ -2080,7 +2086,7 @@ mod tests {
 
     #[test]
     fn test_handle_handshake_no_uffd_fd() {
-        tokio_uring::start(async {
+        compio::runtime::Runtime::new().unwrap().block_on(async {
             let tmpdir = TempDir::new().unwrap();
             let device = create_block_device(tmpdir.as_path().to_path_buf()).unwrap();
             let core = UffdCore::new(device);
@@ -2105,7 +2111,7 @@ mod tests {
 
     #[test]
     fn test_handle_handshake_copy_policy() {
-        tokio_uring::start(async {
+        compio::runtime::Runtime::new().unwrap().block_on(async {
             let tmpdir = TempDir::new().unwrap();
             let device = create_block_device(tmpdir.as_path().to_path_buf()).unwrap();
             let core = UffdCore::new(device);
@@ -2133,7 +2139,7 @@ mod tests {
 
     #[test]
     fn test_handle_handshake_rejects_invalid_vma() {
-        tokio_uring::start(async {
+        compio::runtime::Runtime::new().unwrap().block_on(async {
             let tmpdir = TempDir::new().unwrap();
             let device = create_block_device(tmpdir.as_path().to_path_buf()).unwrap();
             let core = UffdCore::new(device);
@@ -2158,7 +2164,7 @@ mod tests {
 
     #[test]
     fn test_dispatch_message_closes_unexpected_fds() {
-        tokio_uring::start(async {
+        compio::runtime::Runtime::new().unwrap().block_on(async {
             let (sock1, _sock2) = std::os::unix::net::UnixStream::pair().unwrap();
             sock1.set_nonblocking(true).unwrap();
             let sock_async = AsyncFd::new(sock1).unwrap();
@@ -2231,7 +2237,7 @@ mod tests {
 
     #[test]
     fn test_async_send_with_fd() {
-        tokio_uring::start(async {
+        compio::runtime::Runtime::new().unwrap().block_on(async {
             let (sock1, sock2) = std::os::unix::net::UnixStream::pair().unwrap();
             sock1.set_nonblocking(true).unwrap();
             let sock_async = AsyncFd::new(sock1).unwrap();
@@ -2310,7 +2316,7 @@ mod tests {
 
     #[test]
     fn test_handle_conn_graceful_shutdown() {
-        tokio_uring::start(async {
+        compio::runtime::Runtime::new().unwrap().block_on(async {
             let tmpdir = TempDir::new().unwrap();
             let device = create_block_device(tmpdir.as_path().to_path_buf()).unwrap();
 
@@ -2342,7 +2348,7 @@ mod tests {
             let (sender, _receiver) = tokio::sync::broadcast::channel(4);
             let sender = Arc::new(sender);
             let sender_clone = sender.clone();
-            let handle = tokio_uring::spawn(async move {
+            let handle = compio::runtime::spawn(async move {
                 UffdWorker::handle_conn(
                     active,
                     Arc::new(Mutex::new(Vec::new())),
@@ -2376,7 +2382,7 @@ mod tests {
 
     #[test]
     fn test_handle_uffd_event_no_event() {
-        tokio_uring::start(async {
+        compio::runtime::Runtime::new().unwrap().block_on(async {
             let tmpdir = TempDir::new().unwrap();
             let device = create_block_device(tmpdir.as_path().to_path_buf()).unwrap();
             let core = UffdCore::new(device);
@@ -2508,7 +2514,7 @@ mod tests {
             },
         };
 
-        tokio_uring::start(async {
+        compio::runtime::Runtime::new().unwrap().block_on(async {
             let result = core
                 .handle_page_fault(&msg, &vma_regions, FaultPolicy::Copy, -1)
                 .await
@@ -2537,7 +2543,7 @@ mod tests {
                     feat: 0,
                 },
             };
-            tokio_uring::start(async {
+            compio::runtime::Runtime::new().unwrap().block_on(async {
                 let result = core
                     .handle_page_fault(&msg, &vma_regions, FaultPolicy::Copy, -1)
                     .await;
@@ -2573,7 +2579,7 @@ mod tests {
             },
         };
 
-        tokio_uring::start(async {
+        compio::runtime::Runtime::new().unwrap().block_on(async {
             let result = core
                 .handle_page_fault(&msg, &vma_regions, FaultPolicy::Copy, -1)
                 .await
@@ -2604,7 +2610,7 @@ mod tests {
             },
         };
 
-        tokio_uring::start(async {
+        compio::runtime::Runtime::new().unwrap().block_on(async {
             let result = core
                 .handle_page_fault(&msg, &vma_regions, FaultPolicy::Copy, -1)
                 .await
@@ -2634,7 +2640,7 @@ mod tests {
             },
         };
 
-        tokio_uring::start(async {
+        compio::runtime::Runtime::new().unwrap().block_on(async {
             let result = core
                 .handle_page_fault(&msg, &vma_regions, FaultPolicy::Copy, uffd_fd)
                 .await
@@ -2675,7 +2681,7 @@ mod tests {
             },
         };
 
-        tokio_uring::start(async {
+        compio::runtime::Runtime::new().unwrap().block_on(async {
             let result = core
                 .handle_page_fault(&msg, &vma_regions, FaultPolicy::Zerocopy, uffd_fd)
                 .await
@@ -2700,7 +2706,7 @@ mod tests {
 
         let (uffd_fd, addr, mmap_size) = setup_uffd_region(device_size).unwrap();
 
-        tokio_uring::start(async {
+        compio::runtime::Runtime::new().unwrap().block_on(async {
             core.resolve_copy(0, 4096, addr, uffd_fd).await.unwrap();
             let magic_ptr = (addr + 1024) as *const u8;
             let magic = unsafe {
@@ -2725,7 +2731,7 @@ mod tests {
         let (uffd_fd, addr, mmap_size) = setup_uffd_region(device_size).unwrap();
         let vma_region = VmaRegion::new(addr, device_size, 0, 4096);
 
-        tokio_uring::start(async {
+        compio::runtime::Runtime::new().unwrap().block_on(async {
             let result = core
                 .resolve_zerocopy_ranges(0, 4096, &vma_region, uffd_fd)
                 .await
@@ -2745,7 +2751,7 @@ mod tests {
 
         let vma_regions = vec![VmaRegion::new(0, device_size, 0, 4096)];
 
-        tokio_uring::start(async {
+        compio::runtime::Runtime::new().unwrap().block_on(async {
             let _ranges = core.prefault_ranges(&vma_regions).await.unwrap();
         });
     }
@@ -2774,7 +2780,7 @@ mod tests {
             },
         };
 
-        tokio_uring::start(async {
+        compio::runtime::Runtime::new().unwrap().block_on(async {
             let result = core
                 .handle_page_fault(&msg, &vma_regions, FaultPolicy::Zerocopy, uffd_fd)
                 .await
@@ -2817,7 +2823,7 @@ mod tests {
             },
         };
 
-        tokio_uring::start(async {
+        compio::runtime::Runtime::new().unwrap().block_on(async {
             let result = core
                 .handle_page_fault(&msg, &vma_regions, FaultPolicy::Copy, uffd_fd)
                 .await
@@ -2830,7 +2836,7 @@ mod tests {
 
     #[test]
     fn test_uffdio_wake() {
-        tokio_uring::start(async {
+        compio::runtime::Runtime::new().unwrap().block_on(async {
             let (uffd_fd, addr, mmap_size) = setup_uffd_region(4096).unwrap();
 
             let result = uffdio_wake(uffd_fd, addr as u64, 4096).await;
@@ -2860,7 +2866,7 @@ mod tests {
 
     #[test]
     fn test_uffdio_wake_invalid_fd() {
-        tokio_uring::start(async {
+        compio::runtime::Runtime::new().unwrap().block_on(async {
             let result = uffdio_wake(-1, 0x1000, 4096).await;
             assert!(result.is_err());
         });

@@ -301,7 +301,7 @@ impl FanotifyHandler {
         // an incoming event fd can be resolved back to the blob without relying on path names.
         let mut blob_backings = Vec::new();
         for cfg in blob_cache_mgr.get_all_data_blobs() {
-            let blob = match DataBlob::new(&cfg) {
+            let blob = match compio::runtime::Runtime::new().unwrap().block_on(DataBlob::new(&cfg)) {
                 Ok(b) => b,
                 Err(e) => {
                     warn!(

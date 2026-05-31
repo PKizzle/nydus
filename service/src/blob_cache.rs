@@ -5,9 +5,7 @@
 //! Blob cache manager to cache RAFS meta/data blob objects.
 
 use std::collections::HashMap;
-use std::fs::OpenOptions;
 use std::io::{Error, ErrorKind, Result};
-use std::os::fd::FromRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -22,8 +20,10 @@ use nydus_storage::cache::BlobCache;
 use nydus_storage::device::BlobInfo;
 use nydus_storage::factory::BLOB_FACTORY;
 use serde::Serialize;
-use tokio_uring::buf::BoundedBufMut;
-use tokio_uring::fs::File;
+use compio::buf::{BufResult, IoBufMut};
+use compio::fs::File;
+use compio::io::AsyncReadAt;
+use compio::runtime::ResumeUnwind;
 
 const ID_SPLITTER: &str = "/";
 
@@ -544,18 +544,16 @@ pub struct MetaBlob {
 
 impl MetaBlob {
     /// Create a new [MetaBlob] object from
-    pub fn new<P: AsRef<Path>>(path: P) -> Result<Self> {
-        let file = OpenOptions::new()
-            .read(true)
-            .write(false)
-            .open(path.as_ref())
-            .inspect_err(|_e| {
-                warn!(
-                    "blob_cache: failed to open metadata blob {}",
-                    path.as_ref().display()
-                );
-            })?;
-        let md = file.metadata().inspect_err(|_e| {
+    pub async fn new<P: AsRef<Path>>(path: P) -> Result<Self> {
+        // compio's File has no fd-based constructor, so open the metadata blob by path
+        // directly through compio (io_uring); this is read-only positional I/O.
+        let file = File::open(path.as_ref()).await.inspect_err(|_e| {
+            warn!(
+                "blob_cache: failed to open metadata blob {}",
+                path.as_ref().display()
+            );
+        })?;
+        let md = file.metadata().await.inspect_err(|_e| {
             warn!(
                 "blob_cache: failed to get metadata about metadata blob {}",
                 path.as_ref().display()
@@ -569,10 +567,7 @@ impl MetaBlob {
             )));
         }
 
-        Ok(MetaBlob {
-            file: File::from_std(file),
-            size,
-        })
+        Ok(MetaBlob { file, size })
     }
 
     /// Get number of blocks in unit of EROFS_BLOCK_SIZE.
@@ -581,8 +576,9 @@ impl MetaBlob {
     }
 
     /// Read data from the cached metadata blob in asynchronous mode.
-    pub async fn async_read<T: BoundedBufMut>(&self, pos: u64, buf: T) -> (Result<usize>, T) {
-        self.file.read_at(buf, pos).await
+    pub async fn async_read<T: IoBufMut>(&self, pos: u64, buf: T) -> (Result<usize>, T) {
+        let BufResult(res, buf) = self.file.read_at(buf, pos).await;
+        (res, buf)
     }
 
     pub fn file(&self) -> &File {
@@ -600,7 +596,7 @@ pub struct DataBlob {
 
 impl DataBlob {
     /// Create a new instance of [DataBlob].
-    pub fn new(config: &Arc<DataBlobConfig>) -> Result<Self> {
+    pub async fn new(config: &Arc<DataBlobConfig>) -> Result<Self> {
         let blob_id = config.blob_info().blob_id();
         let blob_info = config.blob_info().clone();
         let blob = BLOB_FACTORY
@@ -614,18 +610,25 @@ impl DataBlob {
 
         match blob.get_blob_object() {
             Some(obj) => {
-                // Duplicate the blob object's backing fd. `libc::dup` keeps the simple
-                // `RawFd -> RawFd` contract; nix 0.31's `dup` switched to `AsFd`/`OwnedFd`.
-                let fd = unsafe { libc::dup(obj.as_raw_fd()) };
-                if fd < 0 {
-                    return Err(eio!(format!(
-                        "blob_cache: failed to dup fd for blob {}: {}",
+                // compio's File has no fd-based constructor, so resolve the cache file's real
+                // path from the blob object's fd and re-open the same inode via compio (io_uring).
+                // `/proc/self/fd` avoids assuming the `<work_dir>/<blob_id>.blob.data` layout and
+                // transparently handles hardlinked cache files.
+                let path = std::fs::read_link(format!("/proc/self/fd/{}", obj.as_raw_fd()))
+                    .map_err(|e| {
+                        eio!(format!(
+                            "blob_cache: failed to resolve cache path for blob {}: {}",
+                            blob_id, e
+                        ))
+                    })?;
+                let file = File::open(&path).await.map_err(|e| {
+                    eio!(format!(
+                        "blob_cache: failed to open data blob {} at {}: {}",
                         blob_id,
-                        std::io::Error::last_os_error()
-                    )));
-                }
-                // Safe because the `fd` is valid.
-                let file = unsafe { File::from_raw_fd(fd) };
+                        path.display(),
+                        e
+                    ))
+                })?;
                 Ok(DataBlob {
                     blob_id,
                     blob,
@@ -649,8 +652,10 @@ impl DataBlob {
         let blob = self.blob.clone();
         let blob_id = self.blob_id.clone();
 
-        // Blocking thread pool is needed because reqwest::blocking may be called
-        tokio::task::spawn_blocking(move || -> Result<()> {
+        // Blocking thread pool is needed because reqwest::blocking may be called. Use compio's
+        // blocking pool (not tokio's) since this runs inside the compio runtime; resume_unwind
+        // re-raises a panic in the blocking closure and otherwise yields its `Result`.
+        compio::runtime::spawn_blocking(move || -> Result<()> {
             let obj = blob.get_blob_object().ok_or_else(|| {
                 eio!(format!(
                     "blob_cache: failed to get BlobObject for blob {}",
@@ -660,14 +665,18 @@ impl DataBlob {
             obj.fetch_range_uncompressed(pos, len as u64)
         })
         .await
-        .map_err(|e| eother!(format!("spawn_blocking join error: {e}")))?
+        .resume_unwind()
+        .unwrap_or_else(|| Err(eother!("blob_cache: blob fetch task was cancelled")))
     }
 
     /// Read data from the cached data blob in asynchronous mode.
-    pub async fn async_read<T: BoundedBufMut>(&self, pos: u64, buf: T) -> (Result<usize>, T) {
-        let len = buf.bytes_total();
+    pub async fn async_read<T: IoBufMut>(&self, pos: u64, mut buf: T) -> (Result<usize>, T) {
+        let len = buf.buf_capacity();
         match self.async_fetch(pos, len).await {
-            Ok(()) => self.file.read_at(buf, pos).await,
+            Ok(()) => {
+                let BufResult(res, buf) = self.file.read_at(buf, pos).await;
+                (res, buf)
+            }
             Err(e) => (Err(e), buf),
         }
     }
@@ -1010,8 +1019,8 @@ mod tests {
         let mut source_path = PathBuf::from(root_dir);
         source_path.push("../tests/texture/bootstrap/rafs-v6-2.2.boot");
 
-        tokio_uring::start(async move {
-            let meta_blob = MetaBlob::new(&source_path).unwrap();
+        compio::runtime::Runtime::new().unwrap().block_on(async move {
+            let meta_blob = compio::runtime::Runtime::new().unwrap().block_on(MetaBlob::new(&source_path)).unwrap();
             assert_eq!(meta_blob.blocks(), 5);
             let buf = vec![0u8; 4096];
             let (res, buf) = meta_blob.async_read(0, buf).await;
@@ -1033,8 +1042,8 @@ mod tests {
         let mut source_path = PathBuf::from(root_dir);
         source_path.push("../tests/texture/bootstrap/rafs-v6-2.2.boot");
 
-        tokio_uring::start(async move {
-            let meta_blob = MetaBlob::new(&source_path).unwrap();
+        compio::runtime::Runtime::new().unwrap().block_on(async move {
+            let meta_blob = compio::runtime::Runtime::new().unwrap().block_on(MetaBlob::new(&source_path)).unwrap();
             let file = meta_blob.file();
             assert!(file.as_raw_fd() >= 0);
         });
@@ -1096,7 +1105,7 @@ mod tests {
             _ => panic!("expected DataBlob config"),
         };
 
-        let data_blob = DataBlob::new(&data_blob_config).unwrap();
+        let data_blob = compio::runtime::Runtime::new().unwrap().block_on(DataBlob::new(&data_blob_config)).unwrap();
         assert!(data_blob.file().as_raw_fd() >= 0);
         (data_blob, tmp_dir)
     }
@@ -1116,7 +1125,7 @@ mod tests {
     #[test]
     fn test_data_blob_async_fetch_zero_len() {
         let (data_blob, _tmp_dir) = create_data_blob();
-        tokio_uring::start(async move {
+        compio::runtime::Runtime::new().unwrap().block_on(async move {
             // len=0 should short-circuit with Ok(())
             let res = data_blob.async_fetch(0, 0).await;
             assert!(res.is_ok());
@@ -1126,7 +1135,7 @@ mod tests {
     #[test]
     fn test_data_blob_async_fetch_and_read() {
         let (data_blob, _tmp_dir) = create_data_blob();
-        tokio_uring::start(async move {
+        compio::runtime::Runtime::new().unwrap().block_on(async move {
             // Normal fetch
             let res = data_blob.async_fetch(0, 4096).await;
             assert!(res.is_ok());

@@ -23,8 +23,8 @@ use mio::Waker;
 use nydus_api::{BlobCacheEntry, BuildTimeInfo};
 use nydus_storage::utils::alloc_buf;
 use tokio::sync::broadcast::{channel, Sender};
-use tokio_uring::buf::IoBuf;
-use tokio_uring::net::UnixStream;
+use compio::buf::IoBuf;
+use compio::net::UnixStream;
 
 use crate::blob_cache::{generate_blob_key, BlobCacheMgr};
 use crate::block_device::BlockDevice;
@@ -161,6 +161,7 @@ impl NbdWorker {
     pub async fn run(self) {
         let device =
             match BlockDevice::new_with_cache_manager(self.blob_id.clone(), self.cache_mgr.clone())
+                .await
             {
                 Ok(v) => v,
                 Err(e) => {
@@ -374,7 +375,7 @@ impl NydusDaemon for NbdDaemon {
             let thread = std::thread::Builder::new()
                 .name("nbd_worker".to_string())
                 .spawn(move || {
-                    tokio_uring::start(async move {
+                    compio::runtime::Runtime::new().unwrap().block_on(async move {
                         worker.run().await;
                         // Notify the daemon controller that one working thread has exited.
                         if let Err(err) = waker.wake() {
@@ -595,7 +596,7 @@ mod tests {
         assert!(mgr.get_config(&key).is_some());
 
         let mgr = Arc::new(mgr);
-        let device = BlockDevice::new_with_cache_manager(blob_id.clone(), mgr).unwrap();
+        let device = compio::runtime::Runtime::new().unwrap().block_on(BlockDevice::new_with_cache_manager(blob_id.clone(), mgr)).unwrap();
 
         Ok(Arc::new(device))
     }
@@ -603,7 +604,7 @@ mod tests {
     #[ignore]
     #[test]
     fn test_nbd_device() {
-        tokio_uring::start(async {
+        compio::runtime::Runtime::new().unwrap().block_on(async {
             let tmpdir = TempDir::new().unwrap();
             let device = create_block_device(tmpdir.as_path().to_path_buf()).unwrap();
             let nbd = NbdService::new(device, "/dev/nbd15".to_string()).unwrap();
@@ -612,8 +613,8 @@ mod tests {
             let worker1 = nbd.create_worker().unwrap();
             let worker2 = nbd.create_worker().unwrap();
 
-            tokio_uring::spawn(async move { worker1.run().await });
-            tokio_uring::spawn(async move { worker2.run().await });
+            compio::runtime::spawn(async move { worker1.run().await });
+            compio::runtime::spawn(async move { worker2.run().await });
             std::thread::spawn(move || {
                 nbd2.run().unwrap();
             });
