@@ -769,6 +769,8 @@ impl Node {
     }
 
     fn build_inode_xattr(&mut self) -> Result<()> {
+        use nydus_rafs::metadata::layout::RAFS_XATTR_PREFIXES;
+
         let file_xattrs = match xattr::list(self.path()) {
             Ok(x) => x,
             Err(e) => {
@@ -786,6 +788,23 @@ impl Node {
 
         let mut info = self.info.deref().clone();
         for key in file_xattrs {
+            // Skip xattrs whose namespace prefix is not recognized by RAFS
+            // (e.g. macOS `com.apple.*` xattrs).  Check the prefix before
+            // calling `RafsXAttrs::add()` so we avoid triggering the ERROR
+            // log inside the `einval!()` error-construction path.
+            let key_bytes = key.as_bytes();
+            let recognized = RAFS_XATTR_PREFIXES
+                .iter()
+                .any(|p| key_bytes.len() >= p.len() && &key_bytes[..p.len()] == p.as_bytes());
+            if !recognized {
+                debug!(
+                    "skipping non-RAFS xattr on {}: {}",
+                    self.path().display(),
+                    key.to_string_lossy()
+                );
+                continue;
+            }
+
             let value = xattr::get(self.path(), &key).with_context(|| {
                 format!("failed to get xattr {:?} of {}", key, self.path().display())
             })?;
