@@ -29,8 +29,6 @@ jobs:
         save-if: ${{ github.ref == 'refs/heads/master' }}
     - name: Install cargo nextest
       uses: taiki-e/install-action@nextest
-    - name: Fscache Setup
-      run: sudo bash misc/fscache/setup.sh
     - name: Install Miri
       run: |
         rustup toolchain install nightly --component miri
