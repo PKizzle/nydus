@@ -152,7 +152,6 @@ impl BlobFactory {
                 let mgr = FileCacheMgr::new(
                     cache_cfg,
                     backend,
-                    ASYNC_RUNTIME.clone(),
                     &config.id,
                     user_io_batch_size,
                 )?;

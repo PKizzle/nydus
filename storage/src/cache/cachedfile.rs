@@ -26,7 +26,6 @@ use nydus_utils::compress::Decoder;
 use nydus_utils::crypt::{self, Cipher, CipherContext};
 use nydus_utils::metrics::{BlobcacheMetrics, Metric};
 use nydus_utils::{compress, digest, round_up_usize, DelayType, Delayer, FileRangeReader};
-use tokio::runtime::Runtime;
 
 use crate::backend::BlobReader;
 use crate::cache::state::ChunkMap;
@@ -55,7 +54,6 @@ impl FileCacheMeta {
         blob_file: String,
         blob_info: Arc<BlobInfo>,
         reader: Option<Arc<dyn BlobReader>>,
-        runtime: Option<Arc<Runtime>>,
         sync: bool,
         validation: bool,
     ) -> Result<Self> {
@@ -79,8 +77,10 @@ impl FileCacheMeta {
             };
             let meta1 = meta.clone();
 
-            if let Some(r) = runtime {
-                r.as_ref().spawn_blocking(move || {
+            // Download blob meta off the calling thread on the global blocking
+            // pool (runtime-agnostic; replaces tokio's spawn_blocking). `detach`
+            // keeps it running fire-and-forget — `blocking`'s Task cancels on drop.
+            blocking::unblock(move || {
                     let mut retry = 0;
                     let mut delayer = Delayer::new(
                         DelayType::BackOff,
@@ -106,10 +106,8 @@ impl FileCacheMeta {
                     }
                     warn!("failed to get blob.meta");
                     meta1.has_error.store(true, Ordering::Release);
-                });
-            } else {
-                warn!("Want download blob meta asynchronously but no runtime.");
-            }
+                })
+                .detach();
 
             Ok(meta)
         }
@@ -194,7 +192,6 @@ pub(crate) struct FileCacheEntry {
     pub(crate) metrics: Arc<BlobcacheMetrics>,
     pub(crate) prefetch_state: Arc<AtomicU32>,
     pub(crate) reader: Arc<dyn BlobReader>,
-    pub(crate) runtime: Arc<Runtime>,
     pub(crate) workers: Arc<AsyncWorkerMgr>,
 
     pub(crate) blob_compressed_size: u64,
@@ -249,7 +246,7 @@ impl FileCacheEntry {
         let _cas_mgr = self.cas_mgr.clone();
 
         metrics.buffered_backend_size.add(buffer.size() as u64);
-        self.runtime.spawn_blocking(move || {
+        blocking::unblock(move || {
             metrics.buffered_backend_size.sub(buffer.size() as u64);
             let mut t_buf;
             let buf = if !is_raw_data && is_cache_encrypted {
@@ -313,7 +310,8 @@ impl FileCacheEntry {
                     );
                 }
             }
-        });
+        })
+        .detach();
     }
 
     fn persist_chunk_data(&self, chunk: &dyn BlobChunkInfo, buf: &[u8]) {
