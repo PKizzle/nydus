@@ -100,6 +100,10 @@ nydus-utils = { version = "0.5.1", path = "../utils" }
 [dev-dependencies]
 tempfile = "3"
 assert_cmd = "2"
+# Drive a real tonic gRPC client (over tokio) against the compio cyper-axum
+# server in the gRPC transport round-trip test.
+tonic = { version = "0.14", features = ["transport"] }
+tokio = { version = "1", features = ["rt", "macros"] }
 
 [features]
 default = [
