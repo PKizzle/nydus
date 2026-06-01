@@ -558,7 +558,7 @@ mod tests {
         status.code()
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn prepare_nydus_blob_commits_target_and_returns_already_exists() {
         let dir = tempdir().unwrap();
         let snapshotter = test_snapshotter(dir.path());
@@ -582,7 +582,7 @@ mod tests {
         assert!(snapshotter.stat(key.to_string()).await.is_err());
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn prepare_nydus_blob_is_idempotent_when_target_already_exists() {
         let dir = tempdir().unwrap();
         let snapshotter = test_snapshotter(dir.path());
