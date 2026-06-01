@@ -4,17 +4,15 @@
 
 // ! Storage backend driver to access the blobs through a http proxy.
 
+use compio::net::UnixStream;
+use cyper_core::HyperStream;
 use http::{HeaderMap, HeaderValue, Method, Request};
 use http_body_util::{BodyExt, Full};
-use hyper::{body::Bytes, Response};
-use hyper_util::client::legacy::Client as HyperClient;
-use hyperlocal::Uri as HyperLocalUri;
-use hyperlocal::{UnixClientExt, UnixConnector};
+use hyper::body::Bytes;
 use nydus_api::HttpProxyConfig;
 use nydus_utils::metrics::BackendMetrics;
-use tokio::runtime::Runtime;
 
-use super::connection::{Connection, ConnectionConfig, ConnectionError};
+use super::connection::{block_on_http, Connection, ConnectionConfig, ConnectionError};
 use super::{BackendContext, BackendError, BackendResult, BlobBackend, BlobReader};
 use crate::backend::request;
 use std::path::Path;
@@ -26,19 +24,19 @@ use std::{
     sync::Arc,
 };
 
-const HYPER_LOCAL_CLIENT_RUNTIME_THREAD_NUM: usize = 1;
-
 #[derive(Debug)]
 pub enum HttpProxyError {
     /// Failed to parse string to integer.
     ParseStringToInteger(ParseIntError),
     ParseContentLengthFromHeader(http::header::ToStrError),
+    /// Failed to connect to the local http proxy unix socket.
+    LocalConnect(Error),
+    /// Failed to perform the HTTP/1 handshake with the local http server.
+    LocalHandshake(hyper::Error),
     /// Failed to get response from the local http server.
-    LocalRequest(hyper_util::client::legacy::Error),
+    LocalRequest(hyper::Error),
     /// Failed to get response from the remote http server.
     RemoteRequest(ConnectionError),
-    /// Failed to build the tokio runtime.
-    BuildTokioRuntime(Error),
     /// Failed to build local http request.
     BuildHttpRequest(http::Error),
     /// Failed to read the response body.
@@ -62,11 +60,14 @@ impl fmt::Display for HttpProxyError {
             HttpProxyError::ParseContentLengthFromHeader(e) => {
                 write!(f, "failed to parse content length from header, {}", e)
             }
+            HttpProxyError::LocalConnect(e) => {
+                write!(f, "failed to connect to local http proxy socket, {}", e)
+            }
+            HttpProxyError::LocalHandshake(e) => {
+                write!(f, "failed to handshake with local http proxy, {}", e)
+            }
             HttpProxyError::LocalRequest(e) => write!(f, "failed to get response, {}", e),
             HttpProxyError::RemoteRequest(e) => write!(f, "failed to get response, {}", e),
-            HttpProxyError::BuildTokioRuntime(e) => {
-                write!(f, "failed to build tokio runtime, {}", e)
-            }
             HttpProxyError::BuildHttpRequest(e) => {
                 write!(f, "failed to build http request, {}", e)
             }
@@ -113,10 +114,12 @@ pub struct HttpProxyReader {
     metrics: Arc<BackendMetrics>,
 }
 
+/// Client for the local (unix-socket) http proxy. Speaks HTTP/1 over a compio
+/// `UnixStream` using hyper's low-level client, driven by the shared thread-local
+/// compio HTTP runtime — no tokio.
 #[derive(Clone)]
 struct LocalClient {
-    client: Arc<HyperClient<UnixConnector, Full<Bytes>>>,
-    runtime: Arc<Runtime>,
+    socket: Arc<String>,
 }
 
 #[derive(Clone)]
@@ -126,7 +129,7 @@ enum Client {
 }
 
 enum Uri {
-    Local(Arc<hyper::Uri>),
+    Local,
     Remote(String),
 }
 
@@ -137,76 +140,80 @@ fn range_str_for_header(offset: u64, len: Option<usize>) -> String {
     }
 }
 
-fn build_tokio_runtime(name: &str, thread_num: usize) -> Result<Runtime> {
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .thread_name(name)
-        .worker_threads(thread_num)
-        .enable_all()
-        .build()?;
-    Ok(runtime)
-}
-
 impl LocalClient {
+    /// Issue a single HEAD/GET over a fresh unix-socket connection and return the
+    /// response headers and (for GET) the collected body.
+    ///
+    /// The request-target is `/`, matching the previous `hyperlocal` behavior
+    /// (the local proxy is addressed purely by its socket path).
     async fn do_req(
         &self,
-        uri: Arc<hyper::Uri>,
         only_head: bool,
         offset: u64,
         len: Option<usize>,
-    ) -> BackendResult<Response<hyper::body::Incoming>> {
+    ) -> BackendResult<(HeaderMap<HeaderValue>, Vec<u8>)> {
+        let stream = UnixStream::connect(self.socket.as_str())
+            .await
+            .map_err(HttpProxyError::LocalConnect)?;
+        let io = HyperStream::new_plain(stream);
+        let (mut sender, conn) = hyper::client::conn::http1::handshake(io)
+            .await
+            .map_err(HttpProxyError::LocalHandshake)?;
+        // Drive the connection concurrently with the request on the same compio
+        // runtime; await it after the request so the socket is torn down before
+        // we return (no detached/leaked connection task).
+        let conn_task = compio::runtime::spawn(async move {
+            let _ = conn.await;
+        });
+
         let method = if only_head { Method::HEAD } else { Method::GET };
         let req = Request::builder()
             .method(method)
-            .uri(uri.as_ref())
+            .uri("/")
+            .header(http::header::HOST, "localhost")
             .header(http::header::RANGE, range_str_for_header(offset, len))
             .body(Full::new(Bytes::new()))
             .map_err(HttpProxyError::BuildHttpRequest)?;
-        let resp = self
-            .client
-            .request(req)
+
+        let resp = sender
+            .send_request(req)
             .await
             .map_err(HttpProxyError::LocalRequest)?;
-        Ok(resp)
+        let headers = resp.headers().clone();
+        let body = if only_head {
+            Vec::new()
+        } else {
+            resp.into_body()
+                .collect()
+                .await
+                .map_err(HttpProxyError::ReadResponseBody)?
+                .to_bytes()
+                .to_vec()
+        };
+
+        drop(sender);
+        // The connection task is done once the request completed and the sender
+        // dropped; its result (clean close vs. peer reset) is not actionable here.
+        let _ = conn_task.await;
+        Ok((headers, body))
     }
 
-    fn get_headers(&self, uri: Arc<hyper::Uri>) -> BackendResult<HeaderMap<HeaderValue>> {
-        let headers = self
-            .runtime
-            .block_on(self.do_req(uri, true, 0, None))?
-            .headers()
-            .to_owned();
-        Ok(headers)
+    fn get_headers(&self) -> BackendResult<HeaderMap<HeaderValue>> {
+        block_on_http(self.do_req(true, 0, None)).map(|(headers, _)| headers)
     }
 
-    fn try_read(&self, uri: Arc<hyper::Uri>, offset: u64, len: usize) -> BackendResult<Vec<u8>> {
-        self.runtime.block_on(async {
-            let resp = self.do_req(uri, false, offset, Some(len)).await;
-            match resp {
-                Ok(mut resp) => resp
-                    .body_mut()
-                    .collect()
-                    .await
-                    .map_err(|e| HttpProxyError::ReadResponseBody(e).into())
-                    .map(|b| b.to_bytes().to_vec()),
-                Err(e) => Err(e),
-            }
-        })
+    fn try_read(&self, offset: u64, len: usize) -> BackendResult<Vec<u8>> {
+        block_on_http(self.do_req(false, offset, Some(len))).map(|(_, body)| body)
     }
 }
 
 impl BlobReader for HttpProxyReader {
     fn blob_size(&self) -> super::BackendResult<u64> {
         let headers = match &self.client {
-            Client::Local(client) => {
-                let uri = match self.uri {
-                    Uri::Local(ref uri) => uri.clone(),
-                    Uri::Remote(_) => unreachable!(),
-                };
-                client.get_headers(uri)
-            }
+            Client::Local(client) => client.get_headers(),
             Client::Remote(request) => {
                 let uri = match self.uri {
-                    Uri::Local(_) => unreachable!(),
+                    Uri::Local => unreachable!(),
                     Uri::Remote(ref uri) => uri.clone(),
                 };
                 let mut ctx = BackendContext::default();
@@ -245,11 +252,7 @@ impl BlobReader for HttpProxyReader {
     ) -> BackendResult<usize> {
         match &self.client {
             Client::Local(client) => {
-                let uri = match self.uri {
-                    Uri::Local(ref uri) => uri.clone(),
-                    Uri::Remote(_) => unreachable!(),
-                };
-                let content = client.try_read(uri, offset, buf.len())?;
+                let content = client.try_read(offset, buf.len())?;
                 let copied_size = std::io::copy(&mut content.as_slice(), &mut &mut *buf)
                     .map_err(HttpProxyError::CopyBuffer)?;
                 Ok(copied_size as usize)
@@ -258,7 +261,7 @@ impl BlobReader for HttpProxyReader {
                 let mut default_ctx = BackendContext::default();
                 let ctx = ctx.unwrap_or(&mut default_ctx);
                 let uri = match self.uri {
-                    Uri::Local(_) => unreachable!(),
+                    Uri::Local => unreachable!(),
                     Uri::Remote(ref uri) => uri.clone(),
                 };
                 let mut headers = HeaderMap::new();
@@ -304,13 +307,9 @@ impl HttpProxy {
             let request = request::Request::new(conn, proxy_config, false, id.unwrap_or(""));
             Client::Remote(request)
         } else {
-            let client = HyperClient::unix();
-            let runtime = build_tokio_runtime("http-proxy", HYPER_LOCAL_CLIENT_RUNTIME_THREAD_NUM)?;
-            let local_client = LocalClient {
-                client: Arc::new(client),
-                runtime: Arc::new(runtime),
-            };
-            Client::Local(local_client)
+            Client::Local(LocalClient {
+                socket: Arc::new(config.addr.to_string()),
+            })
         };
         Ok(HttpProxy {
             addr: config.addr.to_string(),
@@ -344,11 +343,7 @@ impl BlobBackend for HttpProxy {
         let path = Path::new(&self.path).join(blob_id);
         let path = path.to_str().ok_or(HttpProxyError::InvalidPath)?;
         let uri = match &self.client {
-            Client::Local(_) => {
-                let uri: Arc<hyper::Uri> =
-                    Arc::new(HyperLocalUri::new(self.addr.clone(), "/").into());
-                Uri::Local(uri)
-            }
+            Client::Local(_) => Uri::Local,
             Client::Remote(_) => {
                 let uri = format!("{}{}", self.addr, path);
                 Uri::Remote(uri)
@@ -397,12 +392,22 @@ mod tests {
         time::Duration,
     };
     use tokio::net::{TcpListener, UnixListener};
+    use tokio::runtime::Runtime;
 
-    use super::build_tokio_runtime;
     use super::Bytes;
 
     const CONTENT: &str = "some content for test";
     const SOCKET_PATH: &str = "/tmp/nydus-test-local-http-proxy.sock";
+
+    /// Build a tokio runtime for the test mock servers (the backend under test
+    /// is on compio; only the test harness uses tokio).
+    fn build_tokio_runtime(name: &str, thread_num: usize) -> std::io::Result<Runtime> {
+        tokio::runtime::Builder::new_multi_thread()
+            .thread_name(name)
+            .worker_threads(thread_num)
+            .enable_all()
+            .build()
+    }
 
     fn parse_range_header(range_str: &str) -> (u64, Option<u64>) {
         let range_str = range_str.trim_start_matches("bytes=");
