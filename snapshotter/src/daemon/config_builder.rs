@@ -11,8 +11,8 @@
 use std::path::Path;
 
 use nydus_api::{
-    BackendConfigV2, BlobCacheEntry, BlobCacheEntryConfigV2, CacheConfigV2, ConfigV2,
-    FileCacheConfig, RafsConfigV2, RegistryConfig, BLOB_CACHE_TYPE_META_BLOB,
+    BLOB_CACHE_TYPE_META_BLOB, BackendConfigV2, BlobCacheEntry, BlobCacheEntryConfigV2,
+    CacheConfigV2, ConfigV2, FileCacheConfig, RafsConfigV2, RegistryConfig,
 };
 use serde_json::json;
 

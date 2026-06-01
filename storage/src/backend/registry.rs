@@ -14,7 +14,7 @@ use std::{fmt, thread};
 use arc_swap::{ArcSwap, ArcSwapOption};
 use base64::Engine;
 pub use http::header::HeaderMap;
-use http::header::{HeaderValue, CONTENT_LENGTH};
+use http::header::{CONTENT_LENGTH, HeaderValue};
 use http::{Method, StatusCode};
 use url::{ParseError, Url};
 
@@ -834,10 +834,12 @@ impl RegistryReader {
                 return self._try_read(buf, offset, false, context);
             }
             if !is_success_status(status) {
-                return Err(RegistryError::Request(ConnectionError::ErrorWithMsg(format!(
-                    "unexpected status {} reading blob from cached redirect",
-                    status
-                ))));
+                return Err(RegistryError::Request(ConnectionError::ErrorWithMsg(
+                    format!(
+                        "unexpected status {} reading blob from cached redirect",
+                        status
+                    ),
+                )));
             }
             return Ok(written);
         }
@@ -928,13 +930,18 @@ impl RegistryReader {
                     )
                     .map_err(request_err_to_registry)?;
                 if !is_success_status(rstatus) {
-                    return Err(RegistryError::Request(ConnectionError::ErrorWithMsg(format!(
-                        "unexpected status {} reading blob from redirect {}",
-                        rstatus,
-                        location.as_str()
-                    ))));
+                    return Err(RegistryError::Request(ConnectionError::ErrorWithMsg(
+                        format!(
+                            "unexpected status {} reading blob from redirect {}",
+                            rstatus,
+                            location.as_str()
+                        ),
+                    )));
                 }
-                trace!("redirect cache for blob={}, status={}", self.blob_id, status);
+                trace!(
+                    "redirect cache for blob={}, status={}",
+                    self.blob_id, status
+                );
                 self.state
                     .cached_redirect
                     .set(self.blob_id.clone(), location.as_str().to_string());
@@ -1715,9 +1722,10 @@ mod tests {
     #[test]
     fn test_registry_error_display() {
         let err = RegistryError::Common("something went wrong".to_string());
-        assert!(err
-            .to_string()
-            .contains("failed to access blob from registry"));
+        assert!(
+            err.to_string()
+                .contains("failed to access blob from registry")
+        );
         assert!(err.to_string().contains("something went wrong"));
 
         let pe = url::Url::parse("::not-a-url").unwrap_err();

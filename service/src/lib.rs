@@ -22,9 +22,9 @@ use std::io;
 use std::str::FromStr;
 use std::sync::mpsc::{RecvError, SendError};
 
+use fuse_backend_rs::Error as FuseError;
 use fuse_backend_rs::api::vfs::VfsError;
 use fuse_backend_rs::transport::Error as FuseTransportError;
-use fuse_backend_rs::Error as FuseError;
 use nydus_api::{ConfigV2, DaemonErrorKind};
 use nydus_rafs::RafsError;
 use serde::{Deserialize, Serialize};
@@ -40,9 +40,9 @@ pub mod upgrade;
 
 pub use blob_cache::{BlobCacheMgr, BlobCacheObjectInfo, BlobCacheObjectList};
 pub use fs_service::{FsBackendCollection, FsBackendMountCmd, FsBackendUmountCmd, FsService};
-pub use fusedev::{create_fuse_daemon, create_vfs_backend, FusedevDaemon};
-pub use singleton::create_daemon;
+pub use fusedev::{FusedevDaemon, create_fuse_daemon, create_vfs_backend};
 pub use singleton::ServiceController;
+pub use singleton::create_daemon;
 
 #[cfg(target_os = "linux")]
 pub mod blob_cache;
@@ -329,9 +329,10 @@ mod tests {
     #[test]
     fn test_backend_fs_type_invalid_inputs() {
         let err = FsBackendType::from_str("").unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("only 'rafs' and 'passthrough_fs' are supported"));
+        assert!(
+            err.to_string()
+                .contains("only 'rafs' and 'passthrough_fs' are supported")
+        );
 
         let err = FsBackendType::from_str("Rafs").unwrap_err();
         assert!(err.to_string().contains("Rafs was specified"));
@@ -415,14 +416,20 @@ mod tests {
         assert!(Error::NotFound.to_string().contains("doesn't exist"));
         assert!(Error::NotReady.to_string().contains("not ready"));
         assert!(Error::Unsupported.to_string().contains("unsupported"));
-        assert!(Error::InvalidPrefetchList
-            .to_string()
-            .contains("prefetch file list"));
-        assert!(Error::InvalidConfig("cfg".into())
-            .to_string()
-            .contains("cfg"));
-        assert!(Error::InvalidArguments("arg".into())
-            .to_string()
-            .contains("arg"));
+        assert!(
+            Error::InvalidPrefetchList
+                .to_string()
+                .contains("prefetch file list")
+        );
+        assert!(
+            Error::InvalidConfig("cfg".into())
+                .to_string()
+                .contains("cfg")
+        );
+        assert!(
+            Error::InvalidArguments("arg".into())
+                .to_string()
+                .contains("arg")
+        );
     }
 }

@@ -16,17 +16,17 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
-use anyhow::{anyhow, bail, Context, Error, Result};
+use anyhow::{Context, Error, Result, anyhow, bail};
 use nydus_rafs::metadata::chunk::ChunkWrapper;
 use nydus_rafs::metadata::inode::InodeWrapper;
-use nydus_rafs::metadata::layout::v6::EROFS_INODE_FLAT_PLAIN;
 use nydus_rafs::metadata::layout::RafsXAttrs;
+use nydus_rafs::metadata::layout::v6::EROFS_INODE_FLAT_PLAIN;
 use nydus_rafs::metadata::{Inode, RafsVersion};
 use nydus_storage::device::BlobFeatures;
 use nydus_storage::meta::{BlobChunkInfoV2Ondisk, BlobMetaChunkInfo};
 use nydus_utils::digest::{DigestHasher, RafsDigest};
+use nydus_utils::{ByteSize, div_round_up, event_tracer, root_tracer, try_round_up_4k};
 use nydus_utils::{compress, crc32, crypt, xxh3};
-use nydus_utils::{div_round_up, event_tracer, root_tracer, try_round_up_4k, ByteSize};
 use parse_size::parse_size;
 use sha2::digest::Digest;
 
@@ -697,8 +697,7 @@ impl Node {
 
         trace!(
             "\t\tfound duplicated chunk: {} compressor {}",
-            chunk,
-            ctx.compressor
+            chunk, ctx.compressor
         );
         let source = if from_dict {
             ChunkSource::Dict
@@ -1054,10 +1053,10 @@ impl Node {
 mod tests {
     use std::{collections::HashMap, io::BufReader};
 
-    use nydus_utils::{digest, BufReaderInfo};
+    use nydus_utils::{BufReaderInfo, digest};
     use vmm_sys_util::tempfile::TempFile;
 
-    use crate::{attributes::Attributes, ArtifactWriter, BlobCacheGenerator, HashChunkDict};
+    use crate::{ArtifactWriter, BlobCacheGenerator, HashChunkDict, attributes::Attributes};
 
     use super::*;
 
@@ -1249,15 +1248,19 @@ mod tests {
         assert_eq!(node.info.deref().symlink, Some(OsString::from("symlink")));
 
         let mut xatter = RafsXAttrs::new();
-        assert!(xatter
-            .add(OsString::from("user.key"), [1u8; 16].to_vec())
-            .is_ok());
-        assert!(xatter
-            .add(
-                OsString::from("system.posix_acl_default.key"),
-                [2u8; 8].to_vec()
-            )
-            .is_ok());
+        assert!(
+            xatter
+                .add(OsString::from("user.key"), [1u8; 16].to_vec())
+                .is_ok()
+        );
+        assert!(
+            xatter
+                .add(
+                    OsString::from("system.posix_acl_default.key"),
+                    [2u8; 8].to_vec()
+                )
+                .is_ok()
+        );
         node.set_xattr(xatter);
         node.inode.set_has_xattr(true);
         node.remove_xattr(OsStr::new("user.key"));

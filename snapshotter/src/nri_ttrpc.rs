@@ -9,7 +9,7 @@
 //! protobuf messages used by the plugin with `prost` and manually registering
 //! ttrpc method handlers.
 
-use crate::nri::{prefetch_hint_from_annotations, PrefetchHint, SysctlClient};
+use crate::nri::{PrefetchHint, SysctlClient, prefetch_hint_from_annotations};
 use anyhow::{Context, Result};
 use prost::Message;
 use std::collections::HashMap;

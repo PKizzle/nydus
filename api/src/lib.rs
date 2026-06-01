@@ -35,7 +35,7 @@ pub(crate) mod http_prometheus;
 
 #[cfg(feature = "handler")]
 pub use http_handler::{
-    extract_query_part, start_http_thread, EndpointHandler, HttpResult, HttpRoutes, HTTP_ROUTES,
+    EndpointHandler, HTTP_ROUTES, HttpResult, HttpRoutes, extract_query_part, start_http_thread,
 };
 
 /// Application build and version information.

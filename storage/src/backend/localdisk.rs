@@ -18,7 +18,7 @@ use nydus_api::LocalDiskConfig;
 use nydus_utils::metrics::BackendMetrics;
 
 use crate::backend::{BackendError, BackendResult, BlobBackend, BlobReader};
-use crate::utils::{readv, MemSliceCursor};
+use crate::utils::{MemSliceCursor, readv};
 
 type LocalDiskResult<T> = std::result::Result<T, LocalDiskError>;
 

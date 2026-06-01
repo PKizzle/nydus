@@ -5,8 +5,8 @@
 use std::collections::HashSet;
 use std::fs::OpenOptions;
 use std::path::Path;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use anyhow::{Context, Result};
 use nydus_api::ConfigV2;
@@ -300,7 +300,9 @@ impl ImageStat {
 
         if self.dedup_enabled {
             println!("\n\nChunk Deduplication Statistics:");
-            println!("Global Dedup Thresh:\tRaw Chunks:\tDedup Chunks:\tComp Content Size:\tComp Base Size:\tComp Image Size:\tUncomp Content Size:\tUncomp Base Size\tUncomp Image Size");
+            println!(
+                "Global Dedup Thresh:\tRaw Chunks:\tDedup Chunks:\tComp Content Size:\tComp Base Size:\tComp Image Size:\tUncomp Content Size:\tUncomp Base Size\tUncomp Image Size"
+            );
             for (idx, info) in self.dedup_info.iter().enumerate() {
                 if info.dedup_chunks == 0 {
                     break;

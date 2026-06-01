@@ -392,7 +392,7 @@ pub fn parse_duration(value: &str) -> CacheResult<Duration> {
         _ => {
             return Err(CacheError::InvalidDuration {
                 value: value.to_string(),
-            })
+            });
         }
     };
     Ok(Duration::from_secs(seconds))
@@ -425,18 +425,24 @@ mod tests {
         let usage = manager.scan().unwrap();
         assert_eq!(usage.total_files, 3);
         assert_eq!(usage.total_bytes, 11);
-        assert!(usage
-            .entries
-            .iter()
-            .any(|entry| entry.kind == CacheArtifactKind::BlobData));
-        assert!(usage
-            .entries
-            .iter()
-            .any(|entry| entry.kind == CacheArtifactKind::BlobMeta));
-        assert!(usage
-            .entries
-            .iter()
-            .any(|entry| entry.kind == CacheArtifactKind::ChunkMap));
+        assert!(
+            usage
+                .entries
+                .iter()
+                .any(|entry| entry.kind == CacheArtifactKind::BlobData)
+        );
+        assert!(
+            usage
+                .entries
+                .iter()
+                .any(|entry| entry.kind == CacheArtifactKind::BlobMeta)
+        );
+        assert!(
+            usage
+                .entries
+                .iter()
+                .any(|entry| entry.kind == CacheArtifactKind::ChunkMap)
+        );
     }
 
     #[test]

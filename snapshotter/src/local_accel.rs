@@ -25,7 +25,7 @@ use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 
 /// A gzip layer of the source image as it exists in containerd's content store.
 #[derive(Clone, Debug, Eq, PartialEq)]

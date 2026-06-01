@@ -8,9 +8,9 @@ use std::slice;
 
 use nydus_utils::compress::zlib_random::{ZranContext, ZranGenerator, ZranReader};
 
-use crate::meta::chunk_info_v2::BlobChunkInfoV2Ondisk;
-use crate::meta::{round_up_4k, BlobMetaChunkInfo};
 use crate::RAFS_DEFAULT_CHUNK_SIZE;
+use crate::meta::chunk_info_v2::BlobChunkInfoV2Ondisk;
+use crate::meta::{BlobMetaChunkInfo, round_up_4k};
 
 /// Context information to support random access to zlib/gzip stream .
 #[repr(C, packed)]

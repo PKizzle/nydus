@@ -35,8 +35,8 @@
 use std::any::Any;
 use std::io::Result;
 
-use crate::device::BlobChunkInfo;
 use crate::StorageResult;
+use crate::device::BlobChunkInfo;
 
 pub use blob_state_map::BlobStateMap;
 pub use digested_chunk_map::DigestedChunkMap;

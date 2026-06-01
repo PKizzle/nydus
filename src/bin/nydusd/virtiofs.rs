@@ -6,13 +6,13 @@
 
 use std::any::Any;
 use std::sync::atomic::{AtomicI32, Ordering};
-use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 use std::thread;
 
-use fuse_backend_rs::api::{server::Server, Vfs};
+use fuse_backend_rs::api::{Vfs, server::Server};
 use fuse_backend_rs::transport::{FsCacheReqHandler, Reader, VirtioFsWriter};
-use vhost::vhost_user::{message::*, Backend, Listener};
+use vhost::vhost_user::{Backend, Listener, message::*};
 use vhost_user_backend::bitmap::BitmapReplace;
 use vhost_user_backend::{
     VhostUserBackend, VhostUserBackendMut, VhostUserDaemon, VringMutex, VringState, VringT,

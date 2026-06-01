@@ -21,16 +21,16 @@ use std::os::unix::fs::MetadataExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::{
-    atomic::{AtomicI32, AtomicU64, Ordering},
-    mpsc::{channel, Receiver, Sender},
     Arc, Mutex, MutexGuard,
+    atomic::{AtomicI32, AtomicU64, Ordering},
+    mpsc::{Receiver, Sender, channel},
 };
 use std::thread::{self, JoinHandle};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use fuse_backend_rs::abi::fuse_abi::{InHeader, OutHeader};
-use fuse_backend_rs::api::server::{MetricsHook, Server};
 use fuse_backend_rs::api::Vfs;
+use fuse_backend_rs::api::server::{MetricsHook, Server};
 use fuse_backend_rs::transport::{FuseChannel, FuseSession, FuseSessionExt};
 use mio::Waker;
 #[cfg(target_os = "linux")]

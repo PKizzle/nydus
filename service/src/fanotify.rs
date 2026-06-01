@@ -29,8 +29,8 @@ use mio::{Events, Interest, Poll, Token, Waker};
 
 use crate::blob_cache::{BlobCacheMgr, DataBlob};
 use crate::fanotify_sys::{
-    fan_deny_errno, fanotify_event_info_header, fanotify_event_info_range, FAN_CLASS_PRE_CONTENT,
-    FAN_EVENT_INFO_TYPE_RANGE, FAN_PRE_ACCESS,
+    FAN_CLASS_PRE_CONTENT, FAN_EVENT_INFO_TYPE_RANGE, FAN_PRE_ACCESS, fan_deny_errno,
+    fanotify_event_info_header, fanotify_event_info_range,
 };
 
 const TOKEN_EVENT_WAKER: usize = 1;
@@ -301,7 +301,10 @@ impl FanotifyHandler {
         // an incoming event fd can be resolved back to the blob without relying on path names.
         let mut blob_backings = Vec::new();
         for cfg in blob_cache_mgr.get_all_data_blobs() {
-            let blob = match compio::runtime::Runtime::new().unwrap().block_on(DataBlob::new(&cfg)) {
+            let blob = match compio::runtime::Runtime::new()
+                .unwrap()
+                .block_on(DataBlob::new(&cfg))
+            {
                 Ok(b) => b,
                 Err(e) => {
                     warn!(
@@ -653,8 +656,7 @@ impl FanotifyHandler {
                 // Unmanaged file (e.g. the fully-present bootstrap): nothing to fetch.
                 trace!(
                     "fanotify: pre-access for unmanaged file dev={} ino={}, allowing",
-                    dev,
-                    ino
+                    dev, ino
                 );
                 return Ok(());
             }

@@ -19,12 +19,12 @@ use clap::{Arg, ArgAction, ArgMatches, Command};
 use nix::sys::signal;
 use rlimit::Resource;
 
-use nydus::{dump_program_info, get_build_time_info, setup_logging, SubCmdArgs};
+use nydus::{SubCmdArgs, dump_program_info, get_build_time_info, setup_logging};
 use nydus_api::{BlobCacheList, BuildTimeInfo, ConfigV2};
 use nydus_service::daemon::DaemonController;
 use nydus_service::{
-    create_daemon, create_fuse_daemon, create_vfs_backend, validate_threads_configuration,
-    Error as NydusError, FsBackendMountCmd, FsBackendType, ServiceArgs,
+    Error as NydusError, FsBackendMountCmd, FsBackendType, ServiceArgs, create_daemon,
+    create_fuse_daemon, create_vfs_backend, validate_threads_configuration,
 };
 use nydus_storage::cache::CasMgr;
 

@@ -33,7 +33,7 @@ use crate::device::{
 };
 use crate::meta::BlobCompressionContextInfo;
 use crate::utils::{alloc_buf, check_crc, check_hash, check_xxh3};
-use crate::{StorageResult, RAFS_MAX_CHUNK_SIZE};
+use crate::{RAFS_MAX_CHUNK_SIZE, StorageResult};
 
 mod cachedfile;
 #[cfg(feature = "dedup")]

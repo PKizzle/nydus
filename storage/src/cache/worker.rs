@@ -468,29 +468,35 @@ mod tests {
         let mgr = Arc::new(AsyncWorkerMgr::new(metrics, config).unwrap());
         AsyncWorkerMgr::start(mgr.clone()).unwrap();
         assert_eq!(mgr.ping_requests.load(Ordering::Acquire), 0);
-        assert!(mgr
-            .send_prefetch_message(AsyncPrefetchMessage::Ping)
-            .is_ok());
-        assert!(mgr
-            .send_prefetch_message(AsyncPrefetchMessage::Ping)
-            .is_ok());
-        assert!(mgr
-            .send_prefetch_message(AsyncPrefetchMessage::Ping)
-            .is_ok());
-        assert!(mgr
-            .send_prefetch_message(AsyncPrefetchMessage::Ping)
-            .is_ok());
-        assert!(mgr
-            .send_prefetch_message(AsyncPrefetchMessage::Ping)
-            .is_ok());
+        assert!(
+            mgr.send_prefetch_message(AsyncPrefetchMessage::Ping)
+                .is_ok()
+        );
+        assert!(
+            mgr.send_prefetch_message(AsyncPrefetchMessage::Ping)
+                .is_ok()
+        );
+        assert!(
+            mgr.send_prefetch_message(AsyncPrefetchMessage::Ping)
+                .is_ok()
+        );
+        assert!(
+            mgr.send_prefetch_message(AsyncPrefetchMessage::Ping)
+                .is_ok()
+        );
+        assert!(
+            mgr.send_prefetch_message(AsyncPrefetchMessage::Ping)
+                .is_ok()
+        );
         thread::sleep(Duration::from_secs(1));
         assert_eq!(mgr.ping_requests.load(Ordering::Acquire), 5);
         assert_eq!(mgr.workers.load(Ordering::Acquire), 2);
         mgr.stop();
         assert_eq!(mgr.workers.load(Ordering::Acquire), 0);
-        assert!(mgr
-            .send_prefetch_message(AsyncPrefetchMessage::Ping)
-            .is_err());
+        assert!(
+            mgr.send_prefetch_message(AsyncPrefetchMessage::Ping)
+                .is_err()
+        );
     }
 
     #[test]
@@ -505,9 +511,10 @@ mod tests {
         });
 
         let mgr = AsyncWorkerMgr::new(metrics, config).unwrap();
-        assert!(mgr
-            .send_prefetch_message(AsyncPrefetchMessage::Ping)
-            .is_err());
+        assert!(
+            mgr.send_prefetch_message(AsyncPrefetchMessage::Ping)
+                .is_err()
+        );
         assert_eq!(mgr.prefetch_inflight.load(Ordering::Acquire), 0);
     }
 
@@ -524,9 +531,10 @@ mod tests {
 
         let mgr = AsyncWorkerMgr::new(metrics, config).unwrap();
         assert_eq!(mgr.prefetch_inflight.load(Ordering::Acquire), 0);
-        assert!(mgr
-            .send_prefetch_message(AsyncPrefetchMessage::Ping)
-            .is_ok());
+        assert!(
+            mgr.send_prefetch_message(AsyncPrefetchMessage::Ping)
+                .is_ok()
+        );
         assert_eq!(mgr.prefetch_inflight.load(Ordering::Acquire), 1);
     }
 
@@ -571,25 +579,30 @@ mod tests {
         assert_eq!(mgr.prefetch_inflight.load(Ordering::Acquire), 0);
 
         thread::sleep(Duration::from_secs(1));
-        assert!(mgr
-            .send_prefetch_message(AsyncPrefetchMessage::RateLimiter(1))
-            .is_ok());
-        assert!(mgr
-            .send_prefetch_message(AsyncPrefetchMessage::RateLimiter(1))
-            .is_ok());
+        assert!(
+            mgr.send_prefetch_message(AsyncPrefetchMessage::RateLimiter(1))
+                .is_ok()
+        );
+        assert!(
+            mgr.send_prefetch_message(AsyncPrefetchMessage::RateLimiter(1))
+                .is_ok()
+        );
         thread::sleep(Duration::from_secs(1));
         assert_eq!(mgr.prefetch_delayed.load(Ordering::Acquire), 0);
         assert_eq!(mgr.prefetch_inflight.load(Ordering::Acquire), 0);
 
-        assert!(mgr
-            .send_prefetch_message(AsyncPrefetchMessage::RateLimiter(0x1000000))
-            .is_ok());
-        assert!(mgr
-            .send_prefetch_message(AsyncPrefetchMessage::RateLimiter(0x1000000))
-            .is_ok());
-        assert!(mgr
-            .send_prefetch_message(AsyncPrefetchMessage::RateLimiter(u64::MAX))
-            .is_ok());
+        assert!(
+            mgr.send_prefetch_message(AsyncPrefetchMessage::RateLimiter(0x1000000))
+                .is_ok()
+        );
+        assert!(
+            mgr.send_prefetch_message(AsyncPrefetchMessage::RateLimiter(0x1000000))
+                .is_ok()
+        );
+        assert!(
+            mgr.send_prefetch_message(AsyncPrefetchMessage::RateLimiter(u64::MAX))
+                .is_ok()
+        );
         assert!(mgr.prefetch_inflight.load(Ordering::Acquire) <= 3);
         assert!(mgr.prefetch_inflight.load(Ordering::Acquire) >= 1);
         // Each oversized request clamps to the 16M bucket capacity and drains the

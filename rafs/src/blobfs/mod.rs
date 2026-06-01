@@ -14,7 +14,7 @@
 use std::any::Any;
 use std::collections::HashMap;
 use std::ffi::{CStr, CString};
-use std::fs::{create_dir_all, File};
+use std::fs::{File, create_dir_all};
 use std::io;
 use std::mem::MaybeUninit;
 use std::os::fd::{AsRawFd, FromRawFd};
@@ -24,16 +24,16 @@ use std::str::FromStr;
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 
-use fuse_backend_rs::api::{filesystem::*, BackendFileSystem, VFS_MAX_INO};
+use fuse_backend_rs::api::{BackendFileSystem, VFS_MAX_INO, filesystem::*};
 use fuse_backend_rs::{passthrough::Config as PassthroughConfig, passthrough::PassthroughFs};
 use nix::NixPath;
-use nydus_api::{einval, ConfigV2};
+use nydus_api::{ConfigV2, einval};
 use nydus_storage::device::BlobPrefetchRequest;
 use serde::Deserialize;
 
+use crate::RafsError;
 use crate::fs::Rafs;
 use crate::metadata::Inode;
-use crate::RafsError;
 
 mod sync_io;
 
@@ -101,14 +101,14 @@ impl BlobfsState {
                         return Err(eio!(format!(
                             "blobfs: failed to get RAFS filesystem handle, {}",
                             e
-                        )))
+                        )));
                     }
                 },
                 Err(e) => {
                     return Err(eio!(format!(
                         "blobfs: failed to get RAFS filesystem handle, {:?}",
                         e
-                    )))
+                    )));
                 }
             }
         }

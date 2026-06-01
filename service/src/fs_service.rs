@@ -19,7 +19,7 @@ use fuse_backend_rs::api::filesystem::{FileSystem, FsOptions, Layer};
 use fuse_backend_rs::api::vfs::VfsError;
 use fuse_backend_rs::api::{BackFileSystem, Vfs};
 #[cfg(target_os = "linux")]
-use fuse_backend_rs::overlayfs::{config::Config as overlay_config, OverlayFs};
+use fuse_backend_rs::overlayfs::{OverlayFs, config::Config as overlay_config};
 #[cfg(target_os = "linux")]
 use fuse_backend_rs::passthrough::{CachePolicy, Config as passthrough_config, PassthroughFs};
 use nydus_api::ConfigV2;
@@ -459,11 +459,13 @@ mod tests {
             "should not pass verify"
         );
 
-        assert!(validate_prefetch_file_list(&Some(vec![
-            "/etc/passwd".to_string(),
-            "relative/path".to_string(),
-        ]))
-        .is_err());
+        assert!(
+            validate_prefetch_file_list(&Some(vec![
+                "/etc/passwd".to_string(),
+                "relative/path".to_string(),
+            ]))
+            .is_err()
+        );
     }
 
     #[test]

@@ -81,9 +81,10 @@ mod tests {
     fn snapshot_dir_name_is_stable_and_filesystem_safe() {
         assert_eq!(snapshot_dir_name("abc"), snapshot_dir_name("abc"));
         let name = snapshot_dir_name("k8s.io/ns/key/sha256:abc");
-        assert!(name
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-')));
+        assert!(
+            name.chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+        );
     }
 
     #[test]

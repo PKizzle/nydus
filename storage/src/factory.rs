@@ -28,8 +28,9 @@ use nydus_api::OssConfig;
 use nydus_api::RegistryConfig;
 #[cfg(feature = "backend-s3")]
 use nydus_api::S3Config;
-use nydus_api::{default_user_io_batch_size, BackendConfigV2, ConfigV2};
+use nydus_api::{BackendConfigV2, ConfigV2, default_user_io_batch_size};
 
+use crate::backend::BlobBackend;
 #[cfg(feature = "backend-http-proxy")]
 use crate::backend::http_proxy;
 #[cfg(feature = "backend-localdisk")]
@@ -42,7 +43,6 @@ use crate::backend::oss;
 use crate::backend::registry;
 #[cfg(feature = "backend-s3")]
 use crate::backend::s3;
-use crate::backend::BlobBackend;
 use crate::cache::{BlobCache, BlobCacheMgr, DummyCacheMgr, FileCacheMgr};
 use crate::device::BlobInfo;
 
@@ -97,9 +97,11 @@ impl BlobFactory {
         // ASYNC_RUNTIME; a plain thread avoids needing any async runtime here.
         std::thread::Builder::new()
             .name("cache-stat-checker".to_string())
-            .spawn(|| loop {
-                std::thread::sleep(Duration::from_secs(5));
-                BLOB_FACTORY.check_cache_stat();
+            .spawn(|| {
+                loop {
+                    std::thread::sleep(Duration::from_secs(5));
+                    BLOB_FACTORY.check_cache_stat();
+                }
             })
             .expect("storage: failed to spawn cache-stat checker thread");
     }
@@ -132,12 +134,7 @@ impl BlobFactory {
             // Without this it would fall through to `DummyCacheMgr` (no `get_blob_object`, no
             // backing file) and every pre-access event would read zeros.
             "blobcache" | "filecache" | "fanotify" => {
-                let mgr = FileCacheMgr::new(
-                    cache_cfg,
-                    backend,
-                    &config.id,
-                    user_io_batch_size,
-                )?;
+                let mgr = FileCacheMgr::new(cache_cfg, backend, &config.id, user_io_batch_size)?;
                 mgr.init()?;
                 Arc::new(mgr) as Arc<dyn BlobCacheMgr>
             }

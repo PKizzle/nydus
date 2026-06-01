@@ -10,8 +10,8 @@
 
 mod qps_integration {
     use nydus_storage::backend::qps::QpsLimiter;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{Duration, Instant};
 
     /// Verify that the QPS limiter enforces the configured rate under sustained load.
@@ -164,8 +164,8 @@ mod qps_integration {
 /// Integration tests for the Pauser module in combination with simulated backend requests.
 mod pauser_integration {
     use nydus_storage::backend::pauser::Pauser;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::{Duration, Instant};
 
     /// Verify that the pauser correctly blocks concurrent "backend requests"

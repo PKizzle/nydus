@@ -9,7 +9,7 @@
 //! mount execution is enabled: a content-addressed backing store and mount plan
 //! generation for EROFS metadata + shared backing data.
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs;

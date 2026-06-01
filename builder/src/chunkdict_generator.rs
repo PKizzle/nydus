@@ -16,9 +16,9 @@
 
 use super::core::node::{ChunkSource, NodeInfo};
 use super::{BlobManager, Bootstrap, BootstrapManager, BuildContext, BuildOutput, Tree};
-use crate::core::node::Node;
 use crate::NodeChunk;
 use crate::OsString;
+use crate::core::node::Node;
 use anyhow::{Ok, Result};
 use nydus_rafs::metadata::chunk::ChunkWrapper;
 use nydus_rafs::metadata::inode::InodeWrapper;

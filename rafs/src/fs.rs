@@ -26,8 +26,8 @@ use std::time::{Duration, SystemTime};
 
 use fuse_backend_rs::abi::fuse_abi::Attr;
 use fuse_backend_rs::abi::fuse_abi::{stat64, statvfs64};
-use fuse_backend_rs::api::filesystem::*;
 use fuse_backend_rs::api::BackendFileSystem;
+use fuse_backend_rs::api::filesystem::*;
 use nix::unistd::{getegid, geteuid};
 
 use nydus_api::ConfigV2;
@@ -39,7 +39,7 @@ use nydus_utils::{
 };
 
 use crate::metadata::{
-    Inode, RafsInode, RafsInodeWalkAction, RafsSuper, RafsSuperMeta, DOT, DOTDOT,
+    DOT, DOTDOT, Inode, RafsInode, RafsInodeWalkAction, RafsSuper, RafsSuperMeta,
 };
 use crate::prefetch::BlobPrefetcher;
 use crate::{RafsError, RafsIoReader, RafsResult};
@@ -728,8 +728,7 @@ impl FileSystem for Rafs {
                     let new_cnt = io_vecs.iter().fold(0, |s, d| s + d.len());
                     trace!(
                         "amplify RAFS v5 read from {} to {} chunks",
-                        orig_cnt,
-                        new_cnt
+                        orig_cnt, new_cnt
                     );
                 }
             }

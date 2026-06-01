@@ -8,7 +8,7 @@ use std::convert::TryFrom;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use anyhow::{anyhow, bail, ensure, Context, Result};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use hex::FromHex;
 use nydus_api::ConfigV2;
 use nydus_rafs::metadata::{RafsSuper, RafsVersion};
@@ -427,10 +427,12 @@ mod tests {
             Arc::new(ConfigV2::new("cfg")),
         );
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("source bootstrap list is empty"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("source bootstrap list is empty")
+        );
     }
 
     #[test]
@@ -454,10 +456,12 @@ mod tests {
             Arc::new(ConfigV2::new("cfg")),
         );
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("blob digest entries"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("blob digest entries")
+        );
     }
 
     #[test]
@@ -481,10 +485,12 @@ mod tests {
             Arc::new(ConfigV2::new("cfg")),
         );
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("original blob id entries"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("original blob id entries")
+        );
     }
 
     #[test]
@@ -508,10 +514,12 @@ mod tests {
             Arc::new(ConfigV2::new("cfg")),
         );
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("blob size entries"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("blob size entries")
+        );
     }
 
     #[test]
@@ -535,10 +543,12 @@ mod tests {
             Arc::new(ConfigV2::new("cfg")),
         );
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("toc digest entries"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("toc digest entries")
+        );
     }
 
     #[test]

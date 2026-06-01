@@ -17,7 +17,7 @@ use std::ptr::null_mut;
 
 use fuse_backend_rs::api::filesystem::{Context, FileSystem};
 
-use crate::{set_errno, FileSystemState, Inode, NydusFsHandle};
+use crate::{FileSystemState, Inode, NydusFsHandle, set_errno};
 
 /// Magic number for Nydus file handle.
 pub const NYDUS_FILE_HANDLE_MAGIC: u64 = 0xedfc_3919_afc3_5187;

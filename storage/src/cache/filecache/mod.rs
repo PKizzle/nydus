@@ -14,13 +14,13 @@ use nydus_utils::crypt;
 use nydus_utils::metrics::BlobcacheMetrics;
 
 use crate::backend::BlobBackend;
+#[cfg(feature = "dedup")]
+use crate::cache::CasMgr;
 use crate::cache::cachedfile::{FileCacheEntry, FileCacheMeta};
 use crate::cache::state::{
     BlobStateMap, ChunkMap, DigestedChunkMap, IndexedChunkMap, NoopChunkMap,
 };
 use crate::cache::worker::{AsyncPrefetchConfig, AsyncWorkerMgr};
-#[cfg(feature = "dedup")]
-use crate::cache::CasMgr;
 use crate::cache::{BlobCache, BlobCacheMgr};
 use crate::device::{BlobFeatures, BlobInfo};
 use crate::utils::get_path_from_file;

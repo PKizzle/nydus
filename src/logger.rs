@@ -8,8 +8,8 @@ use std::io::Result;
 use std::path::PathBuf;
 
 use flexi_logger::{
-    self, style, Cleanup, Criterion, DeferredNow, FileSpec, Logger, Naming,
-    TS_DASHES_BLANK_COLONS_DOT_BLANK,
+    self, Cleanup, Criterion, DeferredNow, FileSpec, Logger, Naming,
+    TS_DASHES_BLANK_COLONS_DOT_BLANK, style,
 };
 use log::{Level, LevelFilter, Record};
 

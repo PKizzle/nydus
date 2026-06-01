@@ -10,9 +10,13 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
+use compio::buf::{BufResult, IoBufMut};
+use compio::fs::File;
+use compio::io::AsyncReadAt;
+use compio::runtime::ResumeUnwind;
 use nydus_api::{
-    BlobCacheEntry, BlobCacheList, BlobCacheObjectId, ConfigV2, BLOB_CACHE_TYPE_DATA_BLOB,
-    BLOB_CACHE_TYPE_META_BLOB,
+    BLOB_CACHE_TYPE_DATA_BLOB, BLOB_CACHE_TYPE_META_BLOB, BlobCacheEntry, BlobCacheList,
+    BlobCacheObjectId, ConfigV2,
 };
 use nydus_rafs::metadata::layout::v6::{EROFS_BLOCK_BITS_12, EROFS_BLOCK_SIZE_4096};
 use nydus_rafs::metadata::{RafsBlobExtraInfo, RafsSuper, RafsSuperFlags};
@@ -20,10 +24,6 @@ use nydus_storage::cache::BlobCache;
 use nydus_storage::device::BlobInfo;
 use nydus_storage::factory::BLOB_FACTORY;
 use serde::Serialize;
-use compio::buf::{BufResult, IoBufMut};
-use compio::fs::File;
-use compio::io::AsyncReadAt;
-use compio::runtime::ResumeUnwind;
 
 const ID_SPLITTER: &str = "/";
 
@@ -1004,13 +1004,19 @@ mod tests {
         assert_eq!(mgr.get_state().id_to_config_map.len(), 2);
         assert!(mgr.get_config("domain2/rafs-v6").is_none());
         assert!(mgr.get_config("domain2/rafs-v6-cloned").is_none());
-        assert!(mgr
-            .get_config("domain2/be7d77eeb719f70884758d1aa800ed0fb09d701aaec469964e9d54325f0d5fef")
-            .is_none());
+        assert!(
+            mgr.get_config(
+                "domain2/be7d77eeb719f70884758d1aa800ed0fb09d701aaec469964e9d54325f0d5fef"
+            )
+            .is_none()
+        );
         assert!(mgr.get_config("domain3/rafs-v6-domain3").is_some());
-        assert!(mgr
-            .get_config("domain3/be7d77eeb719f70884758d1aa800ed0fb09d701aaec469964e9d54325f0d5fef")
-            .is_some());
+        assert!(
+            mgr.get_config(
+                "domain3/be7d77eeb719f70884758d1aa800ed0fb09d701aaec469964e9d54325f0d5fef"
+            )
+            .is_some()
+        );
     }
 
     #[test]
@@ -1019,19 +1025,24 @@ mod tests {
         let mut source_path = PathBuf::from(root_dir);
         source_path.push("../tests/texture/bootstrap/rafs-v6-2.2.boot");
 
-        compio::runtime::Runtime::new().unwrap().block_on(async move {
-            let meta_blob = compio::runtime::Runtime::new().unwrap().block_on(MetaBlob::new(&source_path)).unwrap();
-            assert_eq!(meta_blob.blocks(), 5);
-            let buf = vec![0u8; 4096];
-            let (res, buf) = meta_blob.async_read(0, buf).await;
-            assert_eq!(res.unwrap(), 4096);
-            assert_eq!(buf[0], 0);
-            assert_eq!(buf[1023], 0);
-            assert_eq!(buf[1024], 0xe2);
-            assert_eq!(buf[1027], 0xe0);
-            let (res, _buf) = meta_blob.async_read(0x6000, buf).await;
-            assert_eq!(res.unwrap(), 0);
-        });
+        compio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(async move {
+                let meta_blob = compio::runtime::Runtime::new()
+                    .unwrap()
+                    .block_on(MetaBlob::new(&source_path))
+                    .unwrap();
+                assert_eq!(meta_blob.blocks(), 5);
+                let buf = vec![0u8; 4096];
+                let (res, buf) = meta_blob.async_read(0, buf).await;
+                assert_eq!(res.unwrap(), 4096);
+                assert_eq!(buf[0], 0);
+                assert_eq!(buf[1023], 0);
+                assert_eq!(buf[1024], 0xe2);
+                assert_eq!(buf[1027], 0xe0);
+                let (res, _buf) = meta_blob.async_read(0x6000, buf).await;
+                assert_eq!(res.unwrap(), 0);
+            });
     }
 
     #[test]
@@ -1042,11 +1053,16 @@ mod tests {
         let mut source_path = PathBuf::from(root_dir);
         source_path.push("../tests/texture/bootstrap/rafs-v6-2.2.boot");
 
-        compio::runtime::Runtime::new().unwrap().block_on(async move {
-            let meta_blob = compio::runtime::Runtime::new().unwrap().block_on(MetaBlob::new(&source_path)).unwrap();
-            let file = meta_blob.file();
-            assert!(file.as_raw_fd() >= 0);
-        });
+        compio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(async move {
+                let meta_blob = compio::runtime::Runtime::new()
+                    .unwrap()
+                    .block_on(MetaBlob::new(&source_path))
+                    .unwrap();
+                let file = meta_blob.file();
+                assert!(file.as_raw_fd() >= 0);
+            });
     }
 
     /// Helper to create a DataBlob from the test fixture bootstrap.
@@ -1105,7 +1121,10 @@ mod tests {
             _ => panic!("expected DataBlob config"),
         };
 
-        let data_blob = compio::runtime::Runtime::new().unwrap().block_on(DataBlob::new(&data_blob_config)).unwrap();
+        let data_blob = compio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(DataBlob::new(&data_blob_config))
+            .unwrap();
         assert!(data_blob.file().as_raw_fd() >= 0);
         (data_blob, tmp_dir)
     }
@@ -1125,27 +1144,31 @@ mod tests {
     #[test]
     fn test_data_blob_async_fetch_zero_len() {
         let (data_blob, _tmp_dir) = create_data_blob();
-        compio::runtime::Runtime::new().unwrap().block_on(async move {
-            // len=0 should short-circuit with Ok(())
-            let res = data_blob.async_fetch(0, 0).await;
-            assert!(res.is_ok());
-        });
+        compio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(async move {
+                // len=0 should short-circuit with Ok(())
+                let res = data_blob.async_fetch(0, 0).await;
+                assert!(res.is_ok());
+            });
     }
 
     #[test]
     fn test_data_blob_async_fetch_and_read() {
         let (data_blob, _tmp_dir) = create_data_blob();
-        compio::runtime::Runtime::new().unwrap().block_on(async move {
-            // Normal fetch
-            let res = data_blob.async_fetch(0, 4096).await;
-            assert!(res.is_ok());
+        compio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(async move {
+                // Normal fetch
+                let res = data_blob.async_fetch(0, 4096).await;
+                assert!(res.is_ok());
 
-            // Read after fetch
-            let buf = vec![0u8; 4096];
-            let (res, buf) = data_blob.async_read(0, buf).await;
-            assert_eq!(res.unwrap(), 4096);
-            // Verify we got actual data (not all zeros)
-            assert!(buf.iter().any(|&b| b != 0));
-        });
+                // Read after fetch
+                let buf = vec![0u8; 4096];
+                let (res, buf) = data_blob.async_read(0, buf).await;
+                assert_eq!(res.unwrap(), 4096);
+                // Verify we got actual data (not all zeros)
+                assert!(buf.iter().any(|&b| b != 0));
+            });
     }
 }

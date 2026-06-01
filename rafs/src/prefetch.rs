@@ -575,8 +575,8 @@ mod tests {
 
     use fuse_backend_rs::file_buf::FileVolatileSlice;
     use nydus_storage::backend::{BackendContext, BackendResult, BlobReader};
-    use nydus_storage::cache::state::ChunkMap;
     use nydus_storage::cache::BlobCache;
+    use nydus_storage::cache::state::ChunkMap;
     use nydus_storage::device::{
         BlobChunkInfo, BlobInfo, BlobIoDesc, BlobIoVec, BlobPrefetchRequest,
     };
@@ -847,7 +847,7 @@ mod tests {
         let rate = 1000u64; // 1000 bytes/s
         let mut limiter = RateLimiter::new(rate);
         limiter.consume(2000); // drain capacity (2 × 1000)
-                               // Requesting 500 more bytes should require ~500 ms wait.
+        // Requesting 500 more bytes should require ~500 ms wait.
         let wait = limiter.consume(500).expect("should wait");
         assert!(
             wait >= Duration::from_millis(400),

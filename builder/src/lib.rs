@@ -12,7 +12,7 @@ use std::ffi::OsString;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use nydus_rafs::metadata::inode::InodeWrapper;
 use nydus_rafs::metadata::layout::RafsXAttrs;
 use nydus_rafs::metadata::{Inode, RafsVersion};
@@ -29,7 +29,7 @@ pub use self::chunkdict_generator::Generator;
 pub use self::compact::BlobCompactor;
 pub use self::compact::Config as CompactConfig;
 pub use self::core::bootstrap::Bootstrap;
-pub use self::core::chunk_dict::{parse_chunk_dict_arg, ChunkDict, HashChunkDict};
+pub use self::core::chunk_dict::{ChunkDict, HashChunkDict, parse_chunk_dict_arg};
 pub use self::core::context::{
     ArtifactStorage, ArtifactWriter, BlobCacheGenerator, BlobContext, BlobManager,
     BootstrapContext, BootstrapManager, BuildContext, BuildOutput, ConversionType,
@@ -41,9 +41,9 @@ pub use self::core::prefetch::{Prefetch, PrefetchPolicy};
 pub use self::core::tree::{MetadataTreeBuilder, Tree, TreeNode};
 pub use self::directory::DirectoryBuilder;
 pub use self::merge::Merger;
+pub use self::optimize_prefetch::OptimizePrefetch;
 pub use self::optimize_prefetch::generate_prefetch_file_info;
 pub use self::optimize_prefetch::update_ctx_from_bootstrap;
-pub use self::optimize_prefetch::OptimizePrefetch;
 pub use self::stargz::StargzBuilder;
 pub use self::tarball::TarballBuilder;
 

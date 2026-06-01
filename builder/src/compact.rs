@@ -3,15 +3,15 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-use std::collections::hash_map::Entry;
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::io::Write;
 use std::mem;
 use std::ops::Deref;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use anyhow::{bail, ensure, Result};
+use anyhow::{Result, bail, ensure};
 use nydus_rafs::metadata::chunk::ChunkWrapper;
 use nydus_rafs::metadata::{RafsSuper, RafsVersion};
 use nydus_storage::backend::BlobBackend;
@@ -677,17 +677,17 @@ impl BlobCompactor {
 
 #[cfg(test)]
 mod tests {
-    use crate::core::node::Node;
     use crate::HashChunkDict;
+    use crate::core::node::Node;
     use crate::{NodeChunk, Overlay};
 
     use super::*;
     use nydus_api::ConfigV2;
     use nydus_rafs::metadata::RafsSuperConfig;
+    use nydus_storage::RAFS_DEFAULT_CHUNK_SIZE;
     use nydus_storage::backend::{BackendResult, BlobReader};
     use nydus_storage::device::v5::BlobV5ChunkInfo;
     use nydus_storage::device::{BlobChunkFlags, BlobChunkInfo, BlobFeatures};
-    use nydus_storage::RAFS_DEFAULT_CHUNK_SIZE;
     use nydus_utils::crypt::Algorithm;
     use nydus_utils::metrics::BackendMetrics;
     use nydus_utils::{compress, crypt};
@@ -743,11 +743,7 @@ mod tests {
         }
 
         fn crc32(&self) -> u32 {
-            if self.has_crc32() {
-                self.crc32
-            } else {
-                0
-            }
+            if self.has_crc32() { self.crc32 } else { 0 }
         }
 
         fn as_any(&self) -> &dyn Any {

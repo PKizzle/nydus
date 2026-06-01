@@ -10,8 +10,8 @@ use std::fmt;
 use std::io::{Error, Read};
 use std::str::FromStr;
 
-use sha2::digest::Digest;
 use sha2::Sha256;
+use sha2::digest::Digest;
 
 /// Size in bytes of chunk digest value.
 pub const RAFS_DIGEST_LENGTH: usize = 32;

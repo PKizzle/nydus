@@ -8,7 +8,7 @@ use std::any::Any;
 use std::borrow::Cow;
 use std::collections::{HashMap, VecDeque};
 use std::convert::TryFrom;
-use std::fs::{remove_file, rename, File, OpenOptions};
+use std::fs::{File, OpenOptions, remove_file, rename};
 use std::io::{BufWriter, Cursor, Read, Seek, Write};
 use std::mem::size_of;
 use std::os::unix::fs::FileTypeExt;
@@ -18,7 +18,7 @@ use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 use std::{fmt, fs};
 
-use anyhow::{anyhow, Context, Error, Result};
+use anyhow::{Context, Error, Result, anyhow};
 use nydus_utils::crc32;
 use nydus_utils::crypt::{self, Cipher, CipherContext};
 use sha2::{Digest, Sha256};
@@ -26,24 +26,24 @@ use tar::{EntryType, Header};
 use vmm_sys_util::tempfile::TempFile;
 
 use nydus_api::ConfigV2;
+use nydus_rafs::RafsIoWrite;
 use nydus_rafs::metadata::chunk::ChunkWrapper;
+use nydus_rafs::metadata::layout::RafsBlobTable;
 use nydus_rafs::metadata::layout::v5::RafsV5BlobTable;
 use nydus_rafs::metadata::layout::v6::{
-    RafsV6BlobTable, EROFS_BLOCK_SIZE_4096, EROFS_BLOCK_SIZE_65536, EROFS_INODE_SLOT_SIZE,
+    EROFS_BLOCK_SIZE_4096, EROFS_BLOCK_SIZE_65536, EROFS_INODE_SLOT_SIZE, RafsV6BlobTable,
 };
-use nydus_rafs::metadata::layout::RafsBlobTable;
 use nydus_rafs::metadata::{Inode, RAFS_DEFAULT_CHUNK_SIZE};
 use nydus_rafs::metadata::{RafsSuperFlags, RafsVersion};
-use nydus_rafs::RafsIoWrite;
 use nydus_storage::device::{BlobFeatures, BlobInfo};
 use nydus_storage::factory::BlobFactory;
 use nydus_storage::meta::toc::{TocEntryList, TocLocation};
 use nydus_storage::meta::{
-    toc, BatchContextGenerator, BlobChunkInfoV2Ondisk, BlobCompressionContextHeader,
-    BlobMetaChunkArray, BlobMetaChunkInfo, ZranContextGenerator,
+    BatchContextGenerator, BlobChunkInfoV2Ondisk, BlobCompressionContextHeader, BlobMetaChunkArray,
+    BlobMetaChunkInfo, ZranContextGenerator, toc,
 };
 use nydus_utils::digest::DigestData;
-use nydus_utils::{compress, digest, div_round_up, round_down, try_round_up_4k, BufReaderInfo};
+use nydus_utils::{BufReaderInfo, compress, digest, div_round_up, round_down, try_round_up_4k};
 
 use super::node::ChunkSource;
 use crate::attributes::Attributes;
@@ -951,7 +951,7 @@ impl BlobManager {
                 return Err(anyhow!(format!(
                     "cipher algorithm {:?} does not support",
                     ctx.cipher
-                )))
+                )));
             }
         };
         let mut blob_features = ctx.blob_features;
@@ -1660,9 +1660,10 @@ mod tests {
         let root_dir = &std::env::var("CARGO_MANIFEST_DIR").expect("$CARGO_MANIFEST_DIR");
         let mut source_path = PathBuf::from(root_dir);
         source_path.push("../tests/texture/blobs/be7d77eeb719f70884758d1aa800ed0fb09d701aaec469964e9d54325f0d5fef");
-        assert!(blob
-            .set_blob_id_from_meta_path(source_path.as_path())
-            .is_ok());
+        assert!(
+            blob.set_blob_id_from_meta_path(source_path.as_path())
+                .is_ok()
+        );
         blob.set_blob_meta_size(2);
         blob.set_blob_toc_size(2);
         blob.set_blob_meta_digest([32u8; 32]);

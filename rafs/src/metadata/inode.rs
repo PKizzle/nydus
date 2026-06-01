@@ -10,15 +10,15 @@ use std::sync::Arc;
 
 use nydus_utils::digest::RafsDigest;
 
+use crate::RafsInodeExt;
+use crate::metadata::RafsVersion;
 use crate::metadata::cached_v5::CachedInodeV5;
 use crate::metadata::chunk::ChunkWrapper;
 use crate::metadata::direct_v5::OndiskInodeWrapper as OndiskInodeWrapperV5;
 use crate::metadata::direct_v6::OndiskInodeWrapper as OndiskInodeWrapperV6;
+use crate::metadata::layout::RafsXAttrs;
 use crate::metadata::layout::v5::{RafsV5ChunkInfo, RafsV5Inode};
 use crate::metadata::layout::v6::{RafsV6InodeCompact, RafsV6InodeExtended};
-use crate::metadata::layout::RafsXAttrs;
-use crate::metadata::RafsVersion;
-use crate::RafsInodeExt;
 use nydus_utils::metrics::Inode;
 
 /// An inode object wrapper for different RAFS versions.
@@ -765,7 +765,7 @@ impl Default for RafsInodeFlags {
 mod tests {
     use super::*;
     use crate::{
-        metadata::{direct_v5::DirectSuperBlockV5, RafsSuperMeta},
+        metadata::{RafsSuperMeta, direct_v5::DirectSuperBlockV5},
         mock::MockInode,
     };
 

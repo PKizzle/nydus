@@ -28,7 +28,7 @@ use std::any::Any;
 use std::borrow::Cow;
 use std::fs::OpenOptions;
 use std::io::Result;
-use std::mem::{size_of, ManuallyDrop};
+use std::mem::{ManuallyDrop, size_of};
 use std::ops::{Add, BitAnd, Not};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -44,7 +44,7 @@ use crate::device::v5::BlobV5ChunkInfo;
 use crate::device::{BlobChunkFlags, BlobChunkInfo, BlobFeatures, BlobInfo};
 use crate::meta::toc::{TocEntryList, TocLocation};
 use crate::utils::alloc_buf;
-use crate::{RAFS_MAX_CHUNKS_PER_BLOB, RAFS_MAX_CHUNK_SIZE};
+use crate::{RAFS_MAX_CHUNK_SIZE, RAFS_MAX_CHUNKS_PER_BLOB};
 
 mod chunk_info_v1;
 pub use chunk_info_v1::BlobChunkInfoV1Ondisk;
@@ -415,9 +415,7 @@ impl BlobCompressionContextInfo {
         let meta_path = format!("{}.{}", blob_path, BLOB_CCT_FILE_SUFFIX);
         trace!(
             "try to open blob meta file: path {:?} uncompressed_size {} chunk_count {}",
-            meta_path,
-            uncompressed_size,
-            chunk_count
+            meta_path, uncompressed_size, chunk_count
         );
         let enable_write = reader.is_some();
         let file = OpenOptions::new()
@@ -806,30 +804,34 @@ impl BlobCompressionContextInfo {
             &blob_info.cipher_object(),
             &blob_info.cipher_context(),
             blob_info.cipher() != crypt::Algorithm::None,
-        ){
+        ) {
             Ok(data) => data,
-            Err(e) => return Err(eio!(format!(
-                "failed to decrypt metadata for blob {} from backend, cipher {}, encrypted data size {}, {}",
-                blob_info.blob_id(),
-                blob_info.cipher(),
-                compressed_size,
-                e
-            ))),
+            Err(e) => {
+                return Err(eio!(format!(
+                    "failed to decrypt metadata for blob {} from backend, cipher {}, encrypted data size {}, {}",
+                    blob_info.blob_id(),
+                    blob_info.cipher(),
+                    compressed_size,
+                    e
+                )));
+            }
         };
         let header = match decrypt_with_context(
             &raw_data[compressed_size as usize..expected_raw_size],
             &blob_info.cipher_object(),
             &blob_info.cipher_context(),
             blob_info.cipher() != crypt::Algorithm::None,
-        ){
+        ) {
             Ok(data) => data,
-            Err(e) => return Err(eio!(format!(
-                "failed to decrypt meta header for blob {} from backend, cipher {}, encrypted data size {}, {}",
-                blob_info.blob_id(),
-                blob_info.cipher(),
-                compressed_size,
-                e
-            ))),
+            Err(e) => {
+                return Err(eio!(format!(
+                    "failed to decrypt meta header for blob {} from backend, cipher {}, encrypted data size {}, {}",
+                    blob_info.blob_id(),
+                    blob_info.cipher(),
+                    compressed_size,
+                    e
+                )));
+            }
         };
 
         let uncompressed = if blob_info.meta_ci_compressor() != compress::Algorithm::None {
@@ -870,21 +872,23 @@ impl BlobCompressionContextInfo {
         blob_info: &BlobInfo,
         header: &BlobCompressionContextHeader,
     ) -> Result<bool> {
-        trace!("blob meta header magic {:x}/{:x}, entries {:x}/{:x}, features {:x}/{:x}, compressor {:x}/{:x}, ci_offset {:x}/{:x}, compressed_size {:x}/{:x}, uncompressed_size {:x}/{:x}",
-                u32::from_le(header.s_magic),
-                BLOB_CCT_MAGIC,
-                u32::from_le(header.s_ci_entries),
-                blob_info.chunk_count(),
-                u32::from_le(header.s_features),
-                blob_info.features().bits(),
-                u32::from_le(header.s_ci_compressor),
-                blob_info.meta_ci_compressor() as u32,
-                u64::from_le(header.s_ci_offset),
-                blob_info.meta_ci_offset(),
-                u64::from_le(header.s_ci_compressed_size),
-                blob_info.meta_ci_compressed_size(),
-                u64::from_le(header.s_ci_uncompressed_size),
-                blob_info.meta_ci_uncompressed_size());
+        trace!(
+            "blob meta header magic {:x}/{:x}, entries {:x}/{:x}, features {:x}/{:x}, compressor {:x}/{:x}, ci_offset {:x}/{:x}, compressed_size {:x}/{:x}, uncompressed_size {:x}/{:x}",
+            u32::from_le(header.s_magic),
+            BLOB_CCT_MAGIC,
+            u32::from_le(header.s_ci_entries),
+            blob_info.chunk_count(),
+            u32::from_le(header.s_features),
+            blob_info.features().bits(),
+            u32::from_le(header.s_ci_compressor),
+            blob_info.meta_ci_compressor() as u32,
+            u64::from_le(header.s_ci_offset),
+            blob_info.meta_ci_offset(),
+            u64::from_le(header.s_ci_compressed_size),
+            blob_info.meta_ci_compressed_size(),
+            u64::from_le(header.s_ci_uncompressed_size),
+            blob_info.meta_ci_uncompressed_size()
+        );
 
         if u32::from_le(header.s_magic) != BLOB_CCT_MAGIC
             || u32::from_le(header.s_magic2) != BLOB_CCT_MAGIC
@@ -2112,9 +2116,9 @@ fn round_up_4k<T: Add<Output = T> + BitAnd<Output = T> + Not<Output = T> + From<
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use crate::RAFS_DEFAULT_CHUNK_SIZE;
     use crate::backend::{BackendResult, BlobReader};
     use crate::device::BlobFeatures;
-    use crate::RAFS_DEFAULT_CHUNK_SIZE;
     use nix::sys::uio;
     use nydus_utils::digest::{self, DigestHasher};
     use nydus_utils::metrics::BackendMetrics;
@@ -2260,9 +2264,10 @@ pub(crate) mod tests {
             .unwrap();
         assert_eq!(chunks.len(), 12);
 
-        assert!(meta
-            .get_chunks_uncompressed(0x2000000, 0x100, 4 * RAFS_DEFAULT_CHUNK_SIZE)
-            .is_err());
+        assert!(
+            meta.get_chunks_uncompressed(0x2000000, 0x100, 4 * RAFS_DEFAULT_CHUNK_SIZE)
+                .is_err()
+        );
     }
 
     #[test]
@@ -2314,12 +2319,14 @@ pub(crate) mod tests {
             .unwrap();
         assert_eq!(chunks.len(), 12);
 
-        assert!(meta
-            .get_chunks_compressed(0x0, 0x1, RAFS_DEFAULT_CHUNK_SIZE, false)
-            .is_err());
-        assert!(meta
-            .get_chunks_compressed(0x1000000, 0x1, RAFS_DEFAULT_CHUNK_SIZE, false)
-            .is_err());
+        assert!(
+            meta.get_chunks_compressed(0x0, 0x1, RAFS_DEFAULT_CHUNK_SIZE, false)
+                .is_err()
+        );
+        assert!(
+            meta.get_chunks_compressed(0x1000000, 0x1, RAFS_DEFAULT_CHUNK_SIZE, false)
+                .is_err()
+        );
     }
 
     #[test]

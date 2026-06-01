@@ -10,17 +10,17 @@ use std::mem::size_of;
 use std::os::unix::ffi::OsStrExt;
 use std::sync::Arc;
 
-use anyhow::{bail, ensure, Context, Result};
+use anyhow::{Context, Result, bail, ensure};
+use nydus_rafs::RafsIoWrite;
+use nydus_rafs::metadata::RafsStore;
 use nydus_rafs::metadata::chunk::ChunkWrapper;
 use nydus_rafs::metadata::layout::v6::{
-    align_offset, block_bits_from_size, calculate_nid, new_v6_inode, RafsV6BlobTable, RafsV6Device,
-    RafsV6Dirent, RafsV6InodeChunkAddr, RafsV6InodeChunkHeader, RafsV6OndiskInode,
-    RafsV6SuperBlock, RafsV6SuperBlockExt, EROFS_BLOCK_BITS_9, EROFS_BLOCK_SIZE_512,
-    EROFS_DEVTABLE_OFFSET, EROFS_INODE_CHUNK_BASED, EROFS_INODE_FLAT_INLINE,
-    EROFS_INODE_FLAT_PLAIN, EROFS_INODE_SLOT_SIZE, EROFS_SUPER_BLOCK_SIZE, EROFS_SUPER_OFFSET,
+    EROFS_BLOCK_BITS_9, EROFS_BLOCK_SIZE_512, EROFS_DEVTABLE_OFFSET, EROFS_INODE_CHUNK_BASED,
+    EROFS_INODE_FLAT_INLINE, EROFS_INODE_FLAT_PLAIN, EROFS_INODE_SLOT_SIZE, EROFS_SUPER_BLOCK_SIZE,
+    EROFS_SUPER_OFFSET, RafsV6BlobTable, RafsV6Device, RafsV6Dirent, RafsV6InodeChunkAddr,
+    RafsV6InodeChunkHeader, RafsV6OndiskInode, RafsV6SuperBlock, RafsV6SuperBlockExt, align_offset,
+    block_bits_from_size, calculate_nid, new_v6_inode,
 };
-use nydus_rafs::metadata::RafsStore;
-use nydus_rafs::RafsIoWrite;
 use nydus_storage::device::{BlobFeatures, BlobInfo};
 use nydus_utils::{root_tracer, round_down, round_up, timing_tracer};
 
@@ -655,9 +655,7 @@ impl Bootstrap {
         assert!(blob_table_entries < u8::MAX as usize);
         trace!(
             "devtable len {} blob table offset {} blob table size {}",
-            devtable_len,
-            blob_table_offset,
-            blob_table_size
+            devtable_len, blob_table_offset, blob_table_size
         );
 
         let fs_prefetch_rule_count = ctx.prefetch.fs_prefetch_rule_count();
@@ -794,7 +792,11 @@ impl Bootstrap {
             }
             let cnt = (entry.uncompressed_size() / block_size) as u32;
             if block_count.checked_add(cnt).is_none() {
-                bail!("Too many data blocks in RAFS filesystem, block size 0x{:x}, block count 0x{:x}", block_size, block_count as u64 + cnt as u64);
+                bail!(
+                    "Too many data blocks in RAFS filesystem, block size 0x{:x}, block count 0x{:x}",
+                    block_size,
+                    block_count as u64 + cnt as u64
+                );
             }
             let mapped_blkaddr = Self::v6_align_mapped_blkaddr(block_size, pos)?;
             pos = (mapped_blkaddr + cnt) as u64 * block_size;
@@ -913,7 +915,7 @@ mod tests {
     use nydus_rafs::metadata::layout::v6::{
         EROFS_BLOCK_SIZE_4096, EROFS_INODE_CHUNK_BASED, EROFS_INODE_SLOT_SIZE,
     };
-    use nydus_rafs::metadata::{RafsVersion, RAFS_DEFAULT_CHUNK_SIZE};
+    use nydus_rafs::metadata::{RAFS_DEFAULT_CHUNK_SIZE, RafsVersion};
     use std::fs::File;
     use vmm_sys_util::{tempdir::TempDir, tempfile::TempFile};
 

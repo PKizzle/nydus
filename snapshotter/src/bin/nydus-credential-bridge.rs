@@ -10,8 +10,8 @@
 //! response into the Nydus runtime auth endpoint, and then writes the original
 //! provider response back to stdout unchanged.
 
-use anyhow::{bail, Context, Result};
-use base64::{engine::general_purpose::STANDARD, Engine as _};
+use anyhow::{Context, Result, bail};
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use clap::{Parser, Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -213,7 +213,9 @@ fn extract_runtime_auth(
             } else if value.get("auth").is_some() {
                 kubelet_entries_from_value(value, default_ttl_seconds)
             } else {
-                bail!("unsupported credential payload; expected runtime entries or kubelet CredentialProviderResponse")
+                bail!(
+                    "unsupported credential payload; expected runtime entries or kubelet CredentialProviderResponse"
+                )
             }
         }
     }

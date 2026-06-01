@@ -9,7 +9,7 @@
 //! imports the old `metadata.db` records into the new `metadata.fjall` store and
 //! relocates old numeric snapshot directories to the Rust stable-key layout.
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use bbolt_rs::{Bolt, BucketApi, DbApi, TxApi};
 use clap::{Parser, Subcommand, ValueEnum};
 use nydus_snapshotter::overlay::snapshot_dir_name;

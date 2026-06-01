@@ -14,7 +14,7 @@ use std::sync::Arc;
 use nydus_api::ConfigV2;
 use nydus_rafs::fs::Rafs;
 
-use crate::{cstr_to_str, set_errno, Inode};
+use crate::{Inode, cstr_to_str, set_errno};
 
 /// Magic number for Nydus filesystem handle.
 pub const NYDUS_FS_HANDLE_MAGIC: u64 = 0xedfc_3818_af03_5187;

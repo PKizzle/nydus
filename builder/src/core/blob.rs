@@ -5,10 +5,10 @@
 use std::borrow::Cow;
 use std::slice;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use nydus_rafs::metadata::RAFS_MAX_CHUNK_SIZE;
 use nydus_storage::device::BlobFeatures;
-use nydus_storage::meta::{toc, BlobMetaChunkArray};
+use nydus_storage::meta::{BlobMetaChunkArray, toc};
 use nydus_utils::digest::{self, DigestHasher, RafsDigest};
 use nydus_utils::{compress, crypt};
 use sha2::digest::Digest;

@@ -14,36 +14,37 @@ extern crate serde_json;
 #[macro_use]
 extern crate lazy_static;
 use crate::deduplicate::{
-    check_bootstrap_versions_consistency, update_ctx_from_parent_bootstrap, Deduplicate,
-    SqliteDatabase,
+    Deduplicate, SqliteDatabase, check_bootstrap_versions_consistency,
+    update_ctx_from_parent_bootstrap,
 };
 use std::convert::TryFrom;
-use std::fs::{self, metadata, DirEntry, OpenOptions};
+use std::fs::{self, DirEntry, OpenOptions, metadata};
 use std::os::unix::fs::FileTypeExt;
 use std::path::{Path, PathBuf};
 use std::result::Result::Ok;
 use std::sync::{Arc, Mutex};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::parser::ValueSource;
 use clap::{Arg, ArgAction, ArgMatches, Command as App};
 use nix::unistd::{getegid, geteuid};
 use nydus::{get_build_time_info, setup_logging};
 use nydus_api::{BuildTimeInfo, ConfigV2, LocalFsConfig};
 use nydus_builder::{
+    ArtifactStorage, BlobCacheGenerator, BlobCompactor, BlobManager, BootstrapManager,
+    BuildContext, BuildOutput, Builder, ChunkdictBlobInfo, ChunkdictChunkInfo, ConversionType,
+    DirectoryBuilder, Feature, Features, Generator, HashChunkDict, Merger, OptimizePrefetch,
+    Prefetch, PrefetchPolicy, StargzBuilder, TarballBuilder, Tree, WhiteoutSpec,
     attributes::Attributes, generate_prefetch_file_info, parse_chunk_dict_arg,
-    update_ctx_from_bootstrap, ArtifactStorage, BlobCacheGenerator, BlobCompactor, BlobManager,
-    BootstrapManager, BuildContext, BuildOutput, Builder, ChunkdictBlobInfo, ChunkdictChunkInfo,
-    ConversionType, DirectoryBuilder, Feature, Features, Generator, HashChunkDict, Merger,
-    OptimizePrefetch, Prefetch, PrefetchPolicy, StargzBuilder, TarballBuilder, Tree, WhiteoutSpec,
+    update_ctx_from_bootstrap,
 };
 
 use nydus_rafs::metadata::{MergeError, RafsSuper, RafsSuperConfig, RafsVersion};
-use nydus_storage::backend::localfs::LocalFs;
 use nydus_storage::backend::BlobBackend;
+use nydus_storage::backend::localfs::LocalFs;
 use nydus_storage::device::BlobFeatures;
 use nydus_storage::factory::BlobFactory;
-use nydus_storage::meta::{format_blob_features, BatchContextGenerator};
+use nydus_storage::meta::{BatchContextGenerator, format_blob_features};
 use nydus_storage::{RAFS_DEFAULT_CHUNK_SIZE, RAFS_MAX_CHUNK_SIZE};
 use nydus_utils::trace::{EventTracerClass, TimingTracerClass, TraceClass};
 use nydus_utils::{
@@ -1453,7 +1454,10 @@ impl Command {
                     deduplicate.save_metadata(bootstrap_path, config, image_name, image_tag)?
                 }
                 _ => {
-                    bail!("Unsupported database type: {}, please use a valid database URI, such as 'sqlite:///path/to/chunkdict.db'.", db_strs[0])
+                    bail!(
+                        "Unsupported database type: {}, please use a valid database URI, such as 'sqlite:///path/to/chunkdict.db'.",
+                        db_strs[0]
+                    )
                 }
             };
         }
@@ -1486,7 +1490,10 @@ impl Command {
                 noise_points = result.2;
             }
             _ => {
-                bail!("Unsupported database type: {}, please use a valid database URI, such as 'sqlite:///path/to/chunkdict.db'.", db_strs[0])
+                bail!(
+                    "Unsupported database type: {}, please use a valid database URI, such as 'sqlite:///path/to/chunkdict.db'.",
+                    db_strs[0]
+                )
             }
         };
 
@@ -1943,7 +1950,9 @@ impl Command {
             }
             Ok(ArtifactStorage::FileDir((d, String::new())))
         } else {
-            bail!("both --bootstrap and --blob-dir are missing, please specify one to store the generated metadata blob file");
+            bail!(
+                "both --bootstrap and --blob-dir are missing, please specify one to store the generated metadata blob file"
+            );
         }
     }
 
@@ -2019,7 +2028,9 @@ impl Command {
                 Err(anyhow!("invalid backend config"))
             }
         } else {
-            bail!("both --blob and --blob-dir are missing, please specify one to store the generated data blob file");
+            bail!(
+                "both --blob and --blob-dir are missing, please specify one to store the generated data blob file"
+            );
         }
     }
 

@@ -13,8 +13,8 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use nydus_api::ConfigV2;
 use nydus_rafs::{
-    metadata::{RafsInodeExt, RafsSuper},
     RafsIterator,
+    metadata::{RafsInodeExt, RafsSuper},
 };
 use nydus_storage::backend::BlobBackend;
 use nydus_storage::device::BlobInfo;

@@ -9,12 +9,12 @@ use std::io::Error;
 use std::str::FromStr;
 use std::sync::Arc;
 
-use aes::cipher::generic_array::typenum::{U12, U16};
 use aes::cipher::generic_array::GenericArray;
+use aes::cipher::generic_array::typenum::{U12, U16};
 use aes::cipher::{BlockCipher, BlockDecrypt, BlockEncrypt, KeyInit};
 use aes::{Aes128, Aes256};
-use aes_gcm::aead::AeadInPlace;
 use aes_gcm::AesGcm;
+use aes_gcm::aead::AeadInPlace;
 use xts_mode::Xts128;
 
 /// AES-256-GCM with a 16-byte IV and 12-byte tag, matching the sizes nydus
@@ -372,7 +372,10 @@ impl Cipher {
     ) -> Result<Vec<u8>, Error> {
         let iv = iv.ok_or_else(|| einval!("GCM mode requires an IV"))?;
         if iv.len() != AES_XTS_IV_LENGTH {
-            return Err(einval!(format!("GCM IV must be {} bytes", AES_XTS_IV_LENGTH)));
+            return Err(einval!(format!(
+                "GCM IV must be {} bytes",
+                AES_XTS_IV_LENGTH
+            )));
         }
         let nonce = GenericArray::<u8, U16>::from_slice(iv);
         let cipher =
@@ -399,7 +402,10 @@ impl Cipher {
     ) -> Result<Vec<u8>, Error> {
         let iv = iv.ok_or_else(|| einval!("GCM mode requires an IV"))?;
         if iv.len() != AES_XTS_IV_LENGTH {
-            return Err(einval!(format!("GCM IV must be {} bytes", AES_XTS_IV_LENGTH)));
+            return Err(einval!(format!(
+                "GCM IV must be {} bytes",
+                AES_XTS_IV_LENGTH
+            )));
         }
         if tag.len() != 12 {
             return Err(einval!("GCM tag must be 12 bytes"));
@@ -793,13 +799,15 @@ mod tests {
                 .is_err()
         );
         // create with symmetry key
-        assert!(CipherContext::new(
-            symmetry_key.to_vec(),
-            iv.to_vec(),
-            true,
-            Algorithm::Aes128Xts
-        )
-        .is_err());
+        assert!(
+            CipherContext::new(
+                symmetry_key.to_vec(),
+                iv.to_vec(),
+                true,
+                Algorithm::Aes128Xts
+            )
+            .is_err()
+        );
 
         // test context is none
         let ctx =
@@ -891,8 +899,12 @@ mod tests {
         );
         // old ciphertext must still decrypt to the original plaintext.
         assert_eq!(
-            c.decrypt(&k128, Some(&[0u8; 16]), &unhex("67a2d8fcc3beed670bb626feab5a03f295"))
-                .unwrap(),
+            c.decrypt(
+                &k128,
+                Some(&[0u8; 16]),
+                &unhex("67a2d8fcc3beed670bb626feab5a03f295")
+            )
+            .unwrap(),
             b"11111111111111111"
         );
 
@@ -916,11 +928,12 @@ mod tests {
         let ct = c
             .encrypt_aead(&kg, Some(&[0u8; 16]), b"11111111111111111", &mut tag)
             .unwrap();
-        assert_eq!(ct.as_slice(), unhex("e31df8f1a318235602196b2472bceb58b9").as_slice());
+        assert_eq!(
+            ct.as_slice(),
+            unhex("e31df8f1a318235602196b2472bceb58b9").as_slice()
+        );
         assert_eq!(tag.as_slice(), unhex("c812164983ddf058f424c99e").as_slice());
-        let pt = c
-            .decrypt_aead(&kg, Some(&[0u8; 16]), &ct, &tag)
-            .unwrap();
+        let pt = c.decrypt_aead(&kg, Some(&[0u8; 16]), &ct, &tag).unwrap();
         assert_eq!(pt, b"11111111111111111");
     }
 }

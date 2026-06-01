@@ -51,7 +51,7 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
-    use crate::cli::{default_platform, BackendType};
+    use crate::cli::{BackendType, default_platform};
 
     fn base_args() -> MountArgs {
         MountArgs {

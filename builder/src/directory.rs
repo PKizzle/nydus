@@ -5,7 +5,7 @@
 use std::fs;
 use std::fs::DirEntry;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use nydus_utils::{event_tracer, lazy_drop, root_tracer, timing_tracer};
 
 use crate::core::context::{Artifact, NoopArtifactWriter};
@@ -16,7 +16,7 @@ use super::core::context::{
     ArtifactWriter, BlobManager, BootstrapManager, BuildContext, BuildOutput,
 };
 use super::core::node::Node;
-use super::{build_bootstrap, dump_bootstrap, finalize_blob, Builder, Overlay, Tree, TreeNode};
+use super::{Builder, Overlay, Tree, TreeNode, build_bootstrap, dump_bootstrap, finalize_blob};
 
 struct FilesystemTreeBuilder {}
 

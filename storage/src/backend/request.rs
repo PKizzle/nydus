@@ -14,23 +14,23 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use http::{
-    header::{HeaderMap, HeaderName, HeaderValue},
     Method, StatusCode,
+    header::{HeaderMap, HeaderName, HeaderValue},
 };
 
 use nydus_api::ProxyConfig;
 
+use crate::backend::BackendContext;
 use crate::backend::connection::{
     Connection, ConnectionError, ReqBody, Response as ConnectionResponse,
 };
-use crate::backend::BackendContext;
 
+#[cfg(feature = "backend-dragonfly-proxy")]
+use crate::backend::RequestSource;
 #[cfg(feature = "backend-dragonfly-proxy")]
 use crate::backend::proxy;
 #[cfg(feature = "backend-dragonfly-proxy")]
 use crate::backend::proxy::ProxySDKClients;
-#[cfg(feature = "backend-dragonfly-proxy")]
-use crate::backend::RequestSource;
 
 #[cfg(feature = "backend-dragonfly-proxy")]
 use dragonfly_client_util::request::GetResponse;
@@ -273,8 +273,7 @@ impl Request {
                 context.using_proxy_sdk = true;
                 trace!(
                     "request path: SDK_PROXY, endpoint={}, url={}",
-                    endpoint,
-                    url,
+                    endpoint, url,
                 );
                 let priority = Some(match context.request_source {
                     RequestSource::Prefetch => proxy::HEADER_VALUE_DRAGONFLY_PRIORITY_3,
@@ -309,8 +308,7 @@ impl Request {
             context.using_proxy = true;
             trace!(
                 "request path: HTTP_PROXY, proxy_url={}, url={}",
-                self.proxy_config.url,
-                url,
+                self.proxy_config.url, url,
             );
 
             // Inject Dragonfly priority headers for HTTP proxy mode.
@@ -923,8 +921,8 @@ mod tests {
     ) {
         use std::io::{Read as IoRead, Write};
         use std::net::TcpListener;
-        use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
 
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();

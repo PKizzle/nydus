@@ -12,7 +12,7 @@ pub mod labels;
 pub mod referrer;
 
 pub use labels::{
-    classify_layer, target_snapshot_ref, LayerKind, CRI_IMAGE_REF, CRI_LAYER_DIGEST,
-    NYDUS_BLOB_DIGEST, NYDUS_BLOB_SIZE, NYDUS_DATA_LAYER, NYDUS_META_LAYER, NYDUS_REF_LAYER,
-    TARGET_SNAPSHOT_REF,
+    CRI_IMAGE_REF, CRI_LAYER_DIGEST, LayerKind, NYDUS_BLOB_DIGEST, NYDUS_BLOB_SIZE,
+    NYDUS_DATA_LAYER, NYDUS_META_LAYER, NYDUS_REF_LAYER, TARGET_SNAPSHOT_REF, classify_layer,
+    target_snapshot_ref,
 };

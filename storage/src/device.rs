@@ -20,8 +20,8 @@
 //!   one or more blob IO descriptors
 //! - [BlobPrefetchRequest](struct.BlobPrefetchRequest.html): a blob data prefetching request.
 use std::any::Any;
-use std::collections::hash_map::Drain;
 use std::collections::HashMap;
+use std::collections::hash_map::Drain;
 use std::convert::TryFrom;
 use std::fmt::{Debug, Formatter};
 use std::io::{self, Error};
@@ -1358,9 +1358,7 @@ impl BlobDevice {
             if let Some(cache) = self.get_blob_by_id(&req.blob_id) {
                 trace!(
                     "fetch blob {} offset {} size {}",
-                    req.blob_id,
-                    req.offset,
-                    req.len
+                    req.blob_id, req.offset, req.len
                 );
                 if let Some(obj) = cache.get_blob_object() {
                     obj.fetch_range_uncompressed(req.offset, req.len)
@@ -1877,9 +1875,11 @@ mod tests {
         let mut source_path = PathBuf::from(root_dir);
         source_path.push("../tests/texture/blobs/be7d77eeb719f70884758d1aa800ed0fb09d701aaec469964e9d54325f0d5fef");
 
-        assert!(blob_info
-            .set_blob_id_from_meta_path(source_path.as_path())
-            .is_ok());
+        assert!(
+            blob_info
+                .set_blob_id_from_meta_path(source_path.as_path())
+                .is_ok()
+        );
 
         let id = blob_info.get_blob_meta_id();
         assert!(id.is_ok());

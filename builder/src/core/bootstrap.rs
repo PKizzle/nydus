@@ -7,7 +7,7 @@ use anyhow::{Context, Error, Result};
 use nydus_utils::digest::{self, RafsDigest};
 use std::ops::Deref;
 
-use nydus_rafs::metadata::layout::{RafsBlobTable, RAFS_V5_ROOT_INODE};
+use nydus_rafs::metadata::layout::{RAFS_V5_ROOT_INODE, RafsBlobTable};
 use nydus_rafs::metadata::{RafsSuper, RafsSuperConfig, RafsSuperFlags};
 
 use crate::{ArtifactStorage, BlobManager, BootstrapContext, BootstrapManager, BuildContext, Tree};

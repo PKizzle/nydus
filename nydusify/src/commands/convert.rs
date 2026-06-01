@@ -4,7 +4,7 @@
 
 use std::io::{self, Read};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::Serialize;
 use tracing::info;
 
@@ -206,9 +206,10 @@ mod tests {
         };
 
         let err = plan(&args).unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("--build-cache conflicts with --build-cache-tag"));
+        assert!(
+            err.to_string()
+                .contains("--build-cache conflicts with --build-cache-tag")
+        );
     }
 
     #[test]
@@ -228,9 +229,10 @@ mod tests {
         };
 
         let err = plan(&args).unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("--build-cache-max-records should be greater than 0"));
+        assert!(
+            err.to_string()
+                .contains("--build-cache-max-records should be greater than 0")
+        );
     }
 
     #[test]
@@ -271,9 +273,10 @@ mod tests {
         };
 
         let err = plan(&args).unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("--all-platforms conflicts with --platform"));
+        assert!(
+            err.to_string()
+                .contains("--all-platforms conflicts with --platform")
+        );
     }
 
     #[test]

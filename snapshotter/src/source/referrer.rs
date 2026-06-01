@@ -10,10 +10,10 @@
 use crate::cache::parse_duration;
 use crate::config::SnapshotterConfig;
 use crate::daemon::auth::resolve_auth;
-use crate::daemon::image_ref::{parse_image_ref, ImageRef};
-use anyhow::{anyhow, bail, Context, Result};
+use crate::daemon::image_ref::{ImageRef, parse_image_ref};
+use anyhow::{Context, Result, anyhow, bail};
 use cyper::{Client, Response};
-use http::header::{HeaderValue, ACCEPT, AUTHORIZATION, WWW_AUTHENTICATE};
+use http::header::{ACCEPT, AUTHORIZATION, HeaderValue, WWW_AUTHENTICATE};
 use http::{Method, StatusCode};
 use serde::Deserialize;
 use std::collections::{HashMap, VecDeque};

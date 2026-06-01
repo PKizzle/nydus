@@ -13,8 +13,8 @@ use std::sync::{Arc, Mutex};
 use std::{mem, ptr};
 
 use libz_sys::{
-    inflate, inflateEnd, inflateInit2_, inflatePrime, inflateReset, inflateReset2,
-    inflateSetDictionary, uInt, z_stream, zlibVersion, Z_BLOCK, Z_BUF_ERROR, Z_OK, Z_STREAM_END,
+    Z_BLOCK, Z_BUF_ERROR, Z_OK, Z_STREAM_END, inflate, inflateEnd, inflateInit2_, inflatePrime,
+    inflateReset, inflateReset2, inflateSetDictionary, uInt, z_stream, zlibVersion,
 };
 use sha2::{Digest, Sha256};
 
@@ -174,7 +174,7 @@ impl ZranDecoder {
                     return Err(eio!(format!(
                         "failed to decode data from compressed data stream, ret: {}",
                         e
-                    )))
+                    )));
                 }
             }
         }

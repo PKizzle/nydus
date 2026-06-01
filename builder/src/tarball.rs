@@ -22,22 +22,22 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use tar::{Archive, Entry, EntryType, Header};
 
 use nydus_api::enosys;
-use nydus_rafs::metadata::inode::{InodeWrapper, RafsInodeFlags, RafsV6Inode};
-use nydus_rafs::metadata::layout::v5::RafsV5Inode;
-use nydus_rafs::metadata::layout::RafsXAttrs;
 use nydus_rafs::metadata::RafsVersion;
+use nydus_rafs::metadata::inode::{InodeWrapper, RafsInodeFlags, RafsV6Inode};
+use nydus_rafs::metadata::layout::RafsXAttrs;
+use nydus_rafs::metadata::layout::v5::RafsV5Inode;
+use nydus_storage::RAFS_MAX_CHUNKS_PER_BLOB;
 use nydus_storage::device::BlobFeatures;
 use nydus_storage::meta::ZranContextGenerator;
-use nydus_storage::RAFS_MAX_CHUNKS_PER_BLOB;
 use nydus_utils::compact::makedev;
-use nydus_utils::compress::zlib_random::{ZranReader, ZRAN_READER_BUF_SIZE};
 use nydus_utils::compress::ZlibDecoder;
+use nydus_utils::compress::zlib_random::{ZRAN_READER_BUF_SIZE, ZranReader};
 use nydus_utils::digest::RafsDigest;
-use nydus_utils::{div_round_up, lazy_drop, root_tracer, timing_tracer, BufReaderInfo, ByteSize};
+use nydus_utils::{BufReaderInfo, ByteSize, div_round_up, lazy_drop, root_tracer, timing_tracer};
 
 use crate::core::context::{Artifact, NoopArtifactWriter};
 
@@ -47,7 +47,7 @@ use super::core::context::{
 };
 use super::core::node::{Node, NodeInfo};
 use super::core::tree::Tree;
-use super::{build_bootstrap, dump_bootstrap, finalize_blob, Builder, TarBuilder};
+use super::{Builder, TarBuilder, build_bootstrap, dump_bootstrap, finalize_blob};
 
 enum CompressionType {
     None,
@@ -382,7 +382,7 @@ impl<'a> TarballTreeBuilder<'a> {
                         return Err(anyhow!(
                             "tarball: failed to parse PaxExtension from tar header, {}",
                             e
-                        ))
+                        ));
                     }
                 }
             }
@@ -599,7 +599,7 @@ impl Builder for TarballBuilder {
                 return Err(anyhow!(
                     "tarball: unsupported image conversion type '{}'",
                     self.ty
-                ))
+                ));
             }
         };
 

@@ -11,12 +11,12 @@ use std::fs::metadata;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
-use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use mio::Waker;
-use nydus_api::config::BlobCacheList;
 use nydus_api::BuildTimeInfo;
+use nydus_api::config::BlobCacheList;
 
 use crate::daemon::{
     DaemonState, DaemonStateMachineContext, DaemonStateMachineInput, DaemonStateMachineSubscriber,
@@ -500,10 +500,12 @@ mod tests {
             service_controller.supervisor(),
             Some(String::from("supervisor"))
         );
-        assert!(service_controller
-            .as_any()
-            .downcast_ref::<ServiceController>()
-            .is_some());
+        assert!(
+            service_controller
+                .as_any()
+                .downcast_ref::<ServiceController>()
+                .is_some()
+        );
 
         assert_eq!(service_controller.get_state(), DaemonState::UNKNOWN);
         service_controller.set_state(DaemonState::READY);

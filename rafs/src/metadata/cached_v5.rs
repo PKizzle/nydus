@@ -23,21 +23,21 @@ use fuse_backend_rs::abi::fuse_abi;
 use fuse_backend_rs::api::filesystem::Entry;
 use nydus_storage::device::v5::BlobV5ChunkInfo;
 use nydus_storage::device::{BlobChunkFlags, BlobChunkInfo, BlobDevice, BlobInfo};
-use nydus_utils::digest::RafsDigest;
 use nydus_utils::ByteSize;
+use nydus_utils::digest::RafsDigest;
 
+use crate::RafsIoReader;
 use crate::metadata::inode::RafsInodeFlags;
 use crate::metadata::layout::v5::{
-    rafsv5_alloc_bio_vecs, rafsv5_validate_inode, RafsV5BlobTable, RafsV5ChunkInfo, RafsV5Inode,
-    RafsV5InodeChunkOps, RafsV5InodeOps, RafsV5XAttrsTable, RAFSV5_ALIGNMENT,
+    RAFSV5_ALIGNMENT, RafsV5BlobTable, RafsV5ChunkInfo, RafsV5Inode, RafsV5InodeChunkOps,
+    RafsV5InodeOps, RafsV5XAttrsTable, rafsv5_alloc_bio_vecs, rafsv5_validate_inode,
 };
-use crate::metadata::layout::{bytes_to_os_str, parse_xattr, RAFS_V5_ROOT_INODE};
+use crate::metadata::layout::{RAFS_V5_ROOT_INODE, bytes_to_os_str, parse_xattr};
 use crate::metadata::{
-    BlobIoVec, Inode, RafsError, RafsInode, RafsInodeExt, RafsInodeWalkAction,
-    RafsInodeWalkHandler, RafsResult, RafsSuperBlock, RafsSuperInodes, RafsSuperMeta, XattrName,
-    XattrValue, DOT, DOTDOT, RAFS_ATTR_BLOCK_SIZE, RAFS_MAX_NAME,
+    BlobIoVec, DOT, DOTDOT, Inode, RAFS_ATTR_BLOCK_SIZE, RAFS_MAX_NAME, RafsError, RafsInode,
+    RafsInodeExt, RafsInodeWalkAction, RafsInodeWalkHandler, RafsResult, RafsSuperBlock,
+    RafsSuperInodes, RafsSuperMeta, XattrName, XattrValue,
 };
-use crate::RafsIoReader;
 
 /// Cached Rafs v5 super block.
 pub struct CachedSuperBlockV5 {
@@ -767,11 +767,7 @@ impl BlobChunkInfo for CachedChunkInfoV5 {
     }
 
     fn crc32(&self) -> u32 {
-        if self.has_crc32() {
-            self.crc32
-        } else {
-            0
-        }
+        if self.has_crc32() { self.crc32 } else { 0 }
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -813,20 +809,20 @@ mod cached_tests {
     use std::sync::Arc;
 
     use nydus_storage::device::{BlobDevice, BlobFeatures};
-    use nydus_utils::digest::{Algorithm, RafsDigest};
     use nydus_utils::ByteSize;
+    use nydus_utils::digest::{Algorithm, RafsDigest};
     use storage::device::v5::BlobV5ChunkInfo;
     use storage::device::{BlobChunkFlags, BlobChunkInfo};
 
     use crate::metadata::cached_v5::{CachedInodeV5, CachedSuperBlockV5};
     use crate::metadata::inode::RafsInodeFlags;
     use crate::metadata::layout::v5::{
-        rafsv5_align, RafsV5BlobTable, RafsV5ChunkInfo, RafsV5Inode, RafsV5InodeWrapper,
+        RafsV5BlobTable, RafsV5ChunkInfo, RafsV5Inode, RafsV5InodeWrapper, rafsv5_align,
     };
-    use crate::metadata::layout::{RafsXAttrs, RAFS_V5_ROOT_INODE};
+    use crate::metadata::layout::{RAFS_V5_ROOT_INODE, RafsXAttrs};
     use crate::metadata::{
-        RafsInode, RafsInodeWalkAction, RafsStore, RafsSuperBlock, RafsSuperInodes, RafsSuperMeta,
-        RAFS_MAX_NAME,
+        RAFS_MAX_NAME, RafsInode, RafsInodeWalkAction, RafsStore, RafsSuperBlock, RafsSuperInodes,
+        RafsSuperMeta,
     };
     use crate::{BufWriter, RafsInodeExt, RafsIoRead, RafsIoReader};
     use vmm_sys_util::tempfile::TempFile;

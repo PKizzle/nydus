@@ -37,17 +37,17 @@ use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
+use async_broadcast::Sender;
+use compio::runtime::fd::PollFd;
+use compio::runtime::{ResumeUnwind, spawn_blocking};
 use flume;
+use futures_util::{FutureExt, select};
 use mio::Waker;
 use nydus_api::{BlobCacheEntry, BuildTimeInfo};
 use nydus_storage::utils::alloc_buf;
 use sendfd::{RecvWithFd, SendWithFd};
-use async_broadcast::Sender;
-use compio::runtime::fd::PollFd;
-use compio::runtime::{spawn_blocking, ResumeUnwind};
-use futures_util::{select, FutureExt};
 
-use crate::blob_cache::{generate_blob_key, BlobCacheMgr};
+use crate::blob_cache::{BlobCacheMgr, generate_blob_key};
 use crate::block_device::BlockDevice;
 use crate::daemon::{
     DaemonState, DaemonStateMachineContext, DaemonStateMachineInput, DaemonStateMachineSubscriber,
@@ -709,16 +709,21 @@ impl UffdWorker {
                 // All connection senders dropped: the session is tearing down.
                 Err(_) => break,
             };
-            stream.set_nonblocking(true).expect("failed to set nonblocking");
+            stream
+                .set_nonblocking(true)
+                .expect("failed to set nonblocking");
             let active = self.active.clone();
             let active_conns = self.active_conns.clone();
             let device = device.clone();
             let sender = self.sender.clone();
             compio::runtime::spawn(async move {
-                if let Err(e) = Self::handle_conn(active, active_conns, device, stream, sender).await {
+                if let Err(e) =
+                    Self::handle_conn(active, active_conns, device, stream, sender).await
+                {
                     warn!("block_uffd: connection handler exited with error: {e}");
                 }
-            }).detach();
+            })
+            .detach();
         }
 
         info!("block_uffd: worker {} exit!", self.name);
@@ -897,7 +902,10 @@ impl UffdWorker {
 
         info!(
             "block_uffd: handshake successful, {} regions, {} uffd fds, policy {:?}, enable_prefault={}",
-            request.regions.len(), fds.len(), request.policy, request.enable_prefault
+            request.regions.len(),
+            fds.len(),
+            request.policy,
+            request.enable_prefault
         );
 
         let mut fds = fds;
@@ -949,7 +957,8 @@ impl UffdWorker {
                 {
                     warn!("block_uffd: pre-fault task error: {}", e);
                 }
-            }).detach();
+            })
+            .detach();
         }
 
         Ok(state)
@@ -1060,11 +1069,7 @@ impl UffdWorker {
     /// Send data with fd asynchronously. Avoids spawn_blocking by retrying the
     /// non-blocking `sendmsg` and awaiting the socket's compio `PollFd`
     /// readiness notification between `WouldBlock` attempts.
-    async fn async_send_with_fd(
-        sock: &AsyncSock,
-        data: &[u8],
-        fds: &[RawFd],
-    ) -> Result<()> {
+    async fn async_send_with_fd(sock: &AsyncSock, data: &[u8], fds: &[RawFd]) -> Result<()> {
         loop {
             match sock.get_ref().send_with_fd(data, fds) {
                 Ok(_) => return Ok(()),
@@ -1173,13 +1178,15 @@ impl UffdService {
         let thread: std::thread::JoinHandle<Result<()>> = std::thread::Builder::new()
             .name(name)
             .spawn(move || {
-                compio::runtime::Runtime::new().unwrap().block_on(async move {
-                    worker.run().await;
-                    // Notify the daemon controller that one working thread has exited.
-                    if let Err(err) = waker.wake() {
-                        error!("block: fail to exit daemon, error: {:?}", err);
-                    }
-                });
+                compio::runtime::Runtime::new()
+                    .unwrap()
+                    .block_on(async move {
+                        worker.run().await;
+                        // Notify the daemon controller that one working thread has exited.
+                        if let Err(err) = waker.wake() {
+                            error!("block: fail to exit daemon, error: {:?}", err);
+                        }
+                    });
                 Ok(())
             })
             .map_err(crate::Error::ThreadSpawn)?;
@@ -1479,9 +1486,13 @@ pub fn create_uffd_daemon(
     let blob_id = generate_blob_key(&blob_entry.domain_id, &blob_entry.blob_id);
     let cache_mgr = Arc::new(BlobCacheMgr::new());
     cache_mgr.add_blob_entry(&blob_entry)?;
-    let block_device = compio::runtime::Runtime::new()
-        .unwrap()
-        .block_on(BlockDevice::new_with_cache_manager(blob_id.clone(), cache_mgr.clone()))?;
+    let block_device =
+        compio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(BlockDevice::new_with_cache_manager(
+                blob_id.clone(),
+                cache_mgr.clone(),
+            ))?;
     let service = Arc::new(UffdService::new(Arc::new(block_device), sock)?);
 
     let (trigger, events_rx) = std::sync::mpsc::channel::<DaemonStateMachineInput>();
@@ -1513,7 +1524,7 @@ pub fn create_uffd_daemon(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::blob_cache::{generate_blob_key, BlobCacheMgr};
+    use crate::blob_cache::{BlobCacheMgr, generate_blob_key};
     use nydus_api::BlobCacheEntry;
     use std::io::Read;
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
@@ -1660,7 +1671,10 @@ mod tests {
         assert!(mgr.get_config(&key).is_some());
 
         let mgr = Arc::new(mgr);
-        let device = compio::runtime::Runtime::new().unwrap().block_on(BlockDevice::new_with_cache_manager(blob_id.clone(), mgr)).unwrap();
+        let device = compio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(BlockDevice::new_with_cache_manager(blob_id.clone(), mgr))
+            .unwrap();
 
         Ok(Arc::new(device))
     }
@@ -2112,7 +2126,7 @@ mod tests {
             )
             .await;
             assert!(res.is_ok()); // double handshake is logged but not an error
-                                  // conn_state should remain unchanged
+            // conn_state should remain unchanged
             assert!(conn_state.is_some());
             std::mem::forget(uffd_sock); // prevent double-close
         });

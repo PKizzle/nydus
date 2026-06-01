@@ -3,8 +3,8 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-use nydus_storage::device::BlobChunkFlags;
 use nydus_storage::RAFS_BATCH_SIZE_TO_GAP_SHIFT;
+use nydus_storage::device::BlobChunkFlags;
 
 use super::cached_v5::CachedSuperBlockV5;
 use super::direct_v5::DirectSuperBlockV5;
@@ -255,11 +255,7 @@ impl BlobChunkInfo for V5IoChunk {
     }
 
     fn crc32(&self) -> u32 {
-        if self.has_crc32() {
-            self.crc32
-        } else {
-            0
-        }
+        if self.has_crc32() { self.crc32 } else { 0 }
     }
 
     fn as_any(&self) -> &dyn Any {

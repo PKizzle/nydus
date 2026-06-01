@@ -10,8 +10,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
 use hmac::{Hmac, KeyInit, Mac};
-use http::header::HeaderMap;
 use http::Method;
+use http::header::HeaderMap;
 use sha1::Sha1;
 
 use nydus_api::OssConfig;

@@ -789,8 +789,8 @@ mod tests {
         entry.extract_from_reader(blob.clone(), &mut buf).unwrap();
         assert!(!buf.is_empty());
 
-        assert!(list
-            .add(
+        assert!(
+            list.add(
                 TOC_ENTRY_BLOB_DIGEST,
                 compress::Algorithm::Lz4Block,
                 digest,
@@ -798,7 +798,8 @@ mod tests {
                 2,
                 3
             )
-            .is_ok());
+            .is_ok()
+        );
         assert!(list.get_entry(TOC_ENTRY_BLOB_DIGEST).is_some());
     }
 
