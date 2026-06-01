@@ -11,9 +11,10 @@ use crate::cache::parse_duration;
 use crate::config::SnapshotterConfig;
 use crate::daemon::auth::resolve_auth;
 use crate::daemon::image_ref::{parse_image_ref, ImageRef};
-use anyhow::{bail, Context, Result};
-use reqwest::header::{HeaderValue, ACCEPT, AUTHORIZATION, WWW_AUTHENTICATE};
-use reqwest::{Client, Method, Response, StatusCode};
+use anyhow::{anyhow, bail, Context, Result};
+use cyper::{Client, Response};
+use http::header::{HeaderValue, ACCEPT, AUTHORIZATION, WWW_AUTHENTICATE};
+use http::{Method, StatusCode};
 use serde::Deserialize;
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Mutex, OnceLock};
@@ -54,6 +55,7 @@ pub struct ReferrerInfo {
 pub struct RegistryReferrerClient {
     client: Client,
     scheme: &'static str,
+    timeout: Duration,
 }
 
 /// Small bounded LRU cache for referrer detection results.
@@ -167,14 +169,17 @@ impl RegistryReferrerClient {
             .and_then(|cfg| parse_duration(&cfg.request_timeout).ok())
             .unwrap_or_else(|| Duration::from_secs(30));
         let skip_verify = registry.map(|cfg| cfg.skip_verify).unwrap_or(false);
+        // cyper has no client-level timeout; it is applied per request via
+        // `compio::time::timeout` in `send_once` / `fetch_bearer_token`.
         let client = Client::builder()
-            .timeout(timeout)
+            .use_rustls_default()
             .danger_accept_invalid_certs(skip_verify)
             .build()
             .context("failed to build registry referrer HTTP client")?;
         Ok(Self {
             client,
             scheme: "https",
+            timeout,
         })
     }
 
@@ -329,13 +334,20 @@ impl RegistryReferrerClient {
         accept: &str,
         auth: Option<HeaderValue>,
     ) -> Result<Response> {
-        let mut request = self.client.request(method, url).header(ACCEPT, accept);
+        let mut request = self
+            .client
+            .request(method, url)
+            .with_context(|| format!("invalid registry request URL {url}"))?
+            .header(ACCEPT, accept)
+            .context("invalid Accept header")?;
         if let Some(auth) = auth {
-            request = request.header(AUTHORIZATION, auth);
+            request = request
+                .header(AUTHORIZATION, auth)
+                .context("invalid Authorization header")?;
         }
-        request
-            .send()
+        compio::time::timeout(self.timeout, request.send())
             .await
+            .map_err(|_| anyhow!("registry request to {url} timed out"))?
             .with_context(|| format!("registry request failed for {url}"))
     }
 
@@ -360,13 +372,20 @@ impl RegistryReferrerClient {
         url.push_str("scope=");
         url.push_str(&percent_encode_query(&scope));
 
-        let mut request = self.client.get(url).header(ACCEPT, "application/json");
+        let mut request = self
+            .client
+            .get(url)
+            .context("invalid registry token URL")?
+            .header(ACCEPT, "application/json")
+            .context("invalid Accept header")?;
         if let Some(auth) = auth.map(auth_header_value).transpose()? {
-            request = request.header(AUTHORIZATION, auth);
+            request = request
+                .header(AUTHORIZATION, auth)
+                .context("invalid Authorization header")?;
         }
-        let response = request
-            .send()
+        let response = compio::time::timeout(self.timeout, request.send())
             .await
+            .map_err(|_| anyhow!("registry token request timed out"))?
             .context("registry token request failed")?;
         if !response.status().is_success() {
             bail!(
@@ -589,11 +608,12 @@ mod tests {
         assert_eq!(info.fs_driver_hint.as_deref(), Some("blockdev"));
     }
 
-    #[test]
-    fn registry_urls_use_oci_distribution_referrers_endpoint() {
+    #[compio::test]
+    async fn registry_urls_use_oci_distribution_referrers_endpoint() {
         let client = RegistryReferrerClient {
-            client: Client::new(),
+            client: Client::new().unwrap(),
             scheme: "https",
+            timeout: Duration::from_secs(30),
         };
         let image = parse_image_ref("registry.local:5000/team/app:1").unwrap();
         assert_eq!(
