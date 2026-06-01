@@ -831,16 +831,20 @@ impl Connection {
     /// Streaming counterpart of `call` for the blob read path: routes through the
     /// proxy with origin fallback like the buffered path, but streams the
     /// response body into `dst` and returns the number of bytes written.
-    pub fn call_stream(
+    /// Proxy-aware streaming core: streams the response body into `dst` and
+    /// returns `(status, bytes_written, error_body)` *without* applying
+    /// `catch_status`. Callers decide how to treat the status (e.g. registry
+    /// inspects 307/401/403 itself). Shared by `call_stream` and
+    /// `call_stream_status`.
+    fn call_stream_status_err(
         &self,
         method: Method,
         url: &str,
         query: Option<&[(&str, &str)]>,
         headers: &HeaderMap,
-        catch_status: bool,
         skip_proxy: bool,
         dst: &mut [u8],
-    ) -> ConnectionResult<usize> {
+    ) -> ConnectionResult<(StatusCode, usize, Option<String>)> {
         if self.shutdown.load(Ordering::Acquire) {
             return Err(ConnectionError::Disconnected);
         }
@@ -872,10 +876,7 @@ impl Connection {
                         &mut *dst,
                     )?;
                     if !proxy.fallback || status < StatusCode::INTERNAL_SERVER_ERROR {
-                        if catch_status && !is_success_status(status) {
-                            return Err(ConnectionError::ErrorWithMsg(err.unwrap_or_default()));
-                        }
-                        return Ok(written);
+                        return Ok((status, written, err));
                     }
                     warn!("Request proxy server failed, fallback to original server");
                 } else if !proxy.fallback {
@@ -886,12 +887,44 @@ impl Connection {
             }
         }
 
+        self.call_inner_stream(false, method, url, &query, headers, dst)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn call_stream(
+        &self,
+        method: Method,
+        url: &str,
+        query: Option<&[(&str, &str)]>,
+        headers: &HeaderMap,
+        catch_status: bool,
+        skip_proxy: bool,
+        dst: &mut [u8],
+    ) -> ConnectionResult<usize> {
         let (status, written, err) =
-            self.call_inner_stream(false, method, url, &query, headers, dst)?;
+            self.call_stream_status_err(method, url, query, headers, skip_proxy, dst)?;
         if catch_status && !is_success_status(status) {
             return Err(ConnectionError::ErrorWithMsg(err.unwrap_or_default()));
         }
         Ok(written)
+    }
+
+    /// Like `call_stream`, but returns the HTTP status alongside the byte count
+    /// instead of folding non-success into an error. Used by the registry blob
+    /// read path, which must distinguish 200 (stream the blob) from 401/403 (a
+    /// stale cached redirect to retry).
+    pub fn call_stream_status(
+        &self,
+        method: Method,
+        url: &str,
+        query: Option<&[(&str, &str)]>,
+        headers: &HeaderMap,
+        skip_proxy: bool,
+        dst: &mut [u8],
+    ) -> ConnectionResult<(StatusCode, usize)> {
+        let (status, written, _err) =
+            self.call_stream_status_err(method, url, query, headers, skip_proxy, dst)?;
+        Ok((status, written))
     }
 }
 

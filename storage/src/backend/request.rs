@@ -435,6 +435,61 @@ impl Request {
             )
             .map_err(RequestError::Connection)
     }
+
+    /// Like `call_stream`, but returns the HTTP status with the byte count
+    /// instead of folding non-success into an error. The registry read path
+    /// uses this to stream a 200 blob body while still seeing 401/403 (stale
+    /// cached redirect) without an error round-trip.
+    #[allow(clippy::too_many_arguments)]
+    pub fn call_stream_status(
+        &self,
+        method: Method,
+        url: &str,
+        query: Option<&[(&str, &str)]>,
+        headers: &mut HeaderMap,
+        context: &mut BackendContext,
+        temp_disable_proxy: bool,
+        dst: &mut [u8],
+    ) -> RequestResult<(StatusCode, usize)> {
+        // The Dragonfly SDK path can't stream into `dst`; fall back to buffered.
+        #[cfg(feature = "backend-dragonfly-proxy")]
+        {
+            let endpoint = self.dragonfly_scheduler_endpoint();
+            let use_sdk = !temp_disable_proxy
+                && !context.disable_proxy
+                && !self.proxy_config.url.is_empty()
+                && !endpoint.is_empty()
+                && !context.disable_proxy_sdk
+                && method == Method::GET;
+            if use_sdk {
+                let resp = self.call(
+                    method,
+                    url,
+                    query,
+                    None::<ReqBody<&[u8]>>,
+                    headers,
+                    false,
+                    context,
+                    temp_disable_proxy,
+                )?;
+                let status = resp.status();
+                let written = resp
+                    .copy_to(dst)
+                    .map(|n| n as usize)
+                    .map_err(RequestError::Common)?;
+                return Ok((status, written));
+            }
+        }
+
+        // HTTP path (direct or HTTP proxy): stream into `dst`.
+        headers.extend(self.custom_headers.clone());
+        context.method = method.to_string();
+        context.url = url.to_string();
+        context.using_proxy = false;
+        self.connection
+            .call_stream_status(method, url, query, headers, temp_disable_proxy, dst)
+            .map_err(RequestError::Connection)
+    }
 }
 
 #[cfg(test)]
