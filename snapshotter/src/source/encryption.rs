@@ -14,9 +14,10 @@ use std::path::PathBuf;
 use std::pin::Pin;
 use std::process::Stdio;
 use std::time::Duration;
-use tokio::io::AsyncWriteExt;
-use tokio::process::Command;
-use tokio::time::timeout;
+
+use compio::io::{AsyncWrite, AsyncWriteExt};
+use compio::process::Command;
+use compio::time::timeout;
 
 const DECRYPT_HELPER_ENV: &str = "NYDUS_SNAPSHOTTER_DECRYPT_HELPER";
 
@@ -59,7 +60,7 @@ pub trait EncryptionProvider: Send + Sync {
     fn decrypt<'a>(
         &'a self,
         request: DecryptionRequest<'a>,
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>>> + Send + 'a>>;
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>>> + 'a>>;
 }
 
 /// External helper provider for OCICrypt/imgcrypt/age implementations.
@@ -98,7 +99,7 @@ impl EncryptionProvider for CommandEncryptionProvider {
     fn decrypt<'a>(
         &'a self,
         request: DecryptionRequest<'a>,
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>>> + 'a>> {
         Box::pin(async move {
             if self.program.as_os_str().is_empty() {
                 return Err(EncryptionError::EmptyHelperPath.into());
@@ -111,12 +112,13 @@ impl EncryptionProvider for CommandEncryptionProvider {
             .context("failed to encode encryption helper request")?;
 
             let mut command = Command::new(&self.program);
-            command
-                .args(&self.args)
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .kill_on_drop(true);
+            command.args(&self.args);
+            // compio's stdio builders are fallible and don't chain; configure
+            // them individually. compio has no `kill_on_drop`, but the helper is
+            // short-lived and bounded by `timeout` below.
+            command.stdin(Stdio::piped())?;
+            command.stdout(Stdio::piped())?;
+            command.stderr(Stdio::piped())?;
             let mut child = command.spawn().with_context(|| {
                 format!(
                     "failed to spawn encryption helper {}",
@@ -127,8 +129,9 @@ impl EncryptionProvider for CommandEncryptionProvider {
                 .stdin
                 .take()
                 .context("encryption helper stdin was unavailable")?;
-            let write_task = tokio::spawn(async move {
-                stdin.write_all(&payload).await?;
+            let write_task = compio::runtime::spawn(async move {
+                // compio I/O takes an owned buffer and returns `BufResult`.
+                stdin.write_all(payload).await.0?;
                 stdin.shutdown().await
             });
             let output = timeout(self.timeout, child.wait_with_output())
@@ -136,7 +139,7 @@ impl EncryptionProvider for CommandEncryptionProvider {
                 .map_err(|_| EncryptionError::HelperTimedOut)??;
             write_task
                 .await
-                .context("encryption helper stdin task failed")?
+                .map_err(|e| anyhow::anyhow!("encryption helper stdin task failed: {e}"))?
                 .context("failed to write encryption helper request")?;
             if !output.status.success() {
                 return Err(EncryptionError::HelperFailed {
@@ -246,7 +249,7 @@ mod tests {
         fn decrypt<'a>(
             &'a self,
             request: DecryptionRequest<'a>,
-        ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>>> + Send + 'a>> {
+        ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>>> + 'a>> {
             Box::pin(async move {
                 assert_eq!(request.format, EncryptionFormat::Unknown);
                 assert_eq!(request.key, b"key");

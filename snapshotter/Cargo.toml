@@ -46,6 +46,7 @@ compio = { version = "0.19", default-features = false, features = [
     "runtime",
     "net",
     "time",
+    "process",
     "io-uring",
     "polling",
     "ring",
@@ -56,6 +57,7 @@ cyper-axum = { git = "https://github.com/compio-rs/cyper", rev = "d1c8aff18dd81c
 axum = { version = "0.8.1", default-features = false }
 async-lock = "3.4"
 async-channel = "2.3"
+blocking = "1.6"
 futures = "0.3"
 signal-hook = "0.3"
 # tokio is still pulled by the peripheral NRI plugin (ttrpc) and transitively by

@@ -30,8 +30,9 @@ use std::sync::{
     Arc,
 };
 use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{UnixListener, UnixStream};
+use compio::buf::BufResult;
+use compio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+use compio::net::{UnixListener, UnixStream};
 use tracing::{debug, info, warn};
 
 const MAX_HEADER_BYTES: usize = 16 * 1024;
@@ -313,24 +314,26 @@ pub async fn serve_unix(path: PathBuf, controller: SystemController) -> Result<(
             .with_context(|| format!("failed to remove stale sysctl socket {}", path.display()))?;
     }
     let listener = UnixListener::bind(&path)
+        .await
         .with_context(|| format!("failed to bind sysctl socket {}", path.display()))?;
     info!(path = %path.display(), "starting nydus system-controller API");
 
     loop {
         let (stream, _) = listener.accept().await?;
         let controller = controller.clone();
-        tokio::spawn(async move {
+        compio::runtime::spawn(async move {
             if let Err(e) = handle_connection(stream, controller).await {
                 warn!(error = %e, "sysctl connection failed");
             }
-        });
+        })
+        .detach();
     }
 }
 
 async fn handle_connection(mut stream: UnixStream, controller: SystemController) -> Result<()> {
     let request = read_request(&mut stream).await?;
     let response = route_request(&controller, request).await;
-    stream.write_all(&response.to_http()).await?;
+    stream.write_all(response.to_http()).await.0?;
     stream.shutdown().await?;
     Ok(())
 }
@@ -374,8 +377,9 @@ async fn read_request(stream: &mut UnixStream) -> Result<HttpRequest> {
         if buf.len() > MAX_HEADER_BYTES {
             bail!("HTTP headers exceed {MAX_HEADER_BYTES} bytes");
         }
-        let mut chunk = [0u8; 4096];
-        let n = stream.read(&mut chunk).await?;
+        // compio reads into an owned buffer and returns it via `BufResult`.
+        let BufResult(res, chunk) = stream.read(vec![0u8; 4096]).await;
+        let n = res?;
         if n == 0 {
             bail!("client closed connection before completing HTTP request");
         }
@@ -407,8 +411,8 @@ async fn read_request(stream: &mut UnixStream) -> Result<HttpRequest> {
 
     let body_start = header_end + 4;
     while buf.len() < body_start + content_length {
-        let mut chunk = [0u8; 4096];
-        let n = stream.read(&mut chunk).await?;
+        let BufResult(res, chunk) = stream.read(vec![0u8; 4096]).await;
+        let n = res?;
         if n == 0 {
             bail!("client closed connection before completing HTTP body");
         }

@@ -940,6 +940,7 @@ dependencies = [
  "compio-log",
  "compio-macros",
  "compio-net",
+ "compio-process",
  "compio-quic",
  "compio-runtime",
  "compio-tls",
@@ -1073,6 +1074,20 @@ dependencies = [
  "socket2",
  "synchrony",
  "widestring",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "compio-process"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fb7cc04a44627dab383be5fb327f5952c757091ecfea028b04af0e99e4caa9c6"
+dependencies = [
+ "compio-buf",
+ "compio-driver",
+ "compio-io",
+ "compio-runtime",
+ "futures-util",
  "windows-sys 0.61.2",
 ]
 
@@ -4313,6 +4328,7 @@ dependencies = [
  "axum",
  "base64",
  "bbolt-rs",
+ "blocking",
  "clap",
  "compio",
  "containerd-snapshots",

@@ -23,7 +23,7 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::SystemTime;
-use tokio_stream::Stream;
+use futures::Stream;
 use tracing::{debug, info, warn};
 
 /// Small snapshotter error carrier.
@@ -414,7 +414,7 @@ impl snapshots::Snapshotter for NydusSnapshotter {
                 .map_err(|e| SnapshotterError::internal(e.to_string()))?
                 .into_iter()
                 .map(|info| Ok(info_to_snapshots(info)));
-            Ok(Box::pin(tokio_stream::iter(snapshots)) as Self::InfoStream)
+            Ok(Box::pin(futures::stream::iter(snapshots)) as Self::InfoStream)
         }
         .await;
         timer.finish(snapshot_status_label(&result));
@@ -475,11 +475,12 @@ pub async fn serve_with_supervisor(
             metrics.clone(),
             auto_zran.clone(),
         );
-        tokio::spawn(async move {
+        compio::runtime::spawn(async move {
             if let Err(e) = serve_sysctl_unix(sysctl_path, controller).await {
                 warn!(error = %e, "system-controller API exited unexpectedly");
             }
-        });
+        })
+        .detach();
     }
 
     let reconciler = Reconciler::new(
