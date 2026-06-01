@@ -46,6 +46,11 @@ nix = { version = "0.31.3", features = ["fs", "uio", "zerocopy"] }
 cyper = { git = "https://github.com/compio-rs/cyper", rev = "d1c8aff18dd81c4b1f817d0e8e0e05408c15a04c", default-features = false, features = [
     "rustls",
     "http2",
+    # HTTP/3 over QUIC (compio-quic + h3). `http3-altsvc` auto-upgrades to h3
+    # when a registry/CDN advertises it via Alt-Svc; falls back to h2/h1
+    # otherwise. Pure-Rust (quinn/rustls), so musl-static stays clean.
+    "http3",
+    "http3-altsvc",
     "hickory-dns",
     "stream",
 ], optional = true }
