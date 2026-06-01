@@ -19,7 +19,6 @@ pub use self::inode_bitmap::InodeBitmap;
 pub use self::reader::*;
 pub use self::types::*;
 
-pub mod async_helper;
 pub mod compact;
 pub mod compress;
 pub mod config;
@@ -34,7 +33,6 @@ pub mod logger;
 pub mod metrics;
 pub mod mpmc;
 pub mod reader;
-pub mod singleflight;
 pub mod trace;
 pub mod types;
 pub mod verity;
