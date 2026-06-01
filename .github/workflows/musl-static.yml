@@ -1,0 +1,88 @@
+# Builds the Rust binaries as fully-static musl executables and asserts they
+# carry no dynamic dependencies and no OpenSSL in the tree.
+#
+# This is the regression gate for the compio + rustls migration. Before it,
+# nydusd/nydus-image linked OpenSSL (via reqwest -> native-tls) and could only be
+# built static through a vendored openssl-src perl build; now the default tree is
+# pure-Rust crypto (rustls/ring), so a plain `rustup target add ...-musl` build
+# links fully static. If any change drags OpenSSL back in — e.g. by putting
+# backend-dragonfly-proxy in `default`, or adding a native-tls-bound dep — the
+# "no OpenSSL" assertion fails here instead of silently at release time.
+name: musl-static
+
+on:
+  push:
+    branches: [master, production]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # musl-tools ships /usr/bin/musl-gcc targeting the runner's own arch, so the
+  # same compiler name serves x86_64 (ubuntu-latest) and aarch64 (ubuntu arm).
+  # Only the env var matching the target being built is consulted; the other is
+  # harmlessly ignored.
+  CC_x86_64_unknown_linux_musl: musl-gcc
+  CC_aarch64_unknown_linux_musl: musl-gcc
+  CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+  CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+
+jobs:
+  build-static:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-latest
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install musl toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+      - uses: dsherret/rust-toolchain-file@v1
+      - name: Add musl target
+        run: rustup target add ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+          shared-key: musl-${{ matrix.target }}
+      - name: Assert no OpenSSL in the dependency tree
+        run: |
+          if cargo tree --target ${{ matrix.target }} -i openssl-sys 2>/dev/null | grep -q openssl-sys; then
+            echo "::error::openssl-sys is back in the dependency tree; musl-static is broken"
+            cargo tree --target ${{ matrix.target }} -i openssl-sys || true
+            exit 1
+          fi
+          echo "OK: no openssl-sys in the dependency tree"
+      - name: Build static binaries (nydusd, nydus-image, nydusctl)
+        run: |
+          cargo build --release --target ${{ matrix.target }} \
+            --bin nydusd --bin nydus-image --bin nydusctl
+      - name: Build static snapshotter (containerd-nydus)
+        run: |
+          cargo build --release --target ${{ matrix.target }} \
+            -p nydus-snapshotter --bin containerd-nydus
+      - name: Assert binaries are fully static
+        run: |
+          fail=0
+          for b in nydusd nydus-image nydusctl containerd-nydus; do
+            p="target/${{ matrix.target }}/release/$b"
+            echo "== $b =="
+            file "$p"
+            if file "$p" | grep -q "statically linked"; then
+              echo "OK: $b is statically linked"
+            else
+              echo "::error::$b is NOT statically linked"
+              ldd "$p" || true
+              fail=1
+            fi
+          done
+          exit $fail
