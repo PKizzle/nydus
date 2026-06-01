@@ -12,6 +12,12 @@ extern crate lazy_static;
 #[macro_use]
 extern crate nydus_api;
 
+// compio's completion I/O is owned-buffer-per-op, so the hot read/write path
+// churns many small heap buffers; mimalloc's thread-local pools cut that
+// allocation overhead. Builds on musl-static (pure C, no system deps).
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use std::convert::TryInto;
 use std::io::{Error, ErrorKind, Result};
 

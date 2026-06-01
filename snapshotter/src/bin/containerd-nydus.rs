@@ -7,6 +7,12 @@
 //! Single binary that embeds the nydusd daemon in-process and serves
 //! containerd's proxy-plugin gRPC protocol.
 
+// mimalloc global allocator: compio's completion I/O (gRPC + in-process daemon
+// blob reads) is owned-buffer-per-op; mimalloc's thread-local pools cut the
+// small-buffer allocation overhead.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use anyhow::Result;
 use clap::Parser;
 use futures::FutureExt;
