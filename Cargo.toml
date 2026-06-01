@@ -9,7 +9,6 @@ homepage = "https://nydus.dev/"
 repository = "https://github.com/dragonflyoss/nydus"
 exclude = ["contrib/", "smoke/", "tests/"]
 edition = "2024"
-resolver = "3"
 build = "build.rs"
 
 [profile.release]
@@ -132,6 +131,9 @@ backend-dragonfly-proxy = ["nydus-storage/backend-dragonfly-proxy"]
 dedup = ["nydus-storage/dedup"]
 
 [workspace]
+# All members are edition 2024 (which implies the v3 resolver); set it explicitly
+# at the workspace root so Cargo doesn't warn about ignoring members' resolvers.
+resolver = "3"
 members = [
     "api",
     "builder",
