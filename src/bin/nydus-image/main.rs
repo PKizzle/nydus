@@ -13,6 +13,12 @@ extern crate log;
 extern crate serde_json;
 #[macro_use]
 extern crate lazy_static;
+
+// mimalloc global allocator: image conversion churns many small buffers
+// (chunking, compression, zran); thread-local pools cut allocator overhead.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use crate::deduplicate::{
     Deduplicate, SqliteDatabase, check_bootstrap_versions_consistency,
     update_ctx_from_parent_bootstrap,
