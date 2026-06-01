@@ -13,7 +13,7 @@ use std::io::Read;
 use std::str::FromStr;
 use std::sync::Arc;
 
-use reqwest::{
+use http::{
     header::{HeaderMap, HeaderName, HeaderValue},
     Method, StatusCode,
 };
@@ -343,7 +343,7 @@ impl Request {
         // so retry_op() can apply the correct retry policy.
         #[cfg(feature = "backend-dragonfly-proxy")]
         {
-            use reqwest::header::HeaderValue;
+            use http::header::HeaderValue;
             if resp.headers().get(proxy::HEADER_DRAGONFLY_ERROR_TYPE)
                 == Some(&HeaderValue::from_static(
                     proxy::HEADER_VALUE_DRAGONFLY_ERROR_TYPE_PROXY,

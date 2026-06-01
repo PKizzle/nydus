@@ -16,9 +16,8 @@ use log::{max_level, Level};
 
 use cyper::{Client, RequestBuilder};
 use futures_util::StreamExt;
-// reqwest re-exports the `http`/`url` types (same types cyper uses); keep them
-// until reqwest is dropped from the workspace in a later stage.
-use reqwest::{header::HeaderMap, Method, StatusCode, Url};
+use http::{header::HeaderMap, Method, StatusCode};
+use url::Url;
 
 use nydus_api::{HttpProxyConfig, OssConfig, ProxyConfig, RegistryConfig, S3Config};
 use url::ParseError;
@@ -268,8 +267,8 @@ impl Proxy {
 /// cyper's `Response` body is async, but the backend read path is synchronous.
 /// The body is read fully into memory once (via `block_on_http`) and then
 /// exposed through `std::io::Read` plus `status()`/`headers()`, matching the
-/// surface the cache and `request.rs` previously consumed from
-/// `reqwest::blocking::Response`.
+/// surface the cache and `request.rs` previously consumed from the old
+/// blocking HTTP response.
 #[derive(Debug)]
 pub(crate) struct Response {
     status: StatusCode,

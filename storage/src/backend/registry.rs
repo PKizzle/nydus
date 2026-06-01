@@ -13,9 +13,9 @@ use std::{fmt, thread};
 
 use arc_swap::{ArcSwap, ArcSwapOption};
 use base64::Engine;
-pub use reqwest::header::HeaderMap;
-use reqwest::header::{HeaderValue, CONTENT_LENGTH};
-use reqwest::{Method, StatusCode};
+pub use http::header::HeaderMap;
+use http::header::{HeaderValue, CONTENT_LENGTH};
+use http::{Method, StatusCode};
 use url::{ParseError, Url};
 
 use nydus_api::RegistryConfig;
