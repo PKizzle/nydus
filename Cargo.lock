@@ -1037,8 +1037,6 @@ dependencies = [
 [[package]]
 name = "compio-executor"
 version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "06674049385bd96d4d07bb045c541da7bb8d735b8b5333b723d74870868c9bbd"
 dependencies = [
  "compio-log",
  "compio-send-wrapper",
@@ -1549,7 +1547,7 @@ dependencies = [
  "hickory-resolver 0.26.1",
  "http 1.4.0",
  "http-body-util",
- "hyper 1.10.0",
+ "hyper 1.10.1",
  "hyper-util",
  "mime",
  "rustls-platform-verifier",
@@ -1569,7 +1567,7 @@ source = "git+https://github.com/compio-rs/cyper?rev=d1c8aff18dd81c4b1f817d0e8e0
 dependencies = [
  "compio",
  "futures-util",
- "hyper 1.10.0",
+ "hyper 1.10.1",
  "send_wrapper",
 ]
 
@@ -1831,7 +1829,7 @@ dependencies = [
  "cgroups-rs",
  "headers",
  "http 1.4.0",
- "hyper 1.10.0",
+ "hyper 1.10.1",
  "hyper-util",
  "opendal",
  "reqwest 0.12.28",
@@ -3065,9 +3063,9 @@ dependencies = [
 
 [[package]]
 name = "hyper"
-version = "1.10.0"
+version = "1.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "eb92f162bf56536459fc83c79b974bb12837acfed43d6bc370a7916d0ae15ecc"
+checksum = "55281c53a1894c864990125767da440a4e630446785086f52523b20033b74498"
 dependencies = [
  "atomic-waker",
  "bytes",
@@ -3092,7 +3090,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e3c93eb611681b207e1fe55d5a71ecf91572ec8a6705cdb6857f7d8d5242cf58"
 dependencies = [
  "http 1.4.0",
- "hyper 1.10.0",
+ "hyper 1.10.1",
  "hyper-util",
  "rustls",
  "rustls-pki-types",
@@ -3120,7 +3118,7 @@ version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2b90d566bffbce6a75bd8b09a05aa8c2cb1fabb6cb348f8840c9e4c90a0d83b0"
 dependencies = [
- "hyper 1.10.0",
+ "hyper 1.10.1",
  "hyper-util",
  "pin-project-lite",
  "tokio",
@@ -3135,7 +3133,7 @@ checksum = "70206fc6890eaca9fde8a0bf71caa2ddfc9fe045ac9e5c70df101a7dbde866e0"
 dependencies = [
  "bytes",
  "http-body-util",
- "hyper 1.10.0",
+ "hyper 1.10.1",
  "hyper-util",
  "native-tls",
  "tokio",
@@ -3155,7 +3153,7 @@ dependencies = [
  "futures-util",
  "http 1.4.0",
  "http-body 1.0.1",
- "hyper 1.10.0",
+ "hyper 1.10.1",
  "ipnet",
  "libc",
  "percent-encoding",
@@ -3176,7 +3174,7 @@ checksum = "986c5ce3b994526b3cd75578e62554abd09f0899d6206de48b3e96ab34ccc8c7"
 dependencies = [
  "hex",
  "http-body-util",
- "hyper 1.10.0",
+ "hyper 1.10.1",
  "hyper-util",
  "pin-project-lite",
  "tokio",
@@ -3986,9 +3984,9 @@ dependencies = [
 
 [[package]]
 name = "mio"
-version = "1.2.0"
+version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "50b7e5b27aa02a74bac8c3f23f448f8d87ff11f92d3aac1a6ed369ee08cc56c1"
+checksum = "02bd0af71c67b473010cbbc60715ee815645a4dc942899111f494b4b737d6fda"
 dependencies = [
  "libc",
  "log",
@@ -4269,7 +4267,7 @@ dependencies = [
  "lazy_static",
  "libc",
  "log",
- "mio 1.2.0",
+ "mio 1.2.1",
  "serde",
  "serde_json",
  "serde_yaml",
@@ -4349,14 +4347,14 @@ dependencies = [
  "fuse-backend-rs",
  "hex",
  "http-body-util",
- "hyper 1.10.0",
+ "hyper 1.10.1",
  "hyper-util",
  "hyperlocal",
  "lazy_static",
  "libc",
  "log",
  "log-panics",
- "mio 1.2.0",
+ "mio 1.2.1",
  "nix 0.31.3",
  "nydus-api",
  "nydus-builder",
@@ -4393,7 +4391,7 @@ dependencies = [
  "futures-util",
  "libc",
  "log",
- "mio 1.2.0",
+ "mio 1.2.1",
  "nix 0.31.3",
  "nydus-api",
  "nydus-rafs",
@@ -4430,7 +4428,7 @@ dependencies = [
  "containerd-snapshots",
  "fjall",
  "libc",
- "mio 1.2.0",
+ "mio 1.2.1",
  "nydus-api",
  "nydus-rafs",
  "nydus-service",
@@ -4462,6 +4460,7 @@ dependencies = [
  "base64 0.22.1",
  "bitflags 2.11.1",
  "blocking",
+ "bytes",
  "compio",
  "criterion",
  "cyper",
@@ -4476,7 +4475,7 @@ dependencies = [
  "http 1.4.0",
  "http-body-util",
  "httpdate",
- "hyper 1.10.0",
+ "hyper 1.10.1",
  "hyper-util",
  "hyperlocal",
  "lazy_static",
@@ -5849,7 +5848,7 @@ dependencies = [
  "http 1.4.0",
  "http-body 1.0.1",
  "http-body-util",
- "hyper 1.10.0",
+ "hyper 1.10.1",
  "hyper-rustls",
  "hyper-tls",
  "hyper-util",
@@ -5898,7 +5897,7 @@ dependencies = [
  "http 1.4.0",
  "http-body 1.0.1",
  "http-body-util",
- "hyper 1.10.0",
+ "hyper 1.10.1",
  "hyper-rustls",
  "hyper-tls",
  "hyper-util",
@@ -6997,7 +6996,7 @@ checksum = "8fc7f01b389ac15039e4dc9531aa973a135d7a4135281b12d7c1bc79fd57fffe"
 dependencies = [
  "bytes",
  "libc",
- "mio 1.2.0",
+ "mio 1.2.1",
  "parking_lot",
  "pin-project-lite",
  "signal-hook-registry",
@@ -7170,7 +7169,7 @@ dependencies = [
  "http 1.4.0",
  "http-body 1.0.1",
  "http-body-util",
- "hyper 1.10.0",
+ "hyper 1.10.1",
  "hyper-timeout 0.5.2",
  "hyper-util",
  "percent-encoding",

@@ -14,26 +14,41 @@ use std::{fmt, thread};
 
 use log::{max_level, Level};
 
-use reqwest::{
-    self,
-    blocking::{Body, Client, Response},
-    header::HeaderMap,
-    redirect::Policy,
-    Method, StatusCode, Url,
-};
+use cyper::{Client, RequestBuilder};
+// reqwest re-exports the `http`/`url` types (same types cyper uses); keep them
+// until reqwest is dropped from the workspace in a later stage.
+use reqwest::{header::HeaderMap, Method, StatusCode, Url};
 
 use nydus_api::{HttpProxyConfig, OssConfig, ProxyConfig, RegistryConfig, S3Config};
 use url::ParseError;
-
-use crate::backend::hickory::HickoryDnsResolver;
 
 const HEADER_AUTHORIZATION: &str = "Authorization";
 
 const RATE_LIMITED_LOG_TIME: u8 = 2;
 
-lazy_static::lazy_static! {
-    static ref HICKORY_DNS_RESOLVER: Arc<HickoryDnsResolver> =
-        Arc::new(HickoryDnsResolver::default());
+/// Monotonic id assigned to each `Connection`, used to key its per-thread cyper
+/// clients in `HTTP_CLIENTS`.
+static CONNECTION_ID: AtomicU64 = AtomicU64::new(0);
+
+thread_local! {
+    /// Per-thread compio runtime to drive cyper's async HTTP on the synchronous
+    /// backend read path. `Connection::call` is always invoked from a blocking
+    /// pool thread (cache prefetch via `blocking::unblock`, on-demand reads via
+    /// compio `spawn_blocking`), so this thread-local `block_on` never nests
+    /// inside another compio runtime.
+    static HTTP_RUNTIME: compio::runtime::Runtime =
+        compio::runtime::Runtime::new().expect("storage: failed to create compio HTTP runtime");
+
+    /// Per-thread cyper clients, keyed by `(connection id, is_proxy)`. cyper's
+    /// `Client` is `!Send` (thread-per-core, `Rc`-based), so it cannot live in
+    /// the `Arc`-shared `Connection`. Each worker/blocking thread instead builds
+    /// and pools its own client lazily — the natural thread-per-core model.
+    static HTTP_CLIENTS: RefCell<HashMap<(u64, bool), Client>> = RefCell::new(HashMap::new());
+}
+
+/// Drive a cyper future to completion on the thread-local HTTP runtime.
+fn block_on_http<F: std::future::Future>(fut: F) -> F::Output {
+    HTTP_RUNTIME.with(|rt| rt.block_on(fut))
 }
 
 thread_local! {
@@ -45,8 +60,7 @@ thread_local! {
 pub enum ConnectionError {
     Disconnected,
     ErrorWithMsg(String),
-    Common(reqwest::Error),
-    Format(reqwest::Error),
+    Common(cyper::Error),
     Url(String, ParseError),
     Scheme(String),
 }
@@ -57,7 +71,6 @@ impl fmt::Display for ConnectionError {
             ConnectionError::Disconnected => write!(f, "network connection disconnected"),
             ConnectionError::ErrorWithMsg(s) => write!(f, "network error, {}", s),
             ConnectionError::Common(e) => write!(f, "network error, {}", e),
-            ConnectionError::Format(e) => write!(f, "{}", e),
             ConnectionError::Url(s, e) => write!(f, "failed to parse URL {}, {}", s, e),
             ConnectionError::Scheme(s) => write!(f, "invalid scheme {}", s),
         }
@@ -215,7 +228,6 @@ const SCHEME_REVERSION_CACHE_RETAIN: i16 = 2;
 
 #[derive(Debug)]
 struct Proxy {
-    client: Client,
     health: ProxyHealth,
     fallback: bool,
     use_http: bool,
@@ -247,6 +259,55 @@ impl Proxy {
     }
 }
 
+/// A buffered HTTP response.
+///
+/// cyper's `Response` body is async, but the backend read path is synchronous.
+/// The body is read fully into memory once (via `block_on_http`) and then
+/// exposed through `std::io::Read` plus `status()`/`headers()`, matching the
+/// surface the cache and `request.rs` previously consumed from
+/// `reqwest::blocking::Response`.
+#[derive(Debug)]
+pub(crate) struct Response {
+    status: StatusCode,
+    headers: HeaderMap,
+    // `bytes::Bytes` is Arc-backed, so wrapping it in a `Cursor` exposes the
+    // buffered body through `Read` without an extra copy.
+    body: std::io::Cursor<bytes::Bytes>,
+}
+
+impl Response {
+    pub(crate) fn status(&self) -> StatusCode {
+        self.status
+    }
+
+    pub(crate) fn headers(&self) -> &HeaderMap {
+        &self.headers
+    }
+
+    /// Consume the response and return its body as a (lossy) UTF-8 string.
+    pub(crate) fn text(self) -> String {
+        String::from_utf8_lossy(&self.body.into_inner()).into_owned()
+    }
+}
+
+impl Read for Response {
+    fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
+        self.body.read(buf)
+    }
+}
+
+#[cfg(test)]
+impl<B: Into<bytes::Bytes>> From<http::Response<B>> for Response {
+    fn from(resp: http::Response<B>) -> Self {
+        let (parts, body) = resp.into_parts();
+        Response {
+            status: parts.status,
+            headers: parts.headers,
+            body: std::io::Cursor::new(body.into()),
+        }
+    }
+}
+
 /// Check whether the HTTP status code is a success result.
 pub(crate) fn is_success_status(status: StatusCode) -> bool {
     status >= StatusCode::OK && status < StatusCode::BAD_REQUEST
@@ -257,17 +318,22 @@ pub(crate) fn respond(resp: Response, catch_status: bool) -> ConnectionResult<Re
     if !catch_status || is_success_status(resp.status()) {
         Ok(resp)
     } else {
-        let msg = resp.text().map_err(ConnectionError::Format)?;
-        Err(ConnectionError::ErrorWithMsg(msg))
+        Err(ConnectionError::ErrorWithMsg(resp.text()))
     }
 }
 
 /// A network connection to communicate with remote server.
 #[derive(Debug)]
 pub(crate) struct Connection {
-    client: Client,
+    /// Identifies this connection's per-thread cyper clients in `HTTP_CLIENTS`.
+    id: u64,
+    /// Backend config used to lazily build per-thread cyper clients.
+    config: ConnectionConfig,
     proxy: Option<Arc<Proxy>>,
     pub shutdown: AtomicBool,
+    /// Per-request timeout. cyper has no builtin timeout, so it is applied via
+    /// `compio::time::timeout`. `None` means no timeout.
+    timeout: Option<Duration>,
     /// Timestamp of connection's last active request, represents as duration since UNIX_EPOCH in seconds.
     last_active: Arc<AtomicU64>,
 }
@@ -276,7 +342,8 @@ impl Connection {
     /// Create a new connection according to the configuration.
     pub fn new(config: &ConnectionConfig) -> Result<Arc<Connection>> {
         info!("backend config: {:?}", config);
-        let client = Self::build_connection("", config)?;
+        // Per-thread cyper clients are built lazily inside the compio runtime
+        // (cyper's hickory resolver needs `Runtime::current()` at build time).
 
         let proxy = if !config.proxy.url.is_empty() {
             let ping_url = if !config.proxy.ping_url.is_empty() {
@@ -285,7 +352,6 @@ impl Connection {
                 None
             };
             Some(Arc::new(Proxy {
-                client: Self::build_connection(&config.proxy.url, config)?,
                 health: ProxyHealth::new(
                     config.proxy.check_interval,
                     config.proxy.check_pause_elapsed,
@@ -300,9 +366,15 @@ impl Connection {
         };
 
         let connection = Arc::new(Connection {
-            client,
+            id: CONNECTION_ID.fetch_add(1, Ordering::Relaxed),
+            config: config.clone(),
             proxy,
             shutdown: AtomicBool::new(false),
+            timeout: if config.timeout != 0 {
+                Some(Duration::from_secs(config.timeout as u64))
+            } else {
+                None
+            },
             last_active: Arc::new(AtomicU64::new(
                 SystemTime::now()
                     .duration_since(UNIX_EPOCH)
@@ -336,31 +408,45 @@ impl Connection {
                             - last_active.load(Ordering::Relaxed);
                         // If the connection is not active for a set time, skip proxy health check.
                         if elapsed <= proxy.health.check_pause_elapsed {
-                            let client = Client::new();
-                            let _ = client
-                                .get(ping_url.clone())
-                                .timeout(Duration::from_secs(connect_timeout))
-                                .send()
-                                .map(|resp| {
-                                    let success = is_success_status(resp.status());
+                            let ping: ConnectionResult<StatusCode> = block_on_http(async {
+                                let client = Client::new().map_err(ConnectionError::Common)?;
+                                let rb = client
+                                    .get(ping_url.clone())
+                                    .map_err(ConnectionError::Common)?;
+                                match compio::runtime::time::timeout(
+                                    Duration::from_secs(connect_timeout),
+                                    rb.send(),
+                                )
+                                .await
+                                {
+                                    Ok(r) => Ok(r.map_err(ConnectionError::Common)?.status()),
+                                    Err(_) => Err(ConnectionError::ErrorWithMsg(
+                                        "proxy ping timed out".to_string(),
+                                    )),
+                                }
+                            });
+                            match ping {
+                                Ok(status) => {
+                                    let success = is_success_status(status);
                                     if last_success && !success {
                                         warn!(
                                             "Detected proxy unhealthy when pinging proxy, response status {}",
-                                            resp.status()
+                                            status
                                         );
                                     } else if !last_success && success {
                                         info!("Backend proxy recovered")
                                     }
                                     last_success = success;
                                     proxy.health.set(success);
-                                })
-                                .map_err(|e| {
+                                }
+                                Err(e) => {
                                     if last_success {
                                         warn!("Detected proxy unhealthy when ping proxy, {}", e);
                                     }
                                     last_success = false;
-                                    proxy.health.set(false)
-                                });
+                                    proxy.health.set(false);
+                                }
+                            }
                         }
 
                         thread::sleep(proxy.health.check_interval);
@@ -434,7 +520,7 @@ impl Connection {
                     );
 
                     let result = self.call_inner(
-                        &proxy.client,
+                        true,
                         method.clone(),
                         replaced_url,
                         &query,
@@ -490,7 +576,7 @@ impl Connection {
             url
         );
         self.call_inner(
-            &self.client,
+            false,
             method,
             url,
             &query,
@@ -502,39 +588,33 @@ impl Connection {
     }
 
     fn build_connection(proxy: &str, config: &ConnectionConfig) -> Result<Client> {
-        let connect_timeout = if config.connect_timeout != 0 {
-            Some(Duration::from_secs(config.connect_timeout as u64))
-        } else {
-            None
-        };
-        let timeout = if config.timeout != 0 {
-            Some(Duration::from_secs(config.timeout as u64))
-        } else {
-            None
-        };
-
+        // Note: cyper has no client-level request/connect timeout; the request
+        // timeout is applied per-call via `compio::time::timeout` in `call_inner`.
         let mut cb = Client::builder()
-            .timeout(timeout)
-            .connect_timeout(connect_timeout)
             // Disable automatic redirect following so that registry.rs can
             // cache 307 redirect URLs (cached_redirect) and skip the registry
             // round-trip on subsequent chunk reads from the same blob.
-            .redirect(Policy::none());
-
-        cb = cb.dns_resolver(HICKORY_DNS_RESOLVER.clone());
+            .redirect(cyper::redirect::Policy::none())
+            // Resolve DNS through cyper's bundled hickory resolver.
+            .hickory_dns(true)
+            .use_rustls_default();
 
         if config.skip_verify {
             cb = cb.danger_accept_invalid_certs(true);
         }
 
-        for ca_cert_file in &config.ca_cert_files {
-            let pem = std::fs::read(ca_cert_file).map_err(|e| einval!(e))?;
-            let cert = reqwest::Certificate::from_pem(&pem).map_err(|e| einval!(e))?;
-            cb = cb.add_root_certificate(cert);
+        if !config.ca_cert_files.is_empty() {
+            // TODO: honor custom CA roots on the cyper path via
+            // `use_rustls(ClientConfig)` built from rustls-platform-verifier's
+            // `new_with_extra_roots`. Tracked as a follow-up in this stage.
+            warn!(
+                "connection: {} custom CA cert file(s) configured but not yet honored on the cyper path",
+                config.ca_cert_files.len()
+            );
         }
 
         if !proxy.is_empty() {
-            cb = cb.proxy(reqwest::Proxy::all(proxy).map_err(|e| einval!(e))?)
+            cb = cb.proxy(cyper::proxy::Proxy::all(proxy).map_err(|e| einval!(e))?)
         } else {
             // Explicitly disable system proxy (HTTP_PROXY/HTTPS_PROXY env vars)
             // so that the direct client truly bypasses any proxy, especially when
@@ -548,7 +628,7 @@ impl Connection {
     #[allow(clippy::too_many_arguments)]
     fn call_inner<R: Read + Clone + Send + 'static>(
         &self,
-        client: &Client,
+        is_proxy: bool,
         method: Method,
         url: &str,
         query: &Option<&[(&str, &str)]>,
@@ -568,28 +648,79 @@ impl Connection {
         let has_data = data.is_some();
         let start = Instant::now();
 
-        let mut rb = client.request(method.clone(), url).headers(headers.clone());
-        if let Some(q) = query.as_ref() {
-            rb = rb.query(q);
-        }
-
-        let ret;
-        if let Some(data) = data {
-            match data {
-                ReqBody::Read(body, total) => {
-                    let body = Body::sized(body, total as u64);
-                    ret = rb.body(body).send();
-                }
-                ReqBody::Buf(buf) => {
-                    ret = rb.body(buf).send();
-                }
-                ReqBody::Form(form) => {
-                    ret = rb.form(&form).send();
-                }
+        // cyper is async and its hickory resolver needs `Runtime::current()` at
+        // client-build time, so build the per-thread client, construct the
+        // request, and run it on the thread-local compio runtime. The cache
+        // borrow and the built `RequestBuilder` (which owns an `Rc` clone of the
+        // client) are released before the first `.await`.
+        let timeout = self.timeout;
+        let url_owned = url.to_string();
+        let req_method = method.clone();
+        let result: ConnectionResult<Response> = block_on_http(async move {
+            let rb = HTTP_CLIENTS.with(|clients| -> ConnectionResult<RequestBuilder> {
+            let mut clients = clients.borrow_mut();
+            let key = (self.id, is_proxy);
+            if !clients.contains_key(&key) {
+                let proxy_url = if is_proxy {
+                    self.config.proxy.url.as_str()
+                } else {
+                    ""
+                };
+                let client = Self::build_connection(proxy_url, &self.config).map_err(|e| {
+                    ConnectionError::ErrorWithMsg(format!("failed to build HTTP client: {e}"))
+                })?;
+                clients.insert(key, client);
             }
-        } else {
-            ret = rb.body("").send();
-        }
+            let client = clients.get(&key).unwrap();
+
+            let mut rb = client
+                .request(req_method, url)
+                .map_err(ConnectionError::Common)?
+                .headers(headers.clone());
+            if let Some(q) = query.as_ref() {
+                rb = rb.query(q).map_err(ConnectionError::Common)?;
+            }
+            if let Some(data) = data {
+                rb = match data {
+                    ReqBody::Read(mut body, _total) => {
+                        // cyper has no streaming-from-`Read` body; buffer the
+                        // upload payload (registry push path, not blob reads).
+                        let mut buf = Vec::new();
+                        body.read_to_end(&mut buf).map_err(|e| {
+                            ConnectionError::ErrorWithMsg(format!("read request body: {e}"))
+                        })?;
+                        rb.body(buf)
+                    }
+                    ReqBody::Buf(buf) => rb.body(buf),
+                    ReqBody::Form(form) => rb.form(&form).map_err(ConnectionError::Common)?,
+                };
+            } else {
+                rb = rb.body(Vec::<u8>::new());
+            }
+            Ok(rb)
+        })?;
+
+            let send = rb.send();
+            let cyper_resp = match timeout {
+                Some(t) => match compio::runtime::time::timeout(t, send).await {
+                    Ok(r) => r.map_err(ConnectionError::Common)?,
+                    Err(_) => {
+                        return Err(ConnectionError::ErrorWithMsg(format!(
+                            "request to {url_owned} timed out"
+                        )))
+                    }
+                },
+                None => send.await.map_err(ConnectionError::Common)?,
+            };
+            let status = cyper_resp.status();
+            let resp_headers = cyper_resp.headers().clone();
+            let body = cyper_resp.bytes().await.map_err(ConnectionError::Common)?;
+            Ok(Response {
+                status,
+                headers: resp_headers,
+                body: std::io::Cursor::new(body),
+            })
+        });
 
         debug!(
             "{} Request: {} {} headers: {:?}, proxy: {}, data: {}, duration: {}ms",
@@ -602,10 +733,7 @@ impl Connection {
             Instant::now().duration_since(start).as_millis(),
         );
 
-        match ret {
-            Err(err) => Err(ConnectionError::Common(err)),
-            Ok(resp) => respond(resp, catch_status),
-        }
+        result.and_then(|resp| respond(resp, catch_status))
     }
 }
 
