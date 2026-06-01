@@ -145,23 +145,20 @@ where
             .sign(Method::GET, &mut headers, resource.as_str(), url.as_str())
             .map_err(ObjectStorageError::Auth)?;
 
-        let resp = self
+        let written = self
             .request
-            .call::<&[u8]>(
+            .call_stream(
                 Method::GET,
                 url.as_str(),
-                None,
                 None,
                 &mut headers,
                 true,
                 ctx,
                 false,
+                buf,
             )
             .map_err(BackendError::Request)?;
-        Ok(resp
-            .copy_to(buf)
-            .map_err(|e| ObjectStorageError::Transport(std::io::Error::other(e)))
-            .map(|size| size as usize)?)
+        Ok(written)
     }
 
     /// Start a streaming read from the blob at the given offset.

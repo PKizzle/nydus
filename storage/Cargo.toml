@@ -14,6 +14,7 @@ async-lock = "3.4"
 async-trait = "0.1"
 blocking = "1.6"
 bytes = "1"
+futures-util = { version = "0.3", default-features = false }
 compio = { version = "0.19", default-features = false, features = [
     "runtime",
     "time",
@@ -53,6 +54,7 @@ cyper = { git = "https://github.com/compio-rs/cyper", rev = "d1c8aff18dd81c4b1f8
     "rustls",
     "http2",
     "hickory-dns",
+    "stream",
 ], optional = true }
 rusqlite = { version = "0.39.0", features = ["bundled"], optional = true }
 r2d2 = { version = "0.8", optional = true }

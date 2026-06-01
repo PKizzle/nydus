@@ -4467,6 +4467,7 @@ dependencies = [
  "dragonfly-client-util",
  "fuse-backend-rs",
  "futures",
+ "futures-util",
  "governor",
  "gpt",
  "hex",

@@ -95,9 +95,7 @@ impl Response {
 
     pub fn copy_to(self, writer: &mut [u8]) -> Result<u64, String> {
         match self {
-            Self::HTTP(resp) => {
-                std::io::copy(&mut Box::new(resp), &mut &mut *writer).map_err(|e| format!("{}", e))
-            }
+            Self::HTTP(mut resp) => Ok(resp.copy_to_slice(writer) as u64),
             #[cfg(feature = "backend-dragonfly-proxy")]
             Self::ProxySDK(resp) => {
                 let mut reader = resp.reader.unwrap_or(Box::new(tokio::io::empty()));
@@ -374,6 +372,68 @@ impl Request {
         }
 
         Ok(resp)
+    }
+
+    /// Streaming counterpart of `call` for the blob read path: streams the
+    /// response body directly into `dst` and returns the number of bytes
+    /// written, avoiding a full-body buffer. The Dragonfly SDK path cannot
+    /// stream, so it falls back to the buffered `call` + a direct slice copy.
+    #[allow(clippy::too_many_arguments)]
+    pub fn call_stream(
+        &self,
+        method: Method,
+        url: &str,
+        query: Option<&[(&str, &str)]>,
+        headers: &mut HeaderMap,
+        catch_status: bool,
+        context: &mut BackendContext,
+        temp_disable_proxy: bool,
+        dst: &mut [u8],
+    ) -> RequestResult<usize> {
+        // The Dragonfly SDK path can't stream into `dst`; fall back to buffered.
+        #[cfg(feature = "backend-dragonfly-proxy")]
+        {
+            let endpoint = self.dragonfly_scheduler_endpoint();
+            let use_sdk = !temp_disable_proxy
+                && !context.disable_proxy
+                && !self.proxy_config.url.is_empty()
+                && !endpoint.is_empty()
+                && !context.disable_proxy_sdk
+                && method == Method::GET;
+            if use_sdk {
+                let resp = self.call(
+                    method,
+                    url,
+                    query,
+                    None::<ReqBody<&[u8]>>,
+                    headers,
+                    catch_status,
+                    context,
+                    temp_disable_proxy,
+                )?;
+                return resp
+                    .copy_to(dst)
+                    .map(|n| n as usize)
+                    .map_err(RequestError::Common);
+            }
+        }
+
+        // HTTP path (direct or HTTP proxy): stream into `dst`.
+        headers.extend(self.custom_headers.clone());
+        context.method = method.to_string();
+        context.url = url.to_string();
+        context.using_proxy = false;
+        self.connection
+            .call_stream(
+                method,
+                url,
+                query,
+                headers,
+                catch_status,
+                temp_disable_proxy,
+                dst,
+            )
+            .map_err(RequestError::Connection)
     }
 }
 
