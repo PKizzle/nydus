@@ -25,7 +25,8 @@ getrandom = { version = "0.3", optional = true }
 serde = { version = ">=1.0.27", features = ["serde_derive", "rc"] }
 serde_json = ">=1.0.9"
 sha2 = "0.11.0"
-tokio = { version = "1.52.3", features = ["rt", "sync"] }
+# Runtime-agnostic notifier backing the mpmc channel (replaces tokio::sync).
+event-listener = "5.4"
 zstd = "0.13.3"
 nix = { version = "0.31.3", features = ["uio"] }
 crc = "3.4.0"
@@ -46,7 +47,6 @@ flate2 = { version = "1.0.28", features = ["zlib-ng-compat"], default-features =
 vmm-sys-util = { workspace = true }
 tar = "0.4.46"
 futures = "0.3"
-tokio = { version = "1.52.3", features = ["macros", "rt-multi-thread", "time"] }
 
 [features]
 zran = ["libz-sys"]

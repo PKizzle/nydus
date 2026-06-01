@@ -4,18 +4,22 @@
 
 //! Asynchronous Multi-Producer Multi-Consumer channel.
 //!
-//! This module provides an asynchronous multi-producer multi-consumer channel based on [tokio::sync::Notify].
+//! This module provides an asynchronous multi-producer multi-consumer channel based on [event_listener::Event].
 
 use std::collections::VecDeque;
 use std::io::{Error, ErrorKind, Result};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, MutexGuard};
-use tokio::sync::Notify;
 
-/// An asynchronous multi-producer multi-consumer channel based on [tokio::sync::Notify].
+use event_listener::Event;
+
+/// An asynchronous multi-producer multi-consumer channel based on [event_listener::Event].
+///
+/// `event_listener` is runtime-agnostic, so the channel is driven from the
+/// compio prefetch worker without a tokio runtime.
 pub struct Channel<T> {
     closed: AtomicBool,
-    notifier: Notify,
+    notifier: Event,
     requests: Mutex<VecDeque<T>>,
 }
 
@@ -30,7 +34,7 @@ impl<T> Channel<T> {
     pub fn new() -> Self {
         Channel {
             closed: AtomicBool::new(false),
-            notifier: Notify::new(),
+            notifier: Event::new(),
             requests: Mutex::new(VecDeque::new()),
         }
     }
@@ -38,7 +42,8 @@ impl<T> Channel<T> {
     /// Close the channel.
     pub fn close(&self) {
         self.closed.store(true, Ordering::Release);
-        self.notifier.notify_waiters();
+        // Wake every waiter so they observe the closed state.
+        self.notifier.notify(usize::MAX);
     }
 
     /// Send a message to the channel.
@@ -49,7 +54,7 @@ impl<T> Channel<T> {
             Err(msg)
         } else {
             self.requests.lock().unwrap().push_back(msg);
-            self.notifier.notify_one();
+            self.notifier.notify(1);
             Ok(())
         }
     }
@@ -61,27 +66,21 @@ impl<T> Channel<T> {
 
     /// Receive message from the channel in asynchronous mode.
     pub async fn recv(&self) -> Result<T> {
-        let future = self.notifier.notified();
-        tokio::pin!(future);
-
         loop {
-            // Make sure that no wakeup is lost if we get `None` from `try_recv`.
-            future.as_mut().enable();
+            // Register a listener BEFORE checking the queue, so a `send`/`close`
+            // racing between the check and the await cannot be missed (the same
+            // pattern `async-channel` uses over `event_listener`).
+            let listener = self.notifier.listen();
 
-            match self.try_recv() { Some(msg) => {
+            if let Some(msg) = self.try_recv() {
                 return Ok(msg);
-            } _ => if self.closed.load(Ordering::Acquire) {
+            }
+            if self.closed.load(Ordering::Acquire) {
                 return Err(Error::new(ErrorKind::BrokenPipe, "channel has been closed"));
-            }}
+            }
 
-            // Wait for a call to `notify_one`.
-            //
-            // This uses `.as_mut()` to avoid consuming the future,
-            // which lets us call `Pin::set` below.
-            future.as_mut().await;
-
-            // Reset the future in case another call to `try_recv` got the message before us.
-            future.set(self.notifier.notified());
+            // Wait for a `send`/`close` notification, then re-check the queue.
+            listener.await;
         }
     }
 
@@ -101,7 +100,7 @@ impl<T> Channel<T> {
 
     /// Notify all waiters.
     pub fn notify_waiters(&self) {
-        self.notifier.notify_waiters();
+        self.notifier.notify(usize::MAX);
     }
 }
 
@@ -145,11 +144,9 @@ mod tests {
             channel2.send(1u32).unwrap();
         });
 
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        rt.block_on(async {
+        // The channel is runtime-agnostic now; drive `recv` with a plain
+        // `futures` executor instead of a tokio runtime.
+        futures::executor::block_on(async {
             let msg = channel.recv().await.unwrap();
             assert_eq!(msg, 1);
         });
@@ -187,11 +184,7 @@ mod tests {
         let channel = Arc::new(Channel::<u32>::new());
         channel.close();
 
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        rt.block_on(async {
+        futures::executor::block_on(async {
             let result = channel.recv().await;
             assert!(result.is_err());
             assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::BrokenPipe);
