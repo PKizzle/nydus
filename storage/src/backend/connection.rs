@@ -48,7 +48,10 @@ thread_local! {
 }
 
 /// Drive a cyper future to completion on the thread-local HTTP runtime.
-fn block_on_http<F: std::future::Future>(fut: F) -> F::Output {
+///
+/// Also reused by the http-proxy backend so all backends share one compio HTTP
+/// runtime per thread.
+pub(crate) fn block_on_http<F: std::future::Future>(fut: F) -> F::Output {
     HTTP_RUNTIME.with(|rt| rt.block_on(fut))
 }
 
