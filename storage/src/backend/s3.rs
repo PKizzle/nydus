@@ -14,8 +14,8 @@ use hmac::{Hmac, KeyInit, Mac};
 use http::Uri;
 use nydus_api::S3Config;
 use nydus_utils::metrics::BackendMetrics;
-use reqwest::header::HeaderMap;
-use reqwest::Method;
+use http::header::HeaderMap;
+use http::Method;
 use sha2::{Digest, Sha256};
 use time::{format_description, OffsetDateTime};
 

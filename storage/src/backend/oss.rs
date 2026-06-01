@@ -10,8 +10,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
 use hmac::{Hmac, KeyInit, Mac};
-use reqwest::header::HeaderMap;
-use reqwest::Method;
+use http::header::HeaderMap;
+use http::Method;
 use sha1::Sha1;
 
 use nydus_api::OssConfig;
@@ -268,8 +268,8 @@ mod tests {
         let mut headers = HeaderMap::new();
         // Add an x-oss-* header to exercise the canonicalized_oss_headers branch
         headers.insert(
-            reqwest::header::HeaderName::from_static("x-oss-meta-author"),
-            reqwest::header::HeaderValue::from_static("test"),
+            http::header::HeaderName::from_static("x-oss-meta-author"),
+            http::header::HeaderValue::from_static("test"),
         );
         state
             .sign(Method::GET, &mut headers, "/bucket/someobj", "")

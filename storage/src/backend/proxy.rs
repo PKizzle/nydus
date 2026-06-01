@@ -20,8 +20,8 @@ use dragonfly_client_util::request::Request;
 use dragonfly_client_util::request::{Body, GetRequest, GetResponse, Proxy};
 use lazy_static::lazy_static;
 use log::info;
-use reqwest::header::HeaderMap;
-use reqwest::StatusCode;
+use http::header::HeaderMap;
+use http::StatusCode;
 
 // --- Dragonfly header constants ---
 pub const HEADER_DRAGONFLY_PRIORITY: &str = "X-Dragonfly-Priority";
@@ -119,7 +119,7 @@ impl ProxySDKClient {
                     let mut header_map = HeaderMap::new();
                     for (key, value) in err.header {
                         if let Ok(header_name) =
-                            reqwest::header::HeaderName::from_bytes(key.as_bytes())
+                            http::header::HeaderName::from_bytes(key.as_bytes())
                         {
                             if let Ok(val) = value.as_str().parse() {
                                 header_map.insert(header_name, val);
