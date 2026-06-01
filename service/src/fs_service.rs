@@ -184,18 +184,18 @@ pub trait FsService: Send + Sync {
             .backend_from_mountpoint(&cmd.mountpoint)?
             .ok_or(Error::NotFound)?;
 
-        if self.is_fuse() {
-            if let Some(rafs) = fs.deref().as_any().downcast_ref::<Rafs>() {
-                let root_ino = rafs.get_root_inode().unwrap();
-                let (mountpoint_parent_ino, mountpoint_name) =
-                    mountpoint_invalidation_target(self.get_vfs(), &cmd.mountpoint)?;
-                self.walk_and_notify_invalidation(
-                    mountpoint_parent_ino,
-                    mountpoint_name,
-                    root_ino,
-                    fs_idx,
-                )?;
-            }
+        if self.is_fuse()
+            && let Some(rafs) = fs.deref().as_any().downcast_ref::<Rafs>()
+        {
+            let root_ino = rafs.get_root_inode().unwrap();
+            let (mountpoint_parent_ino, mountpoint_name) =
+                mountpoint_invalidation_target(self.get_vfs(), &cmd.mountpoint)?;
+            self.walk_and_notify_invalidation(
+                mountpoint_parent_ino,
+                mountpoint_name,
+                root_ino,
+                fs_idx,
+            )?;
         }
 
         drop(fs);

@@ -93,10 +93,8 @@ pub trait NydusDaemon: DaemonStateMachineSubscriber + Send + Sync {
             state: self.get_state(),
             backend_collection: None,
         };
-        if include_fs_info {
-            if let Some(fs) = self.get_default_fs_service() {
-                response.backend_collection = Some(fs.backend_collection().deref().clone());
-            }
+        if include_fs_info && let Some(fs) = self.get_default_fs_service() {
+            response.backend_collection = Some(fs.backend_collection().deref().clone());
         }
 
         serde_json::to_string(&response).map_err(Error::Serde)

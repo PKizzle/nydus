@@ -103,20 +103,20 @@ impl ConfigV2 {
         if self.version != 2 {
             return false;
         }
-        if let Some(backend_cfg) = self.backend.as_ref() {
-            if !backend_cfg.validate() {
-                return false;
-            }
+        if let Some(backend_cfg) = self.backend.as_ref()
+            && !backend_cfg.validate()
+        {
+            return false;
         }
-        if let Some(cache_cfg) = self.cache.as_ref() {
-            if !cache_cfg.validate() {
-                return false;
-            }
+        if let Some(cache_cfg) = self.cache.as_ref()
+            && !cache_cfg.validate()
+        {
+            return false;
         }
-        if let Some(rafs_cfg) = self.rafs.as_ref() {
-            if !rafs_cfg.validate() {
-                return false;
-            }
+        if let Some(rafs_cfg) = self.rafs.as_ref()
+            && !rafs_cfg.validate()
+        {
+            return false;
         }
 
         true
@@ -149,10 +149,10 @@ impl ConfigV2 {
             if let Some(c) = cache.file_cache.as_ref() {
                 return Ok(c.work_dir.clone());
             }
-        } else if cache.is_fanotify() {
-            if let Some(c) = cache.fanotify.as_ref() {
-                return Ok(c.work_dir.clone());
-            }
+        } else if cache.is_fanotify()
+            && let Some(c) = cache.fanotify.as_ref()
+        {
+            return Ok(c.work_dir.clone());
         }
 
         Err(Error::new(
@@ -189,10 +189,10 @@ impl ConfigV2 {
                 s3_cfg.access_key_secret = String::new();
             }
         }
-        if let Some(cache_cfg) = cfg.cache.as_mut() {
-            if let Some(file_cache_cfg) = cache_cfg.file_cache.as_mut() {
-                file_cache_cfg.encryption_key = String::new();
-            }
+        if let Some(cache_cfg) = cfg.cache.as_mut()
+            && let Some(file_cache_cfg) = cache_cfg.file_cache.as_mut()
+        {
+            file_cache_cfg.encryption_key = String::new();
         }
         for external_backend in cfg.external_backends.iter_mut() {
             redact_sensitive_map(&mut external_backend.patch);
@@ -209,10 +209,10 @@ impl ConfigV2 {
         } else {
             false
         };
-        if let Some(rafs) = &self.rafs {
-            if rafs.validate {
-                validation = true;
-            }
+        if let Some(rafs) = &self.rafs
+            && rafs.validate
+        {
+            validation = true;
         }
 
         validation
@@ -229,12 +229,11 @@ impl ConfigV2 {
 
     /// Fill authorization for registry backend.
     pub fn update_registry_auth_info(&mut self, auth: &Option<String>) {
-        if let Some(auth) = auth {
-            if let Some(backend) = self.backend.as_mut() {
-                if let Some(registry) = backend.registry.as_mut() {
-                    registry.auth = Some(auth.to_string());
-                }
-            }
+        if let Some(auth) = auth
+            && let Some(backend) = self.backend.as_mut()
+            && let Some(registry) = backend.registry.as_mut()
+        {
+            registry.auth = Some(auth.to_string());
         }
     }
 }
@@ -264,19 +263,17 @@ impl FromStr for ConfigV2 {
                 Err(Error::new(ErrorKind::InvalidInput, "invalid configuration"))
             };
         }
-        if let Ok(v) = serde_json::from_str::<RafsConfig>(s) {
-            if let Ok(v) = ConfigV2::try_from(v) {
-                if v.validate() {
-                    return Ok(v);
-                }
-            }
+        if let Ok(v) = serde_json::from_str::<RafsConfig>(s)
+            && let Ok(v) = ConfigV2::try_from(v)
+            && v.validate()
+        {
+            return Ok(v);
         }
-        if let Ok(v) = serde_yaml::from_str::<RafsConfig>(s) {
-            if let Ok(v) = ConfigV2::try_from(v) {
-                if v.validate() {
-                    return Ok(v);
-                }
-            }
+        if let Ok(v) = serde_yaml::from_str::<RafsConfig>(s)
+            && let Ok(v) = ConfigV2::try_from(v)
+            && v.validate()
+        {
+            return Ok(v);
         }
         Err(Error::new(
             ErrorKind::InvalidInput,
@@ -1149,12 +1146,12 @@ pub struct BlobCacheEntry {
 
 impl BlobCacheEntry {
     pub fn prepare_configuration_info(&mut self) -> bool {
-        if self.blob_config.is_none() {
-            if let Some(legacy) = self.blob_config_legacy.as_ref() {
-                match legacy.try_into() {
-                    Err(_) => return false,
-                    Ok(v) => self.blob_config = Some(v),
-                }
+        if self.blob_config.is_none()
+            && let Some(legacy) = self.blob_config_legacy.as_ref()
+        {
+            match legacy.try_into() {
+                Err(_) => return false,
+                Ok(v) => self.blob_config = Some(v),
             }
         }
 
@@ -1168,12 +1165,11 @@ impl BlobCacheEntry {
     pub fn clone_without_secrets(&self) -> Self {
         let mut entry = self.clone();
 
-        if entry.blob_config.is_none() {
-            if let Some(legacy) = self.blob_config_legacy.as_ref() {
-                if let Ok(config) = legacy.try_into() {
-                    entry.blob_config = Some(config);
-                }
-            }
+        if entry.blob_config.is_none()
+            && let Some(legacy) = self.blob_config_legacy.as_ref()
+            && let Ok(config) = legacy.try_into()
+        {
+            entry.blob_config = Some(config);
         }
         entry.blob_config_legacy = None;
         if let Some(config) = entry.blob_config.as_mut() {
@@ -1206,10 +1202,10 @@ impl BlobCacheEntry {
             log::warn!("invalid blob type {} for blob cache entry", self.blob_type);
             return false;
         }
-        if let Some(config) = self.blob_config.as_ref() {
-            if !config.validate() {
-                return false;
-            }
+        if let Some(config) = self.blob_config.as_ref()
+            && !config.validate()
+        {
+            return false;
         }
         true
     }

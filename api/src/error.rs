@@ -13,12 +13,12 @@ pub fn make_error(
 ) -> std::io::Error {
     #[cfg(feature = "error-backtrace")]
     {
-        if let Ok(val) = std::env::var("RUST_BACKTRACE") {
-            if val.trim() != "0" {
-                error!("Stack:\n{:?}", backtrace::Backtrace::new());
-                error!("Error:\n\t{:?}\n\tat {}:{}", _raw, _file, _line);
-                return err;
-            }
+        if let Ok(val) = std::env::var("RUST_BACKTRACE")
+            && val.trim() != "0"
+        {
+            error!("Stack:\n{:?}", backtrace::Backtrace::new());
+            error!("Error:\n\t{:?}\n\tat {}:{}", _raw, _file, _line);
+            return err;
         }
         error!(
             "Error:\n\t{:?}\n\tat {}:{}\n\tnote: enable `RUST_BACKTRACE=1` env to display a backtrace",

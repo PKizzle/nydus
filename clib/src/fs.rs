@@ -34,19 +34,23 @@ pub(crate) struct FileSystemState {
 impl FileSystemState {
     /// Caller needs to ensure the lifetime of returned reference.
     pub(crate) unsafe fn from_handle(hdl: NydusFsHandle) -> &'static mut Self {
-        let fs = &mut *(hdl as *const FileSystemState as *mut FileSystemState);
-        assert_eq!(fs.magic, NYDUS_FS_HANDLE_MAGIC);
-        fs
+        unsafe {
+            let fs = &mut *(hdl as *const FileSystemState as *mut FileSystemState);
+            assert_eq!(fs.magic, NYDUS_FS_HANDLE_MAGIC);
+            fs
+        }
     }
 
     /// Caller needs to ensure the lifetime of returned reference.
     pub(crate) unsafe fn try_from_handle(hdl: NydusFsHandle) -> Result<&'static mut Self, i32> {
-        if hdl == null::<FileSystemState>() as usize {
-            return Err(libc::EINVAL);
+        unsafe {
+            if hdl == null::<FileSystemState>() as usize {
+                return Err(libc::EINVAL);
+            }
+            let fs = &mut *(hdl as *const FileSystemState as *mut FileSystemState);
+            assert_eq!(fs.magic, NYDUS_FS_HANDLE_MAGIC);
+            Ok(fs)
         }
-        let fs = &mut *(hdl as *const FileSystemState as *mut FileSystemState);
-        assert_eq!(fs.magic, NYDUS_FS_HANDLE_MAGIC);
-        Ok(fs)
     }
 }
 
@@ -118,13 +122,15 @@ pub unsafe extern "C" fn nydus_open_rafs(
     bootstrap: *const c_char,
     config: *const c_char,
 ) -> NydusFsHandle {
-    if bootstrap.is_null() || config.is_null() {
-        return fs_error_einval();
-    }
-    let bootstrap = cstr_to_str!(bootstrap, null_mut::<FileSystemState>() as NydusFsHandle);
-    let config = cstr_to_str!(config, null_mut::<FileSystemState>() as NydusFsHandle);
+    unsafe {
+        if bootstrap.is_null() || config.is_null() {
+            return fs_error_einval();
+        }
+        let bootstrap = cstr_to_str!(bootstrap, null_mut::<FileSystemState>() as NydusFsHandle);
+        let config = cstr_to_str!(config, null_mut::<FileSystemState>() as NydusFsHandle);
 
-    do_nydus_open_rafs(bootstrap, config)
+        do_nydus_open_rafs(bootstrap, config)
+    }
 }
 
 /// Open a RAFS filesystem with default configuration and return a handle to the filesystem object.
@@ -140,28 +146,30 @@ pub unsafe extern "C" fn nydus_open_rafs_default(
     bootstrap: *const c_char,
     dir_path: *const c_char,
 ) -> NydusFsHandle {
-    if bootstrap.is_null() || dir_path.is_null() {
-        return fs_error_einval();
-    }
-    let bootstrap = cstr_to_str!(bootstrap, null_mut::<FileSystemState>() as NydusFsHandle);
-    let dir_path = cstr_to_str!(dir_path, null_mut::<FileSystemState>() as NydusFsHandle);
-
-    let p_tmp;
-    let mut path = Path::new(bootstrap);
-    if path.parent().is_none() {
-        p_tmp = Path::new(dir_path).join(bootstrap);
-        path = &p_tmp
-    }
-    let bootstrap = match path.to_str() {
-        Some(v) => v,
-        None => {
-            warn!("invalid bootstrap path '{}'", bootstrap);
+    unsafe {
+        if bootstrap.is_null() || dir_path.is_null() {
             return fs_error_einval();
         }
-    };
-    let config = default_localfs_rafs_config(dir_path);
+        let bootstrap = cstr_to_str!(bootstrap, null_mut::<FileSystemState>() as NydusFsHandle);
+        let dir_path = cstr_to_str!(dir_path, null_mut::<FileSystemState>() as NydusFsHandle);
 
-    do_nydus_open_rafs(bootstrap, &config)
+        let p_tmp;
+        let mut path = Path::new(bootstrap);
+        if path.parent().is_none() {
+            p_tmp = Path::new(dir_path).join(bootstrap);
+            path = &p_tmp
+        }
+        let bootstrap = match path.to_str() {
+            Some(v) => v,
+            None => {
+                warn!("invalid bootstrap path '{}'", bootstrap);
+                return fs_error_einval();
+            }
+        };
+        let config = default_localfs_rafs_config(dir_path);
+
+        do_nydus_open_rafs(bootstrap, &config)
+    }
 }
 
 /// Close the RAFS filesystem returned by `nydus_open_rafs()` and friends.
@@ -173,10 +181,12 @@ pub unsafe extern "C" fn nydus_open_rafs_default(
 /// Caller needs to ensure `handle` is valid, otherwise it may cause memory access violation.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn nydus_close_rafs(handle: NydusFsHandle) {
-    let mut fs = Box::from_raw(handle as *mut FileSystemState);
-    assert_eq!(fs.magic, NYDUS_FS_HANDLE_MAGIC);
-    fs.magic -= 0x4fdf_03cd_ae34_9d9a;
-    fs.rafs.destroy().unwrap();
+    unsafe {
+        let mut fs = Box::from_raw(handle as *mut FileSystemState);
+        assert_eq!(fs.magic, NYDUS_FS_HANDLE_MAGIC);
+        fs.magic -= 0x4fdf_03cd_ae34_9d9a;
+        fs.rafs.destroy().unwrap();
+    }
 }
 
 #[cfg(test)]

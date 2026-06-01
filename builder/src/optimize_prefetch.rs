@@ -211,11 +211,11 @@ impl OptimizePrefetch {
         blob_mgr.add_blob(blob_state.blob_ctx.clone());
         blob_mgr.set_current_blob_index(0);
         Blob::finalize_blob_data(ctx, &mut blob_mgr, blob_state.blob_writer.as_mut())?;
-        if let RafsBlobTable::V6(_) = blob_table {
-            if let Some((_, blob_ctx)) = blob_mgr.get_current_blob() {
-                Blob::dump_meta_data(ctx, blob_ctx, blob_state.blob_writer.as_mut()).unwrap();
-            };
-        }
+        if let RafsBlobTable::V6(_) = blob_table
+            && let Some((_, blob_ctx)) = blob_mgr.get_current_blob()
+        {
+            Blob::dump_meta_data(ctx, blob_ctx, blob_state.blob_writer.as_mut()).unwrap();
+        };
         ctx.blob_id = String::from("");
         blob_mgr.get_current_blob().unwrap().1.blob_id = String::from("");
         finalize_blob(ctx, &mut blob_mgr, blob_state.blob_writer.as_mut())?;

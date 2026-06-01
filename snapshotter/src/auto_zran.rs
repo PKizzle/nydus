@@ -113,10 +113,10 @@ impl AutoZranState {
                 seen.remove(&job_key(&job.image));
             }
         }
-        if let Ok(mut active) = self.active_image.lock() {
-            if active.as_deref() == Some(job.image.as_str()) {
-                *active = None;
-            }
+        if let Ok(mut active) = self.active_image.lock()
+            && active.as_deref() == Some(job.image.as_str())
+        {
+            *active = None;
         }
     }
 

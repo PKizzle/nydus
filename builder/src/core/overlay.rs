@@ -157,10 +157,9 @@ impl Node {
             .info
             .xattrs
             .get(&OsString::from(OVERLAYFS_WHITEOUT_OPAQUE))
+            && let Ok(v) = std::str::from_utf8(v.as_slice())
         {
-            if let Ok(v) = std::str::from_utf8(v.as_slice()) {
-                return v == "y";
-            }
+            return v == "y";
         }
 
         false

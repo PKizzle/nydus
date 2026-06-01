@@ -253,10 +253,11 @@ impl OverlayEngine {
             // (e.g. raw `sha256:…` digests) so reattach calls without a CRI
             // label can still resolve the right image.
             let has_authoritative = call_image_ref.is_some() || from_containerd.is_some();
-            if stored.as_deref() != Some(image_ref.as_str()) && has_authoritative {
-                if let Err(e) = store.set_image_ref(&snap.key, &image_ref) {
-                    warn!(snap = %snap.key, error = %e, "failed to persist image_ref backfill");
-                }
+            if stored.as_deref() != Some(image_ref.as_str())
+                && has_authoritative
+                && let Err(e) = store.set_image_ref(&snap.key, &image_ref)
+            {
+                warn!(snap = %snap.key, error = %e, "failed to persist image_ref backfill");
             }
             info!(snap = %snap.key, %image_ref, "resolved nydus image ref");
             let bootstrap = self.fs_dir(&snap.key).join("image").join("image.boot");

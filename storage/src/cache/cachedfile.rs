@@ -302,13 +302,13 @@ impl FileCacheEntry {
                 &metrics,
             );
             #[cfg(feature = "dedup")]
-            if let Some(mgr) = _cas_mgr {
-                if let Err(e) = mgr.record_chunk(&_blob_info, chunk.deref(), _file_path.as_ref()) {
-                    warn!(
-                        "failed to record chunk state for dedup in delay_persist_chunk_data, {}",
-                        e
-                    );
-                }
+            if let Some(mgr) = _cas_mgr
+                && let Err(e) = mgr.record_chunk(&_blob_info, chunk.deref(), _file_path.as_ref())
+            {
+                warn!(
+                    "failed to record chunk state for dedup in delay_persist_chunk_data, {}",
+                    e
+                );
             }
         })
         .detach();
@@ -319,13 +319,13 @@ impl FileCacheEntry {
         let res = Self::persist_cached_data(&self.file, offset, buf);
         self.update_chunk_pending_status(chunk, res.is_ok());
         #[cfg(feature = "dedup")]
-        if let Some(mgr) = &self.cas_mgr {
-            if let Err(e) = mgr.record_chunk(&self.blob_info, chunk, self.file_path.as_ref()) {
-                warn!(
-                    "failed to record chunk state for dedup in persist_chunk_data, {}",
-                    e
-                );
-            }
+        if let Some(mgr) = &self.cas_mgr
+            && let Err(e) = mgr.record_chunk(&self.blob_info, chunk, self.file_path.as_ref())
+        {
+            warn!(
+                "failed to record chunk state for dedup in persist_chunk_data, {}",
+                e
+            );
         }
     }
 
@@ -1164,12 +1164,10 @@ impl FileCacheEntry {
             };
 
             #[cfg(feature = "dedup")]
-            if !is_ready {
-                if let Some(mgr) = self.cas_mgr.as_ref() {
-                    is_ready = mgr.dedup_chunk(&self.blob_info, chunk.deref(), &self.file);
-                    if is_ready {
-                        self.update_chunk_pending_status(chunk.deref(), true);
-                    }
+            if !is_ready && let Some(mgr) = self.cas_mgr.as_ref() {
+                is_ready = mgr.dedup_chunk(&self.blob_info, chunk.deref(), &self.file);
+                if is_ready {
+                    self.update_chunk_pending_status(chunk.deref(), true);
                 }
             }
             // Directly read chunk data from file cache into user buffer iff:
@@ -1313,31 +1311,31 @@ impl FileCacheEntry {
 
         // Try to extend requests.
         let mut region_hold;
-        if let Some(v) = self.extend_pending_chunks(&region.chunks, self.user_io_batch_size())? {
-            if v.len() > r.chunks.len() {
-                let mut tag_set = HashSet::new();
-                for (idx, chunk) in region.chunks.iter().enumerate() {
-                    if region.tags[idx] {
-                        tag_set.insert(chunk.id());
-                    }
+        if let Some(v) = self.extend_pending_chunks(&region.chunks, self.user_io_batch_size())?
+            && v.len() > r.chunks.len()
+        {
+            let mut tag_set = HashSet::new();
+            for (idx, chunk) in region.chunks.iter().enumerate() {
+                if region.tags[idx] {
+                    tag_set.insert(chunk.id());
                 }
-
-                region_hold = Region::with(self, region, v)?;
-                for (idx, c) in region_hold.chunks.iter().enumerate() {
-                    if tag_set.contains(&c.id()) {
-                        region_hold.tags[idx] = true;
-                    }
-                }
-                region = &region_hold;
-                trace!(
-                    "extended blob request from 0x{:x}/0x{:x} to 0x{:x}/0x{:x} with {} chunks",
-                    r.blob_address,
-                    r.blob_len,
-                    region_hold.blob_address,
-                    region_hold.blob_len,
-                    region_hold.chunks.len(),
-                );
             }
+
+            region_hold = Region::with(self, region, v)?;
+            for (idx, c) in region_hold.chunks.iter().enumerate() {
+                if tag_set.contains(&c.id()) {
+                    region_hold.tags[idx] = true;
+                }
+            }
+            region = &region_hold;
+            trace!(
+                "extended blob request from 0x{:x}/0x{:x} to 0x{:x}/0x{:x} with {} chunks",
+                r.blob_address,
+                r.blob_len,
+                region_hold.blob_address,
+                region_hold.blob_len,
+                region_hold.chunks.len(),
+            );
         }
 
         if self.is_zran() {
@@ -1571,10 +1569,10 @@ impl FileCacheEntry {
 #[cfg(feature = "dedup")]
 impl Drop for FileCacheEntry {
     fn drop(&mut self) {
-        if let Some(cas_mgr) = &self.cas_mgr {
-            if let Err(e) = cas_mgr.gc() {
-                warn!("cas_mgr gc failed: {}", e);
-            }
+        if let Some(cas_mgr) = &self.cas_mgr
+            && let Err(e) = cas_mgr.gc()
+        {
+            warn!("cas_mgr gc failed: {}", e);
         }
     }
 }
@@ -1619,11 +1617,13 @@ impl DataBuffer {
 
     #[allow(dead_code)]
     unsafe fn from_mut_slice(buf: &mut [u8]) -> Self {
-        DataBuffer::Reuse(ManuallyDrop::new(Vec::from_raw_parts(
-            buf.as_mut_ptr(),
-            buf.len(),
-            buf.len(),
-        )))
+        unsafe {
+            DataBuffer::Reuse(ManuallyDrop::new(Vec::from_raw_parts(
+                buf.as_mut_ptr(),
+                buf.len(),
+                buf.len(),
+            )))
+        }
     }
 }
 
@@ -1790,14 +1790,13 @@ impl FileIoMergeState {
         // Make sure user io of same region continuous
         if !self.regions.is_empty() && self.joinable(region_type) {
             let region = &self.regions[self.regions.len() - 1];
-            if !region.seg.is_empty() && tag.is_user_io() {
-                if let BlobIoTag::User(ref seg) = tag {
-                    if seg.offset as u64 + start
-                        != region.blob_address + region.seg.offset as u64 + region.seg.len as u64
-                    {
-                        self.commit();
-                    }
-                }
+            if !region.seg.is_empty()
+                && tag.is_user_io()
+                && let BlobIoTag::User(ref seg) = tag
+                && seg.offset as u64 + start
+                    != region.blob_address + region.seg.offset as u64 + region.seg.len as u64
+            {
+                self.commit();
             }
         }
 

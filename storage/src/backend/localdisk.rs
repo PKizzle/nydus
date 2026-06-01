@@ -249,12 +249,12 @@ impl LocalDisk {
     }
 
     fn get_blob_from_gpt(&self, blob_id: &str) -> LocalDiskResult<Arc<dyn BlobReader>> {
-        if self.is_gpt_mode {
-            if let Some(localdisk_blob_id) = LocalDisk::truncate_blob_id(blob_id) {
-                // Don't expect poisoned lock here.
-                if let Some(entry) = self.entries.read().unwrap().get(localdisk_blob_id) {
-                    return Ok(entry.clone());
-                }
+        if self.is_gpt_mode
+            && let Some(localdisk_blob_id) = LocalDisk::truncate_blob_id(blob_id)
+        {
+            // Don't expect poisoned lock here.
+            if let Some(entry) = self.entries.read().unwrap().get(localdisk_blob_id) {
+                return Ok(entry.clone());
             }
         }
 

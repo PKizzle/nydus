@@ -120,12 +120,12 @@ impl CachedSuperBlockV5 {
             self.max_inode = inode.ino();
         }
 
-        if inode.is_hardlink() {
-            if let Some(i) = self.s_inodes.get(&inode.i_ino) {
-                // Keep it as is, directory digest algorithm has dependency on it.
-                if !i.i_data.is_empty() {
-                    return Ok(inode);
-                }
+        if inode.is_hardlink()
+            && let Some(i) = self.s_inodes.get(&inode.i_ino)
+        {
+            // Keep it as is, directory digest algorithm has dependency on it.
+            if !i.i_data.is_empty() {
+                return Ok(inode);
             }
         }
         self.s_inodes.insert(inode.ino(), inode.clone());

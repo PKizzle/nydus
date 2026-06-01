@@ -571,12 +571,12 @@ impl RafsV6SuperBlockExt {
                     "blob table intersects with prefetch table in Rafs v6 extended superblock",
                 )));
             }
-            if let Some(chunk_range) = chunk_info_tbl_range.as_ref() {
-                if chunk_range.intersect_with(&prefetch_range) {
-                    return Err(einval!(format!(
-                        "chunk information table intersects with prefetch table in Rafs v6 extended superblock",
-                    )));
-                }
+            if let Some(chunk_range) = chunk_info_tbl_range.as_ref()
+                && chunk_range.intersect_with(&prefetch_range)
+            {
+                return Err(einval!(format!(
+                    "chunk information table intersects with prefetch table in Rafs v6 extended superblock",
+                )));
             }
         }
 

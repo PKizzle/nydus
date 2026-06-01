@@ -396,13 +396,13 @@ async fn read_request(stream: &mut UnixStream) -> Result<HttpRequest> {
 
     let mut content_length = 0usize;
     for line in lines {
-        if let Some((name, value)) = line.split_once(':') {
-            if name.eq_ignore_ascii_case("content-length") {
-                content_length = value
-                    .trim()
-                    .parse::<usize>()
-                    .context("invalid content-length")?;
-            }
+        if let Some((name, value)) = line.split_once(':')
+            && name.eq_ignore_ascii_case("content-length")
+        {
+            content_length = value
+                .trim()
+                .parse::<usize>()
+                .context("invalid content-length")?;
         }
     }
     if content_length > MAX_BODY_BYTES {

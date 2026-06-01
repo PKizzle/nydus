@@ -61,13 +61,13 @@ impl RafsInspector {
             None,
             None,
             &mut |parent, inode, _| {
-                if !inode.is_dir() {
-                    if let Some(parent) = parent {
-                        file_parents
-                            .entry(inode.ino())
-                            .or_insert_with(Vec::new)
-                            .push(parent.ino());
-                    }
+                if !inode.is_dir()
+                    && let Some(parent) = parent
+                {
+                    file_parents
+                        .entry(inode.ino())
+                        .or_insert_with(Vec::new)
+                        .push(parent.ino());
                 }
                 Ok(())
             },

@@ -281,29 +281,8 @@ impl DaemonSupervisor {
 
         {
             let instances = self.instances.read().await;
-            if let Some(inst) = instances.get(image_ref) {
-                if inst.bootstrap == bootstrap
-                    && matches!(
-                        inst.daemon.get_state(),
-                        DaemonState::RUNNING | DaemonState::READY
-                    )
-                {
-                    inst.refcount.fetch_add(1, Ordering::SeqCst);
-                    if let Err(e) = self.persist_instance_record(inst, true) {
-                        warn!(image_ref, error = %e, "failed to persist daemon record");
-                    }
-                    return Ok(Arc::new(MountHandle {
-                        image_ref: image_ref.to_string(),
-                        mountpoint: inst.mountpoint.clone(),
-                        daemon: inst.daemon.clone(),
-                    }));
-                }
-            }
-        }
-
-        let mut instances = self.instances.write().await;
-        if let Some(inst) = instances.get(image_ref) {
-            if inst.bootstrap == bootstrap
+            if let Some(inst) = instances.get(image_ref)
+                && inst.bootstrap == bootstrap
                 && matches!(
                     inst.daemon.get_state(),
                     DaemonState::RUNNING | DaemonState::READY
@@ -321,6 +300,25 @@ impl DaemonSupervisor {
             }
         }
 
+        let mut instances = self.instances.write().await;
+        if let Some(inst) = instances.get(image_ref)
+            && inst.bootstrap == bootstrap
+            && matches!(
+                inst.daemon.get_state(),
+                DaemonState::RUNNING | DaemonState::READY
+            )
+        {
+            inst.refcount.fetch_add(1, Ordering::SeqCst);
+            if let Err(e) = self.persist_instance_record(inst, true) {
+                warn!(image_ref, error = %e, "failed to persist daemon record");
+            }
+            return Ok(Arc::new(MountHandle {
+                image_ref: image_ref.to_string(),
+                mountpoint: inst.mountpoint.clone(),
+                daemon: inst.daemon.clone(),
+            }));
+        }
+
         let instance = self
             .start_instance(image_ref, bootstrap)
             .await
@@ -332,10 +330,10 @@ impl DaemonSupervisor {
             daemon: instance.daemon.clone(),
         };
         instances.insert(image_ref.to_string(), instance);
-        if let Some(inst) = instances.get(image_ref) {
-            if let Err(e) = self.persist_instance_record(inst, true) {
-                warn!(image_ref, error = %e, "failed to persist daemon record");
-            }
+        if let Some(inst) = instances.get(image_ref)
+            && let Err(e) = self.persist_instance_record(inst, true)
+        {
+            warn!(image_ref, error = %e, "failed to persist daemon record");
         }
         Ok(Arc::new(handle))
     }
@@ -388,10 +386,10 @@ impl DaemonSupervisor {
             .with_context(|| format!("failed to spawn nydus daemon for {image_ref}"))?;
         let record = self.record_for_instance(&instance, true);
         instances.insert(image_ref.to_string(), instance);
-        if let Some(inst) = instances.get(image_ref) {
-            if let Err(e) = self.persist_instance_record(inst, true) {
-                warn!(image_ref, error = %e, "failed to persist daemon record");
-            }
+        if let Some(inst) = instances.get(image_ref)
+            && let Err(e) = self.persist_instance_record(inst, true)
+        {
+            warn!(image_ref, error = %e, "failed to persist daemon record");
         }
         Ok(record)
     }
@@ -420,10 +418,10 @@ impl DaemonSupervisor {
                     warn!(image_ref, error = %e, "failed to persist stopped daemon record");
                 }
             }
-        } else if let Some(inst) = instances.get(image_ref) {
-            if let Err(e) = self.persist_instance_record(inst, true) {
-                warn!(image_ref, error = %e, "failed to persist daemon record");
-            }
+        } else if let Some(inst) = instances.get(image_ref)
+            && let Err(e) = self.persist_instance_record(inst, true)
+        {
+            warn!(image_ref, error = %e, "failed to persist daemon record");
         }
         Ok(())
     }

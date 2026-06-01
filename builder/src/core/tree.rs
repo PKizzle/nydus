@@ -219,10 +219,10 @@ impl Tree {
             let mut u_node = u.borrow_mut_node();
             match u_node.whiteout_type(ctx.whiteout_spec) {
                 Some(WhiteoutType::OciRemoval) => {
-                    if let Some(origin_name) = u_node.origin_name(WhiteoutType::OciRemoval) {
-                        if let Some(idx) = self.get_child_idx(origin_name.as_bytes()) {
-                            self.children.remove(idx);
-                        }
+                    if let Some(origin_name) = u_node.origin_name(WhiteoutType::OciRemoval)
+                        && let Some(idx) = self.get_child_idx(origin_name.as_bytes())
+                    {
+                        self.children.remove(idx);
                     }
                 }
                 Some(WhiteoutType::OciOpaque) => {

@@ -407,32 +407,32 @@ Commit:                 {git_commit}
                     git_commit = version_info["git_commit"],
                 );
 
-                if let Some(b) = i.get("backend_collection") {
-                    if let Some(fs_backends) = b.as_object() {
-                        if !fs_backends.is_empty() {
-                            println!("Instances:")
-                        }
+                if let Some(b) = i.get("backend_collection")
+                    && let Some(fs_backends) = b.as_object()
+                {
+                    if !fs_backends.is_empty() {
+                        println!("Instances:")
+                    }
 
-                        for (mount_point, backend_obj) in fs_backends {
-                            let backend: FsBackendDescriptor =
-                                serde_json::from_value(backend_obj.clone()).unwrap();
-                            println!("\tInstance Mountpoint:  {}", mount_point);
-                            println!("\tType:  {}", backend.backend_type);
-                            println!("\tMounted Time:  {}", backend.mounted_time);
-                            match backend.backend_type {
-                                FsBackendType::PassthroughFs => {}
-                                FsBackendType::Rafs => {
-                                    let cfg = backend.config.unwrap();
-                                    let cache_cfg = cfg.get_cache_config()?;
-                                    let rafs_cfg = cfg.get_rafs_config()?;
-                                    println!("\tMode:  {}", rafs_cfg.mode);
-                                    println!("\tPrefetch:  {}", cache_cfg.prefetch.enable);
-                                    println!(
-                                        "\tPrefetch Merging Size:  {}",
-                                        cache_cfg.prefetch.batch_size
-                                    );
-                                    println!();
-                                }
+                    for (mount_point, backend_obj) in fs_backends {
+                        let backend: FsBackendDescriptor =
+                            serde_json::from_value(backend_obj.clone()).unwrap();
+                        println!("\tInstance Mountpoint:  {}", mount_point);
+                        println!("\tType:  {}", backend.backend_type);
+                        println!("\tMounted Time:  {}", backend.mounted_time);
+                        match backend.backend_type {
+                            FsBackendType::PassthroughFs => {}
+                            FsBackendType::Rafs => {
+                                let cfg = backend.config.unwrap();
+                                let cache_cfg = cfg.get_cache_config()?;
+                                let rafs_cfg = cfg.get_rafs_config()?;
+                                println!("\tMode:  {}", rafs_cfg.mode);
+                                println!("\tPrefetch:  {}", cache_cfg.prefetch.enable);
+                                println!(
+                                    "\tPrefetch Merging Size:  {}",
+                                    cache_cfg.prefetch.batch_size
+                                );
+                                println!();
                             }
                         }
                     }

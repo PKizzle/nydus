@@ -145,10 +145,10 @@ impl BlobCacheMgr for FileCacheMgr {
 
         for key in reclaim.iter() {
             let mut guard = self.blobs.write().unwrap();
-            if let Some(entry) = guard.get(key) {
-                if Arc::strong_count(entry) == 1 {
-                    guard.remove(key);
-                }
+            if let Some(entry) = guard.get(key)
+                && Arc::strong_count(entry) == 1
+            {
+                guard.remove(key);
             }
         }
 

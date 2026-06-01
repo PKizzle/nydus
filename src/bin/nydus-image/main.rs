@@ -977,11 +977,11 @@ fn main() -> Result<()> {
         }
     } else if let Some(matches) = cmd.subcommand_matches("merge") {
         let result = Command::merge(matches, &build_info);
-        if let Err(ref err) = result {
-            if let Some(MergeError::InconsistentFilesystem(_)) = err.downcast_ref::<MergeError>() {
-                error!("message:{}", err);
-                std::process::exit(2);
-            }
+        if let Err(ref err) = result
+            && let Some(MergeError::InconsistentFilesystem(_)) = err.downcast_ref::<MergeError>()
+        {
+            error!("message:{}", err);
+            std::process::exit(2);
         }
         result
     } else if let Some(matches) = cmd.subcommand_matches("check") {
@@ -1893,15 +1893,17 @@ impl Command {
             let children = children.collect::<Result<Vec<DirEntry>, std::io::Error>>()?;
             for child in children {
                 let path = child.path();
-                if path.is_file() && path != target && path.extension().is_none() {
-                    if let Err(e) = stat.stat(&path, true, config.clone()) {
-                        debug!(
-                            "failed to process {}, {}",
-                            path.to_str().unwrap_or_default(),
-                            e
-                        );
-                    };
-                }
+                if path.is_file()
+                    && path != target
+                    && path.extension().is_none()
+                    && let Err(e) = stat.stat(&path, true, config.clone())
+                {
+                    debug!(
+                        "failed to process {}, {}",
+                        path.to_str().unwrap_or_default(),
+                        e
+                    );
+                };
             }
         } else {
             bail!("one of `--bootstrap` and `--blob-dir` must be specified");

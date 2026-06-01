@@ -348,18 +348,19 @@ impl FsService for FusedevFsService {
         if cur_inode.is_dir() {
             let mut handler =
                 |child: Option<Arc<dyn RafsInode>>, name: OsString, _ino: u64, _offset: u64| {
-                    if name != OsStr::new(".") && name != OsStr::new("..") {
-                        if let Some(child_inode) = child {
-                            let child_name = name.to_string_lossy().to_string();
-                            // Recursive call
-                            if let Err(e) = self.walk_and_notify_invalidation(
-                                cur_kernel_ino,
-                                &child_name,
-                                child_inode,
-                                fs_idx,
-                            ) {
-                                warn!("recursive walk failed for {}: {:?}", child_name, e);
-                            }
+                    if name != OsStr::new(".")
+                        && name != OsStr::new("..")
+                        && let Some(child_inode) = child
+                    {
+                        let child_name = name.to_string_lossy().to_string();
+                        // Recursive call
+                        if let Err(e) = self.walk_and_notify_invalidation(
+                            cur_kernel_ino,
+                            &child_name,
+                            child_inode,
+                            fs_idx,
+                        ) {
+                            warn!("recursive walk failed for {}: {:?}", child_name, e);
                         }
                     }
                     Ok(RafsInodeWalkAction::Continue)
@@ -773,14 +774,14 @@ pub fn create_fuse_daemon(
             .conn
             .store(calc_fuse_conn(mnt)?, Ordering::Relaxed);
 
-        if let Some(f) = daemon.service.session.lock().unwrap().get_fuse_file() {
-            if let Some(mut m) = daemon.service.upgrade_mgr() {
-                m.hold_file(f).map_err(|e| {
-                    error!("Failed to hold fusedev fd, {:?}", e);
-                    eother!(e)
-                })?;
-                m.save_fuse_cid(daemon.service.conn.load(Ordering::Acquire));
-            }
+        if let Some(f) = daemon.service.session.lock().unwrap().get_fuse_file()
+            && let Some(mut m) = daemon.service.upgrade_mgr()
+        {
+            m.hold_file(f).map_err(|e| {
+                error!("Failed to hold fusedev fd, {:?}", e);
+                eother!(e)
+            })?;
+            m.save_fuse_cid(daemon.service.conn.load(Ordering::Acquire));
         }
     }
 

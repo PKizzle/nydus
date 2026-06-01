@@ -390,10 +390,10 @@ impl snapshots::Snapshotter for NydusSnapshotter {
                     warn!(key, error = %e, "remove snapshot failed");
                     SnapshotterError::internal(e.to_string())
                 })?;
-            if let Some(image_ref) = release_target {
-                if let Err(e) = self.supervisor.release(&image_ref).await {
-                    warn!(image_ref, error = %e, "failed to release nydus daemon refcount");
-                }
+            if let Some(image_ref) = release_target
+                && let Err(e) = self.supervisor.release(&image_ref).await
+            {
+                warn!(image_ref, error = %e, "failed to release nydus daemon refcount");
             }
             Ok(())
         }
@@ -633,7 +633,7 @@ mod tests {
     #[test]
     fn grpc_transport_round_trips_a_real_client_over_compio() {
         use containerd_snapshots::api::snapshots::v1::{
-            snapshots_client::SnapshotsClient, StatSnapshotRequest,
+            StatSnapshotRequest, snapshots_client::SnapshotsClient,
         };
 
         let dir = tempdir().unwrap();

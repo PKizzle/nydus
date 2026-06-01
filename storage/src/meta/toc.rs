@@ -339,10 +339,10 @@ impl TocEntryList {
     /// Get ToC entry with specified name.
     pub fn get_entry(&self, name: &str) -> Option<&TocEntry> {
         for toc in self.entries.iter() {
-            if let Ok(n) = toc.name() {
-                if n == name {
-                    return Some(toc);
-                }
+            if let Ok(n) = toc.name()
+                && n == name
+            {
+                return Some(toc);
             }
         }
 

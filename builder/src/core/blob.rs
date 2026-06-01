@@ -39,10 +39,10 @@ impl Blob {
                     let size = node
                         .dump_node_data(ctx, blob_mgr, blob_writer, &mut chunk_data_buf)
                         .context("failed to dump blob chunks")?;
-                    if idx < prefetch_entries {
-                        if let Some((_, blob_ctx)) = blob_mgr.get_current_blob() {
-                            blob_ctx.blob_prefetch_size += size;
-                        }
+                    if idx < prefetch_entries
+                        && let Some((_, blob_ctx)) = blob_mgr.get_current_blob()
+                    {
+                        blob_ctx.blob_prefetch_size += size;
                     }
                 }
                 Self::finalize_blob_data(ctx, blob_mgr, blob_writer)?;
@@ -102,43 +102,42 @@ impl Blob {
         blob_writer: &mut dyn Artifact,
     ) -> Result<()> {
         // Dump buffered batch chunk data if exists.
-        if let Some(ref batch) = ctx.blob_batch_generator {
-            if let Some((_, blob_ctx)) = blob_mgr.get_current_blob() {
-                let mut batch = batch.lock().unwrap();
-                if !batch.chunk_data_buf_is_empty() {
-                    let (_, compressed_size, _) =
-                        Node::write_chunk_data(ctx, blob_ctx, blob_writer, batch.chunk_data_buf())?;
-                    batch.add_context(compressed_size);
-                    batch.clear_chunk_data_buf();
-                }
+        if let Some(ref batch) = ctx.blob_batch_generator
+            && let Some((_, blob_ctx)) = blob_mgr.get_current_blob()
+        {
+            let mut batch = batch.lock().unwrap();
+            if !batch.chunk_data_buf_is_empty() {
+                let (_, compressed_size, _) =
+                    Node::write_chunk_data(ctx, blob_ctx, blob_writer, batch.chunk_data_buf())?;
+                batch.add_context(compressed_size);
+                batch.clear_chunk_data_buf();
             }
         }
 
         if !ctx.blob_features.contains(BlobFeatures::SEPARATE)
             && (ctx.blob_inline_meta || ctx.features.is_enabled(Feature::BlobToc))
+            && let Some((_, blob_ctx)) = blob_mgr.get_current_blob()
         {
-            if let Some((_, blob_ctx)) = blob_mgr.get_current_blob() {
-                if blob_ctx.external {
-                    return Ok(());
-                }
-                blob_ctx.write_tar_header(
-                    blob_writer,
+            if blob_ctx.external {
+                return Ok(());
+            }
+            blob_ctx.write_tar_header(
+                blob_writer,
+                toc::TOC_ENTRY_BLOB_RAW,
+                blob_ctx.compressed_blob_size,
+            )?;
+            if ctx.features.is_enabled(Feature::BlobToc) {
+                let blob_digest = RafsDigest {
+                    data: blob_ctx.blob_hash.clone().finalize().into(),
+                };
+                blob_ctx.entry_list.add(
                     toc::TOC_ENTRY_BLOB_RAW,
+                    compress::Algorithm::None,
+                    blob_digest,
+                    blob_ctx.compressed_offset(),
                     blob_ctx.compressed_blob_size,
+                    blob_ctx.uncompressed_blob_size,
                 )?;
-                if ctx.features.is_enabled(Feature::BlobToc) {
-                    let blob_digest = RafsDigest {
-                        data: blob_ctx.blob_hash.clone().finalize().into(),
-                    };
-                    blob_ctx.entry_list.add(
-                        toc::TOC_ENTRY_BLOB_RAW,
-                        compress::Algorithm::None,
-                        blob_digest,
-                        blob_ctx.compressed_offset(),
-                        blob_ctx.compressed_blob_size,
-                        blob_ctx.uncompressed_blob_size,
-                    )?;
-                }
             }
         }
 
