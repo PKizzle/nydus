@@ -26,10 +26,18 @@ use nydus_storage::backend::s3::S3;
 use nydus_storage::backend::{BlobBackend, BlobReader};
 
 /// Size of the synthetic blob served by the mock backend.
-const BLOB_SIZE: usize = 64 * 1024 * 1024;
+const BLOB_SIZE: usize = 256 * 1024 * 1024;
 
-/// Read sizes to benchmark (typical RAFS chunk sizes).
-const READ_SIZES: &[usize] = &[4 * 1024, 16 * 1024, 64 * 1024, 1024 * 1024];
+/// Read sizes to benchmark: small (RAFS chunk-sized) through large, to
+/// battle-test large-body throughput.
+const READ_SIZES: &[usize] = &[
+    4 * 1024,
+    64 * 1024,
+    1024 * 1024,
+    4 * 1024 * 1024,
+    16 * 1024 * 1024,
+    64 * 1024 * 1024,
+];
 
 /// Parse the start/end of a `Range: bytes=START-END` header, if present.
 fn parse_range(request: &str) -> Option<(usize, usize)> {
