@@ -15,6 +15,7 @@ use std::{fmt, thread};
 use log::{max_level, Level};
 
 use cyper::{Client, RequestBuilder};
+use futures_util::StreamExt;
 // reqwest re-exports the `http`/`url` types (same types cyper uses); keep them
 // until reqwest is dropped from the workspace in a later stage.
 use reqwest::{header::HeaderMap, Method, StatusCode, Url};
@@ -287,6 +288,19 @@ impl Response {
     /// Consume the response and return its body as a (lossy) UTF-8 string.
     pub(crate) fn text(self) -> String {
         String::from_utf8_lossy(&self.body.into_inner()).into_owned()
+    }
+
+    /// Copy the not-yet-consumed body directly into `dst`, returning the number
+    /// of bytes written. Unlike `std::io::copy` over the `Read` impl, this is a
+    /// single `Bytes`->`dst` `memcpy` with no intermediate buffer — important on
+    /// the blob read hot path, where the destination is a chunk-sized slice.
+    pub(crate) fn copy_to_slice(&mut self, dst: &mut [u8]) -> usize {
+        let pos = self.body.position() as usize;
+        let src = &self.body.get_ref()[pos..];
+        let n = src.len().min(dst.len());
+        dst[..n].copy_from_slice(&src[..n]);
+        self.body.set_position((pos + n) as u64);
+        n
     }
 }
 
@@ -734,6 +748,150 @@ impl Connection {
         );
 
         result.and_then(|resp| respond(resp, catch_status))
+    }
+
+    /// Streaming variant of `call_inner` for the blob read path: stream the
+    /// response body directly into `dst` (no full-body allocation) and return
+    /// `(status, bytes_written, error_body)`. Used only for GET range reads, so
+    /// there is no request body.
+    fn call_inner_stream(
+        &self,
+        is_proxy: bool,
+        method: Method,
+        url: &str,
+        query: &Option<&[(&str, &str)]>,
+        headers: &HeaderMap,
+        dst: &mut [u8],
+    ) -> ConnectionResult<(StatusCode, usize, Option<String>)> {
+        let timeout = self.timeout;
+        let url_owned = url.to_string();
+        let req_method = method.clone();
+        block_on_http(async move {
+            let rb = HTTP_CLIENTS.with(|clients| -> ConnectionResult<RequestBuilder> {
+                let mut clients = clients.borrow_mut();
+                let key = (self.id, is_proxy);
+                if !clients.contains_key(&key) {
+                    let proxy_url = if is_proxy {
+                        self.config.proxy.url.as_str()
+                    } else {
+                        ""
+                    };
+                    let client = Self::build_connection(proxy_url, &self.config).map_err(|e| {
+                        ConnectionError::ErrorWithMsg(format!("failed to build HTTP client: {e}"))
+                    })?;
+                    clients.insert(key, client);
+                }
+                let client = clients.get(&key).unwrap();
+                let mut rb = client
+                    .request(req_method, url)
+                    .map_err(ConnectionError::Common)?
+                    .headers(headers.clone());
+                if let Some(q) = query.as_ref() {
+                    rb = rb.query(q).map_err(ConnectionError::Common)?;
+                }
+                Ok(rb.body(Vec::<u8>::new()))
+            })?;
+
+            let send = rb.send();
+            let resp = match timeout {
+                Some(t) => match compio::runtime::time::timeout(t, send).await {
+                    Ok(r) => r.map_err(ConnectionError::Common)?,
+                    Err(_) => {
+                        return Err(ConnectionError::ErrorWithMsg(format!(
+                            "request to {url_owned} timed out"
+                        )))
+                    }
+                },
+                None => send.await.map_err(ConnectionError::Common)?,
+            };
+
+            let status = resp.status();
+            if is_success_status(status) {
+                // Stream the body straight into `dst` — no full-body allocation.
+                let mut written = 0usize;
+                let mut stream = resp.bytes_stream();
+                while let Some(chunk) = stream.next().await {
+                    let chunk = chunk.map_err(ConnectionError::Common)?;
+                    if written >= dst.len() {
+                        break;
+                    }
+                    let n = chunk.len().min(dst.len() - written);
+                    dst[written..written + n].copy_from_slice(&chunk[..n]);
+                    written += n;
+                }
+                Ok((status, written, None))
+            } else {
+                // Buffer the (small) error body for the caller's message.
+                let body = resp.bytes().await.map_err(ConnectionError::Common)?;
+                Ok((status, 0, Some(String::from_utf8_lossy(&body).into_owned())))
+            }
+        })
+    }
+
+    /// Streaming counterpart of `call` for the blob read path: routes through the
+    /// proxy with origin fallback like the buffered path, but streams the
+    /// response body into `dst` and returns the number of bytes written.
+    pub fn call_stream(
+        &self,
+        method: Method,
+        url: &str,
+        query: Option<&[(&str, &str)]>,
+        headers: &HeaderMap,
+        catch_status: bool,
+        skip_proxy: bool,
+        dst: &mut [u8],
+    ) -> ConnectionResult<usize> {
+        if self.shutdown.load(Ordering::Acquire) {
+            return Err(ConnectionError::Disconnected);
+        }
+        self.last_active.store(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+            Ordering::Relaxed,
+        );
+
+        if !skip_proxy {
+            if let Some(proxy) = &self.proxy {
+                if proxy.health.ok() {
+                    let http_url: Option<String>;
+                    let mut replaced_url = url;
+                    if proxy.use_http {
+                        http_url = proxy.try_use_http(url);
+                        if let Some(ref r) = http_url {
+                            replaced_url = r.as_str();
+                        }
+                    }
+                    let (status, written, err) = self.call_inner_stream(
+                        true,
+                        method.clone(),
+                        replaced_url,
+                        &query,
+                        headers,
+                        &mut *dst,
+                    )?;
+                    if !proxy.fallback || status < StatusCode::INTERNAL_SERVER_ERROR {
+                        if catch_status && !is_success_status(status) {
+                            return Err(ConnectionError::ErrorWithMsg(err.unwrap_or_default()));
+                        }
+                        return Ok(written);
+                    }
+                    warn!("Request proxy server failed, fallback to original server");
+                } else if !proxy.fallback {
+                    return Err(ConnectionError::ErrorWithMsg(
+                        "proxy is not healthy and fallback is disabled".to_string(),
+                    ));
+                }
+            }
+        }
+
+        let (status, written, err) =
+            self.call_inner_stream(false, method, url, &query, headers, dst)?;
+        if catch_status && !is_success_status(status) {
+            return Err(ConnectionError::ErrorWithMsg(err.unwrap_or_default()));
+        }
+        Ok(written)
     }
 }
 
