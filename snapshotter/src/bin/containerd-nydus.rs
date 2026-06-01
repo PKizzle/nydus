@@ -9,8 +9,8 @@
 
 use anyhow::Result;
 use clap::Parser;
+use futures::FutureExt;
 use std::sync::Arc;
-use tokio::signal::unix::{signal, SignalKind};
 use tracing::{info, warn};
 
 use nydus_snapshotter::config::SnapshotterConfig;
@@ -40,7 +40,7 @@ struct Args {
     log_level: String,
 }
 
-#[tokio::main]
+#[compio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
 
@@ -99,20 +99,32 @@ async fn main() -> Result<()> {
     // tear running nydus daemons down on shutdown.
     let supervisor = Arc::new(DaemonSupervisor::new(config.clone()));
     let shutdown_supervisor = supervisor.clone();
-    let server = tokio::spawn(async move {
+    let server = compio::runtime::spawn(async move {
         nydus_snapshotter::grpc::serve_with_supervisor(config, supervisor).await
     });
 
-    let mut sigterm = signal(SignalKind::terminate())?;
-    let mut sigint = signal(SignalKind::interrupt())?;
-    tokio::select! {
-        _ = sigterm.recv() => info!("received SIGTERM, shutting down"),
-        _ = sigint.recv() => info!("received SIGINT, shutting down"),
-        result = server => {
+    // Graceful shutdown on SIGTERM/SIGINT. `signal-hook` is runtime-agnostic; a
+    // dedicated thread blocks on the signal and notifies the compio main over an
+    // async channel (compio runs thread-per-core, so signals are handled off the
+    // runtime thread).
+    let (shutdown_tx, shutdown_rx) = async_channel::bounded::<()>(1);
+    let mut signals = signal_hook::iterator::Signals::new([
+        signal_hook::consts::SIGTERM,
+        signal_hook::consts::SIGINT,
+    ])?;
+    std::thread::spawn(move || {
+        if signals.forever().next().is_some() {
+            let _ = shutdown_tx.try_send(());
+        }
+    });
+
+    futures::select! {
+        _ = shutdown_rx.recv().fuse() => info!("received shutdown signal, shutting down"),
+        result = server.fuse() => {
             match result {
                 Ok(Ok(())) => info!("gRPC server exited cleanly"),
                 Ok(Err(e)) => warn!(error = %e, "gRPC server returned error"),
-                Err(e) => warn!(error = %e, "gRPC server task panicked"),
+                Err(e) => warn!(error = %e, "gRPC server task join error"),
             }
         }
     }
