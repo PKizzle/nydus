@@ -2794,7 +2794,6 @@ dependencies = [
  "rand 0.10.0",
  "thiserror 2.0.18",
  "tinyvec",
- "tokio",
  "tracing",
  "url",
 ]
@@ -2887,7 +2886,6 @@ dependencies = [
  "smallvec",
  "system-configuration",
  "thiserror 2.0.18",
- "tokio",
  "tracing",
 ]
 
@@ -4470,7 +4468,6 @@ dependencies = [
  "governor",
  "gpt",
  "hex",
- "hickory-resolver 0.26.1",
  "hmac 0.13.0",
  "http 1.4.0",
  "http-body-util",

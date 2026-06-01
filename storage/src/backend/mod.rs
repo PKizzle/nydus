@@ -49,13 +49,6 @@ pub mod registry;
 #[cfg(feature = "backend-s3")]
 pub mod s3;
 
-#[cfg(any(
-    feature = "backend-oss",
-    feature = "backend-registry",
-    feature = "backend-s3",
-    feature = "backend-http-proxy",
-))]
-pub mod hickory;
 pub mod pauser;
 #[cfg(feature = "backend-dragonfly-proxy")]
 pub mod proxy;
