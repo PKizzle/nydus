@@ -6,14 +6,14 @@
 use std::convert::TryFrom;
 use std::mem::size_of;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
+use nydus_rafs::RafsIoWrite;
 use nydus_rafs::metadata::inode::InodeWrapper;
 use nydus_rafs::metadata::layout::v5::{
     RafsV5BlobTable, RafsV5ChunkInfo, RafsV5InodeTable, RafsV5InodeWrapper, RafsV5SuperBlock,
     RafsV5XAttrsTable,
 };
 use nydus_rafs::metadata::{RafsStore, RafsVersion};
-use nydus_rafs::RafsIoWrite;
 use nydus_utils::digest::{DigestHasher, RafsDigest};
 use nydus_utils::{div_round_up, root_tracer, timing_tracer, try_round_up_4k};
 

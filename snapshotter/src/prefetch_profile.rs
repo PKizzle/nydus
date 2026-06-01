@@ -9,7 +9,7 @@
 //! stable ordered file list before the builder embeds it into RAFS metadata.
 
 use crate::nri::AccessProfileRecord;
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
@@ -81,7 +81,7 @@ impl PrefetchProfileStore {
                         "failed to read prefetch profile dir {}",
                         self.root.display()
                     )
-                })
+                });
             }
         };
         let mut profiles = Vec::new();

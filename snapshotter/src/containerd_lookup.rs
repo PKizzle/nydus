@@ -18,7 +18,7 @@ use std::fmt::Write as _;
 use std::process::Command;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use tracing::{debug, info, warn};

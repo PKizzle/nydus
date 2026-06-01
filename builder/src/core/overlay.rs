@@ -11,7 +11,7 @@ use std::fmt::{self, Display, Formatter};
 use std::os::unix::ffi::OsStrExt;
 use std::str::FromStr;
 
-use anyhow::{anyhow, Error, Result};
+use anyhow::{Error, Result, anyhow};
 
 use super::node::Node;
 
@@ -280,10 +280,11 @@ mod tests {
 
         let mut inode = InodeWrapper::V5(RafsV5Inode::default());
         let mut info: NodeInfo = NodeInfo::default();
-        assert!(info
-            .xattrs
-            .add(OVERLAYFS_WHITEOUT_OPAQUE.into(), "y".into())
-            .is_ok());
+        assert!(
+            info.xattrs
+                .add(OVERLAYFS_WHITEOUT_OPAQUE.into(), "y".into())
+                .is_ok()
+        );
         inode.set_mode(crate::mode_bits(libc::S_IFDIR));
         let node = Node::new(inode, info, 0);
         assert!(!node.is_overlayfs_opaque(WhiteoutSpec::None));
@@ -295,10 +296,11 @@ mod tests {
 
         let mut inode = InodeWrapper::V5(RafsV5Inode::default());
         let mut info = NodeInfo::default();
-        assert!(info
-            .xattrs
-            .add(OVERLAYFS_WHITEOUT_OPAQUE.into(), "n".into())
-            .is_ok());
+        assert!(
+            info.xattrs
+                .add(OVERLAYFS_WHITEOUT_OPAQUE.into(), "n".into())
+                .is_ok()
+        );
         inode.set_mode(crate::mode_bits(libc::S_IFDIR));
         let node = Node::new(inode, info, 0);
         assert!(!node.is_overlayfs_opaque(WhiteoutSpec::None));
@@ -306,10 +308,11 @@ mod tests {
 
         let mut inode = InodeWrapper::V5(RafsV5Inode::default());
         let mut info = NodeInfo::default();
-        assert!(info
-            .xattrs
-            .add(OVERLAYFS_WHITEOUT_OPAQUE.into(), "y".into())
-            .is_ok());
+        assert!(
+            info.xattrs
+                .add(OVERLAYFS_WHITEOUT_OPAQUE.into(), "y".into())
+                .is_ok()
+        );
         inode.set_mode(crate::mode_bits(libc::S_IFCHR));
         let node = Node::new(inode, info, 0);
         assert!(!node.is_overlayfs_opaque(WhiteoutSpec::None));
@@ -317,10 +320,11 @@ mod tests {
 
         let mut inode = InodeWrapper::V5(RafsV5Inode::default());
         let mut info = NodeInfo::default();
-        assert!(info
-            .xattrs
-            .add(OVERLAYFS_WHITEOUT_OPAQUE.into(), "n".into())
-            .is_ok());
+        assert!(
+            info.xattrs
+                .add(OVERLAYFS_WHITEOUT_OPAQUE.into(), "n".into())
+                .is_ok()
+        );
         inode.set_mode(crate::mode_bits(libc::S_IFDIR));
         let node = Node::new(inode, info, 0);
         assert!(!node.is_overlayfs_opaque(WhiteoutSpec::None));

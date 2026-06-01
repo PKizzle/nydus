@@ -23,10 +23,10 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use nydus_rafs::metadata::chunk::ChunkWrapper;
 use nydus_rafs::metadata::inode::InodeWrapper;
-use nydus_rafs::metadata::layout::{bytes_to_os_str, RafsXAttrs};
+use nydus_rafs::metadata::layout::{RafsXAttrs, bytes_to_os_str};
 use nydus_rafs::metadata::{Inode, RafsInodeExt, RafsSuper};
 use nydus_utils::{lazy_drop, root_tracer, timing_tracer};
 

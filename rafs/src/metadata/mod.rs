@@ -33,7 +33,7 @@ use serde::Serialize;
 
 use self::layout::v5::RafsV5PrefetchTable;
 use self::layout::v6::RafsV6PrefetchTable;
-use self::layout::{XattrName, XattrValue, RAFS_SUPER_VERSION_V5, RAFS_SUPER_VERSION_V6};
+use self::layout::{RAFS_SUPER_VERSION_V5, RAFS_SUPER_VERSION_V6, XattrName, XattrValue};
 use self::noop::NoopSuperBlock;
 use crate::fs::{RAFS_DEFAULT_ATTR_TIMEOUT, RAFS_DEFAULT_ENTRY_TIMEOUT};
 use crate::{RafsError, RafsIoReader, RafsIoWrite, RafsResult};
@@ -98,7 +98,7 @@ pub trait RafsSuperInodes {
 
     /// Get the `RafsInodeExt` trait object corresponding to the 'ino`.
     fn get_extended_inode(&self, ino: Inode, validate_inode: bool)
-        -> Result<Arc<dyn RafsInodeExt>>;
+    -> Result<Arc<dyn RafsInodeExt>>;
 }
 
 /// Trait to access RAFS filesystem metadata, including the RAFS super block and inodes.
@@ -443,10 +443,10 @@ impl RafsSuperConfig {
         ensure!(
             self.explicit_uidgid == meta.explicit_uidgid(),
             MergeError::InconsistentFilesystem(format!(
-                    "Using inconsistent explicit_uidgid setting {:?}, target explicit_uidgid setting {:?}",
-                    self.explicit_uidgid,
-                    meta.explicit_uidgid()
-                ))
+                "Using inconsistent explicit_uidgid setting {:?}, target explicit_uidgid setting {:?}",
+                self.explicit_uidgid,
+                meta.explicit_uidgid()
+            ))
         );
 
         let meta_version = RafsVersion::try_from(meta.version);

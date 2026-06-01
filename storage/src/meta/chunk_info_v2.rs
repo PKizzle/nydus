@@ -7,7 +7,7 @@ use std::io::{Error, Result};
 use std::sync::atomic::{AtomicU8, Ordering};
 
 use crate::device::BlobFeatures;
-use crate::meta::{BlobCompressionContext, BlobMetaChunkInfo, BLOB_CCT_CHUNK_SIZE_MASK};
+use crate::meta::{BLOB_CCT_CHUNK_SIZE_MASK, BlobCompressionContext, BlobMetaChunkInfo};
 
 const CHUNK_V2_COMP_OFFSET_MASK: u64 = 0xff_ffff_ffff;
 const CHUNK_V2_COMP_SIZE_SHIFT: u64 = 40;
@@ -250,22 +250,20 @@ impl BlobMetaChunkInfo for BlobChunkInfoV2Ondisk {
                 && self.uncompressed_size() != self.compressed_size())
             || (self.has_crc32() && self.crc32() == 0)
         {
-            return Err(Error::other(
-                format!(
-                    "invalid chunk, blob: index {}/c_size 0x{:x}/d_size 0x{:x}, chunk: c_end 0x{:x}/d_end 0x{:x}/compressed {} batch {} zran {} encrypted {} has_crc {}, crc32 {}",
-                    state.blob_index,
-                    state.compressed_size,
-                    state.uncompressed_size,
-                    self.compressed_end(),
-                    self.uncompressed_end(),
-                    self.is_compressed(),
-                    self.is_batch(),
-                    self.is_zran(),
-                    self.is_encrypted(),
-                    self.has_crc32(),
-                    self.crc32(),
-                ),
-            ));
+            return Err(Error::other(format!(
+                "invalid chunk, blob: index {}/c_size 0x{:x}/d_size 0x{:x}, chunk: c_end 0x{:x}/d_end 0x{:x}/compressed {} batch {} zran {} encrypted {} has_crc {}, crc32 {}",
+                state.blob_index,
+                state.compressed_size,
+                state.uncompressed_size,
+                self.compressed_end(),
+                self.uncompressed_end(),
+                self.is_compressed(),
+                self.is_batch(),
+                self.is_zran(),
+                self.is_encrypted(),
+                self.has_crc32(),
+                self.crc32(),
+            )));
         }
 
         if self.has_xxh3() && (self.has_crc32() || self.is_batch() || self.is_zran()) {

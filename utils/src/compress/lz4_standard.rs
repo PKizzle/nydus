@@ -4,7 +4,7 @@
 use std::io::Result;
 
 use libc::c_char;
-use lz4_sys::{LZ4_compressBound, LZ4_compress_default, LZ4_decompress_safe};
+use lz4_sys::{LZ4_compress_default, LZ4_compressBound, LZ4_decompress_safe};
 
 pub(super) fn lz4_compress(src: &[u8]) -> Result<Vec<u8>> {
     // 0 iff src too large

@@ -8,7 +8,7 @@ use std::any::Any;
 use std::cmp::{Eq, PartialEq};
 use std::collections::HashMap;
 use std::fmt::{Display, Formatter, Result as FmtResult};
-use std::sync::{atomic::AtomicU64, Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, RwLock, atomic::AtomicU64};
 use std::time::SystemTime;
 
 use serde::Serialize;

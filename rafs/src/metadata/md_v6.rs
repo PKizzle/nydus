@@ -8,8 +8,8 @@ use std::mem::size_of;
 use std::sync::Arc;
 
 use super::direct_v6::DirectSuperBlockV6;
-use super::layout::v6::{RafsV6PrefetchTable, RafsV6SuperBlock, RafsV6SuperBlockExt};
 use super::layout::RAFS_SUPER_VERSION_V6;
+use super::layout::v6::{RafsV6PrefetchTable, RafsV6SuperBlock, RafsV6SuperBlockExt};
 use super::*;
 use super::{RafsMode, RafsSuper, RafsSuperBlock, RafsSuperFlags};
 
@@ -55,8 +55,7 @@ impl RafsSuper {
         self.meta.prefetch_table_offset = ext_sb.prefetch_table_offset();
         trace!(
             "prefetch table offset {} entries {} ",
-            self.meta.prefetch_table_offset,
-            self.meta.prefetch_table_entries
+            self.meta.prefetch_table_offset, self.meta.prefetch_table_entries
         );
 
         match self.mode {
@@ -157,8 +156,8 @@ impl RafsSuper {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::metadata::RafsStore;
     use crate::BufWriter;
+    use crate::metadata::RafsStore;
     use std::fs::OpenOptions;
     use std::io::Write;
     use vmm_sys_util::tempfile::TempFile;

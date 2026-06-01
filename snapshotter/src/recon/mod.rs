@@ -13,11 +13,11 @@ use crate::cache::{CacheGcPolicy, CacheManager};
 use crate::daemon::DaemonSupervisor;
 use crate::store::SnapshotStore;
 use anyhow::{Context, Result};
+use compio::time;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
-use compio::time;
 use tracing::{debug, error, info, warn};
 
 /// Classification of recoverable vs. fatal errors.

@@ -5,7 +5,7 @@
 use std::collections::HashSet;
 use std::convert::TryFrom;
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 
 const ERR_UNSUPPORTED_FEATURE: &str = "unsupported feature";
 

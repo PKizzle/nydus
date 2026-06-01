@@ -6,8 +6,8 @@ use std::io::Result;
 use std::mem::size_of;
 use std::slice;
 
-use crate::meta::chunk_info_v2::BlobChunkInfoV2Ondisk;
 use crate::meta::BlobMetaChunkInfo;
+use crate::meta::chunk_info_v2::BlobChunkInfoV2Ondisk;
 
 /// Context information to support batch chunk.
 /// Each one corresponds to a whole batch chunk containing multiple small chunks.

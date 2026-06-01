@@ -11,8 +11,8 @@ use std::io::{Error, Read, Result};
 use std::marker::Send;
 use std::sync::Arc;
 
-use http::header::{HeaderMap, CONTENT_LENGTH};
 use http::Method;
+use http::header::{CONTENT_LENGTH, HeaderMap};
 
 use nydus_utils::metrics::BackendMetrics;
 

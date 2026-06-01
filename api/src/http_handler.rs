@@ -2,8 +2,8 @@ use std::collections::HashMap;
 use std::io::{Error, Result};
 use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
-use std::sync::mpsc::{Receiver, Sender};
 use std::sync::Arc;
+use std::sync::mpsc::{Receiver, Sender};
 use std::time::SystemTime;
 use std::{fs, thread};
 
@@ -24,13 +24,13 @@ use crate::http_endpoint_common::{
     SendFuseFdHandler, StartHandler, TakeoverFuseFdHandler,
 };
 use crate::http_endpoint_v1::{
-    ConfigHandler, FsBackendInfo, InfoHandler, MetricsFsAccessPatternHandler,
-    MetricsFsFilesHandler, MetricsFsGlobalHandler, MetricsFsInflightHandler, HTTP_ROOT_V1,
+    ConfigHandler, FsBackendInfo, HTTP_ROOT_V1, InfoHandler, MetricsFsAccessPatternHandler,
+    MetricsFsFilesHandler, MetricsFsGlobalHandler, MetricsFsInflightHandler,
 };
 use crate::http_endpoint_v2::{
-    BlobObjectListHandlerV2, ConfigV2Handler, InfoV2Handler, HTTP_ROOT_V2,
+    BlobObjectListHandlerV2, ConfigV2Handler, HTTP_ROOT_V2, InfoV2Handler,
 };
-use crate::http_prometheus::{PrometheusMetricsHandler, PROMETHEUS_METRICS_PATH};
+use crate::http_prometheus::{PROMETHEUS_METRICS_PATH, PrometheusMetricsHandler};
 
 const EXIT_TOKEN: Token = Token(usize::MAX);
 const REQUEST_TOKEN: Token = Token(1);
@@ -347,12 +347,16 @@ mod tests {
         assert!(HTTP_ROUTES.routes.contains_key("/api/v1/daemon/backend"));
         assert!(HTTP_ROUTES.routes.contains_key("/api/v1/daemon/start"));
         assert!(HTTP_ROUTES.routes.contains_key("/api/v1/daemon/exit"));
-        assert!(HTTP_ROUTES
-            .routes
-            .contains_key("/api/v1/daemon/fuse/sendfd"));
-        assert!(HTTP_ROUTES
-            .routes
-            .contains_key("/api/v1/daemon/fuse/takeover"));
+        assert!(
+            HTTP_ROUTES
+                .routes
+                .contains_key("/api/v1/daemon/fuse/sendfd")
+        );
+        assert!(
+            HTTP_ROUTES
+                .routes
+                .contains_key("/api/v1/daemon/fuse/takeover")
+        );
         assert!(HTTP_ROUTES.routes.contains_key("/api/v1/mount"));
         assert!(HTTP_ROUTES.routes.contains_key("/api/v1/metrics"));
         assert!(HTTP_ROUTES.routes.contains_key("/api/v1/metrics/files"));

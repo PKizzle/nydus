@@ -7,9 +7,9 @@
 //! Converts container access records collected by an optimizer/fanotify sidecar
 //! into a Nydus prefetch profile and submits it to the system-controller.
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::Parser;
-use nydus_snapshotter::nri::{AccessProfileRecord, SysctlClient, DEFAULT_SYSCTL_SOCKET};
+use nydus_snapshotter::nri::{AccessProfileRecord, DEFAULT_SYSCTL_SOCKET, SysctlClient};
 use nydus_snapshotter::prefetch_profile::PrefetchProfile;
 use std::io::Read;
 use std::path::PathBuf;

@@ -197,10 +197,12 @@ mod tests {
         .unwrap();
         assert!(count >= before);
         assert_eq!(runtime_auth(&image).as_deref(), Some("runtime-auth"));
-        assert!(runtime_auth_records()
-            .unwrap()
-            .iter()
-            .any(|record| record.registry == "registry.runtime"));
+        assert!(
+            runtime_auth_records()
+                .unwrap()
+                .iter()
+                .any(|record| record.registry == "registry.runtime")
+        );
     }
 
     #[test]

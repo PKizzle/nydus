@@ -7,20 +7,20 @@
 
 use std::io::Result;
 use std::str::FromStr;
-use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
+use std::sync::mpsc::{Receiver, Sender, channel};
 use std::thread::JoinHandle;
 
 use mio::Waker;
-use nix::sys::signal::{kill, SIGTERM};
+use nix::sys::signal::{SIGTERM, kill};
 use nix::unistd::Pid;
 
 use nydus::daemon::NydusDaemon;
 use nydus::{FsBackendMountCmd, FsBackendType, FsBackendUmountCmd, FsService};
 use nydus_api::{
-    start_http_thread, ApiError, ApiMountCmd, ApiRequest, ApiResponse, ApiResponsePayload,
-    ApiResult, BlobCacheEntry, BlobCacheObjectId, Config, ConfigV2, DaemonConf, DaemonErrorKind,
-    MetricsErrorKind,
+    ApiError, ApiMountCmd, ApiRequest, ApiResponse, ApiResponsePayload, ApiResult, BlobCacheEntry,
+    BlobCacheObjectId, Config, ConfigV2, DaemonConf, DaemonErrorKind, MetricsErrorKind,
+    start_http_thread,
 };
 use nydus_utils::metrics;
 

@@ -13,12 +13,12 @@ use nydus_storage::device::{BlobChunkFlags, BlobChunkInfo};
 use nydus_storage::meta::BlobMetaChunk;
 use nydus_utils::digest::RafsDigest;
 
+use crate::RafsIoWrite;
 use crate::metadata::cached_v5::CachedChunkInfoV5;
 use crate::metadata::direct_v5::DirectChunkInfoV5;
 use crate::metadata::direct_v6::{DirectChunkInfoV6, TarfsChunkInfoV6};
 use crate::metadata::layout::v5::RafsV5ChunkInfo;
 use crate::metadata::{RafsStore, RafsVersion};
-use crate::RafsIoWrite;
 
 /// RAFS v6 chunk information used as builder/runtime intermediate representation.
 ///
@@ -55,11 +55,7 @@ impl RafsV6ChunkInfo {
     }
 
     fn xxh3(&self) -> u64 {
-        if self.has_xxh3() {
-            self.xxh3
-        } else {
-            0
-        }
+        if self.has_xxh3() { self.xxh3 } else { 0 }
     }
 }
 

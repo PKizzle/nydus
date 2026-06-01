@@ -14,19 +14,19 @@ use fuse_backend_rs::abi::fuse_abi;
 use fuse_backend_rs::api::filesystem::Entry;
 use nydus_storage::device::v5::BlobV5ChunkInfo;
 use nydus_storage::device::{BlobChunkInfo, BlobDevice, BlobInfo, BlobIoVec};
-use nydus_utils::{digest::RafsDigest, ByteSize};
+use nydus_utils::{ByteSize, digest::RafsDigest};
 
 use super::mock_chunk::MockChunkInfo;
 use super::mock_super::CHUNK_SIZE;
+use crate::RafsInodeExt;
 use crate::metadata::inode::RafsInodeFlags;
 use crate::metadata::layout::v5::{
-    rafsv5_alloc_bio_vecs, RafsV5BlobTable, RafsV5InodeChunkOps, RafsV5InodeOps,
+    RafsV5BlobTable, RafsV5InodeChunkOps, RafsV5InodeOps, rafsv5_alloc_bio_vecs,
 };
 use crate::metadata::{
+    Inode, RAFS_ATTR_BLOCK_SIZE, RafsInode, RafsInodeWalkHandler, RafsSuperMeta,
     layout::{XattrName, XattrValue},
-    Inode, RafsInode, RafsInodeWalkHandler, RafsSuperMeta, RAFS_ATTR_BLOCK_SIZE,
 };
-use crate::RafsInodeExt;
 
 #[derive(Default, Clone, Debug)]
 #[allow(unused)]

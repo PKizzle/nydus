@@ -14,7 +14,7 @@
 //! - cgroup v2 delegation
 
 use crate::config::{FsDriverEntry, FsDriverSelectionPolicy, FsDriverType};
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use std::fs;
 use std::path::Path;
 use tracing::{debug, info, warn};
@@ -160,7 +160,9 @@ fn probe_fusedev(entry: &FsDriverEntry) -> ProbeResult {
 
     // Check FUSE module
     if !has_filesystem("fuse") {
-        warn!("FUSE filesystem module not listed in /proc/filesystems, but /dev/fuse exists; attempting anyway");
+        warn!(
+            "FUSE filesystem module not listed in /proc/filesystems, but /dev/fuse exists; attempting anyway"
+        );
     }
 
     // Check required capabilities
@@ -390,9 +392,11 @@ mod tests {
         let results = probe_drivers(&drivers);
         assert_eq!(results.len(), 2);
         // At least fusedev should be available on most Linux hosts.
-        assert!(results
-            .iter()
-            .any(|r| r.driver_type == FsDriverType::Fusedev));
+        assert!(
+            results
+                .iter()
+                .any(|r| r.driver_type == FsDriverType::Fusedev)
+        );
     }
 
     #[test]

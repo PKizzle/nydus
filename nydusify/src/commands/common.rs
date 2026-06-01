@@ -5,7 +5,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 
 use crate::cli::BackendType;
 
@@ -191,9 +191,10 @@ mod tests {
     fn rejects_backend_config_without_backend_type() {
         let err = resolve_backend_config(None, Some("{}"), None, "source-").unwrap_err();
 
-        assert!(err
-            .to_string()
-            .contains("--source-backend-type is required"));
+        assert!(
+            err.to_string()
+                .contains("--source-backend-type is required")
+        );
     }
 
     #[test]
@@ -208,9 +209,10 @@ mod tests {
     fn rejects_platform_conflict() {
         let err = validate_platform_selection(true, Some("linux/amd64")).unwrap_err();
 
-        assert!(err
-            .to_string()
-            .contains("--all-platforms conflicts with --platform"));
+        assert!(
+            err.to_string()
+                .contains("--all-platforms conflicts with --platform")
+        );
     }
 
     #[test]
@@ -219,9 +221,10 @@ mod tests {
         // --all-platforms must still be reported as a conflict.
         let err = validate_platform_selection(true, Some(&default_platform())).unwrap_err();
 
-        assert!(err
-            .to_string()
-            .contains("--all-platforms conflicts with --platform"));
+        assert!(
+            err.to_string()
+                .contains("--all-platforms conflicts with --platform")
+        );
     }
 
     #[test]

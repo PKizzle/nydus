@@ -11,8 +11,8 @@ use std::io::Result;
 use std::sync::{Arc, Condvar, Mutex, WaitTimeoutResult};
 use std::time::Duration;
 
-use crate::cache::state::{BlobRangeMap, ChunkIndexGetter, ChunkMap, IndexedChunkMap, RangeMap};
 use crate::cache::SINGLE_INFLIGHT_WAIT_TIMEOUT;
+use crate::cache::state::{BlobRangeMap, ChunkIndexGetter, ChunkMap, IndexedChunkMap, RangeMap};
 use crate::device::BlobChunkInfo;
 use crate::{StorageError, StorageResult};
 
@@ -536,9 +536,11 @@ pub(crate) mod tests {
                 .unwrap();
         }
         for idx in 0..chunk_count {
-            assert!(chunk_map
-                .check_ready_and_mark_pending(chunks[idx as usize].as_ref())
-                .unwrap(),);
+            assert!(
+                chunk_map
+                    .check_ready_and_mark_pending(chunks[idx as usize].as_ref())
+                    .unwrap(),
+            );
         }
     }
 
@@ -609,25 +611,31 @@ pub(crate) mod tests {
         index_map
             .set_ready_and_clear_pending(chunk_1.as_ref())
             .unwrap();
-        assert!(index_map
-            .check_ready_and_mark_pending(chunk_1.as_ref())
-            .unwrap(),);
+        assert!(
+            index_map
+                .check_ready_and_mark_pending(chunk_1.as_ref())
+                .unwrap(),
+        );
         assert_eq!(index_map.inflight_tracer.lock().unwrap().len(), 1);
 
         index_map.clear_pending(chunk_2.as_ref());
         assert_eq!(index_map.inflight_tracer.lock().unwrap().len(), 0);
-        assert!(!index_map
-            .check_ready_and_mark_pending(chunk_2.as_ref())
-            .unwrap(),);
+        assert!(
+            !index_map
+                .check_ready_and_mark_pending(chunk_2.as_ref())
+                .unwrap(),
+        );
         assert_eq!(index_map.inflight_tracer.lock().unwrap().len(), 1);
         index_map.clear_pending(chunk_2.as_ref());
         assert_eq!(index_map.inflight_tracer.lock().unwrap().len(), 0);
         index_map
             .set_ready_and_clear_pending(chunk_2.as_ref())
             .unwrap();
-        assert!(index_map
-            .check_ready_and_mark_pending(chunk_2.as_ref())
-            .unwrap(),);
+        assert!(
+            index_map
+                .check_ready_and_mark_pending(chunk_2.as_ref())
+                .unwrap(),
+        );
         assert_eq!(index_map.inflight_tracer.lock().unwrap().len(), 0);
 
         // digested ChunkMap
@@ -649,13 +657,17 @@ pub(crate) mod tests {
         digest_map
             .set_ready_and_clear_pending(chunk_1.as_ref())
             .unwrap();
-        assert!(digest_map
-            .check_ready_and_mark_pending(chunk_1.as_ref())
-            .unwrap(),);
+        assert!(
+            digest_map
+                .check_ready_and_mark_pending(chunk_1.as_ref())
+                .unwrap(),
+        );
         digest_map.clear_pending(chunk_2.as_ref());
-        assert!(!digest_map
-            .check_ready_and_mark_pending(chunk_2.as_ref())
-            .unwrap(),);
+        assert!(
+            !digest_map
+                .check_ready_and_mark_pending(chunk_2.as_ref())
+                .unwrap(),
+        );
         digest_map.clear_pending(chunk_2.as_ref());
         assert_eq!(digest_map.inflight_tracer.lock().unwrap().len(), 0);
     }
@@ -673,10 +685,11 @@ pub(crate) mod tests {
             c
         });
 
-        assert!(!map
-            .as_ref()
-            .check_ready_and_mark_pending(chunk_4.as_ref())
-            .unwrap(),);
+        assert!(
+            !map.as_ref()
+                .check_ready_and_mark_pending(chunk_4.as_ref())
+                .unwrap(),
+        );
         let map_cloned = map.clone();
         assert_eq!(map.inflight_tracer.lock().unwrap().len(), 1);
 

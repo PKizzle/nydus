@@ -15,8 +15,8 @@ use crate::http::{
     MetricsError, MetricsErrorKind,
 };
 use crate::http_handler::{
-    error_response, extract_query_part, success_response, translate_status_code, EndpointHandler,
-    HttpResult,
+    EndpointHandler, HttpResult, error_response, extract_query_part, success_response,
+    translate_status_code,
 };
 
 /// Non-versioned Prometheus scrape endpoint.

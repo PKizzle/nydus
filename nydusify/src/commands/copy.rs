@@ -91,9 +91,10 @@ mod tests {
 
         let err = plan(&args).unwrap_err();
 
-        assert!(err
-            .to_string()
-            .contains("--all-platforms conflicts with --platform"));
+        assert!(
+            err.to_string()
+                .contains("--all-platforms conflicts with --platform")
+        );
     }
 
     #[test]

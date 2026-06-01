@@ -39,8 +39,8 @@ impl BlobLayout {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{core::node::NodeInfo, Tree};
-    use nydus_rafs::metadata::{inode::InodeWrapper, RafsVersion};
+    use crate::{Tree, core::node::NodeInfo};
+    use nydus_rafs::metadata::{RafsVersion, inode::InodeWrapper};
 
     #[test]
     fn test_layout_blob_simple() {

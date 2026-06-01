@@ -11,28 +11,28 @@
 
 use crate::auto_zran::AutoZranManager;
 use crate::cache::{CacheArtifactKind, CacheGcPolicy, CacheGcReport, CacheManager, CacheUsage};
-use crate::daemon::auth::{runtime_auth_records, set_runtime_auth, RuntimeAuthRequest};
+use crate::daemon::auth::{RuntimeAuthRequest, runtime_auth_records, set_runtime_auth};
 use crate::daemon::{
     DaemonStatusRecord, DaemonSupervisor, DaemonUpgradeOptions, DaemonUpgradeReport,
 };
 use crate::metrics::{CacheMetricSnapshot, SnapshotterMetrics};
 use crate::prefetch_profile::{
-    normalize_prefetch_files, runtime_prefetch_records, set_runtime_prefetch, PrefetchProfile,
-    PrefetchProfileStore,
+    PrefetchProfile, PrefetchProfileStore, normalize_prefetch_files, runtime_prefetch_records,
+    set_runtime_prefetch,
 };
 use crate::store::{SnapshotInfo, SnapshotStore};
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
+use compio::buf::BufResult;
+use compio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+use compio::net::{UnixListener, UnixStream};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::{
-    atomic::{AtomicU64, Ordering},
     Arc,
+    atomic::{AtomicU64, Ordering},
 };
 use std::time::{SystemTime, UNIX_EPOCH};
-use compio::buf::BufResult;
-use compio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
-use compio::net::{UnixListener, UnixStream};
 use tracing::{debug, info, warn};
 
 const MAX_HEADER_BYTES: usize = 16 * 1024;

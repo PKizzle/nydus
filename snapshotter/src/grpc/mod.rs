@@ -8,22 +8,22 @@
 //! and serve it over a Unix domain socket.
 
 use crate::auto_zran::AutoZranManager;
-use crate::cache::{parse_duration, CacheGcPolicy, CacheManager};
+use crate::cache::{CacheGcPolicy, CacheManager, parse_duration};
 use crate::config::SnapshotterConfig;
 use crate::daemon::DaemonSupervisor;
 use crate::metrics::SnapshotterMetrics;
 use crate::overlay::{NydusMetaInfo, OverlayEngine, PrepareOutcome};
 use crate::recon::Reconciler;
 use crate::store::{SnapshotInfo, SnapshotStore};
-use crate::sysctl::{serve_unix as serve_sysctl_unix, SystemController};
+use crate::sysctl::{SystemController, serve_unix as serve_sysctl_unix};
 use anyhow::Result;
 use containerd_snapshots::{self as snapshots, Info, Kind, Usage};
+use futures::Stream;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::SystemTime;
-use futures::Stream;
 use tracing::{debug, info, warn};
 
 /// Small snapshotter error carrier.
@@ -150,9 +150,10 @@ impl NydusSnapshotter {
         daemon_mountpoint: &Path,
         readonly: bool,
     ) -> Vec<snapshots::api::types::Mount> {
-        vec![self
-            .overlay
-            .mount_with_daemon(key, daemon_mountpoint, readonly)]
+        vec![
+            self.overlay
+                .mount_with_daemon(key, daemon_mountpoint, readonly),
+        ]
     }
 }
 

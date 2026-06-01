@@ -9,8 +9,8 @@ use std::fs;
 use std::io::{Error, ErrorKind, Result};
 use std::path::Path;
 use std::str::FromStr;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde::Deserialize;
 use serde_json::Value;
@@ -1407,7 +1407,7 @@ impl TryFrom<&BackendConfig> for BackendConfigV2 {
                 return Err(Error::new(
                     ErrorKind::InvalidInput,
                     format!("unsupported backend type '{}'", v),
-                ))
+                ));
             }
         }
 
@@ -1478,7 +1478,7 @@ impl TryFrom<&CacheConfig> for CacheConfigV2 {
                 return Err(Error::new(
                     ErrorKind::InvalidInput,
                     format!("unsupported cache type '{}'", t),
-                ))
+                ));
             }
         }
 
@@ -1715,7 +1715,7 @@ pub struct OverlayConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{BlobCacheEntry, BLOB_CACHE_TYPE_META_BLOB};
+    use crate::{BLOB_CACHE_TYPE_META_BLOB, BlobCacheEntry};
 
     #[test]
     fn test_blob_prefetch_config() {
@@ -2012,15 +2012,17 @@ external_backends:
             .unwrap();
         assert!(registry.auth.is_none());
         assert!(registry.registry_token.is_none());
-        assert!(redacted
-            .cache
-            .as_ref()
-            .unwrap()
-            .file_cache
-            .as_ref()
-            .unwrap()
-            .encryption_key
-            .is_empty());
+        assert!(
+            redacted
+                .cache
+                .as_ref()
+                .unwrap()
+                .file_cache
+                .as_ref()
+                .unwrap()
+                .encryption_key
+                .is_empty()
+        );
         assert_eq!(redacted.external_backends[0].patch["auth"], "");
         assert_eq!(
             redacted.external_backends[0].config["access_key_secret"],

@@ -19,8 +19,8 @@
 //!   The [is_chunk_cached()](../trait.BlobCache.html#tymethod.is_chunk_cached) method always
 //!   return true to enable data prefetching.
 use std::io::Result;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use fuse_backend_rs::file_buf::FileVolatileSlice;
 use nydus_api::CacheConfigV2;
@@ -350,9 +350,11 @@ mod tests {
         let iovec_arr: &[BlobIoDesc] = &[];
         let reqs = &[reqs];
 
-        assert!(cache
-            .prefetch(Arc::new(cache_unuse), reqs, iovec_arr)
-            .is_err());
+        assert!(
+            cache
+                .prefetch(Arc::new(cache_unuse), reqs, iovec_arr)
+                .is_err()
+        );
         assert!(cache.stop_prefetch().is_ok());
         let mut iovec = BlobIoVec::new(Arc::new(info.clone()));
         let chunk: Arc<dyn BlobChunkInfo> = Arc::new(MockChunkInfo {

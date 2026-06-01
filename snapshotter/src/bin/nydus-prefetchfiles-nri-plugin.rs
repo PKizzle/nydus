@@ -8,12 +8,12 @@
 //! containing image annotations; the binary normalizes them and forwards the
 //! resulting hints to the Nydus system-controller.
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::Parser;
 use nydus_snapshotter::nri::{
-    prefetch_hint_from_annotations, PrefetchHint, SysctlClient, DEFAULT_SYSCTL_SOCKET,
+    DEFAULT_SYSCTL_SOCKET, PrefetchHint, SysctlClient, prefetch_hint_from_annotations,
 };
-use nydus_snapshotter::nri_ttrpc::{serve_prefetch_plugin, NriTtrpcConfig};
+use nydus_snapshotter::nri_ttrpc::{NriTtrpcConfig, serve_prefetch_plugin};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::io::Read;

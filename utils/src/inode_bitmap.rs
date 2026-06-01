@@ -5,8 +5,8 @@
 
 use std::collections::BTreeMap;
 use std::fmt::{Debug, Display, Formatter};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::RwLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 #[derive(Default)]
 pub struct InodeBitmap {

@@ -13,20 +13,20 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use anyhow::{anyhow, bail, Context, Error, Result};
+use anyhow::{Context, Error, Result, anyhow, bail};
 use base64::Engine;
 use nix::NixPath;
+use nydus_rafs::metadata::RafsVersion;
 use nydus_rafs::metadata::chunk::ChunkWrapper;
 use nydus_rafs::metadata::inode::{InodeWrapper, RafsInodeFlags, RafsV6Inode};
-use nydus_rafs::metadata::layout::v5::RafsV5ChunkInfo;
 use nydus_rafs::metadata::layout::RafsXAttrs;
-use nydus_rafs::metadata::RafsVersion;
+use nydus_rafs::metadata::layout::v5::RafsV5ChunkInfo;
 use nydus_storage::device::BlobChunkFlags;
-use nydus_storage::{RAFS_MAX_CHUNKS_PER_BLOB, RAFS_MAX_CHUNK_SIZE};
+use nydus_storage::{RAFS_MAX_CHUNK_SIZE, RAFS_MAX_CHUNKS_PER_BLOB};
 use nydus_utils::compact::makedev;
 use nydus_utils::compress::{self, compute_compressed_gzip_size};
 use nydus_utils::digest::{self, DigestData, RafsDigest};
-use nydus_utils::{lazy_drop, root_tracer, timing_tracer, try_round_up_4k, ByteSize};
+use nydus_utils::{ByteSize, lazy_drop, root_tracer, timing_tracer, try_round_up_4k};
 use serde::{Deserialize, Serialize};
 
 use crate::core::context::{Artifact, NoopArtifactWriter};
@@ -37,7 +37,7 @@ use super::core::context::{
 };
 use super::core::node::{ChunkSource, Node, NodeChunk, NodeInfo};
 use super::{
-    build_bootstrap, dump_bootstrap, finalize_blob, Bootstrap, Builder, TarBuilder, Tree, TreeNode,
+    Bootstrap, Builder, TarBuilder, Tree, TreeNode, build_bootstrap, dump_bootstrap, finalize_blob,
 };
 
 #[derive(Deserialize, Serialize, Debug, Clone, Default)]
@@ -263,11 +263,7 @@ impl TocEntry {
 
     /// Get content size of the entry.
     pub fn size(&self) -> u64 {
-        if self.is_reg() {
-            self.size
-        } else {
-            0
-        }
+        if self.is_reg() { self.size } else { 0 }
     }
 
     /// Get file name of the `TocEntry` from the associated path.
@@ -915,7 +911,7 @@ impl Builder for StargzBuilder {
 mod tests {
     use super::*;
     use crate::{
-        attributes::Attributes, ArtifactStorage, ConversionType, Features, Prefetch, WhiteoutSpec,
+        ArtifactStorage, ConversionType, Features, Prefetch, WhiteoutSpec, attributes::Attributes,
     };
 
     #[test]

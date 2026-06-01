@@ -15,10 +15,10 @@ mod paths;
 use crate::config::SnapshotterConfig;
 use crate::containerd_lookup::ContainerdLookup;
 use crate::source::{
-    classify_layer, target_snapshot_ref, LayerKind, CRI_IMAGE_REF, NYDUS_META_LAYER,
+    CRI_IMAGE_REF, LayerKind, NYDUS_META_LAYER, classify_layer, target_snapshot_ref,
 };
 use crate::store::{SnapshotKind, SnapshotStore};
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use containerd_snapshots::api::types::Mount;
 use labels::{bootstrap_digest_from_key, image_ref, is_image_ref_like, normalize_parent};
 use mounts::{bind_mount, overlay_mount};
@@ -483,18 +483,24 @@ mod tests {
         let mounts = expect_mounts(engine.prepare(&store, "child", "base", &labels).unwrap());
 
         assert_eq!(mounts[0].r#type, "overlay");
-        assert!(mounts[0]
-            .options
-            .iter()
-            .any(|opt| opt.starts_with("lowerdir=")));
-        assert!(mounts[0]
-            .options
-            .iter()
-            .any(|opt| opt.starts_with("upperdir=")));
-        assert!(mounts[0]
-            .options
-            .iter()
-            .any(|opt| opt.starts_with("workdir=")));
+        assert!(
+            mounts[0]
+                .options
+                .iter()
+                .any(|opt| opt.starts_with("lowerdir="))
+        );
+        assert!(
+            mounts[0]
+                .options
+                .iter()
+                .any(|opt| opt.starts_with("upperdir="))
+        );
+        assert!(
+            mounts[0]
+                .options
+                .iter()
+                .any(|opt| opt.starts_with("workdir="))
+        );
     }
 
     #[test]
@@ -511,10 +517,12 @@ mod tests {
 
         assert_eq!(mounts[0].r#type, "bind");
         assert!(mounts[0].options.contains(&"ro".to_string()));
-        assert!(!mounts[0]
-            .options
-            .iter()
-            .any(|opt| opt.starts_with("upperdir=")));
+        assert!(
+            !mounts[0]
+                .options
+                .iter()
+                .any(|opt| opt.starts_with("upperdir="))
+        );
     }
 
     #[test]
@@ -538,9 +546,11 @@ mod tests {
         let (engine, store) = test_engine(dir.path());
         let labels = HashMap::new();
 
-        assert!(engine
-            .prepare(&store, "child", "missing-parent", &labels)
-            .is_err());
+        assert!(
+            engine
+                .prepare(&store, "child", "missing-parent", &labels)
+                .is_err()
+        );
 
         assert!(store.stat("child").is_err());
         assert!(!engine.snapshot_dir("child").exists());

@@ -12,7 +12,7 @@ use hyper::body::Bytes;
 use nydus_api::HttpProxyConfig;
 use nydus_utils::metrics::BackendMetrics;
 
-use super::connection::{block_on_http, Connection, ConnectionConfig, ConnectionError};
+use super::connection::{Connection, ConnectionConfig, ConnectionError, block_on_http};
 use super::{BackendContext, BackendError, BackendResult, BlobBackend, BlobReader};
 use crate::backend::request;
 use std::path::Path;
@@ -371,15 +371,15 @@ impl Drop for HttpProxy {
 mod tests {
 
     use crate::{
-        backend::{http_proxy::HttpProxy, BlobBackend},
+        backend::{BlobBackend, http_proxy::HttpProxy},
         utils::alloc_buf,
     };
 
-    use http::{status, Request};
+    use http::{Request, status};
     use http_body_util::Full;
+    use hyper::Response;
     use hyper::body::Incoming;
     use hyper::service::service_fn;
-    use hyper::Response;
     use hyper_util::rt::TokioIo;
     use hyper_util::server::conn::auto::Builder;
     use nydus_api::HttpProxyConfig;

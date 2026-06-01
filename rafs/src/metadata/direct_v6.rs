@@ -30,25 +30,26 @@ use std::time::Duration;
 
 use arc_swap::{ArcSwap, Guard};
 use nydus_storage::device::{
-    v5::BlobV5ChunkInfo, BlobChunkFlags, BlobChunkInfo, BlobDevice, BlobInfo, BlobIoDesc, BlobIoVec,
+    BlobChunkFlags, BlobChunkInfo, BlobDevice, BlobInfo, BlobIoDesc, BlobIoVec, v5::BlobV5ChunkInfo,
 };
 use nydus_storage::utils::readahead;
-use nydus_utils::filemap::{clone_file, FileMapState};
+use nydus_utils::filemap::{FileMapState, clone_file};
 use nydus_utils::{digest::RafsDigest, div_round_up, round_up};
 
 use crate::metadata::layout::v5::RafsV5ChunkInfo;
 use crate::metadata::layout::v6::{
-    block_size_from_bits, rafsv6_load_blob_extra_info, recover_namespace, RafsV6BlobTable,
-    RafsV6Dirent, RafsV6InodeChunkAddr, RafsV6InodeCompact, RafsV6InodeExtended, RafsV6OndiskInode,
-    RafsV6XattrEntry, RafsV6XattrIbodyHeader, EROFS_BLOCK_BITS_9, EROFS_BLOCK_SIZE_4096,
-    EROFS_BLOCK_SIZE_512, EROFS_INODE_CHUNK_BASED, EROFS_INODE_FLAT_INLINE, EROFS_INODE_FLAT_PLAIN,
-    EROFS_INODE_SLOT_SIZE, EROFS_I_DATALAYOUT_BITS, EROFS_I_VERSION_BIT, EROFS_I_VERSION_BITS,
+    EROFS_BLOCK_BITS_9, EROFS_BLOCK_SIZE_512, EROFS_BLOCK_SIZE_4096, EROFS_I_DATALAYOUT_BITS,
+    EROFS_I_VERSION_BIT, EROFS_I_VERSION_BITS, EROFS_INODE_CHUNK_BASED, EROFS_INODE_FLAT_INLINE,
+    EROFS_INODE_FLAT_PLAIN, EROFS_INODE_SLOT_SIZE, RafsV6BlobTable, RafsV6Dirent,
+    RafsV6InodeChunkAddr, RafsV6InodeCompact, RafsV6InodeExtended, RafsV6OndiskInode,
+    RafsV6XattrEntry, RafsV6XattrIbodyHeader, block_size_from_bits, rafsv6_load_blob_extra_info,
+    recover_namespace,
 };
-use crate::metadata::layout::{bytes_to_os_str, MetaRange, XattrName, XattrValue};
+use crate::metadata::layout::{MetaRange, XattrName, XattrValue, bytes_to_os_str};
 use crate::metadata::{
-    Attr, Entry, Inode, RafsBlobExtraInfo, RafsInode, RafsInodeWalkAction, RafsInodeWalkHandler,
-    RafsSuperBlock, RafsSuperFlags, RafsSuperInodes, RafsSuperMeta, RAFS_ATTR_BLOCK_SIZE,
-    RAFS_MAX_NAME,
+    Attr, Entry, Inode, RAFS_ATTR_BLOCK_SIZE, RAFS_MAX_NAME, RafsBlobExtraInfo, RafsInode,
+    RafsInodeWalkAction, RafsInodeWalkHandler, RafsSuperBlock, RafsSuperFlags, RafsSuperInodes,
+    RafsSuperMeta,
 };
 use crate::{MetaType, RafsError, RafsInodeExt, RafsIoReader, RafsResult};
 

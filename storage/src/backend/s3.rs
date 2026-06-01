@@ -11,13 +11,13 @@ use std::io::Result;
 use std::sync::Arc;
 
 use hmac::{Hmac, KeyInit, Mac};
+use http::Method;
 use http::Uri;
+use http::header::HeaderMap;
 use nydus_api::S3Config;
 use nydus_utils::metrics::BackendMetrics;
-use http::header::HeaderMap;
-use http::Method;
 use sha2::{Digest, Sha256};
-use time::{format_description, OffsetDateTime};
+use time::{OffsetDateTime, format_description};
 
 use crate::backend::connection::{Connection, ConnectionConfig};
 use crate::backend::object_storage::{ObjectStorage, ObjectStorageState};
@@ -273,9 +273,9 @@ mod tests {
     use http::{HeaderMap, Method};
     use nydus_api::S3Config;
 
+    use crate::backend::BlobBackend;
     use crate::backend::object_storage::ObjectStorageState;
     use crate::backend::s3::S3State;
-    use crate::backend::BlobBackend;
 
     use super::S3;
 

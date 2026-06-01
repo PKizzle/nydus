@@ -14,7 +14,7 @@ use nydus_utils::{
     digest::{self, RafsDigest},
     round_down_4k,
 };
-use std::alloc::{alloc, handle_alloc_error, Layout};
+use std::alloc::{Layout, alloc, handle_alloc_error};
 use std::cmp::{self, min};
 use std::io::{ErrorKind, IoSliceMut, Result};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd};

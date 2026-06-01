@@ -8,7 +8,7 @@
 //! plugin binaries, the native ttrpc transport, and the sysctl
 //! `/api/v1/prefetch` endpoint.
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;

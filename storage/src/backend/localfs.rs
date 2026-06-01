@@ -19,7 +19,7 @@ use nydus_api::LocalFsConfig;
 use nydus_utils::metrics::BackendMetrics;
 
 use crate::backend::{BackendError, BackendResult, BlobBackend, BlobReader};
-use crate::utils::{readv, MemSliceCursor};
+use crate::utils::{MemSliceCursor, readv};
 
 type LocalFsResult<T> = std::result::Result<T, LocalFsError>;
 

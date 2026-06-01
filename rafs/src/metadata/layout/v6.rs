@@ -18,15 +18,15 @@ use nydus_storage::device::{BlobFeatures, BlobInfo};
 use nydus_storage::meta::{
     BlobChunkInfoV1Ondisk, BlobChunkInfoV2Ondisk, BlobCompressionContextHeader,
 };
-use nydus_storage::{RAFS_MAX_CHUNKS_PER_BLOB, RAFS_MAX_CHUNK_SIZE};
+use nydus_storage::{RAFS_MAX_CHUNK_SIZE, RAFS_MAX_CHUNKS_PER_BLOB};
 use nydus_utils::crypt::{self, Cipher, CipherContext};
-use nydus_utils::{compress, digest, round_up, ByteSize};
+use nydus_utils::{ByteSize, compress, digest, round_up};
 
 use crate::metadata::inode::InodeWrapper;
 use crate::metadata::layout::v5::RafsV5ChunkInfo;
 use crate::metadata::layout::{MetaRange, RafsXAttrs};
 use crate::metadata::{Inode, RafsBlobExtraInfo, RafsStore, RafsSuperFlags, RafsSuperMeta};
-use crate::{impl_bootstrap_converter, impl_pub_getter_setter, RafsIoReader, RafsIoWrite};
+use crate::{RafsIoReader, RafsIoWrite, impl_bootstrap_converter, impl_pub_getter_setter};
 
 /// EROFS metadata slot size.
 pub const EROFS_INODE_SLOT_SIZE: usize = 1 << EROFS_INODE_SLOT_BITS;
@@ -574,8 +574,8 @@ impl RafsV6SuperBlockExt {
             if let Some(chunk_range) = chunk_info_tbl_range.as_ref() {
                 if chunk_range.intersect_with(&prefetch_range) {
                     return Err(einval!(format!(
-                    "chunk information table intersects with prefetch table in Rafs v6 extended superblock",
-                )));
+                        "chunk information table intersects with prefetch table in Rafs v6 extended superblock",
+                    )));
                 }
             }
         }
@@ -1589,7 +1589,7 @@ impl RafsV6Blob {
                 return Err(einval!(format!(
                     "invalid cipher algorithm {:?} when creating cipher context",
                     cipher
-                )))
+                )));
             }
         };
         blob_info.set_cipher_info(cipher, Arc::new(cipher_object), cipher_context);
@@ -1630,7 +1630,7 @@ impl RafsV6Blob {
                     None => {
                         return Err(einval!(
                             "cipher context is unset while using Aes128Xts encryption algorithm"
-                        ))
+                        ));
                     }
                 };
                 let cipher_key: [u8; 32] = cipher_ctx.get_cipher_meta().0.try_into().unwrap();
@@ -1646,7 +1646,7 @@ impl RafsV6Blob {
                 return Err(einval!(format!(
                     "invalid cipher algorithm type {:?} in blob info",
                     blob_info.cipher()
-                )))
+                )));
             }
         };
 
@@ -1734,7 +1734,11 @@ impl RafsV6Blob {
         {
             error!(
                 "RafsV6Blob: idx {} invalid compression_algo {} ci_compressor {} digest_algo {} cipher_algo {}",
-                blob_index, self.compression_algo, self.ci_compressor, self.digest_algo, self.cipher_algo,
+                blob_index,
+                self.compression_algo,
+                self.ci_compressor,
+                self.digest_algo,
+                self.cipher_algo,
             );
             return false;
         }
@@ -1779,10 +1783,16 @@ impl RafsV6Blob {
         let ci_compr_size = u64::from_le(self.ci_compressed_size);
         let ci_uncompr_size = u64::from_le(self.ci_uncompressed_size);
         if ci_offset.checked_add(ci_compr_size).is_none() {
-            error!("RafsV6Blob: idx {} invalid fields, ci_compressed_size {:x} + ci_offset {:x} wraps around", blob_index, ci_compr_size, ci_offset);
+            error!(
+                "RafsV6Blob: idx {} invalid fields, ci_compressed_size {:x} + ci_offset {:x} wraps around",
+                blob_index, ci_compr_size, ci_offset
+            );
             return false;
         } else if ci_compr_size > ci_uncompr_size {
-            error!("RafsV6Blob: idx {} invalid fields, ci_compressed_size {:x} is greater than ci_uncompressed_size {:x}", blob_index, ci_compr_size, ci_uncompr_size);
+            error!(
+                "RafsV6Blob: idx {} invalid fields, ci_compressed_size {:x} is greater than ci_uncompressed_size {:x}",
+                blob_index, ci_compr_size, ci_uncompr_size
+            );
             return false;
         }
 

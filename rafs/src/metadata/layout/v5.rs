@@ -44,7 +44,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::sync::Arc;
 
 use nydus_utils::digest::{self, DigestHasher, RafsDigest};
-use nydus_utils::{compress, ByteSize};
+use nydus_utils::{ByteSize, compress};
 #[allow(unused_imports)]
 use vm_memory::VolatileMemory;
 // With Rafs v5, the storage manager needs to access file system metadata to decompress the
@@ -56,13 +56,13 @@ use nydus_storage::device::{
 };
 
 use crate::metadata::inode::RafsInodeFlags;
-use crate::metadata::layout::{bytes_to_os_str, MetaRange, RafsXAttrs, RAFS_SUPER_VERSION_V5};
+use crate::metadata::layout::{MetaRange, RAFS_SUPER_VERSION_V5, RafsXAttrs, bytes_to_os_str};
 use crate::metadata::md_v5::V5IoChunk;
 use crate::metadata::{
-    Inode, RafsInode, RafsStore, RafsSuperFlags, RAFS_DEFAULT_CHUNK_SIZE, RAFS_MAX_CHUNK_SIZE,
+    Inode, RAFS_DEFAULT_CHUNK_SIZE, RAFS_MAX_CHUNK_SIZE, RafsInode, RafsStore, RafsSuperFlags,
 };
 use crate::{
-    impl_bootstrap_converter, impl_pub_getter_setter, RafsInodeExt, RafsIoReader, RafsIoWrite,
+    RafsInodeExt, RafsIoReader, RafsIoWrite, impl_bootstrap_converter, impl_pub_getter_setter,
 };
 
 pub(crate) const RAFSV5_ALIGNMENT: usize = 8;
@@ -349,9 +349,16 @@ impl Default for RafsV5SuperBlock {
 
 impl Display for RafsV5SuperBlock {
     fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
-        write!(f, "superblock: magic {:x}, version {:x}, sb_size {:x}, block_size {:x}, flags {:x}, inode_count {}",
-               self.magic(), self.version(), self.sb_size(), self.block_size(),
-               self.flags(), self.s_inodes_count)
+        write!(
+            f,
+            "superblock: magic {:x}, version {:x}, sb_size {:x}, block_size {:x}, flags {:x}, inode_count {}",
+            self.magic(),
+            self.version(),
+            self.sb_size(),
+            self.block_size(),
+            self.flags(),
+            self.s_inodes_count
+        )
     }
 }
 
@@ -1656,11 +1663,7 @@ pub mod tests {
         }
 
         fn crc32(&self) -> u32 {
-            if self.has_crc32() {
-                self.crc32
-            } else {
-                0
-            }
+            if self.has_crc32() { self.crc32 } else { 0 }
         }
 
         fn as_any(&self) -> &dyn Any {

@@ -25,7 +25,7 @@ use nix::sys::uio;
 use nydus_utils::compress::Decoder;
 use nydus_utils::crypt::{self, Cipher, CipherContext};
 use nydus_utils::metrics::{BlobcacheMetrics, Metric};
-use nydus_utils::{compress, digest, round_up_usize, DelayType, Delayer, FileRangeReader};
+use nydus_utils::{DelayType, Delayer, FileRangeReader, compress, digest, round_up_usize};
 
 use crate::backend::BlobReader;
 use crate::cache::state::ChunkMap;
@@ -36,8 +36,8 @@ use crate::device::{
     BlobObject, BlobPrefetchRequest,
 };
 use crate::meta::{BlobCompressionContextInfo, BlobMetaChunk};
-use crate::utils::{alloc_buf, copyv, readv, MemSliceCursor};
-use crate::{StorageError, StorageResult, RAFS_BATCH_SIZE_TO_GAP_SHIFT, RAFS_DEFAULT_CHUNK_SIZE};
+use crate::utils::{MemSliceCursor, alloc_buf, copyv, readv};
+use crate::{RAFS_BATCH_SIZE_TO_GAP_SHIFT, RAFS_DEFAULT_CHUNK_SIZE, StorageError, StorageResult};
 
 const DOWNLOAD_META_RETRY_COUNT: u32 = 5;
 const DOWNLOAD_META_RETRY_DELAY: u64 = 400;
@@ -81,33 +81,33 @@ impl FileCacheMeta {
             // pool (runtime-agnostic; replaces tokio's spawn_blocking). `detach`
             // keeps it running fire-and-forget — `blocking`'s Task cancels on drop.
             blocking::unblock(move || {
-                    let mut retry = 0;
-                    let mut delayer = Delayer::new(
-                        DelayType::BackOff,
-                        Duration::from_millis(DOWNLOAD_META_RETRY_DELAY),
-                    );
-                    while retry < DOWNLOAD_META_RETRY_COUNT {
-                        match BlobCompressionContextInfo::new(
-                            &blob_file,
-                            &blob_info,
-                            reader.as_ref(),
-                            validation,
-                        ) {
-                            Ok(m) => {
-                                *meta1.meta.lock().unwrap() = Some(Arc::new(m));
-                                return;
-                            }
-                            Err(e) => {
-                                info!("temporarily failed to get blob.meta, {}", e);
-                                delayer.delay();
-                                retry += 1;
-                            }
+                let mut retry = 0;
+                let mut delayer = Delayer::new(
+                    DelayType::BackOff,
+                    Duration::from_millis(DOWNLOAD_META_RETRY_DELAY),
+                );
+                while retry < DOWNLOAD_META_RETRY_COUNT {
+                    match BlobCompressionContextInfo::new(
+                        &blob_file,
+                        &blob_info,
+                        reader.as_ref(),
+                        validation,
+                    ) {
+                        Ok(m) => {
+                            *meta1.meta.lock().unwrap() = Some(Arc::new(m));
+                            return;
+                        }
+                        Err(e) => {
+                            info!("temporarily failed to get blob.meta, {}", e);
+                            delayer.delay();
+                            retry += 1;
                         }
                     }
-                    warn!("failed to get blob.meta");
-                    meta1.has_error.store(true, Ordering::Release);
-                })
-                .detach();
+                }
+                warn!("failed to get blob.meta");
+                meta1.has_error.store(true, Ordering::Release);
+            })
+            .detach();
 
             Ok(meta)
         }

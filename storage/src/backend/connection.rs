@@ -7,16 +7,16 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io::{Read, Result};
 use std::str::FromStr;
-use std::sync::atomic::{AtomicBool, AtomicI16, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicI16, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use std::{fmt, thread};
 
-use log::{max_level, Level};
+use log::{Level, max_level};
 
 use cyper::{Client, RequestBuilder};
 use futures_util::StreamExt;
-use http::{header::HeaderMap, Method, StatusCode};
+use http::{Method, StatusCode, header::HeaderMap};
 use url::Url;
 
 use nydus_api::{HttpProxyConfig, OssConfig, ProxyConfig, RegistryConfig, S3Config};
@@ -674,47 +674,47 @@ impl Connection {
         let req_method = method.clone();
         let result: ConnectionResult<Response> = block_on_http(async move {
             let rb = HTTP_CLIENTS.with(|clients| -> ConnectionResult<RequestBuilder> {
-            let mut clients = clients.borrow_mut();
-            let key = (self.id, is_proxy);
-            if !clients.contains_key(&key) {
-                let proxy_url = if is_proxy {
-                    self.config.proxy.url.as_str()
-                } else {
-                    ""
-                };
-                let client = Self::build_connection(proxy_url, &self.config).map_err(|e| {
-                    ConnectionError::ErrorWithMsg(format!("failed to build HTTP client: {e}"))
-                })?;
-                clients.insert(key, client);
-            }
-            let client = clients.get(&key).unwrap();
+                let mut clients = clients.borrow_mut();
+                let key = (self.id, is_proxy);
+                if !clients.contains_key(&key) {
+                    let proxy_url = if is_proxy {
+                        self.config.proxy.url.as_str()
+                    } else {
+                        ""
+                    };
+                    let client = Self::build_connection(proxy_url, &self.config).map_err(|e| {
+                        ConnectionError::ErrorWithMsg(format!("failed to build HTTP client: {e}"))
+                    })?;
+                    clients.insert(key, client);
+                }
+                let client = clients.get(&key).unwrap();
 
-            let mut rb = client
-                .request(req_method, url)
-                .map_err(ConnectionError::Common)?
-                .headers(headers.clone());
-            if let Some(q) = query.as_ref() {
-                rb = rb.query(q).map_err(ConnectionError::Common)?;
-            }
-            if let Some(data) = data {
-                rb = match data {
-                    ReqBody::Read(mut body, _total) => {
-                        // cyper has no streaming-from-`Read` body; buffer the
-                        // upload payload (registry push path, not blob reads).
-                        let mut buf = Vec::new();
-                        body.read_to_end(&mut buf).map_err(|e| {
-                            ConnectionError::ErrorWithMsg(format!("read request body: {e}"))
-                        })?;
-                        rb.body(buf)
-                    }
-                    ReqBody::Buf(buf) => rb.body(buf),
-                    ReqBody::Form(form) => rb.form(&form).map_err(ConnectionError::Common)?,
-                };
-            } else {
-                rb = rb.body(Vec::<u8>::new());
-            }
-            Ok(rb)
-        })?;
+                let mut rb = client
+                    .request(req_method, url)
+                    .map_err(ConnectionError::Common)?
+                    .headers(headers.clone());
+                if let Some(q) = query.as_ref() {
+                    rb = rb.query(q).map_err(ConnectionError::Common)?;
+                }
+                if let Some(data) = data {
+                    rb = match data {
+                        ReqBody::Read(mut body, _total) => {
+                            // cyper has no streaming-from-`Read` body; buffer the
+                            // upload payload (registry push path, not blob reads).
+                            let mut buf = Vec::new();
+                            body.read_to_end(&mut buf).map_err(|e| {
+                                ConnectionError::ErrorWithMsg(format!("read request body: {e}"))
+                            })?;
+                            rb.body(buf)
+                        }
+                        ReqBody::Buf(buf) => rb.body(buf),
+                        ReqBody::Form(form) => rb.form(&form).map_err(ConnectionError::Common)?,
+                    };
+                } else {
+                    rb = rb.body(Vec::<u8>::new());
+                }
+                Ok(rb)
+            })?;
 
             let send = rb.send();
             let cyper_resp = match timeout {
@@ -723,7 +723,7 @@ impl Connection {
                     Err(_) => {
                         return Err(ConnectionError::ErrorWithMsg(format!(
                             "request to {url_owned} timed out"
-                        )))
+                        )));
                     }
                 },
                 None => send.await.map_err(ConnectionError::Common)?,
@@ -801,7 +801,7 @@ impl Connection {
                     Err(_) => {
                         return Err(ConnectionError::ErrorWithMsg(format!(
                             "request to {url_owned} timed out"
-                        )))
+                        )));
                     }
                 },
                 None => send.await.map_err(ConnectionError::Common)?,

@@ -52,7 +52,7 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
-    use crate::cli::{default_platform, BackendType};
+    use crate::cli::{BackendType, default_platform};
 
     fn base_args() -> CheckArgs {
         CheckArgs {
@@ -96,9 +96,10 @@ mod tests {
 
         let err = plan(&args).unwrap_err();
 
-        assert!(err
-            .to_string()
-            .contains("--target-backend-type is required"));
+        assert!(
+            err.to_string()
+                .contains("--target-backend-type is required")
+        );
     }
 
     #[test]

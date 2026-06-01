@@ -7,8 +7,8 @@ extern crate log;
 #[macro_use]
 extern crate nydus_api;
 
-use clap::parser::ValuesRef;
 use clap::ArgMatches;
+use clap::parser::ValuesRef;
 use nydus_api::BuildTimeInfo;
 
 pub use logger::{log_level_to_verbosity, setup_logging};

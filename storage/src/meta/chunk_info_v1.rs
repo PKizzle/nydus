@@ -2,7 +2,7 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::meta::{BlobCompressionContext, BlobMetaChunkInfo, BLOB_CCT_CHUNK_SIZE_MASK};
+use crate::meta::{BLOB_CCT_CHUNK_SIZE_MASK, BlobCompressionContext, BlobMetaChunkInfo};
 use std::io::Result;
 
 const BLOB_CC_V1_CHUNK_COMP_OFFSET_MASK: u64 = 0xff_ffff_ffff;
@@ -161,15 +161,15 @@ mod tests {
     use vmm_sys_util::tempfile::TempFile;
 
     use super::*;
+    use crate::RAFS_MAX_CHUNK_SIZE;
     use crate::backend::BlobReader;
     use crate::device::{BlobFeatures, BlobInfo};
     use crate::meta::tests::DummyBlobReader;
     use crate::meta::{
-        round_up_4k, BlobCompressionContext, BlobCompressionContextHeader,
-        BlobCompressionContextInfo, BlobMetaChunkArray,
+        BlobCompressionContext, BlobCompressionContextHeader, BlobCompressionContextInfo,
+        BlobMetaChunkArray, round_up_4k,
     };
     use crate::utils::alloc_buf;
-    use crate::RAFS_MAX_CHUNK_SIZE;
 
     #[test]
     fn test_new_chunk_on_disk() {
@@ -340,9 +340,10 @@ mod tests {
         assert!(info.get_chunks_uncompressed(0x100000, 0x2001, 0).is_err());
         assert!(info.get_chunks_uncompressed(0x100000, 0x4000, 0).is_err());
         assert!(info.get_chunks_uncompressed(0x100000, 0x4001, 0).is_err());
-        assert!(info
-            .get_chunks_uncompressed(0x102000, 0xffff_ffff_ffff_ffff, 0)
-            .is_err());
+        assert!(
+            info.get_chunks_uncompressed(0x102000, 0xffff_ffff_ffff_ffff, 0)
+                .is_err()
+        );
         assert!(info.get_chunks_uncompressed(0x104000, 0x1, 0).is_err());
     }
 

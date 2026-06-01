@@ -16,11 +16,11 @@
 
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use nydus_api::S3Config;
 use nydus_storage::backend::s3::S3;
 use nydus_storage::backend::{BlobBackend, BlobReader};
@@ -61,10 +61,7 @@ fn serve_connection(mut stream: TcpStream, blob: Arc<Vec<u8>>) {
     loop {
         // Accumulate until a full request header (terminated by CRLFCRLF).
         let header_end = loop {
-            if let Some(pos) = pending
-                .windows(4)
-                .position(|w| w == b"\r\n\r\n")
-            {
+            if let Some(pos) = pending.windows(4).position(|w| w == b"\r\n\r\n") {
                 break pos + 4;
             }
             match stream.read(&mut buf) {
@@ -78,11 +75,7 @@ fn serve_connection(mut stream: TcpStream, blob: Arc<Vec<u8>>) {
         pending.drain(..header_end);
 
         let response = if request.starts_with("HEAD ") {
-            format!(
-                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
-                blob.len()
-            )
-            .into_bytes()
+            format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", blob.len()).into_bytes()
         } else if let Some((start, end)) = parse_range(&request) {
             let end = end.min(blob.len().saturating_sub(1));
             let body = &blob[start..=end];
@@ -95,11 +88,8 @@ fn serve_connection(mut stream: TcpStream, blob: Arc<Vec<u8>>) {
             resp
         } else {
             // Whole-object GET.
-            let mut resp = format!(
-                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
-                blob.len()
-            )
-            .into_bytes();
+            let mut resp =
+                format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", blob.len()).into_bytes();
             resp.extend_from_slice(&blob);
             resp
         };

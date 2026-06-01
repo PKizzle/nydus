@@ -15,13 +15,13 @@ use std::{
 use tokio::io::AsyncRead;
 use tokio::runtime::Runtime;
 
-use dragonfly_client_util::request::errors::Error;
 use dragonfly_client_util::request::Request;
+use dragonfly_client_util::request::errors::Error;
 use dragonfly_client_util::request::{Body, GetRequest, GetResponse, Proxy};
+use http::StatusCode;
+use http::header::HeaderMap;
 use lazy_static::lazy_static;
 use log::info;
-use http::header::HeaderMap;
-use http::StatusCode;
 
 // --- Dragonfly header constants ---
 pub const HEADER_DRAGONFLY_PRIORITY: &str = "X-Dragonfly-Priority";
@@ -195,8 +195,8 @@ mod tests {
     use super::*;
     use std::io::Write as _;
     use std::net::TcpListener;
-    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::thread;
     use std::time::Duration;
 

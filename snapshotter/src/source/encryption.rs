@@ -36,7 +36,9 @@ pub enum EncryptionFormat {
 pub enum EncryptionError {
     #[error("encrypted layer key is empty")]
     EmptyKey,
-    #[error("{format:?} encrypted layers require an OCICrypt/age backend that is not linked into this build")]
+    #[error(
+        "{format:?} encrypted layers require an OCICrypt/age backend that is not linked into this build"
+    )]
     BackendUnavailable { format: EncryptionFormat },
     #[error("configured encryption helper path is empty")]
     EmptyHelperPath,

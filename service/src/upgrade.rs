@@ -636,11 +636,11 @@ pub mod fusedev_upgrade {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::FsBackendType;
     use crate::fs_service::{FsBackendMountCmd, FsBackendUmountCmd};
     #[cfg(target_os = "linux")]
     use crate::upgrade::fanotify_upgrade::FanotifyBackendState;
     use crate::upgrade::fusedev_upgrade::FusedevBackendState;
-    use crate::FsBackendType;
     use nydus_upgrade::persist::Snapshotter;
     use vmm_sys_util::tempfile::TempFile;
 
@@ -718,10 +718,12 @@ mod tests {
         }];
 
         upgrade_mgr.add_blob_entry_state(entry);
-        assert!(upgrade_mgr
-            .fanotify_deamon_stat
-            .blob_entry_map
-            .contains_key("domain1/blob1"));
+        assert!(
+            upgrade_mgr
+                .fanotify_deamon_stat
+                .blob_entry_map
+                .contains_key("domain1/blob1")
+        );
 
         assert!(FanotifyBackendState::try_from(&upgrade_mgr.fanotify_deamon_stat).is_ok());
 
@@ -738,10 +740,12 @@ mod tests {
         assert!(stat.blob_entry_map.contains_key("domain1/blob1"));
 
         upgrade_mgr.remove_blob_entry_state("domain1", "blob1");
-        assert!(!upgrade_mgr
-            .fanotify_deamon_stat
-            .blob_entry_map
-            .contains_key("domain1/blob1"));
+        assert!(
+            !upgrade_mgr
+                .fanotify_deamon_stat
+                .blob_entry_map
+                .contains_key("domain1/blob1")
+        );
     }
 
     #[test]
@@ -825,10 +829,12 @@ mod tests {
         upgrade_mgr.save_fuse_cid(10);
         assert_eq!(upgrade_mgr.fuse_deamon_stat.fuse_conn_id, 10);
         upgrade_mgr.add_mounts_state(cmd.clone(), 5);
-        assert!(upgrade_mgr
-            .fuse_deamon_stat
-            .fs_mount_cmd_map
-            .contains_key("testmonutount"));
+        assert!(
+            upgrade_mgr
+                .fuse_deamon_stat
+                .fs_mount_cmd_map
+                .contains_key("testmonutount")
+        );
         assert!(upgrade_mgr.update_mounts_state(cmd).is_ok());
 
         let backend_stat = FusedevBackendState::from(&upgrade_mgr.fuse_deamon_stat);
@@ -842,10 +848,12 @@ mod tests {
             mountpoint: "testmonutount".to_string(),
         };
         upgrade_mgr.remove_mounts_state(umount_cmd);
-        assert!(!upgrade_mgr
-            .fuse_deamon_stat
-            .fs_mount_cmd_map
-            .contains_key("testmonutount"));
+        assert!(
+            !upgrade_mgr
+                .fuse_deamon_stat
+                .fs_mount_cmd_map
+                .contains_key("testmonutount")
+        );
     }
 
     #[test]
@@ -896,15 +904,17 @@ mod tests {
             .unwrap();
         assert!(registry.auth.is_none());
         assert!(registry.registry_token.is_none());
-        assert!(redacted
-            .cache
-            .as_ref()
-            .unwrap()
-            .file_cache
-            .as_ref()
-            .unwrap()
-            .encryption_key
-            .is_empty());
+        assert!(
+            redacted
+                .cache
+                .as_ref()
+                .unwrap()
+                .file_cache
+                .as_ref()
+                .unwrap()
+                .encryption_key
+                .is_empty()
+        );
     }
 
     #[test]

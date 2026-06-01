@@ -373,12 +373,16 @@ mod tests {
         let file = TempFile::new().unwrap();
         let mut generator = VerityGenerator::new(file.into_file(), 0, 0).unwrap();
 
-        assert!(generator
-            .set_digest(0, 0, &NON_EXIST_ENTRY_DIGEST.data)
-            .is_err());
-        assert!(generator
-            .set_digest(1, 0, &NON_EXIST_ENTRY_DIGEST.data)
-            .is_err());
+        assert!(
+            generator
+                .set_digest(0, 0, &NON_EXIST_ENTRY_DIGEST.data)
+                .is_err()
+        );
+        assert!(
+            generator
+                .set_digest(1, 0, &NON_EXIST_ENTRY_DIGEST.data)
+                .is_err()
+        );
 
         let root_digest = generator.generate_all_digests().unwrap();
         assert_eq!(root_digest, NON_EXIST_ENTRY_DIGEST);

@@ -8,8 +8,8 @@ use std::path::Path;
 use std::sync::{Mutex, MutexGuard};
 
 use anyhow::{Context, Result};
-use tracing_subscriber::fmt::MakeWriter;
 use tracing_subscriber::EnvFilter;
+use tracing_subscriber::fmt::MakeWriter;
 
 pub fn init(debug: bool, log_level: &str, log_file: Option<&Path>) -> Result<()> {
     let filter = if debug { "debug" } else { log_level };

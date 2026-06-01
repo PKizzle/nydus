@@ -18,8 +18,8 @@ use std::time::{Duration, SystemTime};
 
 use nydus_api::http::MetricsError;
 
-use crate::logger::ErrorHolder;
 use crate::InodeBitmap;
+use crate::logger::ErrorHolder;
 
 /// Type of `inode`.
 pub type Inode = u64;

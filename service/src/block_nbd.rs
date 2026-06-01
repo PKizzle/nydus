@@ -18,17 +18,17 @@ use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
+use async_broadcast::{Sender, broadcast};
 use bytes::{Buf, BufMut};
-use mio::Waker;
-use nydus_api::{BlobCacheEntry, BuildTimeInfo};
-use nydus_storage::utils::alloc_buf;
-use async_broadcast::{broadcast, Sender};
 use compio::buf::{BufResult, IntoInner, IoBuf};
 use compio::io::{AsyncRead, AsyncWriteExt};
 use compio::net::UnixStream;
-use futures_util::{select, FutureExt};
+use futures_util::{FutureExt, select};
+use mio::Waker;
+use nydus_api::{BlobCacheEntry, BuildTimeInfo};
+use nydus_storage::utils::alloc_buf;
 
-use crate::blob_cache::{generate_blob_key, BlobCacheMgr};
+use crate::blob_cache::{BlobCacheMgr, generate_blob_key};
 use crate::block_device::BlockDevice;
 use crate::daemon::{
     DaemonState, DaemonStateMachineContext, DaemonStateMachineInput, DaemonStateMachineSubscriber,
@@ -224,7 +224,10 @@ impl NbdWorker {
             };
             match res {
                 Err(e) => {
-                    warn!("block_nbd: failed to get request from kernel for {}, {}", self.blob_id, e);
+                    warn!(
+                        "block_nbd: failed to get request from kernel for {}, {}",
+                        self.blob_id, e
+                    );
                     break;
                 }
                 Ok(sz) => {
@@ -235,7 +238,10 @@ impl NbdWorker {
                             Ok(true) => {}
                             Ok(false) => break,
                             Err(e) => {
-                                warn!("block_nbd: failed to handle request for {}, {}", self.blob_id, e);
+                                warn!(
+                                    "block_nbd: failed to handle request for {}, {}",
+                                    self.blob_id, e
+                                );
                                 break;
                             }
                         }
@@ -341,12 +347,9 @@ impl NbdDaemon {
         // `BlockDevice::new_with_cache_manager` opens blob files via compio and
         // is async; run it to completion on a transient compio runtime since
         // this daemon constructor is synchronous.
-        let block_device = compio::runtime::Runtime::new()
-            .unwrap()
-            .block_on(BlockDevice::new_with_cache_manager(
-                blob_id.clone(),
-                cache_mgr.clone(),
-            ))?;
+        let block_device = compio::runtime::Runtime::new().unwrap().block_on(
+            BlockDevice::new_with_cache_manager(blob_id.clone(), cache_mgr.clone()),
+        )?;
         #[allow(clippy::arc_with_non_send_sync)]
         let nbd_service = NbdService::new(Arc::new(block_device), nbd_path)?;
 
@@ -418,13 +421,15 @@ impl NydusDaemon for NbdDaemon {
             let thread = std::thread::Builder::new()
                 .name("nbd_worker".to_string())
                 .spawn(move || {
-                    compio::runtime::Runtime::new().unwrap().block_on(async move {
-                        worker.run().await;
-                        // Notify the daemon controller that one working thread has exited.
-                        if let Err(err) = waker.wake() {
-                            error!("block_nbd: fail to exit daemon, error: {:?}", err);
-                        }
-                    });
+                    compio::runtime::Runtime::new()
+                        .unwrap()
+                        .block_on(async move {
+                            worker.run().await;
+                            // Notify the daemon controller that one working thread has exited.
+                            if let Err(err) = waker.wake() {
+                                error!("block_nbd: fail to exit daemon, error: {:?}", err);
+                            }
+                        });
                     Ok(())
                 })
                 .map_err(NydusError::ThreadSpawn)?;
@@ -580,7 +585,7 @@ pub fn create_nbd_daemon(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::blob_cache::{generate_blob_key, BlobCacheMgr};
+    use crate::blob_cache::{BlobCacheMgr, generate_blob_key};
     use nydus_api::BlobCacheEntry;
     use std::path::PathBuf;
     use std::time::Duration;
@@ -639,7 +644,10 @@ mod tests {
         assert!(mgr.get_config(&key).is_some());
 
         let mgr = Arc::new(mgr);
-        let device = compio::runtime::Runtime::new().unwrap().block_on(BlockDevice::new_with_cache_manager(blob_id.clone(), mgr)).unwrap();
+        let device = compio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(BlockDevice::new_with_cache_manager(blob_id.clone(), mgr))
+            .unwrap();
 
         Ok(Arc::new(device))
     }

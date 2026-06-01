@@ -76,11 +76,7 @@ impl BlobChunkInfo for MockChunkInfo {
     }
 
     fn crc32(&self) -> u32 {
-        if self.has_crc32() {
-            self.crc32
-        } else {
-            0
-        }
+        if self.has_crc32() { self.crc32 } else { 0 }
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -117,7 +113,7 @@ mod tests {
     use std::sync::Arc;
 
     use nydus_utils::digest::{Algorithm, RafsDigest};
-    use storage::device::{v5::BlobV5ChunkInfo, BlobChunkFlags, BlobChunkInfo};
+    use storage::device::{BlobChunkFlags, BlobChunkInfo, v5::BlobV5ChunkInfo};
 
     use super::MockChunkInfo;
 

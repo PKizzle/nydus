@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use anyhow::Result;
 use http_body_util::{BodyExt, Full};
 use hyper::body::Bytes;
-use hyper::{header, Method, Request, Uri as HyperUri};
+use hyper::{Method, Request, Uri as HyperUri, header};
 use hyper_util::client::legacy::Client;
 use hyperlocal::{UnixClientExt, UnixConnector, Uri};
 

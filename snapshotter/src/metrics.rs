@@ -486,8 +486,11 @@ mod tests {
         assert!(body.contains(
             "snapshotter_snapshot_operation_total{snapshot_operation=\"prepare\",status=\"ok\"} 1"
         ));
-        assert!(body
-            .contains("snapshotter_snapshot_operation_inflight{snapshot_operation=\"prepare\"} 0"));
+        assert!(
+            body.contains(
+                "snapshotter_snapshot_operation_inflight{snapshot_operation=\"prepare\"} 0"
+            )
+        );
     }
 
     #[test]

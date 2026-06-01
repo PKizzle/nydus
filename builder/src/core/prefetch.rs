@@ -6,10 +6,10 @@
 use std::path::PathBuf;
 use std::str::FromStr;
 
-use anyhow::{anyhow, Context, Error, Result};
+use anyhow::{Context, Error, Result, anyhow};
 use indexmap::IndexMap;
 use nydus_rafs::metadata::layout::v5::RafsV5PrefetchTable;
-use nydus_rafs::metadata::layout::v6::{calculate_nid, RafsV6PrefetchTable};
+use nydus_rafs::metadata::layout::v6::{RafsV6PrefetchTable, calculate_nid};
 
 use super::node::Node;
 use crate::core::tree::TreeNode;
@@ -264,7 +264,7 @@ impl Prefetch {
 mod tests {
     use super::*;
     use crate::core::node::NodeInfo;
-    use nydus_rafs::metadata::{inode::InodeWrapper, RafsVersion};
+    use nydus_rafs::metadata::{RafsVersion, inode::InodeWrapper};
     use std::cell::RefCell;
 
     #[test]

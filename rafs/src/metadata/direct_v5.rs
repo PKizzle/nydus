@@ -21,7 +21,7 @@ use std::any::Any;
 use std::ffi::{OsStr, OsString};
 use std::io::Result;
 use std::io::SeekFrom;
-use std::mem::{size_of, ManuallyDrop};
+use std::mem::{ManuallyDrop, size_of};
 use std::ops::Deref;
 use std::os::unix::io::AsRawFd;
 use std::sync::Arc;
@@ -31,21 +31,21 @@ use nydus_storage::device::v5::BlobV5ChunkInfo;
 use nydus_storage::device::{BlobChunkFlags, BlobChunkInfo, BlobDevice, BlobInfo, BlobIoVec};
 use nydus_storage::utils::readahead;
 use nydus_utils::digest::RafsDigest;
-use nydus_utils::filemap::{clone_file, FileMapState};
+use nydus_utils::filemap::{FileMapState, clone_file};
 
 use crate::metadata::layout::v5::{
-    rafsv5_align, rafsv5_alloc_bio_vecs, rafsv5_validate_inode, RafsV5BlobTable, RafsV5ChunkInfo,
-    RafsV5Inode, RafsV5InodeChunkOps, RafsV5InodeOps, RafsV5InodeTable, RafsV5XAttrsTable,
-    RAFSV5_ALIGNMENT, RAFSV5_EXT_BLOB_ENTRY_SIZE, RAFSV5_SUPERBLOCK_SIZE,
+    RAFSV5_ALIGNMENT, RAFSV5_EXT_BLOB_ENTRY_SIZE, RAFSV5_SUPERBLOCK_SIZE, RafsV5BlobTable,
+    RafsV5ChunkInfo, RafsV5Inode, RafsV5InodeChunkOps, RafsV5InodeOps, RafsV5InodeTable,
+    RafsV5XAttrsTable, rafsv5_align, rafsv5_alloc_bio_vecs, rafsv5_validate_inode,
 };
 use crate::metadata::layout::{
-    bytes_to_os_str, parse_xattr_names, parse_xattr_value, MetaRange, XattrName, XattrValue,
-    RAFS_V5_ROOT_INODE,
+    MetaRange, RAFS_V5_ROOT_INODE, XattrName, XattrValue, bytes_to_os_str, parse_xattr_names,
+    parse_xattr_value,
 };
 use crate::metadata::{
-    Attr, Entry, Inode, RafsInode, RafsInodeWalkAction, RafsInodeWalkHandler, RafsSuperBlock,
-    RafsSuperInodes, RafsSuperMeta, DOT, DOTDOT, RAFS_ATTR_BLOCK_SIZE, RAFS_MAX_METADATA_SIZE,
-    RAFS_MAX_NAME,
+    Attr, DOT, DOTDOT, Entry, Inode, RAFS_ATTR_BLOCK_SIZE, RAFS_MAX_METADATA_SIZE, RAFS_MAX_NAME,
+    RafsInode, RafsInodeWalkAction, RafsInodeWalkHandler, RafsSuperBlock, RafsSuperInodes,
+    RafsSuperMeta,
 };
 use crate::{RafsError, RafsInodeExt, RafsIoReader, RafsResult};
 

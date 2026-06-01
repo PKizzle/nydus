@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use nydus_api::ConfigV2;
 use nydus_rafs::metadata::chunk::ChunkWrapper;
 use nydus_rafs::metadata::layout::v5::RafsV5ChunkInfo;
@@ -295,10 +295,12 @@ mod tests {
         // Test with invalid type
         let result = parse_chunk_dict_arg("boltdb=/var/db/dict.db");
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("invalid chunk dict type"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("invalid chunk dict type")
+        );
     }
 
     #[test]
@@ -355,9 +357,10 @@ mod tests {
         // Add chunk and retrieve it
         dict.add_chunk(chunk.clone(), digest::Algorithm::Sha256);
         assert!(dict.get_chunk(chunk.id(), 0).is_some());
-        assert!(dict
-            .get_chunk(chunk.id(), chunk.uncompressed_size())
-            .is_some());
+        assert!(
+            dict.get_chunk(chunk.id(), chunk.uncompressed_size())
+                .is_some()
+        );
     }
 
     #[test]

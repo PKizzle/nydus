@@ -6,10 +6,10 @@
 use std::fs::{File, OpenOptions};
 use std::io::{Result, Write};
 use std::os::unix::io::AsRawFd;
-use std::sync::atomic::{AtomicU32, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
 
 use nydus_utils::div_round_up;
-use nydus_utils::filemap::{clone_file, FileMapState};
+use nydus_utils::filemap::{FileMapState, clone_file};
 
 use crate::utils::readahead;
 

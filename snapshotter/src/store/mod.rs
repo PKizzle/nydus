@@ -10,7 +10,7 @@
 //! for inherently bucket-like metadata while still giving us crash-safe,
 //! single-writer transactions and straightforward migration tooling.
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use fjall::{
     KeyspaceCreateOptions, PersistMode, Readable, SingleWriterTxDatabase, SingleWriterTxKeyspace,
 };

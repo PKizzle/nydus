@@ -491,11 +491,13 @@ mod tests {
         assert_eq!(status.queued_total, 1);
         assert_eq!(status.dropped_total, 1);
         assert_eq!(status.known_jobs, 1);
-        assert!(!state
-            .queued_or_done
-            .lock()
-            .unwrap()
-            .contains(&job_key("registry.local/second:1")));
+        assert!(
+            !state
+                .queued_or_done
+                .lock()
+                .unwrap()
+                .contains(&job_key("registry.local/second:1"))
+        );
     }
 
     #[test]
@@ -549,9 +551,10 @@ mod tests {
             args[0..6],
             ["-c", "3", "nice", "-n", "19", "/usr/bin/nydusify"]
         );
-        assert!(args
-            .windows(2)
-            .any(|w| w == ["--source", "registry.local/app:1"]));
+        assert!(
+            args.windows(2)
+                .any(|w| w == ["--source", "registry.local/app:1"])
+        );
         assert!(args.windows(2).any(|w| w == ["--target-suffix", "-zran"]));
         assert!(args.contains(&"--oci-ref".to_string()));
         assert!(args.contains(&"--prefetch-patterns".to_string()));

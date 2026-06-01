@@ -14,8 +14,8 @@ use std::{
 };
 
 use nydus_api::ConfigV2;
-use nydus_rafs::metadata::{RafsInode, RafsInodeExt, RafsInodeWalkAction, RafsSuper};
 use nydus_rafs::RafsIoReader;
+use nydus_rafs::metadata::{RafsInode, RafsInodeExt, RafsInodeWalkAction, RafsSuper};
 use nydus_storage::device::BlobChunkInfo;
 use serde_json::Value;
 

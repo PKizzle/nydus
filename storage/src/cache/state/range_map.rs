@@ -4,8 +4,8 @@
 
 use std::io::Result;
 
-use crate::cache::state::persist_map::PersistMap;
 use crate::cache::state::RangeMap;
+use crate::cache::state::persist_map::PersistMap;
 
 /// The name suffix of blob chunk_map file, named $blob_id.chunk_map.
 const FILE_SUFFIX: &str = "range_map";
@@ -209,9 +209,10 @@ mod tests {
             10
         );
         assert!(map.set_range_ready_and_clear_pending(1, 10).is_ok());
-        assert!(map
-            .check_range_ready_and_mark_pending(1, 10)
-            .unwrap()
-            .is_none());
+        assert!(
+            map.check_range_ready_and_mark_pending(1, 10)
+                .unwrap()
+                .is_none()
+        );
     }
 }

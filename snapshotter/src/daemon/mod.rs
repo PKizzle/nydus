@@ -18,27 +18,27 @@ use std::collections::HashMap;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
+use async_lock::{Mutex, RwLock};
 use mio::{Poll, Token, Waker};
 use nydus_api::BuildTimeInfo;
+use nydus_service::Error as ServiceError;
 use nydus_service::daemon::{
     DaemonState, DaemonStateMachineInput, DaemonStateMachineSubscriber, NydusDaemon,
 };
 use nydus_service::upgrade::FailoverPolicy;
-use nydus_service::Error as ServiceError;
-use nydus_service::{create_fuse_daemon, create_vfs_backend, FsBackendMountCmd, FsBackendType};
-use async_lock::{Mutex, RwLock};
+use nydus_service::{FsBackendMountCmd, FsBackendType, create_fuse_daemon, create_vfs_backend};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tracing::{debug, info, warn};
 
 use crate::config::{FsDriverType, SnapshotterConfig};
 use crate::daemon::config_builder::{build_blob_cache_entry, build_registry_config};
-use crate::daemon::image_ref::{parse_image_ref, ImageRef};
+use crate::daemon::image_ref::{ImageRef, parse_image_ref};
 use crate::prefetch_profile::runtime_prefetch_for_image;
 
 #[cfg(target_os = "linux")]
@@ -1149,9 +1149,10 @@ mod tests {
         let a = slug_for("docker.io/library/nginx:latest");
         let b = slug_for("docker.io/library/nginx:latest");
         assert_eq!(a, b);
-        assert!(a
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_')));
+        assert!(
+            a.chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
+        );
         assert_ne!(
             slug_for("docker.io/library/nginx:1"),
             slug_for("docker.io/library/nginx:2")

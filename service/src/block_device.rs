@@ -21,19 +21,19 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::thread::JoinHandle;
 
+use compio::buf::{BufResult, IntoInner, IoBufMut};
+use compio::io::AsyncWriteAt;
 use dbs_allocator::{Constraint, IntervalTree, NodeState, Range};
 use nydus_api::BlobCacheEntry;
 use nydus_rafs::metadata::layout::v6::{
-    EROFS_BLOCK_BITS_12, EROFS_BLOCK_BITS_9, EROFS_BLOCK_SIZE_4096, EROFS_BLOCK_SIZE_512,
+    EROFS_BLOCK_BITS_9, EROFS_BLOCK_BITS_12, EROFS_BLOCK_SIZE_512, EROFS_BLOCK_SIZE_4096,
 };
 use nydus_storage::utils::alloc_buf;
 use nydus_utils::digest::{self, RafsDigest};
 use nydus_utils::round_up;
 use nydus_utils::verity::VerityGenerator;
-use compio::buf::{BufResult, IntoInner, IoBufMut};
-use compio::io::AsyncWriteAt;
 
-use crate::blob_cache::{generate_blob_key, BlobCacheMgr, BlobConfig, DataBlob, MetaBlob};
+use crate::blob_cache::{BlobCacheMgr, BlobConfig, DataBlob, MetaBlob, generate_blob_key};
 
 const BLOCK_DEVICE_EXPORT_BATCH_SIZE: usize = 0x80000;
 
@@ -89,13 +89,13 @@ impl BlockDevice {
                 return Err(enoent!(format!(
                     "block_device: can not find blob {} in blob cache manager",
                     blob_id
-                )))
+                )));
             }
             Some(BlobConfig::DataBlob(_v)) => {
                 return Err(einval!(format!(
                     "block_device: blob {} is not a metadata blob",
                     blob_id
-                )))
+                )));
             }
             Some(BlobConfig::MetaBlob(v)) => v,
         };
@@ -540,23 +540,25 @@ impl BlockDevice {
             let generator = generator.clone();
             let block_device = block_device.clone();
             let path = path.clone();
-            compio::runtime::Runtime::new().unwrap().block_on(async move {
-                let output_file = Rc::new(
-                    compio::fs::OpenOptions::new()
-                        .read(true)
-                        .write(true)
-                        .open(&path)
-                        .await
-                        .map_err(|e| {
-                            eother!(format!(
-                                "block_device: failed to open output file {}, {}",
-                                path.display(),
-                                e
-                            ))
-                        })?,
-                );
-                Self::do_export(block_device, output_file, 0, blocks, generator).await
-            })?;
+            compio::runtime::Runtime::new()
+                .unwrap()
+                .block_on(async move {
+                    let output_file = Rc::new(
+                        compio::fs::OpenOptions::new()
+                            .read(true)
+                            .write(true)
+                            .open(&path)
+                            .await
+                            .map_err(|e| {
+                                eother!(format!(
+                                    "block_device: failed to open output file {}, {}",
+                                    path.display(),
+                                    e
+                                ))
+                            })?,
+                    );
+                    Self::do_export(block_device, output_file, 0, blocks, generator).await
+                })?;
         } else {
             let mut thread_handlers: Vec<JoinHandle<Result<()>>> =
                 Vec::with_capacity(threads as usize);
@@ -571,32 +573,34 @@ impl BlockDevice {
                 let generator = generator.clone();
 
                 let handler = thread::spawn(move || {
-                    compio::runtime::Runtime::new().unwrap().block_on(async move {
-                        let file = Rc::new(
-                            compio::fs::OpenOptions::new()
-                                .read(true)
-                                .write(true)
-                                .open(&path)
+                    compio::runtime::Runtime::new()
+                        .unwrap()
+                        .block_on(async move {
+                            let file = Rc::new(
+                                compio::fs::OpenOptions::new()
+                                    .read(true)
+                                    .write(true)
+                                    .open(&path)
+                                    .await
+                                    .map_err(|e| {
+                                        eother!(format!(
+                                            "block_device: failed to open output file {}, {}",
+                                            path.display(),
+                                            e
+                                        ))
+                                    })?,
+                            );
+                            let block_device = BlockDevice::new_with_cache_manager(id, mgr)
                                 .await
                                 .map_err(|e| {
-                                    eother!(format!(
-                                        "block_device: failed to open output file {}, {}",
-                                        path.display(),
-                                        e
-                                    ))
-                                })?,
-                        );
-                        let block_device = BlockDevice::new_with_cache_manager(id, mgr)
-                            .await
-                            .map_err(|e| {
                                 eother!(format!(
                                     "block_device: failed to create block device object, {}",
                                     e
                                 ))
                             })?;
-                        let device = Rc::new(block_device);
-                        Self::do_export(device, file, pos, count, generator).await
-                    })?;
+                            let device = Rc::new(block_device);
+                            Self::do_export(device, file, pos, count, generator).await
+                        })?;
                     Ok(())
                 });
                 pos += count;
@@ -629,7 +633,10 @@ impl BlockDevice {
                 .fold(String::new(), |acc, v| acc + &format!("{:02x}", v));
             println!(
                 "dm-verity options: --no-superblock --format=1 -s \"\" --hash=sha256 --data-block-size={} --hash-block-size=4096 --data-blocks {} --hash-offset {} {}",
-                block_device.block_size(), blocks, verity_offset, root_digest
+                block_device.block_size(),
+                blocks,
+                verity_offset,
+                root_digest
             );
         }
 
@@ -665,9 +672,7 @@ impl BlockDevice {
             // compio implements AsyncWriteAt for `&File`, so write through a shared reference
             // (the file is behind an `Rc` and cannot be borrowed mutably).
             let mut out: &compio::fs::File = &output_file;
-            let BufResult(res, buf2) = out
-                .write_at(buf, block_device.blocks_to_size(pos))
-                .await;
+            let BufResult(res, buf2) = out.write_at(buf, block_device.blocks_to_size(pos)).await;
             let sz1 = res?;
             if sz1 != sz {
                 return Err(eio!(
@@ -730,51 +735,64 @@ mod tests {
 
         let mgr = Arc::new(mgr);
         // assert with wrong blob_id
-        assert!(compio::runtime::Runtime::new().unwrap().block_on(BlockDevice::new_with_cache_manager(String::from("blob_id"), mgr.clone())).is_err());
-        let device = compio::runtime::Runtime::new().unwrap().block_on(BlockDevice::new_with_cache_manager(blob_id, mgr)).unwrap();
+        assert!(
+            compio::runtime::Runtime::new()
+                .unwrap()
+                .block_on(BlockDevice::new_with_cache_manager(
+                    String::from("blob_id"),
+                    mgr.clone()
+                ))
+                .is_err()
+        );
+        let device = compio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(BlockDevice::new_with_cache_manager(blob_id, mgr))
+            .unwrap();
         assert_eq!(device.blocks(), 0x209);
 
-        compio::runtime::Runtime::new().unwrap().block_on(async move {
-            let buf = vec![0u8; 8192];
-            let (res, buf) = device.async_read(u32::MAX, u32::MAX, buf).await;
-            assert!(res.is_err());
-            assert_eq!(buf.len(), 8192);
-            let (res, _buf) = device.async_read(0, 1, vec![0u8]).await;
-            assert!(res.is_err());
+        compio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(async move {
+                let buf = vec![0u8; 8192];
+                let (res, buf) = device.async_read(u32::MAX, u32::MAX, buf).await;
+                assert!(res.is_err());
+                assert_eq!(buf.len(), 8192);
+                let (res, _buf) = device.async_read(0, 1, vec![0u8]).await;
+                assert!(res.is_err());
 
-            let (res, buf) = device.async_read(0, 1, buf).await;
-            assert_eq!(buf.len(), 8192);
-            assert_eq!(res.unwrap(), 4096);
-            assert_eq!(buf[0], 0);
-            assert_eq!(buf[1023], 0);
-            assert_eq!(buf[1024], 0xe2);
-            assert_eq!(buf[1027], 0xe0);
+                let (res, buf) = device.async_read(0, 1, buf).await;
+                assert_eq!(buf.len(), 8192);
+                assert_eq!(res.unwrap(), 4096);
+                assert_eq!(buf[0], 0);
+                assert_eq!(buf[1023], 0);
+                assert_eq!(buf[1024], 0xe2);
+                assert_eq!(buf[1027], 0xe0);
 
-            let (res, buf) = device.async_read(4, 2, buf).await;
-            assert_eq!(res.unwrap(), 8192);
-            assert_eq!(buf[4096], 0);
-            assert_eq!(buf[5119], 0);
-            assert_eq!(buf[5120], 0);
-            assert_eq!(buf[5123], 0);
-            assert_eq!(buf[5372], 0);
-            assert_eq!(buf[8191], 0);
+                let (res, buf) = device.async_read(4, 2, buf).await;
+                assert_eq!(res.unwrap(), 8192);
+                assert_eq!(buf[4096], 0);
+                assert_eq!(buf[5119], 0);
+                assert_eq!(buf[5120], 0);
+                assert_eq!(buf[5123], 0);
+                assert_eq!(buf[5372], 0);
+                assert_eq!(buf[8191], 0);
 
-            let (res, buf) = device.async_read(0x200, 2, buf).await;
-            assert_eq!(buf.len(), 8192);
-            assert_eq!(res.unwrap(), 8192);
+                let (res, buf) = device.async_read(0x200, 2, buf).await;
+                assert_eq!(buf.len(), 8192);
+                assert_eq!(res.unwrap(), 8192);
 
-            let (res, buf) = device.async_read(0x208, 2, buf).await;
-            assert_eq!(buf.len(), 8192);
-            assert!(res.is_err());
+                let (res, buf) = device.async_read(0x208, 2, buf).await;
+                assert_eq!(buf.len(), 8192);
+                assert!(res.is_err());
 
-            let (res, buf) = device.async_read(0x208, 1, buf).await;
-            assert_eq!(buf.len(), 8192);
-            assert_eq!(res.unwrap(), 4096);
+                let (res, buf) = device.async_read(0x208, 1, buf).await;
+                assert_eq!(buf.len(), 8192);
+                assert_eq!(res.unwrap(), 4096);
 
-            let (res, buf) = device.async_read(0x209, 1, buf).await;
-            assert_eq!(buf.len(), 8192);
-            assert!(res.is_err());
-        });
+                let (res, buf) = device.async_read(0x209, 1, buf).await;
+                assert_eq!(buf.len(), 8192);
+                assert!(res.is_err());
+            });
     }
 
     fn create_bootstrap_entry(tmp_dir: &TempDir) -> BlobCacheEntry {
@@ -813,7 +831,12 @@ mod tests {
 
         // config with non-existing path
         let entry: BlobCacheEntry = serde_json::from_str(config).unwrap();
-        assert!(compio::runtime::Runtime::new().unwrap().block_on(BlockDevice::new(entry)).is_err());
+        assert!(
+            compio::runtime::Runtime::new()
+                .unwrap()
+                .block_on(BlockDevice::new(entry))
+                .is_err()
+        );
 
         // config with correct path
         let content = config
@@ -828,7 +851,9 @@ mod tests {
         let tmp_dir = TempDir::new().unwrap();
         let entry = create_bootstrap_entry(&tmp_dir);
 
-        let device = compio::runtime::Runtime::new().unwrap().block_on(BlockDevice::new(entry));
+        let device = compio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(BlockDevice::new(entry));
         assert!(device.is_ok());
         let device = device.unwrap();
         assert_eq!(device.blocks(), 0x209);
@@ -842,7 +867,10 @@ mod tests {
         let tmp_dir = TempDir::new().unwrap();
         let entry = create_bootstrap_entry(&tmp_dir);
 
-        let device = compio::runtime::Runtime::new().unwrap().block_on(BlockDevice::new(entry)).unwrap();
+        let device = compio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(BlockDevice::new(entry))
+            .unwrap();
         assert_eq!(device.blocks(), 0x209);
 
         (device, tmp_dir)
@@ -941,216 +969,248 @@ mod tests {
     #[test]
     fn test_fetch_ranges_invalid() {
         let device = create_block_device();
-        compio::runtime::Runtime::new().unwrap().block_on(async move {
-            // Overflow check
-            let res = device.fetch_ranges(u32::MAX, u32::MAX, false).await;
-            assert!(res.is_err());
-        });
+        compio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(async move {
+                // Overflow check
+                let res = device.fetch_ranges(u32::MAX, u32::MAX, false).await;
+                assert!(res.is_err());
+            });
     }
 
     #[test]
     fn test_fetch_ranges_out_of_range() {
         let device = create_block_device();
-        compio::runtime::Runtime::new().unwrap().block_on(async move {
-            // Past device end
-            let res = device.fetch_ranges(0x20A, 1, false).await;
-            assert!(res.is_err());
-        });
+        compio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(async move {
+                // Past device end
+                let res = device.fetch_ranges(0x20A, 1, false).await;
+                assert!(res.is_err());
+            });
     }
 
     #[test]
     fn test_fetch_ranges_meta_blob() {
         let device = create_block_device();
-        compio::runtime::Runtime::new().unwrap().block_on(async move {
-            // Block 0 is MetaBlob
-            let ranges = device.fetch_ranges(0, 1, false).await.unwrap();
-            assert!(!ranges.is_empty());
-            let (fd, _offset, sz, _block_offset) = &ranges[0];
-            assert!(*fd >= 0);
-            assert_eq!(*sz, 4096);
+        compio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(async move {
+                // Block 0 is MetaBlob
+                let ranges = device.fetch_ranges(0, 1, false).await.unwrap();
+                assert!(!ranges.is_empty());
+                let (fd, _offset, sz, _block_offset) = &ranges[0];
+                assert!(*fd >= 0);
+                assert_eq!(*sz, 4096);
 
-            // Multiple MetaBlob blocks
-            let ranges = device.fetch_ranges(0, 5, false).await.unwrap();
-            assert!(!ranges.is_empty());
-            let (fd, _offset, sz, _block_offset) = &ranges[0];
-            assert!(*fd >= 0);
-            assert_eq!(*sz, 5 * 4096);
-        });
+                // Multiple MetaBlob blocks
+                let ranges = device.fetch_ranges(0, 5, false).await.unwrap();
+                assert!(!ranges.is_empty());
+                let (fd, _offset, sz, _block_offset) = &ranges[0];
+                assert!(*fd >= 0);
+                assert_eq!(*sz, 5 * 4096);
+            });
     }
 
     #[test]
     fn test_fetch_ranges_meta_blob_probe() {
         let device = create_block_device();
-        compio::runtime::Runtime::new().unwrap().block_on(async move {
-            // probe_only on MetaBlob should still return ranges (MetaBlob is always ready)
-            let ranges = device.fetch_ranges(0, 1, true).await.unwrap();
-            assert!(!ranges.is_empty());
-            let (fd, _offset, sz, _block_offset) = &ranges[0];
-            assert!(*fd >= 0);
-            assert_eq!(*sz, 4096);
-        });
+        compio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(async move {
+                // probe_only on MetaBlob should still return ranges (MetaBlob is always ready)
+                let ranges = device.fetch_ranges(0, 1, true).await.unwrap();
+                assert!(!ranges.is_empty());
+                let (fd, _offset, sz, _block_offset) = &ranges[0];
+                assert!(*fd >= 0);
+                assert_eq!(*sz, 4096);
+            });
     }
 
     #[test]
     fn test_fetch_ranges_data_blob() {
         let (device, _tmp_dir) = create_block_device_with_tmpdir();
-        compio::runtime::Runtime::new().unwrap().block_on(async move {
-            // Block 0x200 is DataBlob
-            let ranges = device.fetch_ranges(0x200, 2, false).await.unwrap();
-            assert!(!ranges.is_empty());
-            let (fd, _offset, sz, _block_offset) = &ranges[0];
-            assert!(*fd >= 0);
-            assert_eq!(*sz, 2 * 4096);
-        });
+        compio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(async move {
+                // Block 0x200 is DataBlob
+                let ranges = device.fetch_ranges(0x200, 2, false).await.unwrap();
+                assert!(!ranges.is_empty());
+                let (fd, _offset, sz, _block_offset) = &ranges[0];
+                assert!(*fd >= 0);
+                assert_eq!(*sz, 2 * 4096);
+            });
     }
 
     #[test]
     fn test_fetch_ranges_data_blob_probe() {
         let (device, _tmp_dir) = create_block_device_with_tmpdir();
-        compio::runtime::Runtime::new().unwrap().block_on(async move {
-            // probe_only on DataBlob exercises probe_blob_ranges
-            let ranges = device.fetch_ranges(0x200, 2, true).await.unwrap();
-            // May or may not have ready ranges depending on cache state,
-            // but should not error
-            for (fd, _offset, sz, _block_offset) in &ranges {
-                assert!(*fd >= 0);
-                assert!(*sz > 0);
-            }
-        });
+        compio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(async move {
+                // probe_only on DataBlob exercises probe_blob_ranges
+                let ranges = device.fetch_ranges(0x200, 2, true).await.unwrap();
+                // May or may not have ready ranges depending on cache state,
+                // but should not error
+                for (fd, _offset, sz, _block_offset) in &ranges {
+                    assert!(*fd >= 0);
+                    assert!(*sz > 0);
+                }
+            });
     }
 
     #[test]
     fn test_fetch_ranges_mixed() {
         let (device, _tmp_dir) = create_block_device_with_tmpdir();
-        compio::runtime::Runtime::new().unwrap().block_on(async move {
-            // Span across MetaBlob + Hole: blocks 0-5+
-            // MetaBlob is blocks 0-4, after that is Hole until DataBlob
-            let ranges = device.fetch_ranges(0, 6, false).await.unwrap();
-            // Should have at least MetaBlob range; Hole is skipped
-            assert!(!ranges.is_empty());
-        });
+        compio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(async move {
+                // Span across MetaBlob + Hole: blocks 0-5+
+                // MetaBlob is blocks 0-4, after that is Hole until DataBlob
+                let ranges = device.fetch_ranges(0, 6, false).await.unwrap();
+                // Should have at least MetaBlob range; Hole is skipped
+                assert!(!ranges.is_empty());
+            });
     }
 
     #[test]
     fn test_fetch_ranges_hole() {
         let device = create_block_device();
-        compio::runtime::Runtime::new().unwrap().block_on(async move {
-            // Block 5 is in the hole region between MetaBlob and DataBlob
-            let ranges = device.fetch_ranges(5, 1, false).await.unwrap();
-            // Holes produce no ranges
-            assert!(ranges.is_empty());
-        });
+        compio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(async move {
+                // Block 5 is in the hole region between MetaBlob and DataBlob
+                let ranges = device.fetch_ranges(5, 1, false).await.unwrap();
+                // Holes produce no ranges
+                assert!(ranges.is_empty());
+            });
     }
 
     #[test]
     fn test_fetch_ranges_zero_blocks() {
         let device = create_block_device();
-        compio::runtime::Runtime::new().unwrap().block_on(async move {
-            let ranges = device.fetch_ranges(0, 0, false).await.unwrap();
-            assert!(ranges.is_empty());
-        });
+        compio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(async move {
+                let ranges = device.fetch_ranges(0, 0, false).await.unwrap();
+                assert!(ranges.is_empty());
+            });
     }
 
     #[test]
     fn test_fetch_ranges_meta_blob_offsets() {
         let device = create_block_device();
-        compio::runtime::Runtime::new().unwrap().block_on(async move {
-            // Fetch blocks 2..5 from MetaBlob (blocks 0-4)
-            let ranges = device.fetch_ranges(2, 3, false).await.unwrap();
-            assert_eq!(ranges.len(), 1);
-            let (fd, offset, sz, block_offset) = &ranges[0];
-            assert!(*fd >= 0);
-            assert_eq!(*offset, 2 * 4096);
-            assert_eq!(*sz, 3 * 4096);
-            assert_eq!(*block_offset, 2 * 4096);
-        });
+        compio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(async move {
+                // Fetch blocks 2..5 from MetaBlob (blocks 0-4)
+                let ranges = device.fetch_ranges(2, 3, false).await.unwrap();
+                assert_eq!(ranges.len(), 1);
+                let (fd, offset, sz, block_offset) = &ranges[0];
+                assert!(*fd >= 0);
+                assert_eq!(*offset, 2 * 4096);
+                assert_eq!(*sz, 3 * 4096);
+                assert_eq!(*block_offset, 2 * 4096);
+            });
     }
 
     #[test]
     fn test_fetch_ranges_data_blob_offsets() {
         let (device, _tmp_dir) = create_block_device_with_tmpdir();
-        compio::runtime::Runtime::new().unwrap().block_on(async move {
-            // Block 0x200 is the start of DataBlob region
-            let ranges = device.fetch_ranges(0x200, 1, false).await.unwrap();
-            assert_eq!(ranges.len(), 1);
-            let (_fd, offset, sz, block_offset) = &ranges[0];
-            assert_eq!(*sz, 4096);
-            assert_eq!(*block_offset, 0x200u64 * 4096);
-            // offset is relative to the DataBlob range start
-            assert_eq!(*offset, 0);
-        });
+        compio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(async move {
+                // Block 0x200 is the start of DataBlob region
+                let ranges = device.fetch_ranges(0x200, 1, false).await.unwrap();
+                assert_eq!(ranges.len(), 1);
+                let (_fd, offset, sz, block_offset) = &ranges[0];
+                assert_eq!(*sz, 4096);
+                assert_eq!(*block_offset, 0x200u64 * 4096);
+                // offset is relative to the DataBlob range start
+                assert_eq!(*offset, 0);
+            });
     }
 
     #[test]
     fn test_fetch_ranges_probe_after_fetch() {
         let (device, _tmp_dir) = create_block_device_with_tmpdir();
-        compio::runtime::Runtime::new().unwrap().block_on(async move {
-            // First fetch to populate cache (makes chunks ready)
-            let ranges = device.fetch_ranges(0x200, 2, false).await.unwrap();
-            assert!(!ranges.is_empty());
+        compio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(async move {
+                // First fetch to populate cache (makes chunks ready)
+                let ranges = device.fetch_ranges(0x200, 2, false).await.unwrap();
+                assert!(!ranges.is_empty());
 
-            // Now probe — chunks should be ready, exercising:
-            // - (None, true) branch in probe_blob_ranges
-            // - last-range closing logic
-            let probe_ranges = device.fetch_ranges(0x200, 2, true).await.unwrap();
-            assert!(!probe_ranges.is_empty());
-            for (fd, _offset, sz, _block_offset) in &probe_ranges {
-                assert!(*fd >= 0);
-                assert!(*sz > 0);
-            }
-        });
+                // Now probe — chunks should be ready, exercising:
+                // - (None, true) branch in probe_blob_ranges
+                // - last-range closing logic
+                let probe_ranges = device.fetch_ranges(0x200, 2, true).await.unwrap();
+                assert!(!probe_ranges.is_empty());
+                for (fd, _offset, sz, _block_offset) in &probe_ranges {
+                    assert!(*fd >= 0);
+                    assert!(*sz > 0);
+                }
+            });
     }
 
     #[test]
     fn test_fetch_ranges_probe_cold() {
         let (device, _tmp_dir) = create_block_device_with_tmpdir();
-        compio::runtime::Runtime::new().unwrap().block_on(async move {
-            // Probe without prior fetch — no chunks ready
-            let ranges = device.fetch_ranges(0x200, 2, true).await.unwrap();
-            // Empty or partial depending on cache state
-            // This exercises the (None, false) -> _ => {} branch
-            let _ = ranges;
-        });
+        compio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(async move {
+                // Probe without prior fetch — no chunks ready
+                let ranges = device.fetch_ranges(0x200, 2, true).await.unwrap();
+                // Empty or partial depending on cache state
+                // This exercises the (None, false) -> _ => {} branch
+                let _ = ranges;
+            });
     }
 
     #[test]
     fn test_fetch_ranges_probe_mixed_ready() {
         let (device, _tmp_dir) = create_block_device_with_tmpdir();
-        compio::runtime::Runtime::new().unwrap().block_on(async move {
-            // Fetch only 1 block to make some chunks ready
-            let _ = device.fetch_ranges(0x200, 1, false).await.unwrap();
+        compio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(async move {
+                // Fetch only 1 block to make some chunks ready
+                let _ = device.fetch_ranges(0x200, 1, false).await.unwrap();
 
-            // Probe 2 blocks — first block's chunks ready, second not yet
-            // Exercises (Some(start), false) transition in probe_blob_ranges
-            let ranges = device.fetch_ranges(0x200, 2, true).await.unwrap();
-            // Should have at least the ready range
-            for (fd, _offset, sz, _block_offset) in &ranges {
-                assert!(*fd >= 0);
-                assert!(*sz > 0);
-            }
-        });
+                // Probe 2 blocks — first block's chunks ready, second not yet
+                // Exercises (Some(start), false) transition in probe_blob_ranges
+                let ranges = device.fetch_ranges(0x200, 2, true).await.unwrap();
+                // Should have at least the ready range
+                for (fd, _offset, sz, _block_offset) in &ranges {
+                    assert!(*fd >= 0);
+                    assert!(*sz > 0);
+                }
+            });
     }
 
     #[test]
     fn test_async_read_zero_buf() {
         let (device, _tmp_dir) = create_block_device_with_tmpdir();
-        compio::runtime::Runtime::new().unwrap().block_on(async move {
-            // Zero-length read triggers async_fetch(pos, 0) short-circuit
-            let buf = vec![0u8; 0];
-            let (res, _buf) = device.async_read(0x200, 0, buf).await;
-            assert_eq!(res.unwrap(), 0);
-        });
+        compio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(async move {
+                // Zero-length read triggers async_fetch(pos, 0) short-circuit
+                let buf = vec![0u8; 0];
+                let (res, _buf) = device.async_read(0x200, 0, buf).await;
+                assert_eq!(res.unwrap(), 0);
+            });
     }
 
     #[test]
     fn test_async_read_data_blob() {
         let (device, _tmp_dir) = create_block_device_with_tmpdir();
-        compio::runtime::Runtime::new().unwrap().block_on(async move {
-            // Read from DataBlob — exercises async_fetch normal path
-            // and async_read Ok branch in blob_cache.rs
-            let buf = vec![0u8; 4096];
-            let (res, _buf) = device.async_read(0x200, 1, buf).await;
-            assert_eq!(res.unwrap(), 4096);
-        });
+        compio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(async move {
+                // Read from DataBlob — exercises async_fetch normal path
+                // and async_read Ok branch in blob_cache.rs
+                let buf = vec![0u8; 4096];
+                let (res, _buf) = device.async_read(0x200, 1, buf).await;
+                assert_eq!(res.unwrap(), 4096);
+            });
     }
 }

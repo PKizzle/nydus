@@ -2,8 +2,8 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-use std::collections::hash_map::Entry;
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::fmt::{self, Display, Formatter};
 use std::fs::{File, OpenOptions};
 use std::io::Error;
@@ -221,9 +221,9 @@ impl CasMgr {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::RAFS_DEFAULT_CHUNK_SIZE;
     use crate::device::BlobFeatures;
     use crate::test::MockChunkInfo;
-    use crate::RAFS_DEFAULT_CHUNK_SIZE;
     use std::io::{Read, Seek, SeekFrom, Write};
     use vmm_sys_util::tempfile::TempFile;
 

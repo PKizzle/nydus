@@ -81,7 +81,7 @@ mod tests {
 
     use vmm_sys_util::tempfile::TempFile;
 
-    use crate::{mock::MockChunkInfo, RafsIoRead};
+    use crate::{RafsIoRead, mock::MockChunkInfo};
 
     use super::*;
 

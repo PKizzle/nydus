@@ -12,7 +12,7 @@ use nydus_builder::Tree;
 use nydus_builder::{ChunkdictBlobInfo, ChunkdictChunkInfo};
 use nydus_rafs::metadata::{RafsSuper, RafsVersion};
 use nydus_storage::device::BlobInfo;
-use rusqlite::{params, Connection};
+use rusqlite::{Connection, params};
 use std::collections::HashSet;
 use std::collections::{BTreeMap, HashMap};
 use std::convert::TryFrom;
@@ -346,7 +346,9 @@ impl Algorithm<SqliteDatabase> {
         let (chunkdict_version, chunkdict_image) = match &self.algorithm_name as &str {
             "exponential_smoothing" => Self::deduplicate_version(&all_chunks)?,
             _ => {
-                bail!("Unsupported algorithm name:, please use a valid algorithm name, such as exponential_smoothing")
+                bail!(
+                    "Unsupported algorithm name:, please use a valid algorithm name, such as exponential_smoothing"
+                )
             }
         };
         for single_clustering in chunkdict_image {

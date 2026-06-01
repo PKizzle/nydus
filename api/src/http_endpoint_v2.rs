@@ -15,8 +15,8 @@ use crate::http::{
     ApiError, ApiRequest, ApiResponse, ApiResponsePayload, BlobCacheObjectId, HttpError,
 };
 use crate::http_handler::{
-    error_response, extract_query_part, parse_body, success_response, translate_status_code,
-    EndpointHandler, HttpResult,
+    EndpointHandler, HttpResult, error_response, extract_query_part, parse_body, success_response,
+    translate_status_code,
 };
 
 /// HTTP URI prefix for API v2.

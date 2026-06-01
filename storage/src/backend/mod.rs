@@ -24,8 +24,8 @@ use async_trait::async_trait;
 use fuse_backend_rs::file_buf::FileVolatileSlice;
 use nydus_utils::metrics::{BackendMetrics, ERROR_HOLDER};
 
-use crate::utils::{alloc_buf, copyv};
 use crate::StorageError;
+use crate::utils::{alloc_buf, copyv};
 
 #[cfg(any(
     feature = "backend-oss",
