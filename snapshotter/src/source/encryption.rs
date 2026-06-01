@@ -237,7 +237,7 @@ mod tests {
         assert_eq!(detect_format(b"plain"), EncryptionFormat::Unknown);
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn decrypt_layer_reports_missing_key_before_backend() {
         let err = decrypt_layer(b"plain", b"").await.unwrap_err();
         assert!(err.to_string().contains("key is empty"));
@@ -258,7 +258,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn decrypt_layer_uses_explicit_provider() {
         let decrypted = decrypt_layer_with_provider(b"ciphertext", b"key", &EchoProvider)
             .await

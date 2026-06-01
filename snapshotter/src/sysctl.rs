@@ -1193,7 +1193,7 @@ mod tests {
         )
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn list_daemons_is_empty_for_new_controller() {
         let dir = tempdir().unwrap();
         let controller = test_controller(dir.path().to_path_buf());
@@ -1239,7 +1239,7 @@ mod tests {
         assert_eq!(controller.cache_usage().unwrap().total_files, 0);
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn route_daemons_returns_json_array() {
         let dir = tempdir().unwrap();
         let controller = test_controller(dir.path().to_path_buf());
@@ -1258,7 +1258,7 @@ mod tests {
         assert_eq!(body, serde_json::json!([]));
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn route_daemon_records_and_detail_return_persisted_records() {
         let dir = tempdir().unwrap();
         let controller = test_controller(dir.path().to_path_buf());
@@ -1308,7 +1308,7 @@ mod tests {
         assert_eq!(body["slug"], "abc-app");
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn route_upgrade_reports_no_daemons_when_empty() {
         let dir = tempdir().unwrap();
         let controller = test_controller(dir.path().to_path_buf());
@@ -1329,7 +1329,7 @@ mod tests {
         assert_eq!(body["report"]["records"], serde_json::json!([]));
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn route_spawn_rejects_missing_bootstrap() {
         let dir = tempdir().unwrap();
         let controller = test_controller(dir.path().to_path_buf());
@@ -1353,7 +1353,7 @@ mod tests {
         assert!(body["error"].as_str().unwrap().contains("is missing"));
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn route_cache_usage_reports_files() {
         let dir = tempdir().unwrap();
         let controller = test_controller(dir.path().to_path_buf());
@@ -1377,7 +1377,7 @@ mod tests {
         assert_eq!(body["entries"][0]["kind"], "blob_data");
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn route_cache_gc_accepts_policy_override() {
         let dir = tempdir().unwrap();
         let controller = test_controller(dir.path().to_path_buf());
@@ -1402,7 +1402,7 @@ mod tests {
         assert_eq!(body["removals"][0]["dry_run"], true);
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn route_prefetch_put_and_get_round_trip() {
         let dir = tempdir().unwrap();
         let controller = test_controller(dir.path().to_path_buf());
@@ -1436,7 +1436,7 @@ mod tests {
         assert_eq!(body["registry.local/app:1"][1], "/lib/libc.so");
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn route_prefetch_profile_put_uses_structured_profile() {
         let dir = tempdir().unwrap();
         let controller = test_controller(dir.path().to_path_buf());
@@ -1476,7 +1476,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn route_auth_put_and_get_round_trip_without_secret_leak() {
         let dir = tempdir().unwrap();
         let controller = test_controller(dir.path().to_path_buf());
@@ -1509,7 +1509,7 @@ mod tests {
         }));
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn route_unknown_endpoint_returns_404() {
         let dir = tempdir().unwrap();
         let controller = test_controller(dir.path().to_path_buf());
@@ -1528,7 +1528,7 @@ mod tests {
         assert!(body["error"].as_str().unwrap().contains("unknown endpoint"));
     }
 
-    #[tokio::test]
+    #[compio::test]
     async fn route_metrics_returns_prometheus_text() {
         let dir = tempdir().unwrap();
         let controller = test_controller(dir.path().to_path_buf());
