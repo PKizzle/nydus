@@ -488,11 +488,12 @@ pub async fn serve_with_supervisor(
         parse_duration(&config.snapshotter.cache.gc_period)?,
     )
     .with_cache_gc(cache_manager, cache_gc_policy);
-    tokio::spawn(async move {
+    compio::runtime::spawn(async move {
         if let Err(e) = reconciler.run().await {
             warn!(error = %e, "reconciler exited unexpectedly");
         }
-    });
+    })
+    .detach();
 
     let snapshotter = NydusSnapshotter {
         store,
@@ -508,14 +509,15 @@ pub async fn serve_with_supervisor(
 
     info!(path = %socket_path.display(), "starting containerd proxy-plugin server");
 
-    let incoming = tokio_stream::wrappers::UnixListenerStream::new(tokio::net::UnixListener::bind(
-        &socket_path,
-    )?);
-
-    snapshots::tonic::transport::Server::builder()
-        .add_service(snapshots::server(Arc::new(snapshotter)))
-        .serve_with_incoming(incoming)
-        .await?;
+    // Serve the containerd snapshots gRPC service over compio. The service from
+    // `containerd-snapshots` is a tonic tower-service; instead of tonic's tokio
+    // transport we mount it as an axum router and run it on the compio runtime
+    // via cyper-axum's hyper-http2 server (CompioExecutor). No tokio runtime is
+    // involved — the whole snapshotter runs thread-per-core on compio/io_uring.
+    let listener = compio::net::UnixListener::bind(&socket_path).await?;
+    let grpc = snapshots::server(Arc::new(snapshotter));
+    let app = tonic::service::Routes::new(grpc).into_axum_router();
+    cyper_axum::serve(listener, app.into_make_service()).await?;
 
     Ok(())
 }
