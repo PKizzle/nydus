@@ -54,6 +54,15 @@ compio = { version = "0.19", default-features = false, features = [
 cyper-axum = { git = "https://github.com/compio-rs/cyper", rev = "d1c8aff18dd81c4b1f817d0e8e0e05408c15a04c", features = [
     "http2",
 ] }
+# cyper HTTP client for the registry referrer-detection path (replaces reqwest;
+# the rustls crypto provider is `ring`, via compio's `ring` feature above).
+cyper = { git = "https://github.com/compio-rs/cyper", rev = "d1c8aff18dd81c4b1f817d0e8e0e05408c15a04c", default-features = false, features = [
+    "rustls",
+    "json",
+    "http2",
+    "stream",
+] }
+http = "1.4"
 axum = { version = "0.8.1", default-features = false }
 async-lock = "3.4"
 async-channel = "2.3"
@@ -70,7 +79,6 @@ prost = "0.14"
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
 toml = "1.1"
-reqwest = { version = "0.13.4", features = ["json"] }
 ttrpc = "0.9.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
