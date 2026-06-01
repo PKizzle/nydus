@@ -87,11 +87,6 @@ vmm-sys-util = { workspace = true, optional = true }
 [build-dependencies]
 time = { version = "0.3.47", features = ["formatting"] }
 
-[target.'cfg(any(target_arch = "x86_64", target_arch = "aarch64"))'.dependencies]
-nydus-storage = { version = "0.7.2", path = "storage", features = [
-    "backend-dragonfly-proxy",
-] }
-
 [dev-dependencies]
 xattr = "1.6.1"
 vmm-sys-util = { workspace = true }
@@ -128,6 +123,11 @@ backend-localdisk = [
 backend-oss = ["nydus-storage/backend-oss"]
 backend-registry = ["nydus-storage/backend-registry"]
 backend-s3 = ["nydus-storage/backend-s3"]
+# Opt-in only — NOT in `default`. Pulls the third-party dragonfly-client-util,
+# which hardcodes native-tls (OpenSSL on Linux, which blocks the musl-static
+# build) and spins up its own tokio runtime (the default build runs solely on
+# compio). Enable explicitly on a glibc target when Dragonfly P2P is required.
+backend-dragonfly-proxy = ["nydus-storage/backend-dragonfly-proxy"]
 
 dedup = ["nydus-storage/dedup"]
 
