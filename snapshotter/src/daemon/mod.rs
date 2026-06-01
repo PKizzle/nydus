@@ -31,9 +31,9 @@ use nydus_service::daemon::{
 use nydus_service::upgrade::FailoverPolicy;
 use nydus_service::Error as ServiceError;
 use nydus_service::{create_fuse_daemon, create_vfs_backend, FsBackendMountCmd, FsBackendType};
+use async_lock::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, info, warn};
 
 use crate::config::{FsDriverType, SnapshotterConfig};
@@ -661,15 +661,15 @@ impl DaemonSupervisor {
             .context("failed to build blob cache entry for blockdev export")?;
 
             let export_disk = disk_image.clone();
-            tokio::task::spawn_blocking(move || export_blockdev_image(entry, export_disk, threads))
+            blocking::unblock(move || export_blockdev_image(entry, export_disk, threads))
                 .await
-                .context("blockdev export task panicked")??;
+                .context("blockdev export failed")?;
 
             let mount_disk = disk_image.clone();
             let mount_target = mountpoint.clone();
-            tokio::task::spawn_blocking(move || mount_blockdev_erofs(mount_disk, mount_target))
+            blocking::unblock(move || mount_blockdev_erofs(mount_disk, mount_target))
                 .await
-                .context("blockdev mount task panicked")??;
+                .context("blockdev mount failed")?;
 
             let daemon: Arc<dyn NydusDaemon> =
                 Arc::new(BlockdevDaemon::new(daemon_id, mountpoint.clone(), bti));

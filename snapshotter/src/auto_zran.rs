@@ -22,9 +22,10 @@ use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use tokio::io::AsyncWriteExt;
-use tokio::process::Command;
-use tokio::sync::mpsc;
+
+use async_channel::{Receiver, Sender};
+use compio::io::AsyncWriteExt;
+use compio::process::Command;
 use tracing::{debug, info, warn};
 
 /// Conversion job persisted in memory while waiting for the worker.
@@ -146,7 +147,7 @@ impl AutoZranState {
 
 /// Queue manager for the single background zran conversion worker.
 pub struct AutoZranManager {
-    sender: mpsc::Sender<AutoZranJob>,
+    sender: Sender<AutoZranJob>,
     state: Arc<AutoZranState>,
 }
 
@@ -159,14 +160,15 @@ impl AutoZranManager {
         }
 
         let depth = config.queue_depth.max(1);
-        let (sender, receiver) = mpsc::channel(depth);
+        let (sender, receiver) = async_channel::bounded(depth);
         let state = Arc::new(AutoZranState::new(depth));
         let manager = Arc::new(Self {
             sender,
             state: state.clone(),
         });
         let worker_config = config.clone();
-        tokio::spawn(async move { worker_loop(worker_config, receiver, state).await });
+        compio::runtime::spawn(async move { worker_loop(worker_config, receiver, state).await })
+            .detach();
         info!(queue_depth = depth, "auto-zran worker started");
         Some(manager)
     }
@@ -236,10 +238,10 @@ impl AutoZranManager {
 
 async fn worker_loop(
     config: AutoZranConfig,
-    mut receiver: mpsc::Receiver<AutoZranJob>,
+    receiver: Receiver<AutoZranJob>,
     state: Arc<AutoZranState>,
 ) {
-    while let Some(job) = receiver.recv().await {
+    while let Ok(job) = receiver.recv().await {
         state.mark_started(&job);
         let result = run_conversion(&config, &job).await;
         let success = result.is_ok();
@@ -262,18 +264,22 @@ async fn run_conversion(config: &AutoZranConfig, job: &AutoZranJob) -> Result<()
     info!(image = %job.image, program = ?spec.program, args = ?spec.args, "starting auto-zran conversion");
     let mut command = Command::new(&spec.program);
     command.args(&spec.args);
-    command.stdin(Stdio::piped());
-    command.stdout(Stdio::piped());
-    command.stderr(Stdio::piped());
+    // compio's stdio builders are fallible (they set up the pipe eagerly).
+    command.stdin(Stdio::piped())?;
+    command.stdout(Stdio::piped())?;
+    command.stderr(Stdio::piped())?;
 
     let mut child = command
         .spawn()
         .context("failed to spawn auto-zran converter")?;
     if let Some(mut stdin) = child.stdin.take() {
         let prefetch = job.prefetch_files.join("\n") + "\n";
+        // compio I/O takes an owned buffer and returns a `BufResult`; `.0` is the
+        // io result. Dropping `stdin` after the write closes the pipe (EOF).
         stdin
-            .write_all(prefetch.as_bytes())
+            .write_all(prefetch.into_bytes())
             .await
+            .0
             .context("failed to write auto-zran prefetch profile to converter stdin")?;
     }
 
@@ -448,7 +454,7 @@ mod tests {
 
     #[test]
     fn enqueue_profile_deduplicates_same_image() {
-        let (sender, mut receiver) = mpsc::channel(2);
+        let (sender, receiver) = async_channel::bounded(2);
         let state = Arc::new(AutoZranState::new(2));
         let manager = AutoZranManager {
             sender,
@@ -471,7 +477,7 @@ mod tests {
 
     #[test]
     fn enqueue_profile_drops_when_queue_is_full_and_rolls_back_dedupe_key() {
-        let (sender, _receiver) = mpsc::channel(1);
+        let (sender, _receiver) = async_channel::bounded(1);
         let state = Arc::new(AutoZranState::new(1));
         let manager = AutoZranManager {
             sender,
@@ -494,7 +500,7 @@ mod tests {
 
     #[test]
     fn enqueue_profile_skips_empty_and_already_accelerated_profiles() {
-        let (sender, mut receiver) = mpsc::channel(2);
+        let (sender, receiver) = async_channel::bounded(2);
         let state = Arc::new(AutoZranState::new(2));
         let manager = AutoZranManager { sender, state };
         let empty = PrefetchProfile::from_access_records(

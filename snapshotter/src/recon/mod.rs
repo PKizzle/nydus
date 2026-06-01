@@ -17,7 +17,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::time;
+use compio::time;
 use tracing::{debug, error, info, warn};
 
 /// Classification of recoverable vs. fatal errors.
