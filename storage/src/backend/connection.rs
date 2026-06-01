@@ -42,7 +42,7 @@ thread_local! {
     /// Per-thread cyper clients, keyed by `(connection id, is_proxy)`. cyper's
     /// `Client` is `!Send` (thread-per-core, `Rc`-based), so it cannot live in
     /// the `Arc`-shared `Connection`. Each worker/blocking thread instead builds
-    /// and pools its own client lazily — the natural thread-per-core model.
+    /// and pools its own client lazily - the natural thread-per-core model.
     static HTTP_CLIENTS: RefCell<HashMap<(u64, bool), Client>> = RefCell::new(HashMap::new());
 }
 
@@ -269,8 +269,11 @@ impl Proxy {
 /// exposed through `std::io::Read` plus `status()`/`headers()`, matching the
 /// surface the cache and `request.rs` previously consumed from the old
 /// blocking HTTP response.
+// `pub` (not `pub(crate)`) so it is at least as visible as the public
+// `request::Response::Http` variant that wraps it. The fields stay private, so
+// the type remains opaque to external callers.
 #[derive(Debug)]
-pub(crate) struct Response {
+pub struct Response {
     status: StatusCode,
     headers: HeaderMap,
     // `bytes::Bytes` is Arc-backed, so wrapping it in a `Cursor` exposes the
@@ -294,7 +297,7 @@ impl Response {
 
     /// Copy the not-yet-consumed body directly into `dst`, returning the number
     /// of bytes written. Unlike `std::io::copy` over the `Read` impl, this is a
-    /// single `Bytes`->`dst` `memcpy` with no intermediate buffer — important on
+    /// single `Bytes`->`dst` `memcpy` with no intermediate buffer - important on
     /// the blob read hot path, where the destination is a chunk-sized slice.
     pub(crate) fn copy_to_slice(&mut self, dst: &mut [u8]) -> usize {
         let pos = self.body.position() as usize;
@@ -406,69 +409,69 @@ impl Connection {
     }
 
     fn start_proxy_health_thread(&self, connect_timeout: u64) {
-        if let Some(proxy) = self.proxy.as_ref() {
-            if proxy.health.ping_url.is_some() {
-                let proxy = proxy.clone();
-                let last_active = Arc::clone(&self.last_active);
+        if let Some(proxy) = self.proxy.as_ref()
+            && proxy.health.ping_url.is_some()
+        {
+            let proxy = proxy.clone();
+            let last_active = Arc::clone(&self.last_active);
 
-                // Spawn thread to update the health status of proxy server.
-                thread::spawn(move || {
-                    let ping_url = proxy.health.ping_url.as_ref().unwrap();
-                    let mut last_success = true;
+            // Spawn thread to update the health status of proxy server.
+            thread::spawn(move || {
+                let ping_url = proxy.health.ping_url.as_ref().unwrap();
+                let mut last_success = true;
 
-                    loop {
-                        let elapsed = SystemTime::now()
-                            .duration_since(UNIX_EPOCH)
-                            .unwrap()
-                            .as_secs()
-                            - last_active.load(Ordering::Relaxed);
-                        // If the connection is not active for a set time, skip proxy health check.
-                        if elapsed <= proxy.health.check_pause_elapsed {
-                            let ping: ConnectionResult<StatusCode> = block_on_http(async {
-                                let client = Client::new().map_err(ConnectionError::Common)?;
-                                let rb = client
-                                    .get(ping_url.clone())
-                                    .map_err(ConnectionError::Common)?;
-                                match compio::runtime::time::timeout(
-                                    Duration::from_secs(connect_timeout),
-                                    rb.send(),
-                                )
-                                .await
-                                {
-                                    Ok(r) => Ok(r.map_err(ConnectionError::Common)?.status()),
-                                    Err(_) => Err(ConnectionError::ErrorWithMsg(
-                                        "proxy ping timed out".to_string(),
-                                    )),
+                loop {
+                    let elapsed = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs()
+                        - last_active.load(Ordering::Relaxed);
+                    // If the connection is not active for a set time, skip proxy health check.
+                    if elapsed <= proxy.health.check_pause_elapsed {
+                        let ping: ConnectionResult<StatusCode> = block_on_http(async {
+                            let client = Client::new().map_err(ConnectionError::Common)?;
+                            let rb = client
+                                .get(ping_url.clone())
+                                .map_err(ConnectionError::Common)?;
+                            match compio::runtime::time::timeout(
+                                Duration::from_secs(connect_timeout),
+                                rb.send(),
+                            )
+                            .await
+                            {
+                                Ok(r) => Ok(r.map_err(ConnectionError::Common)?.status()),
+                                Err(_) => Err(ConnectionError::ErrorWithMsg(
+                                    "proxy ping timed out".to_string(),
+                                )),
+                            }
+                        });
+                        match ping {
+                            Ok(status) => {
+                                let success = is_success_status(status);
+                                if last_success && !success {
+                                    warn!(
+                                        "Detected proxy unhealthy when pinging proxy, response status {}",
+                                        status
+                                    );
+                                } else if !last_success && success {
+                                    info!("Backend proxy recovered")
                                 }
-                            });
-                            match ping {
-                                Ok(status) => {
-                                    let success = is_success_status(status);
-                                    if last_success && !success {
-                                        warn!(
-                                            "Detected proxy unhealthy when pinging proxy, response status {}",
-                                            status
-                                        );
-                                    } else if !last_success && success {
-                                        info!("Backend proxy recovered")
-                                    }
-                                    last_success = success;
-                                    proxy.health.set(success);
+                                last_success = success;
+                                proxy.health.set(success);
+                            }
+                            Err(e) => {
+                                if last_success {
+                                    warn!("Detected proxy unhealthy when ping proxy, {}", e);
                                 }
-                                Err(e) => {
-                                    if last_success {
-                                        warn!("Detected proxy unhealthy when ping proxy, {}", e);
-                                    }
-                                    last_success = false;
-                                    proxy.health.set(false);
-                                }
+                                last_success = false;
+                                proxy.health.set(false);
                             }
                         }
-
-                        thread::sleep(proxy.health.check_interval);
                     }
-                });
-            }
+
+                    thread::sleep(proxy.health.check_interval);
+                }
+            });
         }
     }
 
@@ -515,75 +518,72 @@ impl Connection {
             Ordering::Relaxed,
         );
 
-        if !skip_proxy {
-            if let Some(proxy) = &self.proxy {
-                if proxy.health.ok() {
-                    let data_cloned = data.as_ref().cloned();
+        if !skip_proxy && let Some(proxy) = &self.proxy {
+            if proxy.health.ok() {
+                let data_cloned = data.as_ref().cloned();
 
-                    let http_url: Option<String>;
-                    let mut replaced_url = url;
+                let http_url: Option<String>;
+                let mut replaced_url = url;
 
-                    if proxy.use_http {
-                        http_url = proxy.try_use_http(url);
-                        if let Some(ref r) = http_url {
-                            replaced_url = r.as_str();
-                        }
+                if proxy.use_http {
+                    http_url = proxy.try_use_http(url);
+                    if let Some(ref r) = http_url {
+                        replaced_url = r.as_str();
                     }
-
-                    debug!(
-                        "connection: routing via PROXY (fallback={}), url={} -> {}",
-                        proxy.fallback, url, replaced_url,
-                    );
-
-                    let result = self.call_inner(
-                        true,
-                        method.clone(),
-                        replaced_url,
-                        &query,
-                        data_cloned,
-                        headers,
-                        catch_status,
-                        true,
-                    );
-
-                    match result {
-                        Ok(resp) => {
-                            debug!(
-                                "connection: proxy returned status={}, fallback={}",
-                                resp.status(),
-                                proxy.fallback,
-                            );
-                            if !proxy.fallback || resp.status() < StatusCode::INTERNAL_SERVER_ERROR
-                            {
-                                return Ok(resp);
-                            }
-                        }
-                        Err(err) => {
-                            warn!("Request proxy server failed: {:?}", err);
-                            if !proxy.fallback {
-                                return Err(err);
-                            }
-                        }
-                    }
-                    // If proxy server responds invalid status code or http connection failed, we need to
-                    // fallback to origin server, the policy only applicable to non-upload operation
-                    warn!("Request proxy server failed, fallback to original server");
-                } else {
-                    if !proxy.fallback {
-                        return Err(ConnectionError::ErrorWithMsg(
-                            "proxy is not healthy and fallback is disabled".to_string(),
-                        ));
-                    }
-                    LAST_FALLBACK_AT.with(|f| {
-                        let current = SystemTime::now();
-                        if current.duration_since(*f.borrow()).unwrap().as_secs()
-                            >= RATE_LIMITED_LOG_TIME as u64
-                        {
-                            warn!("Proxy server is not healthy, fallback to original server");
-                            f.replace(current);
-                        }
-                    })
                 }
+
+                debug!(
+                    "connection: routing via PROXY (fallback={}), url={} -> {}",
+                    proxy.fallback, url, replaced_url,
+                );
+
+                let result = self.call_inner(
+                    true,
+                    method.clone(),
+                    replaced_url,
+                    &query,
+                    data_cloned,
+                    headers,
+                    catch_status,
+                    true,
+                );
+
+                match result {
+                    Ok(resp) => {
+                        debug!(
+                            "connection: proxy returned status={}, fallback={}",
+                            resp.status(),
+                            proxy.fallback,
+                        );
+                        if !proxy.fallback || resp.status() < StatusCode::INTERNAL_SERVER_ERROR {
+                            return Ok(resp);
+                        }
+                    }
+                    Err(err) => {
+                        warn!("Request proxy server failed: {:?}", err);
+                        if !proxy.fallback {
+                            return Err(err);
+                        }
+                    }
+                }
+                // If proxy server responds invalid status code or http connection failed, we need to
+                // fallback to origin server, the policy only applicable to non-upload operation
+                warn!("Request proxy server failed, fallback to original server");
+            } else {
+                if !proxy.fallback {
+                    return Err(ConnectionError::ErrorWithMsg(
+                        "proxy is not healthy and fallback is disabled".to_string(),
+                    ));
+                }
+                LAST_FALLBACK_AT.with(|f| {
+                    let current = SystemTime::now();
+                    if current.duration_since(*f.borrow()).unwrap().as_secs()
+                        >= RATE_LIMITED_LOG_TIME as u64
+                    {
+                        warn!("Proxy server is not healthy, fallback to original server");
+                        f.replace(current);
+                    }
+                })
             }
         } // end if !skip_proxy
 
@@ -676,7 +676,7 @@ impl Connection {
             let rb = HTTP_CLIENTS.with(|clients| -> ConnectionResult<RequestBuilder> {
                 let mut clients = clients.borrow_mut();
                 let key = (self.id, is_proxy);
-                if !clients.contains_key(&key) {
+                if let std::collections::hash_map::Entry::Vacant(e) = clients.entry(key) {
                     let proxy_url = if is_proxy {
                         self.config.proxy.url.as_str()
                     } else {
@@ -685,7 +685,7 @@ impl Connection {
                     let client = Self::build_connection(proxy_url, &self.config).map_err(|e| {
                         ConnectionError::ErrorWithMsg(format!("failed to build HTTP client: {e}"))
                     })?;
-                    clients.insert(key, client);
+                    e.insert(client);
                 }
                 let client = clients.get(&key).unwrap();
 
@@ -772,7 +772,7 @@ impl Connection {
             let rb = HTTP_CLIENTS.with(|clients| -> ConnectionResult<RequestBuilder> {
                 let mut clients = clients.borrow_mut();
                 let key = (self.id, is_proxy);
-                if !clients.contains_key(&key) {
+                if let std::collections::hash_map::Entry::Vacant(e) = clients.entry(key) {
                     let proxy_url = if is_proxy {
                         self.config.proxy.url.as_str()
                     } else {
@@ -781,7 +781,7 @@ impl Connection {
                     let client = Self::build_connection(proxy_url, &self.config).map_err(|e| {
                         ConnectionError::ErrorWithMsg(format!("failed to build HTTP client: {e}"))
                     })?;
-                    clients.insert(key, client);
+                    e.insert(client);
                 }
                 let client = clients.get(&key).unwrap();
                 let mut rb = client
@@ -809,7 +809,7 @@ impl Connection {
 
             let status = resp.status();
             if is_success_status(status) {
-                // Stream the body straight into `dst` — no full-body allocation.
+                // Stream the body straight into `dst` - no full-body allocation.
                 let mut written = 0usize;
                 let mut stream = resp.bytes_stream();
                 while let Some(chunk) = stream.next().await {
@@ -858,34 +858,32 @@ impl Connection {
             Ordering::Relaxed,
         );
 
-        if !skip_proxy {
-            if let Some(proxy) = &self.proxy {
-                if proxy.health.ok() {
-                    let http_url: Option<String>;
-                    let mut replaced_url = url;
-                    if proxy.use_http {
-                        http_url = proxy.try_use_http(url);
-                        if let Some(ref r) = http_url {
-                            replaced_url = r.as_str();
-                        }
+        if !skip_proxy && let Some(proxy) = &self.proxy {
+            if proxy.health.ok() {
+                let http_url: Option<String>;
+                let mut replaced_url = url;
+                if proxy.use_http {
+                    http_url = proxy.try_use_http(url);
+                    if let Some(ref r) = http_url {
+                        replaced_url = r.as_str();
                     }
-                    let (status, written, err) = self.call_inner_stream(
-                        true,
-                        method.clone(),
-                        replaced_url,
-                        &query,
-                        headers,
-                        &mut *dst,
-                    )?;
-                    if !proxy.fallback || status < StatusCode::INTERNAL_SERVER_ERROR {
-                        return Ok((status, written, err));
-                    }
-                    warn!("Request proxy server failed, fallback to original server");
-                } else if !proxy.fallback {
-                    return Err(ConnectionError::ErrorWithMsg(
-                        "proxy is not healthy and fallback is disabled".to_string(),
-                    ));
                 }
+                let (status, written, err) = self.call_inner_stream(
+                    true,
+                    method.clone(),
+                    replaced_url,
+                    &query,
+                    headers,
+                    &mut *dst,
+                )?;
+                if !proxy.fallback || status < StatusCode::INTERNAL_SERVER_ERROR {
+                    return Ok((status, written, err));
+                }
+                warn!("Request proxy server failed, fallback to original server");
+            } else if !proxy.fallback {
+                return Err(ConnectionError::ErrorWithMsg(
+                    "proxy is not healthy and fallback is disabled".to_string(),
+                ));
             }
         }
 

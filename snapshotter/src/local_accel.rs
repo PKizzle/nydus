@@ -18,6 +18,7 @@
 //!   2. merge:                `nydus-image merge -B <bootstrap> --original-blob-ids <d0,d1,..> <b0> <b1> ..`
 //!   3. stage a `localfs` backend dir holding the gzip layers (symlinked from the content store,
 //!      keyed by digest) plus the per-layer zran index blobs.
+//!
 //! The resulting `(bootstrap, backend_dir, work_dir)` feeds a fanotify `BlobCacheEntry`; the
 //! `FanotifyHandler` self-stages the EROFS device files and serves reads on demand.
 

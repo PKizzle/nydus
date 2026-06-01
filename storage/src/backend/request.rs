@@ -52,7 +52,7 @@ pub type RequestResult<T> = std::result::Result<T, RequestError>;
 // --- Response enum: available for all network backends ---
 
 pub enum Response {
-    HTTP(ConnectionResponse),
+    Http(ConnectionResponse),
     #[cfg(feature = "backend-dragonfly-proxy")]
     ProxySDK(GetResponse),
 }
@@ -60,7 +60,7 @@ pub enum Response {
 impl Response {
     pub fn status(&self) -> StatusCode {
         match self {
-            Self::HTTP(resp) => resp.status(),
+            Self::Http(resp) => resp.status(),
             #[cfg(feature = "backend-dragonfly-proxy")]
             Self::ProxySDK(resp) => resp.status_code.unwrap_or(StatusCode::BAD_GATEWAY),
         }
@@ -68,7 +68,7 @@ impl Response {
 
     pub fn headers(&self) -> &HeaderMap {
         match self {
-            Self::HTTP(resp) => resp.headers(),
+            Self::Http(resp) => resp.headers(),
             #[cfg(feature = "backend-dragonfly-proxy")]
             Self::ProxySDK(resp) => &resp.header,
         }
@@ -76,7 +76,7 @@ impl Response {
 
     pub fn reader(self) -> Box<dyn Read + Send> {
         match self {
-            Self::HTTP(resp) => Box::new(resp),
+            Self::Http(resp) => Box::new(resp),
             #[cfg(feature = "backend-dragonfly-proxy")]
             Self::ProxySDK(resp) => {
                 let reader = resp.reader.unwrap_or(Box::new(tokio::io::empty()));
@@ -95,7 +95,7 @@ impl Response {
 
     pub fn copy_to(self, writer: &mut [u8]) -> Result<u64, String> {
         match self {
-            Self::HTTP(mut resp) => Ok(resp.copy_to_slice(writer) as u64),
+            Self::Http(mut resp) => Ok(resp.copy_to_slice(writer) as u64),
             #[cfg(feature = "backend-dragonfly-proxy")]
             Self::ProxySDK(resp) => {
                 let mut reader = resp.reader.unwrap_or(Box::new(tokio::io::empty()));
@@ -243,7 +243,7 @@ impl Request {
                     catch_status,
                     temp_disable_proxy,
                 )
-                .map(Response::HTTP)
+                .map(Response::Http)
                 .map_err(RequestError::Connection);
         }
 
@@ -332,7 +332,7 @@ impl Request {
         let resp = self
             .connection
             .call(method, url, query, data, headers, catch_status)
-            .map(Response::HTTP)
+            .map(Response::Http)
             .map_err(RequestError::Connection)?;
 
         // Detect Dragonfly error type headers on HTTP proxy responses.
@@ -1355,11 +1355,11 @@ mod tests {
         assert!(!ctx.using_proxy_sdk);
     }
 
-    // --- Response::HTTP variant tests ---
+    // --- Response::Http variant tests ---
 
     #[test]
     fn test_http_response_status() {
-        let resp = Response::HTTP(crate::backend::connection::Response::from(
+        let resp = Response::Http(crate::backend::connection::Response::from(
             http::response::Builder::new()
                 .status(StatusCode::NOT_FOUND)
                 .body("not found".to_string())
@@ -1370,7 +1370,7 @@ mod tests {
 
     #[test]
     fn test_http_response_headers() {
-        let resp = Response::HTTP(crate::backend::connection::Response::from(
+        let resp = Response::Http(crate::backend::connection::Response::from(
             http::response::Builder::new()
                 .header("x-test-header", "test-value")
                 .body("".to_string())
@@ -1381,7 +1381,7 @@ mod tests {
 
     #[test]
     fn test_http_response_text() {
-        let resp = Response::HTTP(crate::backend::connection::Response::from(
+        let resp = Response::Http(crate::backend::connection::Response::from(
             http::response::Builder::new()
                 .body("hello from registry".to_string())
                 .unwrap(),
@@ -1393,7 +1393,7 @@ mod tests {
     #[test]
     fn test_http_response_copy_to() {
         let body = "copy this data";
-        let resp = Response::HTTP(crate::backend::connection::Response::from(
+        let resp = Response::Http(crate::backend::connection::Response::from(
             http::response::Builder::new()
                 .body(body.to_string())
                 .unwrap(),
@@ -1407,7 +1407,7 @@ mod tests {
     #[test]
     fn test_http_response_reader() {
         let body = "reader content";
-        let resp = Response::HTTP(crate::backend::connection::Response::from(
+        let resp = Response::Http(crate::backend::connection::Response::from(
             http::response::Builder::new()
                 .body(body.to_string())
                 .unwrap(),
@@ -1440,7 +1440,7 @@ mod tests {
 
     #[test]
     fn test_http_response_empty_body() {
-        let resp = Response::HTTP(crate::backend::connection::Response::from(
+        let resp = Response::Http(crate::backend::connection::Response::from(
             http::response::Builder::new().body(String::new()).unwrap(),
         ));
         let text = resp.text().unwrap();
