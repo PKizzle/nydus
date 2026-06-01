@@ -161,3 +161,14 @@ fuse-backend-rs = "0.14.0"
 # cyper HTTP backend (the panic triggers on HTTP connection teardown).
 # Upstream issue to be filed against compio-rs/compio.
 compio-executor = { path = "third_party/compio-executor" }
+
+# Local fix for a large-body read throughput regression in cyper-core's
+# compio<->hyper stream adapter (rev d1c8aff). compio drains the socket in 8 KiB
+# chunks while hyper grows its read cursor toward ~400 KiB for large bodies; the
+# upstream adapter zero-filled the *entire* cursor before every short read, so
+# the memset scaled with the cursor, not the bytes read — a body-size-scaled
+# overhead that plateaued large-body throughput ~35-40% below reqwest. The
+# vendored copy reads in 256 KiB chunks and bounds the zero-fill window to match.
+# Upstream PR to be filed against compio-rs/cyper.
+[patch."https://github.com/compio-rs/cyper"]
+cyper-core = { path = "third_party/cyper-core" }

@@ -1563,7 +1563,6 @@ dependencies = [
 [[package]]
 name = "cyper-core"
 version = "0.9.0"
-source = "git+https://github.com/compio-rs/cyper?rev=d1c8aff18dd81c4b1f817d0e8e0e05408c15a04c#d1c8aff18dd81c4b1f817d0e8e0e05408c15a04c"
 dependencies = [
  "compio",
  "futures-util",
