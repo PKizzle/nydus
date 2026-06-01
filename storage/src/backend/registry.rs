@@ -805,28 +805,26 @@ impl RegistryReader {
         let range = format!("bytes={}-{}", offset, end_at);
         headers.insert("Range", range.parse().unwrap());
 
-        let mut resp;
         let cached_redirect = self.state.cached_redirect.get(&self.blob_id);
 
         if let Some(cached_redirect) = cached_redirect {
-            resp = self
+            // Hot path: the cached redirect is the final blob URL, so stream the
+            // body straight into `buf` instead of buffering the whole blob first.
+            let (status, written) = self
                 .request
-                .call::<&[u8]>(
+                .call_stream_status(
                     Method::GET,
                     cached_redirect.as_str(),
                     None,
-                    None,
                     &mut headers,
-                    false,
                     context,
                     false,
+                    buf,
                 )
                 .map_err(request_err_to_registry)?;
 
             // The request has expired or has been denied, need to re-request
-            if allow_retry
-                && [StatusCode::UNAUTHORIZED, StatusCode::FORBIDDEN].contains(&resp.status())
-            {
+            if allow_retry && [StatusCode::UNAUTHORIZED, StatusCode::FORBIDDEN].contains(&status) {
                 warn!(
                     "The redirected link has expired: {}, will retry read",
                     cached_redirect.as_str()
@@ -835,109 +833,117 @@ impl RegistryReader {
                 // Try read again only once
                 return self._try_read(buf, offset, false, context);
             }
-        } else {
-            resp = match self.request::<&[u8]>(
-                Method::GET,
-                url.as_str(),
-                None,
-                headers.clone(),
-                false,
-                context,
-            ) {
-                Ok(res) => res,
-                Err(RegistryError::Request(ConnectionError::Common(e)))
-                    if self.state.needs_fallback_http(&e) =>
-                {
-                    self.state.fallback_http();
-                    let url = format!("/blobs/sha256:{}", self.blob_id);
-                    let url = self
-                        .state
-                        .url(url.as_str(), &[])
-                        .map_err(|e| RegistryError::Url(url, e))?;
-                    self.request::<&[u8]>(
-                        Method::GET,
-                        url.as_str(),
-                        None,
-                        headers.clone(),
-                        false,
-                        context,
-                    )?
-                }
-                Err(RegistryError::Request(ConnectionError::Common(e))) => {
-                    if e.to_string().contains("self signed certificate") {
-                        warn!("try to enable \"skip_verify: true\" option");
-                    }
-                    return Err(RegistryError::Request(ConnectionError::Common(e)));
-                }
-                Err(e) => {
-                    return Err(e);
-                }
-            };
-            let status = resp.status();
-            let need_redirect =
-                status >= StatusCode::MULTIPLE_CHOICES && status < StatusCode::BAD_REQUEST;
-
-            // Handle redirect request and cache redirect url
-            if need_redirect {
-                if let Some(location) = resp.headers().get("location") {
-                    let location = location.to_str().unwrap();
-                    let mut location = Url::parse(location)
-                        .map_err(|e| RegistryError::Url(location.to_string(), e))?;
-                    // Note: Some P2P proxy server supports only scheme specified origin blob server,
-                    // so we need change scheme to `blob_url_scheme` here
-                    if !self.state.blob_url_scheme.is_empty() {
-                        location
-                            .set_scheme(&self.state.blob_url_scheme)
-                            .map_err(|_| {
-                                RegistryError::Scheme(self.state.blob_url_scheme.clone())
-                            })?;
-                    }
-                    if !self.state.blob_redirected_host.is_empty() {
-                        location
-                            .set_host(Some(self.state.blob_redirected_host.as_str()))
-                            .map_err(|e| {
-                                error!(
-                                    "Failed to set blob redirected host to {}: {:?}",
-                                    self.state.blob_redirected_host.as_str(),
-                                    e
-                                );
-                                RegistryError::Url(location.to_string(), e)
-                            })?;
-                        debug!("New redirected location {:?}", location.host_str());
-                    }
-                    let resp_ret = self
-                        .request
-                        .call::<&[u8]>(
-                            Method::GET,
-                            location.as_str(),
-                            None,
-                            None,
-                            &mut headers,
-                            true,
-                            context,
-                            false,
-                        )
-                        .map_err(request_err_to_registry);
-                    match resp_ret {
-                        Ok(_resp) => {
-                            trace!(
-                                "redirect cache for blob={}, status={}",
-                                self.blob_id,
-                                status,
-                            );
-                            resp = _resp;
-                            self.state
-                                .cached_redirect
-                                .set(self.blob_id.clone(), location.as_str().to_string())
-                        }
-                        Err(err) => {
-                            return Err(err);
-                        }
-                    }
-                };
-            } else {
-                resp = respond(resp, true)?;
+            if !is_success_status(status) {
+                return Err(RegistryError::Request(ConnectionError::ErrorWithMsg(format!(
+                    "unexpected status {} reading blob from cached redirect",
+                    status
+                ))));
             }
+            return Ok(written);
+        }
+
+        // No cached redirect: resolve the registry GET first. A 307 carries an
+        // empty body (only the `location` header matters) and a direct 200 is the
+        // uncommon non-redirecting case, so buffering this response is cheap.
+        let mut resp = match self.request::<&[u8]>(
+            Method::GET,
+            url.as_str(),
+            None,
+            headers.clone(),
+            false,
+            context,
+        ) {
+            Ok(res) => res,
+            Err(RegistryError::Request(ConnectionError::Common(e)))
+                if self.state.needs_fallback_http(&e) =>
+            {
+                self.state.fallback_http();
+                let url = format!("/blobs/sha256:{}", self.blob_id);
+                let url = self
+                    .state
+                    .url(url.as_str(), &[])
+                    .map_err(|e| RegistryError::Url(url, e))?;
+                self.request::<&[u8]>(
+                    Method::GET,
+                    url.as_str(),
+                    None,
+                    headers.clone(),
+                    false,
+                    context,
+                )?
+            }
+            Err(RegistryError::Request(ConnectionError::Common(e))) => {
+                if e.to_string().contains("self signed certificate") {
+                    warn!("try to enable \"skip_verify: true\" option");
+                }
+                return Err(RegistryError::Request(ConnectionError::Common(e)));
+            }
+            Err(e) => {
+                return Err(e);
+            }
+        };
+        let status = resp.status();
+        let need_redirect =
+            status >= StatusCode::MULTIPLE_CHOICES && status < StatusCode::BAD_REQUEST;
+
+        // Handle redirect request and cache redirect url
+        if need_redirect {
+            if let Some(location) = resp.headers().get("location") {
+                let location = location.to_str().unwrap();
+                let mut location = Url::parse(location)
+                    .map_err(|e| RegistryError::Url(location.to_string(), e))?;
+                // Note: Some P2P proxy server supports only scheme specified origin blob server,
+                // so we need change scheme to `blob_url_scheme` here
+                if !self.state.blob_url_scheme.is_empty() {
+                    location
+                        .set_scheme(&self.state.blob_url_scheme)
+                        .map_err(|_| RegistryError::Scheme(self.state.blob_url_scheme.clone()))?;
+                }
+                if !self.state.blob_redirected_host.is_empty() {
+                    location
+                        .set_host(Some(self.state.blob_redirected_host.as_str()))
+                        .map_err(|e| {
+                            error!(
+                                "Failed to set blob redirected host to {}: {:?}",
+                                self.state.blob_redirected_host.as_str(),
+                                e
+                            );
+                            RegistryError::Url(location.to_string(), e)
+                        })?;
+                    debug!("New redirected location {:?}", location.host_str());
+                }
+
+                // Stream the blob from the redirect target, then cache the URL so
+                // subsequent reads take the hot path above.
+                let (rstatus, written) = self
+                    .request
+                    .call_stream_status(
+                        Method::GET,
+                        location.as_str(),
+                        None,
+                        &mut headers,
+                        context,
+                        false,
+                        buf,
+                    )
+                    .map_err(request_err_to_registry)?;
+                if !is_success_status(rstatus) {
+                    return Err(RegistryError::Request(ConnectionError::ErrorWithMsg(format!(
+                        "unexpected status {} reading blob from redirect {}",
+                        rstatus,
+                        location.as_str()
+                    ))));
+                }
+                trace!("redirect cache for blob={}, status={}", self.blob_id, status);
+                self.state
+                    .cached_redirect
+                    .set(self.blob_id.clone(), location.as_str().to_string());
+                return Ok(written);
+            }
+            // `need_redirect` but no `location` header: fall through and let the
+            // copy below surface the (degenerate) response as-is.
+        } else {
+            resp = respond(resp, true)?;
         }
 
         resp.copy_to(buf)
