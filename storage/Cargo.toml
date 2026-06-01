@@ -13,6 +13,7 @@ arc-swap = "1.5"
 async-lock = "3.4"
 async-trait = "0.1"
 blocking = "1.6"
+bytes = "1"
 compio = { version = "0.19", default-features = false, features = [
     "runtime",
     "time",
@@ -103,10 +104,11 @@ required-features = ["backend-s3"]
 backend-localdisk = []
 backend-localdisk-gpt = ["gpt", "backend-localdisk"]
 backend-localfs = []
-backend-oss = ["base64", "httpdate", "hmac", "sha1", "reqwest", "url"]
-backend-registry = ["base64", "reqwest", "url"]
-backend-s3 = ["base64", "hmac", "http", "reqwest", "sha2", "time", "url"]
+backend-oss = ["base64", "cyper", "httpdate", "hmac", "sha1", "reqwest", "url"]
+backend-registry = ["base64", "cyper", "reqwest", "url"]
+backend-s3 = ["base64", "cyper", "hmac", "http", "reqwest", "sha2", "time", "url"]
 backend-http-proxy = [
+    "cyper",
     "hyper",
     "hyperlocal",
     "http",
@@ -117,7 +119,7 @@ backend-http-proxy = [
 ]
 dedup = ["rusqlite", "r2d2", "r2d2_sqlite"]
 
-backend-dragonfly-proxy = ["dragonfly-client-util", "reqwest"]
+backend-dragonfly-proxy = ["cyper", "dragonfly-client-util", "reqwest"]
 
 [package.metadata.docs.rs]
 all-features = true

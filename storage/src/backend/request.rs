@@ -20,7 +20,9 @@ use reqwest::{
 
 use nydus_api::ProxyConfig;
 
-use crate::backend::connection::{Connection, ConnectionError, ReqBody};
+use crate::backend::connection::{
+    Connection, ConnectionError, ReqBody, Response as ConnectionResponse,
+};
 use crate::backend::BackendContext;
 
 #[cfg(feature = "backend-dragonfly-proxy")]
@@ -50,7 +52,7 @@ pub type RequestResult<T> = std::result::Result<T, RequestError>;
 // --- Response enum: available for all network backends ---
 
 pub enum Response {
-    HTTP(reqwest::blocking::Response),
+    HTTP(ConnectionResponse),
     #[cfg(feature = "backend-dragonfly-proxy")]
     ProxySDK(GetResponse),
 }
@@ -1244,7 +1246,7 @@ mod tests {
 
     #[test]
     fn test_http_response_status() {
-        let resp = Response::HTTP(reqwest::blocking::Response::from(
+        let resp = Response::HTTP(crate::backend::connection::Response::from(
             http::response::Builder::new()
                 .status(StatusCode::NOT_FOUND)
                 .body("not found".to_string())
@@ -1255,7 +1257,7 @@ mod tests {
 
     #[test]
     fn test_http_response_headers() {
-        let resp = Response::HTTP(reqwest::blocking::Response::from(
+        let resp = Response::HTTP(crate::backend::connection::Response::from(
             http::response::Builder::new()
                 .header("x-test-header", "test-value")
                 .body("".to_string())
@@ -1266,7 +1268,7 @@ mod tests {
 
     #[test]
     fn test_http_response_text() {
-        let resp = Response::HTTP(reqwest::blocking::Response::from(
+        let resp = Response::HTTP(crate::backend::connection::Response::from(
             http::response::Builder::new()
                 .body("hello from registry".to_string())
                 .unwrap(),
@@ -1278,7 +1280,7 @@ mod tests {
     #[test]
     fn test_http_response_copy_to() {
         let body = "copy this data";
-        let resp = Response::HTTP(reqwest::blocking::Response::from(
+        let resp = Response::HTTP(crate::backend::connection::Response::from(
             http::response::Builder::new()
                 .body(body.to_string())
                 .unwrap(),
@@ -1292,7 +1294,7 @@ mod tests {
     #[test]
     fn test_http_response_reader() {
         let body = "reader content";
-        let resp = Response::HTTP(reqwest::blocking::Response::from(
+        let resp = Response::HTTP(crate::backend::connection::Response::from(
             http::response::Builder::new()
                 .body(body.to_string())
                 .unwrap(),
@@ -1325,7 +1327,7 @@ mod tests {
 
     #[test]
     fn test_http_response_empty_body() {
-        let resp = Response::HTTP(reqwest::blocking::Response::from(
+        let resp = Response::HTTP(crate::backend::connection::Response::from(
             http::response::Builder::new().body(String::new()).unwrap(),
         ));
         let text = resp.text().unwrap();

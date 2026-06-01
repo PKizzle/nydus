@@ -1646,7 +1646,7 @@ mod tests {
             "token": "test_token_value",
             "expires_in": 3600
         });
-        let response = request::Response::HTTP(reqwest::blocking::Response::from(
+        let response = request::Response::HTTP(crate::backend::connection::Response::from(
             http::response::Builder::new()
                 .body(json_with_token.to_string())
                 .unwrap(),
@@ -1660,7 +1660,7 @@ mod tests {
             "access_token": "test_access_token_value",
             "expires_in": 7200
         });
-        let response = request::Response::HTTP(reqwest::blocking::Response::from(
+        let response = request::Response::HTTP(crate::backend::connection::Response::from(
             http::response::Builder::new()
                 .body(json_with_access_token.to_string())
                 .unwrap(),
@@ -1673,7 +1673,7 @@ mod tests {
         let json_with_default_expiration = json!({
             "token": "default_expiration_token"
         });
-        let response = request::Response::HTTP(reqwest::blocking::Response::from(
+        let response = request::Response::HTTP(crate::backend::connection::Response::from(
             http::response::Builder::new()
                 .body(json_with_default_expiration.to_string())
                 .unwrap(),
@@ -1687,7 +1687,7 @@ mod tests {
             "token": "test_token_value",
             "access_token": "test_access_token_value",
         });
-        let response = request::Response::HTTP(reqwest::blocking::Response::from(
+        let response = request::Response::HTTP(crate::backend::connection::Response::from(
             http::response::Builder::new()
                 .body(json_with_both_tokens.to_string())
                 .unwrap(),
@@ -1697,7 +1697,7 @@ mod tests {
 
         // Case 5: Response contains no token
         let json_with_no_token = json!({});
-        let response = request::Response::HTTP(reqwest::blocking::Response::from(
+        let response = request::Response::HTTP(crate::backend::connection::Response::from(
             http::response::Builder::new()
                 .body(json_with_no_token.to_string())
                 .unwrap(),
@@ -1816,7 +1816,7 @@ mod tests {
 
     #[test]
     fn test_respond_returns_ok_when_status_check_disabled() {
-        let response = request::Response::HTTP(reqwest::blocking::Response::from(
+        let response = request::Response::HTTP(crate::backend::connection::Response::from(
             http::response::Builder::new()
                 .status(StatusCode::UNAUTHORIZED)
                 .body("denied".to_string())
@@ -1830,7 +1830,7 @@ mod tests {
 
     #[test]
     fn test_respond_returns_ok_for_success_status() {
-        let response = request::Response::HTTP(reqwest::blocking::Response::from(
+        let response = request::Response::HTTP(crate::backend::connection::Response::from(
             http::response::Builder::new()
                 .status(StatusCode::OK)
                 .body("ok".to_string())
@@ -1844,7 +1844,7 @@ mod tests {
 
     #[test]
     fn test_respond_returns_request_error_for_failure_status() {
-        let response = request::Response::HTTP(reqwest::blocking::Response::from(
+        let response = request::Response::HTTP(crate::backend::connection::Response::from(
             http::response::Builder::new()
                 .status(StatusCode::TOO_MANY_REQUESTS)
                 .body("rate limited".to_string())
@@ -2011,7 +2011,7 @@ mod tests {
     #[cfg(feature = "backend-registry")]
     #[test]
     fn test_respond_catch_status_disabled_passes_error_status() {
-        let response = request::Response::HTTP(reqwest::blocking::Response::from(
+        let response = request::Response::HTTP(crate::backend::connection::Response::from(
             http::response::Builder::new()
                 .status(StatusCode::INTERNAL_SERVER_ERROR)
                 .body("server error".to_string())
@@ -2026,7 +2026,7 @@ mod tests {
     #[cfg(feature = "backend-registry")]
     #[test]
     fn test_token_response_from_resp_invalid_json() {
-        let response = request::Response::HTTP(reqwest::blocking::Response::from(
+        let response = request::Response::HTTP(crate::backend::connection::Response::from(
             http::response::Builder::new()
                 .body("not valid json {{{{".to_string())
                 .unwrap(),
