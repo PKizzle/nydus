@@ -77,17 +77,14 @@ impl ServiceController {
 
     fn initialize_blob_cache(&self, config: &Option<serde_json::Value>) -> std::io::Result<()> {
         // Create blob cache objects configured by the configuration file.
-        if let Some(config) = config {
-            if let Some(config1) = config.as_object() {
-                if config1.contains_key("blobs") {
-                    if let Ok(v) = serde_json::from_value::<BlobCacheList>(config.clone()) {
-                        if let Err(e) = self.blob_cache_mgr.add_blob_list(&v) {
-                            error!("Failed to add blob list: {}", e);
-                            return Err(e);
-                        }
-                    }
-                }
-            }
+        if let Some(config) = config
+            && let Some(config1) = config.as_object()
+            && config1.contains_key("blobs")
+            && let Ok(v) = serde_json::from_value::<BlobCacheList>(config.clone())
+            && let Err(e) = self.blob_cache_mgr.add_blob_list(&v)
+        {
+            error!("Failed to add blob list: {}", e);
+            return Err(e);
         }
 
         Ok(())
@@ -450,12 +447,9 @@ pub fn create_daemon(
 
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
-    use crate::blob_cache::generate_blob_key;
 
     use super::*;
     use mio::{Poll, Token};
-    use procfs::sys::kernel::Version;
-    use vmm_sys_util::tempdir::TempDir;
 
     fn create_service_controller() -> ServiceController {
         let bti = BuildTimeInfo {

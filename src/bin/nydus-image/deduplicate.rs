@@ -1036,10 +1036,10 @@ impl Ord for CustomString {
                 current_number.clear();
             }
         }
-        if !current_number.is_empty() {
-            if let Ok(number) = current_number.parse::<i32>() {
-                numbers1.push(number);
-            }
+        if !current_number.is_empty()
+            && let Ok(number) = current_number.parse::<i32>()
+        {
+            numbers1.push(number);
         }
         current_number.clear();
 
@@ -1053,10 +1053,10 @@ impl Ord for CustomString {
                 current_number.clear();
             }
         }
-        if !current_number.is_empty() {
-            if let Ok(number) = current_number.parse::<i32>() {
-                numbers2.push(number);
-            }
+        if !current_number.is_empty()
+            && let Ok(number) = current_number.parse::<i32>()
+        {
+            numbers2.push(number);
         }
         current_number.clear();
         numbers1.cmp(&numbers2)

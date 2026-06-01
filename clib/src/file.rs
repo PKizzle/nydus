@@ -47,30 +47,32 @@ pub unsafe extern "C" fn nydus_fopen(
     fs_handle: NydusFsHandle,
     path: *const c_char,
 ) -> NydusFileHandle {
-    if path.is_null() {
-        set_errno(libc::EINVAL);
-        return null_mut::<FileState>() as NydusFileHandle;
-    }
-    let fs = match FileSystemState::try_from_handle(fs_handle) {
-        Err(e) => {
-            set_errno(e);
+    unsafe {
+        if path.is_null() {
+            set_errno(libc::EINVAL);
             return null_mut::<FileState>() as NydusFileHandle;
         }
-        Ok(v) => v,
-    };
+        let fs = match FileSystemState::try_from_handle(fs_handle) {
+            Err(e) => {
+                set_errno(e);
+                return null_mut::<FileState>() as NydusFileHandle;
+            }
+            Ok(v) => v,
+        };
 
-    ////////////////////////////////////////////////////////////
-    // TODO: open file;
-    //////////////////////////////////////////////////////////////////////////
+        ////////////////////////////////////////////////////////////
+        // TODO: open file;
+        //////////////////////////////////////////////////////////////////////////
 
-    let file = Box::new(FileState {
-        magic: NYDUS_FILE_HANDLE_MAGIC,
-        ino: fs.root_ino,
-        pos: 0,
-        fs_handle,
-    });
+        let file = Box::new(FileState {
+            magic: NYDUS_FILE_HANDLE_MAGIC,
+            ino: fs.root_ino,
+            pos: 0,
+            fs_handle,
+        });
 
-    Box::into_raw(file) as NydusFileHandle
+        Box::into_raw(file) as NydusFileHandle
+    }
 }
 
 /// Close the file handle returned by `nydus_fopen()`.
@@ -79,12 +81,14 @@ pub unsafe extern "C" fn nydus_fopen(
 /// Caller needs to ensure `fs_handle` is valid, otherwise it may cause memory access violation.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn nydus_fclose(handle: NydusFileHandle) {
-    let mut file = Box::from_raw(handle as *mut FileState);
-    assert_eq!(file.magic, NYDUS_FILE_HANDLE_MAGIC);
+    unsafe {
+        let mut file = Box::from_raw(handle as *mut FileState);
+        assert_eq!(file.magic, NYDUS_FILE_HANDLE_MAGIC);
 
-    let ctx = Context::default();
-    let fs = FileSystemState::from_handle(file.fs_handle);
-    fs.rafs.forget(&ctx, file.ino, 1);
+        let ctx = Context::default();
+        let fs = FileSystemState::from_handle(file.fs_handle);
+        fs.rafs.forget(&ctx, file.ino, 1);
 
-    file.magic -= 0x4fdf_ae34_9d9a_03cd;
+        file.magic -= 0x4fdf_ae34_9d9a_03cd;
+    }
 }

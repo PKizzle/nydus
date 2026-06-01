@@ -20,7 +20,7 @@
 //!
 //! **Builtin mode** (`UffdCore`): An embeddable library. The consumer creates the
 //! userfaultfd, mmaps the region, and calls `UffdCore::handle_page_fault` directly
-//! in-process — no socket, no protocol overhead.
+//! in-process - no socket, no protocol overhead.
 //!
 //! Protocol (JSON + fd format, Firecracker compatible):
 //! - [Handshake] JSON HandshakeRequest + SCM_RIGHTS (uffd fds)
@@ -319,7 +319,7 @@ pub async fn uffdio_wake(uffd_fd: RawFd, start_addr: u64, len: u64) -> Result<()
 }
 
 // ---------------------------------------------------------------------------
-// UffdCore — page fault resolution engine
+// UffdCore - page fault resolution engine
 // ---------------------------------------------------------------------------
 
 /// Core UFFD page fault resolution engine.
@@ -2211,7 +2211,7 @@ mod tests {
             })
             .unwrap();
 
-            // No uffd fd provided — should fail
+            // No uffd fd provided - should fail
             let result = UffdWorker::handle_handshake(json_val, Vec::new(), &sock_async, &core);
             assert!(result.is_err());
         });

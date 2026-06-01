@@ -363,12 +363,12 @@ impl FsIoStats {
 
     /// Mark ending of filesystem operation and record statistics.
     pub fn latency_end(&self, start: &Option<SystemTime>, fop: StatsFop) {
-        if let Some(start) = start {
-            if let Ok(d) = SystemTime::elapsed(start) {
-                let elapsed = saturating_duration_micros(&d);
-                self.read_latency_dist[latency_micros_range_index(elapsed)].inc();
-                self.fop_cumulative_latency_total[fop as usize].add(elapsed);
-            }
+        if let Some(start) = start
+            && let Ok(d) = SystemTime::elapsed(start)
+        {
+            let elapsed = saturating_duration_micros(&d);
+            self.read_latency_dist[latency_micros_range_index(elapsed)].inc();
+            self.fop_cumulative_latency_total[fop as usize].add(elapsed);
         }
     }
 
@@ -465,14 +465,14 @@ pub fn export_files_stats(
             }
         })?,
         None => {
-            if fs_metrics.len() == 1 {
-                if let Some(ios) = fs_metrics.values().next() {
-                    return if !latest_read_files {
-                        ios.export_files_stats()
-                    } else {
-                        Ok(ios.export_latest_read_files())
-                    };
-                }
+            if fs_metrics.len() == 1
+                && let Some(ios) = fs_metrics.values().next()
+            {
+                return if !latest_read_files {
+                    ios.export_files_stats()
+                } else {
+                    Ok(ios.export_latest_read_files())
+                };
             }
             Err(MetricsError::NoCounter)
         }
@@ -488,10 +488,10 @@ pub fn export_files_access_pattern(name: &Option<String>) -> Result<String, Metr
             .ok_or(MetricsError::NoCounter)
             .map(|v| v.export_files_access_patterns())?,
         None => {
-            if fs_metrics.len() == 1 {
-                if let Some(ios) = fs_metrics.values().next() {
-                    return ios.export_files_access_patterns();
-                }
+            if fs_metrics.len() == 1
+                && let Some(ios) = fs_metrics.values().next()
+            {
+                return ios.export_files_access_patterns();
             }
             Err(MetricsError::NoCounter)
         }
@@ -509,10 +509,10 @@ pub fn export_global_stats(name: &Option<String>) -> Result<String, MetricsError
             .ok_or(MetricsError::NoCounter)
             .map(|v| v.export_fs_stats())?,
         None => {
-            if fs_metrics.len() == 1 {
-                if let Some(ios) = fs_metrics.values().next() {
-                    return ios.export_fs_stats();
-                }
+            if fs_metrics.len() == 1
+                && let Some(ios) = fs_metrics.values().next()
+            {
+                return ios.export_fs_stats();
             }
             Err(MetricsError::NoCounter)
         }
@@ -529,10 +529,10 @@ pub fn export_backend_metrics(name: &Option<String>) -> IoStatsResult<String> {
             .ok_or(MetricsError::NoCounter)
             .map(|v| v.export_metrics())?,
         None => {
-            if metrics.len() == 1 {
-                if let Some(m) = metrics.values().next() {
-                    return m.export_metrics();
-                }
+            if metrics.len() == 1
+                && let Some(m) = metrics.values().next()
+            {
+                return m.export_metrics();
             }
             Err(MetricsError::NoCounter)
         }
@@ -549,10 +549,10 @@ pub fn export_blobcache_metrics(id: &Option<String>) -> IoStatsResult<String> {
             .ok_or(MetricsError::NoCounter)
             .map(|v| v.export_metrics())?,
         None => {
-            if metrics.len() == 1 {
-                if let Some(m) = metrics.values().next() {
-                    return m.export_metrics();
-                }
+            if metrics.len() == 1
+                && let Some(m) = metrics.values().next()
+            {
+                return m.export_metrics();
             }
             Err(MetricsError::NoCounter)
         }

@@ -56,13 +56,13 @@ pub fn resolve_backend_config(
         bail!("--{flag_prefix}backend-type is required when backend configuration is provided");
     }
 
-    if let Some(kind) = backend_type {
-        if kind != BackendType::Registry && config.as_deref().unwrap_or_default().trim().is_empty()
-        {
-            bail!(
-                "backend configuration is empty, please specify option '--{flag_prefix}backend-config'"
-            );
-        }
+    if let Some(kind) = backend_type
+        && kind != BackendType::Registry
+        && config.as_deref().unwrap_or_default().trim().is_empty()
+    {
+        bail!(
+            "backend configuration is empty, please specify option '--{flag_prefix}backend-config'"
+        );
     }
 
     Ok(config)

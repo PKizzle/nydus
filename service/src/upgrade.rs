@@ -113,12 +113,12 @@ struct FusedevState {
 }
 
 fn redact_mount_cmd_secrets(mut cmd: FsBackendMountCmd) -> FsBackendMountCmd {
-    if matches!(&cmd.fs_type, crate::FsBackendType::Rafs) {
-        if let Ok(config) = ConfigV2::from_str(&cmd.config) {
-            match serde_json::to_string(&config.clone_without_secrets()) {
-                Ok(redacted) => cmd.config = redacted,
-                Err(e) => warn!("failed to redact mount configuration: {}", e),
-            }
+    if matches!(&cmd.fs_type, crate::FsBackendType::Rafs)
+        && let Ok(config) = ConfigV2::from_str(&cmd.config)
+    {
+        match serde_json::to_string(&config.clone_without_secrets()) {
+            Ok(redacted) => cmd.config = redacted,
+            Err(e) => warn!("failed to redact mount configuration: {}", e),
         }
     }
     cmd
@@ -451,52 +451,52 @@ pub mod fanotify_upgrade {
     /// (no re-arm, no re-mount — the marks and mount survived) and starts its workers, so the new
     /// daemon resumes serving the still-mounted EROFS filesystems.
     pub fn restore(daemon: &ServiceController) -> Result<()> {
-        if let Some(mut mgr) = daemon.upgrade_mgr() {
-            if let Some(blob_mgr) = daemon.get_blob_cache_mgr() {
-                // restore the preserved fds + serialized state via the backend in the mgr
-                let (files, mut state_data) = mgr.restore_fanotify()?;
+        if let Some(mut mgr) = daemon.upgrade_mgr()
+            && let Some(blob_mgr) = daemon.get_blob_cache_mgr()
+        {
+            // restore the preserved fds + serialized state via the backend in the mgr
+            let (files, mut state_data) = mgr.restore_fanotify()?;
 
-                let backend_stat = FanotifyBackendState::restore(&mut state_data)
-                    .map_err(UpgradeMgrError::Deserialize)?;
+            let backend_stat = FanotifyBackendState::restore(&mut state_data)
+                .map_err(UpgradeMgrError::Deserialize)?;
 
-                let stat =
-                    FanotifyState::try_from(&backend_stat).map_err(UpgradeMgrError::Deserialize)?;
+            let stat =
+                FanotifyState::try_from(&backend_stat).map_err(UpgradeMgrError::Deserialize)?;
 
-                // Re-add blob entries first so handler reconstruction sees a populated cache.
-                stat.blob_entry_map
-                    .iter()
-                    .try_for_each(|(_, entry)| -> Result<()> {
-                        blob_mgr
-                            .add_blob_entry(entry)
-                            .map_err(UpgradeMgrError::Deserialize)?;
-                        Ok(())
-                    })?;
+            // Re-add blob entries first so handler reconstruction sees a populated cache.
+            stat.blob_entry_map
+                .iter()
+                .try_for_each(|(_, entry)| -> Result<()> {
+                    blob_mgr
+                        .add_blob_entry(entry)
+                        .map_err(UpgradeMgrError::Deserialize)?;
+                    Ok(())
+                })?;
 
-                if files.len() != stat.handlers.len() {
-                    warn!(
-                        "fanotify upgrade: {} preserved fds but {} handler records; reconstructing the overlap only",
-                        files.len(),
-                        stat.handlers.len()
-                    );
-                }
-
-                // Rebuild each handler from its preserved group fd (fds[i] <-> handlers[i]).
-                for (desc, file) in stat.handlers.iter().zip(files) {
-                    daemon
-                        .restore_fanotify_handler(
-                            &desc.image_id,
-                            &desc.blob_dir,
-                            &desc.mountpoint,
-                            desc.threads,
-                            file,
-                        )
-                        .map_err(UpgradeMgrError::InitializeFanotify)?;
-                }
-
-                // Restore upgrade manager state
-                mgr.fanotify_deamon_stat = stat;
-                return Ok(());
+            if files.len() != stat.handlers.len() {
+                warn!(
+                    "fanotify upgrade: {} preserved fds but {} handler records; reconstructing the overlap only",
+                    files.len(),
+                    stat.handlers.len()
+                );
             }
+
+            // Rebuild each handler from its preserved group fd (fds[i] <-> handlers[i]).
+            for (desc, file) in stat.handlers.iter().zip(files) {
+                daemon
+                    .restore_fanotify_handler(
+                        &desc.image_id,
+                        &desc.blob_dir,
+                        &desc.mountpoint,
+                        desc.threads,
+                        file,
+                    )
+                    .map_err(UpgradeMgrError::InitializeFanotify)?;
+            }
+
+            // Restore upgrade manager state
+            mgr.fanotify_deamon_stat = stat;
+            return Ok(());
         }
         Err(UpgradeMgrError::MissingSupervisorPath.into())
     }

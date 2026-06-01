@@ -49,15 +49,15 @@ impl FilesystemTreeBuilder {
             let path = child.path();
             let target = Node::generate_target(&path, &ctx.source_path);
             let mut file_size: u64 = 0;
-            if ctx.attributes.is_external(&target) {
-                if let Some(value) = ctx.attributes.get_value(&target, "file_size") {
-                    file_size = value.parse::<u64>().ok().ok_or_else(|| {
-                        anyhow!(
-                            "failed to parse file_size for external file {}",
-                            &target.display()
-                        )
-                    })?;
-                }
+            if ctx.attributes.is_external(&target)
+                && let Some(value) = ctx.attributes.get_value(&target, "file_size")
+            {
+                file_size = value.parse::<u64>().ok().ok_or_else(|| {
+                    anyhow!(
+                        "failed to parse file_size for external file {}",
+                        &target.display()
+                    )
+                })?;
             }
 
             let mut child = Node::from_fs_object(

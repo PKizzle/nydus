@@ -380,16 +380,15 @@ impl AsyncWorkerMgr {
         metrics.prefetch_data_amount.add(size);
 
         if let Some(obj) = cache.get_blob_object() {
-            if let Err(_e) = obj.fetch_range_compressed(offset, size, true) {
-                if mgr.retry_times.load(Ordering::Relaxed) > 0 {
-                    mgr.retry_times.fetch_sub(1, Ordering::Relaxed);
-                    thread::spawn(move || {
-                        thread::sleep(Duration::from_secs(1));
-                        let msg =
-                            AsyncPrefetchMessage::new_blob_prefetch(cache.clone(), offset, size);
-                        let _ = mgr.send_prefetch_message(msg);
-                    });
-                }
+            if let Err(_e) = obj.fetch_range_compressed(offset, size, true)
+                && mgr.retry_times.load(Ordering::Relaxed) > 0
+            {
+                mgr.retry_times.fetch_sub(1, Ordering::Relaxed);
+                thread::spawn(move || {
+                    thread::sleep(Duration::from_secs(1));
+                    let msg = AsyncPrefetchMessage::new_blob_prefetch(cache.clone(), offset, size);
+                    let _ = mgr.send_prefetch_message(msg);
+                });
             }
         } else {
             warn!("prefetch blob range is not supported");

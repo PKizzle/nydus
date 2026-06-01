@@ -154,12 +154,12 @@ impl DirectSuperBlockV5 {
             offset,
         };
 
-        if let Err(e) = wrapper.validate(state.meta.inodes_count, state.meta.chunk_size as u64) {
-            if e.raw_os_error().unwrap_or(0) != libc::EOPNOTSUPP {
-                return Err(e);
-            }
-            // ignore unsupported err
+        if let Err(e) = wrapper.validate(state.meta.inodes_count, state.meta.chunk_size as u64)
+            && e.raw_os_error().unwrap_or(0) != libc::EOPNOTSUPP
+        {
+            return Err(e);
         }
+        // ignore unsupported err
 
         if validate_inode {
             let digester = state.meta.get_digester();

@@ -285,11 +285,11 @@ fn unescape_mount_field(s: &str) -> String {
             let a = chars.next();
             let b = chars.next();
             let d = chars.next();
-            if let (Some(a), Some(b), Some(d)) = (a, b, d) {
-                if let Ok(code) = u8::from_str_radix(&format!("{a}{b}{d}"), 8) {
-                    out.push(code as char);
-                    continue;
-                }
+            if let (Some(a), Some(b), Some(d)) = (a, b, d)
+                && let Ok(code) = u8::from_str_radix(&format!("{a}{b}{d}"), 8)
+            {
+                out.push(code as char);
+                continue;
             }
             out.push('\\');
             if let Some(a) = a {

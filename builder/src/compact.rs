@@ -489,20 +489,18 @@ impl BlobCompactor {
                         need_merge_blobs.push((idx, blob_size));
                     }
                 }
-                State::Rebuild(cs) => {
-                    if cs.total_size < low {
-                        info!(
-                            "compactor: try to merge blob {} size {}",
-                            blob_info.blob_id, cs.total_size
-                        );
-                        need_merge_blobs.push((idx, cs.total_size));
-                    }
+                State::Rebuild(cs) if cs.total_size < low => {
+                    info!(
+                        "compactor: try to merge blob {} size {}",
+                        blob_info.blob_id, cs.total_size
+                    );
+                    need_merge_blobs.push((idx, cs.total_size));
                 }
                 _ => {}
             }
         }
         // sort by size
-        need_merge_blobs.sort_by(|(_, len1), (_, len2)| len1.cmp(len2));
+        need_merge_blobs.sort_by_key(|(_, len1)| *len1);
         // try merge
         if need_merge_blobs.len() < 2 {
             return Ok(());
@@ -897,7 +895,7 @@ mod tests {
             )
             .unwrap();
 
-        res.sort_by(|a, b| a.0.id().data.cmp(&b.0.id().data));
+        res.sort_by_key(|a| a.0.id().data);
 
         assert_eq!(res.len(), 3);
         assert_eq!(

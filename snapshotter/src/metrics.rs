@@ -117,10 +117,10 @@ impl SnapshotterMetrics {
     }
 
     fn cancel_snapshot_operation(&self, operation: &'static str) {
-        if let Ok(mut operations) = self.snapshot_operations.lock() {
-            if let Some(stats) = operations.get_mut(operation) {
-                stats.in_flight = stats.in_flight.saturating_sub(1);
-            }
+        if let Ok(mut operations) = self.snapshot_operations.lock()
+            && let Some(stats) = operations.get_mut(operation)
+        {
+            stats.in_flight = stats.in_flight.saturating_sub(1);
         }
     }
 

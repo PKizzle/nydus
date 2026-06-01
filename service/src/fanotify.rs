@@ -210,8 +210,7 @@ impl FanotifyHandler {
         // We deliberately do NOT set `FAN_REPORT_FID`: pre-content fill needs a real file
         // descriptor on each event (to identify the target via `fstat` and to respond), whereas
         // `FAN_REPORT_FID` reports an opaque file handle and sets `metadata.fd` to `FAN_NOFD`.
-        let init_flags =
-            FAN_CLASS_PRE_CONTENT | (libc::FAN_CLOEXEC as u32) | (libc::FAN_NONBLOCK as u32);
+        let init_flags = FAN_CLASS_PRE_CONTENT | libc::FAN_CLOEXEC | libc::FAN_NONBLOCK;
         let raw_fd =
             unsafe { libc::fanotify_init(init_flags, (libc::O_RDONLY | libc::O_LARGEFILE) as u32) };
         if raw_fd < 0 {
@@ -283,10 +282,9 @@ impl FanotifyHandler {
         // are running and after this constructor has finished opening every backing file.
 
         // mio poll setup.
-        let poller = Poll::new()
-            .map_err(|e| std::io::Error::new(ErrorKind::Other, format!("mio poll: {}", e)))?;
+        let poller = Poll::new().map_err(|e| std::io::Error::other(format!("mio poll: {}", e)))?;
         let waker = Waker::new(poller.registry(), Token(TOKEN_EVENT_WAKER))
-            .map_err(|e| std::io::Error::new(ErrorKind::Other, format!("mio waker: {}", e)))?;
+            .map_err(|e| std::io::Error::other(format!("mio waker: {}", e)))?;
         poller
             .registry()
             .register(
@@ -294,7 +292,7 @@ impl FanotifyHandler {
                 Token(TOKEN_EVENT_FANOTIFY),
                 Interest::READABLE,
             )
-            .map_err(|e| std::io::Error::new(ErrorKind::Other, format!("mio register: {}", e)))?;
+            .map_err(|e| std::io::Error::other(format!("mio register: {}", e)))?;
 
         // Build the set of on-demand data blobs from the shared blob cache manager. Each
         // `DataBlob` owns a handle to its sparse backing file; we record that file's identity so
@@ -338,27 +336,21 @@ impl FanotifyHandler {
             let cache_fd = backing.blob.file().as_raw_fd();
             let cache_path =
                 std::fs::read_link(format!("/proc/self/fd/{}", cache_fd)).map_err(|e| {
-                    std::io::Error::new(
-                        ErrorKind::Other,
-                        format!(
-                            "fanotify: cannot resolve cache file path for blob {}: {}",
-                            backing.blob.blob_info().blob_id(),
-                            e
-                        ),
-                    )
+                    std::io::Error::other(format!(
+                        "fanotify: cannot resolve cache file path for blob {}: {}",
+                        backing.blob.blob_info().blob_id(),
+                        e
+                    ))
                 })?;
             let device_path = cache_path.with_file_name(format!("blob_{i}"));
             // Re-link defensively so a stale `blob_<i>` from a previous run cannot point at the
             // wrong inode. Nothing is mounted yet, so removing the name here is safe.
             let _ = std::fs::remove_file(&device_path);
             std::fs::hard_link(&cache_path, &device_path).map_err(|e| {
-                std::io::Error::new(
-                    ErrorKind::Other,
-                    format!(
-                        "fanotify: failed to link device {:?} -> {:?}: {}",
-                        device_path, cache_path, e
-                    ),
-                )
+                std::io::Error::other(format!(
+                    "fanotify: failed to link device {:?} -> {:?}: {}",
+                    device_path, cache_path, e
+                ))
             })?;
             device_blobs.push(device_path);
         }
@@ -406,14 +398,11 @@ impl FanotifyHandler {
                 )
             };
             if ret != 0 {
-                return Err(std::io::Error::new(
-                    ErrorKind::Other,
-                    format!(
-                        "fanotify_mark on {:?} failed: {}",
-                        blob_path,
-                        std::io::Error::last_os_error()
-                    ),
-                ));
+                return Err(std::io::Error::other(format!(
+                    "fanotify_mark on {:?} failed: {}",
+                    blob_path,
+                    std::io::Error::last_os_error()
+                )));
             }
         }
         Ok(())
@@ -671,13 +660,10 @@ impl FanotifyHandler {
 
         // Download and decompress the requested range into the sparse backing file.
         let obj = backing.blob.blob().get_blob_object().ok_or_else(|| {
-            std::io::Error::new(
-                ErrorKind::Other,
-                format!(
-                    "fanotify: blob object unavailable for {}",
-                    backing.blob.blob_info().blob_id()
-                ),
-            )
+            std::io::Error::other(format!(
+                "fanotify: blob object unavailable for {}",
+                backing.blob.blob_info().blob_id()
+            ))
         })?;
         obj.fetch_range_uncompressed(range.offset, range.count)?;
 

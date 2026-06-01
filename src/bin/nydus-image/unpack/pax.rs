@@ -548,7 +548,7 @@ impl PAXUtil {
 
             let key = Vec::from(PAX_PREFIX.to_owned())
                 .into_iter()
-                .chain(key.into_iter())
+                .chain(key)
                 .collect();
             extensions.push(PAXRecord { k: key, v: value });
         }

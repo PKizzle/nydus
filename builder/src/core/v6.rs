@@ -485,10 +485,10 @@ impl Node {
                 DigestWithBlobIndex(*chunk.inner.id(), chunk.inner.blob_index() + 1, chunk_index),
                 chunk.inner.clone(),
             );
-            if let Some((prev_idx, prev_pos)) = prev {
-                if prev_pos + ctx.chunk_size as u64 != offset || prev_idx != blob_idx {
-                    is_continuous = false;
-                }
+            if let Some((prev_idx, prev_pos)) = prev
+                && (prev_pos + ctx.chunk_size as u64 != offset || prev_idx != blob_idx)
+            {
+                is_continuous = false;
             }
             prev = Some((blob_idx, offset));
         }

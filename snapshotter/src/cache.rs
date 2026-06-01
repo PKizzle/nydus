@@ -290,19 +290,17 @@ impl CacheManager {
     }
 
     fn remove_entry(&self, entry: &CacheEntry, dry_run: bool, report: &mut CacheGcReport) {
-        if !dry_run {
-            if let Err(e) = fs::remove_file(&entry.path) {
-                warn!(
-                    path = %entry.path.display(),
-                    error = %e,
-                    "failed to remove cache file"
-                );
-                report.failures.push(CacheGcFailure {
-                    path: entry.path.clone(),
-                    error: e.to_string(),
-                });
-                return;
-            }
+        if !dry_run && let Err(e) = fs::remove_file(&entry.path) {
+            warn!(
+                path = %entry.path.display(),
+                error = %e,
+                "failed to remove cache file"
+            );
+            report.failures.push(CacheGcFailure {
+                path: entry.path.clone(),
+                error: e.to_string(),
+            });
+            return;
         }
 
         report.removed_files += 1;

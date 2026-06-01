@@ -421,15 +421,15 @@ impl RegistryReferrerClient {
 /// used as the fallback when registries do not expose the referrers API but do
 /// expose an index manifest carrying Nydus descriptors.
 pub fn detect_from_oci_json(payload: &[u8]) -> Result<ReferrerInfo> {
-    if let Ok(index) = serde_json::from_slice::<OciIndex>(payload) {
-        if let Some(info) = index.manifests.iter().find_map(classify_descriptor) {
-            return Ok(info);
-        }
+    if let Ok(index) = serde_json::from_slice::<OciIndex>(payload)
+        && let Some(info) = index.manifests.iter().find_map(classify_descriptor)
+    {
+        return Ok(info);
     }
-    if let Ok(manifest) = serde_json::from_slice::<OciManifest>(payload) {
-        if let Some(info) = manifest.layers.iter().find_map(classify_descriptor) {
-            return Ok(info);
-        }
+    if let Ok(manifest) = serde_json::from_slice::<OciManifest>(payload)
+        && let Some(info) = manifest.layers.iter().find_map(classify_descriptor)
+    {
+        return Ok(info);
     }
     Ok(standard_oci())
 }

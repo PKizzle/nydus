@@ -379,24 +379,23 @@ impl Artifact for ArtifactWriter {
                 if !s.1.is_empty() {
                     path.set_extension(&s.1);
                 }
-                if !path.exists() {
-                    if let Some(tmp_file) = &self.tmp_file {
-                        rename(tmp_file.as_path(), &path).with_context(|| {
-                            format!(
-                                "failed to rename blob {:?} to {:?}",
-                                tmp_file.as_path(),
-                                path
-                            )
-                        })?;
-                    }
+                if !path.exists()
+                    && let Some(tmp_file) = &self.tmp_file
+                {
+                    rename(tmp_file.as_path(), &path).with_context(|| {
+                        format!(
+                            "failed to rename blob {:?} to {:?}",
+                            tmp_file.as_path(),
+                            path
+                        )
+                    })?;
                 }
             }
-        } else if let ArtifactStorage::SingleFile(s) = &self.storage {
-            if let Ok(md) = s.metadata() {
-                if md.is_file() {
-                    remove_file(s).with_context(|| format!("failed to remove blob {:?}", s))?;
-                }
-            }
+        } else if let ArtifactStorage::SingleFile(s) = &self.storage
+            && let Ok(md) = s.metadata()
+            && md.is_file()
+        {
+            remove_file(s).with_context(|| format!("failed to remove blob {:?}", s))?;
         }
 
         Ok(())
@@ -657,21 +656,21 @@ impl BlobContext {
                             let size = reader
                                 .blob_size()
                                 .map_err(|e| anyhow!("failed to get blob size, {:?}", e))?;
-                            if let Ok(v) = hex::decode(digest) {
-                                if v.len() == 32 {
-                                    blob_meta_digest.copy_from_slice(&v[..32]);
-                                    blob_meta_size = size;
-                                }
+                            if let Ok(v) = hex::decode(digest)
+                                && v.len() == 32
+                            {
+                                blob_meta_digest.copy_from_slice(&v[..32]);
+                                blob_meta_size = size;
                             }
-                            if blob.has_feature(BlobFeatures::HAS_TOC) {
-                                if let Ok(toc) = TocEntryList::read_from_blob::<File>(
+                            if blob.has_feature(BlobFeatures::HAS_TOC)
+                                && let Ok(toc) = TocEntryList::read_from_blob::<File>(
                                     reader.as_ref(),
                                     None,
                                     &TocLocation::default(),
-                                ) {
-                                    toc_digest = toc.toc_digest().data;
-                                    toc_size = toc.toc_size();
-                                }
+                                )
+                            {
+                                toc_digest = toc.toc_digest().data;
+                                toc_size = toc.toc_size();
                             }
                         }
                     } else {
@@ -681,25 +680,23 @@ impl BlobContext {
                         compressed_blob_size = reader
                             .blob_size()
                             .map_err(|e| anyhow!("failed to get blob size, {:?}", e))?;
-                        if blob.has_feature(BlobFeatures::HAS_TOC) {
-                            if let Ok(toc) = TocEntryList::read_from_blob::<File>(
+                        if blob.has_feature(BlobFeatures::HAS_TOC)
+                            && let Ok(toc) = TocEntryList::read_from_blob::<File>(
                                 reader.as_ref(),
                                 None,
                                 &TocLocation::default(),
-                            ) {
-                                toc_digest = toc.toc_digest().data;
-                                toc_size = toc.toc_size();
-                            }
+                            )
+                        {
+                            toc_digest = toc.toc_digest().data;
+                            toc_size = toc.toc_size();
                         }
                     }
-                } else if features.contains(BlobFeatures::SEPARATE) {
-                    if let Ok(digest) = blob.get_blob_meta_id() {
-                        if let Ok(v) = hex::decode(digest) {
-                            if v.len() == 32 {
-                                blob_meta_digest.copy_from_slice(&v[..32]);
-                            }
-                        }
-                    }
+                } else if features.contains(BlobFeatures::SEPARATE)
+                    && let Ok(digest) = blob.get_blob_meta_id()
+                    && let Ok(v) = hex::decode(digest)
+                    && v.len() == 32
+                {
+                    blob_meta_digest.copy_from_slice(&v[..32]);
                 }
             } else if !blob.has_feature(BlobFeatures::CAP_TAR_TOC)
                 && !ctx.configuration.internal.blob_accessible()

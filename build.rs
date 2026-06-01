@@ -20,23 +20,22 @@ fn get_git_commit_hash() -> String {
         .arg("--verify")
         .arg("HEAD")
         .output();
-    if let Ok(commit_output) = commit {
-        if let Some(commit) = String::from_utf8_lossy(&commit_output.stdout)
+    if let Ok(commit_output) = commit
+        && let Some(commit) = String::from_utf8_lossy(&commit_output.stdout)
             .lines()
             .next()
-        {
-            return commit.to_string();
-        }
+    {
+        return commit.to_string();
     }
     "unknown".to_string()
 }
 
 fn get_git_commit_version() -> String {
     let tag = Command::new("git").args(["describe", "--tags"]).output();
-    if let Ok(tag) = tag {
-        if let Some(tag) = String::from_utf8_lossy(&tag.stdout).lines().next() {
-            return tag.to_string();
-        }
+    if let Ok(tag) = tag
+        && let Some(tag) = String::from_utf8_lossy(&tag.stdout).lines().next()
+    {
+        return tag.to_string();
     }
     "unknown".to_string()
 }

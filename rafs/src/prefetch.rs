@@ -477,10 +477,10 @@ impl BlobPrefetcher {
             }
 
             // Rate limiting
-            if let Some(ref limiter) = state.rate_limiter {
-                if let Some(d) = limiter.lock().unwrap().consume(n) {
-                    thread::sleep(d);
-                }
+            if let Some(ref limiter) = state.rate_limiter
+                && let Some(d) = limiter.lock().unwrap().consume(n)
+            {
+                thread::sleep(d);
             }
 
             accumulated.extend_from_slice(&read_buf[..n]);

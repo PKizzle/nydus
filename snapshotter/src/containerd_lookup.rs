@@ -161,15 +161,15 @@ impl ContainerdLookup {
             &["k3s", "ctr", "-n", "k8s.io", "content", "get", digest],
         ])?;
         // Try as index first (multi-arch); if no `manifests` field, treat as manifest.
-        if let Ok(index) = serde_json::from_slice::<OciIndex>(&bytes) {
-            if !index.manifests.is_empty() {
-                for child in index.manifests {
-                    if let Err(e) = self.walk_manifest(&child.digest, image_ref, out) {
-                        debug!(child = %child.digest, error = %e, "child manifest fetch failed");
-                    }
+        if let Ok(index) = serde_json::from_slice::<OciIndex>(&bytes)
+            && !index.manifests.is_empty()
+        {
+            for child in index.manifests {
+                if let Err(e) = self.walk_manifest(&child.digest, image_ref, out) {
+                    debug!(child = %child.digest, error = %e, "child manifest fetch failed");
                 }
-                return Ok(());
             }
+            return Ok(());
         }
         let manifest: OciManifest = serde_json::from_slice(&bytes)?;
         // Locate any nydus-bootstrap layer index (typically the last layer).

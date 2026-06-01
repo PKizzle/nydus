@@ -98,10 +98,10 @@ impl ChunkDict for HashChunkDict {
     }
 
     fn get_chunk(&self, digest: &RafsDigest, uncompressed_size: u32) -> Option<&Arc<ChunkWrapper>> {
-        if let Some((chunk, _)) = self.m.get(digest) {
-            if chunk.uncompressed_size() == 0 || chunk.uncompressed_size() == uncompressed_size {
-                return Some(chunk);
-            }
+        if let Some((chunk, _)) = self.m.get(digest)
+            && (chunk.uncompressed_size() == 0 || chunk.uncompressed_size() == uncompressed_size)
+        {
+            return Some(chunk);
         }
         None
     }

@@ -159,10 +159,10 @@ impl BlobFactory {
                 config: config.clone(),
             };
             let mgr = self.mgrs.lock().unwrap().get(&key).cloned();
-            if let Some(mgr) = mgr {
-                if mgr.gc(Some(id)) {
-                    mgrs.push((key, mgr.clone()));
-                }
+            if let Some(mgr) = mgr
+                && mgr.gc(Some(id))
+            {
+                mgrs.push((key, mgr.clone()));
             }
         } else {
             for (key, mgr) in self.mgrs.lock().unwrap().iter() {

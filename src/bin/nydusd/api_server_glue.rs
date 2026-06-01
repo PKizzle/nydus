@@ -441,14 +441,14 @@ impl ApiServer {
                     }
                 }
                 "http-proxy" => {
-                    if let Some(proxy) = backend.http_proxy.as_ref() {
-                        if !proxy.addr.is_empty() {
-                            nydus_utils::config::set(
-                                use_id,
-                                &nydus_utils::config::Keys::ProxyURL,
-                                proxy.addr.clone(),
-                            );
-                        }
+                    if let Some(proxy) = backend.http_proxy.as_ref()
+                        && !proxy.addr.is_empty()
+                    {
+                        nydus_utils::config::set(
+                            use_id,
+                            &nydus_utils::config::Keys::ProxyURL,
+                            proxy.addr.clone(),
+                        );
                     }
                 }
                 _ => {}
@@ -571,21 +571,21 @@ impl ApiServerController {
         if let Some(waker) = self.waker.take() {
             let _ = waker.wake();
         }
-        if let Some(t) = self.http_handler_thread.take() {
-            if let Err(e) = t.join() {
-                error!(
-                    "Failed to join the HTTP handler thread, execution error. {:?}",
-                    e
-                );
-            }
+        if let Some(t) = self.http_handler_thread.take()
+            && let Err(e) = t.join()
+        {
+            error!(
+                "Failed to join the HTTP handler thread, execution error. {:?}",
+                e
+            );
         }
-        if let Some(t) = self.http_router_thread.take() {
-            if let Err(e) = t.join() {
-                error!(
-                    "Failed to join the HTTP router thread, execution error. {:?}",
-                    e
-                );
-            }
+        if let Some(t) = self.http_router_thread.take()
+            && let Err(e) = t.join()
+        {
+            error!(
+                "Failed to join the HTTP router thread, execution error. {:?}",
+                e
+            );
         }
         if let Some(apisock) = self.sock.as_ref() {
             std::fs::remove_file(apisock).unwrap_or_default();
