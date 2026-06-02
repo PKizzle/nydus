@@ -1,0 +1,9 @@
+# Artifact Hub repository metadata.
+# Register the Helm repository (https://pkizzle.github.io/nydus) on Artifact Hub, then replace
+# the repositoryID below with the real value from the repository's control panel. Until then the
+# helm-release workflow still publishes the chart; only Artifact Hub ownership verification is
+# pending.
+repositoryID: REPLACE_WITH_ARTIFACT_HUB_REPOSITORY_ID
+owners:
+  - name: pkizzle
+    email: philipp.kolberg@t-online.de

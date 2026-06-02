@@ -1,0 +1,20 @@
+# Runtime-only image for the CI release pipeline (.github/workflows/docker.yml).
+#
+# Unlike deploy/docker/Dockerfile (which compiles from source), this expects the fully-static musl
+# binaries to be pre-built on a NATIVE runner and staged into the build context, so no Rust
+# toolchain runs here and there is no QEMU emulation. The build context is the staging dir itself
+# (docker.yml sets `context: dist`), so `COPY containerd-nydus ...` resolves to dist/containerd-nydus.
+#
+# For a local from-source build use deploy/docker/Dockerfile instead.
+FROM debian:bookworm-slim
+# Runtime tools the (otherwise static) binaries shell out to: ionice/nice (SchedClass low-priority
+# conversion), mount/umount (EROFS/loop), nsenter (opt-in containerd-config installer), fusermount3
+# (fusedev fallback), and erofs-utils for diagnostics. util-linux provides ionice/nice/nsenter/mount.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      util-linux fuse3 ca-certificates erofs-utils \
+ && rm -rf /var/lib/apt/lists/*
+COPY containerd-nydus /usr/local/bin/containerd-nydus
+COPY nydus-image      /usr/local/bin/nydus-image
+RUN chmod +x /usr/local/bin/containerd-nydus /usr/local/bin/nydus-image
+ENTRYPOINT ["/usr/local/bin/containerd-nydus"]
+CMD ["--config", "/etc/nydus/config.toml"]
