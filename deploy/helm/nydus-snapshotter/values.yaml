@@ -6,8 +6,8 @@
 
 image:
   # Image must bundle: containerd-nydus, nydus-image, nydusify (see deploy/docker/Dockerfile).
-  repository: ghcr.io/dragonflyoss/nydus-snapshotter
-  tag: ""            # defaults to .Chart.appVersion
+  repository: ghcr.io/pkizzle/nydus
+  tag: ""            # defaults to .Chart.appVersion (set to the release tag by helm-release.yml)
   pullPolicy: IfNotPresent
 imagePullSecrets: []
 

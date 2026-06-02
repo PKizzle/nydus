@@ -1,0 +1,214 @@
+name: Release Helm Chart
+
+# Packages the nydus-snapshotter Helm chart, pushes it to the GHCR OCI registry, attaches the
+# archive to the GitHub Release, and publishes a classic Helm repository via GitHub Pages. Runs
+# after a GitHub Release is published (the existing release.yml creates the release on tag push),
+# or manually against an existing tag.
+
+on:
+  workflow_dispatch:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+  packages: write
+  pages: write
+  id-token: write
+
+env:
+  REGISTRY: ghcr.io
+  CHART_NAME: nydus-snapshotter
+  CHART_DIR: deploy/helm/nydus-snapshotter
+  HELM_REPO_URL: https://pkizzle.github.io/nydus
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: v3.16.4
+
+      - name: Determine prerelease status
+        id: prerelease
+        env:
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          # A hyphen in the tag (e.g. v1.0.0-rc.1) marks a SemVer prerelease.
+          if [[ "$REF_NAME" == *"-"* ]]; then
+            echo "is_prerelease=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "is_prerelease=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Render Chart.yaml from template
+        env:
+          VERSION: ${{ github.ref_name }}
+          IS_PRE: ${{ steps.prerelease.outputs.is_prerelease }}
+        run: |
+          set -euo pipefail
+          template="${CHART_DIR}/Chart.template.yaml"
+          chart="${CHART_DIR}/Chart.yaml"
+          # Helm accepts a leading "v" in chart versions; keep it so the chart version, appVersion,
+          # and the image tag published by docker.yml all match the release tag exactly.
+          sed -e "s/{{IS_PRERELEASE}}/$IS_PRE/g" \
+              -e "s/^version: .*/version: $VERSION/" \
+              -e "s/^appVersion: .*/appVersion: \"$VERSION\"/" \
+              "$template" > "$chart"
+          echo "--- rendered Chart.yaml ---"
+          cat "$chart"
+
+      - name: Lint chart
+        run: helm lint "${CHART_DIR}"
+
+      - name: Package Helm chart
+        run: helm package "${CHART_DIR}" --destination .
+
+      - name: Log in to Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Convert repository owner to lowercase
+        id: repository_owner
+        uses: ASzc/change-string-case-action@v6
+        with:
+          string: ${{ github.repository_owner }}
+
+      - name: Push Helm chart to OCI registry
+        env:
+          VERSION: ${{ github.ref_name }}
+          OWNER: ${{ steps.repository_owner.outputs.lowercase }}
+        run: |
+          set -euo pipefail
+          helm push "${CHART_NAME}-${VERSION}.tgz" "oci://${REGISTRY}/${OWNER}/nydus/helm"
+
+      - name: Attach chart to GitHub Release
+        if: github.event_name == 'release'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          gh release upload "$VERSION" "${CHART_NAME}-${VERSION}.tgz" --clobber
+
+      - name: Build Helm repository for GitHub Pages
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          PAGES_DIR="dist/helm-repo"
+          ASSETS_DIR="dist/chart-assets"
+          CURRENT_TAG="$VERSION"
+
+          rm -rf "$PAGES_DIR" "$ASSETS_DIR"
+          mkdir -p "$PAGES_DIR" "$ASSETS_DIR/$CURRENT_TAG"
+
+          # Keep GitHub Releases as the single host for chart archives while still publishing a
+          # classic Helm index via GitHub Pages.
+          cp "${CHART_NAME}-${VERSION}.tgz" "$ASSETS_DIR/$CURRENT_TAG/"
+
+          # Backfill the index from all release chart assets so the first Pages deployment already
+          # exposes historical chart versions.
+          gh release list --limit 100 --json tagName --jq '.[].tagName' | while IFS= read -r tag; do
+            [[ -z "$tag" ]] && continue
+            mkdir -p "$ASSETS_DIR/$tag"
+            gh release download "$tag" \
+              --pattern "${CHART_NAME}-*.tgz" \
+              --dir "$ASSETS_DIR/$tag" \
+              --clobber || true
+          done
+
+          rm -f "$PAGES_DIR/index.yaml"
+          shopt -s nullglob
+          found_package=false
+          for release_dir in "$ASSETS_DIR"/*; do
+            [[ -d "$release_dir" ]] || continue
+
+            tag="$(basename "$release_dir")"
+            packages=("$release_dir"/${CHART_NAME}-*.tgz)
+            if (( ${#packages[@]} == 0 )); then
+              continue
+            fi
+
+            found_package=true
+            tmpdir="$(mktemp -d)"
+            cp "${packages[@]}" "$tmpdir/"
+
+            package_url="https://github.com/${{ github.repository }}/releases/download/${tag}"
+            if [[ -f "$PAGES_DIR/index.yaml" ]]; then
+              helm repo index "$tmpdir" --url "$package_url" --merge "$PAGES_DIR/index.yaml"
+            else
+              helm repo index "$tmpdir" --url "$package_url"
+            fi
+
+            cp "$tmpdir/index.yaml" "$PAGES_DIR/index.yaml"
+            rm -rf "$tmpdir"
+          done
+
+          if [[ "$found_package" != "true" ]]; then
+            echo "::error::No Helm chart packages found for repository index generation"
+            exit 1
+          fi
+
+          if ! grep -q "https://github.com/${{ github.repository }}/releases/download/" "$PAGES_DIR/index.yaml"; then
+            echo "::error::Helm repository index must point to GitHub release chart assets"
+            exit 1
+          fi
+
+          if compgen -G "$PAGES_DIR/*.tgz" > /dev/null; then
+            echo "::error::GitHub Pages artifact must not duplicate chart archives"
+            exit 1
+          fi
+
+          # Artifact Hub metadata is optional; copy it only if it has been added to the repo.
+          if [[ -f artifacthub-repo.yml ]]; then
+            cp artifacthub-repo.yml "$PAGES_DIR/artifacthub-repo.yml"
+          fi
+          touch "$PAGES_DIR/.nojekyll"
+          cat > "$PAGES_DIR/README.md" <<EOF
+          # nydus-snapshotter Helm Repository
+
+          Add this repository with:
+
+              helm repo add nydus-snapshotter ${HELM_REPO_URL}
+              helm repo update
+
+          Then install the chart with:
+
+              helm install nydus-snapshotter nydus-snapshotter/${CHART_NAME}
+          EOF
+
+      - name: Configure GitHub Pages
+        uses: actions/configure-pages@v6
+
+      - name: Upload Helm repository Pages artifact
+        uses: actions/upload-pages-artifact@v5
+        with:
+          path: dist/helm-repo
+          include-hidden-files: true
+
+  deploy-pages:
+    needs: release
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    permissions:
+      pages: write
+      id-token: write
+    steps:
+      - name: Deploy Helm repository to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v5
