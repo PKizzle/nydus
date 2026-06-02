@@ -244,9 +244,15 @@ fn random_duration(min_millis: u64, max_millis: u64) -> Duration {
 
 /// Proxy-aware retry loop for backend read operations.
 ///
+/// Errors are tiered by what the proxy status *means*: a 403 is a deliberate
+/// authorization denial (fatal — retrying or falling back to the origin would
+/// only mask the access-control decision), whereas 429/5xx/timeout are transient
+/// and the origin is the correct relief valve. See `docs/nydus-dragonfly.md`
+/// ("Why 403 is fatal") for the rationale.
+///
 /// Retry policy:
 /// - On-demand requests get 3 retries, prefetch gets 1
-/// - Proxy-forbidden (403): return immediately, no retry
+/// - Proxy-forbidden (403): return immediately, no retry (no origin fallback)
 /// - Proxy rate-limited (429) + prefetch: return immediately
 /// - Proxy rate-limited + on-demand: disable proxy, apply QPS limiter, retry via source
 /// - SDK internal error: disable SDK, retry via HTTP proxy

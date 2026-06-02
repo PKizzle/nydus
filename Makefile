@@ -56,6 +56,15 @@ ifneq (,$(findstring riscv64,$(RUST_TARGET_STATIC)))
 	EXCLUDE_PACKAGES += --exclude nydus-snapshotter
 endif
 
+# Extra opt-in cargo features to fold into the build. Used by the Dragonfly e2e
+# job to enable backend-dragonfly-proxy, which is excluded from the default build
+# (it pulls dragonfly-client-util -> OpenSSL/tokio and blocks the musl-static
+# build) but is required to exercise the Dragonfly proxy error-handling path.
+# Build on a glibc target, e.g. `make release EXTRA_FEATURES=backend-dragonfly-proxy`.
+ifneq ($(EXTRA_FEATURES),)
+	CARGO_COMMON += --features=$(EXTRA_FEATURES)
+endif
+
 # --- Relocate the build directory for checkouts whose path contains spaces ---
 # OpenSSL's vendored build (the openssl-src crate, pulled in by `static-release`)
 # runs perl `Configure` and `make` inside Cargo's OUT_DIR, which lives under the
