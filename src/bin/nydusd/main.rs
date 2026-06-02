@@ -908,6 +908,11 @@ mod uffd {
             error!("Failed in starting UFFD daemon: {}", e);
             e
         })?;
+        // The uffd daemon is a long-running, controller-managed service (like the singleton/blob
+        // cache daemon), not a one-shot fs mount. Without singleton mode, `DaemonController::run_loop`
+        // exits on the first waker event and nydusd quits immediately, tearing down the `--apisock`
+        // HTTP server before clients can query it (smoke TestUffd: "timeout to wait nydusd state").
+        DAEMON_CONTROLLER.set_singleton_mode(true);
         DAEMON_CONTROLLER.set_daemon(daemon);
 
         Ok(())
