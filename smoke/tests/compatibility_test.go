@@ -32,11 +32,21 @@ func (c *CompatibilityTestSuite) TestConvertImages() test.Generator {
 	scenarios := tool.DescartesIterator{}
 	scenarios.
 		Dimension(paramImage, []interface{}{"nginx:latest"}).
-		Dimension(paramFSVersion, []interface{}{"6"}).
+		Dimension(paramFSVersion, []interface{}{"5", "6"}).
 		Dimension(paramNydusImageVersion, []interface{}{"v0.1.0", stableVersion, "latest"}).
 		Dimension(paramNydusifyVersion, []interface{}{"v0.1.0", stableVersion, "latest"}).
 		Dimension(paramNydusdVersion, []interface{}{"v0.1.0", stableVersion, "latest"}).
 		Skip(func(param *tool.DescartesItem) bool {
+
+			// The current (latest) nydus-image / nydusify no longer support *writing* RAFS v5
+			// (only reading). Skip building v5 with the latest builder/nydusify; v5 read
+			// compatibility is still covered by the v0.1.0 / stable builders below, optionally
+			// read back with the latest nydusd.
+			if param.GetString(paramFSVersion) == "5" &&
+				(param.GetString(paramNydusImageVersion) == "latest" ||
+					param.GetString(paramNydusifyVersion) == "latest") {
+				return true
+			}
 
 			// Nydus-image 0.1.0 only works with nydus-nydusify 0.1.0, vice versa.
 			// They both only work with rafs v5.
