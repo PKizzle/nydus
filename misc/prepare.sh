@@ -20,8 +20,18 @@ sudo install -D -m 755 bin/containerd-nydus-grpc /usr/local/bin
 sudo wget https://github.com/containerd/nerdctl/releases/download/v$NERDCTL_VERSION/nerdctl-$NERDCTL_VERSION-linux-amd64.tar.gz
 sudo tar -xzvf nerdctl-$NERDCTL_VERSION-linux-amd64.tar.gz -C /usr/local/bin
 sudo mkdir -p /opt/cni/bin
-sudo wget https://github.com/containernetworking/plugins/releases/download/$CNI_PLUGINS_VERSION/cni-plugins-linux-amd64-$CNI_PLUGINS_VERSION.tgz 
+sudo wget https://github.com/containernetworking/plugins/releases/download/$CNI_PLUGINS_VERSION/cni-plugins-linux-amd64-$CNI_PLUGINS_VERSION.tgz
 sudo tar -xzvf cni-plugins-linux-amd64-$CNI_PLUGINS_VERSION.tgz -C /opt/cni/bin
+
+# Upgrade containerd to a release containing the Transfer-API unpacker fix (containerd#11236).
+# containerd v2.0 enabled the Transfer API by default, and unpatched v2.0.x releases fail to pull
+# images with a snapshotter set: "unable to initialize unpacker: no unpack platforms defined"
+# (containerd issues #11228 / #11606). The runner ships an affected v2.0.x, so nerdctl run of nydus
+# images breaks; pin the latest v2.0 patch which unpacks the default platform without --local.
+readonly CONTAINERD_VERSION=2.0.8
+wget -q https://github.com/containerd/containerd/releases/download/v${CONTAINERD_VERSION}/containerd-static-${CONTAINERD_VERSION}-linux-amd64.tar.gz
+sudo tar -C /usr -xzf containerd-static-${CONTAINERD_VERSION}-linux-amd64.tar.gz
+
 sudo install -D misc/performance/containerd_config.toml /etc/containerd/config.toml
 sudo systemctl restart containerd
 sudo install -D misc/performance/nydusd_config.json /etc/nydus/nydusd-config.fusedev.json

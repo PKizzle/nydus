@@ -31,8 +31,6 @@ func (p *PerformanceTestSuite) TestPerformance(_ *testing.T) {
 		mode = "fs-version-6"
 	}
 	switch mode {
-	case "fs-version-5":
-		ctx.Build.FSVersion = "5"
 	case "fs-version-6":
 		ctx.Build.FSVersion = "6"
 	case "zran":

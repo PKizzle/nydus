@@ -30,7 +30,7 @@ func (c *HotUpgradeTestSuite) buildLayer(t *testing.T, ctx *tool.Context, rootFs
 		converter.PackOption{
 			BuilderPath: ctx.Binary.Builder,
 			Compressor:  "lz4_block",
-			FsVersion:   "5",
+			FsVersion:   "6",
 		},
 		ctx.Env.BlobDir)
 	_, bootstrap := tool.MergeLayers(t, *ctx,

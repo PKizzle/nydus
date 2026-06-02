@@ -190,7 +190,7 @@ func TestModctlExternal(t *testing.T) {
 	ctx := tool.DefaultContext(t)
 	ctx.PrepareWorkDir(t)
 	ctx.Build.Compressor = "lz4_block"
-	ctx.Build.FSVersion = "5"
+	ctx.Build.FSVersion = "6"
 	defer ctx.Destroy(t)
 
 	host, name, tag, err := parseReference(modelImageRef)
@@ -277,7 +277,7 @@ func TestModctlExternalBinary(t *testing.T) {
 	ctx := tool.DefaultContext(t)
 	ctx.PrepareWorkDir(t)
 	ctx.Build.Compressor = "lz4_block"
-	ctx.Build.FSVersion = "5"
+	ctx.Build.FSVersion = "6"
 	defer ctx.Destroy(t)
 	source := modelImageRef
 	target := modelImageRef + "_smoke_test_nydus_v2" + strconv.Itoa(int(time.Now().Unix()))

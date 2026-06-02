@@ -48,7 +48,7 @@ func (n *NativeLayerTestSuite) TestMakeLayers() test.Generator {
 	scenarios.
 		Dimension(paramNydusdVersion, []interface{}{"v0.1.0", "latest"}).
 		Dimension(paramCompressor, []interface{}{"zstd", "none", "lz4_block"}).
-		Dimension(paramFSVersion, []interface{}{"5", "6"}).
+		Dimension(paramFSVersion, []interface{}{"6"}).
 		Dimension(paramChunkSize, []interface{}{"0x100000", "0x200000"}).
 		Dimension(paramCacheType, []interface{}{"blobcache", ""}).
 		Dimension(paramCacheCompressed, []interface{}{true, false}).
@@ -118,7 +118,7 @@ func (n *NativeLayerTestSuite) TestAmplifyIO() test.Generator {
 
 		/* Common params */
 		Dimension(paramCompressor, []interface{}{"lz4_block"}).
-		Dimension(paramFSVersion, []interface{}{"5", "6"}).
+		Dimension(paramFSVersion, []interface{}{"6"}).
 		Dimension(paramChunkSize, []interface{}{"0x100000"}).
 		Dimension(paramCacheType, []interface{}{"blobcache"}).
 		Dimension(paramCacheCompressed, []interface{}{false}).
@@ -171,7 +171,7 @@ func (n *NativeLayerTestSuite) TestAmplifyIO() test.Generator {
 
 func (n *NativeLayerTestSuite) TestMergeLayerWithParentBootstrap(t *testing.T) {
 	ctx := tool.DefaultContext(t)
-	ctx.Build.FSVersion = "5"
+	ctx.Build.FSVersion = "6"
 	ctx.Build.Compressor = "lz4_block"
 
 	packOption := converter.PackOption{

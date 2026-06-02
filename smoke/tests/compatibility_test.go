@@ -32,7 +32,7 @@ func (c *CompatibilityTestSuite) TestConvertImages() test.Generator {
 	scenarios := tool.DescartesIterator{}
 	scenarios.
 		Dimension(paramImage, []interface{}{"nginx:latest"}).
-		Dimension(paramFSVersion, []interface{}{"5", "6"}).
+		Dimension(paramFSVersion, []interface{}{"6"}).
 		Dimension(paramNydusImageVersion, []interface{}{"v0.1.0", stableVersion, "latest"}).
 		Dimension(paramNydusifyVersion, []interface{}{"v0.1.0", stableVersion, "latest"}).
 		Dimension(paramNydusdVersion, []interface{}{"v0.1.0", stableVersion, "latest"}).

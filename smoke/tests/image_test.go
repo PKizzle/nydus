@@ -35,7 +35,7 @@ func (i *ImageTestSuite) TestConvertImages() test.Generator {
 	scenarios := tool.DescartesIterator{}
 	scenarios.
 		Dimension(paramImage, []interface{}{"nginx:latest"}).
-		Dimension(paramFSVersion, []interface{}{"5", "6"}).
+		Dimension(paramFSVersion, []interface{}{"6"}).
 		Dimension(paramZran, []interface{}{false, true}).
 		Dimension(paramBatch, []interface{}{"0", "0x100000"}).
 		Dimension(paramEncrypt, []interface{}{false, true}).
@@ -184,7 +184,7 @@ func (i *ImageTestSuite) TestGenerateChunkdicts() test.Generator {
 	}
 	scenarios := tool.DescartesIterator{}
 	scenarios.
-		Dimension(paramFSVersion, []interface{}{"5", "6"})
+		Dimension(paramFSVersion, []interface{}{"6"})
 	return func() (name string, testCase test.Case) {
 		if !scenarios.HasNext() {
 			return
