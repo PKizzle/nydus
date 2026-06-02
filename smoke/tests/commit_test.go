@@ -45,7 +45,7 @@ func (c *CommitTestSuite) TestCommitContainer() test.Generator {
 func (c *CommitTestSuite) TestCommitAndCheck(ctx tool.Context, image, commitedImage string) {
 	// run nydus container
 	containerName := uuid.NewString()
-	runContainerCmd := fmt.Sprintf("sudo nerdctl --snapshotter nydus run -d -t --insecure-registry --name=%s %s sh", containerName, image)
+	runContainerCmd := fmt.Sprintf("sudo nerdctl --snapshotter nydus run --platform linux/amd64 -d -t --insecure-registry --name=%s %s sh", containerName, image)
 	containerID := strings.Trim(tool.RunWithOutput(runContainerCmd), "\n")
 	defer tool.ClearContainer(c.t, image, "nydus", containerName)
 
@@ -64,7 +64,7 @@ func (c *CommitTestSuite) TestCommitAndCheck(ctx tool.Context, image, commitedIm
 	tool.RunWithoutOutput(c.t, commitCmd)
 
 	// run committed container
-	runCommittedContainerCmd := fmt.Sprintf("sudo nerdctl --snapshotter nydus run  -d -t --insecure-registry --name=%s %s sh", committedContainerName, commitedImage)
+	runCommittedContainerCmd := fmt.Sprintf("sudo nerdctl --snapshotter nydus run  --platform linux/amd64 -d -t --insecure-registry --name=%s %s sh", committedContainerName, commitedImage)
 	tool.RunWithOutput(runCommittedContainerCmd)
 	defer tool.ClearContainer(c.t, commitedImage, "nydus", committedContainerName)
 
