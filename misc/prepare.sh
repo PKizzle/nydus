@@ -7,7 +7,6 @@ if [ "$1" == "takeover_test" ]; then
     sed -i 's/recover_policy = "restart"/recover_policy = "failover"/' "$SNAPSHOTTER_CONFIG"
 fi
 
-readonly SNAPSHOTTER_VERSION=`curl -s https://api.github.com/repos/containerd/nydus-snapshotter/releases/latest | grep tag_name | cut -f4 -d "\""`
 # Pin nerdctl to the 1.7.x line. nerdctl v2 pulls via containerd's Transfer service, which does not
 # propagate the remote-snapshot image-ref annotation a proxy snapshotter needs (containerd issues
 # #11606 / #11082), so `nerdctl run --snapshotter nydus` fails with "failed to find image ref of
@@ -19,9 +18,10 @@ readonly CNI_PLUGINS_VERSION=`curl -s https://api.github.com/repos/containernetw
 # setup nerdctl and nydusd env
 sudo install -D -m 755 contrib/nydusify/cmd/nydusify /usr/local/bin
 sudo install -D -m 755 target/$INSTALL_TARGET_TYPE/nydusd target/$INSTALL_TARGET_TYPE/nydus-image /usr/local/bin
-wget https://github.com/containerd/nydus-snapshotter/releases/download/$SNAPSHOTTER_VERSION/nydus-snapshotter-$SNAPSHOTTER_VERSION-linux-amd64.tar.gz
-tar zxvf nydus-snapshotter-$SNAPSHOTTER_VERSION-linux-amd64.tar.gz
-sudo install -D -m 755 bin/containerd-nydus-grpc /usr/local/bin
+# Install the in-repo Rust nydus snapshotter (containerd-nydus). It links nydus-service and runs the
+# daemon in-process from a single unified TOML config, replacing the legacy Go containerd-nydus-grpc
+# (which forked nydusd and needed a separate nydusd JSON config).
+sudo install -D -m 755 target/$INSTALL_TARGET_TYPE/containerd-nydus /usr/local/bin
 sudo wget https://github.com/containerd/nerdctl/releases/download/v$NERDCTL_VERSION/nerdctl-$NERDCTL_VERSION-linux-amd64.tar.gz
 sudo tar -xzvf nerdctl-$NERDCTL_VERSION-linux-amd64.tar.gz -C /usr/local/bin
 sudo mkdir -p /opt/cni/bin
@@ -39,7 +39,8 @@ sudo tar -C /usr -xzf containerd-static-${CONTAINERD_VERSION}-linux-amd64.tar.gz
 
 sudo install -D misc/performance/containerd_config.toml /etc/containerd/config.toml
 sudo systemctl restart containerd
-sudo install -D misc/performance/nydusd_config.json /etc/nydus/nydusd-config.fusedev.json
+# The Rust snapshotter builds the per-image nydusd backend/cache config in-process
+# (snapshotter/src/daemon/config_builder.rs), so no separate nydusd JSON is installed.
 sudo install -D $SNAPSHOTTER_CONFIG /etc/nydus/config.toml
 sudo install -D misc/performance/nydus-snapshotter.service /etc/systemd/system/nydus-snapshotter.service
 sudo systemctl start nydus-snapshotter
