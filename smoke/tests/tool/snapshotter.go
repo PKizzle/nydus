@@ -122,6 +122,8 @@ func (cli *SnapshotterClient) GetNydusDaemonInfos() ([]*DaemonInfoFromSnapshotte
 }
 
 func (cli *SnapshotterClient) Upgrade(req *UpgradeRequest) error {
-	_, err := cli.request("PUT", "/api/v1/daemons/upgrade", req)
+	// The Rust snapshotter's system-controller serves daemon upgrade as POST (the Go snapshotter
+	// used PUT); align with the in-repo implementation.
+	_, err := cli.request("POST", "/api/v1/daemons/upgrade", req)
 	return err
 }

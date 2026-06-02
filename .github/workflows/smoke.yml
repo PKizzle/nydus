@@ -407,8 +407,11 @@ jobs:
         echo "  GO_TEST_BUILD_FLAGS=${GO_TEST_BUILD_FLAGS}"
         cargo llvm-cov clean --workspace
         cargo build --release --features=virtiofs,block-uffd --bins
+        # The root crate's --bins covers nydusd/nydus-image/nydusctl only; build the Rust snapshotter
+        # (a separate workspace member) explicitly so prepare.sh can install containerd-nydus.
+        cargo build --release -p nydus-snapshotter --bin containerd-nydus
         echo "Built instrumented binaries:"
-        ls -l target/release/nydusd target/release/nydus-image contrib/nydusify/cmd/nydusify
+        ls -l target/release/nydusd target/release/nydus-image target/release/containerd-nydus contrib/nydusify/cmd/nydusify
         target/release/nydusd --version || true
         target/release/nydus-image --version || true
         cargo llvm-cov clean --workspace --profraw-only
