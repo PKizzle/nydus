@@ -120,10 +120,9 @@ impl ProxySDKClient {
                     for (key, value) in err.header {
                         if let Ok(header_name) =
                             http::header::HeaderName::from_bytes(key.as_bytes())
+                            && let Ok(val) = value.as_str().parse()
                         {
-                            if let Ok(val) = value.as_str().parse() {
-                                header_map.insert(header_name, val);
-                            }
+                            header_map.insert(header_name, val);
                         }
                     }
                     Ok(GetResponse {
