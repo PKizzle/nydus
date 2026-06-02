@@ -112,7 +112,7 @@ func GetRunArgs(t *testing.T, image string) *RunArgs {
 
 // runURLWaitContainer run container util getting http response from WaitUrl
 func runURLWaitContainer(t *testing.T, image string, snapshotter string, containerName string, runArgs RunArgs) {
-	cmd := fmt.Sprintf("sudo nerdctl --insecure-registry --snapshotter %s run -d --net=host", snapshotter)
+	cmd := fmt.Sprintf("sudo nerdctl --insecure-registry --snapshotter %s run --platform linux/amd64 -d --net=host", snapshotter)
 	if runArgs.Mount.source != "" {
 		currentDir, err := os.Getwd()
 		if err != nil {
@@ -134,7 +134,7 @@ func runURLWaitContainer(t *testing.T, image string, snapshotter string, contain
 
 // runCmdStdoutContainer run some commands in container by entrypoint.sh
 func runCmdStdoutContainer(t *testing.T, image string, snapshotter string, containerName string, runArgs RunArgs) {
-	cmd := fmt.Sprintf("sudo nerdctl --insecure-registry --snapshotter %s run -i --net=host", snapshotter)
+	cmd := fmt.Sprintf("sudo nerdctl --insecure-registry --snapshotter %s run --platform linux/amd64 -i --net=host", snapshotter)
 	if runArgs.Mount.source != "" {
 		currentDir, err := os.Getwd()
 		if err != nil {
