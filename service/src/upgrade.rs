@@ -81,6 +81,8 @@ impl TryFrom<&String> for FailoverPolicy {
 
 /// Per-handler state needed to rebuild a [`crate::fanotify::FanotifyHandler`] around a fanotify
 /// group fd preserved across a hot upgrade. One entry per registered EROFS mount.
+// The fields are only consumed by the Linux-only `fanotify_upgrade` module below.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 #[derive(Clone, Debug)]
 struct FanotifyHandlerState {
     image_id: String,
@@ -97,6 +99,8 @@ struct FanotifyHandlerState {
 /// fd corresponds to `handlers[i]`.
 struct FanotifyState {
     blob_entry_map: HashMap<String, BlobCacheEntry>,
+    // Only read by the Linux-only `fanotify_upgrade` module below.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     handlers: Vec<FanotifyHandlerState>,
 }
 
@@ -132,6 +136,8 @@ pub struct UpgradeManager {
     /// Fanotify group fds preserved across a hot upgrade, in the same order as
     /// `fanotify_deamon_stat.handlers`. Held only between `save()` and process exit (the predecessor)
     /// or between `restore()` and handler reconstruction (the successor).
+    // Only touched by the Linux-only `save_fanotify`/`restore_fanotify` path.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     fanotify_files: Vec<File>,
     backend: Box<dyn StorageBackend>,
 }
@@ -188,6 +194,7 @@ impl UpgradeManager {
     ///
     /// `files` are dup'd fanotify group fds (one per handler, in `handlers` order); they are kept
     /// alive in `self.fanotify_files` until the backend has transferred them via `SCM_RIGHTS`.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     fn save_fanotify(&mut self, files: Vec<File>, data: &[u8]) -> Result<()> {
         self.fanotify_files = files;
         let fds: Vec<RawFd> = self.fanotify_files.iter().map(|f| f.as_raw_fd()).collect();
@@ -200,6 +207,7 @@ impl UpgradeManager {
     /// Restore the preserved fanotify group fds and serialized daemon state from the backend.
     ///
     /// Returns the fds (as owning `File`s, in `handlers` order) and the serialized state blob.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     fn restore_fanotify(&mut self) -> Result<(Vec<File>, Vec<u8>)> {
         let (fds, state_data) = self
             .backend
