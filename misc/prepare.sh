@@ -8,7 +8,12 @@ if [ "$1" == "takeover_test" ]; then
 fi
 
 readonly SNAPSHOTTER_VERSION=`curl -s https://api.github.com/repos/containerd/nydus-snapshotter/releases/latest | grep tag_name | cut -f4 -d "\""`
-readonly NERDCTL_VERSION=`curl -s https://api.github.com/repos/containerd/nerdctl/releases/latest | grep tag_name | cut -f4 -d "\"" | sed 's/^v//g'`
+# Pin nerdctl to the 1.7.x line. nerdctl v2 pulls via containerd's Transfer service, which does not
+# propagate the remote-snapshot image-ref annotation a proxy snapshotter needs (containerd issues
+# #11606 / #11082), so `nerdctl run --snapshotter nydus` fails with "failed to find image ref of
+# snapshot". nerdctl 1.7.x uses the legacy client-side pull that sets the label. This mirrors the
+# nydus-snapshotter project's own integration test (NERDCTL_VER=1.7.6 with containerd v2).
+readonly NERDCTL_VERSION=1.7.6
 readonly CNI_PLUGINS_VERSION=`curl -s https://api.github.com/repos/containernetworking/plugins/releases/latest | grep tag_name | cut -f4 -d "\""`
 
 # setup nerdctl and nydusd env
