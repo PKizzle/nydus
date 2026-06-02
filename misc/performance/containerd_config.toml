@@ -3,15 +3,6 @@ root = "/var/lib/containerd"
 state = "/run/containerd"
 oom_score = 0
 
-# containerd v2 enables the Transfer service by default, but it does not propagate the
-# remote-snapshot annotations (notably the image ref) that a proxy snapshotter needs: pulling
-# with `--snapshotter nydus` first fails with "no unpack platforms defined" and then, once that is
-# worked around, with "failed to find image ref of snapshot" (still-open containerd issue #11606).
-# Disable the Transfer service so nerdctl/ctr fall back to the legacy client-side pull path, which
-# sets the remote-snapshot labels (with proxy_plugins.nydus.exports below). This is the global
-# equivalent of `ctr --local`.
-disabled_plugins = ["io.containerd.transfer.v1.local"]
-
 [debug]
   level = "debug"
 
@@ -19,6 +10,14 @@ disabled_plugins = ["io.containerd.transfer.v1.local"]
   snapshotter = "nydus"
   disable_snapshot_annotations = false
   discard_unpacked_layers = false
+
+# containerd v2 enables the Transfer service by default (and nerdctl v2 requires it). For a
+# non-default snapshotter it must be told which platform to unpack for, otherwise pulling with
+# `--snapshotter nydus` fails with "unable to initialize unpacker: no unpack platforms defined"
+# (still-open containerd issue #11606; PR #11236 only fixed the `ctr images import` path).
+[[plugins."io.containerd.transfer.v1.local".unpack_config]]
+  platform = "linux"
+  snapshotter = "nydus"
 
 [proxy_plugins]
   [proxy_plugins.nydus]
