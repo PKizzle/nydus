@@ -16,6 +16,9 @@ extern crate lazy_static;
 
 // mimalloc global allocator: image conversion churns many small buffers
 // (chunking, compression, zran); thread-local pools cut allocator overhead.
+// Disabled under Miri, which cannot call mimalloc's FFI (mi_malloc_aligned) and
+// aborts even when just listing tests; fall back to Miri's own allocator.
+#[cfg(not(miri))]
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 

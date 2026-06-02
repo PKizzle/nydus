@@ -15,6 +15,9 @@ extern crate nydus_api;
 // compio's completion I/O is owned-buffer-per-op, so the hot read/write path
 // churns many small heap buffers; mimalloc's thread-local pools cut that
 // allocation overhead. Builds on musl-static (pure C, no system deps).
+// Disabled under Miri, which cannot call mimalloc's FFI (mi_malloc_aligned) and
+// aborts even when just listing tests; fall back to Miri's own allocator.
+#[cfg(not(miri))]
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
