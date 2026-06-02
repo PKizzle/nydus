@@ -250,8 +250,10 @@ pub enum ProxyError {
 determine the retry strategy:
 
 - `is_proxy_forbidden()` -- Detects `ProxyError::Forbidden`. The proxy has
-  denied the request (e.g., authentication failure, access policy). Retrying
-  will not help.
+  denied the request (e.g., authentication failure, access policy). This is a
+  **deliberate authorization decision, not a transient fault**, so `retry_op()`
+  returns immediately with no retry and no fallback to the origin. See
+  [Why 403 is fatal](#why-403-is-fatal) below for the rationale.
 
 - `is_proxy_limited()` -- Detects `ProxyError::TooManyRequests`. The proxy is
   rate-limiting requests. The correct response depends on request source: for
@@ -275,6 +277,34 @@ and behavior differ based on the request source:
 | On 429 (rate limit) | Disable proxy, apply QPS limiter, retry direct | Immediate return, no retry |
 | On SDK internal | Disable SDK, retry via HTTP proxy | Disable SDK, retry via HTTP proxy |
 | Last retry | Disable proxy, apply QPS limiter | Random sleep 100ms-1s between attempts |
+
+### Why 403 is fatal
+
+nydus deliberately tiers proxy errors by what the status code *means*, mirroring
+the way OCI/Docker registry clients separate the auth state machine:
+
+| Proxy status | Class | nydus policy | Why |
+|---|---|---|---|
+| **403** Forbidden | deliberate authorization denial | **hard fail, no retry, no origin fallback** | A 403 is an access-control decision, not a transient condition. Retrying is futile, and *silently falling back to the origin would defeat the proxy's access policy and mask a real authz/misconfiguration error* — serving content the operator may have intended to block. This matches the OCI Distribution Spec, where `DENIED` (403) has no defined recovery path, unlike `UNAUTHORIZED` (401, which triggers token refresh). |
+| **429** Too Many Requests | transient rate limiting | disable proxy → retry direct to origin (on-demand); give up (prefetch) | Rate limiting is operational and self-clearing. The origin is the correct relief valve, throttled by the QPS limiter. The OCI spec marks 429 as the retryable/back-off code (`Retry-After`). |
+| **5xx** / timeout | proxy unhealthy | fall back to origin (when `fallback=true`) | A sick proxy does not mean the content is unavailable; the origin is authoritative. Handled at the `Connection::call()` layer (see [Per-Request Fallback](#per-request-fallback)). |
+
+This is intentionally *narrower* than some clients: containerd, for example, can
+silently fall back to an origin registry that is not even in the configured
+endpoint list ([containerd#9206](https://github.com/containerd/containerd/issues/9206)),
+a behavior its own users flag as a security/auditing hazard precisely because it
+can mask an authz decision. nydus avoids that for 403.
+
+Note: this tiering applies to errors the proxy *originates* (tagged with
+`X-Dragonfly-Error-Type: proxy`, or surfaced as SDK error types). A 403 the proxy
+*forwards* from the upstream registry, or a 403 from a redirected/pre-signed blob
+URL (an expired S3/CDN signature), is a different case handled by the registry
+backend's redirect re-resolution, not by `retry_op()`.
+
+The `Status403_ReadFails`, `Status429_FallbackViaDisableProxy`, and
+`Status500_FallbackToOrigin` cases in `smoke/dragonfly/proxy_error_test.go`
+encode exactly this contract. They require a binary built with
+`backend-dragonfly-proxy` (see [Feature Flags](#feature-flags)).
 
 **SDK retry budget reduction**: When the SDK path fails with a non-internal
 error (e.g., upstream 500 relayed through the SDK), the retry budget is
@@ -366,15 +396,32 @@ and trigger fallback to the HTTP proxy path.
 
 | Feature | Deps | Purpose |
 |---------|------|---------|
-| `backend-dragonfly-proxy` | `dragonfly-client-util` | Dragonfly SDK integration. x86_64/aarch64 only (ring crate limitation). |
+| `backend-dragonfly-proxy` | `dragonfly-client-util`, `cyper`, `http`, `url` | Dragonfly P2P proxy integration: the SDK path **and** the HTTP-proxy `X-Dragonfly-Error-Type` typed-error handling. |
+
+`backend-dragonfly-proxy` is **opt-in — it is NOT in `default`**. It pulls the
+third-party `dragonfly-client-util`, which hardcodes `native-tls` (OpenSSL on
+Linux) and spins up its own tokio runtime; that is the sole remaining consumer of
+both OpenSSL and tokio in the default build and would block the fully-static musl
+build. Enable it explicitly on a **glibc** target when Dragonfly P2P is required:
+
+```bash
+cargo build --release --features backend-dragonfly-proxy
+# or, via the Makefile (used by the Dragonfly e2e CI job):
+make release EXTRA_FEATURES=backend-dragonfly-proxy
+```
 
 The following capabilities are always compiled in (no feature flag required):
 - **DNS resolution** (`hickory-resolver`, `once_cell`): Caching and singleflight deduplication via hickory-dns.
 - **QPS rate limiter** (`rand`): Source fallback protection to prevent thundering herd on origin.
 - **Prefetch rate limiter** (`leaky-bucket`): Bandwidth throttling for background prefetch.
 
-When `backend-dragonfly-proxy` is not enabled, all SDK-related code paths are
-compiled out. The HTTP proxy path and retry logic remain functional without it.
+When `backend-dragonfly-proxy` is not enabled, all Dragonfly-specific code paths
+are compiled out: the SDK path **and** the `X-Dragonfly-Error-Type` typed-error
+classification (so a proxy 403/429 is no longer mapped to
+`ProxyError::Forbidden`/`TooManyRequests`). A plain HTTP proxy URL still works via
+`Connection::call()` with 5xx/connection-error origin fallback, but the
+proxy-originated 403/429 retry tiers described above are unavailable. This is why
+the Dragonfly e2e suite must build with the feature enabled.
 
 ## SDK Runtime
 

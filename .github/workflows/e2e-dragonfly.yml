@@ -40,7 +40,10 @@ jobs:
         run: bash misc/install-protoc.sh
 
       - name: Build Nydus
-        run: make release
+        # backend-dragonfly-proxy is opt-in (excluded from the default build to
+        # keep it OpenSSL-free / musl-static); the Dragonfly e2e suite needs it to
+        # exercise the proxy error-handling path (typed 403/429 from dfdaemon).
+        run: make release EXTRA_FEATURES=backend-dragonfly-proxy
 
       - name: Upload Nydus Binaries
         uses: actions/upload-artifact@v6
