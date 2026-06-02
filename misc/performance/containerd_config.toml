@@ -11,7 +11,18 @@ oom_score = 0
   disable_snapshot_annotations = false
   discard_unpacked_layers = false
 
+# containerd v2 enables the Transfer service by default (used by `nerdctl pull`/`run`). For a
+# non-default snapshotter it must be told which platform to unpack for, otherwise pulling with
+# `--snapshotter nydus` fails with "unable to initialize unpacker: no unpack platforms defined"
+# (still-open containerd issue #11606; PR #11236 only fixed the `ctr images import` path).
+[[plugins."io.containerd.transfer.v1.local".unpack_config]]
+  platform = "linux"
+  snapshotter = "nydus"
+
 [proxy_plugins]
   [proxy_plugins.nydus]
       type = "snapshot"
       address = "/run/containerd-nydus/containerd-nydus-grpc.sock"
+      # Required for the zran / lazy-pulling (remote snapshot) path.
+      [proxy_plugins.nydus.exports]
+        enable_remote_snapshot_annotations = "true"
