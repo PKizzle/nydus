@@ -49,8 +49,6 @@ func (b *BenchmarkTestSuite) TestBenchmark(t *testing.T) {
 	}
 	switch mode {
 	case "oci":
-	case "fs-version-5":
-		ctx.Build.FSVersion = "5"
 	case "fs-version-6":
 		ctx.Build.FSVersion = "6"
 	case "zran":
