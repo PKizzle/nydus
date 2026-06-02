@@ -79,7 +79,11 @@ jobs:
             p="target/${{ matrix.target }}/release/$b"
             echo "== $b =="
             file "$p"
-            if file "$p" | grep -q "statically linked"; then
+            # Accept both classic "statically linked" and "static-pie linked":
+            # a static-PIE is a position-independent executable with no dynamic
+            # dependencies and no interpreter, i.e. still fully static. Newer Rust
+            # musl targets emit static-pie by default.
+            if file "$p" | grep -qE "statically linked|static-pie linked"; then
               echo "OK: $b is statically linked"
             else
               echo "::error::$b is NOT statically linked"
