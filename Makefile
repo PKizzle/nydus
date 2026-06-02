@@ -44,6 +44,18 @@ endif
 endif
 RUST_TARGET_STATIC ?= $(STATIC_TARGET)
 
+# The snapshotter pulls in bbolt-rs -> aligners, whose default `simd` feature
+# only compiles on x86_64/aarch64 and `compile_error!`s elsewhere (bbolt-rs only
+# disables it for aarch64). The snapshotter is not a release target on ppc64le or
+# riscv64, so drop it from the build on those arches. Excludes apply to both the
+# `cargo build` and `cargo clippy` invocations in the `build` target.
+ifneq (,$(findstring powerpc64le,$(RUST_TARGET_STATIC)))
+	EXCLUDE_PACKAGES += --exclude nydus-snapshotter
+endif
+ifneq (,$(findstring riscv64,$(RUST_TARGET_STATIC)))
+	EXCLUDE_PACKAGES += --exclude nydus-snapshotter
+endif
+
 # --- Relocate the build directory for checkouts whose path contains spaces ---
 # OpenSSL's vendored build (the openssl-src crate, pulled in by `static-release`)
 # runs perl `Configure` and `make` inside Cargo's OUT_DIR, which lives under the
@@ -125,7 +137,7 @@ prepare-codecov:
 
 # Targets that are exposed to developers and users.
 build: .format
-	$(CARGO_COV_FLAGS) ${CARGO} build $(CARGO_COMMON) $(CARGO_BUILD_FLAGS)
+	$(CARGO_COV_FLAGS) ${CARGO} build --workspace $(EXCLUDE_PACKAGES) $(CARGO_COMMON) $(CARGO_BUILD_FLAGS)
 	# Cargo will skip checking if it is already checked
 	${CARGO} clippy --workspace $(EXCLUDE_PACKAGES) $(CARGO_COMMON) $(CARGO_BUILD_FLAGS) --bins --tests -- -Dwarnings --allow clippy::unnecessary_cast --allow clippy::needless_borrow --allow clippy::result_large_err --allow clippy::manual_is_multiple_of --allow clippy::io_other_error
 
@@ -152,8 +164,11 @@ ut-nextest:
 	$(CARGO_COV_FLAGS) TEST_WORKDIR_PREFIX=$(TEST_WORKDIR_PREFIX) RUST_BACKTRACE=1 ${RUSTUP} run stable cargo nextest run --no-fail-fast --filter-expr 'test(test) - test(integration)' --workspace $(EXCLUDE_PACKAGES) $(CARGO_COMMON) $(CARGO_BUILD_FLAGS)
 
 # install miri first from https://github.com/rust-lang/miri/
+# nydus-snapshotter is excluded: its transitive dep aligners 0.0.10 (via bbolt-rs)
+# calls the removed nightly intrinsic `std::ptr::invalid_mut`, so it no longer
+# compiles under the nightly toolchain Miri requires.
 miri-ut-nextest:
-	$(CARGO_COV_FLAGS) MIRIFLAGS=-Zmiri-disable-isolation TEST_WORKDIR_PREFIX=$(TEST_WORKDIR_PREFIX) RUST_BACKTRACE=1 ${RUSTUP} run nightly cargo miri nextest run --no-fail-fast --filter-expr 'test(test) - test(integration) - test(deduplicate::tests) - test(inode_bitmap::tests::test_inode_bitmap)' --workspace $(EXCLUDE_PACKAGES) $(CARGO_COMMON) $(CARGO_BUILD_FLAGS)
+	$(CARGO_COV_FLAGS) MIRIFLAGS=-Zmiri-disable-isolation TEST_WORKDIR_PREFIX=$(TEST_WORKDIR_PREFIX) RUST_BACKTRACE=1 ${RUSTUP} run nightly cargo miri nextest run --no-fail-fast --filter-expr 'test(test) - test(integration) - test(deduplicate::tests) - test(inode_bitmap::tests::test_inode_bitmap)' --workspace $(EXCLUDE_PACKAGES) --exclude nydus-snapshotter $(CARGO_COMMON) $(CARGO_BUILD_FLAGS)
 
 smoke-only:
 	CARGO_COV_FLAGS="$(CARGO_COV_FLAGS)" make -C smoke test
