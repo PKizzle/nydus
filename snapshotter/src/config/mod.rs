@@ -308,6 +308,11 @@ pub struct RegistryBackendConfig {
     /// Skip TLS verification.
     #[serde(default)]
     pub skip_verify: bool,
+    /// Use plain HTTP (no TLS) when the daemon pulls blobs from the registry.
+    /// Needed for insecure/local registries (e.g. CI test registries); the daemon
+    /// otherwise defaults to HTTPS.
+    #[serde(default)]
+    pub plain_http: bool,
     /// Request timeout (e.g. "30s").
     #[serde(default = "default_request_timeout")]
     pub request_timeout: String,

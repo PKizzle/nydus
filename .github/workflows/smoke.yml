@@ -118,6 +118,9 @@ jobs:
         RUST_TARGET=${rust_target_map[${{ matrix.arch }}]}
         sudo mv target/$RUST_TARGET/release/nydusd .
         sudo mv target/$RUST_TARGET/release/nydus-image .
+        # The Rust snapshotter (containerd-nydus) is only built for arches where nydus-snapshotter
+        # is not excluded (i.e. not ppc64le/riscv64); move it when present so smoke can use it.
+        [ -f "target/$RUST_TARGET/release/containerd-nydus" ] && sudo mv "target/$RUST_TARGET/release/containerd-nydus" . || true
     - name: Upload Nydus Binaries
       if: matrix.arch == 'amd64'
       uses: actions/upload-artifact@v6
@@ -126,6 +129,7 @@ jobs:
         path: |
           nydus-image
           nydusd
+          containerd-nydus
 
   nydusd-build-macos:
     runs-on: macos-15
