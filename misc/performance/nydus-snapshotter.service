@@ -6,6 +6,7 @@ Before=containerd.service
 [Service]
 Type=simple
 Environment=HOME=/root
+Environment=RUST_BACKTRACE=1
 ExecStart=/usr/local/bin/containerd-nydus --config /etc/nydus/config.toml
 Restart=always
 RestartSec=1

@@ -61,6 +61,25 @@ async fn main() -> Result<()> {
         )
         .init();
 
+    // Surface panics from detached async tasks (e.g. the system-controller connection
+    // handlers): the async runtime catches them, so without a hook they vanish silently
+    // and only show up as a dropped/reset socket on the client side.
+    let default_panic = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let location = info
+            .location()
+            .map(|l| format!("{}:{}", l.file(), l.line()))
+            .unwrap_or_else(|| "unknown".to_string());
+        let payload = info
+            .payload()
+            .downcast_ref::<&str>()
+            .map(|s| s.to_string())
+            .or_else(|| info.payload().downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "<non-string panic payload>".to_string());
+        tracing::error!(location = %location, payload = %payload, "panic in snapshotter task");
+        default_panic(info);
+    }));
+
     info!(
         version = nydus_snapshotter::VERSION,
         "starting containerd-nydus snapshotter"
