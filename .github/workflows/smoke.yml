@@ -812,3 +812,10 @@ jobs:
       run: |
         export NEW_NYDUSD_BINARY_PATH=target/release/nydusd
         sudo -E make smoke-takeover
+    - name: Dump nydus-snapshotter logs
+      if: always()
+      run: |
+        echo "=== nydus-snapshotter (Rust containerd-nydus) journal ==="
+        sudo journalctl -u nydus-snapshotter --no-pager || true
+        echo "=== nydus-snapshotter status ==="
+        sudo systemctl status nydus-snapshotter --no-pager --full || true
