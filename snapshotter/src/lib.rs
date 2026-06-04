@@ -37,6 +37,8 @@ pub mod cache;
 pub mod config;
 pub mod containerd_lookup;
 pub mod daemon;
+pub mod failover;
+pub mod fdstore;
 pub mod grpc;
 pub mod local_accel;
 pub mod metrics;

@@ -126,10 +126,28 @@ async fn main() -> Result<()> {
     // Start the gRPC server with a shared supervisor so signal handlers can
     // tear running nydus daemons down on shutdown.
     let supervisor = Arc::new(DaemonSupervisor::new(config.clone()));
+
+    // Take over any mounts whose `/dev/fuse` fds systemd preserved across our
+    // restart (or `kill -9`) so running containers keep their filesystem without
+    // a remount. No-op when not run under a `Type=notify` unit with a fd store.
+    let restored = supervisor.restore_from_store().await;
+    if restored > 0 {
+        info!(
+            restored,
+            "resumed nydus daemons from preserved fuse descriptors"
+        );
+    }
+
     let shutdown_supervisor = supervisor.clone();
     let server = compio::runtime::spawn(async move {
         nydus_snapshotter::grpc::serve_with_supervisor(config, supervisor).await
     });
+
+    // Notify systemd we finished starting (required for `Type=notify`). No-op
+    // without a notify socket.
+    if let Err(e) = nydus_snapshotter::fdstore::notify_ready() {
+        warn!(error = %e, "sd_notify READY failed");
+    }
 
     // Graceful shutdown on SIGTERM/SIGINT. `signal-hook` is runtime-agnostic; a
     // dedicated thread blocks on the signal and notifies the compio main over an
@@ -157,6 +175,14 @@ async fn main() -> Result<()> {
         }
     }
 
+    // When systemd is preserving our descriptors, leave the kernel mounts up and
+    // exit WITHOUT running daemon destructors (which would unmount) — the fuse
+    // fds are parked in the fd store and the successor takes the mounts over.
+    // Otherwise (local/dev, no fd store) tear everything down cleanly.
+    if nydus_snapshotter::fdstore::is_available() {
+        info!("preserving nydus mounts for failover; exiting without unmount");
+        std::process::exit(0);
+    }
     shutdown_supervisor.shutdown_all().await;
     Ok(())
 }

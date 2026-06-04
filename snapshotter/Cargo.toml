@@ -90,6 +90,7 @@ bbolt-rs = "1.3.10"
 thiserror = "2.0.18"
 libc = "0.2"
 mio = { version = "1.2", features = ["os-poll", "os-ext"] }
+sendfd = "0.4.3"
 sha2 = "0.11"
 
 nydus-api = { version = "0.4.1", path = "../api" }
