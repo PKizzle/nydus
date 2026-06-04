@@ -18,7 +18,7 @@ use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
-use async_broadcast::{Sender, broadcast};
+use async_broadcast::{InactiveReceiver, Sender, broadcast};
 use bytes::{Buf, BufMut};
 use compio::buf::{BufResult, IntoInner, IoBuf};
 use compio::io::{AsyncRead, AsyncWriteExt};
@@ -72,6 +72,12 @@ pub struct NbdService {
     cache_mgr: Arc<BlobCacheMgr>,
     nbd_dev: fs::File,
     sender: Arc<Sender<u32>>,
+    // Keepalive for the shutdown broadcast channel. An `async-broadcast` channel
+    // closes as soon as its last receiver is dropped, after which `new_receiver()`
+    // yields a receiver whose `recv()` returns `Closed` immediately. Workers
+    // subscribe lazily via `new_receiver()`, so this inactive receiver pins the
+    // channel open without consuming messages; it is never read.
+    _shutdown_keepalive: InactiveReceiver<u32>,
 }
 
 impl NbdService {
@@ -102,10 +108,13 @@ impl NbdService {
         // Shutdown notification: a single value broadcast to every worker so
         // they wake from `select!` and re-check `active`. Overflow mode keeps
         // `try_broadcast` non-blocking and infallible even if the (bounded)
-        // queue is full or no worker has subscribed yet.
+        // queue is full or no worker has subscribed yet. Deactivate (rather than
+        // drop) the initial receiver so the channel stays open until workers
+        // subscribe via `new_receiver()`; dropping the last receiver would close
+        // the channel and make every worker exit its loop immediately.
         let (mut sender, receiver) = broadcast(4);
         sender.set_overflow(true);
-        drop(receiver);
+        let shutdown_keepalive = receiver.deactivate();
 
         Ok(NbdService {
             active: Arc::new(AtomicBool::new(true)),
@@ -113,6 +122,7 @@ impl NbdService {
             cache_mgr: device.cache_mgr().clone(),
             nbd_dev,
             sender: Arc::new(sender),
+            _shutdown_keepalive: shutdown_keepalive,
         })
     }
 
