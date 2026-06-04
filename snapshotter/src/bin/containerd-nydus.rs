@@ -180,7 +180,11 @@ async fn main() -> Result<()> {
     // fds are parked in the fd store and the successor takes the mounts over.
     // Otherwise (local/dev, no fd store) tear everything down cleanly.
     if nydus_snapshotter::fdstore::is_available() {
-        info!("preserving nydus mounts for failover; exiting without unmount");
+        // Unmount daemons whose fd wasn't parked (they can't be taken over);
+        // leave armed mounts held for the successor, then exit without running
+        // destructors so those mounts survive.
+        shutdown_supervisor.preserve_for_failover().await;
+        info!("preserving armed nydus mounts for failover; exiting without unmount");
         std::process::exit(0);
     }
     shutdown_supervisor.shutdown_all().await;

@@ -14,11 +14,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/containerd/nydus-snapshotter/config"
 	"github.com/dragonflyoss/nydus/smoke/tests/tool"
 	"github.com/dragonflyoss/nydus/smoke/tests/tool/test"
 	"github.com/google/uuid"
-	"github.com/pelletier/go-toml"
 	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/require"
 )
@@ -28,7 +26,6 @@ import (
 
 const (
 	hotUpgradeRepeatCount = 6
-	configPath            = "/etc/nydus/config.toml"
 )
 
 var (
@@ -170,22 +167,13 @@ func getNydusdVersion(nydusdPath string) string {
 	return version
 }
 
-func setNydusdPathInConfig(t *testing.T, newNydusdPath string) {
-	data, err := os.ReadFile(configPath)
-	require.NoError(t, err, "read snapshotter config.toml")
-
-	cfg := &config.SnapshotterConfig{}
-	err = toml.Unmarshal(data, cfg)
-	require.NoError(t, err, "unmarshal snapshotter config.toml")
-
-	cfg.DaemonConfig.NydusdPath = newNydusdPath
-
-	newData, err := toml.Marshal(cfg)
-	require.NoError(t, err, "marshal config.toml")
-
-	err = os.WriteFile(configPath, newData, 0644)
-	require.NoError(t, err, "write config.toml")
-}
+// setNydusdPathInConfig is a no-op for the in-process Rust snapshotter
+// (containerd-nydus): it embeds nydusd and never spawns a nydusd binary, so
+// DaemonConfig.NydusdPath is meaningless. Rewriting /etc/nydus/config.toml
+// through the legacy Go snapshotter's config schema would corrupt the Rust
+// unified TOML and break the next `systemctl restart` with a parse error, so
+// the hot-upgrade loop just restarts the snapshotter without touching config.
+func setNydusdPathInConfig(_ *testing.T, _ string) {}
 
 func checkContainerAccess(t *testing.T, imageName string) {
 	runArgs := tool.GetRunArgs(t, imageName)
