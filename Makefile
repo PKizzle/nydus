@@ -25,7 +25,7 @@ UNAME_M := $(shell uname -m)
 UNAME_S := $(shell uname -s)
 STATIC_TARGET = $(UNAME_M)-unknown-linux-musl
 ifeq ($(UNAME_S),Linux)
-	CARGO_COMMON += --features=virtiofs,block-uffd
+	CARGO_COMMON += --features=virtiofs,block-uffd,block-nbd
 ifeq ($(UNAME_M),ppc64le)
 	STATIC_TARGET = powerpc64le-unknown-linux-gnu
 endif
@@ -44,16 +44,16 @@ endif
 endif
 RUST_TARGET_STATIC ?= $(STATIC_TARGET)
 
-# The snapshotter pulls in bbolt-rs -> aligners, whose default `simd` feature
-# only compiles on x86_64/aarch64 and `compile_error!`s elsewhere (bbolt-rs only
-# disables it for aarch64). The snapshotter is not a release target on ppc64le or
-# riscv64, so drop it from the build on those arches. Excludes apply to both the
-# `cargo build` and `cargo clippy` invocations in the `build` target.
-ifneq (,$(findstring powerpc64le,$(RUST_TARGET_STATIC)))
-	EXCLUDE_PACKAGES += --exclude nydus-snapshotter
+# The snapshotter's legacy-migration tool (`nydus-migrate`) pulls in bbolt-rs ->
+# aligners, whose default `simd` feature only compiles on x86_64/aarch64 and
+# `compile_error!`s elsewhere. That tool is gated behind the snapshotter's
+# (optional, non-default) `migrate` feature, so the core snapshotter now builds on
+# every arch. Enable `migrate` only where its deps compile; on ppc64le/riscv64 the
+# snapshotter is built without it (and `nydus-migrate` is simply not produced).
+ifeq (,$(findstring powerpc64le,$(RUST_TARGET_STATIC)))
+ifeq (,$(findstring riscv64,$(RUST_TARGET_STATIC)))
+	CARGO_COMMON += --features=nydus-snapshotter/migrate
 endif
-ifneq (,$(findstring riscv64,$(RUST_TARGET_STATIC)))
-	EXCLUDE_PACKAGES += --exclude nydus-snapshotter
 endif
 
 # Extra opt-in cargo features to fold into the build. Used by the Dragonfly e2e
@@ -173,9 +173,9 @@ ut-nextest:
 	$(CARGO_COV_FLAGS) TEST_WORKDIR_PREFIX=$(TEST_WORKDIR_PREFIX) RUST_BACKTRACE=1 ${RUSTUP} run stable cargo nextest run --no-fail-fast --filter-expr 'test(test) - test(integration)' --workspace $(EXCLUDE_PACKAGES) $(CARGO_COMMON) $(CARGO_BUILD_FLAGS)
 
 # install miri first from https://github.com/rust-lang/miri/
-# nydus-snapshotter is excluded: its transitive dep aligners 0.0.10 (via bbolt-rs)
-# calls the removed nightly intrinsic `std::ptr::invalid_mut`, so it no longer
-# compiles under the nightly toolchain Miri requires.
+# nydus-snapshotter is excluded from Miri: it links compio (io_uring) + mimalloc
+# and is FFI/syscall-heavy, which Miri cannot execute. (Its bbolt-rs/aligners dep,
+# the former blocker, is now gated behind the optional `migrate` feature.)
 miri-ut-nextest:
 	$(CARGO_COV_FLAGS) MIRIFLAGS=-Zmiri-disable-isolation TEST_WORKDIR_PREFIX=$(TEST_WORKDIR_PREFIX) RUST_BACKTRACE=1 ${RUSTUP} run nightly cargo miri nextest run --no-fail-fast --filter-expr 'test(test) - test(integration) - test(deduplicate::tests) - test(inode_bitmap::tests::test_inode_bitmap)' --workspace $(EXCLUDE_PACKAGES) --exclude nydus-snapshotter $(CARGO_COMMON) $(CARGO_BUILD_FLAGS)
 
