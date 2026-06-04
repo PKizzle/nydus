@@ -42,10 +42,12 @@ var urlWait = map[string]RunArgs{
 	"wordpress": {
 		WaitURL: "http://localhost:80",
 		BaselineReadCount: map[string]uint64{
+			"fs-version-5": 328,
 			"fs-version-6": 131,
 			"zran":         186,
 		},
 		BaselineReadAmount: map[string]uint64{
+			"fs-version-5": 54307819,
 			"fs-version-6": 77580818,
 			"zran":         79836339,
 		},
