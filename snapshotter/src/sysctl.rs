@@ -21,10 +21,8 @@ use crate::prefetch_profile::{
     set_runtime_prefetch,
 };
 use crate::store::{SnapshotInfo, SnapshotStore};
-use anyhow::{Context, Result, bail};
-use compio::buf::BufResult;
-use compio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
-use compio::net::{UnixListener, UnixStream};
+use anyhow::{Context, Result};
+use compio::net::UnixListener;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -35,7 +33,6 @@ use std::sync::{
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{debug, info, warn};
 
-const MAX_HEADER_BYTES: usize = 16 * 1024;
 const MAX_BODY_BYTES: usize = 1024 * 1024;
 
 /// In-process system controller.
@@ -318,24 +315,45 @@ pub async fn serve_unix(path: PathBuf, controller: SystemController) -> Result<(
         .with_context(|| format!("failed to bind sysctl socket {}", path.display()))?;
     info!(path = %path.display(), "starting nydus system-controller API");
 
-    loop {
-        let (stream, _) = listener.accept().await?;
-        let controller = controller.clone();
-        compio::runtime::spawn(async move {
-            if let Err(e) = handle_connection(stream, controller).await {
-                warn!(error = %e, "sysctl connection failed");
-            }
-        })
-        .detach();
-    }
+    // Serve over cyper-axum (hyper-on-compio) like the gRPC server, instead of a raw
+    // `listener.accept()` loop: compio-driver's io_uring accept hits a multishot-accept
+    // panic that aborts the whole snapshotter process.
+    let app = axum::Router::new()
+        .fallback(handle_request)
+        .with_state(controller);
+    cyper_axum::serve(listener, app.into_make_service()).await?;
+    Ok(())
 }
 
-async fn handle_connection(mut stream: UnixStream, controller: SystemController) -> Result<()> {
-    let request = read_request(&mut stream).await?;
-    let response = route_request(&controller, request).await;
-    stream.write_all(response.to_http()).await.0?;
-    stream.shutdown().await?;
-    Ok(())
+/// Bridge an axum request to the existing `route_request` dispatcher.
+///
+/// Serving over cyper-axum (the same hyper-on-compio path the gRPC server uses)
+/// avoids the raw `compio` `UnixListener::accept()` loop, which triggers a
+/// multishot-accept panic in compio-driver and aborts the whole process.
+async fn handle_request(
+    axum::extract::State(controller): axum::extract::State<SystemController>,
+    request: axum::extract::Request,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let method = request.method().as_str().to_string();
+    let path = request.uri().path().to_string();
+    let body = match axum::body::to_bytes(request.into_body(), MAX_BODY_BYTES).await {
+        Ok(bytes) => bytes.to_vec(),
+        Err(_) => {
+            return (
+                axum::http::StatusCode::PAYLOAD_TOO_LARGE,
+                "request body too large",
+            )
+                .into_response();
+        }
+    };
+    debug!(%method, %path, body_bytes = body.len(), "sysctl request received");
+    let response = route_request(&controller, HttpRequest { method, path, body }).await;
+    axum::response::Response::builder()
+        .status(response.status)
+        .header(axum::http::header::CONTENT_TYPE, response.content_type)
+        .body(axum::body::Body::from(response.body))
+        .unwrap_or_else(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
 
 #[derive(Debug)]
@@ -348,84 +366,8 @@ struct HttpRequest {
 #[derive(Debug)]
 struct HttpResponse {
     status: u16,
-    reason: &'static str,
     content_type: &'static str,
     body: Vec<u8>,
-}
-
-impl HttpResponse {
-    fn to_http(&self) -> Vec<u8> {
-        let mut out = format!(
-            "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-            self.status,
-            self.reason,
-            self.content_type,
-            self.body.len()
-        )
-        .into_bytes();
-        out.extend_from_slice(&self.body);
-        out
-    }
-}
-
-async fn read_request(stream: &mut UnixStream) -> Result<HttpRequest> {
-    let mut buf = Vec::with_capacity(4096);
-    let header_end = loop {
-        if let Some(pos) = find_header_end(&buf) {
-            break pos;
-        }
-        if buf.len() > MAX_HEADER_BYTES {
-            bail!("HTTP headers exceed {MAX_HEADER_BYTES} bytes");
-        }
-        // compio reads into an owned buffer and returns it via `BufResult`.
-        let BufResult(res, chunk) = stream.read(vec![0u8; 4096]).await;
-        let n = res?;
-        if n == 0 {
-            bail!("client closed connection before completing HTTP request");
-        }
-        buf.extend_from_slice(&chunk[..n]);
-    };
-
-    let header_bytes = &buf[..header_end];
-    let headers = std::str::from_utf8(header_bytes).context("HTTP headers are not UTF-8")?;
-    let mut lines = headers.split("\r\n");
-    let request_line = lines.next().context("missing request line")?;
-    let mut parts = request_line.split_whitespace();
-    let method = parts.next().context("missing HTTP method")?.to_string();
-    let path = parts.next().context("missing HTTP path")?.to_string();
-
-    let mut content_length = 0usize;
-    for line in lines {
-        if let Some((name, value)) = line.split_once(':')
-            && name.eq_ignore_ascii_case("content-length")
-        {
-            content_length = value
-                .trim()
-                .parse::<usize>()
-                .context("invalid content-length")?;
-        }
-    }
-    if content_length > MAX_BODY_BYTES {
-        bail!("HTTP body exceeds {MAX_BODY_BYTES} bytes");
-    }
-
-    let body_start = header_end + 4;
-    while buf.len() < body_start + content_length {
-        let BufResult(res, chunk) = stream.read(vec![0u8; 4096]).await;
-        let n = res?;
-        if n == 0 {
-            bail!("client closed connection before completing HTTP body");
-        }
-        buf.extend_from_slice(&chunk[..n]);
-    }
-    let body = buf[body_start..body_start + content_length].to_vec();
-
-    debug!(%method, %path, body_bytes = body.len(), "sysctl request received");
-    Ok(HttpRequest { method, path, body })
-}
-
-fn find_header_end(buf: &[u8]) -> Option<usize> {
-    buf.windows(4).position(|w| w == b"\r\n\r\n")
 }
 
 async fn route_request(controller: &SystemController, request: HttpRequest) -> HttpResponse {
@@ -599,7 +541,6 @@ fn json_response<T: Serialize>(status: u16, body: T) -> HttpResponse {
     match serde_json::to_vec(&body) {
         Ok(body) => HttpResponse {
             status,
-            reason: reason_phrase(status),
             content_type: "application/json",
             body,
         },
@@ -614,7 +555,6 @@ fn error_response(status: u16, message: impl Into<String>) -> HttpResponse {
     .unwrap_or_else(|_| b"{\"error\":\"failed to encode error\"}".to_vec());
     HttpResponse {
         status,
-        reason: reason_phrase(status),
         content_type: "application/json",
         body,
     }
@@ -867,7 +807,6 @@ async fn metrics_response(controller: &SystemController) -> HttpResponse {
 
     HttpResponse {
         status: 200,
-        reason: reason_phrase(200),
         content_type: "text/plain; version=0.0.4",
         body: body.into_bytes(),
     }
@@ -958,16 +897,6 @@ fn cache_artifact_label(kind: CacheArtifactKind) -> &'static str {
 
 fn usize_to_u64(value: usize) -> u64 {
     u64::try_from(value).unwrap_or(u64::MAX)
-}
-
-fn reason_phrase(status: u16) -> &'static str {
-    match status {
-        200 => "OK",
-        400 => "Bad Request",
-        404 => "Not Found",
-        500 => "Internal Server Error",
-        _ => "Unknown",
-    }
 }
 
 #[derive(Serialize)]
