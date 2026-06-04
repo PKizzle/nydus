@@ -1200,6 +1200,7 @@ mod tests {
             state: "STOPPED".to_string(),
             live: false,
             updated_at: 1,
+            pid: 0,
         };
         let records_dir = controller.supervisor.daemons_root().join("records");
         std::fs::create_dir_all(&records_dir).unwrap();

@@ -17,6 +17,7 @@ pub mod image_ref;
 use std::collections::HashMap;
 use std::fs;
 use std::io;
+use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
@@ -58,6 +59,13 @@ pub struct DaemonStatusRecord {
     pub state: String,
     pub live: bool,
     pub updated_at: i64,
+    /// PID to target for failover (`kill -9`) of this daemon. The Rust
+    /// snapshotter runs daemons in-process, so a live daemon's PID is the
+    /// snapshotter's own PID (0 when stopped). Serialized as `pid` for the
+    /// system-controller API; `#[serde(default)]` keeps older on-disk records
+    /// (written before this field existed) loadable.
+    #[serde(default)]
+    pub pid: u32,
 }
 
 /// Outcome for one daemon recovery attempt.
@@ -710,10 +718,14 @@ impl DaemonSupervisor {
 
         let mountpoint_str = mountpoint.display().to_string();
 
+        // Give the daemon a supervisor socket so its upgrade manager records
+        // mount state and holds the `/dev/fuse` fd. We drive `save()` into that
+        // socket right after start to snapshot the fd + state for failover.
+        let supervisor_sock = daemon_root.join("supervisor.sock");
         let daemon = create_fuse_daemon(
             &mountpoint_str,
             vfs,
-            None,
+            Some(supervisor_sock.display().to_string()),
             Some(daemon_id),
             threads,
             waker,
@@ -735,6 +747,13 @@ impl DaemonSupervisor {
             "nydus daemon ready"
         );
 
+        // Snapshot the daemon's fuse fd + serialized state and park them so the
+        // mount survives a snapshotter restart / kill -9 (see `failover` /
+        // `fdstore`). Best-effort: a failure here only disables failover for this
+        // image, it must not fail the mount the container is waiting on.
+        self.park_failover_state(&slug, &daemon, &supervisor_sock, &daemon_root)
+            .await;
+
         Ok(Arc::new(DaemonInstance {
             image_ref: image_ref_str.to_string(),
             mountpoint,
@@ -743,6 +762,205 @@ impl DaemonSupervisor {
             refcount: AtomicUsize::new(0),
             _poll: poll,
         }))
+    }
+
+    /// Path of the on-disk serialized upgrade state for a daemon slug.
+    fn failover_state_path(&self, slug: &str) -> PathBuf {
+        self.daemons_root().join(slug).join("upgrade.state")
+    }
+
+    /// Capture a daemon's `/dev/fuse` fd + serialized state (by driving `save()`
+    /// into a one-shot supervisor socket) and park them in systemd's fd store +
+    /// on disk, so a successor process can take the mount over. Best-effort.
+    async fn park_failover_state(
+        &self,
+        slug: &str,
+        daemon: &Arc<dyn NydusDaemon>,
+        supervisor_sock: &Path,
+        daemon_root: &Path,
+    ) {
+        let daemon = daemon.clone();
+        let sock = supervisor_sock.to_path_buf();
+        let captured = blocking::unblock(move || {
+            crate::failover::capture_on_save(&sock, || {
+                daemon
+                    .save()
+                    .map_err(|e| anyhow::anyhow!("daemon save(): {e}"))
+            })
+        })
+        .await;
+
+        let (fuse_fd, state) = match captured {
+            Ok(parts) => parts,
+            Err(e) => {
+                warn!(slug, error = %e, "failed to snapshot daemon state; failover disabled for this image");
+                return;
+            }
+        };
+
+        let state_path = daemon_root.join("upgrade.state");
+        if let Err(e) = fs::write(&state_path, &state) {
+            warn!(slug, error = %e, "failed to persist failover state blob; failover disabled for this image");
+            return;
+        }
+        match crate::fdstore::store_fd(slug, fuse_fd.as_raw_fd()) {
+            Ok(true) => info!(slug, "parked fuse fd in systemd fd store for failover"),
+            Ok(false) => {
+                debug!(
+                    slug,
+                    "no systemd fd store (NOTIFY_SOCKET unset); failover unavailable"
+                );
+                let _ = fs::remove_file(&state_path);
+            }
+            Err(e) => warn!(slug, error = %e, "failed to store fuse fd in systemd fd store"),
+        }
+        // `fuse_fd` (our copy) is dropped here; systemd holds its own dup.
+    }
+
+    /// Resume daemons whose `/dev/fuse` fds systemd preserved across our restart
+    /// (or `kill -9`), so containers never see their mount disappear. Returns the
+    /// number of daemons restored. Best-effort per daemon; call once at startup
+    /// before serving gRPC.
+    pub async fn restore_from_store(&self) -> usize {
+        let stored = crate::fdstore::take_stored_fds();
+        if stored.is_empty() {
+            return 0;
+        }
+        let records = self.read_persisted_records();
+        let by_slug: HashMap<&str, &DaemonStatusRecord> = records
+            .iter()
+            .filter(|r| r.live)
+            .map(|r| (r.slug.as_str(), r))
+            .collect();
+
+        let mut restored = 0;
+        for (slug, fds) in &stored {
+            let Some(record) = by_slug.get(slug.as_str()) else {
+                warn!(slug, "preserved fd has no live daemon record; dropping it");
+                continue;
+            };
+            let Some(fd) = fds.first() else { continue };
+            match self.restore_instance(record, fd.as_raw_fd()).await {
+                Ok(()) => {
+                    restored += 1;
+                    info!(slug, image_ref = %record.image_ref, "took over nydus mount from preserved fuse fd");
+                }
+                Err(e) => {
+                    warn!(slug, image_ref = %record.image_ref, error = %e, "failed to take over mount; it may be stale");
+                }
+            }
+        }
+        restored
+    }
+
+    /// Recreate a fusedev daemon in upgrade mode and drive it through the
+    /// `Takeover -> Restore -> Start` path, adopting the preserved `fuse_fd` and
+    /// the on-disk state blob, so it resumes serving the still-mounted image.
+    async fn restore_instance(
+        &self,
+        record: &DaemonStatusRecord,
+        fuse_fd: std::os::fd::RawFd,
+    ) -> Result<()> {
+        if self.active_fs_driver() != FsDriverType::Fusedev {
+            bail!("failover restore is only supported for the fusedev driver");
+        }
+        let image_ref_str = record.image_ref.as_str();
+        let slug = record.slug.as_str();
+        let bootstrap = record.bootstrap.clone();
+        if !bootstrap.is_file() {
+            bail!(
+                "bootstrap {} for {image_ref_str} is gone",
+                bootstrap.display()
+            );
+        }
+        let state_path = self.failover_state_path(slug);
+        let state = fs::read(&state_path)
+            .with_context(|| format!("read failover state {}", state_path.display()))?;
+
+        let parsed = parse_image_ref(image_ref_str)
+            .with_context(|| format!("invalid image reference '{image_ref_str}'"))?;
+        let daemon_root = self.daemons_root().join(slug);
+        let mountpoint = daemon_root.join("mnt");
+        let cache_dir = self.config.snapshotter.cache.work_dir.join(slug);
+        fs::create_dir_all(&mountpoint)?;
+        fs::create_dir_all(&cache_dir)?;
+
+        let auth = self.resolve_auth(&parsed);
+        let threads = self.config.snapshotter.daemon.threads.max(1) as u32;
+        let bti = self.build_info.clone();
+
+        let poll = Poll::new().context("failed to create mio Poll for daemon waker")?;
+        let waker =
+            Arc::new(Waker::new(poll.registry(), Token(1)).context("failed to create mio Waker")?);
+        let poll = Arc::new(Mutex::new(poll));
+
+        let cfg_v2 = build_registry_config(&self.config, &parsed, &cache_dir, auth, slug);
+        let cfg_json = serde_json::to_string(&cfg_v2).context("serialise ConfigV2 for nydusd")?;
+        let vfs = create_vfs_backend(FsBackendType::Rafs, true, false)
+            .context("create RAFS VFS backend")?;
+        let mount_cmd = FsBackendMountCmd {
+            fs_type: FsBackendType::Rafs,
+            source: bootstrap.display().to_string(),
+            config: cfg_json,
+            mountpoint: "/".to_string(),
+            prefetch_files: runtime_prefetch_for_image(image_ref_str),
+        };
+
+        let mountpoint_str = mountpoint.display().to_string();
+        let supervisor_sock = daemon_root.join("supervisor.sock");
+        // `upgrade=true` together with a `Some(api_sock)` makes create_fuse_daemon
+        // skip the fresh mount and leave the daemon in INIT, ready for takeover.
+        let api_sock = daemon_root.join("api.sock");
+        let daemon = create_fuse_daemon(
+            &mountpoint_str,
+            vfs,
+            Some(supervisor_sock.display().to_string()),
+            Some(slug.to_string()),
+            threads,
+            waker,
+            Some(api_sock.as_path()),
+            true,
+            true,
+            FailoverPolicy::Flush,
+            Some(mount_cmd),
+            bti,
+        )
+        .with_context(|| format!("create upgrade fuse daemon at {}", mountpoint.display()))?;
+
+        // Replay (fd, state) into the daemon's restore() over the supervisor
+        // socket, then start it serving on the existing kernel mount.
+        let daemon_for_takeover = daemon.clone();
+        let state_owned = state;
+        blocking::unblock(move || {
+            crate::failover::serve_on_restore(&supervisor_sock, fuse_fd, state_owned, || {
+                daemon_for_takeover
+                    .trigger_takeover()
+                    .map_err(|e| anyhow::anyhow!("trigger_takeover: {e}"))
+            })
+        })
+        .await
+        .context("replay preserved fuse fd into daemon")?;
+
+        daemon
+            .trigger_start()
+            .map_err(|e| anyhow::anyhow!("trigger_start: {e}"))?;
+        wait_for_running(&*daemon, self.startup_timeout).with_context(|| {
+            format!("restored daemon for {image_ref_str} never reached RUNNING")
+        })?;
+
+        let instance = Arc::new(DaemonInstance {
+            image_ref: image_ref_str.to_string(),
+            mountpoint,
+            bootstrap,
+            daemon,
+            refcount: AtomicUsize::new(record.refcount.max(1)),
+            _poll: poll,
+        });
+        self.instances
+            .write()
+            .await
+            .insert(image_ref_str.to_string(), instance);
+        Ok(())
     }
 
     fn active_fs_driver(&self) -> FsDriverType {
@@ -893,6 +1111,9 @@ impl DaemonSupervisor {
             },
             live,
             updated_at: unix_now(),
+            // In-process daemon: failover targets the snapshotter process itself,
+            // so `kill -9` restarts it and the successor takes the mount over.
+            pid: if live { std::process::id() } else { 0 },
         }
     }
 
