@@ -662,6 +662,69 @@ mod tests {
         Ok(Arc::new(device))
     }
 
+    // Regression: NbdService::new builds its shutdown broadcast with
+    // `broadcast(4)` + `set_overflow(true)` + `receiver.deactivate()`. If that
+    // `deactivate()` were a `drop()` (as it was before the async-broadcast
+    // migration fix), the channel would close and `NbdWorker::run`'s lazily
+    // subscribed `new_receiver().recv()` would return `Closed` immediately,
+    // exiting every worker at startup (daemon up, serves nothing) — the exact
+    // bug fixed in `block_uffd.rs`. Assert the channel stays open and still
+    // delivers the stop signal.
+    #[test]
+    fn test_nbd_shutdown_channel_stays_open() {
+        let (mut sender, receiver) = broadcast::<u32>(4);
+        sender.set_overflow(true);
+        let _keepalive = receiver.deactivate();
+
+        let mut rx = sender.new_receiver();
+        assert_eq!(
+            rx.try_recv(),
+            Err(async_broadcast::TryRecvError::Empty),
+            "a worker subscribing after construction must wait for the stop \
+             signal, not observe a closed channel and exit immediately",
+        );
+        let _ = sender.try_broadcast(0);
+        assert_eq!(rx.try_recv(), Ok(0), "stop signal must reach the worker");
+    }
+
+    // The real `NbdWorker::run` event loop must wake from its `select!` and exit
+    // when the shutdown broadcast fires (rather than hang on the idle kernel
+    // socket). Construct a worker directly over a socketpair so no `/dev/nbd*`
+    // device is needed.
+    #[test]
+    fn test_nbd_worker_exits_on_shutdown_broadcast() {
+        compio::runtime::Runtime::new().unwrap().block_on(async {
+            let tmpdir = TempDir::new().unwrap();
+            let device = create_block_device(tmpdir.as_path().to_path_buf()).unwrap();
+            let (sock_kern, sock_user) = std::os::unix::net::UnixStream::pair().unwrap();
+
+            let (mut sender, receiver) = broadcast::<u32>(4);
+            sender.set_overflow(true);
+            let _keepalive = receiver.deactivate();
+            let sender = Arc::new(sender);
+            let active = Arc::new(AtomicBool::new(true));
+
+            let worker = NbdWorker {
+                active: active.clone(),
+                blob_id: device.meta_blob_id().to_string(),
+                cache_mgr: device.cache_mgr().clone(),
+                _sock_kern: sock_kern,
+                sock_user,
+                sender: sender.clone(),
+            };
+
+            let handle = compio::runtime::spawn(async move { worker.run().await });
+            // Let the worker reach its select! loop (blocked on the idle socket).
+            compio::runtime::time::sleep(Duration::from_millis(50)).await;
+            // Signal shutdown; the worker must wake and exit.
+            active.store(false, Ordering::Release);
+            let _ = sender.try_broadcast(0);
+
+            let res = compio::runtime::time::timeout(Duration::from_secs(2), handle).await;
+            assert!(res.is_ok(), "NbdWorker did not exit on shutdown broadcast");
+        })
+    }
+
     #[ignore]
     #[test]
     fn test_nbd_device() {
