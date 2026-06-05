@@ -60,9 +60,12 @@ fn nbd_ioctl(fd: RawFd, cmd: u32, arg: u64) -> nix::Result<libc::c_int> {
     // `_IO(0xab, cmd)`: direction NONE and size 0, so the request code reduces
     // to `(type << _IOC_NRBITS) | nr` == `(0xab << 8) | cmd`. nix 0.31 dropped
     // the `request_code_none!`/`convert_ioctl_res!` macros, so compute the code
-    // directly and map the result through `Errno::result`.
-    let code = ((0xab_u32 << 8) | cmd) as libc::c_ulong;
-    nix::errno::Errno::result(unsafe { libc::ioctl(fd, code, arg) })
+    // directly and map the result through `Errno::result`. `libc::ioctl`'s
+    // request parameter is `libc::Ioctl`, which is `c_ulong` on linux-gnu but
+    // `c_int` on linux-musl/android — `as _` lets the compiler pick the right
+    // width per target so the musl static-release builds stop tripping E0308.
+    let code = (0xab_u32 << 8) | cmd;
+    nix::errno::Errno::result(unsafe { libc::ioctl(fd, code as _, arg) })
 }
 
 /// Network Block Device server to expose RAFSv6 images as block devices.

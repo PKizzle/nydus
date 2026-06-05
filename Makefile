@@ -176,8 +176,12 @@ ut-nextest:
 # nydus-snapshotter is excluded from Miri: it links compio (io_uring) + mimalloc
 # and is FFI/syscall-heavy, which Miri cannot execute. (Its bbolt-rs/aligners dep,
 # the former blocker, is now gated behind the optional `migrate` feature.)
+# Strip --features=nydus-snapshotter/migrate from CARGO_COMMON: cargo errors with
+# "none of the selected packages contains this feature" when the owning package
+# is also excluded from the build set.
+MIRI_CARGO_COMMON := $(filter-out --features=nydus-snapshotter/migrate,$(CARGO_COMMON))
 miri-ut-nextest:
-	$(CARGO_COV_FLAGS) MIRIFLAGS=-Zmiri-disable-isolation TEST_WORKDIR_PREFIX=$(TEST_WORKDIR_PREFIX) RUST_BACKTRACE=1 ${RUSTUP} run nightly cargo miri nextest run --no-fail-fast --filter-expr 'test(test) - test(integration) - test(deduplicate::tests) - test(inode_bitmap::tests::test_inode_bitmap)' --workspace $(EXCLUDE_PACKAGES) --exclude nydus-snapshotter $(CARGO_COMMON) $(CARGO_BUILD_FLAGS)
+	$(CARGO_COV_FLAGS) MIRIFLAGS=-Zmiri-disable-isolation TEST_WORKDIR_PREFIX=$(TEST_WORKDIR_PREFIX) RUST_BACKTRACE=1 ${RUSTUP} run nightly cargo miri nextest run --no-fail-fast --filter-expr 'test(test) - test(integration) - test(deduplicate::tests) - test(inode_bitmap::tests::test_inode_bitmap)' --workspace $(EXCLUDE_PACKAGES) --exclude nydus-snapshotter $(MIRI_CARGO_COMMON) $(CARGO_BUILD_FLAGS)
 
 smoke-only:
 	CARGO_COV_FLAGS="$(CARGO_COV_FLAGS)" make -C smoke test
