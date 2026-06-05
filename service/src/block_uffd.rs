@@ -2736,15 +2736,14 @@ mod tests {
         let vma_regions = vec![VmaRegion::new(0x1000, 0x2000, 0, 4096)];
 
         let mut sock_fds = [-1_i32; 2];
-        let rc = unsafe {
-            libc::socketpair(
-                libc::AF_UNIX,
-                libc::SOCK_STREAM,
-                0,
-                sock_fds.as_mut_ptr(),
-            )
-        };
-        assert_eq!(rc, 0, "socketpair failed: {}", std::io::Error::last_os_error());
+        let rc =
+            unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, sock_fds.as_mut_ptr()) };
+        assert_eq!(
+            rc,
+            0,
+            "socketpair failed: {}",
+            std::io::Error::last_os_error()
+        );
         let child_fd = sock_fds[0];
         let peer_fd = sock_fds[1];
 
@@ -2770,14 +2769,7 @@ mod tests {
         // If the handler closed `child_fd`, the socket peer has no remaining endpoint,
         // and `send(peer_fd, MSG_NOSIGNAL)` returns -1 with EPIPE. If the handler
         // leaked the fd, the send succeeds (data queues into the still-open peer).
-        let n = unsafe {
-            libc::send(
-                peer_fd,
-                b"x".as_ptr() as *const _,
-                1,
-                libc::MSG_NOSIGNAL,
-            )
-        };
+        let n = unsafe { libc::send(peer_fd, b"x".as_ptr() as *const _, 1, libc::MSG_NOSIGNAL) };
         let errno = std::io::Error::last_os_error().raw_os_error();
         unsafe { libc::close(peer_fd) };
 
