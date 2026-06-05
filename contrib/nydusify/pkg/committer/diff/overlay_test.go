@@ -578,6 +578,16 @@ func TestChangesUnmodifiedDir(t *testing.T) {
 	require.NoError(t, os.MkdirAll(filepath.Join(upper, "dir"), 0755))
 	require.NoError(t, os.WriteFile(filepath.Join(upper, "dir", "file.txt"), []byte("same"), 0644))
 
+	// sameDirent compares nanosecond mtimes, so two back-to-back WriteFile calls
+	// otherwise look like a modification even though content is byte-identical.
+	// Pin both files (and parent dirs) to the same mtime so the comparison
+	// hinges on content alone, which is what this test means to assert.
+	pinned := time.Unix(1_700_000_000, 0)
+	for _, root := range []string{base, upper} {
+		require.NoError(t, os.Chtimes(filepath.Join(root, "dir", "file.txt"), pinned, pinned))
+		require.NoError(t, os.Chtimes(filepath.Join(root, "dir"), pinned, pinned))
+	}
+
 	type change struct {
 		kind int
 		path string
