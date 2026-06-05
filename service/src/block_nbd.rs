@@ -18,7 +18,7 @@ use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
-use async_broadcast::{Sender, broadcast};
+use async_broadcast::{InactiveReceiver, Sender, broadcast};
 use bytes::{Buf, BufMut};
 use compio::buf::{BufResult, IntoInner, IoBuf};
 use compio::io::{AsyncRead, AsyncWriteExt};
@@ -60,9 +60,12 @@ fn nbd_ioctl(fd: RawFd, cmd: u32, arg: u64) -> nix::Result<libc::c_int> {
     // `_IO(0xab, cmd)`: direction NONE and size 0, so the request code reduces
     // to `(type << _IOC_NRBITS) | nr` == `(0xab << 8) | cmd`. nix 0.31 dropped
     // the `request_code_none!`/`convert_ioctl_res!` macros, so compute the code
-    // directly and map the result through `Errno::result`.
-    let code = ((0xab_u32 << 8) | cmd) as libc::c_ulong;
-    nix::errno::Errno::result(unsafe { libc::ioctl(fd, code, arg) })
+    // directly and map the result through `Errno::result`. `libc::ioctl`'s
+    // request parameter is `libc::Ioctl`, which is `c_ulong` on linux-gnu but
+    // `c_int` on linux-musl/android — `as _` lets the compiler pick the right
+    // width per target so the musl static-release builds stop tripping E0308.
+    let code = (0xab_u32 << 8) | cmd;
+    nix::errno::Errno::result(unsafe { libc::ioctl(fd, code as _, arg) })
 }
 
 /// Network Block Device server to expose RAFSv6 images as block devices.
@@ -72,6 +75,12 @@ pub struct NbdService {
     cache_mgr: Arc<BlobCacheMgr>,
     nbd_dev: fs::File,
     sender: Arc<Sender<u32>>,
+    // Keepalive for the shutdown broadcast channel. An `async-broadcast` channel
+    // closes as soon as its last receiver is dropped, after which `new_receiver()`
+    // yields a receiver whose `recv()` returns `Closed` immediately. Workers
+    // subscribe lazily via `new_receiver()`, so this inactive receiver pins the
+    // channel open without consuming messages; it is never read.
+    _shutdown_keepalive: InactiveReceiver<u32>,
 }
 
 impl NbdService {
@@ -102,10 +111,13 @@ impl NbdService {
         // Shutdown notification: a single value broadcast to every worker so
         // they wake from `select!` and re-check `active`. Overflow mode keeps
         // `try_broadcast` non-blocking and infallible even if the (bounded)
-        // queue is full or no worker has subscribed yet.
+        // queue is full or no worker has subscribed yet. Deactivate (rather than
+        // drop) the initial receiver so the channel stays open until workers
+        // subscribe via `new_receiver()`; dropping the last receiver would close
+        // the channel and make every worker exit its loop immediately.
         let (mut sender, receiver) = broadcast(4);
         sender.set_overflow(true);
-        drop(receiver);
+        let shutdown_keepalive = receiver.deactivate();
 
         Ok(NbdService {
             active: Arc::new(AtomicBool::new(true)),
@@ -113,6 +125,7 @@ impl NbdService {
             cache_mgr: device.cache_mgr().clone(),
             nbd_dev,
             sender: Arc::new(sender),
+            _shutdown_keepalive: shutdown_keepalive,
         })
     }
 
@@ -650,6 +663,69 @@ mod tests {
             .unwrap();
 
         Ok(Arc::new(device))
+    }
+
+    // Regression: NbdService::new builds its shutdown broadcast with
+    // `broadcast(4)` + `set_overflow(true)` + `receiver.deactivate()`. If that
+    // `deactivate()` were a `drop()` (as it was before the async-broadcast
+    // migration fix), the channel would close and `NbdWorker::run`'s lazily
+    // subscribed `new_receiver().recv()` would return `Closed` immediately,
+    // exiting every worker at startup (daemon up, serves nothing) — the exact
+    // bug fixed in `block_uffd.rs`. Assert the channel stays open and still
+    // delivers the stop signal.
+    #[test]
+    fn test_nbd_shutdown_channel_stays_open() {
+        let (mut sender, receiver) = broadcast::<u32>(4);
+        sender.set_overflow(true);
+        let _keepalive = receiver.deactivate();
+
+        let mut rx = sender.new_receiver();
+        assert_eq!(
+            rx.try_recv(),
+            Err(async_broadcast::TryRecvError::Empty),
+            "a worker subscribing after construction must wait for the stop \
+             signal, not observe a closed channel and exit immediately",
+        );
+        let _ = sender.try_broadcast(0);
+        assert_eq!(rx.try_recv(), Ok(0), "stop signal must reach the worker");
+    }
+
+    // The real `NbdWorker::run` event loop must wake from its `select!` and exit
+    // when the shutdown broadcast fires (rather than hang on the idle kernel
+    // socket). Construct a worker directly over a socketpair so no `/dev/nbd*`
+    // device is needed.
+    #[test]
+    fn test_nbd_worker_exits_on_shutdown_broadcast() {
+        compio::runtime::Runtime::new().unwrap().block_on(async {
+            let tmpdir = TempDir::new().unwrap();
+            let device = create_block_device(tmpdir.as_path().to_path_buf()).unwrap();
+            let (sock_kern, sock_user) = std::os::unix::net::UnixStream::pair().unwrap();
+
+            let (mut sender, receiver) = broadcast::<u32>(4);
+            sender.set_overflow(true);
+            let _keepalive = receiver.deactivate();
+            let sender = Arc::new(sender);
+            let active = Arc::new(AtomicBool::new(true));
+
+            let worker = NbdWorker {
+                active: active.clone(),
+                blob_id: device.meta_blob_id().to_string(),
+                cache_mgr: device.cache_mgr().clone(),
+                _sock_kern: sock_kern,
+                sock_user,
+                sender: sender.clone(),
+            };
+
+            let handle = compio::runtime::spawn(async move { worker.run().await });
+            // Let the worker reach its select! loop (blocked on the idle socket).
+            compio::runtime::time::sleep(Duration::from_millis(50)).await;
+            // Signal shutdown; the worker must wake and exit.
+            active.store(false, Ordering::Release);
+            let _ = sender.try_broadcast(0);
+
+            let res = compio::runtime::time::timeout(Duration::from_secs(2), handle).await;
+            assert!(res.is_ok(), "NbdWorker did not exit on shutdown broadcast");
+        })
     }
 
     #[ignore]

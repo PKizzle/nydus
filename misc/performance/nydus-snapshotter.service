@@ -4,9 +4,17 @@ After=network.target
 Before=containerd.service
 
 [Service]
-Type=simple
+# Type=notify + a file-descriptor store let the in-process snapshotter park each
+# daemon's /dev/fuse fd in PID 1 and reclaim it after a restart / kill -9, so
+# container mounts survive a snapshotter upgrade (the takeover smoke test).
+Type=notify
+NotifyAccess=main
+FileDescriptorStoreMax=512
+# Keep stored fds across a restart but drop them on a real stop (default).
+FileDescriptorStorePreserve=restart
 Environment=HOME=/root
-ExecStart=/usr/local/bin/containerd-nydus-grpc --config /etc/nydus/config.toml
+Environment=RUST_BACKTRACE=1
+ExecStart=/usr/local/bin/containerd-nydus --config /etc/nydus/config.toml
 Restart=always
 RestartSec=1
 KillMode=process

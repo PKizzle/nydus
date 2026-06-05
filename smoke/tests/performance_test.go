@@ -31,6 +31,22 @@ func (p *PerformanceTestSuite) TestPerformance(_ *testing.T) {
 		mode = "fs-version-6"
 	}
 	switch mode {
+	case "fs-version-5":
+		// The current nydus-image dropped RAFS v5 *writing* (default v6), so we
+		// can't convert the fixture with it. Build the v5 fixture with the last
+		// v5-capable nydus release (exposed by the perf job as NYDUS_BUILDER_v5 /
+		// NYDUS_NYDUSIFY_v5); the current in-process nydusd still performs the v5
+		// READ this benchmark measures. Skip gracefully when those binaries are
+		// not provided (e.g. a local run without the v5 toolchain).
+		v5Builder := os.Getenv("NYDUS_BUILDER_v5")
+		v5Nydusify := os.Getenv("NYDUS_NYDUSIFY_v5")
+		if v5Builder == "" || v5Nydusify == "" {
+			p.t.Skip("fs-version-5 perf needs NYDUS_BUILDER_v5 / NYDUS_NYDUSIFY_v5 (a v5-capable nydus release)")
+		}
+		ctx.Build.FSVersion = "5"
+		ctx.Binary.Builder = v5Builder
+		ctx.Binary.Nydusify = v5Nydusify
+		ctx.Binary.NydusifyChecker = v5Nydusify
 	case "fs-version-6":
 		ctx.Build.FSVersion = "6"
 	case "zran":

@@ -37,8 +37,13 @@ pub fn build_registry_config(
             .map(|c| c.request_timeout.as_str())
             .unwrap_or("30s"),
     );
+    let scheme = if registry_cfg.map(|c| c.plain_http).unwrap_or(false) {
+        "http"
+    } else {
+        "https"
+    };
     let registry = RegistryConfig {
-        scheme: "https".to_string(),
+        scheme: scheme.to_string(),
         host: image_ref.api_host.clone(),
         repo: image_ref.repo.clone(),
         auth,

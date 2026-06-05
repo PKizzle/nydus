@@ -1,8 +1,11 @@
 name: Smoke Test
 
 on:
+  # Only run the `push` trigger on long-lived branches. For feature branches the
+  # open pull request already runs the full suite via the `pull_request` trigger;
+  # leaving `push: ["**"]` made every PR push run the whole workflow twice.
   push:
-    branches: ["**", "stable/**"]
+    branches: [master, "stable/**"]
     paths-ignore: [ '**.md', '**.png', '**.jpg', '**.svg', '**/docs/**' ]
   pull_request:
     branches: ["**", "stable/**"]
@@ -11,6 +14,12 @@ on:
     # Run daily sanity check at 03:00 clock UTC
     - cron: "0 03 * * *"
   workflow_dispatch:
+
+# Cancel superseded runs for the same PR (or branch push) so rapid pushes don't
+# pile up redundant work.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
@@ -118,6 +127,9 @@ jobs:
         RUST_TARGET=${rust_target_map[${{ matrix.arch }}]}
         sudo mv target/$RUST_TARGET/release/nydusd .
         sudo mv target/$RUST_TARGET/release/nydus-image .
+        # The Rust snapshotter (containerd-nydus) is only built for arches where nydus-snapshotter
+        # is not excluded (i.e. not ppc64le/riscv64); move it when present so smoke can use it.
+        [ -f "target/$RUST_TARGET/release/containerd-nydus" ] && sudo mv "target/$RUST_TARGET/release/containerd-nydus" . || true
     - name: Upload Nydus Binaries
       if: matrix.arch == 'amd64'
       uses: actions/upload-artifact@v6
@@ -126,6 +138,7 @@ jobs:
         path: |
           nydus-image
           nydusd
+          containerd-nydus
 
   nydusd-build-macos:
     runs-on: macos-15
@@ -403,8 +416,11 @@ jobs:
         echo "  GO_TEST_BUILD_FLAGS=${GO_TEST_BUILD_FLAGS}"
         cargo llvm-cov clean --workspace
         cargo build --release --features=virtiofs,block-uffd --bins
+        # The root crate's --bins covers nydusd/nydus-image/nydusctl only; build the Rust snapshotter
+        # (a separate workspace member) explicitly so prepare.sh can install containerd-nydus.
+        cargo build --release -p nydus-snapshotter --bin containerd-nydus
         echo "Built instrumented binaries:"
-        ls -l target/release/nydusd target/release/nydus-image contrib/nydusify/cmd/nydusify
+        ls -l target/release/nydusd target/release/nydus-image target/release/containerd-nydus contrib/nydusify/cmd/nydusify
         target/release/nydusd --version || true
         target/release/nydus-image --version || true
         cargo llvm-cov clean --workspace --profraw-only
@@ -636,7 +652,10 @@ jobs:
         fail_ci_if_error: true
 
   upload-pr-coverage-to-codecov:
-    if: github.event_name == 'pull_request'
+    # Skip on forks without a CODECOV_TOKEN secret (the upload sets
+    # fail_ci_if_error, so without the token it would fail the whole run).
+    # Mirrors the guard on `upload-coverage-to-codecov`.
+    if: github.event_name == 'pull_request' && needs.nydus-unit-test-coverage.outputs.has-codecov-credentials
     runs-on: ${{ vars.RUNNER_OS || 'ubuntu-latest' }}
     needs: [contrib-unit-test-coverage, nydus-unit-test-coverage, nydus-integration-test-coverage]
     env:
@@ -759,6 +778,7 @@ jobs:
     strategy:
       matrix:
         include:
+          - mode: fs-version-5
           - mode: fs-version-6
           - mode: zran
     steps:
@@ -774,6 +794,18 @@ jobs:
       with:
         name: nydusify-artifact
         path: contrib/nydusify/cmd
+    - name: Prepare v5-capable builder
+      if: matrix.mode == 'fs-version-5'
+      run: |
+        # The current nydus-image cannot write RAFS v5 (default v6). Fetch the
+        # last released, v5-capable nydus and expose it so the perf test converts
+        # the fixture with it; the current nydusd performs the v5 read we measure.
+        NYDUS_STABLE_VERSION=$(curl -s https://api.github.com/repos/Dragonflyoss/nydus/releases/latest | jq -r '.tag_name')
+        wget -q "https://github.com/dragonflyoss/nydus/releases/download/${NYDUS_STABLE_VERSION}/nydus-static-${NYDUS_STABLE_VERSION}-linux-amd64.tgz"
+        sudo mkdir -p /usr/bin/nydus-v5
+        sudo tar xzf "nydus-static-${NYDUS_STABLE_VERSION}-linux-amd64.tgz" -C /usr/bin/nydus-v5 --strip-components=1
+        echo "NYDUS_BUILDER_v5=/usr/bin/nydus-v5/nydus-image" >> "$GITHUB_ENV"
+        echo "NYDUS_NYDUSIFY_v5=/usr/bin/nydus-v5/nydusify" >> "$GITHUB_ENV"
     - name: Prepare Nydus Container Environment
       run: |
         sudo bash misc/prepare.sh
@@ -805,3 +837,10 @@ jobs:
       run: |
         export NEW_NYDUSD_BINARY_PATH=target/release/nydusd
         sudo -E make smoke-takeover
+    - name: Dump nydus-snapshotter logs
+      if: always()
+      run: |
+        echo "=== nydus-snapshotter (Rust containerd-nydus) journal ==="
+        sudo journalctl -u nydus-snapshotter --no-pager || true
+        echo "=== nydus-snapshotter status ==="
+        sudo systemctl status nydus-snapshotter --no-pager --full || true

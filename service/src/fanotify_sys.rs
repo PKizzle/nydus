@@ -115,3 +115,43 @@ pub struct fanotify_event_info_range {
 
 const _: () = assert!(mem::size_of::<fanotify_event_info_header>() == 4);
 const _: () = assert!(mem::size_of::<fanotify_event_info_range>() == 24);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Golden values from <linux/fanotify.h> (kernel 6.14). The pre-content path
+    // fails silently or at mount if any of these drift from the kernel UAPI
+    // (CLAUDE.md gotcha #4); this guards against accidental edits. When bumping
+    // the minimum kernel, re-verify against /usr/include/linux/fanotify.h.
+    #[test]
+    fn test_abi_constants_match_kernel_uapi() {
+        assert_eq!(FAN_CLASS_PRE_CONTENT, 0x0000_0008);
+        assert_eq!(FAN_REPORT_FID, 0x0000_0200);
+        assert_eq!(FAN_REPORT_TARGET_FID, 0x0000_1000);
+        assert_eq!(FAN_PRE_ACCESS, 0x0010_0000);
+        assert_eq!(FAN_EVENT_INFO_TYPE_RANGE, 6u8);
+    }
+
+    // FAN_DENY_ERRNO(e) = FAN_DENY(0x02) | ((e & 0xFF) << 24).
+    #[test]
+    fn test_fan_deny_errno_masks_to_eight_bits() {
+        assert_eq!(fan_deny_errno(libc::EIO), 0x0500_0002); // EIO == 5
+        // Only the low 8 bits of the errno survive; FAN_DENY stays set.
+        let encoded = fan_deny_errno(0x1FF);
+        assert_eq!(encoded & 0x0000_00FF, 0x02, "FAN_DENY bit preserved");
+        assert_eq!(encoded >> 24, 0xFF, "errno masked to 8 bits");
+    }
+
+    // The kernel writes `offset`/`count` at fixed positions in the range record;
+    // a field reorder or padding change here silently corrupts range parsing.
+    #[test]
+    fn test_event_info_range_field_offsets() {
+        assert_eq!(mem::offset_of!(fanotify_event_info_header, info_type), 0);
+        assert_eq!(mem::offset_of!(fanotify_event_info_header, len), 2);
+
+        assert_eq!(mem::offset_of!(fanotify_event_info_range, hdr), 0);
+        assert_eq!(mem::offset_of!(fanotify_event_info_range, offset), 8);
+        assert_eq!(mem::offset_of!(fanotify_event_info_range, count), 16);
+    }
+}

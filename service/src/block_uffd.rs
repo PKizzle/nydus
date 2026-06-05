@@ -37,7 +37,7 @@ use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
-use async_broadcast::Sender;
+use async_broadcast::{InactiveReceiver, Sender};
 use compio::runtime::fd::PollFd;
 use compio::runtime::{ResumeUnwind, spawn_blocking};
 use flume;
@@ -1130,6 +1130,15 @@ pub struct UffdService {
     cache_mgr: Arc<BlobCacheMgr>,
     uds_path: String,
     sender: Arc<Sender<u32>>,
+    // Keepalive for the shutdown broadcast channel. An `async-broadcast` channel
+    // closes as soon as its last receiver is dropped, after which `new_receiver()`
+    // yields a receiver whose `recv()` returns `Closed` immediately. The workers
+    // subscribe lazily via `new_receiver()`, so without an inactive receiver
+    // pinning the channel open they would `select!` on an already-closed channel
+    // and exit their accept loop the instant they start (the daemon reaches
+    // RUNNING but serves no connections). Holding this keeps the channel open
+    // without consuming messages; it is never read.
+    _shutdown_keepalive: InactiveReceiver<u32>,
     active_conns: Arc<Mutex<Vec<RawFd>>>,
     worker_senders: Mutex<Vec<flume::Sender<StdUnixStream>>>,
     worker_threads: Mutex<Vec<JoinHandle<Result<()>>>>,
@@ -1144,9 +1153,13 @@ impl UffdService {
         // Shutdown notification broadcast to every worker/connection so they
         // wake from `select!` and re-check `active`. Overflow mode keeps
         // `try_broadcast` non-blocking and infallible regardless of subscribers.
+        // Deactivate (rather than drop) the initial receiver: an `async-broadcast`
+        // channel closes once its last receiver is gone, and the workers only
+        // subscribe later via `new_receiver()`. The inactive receiver pins the
+        // channel open without consuming messages.
         let (mut sender, receiver) = async_broadcast::broadcast(4);
         sender.set_overflow(true);
-        drop(receiver);
+        let shutdown_keepalive = receiver.deactivate();
 
         Ok(UffdService {
             active: Arc::new(AtomicBool::new(true)),
@@ -1154,6 +1167,7 @@ impl UffdService {
             cache_mgr: device.cache_mgr().clone(),
             uds_path,
             sender: Arc::new(sender),
+            _shutdown_keepalive: shutdown_keepalive,
             active_conns: Arc::new(Mutex::new(Vec::new())),
             worker_threads: Mutex::new(Vec::new()),
             worker_senders: Mutex::new(Vec::new()),
@@ -1780,6 +1794,41 @@ mod tests {
         assert!(service.active.load(Ordering::Acquire));
         service.stop();
         assert!(!service.active.load(Ordering::Acquire));
+    }
+
+    // Regression: the shutdown broadcast channel must stay open after construction.
+    // Workers subscribe lazily via `sender.new_receiver()`, then `select!` on
+    // `recv()` to wait for the stop signal. An `async-broadcast` channel closes the
+    // instant its last receiver is dropped, after which a freshly-subscribed
+    // receiver's `recv()` returns `Closed` immediately. The constructor used to
+    // `drop(receiver)`, which closed the channel, so every worker exited its accept
+    // loop at startup: the daemon reached RUNNING but served no connections (clients
+    // saw "connection reset by peer"). The fix deactivates the receiver instead,
+    // pinning the channel open. Here we assert the observable invariant the workers
+    // rely on: a new receiver is *Empty* (pending), not *Closed*, and a stop signal
+    // still reaches it.
+    #[test]
+    fn test_uffd_service_shutdown_channel_stays_open() {
+        let tmpdir = TempDir::new().unwrap();
+        let device = create_block_device(tmpdir.as_path().to_path_buf()).unwrap();
+        let sock_path = format!("{}/test.sock", tmpdir.as_path().display());
+        let service = UffdService::new(device, sock_path).unwrap();
+
+        let mut rx = service.sender.new_receiver();
+        assert_eq!(
+            rx.try_recv(),
+            Err(async_broadcast::TryRecvError::Empty),
+            "a worker subscribing after construction must wait for the stop signal, \
+             not observe a closed channel and exit immediately",
+        );
+
+        // The stop broadcast must still wake that receiver.
+        service.stop();
+        assert_eq!(
+            rx.try_recv(),
+            Ok(0),
+            "stop() must deliver the shutdown signal to subscribed workers",
+        );
     }
 
     #[test]
@@ -2451,11 +2500,15 @@ mod tests {
                 .send_with_fd(&json, &[uffd_fd])
                 .unwrap();
 
-            // Spawn handle_conn with broadcast sender for graceful shutdown
+            // Spawn handle_conn with broadcast sender for graceful shutdown.
+            // Deactivate (not drop) the initial receiver so the channel stays
+            // open: handle_conn subscribes via `new_receiver()` and must block on
+            // `recv()` until the `try_broadcast(0)` below, exercising the real
+            // shutdown path rather than an already-closed channel.
             let active = Arc::new(AtomicBool::new(true));
             let (mut sender, receiver) = async_broadcast::broadcast(4);
             sender.set_overflow(true);
-            drop(receiver);
+            let _shutdown_keepalive = receiver.deactivate();
             let sender = Arc::new(sender);
             let sender_clone = sender.clone();
             let handle = compio::runtime::spawn(async move {
@@ -2667,14 +2720,32 @@ mod tests {
     fn test_handle_page_fault_fork_closes_child_fd() {
         // A FORK event carries a brand-new child uffd fd in the first u64 of the union; the handler
         // must close it (returning Noop) instead of leaking it.
+        //
+        // We can't check this by dup'ing fd 0 and asserting `fcntl(child_fd, F_GETFD) == -1`
+        // afterwards: cargo test runs tests on multiple threads (Makefile passes
+        // `--test-threads=8`) so an unrelated test thread can race and `open()` a file into the
+        // just-freed fd number — `F_GETFD` then returns 0 and this test fails spuriously. (nextest
+        // runs each test in its own process so it never hit the race; the coverage job uses
+        // `cargo test` and did.) Use a socketpair instead: kernel pipe/socket peer-state is
+        // tracked by the file-table entry, not the fd number, so `send(peer, MSG_NOSIGNAL)`
+        // returns EPIPE iff the OTHER end was genuinely closed — independent of whether some
+        // unrelated open() later reused that fd number on a different thread.
         let tmpdir = TempDir::new().unwrap();
         let device = create_block_device(tmpdir.as_path().to_path_buf()).unwrap();
         let core = UffdCore::new(device);
         let vma_regions = vec![VmaRegion::new(0x1000, 0x2000, 0, 4096)];
 
-        // A real fd we expect the handler to close.
-        let child_fd = unsafe { libc::dup(0) };
-        assert!(child_fd >= 0, "failed to set up a child fd for the test");
+        let mut sock_fds = [-1_i32; 2];
+        let rc =
+            unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, sock_fds.as_mut_ptr()) };
+        assert_eq!(
+            rc,
+            0,
+            "socketpair failed: {}",
+            std::io::Error::last_os_error()
+        );
+        let child_fd = sock_fds[0];
+        let peer_fd = sock_fds[1];
 
         let msg = UffdMsg {
             event: UFFD_EVENT_FORK,
@@ -2695,9 +2766,15 @@ mod tests {
             assert!(matches!(result, PageFaultResult::Noop));
         });
 
-        // The child fd must now be closed: F_GETFD should fail with EBADF.
-        let still_open = unsafe { libc::fcntl(child_fd, libc::F_GETFD) };
-        assert_eq!(still_open, -1, "FORK child fd was leaked, not closed");
+        // If the handler closed `child_fd`, the socket peer has no remaining endpoint,
+        // and `send(peer_fd, MSG_NOSIGNAL)` returns -1 with EPIPE. If the handler
+        // leaked the fd, the send succeeds (data queues into the still-open peer).
+        let n = unsafe { libc::send(peer_fd, b"x".as_ptr() as *const _, 1, libc::MSG_NOSIGNAL) };
+        let errno = std::io::Error::last_os_error().raw_os_error();
+        unsafe { libc::close(peer_fd) };
+
+        assert_eq!(n, -1, "FORK child fd was leaked: send to peer succeeded");
+        assert_eq!(errno, Some(libc::EPIPE), "expected EPIPE after peer closed");
     }
 
     #[test]
