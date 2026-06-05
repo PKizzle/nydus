@@ -2720,14 +2720,33 @@ mod tests {
     fn test_handle_page_fault_fork_closes_child_fd() {
         // A FORK event carries a brand-new child uffd fd in the first u64 of the union; the handler
         // must close it (returning Noop) instead of leaking it.
+        //
+        // We can't check this by dup'ing fd 0 and asserting `fcntl(child_fd, F_GETFD) == -1`
+        // afterwards: cargo test runs tests on multiple threads (Makefile passes
+        // `--test-threads=8`) so an unrelated test thread can race and `open()` a file into the
+        // just-freed fd number — `F_GETFD` then returns 0 and this test fails spuriously. (nextest
+        // runs each test in its own process so it never hit the race; the coverage job uses
+        // `cargo test` and did.) Use a socketpair instead: kernel pipe/socket peer-state is
+        // tracked by the file-table entry, not the fd number, so `send(peer, MSG_NOSIGNAL)`
+        // returns EPIPE iff the OTHER end was genuinely closed — independent of whether some
+        // unrelated open() later reused that fd number on a different thread.
         let tmpdir = TempDir::new().unwrap();
         let device = create_block_device(tmpdir.as_path().to_path_buf()).unwrap();
         let core = UffdCore::new(device);
         let vma_regions = vec![VmaRegion::new(0x1000, 0x2000, 0, 4096)];
 
-        // A real fd we expect the handler to close.
-        let child_fd = unsafe { libc::dup(0) };
-        assert!(child_fd >= 0, "failed to set up a child fd for the test");
+        let mut sock_fds = [-1_i32; 2];
+        let rc = unsafe {
+            libc::socketpair(
+                libc::AF_UNIX,
+                libc::SOCK_STREAM,
+                0,
+                sock_fds.as_mut_ptr(),
+            )
+        };
+        assert_eq!(rc, 0, "socketpair failed: {}", std::io::Error::last_os_error());
+        let child_fd = sock_fds[0];
+        let peer_fd = sock_fds[1];
 
         let msg = UffdMsg {
             event: UFFD_EVENT_FORK,
@@ -2748,9 +2767,22 @@ mod tests {
             assert!(matches!(result, PageFaultResult::Noop));
         });
 
-        // The child fd must now be closed: F_GETFD should fail with EBADF.
-        let still_open = unsafe { libc::fcntl(child_fd, libc::F_GETFD) };
-        assert_eq!(still_open, -1, "FORK child fd was leaked, not closed");
+        // If the handler closed `child_fd`, the socket peer has no remaining endpoint,
+        // and `send(peer_fd, MSG_NOSIGNAL)` returns -1 with EPIPE. If the handler
+        // leaked the fd, the send succeeds (data queues into the still-open peer).
+        let n = unsafe {
+            libc::send(
+                peer_fd,
+                b"x".as_ptr() as *const _,
+                1,
+                libc::MSG_NOSIGNAL,
+            )
+        };
+        let errno = std::io::Error::last_os_error().raw_os_error();
+        unsafe { libc::close(peer_fd) };
+
+        assert_eq!(n, -1, "FORK child fd was leaked: send to peer succeeded");
+        assert_eq!(errno, Some(libc::EPIPE), "expected EPIPE after peer closed");
     }
 
     #[test]
