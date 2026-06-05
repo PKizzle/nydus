@@ -27,6 +27,18 @@ RUN add-apt-repository ppa:ubuntu-toolchain-r/test \
 
 WORKDIR /root
 
+# `containerd-snapshots`' build script needs `protoc` to generate the gRPC
+# bindings. The non-RISC-V matrix arches install it on the runner via
+# `misc/install-protoc.sh`, but that step is skipped for riscv64 (upstream
+# protobuf publishes no riscv64 binary) and, since the riscv64 build runs
+# *inside* this container rather than on the runner, the host-installed
+# protoc isn't visible anyway. The container is x86_64 cross-compiling to
+# riscv64, so a build-host x86_64 protoc is correct here.
+ARG PROTOC_VERSION=29.6
+RUN curl -fsSL "https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-linux-x86_64.zip" -o /tmp/protoc.zip \
+    && unzip -o /tmp/protoc.zip -d /usr/local \
+    && rm /tmp/protoc.zip
+
 RUN curl https://sh.rustup.rs -sSf | sh -s -- -y --default-toolchain $RUST_VERSION
 
 ENV PATH="/root/.cargo/bin:${PATH}"
