@@ -92,7 +92,14 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 fjall = "3.1.4"
 # Only used by the `nydus-migrate` legacy-import tool; optional so the snapshotter
 # builds on ppc64le/riscv64 (bbolt-rs -> aligners `simd` fails to compile there).
-bbolt-rs = { version = "1.3.10", optional = true }
+#
+# `compat` is REQUIRED so bbolt-rs reads files written by Go's bbolt (the format
+# the legacy Go nydus-snapshotter uses for `metadata.db`). Without it, bbolt-rs
+# uses its own custom magic `0x5caff01d` instead of Go's `0xED0CDAED` and rejects
+# every Go-written file with "invalid database - meta_can_read: true". The
+# import tool exists solely to migrate those Go-written files into fjall, so
+# compat is mandatory, not optional. See bbolt-rs/src/common/defaults.rs.
+bbolt-rs = { version = "1.3.10", optional = true, features = ["compat"] }
 thiserror = "2.0.18"
 libc = "0.2"
 mio = { version = "1.2", features = ["os-poll", "os-ext"] }
