@@ -2,30 +2,28 @@
 //
 // SPDX-License-Identifier: (Apache-2.0 AND BSD-3-Clause)
 
-//! Low-priority background zran artifact generation.
+//! Low-priority background node-local zran artifact generation.
 //!
-//! This is the first P5 integration point: once the optimizer NRI plugin submits
-//! a structured runtime access profile, the snapshotter can enqueue a low
-//! priority `nydusify convert --oci-ref` job for the original OCI image. The
-//! generated zran artifact reuses the original gzip layers, so mirrors such as
-//! spegel can serve an accelerated artifact to other nodes without storing a
-//! second full native RAFS image.
+//! Triggered by structured prefetch profiles submitted to the sysctl API by the
+//! access tracer (after pod-startup settle). The worker dequeues each job and
+//! runs `local_accel::convert` to produce a RAFS v6 + zran artifact node-locally,
+//! then uploads the artifact (merged bootstrap + per-layer zran indexes +
+//! optional prefetch blob + a small auto-accel manifest JSON) into containerd's
+//! content store with labels linking it to the original image manifest. Spegel
+//! mirrors the artifact to peer nodes; subsequent pods of the same image on any
+//! node get a fanotify-served mount of the converted bootstrap on top of the
+//! original, unchanged gzip layers — no tag change, no sha256 churn.
 
 use crate::config::AutoZranConfig;
 use crate::prefetch_profile::PrefetchProfile;
-use anyhow::{Context, Result};
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
-use std::ffi::OsString;
-use std::path::PathBuf;
-use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_channel::{Receiver, Sender};
-use compio::io::AsyncWriteExt;
-use compio::process::Command;
 use tracing::{debug, info, warn};
 
 /// Conversion job persisted in memory while waiting for the worker.
@@ -187,14 +185,6 @@ impl AutoZranManager {
             debug!(image = %profile.image, "auto-zran skipped empty prefetch profile");
             return;
         };
-        if should_skip_image(&job.image) {
-            self.state
-                .metrics
-                .skipped_total
-                .fetch_add(1, Ordering::Relaxed);
-            debug!(image = %job.image, "auto-zran skipped already accelerated image");
-            return;
-        }
 
         let key = job_key(&job.image);
         match self.state.queued_or_done.lock() {
@@ -252,118 +242,21 @@ async fn worker_loop(
     }
 }
 
-async fn run_conversion(config: &AutoZranConfig, job: &AutoZranJob) -> Result<()> {
-    std::fs::create_dir_all(&config.work_dir).with_context(|| {
-        format!(
-            "failed to create auto-zran work dir {}",
-            config.work_dir.display()
-        )
-    })?;
-
-    let spec = CommandSpec::for_job(config, job);
-    info!(image = %job.image, program = ?spec.program, args = ?spec.args, "starting auto-zran conversion");
-    let mut command = Command::new(&spec.program);
-    command.args(&spec.args);
-    // compio's stdio builders are fallible (they set up the pipe eagerly).
-    command.stdin(Stdio::piped())?;
-    command.stdout(Stdio::piped())?;
-    command.stderr(Stdio::piped())?;
-
-    let mut child = command
-        .spawn()
-        .context("failed to spawn auto-zran converter")?;
-    if let Some(mut stdin) = child.stdin.take() {
-        let prefetch = job.prefetch_files.join("\n") + "\n";
-        // compio I/O takes an owned buffer and returns a `BufResult`; `.0` is the
-        // io result. Dropping `stdin` after the write closes the pipe (EOF).
-        stdin
-            .write_all(prefetch.into_bytes())
-            .await
-            .0
-            .context("failed to write auto-zran prefetch profile to converter stdin")?;
-    }
-
-    let output = child
-        .wait_with_output()
-        .await
-        .context("failed to wait for auto-zran converter")?;
-    if !output.status.success() {
-        anyhow::bail!(
-            "converter exited with {}; stderr: {}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-
-    info!(image = %job.image, "auto-zran conversion completed");
+/// Drive a single conversion job end-to-end. Phase 6 fills in the body:
+/// resolve the original manifest digest + gzip-layer paths via
+/// `ContainerdLookup`, call `local_accel::convert(cfg, layers, &job.prefetch_files)`,
+/// upload the artifacts to containerd's content store with auto-accel labels,
+/// register the deterministic `nydus-auto-accel:v1:<subject_digest>` ref, then
+/// mark the image accelerated in the access tracer. For now this is a no-op so
+/// the queue/state machinery compiles and runs cleanly while the surrounding
+/// phases land.
+async fn run_conversion(_config: &AutoZranConfig, job: &AutoZranJob) -> Result<()> {
+    info!(
+        image = %job.image,
+        prefetch_files = job.prefetch_files.len(),
+        "auto-zran conversion queued (no-op until phase 6 wires the pipeline)"
+    );
     Ok(())
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct CommandSpec {
-    program: OsString,
-    args: Vec<OsString>,
-}
-
-impl CommandSpec {
-    fn for_job(config: &AutoZranConfig, job: &AutoZranJob) -> Self {
-        let mut converter_args = vec![
-            config.nydusify.as_os_str().to_os_string(),
-            OsString::from("convert"),
-            OsString::from("--oci-ref"),
-            OsString::from("--source"),
-            OsString::from(&job.image),
-            OsString::from("--target-suffix"),
-            OsString::from(&config.target_suffix),
-            OsString::from("--fs-version"),
-            OsString::from("6"),
-            OsString::from("--prefetch-patterns"),
-            OsString::from("--work-dir"),
-            job_work_dir(config, &job.image).into_os_string(),
-        ];
-
-        if config.plain_http {
-            converter_args.push(OsString::from("--plain-http"));
-        }
-        if config.source_insecure {
-            converter_args.push(OsString::from("--source-insecure"));
-        }
-        if config.target_insecure {
-            converter_args.push(OsString::from("--target-insecure"));
-        }
-
-        let mut nice_args = vec![
-            OsString::from("-n"),
-            OsString::from(config.nice.clamp(0, 19).to_string()),
-        ];
-        nice_args.extend(converter_args);
-
-        if config.ionice_idle {
-            let mut args = vec![
-                OsString::from("-c"),
-                OsString::from("3"),
-                OsString::from("nice"),
-            ];
-            args.extend(nice_args);
-            return Self {
-                program: OsString::from("ionice"),
-                args,
-            };
-        }
-
-        Self {
-            program: OsString::from("nice"),
-            args: nice_args,
-        }
-    }
-}
-
-fn should_skip_image(image: &str) -> bool {
-    image.ends_with("-nydus-oci-ref") || image.contains("-nydus-oci-ref@")
-}
-
-fn job_work_dir(config: &AutoZranConfig, image: &str) -> PathBuf {
-    config.work_dir.join(job_key(image))
 }
 
 fn job_key(image: &str) -> String {
@@ -501,7 +394,7 @@ mod tests {
     }
 
     #[test]
-    fn enqueue_profile_skips_empty_and_already_accelerated_profiles() {
+    fn enqueue_profile_skips_empty_profiles() {
         let (sender, receiver) = async_channel::bounded(2);
         let state = Arc::new(AutoZranState::new(2));
         let manager = AutoZranManager { sender, state };
@@ -509,88 +402,13 @@ mod tests {
             "registry.local/empty:1",
             Vec::<AccessProfileRecord>::new(),
         );
-        let accelerated = profile("registry.local/app:1-nydus-oci-ref");
 
         manager.try_enqueue_profile(&empty);
-        manager.try_enqueue_profile(&accelerated);
 
         let status = manager.status();
         assert_eq!(status.queued_total, 0);
-        assert_eq!(status.skipped_total, 2);
+        assert_eq!(status.skipped_total, 1);
         assert_eq!(status.known_jobs, 0);
         assert!(receiver.try_recv().is_err());
-    }
-
-    #[test]
-    fn command_spec_uses_low_priority_nydusify_oci_ref() {
-        let config = AutoZranConfig {
-            enable: true,
-            nydusify: PathBuf::from("/usr/bin/nydusify"),
-            target_suffix: "-zran".to_string(),
-            queue_depth: 4,
-            nice: 99,
-            ionice_idle: true,
-            work_dir: PathBuf::from("/tmp/auto-zran"),
-            plain_http: true,
-            source_insecure: true,
-            target_insecure: false,
-        };
-        let job = AutoZranJob {
-            image: "registry.local/app:1".to_string(),
-            prefetch_files: vec!["/bin/app".to_string()],
-        };
-        let spec = CommandSpec::for_job(&config, &job);
-        let args = spec
-            .args
-            .iter()
-            .map(|arg| arg.to_string_lossy().into_owned())
-            .collect::<Vec<_>>();
-
-        assert_eq!(spec.program, OsString::from("ionice"));
-        assert_eq!(
-            args[0..6],
-            ["-c", "3", "nice", "-n", "19", "/usr/bin/nydusify"]
-        );
-        assert!(
-            args.windows(2)
-                .any(|w| w == ["--source", "registry.local/app:1"])
-        );
-        assert!(args.windows(2).any(|w| w == ["--target-suffix", "-zran"]));
-        assert!(args.contains(&"--oci-ref".to_string()));
-        assert!(args.contains(&"--prefetch-patterns".to_string()));
-        assert!(args.contains(&"--plain-http".to_string()));
-        assert!(args.contains(&"--source-insecure".to_string()));
-        assert!(!args.contains(&"--target-insecure".to_string()));
-    }
-
-    #[test]
-    fn command_spec_can_disable_ionice_for_non_linux_hosts() {
-        let config = AutoZranConfig {
-            enable: true,
-            nydusify: PathBuf::from("nydusify"),
-            target_suffix: "-zran".to_string(),
-            queue_depth: 4,
-            nice: 10,
-            ionice_idle: false,
-            work_dir: PathBuf::from("/tmp/auto-zran"),
-            plain_http: false,
-            source_insecure: false,
-            target_insecure: false,
-        };
-        let job = AutoZranJob {
-            image: "registry.local/app:1".to_string(),
-            prefetch_files: vec!["/bin/app".to_string()],
-        };
-        let spec = CommandSpec::for_job(&config, &job);
-        assert_eq!(spec.program, OsString::from("nice"));
-    }
-
-    #[test]
-    fn skips_already_accelerated_images() {
-        assert!(should_skip_image("registry.local/app:1-nydus-oci-ref"));
-        assert!(should_skip_image(
-            "registry.local/app@sha256:abc-nydus-oci-ref@"
-        ));
-        assert!(!should_skip_image("registry.local/app:1"));
     }
 }

@@ -78,8 +78,15 @@ signal-hook = "0.3"
 # snapshotter, which runs on compio.
 tokio = { version = "1", features = ["full"] }
 tokio-stream = "0.1"
-tonic = "0.14"
+tonic = { version = "0.14", features = ["transport"] }
+tonic-prost = "0.14"
 prost = "0.14"
+prost-types = "0.14"
+# UDS connector for the containerd Content gRPC client. tonic 0.14 transport
+# needs a tower::Service<Uri> connector and an `Io` adapter; we drive both via
+# `tower::service_fn` + `hyper_util::rt::TokioIo<tokio::net::UnixStream>`.
+hyper-util = { version = "0.1", features = ["client-legacy"] }
+tower = { version = "0.5", features = ["util"] }
 # Global allocator for containerd-nydus (see its main.rs): compio owned-buffer
 # completion I/O churns small allocations; mimalloc's thread-local pools help.
 mimalloc = "0.1"
@@ -103,8 +110,25 @@ bbolt-rs = { version = "1.3.10", optional = true, features = ["compat"] }
 thiserror = "2.0.18"
 libc = "0.2"
 mio = { version = "1.2", features = ["os-poll", "os-ext"] }
+# Used by `access_tracer` for fanotify FAN_CLASS_NOTIF marks (auto-accel capture
+# path). The pre-content read-serving path in `service/src/fanotify.rs` keeps
+# its hand-rolled `fanotify_sys` because nix doesn't expose the pre-content
+# constants; the capture path only needs the notify-class API which nix has.
+nix = { version = "0.31", features = ["fanotify"] }
+# Glob-matching for the auto-accel capture exclude list.
+glob = "0.3"
 sendfd = "0.4.3"
 sha2 = "0.11"
+# sha2 0.11 returns a `Array` (renamed from GenericArray) which no longer
+# implements `LowerHex`, so `format!("{:x}", hasher.finalize())` won't compile.
+# `hex` formats the digest into a hex string and is the idiomatic replacement.
+hex = "0.4"
+# Used by `content_store` to look up the `k3s` / `ctr` binary at runtime.
+which = "8"
+# Used by `content_store::write_blob_from_data` for an O_CREAT|O_EXCL +
+# random-suffix temp file, so we don't write through a pre-planted symlink
+# in /tmp while the snapshotter runs as root.
+tempfile = "3"
 
 nydus-api = { version = "0.4.1", path = "../api" }
 nydus-rafs = { version = "0.4.1", path = "../rafs" }
@@ -121,6 +145,12 @@ assert_cmd = "2"
 # server in the gRPC transport round-trip test.
 tonic = { version = "0.14", features = ["transport"] }
 tokio = { version = "1", features = ["rt", "macros"] }
+
+[build-dependencies]
+# Generates tonic 0.14 gRPC client bindings for containerd's Content service
+# (proto vendored under snapshotter/proto/). The prost codegen split moved to
+# `tonic-prost-build` in 0.14; matches `containerd-snapshots`' own build.rs.
+tonic-prost-build = "0.14"
 
 [features]
 default = [

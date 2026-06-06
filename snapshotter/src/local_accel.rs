@@ -100,18 +100,30 @@ pub struct LocalAccelConfig {
     pub nice: i32,
 }
 
-/// Result of a node-local conversion, ready to feed a fanotify `BlobCacheEntry`.
+/// Result of a node-local conversion, ready to feed a fanotify `BlobCacheEntry`
+/// and uploaded as a content-store sidecar by the auto-zran worker.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NodeLocalArtifact {
-    /// Merged RAFS v6 bootstrap (the fanotify staging dir's `bootstrap`).
+    /// Merged RAFS v6 bootstrap (the fanotify staging dir's `bootstrap`). When
+    /// `prefetch_files` was non-empty this is the OPTIMIZED bootstrap produced
+    /// by `nydus-image optimize`, with prefetch hints baked in.
     pub bootstrap: PathBuf,
-    /// `localfs` backend directory holding the gzip layers (by digest) and zran index blobs.
+    /// `localfs` backend directory holding the gzip layers (symlinked, by
+    /// blob_id) and the per-layer zran index blobs (real files, by blob_id).
     pub backend_dir: PathBuf,
-    /// Blob-cache working directory (also the fanotify staging dir); equals the parent of
-    /// `bootstrap`.
+    /// Blob-cache working directory (also the fanotify staging dir); equals
+    /// the parent of `bootstrap`.
     pub work_dir: PathBuf,
     /// Original gzip-layer blob ids, lower→upper, in device-table order.
     pub layer_blob_ids: Vec<String>,
+    /// Per-layer zran index blob ids (one per gzip layer, same order as
+    /// `layer_blob_ids`). Each blob lives at `backend_dir.join(id)`.
+    pub zran_index_blob_ids: Vec<String>,
+    /// Optional prefetch blob id (only present when `convert` was called with
+    /// non-empty `prefetch_files`). The blob holds the chunks listed by the
+    /// prefetch hint, packed for one-shot warm-up; it lives at
+    /// `backend_dir.join(id)`.
+    pub prefetch_blob_id: Option<String>,
 }
 
 /// Build the args for a per-layer `nydus-image create --type targz-ref` conversion.
@@ -208,9 +220,22 @@ fn find_zran_index(blob_out_dir: &Path, bootstrap: &Path) -> Result<PathBuf> {
         .ok_or_else(|| anyhow::anyhow!("no zran index blob produced in {}", blob_out_dir.display()))
 }
 
-/// Convert the gzip layers (lower→upper) of a standard OCI image into a node-local RAFS v6 + zran
-/// artifact. No registry interaction; the gzip layers are referenced in place.
-pub fn convert(config: &LocalAccelConfig, layers: &[GzipLayer]) -> Result<NodeLocalArtifact> {
+/// Convert the gzip layers (lower→upper) of a standard OCI image into a
+/// node-local RAFS v6 + zran artifact. No registry interaction; the gzip
+/// layers are referenced in place.
+///
+/// `prefetch_files` is an optional ordered list of in-image paths captured by
+/// the access tracer during pod startup; when non-empty, after the merge step
+/// we invoke `nydus-image optimize --prefetch-files` to bake the hints into a
+/// new bootstrap (replacing the merged one) and to write a packed prefetch
+/// blob into `backend_dir`. The fanotify daemon uses the prefetch blob to
+/// warm-cache the listed chunks on first access. When `prefetch_files` is
+/// empty the optimize step is skipped and `prefetch_blob_id` is `None`.
+pub fn convert(
+    config: &LocalAccelConfig,
+    layers: &[GzipLayer],
+    prefetch_files: &[String],
+) -> Result<NodeLocalArtifact> {
     if layers.is_empty() {
         bail!("node-local conversion requires at least one layer");
     }
@@ -223,6 +248,7 @@ pub fn convert(config: &LocalAccelConfig, layers: &[GzipLayer]) -> Result<NodeLo
 
     let mut layer_bootstraps = Vec::with_capacity(layers.len());
     let mut blob_ids = Vec::with_capacity(layers.len());
+    let mut zran_index_blob_ids = Vec::with_capacity(layers.len());
 
     for (i, layer) in layers.iter().enumerate() {
         if !layer.path.is_file() {
@@ -251,13 +277,16 @@ pub fn convert(config: &LocalAccelConfig, layers: &[GzipLayer]) -> Result<NodeLo
         symlink_force(&layer.path, &backend.join(&blob_id))?;
         let index_name = index
             .file_name()
-            .context("zran index blob has no file name")?;
-        std::fs::rename(&index, backend.join(index_name))
-            .or_else(|_| std::fs::copy(&index, backend.join(index_name)).map(|_| ()))
+            .context("zran index blob has no file name")?
+            .to_string_lossy()
+            .into_owned();
+        std::fs::rename(&index, backend.join(&index_name))
+            .or_else(|_| std::fs::copy(&index, backend.join(&index_name)).map(|_| ()))
             .with_context(|| "staging zran index blob into backend")?;
 
         layer_bootstraps.push(bootstrap);
         blob_ids.push(blob_id);
+        zran_index_blob_ids.push(index_name);
     }
 
     let bootstrap = stage.join("bootstrap");
@@ -270,11 +299,93 @@ pub fn convert(config: &LocalAccelConfig, layers: &[GzipLayer]) -> Result<NodeLo
         "merge",
     )?;
 
+    let prefetch_blob_id = if prefetch_files.is_empty() {
+        None
+    } else {
+        Some(run_optimize(config, &backend, &bootstrap, prefetch_files)?)
+    };
+
     Ok(NodeLocalArtifact {
         bootstrap,
         backend_dir: backend,
         work_dir: stage.clone(),
         layer_blob_ids: blob_ids,
+        zran_index_blob_ids,
+        prefetch_blob_id,
+    })
+}
+
+/// Bake prefetch hints into the merged bootstrap via `nydus-image optimize`.
+/// Returns the id (= file name in `backend_dir`) of the new prefetch blob.
+///
+/// `nydus-image optimize --prefetch-files` expects a v1 JSON file (see
+/// `builder/src/optimize_prefetch.rs::PrefetchJson`); plain newline lists are
+/// rejected. The optimize subcommand writes the new prefetch blob into
+/// `--blob-dir`, so we snapshot the dir before and pick up the new file
+/// afterwards.
+fn run_optimize(
+    config: &LocalAccelConfig,
+    backend: &Path,
+    merged_bootstrap: &Path,
+    prefetch_files: &[String],
+) -> Result<String> {
+    let stage = config.work_dir.as_path();
+    let prefetch_json_path = stage.join("prefetch.json");
+    let prefetch_json = serde_json::json!({
+        "version": "v1",
+        "files": prefetch_files.iter().map(|p| {
+            serde_json::json!({ "path": p, "ranges": null })
+        }).collect::<Vec<_>>(),
+    });
+    std::fs::write(&prefetch_json_path, serde_json::to_vec(&prefetch_json)?)
+        .with_context(|| format!("writing {}", prefetch_json_path.display()))?;
+
+    let before: std::collections::HashSet<std::ffi::OsString> = std::fs::read_dir(backend)?
+        .filter_map(Result::ok)
+        .map(|e| e.file_name())
+        .collect();
+
+    let optimized_bootstrap = stage.join("bootstrap.optimized");
+    let args: Vec<OsString> = vec![
+        "optimize".into(),
+        "--bootstrap".into(),
+        merged_bootstrap.into(),
+        "--prefetch-files".into(),
+        prefetch_json_path.as_path().into(),
+        "--blob-dir".into(),
+        backend.into(),
+        "--output-bootstrap".into(),
+        optimized_bootstrap.as_path().into(),
+    ];
+    run(
+        &config.nydus_image,
+        &args,
+        config.sched,
+        config.nice,
+        "optimize",
+    )?;
+
+    std::fs::rename(&optimized_bootstrap, merged_bootstrap)
+        .with_context(|| "replacing merged bootstrap with optimized one")?;
+
+    let mut found = None;
+    for entry in std::fs::read_dir(backend)? {
+        let entry = entry?;
+        if entry.file_type()?.is_file() && !before.contains(&entry.file_name()) {
+            if found.is_some() {
+                bail!(
+                    "optimize produced more than one new blob in {}",
+                    backend.display()
+                );
+            }
+            found = Some(entry.file_name().to_string_lossy().into_owned());
+        }
+    }
+    found.ok_or_else(|| {
+        anyhow::anyhow!(
+            "optimize did not produce a new prefetch blob in {}",
+            backend.display()
+        )
     })
 }
 

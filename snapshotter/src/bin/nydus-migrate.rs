@@ -139,6 +139,16 @@ struct ReconcileSnapshotsArgs {
     /// single-writer) to be stopped while this runs.
     #[arg(long)]
     commit: bool,
+
+    /// Permit operating against a fjall store that contains zero snapshots.
+    /// By default the tool refuses, because an empty store makes every
+    /// containerd bolt record look stale — a typo'd `--snapshotter-store`
+    /// (fjall silently creates the directory on open) would otherwise wipe
+    /// the entire snapshotter section of containerd's metadata on
+    /// `--commit`. Only pass this when you genuinely have a fresh fjall
+    /// store and want to clear matching containerd records.
+    #[arg(long)]
+    allow_empty_snapshotter_store: bool,
 }
 
 #[derive(Parser, Debug)]
@@ -242,6 +252,12 @@ struct ReconcileSnapshotsReport {
     /// inconsistency we can't safely auto-resolve; the operator needs to
     /// inspect.
     stale_with_live_child: Vec<StaleWithLiveChild>,
+    /// Snapshot keys whose fjall liveness could not be determined because
+    /// `SnapshotStore::exists` failed (fjall I/O error). These are
+    /// conservatively treated as live so the bolt record is preserved;
+    /// surfaced here so the operator can fix the underlying fjall problem
+    /// before re-running.
+    undetermined: Vec<UndeterminedKey>,
     /// Stale snapshot keys deleted (or that would be deleted on `--commit`).
     cleared: Vec<String>,
     errors: Vec<String>,
@@ -251,6 +267,12 @@ struct ReconcileSnapshotsReport {
 struct StaleWithLiveChild {
     stale_parent: String,
     live_child: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct UndeterminedKey {
+    key: String,
+    error: String,
 }
 
 fn main() -> Result<()> {
@@ -502,12 +524,45 @@ fn reconcile_snapshots(args: ReconcileSnapshotsArgs) -> Result<()> {
         "starting snapshot reconciliation"
     );
 
+    // Refuse to let fjall auto-create an empty store from a typo'd path.
+    // `SnapshotStore::open` does `create_dir_all` + materialise — without
+    // this guard, a wrong `--snapshotter-store` produces a brand-new empty
+    // store whose missing keys would classify every containerd record as
+    // stale.
+    if !args.snapshotter_store.exists() {
+        bail!(
+            "snapshotter fjall store {} does not exist; refusing to auto-create \
+             (a typo here would classify every containerd record as stale). \
+             Pass the correct path, or pre-create the directory only if you \
+             know what you're doing.",
+            args.snapshotter_store.display()
+        );
+    }
+
     let store = SnapshotStore::open(&args.snapshotter_store).with_context(|| {
         format!(
-            "failed to open snapshotter fjall store at {} (is nydus-snapshotter still running?)",
+            "failed to open snapshotter fjall store at {} \
+             (is nydus-snapshotter still running, or did you point at the wrong fjall directory?)",
             args.snapshotter_store.display()
         )
     })?;
+
+    // Final safeguard: an empty store makes every containerd record look
+    // stale. Even when the path existed, it may have been pre-created
+    // empty (mount-not-yet-up, fresh nydus install) — bail unless the
+    // operator explicitly opted in.
+    let store_snapshot_count = store
+        .list()
+        .context("failed to list fjall snapshots to verify the store isn't empty")?
+        .len();
+    if store_snapshot_count == 0 && !args.allow_empty_snapshotter_store {
+        bail!(
+            "snapshotter fjall store {} is empty; refusing to reconcile against it \
+             because every containerd record would look stale. Re-run with \
+             `--allow-empty-snapshotter-store` if this is intentional.",
+            args.snapshotter_store.display()
+        );
+    }
 
     let mut report = ReconcileSnapshotsReport {
         dry_run: !args.commit,
@@ -528,6 +583,7 @@ fn reconcile_snapshots(args: ReconcileSnapshotsArgs) -> Result<()> {
     let mut snapshots_total: usize = 0;
     let mut stale: BTreeSet<String> = BTreeSet::new();
     let mut children_of: HashMap<String, Vec<String>> = HashMap::new();
+    let mut undetermined: Vec<UndeterminedKey> = Vec::new();
     let mut bucket_present = true;
     {
         let db = bbolt_rs::Bolt::open_ro(&args.containerd_meta_db).with_context(|| {
@@ -551,8 +607,21 @@ fn reconcile_snapshots(args: ReconcileSnapshotsArgs) -> Result<()> {
                 if let Some(p) = &parent {
                     children_of.entry(p.clone()).or_default().push(key.clone());
                 }
-                if store.stat(&key).is_err() {
-                    stale.insert(key.clone());
+                // Only a definite `Ok(false)` from fjall counts as stale.
+                // `Err(_)` means we couldn't determine liveness (transient
+                // fjall I/O error) — treat as live so we never destroy a
+                // bolt record on the basis of an indeterminate read.
+                match store.exists(&key) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        stale.insert(key.clone());
+                    }
+                    Err(e) => {
+                        undetermined.push(UndeterminedKey {
+                            key: key.clone(),
+                            error: format!("{e:#}"),
+                        });
+                    }
                 }
                 snapshots_total += 1;
             }
@@ -573,8 +642,15 @@ fn reconcile_snapshots(args: ReconcileSnapshotsArgs) -> Result<()> {
     }
 
     report.containerd_snapshots = snapshots_total;
-    report.consistent = snapshots_total - stale.len();
     report.stale = stale.len();
+    report.consistent = snapshots_total - stale.len() - undetermined.len();
+    if !undetermined.is_empty() {
+        report.errors.push(format!(
+            "{} snapshot key(s) had indeterminate fjall liveness; preserving their bolt records",
+            undetermined.len()
+        ));
+        report.undetermined = undetermined;
+    }
 
     // Refuse to delete any stale snapshot whose `children/` sub-bucket
     // contains an entry that is NOT stale — that would orphan the still-
@@ -651,18 +727,17 @@ fn reconcile_snapshots(args: ReconcileSnapshotsArgs) -> Result<()> {
 
             // First read the parent field so we can scrub the child link.
             let parent_key = {
-                let v1 = tx.bucket("v1").ok_or_else(|| {
-                    anyhow::anyhow!("v1 bucket vanished mid-transaction")
-                })?;
+                let v1 = tx
+                    .bucket("v1")
+                    .ok_or_else(|| anyhow::anyhow!("v1 bucket vanished mid-transaction"))?;
                 let ns = v1.bucket(args.namespace.as_str()).ok_or_else(|| {
                     anyhow::anyhow!("v1/{} bucket vanished mid-transaction", args.namespace)
                 })?;
                 let snapshots = ns.bucket("snapshots").ok_or_else(|| {
                     anyhow::anyhow!("v1/{}/snapshots vanished mid-transaction", args.namespace)
                 })?;
-                let snapshotter_bucket = snapshots
-                    .bucket(args.snapshotter.as_str())
-                    .ok_or_else(|| {
+                let snapshotter_bucket =
+                    snapshots.bucket(args.snapshotter.as_str()).ok_or_else(|| {
                         anyhow::anyhow!(
                             "v1/{}/snapshots/{} vanished mid-transaction",
                             args.namespace,
@@ -682,25 +757,24 @@ fn reconcile_snapshots(args: ReconcileSnapshotsArgs) -> Result<()> {
             // containerd's own Remove takes, just deferred so we never
             // skip the precondition the way `--force` would.
             {
-                let mut v1 = tx.bucket_mut("v1").ok_or_else(|| {
-                    anyhow::anyhow!("v1 bucket vanished mid-transaction")
-                })?;
+                let mut v1 = tx
+                    .bucket_mut("v1")
+                    .ok_or_else(|| anyhow::anyhow!("v1 bucket vanished mid-transaction"))?;
                 let mut ns = v1.bucket_mut(args.namespace.as_str()).ok_or_else(|| {
                     anyhow::anyhow!("v1/{} bucket vanished mid-transaction", args.namespace)
                 })?;
                 let mut snapshots = ns.bucket_mut("snapshots").ok_or_else(|| {
                     anyhow::anyhow!("v1/{}/snapshots vanished mid-transaction", args.namespace)
                 })?;
-                let mut snapshotter_bucket =
-                    snapshots
-                        .bucket_mut(args.snapshotter.as_str())
-                        .ok_or_else(|| {
-                            anyhow::anyhow!(
-                                "v1/{}/snapshots/{} vanished mid-transaction",
-                                args.namespace,
-                                args.snapshotter
-                            )
-                        })?;
+                let mut snapshotter_bucket = snapshots
+                    .bucket_mut(args.snapshotter.as_str())
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "v1/{}/snapshots/{} vanished mid-transaction",
+                            args.namespace,
+                            args.snapshotter
+                        )
+                    })?;
 
                 if let Some(parent) = parent_key {
                     if let Some(mut pbkt) = snapshotter_bucket.bucket_mut(&parent) {

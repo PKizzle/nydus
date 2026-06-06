@@ -32,10 +32,12 @@
 #![deny(warnings)]
 #![warn(clippy::all)]
 
+pub mod access_tracer;
 pub mod auto_zran;
 pub mod cache;
 pub mod config;
 pub mod containerd_lookup;
+pub mod content_store;
 pub mod daemon;
 pub mod failover;
 pub mod fdstore;

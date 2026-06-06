@@ -442,7 +442,12 @@ pub async fn serve(mut config: SnapshotterConfig) -> Result<()> {
     };
     info!(driver = ?selected, "selected filesystem driver");
     let store = open_store_for_config(&config)?;
-    serve_with_supervisor(config.clone(), Arc::new(DaemonSupervisor::new(config)), store).await
+    serve_with_supervisor(
+        config.clone(),
+        Arc::new(DaemonSupervisor::new(config)),
+        store,
+    )
+    .await
 }
 
 /// Build the snapshot store at the path the config implies. Pulled out of

@@ -61,10 +61,16 @@ pub struct SnapshotterSection {
     #[serde(default)]
     pub cgroup: CgroupConfig,
 
-    /// Background zran conversion for plain OCI images after runtime access
-    /// profiles have been collected by the optimizer NRI plugin.
+    /// Background node-local zran conversion for plain OCI images, triggered
+    /// by file-access traces captured during pod startup.
     #[serde(default)]
     pub auto_zran: AutoZranConfig,
+
+    /// Containerd integration (Content gRPC client, content-store layout).
+    /// Required when `auto_zran.enable = true` so the snapshotter can read
+    /// gzip-layer blobs and upload sidecar artifacts.
+    #[serde(default)]
+    pub containerd: ContainerdConfig,
 }
 
 impl Default for SnapshotterSection {
@@ -81,6 +87,7 @@ impl Default for SnapshotterSection {
             features: FeaturesConfig::default(),
             cgroup: CgroupConfig::default(),
             auto_zran: AutoZranConfig::default(),
+            containerd: ContainerdConfig::default(),
         }
     }
 }
@@ -223,63 +230,139 @@ pub struct CgroupConfig {
     pub memory_limit: Option<String>,
 }
 
-/// Background zran conversion configuration.
+/// Background node-local zran conversion configuration.
 ///
-/// The worker is intentionally disabled by default. When enabled, structured
-/// prefetch profiles submitted by the optimizer NRI plugin enqueue a low-priority
-/// `nydusify convert --oci-ref` job for the profiled image. Spegel or any other
-/// registry mirror can then serve the generated OCI-reference artifact to other
-/// nodes.
+/// When enabled, the access tracer captures file-access traces during pod
+/// startup; on settle the snapshotter runs `local_accel::convert` to build a
+/// RAFS v6 + zran artifact node-locally and uploads it to containerd's content
+/// store with labels linking it to the original image manifest. Spegel then
+/// mirrors the artifact to peer nodes. The original image manifest is never
+/// rewritten (no tag change, no sha256 churn). Disabled by default.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct AutoZranConfig {
-    /// Enable automatic zran artifact generation.
+    /// Enable automatic node-local zran artifact generation. When `false`, the
+    /// access tracer is also dormant and the snapshotter behaves as before.
     #[serde(default)]
     pub enable: bool,
-    /// Path to the current nydusify binary. P7 will replace this CLI boundary
-    /// with the Rust nydusify library.
-    #[serde(default = "default_auto_zran_nydusify")]
-    pub nydusify: PathBuf,
-    /// Suffix appended to the source image reference when generating target
-    /// artifact references.
-    #[serde(default = "default_auto_zran_target_suffix")]
-    pub target_suffix: String,
+    /// Path to the `nydus-image` binary used by `local_accel::convert` for the
+    /// `create --type targz-ref` / `merge` / `optimize` invocations.
+    #[serde(default = "default_auto_zran_nydus_image")]
+    pub nydus_image: PathBuf,
     /// Maximum queued conversion jobs before new profiles are dropped.
     #[serde(default = "default_auto_zran_queue_depth")]
     pub queue_depth: usize,
     /// Unix niceness for conversion subprocesses. Higher means lower CPU priority.
     #[serde(default = "default_auto_zran_nice")]
     pub nice: i32,
-    /// Run conversion under `ionice -c 3` (idle I/O priority). Disable on
-    /// systems where `ionice` is unavailable.
-    #[serde(default = "default_true")]
-    pub ionice_idle: bool,
-    /// Working directory used by nydusify conversions.
+    /// OS-portable I/O scheduling class for conversion subprocesses. `idle`
+    /// uses `ionice -c 3` on Linux and `taskpolicy -c utility` on macOS;
+    /// `normal` runs without explicit scheduling override.
+    #[serde(default)]
+    pub sched_class: SchedClass,
+    /// Working directory used by node-local conversions. Per-image scratch
+    /// dirs are removed after the artifacts are committed to the content store.
     #[serde(default = "default_auto_zran_work_dir")]
     pub work_dir: PathBuf,
-    /// Pass `--plain-http` to nydusify.
+    /// File-access capture (tracing) configuration. Tied to `enable`.
     #[serde(default)]
-    pub plain_http: bool,
-    /// Pass `--source-insecure` to nydusify.
-    #[serde(default)]
-    pub source_insecure: bool,
-    /// Pass `--target-insecure` to nydusify.
-    #[serde(default)]
-    pub target_insecure: bool,
+    pub capture: AccessCaptureConfig,
 }
 
 impl Default for AutoZranConfig {
     fn default() -> Self {
         Self {
             enable: false,
-            nydusify: default_auto_zran_nydusify(),
-            target_suffix: default_auto_zran_target_suffix(),
+            nydus_image: default_auto_zran_nydus_image(),
             queue_depth: default_auto_zran_queue_depth(),
             nice: default_auto_zran_nice(),
-            ionice_idle: true,
+            sched_class: SchedClass::default(),
             work_dir: default_auto_zran_work_dir(),
-            plain_http: false,
-            source_insecure: false,
-            target_insecure: false,
+            capture: AccessCaptureConfig::default(),
+        }
+    }
+}
+
+/// OS-portable I/O scheduling class for low-priority background work.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SchedClass {
+    /// Idle: Linux `ionice -c 3`, macOS `taskpolicy -c utility`. Default.
+    #[default]
+    Idle,
+    /// No explicit scheduling override (run at the parent process's class).
+    Normal,
+}
+
+/// File-access capture configuration for the auto-accel access tracer.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct AccessCaptureConfig {
+    /// Enable the fanotify-based access tracer. Inherits from
+    /// `AutoZranConfig::enable` if not explicitly set.
+    #[serde(default = "default_true")]
+    pub enable: bool,
+    /// Idle settle threshold: stop capturing when no new files have been
+    /// recorded for this duration. Default `5s`.
+    #[serde(default = "default_capture_settle_idle")]
+    pub settle_idle: String,
+    /// Absolute capture deadline: stop capturing after this elapsed time even
+    /// if reads are still ongoing. Default `60s`.
+    #[serde(default = "default_capture_settle_max")]
+    pub settle_max: String,
+    /// Minimum number of distinct files required to submit a profile.
+    /// Smaller-than-min profiles are dropped (next pod restart re-captures).
+    #[serde(default = "default_capture_min_files")]
+    pub min_files: usize,
+    /// Safety cap on the captured file list.
+    #[serde(default = "default_capture_max_files")]
+    pub max_files: usize,
+    /// Glob patterns excluded from the captured profile (pseudo filesystems,
+    /// host bind mounts, etc.).
+    #[serde(default = "default_capture_exclude_globs")]
+    pub exclude_globs: Vec<String>,
+}
+
+impl Default for AccessCaptureConfig {
+    fn default() -> Self {
+        Self {
+            enable: true,
+            settle_idle: default_capture_settle_idle(),
+            settle_max: default_capture_settle_max(),
+            min_files: default_capture_min_files(),
+            max_files: default_capture_max_files(),
+            exclude_globs: default_capture_exclude_globs(),
+        }
+    }
+}
+
+/// Containerd integration configuration.
+///
+/// The snapshotter uses containerd's Content gRPC service to read gzip-layer
+/// blobs (during conversion) and to upload sidecar artifacts (after
+/// conversion). It also resolves blob digests to on-disk paths under
+/// `content_root` so the fanotify backend dir can symlink to them without
+/// re-copying.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ContainerdConfig {
+    /// Path to containerd's gRPC socket.
+    #[serde(default = "default_containerd_address")]
+    pub address: PathBuf,
+    /// Containerd namespace to operate in. For k3s/CRI this is `k8s.io`.
+    #[serde(default = "default_containerd_namespace")]
+    pub namespace: String,
+    /// Root of containerd's content store on disk. Used for `blob_path`
+    /// resolution (so we can pass already-committed blobs into the fanotify
+    /// backend dir as symlinks). The well-known layout is stable across
+    /// containerd 1.x and 2.x: `<root>/blobs/sha256/<hex>`.
+    #[serde(default = "default_containerd_content_root")]
+    pub content_root: PathBuf,
+}
+
+impl Default for ContainerdConfig {
+    fn default() -> Self {
+        Self {
+            address: default_containerd_address(),
+            namespace: default_containerd_namespace(),
+            content_root: default_containerd_content_root(),
         }
     }
 }
@@ -379,11 +462,8 @@ fn default_request_timeout() -> String {
 fn default_true() -> bool {
     true
 }
-fn default_auto_zran_nydusify() -> PathBuf {
-    PathBuf::from("nydusify")
-}
-fn default_auto_zran_target_suffix() -> String {
-    "-nydus-oci-ref".to_string()
+fn default_auto_zran_nydus_image() -> PathBuf {
+    PathBuf::from("/usr/local/bin/nydus-image")
 }
 fn default_auto_zran_queue_depth() -> usize {
     128
@@ -393,6 +473,37 @@ fn default_auto_zran_nice() -> i32 {
 }
 fn default_auto_zran_work_dir() -> PathBuf {
     PathBuf::from("/var/lib/containerd-nydus/auto-zran")
+}
+fn default_capture_settle_idle() -> String {
+    "5s".to_string()
+}
+fn default_capture_settle_max() -> String {
+    "60s".to_string()
+}
+fn default_capture_min_files() -> usize {
+    1
+}
+fn default_capture_max_files() -> usize {
+    4096
+}
+fn default_capture_exclude_globs() -> Vec<String> {
+    vec![
+        "/proc/**".to_string(),
+        "/sys/**".to_string(),
+        "/dev/**".to_string(),
+        "/tmp/**".to_string(),
+        "/run/**".to_string(),
+        "/var/run/**".to_string(),
+    ]
+}
+fn default_containerd_address() -> PathBuf {
+    PathBuf::from("/run/k3s/containerd/containerd.sock")
+}
+fn default_containerd_namespace() -> String {
+    "k8s.io".to_string()
+}
+fn default_containerd_content_root() -> PathBuf {
+    PathBuf::from("/var/lib/rancher/k3s/agent/containerd/io.containerd.content.v1.content")
 }
 
 fn default_fs_drivers() -> Vec<FsDriverEntry> {
@@ -503,8 +614,10 @@ skip_verify = true
             PathBuf::from("/run/containerd-nydus/containerd-nydus-api.sock")
         );
         assert!(!config.snapshotter.auto_zran.enable);
-        assert_eq!(config.snapshotter.auto_zran.target_suffix, "-nydus-oci-ref");
+        assert_eq!(config.snapshotter.auto_zran.sched_class, SchedClass::Idle);
         assert_eq!(config.snapshotter.auto_zran.nice, 19);
+        assert!(config.snapshotter.auto_zran.capture.enable);
+        assert_eq!(config.snapshotter.containerd.namespace, "k8s.io");
     }
 
     #[test]
@@ -512,33 +625,33 @@ skip_verify = true
         let toml_str = r#"
 [snapshotter.auto_zran]
 enable = true
-nydusify = "/usr/local/bin/nydusify"
-target_suffix = "-zran"
+nydus_image = "/opt/nydus-image"
 queue_depth = 8
 nice = 15
-ionice_idle = false
+sched_class = "normal"
 work_dir = "/var/tmp/nydus-zran"
-plain_http = true
-source_insecure = true
-target_insecure = true
+
+[snapshotter.auto_zran.capture]
+settle_idle = "10s"
+settle_max = "120s"
+min_files = 5
 "#;
         let config: SnapshotterConfig = toml::from_str(toml_str).expect("parse config");
         assert!(config.snapshotter.auto_zran.enable);
         assert_eq!(
-            config.snapshotter.auto_zran.nydusify,
-            PathBuf::from("/usr/local/bin/nydusify")
+            config.snapshotter.auto_zran.nydus_image,
+            PathBuf::from("/opt/nydus-image")
         );
-        assert_eq!(config.snapshotter.auto_zran.target_suffix, "-zran");
         assert_eq!(config.snapshotter.auto_zran.queue_depth, 8);
         assert_eq!(config.snapshotter.auto_zran.nice, 15);
-        assert!(!config.snapshotter.auto_zran.ionice_idle);
+        assert_eq!(config.snapshotter.auto_zran.sched_class, SchedClass::Normal);
         assert_eq!(
             config.snapshotter.auto_zran.work_dir,
             PathBuf::from("/var/tmp/nydus-zran")
         );
-        assert!(config.snapshotter.auto_zran.plain_http);
-        assert!(config.snapshotter.auto_zran.source_insecure);
-        assert!(config.snapshotter.auto_zran.target_insecure);
+        assert_eq!(config.snapshotter.auto_zran.capture.settle_idle, "10s");
+        assert_eq!(config.snapshotter.auto_zran.capture.settle_max, "120s");
+        assert_eq!(config.snapshotter.auto_zran.capture.min_files, 5);
     }
 
     #[test]
