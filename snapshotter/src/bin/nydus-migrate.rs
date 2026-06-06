@@ -45,6 +45,12 @@ enum Command {
     Store(StoreArgs),
     /// Clear containerd content labels that point at missing nydus snapshots.
     RepairLabels(RepairLabelsArgs),
+    /// Delete snapshot records from containerd's metadata bolt that the
+    /// nydus snapshotter no longer holds (drifts in either direction —
+    /// typically containerd remembering a snapshot whose fjall record was
+    /// lost on an unclean shutdown — wedge pod creation with `snapshot ...
+    /// does not exist` or `target snapshot ... already exists`).
+    ReconcileSnapshots(ReconcileSnapshotsArgs),
 }
 
 #[derive(Parser, Debug)]
@@ -93,6 +99,44 @@ struct StoreArgs {
     strict: bool,
 
     /// Actually write fjall metadata and copy/hardlink snapshot directories.
+    #[arg(long)]
+    commit: bool,
+}
+
+#[derive(Parser, Debug)]
+struct ReconcileSnapshotsArgs {
+    /// Path to containerd's main metadata bolt database — the one whose
+    /// `v1/<ns>/snapshots/<snapshotter>/` bucket diverges from the
+    /// snapshotter's fjall store when an unclean shutdown loses the
+    /// in-memory snapshot batch. Default targets a k3s-managed containerd.
+    #[arg(
+        long,
+        default_value = "/var/lib/rancher/k3s/agent/containerd/io.containerd.metadata.v1.bolt/meta.db"
+    )]
+    containerd_meta_db: PathBuf,
+
+    /// Path to the snapshotter's fjall directory — the same store
+    /// `containerd-nydus` opens. Source of truth: if this store does not
+    /// have a key that containerd's bolt does, the bolt record is stale.
+    #[arg(
+        long,
+        default_value = "/var/lib/rancher/k3s/agent/containerd/nydus/snapshotter/metadata.fjall"
+    )]
+    snapshotter_store: PathBuf,
+
+    /// Containerd namespace to scan.
+    #[arg(long, default_value = "k8s.io")]
+    namespace: String,
+
+    /// Snapshotter name inside containerd's bolt — the bucket immediately
+    /// under `v1/<namespace>/snapshots/`.
+    #[arg(long, default_value = "nydus")]
+    snapshotter: String,
+
+    /// Actually delete stale records (and clean up parent->child links).
+    /// Default is dry-run. Requires both `k3s` (so containerd releases its
+    /// bolt write-lock) and `nydus-snapshotter` (so fjall opens
+    /// single-writer) to be stopped while this runs.
     #[arg(long)]
     commit: bool,
 }
@@ -178,6 +222,37 @@ struct StaleContentLabel {
     snapshot: String,
 }
 
+#[derive(Debug, Default, Serialize)]
+struct ReconcileSnapshotsReport {
+    dry_run: bool,
+    containerd_meta_db: String,
+    snapshotter_store: String,
+    namespace: String,
+    snapshotter: String,
+    /// Number of snapshot buckets containerd's bolt holds for this
+    /// snapshotter — the universe we walked.
+    containerd_snapshots: usize,
+    /// Number of those that also exist in the snapshotter's fjall store.
+    consistent: usize,
+    /// Number whose key the snapshotter does not have. These get deleted on
+    /// `--commit`.
+    stale: usize,
+    /// Stale snapshot records the tool would not delete because a child of
+    /// theirs still resolves in the snapshotter. Surfaces a true bolt/fjall
+    /// inconsistency we can't safely auto-resolve; the operator needs to
+    /// inspect.
+    stale_with_live_child: Vec<StaleWithLiveChild>,
+    /// Stale snapshot keys deleted (or that would be deleted on `--commit`).
+    cleared: Vec<String>,
+    errors: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct StaleWithLiveChild {
+    stale_parent: String,
+    live_child: String,
+}
+
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
@@ -187,6 +262,7 @@ fn main() -> Result<()> {
         Command::Config(args) => analyze_config(args),
         Command::Store(args) => migrate_store(args),
         Command::RepairLabels(args) => repair_labels(args),
+        Command::ReconcileSnapshots(args) => reconcile_snapshots(args),
     }
 }
 
@@ -391,6 +467,272 @@ fn repair_labels(args: RepairLabelsArgs) -> Result<()> {
     };
     println!("{}", serde_json::to_string_pretty(&report)?);
 
+    Ok(())
+}
+
+/// Walk containerd's metadata bolt for `<namespace>/snapshots/<snapshotter>/`
+/// and delete records the snapshotter's fjall store no longer holds. The
+/// snapshotter store is authoritative: anything in containerd's bolt that
+/// the snapshotter doesn't have can't be backed by an on-disk snapshot
+/// directory anyway (the snapshotter is the only writer for both), so the
+/// bolt record is stale.
+///
+/// Preconditions (enforced by docs, not by the tool — the tool just fails
+/// loudly if bolt can't be opened RW or fjall can't take the single-writer
+/// lock):
+///
+///   * `--commit` requires `k3s` (and therefore containerd) to be stopped,
+///     since bolt holds an exclusive flock while containerd runs.
+///   * Likewise it requires `nydus-snapshotter` to be stopped, because
+///     fjall's `SingleWriterTxDatabase` also takes an exclusive lock.
+///
+/// The deletion mirrors what `core/metadata/snapshot.go::Remove` does in
+/// containerd itself: read the `parent` field, scrub the entry from the
+/// parent's `children` sub-bucket, then delete the bucket. The only extra
+/// piece is iterating until a fixed point so a stale leaf gets deleted
+/// before its (also-stale) parent — otherwise we'd hit containerd's own
+/// "cannot remove snapshot with child" invariant.
+fn reconcile_snapshots(args: ReconcileSnapshotsArgs) -> Result<()> {
+    use bbolt_rs::{BucketApi, BucketRwApi, DbApi, DbRwAPI, TxApi, TxRwApi, TxRwRefApi};
+
+    info!(
+        namespace = args.namespace,
+        snapshotter = args.snapshotter,
+        commit = args.commit,
+        "starting snapshot reconciliation"
+    );
+
+    let store = SnapshotStore::open(&args.snapshotter_store).with_context(|| {
+        format!(
+            "failed to open snapshotter fjall store at {} (is nydus-snapshotter still running?)",
+            args.snapshotter_store.display()
+        )
+    })?;
+
+    let mut report = ReconcileSnapshotsReport {
+        dry_run: !args.commit,
+        containerd_meta_db: args.containerd_meta_db.display().to_string(),
+        snapshotter_store: args.snapshotter_store.display().to_string(),
+        namespace: args.namespace.clone(),
+        snapshotter: args.snapshotter.clone(),
+        ..Default::default()
+    };
+
+    // Read-only first pass: walk every snapshot under
+    // `v1/<namespace>/snapshots/<snapshotter>/`, ask the fjall store
+    // whether it agrees, and capture each record's parent so the write
+    // pass can scrub the matching `parent.children/<key>` entry the way
+    // containerd's own `core/metadata/snapshot.go::Remove` does. We do
+    // this even in dry-run mode so the JSON report shows exactly what
+    // `--commit` would touch.
+    let mut snapshots_total: usize = 0;
+    let mut stale: BTreeSet<String> = BTreeSet::new();
+    let mut children_of: HashMap<String, Vec<String>> = HashMap::new();
+    let mut bucket_present = true;
+    {
+        let db = bbolt_rs::Bolt::open_ro(&args.containerd_meta_db).with_context(|| {
+            format!(
+                "failed to open containerd metadata bolt at {} read-only",
+                args.containerd_meta_db.display()
+            )
+        })?;
+        let tx = db.begin().context("begin read-only bbolt transaction")?;
+        let walked: Option<()> = (|| {
+            let v1 = tx.bucket("v1")?;
+            let ns = v1.bucket(args.namespace.as_str())?;
+            let snapshots = ns.bucket("snapshots")?;
+            let snapshotter_bucket = snapshots.bucket(args.snapshotter.as_str())?;
+            for (key_bytes, snapshot_bucket) in snapshotter_bucket.iter_buckets() {
+                let key = String::from_utf8_lossy(key_bytes).into_owned();
+                let parent = snapshot_bucket
+                    .get("parent")
+                    .map(|v| String::from_utf8_lossy(v).into_owned())
+                    .filter(|v| !v.is_empty());
+                if let Some(p) = &parent {
+                    children_of.entry(p.clone()).or_default().push(key.clone());
+                }
+                if store.stat(&key).is_err() {
+                    stale.insert(key.clone());
+                }
+                snapshots_total += 1;
+            }
+            Some(())
+        })();
+        if walked.is_none() {
+            bucket_present = false;
+        }
+    }
+
+    if !bucket_present {
+        report.errors.push(format!(
+            "containerd metadata bolt has no `v1/{}/snapshots/{}` bucket — nothing to reconcile",
+            args.namespace, args.snapshotter
+        ));
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
+
+    report.containerd_snapshots = snapshots_total;
+    report.consistent = snapshots_total - stale.len();
+    report.stale = stale.len();
+
+    // Refuse to delete any stale snapshot whose `children/` sub-bucket
+    // contains an entry that is NOT stale — that would orphan the still-
+    // live child and quietly break it. Surface those in the report
+    // instead and let the operator decide.
+    for stale_key in &stale {
+        if let Some(children) = children_of.get(stale_key) {
+            for child in children {
+                if !stale.contains(child) {
+                    report.stale_with_live_child.push(StaleWithLiveChild {
+                        stale_parent: stale_key.clone(),
+                        live_child: child.clone(),
+                    });
+                }
+            }
+        }
+    }
+    if !report.stale_with_live_child.is_empty() {
+        report.errors.push(format!(
+            "{} stale parent record(s) have at least one live child; refusing to delete those",
+            report.stale_with_live_child.len()
+        ));
+    }
+
+    // Stale-with-live-child is excluded so we never orphan a live child.
+    let excluded: BTreeSet<&str> = report
+        .stale_with_live_child
+        .iter()
+        .map(|s| s.stale_parent.as_str())
+        .collect();
+    let mut deletable: BTreeSet<String> = stale
+        .iter()
+        .filter(|k| !excluded.contains(k.as_str()))
+        .cloned()
+        .collect();
+
+    if !args.commit {
+        report.cleared = deletable.into_iter().collect();
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
+
+    // Commit path. We open the bolt RW, walk in passes that each delete
+    // every stale key whose stale dependants are already gone — that
+    // matches containerd's own remove ordering and avoids hitting the
+    // "cannot remove snapshot with child" invariant inside our own
+    // transaction. The navigation is inlined per delete because bbolt-rs's
+    // `BucketRwApi` returns a borrow tied to its receiver, and threading
+    // a re-usable bucket handle through the loop fights the borrow
+    // checker harder than it's worth here.
+    let mut db = bbolt_rs::Bolt::open(&args.containerd_meta_db).with_context(|| {
+        format!(
+            "failed to open containerd metadata bolt at {} for writing (is k3s still running?)",
+            args.containerd_meta_db.display()
+        )
+    })?;
+    let mut tx = db
+        .begin_rw()
+        .context("begin read-write bbolt transaction")?;
+
+    let mut cleared: Vec<String> = Vec::new();
+    while !deletable.is_empty() {
+        let mut progress = false;
+        let pass: Vec<String> = deletable.iter().cloned().collect();
+        for key in pass {
+            // Defer until our stale dependants are gone.
+            let pending_child = children_of
+                .get(&key)
+                .map(|cs| cs.iter().any(|c| deletable.contains(c)))
+                .unwrap_or(false);
+            if pending_child {
+                continue;
+            }
+
+            // First read the parent field so we can scrub the child link.
+            let parent_key = {
+                let v1 = tx.bucket("v1").ok_or_else(|| {
+                    anyhow::anyhow!("v1 bucket vanished mid-transaction")
+                })?;
+                let ns = v1.bucket(args.namespace.as_str()).ok_or_else(|| {
+                    anyhow::anyhow!("v1/{} bucket vanished mid-transaction", args.namespace)
+                })?;
+                let snapshots = ns.bucket("snapshots").ok_or_else(|| {
+                    anyhow::anyhow!("v1/{}/snapshots vanished mid-transaction", args.namespace)
+                })?;
+                let snapshotter_bucket = snapshots
+                    .bucket(args.snapshotter.as_str())
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "v1/{}/snapshots/{} vanished mid-transaction",
+                            args.namespace,
+                            args.snapshotter
+                        )
+                    })?;
+                let sbkt = snapshotter_bucket.bucket(&key).ok_or_else(|| {
+                    anyhow::anyhow!("stale snapshot {key} vanished from bolt before delete")
+                })?;
+                sbkt.get("parent")
+                    .map(|v| String::from_utf8_lossy(v).into_owned())
+                    .filter(|v| !v.is_empty())
+            };
+
+            // Scrub the child link in the parent's `children/` sub-bucket,
+            // then delete the stale snapshot's own bucket. Same write path
+            // containerd's own Remove takes, just deferred so we never
+            // skip the precondition the way `--force` would.
+            {
+                let mut v1 = tx.bucket_mut("v1").ok_or_else(|| {
+                    anyhow::anyhow!("v1 bucket vanished mid-transaction")
+                })?;
+                let mut ns = v1.bucket_mut(args.namespace.as_str()).ok_or_else(|| {
+                    anyhow::anyhow!("v1/{} bucket vanished mid-transaction", args.namespace)
+                })?;
+                let mut snapshots = ns.bucket_mut("snapshots").ok_or_else(|| {
+                    anyhow::anyhow!("v1/{}/snapshots vanished mid-transaction", args.namespace)
+                })?;
+                let mut snapshotter_bucket =
+                    snapshots
+                        .bucket_mut(args.snapshotter.as_str())
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "v1/{}/snapshots/{} vanished mid-transaction",
+                                args.namespace,
+                                args.snapshotter
+                            )
+                        })?;
+
+                if let Some(parent) = parent_key {
+                    if let Some(mut pbkt) = snapshotter_bucket.bucket_mut(&parent) {
+                        if let Some(mut cbkt) = pbkt.bucket_mut("children") {
+                            // Tolerate the child entry already being gone.
+                            let _ = cbkt.delete(&key);
+                        }
+                    }
+                }
+                snapshotter_bucket.delete_bucket(&key).with_context(|| {
+                    format!("failed to delete stale snapshot bucket {key} from containerd bolt")
+                })?;
+            }
+
+            cleared.push(key.clone());
+            deletable.remove(&key);
+            progress = true;
+        }
+
+        if !progress {
+            return Err(anyhow::anyhow!(
+                "reconcile-snapshots stuck with {} undeletable keys; bailing without commit (no records changed)",
+                deletable.len()
+            ));
+        }
+    }
+
+    tx.commit()
+        .context("commit reconcile-snapshots bbolt transaction")?;
+
+    report.cleared = cleared;
+    println!("{}", serde_json::to_string_pretty(&report)?);
     Ok(())
 }
 
