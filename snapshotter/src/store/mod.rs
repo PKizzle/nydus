@@ -67,7 +67,17 @@ impl SnapshotStore {
     }
 
     /// Look up a snapshot by key and return basic info.
-    #[instrument(level = "debug", skip(self), err)]
+    //
+    // `err(level = "debug")` because NotFound is a routine response on this
+    // path — containerd's GC walker polls `Stat` for every snapshot reference
+    // it holds in its own metadata.db, including stale ones left over from a
+    // store migration (legacy SQLite → fjall). Logging each miss at ERROR
+    // floods the journal at ~140 lines/min on a node that's otherwise fine
+    // (the gRPC layer converts the result to `tonic::Status::not_found` and
+    // containerd handles it correctly). Other write paths (`commit`,
+    // `create`, `remove`) keep the default ERROR level because a missing key
+    // there is genuinely surprising.
+    #[instrument(level = "debug", skip(self), err(level = "debug"))]
     pub fn stat(&self, key: &str) -> Result<SnapshotInfo> {
         let value = self
             .snapshots
