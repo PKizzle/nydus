@@ -14,17 +14,65 @@
 //! node get a fanotify-served mount of the converted bootstrap on top of the
 //! original, unchanged gzip layers — no tag change, no sha256 churn.
 
-use crate::config::AutoZranConfig;
+use crate::access_tracer::AccessTracer;
+use crate::config::{AutoZranConfig, ContainerdConfig, SchedClass as ConfigSchedClass};
+use crate::containerd_lookup::ContainerdLookup;
+use crate::content_store::ContentStoreClient;
+use crate::local_accel::{self, LocalAccelConfig, SchedClass as AccelSchedClass};
 use crate::prefetch_profile::PrefetchProfile;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_channel::{Receiver, Sender};
 use tracing::{debug, info, warn};
+
+/// Auto-accel sidecar manifest written into containerd's content store
+/// alongside the bootstrap + zran index + prefetch blobs. The whole JSON is
+/// itself a content blob (so spegel mirrors it), and we register it under
+/// the well-known ref `nydus-auto-accel:v1:<subject_manifest_digest>` so
+/// peer nodes can discover it without enumerating labels.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct AutoAccelManifest {
+    pub version: u32,
+    /// Original image manifest digest (the GC subject).
+    pub subject_manifest_digest: String,
+    /// Human-readable image ref hint (NOT load-bearing).
+    pub image_ref: String,
+    pub bootstrap: AutoAccelDescriptor,
+    /// Per-layer zran index blobs (same order as the original gzip layers).
+    pub zran_indexes: Vec<AutoAccelLayerDescriptor>,
+    /// Optional packed prefetch blob (only set when convert had prefetch_files).
+    pub prefetch_blob: Option<AutoAccelDescriptor>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct AutoAccelDescriptor {
+    pub digest: String,
+    pub size: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct AutoAccelLayerDescriptor {
+    /// Original gzip layer digest (== nydus zran data blob id).
+    pub layer_digest: String,
+    pub digest: String,
+    pub size: u64,
+}
+
+/// Dependencies that the conversion worker needs in addition to the static
+/// `AutoZranConfig`. Bundled so the manager's `start()` signature stays
+/// terse and the worker_loop can take a single Arc.
+#[derive(Clone)]
+pub struct ConversionDeps {
+    pub content_store: ContentStoreClient,
+    pub containerd: ContainerdConfig,
+    pub containerd_lookup: Arc<ContainerdLookup>,
+    pub access_tracer: Arc<AccessTracer>,
+}
 
 /// Conversion job persisted in memory while waiting for the worker.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -152,7 +200,7 @@ pub struct AutoZranManager {
 impl AutoZranManager {
     /// Start the manager when configured. Returns `None` when auto-zran is
     /// disabled so callers can keep the fast path branch-free.
-    pub fn start(config: &AutoZranConfig) -> Option<Arc<Self>> {
+    pub fn start(config: &AutoZranConfig, deps: ConversionDeps) -> Option<Arc<Self>> {
         if !config.enable {
             return None;
         }
@@ -165,8 +213,11 @@ impl AutoZranManager {
             state: state.clone(),
         });
         let worker_config = config.clone();
-        compio::runtime::spawn(async move { worker_loop(worker_config, receiver, state).await })
-            .detach();
+        let worker_deps = deps;
+        compio::runtime::spawn(async move {
+            worker_loop(worker_config, worker_deps, receiver, state).await
+        })
+        .detach();
         info!(queue_depth = depth, "auto-zran worker started");
         Some(manager)
     }
@@ -228,12 +279,13 @@ impl AutoZranManager {
 
 async fn worker_loop(
     config: AutoZranConfig,
+    deps: ConversionDeps,
     receiver: Receiver<AutoZranJob>,
     state: Arc<AutoZranState>,
 ) {
     while let Ok(job) = receiver.recv().await {
         state.mark_started(&job);
-        let result = run_conversion(&config, &job).await;
+        let result = run_conversion(&config, &deps, &job).await;
         let success = result.is_ok();
         state.mark_finished(&job, success);
         if let Err(e) = result {
@@ -242,21 +294,211 @@ async fn worker_loop(
     }
 }
 
-/// Drive a single conversion job end-to-end. Phase 6 fills in the body:
-/// resolve the original manifest digest + gzip-layer paths via
-/// `ContainerdLookup`, call `local_accel::convert(cfg, layers, &job.prefetch_files)`,
-/// upload the artifacts to containerd's content store with auto-accel labels,
-/// register the deterministic `nydus-auto-accel:v1:<subject_digest>` ref, then
-/// mark the image accelerated in the access tracer. For now this is a no-op so
-/// the queue/state machinery compiles and runs cleanly while the surrounding
-/// phases land.
-async fn run_conversion(_config: &AutoZranConfig, job: &AutoZranJob) -> Result<()> {
+/// Map our config-side scheduling enum to the local_accel-side one.
+/// (Two enums exist because `SchedClass` was originally lower-level in
+/// `local_accel`; the config-side enum is the public-facing one.)
+fn map_sched(class: ConfigSchedClass) -> AccelSchedClass {
+    match class {
+        ConfigSchedClass::Idle => AccelSchedClass::Idle,
+        ConfigSchedClass::Normal => AccelSchedClass::Normal,
+    }
+}
+
+/// Drive a single conversion job end-to-end:
+/// 1. Resolve the manifest digest + ordered gzip-layer paths via
+///    `ContainerdLookup::manifest_info`.
+/// 2. Skip if a sidecar for this manifest is already in the content store
+///    (idempotent across racing pods on the same node).
+/// 3. Run `local_accel::convert(cfg, layers, prefetch_files)` on a blocking
+///    thread (CPU-bound; mustn't tie up the compio runtime).
+/// 4. Upload bootstrap + zran indexes + (optional) prefetch blob via the
+///    content_store client with `containerd.io/gc.ref.content.subject` +
+///    auto-accel role labels.
+/// 5. Build and upload the small auto-accel manifest JSON; register under the
+///    deterministic ref `nydus-auto-accel:v1:<subject_manifest_digest>`.
+/// 6. Tell the access tracer to stop capturing for this image and clean up
+///    the per-image work_dir.
+async fn run_conversion(
+    config: &AutoZranConfig,
+    deps: &ConversionDeps,
+    job: &AutoZranJob,
+) -> Result<()> {
+    // (1) Resolve manifest + layers.
+    let info = deps
+        .containerd_lookup
+        .manifest_info(&job.image, &deps.containerd.content_root)
+        .with_context(|| format!("resolve manifest for {}", job.image))?;
+    let manifest_digest = info.manifest_digest.clone();
     info!(
         image = %job.image,
+        manifest = %manifest_digest,
+        layers = info.layers.len(),
         prefetch_files = job.prefetch_files.len(),
-        "auto-zran conversion queued (no-op until phase 6 wires the pipeline)"
+        "auto-zran starting conversion"
     );
+
+    // (2) Skip if already done.
+    let auto_accel_ref = auto_accel_manifest_ref(&manifest_digest);
+    if let Some(existing) = deps
+        .content_store
+        .info(&auto_accel_ref)
+        .await
+        .ok()
+        .flatten()
+    {
+        info!(
+            image = %job.image,
+            ref = %auto_accel_ref,
+            digest = %existing.digest,
+            "auto-accel sidecar already present; skipping conversion"
+        );
+        deps.access_tracer.mark_image_accelerated(&job.image);
+        return Ok(());
+    }
+
+    // (3) Convert on a blocking thread.
+    let work_dir = job_work_dir(config, &job.image);
+    std::fs::create_dir_all(&work_dir)
+        .with_context(|| format!("create work dir {}", work_dir.display()))?;
+    let local_cfg = LocalAccelConfig {
+        nydus_image: config.nydus_image.clone(),
+        work_dir: work_dir.clone(),
+        sched: map_sched(config.sched_class),
+        nice: config.nice,
+    };
+    let layers = info.layers;
+    let prefetch_files = job.prefetch_files.clone();
+    let artifact =
+        blocking::unblock(move || local_accel::convert(&local_cfg, &layers, &prefetch_files))
+            .await
+            .context("local_accel::convert failed")?;
+
+    // (4) Upload artifacts. Labels:
+    //   - gc.ref.content.subject  pins lifetime to the original manifest
+    //   - nydus.auto-accel.role   identifies bootstrap / index / prefetch-blob
+    //   - nydus.auto-accel.layer-digest (index/prefetch only) links to the
+    //     original gzip layer the blob accelerates
+    let subject = manifest_digest.clone();
+    let base_labels = |role: &str| -> HashMap<String, String> {
+        let mut m = HashMap::new();
+        m.insert(
+            "containerd.io/gc.ref.content.subject".to_string(),
+            subject.clone(),
+        );
+        m.insert(
+            "containerd.io/snapshot/nydus.auto-accel.role".to_string(),
+            role.to_string(),
+        );
+        m
+    };
+
+    let bootstrap_meta = std::fs::metadata(&artifact.bootstrap)
+        .with_context(|| format!("stat bootstrap {}", artifact.bootstrap.display()))?;
+    let bootstrap_digest = deps
+        .content_store
+        .write_blob(&artifact.bootstrap, base_labels("bootstrap"))
+        .await
+        .context("upload bootstrap")?;
+
+    let mut zran_descriptors = Vec::with_capacity(artifact.zran_index_blob_ids.len());
+    for (i, blob_id) in artifact.zran_index_blob_ids.iter().enumerate() {
+        let layer_digest = artifact
+            .layer_blob_ids
+            .get(i)
+            .map(|id| {
+                if id.starts_with("sha256:") {
+                    id.clone()
+                } else {
+                    format!("sha256:{id}")
+                }
+            })
+            .unwrap_or_default();
+        let path = artifact.backend_dir.join(blob_id);
+        let size = std::fs::metadata(&path)
+            .with_context(|| format!("stat zran index {}", path.display()))?
+            .len();
+        let mut labels = base_labels("index");
+        labels.insert(
+            "containerd.io/snapshot/nydus.auto-accel.layer-digest".to_string(),
+            layer_digest.clone(),
+        );
+        let digest = deps
+            .content_store
+            .write_blob(&path, labels)
+            .await
+            .with_context(|| format!("upload zran index for layer {layer_digest}"))?;
+        zran_descriptors.push(AutoAccelLayerDescriptor {
+            layer_digest,
+            digest,
+            size,
+        });
+    }
+
+    let prefetch_descriptor = if let Some(prefetch_id) = &artifact.prefetch_blob_id {
+        let path = artifact.backend_dir.join(prefetch_id);
+        let size = std::fs::metadata(&path)
+            .with_context(|| format!("stat prefetch blob {}", path.display()))?
+            .len();
+        let digest = deps
+            .content_store
+            .write_blob(&path, base_labels("prefetch-blob"))
+            .await
+            .context("upload prefetch blob")?;
+        Some(AutoAccelDescriptor { digest, size })
+    } else {
+        None
+    };
+
+    // (5) Auto-accel manifest JSON.
+    let manifest = AutoAccelManifest {
+        version: 1,
+        subject_manifest_digest: manifest_digest.clone(),
+        image_ref: job.image.clone(),
+        bootstrap: AutoAccelDescriptor {
+            digest: bootstrap_digest,
+            size: bootstrap_meta.len(),
+        },
+        zran_indexes: zran_descriptors,
+        prefetch_blob: prefetch_descriptor,
+    };
+    let manifest_bytes = serde_json::to_vec(&manifest).context("serialize auto-accel manifest")?;
+    let manifest_digest_in_store = deps
+        .content_store
+        .write_bytes(&manifest_bytes, &auto_accel_ref, base_labels("manifest"))
+        .await
+        .context("upload auto-accel manifest")?;
+
+    info!(
+        image = %job.image,
+        subject = %manifest_digest,
+        auto_accel_manifest = %manifest_digest_in_store,
+        "auto-zran conversion complete"
+    );
+
+    // (6) Tell the tracer to stop capturing + clean up scratch.
+    deps.access_tracer.mark_image_accelerated(&job.image);
+    if let Err(e) = std::fs::remove_dir_all(&work_dir) {
+        warn!(
+            error = %e,
+            work_dir = %work_dir.display(),
+            "auto-zran work_dir cleanup failed (non-fatal)"
+        );
+    }
     Ok(())
+}
+
+/// Per-image scratch dir under `auto_zran.work_dir`. We use a sha256 of the
+/// image ref so concurrent conversions of different images don't collide.
+fn job_work_dir(config: &AutoZranConfig, image: &str) -> std::path::PathBuf {
+    config.work_dir.join(job_key(image))
+}
+
+/// Deterministic content-store ref for the auto-accel manifest of a given
+/// original-image manifest digest. Used as the cross-node discovery key:
+/// peer nodes look up `nydus-auto-accel:v1:<subject>` and, if spegel
+/// mirrored it, get the same manifest digest the producing node wrote.
+fn auto_accel_manifest_ref(subject_manifest_digest: &str) -> String {
+    format!("nydus-auto-accel:v1:{subject_manifest_digest}")
 }
 
 fn job_key(image: &str) -> String {

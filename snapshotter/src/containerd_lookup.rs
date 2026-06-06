@@ -242,6 +242,163 @@ impl ContainerdLookup {
     }
 }
 
+/// Layer + manifest summary used by the auto-accel pipeline. The layer list
+/// is gzip-only (skipping nydus-bootstrap / nydus-blob layers, which the
+/// auto-accel path doesn't consume) in OCI manifest order, lower → upper.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ManifestInfo {
+    /// The image's manifest digest (`sha256:...`). The auto-accel sidecar
+    /// uses this as the `containerd.io/gc.ref.content.subject` label so
+    /// containerd's GC keeps the sidecar alive as long as the original
+    /// manifest exists.
+    pub manifest_digest: String,
+    /// Gzip layers in device-table order with their on-disk content-store
+    /// paths already resolved.
+    pub layers: Vec<crate::local_accel::GzipLayer>,
+}
+
+impl ContainerdLookup {
+    /// Forward direction: resolve an image reference to its manifest digest
+    /// and ordered gzip layer list (lower→upper), with each layer's on-disk
+    /// path in containerd's content store. Returns `None` if the image isn't
+    /// known to crictl, has no compatible architecture in a multi-arch index,
+    /// or carries no readable gzip layers.
+    ///
+    /// This is on-demand (not cached); the conversion path needs a single
+    /// resolution per image and the call cost is dominated by `ctr content
+    /// get` for the manifest+config blobs, which is cheap.
+    pub fn manifest_info(
+        &self,
+        image_ref: &str,
+        content_root: &std::path::Path,
+    ) -> Result<ManifestInfo> {
+        // Walk crictl images to find the manifest digest for this ref.
+        let out = run_first_ok(&[
+            &["crictl", "images", "-o", "json"],
+            &["k3s", "crictl", "images", "-o", "json"],
+        ])?;
+        let parsed: CrictlImages = serde_json::from_slice(&out)?;
+        for img in parsed.images {
+            // Match either a repoTag (`name:tag`) or a repoDigest's name part
+            // (`name@sha256:...`). The caller usually has the ref in tag form.
+            let mut matched_manifest: Option<String> = None;
+            for repo_digest in &img.repo_digests {
+                if let Some((name, manifest_digest)) = repo_digest.split_once('@')
+                    && (name == image_ref || img.repo_tags.iter().any(|t| t == image_ref))
+                {
+                    matched_manifest = Some(manifest_digest.to_string());
+                    break;
+                }
+            }
+            if matched_manifest.is_none() {
+                continue;
+            }
+            let manifest_digest = matched_manifest.unwrap();
+            // Walk the manifest (resolving indices on multi-arch) for this arch.
+            let (final_digest, gzip_layers) = resolve_gzip_layers(&manifest_digest, content_root)?;
+            return Ok(ManifestInfo {
+                manifest_digest: final_digest,
+                layers: gzip_layers,
+            });
+        }
+        anyhow::bail!(
+            "image {image_ref} not found in crictl images output; \
+             make sure it's been pulled at least once"
+        )
+    }
+}
+
+/// Resolve an index/manifest reference to (manifest_digest, gzip_layers) for
+/// the current host's architecture. For a single-manifest digest this is a
+/// pass-through; for a multi-arch index we pick the matching child by GOARCH.
+fn resolve_gzip_layers(
+    digest: &str,
+    content_root: &std::path::Path,
+) -> Result<(String, Vec<crate::local_accel::GzipLayer>)> {
+    let bytes = run_first_ok(&[
+        &["ctr", "-n", "k8s.io", "content", "get", digest],
+        &["k3s", "ctr", "-n", "k8s.io", "content", "get", digest],
+    ])?;
+    // Multi-arch index? Pick the child matching this host's arch.
+    if let Ok(index) = serde_json::from_slice::<OciIndexWithPlatforms>(&bytes)
+        && !index.manifests.is_empty()
+    {
+        let host_arch = match std::env::consts::ARCH {
+            "x86_64" => "amd64",
+            "aarch64" => "arm64",
+            other => other,
+        };
+        let host_os = std::env::consts::OS;
+        for child in &index.manifests {
+            let arch_match = child
+                .platform
+                .as_ref()
+                .map(|p| p.architecture == host_arch && p.os == host_os)
+                .unwrap_or(false);
+            if arch_match {
+                return resolve_gzip_layers(&child.digest, content_root);
+            }
+        }
+        anyhow::bail!("no manifest in index {digest} matches host {host_os}/{host_arch}");
+    }
+    // Plain manifest.
+    let manifest: OciManifest = serde_json::from_slice(&bytes)
+        .map_err(|e| anyhow::anyhow!("parse manifest {digest}: {e}"))?;
+    let mut layers = Vec::with_capacity(manifest.layers.len());
+    for layer in manifest.layers {
+        // Skip nydus-bootstrap / nydus-blob layers — they're not gzip data
+        // layers from the auto-accel path's perspective.
+        let is_nydus = layer
+            .annotations
+            .get(NYDUS_BOOTSTRAP_ANNOTATION)
+            .map(|s| s == "true")
+            .unwrap_or(false)
+            || layer.media_type.contains("nydus");
+        if is_nydus {
+            continue;
+        }
+        let hex = layer
+            .digest
+            .strip_prefix("sha256:")
+            .unwrap_or(&layer.digest);
+        let path = content_root.join("blobs").join("sha256").join(hex);
+        if !path.is_file() {
+            anyhow::bail!(
+                "layer {} not present at {} (content store out of sync?)",
+                layer.digest,
+                path.display()
+            );
+        }
+        layers.push(crate::local_accel::GzipLayer {
+            digest: layer.digest,
+            path,
+        });
+    }
+    if layers.is_empty() {
+        anyhow::bail!("manifest {digest} has no gzip layers");
+    }
+    Ok((digest.to_string(), layers))
+}
+
+#[derive(Deserialize)]
+struct OciIndexWithPlatforms {
+    #[serde(default)]
+    manifests: Vec<OciIndexEntry>,
+}
+
+#[derive(Deserialize)]
+struct OciIndexEntry {
+    digest: String,
+    #[serde(default)]
+    platform: Option<OciPlatform>,
+}
+
+#[derive(Deserialize)]
+struct OciPlatform {
+    architecture: String,
+    os: String,
+}
+
 /// Compute the containerd snapshot chainID list from an ordered list of
 /// diff_ids. `chain[0] = diff_ids[0]`; `chain[i] = sha256(chain[i-1] + " " + diff_ids[i])`.
 fn chain_ids(diff_ids: &[String]) -> Vec<String> {

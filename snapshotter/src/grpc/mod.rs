@@ -16,7 +16,7 @@ use crate::overlay::{NydusMetaInfo, OverlayEngine, PrepareOutcome};
 use crate::recon::Reconciler;
 use crate::store::{SnapshotInfo, SnapshotStore};
 use crate::sysctl::{SystemController, serve_unix as serve_sysctl_unix};
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use containerd_snapshots::{self as snapshots, Info, Kind, Usage};
 use futures::Stream;
 use std::collections::HashMap;
@@ -107,12 +107,44 @@ fn snapshot_status_label<T>(result: &Result<T, SnapshotterError>) -> &'static st
 /// The main snapshotter implementation.
 ///
 /// Bridges containerd's gRPC proxy-plugin protocol to the overlay engine
+/// Parse `lowerdir=…` out of the first overlay mount in `mounts`, returning
+/// the *lowest* (closest to the image rootfs) directory in the list. Used by
+/// the access tracer to FAN_MARK_MOUNT the image's filesystem rather than
+/// the overlay's merged view (which includes the writable upper).
+///
+/// containerd overlay mounts encode the layer stack as
+/// `lowerdir=L0:L1:…:Ln,upperdir=U,workdir=W`, where `L0` is the layer
+/// closest to the rootfs read order. For a multi-layer image any of the
+/// L0..Ln directories live on the same filesystem (the snapshotter's
+/// snapshots root), so marking any one of them with `FAN_MARK_MOUNT`
+/// captures opens across the whole stack on that mount.
+fn first_lowerdir(mounts: &[snapshots::api::types::Mount]) -> Option<PathBuf> {
+    for mount in mounts {
+        if mount.r#type != "overlay" {
+            continue;
+        }
+        for opt in &mount.options {
+            if let Some(rest) = opt.strip_prefix("lowerdir=")
+                && let Some(first) = rest.split(':').next()
+                && !first.is_empty()
+            {
+                return Some(PathBuf::from(first));
+            }
+        }
+    }
+    None
+}
+
 /// and daemon supervisor.
 pub struct NydusSnapshotter {
     store: Arc<SnapshotStore>,
     overlay: OverlayEngine,
     supervisor: Arc<DaemonSupervisor>,
     metrics: Arc<SnapshotterMetrics>,
+    /// Auto-accel access tracer. Disabled (no-op) when
+    /// `auto_zran.capture.enable = false` or fanotify init fails; cheap
+    /// (no-op) clone otherwise.
+    access_tracer: Arc<crate::access_tracer::AccessTracer>,
 }
 
 impl NydusSnapshotter {
@@ -272,6 +304,21 @@ impl snapshots::Snapshotter for NydusSnapshotter {
                     if let Some((_, daemon_mnt)) = self.resolve_nydus_mount(&parent, &labels).await? {
                         debug!(key, parent, mountpoint = %daemon_mnt.display(), "prepared nydus rootfs");
                         return Ok(self.rewrite_mounts_with_daemon(&key, &daemon_mnt, false));
+                    }
+                    // Auto-accel capture hook: standard OCI image, no nydus
+                    // meta. Attach the access tracer to the *lowest* lowerdir
+                    // (the image's filesystem) so fanotify records open/read
+                    // events during pod startup. The flush path enqueues a
+                    // conversion job once settle fires. The tracer is a no-op
+                    // when capture is disabled in config or when fanotify
+                    // isn't available on this kernel.
+                    if let (Some(image_ref), Some(image_root)) = (
+                        labels
+                            .get(crate::source::labels::CRI_IMAGE_REF)
+                            .cloned(),
+                        first_lowerdir(&mounts),
+                    ) && let Err(e) = self.access_tracer.attach(&image_ref, &image_root) {
+                        debug!(image = %image_ref, error = %e, "access_tracer attach failed");
                     }
                     debug!(key, parent, mounts = mounts.len(), "prepared snapshot");
                     Ok(mounts)
@@ -478,7 +525,35 @@ pub async fn serve_with_supervisor(
     let cache_gc_policy = CacheGcPolicy::from_config(&config)?;
     let cache_manager = CacheManager::from_config(&config);
     let metrics = Arc::new(SnapshotterMetrics::new());
-    let auto_zran = AutoZranManager::start(&config.snapshotter.auto_zran);
+
+    // Auto-accel: build the access tracer and conversion deps. The tracer is
+    // built unconditionally but becomes a no-op when
+    // `auto_zran.capture.enable = false` so prepare() can call its attach()
+    // without a branch. The `AutoZranManager` (conversion worker) only spins
+    // up when `auto_zran.enable = true`.
+    let profile_store = crate::prefetch_profile::PrefetchProfileStore::from_cache_root(
+        &config.snapshotter.cache.work_dir,
+    );
+    let access_tracer = crate::access_tracer::AccessTracer::start(
+        config.snapshotter.auto_zran.capture.clone(),
+        profile_store,
+        None, // back-filled below once AutoZranManager exists
+    );
+    let auto_zran = if config.snapshotter.auto_zran.enable {
+        let content_store =
+            crate::content_store::ContentStoreClient::new(&config.snapshotter.containerd)
+                .context("connect to containerd content store")?;
+        let containerd_lookup = Arc::new(crate::containerd_lookup::ContainerdLookup::new());
+        let deps = crate::auto_zran::ConversionDeps {
+            content_store,
+            containerd: config.snapshotter.containerd.clone(),
+            containerd_lookup,
+            access_tracer: access_tracer.clone(),
+        };
+        AutoZranManager::start(&config.snapshotter.auto_zran, deps)
+    } else {
+        None
+    };
 
     if config.snapshotter.sysctl.enable {
         let sysctl_path = config.snapshotter.sysctl.address.clone();
@@ -516,6 +591,7 @@ pub async fn serve_with_supervisor(
         overlay,
         supervisor,
         metrics,
+        access_tracer,
     };
 
     // Remove stale socket if it exists.
@@ -558,6 +634,11 @@ mod tests {
             overlay,
             supervisor,
             metrics: Arc::new(SnapshotterMetrics::new()),
+            access_tracer: crate::access_tracer::AccessTracer::start(
+                Default::default(),
+                crate::prefetch_profile::PrefetchProfileStore::from_cache_root(root),
+                None,
+            ),
         }
     }
 
