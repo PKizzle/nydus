@@ -441,7 +441,20 @@ pub async fn serve(mut config: SnapshotterConfig) -> Result<()> {
         anyhow::bail!("no viable filesystem driver found during snapshotter startup");
     };
     info!(driver = ?selected, "selected filesystem driver");
-    serve_with_supervisor(config.clone(), Arc::new(DaemonSupervisor::new(config))).await
+    let store = open_store_for_config(&config)?;
+    serve_with_supervisor(config.clone(), Arc::new(DaemonSupervisor::new(config)), store).await
+}
+
+/// Build the snapshot store at the path the config implies. Pulled out of
+/// `serve_with_supervisor` so the binary entry point can open the store before
+/// the runtime spawns the server task — that way it can `persist_now()` on a
+/// SIGTERM path without reaching into the server task to fish out its handle,
+/// which matters because the server task may be cancelled by runtime drop
+/// before its inner Drops fire.
+pub fn open_store_for_config(config: &SnapshotterConfig) -> Result<Arc<SnapshotStore>> {
+    std::fs::create_dir_all(&config.snapshotter.root)?;
+    let store_path = PathBuf::from(&config.snapshotter.root).join("metadata.fjall");
+    Ok(Arc::new(SnapshotStore::open(&store_path)?))
 }
 
 /// Start the gRPC server with a caller-provided supervisor so that the binary
@@ -452,14 +465,10 @@ pub async fn serve(mut config: SnapshotterConfig) -> Result<()> {
 pub async fn serve_with_supervisor(
     config: SnapshotterConfig,
     supervisor: Arc<DaemonSupervisor>,
+    store: Arc<SnapshotStore>,
 ) -> Result<()> {
     let socket_path = PathBuf::from(&config.snapshotter.address);
-    let store_path = PathBuf::from(&config.snapshotter.root).join("metadata.fjall");
 
-    // Ensure root directory exists
-    std::fs::create_dir_all(&config.snapshotter.root)?;
-
-    let store = Arc::new(SnapshotStore::open(&store_path)?);
     let overlay = OverlayEngine::new(config.clone());
     let cache_gc_policy = CacheGcPolicy::from_config(&config)?;
     let cache_manager = CacheManager::from_config(&config);

@@ -138,9 +138,18 @@ async fn main() -> Result<()> {
         );
     }
 
+    // Open the fjall snapshot store HERE — not inside the server task — so the
+    // shutdown path below can fsync the journal with a known-good handle even
+    // when systemd is about to `kill -9` us on the failover path. If the store
+    // lived inside the server task, runtime drop could cancel that task with
+    // the journal's last batch still buffered, costing us the in-flight
+    // snapshot metadata on the next start.
+    let store = nydus_snapshotter::grpc::open_store_for_config(&config)?;
+    let shutdown_store = store.clone();
+
     let shutdown_supervisor = supervisor.clone();
     let server = compio::runtime::spawn(async move {
-        nydus_snapshotter::grpc::serve_with_supervisor(config, supervisor).await
+        nydus_snapshotter::grpc::serve_with_supervisor(config, supervisor, store).await
     });
 
     // Notify systemd we finished starting (required for `Type=notify`). No-op
@@ -175,17 +184,26 @@ async fn main() -> Result<()> {
         }
     }
 
-    // When systemd is preserving our descriptors, leave the kernel mounts up and
-    // exit WITHOUT running daemon destructors (which would unmount) — the fuse
-    // fds are parked in the fd store and the successor takes the mounts over.
-    // Otherwise (local/dev, no fd store) tear everything down cleanly.
+    // ALWAYS persist the journal first so anything still buffered (last commit,
+    // a Drop-time flush that the runtime cancel would otherwise skip) lands on
+    // disk before we exit. fjall's Journal::Drop also calls persist(SyncAll),
+    // but on the fdstore path we historically called `std::process::exit(0)`
+    // to skip user destructors — which also skips fjall's Drop. The explicit
+    // call here makes durability independent of whether Drop fires.
+    if let Err(e) = shutdown_store.persist_now() {
+        warn!(error = %e, "final fjall persist failed; in-flight snapshot metadata may be lost on next start");
+    }
+
+    // When systemd is preserving our descriptors, leave the kernel mounts up
+    // and let Rust destructors run normally: nothing in the supervisor or
+    // overlay engine drops the FUSE mounts (only `stop_instance()` does, and
+    // that's called explicitly from `shutdown_all` / `preserve_for_failover`).
+    // Returning Ok(()) here lets fjall's worker pool flush + drop cleanly,
+    // which an earlier `std::process::exit(0)` skipped.
     if nydus_snapshotter::fdstore::is_available() {
-        // Unmount daemons whose fd wasn't parked (they can't be taken over);
-        // leave armed mounts held for the successor, then exit without running
-        // destructors so those mounts survive.
         shutdown_supervisor.preserve_for_failover().await;
-        info!("preserving armed nydus mounts for failover; exiting without unmount");
-        std::process::exit(0);
+        info!("preserving armed nydus mounts for failover");
+        return Ok(());
     }
     shutdown_supervisor.shutdown_all().await;
     Ok(())
