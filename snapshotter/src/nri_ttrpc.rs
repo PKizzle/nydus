@@ -49,6 +49,18 @@ struct PrefetchPluginService {
     event_mask: i32,
 }
 
+#[derive(Clone)]
+struct OptimizerPluginService {
+    sysctl: SysctlClient,
+    event_mask: i32,
+}
+
+impl NriTtrpcConfig {
+    pub fn optimizer_events(&self) -> i32 {
+        event_mask(&[EVENT_START_CONTAINER])
+    }
+}
+
 pub fn serve_prefetch_plugin(config: NriTtrpcConfig) -> Result<()> {
     if let Some(runtime_socket) = config.runtime_socket.as_ref() {
         register_plugin(runtime_socket, &config.plugin_name, &config.plugin_idx)
@@ -64,6 +76,33 @@ pub fn serve_prefetch_plugin(config: NriTtrpcConfig) -> Result<()> {
         .register_service(plugin_methods(service));
     server.start()?;
     info!(socket = %config.listen_socket.display(), "NRI prefetch ttrpc plugin listening");
+
+    loop {
+        std::thread::park();
+    }
+}
+
+/// Run the NRI optimizer plugin: drives the in-process access tracer's
+/// `settle_max` baseline off real container start/stop events instead of off
+/// snapshot `Prepare`. On `StartContainer` it POSTs to
+/// `/api/v1/access-tracer/start` so the timer resets to "now"; on
+/// `StopContainer` it POSTs to `/api/v1/access-tracer/settle` so a
+/// short-lived container ships its profile immediately.
+pub fn serve_optimizer_plugin(config: NriTtrpcConfig) -> Result<()> {
+    if let Some(runtime_socket) = config.runtime_socket.as_ref() {
+        register_plugin(runtime_socket, &config.plugin_name, &config.plugin_idx)
+            .with_context(|| format!("failed to register NRI plugin {}", config.plugin_name))?;
+    }
+
+    let service = Arc::new(OptimizerPluginService {
+        sysctl: SysctlClient::new(config.sysctl_socket.clone()),
+        event_mask: config.optimizer_events(),
+    });
+    let mut server = Server::new()
+        .bind(&ttrpc_unix_address(&config.listen_socket))?
+        .register_service(optimizer_plugin_methods(service));
+    server.start()?;
+    info!(socket = %config.listen_socket.display(), "NRI optimizer ttrpc plugin listening");
 
     loop {
         std::thread::park();
@@ -245,6 +284,189 @@ impl PrefetchPluginService {
     }
 }
 
+fn optimizer_plugin_methods(
+    service: Arc<OptimizerPluginService>,
+) -> HashMap<String, Box<dyn MethodHandler + Send + Sync>> {
+    let mut methods: HashMap<String, Box<dyn MethodHandler + Send + Sync>> = HashMap::new();
+    methods.insert(
+        method_path("Configure"),
+        Box::new(OptimizerMethodHandler::new(
+            service.clone(),
+            OptimizerMethod::Configure,
+        )),
+    );
+    methods.insert(
+        method_path("Synchronize"),
+        Box::new(OptimizerMethodHandler::new(
+            service.clone(),
+            OptimizerMethod::Synchronize,
+        )),
+    );
+    methods.insert(
+        method_path("Shutdown"),
+        Box::new(OptimizerMethodHandler::new(
+            service.clone(),
+            OptimizerMethod::Shutdown,
+        )),
+    );
+    methods.insert(
+        method_path("CreateContainer"),
+        Box::new(OptimizerMethodHandler::new(
+            service.clone(),
+            OptimizerMethod::CreateContainer,
+        )),
+    );
+    methods.insert(
+        method_path("UpdateContainer"),
+        Box::new(OptimizerMethodHandler::new(
+            service.clone(),
+            OptimizerMethod::UpdateContainer,
+        )),
+    );
+    methods.insert(
+        method_path("StopContainer"),
+        Box::new(OptimizerMethodHandler::new(
+            service.clone(),
+            OptimizerMethod::StopContainer,
+        )),
+    );
+    methods.insert(
+        method_path("StateChange"),
+        Box::new(OptimizerMethodHandler::new(
+            service,
+            OptimizerMethod::StateChange,
+        )),
+    );
+    methods
+}
+
+struct OptimizerMethodHandler {
+    service: Arc<OptimizerPluginService>,
+    method: OptimizerMethod,
+}
+
+#[derive(Clone, Copy)]
+enum OptimizerMethod {
+    Configure,
+    Synchronize,
+    Shutdown,
+    CreateContainer,
+    UpdateContainer,
+    StopContainer,
+    StateChange,
+}
+
+impl OptimizerMethodHandler {
+    fn new(service: Arc<OptimizerPluginService>, method: OptimizerMethod) -> Self {
+        Self { service, method }
+    }
+}
+
+impl MethodHandler for OptimizerMethodHandler {
+    fn handler(&self, ctx: TtrpcContext, req: Request) -> ttrpc::Result<()> {
+        match self.method {
+            OptimizerMethod::Configure => {
+                let _req = decode::<ConfigureRequest>(&req)?;
+                respond(
+                    ctx,
+                    ConfigureResponse {
+                        events: self.service.event_mask,
+                    },
+                )
+            }
+            OptimizerMethod::Synchronize => {
+                let _req = decode::<SynchronizeRequest>(&req)?;
+                respond(
+                    ctx,
+                    SynchronizeResponse {
+                        update: Vec::new(),
+                        more: false,
+                    },
+                )
+            }
+            OptimizerMethod::Shutdown => respond(ctx, Empty {}),
+            OptimizerMethod::CreateContainer => respond(
+                ctx,
+                CreateContainerResponse {
+                    adjust: None,
+                    update: Vec::new(),
+                    evict: Vec::new(),
+                },
+            ),
+            OptimizerMethod::UpdateContainer => respond(
+                ctx,
+                UpdateContainerResponse {
+                    update: Vec::new(),
+                    evict: Vec::new(),
+                },
+            ),
+            OptimizerMethod::StopContainer => {
+                let event = decode::<StopContainerRequest>(&req)?;
+                if let Some(container) = event.container.as_ref() {
+                    self.service.handle_stop_container(container);
+                }
+                respond(ctx, StopContainerResponse { update: Vec::new() })
+            }
+            OptimizerMethod::StateChange => {
+                let event = decode::<StateChangeEvent>(&req)?;
+                self.service.handle_state_change(event);
+                respond(ctx, Empty {})
+            }
+        }
+    }
+}
+
+impl OptimizerPluginService {
+    fn handle_state_change(&self, event: StateChangeEvent) {
+        if event.event != EVENT_START_CONTAINER {
+            return;
+        }
+        let Some(container) = event.container.as_ref() else {
+            return;
+        };
+        let Some(image) = container_image_ref(container) else {
+            return;
+        };
+        match self.sysctl.post_access_tracer_start(&image) {
+            Ok(response) => {
+                if response.applied {
+                    info!(
+                        image = image,
+                        mounts = response.mounts,
+                        "access-tracer settle_max baseline reset by NRI StartContainer"
+                    );
+                }
+            }
+            Err(e) => warn!(
+                image = image,
+                error = %e,
+                "failed to POST access-tracer/start"
+            ),
+        }
+    }
+
+    fn handle_stop_container(&self, container: &Container) {
+        let Some(image) = container_image_ref(container) else {
+            return;
+        };
+        match self.sysctl.post_access_tracer_settle(&image) {
+            Ok(response) => {
+                if response.flushed {
+                    info!(
+                        image = image,
+                        "access-tracer profile force-flushed by NRI StopContainer"
+                    );
+                }
+            }
+            Err(e) => warn!(
+                image = image,
+                error = %e,
+                "failed to POST access-tracer/settle"
+            ),
+        }
+    }
+}
+
 fn prefetch_hint_from_pod(pod: &PodSandbox) -> Option<PrefetchHint> {
     let image = pod.annotations.get(PREFETCH_IMAGE_ANNOTATION)?.clone();
     prefetch_hint_from_annotations(image, &pod.annotations)
@@ -387,6 +609,14 @@ pub struct UpdateContainerResponse {
 }
 
 #[derive(Clone, PartialEq, Message)]
+pub struct StopContainerRequest {
+    #[prost(message, optional, tag = "1")]
+    pub container: Option<Container>,
+    #[prost(message, optional, tag = "2")]
+    pub pod: Option<PodSandbox>,
+}
+
+#[derive(Clone, PartialEq, Message)]
 pub struct StopContainerResponse {
     #[prost(message, repeated, tag = "1")]
     pub update: Vec<ContainerUpdate>,
@@ -475,6 +705,37 @@ mod tests {
             event_mask(&[EVENT_RUN_POD_SANDBOX, EVENT_START_CONTAINER]),
             (1_i32 << EVENT_RUN_POD_SANDBOX) | (1_i32 << EVENT_START_CONTAINER)
         );
+    }
+
+    #[test]
+    fn optimizer_events_includes_only_start_container() {
+        let config = NriTtrpcConfig {
+            listen_socket: PathBuf::from("/tmp/x.sock"),
+            runtime_socket: None,
+            sysctl_socket: PathBuf::from("/tmp/y.sock"),
+            plugin_name: "n".to_string(),
+            plugin_idx: "1".to_string(),
+        };
+        assert_eq!(config.optimizer_events(), 1_i32 << EVENT_START_CONTAINER);
+    }
+
+    #[test]
+    fn stop_container_request_decodes_container() {
+        let req = StopContainerRequest {
+            container: Some(Container {
+                id: "ctr-1".to_string(),
+                labels: HashMap::from([(
+                    CRI_IMAGE_NAME_LABEL.to_string(),
+                    "registry.local/app:1".to_string(),
+                )]),
+                ..Container::default()
+            }),
+            pod: None,
+        };
+        let bytes = req.encode_to_vec();
+        let decoded = StopContainerRequest::decode(bytes.as_slice()).unwrap();
+        let image = container_image_ref(decoded.container.as_ref().unwrap()).unwrap();
+        assert_eq!(image, "registry.local/app:1");
     }
 
     #[test]

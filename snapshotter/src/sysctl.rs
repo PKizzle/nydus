@@ -9,6 +9,7 @@
 //! a Unix-socket REST server, tests, or future gRPC admin service can all call
 //! the same operations.
 
+use crate::access_tracer::AccessTracer;
 use crate::auto_zran::AutoZranManager;
 use crate::cache::{CacheArtifactKind, CacheGcPolicy, CacheGcReport, CacheManager, CacheUsage};
 use crate::daemon::auth::{RuntimeAuthRequest, runtime_auth_records, set_runtime_auth};
@@ -45,6 +46,7 @@ pub struct SystemController {
     profile_store: PrefetchProfileStore,
     snapshotter_metrics: Arc<SnapshotterMetrics>,
     auto_zran: Option<Arc<AutoZranManager>>,
+    access_tracer: Option<Arc<AccessTracer>>,
     metrics: Arc<ControllerMetrics>,
 }
 
@@ -162,6 +164,26 @@ impl SystemController {
         snapshotter_metrics: Arc<SnapshotterMetrics>,
         auto_zran: Option<Arc<AutoZranManager>>,
     ) -> Self {
+        Self::new_with_metrics_auto_zran_and_tracer(
+            supervisor,
+            store,
+            cache,
+            cache_policy,
+            snapshotter_metrics,
+            auto_zran,
+            None,
+        )
+    }
+
+    pub fn new_with_metrics_auto_zran_and_tracer(
+        supervisor: Arc<DaemonSupervisor>,
+        store: Arc<SnapshotStore>,
+        cache: CacheManager,
+        cache_policy: CacheGcPolicy,
+        snapshotter_metrics: Arc<SnapshotterMetrics>,
+        auto_zran: Option<Arc<AutoZranManager>>,
+        access_tracer: Option<Arc<AccessTracer>>,
+    ) -> Self {
         let profile_store = PrefetchProfileStore::from_cache_root(cache.root());
         if let Err(e) = profile_store.restore_runtime() {
             warn!(error = %e, "failed to restore persisted prefetch profiles");
@@ -174,6 +196,7 @@ impl SystemController {
             profile_store,
             snapshotter_metrics,
             auto_zran,
+            access_tracer,
             metrics: Arc::new(ControllerMetrics::default()),
         }
     }
@@ -281,6 +304,29 @@ impl SystemController {
             auto_zran.try_enqueue_profile(&profile);
         }
         Ok(PrefetchResponse { images: updated })
+    }
+
+    /// Reset the access-tracer `first_seen`/`last_event` baseline for every
+    /// active mount of `image_ref`. Returns the number of mounts whose timer
+    /// was reset, or `Ok(0)` when the tracer is disabled / the image has no
+    /// open capture state. Called from the NRI optimizer plugin's
+    /// `StartContainer` hook.
+    pub fn access_tracer_start(&self, image_ref: &str) -> Result<usize> {
+        match self.access_tracer.as_ref() {
+            Some(tracer) => tracer.restart_image_timer(image_ref),
+            None => Ok(0),
+        }
+    }
+
+    /// Force-flush the access-tracer profile for `image_ref` regardless of
+    /// timer state. Returns `Ok(true)` if a profile was flushed (i.e. at
+    /// least `min_files` captured), `Ok(false)` otherwise. Called from the
+    /// NRI optimizer plugin's `StopContainer` hook.
+    pub fn access_tracer_settle(&self, image_ref: &str) -> Result<bool> {
+        match self.access_tracer.as_ref() {
+            Some(tracer) => tracer.settle_image(image_ref),
+            None => Ok(false),
+        }
     }
 
     /// Return all known prefetch hints.
@@ -397,6 +443,12 @@ async fn route_request(controller: &SystemController, request: HttpRequest) -> H
         ("PUT", "/api/v1/prefetch/profile") => {
             handle_prefetch_profile_put(controller, &request.body)
         }
+        ("POST", "/api/v1/access-tracer/start") => {
+            handle_access_tracer_event(controller, &request.body, AccessTracerEvent::Start)
+        }
+        ("POST", "/api/v1/access-tracer/settle") => {
+            handle_access_tracer_event(controller, &request.body, AccessTracerEvent::Settle)
+        }
         ("GET", "/api/v1/auth") => match runtime_auth_records() {
             Ok(records) => json_response(200, records),
             Err(e) => error_response(500, e.to_string()),
@@ -483,6 +535,53 @@ fn handle_prefetch_profile_put(controller: &SystemController, body: &[u8]) -> Ht
     match controller.set_prefetch_profile(profile) {
         Ok(response) => json_response(200, response),
         Err(e) => controller_error_response(e),
+    }
+}
+
+#[derive(Clone, Copy)]
+enum AccessTracerEvent {
+    Start,
+    Settle,
+}
+
+fn handle_access_tracer_event(
+    controller: &SystemController,
+    body: &[u8],
+    event: AccessTracerEvent,
+) -> HttpResponse {
+    let req = match serde_json::from_slice::<AccessTracerEventRequest>(body) {
+        Ok(req) => req,
+        Err(e) => return error_response(400, format!("invalid access-tracer request: {e}")),
+    };
+    let image = req.image.trim();
+    if image.is_empty() {
+        return error_response(400, "access-tracer request missing 'image'".to_string());
+    }
+    match event {
+        AccessTracerEvent::Start => match controller.access_tracer_start(image) {
+            Ok(mounts) => json_response(
+                200,
+                AccessTracerEventResponse {
+                    image: image.to_string(),
+                    applied: mounts > 0,
+                    mounts,
+                    flushed: false,
+                },
+            ),
+            Err(e) => controller_error_response(e),
+        },
+        AccessTracerEvent::Settle => match controller.access_tracer_settle(image) {
+            Ok(flushed) => json_response(
+                200,
+                AccessTracerEventResponse {
+                    image: image.to_string(),
+                    applied: flushed,
+                    mounts: 0,
+                    flushed,
+                },
+            ),
+            Err(e) => controller_error_response(e),
+        },
     }
 }
 
@@ -928,6 +1027,19 @@ pub struct PrefetchRequestEntry {
 #[derive(Clone, Debug, Serialize)]
 pub struct PrefetchResponse {
     images: usize,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct AccessTracerEventRequest {
+    image: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct AccessTracerEventResponse {
+    image: String,
+    applied: bool,
+    mounts: usize,
+    flushed: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -1523,5 +1635,61 @@ mod tests {
             escape_label_value("quote\"slash\\line\n"),
             "quote\\\"slash\\\\line\\n"
         );
+    }
+
+    #[compio::test]
+    async fn route_access_tracer_start_without_tracer_reports_not_applied() {
+        let dir = tempdir().unwrap();
+        let controller = test_controller(dir.path().to_path_buf());
+        let response = route_request(
+            &controller,
+            HttpRequest {
+                method: "POST".to_string(),
+                path: "/api/v1/access-tracer/start".to_string(),
+                body: br#"{"image":"registry.local/app:1"}"#.to_vec(),
+            },
+        )
+        .await;
+        assert_eq!(response.status, 200);
+        let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(body["image"], "registry.local/app:1");
+        assert_eq!(body["applied"], false);
+        assert_eq!(body["mounts"], 0);
+    }
+
+    #[compio::test]
+    async fn route_access_tracer_settle_without_tracer_reports_not_flushed() {
+        let dir = tempdir().unwrap();
+        let controller = test_controller(dir.path().to_path_buf());
+        let response = route_request(
+            &controller,
+            HttpRequest {
+                method: "POST".to_string(),
+                path: "/api/v1/access-tracer/settle".to_string(),
+                body: br#"{"image":"registry.local/app:1"}"#.to_vec(),
+            },
+        )
+        .await;
+        assert_eq!(response.status, 200);
+        let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(body["image"], "registry.local/app:1");
+        assert_eq!(body["applied"], false);
+        assert_eq!(body["flushed"], false);
+    }
+
+    #[compio::test]
+    async fn route_access_tracer_rejects_missing_image() {
+        let dir = tempdir().unwrap();
+        let controller = test_controller(dir.path().to_path_buf());
+        let response = route_request(
+            &controller,
+            HttpRequest {
+                method: "POST".to_string(),
+                path: "/api/v1/access-tracer/start".to_string(),
+                body: br#"{"image":""}"#.to_vec(),
+            },
+        )
+        .await;
+        assert_eq!(response.status, 400);
     }
 }

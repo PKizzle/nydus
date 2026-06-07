@@ -634,13 +634,14 @@ pub async fn serve_with_supervisor(
 
     if config.snapshotter.sysctl.enable {
         let sysctl_path = config.snapshotter.sysctl.address.clone();
-        let controller = SystemController::new_with_metrics_and_auto_zran(
+        let controller = SystemController::new_with_metrics_auto_zran_and_tracer(
             supervisor.clone(),
             store.clone(),
             cache_manager.clone(),
             cache_gc_policy.clone(),
             metrics.clone(),
             auto_zran.clone(),
+            Some(access_tracer.clone()),
         );
         compio::runtime::spawn(async move {
             if let Err(e) = serve_sysctl_unix(sysctl_path, controller).await {

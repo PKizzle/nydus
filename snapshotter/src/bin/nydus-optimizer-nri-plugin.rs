@@ -4,12 +4,25 @@
 
 //! Rust optimizer NRI plugin entrypoint.
 //!
-//! Converts container access records collected by an optimizer/fanotify sidecar
-//! into a Nydus prefetch profile and submits it to the system-controller.
+//! Two modes:
+//!
+//! 1. `--nri-listen-socket <path>` runs as a long-lived containerd NRI plugin.
+//!    On `StartContainer` it POSTs to `/api/v1/access-tracer/start` so the
+//!    snapshotter's in-process tracer resets `settle_max` to real container
+//!    start (instead of snapshot `Prepare`). On `StopContainer` it POSTs to
+//!    `/api/v1/access-tracer/settle` so a short-lived container ships its
+//!    profile immediately rather than waiting up to `settle_max` for the
+//!    timer.
+//!
+//! 2. Without `--nri-listen-socket` it acts as a one-shot CLI that converts
+//!    container access records (collected by an external optimizer/fanotify
+//!    sidecar) into a Nydus prefetch profile and submits it to the
+//!    system-controller's `/api/v1/prefetch/profile` endpoint.
 
 use anyhow::{Context, Result, bail};
 use clap::Parser;
 use nydus_snapshotter::nri::{AccessProfileRecord, DEFAULT_SYSCTL_SOCKET, SysctlClient};
+use nydus_snapshotter::nri_ttrpc::{NriTtrpcConfig, serve_optimizer_plugin};
 use nydus_snapshotter::prefetch_profile::PrefetchProfile;
 use std::io::Read;
 use std::path::PathBuf;
@@ -20,7 +33,8 @@ use std::path::PathBuf;
     about = "Submit optimizer access profiles to the Nydus snapshotter"
 )]
 struct Args {
-    /// Nydus sysctl Unix socket used by /api/v1/prefetch/profile.
+    /// Nydus sysctl Unix socket used by /api/v1/prefetch/profile and
+    /// /api/v1/access-tracer/*.
     #[arg(long, default_value = DEFAULT_SYSCTL_SOCKET)]
     sysctl_socket: PathBuf,
 
@@ -31,10 +45,37 @@ struct Args {
     /// Read access records from this file instead of stdin.
     #[arg(long)]
     input: Option<PathBuf>,
+
+    /// Listen on this Unix socket as a native NRI ttrpc Plugin service.
+    /// When set, the binary runs as a long-lived plugin instead of a
+    /// one-shot CLI.
+    #[arg(long)]
+    nri_listen_socket: Option<PathBuf>,
+
+    /// Optional containerd NRI runtime socket to register with.
+    #[arg(long)]
+    nri_runtime_socket: Option<PathBuf>,
+
+    /// NRI plugin name used during registration.
+    #[arg(long, default_value = "nydus-optimizer")]
+    name: String,
+
+    /// NRI plugin invocation index used during registration.
+    #[arg(long, default_value = "80")]
+    idx: String,
 }
 
 fn main() -> Result<()> {
     let args = Args::parse();
+    if let Some(listen_socket) = args.nri_listen_socket.clone() {
+        return serve_optimizer_plugin(NriTtrpcConfig {
+            listen_socket,
+            runtime_socket: args.nri_runtime_socket.clone(),
+            sysctl_socket: args.sysctl_socket.clone(),
+            plugin_name: args.name.clone(),
+            plugin_idx: args.idx.clone(),
+        });
+    }
     let input = read_input(args.input.as_ref())?;
     let profile = profile_from_input(&input, args.image.as_deref())?;
     let response = SysctlClient::new(args.sysctl_socket).put_prefetch_profile(&profile)?;

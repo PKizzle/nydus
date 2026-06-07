@@ -313,6 +313,96 @@ impl AccessTracer {
         Ok(())
     }
 
+    /// Reset the `first_seen`/`last_event` baseline for every active mount of
+    /// `image_ref`. Called from the NRI optimizer plugin on `StartContainer`
+    /// so `settle_max` is measured from real container start instead of from
+    /// snapshot `Prepare` (which can fire seconds-to-minutes earlier). Mounts
+    /// that have already been settled are left alone.
+    pub fn restart_image_timer(&self, image_ref: &str) -> Result<usize> {
+        if self.inner.fanotify.is_none() {
+            return Ok(0);
+        }
+        let mut mounts = self
+            .inner
+            .mounts
+            .lock()
+            .map_err(|_| anyhow::anyhow!("access_tracer mounts mutex poisoned"))?;
+        let now = Instant::now();
+        let mut reset = 0;
+        for state in mounts.values_mut() {
+            if state.image_ref != image_ref || state.settled {
+                continue;
+            }
+            state.first_seen = now;
+            state.last_event = now;
+            reset += 1;
+        }
+        if reset > 0 {
+            debug!(
+                image = image_ref,
+                mounts = reset,
+                "access_tracer restart_image_timer"
+            );
+        }
+        Ok(reset)
+    }
+
+    /// Force-flush every non-settled mount of `image_ref` regardless of the
+    /// idle/max timers. Called from the NRI optimizer plugin on
+    /// `StopContainer` so a short-lived container ships its profile
+    /// immediately instead of waiting up to `settle_max` for the timer to
+    /// fire. Profiles below `min_files` are dropped (same as the timer path).
+    #[cfg(target_os = "linux")]
+    pub fn settle_image(&self, image_ref: &str) -> Result<bool> {
+        if self.inner.fanotify.is_none() {
+            return Ok(false);
+        }
+        let mut files: Vec<String> = Vec::new();
+        let mut had_state = false;
+        {
+            let mut mounts = self
+                .inner
+                .mounts
+                .lock()
+                .map_err(|_| anyhow::anyhow!("access_tracer mounts mutex poisoned"))?;
+            for state in mounts.values_mut() {
+                if state.image_ref != image_ref || state.settled {
+                    continue;
+                }
+                had_state = true;
+                for f in &state.files {
+                    if !files.iter().any(|existing| existing == f) {
+                        files.push(f.clone());
+                    }
+                }
+                state.settled = true;
+            }
+        }
+        if !had_state {
+            return Ok(false);
+        }
+        if files.len() < self.inner.config.min_files {
+            debug!(
+                image = image_ref,
+                files = files.len(),
+                min = self.inner.config.min_files,
+                "access_tracer settle_image dropping short profile"
+            );
+            return Ok(false);
+        }
+        self.inner
+            .metrics
+            .settled_total
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        flush_profile(&self.inner, image_ref, files)?;
+        Ok(true)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub fn settle_image(&self, _image_ref: &str) -> Result<bool> {
+        Ok(false)
+    }
+
     /// Called by `AutoZranManager::run_conversion` after a successful sidecar
     /// upload. Future `attach` calls for this image become no-ops; any
     /// in-flight state is dropped.

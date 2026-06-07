@@ -122,19 +122,68 @@ impl SysctlClient {
         self.put_json("/api/v1/prefetch/profile", profile)
     }
 
+    /// POST `/api/v1/access-tracer/start { image }` — reset the
+    /// `settle_max`/idle baseline for `image` so the timer measures from
+    /// real container start instead of from snapshot `Prepare`.
+    pub fn post_access_tracer_start(&self, image: &str) -> Result<AccessTracerEventResponse> {
+        self.post_json(
+            "/api/v1/access-tracer/start",
+            &AccessTracerEventRequest { image },
+        )
+    }
+
+    /// POST `/api/v1/access-tracer/settle { image }` — force-flush the
+    /// captured profile for `image` (called from the NRI optimizer plugin's
+    /// `StopContainer` hook).
+    pub fn post_access_tracer_settle(&self, image: &str) -> Result<AccessTracerEventResponse> {
+        self.post_json(
+            "/api/v1/access-tracer/settle",
+            &AccessTracerEventRequest { image },
+        )
+    }
+
     fn put_json<T, R>(&self, path: &str, body: &T) -> Result<R>
+    where
+        T: Serialize,
+        R: DeserializeOwned,
+    {
+        self.send_json("PUT", path, body)
+    }
+
+    fn post_json<T, R>(&self, path: &str, body: &T) -> Result<R>
+    where
+        T: Serialize,
+        R: DeserializeOwned,
+    {
+        self.send_json("POST", path, body)
+    }
+
+    fn send_json<T, R>(&self, method: &str, path: &str, body: &T) -> Result<R>
     where
         T: Serialize,
         R: DeserializeOwned,
     {
         let body = serde_json::to_vec(body).context("failed to encode sysctl request")?;
         let request = format!(
-            "PUT {path} HTTP/1.1\r\nHost: nydus-snapshotter\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            "{method} {path} HTTP/1.1\r\nHost: nydus-snapshotter\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
             body.len()
         );
         let response = send_http_over_unix(&self.socket, request.as_bytes(), &body)?;
         parse_json_response(&response)
     }
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct AccessTracerEventRequest<'a> {
+    image: &'a str,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct AccessTracerEventResponse {
+    pub image: String,
+    pub applied: bool,
+    pub mounts: usize,
+    pub flushed: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
