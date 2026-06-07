@@ -211,8 +211,20 @@ impl FanotifyHandler {
         // descriptor on each event (to identify the target via `fstat` and to respond), whereas
         // `FAN_REPORT_FID` reports an opaque file handle and sets `metadata.fd` to `FAN_NOFD`.
         let init_flags = FAN_CLASS_PRE_CONTENT | libc::FAN_CLOEXEC | libc::FAN_NONBLOCK;
-        let raw_fd =
-            unsafe { libc::fanotify_init(init_flags, (libc::O_RDONLY | libc::O_LARGEFILE) as u32) };
+        // `O_LARGEFILE` is deliberately NOT ORed in for the event_f_flags
+        // arg even though the kernel's `FANOTIFY_INIT_FD_FLAGS` allowlist
+        // accepts it: the Rust `libc` crate on `aarch64-unknown-linux-musl`
+        // defines `O_LARGEFILE` as 0x8000 (the generic 32-bit value), but
+        // on the aarch64 Linux UAPI 0x8000 is `O_NOFOLLOW` and
+        // `O_LARGEFILE` is 0x20000. Passing `libc::O_LARGEFILE` on this
+        // target therefore makes the kernel see `O_NOFOLLOW` (not in the
+        // allowlist) and `fanotify_init` returns EINVAL on every aarch64
+        // host — including kernels with `CONFIG_FANOTIFY_ACCESS_PERMISSIONS=y`.
+        // On 64-bit Linux `O_LARGEFILE` is implicit anyway, so the only
+        // observable difference of leaving it off is that fanotify_init
+        // succeeds where it previously failed. Same fix mirrored in
+        // `snapshotter/src/probe/mod.rs::try_fanotify_init`.
+        let raw_fd = unsafe { libc::fanotify_init(init_flags, libc::O_RDONLY as u32) };
         if raw_fd < 0 {
             return Err(std::io::Error::last_os_error());
         }

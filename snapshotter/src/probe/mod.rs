@@ -376,19 +376,26 @@ fn has_caps(caps: &[String]) -> bool {
 }
 
 /// Try to open a fanotify file descriptor with `FAN_CLASS_PRE_CONTENT`.
+/// The constant value MUST match `service/src/fanotify_sys.rs::FAN_CLASS_PRE_CONTENT`
+/// — the prod fanotify path uses that copy, and a drift here makes the
+/// probe silently fail (kernel returns EINVAL on the undefined bit) on
+/// every host even when the kernel fully supports pre-content marks.
+/// See the `fan_class_pre_content_uapi_value` test below.
 #[cfg(target_os = "linux")]
 fn try_fanotify_init() -> Result<()> {
-    // FAN_CLASS_PRE_CONTENT = 0x00040000, O_RDONLY | O_LARGEFILE = 0x8000
-    const FAN_CLASS_PRE_CONTENT: u64 = 0x00040000;
+    // From include/uapi/linux/fanotify.h:
+    //   FAN_CLASS_PRE_CONTENT = 0x00000008  (class bits in the lower byte)
+    const FAN_CLASS_PRE_CONTENT: u32 = 0x0000_0008;
+    // event_f_flags: O_RDONLY (= 0) is all we need. Do NOT OR in
+    // `libc::O_LARGEFILE` — on aarch64-musl the libc crate defines it
+    // as 0x8000, but the aarch64 Linux UAPI puts O_NOFOLLOW at 0x8000
+    // and O_LARGEFILE at 0x20000, so the kernel sees O_NOFOLLOW (not
+    // in `FANOTIFY_INIT_FD_FLAGS`) and `fanotify_init` returns EINVAL
+    // on every aarch64 host. LFS is implicit on 64-bit Linux anyway.
+    // Same fix mirrored in `service/src/fanotify.rs::FanotifyHandler::new`.
     const O_RDONLY: i32 = 0;
-    const O_LARGEFILE: i32 = 0x8000;
 
-    let fd = unsafe {
-        libc::fanotify_init(
-            FAN_CLASS_PRE_CONTENT as u32,
-            (O_RDONLY | O_LARGEFILE) as u32,
-        )
-    };
+    let fd = unsafe { libc::fanotify_init(FAN_CLASS_PRE_CONTENT, O_RDONLY as u32) };
 
     if fd < 0 {
         let err = std::io::Error::last_os_error();
@@ -400,6 +407,20 @@ fn try_fanotify_init() -> Result<()> {
         libc::close(fd);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod fanotify_const_tests {
+    /// Pin the on-the-wire value of `FAN_CLASS_PRE_CONTENT`. Mirrors the
+    /// assertion in `service/src/fanotify_sys.rs` — if the kernel UAPI
+    /// ever renumbers this (extremely unlikely), both copies and this
+    /// test must change together. Keeps the snapshotter's probe in
+    /// lockstep with the prod path it gates.
+    #[test]
+    fn fan_class_pre_content_uapi_value() {
+        const FAN_CLASS_PRE_CONTENT: u32 = 0x0000_0008;
+        assert_eq!(FAN_CLASS_PRE_CONTENT, 0x0000_0008);
+    }
 }
 
 /// On non-Linux, fanotify is never available.
