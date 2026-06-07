@@ -173,6 +173,10 @@ impl ContainerdLookup {
         }
         let manifest: OciManifest = serde_json::from_slice(&bytes)?;
         // Locate any nydus-bootstrap layer index (typically the last layer).
+        // Standard OCI images have none; the cache still needs to map their
+        // topmost chainID to image-ref so the auto-accel capture/discovery
+        // path in grpc::prepare can resolve image-ref when containerd's CRI
+        // plugin doesn't pass the `cri.image-ref` label (2.x default).
         let mut bootstrap_indices: Vec<usize> = Vec::new();
         for (i, layer) in manifest.layers.iter().enumerate() {
             let is_bootstrap = layer
@@ -192,12 +196,9 @@ impl ContainerdLookup {
                 bootstrap_indices.push(i);
             }
         }
-        if bootstrap_indices.is_empty() {
-            return Ok(());
-        }
-        // Compute chainIDs from image config diff_ids and insert under each
-        // chainID up to and including any bootstrap layer. The active
-        // snapshot key uses the chainID of all stacked layers.
+        // Compute chainIDs from the image config's diff_ids. We register the
+        // topmost chain_id unconditionally (for auto-accel lookup) and any
+        // bootstrap-layer chain_ids (for nydus-meta lookup).
         let Some(cfg_desc) = manifest.config.as_ref() else {
             return Ok(());
         };
@@ -227,6 +228,14 @@ impl ContainerdLookup {
             }
         };
         let chain_ids = chain_ids(&cfg.rootfs.diff_ids);
+        if let Some(top) = chain_ids.last() {
+            debug!(
+                chain_id = %top,
+                image = %image_ref,
+                "registered topmost chainID for image"
+            );
+            out.insert(top.clone(), image_ref.to_string());
+        }
         for &i in &bootstrap_indices {
             if let Some(chain_id) = chain_ids.get(i) {
                 debug!(

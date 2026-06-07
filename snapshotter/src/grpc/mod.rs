@@ -135,6 +135,16 @@ fn first_lowerdir(mounts: &[snapshots::api::types::Mount]) -> Option<PathBuf> {
     None
 }
 
+/// Extract the chainID digest from a snapshot parent string. containerd's
+/// proxy-plugin protocol prefixes the snapshot key with the namespace and an
+/// incrementing id (e.g. `k8s.io/18004/sha256:ead2…`), so the actual digest
+/// lives after the last `/`. Returns `None` when the suffix isn't a
+/// `sha256:`-prefixed digest (chain-rooted snapshots, untagged entries, etc.).
+fn parent_chain_digest(parent: &str) -> Option<&str> {
+    let suffix = parent.rsplit('/').next().unwrap_or(parent);
+    suffix.starts_with("sha256:").then_some(suffix)
+}
+
 /// and daemon supervisor.
 pub struct NydusSnapshotter {
     store: Arc<SnapshotStore>,
@@ -365,13 +375,30 @@ impl snapshots::Snapshotter for NydusSnapshotter {
                         debug!(key, parent, mountpoint = %daemon_mnt.display(), "prepared nydus rootfs");
                         return Ok(self.rewrite_mounts_with_daemon(&key, &daemon_mnt, false));
                     }
+                    // Resolve the image-ref for this prepare. containerd's
+                    // CRI plugin (v2.x in k3s 1.36+) does not pass
+                    // `cri.image-ref` on the container rootfs prepare —
+                    // labels are empty. Fall back to a chainID lookup against
+                    // containerd's image store via `ContainerdLookup`, which
+                    // walks images once and caches `topmost chainID →
+                    // image_ref` for every image known to crictl.
+                    let image_ref = labels
+                        .get(crate::source::labels::CRI_IMAGE_REF)
+                        .cloned()
+                        .or_else(|| {
+                            let chain = parent_chain_digest(&parent)?;
+                            self.containerd_lookup
+                                .as_ref()
+                                .and_then(|cl| cl.lookup(chain))
+                        });
+
                     // Auto-accel routing: if a sidecar artifact exists for
                     // this image in containerd's content store (locally
                     // produced or spegel-mirrored), substitute a
                     // localfs+fanotify daemon mount for the overlay. The
                     // original gzip layers stay where they are; the daemon
                     // serves them on demand from the merged bootstrap.
-                    if let Some(image_ref) = labels.get(crate::source::labels::CRI_IMAGE_REF)
+                    if let Some(image_ref) = image_ref.as_deref()
                         && let Some(daemon_mnt) = self.resolve_auto_accel_mount(image_ref).await?
                     {
                         debug!(key, parent, mountpoint = %daemon_mnt.display(), "prepared auto-accel rootfs");
@@ -383,12 +410,9 @@ impl snapshots::Snapshotter for NydusSnapshotter {
                     // startup. On settle, a conversion job runs and lands
                     // the sidecar that the next pod (or peer node) picks up
                     // via the resolve_auto_accel_mount branch above.
-                    if let (Some(image_ref), Some(image_root)) = (
-                        labels
-                            .get(crate::source::labels::CRI_IMAGE_REF)
-                            .cloned(),
-                        first_lowerdir(&mounts),
-                    ) && let Err(e) = self.access_tracer.attach(&image_ref, &image_root) {
+                    if let (Some(image_ref), Some(image_root)) = (image_ref, first_lowerdir(&mounts))
+                        && let Err(e) = self.access_tracer.attach(&image_ref, &image_root)
+                    {
                         debug!(image = %image_ref, error = %e, "access_tracer attach failed");
                     }
                     debug!(key, parent, mounts = mounts.len(), "prepared snapshot");
