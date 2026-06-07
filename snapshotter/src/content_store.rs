@@ -92,7 +92,23 @@ struct Inner {
     socket: PathBuf,
     namespace: String,
     content_root: PathBuf,
-    rt: tokio::runtime::Runtime,
+    /// `Option<Runtime>` rather than `Runtime` because `Runtime::drop`
+    /// panics with "Cannot drop a runtime in a context where blocking is
+    /// not allowed" when the drop happens on a tokio worker thread —
+    /// which is exactly what would happen if the last
+    /// `Arc<Inner>` outlived a future and got dropped from inside a
+    /// `blocking::unblock` closure during shutdown. `Drop` for `Inner`
+    /// pulls the runtime out via `.take()` and uses
+    /// `shutdown_background()` to avoid the foot-gun entirely.
+    rt: Option<tokio::runtime::Runtime>,
+}
+
+impl Drop for Inner {
+    fn drop(&mut self) {
+        if let Some(rt) = self.rt.take() {
+            rt.shutdown_background();
+        }
+    }
 }
 
 impl ContentStoreClient {
@@ -110,7 +126,7 @@ impl ContentStoreClient {
                 socket: config.address.clone(),
                 namespace: config.namespace.clone(),
                 content_root: config.content_root.clone(),
-                rt,
+                rt: Some(rt),
             }),
         })
     }
@@ -135,7 +151,7 @@ impl ContentStoreClient {
         let inner = self.inner.clone();
         let digest = digest.to_string();
         blocking::unblock(move || {
-            inner.rt.block_on(async {
+            inner.rt.as_ref().expect("runtime present").block_on(async {
                 let mut client = connect(&inner).await?;
                 let mut request = tonic::Request::new(InfoRequest {
                     digest: digest.clone(),
@@ -192,7 +208,7 @@ impl ContentStoreClient {
         let digest_clone = digest_with_prefix.clone();
         let labels_clone = labels.clone();
         blocking::unblock(move || {
-            inner.rt.block_on(async {
+            inner.rt.as_ref().expect("runtime present").block_on(async {
                 let mut client = connect(&inner).await?;
                 let total = bytes.len() as i64;
                 // Single-shot commit message. containerd accepts the whole
@@ -256,7 +272,7 @@ impl ContentStoreClient {
         let data_owned = data.to_vec();
         let ref_owned = format!("nydus-auto-accel-{ref_hint}-{digest}");
         blocking::unblock(move || {
-            inner.rt.block_on(async {
+            inner.rt.as_ref().expect("runtime present").block_on(async {
                 let mut client = connect(&inner).await?;
                 let total = data_owned.len() as i64;
                 let req = WriteContentRequest {
@@ -301,7 +317,7 @@ impl ContentStoreClient {
         let digest = digest.to_string();
         let labels = labels.clone();
         blocking::unblock(move || {
-            inner.rt.block_on(async {
+            inner.rt.as_ref().expect("runtime present").block_on(async {
                 let mut client = connect(&inner).await?;
                 let info = containerd::services::content::v1::Info {
                     digest: digest.clone(),
@@ -339,7 +355,7 @@ impl ContentStoreClient {
     pub async fn list_with_filters(&self, filters: Vec<String>) -> Result<Vec<ContentInfo>> {
         let inner = self.inner.clone();
         blocking::unblock(move || {
-            inner.rt.block_on(async {
+            inner.rt.as_ref().expect("runtime present").block_on(async {
                 let mut client = connect(&inner).await?;
                 let mut request = tonic::Request::new(ListContentRequest { filters });
                 attach_namespace(&mut request, &inner.namespace)?;
@@ -377,7 +393,7 @@ impl ContentStoreClient {
         let inner = self.inner.clone();
         let digest_owned = digest.to_string();
         blocking::unblock(move || {
-            inner.rt.block_on(async {
+            inner.rt.as_ref().expect("runtime present").block_on(async {
                 let mut client = connect(&inner).await?;
                 let mut request = tonic::Request::new(ReadContentRequest {
                     digest: digest_owned.clone(),
@@ -428,7 +444,7 @@ impl ContentStoreClient {
         let digest = digest.to_string();
         let media_type = media_type.to_string();
         blocking::unblock(move || {
-            inner.rt.block_on(async {
+            inner.rt.as_ref().expect("runtime present").block_on(async {
                 let mut client = connect_images(&inner).await?;
                 let mut request = tonic::Request::new(CreateImageRequest {
                     image: Some(Image {
@@ -466,7 +482,7 @@ impl ContentStoreClient {
         let inner = self.inner.clone();
         let name = name.to_string();
         blocking::unblock(move || {
-            inner.rt.block_on(async {
+            inner.rt.as_ref().expect("runtime present").block_on(async {
                 let mut client = connect_images(&inner).await?;
                 let mut request = tonic::Request::new(GetImageRequest { name: name.clone() });
                 attach_namespace(&mut request, &inner.namespace)?;

@@ -123,82 +123,85 @@ impl ControllerMetrics {
     }
 }
 
-impl SystemController {
+/// Builder for `SystemController`. Replaces the previous four-step
+/// `new`/`new_with_metrics`/`new_with_metrics_and_auto_zran`/
+/// `new_with_metrics_auto_zran_and_tracer` chain that doubled in length
+/// every time an optional dep was added. Each `.with_*` accessor takes
+/// the dep; `.build()` constructs the controller.
+pub struct SystemControllerBuilder {
+    supervisor: Arc<DaemonSupervisor>,
+    store: Arc<SnapshotStore>,
+    cache: CacheManager,
+    cache_policy: CacheGcPolicy,
+    snapshotter_metrics: Option<Arc<SnapshotterMetrics>>,
+    auto_zran: Option<Arc<AutoZranManager>>,
+    access_tracer: Option<Arc<AccessTracer>>,
+}
+
+impl SystemControllerBuilder {
     pub fn new(
         supervisor: Arc<DaemonSupervisor>,
         store: Arc<SnapshotStore>,
         cache: CacheManager,
         cache_policy: CacheGcPolicy,
     ) -> Self {
-        Self::new_with_metrics(
-            supervisor,
-            store,
-            cache,
-            cache_policy,
-            Arc::new(SnapshotterMetrics::new()),
-        )
-    }
-
-    pub fn new_with_metrics(
-        supervisor: Arc<DaemonSupervisor>,
-        store: Arc<SnapshotStore>,
-        cache: CacheManager,
-        cache_policy: CacheGcPolicy,
-        snapshotter_metrics: Arc<SnapshotterMetrics>,
-    ) -> Self {
-        Self::new_with_metrics_and_auto_zran(
-            supervisor,
-            store,
-            cache,
-            cache_policy,
-            snapshotter_metrics,
-            None,
-        )
-    }
-
-    pub fn new_with_metrics_and_auto_zran(
-        supervisor: Arc<DaemonSupervisor>,
-        store: Arc<SnapshotStore>,
-        cache: CacheManager,
-        cache_policy: CacheGcPolicy,
-        snapshotter_metrics: Arc<SnapshotterMetrics>,
-        auto_zran: Option<Arc<AutoZranManager>>,
-    ) -> Self {
-        Self::new_with_metrics_auto_zran_and_tracer(
-            supervisor,
-            store,
-            cache,
-            cache_policy,
-            snapshotter_metrics,
-            auto_zran,
-            None,
-        )
-    }
-
-    pub fn new_with_metrics_auto_zran_and_tracer(
-        supervisor: Arc<DaemonSupervisor>,
-        store: Arc<SnapshotStore>,
-        cache: CacheManager,
-        cache_policy: CacheGcPolicy,
-        snapshotter_metrics: Arc<SnapshotterMetrics>,
-        auto_zran: Option<Arc<AutoZranManager>>,
-        access_tracer: Option<Arc<AccessTracer>>,
-    ) -> Self {
-        let profile_store = PrefetchProfileStore::from_cache_root(cache.root());
-        if let Err(e) = profile_store.restore_runtime() {
-            warn!(error = %e, "failed to restore persisted prefetch profiles");
-        }
         Self {
             supervisor,
             store,
             cache,
             cache_policy,
+            snapshotter_metrics: None,
+            auto_zran: None,
+            access_tracer: None,
+        }
+    }
+
+    pub fn with_metrics(mut self, metrics: Arc<SnapshotterMetrics>) -> Self {
+        self.snapshotter_metrics = Some(metrics);
+        self
+    }
+
+    pub fn with_auto_zran(mut self, auto_zran: Option<Arc<AutoZranManager>>) -> Self {
+        self.auto_zran = auto_zran;
+        self
+    }
+
+    pub fn with_access_tracer(mut self, tracer: Option<Arc<AccessTracer>>) -> Self {
+        self.access_tracer = tracer;
+        self
+    }
+
+    pub fn build(self) -> SystemController {
+        let profile_store = PrefetchProfileStore::from_cache_root(self.cache.root());
+        if let Err(e) = profile_store.restore_runtime() {
+            warn!(error = %e, "failed to restore persisted prefetch profiles");
+        }
+        SystemController {
+            supervisor: self.supervisor,
+            store: self.store,
+            cache: self.cache,
+            cache_policy: self.cache_policy,
             profile_store,
-            snapshotter_metrics,
-            auto_zran,
-            access_tracer,
+            snapshotter_metrics: self
+                .snapshotter_metrics
+                .unwrap_or_else(|| Arc::new(SnapshotterMetrics::new())),
+            auto_zran: self.auto_zran,
+            access_tracer: self.access_tracer,
             metrics: Arc::new(ControllerMetrics::default()),
         }
+    }
+}
+
+impl SystemController {
+    /// Backwards-compatible shortcut for tests that need the minimal-deps
+    /// controller. Production code uses `SystemControllerBuilder` directly.
+    pub fn new(
+        supervisor: Arc<DaemonSupervisor>,
+        store: Arc<SnapshotStore>,
+        cache: CacheManager,
+        cache_policy: CacheGcPolicy,
+    ) -> Self {
+        SystemControllerBuilder::new(supervisor, store, cache, cache_policy).build()
     }
 
     /// Return live and persisted daemon records.
@@ -487,50 +490,89 @@ async fn route_request(controller: &SystemController, request: HttpRequest) -> H
 /// Resolve a container PID to the host-side overlay rootfs mount path.
 ///
 /// Canonicalizing `/proc/<pid>/root` directly returns `"/"` because the proc
-/// magic symlink reads as the process's view of its root. To actually mark
-/// the overlay mount the container is using we cross the mount-namespace
-/// boundary via `mountinfo`:
-///
-/// 1. Read the container's `/proc/<pid>/mountinfo` and find the line whose
-///    mount-point is `/` (the container's root). Take its `st_dev`
-///    (major:minor, field 3 in the 0-indexed mountinfo schema).
-/// 2. Read `/proc/self/mountinfo` (the snapshotter's view, identical to
-///    PID 1's view on a typical k3s host) and find the matching mount on
-///    the same device whose mount-point is the canonical containerd CRI
-///    runtime rootfs path (`…/io.containerd.runtime.*/rootfs`).
-///
-/// Both lines describe the same overlay mount under different mount
-/// namespaces; the host-side mount-point is what we hand to fanotify so
-/// container reads fire events with paths that strip cleanly down to
-/// in-container paths.
+/// magic symlink reads as the process's view of its root. We cross the
+/// mount-namespace boundary via `mountinfo` strings — see
+/// `find_rootfs_in_mountinfo` for the pure logic that this wrapper
+/// I/O-binds. Splitting these two so the parser can be unit-tested from
+/// fixtures rather than against a live `/proc`.
 fn host_rootfs_for_pid(pid: u32) -> Result<PathBuf> {
     let container_info = std::fs::read_to_string(format!("/proc/{pid}/mountinfo"))
         .with_context(|| format!("read /proc/{pid}/mountinfo"))?;
-    let device = container_info
+    let host_info =
+        std::fs::read_to_string("/proc/self/mountinfo").context("read /proc/self/mountinfo")?;
+    find_rootfs_in_mountinfo(&container_info, &host_info)
+        .with_context(|| format!("resolve host rootfs for pid {pid}"))
+}
+
+/// Pure-function side of `host_rootfs_for_pid`. Given the contents of
+/// `/proc/<pid>/mountinfo` (the container's view) and
+/// `/proc/self/mountinfo` (the host's), find the host-side mount-point of
+/// the container's overlay rootfs.
+///
+/// Algorithm:
+///
+/// 1. In the container's mountinfo find the line whose mount-point is
+///    `"/"` (its rootfs). Capture its `st_dev` (`MAJOR:MINOR`) AND the
+///    `lowerdir=` suffix of its super-options. `st_dev` alone is not
+///    enough on a node with multiple overlay mounts because all overlay
+///    mounts share the same anon block-device family `0:N`; the
+///    `lowerdir=` chain disambiguates because each container's overlay
+///    pulls a unique snapshot chain.
+/// 2. In the host's mountinfo find the first matching mount where:
+///    - `st_dev` matches AND
+///    - the mount-point looks like a containerd CRI runtime rootfs
+///      (`…/io.containerd.runtime.*/rootfs`) AND
+///    - the `lowerdir=` super-option matches the container's.
+///
+/// The previous version keyed only on `st_dev` + path-shape; on a node
+/// with two containers of the same image we'd return the first match
+/// — possibly the *other* container's rootfs — and silently capture the
+/// wrong process's reads.
+fn find_rootfs_in_mountinfo(container_info: &str, host_info: &str) -> Result<PathBuf> {
+    let (device, lowerdir) = container_info
         .lines()
         .find_map(|line| {
             let fields: Vec<&str> = line.split_whitespace().collect();
-            // mountinfo: [id parent st_dev root mount_point ...]
-            if fields.len() >= 5 && fields[4] == "/" {
-                Some(fields[2].to_string())
-            } else {
-                None
+            // mountinfo schema: [id parent st_dev root mount_point options ... - fs_type source super_options]
+            if fields.len() < 5 || fields[4] != "/" {
+                return None;
             }
+            Some((fields[2].to_string(), extract_lowerdir(line)))
         })
         .context("container has no '/' mount in mountinfo")?;
-    let host_info =
-        std::fs::read_to_string("/proc/self/mountinfo").context("read /proc/self/mountinfo")?;
+
     for line in host_info.lines() {
         let fields: Vec<&str> = line.split_whitespace().collect();
         if fields.len() < 5 || fields[2] != device {
             continue;
         }
         let mount_point = fields[4];
-        if mount_point.contains("/io.containerd.runtime.") && mount_point.ends_with("/rootfs") {
-            return Ok(PathBuf::from(mount_point));
+        if !mount_point.contains("/io.containerd.runtime.") || !mount_point.ends_with("/rootfs") {
+            continue;
+        }
+        // Always require matching lowerdir when the container exposed
+        // one. If the container's "/" wasn't overlay (rare but possible
+        // in unprivileged runtimes) we accept any path-shape match.
+        match (&lowerdir, extract_lowerdir(line)) {
+            (Some(want), Some(have)) if want == &have => return Ok(PathBuf::from(mount_point)),
+            (Some(_), Some(_)) => continue,
+            (Some(_), None) => continue,
+            (None, _) => return Ok(PathBuf::from(mount_point)),
         }
     }
-    anyhow::bail!("no host rootfs overlay mount for pid {pid} (device {device})")
+    anyhow::bail!("no host rootfs overlay mount matches device {device} + lowerdir {lowerdir:?}")
+}
+
+/// Extract the `lowerdir=…` super-option from one mountinfo line. Returns
+/// `None` for non-overlay mounts or lines that don't include the suffix.
+fn extract_lowerdir(line: &str) -> Option<String> {
+    let opts = line.split(" - ").nth(1)?;
+    for token in opts.split([',', ' ']) {
+        if let Some(rest) = token.strip_prefix("lowerdir=") {
+            return Some(rest.to_string());
+        }
+    }
+    None
 }
 
 fn handle_auth_put(body: &[u8]) -> HttpResponse {
@@ -1791,5 +1833,78 @@ mod tests {
         )
         .await;
         assert_eq!(response.status, 400);
+    }
+
+    /// `find_rootfs_in_mountinfo` cross-namespaces mountinfo strings to
+    /// the host-side overlay rootfs mount-point. This is the exact bug
+    /// commit 9e85c5cf fixed (`canonicalize("/proc/<pid>/root")`
+    /// returned "/" and the snapshotter mark'd the host root fs); the
+    /// extra `lowerdir=` tiebreaker added in this round prevents marking
+    /// a SIBLING container's rootfs when two pods of the same image
+    /// share an st_dev.
+    #[test]
+    fn find_rootfs_in_mountinfo_resolves_host_overlay_for_container() {
+        let container = "\
+3039 2510 0:274 / / rw,relatime - overlay overlay rw,lowerdir=/var/lib/.../snapshots/L/fs,upperdir=/U/fs,workdir=/U/work\n";
+        let host = "\
+1 0 8:1 / / rw - ext4 /dev/sda1 rw\n\
+2460 30 0:274 / /run/k3s/containerd/io.containerd.runtime.v2.task/k8s.io/CID/rootfs rw,relatime shared:1614 - overlay overlay rw,lowerdir=/var/lib/.../snapshots/L/fs,upperdir=/U/fs,workdir=/U/work\n";
+        let p = find_rootfs_in_mountinfo(container, host).unwrap();
+        assert_eq!(
+            p.to_str().unwrap(),
+            "/run/k3s/containerd/io.containerd.runtime.v2.task/k8s.io/CID/rootfs"
+        );
+    }
+
+    #[test]
+    fn find_rootfs_in_mountinfo_disambiguates_siblings_via_lowerdir() {
+        // Two host-side overlay mounts on the same st_dev (0:274) — only
+        // the second matches the container's lowerdir. Without the
+        // tiebreaker the helper would return the first one.
+        let container = "\
+3039 2510 0:274 / / rw,relatime - overlay overlay rw,lowerdir=/var/lib/.../snapshots/WANT/fs,upperdir=/U/fs,workdir=/U/work\n";
+        let host = "\
+2459 30 0:274 / /run/k3s/containerd/io.containerd.runtime.v2.task/k8s.io/OTHER/rootfs rw - overlay overlay rw,lowerdir=/var/lib/.../snapshots/SIBLING/fs,upperdir=/V/fs,workdir=/V/work\n\
+2460 30 0:274 / /run/k3s/containerd/io.containerd.runtime.v2.task/k8s.io/CID/rootfs rw - overlay overlay rw,lowerdir=/var/lib/.../snapshots/WANT/fs,upperdir=/U/fs,workdir=/U/work\n";
+        let p = find_rootfs_in_mountinfo(container, host).unwrap();
+        assert!(
+            p.to_str().unwrap().ends_with("k8s.io/CID/rootfs"),
+            "expected the CID rootfs (matching lowerdir), got {}",
+            p.display()
+        );
+    }
+
+    #[test]
+    fn find_rootfs_in_mountinfo_errors_when_no_host_mount_matches() {
+        let container = "\
+3039 2510 0:274 / / rw - overlay overlay rw,lowerdir=/L/fs\n";
+        let host = "\
+1 0 8:1 / / rw - ext4 /dev/sda1 rw\n";
+        assert!(find_rootfs_in_mountinfo(container, host).is_err());
+    }
+
+    #[test]
+    fn find_rootfs_in_mountinfo_does_not_match_host_root_fs() {
+        // st_dev matches but mount-point is "/" not the runtime rootfs
+        // path. The earlier version that canonicalised
+        // `/proc/<pid>/root` returned "/" and silently marked the host
+        // root fs; this assertion locks in that we won't regress.
+        let container = "\
+3039 2510 0:1 / / rw - overlay overlay rw,lowerdir=/L\n";
+        let host = "\
+1 0 0:1 / / rw - overlay overlay rw,lowerdir=/L\n";
+        assert!(find_rootfs_in_mountinfo(container, host).is_err());
+    }
+
+    #[test]
+    fn extract_lowerdir_pulls_value_out_of_super_options() {
+        let line = "2460 30 0:274 / /R rw - overlay overlay rw,lowerdir=/A/fs,upperdir=/B/fs,workdir=/C/fs,uuid=on";
+        assert_eq!(extract_lowerdir(line).as_deref(), Some("/A/fs"));
+    }
+
+    #[test]
+    fn extract_lowerdir_is_none_for_non_overlay() {
+        let line = "1 0 8:1 / / rw - ext4 /dev/sda1 rw";
+        assert!(extract_lowerdir(line).is_none());
     }
 }

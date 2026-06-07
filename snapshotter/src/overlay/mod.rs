@@ -231,7 +231,15 @@ impl OverlayEngine {
             }
             let stored = snap.image_ref.clone().filter(|s| is_image_ref_like(s));
             let from_containerd = if call_image_ref.is_none() && stored.is_none() {
-                bootstrap_digest_from_key(&snap.key).and_then(|d| self.containerd_lookup.lookup(d))
+                bootstrap_digest_from_key(&snap.key).and_then(|d| {
+                    // Refresh failures are non-fatal here: this is the
+                    // nydus-bootstrap lookup path, and we fall through to
+                    // the stored image_ref / labels below.
+                    self.containerd_lookup.lookup(d).unwrap_or_else(|e| {
+                        debug!(error = %e, "containerd-lookup refresh failed");
+                        None
+                    })
+                })
             } else {
                 None
             };

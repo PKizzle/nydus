@@ -15,7 +15,7 @@ use crate::metrics::SnapshotterMetrics;
 use crate::overlay::{NydusMetaInfo, OverlayEngine, PrepareOutcome};
 use crate::recon::Reconciler;
 use crate::store::{SnapshotInfo, SnapshotStore};
-use crate::sysctl::{SystemController, serve_unix as serve_sysctl_unix};
+use crate::sysctl::serve_unix as serve_sysctl_unix;
 use anyhow::{Context as _, Result};
 use containerd_snapshots::{self as snapshots, Info, Kind, Usage};
 use futures::Stream;
@@ -137,12 +137,16 @@ fn first_lowerdir(mounts: &[snapshots::api::types::Mount]) -> Option<PathBuf> {
 
 /// Extract the chainID digest from a snapshot parent string. containerd's
 /// proxy-plugin protocol prefixes the snapshot key with the namespace and an
-/// incrementing id (e.g. `k8s.io/18004/sha256:ead2…`), so the actual digest
-/// lives after the last `/`. Returns `None` when the suffix isn't a
-/// `sha256:`-prefixed digest (chain-rooted snapshots, untagged entries, etc.).
+/// incrementing id (e.g. `k8s.io/18004/sha256:ead2…64hex`), so the actual
+/// digest lives after the last `/`. Returns `None` when the suffix isn't a
+/// `sha256:<64-hex>` digest. The hex-length check (vs just the prefix)
+/// guards against a future containerd format change leaking a partial
+/// or non-hex suffix through to `ContainerdLookup`, which would then
+/// silently miss for every prepare on the node.
 fn parent_chain_digest(parent: &str) -> Option<&str> {
     let suffix = parent.rsplit('/').next().unwrap_or(parent);
-    suffix.starts_with("sha256:").then_some(suffix)
+    let hex = suffix.strip_prefix("sha256:")?;
+    (hex.len() == 64 && hex.chars().all(|c| c.is_ascii_hexdigit())).then_some(suffix)
 }
 
 /// and daemon supervisor.
@@ -387,9 +391,22 @@ impl snapshots::Snapshotter for NydusSnapshotter {
                         .cloned()
                         .or_else(|| {
                             let chain = parent_chain_digest(&parent)?;
-                            self.containerd_lookup
-                                .as_ref()
-                                .and_then(|cl| cl.lookup(chain))
+                            let lookup = self.containerd_lookup.as_ref()?;
+                            match lookup.lookup(chain) {
+                                Ok(opt) => opt,
+                                Err(e) => {
+                                    // Refresh failure (containerd
+                                    // unreachable, crictl json parse error,
+                                    // etc.) is loudly logged rather than
+                                    // silently collapsed into a miss — a
+                                    // missing image-ref disables auto-accel
+                                    // routing AND capture, and we'd
+                                    // otherwise have no signal that the
+                                    // lookup pipeline itself is broken.
+                                    warn!(chain, parent, error = %e, "containerd-lookup refresh failed; auto-accel disabled for this prepare");
+                                    None
+                                }
+                            }
                         });
 
                     // Auto-accel routing: if a sidecar artifact exists for
@@ -666,15 +683,16 @@ pub async fn serve_with_supervisor(
 
     if config.snapshotter.sysctl.enable {
         let sysctl_path = config.snapshotter.sysctl.address.clone();
-        let controller = SystemController::new_with_metrics_auto_zran_and_tracer(
+        let controller = crate::sysctl::SystemControllerBuilder::new(
             supervisor.clone(),
             store.clone(),
             cache_manager.clone(),
             cache_gc_policy.clone(),
-            metrics.clone(),
-            auto_zran.clone(),
-            Some(access_tracer.clone()),
-        );
+        )
+        .with_metrics(metrics.clone())
+        .with_auto_zran(auto_zran.clone())
+        .with_access_tracer(Some(access_tracer.clone()))
+        .build();
         compio::runtime::spawn(async move {
             if let Err(e) = serve_sysctl_unix(sysctl_path, controller).await {
                 warn!(error = %e, "system-controller API exited unexpectedly");
@@ -890,5 +908,49 @@ mod tests {
 
         // The detached server thread keeps serving; keep its root alive.
         std::mem::forget(dir);
+    }
+
+    /// `parent_chain_digest` is the linchpin of the Gap 1 fallback: it
+    /// parses containerd's `<namespace>/<id>/sha256:<64-hex>` proxy-plugin
+    /// key into a digest the lookup cache keys on. Loose validation here
+    /// would silently miss every prepare on a node when containerd's
+    /// format shifts.
+    #[test]
+    fn parent_chain_digest_accepts_well_formed_64_hex_digest() {
+        let parent = "k8s.io/18004/sha256:\
+ead2bc6bac86c94fd0bfe3dda6bd9c1dc39bf2bd2446f8048aee82f437584bb5";
+        assert_eq!(
+            parent_chain_digest(parent),
+            Some("sha256:ead2bc6bac86c94fd0bfe3dda6bd9c1dc39bf2bd2446f8048aee82f437584bb5")
+        );
+    }
+
+    #[test]
+    fn parent_chain_digest_rejects_non_hex_suffix() {
+        assert_eq!(
+            parent_chain_digest("k8s.io/18004/sha256:not-a-hex-digest"),
+            None
+        );
+    }
+
+    #[test]
+    fn parent_chain_digest_rejects_wrong_length_hex() {
+        // 63 hex chars instead of 64.
+        let parent = "k8s.io/18004/sha256:\
+ead2bc6bac86c94fd0bfe3dda6bd9c1dc39bf2bd2446f8048aee82f437584bb";
+        assert_eq!(parent_chain_digest(parent), None);
+    }
+
+    #[test]
+    fn parent_chain_digest_rejects_non_sha256_prefix() {
+        assert_eq!(parent_chain_digest("k8s.io/18004/md5:abc"), None);
+    }
+
+    #[test]
+    fn parent_chain_digest_handles_chain_root_snapshot() {
+        // Some prepare keys are bare ids (chain root, sandboxes) — no
+        // digest suffix at all. Return None so auto-accel cleanly skips
+        // this snapshot rather than passing a garbage key to the cache.
+        assert_eq!(parent_chain_digest("k8s.io/2/extract-12345-RC1f"), None);
     }
 }

@@ -18,10 +18,10 @@ use std::fmt::Write as _;
 use std::process::Command;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 /// Acquire a lock without panicking on poisoning. A previous panic while a
 /// lock was held would only have left the cache in a partially-populated
@@ -94,17 +94,22 @@ impl ContainerdLookup {
         Self::default()
     }
 
-    /// Look up the image ref for a given bootstrap layer digest. Uses an
-    /// in-memory cache; on miss, refreshes by walking containerd's image
-    /// store.
-    pub fn lookup(&self, bootstrap_digest: &str) -> Option<String> {
+    /// Look up the image ref for a given bootstrap layer / topmost chain
+    /// digest. Returns:
+    ///
+    /// - `Ok(Some(image_ref))` — hit.
+    /// - `Ok(None)` — refresh succeeded but no image references this digest
+    ///   (genuine miss).
+    /// - `Err(_)` — couldn't refresh (crictl unreachable, JSON unparsable,
+    ///   etc.). Distinguishing this from a miss lets callers log loudly
+    ///   when discovery is broken vs simply absent — previously we
+    ///   collapsed both into `None` and a registry flake silently disabled
+    ///   auto-accel cluster-wide.
+    pub fn lookup(&self, bootstrap_digest: &str) -> Result<Option<String>> {
         if let Some(r) = lock_cache(&self.cache).get(bootstrap_digest) {
-            return Some(r.clone());
+            return Ok(Some(r.clone()));
         }
-        if let Err(e) = self.refresh() {
-            warn!(error = %e, "containerd image-ref refresh failed");
-            return None;
-        }
+        self.refresh()?;
         let hit = lock_cache(&self.cache).get(bootstrap_digest).cloned();
         if hit.is_none() {
             info!(
@@ -112,7 +117,7 @@ impl ContainerdLookup {
                 "no containerd image found containing nydus bootstrap digest"
             );
         }
-        hit
+        Ok(hit)
     }
 
     fn refresh(&self) -> Result<()> {
@@ -202,7 +207,13 @@ impl ContainerdLookup {
         let Some(cfg_desc) = manifest.config.as_ref() else {
             return Ok(());
         };
-        let cfg_bytes = match run_first_ok(&[
+        // Config fetch + parse failure used to silently `return Ok(())`,
+        // which on a refresh sweep skipped the affected image without ever
+        // notifying the caller and (worse) baked the missing entry into
+        // the cache's "first writer wins" via `or_insert`. Now we bubble
+        // up — `refresh()` can decide whether to keep the partial map or
+        // bail; the chain insert at the producer side is the same.
+        let cfg_bytes = run_first_ok(&[
             &["ctr", "-n", "k8s.io", "content", "get", &cfg_desc.digest],
             &[
                 "k3s",
@@ -213,41 +224,49 @@ impl ContainerdLookup {
                 "get",
                 &cfg_desc.digest,
             ],
-        ]) {
-            Ok(b) => b,
-            Err(e) => {
-                debug!(image = %image_ref, error = %e, "image config fetch failed");
-                return Ok(());
-            }
-        };
-        let cfg: OciImageConfig = match serde_json::from_slice(&cfg_bytes) {
-            Ok(c) => c,
-            Err(e) => {
-                debug!(image = %image_ref, error = %e, "image config parse failed");
-                return Ok(());
-            }
-        };
-        let chain_ids = chain_ids(&cfg.rootfs.diff_ids);
-        if let Some(top) = chain_ids.last() {
-            debug!(
-                chain_id = %top,
-                image = %image_ref,
-                "registered topmost chainID for image"
-            );
-            out.insert(top.clone(), image_ref.to_string());
-        }
-        for &i in &bootstrap_indices {
-            if let Some(chain_id) = chain_ids.get(i) {
-                debug!(
-                    chain_id = %chain_id,
-                    image = %image_ref,
-                    layer_index = i,
-                    "registered chainID for bootstrap layer"
-                );
-                out.insert(chain_id.clone(), image_ref.to_string());
-            }
-        }
+        ])
+        .with_context(|| format!("fetch image config for {image_ref}"))?;
+        let cfg: OciImageConfig = serde_json::from_slice(&cfg_bytes)
+            .with_context(|| format!("parse image config for {image_ref}"))?;
+        register_chain_ids(image_ref, &cfg.rootfs.diff_ids, &bootstrap_indices, out);
         Ok(())
+    }
+}
+
+/// Pure registration step factored out of `walk_manifest` so unit tests
+/// can pin the chainID rules (topmost-for-any-image, bootstrap-layer-for-
+/// nydus) without shelling out to ctr/crictl.
+fn register_chain_ids(
+    image_ref: &str,
+    diff_ids: &[String],
+    bootstrap_indices: &[usize],
+    out: &mut HashMap<String, String>,
+) {
+    let chain_ids = chain_ids(diff_ids);
+    // Topmost chain_id makes auto-accel lookup work for STANDARD OCI
+    // images on the prepare path — without this entry the chainID-to-
+    // image-ref fallback in grpc::prepare misses every Run-of-nginx and
+    // both capture and discovery are dead. The 9bffd0f1 commit added
+    // this; the test below pins that the cache entry exists for an image
+    // with no bootstrap-annotated layer.
+    if let Some(top) = chain_ids.last() {
+        debug!(
+            chain_id = %top,
+            image = %image_ref,
+            "registered topmost chainID for image"
+        );
+        out.insert(top.clone(), image_ref.to_string());
+    }
+    for &i in bootstrap_indices {
+        if let Some(chain_id) = chain_ids.get(i) {
+            debug!(
+                chain_id = %chain_id,
+                image = %image_ref,
+                layer_index = i,
+                "registered chainID for bootstrap layer"
+            );
+            out.insert(chain_id.clone(), image_ref.to_string());
+        }
     }
 }
 
@@ -524,5 +543,66 @@ mod tests {
         // `crictl`/`ctr` binary is available, but it must succeed in
         // reaching the get-on-cache path despite the poisoned mutex.
         let _ = lookup.lookup("sha256:does-not-exist");
+    }
+
+    /// Standard OCI images (no nydus-bootstrap annotated layer) MUST
+    /// still register their topmost chainID against the image-ref —
+    /// otherwise the prepare path can't resolve `image_ref` from the
+    /// snapshot's parent chain when containerd's CRI plugin omits the
+    /// `cri.image-ref` label (which it does on every container rootfs
+    /// prepare in 2.x). Commit 9bffd0f1 added the unconditional topmost
+    /// registration; this test pins that behaviour so a future refactor
+    /// can't quietly drop it.
+    #[test]
+    fn register_chain_ids_writes_topmost_for_standard_oci_image() {
+        let mut out = HashMap::new();
+        let diff_ids = vec![
+            "sha256:8eac19f9e87977480de84b7569cbd6801c42129116a797685e10bb5b054f99a7".to_string(),
+            "sha256:800fc873f06d73e99c37b6f1b37a12029cad46f0ef7206ed2c384ccb0a76ae90".to_string(),
+        ];
+        // No bootstrap layers — standard OCI (nginx, postgres, etc.).
+        register_chain_ids("docker.io/library/nginx", &diff_ids, &[], &mut out);
+        let chain_ids = chain_ids(&diff_ids);
+        let topmost = chain_ids.last().unwrap();
+        assert_eq!(
+            out.get(topmost).map(String::as_str),
+            Some("docker.io/library/nginx"),
+            "topmost chainID must map to image ref even when image has NO nydus-bootstrap layer"
+        );
+    }
+
+    #[test]
+    fn register_chain_ids_writes_bootstrap_layer_entries_when_present() {
+        let mut out = HashMap::new();
+        let diff_ids = vec![
+            "sha256:layer-a".to_string(),
+            "sha256:layer-b".to_string(),
+            "sha256:layer-c-nydus-bootstrap".to_string(),
+        ];
+        // Layer index 2 carries the nydus-bootstrap annotation.
+        register_chain_ids("registry.local/img:nydus", &diff_ids, &[2], &mut out);
+        let chain_ids = chain_ids(&diff_ids);
+        let topmost = chain_ids.last().unwrap();
+        let bootstrap = chain_ids.get(2).unwrap();
+        // The bootstrap layer IS the topmost in this example, so the
+        // entry is registered once; the assertions verify the value is
+        // the correct image ref via both code paths.
+        assert_eq!(
+            out.get(topmost).map(String::as_str),
+            Some("registry.local/img:nydus")
+        );
+        assert_eq!(
+            out.get(bootstrap).map(String::as_str),
+            Some("registry.local/img:nydus")
+        );
+    }
+
+    #[test]
+    fn register_chain_ids_skips_empty_diff_id_list() {
+        // Edge: corrupt or missing image config => empty diff_ids. Don't
+        // register a phantom entry.
+        let mut out = HashMap::new();
+        register_chain_ids("docker.io/library/nginx", &[], &[], &mut out);
+        assert!(out.is_empty());
     }
 }

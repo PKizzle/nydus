@@ -58,7 +58,8 @@ impl SidecarLocator {
         }
     }
 
-    /// Find an auto-accel manifest for `manifest_digest`. Tries in order:
+    /// Resolve an auto-accel manifest for `manifest_digest`, pulling it
+    /// from a peer via spegel when not already local. Tries in order:
     ///
     /// 1. Local `images.Get(synthetic-ref)` — hit on the producer node and
     ///    on any peer that already pulled this sidecar.
@@ -68,13 +69,20 @@ impl SidecarLocator {
     ///    libp2p; if a peer has the image record advertised, the OCI
     ///    manifest + its config + every layer (bootstrap, zran indexes,
     ///    prefetch blob) flow through the mirror in one transfer. After
-    ///    success we retry `images.Get`.
+    ///    success we retry `images.Get`. A categorised pull failure
+    ///    distinguishes "no peer has it" (clean miss) from "mirror /
+    ///    registry is broken" (warn + still fall through, but operator
+    ///    sees the signal).
     /// 3. Label-filter scan on the content store — covers legacy artifacts
     ///    uploaded before the image-record registration landed.
     ///
     /// Returns `Ok(None)` when nothing matches — the caller falls back to
-    /// overlay.
-    pub async fn find(&self, manifest_digest: &str) -> Result<Option<AutoAccelManifest>> {
+    /// overlay. Named for the actual behaviour (not just a read-only
+    /// "find") so callers see the mutation.
+    pub async fn resolve_or_pull(
+        &self,
+        manifest_digest: &str,
+    ) -> Result<Option<AutoAccelManifest>> {
         let image_name = crate::auto_zran::auto_accel_image_name(manifest_digest);
 
         let mut resolved = self
@@ -91,7 +99,7 @@ impl SidecarLocator {
             // peer. If a peer advertises the image record, this brings
             // everything down in one shot.
             match ctr_image_pull(&image_name).await {
-                Ok(true) => {
+                PullOutcome::Ok => {
                     info!(image_name = %image_name, "auto-accel pulled via spegel mirror");
                     resolved = self
                         .content_store
@@ -102,11 +110,22 @@ impl SidecarLocator {
                             None
                         });
                 }
-                Ok(false) => {
+                PullOutcome::NotFound => {
                     debug!(image_name = %image_name, "no peer advertised this sidecar; falling back to label scan");
                 }
-                Err(e) => {
-                    debug!(image_name = %image_name, error = %e, "ctr image pull errored unexpectedly");
+                PullOutcome::RegistryError { stderr, exit_code } => {
+                    // Real configuration failure — surface loudly. Without
+                    // this every pod on a misconfigured-spegel node would
+                    // silently degrade to overlay forever.
+                    warn!(
+                        image_name = %image_name,
+                        exit_code,
+                        stderr = %stderr,
+                        "auto-accel pull failed: registry/mirror error (spegel mTLS, auth, daemon down?). Cross-node discovery disabled until fixed."
+                    );
+                }
+                PullOutcome::NoBinary => {
+                    warn!(image_name = %image_name, "auto-accel pull skipped: neither `ctr` nor `k3s ctr` runnable");
                 }
             }
         }
@@ -275,18 +294,40 @@ fn strip_sha256(digest: &str) -> &str {
     digest.strip_prefix("sha256:").unwrap_or(digest)
 }
 
+/// Categorised outcome of a containerd image-pull attempt for the
+/// synthetic auto-accel ref. Discovery treats `NotFound` as a clean miss
+/// (no peer advertised this sidecar — fall back to overlay) but logs
+/// `RegistryError` at `warn!` so a broken spegel mirror or stale mTLS
+/// doesn't silently disable every auto-accel mount cluster-wide.
+#[derive(Debug, Clone, Eq, PartialEq)]
+enum PullOutcome {
+    /// Pull committed; the manifest is now in the local content store.
+    Ok,
+    /// Resolver returned a 404 / NotFound — no peer advertises this ref.
+    /// Expected on first-pod scheduling before any node has converted.
+    NotFound,
+    /// `ctr` ran and failed with something OTHER than NotFound. Examples:
+    /// 401/403 (spegel auth misconfigured), DNS lookup error not at the
+    /// "synthetic host doesn't resolve" tail of the chain, daemon-not-
+    /// running, flag-parse skew on a version mismatch. Captured for
+    /// triage.
+    RegistryError { stderr: String, exit_code: i32 },
+    /// Couldn't spawn any candidate binary at all.
+    NoBinary,
+}
+
 /// Attempt a containerd image pull for the synthetic auto-accel ref. We
 /// shell out to `ctr` (rather than wire up the containerd Transfer service
-/// in tonic) because pull is one-shot work, error-tolerant, and behind a
-/// best-effort fallback: a failure just means "no peer advertised this
-/// sidecar", and the caller silently falls through to overlay. Returns
-/// `Ok(true)` when the pull committed something, `Ok(false)` when ctr
-/// returned a non-zero exit (typical 404 from spegel + no upstream
-/// fallback), `Err(...)` only when we couldn't run the command at all.
-async fn ctr_image_pull(image_name: &str) -> Result<bool> {
+/// in tonic) because pull is one-shot work and behind a best-effort
+/// fallback. Categorising the failure mode (vs collapsing every error
+/// into `Ok(false)` as the earlier version did) lets discovery log loudly
+/// when the mirror itself is broken — previously a node with broken
+/// spegel mTLS would have every auto-accel mount silently degrade to
+/// overlay forever with no signal.
+async fn ctr_image_pull(image_name: &str) -> PullOutcome {
     let image_name = image_name.to_string();
     blocking::unblock(move || {
-        // Try `ctr` first, then `k3s ctr` for k3s nodes where ctr isn't on PATH.
+        let mut last_failure: Option<PullOutcome> = None;
         for argv in &[
             vec![
                 "ctr",
@@ -320,22 +361,44 @@ async fn ctr_image_pull(image_name: &str) -> Result<bool> {
                 }
             };
             if output.status.success() {
-                return Ok(true);
+                return PullOutcome::Ok;
             }
-            // Non-zero status from a binary that DID run. Most common reason:
-            // no peer + no real registry behind the synthetic hostname →
-            // resolver returns 404. Surface stderr at debug for triage.
-            debug!(
-                argv = ?argv,
-                exit = output.status.code().unwrap_or(-1),
-                stderr = %String::from_utf8_lossy(&output.stderr),
-                "ctr image pull returned non-zero"
-            );
-            return Ok(false);
+            let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+            let exit_code = output.status.code().unwrap_or(-1);
+            last_failure = Some(classify_pull_failure(&stderr, exit_code));
+            // Same binary version of containerd answers both `ctr` and
+            // `k3s ctr` — if the first ran and gave a categorised failure
+            // the second will too. Only spawn-failure (the `continue`
+            // above) tries the next candidate.
+            return last_failure.unwrap();
         }
-        anyhow::bail!("neither `ctr` nor `k3s ctr` was runnable for image pull")
+        last_failure.unwrap_or(PullOutcome::NoBinary)
     })
     .await
+}
+
+/// Map `ctr image pull` stderr + exit code to a `PullOutcome`. Pulled out
+/// of `ctr_image_pull` so unit tests can pin the categorisation without
+/// spawning a process.
+fn classify_pull_failure(stderr: &str, exit_code: i32) -> PullOutcome {
+    let lower = stderr.to_ascii_lowercase();
+    // Spegel + missing real registry produces the literal "not found"
+    // from the resolver. `dial tcp: lookup …: no such host` is also the
+    // miss path — the synthetic `.local` hostname doesn't resolve and
+    // the mirror chain had no peer answer either, so reaching the host
+    // lookup means resolve already 404'd.
+    let is_not_found = lower.contains("not found")
+        || lower.contains("no such host")
+        || lower.contains("manifest unknown")
+        || lower.contains("404");
+    if is_not_found {
+        PullOutcome::NotFound
+    } else {
+        PullOutcome::RegistryError {
+            stderr: stderr.to_string(),
+            exit_code,
+        }
+    }
 }
 
 /// Per-manifest slug for staging dirs. Uses the bare hex (no `sha256:`
@@ -362,10 +425,10 @@ impl AutoAccelDiscovery {
         }
     }
 
-    /// One-shot helper: find + stage in one call. Returns `Ok(None)` if no
-    /// sidecar exists; the caller falls back to overlay.
+    /// One-shot helper: resolve-or-pull + stage in one call. Returns
+    /// `Ok(None)` if no sidecar exists; the caller falls back to overlay.
     pub async fn resolve(&self, manifest_digest: &str) -> Result<Option<StagedSidecar>> {
-        let Some(manifest) = self.locator.find(manifest_digest).await? else {
+        let Some(manifest) = self.locator.resolve_or_pull(manifest_digest).await? else {
             return Ok(None);
         };
         let staged = self.locator.stage(manifest_digest, &manifest).await?;
@@ -416,5 +479,56 @@ mod tests {
             "abcdef1234567890"
         );
         assert_eq!(slug_for_digest("abc"), "abc");
+    }
+
+    /// `classify_pull_failure` is the critical bit of `ctr_image_pull`:
+    /// it decides whether a non-zero exit is a clean "no peer has it"
+    /// miss (silent fallback to overlay) or a real "mirror is broken"
+    /// signal that needs operator attention. Pre-fix the categorisation
+    /// was missing and a busted spegel mTLS would have silently
+    /// disabled every auto-accel mount on the node.
+    #[test]
+    fn classify_pull_failure_treats_404_as_not_found() {
+        assert_eq!(
+            classify_pull_failure("ctr: failed to resolve image: manifest unknown", 1),
+            PullOutcome::NotFound
+        );
+    }
+
+    #[test]
+    fn classify_pull_failure_treats_dns_lookup_as_not_found() {
+        // Synthetic host `nydus.auto-accel.local` deliberately doesn't
+        // resolve — when spegel finds no peer the fallback fails DNS,
+        // which is a clean miss not a real error.
+        let stderr = "ctr: failed to do request: Head \"https://nydus.auto-accel.local/v2/sidecar/manifests/X\": dial tcp: lookup nydus.auto-accel.local: no such host";
+        assert_eq!(classify_pull_failure(stderr, 1), PullOutcome::NotFound);
+    }
+
+    #[test]
+    fn classify_pull_failure_treats_404_status_word_as_not_found() {
+        assert_eq!(
+            classify_pull_failure("HTTP 404 Not Found", 1),
+            PullOutcome::NotFound
+        );
+    }
+
+    #[test]
+    fn classify_pull_failure_flags_auth_as_registry_error() {
+        // 401/403 / "unauthorized" / spegel mTLS misconfig — operator
+        // needs the signal. NOT a silent fallback.
+        let stderr = "ctr: failed to resolve image: failed to fetch manifest: 401 Unauthorized";
+        match classify_pull_failure(stderr, 1) {
+            PullOutcome::RegistryError { exit_code, .. } => assert_eq!(exit_code, 1),
+            other => panic!("expected RegistryError for auth failure, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_pull_failure_flags_daemon_down_as_registry_error() {
+        let stderr = "ctr: failed to dial: connection refused";
+        match classify_pull_failure(stderr, 1) {
+            PullOutcome::RegistryError { .. } => {}
+            other => panic!("expected RegistryError for daemon-down, got {other:?}"),
+        }
     }
 }

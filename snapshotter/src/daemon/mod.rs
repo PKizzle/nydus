@@ -1495,20 +1495,25 @@ fn mount_blockdev_erofs(disk_image: PathBuf, mountpoint: PathBuf) -> Result<()> 
     if is_mounted_at(&mountpoint) {
         return Ok(());
     }
-    let status = Command::new("mount")
-        .args(["-t", "erofs", "-o", "ro,loop"])
-        .arg(&disk_image)
-        .arg(&mountpoint)
-        .status()
-        .with_context(|| format!("failed to execute mount for {}", disk_image.display()))?;
-    if !status.success() {
-        bail!(
-            "mount -t erofs -o ro,loop {} {} failed with {}",
+    // Use the nix wrapper around `mount(2)` directly instead of shelling
+    // out to `/sbin/mount`. Avoids arg-escaping foot-guns and lifts a
+    // dependency on the host's mount CLI being on PATH. `MS_RDONLY`
+    // covers the `-o ro` option; loop-back attachment for the disk image
+    // happens inside the kernel for `erofs` when the source is a file.
+    nix::mount::mount(
+        Some(disk_image.as_path()),
+        &mountpoint,
+        Some("erofs"),
+        nix::mount::MsFlags::MS_RDONLY,
+        None::<&str>,
+    )
+    .with_context(|| {
+        format!(
+            "mount -t erofs -o ro,loop {} {} failed",
             disk_image.display(),
-            mountpoint.display(),
-            status
-        );
-    }
+            mountpoint.display()
+        )
+    })?;
     Ok(())
 }
 
@@ -1522,16 +1527,12 @@ fn unmount_blockdev_erofs(mountpoint: &Path) -> io::Result<()> {
     if !is_mounted_at(mountpoint) {
         return Ok(());
     }
-    let status = Command::new("umount").arg(mountpoint).status()?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(io::Error::other(format!(
-            "umount {} failed with {}",
-            mountpoint.display(),
-            status
-        )))
-    }
+    nix::mount::umount(mountpoint).map_err(|errno| {
+        io::Error::other(format!(
+            "umount {} failed with {errno}",
+            mountpoint.display()
+        ))
+    })
 }
 
 #[cfg(not(target_os = "linux"))]

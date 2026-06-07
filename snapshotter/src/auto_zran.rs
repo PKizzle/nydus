@@ -63,44 +63,16 @@ pub struct AutoAccelLayerDescriptor {
     pub size: u64,
 }
 
-/// Minimal OCI image manifest schema. We wrap `AutoAccelManifest` as the
-/// `config` blob and list the bootstrap + zran indexes + optional prefetch
-/// blob as `layers[]`. The point of this wrapping is purely to make
-/// `ctr image pull <synthetic-ref>` work: containerd recognises this as an
-/// OCI image manifest and walks `config` + `layers[]`, pulling each blob via
-/// the configured registries.yaml mirror (and so through k3s's embedded
-/// spegel) in one shot. The on-the-wire content stays standard OCI; only
-/// the media types signal "this is a nydus auto-accel sidecar, not a
-/// runnable container image".
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct OciImageManifest {
-    pub schema_version: u32,
-    #[serde(rename = "mediaType")]
-    pub media_type: String,
-    pub config: OciDescriptor,
-    pub layers: Vec<OciDescriptor>,
-    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
-    pub annotations: HashMap<String, String>,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct OciDescriptor {
-    #[serde(rename = "mediaType")]
-    pub media_type: String,
-    pub digest: String,
-    pub size: u64,
-    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
-    pub annotations: HashMap<String, String>,
-}
-
-pub const OCI_MANIFEST_MEDIATYPE: &str = "application/vnd.oci.image.manifest.v1+json";
-pub const AUTO_ACCEL_CONFIG_MEDIATYPE: &str = "application/vnd.nydus.auto-accel.config.v1+json";
-pub const AUTO_ACCEL_BOOTSTRAP_MEDIATYPE: &str = "application/vnd.nydus.auto-accel.bootstrap.v1";
-pub const AUTO_ACCEL_INDEX_MEDIATYPE: &str = "application/vnd.nydus.auto-accel.zran-index.v1";
-pub const AUTO_ACCEL_PREFETCH_MEDIATYPE: &str = "application/vnd.nydus.auto-accel.prefetch-blob.v1";
-pub const AUTO_ACCEL_SUBJECT_ANNOTATION: &str = "containerd.io/snapshot/nydus.auto-accel.subject";
-pub const AUTO_ACCEL_LAYER_DIGEST_ANNOTATION: &str =
-    "containerd.io/snapshot/nydus.auto-accel.layer-digest";
+// OCI image-manifest types + assembly helper now live in
+// `crate::auto_accel_oci`. The producer and consumer share that module
+// for a single wire-schema definition. Re-export the constants the
+// producer below references so the rest of this file stays terse.
+pub use crate::auto_accel_oci::{
+    AUTO_ACCEL_BOOTSTRAP_MEDIATYPE, AUTO_ACCEL_CONFIG_MEDIATYPE, AUTO_ACCEL_INDEX_MEDIATYPE,
+    AUTO_ACCEL_LAYER_DIGEST_ANNOTATION, AUTO_ACCEL_PREFETCH_MEDIATYPE,
+    AUTO_ACCEL_SUBJECT_ANNOTATION, OCI_MANIFEST_MEDIATYPE, OciDescriptor, OciImageManifest,
+    OciManifestInputs, build_oci_manifest,
+};
 
 /// Dependencies that the conversion worker needs in addition to the static
 /// `AutoZranConfig`. Bundled so the manager's `start()` signature stays
@@ -376,23 +348,50 @@ async fn run_conversion(
         "auto-zran starting conversion"
     );
 
-    // (2) Skip if already done.
-    let auto_accel_ref = auto_accel_manifest_ref(&manifest_digest);
-    if let Some(existing) = deps
-        .content_store
-        .info(&auto_accel_ref)
-        .await
-        .ok()
-        .flatten()
-    {
-        info!(
-            image = %job.image,
-            ref = %auto_accel_ref,
-            digest = %existing.digest,
-            "auto-accel sidecar already present; skipping conversion"
-        );
-        deps.access_tracer.mark_image_accelerated(&job.image);
-        return Ok(());
+    // (2) Skip if already done — AND every referenced blob is still
+    // present. The old version checked `info(auto_accel_manifest_ref)`,
+    // but `info()` takes a digest not a ref, so the call always
+    // returned NotFound and the skip path was dead code (every run
+    // re-converted). The new check uses `images_get(synthetic_ref)` and
+    // round-trips each referenced descriptor through `info()` so we
+    // detect half-uploaded sidecars (snapshotter killed mid-write, GC
+    // raced) rather than mark-accelerated-then-fail-to-mount.
+    let image_name = auto_accel_image_name(&manifest_digest);
+    match deps.content_store.images_get(&image_name).await {
+        Ok(Some(existing)) => match completeness_check(deps, &existing.digest).await {
+            Ok(true) => {
+                info!(
+                    image = %job.image,
+                    image_name = %image_name,
+                    manifest_digest = %existing.digest,
+                    "auto-accel sidecar already present and complete; skipping conversion"
+                );
+                deps.access_tracer.mark_image_accelerated(&job.image);
+                return Ok(());
+            }
+            Ok(false) => {
+                warn!(
+                    image = %job.image,
+                    image_name = %image_name,
+                    "auto-accel sidecar is present but some referenced blobs are missing; re-converting"
+                );
+            }
+            Err(e) => {
+                warn!(
+                    image = %job.image,
+                    error = ?e,
+                    "auto-accel sidecar completeness check failed; re-converting to be safe"
+                );
+            }
+        },
+        Ok(None) => { /* no record yet — proceed with conversion */ }
+        Err(e) => {
+            warn!(
+                image = %job.image,
+                error = ?e,
+                "auto-accel images.Get failed; proceeding with conversion"
+            );
+        }
     }
 
     // (3) Convert on a blocking thread.
@@ -501,62 +500,35 @@ async fn run_conversion(
         prefetch_blob: prefetch_descriptor.clone(),
     };
     let config_bytes = serde_json::to_vec(&manifest).context("serialize auto-accel config")?;
+    // The ingest-time ref is just a label for the streaming Write; after
+    // commit the blob is addressed by its content digest. Use a
+    // distinguishable string so half-uploaded sidecars are debuggable
+    // (`ctr -n k8s.io content ls` shows the ingest ref).
+    let config_ingest_ref = format!("nydus-auto-accel-config:v1:{manifest_digest}");
     let config_digest = deps
         .content_store
-        .write_bytes(&config_bytes, &auto_accel_ref, base_labels("config"))
+        .write_bytes(&config_bytes, &config_ingest_ref, base_labels("config"))
         .await
         .context("upload auto-accel config")?;
 
-    // (5a) Build the OCI image manifest that wraps the config + all data
-    // blobs as `layers[]`. This is what makes `ctr image pull <synthetic-ref>`
-    // bring down everything in one go on peer nodes: containerd treats it
-    // as a regular OCI image and walks `config` + `layers[]`, fetching
-    // each blob via the registries.yaml mirror (spegel) by digest.
-    let mut layers: Vec<OciDescriptor> = Vec::with_capacity(1 + zran_descriptors.len() + 1);
-    layers.push(OciDescriptor {
-        media_type: AUTO_ACCEL_BOOTSTRAP_MEDIATYPE.to_string(),
+    // (5a) Wrap the config + data blobs as a real OCI image manifest so
+    // `ctr image pull <synthetic-ref>` pulls everything in one go via the
+    // registries.yaml mirror chain (spegel). The assembly is in
+    // `auto_accel_oci::build_oci_manifest` so the consumer parses the
+    // exact same wire schema and the unit tests cover this code path
+    // without an in-flight conversion.
+    let bootstrap_descriptor = AutoAccelDescriptor {
         digest: bootstrap_digest.clone(),
         size: bootstrap_meta.len(),
-        annotations: HashMap::new(),
-    });
-    for index in &zran_descriptors {
-        let mut anns = HashMap::new();
-        anns.insert(
-            AUTO_ACCEL_LAYER_DIGEST_ANNOTATION.to_string(),
-            index.layer_digest.clone(),
-        );
-        layers.push(OciDescriptor {
-            media_type: AUTO_ACCEL_INDEX_MEDIATYPE.to_string(),
-            digest: index.digest.clone(),
-            size: index.size,
-            annotations: anns,
-        });
-    }
-    if let Some(pf) = &prefetch_descriptor {
-        layers.push(OciDescriptor {
-            media_type: AUTO_ACCEL_PREFETCH_MEDIATYPE.to_string(),
-            digest: pf.digest.clone(),
-            size: pf.size,
-            annotations: HashMap::new(),
-        });
-    }
-    let mut manifest_annotations = HashMap::new();
-    manifest_annotations.insert(
-        AUTO_ACCEL_SUBJECT_ANNOTATION.to_string(),
-        manifest_digest.clone(),
-    );
-    let oci_manifest = OciImageManifest {
-        schema_version: 2,
-        media_type: OCI_MANIFEST_MEDIATYPE.to_string(),
-        config: OciDescriptor {
-            media_type: AUTO_ACCEL_CONFIG_MEDIATYPE.to_string(),
-            digest: config_digest.clone(),
-            size: config_bytes.len() as u64,
-            annotations: HashMap::new(),
-        },
-        layers,
-        annotations: manifest_annotations,
     };
+    let oci_manifest = build_oci_manifest(&OciManifestInputs {
+        subject_manifest_digest: &manifest_digest,
+        config_digest: &config_digest,
+        config_size: config_bytes.len() as u64,
+        bootstrap: &bootstrap_descriptor,
+        zran_indexes: &zran_descriptors,
+        prefetch_blob: prefetch_descriptor.as_ref(),
+    });
     let manifest_bytes =
         serde_json::to_vec(&oci_manifest).context("serialize auto-accel oci manifest")?;
     let manifest_oci_ref = format!("nydus-auto-accel-oci:v1:{manifest_digest}");
@@ -573,13 +545,12 @@ async fn run_conversion(
     // registry-mirror path in one transfer. Without an Image record the
     // manifest blob sits in the content store but spegel has no name to
     // publish.
-    let image_name = auto_accel_image_name(&manifest_digest);
     let mut image_labels = base_labels("manifest");
     image_labels.insert(
         "containerd.io/snapshot/nydus.auto-accel.subject-image".to_string(),
         job.image.clone(),
     );
-    if let Err(e) = deps
+    let image_record_ok = match deps
         .content_store
         .images_create(
             &image_name,
@@ -590,27 +561,37 @@ async fn run_conversion(
         )
         .await
     {
-        // Non-fatal: the blobs are committed, GC anchored by content-subject
-        // labels, and local discovery still works via label scan. We just
-        // lose cross-node spegel advertisement for this artifact.
-        warn!(
-            image = %job.image,
-            image_name = %image_name,
-            error = ?e,
-            "auto-zran image-record registration failed (cross-node spegel mirror disabled for this manifest)"
-        );
-    }
+        Ok(_) => true,
+        Err(e) => {
+            warn!(
+                image = %job.image,
+                image_name = %image_name,
+                error = ?e,
+                "auto-zran image-record registration failed (cross-node spegel mirror disabled for this manifest)"
+            );
+            false
+        }
+    };
 
     info!(
         image = %job.image,
         subject = %manifest_digest,
         auto_accel_manifest = %manifest_digest_in_store,
         image_name = %image_name,
+        image_record = image_record_ok,
         "auto-zran conversion complete"
     );
 
-    // (6) Tell the tracer to stop capturing + clean up scratch.
-    deps.access_tracer.mark_image_accelerated(&job.image);
+    // (6) Tell the tracer to stop capturing + clean up scratch — but
+    // ONLY if the cross-node advertisement is also wired. With
+    // image_record_ok=false this node would serve the next pod locally
+    // via label scan, but peers can never discover it; marking the image
+    // accelerated would also stop us from re-attempting the
+    // image-record creation on subsequent capture cycles. Keep capture
+    // alive so the next conversion retries the registration.
+    if image_record_ok {
+        deps.access_tracer.mark_image_accelerated(&job.image);
+    }
     if let Err(e) = std::fs::remove_dir_all(&work_dir) {
         warn!(
             error = %e,
@@ -627,14 +608,54 @@ fn job_work_dir(config: &AutoZranConfig, image: &str) -> std::path::PathBuf {
     config.work_dir.join(job_key(image))
 }
 
-/// Deterministic content-store ref for the auto-accel manifest of a given
-/// original-image manifest digest. The ref is the ingest-time identifier
-/// (not a permanent address); after commit the manifest is addressed by its
-/// own content digest. Discovery still works via the
-/// `gc.ref.content.subject` + `nydus.auto-accel.role=manifest` labels — see
-/// `auto_accel_sidecar::SidecarLocator::find`.
-pub fn auto_accel_manifest_ref(subject_manifest_digest: &str) -> String {
-    format!("nydus-auto-accel:v1:{subject_manifest_digest}")
+/// Verify every descriptor referenced by an OCI sidecar manifest is still
+/// in the local content store. Used by the early-skip path in
+/// `run_conversion`: a pre-existing Image record is only safe to skip on
+/// if `config` + every `layer` blob still exists locally. Otherwise the
+/// next pod's discovery will succeed at the manifest level but fail
+/// during backend staging (`ensure_present` in auto_accel_sidecar.rs)
+/// and degrade to overlay — silently if our log filter happens to miss
+/// it. Catches: snapshotter killed mid-upload, containerd GC race after
+/// a label-stripping bug, manual `ctr content rm` poking.
+async fn completeness_check(deps: &ConversionDeps, manifest_digest: &str) -> Result<bool> {
+    let manifest_bytes = match deps.content_store.fetch_bytes(manifest_digest).await {
+        Ok(b) => b,
+        Err(e) => {
+            return Err(anyhow::anyhow!(
+                "completeness fetch_bytes({manifest_digest}): {e}"
+            ));
+        }
+    };
+    let oci: serde_json::Value = serde_json::from_slice(&manifest_bytes)
+        .with_context(|| format!("parse OCI manifest {manifest_digest}"))?;
+    let mut descriptors: Vec<String> = Vec::new();
+    if let Some(config) = oci
+        .get("config")
+        .and_then(|c| c.get("digest"))
+        .and_then(|d| d.as_str())
+    {
+        descriptors.push(config.to_string());
+    } else {
+        return Ok(false);
+    }
+    if let Some(layers) = oci.get("layers").and_then(|l| l.as_array()) {
+        for layer in layers {
+            if let Some(digest) = layer.get("digest").and_then(|d| d.as_str()) {
+                descriptors.push(digest.to_string());
+            } else {
+                return Ok(false);
+            }
+        }
+    } else {
+        return Ok(false);
+    }
+    for digest in descriptors {
+        if deps.content_store.info(&digest).await?.is_none() {
+            debug!(missing = %digest, "auto-accel completeness check: blob missing");
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 /// Synthetic registry-shaped image name we register the auto-accel manifest

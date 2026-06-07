@@ -57,7 +57,13 @@ struct OptimizerPluginService {
 
 impl NriTtrpcConfig {
     pub fn optimizer_events(&self) -> i32 {
-        event_mask(&[EVENT_START_CONTAINER])
+        // Subscribe to both. StartContainer triggers the rootfs FAN_MARK_MOUNT
+        // + settle_max baseline reset; StopContainer force-flushes the
+        // captured profile immediately so short-lived containers don't wait
+        // out the idle timer. NRI delivers only subscribed events, so
+        // forgetting either side here silently disables the corresponding
+        // handler — easy to miss because `handle_*` still exists.
+        event_mask(&[EVENT_START_CONTAINER, EVENT_STOP_CONTAINER])
     }
 }
 
@@ -716,7 +722,11 @@ mod tests {
     }
 
     #[test]
-    fn optimizer_events_includes_only_start_container() {
+    fn optimizer_events_includes_start_and_stop_container() {
+        // NRI delivers only subscribed events; the optimizer plugin's
+        // StopContainer handler is dead code unless EVENT_STOP_CONTAINER is
+        // in the mask. Forgetting the stop bit silently disables the
+        // "short-lived containers ship immediately" guarantee.
         let config = NriTtrpcConfig {
             listen_socket: PathBuf::from("/tmp/x.sock"),
             runtime_socket: None,
@@ -724,7 +734,9 @@ mod tests {
             plugin_name: "n".to_string(),
             plugin_idx: "1".to_string(),
         };
-        assert_eq!(config.optimizer_events(), 1_i32 << EVENT_START_CONTAINER);
+        let mask = config.optimizer_events();
+        assert_ne!(mask & (1_i32 << EVENT_START_CONTAINER), 0);
+        assert_ne!(mask & (1_i32 << EVENT_STOP_CONTAINER), 0);
     }
 
     #[test]
