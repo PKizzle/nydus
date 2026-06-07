@@ -168,6 +168,20 @@ fuse-backend-rs = "0.14.0"
 # Upstream issue to be filed against compio-rs/compio.
 compio-executor = { path = "third_party/compio-executor" }
 
+# Local patch adding `NoFreelistSync` support to bbolt-rs 1.3.10. Upstream gates
+# `meta.free_list() == PGID_NO_FREE_LIST` with a hard error in `Bolt::new_db`,
+# so it cannot open any bolt file produced by Go's bbolt with that option set —
+# which is the default mode for containerd's metadata DB. The patch:
+#   - rebuilds the freelist by scanning the page tree at open time (matching
+#     Go bbolt's `db.freepages()` recovery path),
+#   - skips the freelist-page commit and stamps PGID_NO_FREE_LIST in meta when
+#     the new builder option `no_freelist_sync()` is set,
+#   - exposes that setter on `BoltOptionsBuilder` (previously `setter(skip)`).
+# `nydus-migrate reconcile-snapshots` depends on this to read containerd's
+# `meta.db` in-process instead of shelling out to a Go helper.
+# Upstream PR to be filed against ambaxter/bbolt-rs.
+bbolt-rs = { path = "third_party/bbolt-rs" }
+
 # Local fix for a large-body read throughput regression in cyper-core's
 # compio<->hyper stream adapter (rev d1c8aff). compio drains the socket in 8 KiB
 # chunks while hyper grows its read cursor toward ~400 KiB for large bodies; the
