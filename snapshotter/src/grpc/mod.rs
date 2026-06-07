@@ -647,6 +647,14 @@ pub async fn serve_with_supervisor(
                 access_tracer: access_tracer.clone(),
             };
             let auto_zran = AutoZranManager::start(&config.snapshotter.auto_zran, deps);
+            // Back-fill the access_tracer's auto_zran link now that the
+            // manager exists. AccessTracer was built first because the
+            // manager's `ConversionDeps` borrow the tracer; without this
+            // back-fill, settled profiles get persisted to disk but never
+            // enqueue into the conversion worker.
+            if let Some(ref manager) = auto_zran {
+                access_tracer.set_auto_zran(manager.clone());
+            }
             let discovery = crate::auto_accel_sidecar::AutoAccelDiscovery::new(
                 content_store,
                 &config.snapshotter.root,

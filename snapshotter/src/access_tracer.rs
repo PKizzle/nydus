@@ -113,7 +113,12 @@ struct Inner {
     config: AccessCaptureConfig,
     exclude_patterns: Vec<Pattern>,
     profile_store: PrefetchProfileStore,
-    auto_zran: Option<Arc<AutoZranManager>>,
+    /// Filled by `AccessTracer::set_auto_zran` after the AutoZranManager is
+    /// constructed. AccessTracer has to be built first because the manager's
+    /// `ConversionDeps` borrow it, so the link is back-filled once both
+    /// exist. `OnceLock` keeps this single-writer / many-reader without a
+    /// lock on the hot event-loop path.
+    auto_zran: std::sync::OnceLock<Arc<AutoZranManager>>,
     /// Keyed by mount_root canonical path.
     mounts: Mutex<HashMap<PathBuf, ImageCapture>>,
     skip_images: Mutex<HashSet<String>>,
@@ -141,6 +146,10 @@ impl AccessTracer {
         auto_zran: Option<Arc<AutoZranManager>>,
     ) -> Arc<Self> {
         let exclude_patterns = compile_exclude_patterns(&config.exclude_globs);
+        let auto_zran_cell: std::sync::OnceLock<Arc<AutoZranManager>> = std::sync::OnceLock::new();
+        if let Some(az) = auto_zran {
+            let _ = auto_zran_cell.set(az);
+        }
 
         if !config.enable {
             return Arc::new(Self {
@@ -148,7 +157,7 @@ impl AccessTracer {
                     config,
                     exclude_patterns,
                     profile_store,
-                    auto_zran,
+                    auto_zran: auto_zran_cell,
                     mounts: Mutex::new(HashMap::new()),
                     skip_images: Mutex::new(HashSet::new()),
                     fanotify: None,
@@ -178,7 +187,7 @@ impl AccessTracer {
             config,
             exclude_patterns,
             profile_store,
-            auto_zran,
+            auto_zran: auto_zran_cell,
             mounts: Mutex::new(HashMap::new()),
             skip_images: Mutex::new(HashSet::new()),
             fanotify,
@@ -406,6 +415,17 @@ impl AccessTracer {
     /// Called by `AutoZranManager::run_conversion` after a successful sidecar
     /// upload. Future `attach` calls for this image become no-ops; any
     /// in-flight state is dropped.
+    /// Back-fill the auto_zran link after AccessTracer and AutoZranManager
+    /// finish construction. AutoZranManager's `ConversionDeps` need
+    /// AccessTracer, so AccessTracer is built first with no auto_zran ref;
+    /// once the manager exists, call this to wire profile flushes to the
+    /// conversion queue. Idempotent (later calls silently no-op).
+    pub fn set_auto_zran(&self, auto_zran: Arc<AutoZranManager>) {
+        if self.inner.auto_zran.set(auto_zran).is_err() {
+            debug!("access_tracer auto_zran already set; ignoring back-fill");
+        }
+    }
+
     pub fn mark_image_accelerated(&self, image_ref: &str) {
         if let Ok(mut skip) = self.inner.skip_images.lock() {
             skip.insert(image_ref.to_string());
@@ -692,12 +712,16 @@ fn flush_profile(inner: &Inner, image_ref: &str, files: Vec<String>) -> Result<(
         .profile_store
         .put(&profile)
         .context("persist auto-accel prefetch profile")?;
-    if let Some(auto_zran) = &inner.auto_zran {
+    let enqueued = if let Some(auto_zran) = inner.auto_zran.get() {
         auto_zran.try_enqueue_profile(&profile);
-    }
+        true
+    } else {
+        false
+    };
     info!(
         image = image_ref,
         files = profile.prefetch_files().len(),
+        enqueued,
         "access_tracer flushed prefetch profile"
     );
     Ok(())
