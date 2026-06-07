@@ -44,8 +44,8 @@ mod proto {
 }
 
 use proto::{
-    InfoRequest, ReadContentRequest, UpdateRequest, WriteAction, WriteContentRequest,
-    content_client::ContentClient,
+    InfoRequest, ListContentRequest, ReadContentRequest, UpdateRequest, WriteAction,
+    WriteContentRequest, content_client::ContentClient,
 };
 
 /// A snapshot of one content-store blob's metadata.
@@ -297,6 +297,48 @@ impl ContentStoreClient {
                     anyhow::anyhow!("containerd Update({digest}) failed: {status}")
                 })?;
                 Ok::<_, anyhow::Error>(())
+            })
+        })
+        .await
+    }
+
+    /// List content blobs matching the given containerd-style filters.
+    /// Filters use containerd's filter syntax, e.g.
+    /// `labels."containerd.io/gc.ref.content.subject"==sha256:abc`. Returns
+    /// the matched blobs' info (digest, size, labels) in arbitrary order.
+    ///
+    /// Used by sidecar discovery: to find the auto-accel manifest blob for
+    /// an image whose digest we know, we filter by
+    /// `gc.ref.content.subject == <manifest>` AND
+    /// `nydus.auto-accel.role == manifest`.
+    #[instrument(level = "debug", skip(self), err)]
+    pub async fn list_with_filters(&self, filters: Vec<String>) -> Result<Vec<ContentInfo>> {
+        let inner = self.inner.clone();
+        blocking::unblock(move || {
+            inner.rt.block_on(async {
+                let mut client = connect(&inner).await?;
+                let mut request = tonic::Request::new(ListContentRequest { filters });
+                attach_namespace(&mut request, &inner.namespace)?;
+                let mut stream = client
+                    .list(request)
+                    .await
+                    .map_err(|status| anyhow::anyhow!("containerd List failed: {status}"))?
+                    .into_inner();
+                let mut out = Vec::new();
+                while let Some(chunk) = stream
+                    .message()
+                    .await
+                    .map_err(|status| anyhow::anyhow!("containerd List stream failed: {status}"))?
+                {
+                    for info in chunk.info {
+                        out.push(ContentInfo {
+                            digest: info.digest,
+                            size: info.size as u64,
+                            labels: info.labels,
+                        });
+                    }
+                }
+                Ok(out)
             })
         })
         .await

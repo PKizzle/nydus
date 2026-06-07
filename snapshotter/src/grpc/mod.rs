@@ -145,6 +145,14 @@ pub struct NydusSnapshotter {
     /// `auto_zran.capture.enable = false` or fanotify init fails; cheap
     /// (no-op) clone otherwise.
     access_tracer: Arc<crate::access_tracer::AccessTracer>,
+    /// Auto-accel sidecar discovery + staging. `Some` when `auto_zran.enable`
+    /// is on (with a containerd content-store client behind it); `None`
+    /// otherwise — in which case `resolve_auto_accel_mount` is a no-op.
+    auto_accel_discovery: Option<crate::auto_accel_sidecar::AutoAccelDiscovery>,
+    /// Containerd-side state used by `resolve_auto_accel_mount` to resolve
+    /// an image ref to its manifest digest. `None` when auto-accel is off.
+    containerd_lookup: Option<Arc<crate::containerd_lookup::ContainerdLookup>>,
+    containerd_content_root: Option<PathBuf>,
 }
 
 impl NydusSnapshotter {
@@ -174,6 +182,58 @@ impl NydusSnapshotter {
             })?;
         let mountpoint = handle.mountpoint().to_path_buf();
         Ok(Some((meta, mountpoint)))
+    }
+
+    /// Resolve a sidecar-backed auto-accel mount for `image_ref` if one is
+    /// present in containerd's content store (locally produced or
+    /// spegel-mirrored). Returns the daemon mountpoint to substitute for the
+    /// overlay mount, or `Ok(None)` when no sidecar exists or auto-accel is
+    /// disabled — the caller falls back to overlay.
+    ///
+    /// Distinct from `resolve_nydus_mount` (which handles tag-of-image-was-
+    /// converted nydus-meta layers) because the auto-accel path uses a
+    /// localfs+fanotify daemon over symlinked gzip layers, not a registry
+    /// FUSE/RAFS mount.
+    async fn resolve_auto_accel_mount(
+        &self,
+        image_ref: &str,
+    ) -> Result<Option<PathBuf>, SnapshotterError> {
+        let (Some(discovery), Some(lookup), Some(content_root)) = (
+            self.auto_accel_discovery.as_ref(),
+            self.containerd_lookup.as_ref(),
+            self.containerd_content_root.as_ref(),
+        ) else {
+            return Ok(None);
+        };
+        let info = match lookup.manifest_info(image_ref, content_root) {
+            Ok(info) => info,
+            Err(e) => {
+                debug!(image_ref, error = %e, "auto-accel manifest_info failed; falling back to overlay");
+                return Ok(None);
+            }
+        };
+        let staged = match discovery.resolve(&info.manifest_digest).await {
+            Ok(Some(s)) => s,
+            Ok(None) => return Ok(None),
+            Err(e) => {
+                warn!(image_ref, error = %e, "auto-accel discovery failed; falling back to overlay");
+                return Ok(None);
+            }
+        };
+        let handle = self
+            .supervisor
+            .ensure_instance_local(image_ref, &staged.bootstrap, &staged.backend_dir)
+            .await
+            .map_err(|e| {
+                warn!(image_ref, error = %e, "auto-accel fanotify daemon failed to start");
+                SnapshotterError::internal(e.to_string())
+            })?;
+        debug!(
+            image_ref,
+            mountpoint = %handle.mountpoint().display(),
+            "auto-accel mount ready"
+        );
+        Ok(Some(handle.mountpoint().to_path_buf()))
     }
 
     fn rewrite_mounts_with_daemon(
@@ -305,13 +365,24 @@ impl snapshots::Snapshotter for NydusSnapshotter {
                         debug!(key, parent, mountpoint = %daemon_mnt.display(), "prepared nydus rootfs");
                         return Ok(self.rewrite_mounts_with_daemon(&key, &daemon_mnt, false));
                     }
-                    // Auto-accel capture hook: standard OCI image, no nydus
-                    // meta. Attach the access tracer to the *lowest* lowerdir
-                    // (the image's filesystem) so fanotify records open/read
-                    // events during pod startup. The flush path enqueues a
-                    // conversion job once settle fires. The tracer is a no-op
-                    // when capture is disabled in config or when fanotify
-                    // isn't available on this kernel.
+                    // Auto-accel routing: if a sidecar artifact exists for
+                    // this image in containerd's content store (locally
+                    // produced or spegel-mirrored), substitute a
+                    // localfs+fanotify daemon mount for the overlay. The
+                    // original gzip layers stay where they are; the daemon
+                    // serves them on demand from the merged bootstrap.
+                    if let Some(image_ref) = labels.get(crate::source::labels::CRI_IMAGE_REF)
+                        && let Some(daemon_mnt) = self.resolve_auto_accel_mount(image_ref).await?
+                    {
+                        debug!(key, parent, mountpoint = %daemon_mnt.display(), "prepared auto-accel rootfs");
+                        return Ok(self.rewrite_mounts_with_daemon(&key, &daemon_mnt, false));
+                    }
+                    // Auto-accel capture: no sidecar yet, so attach the
+                    // tracer to the *lowest* lowerdir (the image's
+                    // filesystem) and let it record reads during pod
+                    // startup. On settle, a conversion job runs and lands
+                    // the sidecar that the next pod (or peer node) picks up
+                    // via the resolve_auto_accel_mount branch above.
                     if let (Some(image_ref), Some(image_root)) = (
                         labels
                             .get(crate::source::labels::CRI_IMAGE_REF)
@@ -539,21 +610,27 @@ pub async fn serve_with_supervisor(
         profile_store,
         None, // back-filled below once AutoZranManager exists
     );
-    let auto_zran = if config.snapshotter.auto_zran.enable {
-        let content_store =
-            crate::content_store::ContentStoreClient::new(&config.snapshotter.containerd)
-                .context("connect to containerd content store")?;
-        let containerd_lookup = Arc::new(crate::containerd_lookup::ContainerdLookup::new());
-        let deps = crate::auto_zran::ConversionDeps {
-            content_store,
-            containerd: config.snapshotter.containerd.clone(),
-            containerd_lookup,
-            access_tracer: access_tracer.clone(),
+    let (auto_zran, auto_accel_discovery, containerd_lookup_for_discovery) =
+        if config.snapshotter.auto_zran.enable {
+            let content_store =
+                crate::content_store::ContentStoreClient::new(&config.snapshotter.containerd)
+                    .context("connect to containerd content store")?;
+            let containerd_lookup = Arc::new(crate::containerd_lookup::ContainerdLookup::new());
+            let deps = crate::auto_zran::ConversionDeps {
+                content_store: content_store.clone(),
+                containerd: config.snapshotter.containerd.clone(),
+                containerd_lookup: containerd_lookup.clone(),
+                access_tracer: access_tracer.clone(),
+            };
+            let auto_zran = AutoZranManager::start(&config.snapshotter.auto_zran, deps);
+            let discovery = crate::auto_accel_sidecar::AutoAccelDiscovery::new(
+                content_store,
+                &config.snapshotter.root,
+            );
+            (auto_zran, Some(discovery), Some(containerd_lookup))
+        } else {
+            (None, None, None)
         };
-        AutoZranManager::start(&config.snapshotter.auto_zran, deps)
-    } else {
-        None
-    };
 
     if config.snapshotter.sysctl.enable {
         let sysctl_path = config.snapshotter.sysctl.address.clone();
@@ -592,6 +669,13 @@ pub async fn serve_with_supervisor(
         supervisor,
         metrics,
         access_tracer,
+        auto_accel_discovery,
+        containerd_lookup: containerd_lookup_for_discovery,
+        containerd_content_root: if config.snapshotter.auto_zran.enable {
+            Some(config.snapshotter.containerd.content_root.clone())
+        } else {
+            None
+        },
     };
 
     // Remove stale socket if it exists.
@@ -639,6 +723,9 @@ mod tests {
                 crate::prefetch_profile::PrefetchProfileStore::from_cache_root(root),
                 None,
             ),
+            auto_accel_discovery: None,
+            containerd_lookup: None,
+            containerd_content_root: None,
         }
     }
 

@@ -494,10 +494,12 @@ fn job_work_dir(config: &AutoZranConfig, image: &str) -> std::path::PathBuf {
 }
 
 /// Deterministic content-store ref for the auto-accel manifest of a given
-/// original-image manifest digest. Used as the cross-node discovery key:
-/// peer nodes look up `nydus-auto-accel:v1:<subject>` and, if spegel
-/// mirrored it, get the same manifest digest the producing node wrote.
-fn auto_accel_manifest_ref(subject_manifest_digest: &str) -> String {
+/// original-image manifest digest. The ref is the ingest-time identifier
+/// (not a permanent address); after commit the manifest is addressed by its
+/// own content digest. Discovery still works via the
+/// `gc.ref.content.subject` + `nydus.auto-accel.role=manifest` labels — see
+/// `auto_accel_sidecar::SidecarLocator::find`.
+pub fn auto_accel_manifest_ref(subject_manifest_digest: &str) -> String {
     format!("nydus-auto-accel:v1:{subject_manifest_digest}")
 }
 

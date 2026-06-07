@@ -33,6 +33,7 @@
 #![warn(clippy::all)]
 
 pub mod access_tracer;
+pub mod auto_accel_sidecar;
 pub mod auto_zran;
 pub mod cache;
 pub mod config;

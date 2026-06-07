@@ -32,13 +32,17 @@ use nydus_service::daemon::{
     DaemonState, DaemonStateMachineInput, DaemonStateMachineSubscriber, NydusDaemon,
 };
 use nydus_service::upgrade::FailoverPolicy;
-use nydus_service::{FsBackendMountCmd, FsBackendType, create_fuse_daemon, create_vfs_backend};
+use nydus_service::{
+    FsBackendMountCmd, FsBackendType, create_daemon, create_fuse_daemon, create_vfs_backend,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tracing::{debug, info, warn};
 
 use crate::config::{FsDriverType, SnapshotterConfig};
-use crate::daemon::config_builder::{build_blob_cache_entry, build_registry_config};
+use crate::daemon::config_builder::{
+    build_auto_accel_config, build_blob_cache_entry, build_registry_config,
+};
 use crate::daemon::image_ref::{ImageRef, parse_image_ref};
 use crate::prefetch_profile::runtime_prefetch_for_image;
 
@@ -348,6 +352,206 @@ impl DaemonSupervisor {
             warn!(image_ref, error = %e, "failed to persist daemon record");
         }
         Ok(Arc::new(handle))
+    }
+
+    /// Ensure an **auto-accel** daemon for `image_ref` is mounted, then return
+    /// its mountpoint handle. This is the read side of the node-local
+    /// acceleration flow: the bootstrap was produced by `local_accel::convert`
+    /// and the `backend_dir` already contains symlinks to the gzip layers in
+    /// containerd's content store plus the per-layer zran index blobs (and an
+    /// optional packed prefetch blob).
+    ///
+    /// Dedup is by `image_ref`, same as `ensure_instance`. A daemon already
+    /// running with a *registry* backend for the same image cannot be reused
+    /// (different mount source); the auto-accel call replaces it on the next
+    /// snapshot release. For now we require the existing instance — if any —
+    /// to already be the local variant; otherwise we bail out and the caller
+    /// falls back to the overlay path.
+    pub async fn ensure_instance_local(
+        &self,
+        image_ref: &str,
+        bootstrap: &Path,
+        backend_dir: &Path,
+    ) -> Result<Arc<MountHandle>> {
+        if image_ref.is_empty() {
+            bail!("image reference must be non-empty to mount an auto-accel sidecar");
+        }
+        if !bootstrap.is_file() {
+            bail!(
+                "auto-accel bootstrap {} is missing - was local_accel::convert run?",
+                bootstrap.display()
+            );
+        }
+        if !backend_dir.is_dir() {
+            bail!(
+                "auto-accel backend dir {} is missing",
+                backend_dir.display()
+            );
+        }
+
+        {
+            let instances = self.instances.read().await;
+            if let Some(inst) = instances.get(image_ref)
+                && inst.bootstrap == bootstrap
+                && matches!(
+                    inst.daemon.get_state(),
+                    DaemonState::RUNNING | DaemonState::READY
+                )
+            {
+                inst.refcount.fetch_add(1, Ordering::SeqCst);
+                if let Err(e) = self.persist_instance_record(inst, true) {
+                    warn!(image_ref, error = %e, "failed to persist daemon record");
+                }
+                return Ok(Arc::new(MountHandle {
+                    image_ref: image_ref.to_string(),
+                    mountpoint: inst.mountpoint.clone(),
+                    daemon: inst.daemon.clone(),
+                }));
+            }
+        }
+
+        let mut instances = self.instances.write().await;
+        if let Some(inst) = instances.get(image_ref)
+            && inst.bootstrap == bootstrap
+            && matches!(
+                inst.daemon.get_state(),
+                DaemonState::RUNNING | DaemonState::READY
+            )
+        {
+            inst.refcount.fetch_add(1, Ordering::SeqCst);
+            if let Err(e) = self.persist_instance_record(inst, true) {
+                warn!(image_ref, error = %e, "failed to persist daemon record");
+            }
+            return Ok(Arc::new(MountHandle {
+                image_ref: image_ref.to_string(),
+                mountpoint: inst.mountpoint.clone(),
+                daemon: inst.daemon.clone(),
+            }));
+        }
+
+        let instance = self
+            .start_local_instance(image_ref, bootstrap, backend_dir)
+            .await
+            .with_context(|| format!("failed to start auto-accel daemon for {image_ref}"))?;
+        instance.refcount.fetch_add(1, Ordering::SeqCst);
+        let handle = MountHandle {
+            image_ref: image_ref.to_string(),
+            mountpoint: instance.mountpoint.clone(),
+            daemon: instance.daemon.clone(),
+        };
+        instances.insert(image_ref.to_string(), instance);
+        if let Some(inst) = instances.get(image_ref)
+            && let Err(e) = self.persist_instance_record(inst, true)
+        {
+            warn!(image_ref, error = %e, "failed to persist daemon record");
+        }
+        Ok(Arc::new(handle))
+    }
+
+    /// Spawn an in-process auto-accel daemon. Mirrors the FUSE start path in
+    /// `start_instance` but uses `nydus_service::create_daemon` (the
+    /// fanotify-singleton flavour) instead of `create_fuse_daemon`. The
+    /// resulting daemon mounts EROFS directly via fanotify; gzip-layer reads
+    /// are served on demand by `FanotifyHandler` which decompresses the
+    /// per-layer zran ranges into the file cache.
+    async fn start_local_instance(
+        &self,
+        image_ref_str: &str,
+        bootstrap: &Path,
+        backend_dir: &Path,
+    ) -> Result<Arc<DaemonInstance>> {
+        let slug = slug_for(image_ref_str);
+        let daemon_root = self.config.snapshotter.root.join("daemons").join(&slug);
+        let mountpoint = daemon_root.join("mnt");
+        // The fanotify cache `work_dir` doubles as the EROFS staging dir: the
+        // fanotify handler self-stages device files as hardlinks to the
+        // per-layer cache files inside it (CLAUDE.md §"Fanotify on-demand
+        // runtime constraints"). Keep it next to the daemon dir so per-image
+        // cleanup is one `rm -rf`.
+        let stage_dir = daemon_root.join("stage");
+        fs::create_dir_all(&mountpoint).with_context(|| {
+            format!(
+                "failed to create daemon mountpoint {}",
+                mountpoint.display()
+            )
+        })?;
+        fs::create_dir_all(&stage_dir).with_context(|| {
+            format!(
+                "failed to create fanotify stage dir {}",
+                stage_dir.display()
+            )
+        })?;
+        // Copy the bootstrap into the stage dir so the fanotify handler finds
+        // it under the expected `bootstrap` filename (see
+        // `service/src/fanotify.rs::discover_blobs`).
+        let staged_bootstrap = stage_dir.join("bootstrap");
+        fs::copy(bootstrap, &staged_bootstrap).with_context(|| {
+            format!(
+                "failed to stage bootstrap {} -> {}",
+                bootstrap.display(),
+                staged_bootstrap.display()
+            )
+        })?;
+
+        let threads = self.config.snapshotter.daemon.threads.max(1) as u32;
+        let bti = self.build_info.clone();
+        let daemon_id = slug.clone();
+
+        let poll = Poll::new().context("failed to create mio Poll for daemon waker")?;
+        let waker =
+            Arc::new(Waker::new(poll.registry(), Token(1)).context("failed to create mio Waker")?);
+        let poll = Arc::new(Mutex::new(poll));
+
+        let cfg_v2 = build_auto_accel_config(backend_dir, &stage_dir, &mountpoint, &daemon_id);
+        let cfg_json =
+            serde_json::to_value(&cfg_v2).context("failed to serialise auto-accel ConfigV2")?;
+
+        let supervisor_sock = supervisor_sock_path(&slug);
+        let backend_dir_str = backend_dir.display().to_string();
+        let mountpoint_str = mountpoint.display().to_string();
+        let threads_str = threads.to_string();
+        let daemon = create_daemon(
+            Some(daemon_id.clone()),
+            Some(supervisor_sock.display().to_string()),
+            Some(&backend_dir_str),
+            Some(&mountpoint_str),
+            Some(threads_str.as_str()),
+            Some(cfg_json),
+            bti,
+            waker,
+            None::<&Path>,
+            false,
+        )
+        .map_err(|e| anyhow::anyhow!("failed to create auto-accel fanotify daemon: {e}"))?;
+
+        wait_for_running(&*daemon, self.startup_timeout).with_context(|| {
+            format!("auto-accel daemon for {image_ref_str} never reached RUNNING")
+        })?;
+
+        info!(
+            image_ref = %image_ref_str,
+            mountpoint = %mountpoint.display(),
+            backend = %backend_dir.display(),
+            "auto-accel fanotify daemon ready"
+        );
+
+        // Failover armed via fdstore — same code path the registry-backed
+        // FUSE start uses; the snapshot also covers the fanotify group fd
+        // because the FanotifyHandler is registered in the singleton's
+        // ServiceController before READY.
+        let armed = self
+            .park_failover_state(&slug, &daemon, &supervisor_sock, &daemon_root)
+            .await;
+
+        Ok(Arc::new(DaemonInstance {
+            image_ref: image_ref_str.to_string(),
+            mountpoint,
+            bootstrap: bootstrap.to_path_buf(),
+            daemon,
+            refcount: AtomicUsize::new(0),
+            failover_armed: AtomicBool::new(armed),
+            _poll: poll,
+        }))
     }
 
     /// Explicitly spawn a daemon without acquiring a snapshot reference.

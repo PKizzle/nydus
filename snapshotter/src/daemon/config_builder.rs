@@ -12,7 +12,8 @@ use std::path::Path;
 
 use nydus_api::{
     BLOB_CACHE_TYPE_META_BLOB, BackendConfigV2, BlobCacheEntry, BlobCacheEntryConfigV2,
-    CacheConfigV2, ConfigV2, FileCacheConfig, RafsConfigV2, RegistryConfig,
+    CacheConfigV2, ConfigV2, FanotifyConfig, FileCacheConfig, LocalFsConfig, RafsConfigV2,
+    RegistryConfig,
 };
 use serde_json::json;
 
@@ -104,6 +105,103 @@ pub fn build_registry_config(
         overlay: None,
         internal: Default::default(),
     }
+}
+
+/// Build a `ConfigV2` for the **auto-accel sidecar** mount: a `localfs`
+/// backend pointed at the symlinked gzip-layer / zran-index directory + a
+/// `fanotify` pre-content cache pointed at the staging directory holding the
+/// merged bootstrap.
+///
+/// This is the read-side of the node-local acceleration flow: gzip layers
+/// (already in containerd's content store) appear in `backend_dir` as
+/// symlinks keyed by their nydus blob ids; the merged RAFS v6 bootstrap and
+/// per-layer zran index blobs live under the same `backend_dir`. The fanotify
+/// handler stages EROFS device files as hardlinks to the blob cache files and
+/// serves on-demand reads via `FAN_PRE_ACCESS`.
+///
+/// `daemon_mountpoint` is the FUSE mountpoint the snapshotter hands back to
+/// containerd; the fanotify EROFS mount and the FUSE bind reuse it.
+pub fn build_auto_accel_config(
+    backend_dir: &Path,
+    stage_dir: &Path,
+    daemon_mountpoint: &Path,
+    daemon_id: &str,
+) -> ConfigV2 {
+    let backend = BackendConfigV2 {
+        backend_type: "localfs".to_string(),
+        localdisk: None,
+        localfs: Some(LocalFsConfig {
+            blob_file: String::new(),
+            dir: backend_dir.display().to_string(),
+            alt_dirs: Vec::new(),
+        }),
+        oss: None,
+        s3: None,
+        registry: None,
+        http_proxy: None,
+    };
+
+    let cache = CacheConfigV2 {
+        cache_type: "fanotify".to_string(),
+        cache_compressed: false,
+        cache_validate: false,
+        prefetch: Default::default(),
+        file_cache: None,
+        fanotify: Some(FanotifyConfig {
+            work_dir: stage_dir.display().to_string(),
+            mountpoint: daemon_mountpoint.display().to_string(),
+        }),
+    };
+
+    let rafs = RafsConfigV2 {
+        mode: "direct".to_string(),
+        user_io_batch_size: 1024 * 1024,
+        validate: false,
+        enable_xattr: true,
+        iostats_files: false,
+        access_pattern: false,
+        latest_read_files: false,
+        prefetch: Default::default(),
+    };
+
+    ConfigV2 {
+        version: 2,
+        id: daemon_id.to_string(),
+        backend: Some(backend),
+        external_backends: Vec::new(),
+        cache: Some(cache),
+        rafs: Some(rafs),
+        overlay: None,
+        internal: Default::default(),
+    }
+}
+
+/// Wrap an auto-accel `ConfigV2` + bootstrap in the `BlobCacheEntry` form the
+/// fanotify pre-content path consumes (mirrors `build_blob_cache_entry` but
+/// for the localfs+fanotify combo, not registry+filecache).
+pub fn build_auto_accel_blob_cache_entry(
+    backend_dir: &Path,
+    stage_dir: &Path,
+    daemon_mountpoint: &Path,
+    daemon_id: &str,
+    bootstrap: &Path,
+) -> anyhow::Result<BlobCacheEntry> {
+    let cfg_v2 = build_auto_accel_config(backend_dir, stage_dir, daemon_mountpoint, daemon_id);
+    let entry_config = BlobCacheEntryConfigV2 {
+        version: cfg_v2.version,
+        id: cfg_v2.id,
+        backend: cfg_v2.backend.unwrap_or_default(),
+        external_backends: cfg_v2.external_backends,
+        cache: cfg_v2.cache.unwrap_or_default(),
+        metadata_path: Some(bootstrap.display().to_string()),
+    };
+    let value = json!({
+        "type": BLOB_CACHE_TYPE_META_BLOB,
+        "id": daemon_id,
+        "domain_id": daemon_id,
+        "config_v2": entry_config,
+    });
+    Ok(serde_json::from_value(value)?)
 }
 
 /// Build a blob-cache entry for service block-device export.
