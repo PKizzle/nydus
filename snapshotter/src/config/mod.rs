@@ -71,6 +71,14 @@ pub struct SnapshotterSection {
     /// gzip-layer blobs and upload sidecar artifacts.
     #[serde(default)]
     pub containerd: ContainerdConfig,
+
+    /// k3s embedded spegel mirror endpoint used by auto-accel cross-node
+    /// sidecar discovery. When enabled and reachable, a peer-node consumer
+    /// can fetch the OCI manifest + config + blobs for a converted sidecar
+    /// straight from spegel's `/v2/...?ns=<registry>` endpoint rather than
+    /// each node having to convert independently.
+    #[serde(default)]
+    pub spegel_mirror: SpegelMirrorConfig,
 }
 
 impl Default for SnapshotterSection {
@@ -88,6 +96,7 @@ impl Default for SnapshotterSection {
             cgroup: CgroupConfig::default(),
             auto_zran: AutoZranConfig::default(),
             containerd: ContainerdConfig::default(),
+            spegel_mirror: SpegelMirrorConfig::default(),
         }
     }
 }
@@ -367,6 +376,67 @@ impl Default for ContainerdConfig {
     }
 }
 
+/// k3s embedded spegel mirror endpoint configuration for cross-node
+/// auto-accel sidecar discovery. spegel listens on `127.0.0.1:6443/v2`
+/// behind mTLS, watches containerd image-store events, and serves locally
+/// present content directly while falling back to libp2p peer lookup for
+/// digests it doesn't have. The consumer-side `SidecarLocator::resolve_or_pull`
+/// hits this endpoint with the required `?ns=<registry>` query parameter
+/// — without that query string, spegel's distribution.go parser returns
+/// 404 for every path, even for content that IS local.
+///
+/// When `enable = false` (or any of the cert files don't exist on disk at
+/// startup) the spegel-pull path is skipped silently and the locator falls
+/// straight through to the existing label-filter scan, preserving the
+/// pre-spegel behaviour on hosts without an embedded mirror.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct SpegelMirrorConfig {
+    #[serde(default = "default_spegel_enable")]
+    pub enable: bool,
+    /// Mirror endpoint URL. k3s' embedded spegel binds to the API server
+    /// socket on `127.0.0.1:6443`; the `/v2/...` distribution endpoints
+    /// hang off the same TLS listener.
+    #[serde(default = "default_spegel_endpoint")]
+    pub endpoint: String,
+    /// Additional peer mirror endpoints tried in order if the primary
+    /// `endpoint` returns 404 — workaround for k3s' embedded spegel libp2p
+    /// peer discovery returning "empty list of address ports" on
+    /// multi-node clusters where the DHT advertisement carries no dialable
+    /// multiaddr. With these set, the snapshotter bypasses libp2p and
+    /// pulls straight from each peer's mirror endpoint over mTLS using
+    /// the same `ca_path` / `client_cert_path` / `client_key_path` as
+    /// `endpoint`. Example: `["https://node-b:6443",
+    /// "https://node-c:6443"]`. Leave empty (default) when
+    /// libp2p routing works or for single-node deployments.
+    #[serde(default)]
+    pub peer_endpoints: Vec<String>,
+    /// PEM-encoded CA bundle for verifying the mirror endpoint's serving
+    /// cert. k3s ships its server CA at the path below.
+    #[serde(default = "default_spegel_ca_path")]
+    pub ca_path: PathBuf,
+    /// PEM-encoded client cert for mTLS to the mirror. k3s' standard
+    /// controller client cert works here — same identity its own internal
+    /// components use to call back through the API server.
+    #[serde(default = "default_spegel_client_cert_path")]
+    pub client_cert_path: PathBuf,
+    /// PEM-encoded private key matching `client_cert_path`.
+    #[serde(default = "default_spegel_client_key_path")]
+    pub client_key_path: PathBuf,
+}
+
+impl Default for SpegelMirrorConfig {
+    fn default() -> Self {
+        Self {
+            enable: default_spegel_enable(),
+            endpoint: default_spegel_endpoint(),
+            peer_endpoints: Vec::new(),
+            ca_path: default_spegel_ca_path(),
+            client_cert_path: default_spegel_client_cert_path(),
+            client_key_path: default_spegel_client_key_path(),
+        }
+    }
+}
+
 /// All backend sections under `[backends.*]`.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct BackendsConfig {
@@ -504,6 +574,21 @@ fn default_containerd_namespace() -> String {
 }
 fn default_containerd_content_root() -> PathBuf {
     PathBuf::from("/var/lib/rancher/k3s/agent/containerd/io.containerd.content.v1.content")
+}
+fn default_spegel_enable() -> bool {
+    true
+}
+fn default_spegel_endpoint() -> String {
+    "https://127.0.0.1:6443".to_string()
+}
+fn default_spegel_ca_path() -> PathBuf {
+    PathBuf::from("/var/lib/rancher/k3s/agent/server-ca.crt")
+}
+fn default_spegel_client_cert_path() -> PathBuf {
+    PathBuf::from("/var/lib/rancher/k3s/agent/client-k3s-controller.crt")
+}
+fn default_spegel_client_key_path() -> PathBuf {
+    PathBuf::from("/var/lib/rancher/k3s/agent/client-k3s-controller.key")
 }
 
 fn default_fs_drivers() -> Vec<FsDriverEntry> {

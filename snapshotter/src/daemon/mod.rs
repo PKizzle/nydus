@@ -47,9 +47,6 @@ use crate::daemon::image_ref::{ImageRef, parse_image_ref};
 use crate::prefetch_profile::runtime_prefetch_for_image;
 
 #[cfg(target_os = "linux")]
-use std::process::Command;
-
-#[cfg(target_os = "linux")]
 use nydus_service::block_device::BlockDevice;
 
 /// Persisted and live daemon status exposed through the system controller.

@@ -427,6 +427,16 @@ async fn run_conversion(
             "containerd.io/snapshot/nydus.auto-accel.role".to_string(),
             role.to_string(),
         );
+        // Spegel's containerd watcher only advertises blobs that carry a
+        // `distribution.source.<host>` label, since that's the signal the
+        // upstream OCI distribution conventions use to say "this blob
+        // originates from this registry host." Without it spegel logs the
+        // image-record CREATE but never gossips the underlying digests over
+        // libp2p, so peer nodes can't discover the sidecar via the mirror.
+        m.insert(
+            "containerd.io/distribution.source.nydus.auto-accel.local".to_string(),
+            "sidecar".to_string(),
+        );
         m
     };
 

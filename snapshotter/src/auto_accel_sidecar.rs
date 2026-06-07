@@ -15,17 +15,42 @@
 //! `DaemonSupervisor::ensure_instance_local`.
 
 use std::collections::HashMap;
+use std::fs::File;
+use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
+use http::header::ACCEPT;
 use tracing::{debug, info, warn};
 
+use crate::auto_accel_oci::{
+    AUTO_ACCEL_BOOTSTRAP_MEDIATYPE, AUTO_ACCEL_CONFIG_MEDIATYPE,
+    AUTO_ACCEL_LAYER_DIGEST_ANNOTATION, AUTO_ACCEL_PREFETCH_MEDIATYPE, OCI_MANIFEST_MEDIATYPE,
+    OciImageManifest,
+};
+// `AUTO_ACCEL_INDEX_MEDIATYPE` is the producer's per-layer media type, used
+// only by `role_for_media_type`'s test (#[cfg(test)] module below) — keep
+// the import there rather than at the file top so a stale prod-side rename
+// doesn't fail the build only in test mode.
 use crate::auto_zran::AutoAccelManifest;
+use crate::config::SpegelMirrorConfig;
 use crate::content_store::{ContentInfo, ContentStoreClient};
 
 const LABEL_ROLE: &str = "containerd.io/snapshot/nydus.auto-accel.role";
 const LABEL_SUBJECT: &str = "containerd.io/gc.ref.content.subject";
+const LABEL_DISTRIBUTION_SOURCE: &str = "containerd.io/distribution.source.nydus.auto-accel.local";
+
+/// Accept header used on every manifest GET. We accept both the OCI media
+/// type our producer emits and the docker v2 manifest media type so a
+/// spegel that's been asked to fall back to upstream (or that's serving a
+/// manifest we converted with a docker media type for any reason) still
+/// returns the body rather than 406.
+const ACCEPT_MANIFEST: &str = concat!(
+    "application/vnd.oci.image.manifest.v1+json,",
+    "application/vnd.docker.distribution.manifest.v2+json"
+);
 
 /// A resolved auto-accel sidecar with its on-disk paths ready for the fanotify
 /// backend.
@@ -48,13 +73,74 @@ pub struct SidecarLocator {
     /// Snapshotter root joined with `"auto-accel"`; per-image scratch dirs
     /// hang off this.
     stage_root: PathBuf,
+    /// Spegel HTTPS client + endpoint URL. `None` when the mirror is
+    /// disabled by config, or when any of the configured cert files don't
+    /// exist on disk at startup. When `None`, `spegel_pull` is a no-op
+    /// returning `PullOutcome::NoBinary` so the locator falls through to
+    /// the label-filter scan.
+    spegel: Option<Arc<SpegelClient>>,
+}
+
+/// Send + Sync metadata bundle for the embedded spegel mirror. Holds
+/// only Send + Sync state (an `Arc`-shared rustls config + the endpoint
+/// list); the actual `cyper::Client` is `!Send + !Sync` because it
+/// targets the compio current_thread runtime, so it is built per call
+/// on a blocking pool thread driving its own thread-local compio
+/// runtime (see `block_on_http`). This matches the per-thread cyper
+/// pattern `storage/src/backend/connection.rs` uses for the registry
+/// backend and keeps reqwest + tokio out of the snapshotter.
+///
+/// `endpoints[0]` is the primary (local spegel on `127.0.0.1`); the
+/// rest are peer fallbacks for clusters where libp2p peer routing
+/// fails ("empty list of address ports").
+struct SpegelClient {
+    tls: Arc<rustls::ClientConfig>,
+    endpoints: Vec<String>,
+}
+
+thread_local! {
+    /// Per-thread compio runtime used by `block_on_http` to drive cyper
+    /// from inside `blocking::unblock`. cyper's HTTPS plumbing
+    /// (hickory DNS resolver, hyper executor) needs `Runtime::current()`
+    /// at client-build time and a `block_on` to run requests, so each
+    /// blocking thread gets its own. Mirrors the per-thread runtime in
+    /// `storage/src/backend/connection.rs`.
+    static HTTP_RUNTIME: compio::runtime::Runtime = compio::runtime::Runtime::new()
+        .expect("auto_accel_sidecar: failed to create compio HTTP runtime");
+}
+
+fn block_on_http<F: std::future::Future>(fut: F) -> F::Output {
+    HTTP_RUNTIME.with(|rt| rt.block_on(fut))
 }
 
 impl SidecarLocator {
-    pub fn new(content_store: ContentStoreClient, snapshotter_root: &Path) -> Self {
+    pub fn new(
+        content_store: ContentStoreClient,
+        snapshotter_root: &Path,
+        spegel_config: &SpegelMirrorConfig,
+    ) -> Self {
+        let spegel = match build_spegel_client(spegel_config) {
+            Ok(client) => client.map(Arc::new),
+            Err(e) => {
+                warn!(
+                    error = ?e,
+                    "spegel mirror client setup failed; cross-node auto-accel discovery disabled"
+                );
+                None
+            }
+        };
+        if spegel.is_none() && spegel_config.enable {
+            warn!(
+                endpoint = %spegel_config.endpoint,
+                ca = %spegel_config.ca_path.display(),
+                "spegel mirror enabled in config but client could not be constructed; \
+                 cross-node auto-accel discovery disabled"
+            );
+        }
         Self {
             content_store,
             stage_root: snapshotter_root.join("auto-accel"),
+            spegel,
         }
     }
 
@@ -63,10 +149,10 @@ impl SidecarLocator {
     ///
     /// 1. Local `images.Get(synthetic-ref)` — hit on the producer node and
     ///    on any peer that already pulled this sidecar.
-    /// 2. `ctr -n k8s.io image pull <synthetic-ref>` — drives containerd's
-    ///    Resolver through `registries.yaml`'s `mirrors:{"+":...}` config,
-    ///    which routes to k3s's embedded spegel. spegel asks peers via
-    ///    libp2p; if a peer has the image record advertised, the OCI
+    /// 2. Direct HTTPS GET to k3s's embedded spegel mirror endpoint with
+    ///    the required `?ns=<registry>` query parameter. spegel checks its
+    ///    local content store first, then falls back to a libp2p peer
+    ///    lookup; if a peer has the image record advertised, the OCI
     ///    manifest + its config + every layer (bootstrap, zran indexes,
     ///    prefetch blob) flow through the mirror in one transfer. After
     ///    success we retry `images.Get`. A categorised pull failure
@@ -95,10 +181,10 @@ impl SidecarLocator {
             });
 
         if resolved.is_none() {
-            // Drive a containerd pull through registries.yaml → spegel →
-            // peer. If a peer advertises the image record, this brings
-            // everything down in one shot.
-            match ctr_image_pull(&image_name).await {
+            // Drive a direct HTTPS pull through spegel. If a peer
+            // advertises the image record, this brings everything down in
+            // one transfer.
+            match self.spegel_pull(manifest_digest, &image_name).await {
                 PullOutcome::Ok => {
                     info!(image_name = %image_name, "auto-accel pulled via spegel mirror");
                     resolved = self
@@ -113,19 +199,19 @@ impl SidecarLocator {
                 PullOutcome::NotFound => {
                     debug!(image_name = %image_name, "no peer advertised this sidecar; falling back to label scan");
                 }
-                PullOutcome::RegistryError { stderr, exit_code } => {
+                PullOutcome::RegistryError { status, body } => {
                     // Real configuration failure — surface loudly. Without
                     // this every pod on a misconfigured-spegel node would
                     // silently degrade to overlay forever.
                     warn!(
                         image_name = %image_name,
-                        exit_code,
-                        stderr = %stderr,
+                        status,
+                        body = %body,
                         "auto-accel pull failed: registry/mirror error (spegel mTLS, auth, daemon down?). Cross-node discovery disabled until fixed."
                     );
                 }
                 PullOutcome::NoBinary => {
-                    warn!(image_name = %image_name, "auto-accel pull skipped: neither `ctr` nor `k3s ctr` runnable");
+                    debug!(image_name = %image_name, "spegel mirror disabled or unconfigured; cross-node discovery skipped");
                 }
             }
         }
@@ -301,104 +387,547 @@ fn strip_sha256(digest: &str) -> &str {
 /// doesn't silently disable every auto-accel mount cluster-wide.
 #[derive(Debug, Clone, Eq, PartialEq)]
 enum PullOutcome {
-    /// Pull committed; the manifest is now in the local content store.
+    /// Pull committed; the manifest + every referenced blob are now in
+    /// the local content store and the Image record is registered.
     Ok,
-    /// Resolver returned a 404 / NotFound — no peer advertises this ref.
-    /// Expected on first-pod scheduling before any node has converted.
+    /// Spegel returned 404 — no peer has the sidecar locally and the
+    /// libp2p DHT has no advertisement for it either. Expected on
+    /// first-pod scheduling before any node has converted.
     NotFound,
-    /// `ctr` ran and failed with something OTHER than NotFound. Examples:
-    /// 401/403 (spegel auth misconfigured), DNS lookup error not at the
-    /// "synthetic host doesn't resolve" tail of the chain, daemon-not-
-    /// running, flag-parse skew on a version mismatch. Captured for
-    /// triage.
-    RegistryError { stderr: String, exit_code: i32 },
-    /// Couldn't spawn any candidate binary at all.
+    /// Spegel returned any other non-success status (401/403/5xx etc),
+    /// or a transport-layer failure prevented the request from
+    /// completing. Captured for triage so a misconfigured-spegel node
+    /// doesn't silently disable every auto-accel mount cluster-wide.
+    /// `status: 0` means the request never reached spegel (transport,
+    /// TLS, malformed ref, write-to-content-store failure, etc.).
+    RegistryError { status: u16, body: String },
+    /// Mirror is disabled by config, or any of the cert files don't
+    /// exist on disk. Quiet fallback — the locator falls through to its
+    /// label-filter scan and the node behaves exactly as it did before
+    /// the spegel-pull path landed.
     NoBinary,
 }
 
-/// Attempt a containerd image pull for the synthetic auto-accel ref. We
-/// shell out to `ctr` (rather than wire up the containerd Transfer service
-/// in tonic) because pull is one-shot work and behind a best-effort
-/// fallback. Categorising the failure mode (vs collapsing every error
-/// into `Ok(false)` as the earlier version did) lets discovery log loudly
-/// when the mirror itself is broken — previously a node with broken
-/// spegel mTLS would have every auto-accel mount silently degrade to
-/// overlay forever with no signal.
-async fn ctr_image_pull(image_name: &str) -> PullOutcome {
-    let image_name = image_name.to_string();
+impl SidecarLocator {
+    /// Pull the auto-accel sidecar manifest + every referenced blob from
+    /// k3s's embedded spegel mirror. Returns `PullOutcome::NoBinary` when
+    /// the mirror isn't configured (silent fallback to overlay), otherwise
+    /// maps spegel's HTTP response into one of the four outcomes.
+    ///
+    /// Spegel requires the `?ns=<registry>` query parameter on every
+    /// request; its `distribution.go` parser reads the registry namespace
+    /// from there and 404s every request that omits it — even for content
+    /// that IS in the local content store. That's the entire reason we're
+    /// here.
+    async fn spegel_pull(&self, manifest_digest: &str, synthetic_ref: &str) -> PullOutcome {
+        let Some(spegel) = self.spegel.as_ref() else {
+            return PullOutcome::NoBinary;
+        };
+
+        let (host, repo, tag) = match split_synthetic_ref(synthetic_ref) {
+            Some(parts) => parts,
+            None => {
+                return PullOutcome::RegistryError {
+                    status: 0,
+                    body: format!("malformed synthetic ref {synthetic_ref}"),
+                };
+            }
+        };
+
+        // 1. Manifest fetch (`?ns=` is the load-bearing query parameter).
+        let manifest_path = format!("/v2/{}/manifests/{}?ns={}", repo, tag, host);
+        let manifest_bytes = match spegel_fetch(spegel, &manifest_path, Some(ACCEPT_MANIFEST)).await
+        {
+            FetchResult::Ok(b) => b,
+            FetchResult::Outcome(o) => return o,
+            FetchResult::NotFound => return PullOutcome::NotFound,
+            FetchResult::Error { status, body } => {
+                return PullOutcome::RegistryError { status, body };
+            }
+        };
+        let subject_labels = labels_for_role(manifest_digest, "manifest", synthetic_ref, None);
+        let manifest_digest_in_store = match self
+            .content_store
+            .write_bytes(
+                &manifest_bytes,
+                &format!(
+                    "nydus-auto-accel-spegel-manifest:{}",
+                    strip_sha256(manifest_digest)
+                ),
+                subject_labels,
+            )
+            .await
+        {
+            Ok(d) => d,
+            Err(e) => {
+                return PullOutcome::RegistryError {
+                    status: 0,
+                    body: format!("write manifest to content store failed: {e}"),
+                };
+            }
+        };
+
+        // 2. Parse the OCI wrapper, then fetch the config + every layer
+        //    by digest through spegel (still with `?ns=`).
+        let oci: OciImageManifest = match serde_json::from_slice(&manifest_bytes) {
+            Ok(m) => m,
+            Err(e) => {
+                return PullOutcome::RegistryError {
+                    status: 0,
+                    body: format!("parse oci manifest pulled from spegel: {e}"),
+                };
+            }
+        };
+        if oci.media_type != OCI_MANIFEST_MEDIATYPE {
+            return PullOutcome::RegistryError {
+                status: 0,
+                body: format!(
+                    "unexpected manifest mediaType {}; expected {}",
+                    oci.media_type, OCI_MANIFEST_MEDIATYPE
+                ),
+            };
+        }
+
+        // 2a. Config blob.
+        if let Err(o) = self
+            .spegel_pull_blob(
+                spegel,
+                manifest_digest,
+                &host,
+                &repo,
+                &oci.config.digest,
+                AUTO_ACCEL_CONFIG_MEDIATYPE,
+                synthetic_ref,
+                None,
+            )
+            .await
+        {
+            return o;
+        }
+
+        // 2b. Each layer blob (bootstrap, indexes, optional prefetch).
+        for layer in &oci.layers {
+            let role = role_for_media_type(&layer.media_type);
+            let layer_digest = layer
+                .annotations
+                .get(AUTO_ACCEL_LAYER_DIGEST_ANNOTATION)
+                .cloned();
+            if let Err(o) = self
+                .spegel_pull_blob(
+                    spegel,
+                    manifest_digest,
+                    &host,
+                    &repo,
+                    &layer.digest,
+                    role,
+                    synthetic_ref,
+                    layer_digest,
+                )
+                .await
+            {
+                return o;
+            }
+        }
+
+        // 3. Register the Image record locally so the next pod hits
+        //    `images_get` straight away.
+        if let Err(e) = self
+            .content_store
+            .images_create(
+                synthetic_ref,
+                &manifest_digest_in_store,
+                manifest_bytes.len() as u64,
+                OCI_MANIFEST_MEDIATYPE,
+                image_record_labels(manifest_digest),
+            )
+            .await
+        {
+            // Non-fatal: blobs are written + GC-anchored. images_get
+            // would miss but the label-scan fallback in `resolve_or_pull`
+            // still finds the manifest. Log loud so operators see it.
+            warn!(
+                image_name = %synthetic_ref,
+                error = ?e,
+                "spegel pull wrote blobs but Image record registration failed"
+            );
+        }
+
+        PullOutcome::Ok
+    }
+
+    /// Pull one blob by digest via spegel and write it into the local
+    /// content store with the right role + layer-digest labels. Returns
+    /// `Ok(())` on success or the `PullOutcome` to propagate on failure.
+    #[allow(clippy::too_many_arguments)]
+    async fn spegel_pull_blob(
+        &self,
+        spegel: &SpegelClient,
+        manifest_digest: &str,
+        host: &str,
+        repo: &str,
+        blob_digest: &str,
+        role: &str,
+        synthetic_ref: &str,
+        layer_digest: Option<String>,
+    ) -> std::result::Result<(), PullOutcome> {
+        let path = format!("/v2/{}/blobs/{}?ns={}", repo, blob_digest, host);
+        let bytes = match spegel_fetch(spegel, &path, None).await {
+            FetchResult::Ok(b) => b,
+            FetchResult::Outcome(o) => return Err(o),
+            FetchResult::NotFound => return Err(PullOutcome::NotFound),
+            FetchResult::Error { status, body } => {
+                return Err(PullOutcome::RegistryError { status, body });
+            }
+        };
+        let labels = labels_for_role(manifest_digest, role, synthetic_ref, layer_digest);
+        self.content_store
+            .write_bytes(
+                &bytes,
+                &format!(
+                    "nydus-auto-accel-spegel-{}:{}",
+                    role,
+                    strip_sha256(blob_digest)
+                ),
+                labels,
+            )
+            .await
+            .map_err(|e| PullOutcome::RegistryError {
+                status: 0,
+                body: format!("write blob {blob_digest} to content store failed: {e}"),
+            })?;
+        Ok(())
+    }
+}
+
+/// Map an OCI layer mediaType from our producer to the `role` label we
+/// stamp on the corresponding content blob. Unknown mediaTypes fall back
+/// to `"index"` to match the producer's per-layer default (zran indexes
+/// are by far the most common layer kind in a sidecar).
+fn role_for_media_type(media_type: &str) -> &'static str {
+    match media_type {
+        AUTO_ACCEL_BOOTSTRAP_MEDIATYPE => "bootstrap",
+        AUTO_ACCEL_PREFETCH_MEDIATYPE => "prefetch-blob",
+        // `index` covers the canonical zran-index mediaType AND any
+        // unknown mediaType (defensive against a producer-side rename).
+        _ => "index",
+    }
+}
+
+/// Build the label set the local content store expects for a pulled
+/// blob. Mirrors the producer side so an `images_get` after a
+/// spegel-pulled blob hands back the same shape a locally-converted blob
+/// would.
+fn labels_for_role(
+    manifest_digest: &str,
+    role: &str,
+    synthetic_ref: &str,
+    layer_digest: Option<String>,
+) -> HashMap<String, String> {
+    let mut m = HashMap::new();
+    m.insert(LABEL_SUBJECT.to_string(), manifest_digest.to_string());
+    m.insert(LABEL_ROLE.to_string(), role.to_string());
+    m.insert(LABEL_DISTRIBUTION_SOURCE.to_string(), "sidecar".to_string());
+    if let Some(ld) = layer_digest {
+        m.insert(
+            "containerd.io/snapshot/nydus.auto-accel.layer-digest".to_string(),
+            ld,
+        );
+    }
+    // The synthetic ref is also kept as an annotation hint so logs +
+    // `ctr content ls` show which sidecar this blob belongs to.
+    m.insert(
+        "containerd.io/snapshot/nydus.auto-accel.subject-image".to_string(),
+        synthetic_ref.to_string(),
+    );
+    m
+}
+
+/// Labels stamped on the Image record itself. The producer uses the same
+/// shape — keep it identical so an `images_get` after a spegel-pulled
+/// record returns the same labels callers expect.
+fn image_record_labels(manifest_digest: &str) -> HashMap<String, String> {
+    let mut m = HashMap::new();
+    m.insert(LABEL_SUBJECT.to_string(), manifest_digest.to_string());
+    m.insert(LABEL_ROLE.to_string(), "manifest".to_string());
+    m.insert(LABEL_DISTRIBUTION_SOURCE.to_string(), "sidecar".to_string());
+    m
+}
+
+/// Split a synthetic ref `<host>/<repo>:<tag>` into its three components.
+/// Returns `None` for any shape we can't parse — that surfaces as a
+/// `RegistryError { status: 0, ... }` in `spegel_pull`.
+fn split_synthetic_ref(synthetic_ref: &str) -> Option<(String, String, String)> {
+    let (host_and_repo, tag) = synthetic_ref.rsplit_once(':')?;
+    let (host, repo) = host_and_repo.split_once('/')?;
+    if host.is_empty() || repo.is_empty() || tag.is_empty() {
+        return None;
+    }
+    Some((host.to_string(), repo.to_string(), tag.to_string()))
+}
+
+/// Intermediate result for a spegel HTTPS GET.
+enum FetchResult {
+    Ok(Vec<u8>),
+    NotFound,
+    Error {
+        status: u16,
+        body: String,
+    },
+    /// Catastrophic client-side failure that maps cleanly to a
+    /// `PullOutcome` other than NotFound/Error.
+    Outcome(PullOutcome),
+}
+
+/// GET + body read against the ordered spegel endpoints list. Pulled
+/// out of `spegel_pull` so the same status-categorisation logic runs
+/// for manifest + every blob, and so the fallback iteration happens
+/// in one place.
+///
+/// Runs the cyper call inside `blocking::unblock` so the future this
+/// returns IS `Send` (required because the containerd-snapshots
+/// `Snapshotter` trait via `#[tonic::async_trait]` makes its method
+/// futures `Send + 'static`) even though cyper's `Client` is
+/// `!Send + !Sync` underneath. The blocking thread drives a
+/// thread-local compio runtime and a one-shot cyper client; both are
+/// dropped before the outer future resumes.
+///
+/// Iteration rules:
+/// - The list is `[primary, peer1, peer2, ...]`. We always start at
+///   the primary so single-node clusters keep the cheap local hit and
+///   never touch the cross-node network.
+/// - 2xx from any endpoint → `Ok(bytes)`, no further endpoints tried.
+/// - 404 from one endpoint → try the next one. 404 across the entire
+///   list → `NotFound` (real "nobody has it" signal).
+/// - Any other status / transport error → remember it as a candidate
+///   `Error` outcome but keep iterating: a peer further down the list
+///   might still have the content. If every endpoint either errors or
+///   404s and at least one errored, surface the LAST error (richest
+///   triage data for the operator).
+///
+/// `path_and_query` MUST start with `/v2/...` and include the load-
+/// bearing `?ns=<registry>` query parameter — see `spegel_pull` for
+/// why.
+async fn spegel_fetch(
+    spegel: &SpegelClient,
+    path_and_query: &str,
+    accept: Option<&str>,
+) -> FetchResult {
+    let tls = spegel.tls.clone();
+    let endpoints = spegel.endpoints.clone();
+    let path = path_and_query.to_string();
+    let accept = accept.map(str::to_string);
     blocking::unblock(move || {
-        let mut last_failure: Option<PullOutcome> = None;
-        for argv in &[
-            vec![
-                "ctr",
-                "-n",
-                "k8s.io",
-                "image",
-                "pull",
-                "--plain-http=false",
-                &image_name,
-            ],
-            vec![
-                "k3s",
-                "ctr",
-                "-n",
-                "k8s.io",
-                "image",
-                "pull",
-                "--plain-http=false",
-                &image_name,
-            ],
-        ] {
-            let mut cmd = std::process::Command::new(argv[0]);
-            cmd.args(&argv[1..]);
-            cmd.stdout(std::process::Stdio::null());
-            cmd.stderr(std::process::Stdio::piped());
-            let output = match cmd.output() {
-                Ok(o) => o,
+        block_on_http(async move {
+            let client = match cyper::Client::builder().use_rustls(tls).build() {
+                Ok(c) => c,
                 Err(e) => {
-                    debug!(error = %e, argv = ?argv, "ctr image pull failed to spawn; trying next");
-                    continue;
+                    return FetchResult::Outcome(PullOutcome::RegistryError {
+                        status: 0,
+                        body: format!("build cyper client for spegel: {e}"),
+                    });
                 }
             };
-            if output.status.success() {
-                return PullOutcome::Ok;
+            let mut last_error: Option<FetchResult> = None;
+            let mut last_outcome: Option<FetchResult> = None;
+            for endpoint in &endpoints {
+                let url = format!("{endpoint}{path}");
+                let req_builder = match client.get(&url) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        last_outcome = Some(FetchResult::Outcome(PullOutcome::RegistryError {
+                            status: 0,
+                            body: format!("invalid spegel URL {url}: {e}"),
+                        }));
+                        continue;
+                    }
+                };
+                let req = if let Some(ref accept) = accept {
+                    match req_builder.header(ACCEPT, accept.as_str()) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            last_outcome = Some(FetchResult::Outcome(PullOutcome::RegistryError {
+                                status: 0,
+                                body: format!("invalid Accept header for {url}: {e}"),
+                            }));
+                            continue;
+                        }
+                    }
+                } else {
+                    req_builder
+                };
+                let response =
+                    match compio::time::timeout(Duration::from_secs(30), req.send()).await {
+                        Ok(Ok(r)) => r,
+                        Ok(Err(e)) => {
+                            last_outcome = Some(FetchResult::Outcome(PullOutcome::RegistryError {
+                                status: 0,
+                                body: format!("transport error for {url}: {e}"),
+                            }));
+                            continue;
+                        }
+                        Err(_) => {
+                            last_outcome = Some(FetchResult::Outcome(PullOutcome::RegistryError {
+                                status: 0,
+                                body: format!("spegel request timed out for {url}"),
+                            }));
+                            continue;
+                        }
+                    };
+                let status = response.status();
+                match http_status_to_outcome(status.as_u16()) {
+                    StatusOutcome::Ok => match response.bytes().await {
+                        Ok(b) => return FetchResult::Ok(b.to_vec()),
+                        Err(e) => {
+                            last_outcome = Some(FetchResult::Outcome(PullOutcome::RegistryError {
+                                status: status.as_u16(),
+                                body: format!("read body for {url}: {e}"),
+                            }));
+                        }
+                    },
+                    StatusOutcome::NotFound => {
+                        // Try the next peer; keep going.
+                    }
+                    StatusOutcome::Error => {
+                        let body = response.text().await.unwrap_or_default();
+                        last_error = Some(FetchResult::Error {
+                            status: status.as_u16(),
+                            body,
+                        });
+                    }
+                }
             }
-            let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-            let exit_code = output.status.code().unwrap_or(-1);
-            last_failure = Some(classify_pull_failure(&stderr, exit_code));
-            // Same binary version of containerd answers both `ctr` and
-            // `k3s ctr` — if the first ran and gave a categorised failure
-            // the second will too. Only spawn-failure (the `continue`
-            // above) tries the next candidate.
-            return last_failure.unwrap();
-        }
-        last_failure.unwrap_or(PullOutcome::NoBinary)
+            // No 2xx from any endpoint. Prefer surfacing a real Error
+            // (operator wants to see 5xx / TLS / transport failure) over
+            // a NotFound, since NotFound is the expected "nobody has it"
+            // case.
+            last_error.or(last_outcome).unwrap_or(FetchResult::NotFound)
+        })
     })
     .await
 }
 
-/// Map `ctr image pull` stderr + exit code to a `PullOutcome`. Pulled out
-/// of `ctr_image_pull` so unit tests can pin the categorisation without
-/// spawning a process.
-fn classify_pull_failure(stderr: &str, exit_code: i32) -> PullOutcome {
-    let lower = stderr.to_ascii_lowercase();
-    // Spegel + missing real registry produces the literal "not found"
-    // from the resolver. `dial tcp: lookup …: no such host` is also the
-    // miss path — the synthetic `.local` hostname doesn't resolve and
-    // the mirror chain had no peer answer either, so reaching the host
-    // lookup means resolve already 404'd.
-    let is_not_found = lower.contains("not found")
-        || lower.contains("no such host")
-        || lower.contains("manifest unknown")
-        || lower.contains("404");
-    if is_not_found {
-        PullOutcome::NotFound
+/// Tri-state categorisation for one HTTP status code. Pulled out so unit
+/// tests can pin the boundary (404 → NotFound vs 401/403/5xx → Error)
+/// without spinning a real HTTP server.
+fn http_status_to_outcome(status: u16) -> StatusOutcome {
+    if (200..300).contains(&status) {
+        StatusOutcome::Ok
+    } else if status == 404 {
+        StatusOutcome::NotFound
     } else {
-        PullOutcome::RegistryError {
-            stderr: stderr.to_string(),
-            exit_code,
+        StatusOutcome::Error
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum StatusOutcome {
+    Ok,
+    NotFound,
+    Error,
+}
+
+/// Build the rustls TLS config + endpoint list used for every spegel
+/// call. Pure metadata: no cyper `Client` is constructed here because
+/// cyper's client is `!Send + !Sync` (Rc-based for compio
+/// current_thread). The actual client is built per call in
+/// `spegel_fetch` on a blocking thread.
+///
+/// `Ok(None)` is returned when the mirror is disabled by config or any
+/// of the configured cert files don't exist on disk — both map to
+/// "skip the spegel-pull path" rather than an error, so a host without
+/// an embedded spegel mirror runs the same as it did before.
+fn build_spegel_client(cfg: &SpegelMirrorConfig) -> Result<Option<SpegelClient>> {
+    if !cfg.enable {
+        return Ok(None);
+    }
+    for path in [&cfg.ca_path, &cfg.client_cert_path, &cfg.client_key_path] {
+        if !path.is_file() {
+            debug!(
+                ca = %cfg.ca_path.display(),
+                cert = %cfg.client_cert_path.display(),
+                key = %cfg.client_key_path.display(),
+                missing = %path.display(),
+                "spegel cert file missing; mirror client disabled"
+            );
+            return Ok(None);
         }
     }
+
+    // 1. Custom root CA (the k3s server CA — system trust store is not
+    //    used; the only thing we authenticate against is the embedded
+    //    spegel + peer mirrors signed by this CA).
+    let mut roots = rustls::RootCertStore::empty();
+    let mut ca_reader = BufReader::new(
+        File::open(&cfg.ca_path)
+            .with_context(|| format!("open spegel CA cert {}", cfg.ca_path.display()))?,
+    );
+    let mut ca_added = 0usize;
+    for cert in rustls_pemfile::certs(&mut ca_reader) {
+        let cert =
+            cert.with_context(|| format!("parse spegel CA cert {}", cfg.ca_path.display()))?;
+        roots
+            .add(cert)
+            .with_context(|| format!("add spegel CA to root store {}", cfg.ca_path.display()))?;
+        ca_added += 1;
+    }
+    if ca_added == 0 {
+        return Err(anyhow!(
+            "no CA certificates found in {}",
+            cfg.ca_path.display()
+        ));
+    }
+
+    // 2. Client identity for mTLS (k3s controller cert + key — same
+    //    identity k3s' own internal components use).
+    let mut cert_reader =
+        BufReader::new(File::open(&cfg.client_cert_path).with_context(|| {
+            format!("open spegel client cert {}", cfg.client_cert_path.display())
+        })?);
+    let client_certs: Vec<rustls::pki_types::CertificateDer<'static>> =
+        rustls_pemfile::certs(&mut cert_reader)
+            .collect::<std::result::Result<_, _>>()
+            .with_context(|| {
+                format!(
+                    "parse spegel client cert {}",
+                    cfg.client_cert_path.display()
+                )
+            })?;
+    if client_certs.is_empty() {
+        return Err(anyhow!(
+            "no client certificates found in {}",
+            cfg.client_cert_path.display()
+        ));
+    }
+
+    let mut key_reader =
+        BufReader::new(File::open(&cfg.client_key_path).with_context(|| {
+            format!("open spegel client key {}", cfg.client_key_path.display())
+        })?);
+    let client_key = rustls_pemfile::private_key(&mut key_reader)
+        .with_context(|| format!("parse spegel client key {}", cfg.client_key_path.display()))?
+        .ok_or_else(|| anyhow!("no private key found in {}", cfg.client_key_path.display()))?;
+
+    let tls = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_client_auth_cert(client_certs, client_key)
+        .context("build rustls ClientConfig for spegel mirror")?;
+
+    // Primary endpoint first, then operator-configured peer fallbacks
+    // (workaround for libp2p "empty list of address ports" — see
+    // `spegel_fetch` for the iteration semantics).
+    let mut endpoints = Vec::with_capacity(1 + cfg.peer_endpoints.len());
+    endpoints.push(cfg.endpoint.trim_end_matches('/').to_string());
+    for peer in &cfg.peer_endpoints {
+        let trimmed = peer.trim_end_matches('/').to_string();
+        if !trimmed.is_empty() && !endpoints.contains(&trimmed) {
+            endpoints.push(trimmed);
+        }
+    }
+
+    Ok(Some(SpegelClient {
+        tls: Arc::new(tls),
+        endpoints,
+    }))
 }
 
 /// Per-manifest slug for staging dirs. Uses the bare hex (no `sha256:`
@@ -419,9 +948,17 @@ pub struct AutoAccelDiscovery {
 }
 
 impl AutoAccelDiscovery {
-    pub fn new(content_store: ContentStoreClient, snapshotter_root: &Path) -> Self {
+    pub fn new(
+        content_store: ContentStoreClient,
+        snapshotter_root: &Path,
+        spegel_config: &SpegelMirrorConfig,
+    ) -> Self {
         Self {
-            locator: Arc::new(SidecarLocator::new(content_store, snapshotter_root)),
+            locator: Arc::new(SidecarLocator::new(
+                content_store,
+                snapshotter_root,
+                spegel_config,
+            )),
         }
     }
 
@@ -448,6 +985,7 @@ pub fn auto_accel_labels(subject: &str, role: &str) -> HashMap<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auto_accel_oci::AUTO_ACCEL_INDEX_MEDIATYPE;
 
     #[test]
     fn pick_latest_prefers_larger_size_then_digest() {
@@ -481,54 +1019,86 @@ mod tests {
         assert_eq!(slug_for_digest("abc"), "abc");
     }
 
-    /// `classify_pull_failure` is the critical bit of `ctr_image_pull`:
-    /// it decides whether a non-zero exit is a clean "no peer has it"
-    /// miss (silent fallback to overlay) or a real "mirror is broken"
-    /// signal that needs operator attention. Pre-fix the categorisation
-    /// was missing and a busted spegel mTLS would have silently
-    /// disabled every auto-accel mount on the node.
+    /// `http_status_to_outcome` is the critical categorisation that
+    /// decides whether spegel's response is a clean "no peer has it"
+    /// (silent fallback to overlay) or a real "mirror is broken" signal
+    /// that needs operator attention. Pre-spegel-pull, the equivalent
+    /// stderr-parsing version of this categorisation was missing and a
+    /// busted spegel mTLS would have silently disabled every auto-accel
+    /// mount on the node.
     #[test]
-    fn classify_pull_failure_treats_404_as_not_found() {
+    fn http_status_to_outcome_404_is_not_found() {
+        assert_eq!(http_status_to_outcome(404), StatusOutcome::NotFound);
+    }
+
+    #[test]
+    fn http_status_to_outcome_2xx_is_ok() {
+        assert_eq!(http_status_to_outcome(200), StatusOutcome::Ok);
+        assert_eq!(http_status_to_outcome(204), StatusOutcome::Ok);
+        assert_eq!(http_status_to_outcome(299), StatusOutcome::Ok);
+    }
+
+    #[test]
+    fn http_status_to_outcome_auth_failures_are_registry_error() {
+        // 401/403 → spegel mTLS misconfigured, client cert expired, etc.
+        // Operator needs the signal — NOT a silent fallback.
+        assert_eq!(http_status_to_outcome(401), StatusOutcome::Error);
+        assert_eq!(http_status_to_outcome(403), StatusOutcome::Error);
+    }
+
+    #[test]
+    fn http_status_to_outcome_5xx_is_registry_error() {
+        // Daemon down, panic, OOM — same operator-needs-to-look story.
+        assert_eq!(http_status_to_outcome(500), StatusOutcome::Error);
+        assert_eq!(http_status_to_outcome(502), StatusOutcome::Error);
+        assert_eq!(http_status_to_outcome(503), StatusOutcome::Error);
+    }
+
+    #[test]
+    fn http_status_to_outcome_3xx_is_registry_error() {
+        // We don't follow redirects through spegel — a peer that needs to
+        // redirect us is a config bug to flag.
+        assert_eq!(http_status_to_outcome(301), StatusOutcome::Error);
+        assert_eq!(http_status_to_outcome(307), StatusOutcome::Error);
+    }
+
+    /// `split_synthetic_ref` is the producer/consumer contract for the
+    /// `<host>/<repo>:<tag>` shape. Pin it so a rename on either side
+    /// fails at compile/test time, not at runtime when a pull lands on a
+    /// peer node.
+    #[test]
+    fn split_synthetic_ref_parses_the_canonical_shape() {
+        let (host, repo, tag) =
+            split_synthetic_ref("nydus.auto-accel.local/sidecar:e6017bb").unwrap();
+        assert_eq!(host, "nydus.auto-accel.local");
+        assert_eq!(repo, "sidecar");
+        assert_eq!(tag, "e6017bb");
+    }
+
+    #[test]
+    fn split_synthetic_ref_rejects_missing_pieces() {
+        assert!(split_synthetic_ref("nydus.auto-accel.local").is_none()); // no `:`
+        assert!(split_synthetic_ref("nydus.auto-accel.local/sidecar").is_none()); // no `:`
+        assert!(split_synthetic_ref(":e6017bb").is_none()); // no host/repo
+        assert!(split_synthetic_ref("nydus.auto-accel.local/:e6017bb").is_none()); // empty repo
+        assert!(split_synthetic_ref("nydus.auto-accel.local/sidecar:").is_none()); // empty tag
+    }
+
+    /// `role_for_media_type` is the mediaType → role translation the
+    /// consumer uses when stamping labels on a spegel-pulled blob. Keep
+    /// it pinned so a producer-side mediaType rename fails here, not at
+    /// runtime when the wrong label lands on a blob.
+    #[test]
+    fn role_for_media_type_maps_each_known_layer_kind() {
         assert_eq!(
-            classify_pull_failure("ctr: failed to resolve image: manifest unknown", 1),
-            PullOutcome::NotFound
+            role_for_media_type(AUTO_ACCEL_BOOTSTRAP_MEDIATYPE),
+            "bootstrap"
         );
-    }
-
-    #[test]
-    fn classify_pull_failure_treats_dns_lookup_as_not_found() {
-        // Synthetic host `nydus.auto-accel.local` deliberately doesn't
-        // resolve — when spegel finds no peer the fallback fails DNS,
-        // which is a clean miss not a real error.
-        let stderr = "ctr: failed to do request: Head \"https://nydus.auto-accel.local/v2/sidecar/manifests/X\": dial tcp: lookup nydus.auto-accel.local: no such host";
-        assert_eq!(classify_pull_failure(stderr, 1), PullOutcome::NotFound);
-    }
-
-    #[test]
-    fn classify_pull_failure_treats_404_status_word_as_not_found() {
+        assert_eq!(role_for_media_type(AUTO_ACCEL_INDEX_MEDIATYPE), "index");
         assert_eq!(
-            classify_pull_failure("HTTP 404 Not Found", 1),
-            PullOutcome::NotFound
+            role_for_media_type(AUTO_ACCEL_PREFETCH_MEDIATYPE),
+            "prefetch-blob"
         );
-    }
-
-    #[test]
-    fn classify_pull_failure_flags_auth_as_registry_error() {
-        // 401/403 / "unauthorized" / spegel mTLS misconfig — operator
-        // needs the signal. NOT a silent fallback.
-        let stderr = "ctr: failed to resolve image: failed to fetch manifest: 401 Unauthorized";
-        match classify_pull_failure(stderr, 1) {
-            PullOutcome::RegistryError { exit_code, .. } => assert_eq!(exit_code, 1),
-            other => panic!("expected RegistryError for auth failure, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn classify_pull_failure_flags_daemon_down_as_registry_error() {
-        let stderr = "ctr: failed to dial: connection refused";
-        match classify_pull_failure(stderr, 1) {
-            PullOutcome::RegistryError { .. } => {}
-            other => panic!("expected RegistryError for daemon-down, got {other:?}"),
-        }
+        assert_eq!(role_for_media_type("something/unknown"), "index");
     }
 }

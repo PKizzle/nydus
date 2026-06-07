@@ -66,6 +66,22 @@ cyper = { git = "https://github.com/compio-rs/cyper", rev = "d1c8aff18dd81c4b1f8
     "http2",
     "stream",
 ] }
+# rustls (+ pemfile loader) for the auto-accel spegel mirror pull. The
+# snapshotter trait requires `Send + Sync`, but cyper's `Client` holds an
+# `Rc` internally (it targets the compio current_thread runtime), so the
+# stored TLS material is `Arc<rustls::ClientConfig>` + the endpoint list
+# (both Send + Sync) and the actual `cyper::Client` is built per call on
+# a blocking thread driving its own thread-local compio runtime (see
+# `auto_accel_sidecar.rs::block_on_http`). This matches the pattern
+# `storage/src/backend/connection.rs` already uses for the registry
+# backend, keeps reqwest+tokio out of the snapshotter, and avoids
+# pulling OpenSSL.
+rustls = { version = "0.23", default-features = false, features = [
+    "ring",
+    "std",
+    "tls12",
+] }
+rustls-pemfile = "2"
 http = "1.4"
 axum = { version = "0.8.1", default-features = false }
 async-lock = "3.4"
@@ -114,7 +130,7 @@ mio = { version = "1.2", features = ["os-poll", "os-ext"] }
 # path). The pre-content read-serving path in `service/src/fanotify.rs` keeps
 # its hand-rolled `fanotify_sys` because nix doesn't expose the pre-content
 # constants; the capture path only needs the notify-class API which nix has.
-nix = { version = "0.31", features = ["fanotify"] }
+nix = { version = "0.31", features = ["fanotify", "mount"] }
 # Glob-matching for the auto-accel capture exclude list.
 glob = "0.3"
 sendfd = "0.4.3"
