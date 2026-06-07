@@ -31,6 +31,15 @@ pub struct ProbeResult {
 ///
 /// The first driver that passes the probe is selected as the active driver.
 pub fn probe_drivers(drivers: &[FsDriverEntry]) -> Vec<ProbeResult> {
+    // Best-effort load erofs once before per-driver probing so both
+    // fanotify and blockdev see it. Distros that compile erofs as a
+    // module (Raspberry Pi OS' upstream kernels do — `CONFIG_EROFS_FS=m`)
+    // leave it unloaded until the first mount, which makes the
+    // `has_filesystem("erofs")` check at startup fall through to fusedev
+    // even though the kernel fully supports it. modprobe is idempotent;
+    // failures (missing binary, missing CAP_SYS_MODULE, already
+    // built-in) are silent.
+    ensure_erofs_loaded_once();
     drivers.iter().map(probe_single).collect()
 }
 
@@ -296,6 +305,50 @@ fn has_filesystem(fs_name: &str) -> bool {
         .map(|content| content.contains(fs_name))
         .unwrap_or(false)
 }
+
+/// Best-effort `modprobe erofs` at startup. Only runs once per process
+/// (cached in `EROFS_MODPROBE`), skips when erofs is already listed in
+/// `/proc/filesystems` (built-in or already-loaded), and silently
+/// tolerates a missing modprobe binary / missing CAP_SYS_MODULE. The
+/// fanotify + blockdev probes downstream still do their own
+/// `has_filesystem("erofs")` check, so a failure here just keeps the
+/// pre-existing behaviour.
+fn ensure_erofs_loaded_once() {
+    use std::sync::Once;
+    static EROFS_MODPROBE: Once = Once::new();
+    EROFS_MODPROBE.call_once(ensure_erofs_loaded_inner);
+}
+
+#[cfg(target_os = "linux")]
+fn ensure_erofs_loaded_inner() {
+    if has_filesystem("erofs") {
+        return; // already loaded or built-in
+    }
+    // Try the usual locations. Some minimal images don't put
+    // modprobe on PATH for non-interactive systemd units.
+    for binary in ["modprobe", "/sbin/modprobe", "/usr/sbin/modprobe"] {
+        match std::process::Command::new(binary).arg("erofs").status() {
+            Ok(status) if status.success() => {
+                info!("loaded erofs kernel module via {binary}");
+                return;
+            }
+            Ok(status) => {
+                debug!(%binary, code = status.code(), "modprobe erofs returned non-zero");
+            }
+            Err(e) => {
+                debug!(%binary, error = %e, "modprobe erofs invocation failed");
+            }
+        }
+    }
+    debug!(
+        "erofs not loadable via modprobe; \
+         fanotify + blockdev probes will fall through to fusedev \
+         unless erofs is autoloaded out-of-band"
+    );
+}
+
+#[cfg(not(target_os = "linux"))]
+fn ensure_erofs_loaded_inner() {}
 
 /// Check whether the current process holds all required Linux capabilities.
 fn has_caps(caps: &[String]) -> bool {
