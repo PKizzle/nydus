@@ -47,6 +47,46 @@ pub struct AutoAccelManifest {
     pub zran_indexes: Vec<AutoAccelLayerDescriptor>,
     /// Optional packed prefetch blob (only set when convert had prefetch_files).
     pub prefetch_blob: Option<AutoAccelDescriptor>,
+    /// OCI image config sentinel fields. Spegel's `FingerprintMediaType`
+    /// only recognises a JSON blob as an OCI image config when the body
+    /// contains `architecture`, `os`, AND `rootfs` keys (see
+    /// spegel/pkg/oci/oci.go). A blob it can't classify gets served as
+    /// 404 from `/v2/blobs` even when it's physically present in
+    /// containerd's content store — that broke the cross-node config
+    /// fetch with "spegel: response status=404 Not Found" while every
+    /// layer blob served 200. These three fields are inert
+    /// (linux/amd64 + empty layer list) and the only cost is ~30 bytes
+    /// on the wire.
+    #[serde(default = "default_oci_architecture")]
+    pub architecture: String,
+    #[serde(default = "default_oci_os")]
+    pub os: String,
+    #[serde(default = "default_oci_rootfs")]
+    pub rootfs: OciConfigRootfs,
+}
+
+/// Minimal OCI image-config `rootfs` shape — exists only to satisfy
+/// spegel's `FingerprintMediaType` heuristic. Contents are inert.
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+pub struct OciConfigRootfs {
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub diff_ids: Vec<String>,
+}
+
+fn default_oci_architecture() -> String {
+    "amd64".to_string()
+}
+
+fn default_oci_os() -> String {
+    "linux".to_string()
+}
+
+fn default_oci_rootfs() -> OciConfigRootfs {
+    OciConfigRootfs {
+        kind: "layers".to_string(),
+        diff_ids: Vec::new(),
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -508,6 +548,9 @@ async fn run_conversion(
         },
         zran_indexes: zran_descriptors.clone(),
         prefetch_blob: prefetch_descriptor.clone(),
+        architecture: default_oci_architecture(),
+        os: default_oci_os(),
+        rootfs: default_oci_rootfs(),
     };
     let config_bytes = serde_json::to_vec(&manifest).context("serialize auto-accel config")?;
     // The ingest-time ref is just a label for the streaming Write; after
