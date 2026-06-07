@@ -356,6 +356,8 @@ fn run_optimize(
         backend.into(),
         "--output-bootstrap".into(),
         optimized_bootstrap.as_path().into(),
+        "--output-blob-dir".into(),
+        backend.into(),
     ];
     run(
         &config.nydus_image,

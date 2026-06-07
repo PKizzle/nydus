@@ -289,7 +289,7 @@ async fn worker_loop(
         let success = result.is_ok();
         state.mark_finished(&job, success);
         if let Err(e) = result {
-            warn!(image = %job.image, error = %e, "auto-zran conversion failed");
+            warn!(image = %job.image, error = ?e, "auto-zran conversion failed");
         }
     }
 }
