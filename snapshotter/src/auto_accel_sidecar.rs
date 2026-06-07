@@ -58,30 +58,63 @@ impl SidecarLocator {
         }
     }
 
-    /// Find an auto-accel manifest for `manifest_digest` if one is present in
-    /// the local content store (either because this node produced it or
-    /// because spegel replicated a peer's). Returns `Ok(None)` when none
-    /// exists — the caller falls back to overlay.
+    /// Find an auto-accel manifest for `manifest_digest`. Tries in order:
+    ///
+    /// 1. Local `images.Get(synthetic-ref)` — hit on the producer node and
+    ///    on any peer that already pulled this sidecar.
+    /// 2. `ctr -n k8s.io image pull <synthetic-ref>` — drives containerd's
+    ///    Resolver through `registries.yaml`'s `mirrors:{"+":...}` config,
+    ///    which routes to k3s's embedded spegel. spegel asks peers via
+    ///    libp2p; if a peer has the image record advertised, the OCI
+    ///    manifest + its config + every layer (bootstrap, zran indexes,
+    ///    prefetch blob) flow through the mirror in one transfer. After
+    ///    success we retry `images.Get`.
+    /// 3. Label-filter scan on the content store — covers legacy artifacts
+    ///    uploaded before the image-record registration landed.
+    ///
+    /// Returns `Ok(None)` when nothing matches — the caller falls back to
+    /// overlay.
     pub async fn find(&self, manifest_digest: &str) -> Result<Option<AutoAccelManifest>> {
-        // Fast path: ask containerd's Images service for the synthetic ref
-        // we deterministically register on the producer side. Same name on
-        // every node, so a peer's Image record visible locally via spegel
-        // mirror lands here first; a label-filter scan only kicks in for
-        // legacy artifacts uploaded before the image-record registration
-        // landed.
         let image_name = crate::auto_zran::auto_accel_image_name(manifest_digest);
-        let resolved = match self.content_store.images_get(&image_name).await {
-            Ok(opt) => opt,
-            Err(e) => {
-                debug!(image_name = %image_name, error = %e, "auto-accel images.Get failed; falling back to label scan");
+
+        let mut resolved = self
+            .content_store
+            .images_get(&image_name)
+            .await
+            .unwrap_or_else(|e| {
+                debug!(image_name = %image_name, error = %e, "auto-accel images.Get failed; will try pull");
                 None
+            });
+
+        if resolved.is_none() {
+            // Drive a containerd pull through registries.yaml → spegel →
+            // peer. If a peer advertises the image record, this brings
+            // everything down in one shot.
+            match ctr_image_pull(&image_name).await {
+                Ok(true) => {
+                    info!(image_name = %image_name, "auto-accel pulled via spegel mirror");
+                    resolved = self
+                        .content_store
+                        .images_get(&image_name)
+                        .await
+                        .unwrap_or_else(|e| {
+                            debug!(image_name = %image_name, error = %e, "post-pull images.Get failed");
+                            None
+                        });
+                }
+                Ok(false) => {
+                    debug!(image_name = %image_name, "no peer advertised this sidecar; falling back to label scan");
+                }
+                Err(e) => {
+                    debug!(image_name = %image_name, error = %e, "ctr image pull errored unexpectedly");
+                }
             }
-        };
+        }
 
         let blob = match resolved {
             Some(info) => info,
             None => {
-                // containerd filter syntax: each filter is AND-ed.
+                // Label-filter fallback (legacy artifacts).
                 let filters = vec![format!(
                     "labels.\"{LABEL_SUBJECT}\"=={manifest_digest},labels.\"{LABEL_ROLE}\"==manifest"
                 )];
@@ -92,9 +125,22 @@ impl SidecarLocator {
                 blob
             }
         };
-        let bytes = self.content_store.fetch_bytes(&blob.digest).await?;
-        let manifest: AutoAccelManifest = serde_json::from_slice(&bytes)
-            .with_context(|| format!("parse auto-accel manifest blob {}", blob.digest))?;
+
+        // The Image record points at the OCI manifest. Parse it, fetch the
+        // referenced config blob (which is our AutoAccelManifest JSON), and
+        // return that to the caller.
+        let manifest_bytes = self.content_store.fetch_bytes(&blob.digest).await?;
+        let oci: serde_json::Value = serde_json::from_slice(&manifest_bytes)
+            .with_context(|| format!("parse oci wrapper for {}", blob.digest))?;
+        let config_digest = oci
+            .get("config")
+            .and_then(|c| c.get("digest"))
+            .and_then(|d| d.as_str())
+            .ok_or_else(|| anyhow!("oci manifest {} missing config.digest", blob.digest))?
+            .to_string();
+        let config_bytes = self.content_store.fetch_bytes(&config_digest).await?;
+        let manifest: AutoAccelManifest = serde_json::from_slice(&config_bytes)
+            .with_context(|| format!("parse auto-accel config blob {config_digest}"))?;
         if manifest.subject_manifest_digest != manifest_digest {
             warn!(
                 expected = manifest_digest,
@@ -227,6 +273,69 @@ fn symlink_force(target: &Path, link: &Path) -> Result<()> {
 
 fn strip_sha256(digest: &str) -> &str {
     digest.strip_prefix("sha256:").unwrap_or(digest)
+}
+
+/// Attempt a containerd image pull for the synthetic auto-accel ref. We
+/// shell out to `ctr` (rather than wire up the containerd Transfer service
+/// in tonic) because pull is one-shot work, error-tolerant, and behind a
+/// best-effort fallback: a failure just means "no peer advertised this
+/// sidecar", and the caller silently falls through to overlay. Returns
+/// `Ok(true)` when the pull committed something, `Ok(false)` when ctr
+/// returned a non-zero exit (typical 404 from spegel + no upstream
+/// fallback), `Err(...)` only when we couldn't run the command at all.
+async fn ctr_image_pull(image_name: &str) -> Result<bool> {
+    let image_name = image_name.to_string();
+    blocking::unblock(move || {
+        // Try `ctr` first, then `k3s ctr` for k3s nodes where ctr isn't on PATH.
+        for argv in &[
+            vec![
+                "ctr",
+                "-n",
+                "k8s.io",
+                "image",
+                "pull",
+                "--plain-http=false",
+                &image_name,
+            ],
+            vec![
+                "k3s",
+                "ctr",
+                "-n",
+                "k8s.io",
+                "image",
+                "pull",
+                "--plain-http=false",
+                &image_name,
+            ],
+        ] {
+            let mut cmd = std::process::Command::new(argv[0]);
+            cmd.args(&argv[1..]);
+            cmd.stdout(std::process::Stdio::null());
+            cmd.stderr(std::process::Stdio::piped());
+            let output = match cmd.output() {
+                Ok(o) => o,
+                Err(e) => {
+                    debug!(error = %e, argv = ?argv, "ctr image pull failed to spawn; trying next");
+                    continue;
+                }
+            };
+            if output.status.success() {
+                return Ok(true);
+            }
+            // Non-zero status from a binary that DID run. Most common reason:
+            // no peer + no real registry behind the synthetic hostname →
+            // resolver returns 404. Surface stderr at debug for triage.
+            debug!(
+                argv = ?argv,
+                exit = output.status.code().unwrap_or(-1),
+                stderr = %String::from_utf8_lossy(&output.stderr),
+                "ctr image pull returned non-zero"
+            );
+            return Ok(false);
+        }
+        anyhow::bail!("neither `ctr` nor `k3s ctr` was runnable for image pull")
+    })
+    .await
 }
 
 /// Per-manifest slug for staging dirs. Uses the bare hex (no `sha256:`

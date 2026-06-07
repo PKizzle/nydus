@@ -63,6 +63,45 @@ pub struct AutoAccelLayerDescriptor {
     pub size: u64,
 }
 
+/// Minimal OCI image manifest schema. We wrap `AutoAccelManifest` as the
+/// `config` blob and list the bootstrap + zran indexes + optional prefetch
+/// blob as `layers[]`. The point of this wrapping is purely to make
+/// `ctr image pull <synthetic-ref>` work: containerd recognises this as an
+/// OCI image manifest and walks `config` + `layers[]`, pulling each blob via
+/// the configured registries.yaml mirror (and so through k3s's embedded
+/// spegel) in one shot. The on-the-wire content stays standard OCI; only
+/// the media types signal "this is a nydus auto-accel sidecar, not a
+/// runnable container image".
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct OciImageManifest {
+    pub schema_version: u32,
+    #[serde(rename = "mediaType")]
+    pub media_type: String,
+    pub config: OciDescriptor,
+    pub layers: Vec<OciDescriptor>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub annotations: HashMap<String, String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct OciDescriptor {
+    #[serde(rename = "mediaType")]
+    pub media_type: String,
+    pub digest: String,
+    pub size: u64,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub annotations: HashMap<String, String>,
+}
+
+pub const OCI_MANIFEST_MEDIATYPE: &str = "application/vnd.oci.image.manifest.v1+json";
+pub const AUTO_ACCEL_CONFIG_MEDIATYPE: &str = "application/vnd.nydus.auto-accel.config.v1+json";
+pub const AUTO_ACCEL_BOOTSTRAP_MEDIATYPE: &str = "application/vnd.nydus.auto-accel.bootstrap.v1";
+pub const AUTO_ACCEL_INDEX_MEDIATYPE: &str = "application/vnd.nydus.auto-accel.zran-index.v1";
+pub const AUTO_ACCEL_PREFETCH_MEDIATYPE: &str = "application/vnd.nydus.auto-accel.prefetch-blob.v1";
+pub const AUTO_ACCEL_SUBJECT_ANNOTATION: &str = "containerd.io/snapshot/nydus.auto-accel.subject";
+pub const AUTO_ACCEL_LAYER_DIGEST_ANNOTATION: &str =
+    "containerd.io/snapshot/nydus.auto-accel.layer-digest";
+
 /// Dependencies that the conversion worker needs in addition to the static
 /// `AutoZranConfig`. Bundled so the manager's `start()` signature stays
 /// terse and the worker_loop can take a single Arc.
@@ -449,31 +488,91 @@ async fn run_conversion(
         None
     };
 
-    // (5) Auto-accel manifest JSON.
+    // (5) AutoAccelManifest goes up as the OCI image *config* blob.
     let manifest = AutoAccelManifest {
         version: 1,
         subject_manifest_digest: manifest_digest.clone(),
         image_ref: job.image.clone(),
         bootstrap: AutoAccelDescriptor {
-            digest: bootstrap_digest,
+            digest: bootstrap_digest.clone(),
             size: bootstrap_meta.len(),
         },
-        zran_indexes: zran_descriptors,
-        prefetch_blob: prefetch_descriptor,
+        zran_indexes: zran_descriptors.clone(),
+        prefetch_blob: prefetch_descriptor.clone(),
     };
-    let manifest_bytes = serde_json::to_vec(&manifest).context("serialize auto-accel manifest")?;
+    let config_bytes = serde_json::to_vec(&manifest).context("serialize auto-accel config")?;
+    let config_digest = deps
+        .content_store
+        .write_bytes(&config_bytes, &auto_accel_ref, base_labels("config"))
+        .await
+        .context("upload auto-accel config")?;
+
+    // (5a) Build the OCI image manifest that wraps the config + all data
+    // blobs as `layers[]`. This is what makes `ctr image pull <synthetic-ref>`
+    // bring down everything in one go on peer nodes: containerd treats it
+    // as a regular OCI image and walks `config` + `layers[]`, fetching
+    // each blob via the registries.yaml mirror (spegel) by digest.
+    let mut layers: Vec<OciDescriptor> = Vec::with_capacity(1 + zran_descriptors.len() + 1);
+    layers.push(OciDescriptor {
+        media_type: AUTO_ACCEL_BOOTSTRAP_MEDIATYPE.to_string(),
+        digest: bootstrap_digest.clone(),
+        size: bootstrap_meta.len(),
+        annotations: HashMap::new(),
+    });
+    for index in &zran_descriptors {
+        let mut anns = HashMap::new();
+        anns.insert(
+            AUTO_ACCEL_LAYER_DIGEST_ANNOTATION.to_string(),
+            index.layer_digest.clone(),
+        );
+        layers.push(OciDescriptor {
+            media_type: AUTO_ACCEL_INDEX_MEDIATYPE.to_string(),
+            digest: index.digest.clone(),
+            size: index.size,
+            annotations: anns,
+        });
+    }
+    if let Some(pf) = &prefetch_descriptor {
+        layers.push(OciDescriptor {
+            media_type: AUTO_ACCEL_PREFETCH_MEDIATYPE.to_string(),
+            digest: pf.digest.clone(),
+            size: pf.size,
+            annotations: HashMap::new(),
+        });
+    }
+    let mut manifest_annotations = HashMap::new();
+    manifest_annotations.insert(
+        AUTO_ACCEL_SUBJECT_ANNOTATION.to_string(),
+        manifest_digest.clone(),
+    );
+    let oci_manifest = OciImageManifest {
+        schema_version: 2,
+        media_type: OCI_MANIFEST_MEDIATYPE.to_string(),
+        config: OciDescriptor {
+            media_type: AUTO_ACCEL_CONFIG_MEDIATYPE.to_string(),
+            digest: config_digest.clone(),
+            size: config_bytes.len() as u64,
+            annotations: HashMap::new(),
+        },
+        layers,
+        annotations: manifest_annotations,
+    };
+    let manifest_bytes =
+        serde_json::to_vec(&oci_manifest).context("serialize auto-accel oci manifest")?;
+    let manifest_oci_ref = format!("nydus-auto-accel-oci:v1:{manifest_digest}");
     let manifest_digest_in_store = deps
         .content_store
-        .write_bytes(&manifest_bytes, &auto_accel_ref, base_labels("manifest"))
+        .write_bytes(&manifest_bytes, &manifest_oci_ref, base_labels("manifest"))
         .await
-        .context("upload auto-accel manifest")?;
+        .context("upload auto-accel oci manifest")?;
 
-    // (5a) Register a containerd Image record so the embedded spegel
-    // registry mirror advertises this manifest to peer nodes. Without an
-    // Image record the manifest blob sits in the content store but spegel
-    // has no name to publish — peers can't discover it. The Image's
-    // `gc.ref.content.subject` label keeps containerd's GC pinning the
-    // sidecar to the original-image manifest's lifetime.
+    // (5b) Register the containerd Image record at the OCI manifest. spegel
+    // watches image records and advertises them to peers via libp2p; a peer
+    // doing `ctr image pull <image_name>` resolves through registries.yaml's
+    // mirror config → spegel → producer node → all blobs flow through the
+    // registry-mirror path in one transfer. Without an Image record the
+    // manifest blob sits in the content store but spegel has no name to
+    // publish.
     let image_name = auto_accel_image_name(&manifest_digest);
     let mut image_labels = base_labels("manifest");
     image_labels.insert(
@@ -486,7 +585,7 @@ async fn run_conversion(
             &image_name,
             &manifest_digest_in_store,
             manifest_bytes.len() as u64,
-            "application/vnd.nydus.auto-accel.manifest.v1+json",
+            OCI_MANIFEST_MEDIATYPE,
             image_labels,
         )
         .await
