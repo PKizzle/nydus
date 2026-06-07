@@ -63,14 +63,34 @@ impl SidecarLocator {
     /// because spegel replicated a peer's). Returns `Ok(None)` when none
     /// exists — the caller falls back to overlay.
     pub async fn find(&self, manifest_digest: &str) -> Result<Option<AutoAccelManifest>> {
-        // containerd filter syntax: each filter is AND-ed; we want
-        // `labels.subject == manifest_digest` AND `labels.role == manifest`.
-        let filters = vec![format!(
-            "labels.\"{LABEL_SUBJECT}\"=={manifest_digest},labels.\"{LABEL_ROLE}\"==manifest"
-        )];
-        let blobs = self.content_store.list_with_filters(filters).await?;
-        let Some(blob) = pick_latest_manifest(&blobs) else {
-            return Ok(None);
+        // Fast path: ask containerd's Images service for the synthetic ref
+        // we deterministically register on the producer side. Same name on
+        // every node, so a peer's Image record visible locally via spegel
+        // mirror lands here first; a label-filter scan only kicks in for
+        // legacy artifacts uploaded before the image-record registration
+        // landed.
+        let image_name = crate::auto_zran::auto_accel_image_name(manifest_digest);
+        let resolved = match self.content_store.images_get(&image_name).await {
+            Ok(opt) => opt,
+            Err(e) => {
+                debug!(image_name = %image_name, error = %e, "auto-accel images.Get failed; falling back to label scan");
+                None
+            }
+        };
+
+        let blob = match resolved {
+            Some(info) => info,
+            None => {
+                // containerd filter syntax: each filter is AND-ed.
+                let filters = vec![format!(
+                    "labels.\"{LABEL_SUBJECT}\"=={manifest_digest},labels.\"{LABEL_ROLE}\"==manifest"
+                )];
+                let blobs = self.content_store.list_with_filters(filters).await?;
+                let Some(blob) = pick_latest_manifest(&blobs).cloned() else {
+                    return Ok(None);
+                };
+                blob
+            }
         };
         let bytes = self.content_store.fetch_bytes(&blob.digest).await?;
         let manifest: AutoAccelManifest = serde_json::from_slice(&bytes)

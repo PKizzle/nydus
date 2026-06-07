@@ -38,15 +38,39 @@ use tonic::Code;
 use tonic::metadata::MetadataValue;
 use tracing::{debug, instrument};
 
-/// Generated containerd Content service bindings.
-mod proto {
-    tonic::include_proto!("containerd.services.content.v1");
+/// Generated containerd protos. Module nesting must match the protobuf
+/// package paths (`containerd.types`, `containerd.services.content.v1`,
+/// `containerd.services.images.v1`) so the cross-package `super::…` refs
+/// the prost generator emits (e.g. `Image.target:
+/// super::super::super::types::Descriptor`) resolve.
+mod containerd {
+    pub mod types {
+        tonic::include_proto!("containerd.types");
+    }
+    pub mod services {
+        pub mod content {
+            pub mod v1 {
+                tonic::include_proto!("containerd.services.content.v1");
+            }
+        }
+        pub mod images {
+            pub mod v1 {
+                tonic::include_proto!("containerd.services.images.v1");
+            }
+        }
+    }
 }
 
-use proto::{
+use containerd::services::content::v1::{
     InfoRequest, ListContentRequest, ReadContentRequest, UpdateRequest, WriteAction,
     WriteContentRequest, content_client::ContentClient,
 };
+
+use containerd::services::images::v1::{
+    CreateImageRequest, GetImageRequest, Image, images_client::ImagesClient,
+};
+
+use containerd::types as types_proto;
 
 /// A snapshot of one content-store blob's metadata.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -279,7 +303,7 @@ impl ContentStoreClient {
         blocking::unblock(move || {
             inner.rt.block_on(async {
                 let mut client = connect(&inner).await?;
-                let info = proto::Info {
+                let info = containerd::services::content::v1::Info {
                     digest: digest.clone(),
                     labels,
                     ..Default::default()
@@ -379,16 +403,114 @@ impl ContentStoreClient {
         })
         .await
     }
+
+    /// Register a containerd Image record pointing at an existing content
+    /// blob (typically an auto-accel manifest just uploaded via
+    /// `write_blob`). Idempotent: if an image with the same name already
+    /// exists, we treat the AlreadyExists status as success — last-write
+    /// semantics are the caller's concern (auto_zran picks
+    /// "largest-size manifest wins" elsewhere).
+    ///
+    /// The image record is what k3s's embedded spegel advertises to peers;
+    /// without it the manifest sits in the content store but spegel has no
+    /// name to publish.
+    #[instrument(level = "debug", skip(self, labels), err)]
+    pub async fn images_create(
+        &self,
+        name: &str,
+        digest: &str,
+        size: u64,
+        media_type: &str,
+        labels: HashMap<String, String>,
+    ) -> Result<()> {
+        let inner = self.inner.clone();
+        let name = name.to_string();
+        let digest = digest.to_string();
+        let media_type = media_type.to_string();
+        blocking::unblock(move || {
+            inner.rt.block_on(async {
+                let mut client = connect_images(&inner).await?;
+                let mut request = tonic::Request::new(CreateImageRequest {
+                    image: Some(Image {
+                        name: name.clone(),
+                        labels,
+                        target: Some(types_proto::Descriptor {
+                            media_type,
+                            digest,
+                            size: size as i64,
+                            annotations: HashMap::new(),
+                        }),
+                        created_at: None,
+                        updated_at: None,
+                    }),
+                    source_date_epoch: None,
+                });
+                attach_namespace(&mut request, &inner.namespace)?;
+                match client.create(request).await {
+                    Ok(_) => Ok(()),
+                    Err(status) if status.code() == Code::AlreadyExists => Ok(()),
+                    Err(status) => Err(anyhow::anyhow!(
+                        "containerd Images.Create({name}) failed: {status}"
+                    )),
+                }
+            })
+        })
+        .await
+    }
+
+    /// Look up a containerd Image record by name. Returns `None` for genuine
+    /// NotFound; bubbles up any other RPC error. Used by sidecar discovery
+    /// as a fast-path on top of (and before) the label-filter scan.
+    #[instrument(level = "debug", skip(self), err)]
+    pub async fn images_get(&self, name: &str) -> Result<Option<ContentInfo>> {
+        let inner = self.inner.clone();
+        let name = name.to_string();
+        blocking::unblock(move || {
+            inner.rt.block_on(async {
+                let mut client = connect_images(&inner).await?;
+                let mut request = tonic::Request::new(GetImageRequest { name: name.clone() });
+                attach_namespace(&mut request, &inner.namespace)?;
+                match client.get(request).await {
+                    Ok(response) => {
+                        let Some(image) = response.into_inner().image else {
+                            return Ok(None);
+                        };
+                        let Some(target) = image.target else {
+                            return Ok(None);
+                        };
+                        Ok(Some(ContentInfo {
+                            digest: target.digest,
+                            size: target.size as u64,
+                            labels: image.labels,
+                        }))
+                    }
+                    Err(status) if status.code() == Code::NotFound => Ok(None),
+                    Err(status) => Err(anyhow::anyhow!(
+                        "containerd Images.Get({name}) failed: {status}"
+                    )),
+                }
+            })
+        })
+        .await
+    }
 }
 
 /// Open a fresh Content service client over the configured Unix socket. The
 /// tonic transport pins this future to the current tokio runtime, so it must
 /// only be called inside `rt.block_on`.
 async fn connect(inner: &Inner) -> Result<ContentClient<tonic::transport::Channel>> {
+    Ok(ContentClient::new(connect_channel(inner).await?))
+}
+
+async fn connect_images(inner: &Inner) -> Result<ImagesClient<tonic::transport::Channel>> {
+    Ok(ImagesClient::new(connect_channel(inner).await?))
+}
+
+async fn connect_channel(inner: &Inner) -> Result<tonic::transport::Channel> {
     let socket = inner.socket.clone();
     // The URI is a placeholder; the actual connection is established by the
     // service_fn connector which dials the Unix socket.
-    let channel = tonic::transport::Endpoint::try_from("http://[::]:50051")?
+    tonic::transport::Endpoint::try_from("http://[::]:50051")?
         .connect_with_connector(tower::service_fn(move |_uri: tonic::transport::Uri| {
             let socket = socket.clone();
             async move {
@@ -402,8 +524,7 @@ async fn connect(inner: &Inner) -> Result<ContentClient<tonic::transport::Channe
                 "failed to connect to containerd at {}",
                 inner.socket.display()
             )
-        })?;
-    Ok(ContentClient::new(channel))
+        })
 }
 
 /// Attach the `containerd-namespace` metadata header that every containerd

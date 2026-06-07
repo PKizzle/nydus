@@ -468,10 +468,45 @@ async fn run_conversion(
         .await
         .context("upload auto-accel manifest")?;
 
+    // (5a) Register a containerd Image record so the embedded spegel
+    // registry mirror advertises this manifest to peer nodes. Without an
+    // Image record the manifest blob sits in the content store but spegel
+    // has no name to publish — peers can't discover it. The Image's
+    // `gc.ref.content.subject` label keeps containerd's GC pinning the
+    // sidecar to the original-image manifest's lifetime.
+    let image_name = auto_accel_image_name(&manifest_digest);
+    let mut image_labels = base_labels("manifest");
+    image_labels.insert(
+        "containerd.io/snapshot/nydus.auto-accel.subject-image".to_string(),
+        job.image.clone(),
+    );
+    if let Err(e) = deps
+        .content_store
+        .images_create(
+            &image_name,
+            &manifest_digest_in_store,
+            manifest_bytes.len() as u64,
+            "application/vnd.nydus.auto-accel.manifest.v1+json",
+            image_labels,
+        )
+        .await
+    {
+        // Non-fatal: the blobs are committed, GC anchored by content-subject
+        // labels, and local discovery still works via label scan. We just
+        // lose cross-node spegel advertisement for this artifact.
+        warn!(
+            image = %job.image,
+            image_name = %image_name,
+            error = ?e,
+            "auto-zran image-record registration failed (cross-node spegel mirror disabled for this manifest)"
+        );
+    }
+
     info!(
         image = %job.image,
         subject = %manifest_digest,
         auto_accel_manifest = %manifest_digest_in_store,
+        image_name = %image_name,
         "auto-zran conversion complete"
     );
 
@@ -501,6 +536,23 @@ fn job_work_dir(config: &AutoZranConfig, image: &str) -> std::path::PathBuf {
 /// `auto_accel_sidecar::SidecarLocator::find`.
 pub fn auto_accel_manifest_ref(subject_manifest_digest: &str) -> String {
     format!("nydus-auto-accel:v1:{subject_manifest_digest}")
+}
+
+/// Synthetic registry-shaped image name we register the auto-accel manifest
+/// under after upload. Containerd's embedded spegel watches image records
+/// and advertises them to peers via libp2p; the host part
+/// (`nydus.auto-accel.local`) deliberately doesn't resolve to a real
+/// registry so the fallback path (when no peer has the manifest) is a
+/// clean 404, not a noisy upstream DNS lookup.
+///
+/// `<bare-hex>` is the hex part of the subject manifest digest so peers can
+/// derive this name themselves from the parent chain → original-image
+/// manifest digest mapping that already feeds discovery.
+pub fn auto_accel_image_name(subject_manifest_digest: &str) -> String {
+    let hex = subject_manifest_digest
+        .strip_prefix("sha256:")
+        .unwrap_or(subject_manifest_digest);
+    format!("nydus.auto-accel.local/sidecar:{hex}")
 }
 
 fn job_key(image: &str) -> String {

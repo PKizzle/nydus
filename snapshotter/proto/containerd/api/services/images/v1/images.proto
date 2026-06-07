@@ -1,0 +1,53 @@
+// Minimal subset of containerd's Images service proto, vendored locally so
+// the snapshotter's auto-accel pipeline can register image records under the
+// `nydus.auto-accel.local/sidecar:<hex>` synthetic ref without depending on
+// the full containerd-client crate (which targets a different tonic version).
+//
+// Only Get + Create are needed:
+// - Create:  after a successful auto-zran upload, register the manifest
+//            descriptor so containerd's GC and the embedded spegel registry
+//            mirror both know about it.
+// - Get:     fast local-side discovery on subsequent Prepares of the same
+//            image (the cross-node spegel-mediated discovery path that goes
+//            through the Transfer service is a separate follow-up).
+//
+// Source: https://github.com/containerd/containerd/blob/main/core/images/proto/images.proto
+// containerd is Apache-2.0; this vendoring is compatible with our license.
+
+syntax = "proto3";
+
+package containerd.services.images.v1;
+
+import "google/protobuf/timestamp.proto";
+
+import "containerd/api/types/descriptor.proto";
+
+message Image {
+    string name = 1;
+    map<string, string> labels = 2;
+    containerd.types.Descriptor target = 3;
+    google.protobuf.Timestamp created_at = 7;
+    google.protobuf.Timestamp updated_at = 8;
+}
+
+message GetImageRequest {
+    string name = 1;
+}
+
+message GetImageResponse {
+    Image image = 1;
+}
+
+message CreateImageRequest {
+    Image image = 1;
+    optional google.protobuf.Timestamp source_date_epoch = 2;
+}
+
+message CreateImageResponse {
+    Image image = 1;
+}
+
+service Images {
+    rpc Get(GetImageRequest) returns (GetImageResponse);
+    rpc Create(CreateImageRequest) returns (CreateImageResponse);
+}

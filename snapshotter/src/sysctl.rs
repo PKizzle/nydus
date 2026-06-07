@@ -318,6 +318,28 @@ impl SystemController {
         }
     }
 
+    /// Attach the access-tracer to the container's rootfs overlay mount,
+    /// resolved from `/proc/<pid>/root`. This is the high-fidelity capture
+    /// path: events fire with paths relative to the container's rootfs
+    /// (e.g. `/etc/nginx/nginx.conf`), so `record_event`'s prefix strip
+    /// produces the in-container paths the auto-zran pipeline wants.
+    ///
+    /// The Prepare-time attach (on the snapshotter's snapshot dir) still
+    /// runs but is a no-op for capture because container reads through the
+    /// overlay mount don't generate events on the lower snapshot mount.
+    /// This rootfs-time attach is what actually captures.
+    ///
+    /// Called by the NRI optimizer plugin's `StartContainer` hook with the
+    /// container PID from the NRI Container message.
+    pub fn access_tracer_attach_rootfs(&self, image_ref: &str, pid: u32) -> Result<bool> {
+        let Some(tracer) = self.access_tracer.as_ref() else {
+            return Ok(false);
+        };
+        let rootfs = std::path::PathBuf::from(format!("/proc/{pid}/root"));
+        tracer.attach(image_ref, &rootfs)?;
+        Ok(true)
+    }
+
     /// Force-flush the access-tracer profile for `image_ref` regardless of
     /// timer state. Returns `Ok(true)` if a profile was flushed (i.e. at
     /// least `min_files` captured), `Ok(false)` otherwise. Called from the
@@ -558,18 +580,34 @@ fn handle_access_tracer_event(
         return error_response(400, "access-tracer request missing 'image'".to_string());
     }
     match event {
-        AccessTracerEvent::Start => match controller.access_tracer_start(image) {
-            Ok(mounts) => json_response(
-                200,
-                AccessTracerEventResponse {
-                    image: image.to_string(),
-                    applied: mounts > 0,
-                    mounts,
-                    flushed: false,
+        AccessTracerEvent::Start => {
+            // Optional rootfs attach when caller provides a container PID
+            // (NRI optimizer plugin path). On failure we still report the
+            // baseline reset result so the timer-only path still works.
+            let rootfs_attached = match req.pid {
+                Some(pid) => match controller.access_tracer_attach_rootfs(image, pid) {
+                    Ok(applied) => applied,
+                    Err(e) => {
+                        debug!(image, pid, error = %e, "access-tracer rootfs attach failed");
+                        false
+                    }
                 },
-            ),
-            Err(e) => controller_error_response(e),
-        },
+                None => false,
+            };
+            match controller.access_tracer_start(image) {
+                Ok(mounts) => json_response(
+                    200,
+                    AccessTracerEventResponse {
+                        image: image.to_string(),
+                        applied: mounts > 0 || rootfs_attached,
+                        mounts,
+                        flushed: false,
+                        rootfs_attached,
+                    },
+                ),
+                Err(e) => controller_error_response(e),
+            }
+        }
         AccessTracerEvent::Settle => match controller.access_tracer_settle(image) {
             Ok(flushed) => json_response(
                 200,
@@ -578,6 +616,7 @@ fn handle_access_tracer_event(
                     applied: flushed,
                     mounts: 0,
                     flushed,
+                    rootfs_attached: false,
                 },
             ),
             Err(e) => controller_error_response(e),
@@ -1032,6 +1071,12 @@ pub struct PrefetchResponse {
 #[derive(Clone, Debug, Deserialize)]
 struct AccessTracerEventRequest {
     image: String,
+    /// Container PID. When set on `/start`, the snapshotter additionally
+    /// attaches the access-tracer to `/proc/<pid>/root` so it captures the
+    /// container's reads on the overlay rootfs mount (not just the lower
+    /// snapshot dir).
+    #[serde(default)]
+    pid: Option<u32>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -1040,6 +1085,9 @@ struct AccessTracerEventResponse {
     applied: bool,
     mounts: usize,
     flushed: bool,
+    /// True when `/start` also performed a rootfs attach via `pid`.
+    #[serde(default)]
+    rootfs_attached: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]

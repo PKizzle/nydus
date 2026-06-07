@@ -122,13 +122,21 @@ impl SysctlClient {
         self.put_json("/api/v1/prefetch/profile", profile)
     }
 
-    /// POST `/api/v1/access-tracer/start { image }` — reset the
-    /// `settle_max`/idle baseline for `image` so the timer measures from
-    /// real container start instead of from snapshot `Prepare`.
-    pub fn post_access_tracer_start(&self, image: &str) -> Result<AccessTracerEventResponse> {
+    /// POST `/api/v1/access-tracer/start { image, pid? }` — reset the
+    /// `settle_max`/idle baseline for `image`. When `pid` is set the
+    /// snapshotter additionally marks `/proc/<pid>/root` with
+    /// `FAN_MARK_MOUNT`, which is the only attach path that actually
+    /// captures container reads (the Prepare-time attach on the lower
+    /// snapshot dir doesn't see them — overlay resolves paths in the
+    /// container's namespace).
+    pub fn post_access_tracer_start(
+        &self,
+        image: &str,
+        pid: Option<u32>,
+    ) -> Result<AccessTracerEventResponse> {
         self.post_json(
             "/api/v1/access-tracer/start",
-            &AccessTracerEventRequest { image },
+            &AccessTracerEventRequest { image, pid },
         )
     }
 
@@ -138,7 +146,7 @@ impl SysctlClient {
     pub fn post_access_tracer_settle(&self, image: &str) -> Result<AccessTracerEventResponse> {
         self.post_json(
             "/api/v1/access-tracer/settle",
-            &AccessTracerEventRequest { image },
+            &AccessTracerEventRequest { image, pid: None },
         )
     }
 
@@ -176,6 +184,8 @@ impl SysctlClient {
 #[derive(Clone, Debug, Serialize)]
 struct AccessTracerEventRequest<'a> {
     image: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pid: Option<u32>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -184,6 +194,8 @@ pub struct AccessTracerEventResponse {
     pub applied: bool,
     pub mounts: usize,
     pub flushed: bool,
+    #[serde(default)]
+    pub rootfs_attached: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

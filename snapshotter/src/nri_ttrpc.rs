@@ -427,13 +427,21 @@ impl OptimizerPluginService {
         let Some(image) = container_image_ref(container) else {
             return;
         };
-        match self.sysctl.post_access_tracer_start(&image) {
+        // NRI tags the container PID with field 12 (host-namespace pid).
+        // Pass it so the snapshotter marks `/proc/<pid>/root` —
+        // the only attach path that actually captures container reads.
+        // `pid == 0` means NRI didn't populate the field; omit so the
+        // snapshotter falls back to baseline reset only.
+        let pid = (container.pid != 0).then_some(container.pid);
+        match self.sysctl.post_access_tracer_start(&image, pid) {
             Ok(response) => {
                 if response.applied {
                     info!(
                         image = image,
+                        pid = container.pid,
                         mounts = response.mounts,
-                        "access-tracer settle_max baseline reset by NRI StartContainer"
+                        rootfs_attached = response.rootfs_attached,
+                        "access-tracer activated by NRI StartContainer"
                     );
                 }
             }
