@@ -445,7 +445,46 @@ impl SidecarLocator {
                 return PullOutcome::RegistryError { status, body };
             }
         };
-        let subject_labels = labels_for_role(manifest_digest, "manifest", synthetic_ref, None);
+
+        // 2. Parse the OCI wrapper first so the manifest write below can
+        //    carry `gc.ref.content.config` + `gc.ref.content.l.<n>`
+        //    labels pointing at every blob the manifest references.
+        //    Without these labels containerd's GC orphans the just-
+        //    written config + layer blobs the moment GC runs (it does
+        //    NOT parse manifest JSON for GC walking — operators have to
+        //    mirror the references into labels). The producer (auto_zran)
+        //    mirrors the same pattern; consumer must match so the second
+        //    pod on this node doesn't refetch.
+        let oci: OciImageManifest = match serde_json::from_slice(&manifest_bytes) {
+            Ok(m) => m,
+            Err(e) => {
+                return PullOutcome::RegistryError {
+                    status: 0,
+                    body: format!("parse oci manifest pulled from spegel: {e}"),
+                };
+            }
+        };
+        if oci.media_type != OCI_MANIFEST_MEDIATYPE {
+            return PullOutcome::RegistryError {
+                status: 0,
+                body: format!(
+                    "unexpected manifest mediaType {}; expected {}",
+                    oci.media_type, OCI_MANIFEST_MEDIATYPE
+                ),
+            };
+        }
+
+        let mut subject_labels = labels_for_role(manifest_digest, "manifest", synthetic_ref, None);
+        subject_labels.insert(
+            "containerd.io/gc.ref.content.config".to_string(),
+            oci.config.digest.clone(),
+        );
+        for (i, layer) in oci.layers.iter().enumerate() {
+            subject_labels.insert(
+                format!("containerd.io/gc.ref.content.l.{}", i),
+                layer.digest.clone(),
+            );
+        }
         let manifest_digest_in_store = match self
             .content_store
             .write_bytes(
@@ -466,27 +505,6 @@ impl SidecarLocator {
                 };
             }
         };
-
-        // 2. Parse the OCI wrapper, then fetch the config + every layer
-        //    by digest through spegel (still with `?ns=`).
-        let oci: OciImageManifest = match serde_json::from_slice(&manifest_bytes) {
-            Ok(m) => m,
-            Err(e) => {
-                return PullOutcome::RegistryError {
-                    status: 0,
-                    body: format!("parse oci manifest pulled from spegel: {e}"),
-                };
-            }
-        };
-        if oci.media_type != OCI_MANIFEST_MEDIATYPE {
-            return PullOutcome::RegistryError {
-                status: 0,
-                body: format!(
-                    "unexpected manifest mediaType {}; expected {}",
-                    oci.media_type, OCI_MANIFEST_MEDIATYPE
-                ),
-            };
-        }
 
         // 2a. Config blob.
         if let Err(o) = self
@@ -731,9 +749,11 @@ async fn spegel_fetch(
             let mut last_outcome: Option<FetchResult> = None;
             for endpoint in &endpoints {
                 let url = format!("{endpoint}{path}");
+                debug!(target: "nydus_snapshotter::auto_accel_sidecar::spegel_fetch", url = %url, "spegel attempt");
                 let req_builder = match client.get(&url) {
                     Ok(r) => r,
                     Err(e) => {
+                        debug!(target: "nydus_snapshotter::auto_accel_sidecar::spegel_fetch", url = %url, error = %e, "spegel: invalid URL");
                         last_outcome = Some(FetchResult::Outcome(PullOutcome::RegistryError {
                             status: 0,
                             body: format!("invalid spegel URL {url}: {e}"),
@@ -759,6 +779,7 @@ async fn spegel_fetch(
                     match compio::time::timeout(Duration::from_secs(30), req.send()).await {
                         Ok(Ok(r)) => r,
                         Ok(Err(e)) => {
+                            debug!(target: "nydus_snapshotter::auto_accel_sidecar::spegel_fetch", url = %url, error = %e, "spegel: transport error");
                             last_outcome = Some(FetchResult::Outcome(PullOutcome::RegistryError {
                                 status: 0,
                                 body: format!("transport error for {url}: {e}"),
@@ -766,6 +787,7 @@ async fn spegel_fetch(
                             continue;
                         }
                         Err(_) => {
+                            debug!(target: "nydus_snapshotter::auto_accel_sidecar::spegel_fetch", url = %url, "spegel: request timeout");
                             last_outcome = Some(FetchResult::Outcome(PullOutcome::RegistryError {
                                 status: 0,
                                 body: format!("spegel request timed out for {url}"),
@@ -774,6 +796,7 @@ async fn spegel_fetch(
                         }
                     };
                 let status = response.status();
+                debug!(target: "nydus_snapshotter::auto_accel_sidecar::spegel_fetch", url = %url, status = %status, "spegel: response");
                 match http_status_to_outcome(status.as_u16()) {
                     StatusOutcome::Ok => match response.bytes().await {
                         Ok(b) => return FetchResult::Ok(b.to_vec()),

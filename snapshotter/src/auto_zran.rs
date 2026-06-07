@@ -542,9 +542,43 @@ async fn run_conversion(
     let manifest_bytes =
         serde_json::to_vec(&oci_manifest).context("serialize auto-accel oci manifest")?;
     let manifest_oci_ref = format!("nydus-auto-accel-oci:v1:{manifest_digest}");
+    // Containerd's GC roots a manifest blob through its Image record, then
+    // walks the manifest's outgoing `gc.ref.content.*` labels to find its
+    // config + layer blobs. Without these labels the just-written
+    // config/bootstrap/index/prefetch blobs become orphans the moment GC
+    // runs (which happens on every container/image churn), even though
+    // the manifest body itself names them by digest — containerd does NOT
+    // parse the manifest JSON for GC; it relies on operators to mirror
+    // those references into labels. Add them here so the artifact
+    // survives until the original image (`gc.ref.content.subject`) is
+    // pruned.
+    let mut manifest_labels = base_labels("manifest");
+    manifest_labels.insert(
+        "containerd.io/gc.ref.content.config".to_string(),
+        config_digest.clone(),
+    );
+    manifest_labels.insert(
+        "containerd.io/gc.ref.content.l.0".to_string(),
+        bootstrap_digest.clone(),
+    );
+    for (i, layer) in zran_descriptors.iter().enumerate() {
+        manifest_labels.insert(
+            format!("containerd.io/gc.ref.content.l.{}", i + 1),
+            layer.digest.clone(),
+        );
+    }
+    if let Some(prefetch) = &prefetch_descriptor {
+        manifest_labels.insert(
+            format!(
+                "containerd.io/gc.ref.content.l.{}",
+                zran_descriptors.len() + 1
+            ),
+            prefetch.digest.clone(),
+        );
+    }
     let manifest_digest_in_store = deps
         .content_store
-        .write_bytes(&manifest_bytes, &manifest_oci_ref, base_labels("manifest"))
+        .write_bytes(&manifest_bytes, &manifest_oci_ref, manifest_labels)
         .await
         .context("upload auto-accel oci manifest")?;
 
