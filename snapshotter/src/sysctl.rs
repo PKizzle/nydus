@@ -319,14 +319,16 @@ impl SystemController {
     }
 
     /// Attach the access-tracer to the container's rootfs overlay mount,
-    /// resolved from `/proc/<pid>/root`. This is the high-fidelity capture
-    /// path: events fire with paths relative to the container's rootfs
-    /// (e.g. `/etc/nginx/nginx.conf`), so `record_event`'s prefix strip
-    /// produces the in-container paths the auto-zran pipeline wants.
+    /// resolved from the container PID via `mountinfo`. This is the
+    /// high-fidelity capture path: events fire with paths relative to the
+    /// host-side overlay mount (e.g.
+    /// `/run/k3s/containerd/io.containerd.runtime.v2.task/k8s.io/<id>/rootfs/etc/nginx/nginx.conf`),
+    /// so `record_event`'s prefix strip produces the in-container paths
+    /// (e.g. `/etc/nginx/nginx.conf`) the auto-zran pipeline wants.
     ///
-    /// The Prepare-time attach (on the snapshotter's snapshot dir) still
-    /// runs but is a no-op for capture because container reads through the
-    /// overlay mount don't generate events on the lower snapshot mount.
+    /// The Prepare-time attach (on the snapshotter's lower snapshot dir)
+    /// still runs but doesn't capture container reads — overlay resolves
+    /// container paths in the container's namespace, not against the lower.
     /// This rootfs-time attach is what actually captures.
     ///
     /// Called by the NRI optimizer plugin's `StartContainer` hook with the
@@ -335,7 +337,8 @@ impl SystemController {
         let Some(tracer) = self.access_tracer.as_ref() else {
             return Ok(false);
         };
-        let rootfs = std::path::PathBuf::from(format!("/proc/{pid}/root"));
+        let rootfs = host_rootfs_for_pid(pid)
+            .with_context(|| format!("resolve host rootfs for pid {pid}"))?;
         tracer.attach(image_ref, &rootfs)?;
         Ok(true)
     }
@@ -479,6 +482,55 @@ async fn route_request(controller: &SystemController, request: HttpRequest) -> H
         ("GET", "/metrics") => metrics_response(controller).await,
         _ => route_dynamic_request(controller, &request.method, path, &request.body).await,
     }
+}
+
+/// Resolve a container PID to the host-side overlay rootfs mount path.
+///
+/// Canonicalizing `/proc/<pid>/root` directly returns `"/"` because the proc
+/// magic symlink reads as the process's view of its root. To actually mark
+/// the overlay mount the container is using we cross the mount-namespace
+/// boundary via `mountinfo`:
+///
+/// 1. Read the container's `/proc/<pid>/mountinfo` and find the line whose
+///    mount-point is `/` (the container's root). Take its `st_dev`
+///    (major:minor, field 3 in the 0-indexed mountinfo schema).
+/// 2. Read `/proc/self/mountinfo` (the snapshotter's view, identical to
+///    PID 1's view on a typical k3s host) and find the matching mount on
+///    the same device whose mount-point is the canonical containerd CRI
+///    runtime rootfs path (`…/io.containerd.runtime.*/rootfs`).
+///
+/// Both lines describe the same overlay mount under different mount
+/// namespaces; the host-side mount-point is what we hand to fanotify so
+/// container reads fire events with paths that strip cleanly down to
+/// in-container paths.
+fn host_rootfs_for_pid(pid: u32) -> Result<PathBuf> {
+    let container_info = std::fs::read_to_string(format!("/proc/{pid}/mountinfo"))
+        .with_context(|| format!("read /proc/{pid}/mountinfo"))?;
+    let device = container_info
+        .lines()
+        .find_map(|line| {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            // mountinfo: [id parent st_dev root mount_point ...]
+            if fields.len() >= 5 && fields[4] == "/" {
+                Some(fields[2].to_string())
+            } else {
+                None
+            }
+        })
+        .context("container has no '/' mount in mountinfo")?;
+    let host_info =
+        std::fs::read_to_string("/proc/self/mountinfo").context("read /proc/self/mountinfo")?;
+    for line in host_info.lines() {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        if fields.len() < 5 || fields[2] != device {
+            continue;
+        }
+        let mount_point = fields[4];
+        if mount_point.contains("/io.containerd.runtime.") && mount_point.ends_with("/rootfs") {
+            return Ok(PathBuf::from(mount_point));
+        }
+    }
+    anyhow::bail!("no host rootfs overlay mount for pid {pid} (device {device})")
 }
 
 fn handle_auth_put(body: &[u8]) -> HttpResponse {
