@@ -584,7 +584,7 @@ fn run_event_loop(inner: Arc<Inner>) {
         if events.iter().any(|e| e.is_readable()) {
             match fanotify.read_events() {
                 Ok(read) => process_events(&inner, read),
-                Err(err) if err == nix::errno::Errno::EAGAIN => {}
+                Err(nix::errno::Errno::EAGAIN) => {}
                 Err(err) => {
                     warn!(error = %err, "access_tracer read_events failed");
                 }
@@ -621,14 +621,14 @@ fn process_events(inner: &Inner, events: Vec<nix::sys::fanotify::FanotifyEvent>)
             }
         };
 
-        if let Some(path) = path_buf {
-            if let Err(err) = record_event(inner, &path) {
-                debug!(error = %err, "access_tracer dropped event");
-                inner
-                    .metrics
-                    .dropped_events_total
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            }
+        if let Some(path) = path_buf
+            && let Err(err) = record_event(inner, &path)
+        {
+            debug!(error = %err, "access_tracer dropped event");
+            inner
+                .metrics
+                .dropped_events_total
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
     }
 }

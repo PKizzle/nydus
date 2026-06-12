@@ -776,13 +776,12 @@ fn reconcile_snapshots(args: ReconcileSnapshotsArgs) -> Result<()> {
                         )
                     })?;
 
-                if let Some(parent) = parent_key {
-                    if let Some(mut pbkt) = snapshotter_bucket.bucket_mut(&parent) {
-                        if let Some(mut cbkt) = pbkt.bucket_mut("children") {
-                            // Tolerate the child entry already being gone.
-                            let _ = cbkt.delete(&key);
-                        }
-                    }
+                if let Some(parent) = parent_key
+                    && let Some(mut pbkt) = snapshotter_bucket.bucket_mut(&parent)
+                    && let Some(mut cbkt) = pbkt.bucket_mut("children")
+                {
+                    // Tolerate the child entry already being gone.
+                    let _ = cbkt.delete(&key);
                 }
                 snapshotter_bucket.delete_bucket(&key).with_context(|| {
                     format!("failed to delete stale snapshot bucket {key} from containerd bolt")
