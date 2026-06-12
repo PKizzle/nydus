@@ -5,24 +5,25 @@
 //! Sidecar discovery + backend-dir staging for the auto-accel read side.
 //!
 //! When `OverlayEngine::prepare` returns plain overlay mounts for a standard
-//! OCI image, [`SidecarLocator::find`] asks containerd's content store
-//! whether an auto-accel manifest exists for the image's manifest digest. If
-//! one is mirrored locally (either because this node produced it or because
-//! spegel replicated it from a peer), [`stage_backend`] symlinks the gzip
-//! layers + per-layer zran indexes + optional prefetch blob into a fresh
-//! `backend/` directory and copies the merged bootstrap into a `stage/`
-//! directory. The result feeds straight into
+//! OCI image, [`SidecarLocator::resolve_or_pull`] asks containerd's content
+//! store whether an auto-accel manifest exists for the image's manifest
+//! digest. If one is mirrored locally (either because this node produced it
+//! or because a peer's spegel mirror served it), [`SidecarLocator::stage`]
+//! symlinks the gzip layers + per-layer zran indexes + optional prefetch
+//! blob into a fresh `backend/` directory and copies the merged bootstrap
+//! into a `stage/` directory. The result feeds straight into
 //! `DaemonSupervisor::ensure_instance_local`.
+//!
+//! The HTTP transport (endpoint failover, peer discovery, mTLS) lives in
+//! [`crate::spegel`]; this module owns the pull *protocol* — which paths to
+//! fetch, how to label what lands in the content store, and when to fall
+//! back to the label-filter scan.
 
 use std::collections::HashMap;
-use std::fs::File;
-use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
-use http::header::ACCEPT;
 use tracing::{debug, info, warn};
 
 use crate::auto_accel_oci::{
@@ -37,6 +38,7 @@ use crate::auto_accel_oci::{
 use crate::auto_zran::AutoAccelManifest;
 use crate::config::SpegelMirrorConfig;
 use crate::content_store::{ContentInfo, ContentStoreClient};
+use crate::spegel::{FetchResult, PullOutcome, SpegelMirror, build_spegel_mirror};
 
 const LABEL_ROLE: &str = "containerd.io/snapshot/nydus.auto-accel.role";
 const LABEL_SUBJECT: &str = "containerd.io/gc.ref.content.subject";
@@ -73,44 +75,12 @@ pub struct SidecarLocator {
     /// Snapshotter root joined with `"auto-accel"`; per-image scratch dirs
     /// hang off this.
     stage_root: PathBuf,
-    /// Spegel HTTPS client + endpoint URL. `None` when the mirror is
-    /// disabled by config, or when any of the configured cert files don't
-    /// exist on disk at startup. When `None`, `spegel_pull` is a no-op
-    /// returning `PullOutcome::NoBinary` so the locator falls through to
-    /// the label-filter scan.
-    spegel: Option<Arc<SpegelClient>>,
-}
-
-/// Send + Sync metadata bundle for the embedded spegel mirror. Holds
-/// only Send + Sync state (an `Arc`-shared rustls config + the endpoint
-/// list); the actual `cyper::Client` is `!Send + !Sync` because it
-/// targets the compio current_thread runtime, so it is built per call
-/// on a blocking pool thread driving its own thread-local compio
-/// runtime (see `block_on_http`). This matches the per-thread cyper
-/// pattern `storage/src/backend/connection.rs` uses for the registry
-/// backend and keeps reqwest + tokio out of the snapshotter.
-///
-/// `endpoints[0]` is the primary (local spegel on `127.0.0.1`); the
-/// rest are peer fallbacks for clusters where libp2p peer routing
-/// fails ("empty list of address ports").
-struct SpegelClient {
-    tls: Arc<rustls::ClientConfig>,
-    endpoints: Vec<String>,
-}
-
-thread_local! {
-    /// Per-thread compio runtime used by `block_on_http` to drive cyper
-    /// from inside `blocking::unblock`. cyper's HTTPS plumbing
-    /// (hickory DNS resolver, hyper executor) needs `Runtime::current()`
-    /// at client-build time and a `block_on` to run requests, so each
-    /// blocking thread gets its own. Mirrors the per-thread runtime in
-    /// `storage/src/backend/connection.rs`.
-    static HTTP_RUNTIME: compio::runtime::Runtime = compio::runtime::Runtime::new()
-        .expect("auto_accel_sidecar: failed to create compio HTTP runtime");
-}
-
-fn block_on_http<F: std::future::Future>(fut: F) -> F::Output {
-    HTTP_RUNTIME.with(|rt| rt.block_on(fut))
+    /// Spegel mirror transport. `None` when the mirror is disabled by
+    /// config, or when the configured TLS material doesn't exist on disk
+    /// at startup. When `None`, `spegel_pull` is a no-op returning
+    /// `PullOutcome::Disabled` so the locator falls through to the
+    /// label-filter scan.
+    spegel: Option<Arc<SpegelMirror>>,
 }
 
 impl SidecarLocator {
@@ -119,12 +89,12 @@ impl SidecarLocator {
         snapshotter_root: &Path,
         spegel_config: &SpegelMirrorConfig,
     ) -> Self {
-        let spegel = match build_spegel_client(spegel_config) {
-            Ok(client) => client.map(Arc::new),
+        let spegel = match build_spegel_mirror(spegel_config) {
+            Ok(mirror) => mirror,
             Err(e) => {
                 warn!(
                     error = ?e,
-                    "spegel mirror client setup failed; cross-node auto-accel discovery disabled"
+                    "spegel mirror setup failed; cross-node auto-accel discovery disabled"
                 );
                 None
             }
@@ -149,16 +119,14 @@ impl SidecarLocator {
     ///
     /// 1. Local `images.Get(synthetic-ref)` — hit on the producer node and
     ///    on any peer that already pulled this sidecar.
-    /// 2. Direct HTTPS GET to k3s's embedded spegel mirror endpoint with
-    ///    the required `?ns=<registry>` query parameter. spegel checks its
-    ///    local content store first, then falls back to a libp2p peer
-    ///    lookup; if a peer has the image record advertised, the OCI
-    ///    manifest + its config + every layer (bootstrap, zran indexes,
-    ///    prefetch blob) flow through the mirror in one transfer. After
-    ///    success we retry `images.Get`. A categorised pull failure
-    ///    distinguishes "no peer has it" (clean miss) from "mirror /
-    ///    registry is broken" (warn + still fall through, but operator
-    ///    sees the signal).
+    /// 2. Direct HTTPS GET against the local spegel mirror, then every
+    ///    discovered/configured peer mirror (see [`crate::spegel`] for the
+    ///    failover semantics). On a hit, the OCI manifest + its config +
+    ///    every layer (bootstrap, zran indexes, prefetch blob) land in the
+    ///    local content store and the Image record is registered. A
+    ///    categorised pull failure distinguishes "no peer has it" (clean
+    ///    miss) from "mirror / registry is broken" (warn + still fall
+    ///    through, but operator sees the signal).
     /// 3. Label-filter scan on the content store — covers legacy artifacts
     ///    uploaded before the image-record registration landed.
     ///
@@ -181,9 +149,9 @@ impl SidecarLocator {
             });
 
         if resolved.is_none() {
-            // Drive a direct HTTPS pull through spegel. If a peer
-            // advertises the image record, this brings everything down in
-            // one transfer.
+            // Drive a direct HTTPS pull through spegel. If any mirror has
+            // the image record, this brings everything down in one
+            // transfer.
             match self.spegel_pull(manifest_digest, &image_name).await {
                 PullOutcome::Ok => {
                     info!(image_name = %image_name, "auto-accel pulled via spegel mirror");
@@ -197,7 +165,7 @@ impl SidecarLocator {
                         });
                 }
                 PullOutcome::NotFound => {
-                    debug!(image_name = %image_name, "no peer advertised this sidecar; falling back to label scan");
+                    debug!(image_name = %image_name, "no mirror has this sidecar; falling back to label scan");
                 }
                 PullOutcome::RegistryError { status, body } => {
                     // Real configuration failure — surface loudly. Without
@@ -207,10 +175,10 @@ impl SidecarLocator {
                         image_name = %image_name,
                         status,
                         body = %body,
-                        "auto-accel pull failed: registry/mirror error (spegel mTLS, auth, daemon down?). Cross-node discovery disabled until fixed."
+                        "auto-accel pull failed: registry/mirror error (spegel mTLS, auth, daemon down?). Cross-node discovery degraded until fixed."
                     );
                 }
-                PullOutcome::NoBinary => {
+                PullOutcome::Disabled => {
                     debug!(image_name = %image_name, "spegel mirror disabled or unconfigured; cross-node discovery skipped");
                 }
             }
@@ -325,6 +293,20 @@ impl SidecarLocator {
                 bootstrap_dst.display()
             )
         })?;
+        // 5. The daemon's fanotify service discovers its inputs from the
+        //    backend dir alone (`service/src/fanotify.rs::discover_blobs`
+        //    requires a file literally named `bootstrap` next to the data
+        //    blobs), so the bootstrap must ALSO live inside backend_dir —
+        //    without it `ensure_instance_local` fails with "no bootstrap
+        //    file in blob directory" on every node.
+        let backend_bootstrap = backend_dir.join("bootstrap");
+        std::fs::copy(&bootstrap_src, &backend_bootstrap).with_context(|| {
+            format!(
+                "copy bootstrap {} -> {}",
+                bootstrap_src.display(),
+                backend_bootstrap.display()
+            )
+        })?;
 
         Ok(StagedSidecar {
             bootstrap: bootstrap_dst,
@@ -332,96 +314,14 @@ impl SidecarLocator {
             work_dir,
         })
     }
-}
 
-/// When multiple auto-accel manifests claim the same subject (e.g. two nodes
-/// converted with different prefetch profiles), prefer whichever blob has the
-/// largest size — heuristically the most-complete profile. Fall back to the
-/// lexicographically-largest digest for stable ordering when sizes match.
-fn pick_latest_manifest(blobs: &[ContentInfo]) -> Option<&ContentInfo> {
-    let mut best: Option<&ContentInfo> = None;
-    for blob in blobs {
-        match best {
-            None => best = Some(blob),
-            Some(prev) if blob.size > prev.size => best = Some(blob),
-            Some(prev) if blob.size == prev.size && blob.digest > prev.digest => best = Some(blob),
-            _ => {}
-        }
-    }
-    best
-}
-
-fn ensure_present(path: &Path, kind: &str) -> Result<()> {
-    if !path.is_file() {
-        return Err(anyhow!(
-            "{kind} {} missing from content store (spegel cache miss?)",
-            path.display()
-        ));
-    }
-    Ok(())
-}
-
-fn symlink_force(target: &Path, link: &Path) -> Result<()> {
-    let _ = std::fs::remove_file(link);
-    #[cfg(unix)]
-    {
-        std::os::unix::fs::symlink(target, link)
-            .with_context(|| format!("symlink {} -> {}", link.display(), target.display()))
-    }
-    #[cfg(not(unix))]
-    {
-        std::fs::copy(target, link)
-            .map(|_| ())
-            .with_context(|| format!("copy {} -> {}", link.display(), target.display()))
-    }
-}
-
-fn strip_sha256(digest: &str) -> &str {
-    digest.strip_prefix("sha256:").unwrap_or(digest)
-}
-
-/// Categorised outcome of a containerd image-pull attempt for the
-/// synthetic auto-accel ref. Discovery treats `NotFound` as a clean miss
-/// (no peer advertised this sidecar — fall back to overlay) but logs
-/// `RegistryError` at `warn!` so a broken spegel mirror or stale mTLS
-/// doesn't silently disable every auto-accel mount cluster-wide.
-#[derive(Debug, Clone, Eq, PartialEq)]
-enum PullOutcome {
-    /// Pull committed; the manifest + every referenced blob are now in
-    /// the local content store and the Image record is registered.
-    Ok,
-    /// Spegel returned 404 — no peer has the sidecar locally and the
-    /// libp2p DHT has no advertisement for it either. Expected on
-    /// first-pod scheduling before any node has converted.
-    NotFound,
-    /// Spegel returned any other non-success status (401/403/5xx etc),
-    /// or a transport-layer failure prevented the request from
-    /// completing. Captured for triage so a misconfigured-spegel node
-    /// doesn't silently disable every auto-accel mount cluster-wide.
-    /// `status: 0` means the request never reached spegel (transport,
-    /// TLS, malformed ref, write-to-content-store failure, etc.).
-    RegistryError { status: u16, body: String },
-    /// Mirror is disabled by config, or any of the cert files don't
-    /// exist on disk. Quiet fallback — the locator falls through to its
-    /// label-filter scan and the node behaves exactly as it did before
-    /// the spegel-pull path landed.
-    NoBinary,
-}
-
-impl SidecarLocator {
     /// Pull the auto-accel sidecar manifest + every referenced blob from
-    /// k3s's embedded spegel mirror. Returns `PullOutcome::NoBinary` when
-    /// the mirror isn't configured (silent fallback to overlay), otherwise
-    /// maps spegel's HTTP response into one of the four outcomes.
-    ///
-    /// Spegel requires the `?ns=<registry>` query parameter on every
-    /// request; its `distribution.go` parser reads the registry namespace
-    /// from there and 404s every request that omits it — even for content
-    /// that IS in the local content store. That's the entire reason we're
-    /// here.
+    /// the spegel mirrors. Returns `PullOutcome::Disabled` when the
+    /// mirror isn't configured (silent fallback to overlay), otherwise
+    /// maps the HTTP responses into one of the four outcomes.
     async fn spegel_pull(&self, manifest_digest: &str, synthetic_ref: &str) -> PullOutcome {
         let Some(spegel) = self.spegel.as_ref() else {
-            return PullOutcome::NoBinary;
+            return PullOutcome::Disabled;
         };
 
         let (host, repo, tag) = match split_synthetic_ref(synthetic_ref) {
@@ -436,8 +336,7 @@ impl SidecarLocator {
 
         // 1. Manifest fetch (`?ns=` is the load-bearing query parameter).
         let manifest_path = format!("/v2/{}/manifests/{}?ns={}", repo, tag, host);
-        let manifest_bytes = match spegel_fetch(spegel, &manifest_path, Some(ACCEPT_MANIFEST)).await
-        {
+        let manifest_bytes = match spegel.fetch(&manifest_path, Some(ACCEPT_MANIFEST)).await {
             FetchResult::Ok(b) => b,
             FetchResult::Outcome(o) => return o,
             FetchResult::NotFound => return PullOutcome::NotFound,
@@ -474,17 +373,7 @@ impl SidecarLocator {
             };
         }
 
-        let mut subject_labels = labels_for_role(manifest_digest, "manifest", synthetic_ref, None);
-        subject_labels.insert(
-            "containerd.io/gc.ref.content.config".to_string(),
-            oci.config.digest.clone(),
-        );
-        for (i, layer) in oci.layers.iter().enumerate() {
-            subject_labels.insert(
-                format!("containerd.io/gc.ref.content.l.{}", i),
-                layer.digest.clone(),
-            );
-        }
+        let subject_labels = manifest_blob_labels(manifest_digest, synthetic_ref, &oci);
         let manifest_digest_in_store = match self
             .content_store
             .write_bytes(
@@ -579,7 +468,7 @@ impl SidecarLocator {
     #[allow(clippy::too_many_arguments)]
     async fn spegel_pull_blob(
         &self,
-        spegel: &SpegelClient,
+        spegel: &Arc<SpegelMirror>,
         manifest_digest: &str,
         host: &str,
         repo: &str,
@@ -589,7 +478,7 @@ impl SidecarLocator {
         layer_digest: Option<String>,
     ) -> std::result::Result<(), PullOutcome> {
         let path = format!("/v2/{}/blobs/{}?ns={}", repo, blob_digest, host);
-        let bytes = match spegel_fetch(spegel, &path, None).await {
+        let bytes = match spegel.fetch(&path, None).await {
             FetchResult::Ok(b) => b,
             FetchResult::Outcome(o) => return Err(o),
             FetchResult::NotFound => return Err(PullOutcome::NotFound),
@@ -615,6 +504,52 @@ impl SidecarLocator {
             })?;
         Ok(())
     }
+}
+
+/// When multiple auto-accel manifests claim the same subject (e.g. two nodes
+/// converted with different prefetch profiles), prefer whichever blob has the
+/// largest size — heuristically the most-complete profile. Fall back to the
+/// lexicographically-largest digest for stable ordering when sizes match.
+fn pick_latest_manifest(blobs: &[ContentInfo]) -> Option<&ContentInfo> {
+    let mut best: Option<&ContentInfo> = None;
+    for blob in blobs {
+        match best {
+            None => best = Some(blob),
+            Some(prev) if blob.size > prev.size => best = Some(blob),
+            Some(prev) if blob.size == prev.size && blob.digest > prev.digest => best = Some(blob),
+            _ => {}
+        }
+    }
+    best
+}
+
+fn ensure_present(path: &Path, kind: &str) -> Result<()> {
+    if !path.is_file() {
+        return Err(anyhow!(
+            "{kind} {} missing from content store (spegel cache miss?)",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+fn symlink_force(target: &Path, link: &Path) -> Result<()> {
+    let _ = std::fs::remove_file(link);
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(target, link)
+            .with_context(|| format!("symlink {} -> {}", link.display(), target.display()))
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::copy(target, link)
+            .map(|_| ())
+            .with_context(|| format!("copy {} -> {}", link.display(), target.display()))
+    }
+}
+
+fn strip_sha256(digest: &str) -> &str {
+    digest.strip_prefix("sha256:").unwrap_or(digest)
 }
 
 /// Map an OCI layer mediaType from our producer to the `role` label we
@@ -660,6 +595,31 @@ fn labels_for_role(
     m
 }
 
+/// Labels for the OCI manifest blob itself: the `labels_for_role` base
+/// plus one `gc.ref.content.*` edge per referenced blob so containerd's
+/// GC keeps the config + layers alive exactly as long as the manifest.
+/// Containerd does NOT parse manifest JSON when walking GC references —
+/// without these labels every referenced blob is an orphan at the next
+/// GC pass.
+fn manifest_blob_labels(
+    manifest_digest: &str,
+    synthetic_ref: &str,
+    oci: &OciImageManifest,
+) -> HashMap<String, String> {
+    let mut labels = labels_for_role(manifest_digest, "manifest", synthetic_ref, None);
+    labels.insert(
+        "containerd.io/gc.ref.content.config".to_string(),
+        oci.config.digest.clone(),
+    );
+    for (i, layer) in oci.layers.iter().enumerate() {
+        labels.insert(
+            format!("containerd.io/gc.ref.content.l.{}", i),
+            layer.digest.clone(),
+        );
+    }
+    labels
+}
+
 /// Labels stamped on the Image record itself. The producer uses the same
 /// shape — keep it identical so an `images_get` after a spegel-pulled
 /// record returns the same labels callers expect.
@@ -681,276 +641,6 @@ fn split_synthetic_ref(synthetic_ref: &str) -> Option<(String, String, String)> 
         return None;
     }
     Some((host.to_string(), repo.to_string(), tag.to_string()))
-}
-
-/// Intermediate result for a spegel HTTPS GET.
-enum FetchResult {
-    Ok(Vec<u8>),
-    NotFound,
-    Error {
-        status: u16,
-        body: String,
-    },
-    /// Catastrophic client-side failure that maps cleanly to a
-    /// `PullOutcome` other than NotFound/Error.
-    Outcome(PullOutcome),
-}
-
-/// GET + body read against the ordered spegel endpoints list. Pulled
-/// out of `spegel_pull` so the same status-categorisation logic runs
-/// for manifest + every blob, and so the fallback iteration happens
-/// in one place.
-///
-/// Runs the cyper call inside `blocking::unblock` so the future this
-/// returns IS `Send` (required because the containerd-snapshots
-/// `Snapshotter` trait via `#[tonic::async_trait]` makes its method
-/// futures `Send + 'static`) even though cyper's `Client` is
-/// `!Send + !Sync` underneath. The blocking thread drives a
-/// thread-local compio runtime and a one-shot cyper client; both are
-/// dropped before the outer future resumes.
-///
-/// Iteration rules:
-/// - The list is `[primary, peer1, peer2, ...]`. We always start at
-///   the primary so single-node clusters keep the cheap local hit and
-///   never touch the cross-node network.
-/// - 2xx from any endpoint → `Ok(bytes)`, no further endpoints tried.
-/// - 404 from one endpoint → try the next one. 404 across the entire
-///   list → `NotFound` (real "nobody has it" signal).
-/// - Any other status / transport error → remember it as a candidate
-///   `Error` outcome but keep iterating: a peer further down the list
-///   might still have the content. If every endpoint either errors or
-///   404s and at least one errored, surface the LAST error (richest
-///   triage data for the operator).
-///
-/// `path_and_query` MUST start with `/v2/...` and include the load-
-/// bearing `?ns=<registry>` query parameter — see `spegel_pull` for
-/// why.
-async fn spegel_fetch(
-    spegel: &SpegelClient,
-    path_and_query: &str,
-    accept: Option<&str>,
-) -> FetchResult {
-    let tls = spegel.tls.clone();
-    let endpoints = spegel.endpoints.clone();
-    let path = path_and_query.to_string();
-    let accept = accept.map(str::to_string);
-    blocking::unblock(move || {
-        block_on_http(async move {
-            let client = match cyper::Client::builder().use_rustls(tls).build() {
-                Ok(c) => c,
-                Err(e) => {
-                    return FetchResult::Outcome(PullOutcome::RegistryError {
-                        status: 0,
-                        body: format!("build cyper client for spegel: {e}"),
-                    });
-                }
-            };
-            let mut last_error: Option<FetchResult> = None;
-            let mut last_outcome: Option<FetchResult> = None;
-            for endpoint in &endpoints {
-                let url = format!("{endpoint}{path}");
-                debug!(target: "nydus_snapshotter::auto_accel_sidecar::spegel_fetch", url = %url, "spegel attempt");
-                let req_builder = match client.get(&url) {
-                    Ok(r) => r,
-                    Err(e) => {
-                        debug!(target: "nydus_snapshotter::auto_accel_sidecar::spegel_fetch", url = %url, error = %e, "spegel: invalid URL");
-                        last_outcome = Some(FetchResult::Outcome(PullOutcome::RegistryError {
-                            status: 0,
-                            body: format!("invalid spegel URL {url}: {e}"),
-                        }));
-                        continue;
-                    }
-                };
-                let req = if let Some(ref accept) = accept {
-                    match req_builder.header(ACCEPT, accept.as_str()) {
-                        Ok(r) => r,
-                        Err(e) => {
-                            last_outcome = Some(FetchResult::Outcome(PullOutcome::RegistryError {
-                                status: 0,
-                                body: format!("invalid Accept header for {url}: {e}"),
-                            }));
-                            continue;
-                        }
-                    }
-                } else {
-                    req_builder
-                };
-                let response =
-                    match compio::time::timeout(Duration::from_secs(30), req.send()).await {
-                        Ok(Ok(r)) => r,
-                        Ok(Err(e)) => {
-                            debug!(target: "nydus_snapshotter::auto_accel_sidecar::spegel_fetch", url = %url, error = %e, "spegel: transport error");
-                            last_outcome = Some(FetchResult::Outcome(PullOutcome::RegistryError {
-                                status: 0,
-                                body: format!("transport error for {url}: {e}"),
-                            }));
-                            continue;
-                        }
-                        Err(_) => {
-                            debug!(target: "nydus_snapshotter::auto_accel_sidecar::spegel_fetch", url = %url, "spegel: request timeout");
-                            last_outcome = Some(FetchResult::Outcome(PullOutcome::RegistryError {
-                                status: 0,
-                                body: format!("spegel request timed out for {url}"),
-                            }));
-                            continue;
-                        }
-                    };
-                let status = response.status();
-                debug!(target: "nydus_snapshotter::auto_accel_sidecar::spegel_fetch", url = %url, status = %status, "spegel: response");
-                match http_status_to_outcome(status.as_u16()) {
-                    StatusOutcome::Ok => match response.bytes().await {
-                        Ok(b) => return FetchResult::Ok(b.to_vec()),
-                        Err(e) => {
-                            last_outcome = Some(FetchResult::Outcome(PullOutcome::RegistryError {
-                                status: status.as_u16(),
-                                body: format!("read body for {url}: {e}"),
-                            }));
-                        }
-                    },
-                    StatusOutcome::NotFound => {
-                        // Try the next peer; keep going.
-                    }
-                    StatusOutcome::Error => {
-                        let body = response.text().await.unwrap_or_default();
-                        last_error = Some(FetchResult::Error {
-                            status: status.as_u16(),
-                            body,
-                        });
-                    }
-                }
-            }
-            // No 2xx from any endpoint. Prefer surfacing a real Error
-            // (operator wants to see 5xx / TLS / transport failure) over
-            // a NotFound, since NotFound is the expected "nobody has it"
-            // case.
-            last_error.or(last_outcome).unwrap_or(FetchResult::NotFound)
-        })
-    })
-    .await
-}
-
-/// Tri-state categorisation for one HTTP status code. Pulled out so unit
-/// tests can pin the boundary (404 → NotFound vs 401/403/5xx → Error)
-/// without spinning a real HTTP server.
-fn http_status_to_outcome(status: u16) -> StatusOutcome {
-    if (200..300).contains(&status) {
-        StatusOutcome::Ok
-    } else if status == 404 {
-        StatusOutcome::NotFound
-    } else {
-        StatusOutcome::Error
-    }
-}
-
-#[derive(Debug, Eq, PartialEq)]
-enum StatusOutcome {
-    Ok,
-    NotFound,
-    Error,
-}
-
-/// Build the rustls TLS config + endpoint list used for every spegel
-/// call. Pure metadata: no cyper `Client` is constructed here because
-/// cyper's client is `!Send + !Sync` (Rc-based for compio
-/// current_thread). The actual client is built per call in
-/// `spegel_fetch` on a blocking thread.
-///
-/// `Ok(None)` is returned when the mirror is disabled by config or any
-/// of the configured cert files don't exist on disk — both map to
-/// "skip the spegel-pull path" rather than an error, so a host without
-/// an embedded spegel mirror runs the same as it did before.
-fn build_spegel_client(cfg: &SpegelMirrorConfig) -> Result<Option<SpegelClient>> {
-    if !cfg.enable {
-        return Ok(None);
-    }
-    for path in [&cfg.ca_path, &cfg.client_cert_path, &cfg.client_key_path] {
-        if !path.is_file() {
-            debug!(
-                ca = %cfg.ca_path.display(),
-                cert = %cfg.client_cert_path.display(),
-                key = %cfg.client_key_path.display(),
-                missing = %path.display(),
-                "spegel cert file missing; mirror client disabled"
-            );
-            return Ok(None);
-        }
-    }
-
-    // 1. Custom root CA (the k3s server CA — system trust store is not
-    //    used; the only thing we authenticate against is the embedded
-    //    spegel + peer mirrors signed by this CA).
-    let mut roots = rustls::RootCertStore::empty();
-    let mut ca_reader = BufReader::new(
-        File::open(&cfg.ca_path)
-            .with_context(|| format!("open spegel CA cert {}", cfg.ca_path.display()))?,
-    );
-    let mut ca_added = 0usize;
-    for cert in rustls_pemfile::certs(&mut ca_reader) {
-        let cert =
-            cert.with_context(|| format!("parse spegel CA cert {}", cfg.ca_path.display()))?;
-        roots
-            .add(cert)
-            .with_context(|| format!("add spegel CA to root store {}", cfg.ca_path.display()))?;
-        ca_added += 1;
-    }
-    if ca_added == 0 {
-        return Err(anyhow!(
-            "no CA certificates found in {}",
-            cfg.ca_path.display()
-        ));
-    }
-
-    // 2. Client identity for mTLS (k3s controller cert + key — same
-    //    identity k3s' own internal components use).
-    let mut cert_reader =
-        BufReader::new(File::open(&cfg.client_cert_path).with_context(|| {
-            format!("open spegel client cert {}", cfg.client_cert_path.display())
-        })?);
-    let client_certs: Vec<rustls::pki_types::CertificateDer<'static>> =
-        rustls_pemfile::certs(&mut cert_reader)
-            .collect::<std::result::Result<_, _>>()
-            .with_context(|| {
-                format!(
-                    "parse spegel client cert {}",
-                    cfg.client_cert_path.display()
-                )
-            })?;
-    if client_certs.is_empty() {
-        return Err(anyhow!(
-            "no client certificates found in {}",
-            cfg.client_cert_path.display()
-        ));
-    }
-
-    let mut key_reader =
-        BufReader::new(File::open(&cfg.client_key_path).with_context(|| {
-            format!("open spegel client key {}", cfg.client_key_path.display())
-        })?);
-    let client_key = rustls_pemfile::private_key(&mut key_reader)
-        .with_context(|| format!("parse spegel client key {}", cfg.client_key_path.display()))?
-        .ok_or_else(|| anyhow!("no private key found in {}", cfg.client_key_path.display()))?;
-
-    let tls = rustls::ClientConfig::builder()
-        .with_root_certificates(roots)
-        .with_client_auth_cert(client_certs, client_key)
-        .context("build rustls ClientConfig for spegel mirror")?;
-
-    // Primary endpoint first, then operator-configured peer fallbacks
-    // (workaround for libp2p "empty list of address ports" — see
-    // `spegel_fetch` for the iteration semantics).
-    let mut endpoints = Vec::with_capacity(1 + cfg.peer_endpoints.len());
-    endpoints.push(cfg.endpoint.trim_end_matches('/').to_string());
-    for peer in &cfg.peer_endpoints {
-        let trimmed = peer.trim_end_matches('/').to_string();
-        if !trimmed.is_empty() && !endpoints.contains(&trimmed) {
-            endpoints.push(trimmed);
-        }
-    }
-
-    Ok(Some(SpegelClient {
-        tls: Arc::new(tls),
-        endpoints,
-    }))
 }
 
 /// Per-manifest slug for staging dirs. Uses the bare hex (no `sha256:`
@@ -1008,7 +698,7 @@ pub fn auto_accel_labels(subject: &str, role: &str) -> HashMap<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::auto_accel_oci::AUTO_ACCEL_INDEX_MEDIATYPE;
+    use crate::auto_accel_oci::{AUTO_ACCEL_INDEX_MEDIATYPE, OciDescriptor};
 
     #[test]
     fn pick_latest_prefers_larger_size_then_digest() {
@@ -1040,49 +730,6 @@ mod tests {
             "abcdef1234567890"
         );
         assert_eq!(slug_for_digest("abc"), "abc");
-    }
-
-    /// `http_status_to_outcome` is the critical categorisation that
-    /// decides whether spegel's response is a clean "no peer has it"
-    /// (silent fallback to overlay) or a real "mirror is broken" signal
-    /// that needs operator attention. Pre-spegel-pull, the equivalent
-    /// stderr-parsing version of this categorisation was missing and a
-    /// busted spegel mTLS would have silently disabled every auto-accel
-    /// mount on the node.
-    #[test]
-    fn http_status_to_outcome_404_is_not_found() {
-        assert_eq!(http_status_to_outcome(404), StatusOutcome::NotFound);
-    }
-
-    #[test]
-    fn http_status_to_outcome_2xx_is_ok() {
-        assert_eq!(http_status_to_outcome(200), StatusOutcome::Ok);
-        assert_eq!(http_status_to_outcome(204), StatusOutcome::Ok);
-        assert_eq!(http_status_to_outcome(299), StatusOutcome::Ok);
-    }
-
-    #[test]
-    fn http_status_to_outcome_auth_failures_are_registry_error() {
-        // 401/403 → spegel mTLS misconfigured, client cert expired, etc.
-        // Operator needs the signal — NOT a silent fallback.
-        assert_eq!(http_status_to_outcome(401), StatusOutcome::Error);
-        assert_eq!(http_status_to_outcome(403), StatusOutcome::Error);
-    }
-
-    #[test]
-    fn http_status_to_outcome_5xx_is_registry_error() {
-        // Daemon down, panic, OOM — same operator-needs-to-look story.
-        assert_eq!(http_status_to_outcome(500), StatusOutcome::Error);
-        assert_eq!(http_status_to_outcome(502), StatusOutcome::Error);
-        assert_eq!(http_status_to_outcome(503), StatusOutcome::Error);
-    }
-
-    #[test]
-    fn http_status_to_outcome_3xx_is_registry_error() {
-        // We don't follow redirects through spegel — a peer that needs to
-        // redirect us is a config bug to flag.
-        assert_eq!(http_status_to_outcome(301), StatusOutcome::Error);
-        assert_eq!(http_status_to_outcome(307), StatusOutcome::Error);
     }
 
     /// `split_synthetic_ref` is the producer/consumer contract for the
@@ -1123,5 +770,54 @@ mod tests {
             "prefetch-blob"
         );
         assert_eq!(role_for_media_type("something/unknown"), "index");
+    }
+
+    fn descriptor(media_type: &str, digest: &str) -> OciDescriptor {
+        OciDescriptor {
+            media_type: media_type.to_string(),
+            digest: digest.to_string(),
+            size: 1,
+            annotations: HashMap::new(),
+        }
+    }
+
+    /// The GC-edge labels on the manifest blob are what keep the config
+    /// and layer blobs alive across containerd GC passes. A missing edge
+    /// here resurfaces as a spegel 404 for a referenced blob on every
+    /// consumer node — pin the full shape.
+    #[test]
+    fn manifest_blob_labels_carry_gc_edges_for_all_references() {
+        let oci = OciImageManifest {
+            schema_version: 2,
+            media_type: OCI_MANIFEST_MEDIATYPE.to_string(),
+            config: descriptor(AUTO_ACCEL_CONFIG_MEDIATYPE, "sha256:cfg"),
+            layers: vec![
+                descriptor(AUTO_ACCEL_BOOTSTRAP_MEDIATYPE, "sha256:boot"),
+                descriptor(AUTO_ACCEL_INDEX_MEDIATYPE, "sha256:idx0"),
+                descriptor(AUTO_ACCEL_PREFETCH_MEDIATYPE, "sha256:pf"),
+            ],
+            annotations: HashMap::new(),
+        };
+        let labels =
+            manifest_blob_labels("sha256:subject", "nydus.auto-accel.local/sidecar:t", &oci);
+        assert_eq!(
+            labels.get("containerd.io/gc.ref.content.config").unwrap(),
+            "sha256:cfg"
+        );
+        assert_eq!(
+            labels.get("containerd.io/gc.ref.content.l.0").unwrap(),
+            "sha256:boot"
+        );
+        assert_eq!(
+            labels.get("containerd.io/gc.ref.content.l.1").unwrap(),
+            "sha256:idx0"
+        );
+        assert_eq!(
+            labels.get("containerd.io/gc.ref.content.l.2").unwrap(),
+            "sha256:pf"
+        );
+        // Base labels still present.
+        assert_eq!(labels.get(LABEL_SUBJECT).unwrap(), "sha256:subject");
+        assert_eq!(labels.get(LABEL_ROLE).unwrap(), "manifest");
     }
 }

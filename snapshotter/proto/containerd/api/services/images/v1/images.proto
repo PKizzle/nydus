@@ -3,13 +3,15 @@
 // `nydus.auto-accel.local/sidecar:<hex>` synthetic ref without depending on
 // the full containerd-client crate (which targets a different tonic version).
 //
-// Only Get + Create are needed:
+// Only Get + Create + List are needed:
 // - Create:  after a successful auto-zran upload, register the manifest
 //            descriptor so containerd's GC and the embedded spegel registry
 //            mirror both know about it.
 // - Get:     fast local-side discovery on subsequent Prepares of the same
 //            image (the cross-node spegel-mediated discovery path that goes
 //            through the Transfer service is a separate follow-up).
+// - List:    enumerate image records for the chainID → image-ref cache in
+//            `containerd_lookup` (replaces shelling `crictl images`).
 //
 // Source: https://github.com/containerd/containerd/blob/main/core/images/proto/images.proto
 // containerd is Apache-2.0; this vendoring is compatible with our license.
@@ -47,7 +49,16 @@ message CreateImageResponse {
     Image image = 1;
 }
 
+message ListImagesRequest {
+    repeated string filters = 1;
+}
+
+message ListImagesResponse {
+    repeated Image images = 1;
+}
+
 service Images {
     rpc Get(GetImageRequest) returns (GetImageResponse);
+    rpc List(ListImagesRequest) returns (ListImagesResponse);
     rpc Create(CreateImageRequest) returns (CreateImageResponse);
 }

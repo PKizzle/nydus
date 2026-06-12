@@ -17,6 +17,11 @@ const SNAPSHOT_DURATION_BUCKETS_MS: [f64; 14] = [
     0.5, 1.0, 5.0, 10.0, 50.0, 100.0, 150.0, 200.0, 250.0, 300.0, 350.0, 400.0, 600.0, 1000.0,
 ];
 
+/// gRPC handlers slower than this get a `warn!` — on the snapshotter's
+/// single-threaded runtime one slow handler stalls every concurrent
+/// containerd call, so these must be loud, not just a histogram bucket.
+const SLOW_OPERATION_THRESHOLD: Duration = Duration::from_secs(1);
+
 #[derive(Debug)]
 pub struct SnapshotterMetrics {
     started_at: Instant,
@@ -112,6 +117,19 @@ impl SnapshotterMetrics {
                 .entry(operation)
                 .or_insert_with(SnapshotOperationStats::default);
             stats.in_flight = stats.in_flight.saturating_sub(1);
+        }
+        // The snapshotter serves gRPC from a single-threaded runtime — one
+        // slow handler head-of-line-blocks every concurrent containerd
+        // call (pulls stall, CreateContainer hits its deadline). Surface
+        // any handler that crosses the threshold so the operator sees the
+        // culprit operation instead of diffuse cluster slowness.
+        if elapsed >= SLOW_OPERATION_THRESHOLD {
+            tracing::warn!(
+                operation,
+                status,
+                elapsed_ms = elapsed.as_millis() as u64,
+                "slow snapshotter operation (blocks all concurrent gRPC calls)"
+            );
         }
         self.record_snapshot_operation(operation, status, elapsed);
     }

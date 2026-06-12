@@ -27,6 +27,7 @@ use paths::{dir_usage, fs_dir, snapshot_dir, work_dir};
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use tracing::{debug, info, warn};
 
 /// Outcome of a `Prepare` call, signalling whether containerd should mount
@@ -52,7 +53,10 @@ pub enum PrepareOutcome {
 /// Overlay engine coordinates snapshot lifecycle with mount generation.
 pub struct OverlayEngine {
     config: SnapshotterConfig,
-    containerd_lookup: ContainerdLookup,
+    /// Shared with the gRPC layer's async prepare path; this engine only
+    /// reads the cache (`lookup_cached`) — sync code must never trigger
+    /// an image-store walk.
+    containerd_lookup: Option<Arc<ContainerdLookup>>,
 }
 
 impl OverlayEngine {
@@ -60,8 +64,16 @@ impl OverlayEngine {
     pub fn new(config: SnapshotterConfig) -> Self {
         Self {
             config,
-            containerd_lookup: ContainerdLookup::new(),
+            containerd_lookup: None,
         }
+    }
+
+    /// Share the gRPC layer's `ContainerdLookup` so `nydus_meta_info`'s
+    /// last-resort image-ref fallback can read the digest cache the async
+    /// prepare path populates.
+    pub fn with_containerd_lookup(mut self, lookup: Option<Arc<ContainerdLookup>>) -> Self {
+        self.containerd_lookup = lookup;
+        self
     }
 
     /// Return mounts for an existing active/view snapshot.
@@ -231,15 +243,11 @@ impl OverlayEngine {
             }
             let stored = snap.image_ref.clone().filter(|s| is_image_ref_like(s));
             let from_containerd = if call_image_ref.is_none() && stored.is_none() {
-                bootstrap_digest_from_key(&snap.key).and_then(|d| {
-                    // Refresh failures are non-fatal here: this is the
-                    // nydus-bootstrap lookup path, and we fall through to
-                    // the stored image_ref / labels below.
-                    self.containerd_lookup.lookup(d).unwrap_or_else(|e| {
-                        debug!(error = %e, "containerd-lookup refresh failed");
-                        None
-                    })
-                })
+                // Cache-only: this is sync code on the gRPC runtime, so it
+                // must never trigger an image-store walk. The cache is
+                // shared with (and populated by) the async prepare path.
+                bootstrap_digest_from_key(&snap.key)
+                    .and_then(|d| self.containerd_lookup.as_ref()?.lookup_cached(d))
             } else {
                 None
             };

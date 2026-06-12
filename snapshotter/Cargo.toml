@@ -130,7 +130,9 @@ mio = { version = "1.2", features = ["os-poll", "os-ext"] }
 # path). The pre-content read-serving path in `service/src/fanotify.rs` keeps
 # its hand-rolled `fanotify_sys` because nix doesn't expose the pre-content
 # constants; the capture path only needs the notify-class API which nix has.
-nix = { version = "0.31", features = ["fanotify", "mount"] }
+# `hostname` is for spegel peer discovery's self-node filter
+# (`nix::unistd::gethostname`).
+nix = { version = "0.31", features = ["fanotify", "mount", "hostname"] }
 # Glob-matching for the auto-accel capture exclude list.
 glob = "0.3"
 sendfd = "0.4.3"

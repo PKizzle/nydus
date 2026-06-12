@@ -219,7 +219,7 @@ impl NydusSnapshotter {
         ) else {
             return Ok(None);
         };
-        let info = match lookup.manifest_info(image_ref, content_root) {
+        let info = match lookup.manifest_info(image_ref, content_root).await {
             Ok(info) => info,
             Err(e) => {
                 debug!(image_ref, error = %e, "auto-accel manifest_info failed; falling back to overlay");
@@ -234,14 +234,27 @@ impl NydusSnapshotter {
                 return Ok(None);
             }
         };
-        let handle = self
+        // Daemon start failure is NON-FATAL: the sidecar mount is an
+        // optimization, never a requirement. Failing the prepare here
+        // wedged pods in CreateContainerError loops on hosts where the
+        // fanotify daemon couldn't come up; falling back to overlay keeps
+        // the pod scheduling while the warn (with the full error chain)
+        // tells the operator why acceleration is off.
+        let handle = match self
             .supervisor
             .ensure_instance_local(image_ref, &staged.bootstrap, &staged.backend_dir)
             .await
-            .map_err(|e| {
-                warn!(image_ref, error = %e, "auto-accel fanotify daemon failed to start");
-                SnapshotterError::internal(e.to_string())
-            })?;
+        {
+            Ok(handle) => handle,
+            Err(e) => {
+                warn!(
+                    image_ref,
+                    error = format!("{e:#}"),
+                    "auto-accel fanotify daemon failed to start; falling back to overlay"
+                );
+                return Ok(None);
+            }
+        };
         debug!(
             image_ref,
             mountpoint = %handle.mountpoint().display(),
@@ -385,29 +398,37 @@ impl snapshots::Snapshotter for NydusSnapshotter {
                     // labels are empty. Fall back to a chainID lookup against
                     // containerd's image store via `ContainerdLookup`, which
                     // walks images once and caches `topmost chainID →
-                    // image_ref` for every image known to crictl.
-                    let image_ref = labels
-                        .get(crate::source::labels::CRI_IMAGE_REF)
-                        .cloned()
-                        .or_else(|| {
-                            let chain = parent_chain_digest(&parent)?;
-                            let lookup = self.containerd_lookup.as_ref()?;
-                            match lookup.lookup(chain) {
-                                Ok(opt) => opt,
-                                Err(e) => {
-                                    // Refresh failure (containerd
-                                    // unreachable, crictl json parse error,
-                                    // etc.) is loudly logged rather than
-                                    // silently collapsed into a miss — a
-                                    // missing image-ref disables auto-accel
-                                    // routing AND capture, and we'd
-                                    // otherwise have no signal that the
-                                    // lookup pipeline itself is broken.
-                                    warn!(chain, parent, error = %e, "containerd-lookup refresh failed; auto-accel disabled for this prepare");
-                                    None
-                                }
+                    // image_ref` for every image containerd knows.
+                    //
+                    // Unpack prepares (containerd's image-puller extracting
+                    // layers, marked by `containerd.io/snapshot.ref`) are
+                    // skipped outright: their chain digests belong to a
+                    // still-incomplete image that can never be in the cache,
+                    // so each one would trigger a full image walk — during a
+                    // multi-layer pull that turned into one walk PER LAYER
+                    // and minutes of added pull latency.
+                    let is_unpack = labels.contains_key("containerd.io/snapshot.ref");
+                    let mut image_ref = labels.get(crate::source::labels::CRI_IMAGE_REF).cloned();
+                    if image_ref.is_none()
+                        && !is_unpack
+                        && let Some(chain) = parent_chain_digest(&parent)
+                        && let Some(lookup) = self.containerd_lookup.as_ref()
+                    {
+                        image_ref = match lookup.lookup(chain).await {
+                            Ok(opt) => opt,
+                            Err(e) => {
+                                // Refresh failure (containerd unreachable,
+                                // JSON parse error, etc.) is loudly logged
+                                // rather than silently collapsed into a miss
+                                // — a missing image-ref disables auto-accel
+                                // routing AND capture, and we'd otherwise
+                                // have no signal that the lookup pipeline
+                                // itself is broken.
+                                warn!(chain, parent, error = %e, "containerd-lookup refresh failed; auto-accel disabled for this prepare");
+                                None
                             }
-                        });
+                        };
+                    }
 
                     // Auto-accel routing: if a sidecar artifact exists for
                     // this image in containerd's content store (locally
@@ -633,7 +654,6 @@ pub async fn serve_with_supervisor(
 ) -> Result<()> {
     let socket_path = PathBuf::from(&config.snapshotter.address);
 
-    let overlay = OverlayEngine::new(config.clone());
     let cache_gc_policy = CacheGcPolicy::from_config(&config)?;
     let cache_manager = CacheManager::from_config(&config);
     let metrics = Arc::new(SnapshotterMetrics::new());
@@ -656,7 +676,13 @@ pub async fn serve_with_supervisor(
             let content_store =
                 crate::content_store::ContentStoreClient::new(&config.snapshotter.containerd)
                     .context("connect to containerd content store")?;
-            let containerd_lookup = Arc::new(crate::containerd_lookup::ContainerdLookup::new());
+            // gRPC-backed lookup: image walks go over Images.List +
+            // Content.Read instead of spawning crictl/ctr per image —
+            // the CLI walk took ~80 s per refresh on a loaded node and
+            // head-of-line-blocked every other snapshotter call.
+            let containerd_lookup = Arc::new(crate::containerd_lookup::ContainerdLookup::new(
+                content_store.clone(),
+            ));
             let deps = crate::auto_zran::ConversionDeps {
                 content_store: content_store.clone(),
                 containerd: config.snapshotter.containerd.clone(),
@@ -681,6 +707,12 @@ pub async fn serve_with_supervisor(
         } else {
             (None, None, None)
         };
+
+    // The overlay engine shares the gRPC layer's lookup so its sync
+    // `nydus_meta_info` fallback reads the cache the async prepare path
+    // populates (cache-only — sync code never walks the image store).
+    let overlay = OverlayEngine::new(config.clone())
+        .with_containerd_lookup(containerd_lookup_for_discovery.clone());
 
     if config.snapshotter.sysctl.enable {
         let sysctl_path = config.snapshotter.sysctl.address.clone();

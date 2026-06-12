@@ -67,7 +67,7 @@ use containerd::services::content::v1::{
 };
 
 use containerd::services::images::v1::{
-    CreateImageRequest, GetImageRequest, Image, images_client::ImagesClient,
+    CreateImageRequest, GetImageRequest, Image, ListImagesRequest, images_client::ImagesClient,
 };
 
 use containerd::types as types_proto;
@@ -505,6 +505,39 @@ impl ContentStoreClient {
                         "containerd Images.Get({name}) failed: {status}"
                     )),
                 }
+            })
+        })
+        .await
+    }
+
+    /// List all containerd Image records (name + target digest). Used by
+    /// `containerd_lookup` to build the chainID → image-ref cache without
+    /// shelling out to `crictl images`.
+    #[instrument(level = "debug", skip(self), err)]
+    pub async fn images_list(&self) -> Result<Vec<crate::containerd_lookup::ImageRecord>> {
+        let inner = self.inner.clone();
+        blocking::unblock(move || {
+            inner.rt.as_ref().expect("runtime present").block_on(async {
+                let mut client = connect_images(&inner).await?;
+                let mut request = tonic::Request::new(ListImagesRequest { filters: vec![] });
+                attach_namespace(&mut request, &inner.namespace)?;
+                let response = client
+                    .list(request)
+                    .await
+                    .map_err(|status| anyhow::anyhow!("containerd Images.List failed: {status}"))?;
+                let records = response
+                    .into_inner()
+                    .images
+                    .into_iter()
+                    .filter_map(|image| {
+                        let target = image.target?;
+                        Some(crate::containerd_lookup::ImageRecord {
+                            name: image.name,
+                            target_digest: target.digest,
+                        })
+                    })
+                    .collect();
+                Ok(records)
             })
         })
         .await

@@ -398,16 +398,30 @@ pub struct SpegelMirrorConfig {
     /// hang off the same TLS listener.
     #[serde(default = "default_spegel_endpoint")]
     pub endpoint: String,
-    /// Additional peer mirror endpoints tried in order if the primary
-    /// `endpoint` returns 404 — workaround for k3s' embedded spegel libp2p
-    /// peer discovery returning "empty list of address ports" on
-    /// multi-node clusters where the DHT advertisement carries no dialable
-    /// multiaddr. With these set, the snapshotter bypasses libp2p and
-    /// pulls straight from each peer's mirror endpoint over mTLS using
-    /// the same `ca_path` / `client_cert_path` / `client_key_path` as
-    /// `endpoint`. Example: `["https://node-b:6443",
-    /// "https://node-c:6443"]`. Leave empty (default) when
-    /// libp2p routing works or for single-node deployments.
+    /// How peer mirror endpoints are found when the local mirror misses.
+    /// k3s' embedded spegel (v0.7.x) relies on a libp2p DHT whose
+    /// provider-address records rot on long-lived clusters ("could not
+    /// find peer" / "empty list of address ports" for content peers
+    /// demonstrably hold), so the default `kubernetes` mode bypasses
+    /// libp2p: the snapshotter lists the cluster's nodes via the local
+    /// API server — using the same mTLS identity the mirror requires —
+    /// and tries each Ready node's mirror endpoint directly.
+    #[serde(default)]
+    pub peer_discovery: PeerDiscoveryMode,
+    /// How long a discovered node list is cached before it is refreshed
+    /// from the API server. Refreshes run on the pull path's blocking
+    /// thread, never on the snapshotter's gRPC runtime.
+    #[serde(default = "default_spegel_discovery_ttl")]
+    pub discovery_ttl: String,
+    /// Per-endpoint timeout for one mirror request. Sidecar artifacts are
+    /// small (bootstrap ≈ 1 MiB, indexes ≈ KiBs), so keep this short — a
+    /// slow peer must not stall pod creation.
+    #[serde(default = "default_spegel_request_timeout")]
+    pub request_timeout: String,
+    /// Statically-pinned peer mirror endpoints, tried after discovered
+    /// peers (or alone with `peer_discovery = "static"`). Useful for
+    /// clusters where the snapshotter may not list nodes, or to pin an
+    /// order in tests. Example: `["https://node-b:6443"]`.
     #[serde(default)]
     pub peer_endpoints: Vec<String>,
     /// PEM-encoded CA bundle for verifying the mirror endpoint's serving
@@ -429,12 +443,29 @@ impl Default for SpegelMirrorConfig {
         Self {
             enable: default_spegel_enable(),
             endpoint: default_spegel_endpoint(),
+            peer_discovery: PeerDiscoveryMode::default(),
+            discovery_ttl: default_spegel_discovery_ttl(),
+            request_timeout: default_spegel_request_timeout(),
             peer_endpoints: Vec::new(),
             ca_path: default_spegel_ca_path(),
             client_cert_path: default_spegel_client_cert_path(),
             client_key_path: default_spegel_client_key_path(),
         }
     }
+}
+
+/// Where the spegel-pull path finds peer mirror endpoints.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum PeerDiscoveryMode {
+    /// List the cluster's nodes from the local Kubernetes API server and
+    /// try each Ready node's mirror endpoint (default).
+    #[default]
+    Kubernetes,
+    /// Only the statically-configured `peer_endpoints`.
+    Static,
+    /// No peers — only the local mirror endpoint is tried.
+    Off,
 }
 
 /// All backend sections under `[backends.*]`.
@@ -589,6 +620,12 @@ fn default_spegel_client_cert_path() -> PathBuf {
 }
 fn default_spegel_client_key_path() -> PathBuf {
     PathBuf::from("/var/lib/rancher/k3s/agent/client-k3s-controller.key")
+}
+fn default_spegel_discovery_ttl() -> String {
+    "5m".to_string()
+}
+fn default_spegel_request_timeout() -> String {
+    "10s".to_string()
 }
 
 fn default_fs_drivers() -> Vec<FsDriverEntry> {

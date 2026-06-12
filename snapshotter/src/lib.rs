@@ -54,6 +54,7 @@ pub mod prefetch_profile;
 pub mod probe;
 pub mod recon;
 pub mod source;
+pub mod spegel;
 pub mod store;
 pub mod sysctl;
 

@@ -378,6 +378,7 @@ async fn run_conversion(
     let info = deps
         .containerd_lookup
         .manifest_info(&job.image, &deps.containerd.content_root)
+        .await
         .with_context(|| format!("resolve manifest for {}", job.image))?;
     let manifest_digest = info.manifest_digest.clone();
     info!(
