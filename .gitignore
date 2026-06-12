@@ -9,6 +9,7 @@ __pycache__
 .DS_Store
 go.work.sum
 dist/
+graphify-out/
 nydus-static/
 .goreleaser.yml
 metadata.db
