@@ -24,7 +24,7 @@
 //! `current_thread` runtime (so it can share an io-uring driver with
 //! FUSE/fanotify) but tonic's transport requires a tokio runtime. We isolate
 //! that with a dedicated multi-thread tokio runtime owned by this module and
-//! drive each public async method via `blocking::unblock` → `rt.block_on`. The
+//! drive each public async method via `blocking::unblock` → `handle.block_on`. The
 //! compio scheduler keeps progressing while the gRPC call happens off-thread.
 
 use crate::config::ContainerdConfig;
@@ -102,10 +102,12 @@ struct Inner {
     /// `shutdown_background()` to avoid the foot-gun entirely.
     rt: Option<tokio::runtime::Runtime>,
     /// Cloned `Handle` to the same runtime, used for all `block_on` calls on
-    /// the hot path. `Handle::block_on` has the same semantics as
-    /// `Runtime::block_on` and, unlike `rt.as_ref()`, doesn't require an
-    /// `Option::expect`/`unwrap` at every call site — the handle stays valid
-    /// for the lifetime of `Inner` regardless of what `Drop` does to `rt`.
+    /// the hot path. Safety invariant: every `block_on` call site reaches
+    /// this handle through a cloned `Arc<Inner>` that is moved into the
+    /// `blocking::unblock` closure, so `Drop for Inner` — and therefore
+    /// `shutdown_background()` — strictly happens-after the last in-flight
+    /// `block_on` returns. Do not hand this `Handle` out detached from the
+    /// `Arc<Inner>`: a `block_on` racing runtime shutdown would panic.
     handle: tokio::runtime::Handle,
 }
 
@@ -554,7 +556,7 @@ impl ContentStoreClient {
 
 /// Open a fresh Content service client over the configured Unix socket. The
 /// tonic transport pins this future to the current tokio runtime, so it must
-/// only be called inside `rt.block_on`.
+/// only be called inside `handle.block_on`.
 async fn connect(inner: &Inner) -> Result<ContentClient<tonic::transport::Channel>> {
     Ok(ContentClient::new(connect_channel(inner).await?))
 }
