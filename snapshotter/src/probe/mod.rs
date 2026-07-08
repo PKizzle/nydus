@@ -31,14 +31,14 @@ pub struct ProbeResult {
     pub reason: String,
 }
 
-/// Probe all configured filesystem drivers and return results in priority order.
+/// Probe each configured filesystem driver and return one [`ProbeResult`] per
+/// entry, in the same order as `drivers`.
 ///
-/// The first driver that passes the probe is selected as the active driver.
-///
-/// This does NOT promote/normalize `drivers`, so callers that then serve
-/// traffic off the same config can disagree with what got probed here. Use
-/// [`probe_and_promote_driver`] on any path that actually starts serving;
-/// this function is `pub(crate)` (test/diagnostic use only) for that reason.
+/// This does NOT promote/normalize `drivers` and does not itself choose an
+/// active driver — selection semantics live in [`probe_and_promote_driver`],
+/// which callers that then serve traffic off the same config must use so the
+/// running driver matches what was probed. This function is `pub(crate)`
+/// (test/diagnostic use only) for that reason.
 pub(crate) fn probe_drivers(drivers: &[FsDriverEntry]) -> Vec<ProbeResult> {
     // Best-effort load erofs once before per-driver probing so both
     // fanotify and blockdev see it. Distros that compile erofs as a

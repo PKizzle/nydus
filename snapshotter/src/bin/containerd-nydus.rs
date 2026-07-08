@@ -106,9 +106,10 @@ async fn main() -> Result<()> {
     // Probe filesystem drivers and promote the selected one to the front of
     // `fs_drivers` — same call convention as `grpc::serve` (grpc/mod.rs)
     // — so the config we hand to `DaemonSupervisor` and `serve_with_supervisor`
-    // below agrees with what a probe-only path would report. Must run before
-    // `config` is cloned into the supervisor: `serve_with_supervisor` assumes
-    // its caller already normalized the driver list (see its doc comment).
+    // below agrees with what `grpc::serve` would select for the same config.
+    // Must run before `config` is cloned into the supervisor:
+    // `serve_with_supervisor` assumes its caller already normalized the driver
+    // list (see its doc comment).
     let (probe_results, selected) = nydus_snapshotter::probe::probe_and_promote_driver(
         &mut config.snapshotter.fs_drivers,
         config.snapshotter.fs_driver_policy,
