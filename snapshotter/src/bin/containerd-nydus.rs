@@ -103,8 +103,16 @@ async fn main() -> Result<()> {
         config.snapshotter.root = std::path::PathBuf::from(root);
     }
 
-    // Probe filesystem drivers.
-    let probe_results = nydus_snapshotter::probe::probe_drivers(&config.snapshotter.fs_drivers);
+    // Probe filesystem drivers and promote the selected one to the front of
+    // `fs_drivers` — same call convention as `grpc::serve` (grpc/mod.rs)
+    // — so the config we hand to `DaemonSupervisor` and `serve_with_supervisor`
+    // below agrees with what a probe-only path would report. Must run before
+    // `config` is cloned into the supervisor: `serve_with_supervisor` assumes
+    // its caller already normalized the driver list (see its doc comment).
+    let (probe_results, selected) = nydus_snapshotter::probe::probe_and_promote_driver(
+        &mut config.snapshotter.fs_drivers,
+        config.snapshotter.fs_driver_policy,
+    );
     for result in &probe_results {
         info!(
             driver = ?result.driver_type,
@@ -113,9 +121,6 @@ async fn main() -> Result<()> {
             "driver probe result"
         );
     }
-
-    // Select the best available driver.
-    let selected = nydus_snapshotter::probe::select_driver(&probe_results);
     match selected {
         Some(driver) => info!(driver = ?driver, "selected filesystem driver"),
         None => anyhow::bail!(

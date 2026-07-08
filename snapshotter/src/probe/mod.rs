@@ -34,7 +34,12 @@ pub struct ProbeResult {
 /// Probe all configured filesystem drivers and return results in priority order.
 ///
 /// The first driver that passes the probe is selected as the active driver.
-pub fn probe_drivers(drivers: &[FsDriverEntry]) -> Vec<ProbeResult> {
+///
+/// This does NOT promote/normalize `drivers`, so callers that then serve
+/// traffic off the same config can disagree with what got probed here. Use
+/// [`probe_and_promote_driver`] on any path that actually starts serving;
+/// this function is `pub(crate)` (test/diagnostic use only) for that reason.
+pub(crate) fn probe_drivers(drivers: &[FsDriverEntry]) -> Vec<ProbeResult> {
     // Best-effort load erofs once before per-driver probing so both
     // fanotify and blockdev see it. Distros that compile erofs as a
     // module (Raspberry Pi OS' upstream kernels do — `CONFIG_EROFS_FS=m`)
@@ -71,11 +76,6 @@ pub fn apply_driver_selection_policy(
     if policy == FsDriverSelectionPolicy::Auto {
         drivers.sort_by_key(|entry| driver_auto_rank(&entry.driver_type));
     }
-}
-
-/// Select the best available driver from the probe results.
-pub fn select_driver(results: &[ProbeResult]) -> Option<&FsDriverType> {
-    select_driver_index(results).and_then(|idx| results.get(idx).map(|r| &r.driver_type))
 }
 
 /// Promote the first available driver from `results` to index 0 in `drivers`.
