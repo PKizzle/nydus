@@ -350,29 +350,148 @@ fn ensure_erofs_loaded_inner() {
 #[cfg(not(target_os = "linux"))]
 fn ensure_erofs_loaded_inner() {}
 
+/// Name -> bit table for Linux capabilities, from `linux/capability.h`.
+/// Index into this table is the bit position in the `CapEff`/`CapPrm`/etc.
+/// bitmasks reported by `/proc/self/status`.
+const CAPABILITY_BITS: &[(&str, u32)] = &[
+    ("CHOWN", 0),
+    ("DAC_OVERRIDE", 1),
+    ("DAC_READ_SEARCH", 2),
+    ("FOWNER", 3),
+    ("FSETID", 4),
+    ("KILL", 5),
+    ("SETGID", 6),
+    ("SETUID", 7),
+    ("SETPCAP", 8),
+    ("LINUX_IMMUTABLE", 9),
+    ("NET_BIND_SERVICE", 10),
+    ("NET_BROADCAST", 11),
+    ("NET_ADMIN", 12),
+    ("NET_RAW", 13),
+    ("IPC_LOCK", 14),
+    ("IPC_OWNER", 15),
+    ("SYS_MODULE", 16),
+    ("SYS_RAWIO", 17),
+    ("SYS_CHROOT", 18),
+    ("SYS_PTRACE", 19),
+    ("SYS_PACCT", 20),
+    ("SYS_ADMIN", 21),
+    ("SYS_BOOT", 22),
+    ("SYS_NICE", 23),
+    ("SYS_RESOURCE", 24),
+    ("SYS_TIME", 25),
+    ("SYS_TTY_CONFIG", 26),
+    ("MKNOD", 27),
+    ("LEASE", 28),
+    ("AUDIT_WRITE", 29),
+    ("AUDIT_CONTROL", 30),
+    ("SETFCAP", 31),
+    ("MAC_OVERRIDE", 32),
+    ("MAC_ADMIN", 33),
+    ("SYSLOG", 34),
+    ("WAKE_ALARM", 35),
+    ("BLOCK_SUSPEND", 36),
+    ("AUDIT_READ", 37),
+    ("PERFMON", 38),
+    ("BPF", 39),
+    ("CHECKPOINT_RESTORE", 40),
+];
+
+/// Normalize a capability name from config into the bare `linux/capability.h`
+/// spelling used by [`CAPABILITY_BITS`]: uppercase, `CAP_` prefix stripped.
+fn normalize_cap_name(name: &str) -> String {
+    let upper = name.trim().to_ascii_uppercase();
+    upper.strip_prefix("CAP_").unwrap_or(&upper).to_string()
+}
+
+/// Look up the bit position for a capability name (case-insensitive, with or
+/// without the `CAP_` prefix). Returns `None` for unknown names.
+fn cap_bit(name: &str) -> Option<u32> {
+    let normalized = normalize_cap_name(name);
+    CAPABILITY_BITS
+        .iter()
+        .find(|(cap_name, _)| *cap_name == normalized)
+        .map(|(_, bit)| *bit)
+}
+
+/// Parse the `CapEff:` line out of `/proc/self/status` content and check
+/// that every capability in `caps` is set in the effective bitmask.
+///
+/// This is the pure, unit-testable core of [`has_caps`]. Semantics:
+/// - If the `CapEff:` line is missing or unparsable, assume capabilities are
+///   present (permissive fallback; the caller logs a `warn!` for this case).
+/// - If any name in `caps` doesn't match a known capability, treat it as
+///   not satisfied (return `false`); the caller logs a `warn!` identifying
+///   the offending name so a config typo doesn't silently pass.
+/// - Otherwise, return `true` only if every requested capability's bit is
+///   set in `CapEff`.
+fn has_caps_in_status(status: &str, caps: &[String]) -> bool {
+    if caps.is_empty() {
+        return true;
+    }
+
+    let cap_eff_hex = status
+        .lines()
+        .find_map(|line| line.strip_prefix("CapEff:"))
+        .map(|rest| rest.trim());
+
+    let Some(hex) = cap_eff_hex else {
+        warn!(
+            "no CapEff line in /proc/self/status; assuming required capabilities {:?} are present",
+            caps
+        );
+        return true;
+    };
+
+    let Ok(mask) = u64::from_str_radix(hex, 16) else {
+        warn!(
+            hex = %hex,
+            "unparsable CapEff value in /proc/self/status; assuming required capabilities {:?} are present",
+            caps
+        );
+        return true;
+    };
+
+    for cap in caps {
+        match cap_bit(cap) {
+            Some(bit) => {
+                if mask & (1u64 << bit) == 0 {
+                    debug!(capability = %cap, "required capability not set in CapEff");
+                    return false;
+                }
+            }
+            None => {
+                warn!(capability = %cap, "unknown capability name in require_caps; treating as not satisfied");
+                return false;
+            }
+        }
+    }
+    true
+}
+
 /// Check whether the current process holds all required Linux capabilities.
+///
+/// Reads the effective capability bitmask (`CapEff`) from
+/// `/proc/self/status` and checks it against `caps` via
+/// [`has_caps_in_status`]. If `/proc/self/status` itself can't be read
+/// (e.g. a container without `/proc` mounted), this degrades permissively
+/// and assumes the capabilities are present; the actual fanotify/fuse calls
+/// will fail at runtime if we actually lack them.
 fn has_caps(caps: &[String]) -> bool {
     if caps.is_empty() {
         return true;
     }
-    // Best-effort: check /proc/self/status for CapEff
-    if let Ok(status) = fs::read_to_string("/proc/self/status") {
-        for line in status.lines() {
-            if line.starts_with("CapEff:") {
-                debug!("CapEff: {}", line);
-                // Full capability check would require libcap or bit manipulation.
-                // For now, assume CAP_SYS_ADMIN (bit 21) is present if we can
-                // read the file. A more thorough check will use libcap in the
-                // full implementation.
-                return true;
-            }
+    match fs::read_to_string("/proc/self/status") {
+        Ok(status) => has_caps_in_status(&status, caps),
+        Err(e) => {
+            warn!(
+                error = %e,
+                "could not read /proc/self/status; assuming required capabilities {:?} are present",
+                caps
+            );
+            true
         }
     }
-    // If we can't determine capabilities, assume we have them (e.g. in a container
-    // without /proc mounted). The actual fanotify/fuse calls will fail at runtime
-    // if we lack them.
-    debug!("could not read /proc/self/status, assuming capabilities present");
-    true
 }
 
 /// Try to open a fanotify file descriptor with `FAN_CLASS_PRE_CONTENT`.
@@ -588,6 +707,86 @@ mod tests {
 
         assert_eq!(drivers[0].driver_type, FsDriverType::Fusedev);
         assert_eq!(drivers[1].driver_type, FsDriverType::Fanotify);
+    }
+
+    #[test]
+    fn has_caps_in_status_empty_requirements_always_pass() {
+        assert!(has_caps_in_status("", &[]));
+    }
+
+    #[test]
+    fn has_caps_in_status_full_mask_grants_all_known_caps() {
+        // Root's typical CapEff: all 41 defined capability bits set.
+        let status = "Name:\tfoo\nCapEff:\t000001ffffffffff\n";
+        assert!(has_caps_in_status(status, &["CAP_SYS_ADMIN".to_string()]));
+        assert!(has_caps_in_status(
+            status,
+            &[
+                "CAP_SYS_ADMIN".to_string(),
+                "CAP_NET_ADMIN".to_string(),
+                "CAP_CHECKPOINT_RESTORE".to_string()
+            ]
+        ));
+    }
+
+    #[test]
+    fn has_caps_in_status_empty_mask_fails_sys_admin() {
+        let status = "Name:\tfoo\nCapEff:\t0000000000000000\n";
+        assert!(!has_caps_in_status(status, &["CAP_SYS_ADMIN".to_string()]));
+    }
+
+    #[test]
+    fn has_caps_in_status_missing_line_is_permissive() {
+        let status = "Name:\tfoo\nPid:\t1\n";
+        assert!(has_caps_in_status(status, &["CAP_SYS_ADMIN".to_string()]));
+    }
+
+    #[test]
+    fn has_caps_in_status_unparsable_line_is_permissive() {
+        let status = "Name:\tfoo\nCapEff:\tnot-hex\n";
+        assert!(has_caps_in_status(status, &["CAP_SYS_ADMIN".to_string()]));
+    }
+
+    #[test]
+    fn has_caps_in_status_unknown_cap_name_fails() {
+        // Only CAP_SYS_ADMIN's bit (21) is set; the unknown name must not
+        // silently pass even though every *known* bit here is satisfied.
+        let status = "Name:\tfoo\nCapEff:\t0000000000200000\n";
+        assert!(!has_caps_in_status(
+            status,
+            &["CAP_NOT_A_REAL_CAP".to_string()]
+        ));
+    }
+
+    #[test]
+    fn has_caps_in_status_name_normalization() {
+        // Only CAP_SYS_ADMIN's bit (21) is set.
+        let status = "Name:\tfoo\nCapEff:\t0000000000200000\n";
+        for variant in ["CAP_SYS_ADMIN", "cap_sys_admin", "sys_admin", "SYS_ADMIN"] {
+            assert!(
+                has_caps_in_status(status, &[variant.to_string()]),
+                "variant {variant} should match CAP_SYS_ADMIN bit"
+            );
+        }
+    }
+
+    #[test]
+    fn has_caps_in_status_partial_mask_missing_one_cap_fails() {
+        // Only CAP_SYS_ADMIN's bit (21) is set; CAP_NET_ADMIN (bit 12) is not.
+        let status = "Name:\tfoo\nCapEff:\t0000000000200000\n";
+        assert!(!has_caps_in_status(
+            status,
+            &["CAP_SYS_ADMIN".to_string(), "CAP_NET_ADMIN".to_string()]
+        ));
+    }
+
+    #[test]
+    fn cap_bit_known_and_unknown_names() {
+        assert_eq!(cap_bit("CAP_SYS_ADMIN"), Some(21));
+        assert_eq!(cap_bit("sys_admin"), Some(21));
+        assert_eq!(cap_bit("cap_chown"), Some(0));
+        assert_eq!(cap_bit("CAP_CHECKPOINT_RESTORE"), Some(40));
+        assert_eq!(cap_bit("not_a_cap"), None);
     }
 
     #[test]
