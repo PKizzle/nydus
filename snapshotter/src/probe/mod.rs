@@ -17,7 +17,11 @@ use crate::config::{FsDriverEntry, FsDriverSelectionPolicy, FsDriverType};
 use anyhow::{Result, bail};
 use std::fs;
 use std::path::Path;
-use tracing::{debug, info, warn};
+// `debug!` is only used in Linux-gated probe paths (kernel version,
+// modprobe); an unconditional import trips #![deny(warnings)] on macOS.
+#[cfg(target_os = "linux")]
+use tracing::debug;
+use tracing::{info, warn};
 
 /// Result of a capability probe for a single driver.
 #[derive(Clone, Debug)]
@@ -417,12 +421,13 @@ fn cap_bit(name: &str) -> Option<u32> {
 /// Parse the `CapEff:` line out of `/proc/self/status` content and check
 /// that every capability in `caps` is set in the effective bitmask.
 ///
-/// This is the pure, unit-testable core of [`has_caps`]. Semantics:
+/// This is the unit-testable core of [`has_caps`] — pure except for
+/// `tracing` output. Semantics:
 /// - If the `CapEff:` line is missing or unparsable, assume capabilities are
-///   present (permissive fallback; the caller logs a `warn!` for this case).
+///   present (permissive fallback, logged here via `warn!`).
 /// - If any name in `caps` doesn't match a known capability, treat it as
-///   not satisfied (return `false`); the caller logs a `warn!` identifying
-///   the offending name so a config typo doesn't silently pass.
+///   not satisfied (return `false`) and `warn!` the offending name so a
+///   config typo doesn't silently pass.
 /// - Otherwise, return `true` only if every requested capability's bit is
 ///   set in `CapEff`.
 fn has_caps_in_status(status: &str, caps: &[String]) -> bool {
@@ -456,7 +461,12 @@ fn has_caps_in_status(status: &str, caps: &[String]) -> bool {
         match cap_bit(cap) {
             Some(bit) => {
                 if mask & (1u64 << bit) == 0 {
-                    debug!(capability = %cap, "required capability not set in CapEff");
+                    warn!(
+                        capability = %cap,
+                        bit,
+                        cap_eff = format!("{mask:#018x}"),
+                        "required capability not set in CapEff; grant it (e.g. via securityContext.capabilities) to enable this driver"
+                    );
                     return false;
                 }
             }
@@ -478,6 +488,8 @@ fn has_caps_in_status(status: &str, caps: &[String]) -> bool {
 /// and assumes the capabilities are present; the actual fanotify/fuse calls
 /// will fail at runtime if we actually lack them.
 fn has_caps(caps: &[String]) -> bool {
+    // Load-bearing early return: avoids a spurious warn! from the read
+    // failure path below when nothing is required in the first place.
     if caps.is_empty() {
         return true;
     }
@@ -778,6 +790,16 @@ mod tests {
             status,
             &["CAP_SYS_ADMIN".to_string(), "CAP_NET_ADMIN".to_string()]
         ));
+    }
+
+    #[test]
+    fn capability_table_bits_match_positions() {
+        // The bit value of each entry must equal its index — a mistyped
+        // bit in a future edit of CAPABILITY_BITS breaks this immediately.
+        assert_eq!(CAPABILITY_BITS.len(), 41);
+        for (i, (_, bit)) in CAPABILITY_BITS.iter().enumerate() {
+            assert_eq!(i as u32, *bit);
+        }
     }
 
     #[test]
