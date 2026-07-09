@@ -245,13 +245,15 @@ fn parse_filters(filters: &[String]) -> Option<Vec<Vec<FilterTerm>>> {
 }
 
 /// Map a stored snapshot kind (`kind_active` etc.) to the containerd filter
-/// token (`active` etc.).
+/// token (`active` etc.). Routes through [`SnapshotKind::from_store_str`] so the
+/// store's on-disk kind strings stay the single source of truth — if they ever
+/// change, this mapping follows rather than silently stopping to match.
 fn kind_filter_token(store_kind: &str) -> &'static str {
-    match store_kind {
-        "kind_active" => "active",
-        "kind_committed" => "committed",
-        "kind_view" => "view",
-        _ => "unknown",
+    match crate::store::SnapshotKind::from_store_str(store_kind) {
+        Ok(crate::store::SnapshotKind::Active) => "active",
+        Ok(crate::store::SnapshotKind::Committed) => "committed",
+        Ok(crate::store::SnapshotKind::View) => "view",
+        Err(_) => "unknown",
     }
 }
 
@@ -504,17 +506,22 @@ impl snapshots::Snapshotter for NydusSnapshotter {
                 })?,
             };
 
+            // Stat up front on BOTH mask paths so a missing snapshot always
+            // answers NotFound (containerd's expectation), not Internal — the
+            // merge path needs the existing labels anyway, and the replace-all
+            // path needs the existence check for a consistent status code.
+            //
+            // This stat + the store.update below is a read-then-write TOCTOU. It
+            // is safe only because containerd serializes RPCs per snapshot key,
+            // so no concurrent update can race between the two calls.
+            let existing = store.stat(&info.name).map_err(|e| {
+                warn!(name = %info.name, error = %e, "update snapshot: not found");
+                SnapshotterError::not_found(e.to_string())
+            })?;
+
             let new_labels = match mask {
                 LabelMask::ReplaceAll => info.labels.clone(),
-                LabelMask::Merge(keys) => {
-                    // Read the current labels to merge onto. NotFound here is the
-                    // right gRPC answer for updating a missing snapshot.
-                    let existing = store.stat(&info.name).map_err(|e| {
-                        warn!(name = %info.name, error = %e, "update snapshot: not found");
-                        SnapshotterError::not_found(e.to_string())
-                    })?;
-                    merge_labels(&existing.labels, &info.labels, &keys)
-                }
+                LabelMask::Merge(keys) => merge_labels(&existing.labels, &info.labels, &keys),
             };
 
             let labels: Vec<(String, String)> = new_labels.into_iter().collect();
@@ -1236,6 +1243,25 @@ mod tests {
     }
 
     #[compio::test]
+    async fn update_missing_snapshot_is_not_found() {
+        // Both mask paths must agree: updating a snapshot that does not exist is
+        // NotFound, not Internal. This covers the common absent-mask replace-all
+        // path (which previously skipped the stat and surfaced Internal).
+        let dir = tempdir().unwrap();
+        let snapshotter = test_snapshotter(dir.path());
+        let info = Info {
+            name: "missing".to_string(),
+            labels: labels(&[("k", "v")]),
+            ..Default::default()
+        };
+        let err = snapshotter
+            .update(info, None)
+            .await
+            .expect_err("replace-all update of a missing snapshot must fail");
+        assert_eq!(status_code(err), snapshots::tonic::Code::NotFound);
+    }
+
+    #[compio::test]
     async fn update_unsupported_fieldpath_is_invalid_argument() {
         use crate::store::SnapshotKind;
         let dir = tempdir().unwrap();
@@ -1400,7 +1426,7 @@ ead2bc6bac86c94fd0bfe3dda6bd9c1dc39bf2bd2446f8048aee82f437584bb";
     }
 
     #[test]
-    fn parse_label_mask_none_paths_replace_all() {
+    fn parse_label_mask_bare_labels_replace_all() {
         assert_eq!(
             parse_label_mask(&["labels".to_string()]).unwrap(),
             LabelMask::ReplaceAll

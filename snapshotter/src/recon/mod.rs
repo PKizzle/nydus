@@ -112,6 +112,12 @@ impl Reconciler {
     /// caller (unlike [`Reconciler::run`], which loops and only logs errors).
     /// Wired to the containerd Cleanup RPC so an operator/containerd can force
     /// orphan reclamation synchronously instead of waiting for the next tick.
+    ///
+    /// May run concurrently with the background loop (both share one
+    /// `Arc<Reconciler>`): every reconcile op must remain idempotent and
+    /// read-mostly. There is deliberately no in-flight guard — a redundant
+    /// overlapping pass is cheap and self-correcting; add a `try_lock` only if a
+    /// future non-idempotent op needs it.
     pub async fn run_once(&self) -> Result<()> {
         self.reconcile().await
     }
