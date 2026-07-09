@@ -104,9 +104,12 @@ sudo perf script | stackcollapse-perf.pl | flamegraph.pl > containerd-nydus.svg
 
 Notes specific to this codebase:
 
-- Build with debug info for readable symbols: `cargo build --release` already carries
-  `debuginfo` for this workspace's profile; if stacks show up as raw addresses, rebuild with
-  `CARGO_PROFILE_RELEASE_DEBUG=true` or use a `dev` build.
+- Build with debug info for readable symbols. The workspace `[profile.release]` sets only
+  `panic = "abort"` — it does **not** enable `debug`, so a plain `cargo build --release` ships
+  **without** DWARF debug info and `perf`/`samply` stacks will show raw addresses instead of
+  function names. For symbolized stacks, build with `CARGO_PROFILE_RELEASE_DEBUG=true cargo build
+  --release` (keeps release optimizations, adds debuginfo) or use a `dev` build (`[profile.dev]`
+  already sets `debug = true`).
 - The FUSE/fanotify event loop runs on a `current_thread` compio runtime pinned to its own OS
   thread; `perf record -p <pid> -g` (whole-process, all threads) is what you want, not
   `--per-thread` unless you're specifically isolating that thread from the gRPC server's

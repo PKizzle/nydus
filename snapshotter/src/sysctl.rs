@@ -1171,71 +1171,74 @@ struct AllocatorStatsResponse {
 
 impl AllocatorStatsResponse {
     fn collect() -> Self {
-        let (source, current_rss_bytes, peak_rss_bytes, virtual_size_bytes, note) =
-            process_memory_stats();
+        let stats = process_memory_stats();
         Self {
-            source,
+            source: stats.source,
             mimalloc_extended_stats_available: false,
-            current_rss_bytes,
-            peak_rss_bytes,
-            virtual_size_bytes,
-            note,
+            current_rss_bytes: stats.current_rss,
+            peak_rss_bytes: stats.peak_rss,
+            virtual_size_bytes: stats.virtual_size,
+            note: stats.note,
         }
     }
 }
 
-/// Portable process memory snapshot: `(source, current_rss, peak_rss, virtual_size, note)`.
+/// Portable process memory snapshot. Named fields (rather than a positional
+/// tuple) so the three same-typed `Option<u64>` sizes can't be silently
+/// transposed by a future edit — the compiler checks them by name.
+struct ProcMemStats {
+    /// Where the numbers came from, e.g. `"proc_self_status"` or `"unavailable"`.
+    source: &'static str,
+    /// Current resident set size, in bytes (`VmRSS`).
+    current_rss: Option<u64>,
+    /// Peak resident set size, in bytes (`VmHWM`).
+    peak_rss: Option<u64>,
+    /// Current virtual memory size, in bytes (`VmSize`).
+    virtual_size: Option<u64>,
+    /// Human-readable caveat about what is/isn't included.
+    note: &'static str,
+}
+
+/// Read a portable process memory snapshot.
 ///
 /// Linux reads `/proc/self/status`, which reports resident/peak/virtual
 /// sizes in kB regardless of allocator; non-Linux targets (macOS dev boxes)
 /// have no equivalently cheap portable syscall wired up here, so they get
 /// an explicit `"unavailable"` source rather than silently-wrong zeros.
 #[cfg(target_os = "linux")]
-fn process_memory_stats() -> (
-    &'static str,
-    Option<u64>,
-    Option<u64>,
-    Option<u64>,
-    &'static str,
-) {
+fn process_memory_stats() -> ProcMemStats {
     let status = match std::fs::read_to_string("/proc/self/status") {
         Ok(s) => s,
         Err(e) => {
             warn!(error = %e, "failed to read /proc/self/status for /debug/allocator");
-            return (
-                "unavailable",
-                None,
-                None,
-                None,
-                "failed to read /proc/self/status",
-            );
+            return ProcMemStats {
+                source: "unavailable",
+                current_rss: None,
+                peak_rss: None,
+                virtual_size: None,
+                note: "failed to read /proc/self/status",
+            };
         }
     };
-    let (current, peak, virt) = parse_proc_status_memory(&status);
-    (
-        "proc_self_status",
-        current,
-        peak,
-        virt,
-        "portable RSS via /proc/self/status; mimalloc extended stats not enabled",
-    )
+    let (current_rss, peak_rss, virtual_size) = parse_proc_status_memory(&status);
+    ProcMemStats {
+        source: "proc_self_status",
+        current_rss,
+        peak_rss,
+        virtual_size,
+        note: "portable RSS via /proc/self/status; mimalloc extended stats not enabled",
+    }
 }
 
 #[cfg(not(target_os = "linux"))]
-fn process_memory_stats() -> (
-    &'static str,
-    Option<u64>,
-    Option<u64>,
-    Option<u64>,
-    &'static str,
-) {
-    (
-        "unavailable",
-        None,
-        None,
-        None,
-        "no portable RSS source wired up for this platform; mimalloc extended stats not enabled",
-    )
+fn process_memory_stats() -> ProcMemStats {
+    ProcMemStats {
+        source: "unavailable",
+        current_rss: None,
+        peak_rss: None,
+        virtual_size: None,
+        note: "no portable RSS source wired up for this platform; mimalloc extended stats not enabled",
+    }
 }
 
 /// Parse `VmRSS`/`VmHWM`/`VmSize` (all in kB in `/proc/self/status`) into
