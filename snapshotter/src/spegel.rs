@@ -141,23 +141,42 @@ fn block_on_http<F: std::future::Future>(fut: F) -> F::Output {
 }
 
 /// Identity key for the per-thread [`HTTP_CLIENT`] cache: which rustls
-/// `ClientConfig` (by `Arc` pointer) — or "no TLS" — a cached client was
-/// built from. The `Arc<rustls::ClientConfig>` is constructed once in
+/// `ClientConfig` — or "no TLS" — a cached client was built from. The
+/// `Arc<rustls::ClientConfig>` is constructed once in
 /// [`build_spegel_mirror`] and held for the mirror's lifetime (mirrored
-/// into `NodeDiscovery`), so its pointer is a stable identity to key on;
-/// a `Client` is only ever rebuilt if that identity changes (e.g. a test
-/// constructing a second `SpegelMirror` on the same thread).
-#[derive(Clone, Copy, PartialEq, Eq)]
+/// into `NodeDiscovery`), so its identity is stable to key on; a `Client`
+/// is only ever rebuilt if that identity changes (e.g. a mirror
+/// reconfiguration, or a test constructing a second `SpegelMirror` on the
+/// same thread).
+///
+/// The `Tls` variant stores the `Arc` itself, not an erased pointer: the
+/// cache holding the `Arc` pins the allocation so its pointer identity
+/// stays valid for the cache entry's lifetime. A bare `usize` from
+/// `Arc::as_ptr` would be an ABA hazard — a dropped config could free its
+/// allocation, a new config could be allocated at the same address, and a
+/// stale cached client would be served for it. Comparison uses
+/// [`Arc::ptr_eq`], so it's still a cheap pointer compare, not a deep
+/// `ClientConfig` equality.
 enum ClientKey {
     Plain,
-    Tls(usize),
+    Tls(Arc<rustls::ClientConfig>),
 }
 
 impl ClientKey {
     fn for_tls(tls: &Option<Arc<rustls::ClientConfig>>) -> Self {
         match tls {
-            Some(cfg) => ClientKey::Tls(Arc::as_ptr(cfg) as usize),
+            Some(cfg) => ClientKey::Tls(Arc::clone(cfg)),
             None => ClientKey::Plain,
+        }
+    }
+
+    /// True when `self` and `other` name the same TLS config (by `Arc`
+    /// identity) or are both plain-HTTP.
+    fn matches(&self, other: &ClientKey) -> bool {
+        match (self, other) {
+            (ClientKey::Plain, ClientKey::Plain) => true,
+            (ClientKey::Tls(a), ClientKey::Tls(b)) => Arc::ptr_eq(a, b),
+            _ => false,
         }
     }
 }
@@ -185,7 +204,7 @@ fn cached_client(tls: Option<Arc<rustls::ClientConfig>>) -> Result<cyper::Client
     let key = ClientKey::for_tls(&tls);
     HTTP_CLIENT.with(|cell| {
         if let Some((cached_key, client)) = cell.borrow().as_ref()
-            && *cached_key == key
+            && cached_key.matches(&key)
         {
             return Ok(client.clone());
         }
