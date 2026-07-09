@@ -81,6 +81,27 @@ curl -s --unix-socket /run/containerd-nydus/containerd-nydus-api.sock \
   http://localhost/debug/allocator | jq .
 ```
 
+## Prometheus metrics
+
+`GET /metrics` (Prometheus text) is always served on the sysctl Unix socket. An **optional** TCP
+listener can be enabled for scrapers that prefer a network endpoint:
+
+```toml
+[snapshotter.metrics]
+listen = "127.0.0.1:9110"   # default: unset -> UDS-only, no TCP listener
+```
+
+```bash
+curl -s http://127.0.0.1:9110/metrics
+```
+
+Caveat: the TCP endpoint emits the process and snapshot-operation metrics plus
+`snapshotter_cache_usage_kilobytes`, but **omits the sysctl-only cache-GC counters**
+(`snapshotter_cache_blobs_deleted_total`, `snapshotter_cache_blob_deletion_errors_total`,
+`snapshotter_cache_blobs_in_use`, and the `nydus_snapshotter_cache_gc_*` series) — those are
+tracked inside the sysctl controller and are unreachable from the TCP handler, so they render as
+`0`/absent there. Scrape the UDS `/metrics` if you need the GC counters.
+
 ## CPU profiling: `perf` and `samply`
 
 For actual CPU profiling (where is the process spending time?), use a system sampling profiler

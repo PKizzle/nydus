@@ -532,7 +532,8 @@ async fn handle_metrics(
     axum::extract::State(state): axum::extract::State<MetricsState>,
 ) -> axum::response::Response {
     use axum::response::IntoResponse as _;
-    let body = render_metrics_body(&state.metrics, &state.cache);
+    let total_bytes = scan_cache_bytes(state.cache.clone()).await;
+    let body = render_metrics_body(&state.metrics, total_bytes);
     (
         axum::http::StatusCode::OK,
         [(
@@ -544,14 +545,27 @@ async fn handle_metrics(
         .into_response()
 }
 
-/// Render the Prometheus body for the TCP endpoint. Reports live cache-usage
-/// bytes (matching the sysctl endpoint's `snapshotter_cache_usage_kilobytes`)
-/// and delegates all metric-text generation to
-/// [`SnapshotterMetrics::render_prometheus`] — the GC counters
+/// Total on-disk cache bytes, computed off the compio reactor.
+///
+/// `CacheManager::scan` recurses `std::fs::read_dir` synchronously; running it
+/// inline in the async handler would block the compio reactor thread that also
+/// serves the Snapshotter gRPC for the full cache-tree walk. Since the TCP
+/// metrics endpoint is network-exposed and unauthenticated, a frequent scraper
+/// (or an attacker) could otherwise repeatedly stall gRPC. Offload the walk to a
+/// blocking thread via `blocking::unblock` — the same pattern peer_mirror /
+/// referrer use for blocking work — so the reactor stays responsive.
+async fn scan_cache_bytes(cache: crate::cache::CacheManager) -> u64 {
+    blocking::unblock(move || cache.scan().map(|usage| usage.total_bytes).unwrap_or(0)).await
+}
+
+/// Render the Prometheus body for the TCP endpoint. `total_bytes` is the live
+/// cache usage (matching the sysctl endpoint's
+/// `snapshotter_cache_usage_kilobytes`); all metric-text generation is delegated
+/// to [`SnapshotterMetrics::render_prometheus`]. The GC counters
 /// (`deleted_blobs`/`deletion_errors`/`blobs_in_use`) are tracked by the sysctl
-/// controller and left at their defaults on this endpoint.
-fn render_metrics_body(metrics: &SnapshotterMetrics, cache: &crate::cache::CacheManager) -> String {
-    let total_bytes = cache.scan().map(|usage| usage.total_bytes).unwrap_or(0);
+/// controller and unreachable here, so they render at their defaults — the TCP
+/// endpoint omits the sysctl-only GC counters; scrape the UDS `/metrics` for those.
+fn render_metrics_body(metrics: &SnapshotterMetrics, total_bytes: u64) -> String {
     metrics.render_prometheus(CacheMetricSnapshot {
         total_bytes,
         ..Default::default()
@@ -566,17 +580,39 @@ mod tests {
     fn tcp_metrics_body_reuses_render_prometheus() {
         let metrics = Arc::new(SnapshotterMetrics::new());
         metrics.start_snapshot_operation("prepare").finish("ok");
-        // A missing cache root scans as empty (cheap first-boot path), so usage
-        // is reported as 0 without touching disk.
-        let cache =
-            crate::cache::CacheManager::new(std::path::PathBuf::from("/nonexistent-nydus-metrics"));
-        let body = render_metrics_body(&metrics, &cache);
+        let body = render_metrics_body(&metrics, 0);
         // Identical Go-parity output to the UDS endpoint's renderer.
         assert!(body.contains(
             "snapshotter_snapshot_operation_total{snapshot_operation=\"prepare\",status=\"ok\"} 1"
         ));
         assert!(body.contains("snapshotter_run_time_seconds"));
         assert!(body.contains("snapshotter_cache_usage_kilobytes 0"));
+    }
+
+    #[compio::test]
+    async fn scan_cache_bytes_offloads_and_sums_usage() {
+        // The cache walk must run off the reactor (via blocking::unblock) yet
+        // still return the real on-disk byte total that feeds
+        // snapshotter_cache_usage_kilobytes.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("blob.data"), b"0123456789").unwrap();
+        let cache = crate::cache::CacheManager::new(dir.path());
+        let total_bytes = scan_cache_bytes(cache).await;
+        assert_eq!(total_bytes, 10);
+
+        let metrics = SnapshotterMetrics::new();
+        let body = render_metrics_body(&metrics, total_bytes);
+        // 10 bytes -> 0 KiB (integer division), proving the offloaded total
+        // flows into the reused renderer.
+        assert!(body.contains("snapshotter_cache_usage_kilobytes 0"));
+    }
+
+    #[compio::test]
+    async fn scan_cache_bytes_missing_root_is_zero() {
+        // A missing cache root scans as empty (cheap first-boot path).
+        let cache =
+            crate::cache::CacheManager::new(std::path::PathBuf::from("/nonexistent-nydus-metrics"));
+        assert_eq!(scan_cache_bytes(cache).await, 0);
     }
 
     #[test]
