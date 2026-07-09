@@ -43,6 +43,8 @@ nix = { version = "0.31.3", features = ["fs", "uio", "zerocopy"] }
 # Compio-native HTTP client replacing reqwest (cyper 0.9 tracks compio 0.19; the
 # crates.io release still targets 0.18, so pin the master commit). default
 # features drop native-tls so only rustls is pulled (musl-static goal).
+# Drop trigger: cyper publishes a crates.io release built against compio
+# 0.19+, then move to a version req; see docs/dependencies.md.
 cyper = { git = "https://github.com/compio-rs/cyper", rev = "d1c8aff18dd81c4b1f817d0e8e0e05408c15a04c", default-features = false, features = [
     "rustls",
     "http2",
@@ -57,7 +59,9 @@ cyper = { git = "https://github.com/compio-rs/cyper", rev = "d1c8aff18dd81c4b1f8
 # cyper-core provides the compio<->hyper stream adapter (`HyperStream`), reused
 # by the http-proxy backend to speak HTTP/1 over a compio Unix socket. Pinned to
 # the same rev as cyper and redirected to the local patched copy (see the
-# workspace `[patch]`).
+# workspace `[patch]`). Same drop trigger as cyper above, plus the vendored
+# zero-fill fix landing upstream (see the `[patch]` comment in the workspace
+# root Cargo.toml).
 cyper-core = { git = "https://github.com/compio-rs/cyper", rev = "d1c8aff18dd81c4b1f817d0e8e0e05408c15a04c", default-features = false, optional = true }
 rusqlite = { version = "0.39.0", features = ["bundled"], optional = true }
 r2d2 = { version = "0.8", optional = true }

@@ -165,7 +165,9 @@ fuse-backend-rs = "0.14.0"
 # wakers mutate that list (move/remove tasks), invalidating the cursor. The
 # vendored copy snapshots the hot ids before running them. Required for the
 # cyper HTTP backend (the panic triggers on HTTP connection teardown).
-# Upstream issue to be filed against compio-rs/compio.
+# Upstream issue to be filed against compio-rs/compio. Drop trigger: upstream
+# fixes the tick() cursor invalidation and releases compio-executor > 0.1.0
+# with the fix; see docs/dependencies.md for filing/tracking status.
 compio-executor = { path = "third_party/compio-executor" }
 
 # Local patch adding `NoFreelistSync` support to bbolt-rs 1.3.10. Upstream gates
@@ -179,7 +181,9 @@ compio-executor = { path = "third_party/compio-executor" }
 #   - exposes that setter on `BoltOptionsBuilder` (previously `setter(skip)`).
 # `nydus-migrate reconcile-snapshots` depends on this to read containerd's
 # `meta.db` in-process instead of shelling out to a Go helper.
-# Upstream PR to be filed against ambaxter/bbolt-rs.
+# Upstream PR to be filed against ambaxter/bbolt-rs. Drop trigger: upstream
+# merges NoFreelistSync support and releases bbolt-rs > 1.3.10 with it; see
+# docs/dependencies.md for filing/tracking status.
 bbolt-rs = { path = "third_party/bbolt-rs" }
 
 # Local fix for a large-body read throughput regression in cyper-core's
@@ -189,6 +193,8 @@ bbolt-rs = { path = "third_party/bbolt-rs" }
 # the memset scaled with the cursor, not the bytes read — a body-size-scaled
 # overhead that plateaued large-body throughput ~35-40% below reqwest. The
 # vendored copy reads in 256 KiB chunks and bounds the zero-fill window to match.
-# Upstream PR to be filed against compio-rs/cyper.
+# Upstream PR to be filed against compio-rs/cyper. Drop trigger: upstream
+# fixes the zero-fill window and cyper-core publishes a release at/after the
+# fix commit; see docs/dependencies.md for filing/tracking status.
 [patch."https://github.com/compio-rs/cyper"]
 cyper-core = { path = "third_party/cyper-core" }
