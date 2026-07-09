@@ -58,7 +58,7 @@ nydus/
 │   ├── src/probe/       # Kernel capability probe (fanotify/fusedev/blockdev)
 │   ├── src/recon/       # Reconciler loop (self-healing)
 │   ├── src/source/      # Image source detection (referrer, encryption)
-│   ├── src/store/       # SQLite snapshot metadata store
+│   ├── src/store/       # fjall (LSM) snapshot metadata store (metadata.fjall)
 │   └── src/bin/         # containerd-nydus, nydus-migrate
 ├── storage/          # Core storage subsystem (backends, caching)
 ├── utils/            # Common utilities (logging, metrics, etc.)
@@ -70,7 +70,7 @@ nydus/
 
 - **Language**: Rust, edition 2021. `#![deny(warnings)]` in all binary crates.
 - **Error handling**: Use `anyhow::Result` in applications; `thiserror` for library error types.
-- **Async runtime**: Tokio. **Critical**: FUSE and fanotify I/O must use `current_thread` runtime for io-uring compatibility. The gRPC server uses a multi-thread runtime.
+- **Async runtime**: split by crate. The **snapshotter** (`containerd-nydus`) runs on **compio** (io_uring, `#[compio::main]`); its gRPC/health server and sysctl HTTP API are cyper-axum (hyper-on-compio) — no tokio. The **`service/` crate** (in-process nydus-service: FUSE + fanotify I/O) uses a `current_thread` **tokio** runtime, required for io-uring compatibility — see gotcha #1. Do not conflate the two: never hand the FUSE/fanotify session thread a multi-thread tokio handle.
 - **Logging**: Use `tracing` macros (`info!`, `warn!`, `error!`, `debug!`, `trace!`). Never use `println!` in library code.
 - **Naming**: Follow standard Rust conventions (snake_case, PascalCase).
 - **Configuration**: All config types use `serde` with `Deserialize`/`Serialize`. The unified TOML config is in `snapshotter/src/config/`.
@@ -90,7 +90,7 @@ nydus/
    - **Ordering**: worker threads must be draining BEFORE marks are armed (`arm()`) and BEFORE `mount()`, or the daemon deadlocks in `D` state. Mark data blobs with `FAN_PRE_ACCESS` only (never `FAN_OPEN_PERM`).
    - **Backing fs**: `work_dir` must be on a fs that supports pre-content marks — ext4 works, **tmpfs returns `ENOTSUP`**. Block size must equal the host page size (4K/16K/64K all supported).
 6. **In-process daemon**: The snapshotter links `nydus-service` as a library. Never spawn `nydusd` as a child process. Use `FsService`, `FanotifyHandler`, `FuseServer`, `BlockDevice` directly.
-7. **SQLite WAL mode**: The snapshot store uses SQLite with WAL journaling for concurrent reads. Never switch to DELETE mode.
+7. **fjall snapshot store**: The snapshot metadata store is an embedded **fjall** LSM key/value store (`snapshotter/src/store/mod.rs`, on-disk dir `metadata.fjall`), NOT SQLite. It uses `manual_journal_persist(true)` with a `PersistMode::SyncAll` after every mutation and `max_journaling_size` pinned to fjall's 64 MiB minimum. Do not reintroduce SQLite/sqlx or a relational schema; `nydus-migrate` handles legacy bbolt/SQLite import.
 8. **Config format**: The unified TOML config replaces both the old snapshotter TOML and the nydusd JSON. Do not create separate config files.
 9. **Nydus blob layers bypass stream processors**: `application/vnd.oci.image.layer.nydus.blob.v1` layers are NOT routed through a containerd stream processor. On `Prepare`, the snapshotter classifies the layer via `containerd.io/snapshot/nydus-blob`, commits the target snapshot directly, and returns gRPC `AlreadyExists` so containerd's image-unpacker skips extraction. See [snapshotter/src/source/labels.rs](snapshotter/src/source/labels.rs) and `OverlayEngine::prepare`.
 
