@@ -197,27 +197,56 @@ fn run(prog: &Path, args: &[OsString], sched: SchedClass, nice: i32, what: &str)
     Ok(())
 }
 
-/// The single non-bootstrap file produced by a per-layer `targz-ref` conversion is its zran index
-/// blob; find it in `blob_out_dir`.
-fn find_zran_index(blob_out_dir: &Path, bootstrap: &Path) -> Result<PathBuf> {
-    let boot_name = bootstrap.file_name();
+/// Deterministic, content-derived subdirectory name for one layer's per-invocation
+/// `targz-ref` output dir. Combining the layer's position (readable device-table
+/// ordering when debugging) with its blob id (content hash of the *input*, not the
+/// nydus-image-chosen output name) means retries of the same job after a crash land
+/// in the same place instead of minting a fresh name every attempt -- which matters
+/// for the recon sweep and for correlating a stuck job with a directory by eye.
+fn layer_invocation_dir(index: usize, blob_id: &str) -> String {
+    format!("l{index}-{blob_id}")
+}
+
+/// (Re)create `dir` as empty, discarding any stray content a crashed prior
+/// invocation may have left behind. Every `nydus-image` invocation below gets its
+/// own freshly-wiped directory so "exactly one output file" is a structural
+/// guarantee -- nothing else can have written into `dir` since it was last emptied
+/// -- rather than something detected heuristically via a before/after diff or an
+/// "ignore the known bootstrap name" scan.
+fn fresh_dir(dir: &Path) -> Result<()> {
+    match std::fs::remove_dir_all(dir) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e).with_context(|| format!("clearing stale dir {}", dir.display())),
+    }
+    std::fs::create_dir_all(dir).with_context(|| format!("creating dir {}", dir.display()))
+}
+
+/// Return the single file in `dir` other than `exclude` (if given). The caller must
+/// have just wiped-and-recreated `dir` exclusively for one `nydus-image` invocation
+/// (see `fresh_dir`), so finding more than one candidate here means `nydus-image`
+/// itself produced unexpected output -- a real bug to surface, not a discovery race
+/// to paper over.
+fn expect_single_output(dir: &Path, exclude: Option<&Path>) -> Result<PathBuf> {
+    let exclude_name = exclude.and_then(Path::file_name);
     let mut found = None;
-    for entry in std::fs::read_dir(blob_out_dir)
-        .with_context(|| format!("reading conversion output dir {}", blob_out_dir.display()))?
+    for entry in
+        std::fs::read_dir(dir).with_context(|| format!("reading output dir {}", dir.display()))?
     {
         let entry = entry?;
-        if entry.path().is_file() && Some(entry.file_name().as_os_str()) != boot_name {
-            if found.is_some() {
-                bail!(
-                    "expected exactly one zran index blob in {}, found multiple",
-                    blob_out_dir.display()
-                );
-            }
-            found = Some(entry.path());
+        if !entry.path().is_file() || Some(entry.file_name().as_os_str()) == exclude_name {
+            continue;
         }
+        if found.is_some() {
+            bail!(
+                "nydus-image wrote more than one output file into the fresh dir {} \
+                 (dir is private to this invocation, so this is unexpected)",
+                dir.display()
+            );
+        }
+        found = Some(entry.path());
     }
-    found
-        .ok_or_else(|| anyhow::anyhow!("no zran index blob produced in {}", blob_out_dir.display()))
+    found.ok_or_else(|| anyhow::anyhow!("nydus-image produced no output file in {}", dir.display()))
 }
 
 /// Convert the gzip layers (lower→upper) of a standard OCI image into a
@@ -258,8 +287,8 @@ pub fn convert(
                 layer.path.display()
             );
         }
-        let out_dir = convert_root.join(format!("l{i}"));
-        std::fs::create_dir_all(&out_dir)?;
+        let out_dir = convert_root.join(layer_invocation_dir(i, layer.blob_id()));
+        fresh_dir(&out_dir)?;
         let bootstrap = out_dir.join("bootstrap");
         let args = targz_ref_args(&layer.path, &bootstrap, &out_dir);
         run(
@@ -269,7 +298,8 @@ pub fn convert(
             config.nice,
             "targz-ref convert",
         )?;
-        let index = find_zran_index(&out_dir, &bootstrap)?;
+        let index =
+            expect_single_output(&out_dir, Some(&bootstrap)).context("locating zran index blob")?;
 
         // Stage the backend: symlink the gzip layer in place (no copy), and move the small zran
         // index blob in, both keyed by their nydus blob ids.
@@ -320,9 +350,12 @@ pub fn convert(
 ///
 /// `nydus-image optimize --prefetch-files` expects a v1 JSON file (see
 /// `builder/src/optimize_prefetch.rs::PrefetchJson`); plain newline lists are
-/// rejected. The optimize subcommand writes the new prefetch blob into
-/// `--blob-dir`, so we snapshot the dir before and pick up the new file
-/// afterwards.
+/// rejected. `--blob-dir` (read-only: existing blobs the bootstrap references) and
+/// `--output-blob-dir` (write-only: the new prefetch blob) are independent
+/// directories in the `nydus-image` CLI, so the new blob is written into its own
+/// fresh, otherwise-empty dir instead of `backend` -- turning "find the new file"
+/// into a direct scan of a dir nothing else could have touched, then a single
+/// deterministic move into `backend`.
 fn run_optimize(
     config: &LocalAccelConfig,
     backend: &Path,
@@ -340,10 +373,8 @@ fn run_optimize(
     std::fs::write(&prefetch_json_path, serde_json::to_vec(&prefetch_json)?)
         .with_context(|| format!("writing {}", prefetch_json_path.display()))?;
 
-    let before: std::collections::HashSet<std::ffi::OsString> = std::fs::read_dir(backend)?
-        .filter_map(Result::ok)
-        .map(|e| e.file_name())
-        .collect();
+    let optimize_out_dir = stage.join("optimize-out");
+    fresh_dir(&optimize_out_dir)?;
 
     let optimized_bootstrap = stage.join("bootstrap.optimized");
     let args: Vec<OsString> = vec![
@@ -357,7 +388,7 @@ fn run_optimize(
         "--output-bootstrap".into(),
         optimized_bootstrap.as_path().into(),
         "--output-blob-dir".into(),
-        backend.into(),
+        optimize_out_dir.as_path().into(),
     ];
     run(
         &config.nydus_image,
@@ -370,25 +401,18 @@ fn run_optimize(
     std::fs::rename(&optimized_bootstrap, merged_bootstrap)
         .with_context(|| "replacing merged bootstrap with optimized one")?;
 
-    let mut found = None;
-    for entry in std::fs::read_dir(backend)? {
-        let entry = entry?;
-        if entry.file_type()?.is_file() && !before.contains(&entry.file_name()) {
-            if found.is_some() {
-                bail!(
-                    "optimize produced more than one new blob in {}",
-                    backend.display()
-                );
-            }
-            found = Some(entry.file_name().to_string_lossy().into_owned());
-        }
-    }
-    found.ok_or_else(|| {
-        anyhow::anyhow!(
-            "optimize did not produce a new prefetch blob in {}",
-            backend.display()
-        )
-    })
+    let new_blob = expect_single_output(&optimize_out_dir, None)
+        .context("locating optimize's new prefetch blob")?;
+    let blob_name = new_blob
+        .file_name()
+        .context("prefetch blob has no file name")?
+        .to_string_lossy()
+        .into_owned();
+    std::fs::rename(&new_blob, backend.join(&blob_name))
+        .or_else(|_| std::fs::copy(&new_blob, backend.join(&blob_name)).map(|_| ()))
+        .with_context(|| "staging prefetch blob into backend")?;
+
+    Ok(blob_name)
 }
 
 fn symlink_force(target: &Path, link: &Path) -> Result<()> {
@@ -488,5 +512,75 @@ mod tests {
         // sources follow, lower then upper
         assert_eq!(s[s.len() - 2], "/w/l0/bootstrap");
         assert_eq!(s[s.len() - 1], "/w/l1/bootstrap");
+    }
+
+    #[test]
+    fn layer_invocation_dir_is_deterministic_and_disambiguates_duplicate_digests() {
+        // Same (index, blob_id) always yields the same name -- this is what lets a
+        // retry of the same job reuse (and re-wipe) the same location.
+        assert_eq!(layer_invocation_dir(0, "deadbeef"), "l0-deadbeef");
+        assert_eq!(layer_invocation_dir(0, "deadbeef"), "l0-deadbeef");
+        // Different positions with the same content digest (a degenerate but legal
+        // OCI image with two identical layers) must not collide.
+        assert_ne!(
+            layer_invocation_dir(0, "deadbeef"),
+            layer_invocation_dir(1, "deadbeef")
+        );
+    }
+
+    #[test]
+    fn fresh_dir_wipes_stray_files_left_by_a_crashed_prior_invocation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("l0-abc123");
+        std::fs::create_dir_all(&target).unwrap();
+        // Simulate debris from a crashed earlier attempt: an old bootstrap AND an
+        // extra stray file that would have made the old "exactly one non-bootstrap
+        // file" scan bail out with "found multiple".
+        std::fs::write(target.join("bootstrap"), b"old").unwrap();
+        std::fs::write(target.join("stray-leftover"), b"old").unwrap();
+
+        fresh_dir(&target).unwrap();
+
+        let entries: Vec<_> = std::fs::read_dir(&target).unwrap().collect();
+        assert!(entries.is_empty(), "fresh_dir must leave the dir empty");
+    }
+
+    #[test]
+    fn fresh_dir_creates_a_missing_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("does/not/exist/yet");
+        fresh_dir(&target).unwrap();
+        assert!(target.is_dir());
+    }
+
+    #[test]
+    fn expect_single_output_finds_the_one_non_excluded_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bootstrap = tmp.path().join("bootstrap");
+        std::fs::write(&bootstrap, b"boot").unwrap();
+        let index = tmp.path().join("a1b2c3");
+        std::fs::write(&index, b"index").unwrap();
+
+        let found = expect_single_output(tmp.path(), Some(&bootstrap)).unwrap();
+        assert_eq!(found, index);
+    }
+
+    #[test]
+    fn expect_single_output_errors_on_empty_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let err = expect_single_output(tmp.path(), None).unwrap_err();
+        assert!(err.to_string().contains("no output file"));
+    }
+
+    #[test]
+    fn expect_single_output_errors_when_more_than_one_candidate_remains() {
+        // With a fresh, private dir this can only happen if nydus-image itself wrote
+        // more than one file -- a real bug, which is why this stays an error rather
+        // than a silent pick.
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("blob-a"), b"a").unwrap();
+        std::fs::write(tmp.path().join("blob-b"), b"b").unwrap();
+        let err = expect_single_output(tmp.path(), None).unwrap_err();
+        assert!(err.to_string().contains("more than one"));
     }
 }

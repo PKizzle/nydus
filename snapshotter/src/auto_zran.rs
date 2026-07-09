@@ -277,6 +277,21 @@ impl AutoZranManager {
         self.state.status()
     }
 
+    /// Directory-safe key of the job the (single) worker is currently converting,
+    /// if any. The reconciler's stale-job-dir sweep (`recon::check_stale_autozran_dirs`)
+    /// excludes this key so it never races the live worker: a long conversion's job
+    /// dir can go a while without its own mtime changing (the worker writes into
+    /// nested subdirs, which doesn't bump the parent's mtime), so mtime age alone
+    /// isn't sufficient proof that a directory is abandoned.
+    pub fn active_job_key(&self) -> Option<String> {
+        self.state
+            .active_image
+            .lock()
+            .ok()
+            .and_then(|active| active.clone())
+            .map(|image| job_key(&image))
+    }
+
     /// Try to enqueue a profile without blocking the sysctl request path.
     pub fn try_enqueue_profile(&self, profile: &PrefetchProfile) {
         let Some(job) = AutoZranJob::from_profile(profile) else {
@@ -847,6 +862,27 @@ mod tests {
         assert_eq!(status.failed_total, 1);
         assert_eq!(status.known_jobs, 1);
         assert!(status.active_image.is_none());
+    }
+
+    #[test]
+    fn active_job_key_tracks_the_running_job_and_clears_on_finish() {
+        let (sender, _receiver) = async_channel::bounded(2);
+        let state = Arc::new(AutoZranState::new(2));
+        let manager = AutoZranManager {
+            sender,
+            state: state.clone(),
+        };
+        assert!(manager.active_job_key().is_none());
+
+        let job = AutoZranJob {
+            image: "registry.local/app:1".to_string(),
+            prefetch_files: vec!["/bin/app".to_string()],
+        };
+        state.mark_started(&job);
+        assert_eq!(manager.active_job_key(), Some(job_key(&job.image)));
+
+        state.mark_finished(&job, true);
+        assert!(manager.active_job_key().is_none());
     }
 
     #[test]

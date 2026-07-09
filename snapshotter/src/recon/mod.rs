@@ -54,6 +54,7 @@ pub struct Reconciler {
     supervisor: Arc<DaemonSupervisor>,
     store: Arc<SnapshotStore>,
     cache_gc: Option<(CacheManager, CacheGcPolicy)>,
+    auto_zran_sweep: Option<(PathBuf, Duration, Arc<crate::auto_zran::AutoZranManager>)>,
     interval: Duration,
 }
 
@@ -68,6 +69,7 @@ impl Reconciler {
             supervisor,
             store,
             cache_gc: None,
+            auto_zran_sweep: None,
             interval,
         }
     }
@@ -75,6 +77,23 @@ impl Reconciler {
     /// Enable a cache-GC pass as part of each reconciliation tick.
     pub fn with_cache_gc(mut self, manager: CacheManager, policy: CacheGcPolicy) -> Self {
         self.cache_gc = Some((manager, policy));
+        self
+    }
+
+    /// Enable the auto-zran stale-job-dir sweep as part of each reconciliation
+    /// tick. `work_dir` is `AutoZranConfig::work_dir`; `max_age` is how old a job
+    /// dir's mtime must be before it's considered abandoned (a successful
+    /// conversion removes its own dir -- see `auto_zran::run_conversion` step 6 --
+    /// so anything that lingers past `max_age` is debris from a crash). `manager`
+    /// is consulted every pass to exclude the currently-running job's directory
+    /// regardless of its mtime.
+    pub fn with_auto_zran_sweep(
+        mut self,
+        work_dir: PathBuf,
+        max_age: Duration,
+        manager: Arc<crate::auto_zran::AutoZranManager>,
+    ) -> Self {
+        self.auto_zran_sweep = Some((work_dir, max_age, manager));
         self
     }
 
@@ -104,6 +123,9 @@ impl Reconciler {
 
         // 4. Account for and optionally garbage-collect blob-cache artifacts.
         self.check_cache_gc().await?;
+
+        // 5. Sweep orphaned auto-zran per-job scratch dirs left by a crash.
+        self.check_stale_autozran_dirs().await?;
 
         debug!("reconciliation pass complete");
         Ok(())
@@ -233,6 +255,35 @@ impl Reconciler {
         Ok(())
     }
 
+    /// Remove `{auto_zran.work_dir}/<job-key>/` scratch directories left behind by
+    /// a crashed conversion. `local_accel::convert` already gives every
+    /// `nydus-image` invocation a fresh per-layer subdirectory (see
+    /// `local_accel::fresh_dir`), so leftovers here are always whole job dirs a
+    /// prior process died before cleaning up, never a live worker's in-progress
+    /// output.
+    ///
+    /// Staleness is judged by top-level job-dir mtime (which is bumped whenever a
+    /// direct child -- `backend/`, `convert/`, the merged `bootstrap`,
+    /// `prefetch.json` -- is created, i.e. at job start and at each pipeline
+    /// stage) crossed with the manager's live `active_job_key()`, so a long-running
+    /// conversion whose job dir hasn't been touched in a while (e.g. deep inside a
+    /// single `nydus-image create` call) is never swept out from under it.
+    async fn check_stale_autozran_dirs(&self) -> Result<()> {
+        let Some((work_dir, max_age, manager)) = &self.auto_zran_sweep else {
+            return Ok(());
+        };
+        let removed = sweep_stale_job_dirs(
+            work_dir,
+            *max_age,
+            manager.active_job_key().as_deref(),
+            std::time::SystemTime::now(),
+        )?;
+        if removed > 0 {
+            info!(removed, "recon: auto-zran stale job dir sweep completed");
+        }
+        Ok(())
+    }
+
     /// Run one configured cache-GC pass. With the default policy this only
     /// reports usage; eviction starts once `gc_max_age` or `gc_max_bytes` is
     /// configured.
@@ -245,6 +296,69 @@ impl Reconciler {
             .with_context(|| format!("cache GC failed for {}", manager.root().display()))?;
         Ok(())
     }
+}
+
+/// Remove immediate subdirectories of `work_dir` whose mtime is at least `max_age`
+/// old, skipping `active` (the currently-running job's directory name, if any) no
+/// matter how old it looks. Returns the number of directories removed. Pulled out
+/// of `Reconciler::check_stale_autozran_dirs` as a pure(-ish) function of its
+/// inputs (plus `now`, so tests don't depend on wall-clock timing) so the sweep
+/// logic is unit-testable without constructing a full `Reconciler` /
+/// `AutoZranManager`.
+fn sweep_stale_job_dirs(
+    work_dir: &Path,
+    max_age: Duration,
+    active: Option<&str>,
+    now: std::time::SystemTime,
+) -> Result<usize> {
+    let entries = match std::fs::read_dir(work_dir) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => return Err(e).context("recon: failed to read auto-zran work dir"),
+    };
+
+    let mut removed = 0usize;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if !file_type.is_dir() {
+            continue;
+        }
+        if let Some(name) = path.file_name().and_then(|n| n.to_str())
+            && active == Some(name)
+        {
+            continue;
+        }
+        let age = match entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .map(|modified| now.duration_since(modified).unwrap_or_default())
+        {
+            Ok(age) => age,
+            Err(_) => continue,
+        };
+        if age < max_age {
+            continue;
+        }
+        match std::fs::remove_dir_all(&path) {
+            Ok(()) => {
+                removed += 1;
+                info!(
+                    dir = %path.display(),
+                    age_secs = age.as_secs(),
+                    "recon: removed stale auto-zran job dir"
+                );
+            }
+            Err(e) => warn!(
+                dir = %path.display(),
+                error = %e,
+                "recon: failed to remove stale auto-zran job dir"
+            ),
+        }
+    }
+    Ok(removed)
 }
 
 /// One row of `/proc/mounts` that the reconciler cares about.
@@ -340,5 +454,66 @@ proc /proc proc rw,nosuid 0 0
     fn parse_mounts_ignores_malformed_lines() {
         let parsed = parse_mounts("garbage\n\n");
         assert!(parsed.is_empty());
+    }
+
+    fn touch_dir_with_age(root: &Path, name: &str, age: Duration) -> PathBuf {
+        let dir = root.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        let stale_time = std::time::SystemTime::now() - age;
+        // `File::open` on a directory (read-only) + `set_modified` is portable on
+        // Unix without pulling in a `filetime` dependency just for this test.
+        let f = std::fs::File::open(&dir).unwrap();
+        f.set_modified(stale_time).unwrap();
+        dir
+    }
+
+    #[test]
+    fn sweep_stale_job_dirs_removes_only_dirs_older_than_max_age() {
+        let tmp = tempfile::tempdir().unwrap();
+        let old = touch_dir_with_age(tmp.path(), "old-crash", Duration::from_secs(7200));
+        let fresh = touch_dir_with_age(tmp.path(), "fresh-job", Duration::from_secs(60));
+
+        let removed = sweep_stale_job_dirs(
+            tmp.path(),
+            Duration::from_secs(3600),
+            None,
+            std::time::SystemTime::now(),
+        )
+        .unwrap();
+
+        assert_eq!(removed, 1);
+        assert!(!old.exists());
+        assert!(fresh.exists());
+    }
+
+    #[test]
+    fn sweep_stale_job_dirs_never_removes_the_active_job_regardless_of_age() {
+        let tmp = tempfile::tempdir().unwrap();
+        let active = touch_dir_with_age(tmp.path(), "running-job", Duration::from_secs(999_999));
+
+        let removed = sweep_stale_job_dirs(
+            tmp.path(),
+            Duration::from_secs(3600),
+            Some("running-job"),
+            std::time::SystemTime::now(),
+        )
+        .unwrap();
+
+        assert_eq!(removed, 0);
+        assert!(active.exists());
+    }
+
+    #[test]
+    fn sweep_stale_job_dirs_tolerates_a_missing_work_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = tmp.path().join("does-not-exist");
+        let removed = sweep_stale_job_dirs(
+            &missing,
+            Duration::from_secs(3600),
+            None,
+            std::time::SystemTime::now(),
+        )
+        .unwrap();
+        assert_eq!(removed, 0);
     }
 }

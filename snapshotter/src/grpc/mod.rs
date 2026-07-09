@@ -26,6 +26,17 @@ use std::sync::Arc;
 use std::time::SystemTime;
 use tracing::{debug, info, warn};
 
+/// How old an auto-zran per-job scratch directory's mtime must be before the
+/// reconciler treats it as crash debris and removes it. A successful conversion
+/// deletes its own job dir (see `auto_zran::run_conversion` step 6), so any dir
+/// that survives is either the live job (excluded via `active_job_key()`) or a
+/// leftover from a worker that died mid-conversion. Six hours is deliberately
+/// generous: conversions run at idle scheduling priority and a large multi-layer
+/// image can legitimately churn for a long time, so the sweep must never race a
+/// slow-but-healthy job.
+const AUTO_ZRAN_STALE_JOB_MAX_AGE: std::time::Duration =
+    std::time::Duration::from_secs(6 * 60 * 60);
+
 /// Small snapshotter error carrier.
 ///
 /// `tonic::Status` is intentionally boxed so `Result<_, Error>` stays small in
@@ -734,12 +745,24 @@ pub async fn serve_with_supervisor(
         .detach();
     }
 
-    let reconciler = Reconciler::new(
+    let mut reconciler = Reconciler::new(
         supervisor.clone(),
         store.clone(),
         parse_duration(&config.snapshotter.cache.gc_period)?,
     )
     .with_cache_gc(cache_manager, cache_gc_policy);
+    // A successful conversion removes its own job dir (see
+    // `auto_zran::run_conversion` step 6); anything that outlives
+    // `AUTO_ZRAN_STALE_JOB_MAX_AGE` is debris from a crashed worker. The threshold
+    // is generous because conversions run at (possibly) idle scheduling priority
+    // and large multi-layer images can legitimately take a long time.
+    if let Some(manager) = auto_zran.clone() {
+        reconciler = reconciler.with_auto_zran_sweep(
+            config.snapshotter.auto_zran.work_dir.clone(),
+            AUTO_ZRAN_STALE_JOB_MAX_AGE,
+            manager,
+        );
+    }
     compio::runtime::spawn(async move {
         if let Err(e) = reconciler.run().await {
             warn!(error = %e, "reconciler exited unexpectedly");
