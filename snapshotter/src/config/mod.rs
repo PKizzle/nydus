@@ -146,15 +146,13 @@ impl Profile {
     fn defaults(self) -> ProfileDefaults {
         match self {
             Profile::K3s => ProfileDefaults {
-                containerd_address: PathBuf::from("/run/k3s/containerd/containerd.sock"),
-                content_root: PathBuf::from(
-                    "/var/lib/rancher/k3s/agent/containerd/io.containerd.content.v1.content",
-                ),
+                containerd_address: PathBuf::from(K3S_CONTAINERD_SOCKET),
+                content_root: PathBuf::from(K3S_CONTENT_ROOT),
                 mirror_preset: MirrorPreset::K3sSpegel,
             },
             Profile::Auto | Profile::Containerd => ProfileDefaults {
-                containerd_address: PathBuf::from("/run/containerd/containerd.sock"),
-                content_root: PathBuf::from("/var/lib/containerd/io.containerd.content.v1.content"),
+                containerd_address: PathBuf::from(STOCK_CONTAINERD_SOCKET),
+                content_root: PathBuf::from(STOCK_CONTENT_ROOT),
                 mirror_preset: MirrorPreset::None,
             },
         }
@@ -165,6 +163,18 @@ impl Profile {
 pub const K3S_CONTAINERD_SOCKET: &str = "/run/k3s/containerd/containerd.sock";
 /// Well-known containerd socket probed for `Profile::Auto` stock detection.
 pub const STOCK_CONTAINERD_SOCKET: &str = "/run/containerd/containerd.sock";
+/// k3s content-store root (profile default + nothing else — no accessor
+/// fallback uses it, but kept next to its socket for symmetry).
+pub const K3S_CONTENT_ROOT: &str =
+    "/var/lib/rancher/k3s/agent/containerd/io.containerd.content.v1.content";
+/// Stock-containerd content-store root. Used by both the containerd profile
+/// table AND the `ContainerdConfig::content_root` accessor fallback — keep
+/// them referencing this one const so they can never drift apart.
+pub const STOCK_CONTENT_ROOT: &str = "/var/lib/containerd/io.containerd.content.v1.content";
+/// Default local peer-mirror endpoint (k3s' embedded Spegel binds here).
+/// Used by every `MirrorPreset` table AND the `PeerMirrorConfig::endpoint`
+/// accessor fallback — one source of truth for both.
+pub const DEFAULT_MIRROR_ENDPOINT: &str = "https://127.0.0.1:6443";
 
 /// Outcome of profile resolution: the concrete profile chosen and a
 /// human-readable reason (logged at `info!` by the binary).
@@ -271,6 +281,49 @@ impl SnapshotterConfig {
         if pm.client_key_path.is_none() {
             pm.client_key_path = mdef.client_key_path;
         }
+
+        // Exhaustiveness guard. The destructures below name every field, so
+        // adding a new profile-sensitive `Option` to either struct and
+        // forgetting its fill line above fails to COMPILE here (missing-field
+        // error), not silently at runtime. The `debug_assert!`s then pin the
+        // invariant that the unconditionally-filled fields are `Some` after
+        // resolution — a forgotten fill would otherwise leave `None`, the
+        // accessor would fall back to the stock default, and k3s would get the
+        // wrong value with no compile error and no test failure.
+        let ContainerdConfig {
+            address,
+            namespace: _,
+            content_root,
+        } = &self.snapshotter.containerd;
+        debug_assert!(
+            address.is_some() && content_root.is_some(),
+            "resolve_profile left a containerd host-path field unset: \
+             address={address:?} content_root={content_root:?}"
+        );
+        let PeerMirrorConfig {
+            preset,
+            enable,
+            endpoint,
+            peer_discovery,
+            // Cert paths are preset-derived and legitimately `None` for the
+            // `spegel`/`none` presets, so they are named (to catch a
+            // rename/removal) but NOT asserted `Some`.
+            ca_path: _,
+            client_cert_path: _,
+            client_key_path: _,
+            // Non-profile-sensitive fields carry plain serde defaults; named
+            // only to keep this destructure exhaustive.
+            query_template: _,
+            discovery_ttl: _,
+            request_timeout: _,
+            peer_endpoints: _,
+        } = &self.snapshotter.peer_mirror;
+        debug_assert!(
+            preset.is_some() && enable.is_some() && endpoint.is_some() && peer_discovery.is_some(),
+            "resolve_profile left a preset-derived mirror field unset: \
+             preset={preset:?} enable={enable:?} endpoint={endpoint:?} \
+             peer_discovery={peer_discovery:?}"
+        );
 
         Ok(resolved)
     }
@@ -585,9 +638,9 @@ impl ContainerdConfig {
     /// Resolved content-store root. Falls back to the stock-containerd layout
     /// when unresolved.
     pub fn content_root(&self) -> PathBuf {
-        self.content_root.clone().unwrap_or_else(|| {
-            PathBuf::from("/var/lib/containerd/io.containerd.content.v1.content")
-        })
+        self.content_root
+            .clone()
+            .unwrap_or_else(|| PathBuf::from(STOCK_CONTENT_ROOT))
     }
 }
 
@@ -632,6 +685,12 @@ pub struct PeerMirrorConfig {
     /// expanded to the target registry host. Spegel's load-bearing `?ns=`
     /// quirk is expressed as the default template `ns={registry}`; an empty
     /// string means "no query parameter". See [`Self::artifact_query`].
+    ///
+    /// NOTE: unlike the preset-derived fields, this is a single GLOBAL default
+    /// (`ns={registry}`) applied to ALL presets including `spegel` and `none` —
+    /// it is not preset-sensitive and `resolve_profile` never touches it. A
+    /// generic (non-Spegel) mirror under `preset = "none"` that does not want
+    /// the `?ns=` parameter must set `query_template = ""` explicitly.
     #[serde(default = "default_query_template")]
     pub query_template: String,
     /// How peer mirror endpoints are found when the local mirror misses.
@@ -684,7 +743,7 @@ impl PeerMirrorConfig {
     /// Resolved mirror endpoint URL. Falls back to the local Spegel endpoint
     /// when unresolved.
     pub fn endpoint(&self) -> &str {
-        self.endpoint.as_deref().unwrap_or("https://127.0.0.1:6443")
+        self.endpoint.as_deref().unwrap_or(DEFAULT_MIRROR_ENDPOINT)
     }
 
     /// Resolved peer-discovery mode. Defaults to `off` (local-mirror-only)
@@ -759,7 +818,7 @@ impl MirrorPreset {
         match self {
             MirrorPreset::K3sSpegel => MirrorPresetDefaults {
                 enable: true,
-                endpoint: "https://127.0.0.1:6443".to_string(),
+                endpoint: DEFAULT_MIRROR_ENDPOINT.to_string(),
                 peer_discovery: PeerDiscoveryMode::Kubernetes,
                 ca_path: Some(PathBuf::from("/var/lib/rancher/k3s/agent/server-ca.crt")),
                 client_cert_path: Some(PathBuf::from(
@@ -771,7 +830,7 @@ impl MirrorPreset {
             },
             MirrorPreset::Spegel => MirrorPresetDefaults {
                 enable: true,
-                endpoint: "https://127.0.0.1:6443".to_string(),
+                endpoint: DEFAULT_MIRROR_ENDPOINT.to_string(),
                 peer_discovery: PeerDiscoveryMode::Off,
                 ca_path: None,
                 client_cert_path: None,
@@ -779,7 +838,7 @@ impl MirrorPreset {
             },
             MirrorPreset::None => MirrorPresetDefaults {
                 enable: false,
-                endpoint: "https://127.0.0.1:6443".to_string(),
+                endpoint: DEFAULT_MIRROR_ENDPOINT.to_string(),
                 peer_discovery: PeerDiscoveryMode::Off,
                 ca_path: None,
                 client_cert_path: None,
@@ -1247,6 +1306,27 @@ content_root = "/custom/content"
             .resolve_profile_with(probe_present(&[]))
             .expect("resolve");
         assert_eq!(rp.profile, Profile::Containerd);
+    }
+
+    /// The accessor `.unwrap_or` fallback arms are only hit when
+    /// `resolve_profile` was NOT run (all Option fields still `None`). Every
+    /// other test resolves first, so pin the unresolved fallbacks here to the
+    /// stock-containerd defaults — a drift in the fallback consts would flip
+    /// out-of-box behaviour on a config that never resolved.
+    #[test]
+    fn unresolved_accessors_return_stock_defaults() {
+        let config = SnapshotterConfig::default();
+        let c = &config.snapshotter.containerd;
+        assert_eq!(c.address(), PathBuf::from(STOCK_CONTAINERD_SOCKET));
+        assert_eq!(c.content_root(), PathBuf::from(STOCK_CONTENT_ROOT));
+
+        let pm = &config.snapshotter.peer_mirror;
+        assert!(!pm.is_enabled());
+        assert_eq!(pm.endpoint(), DEFAULT_MIRROR_ENDPOINT);
+        assert_eq!(pm.peer_discovery(), PeerDiscoveryMode::Off);
+        assert_eq!(pm.ca_path(), None);
+        assert_eq!(pm.client_cert_path(), None);
+        assert_eq!(pm.client_key_path(), None);
     }
 
     // ── B2: back-compat + preset + query template ──────────────────────
