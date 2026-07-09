@@ -976,6 +976,22 @@ pub async fn serve_with_supervisor(
     let cache_manager = CacheManager::from_config(&config);
     let metrics = Arc::new(SnapshotterMetrics::new());
 
+    // Optional TCP Prometheus endpoint (opt-in via `[snapshotter.metrics]`).
+    // Additive: when `listen` is unset this block is skipped and metrics stay
+    // UDS-only, exactly as before. When set, a one-route cyper-axum server
+    // exposes `GET /metrics` reusing the same `SnapshotterMetrics` renderer as
+    // the sysctl UDS endpoint (no metric text is duplicated).
+    if let Some(listen) = config.snapshotter.metrics.listen.clone() {
+        let metrics = metrics.clone();
+        let cache = cache_manager.clone();
+        compio::runtime::spawn(async move {
+            if let Err(e) = crate::metrics::serve_metrics_tcp(listen, metrics, cache).await {
+                warn!(error = %e, "Prometheus metrics TCP endpoint exited unexpectedly");
+            }
+        })
+        .detach();
+    }
+
     // Auto-accel: build the access tracer and conversion deps. The tracer is
     // built unconditionally but becomes a no-op when
     // `auto_zran.capture.enable = false` so prepare() can call its attach()

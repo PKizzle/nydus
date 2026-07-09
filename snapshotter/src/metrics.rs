@@ -489,9 +489,95 @@ fn escape_label_value(value: &str) -> String {
     out
 }
 
+/// Shared state for the optional TCP metrics endpoint: the live metrics
+/// registry plus the cache manager used to report on-disk cache usage.
+#[derive(Clone)]
+struct MetricsState {
+    metrics: Arc<SnapshotterMetrics>,
+    cache: crate::cache::CacheManager,
+}
+
+/// Serve a minimal Prometheus `GET /metrics` HTTP endpoint on a TCP socket.
+///
+/// Opt-in via `[snapshotter.metrics] listen = "host:port"`. Reuses
+/// [`SnapshotterMetrics::render_prometheus`] — the same renderer the sysctl UDS
+/// `GET /metrics` handler uses — so no metric text is duplicated here. Runs on
+/// the compio runtime and is served over cyper-axum (hyper-on-compio), the same
+/// stack as the gRPC and sysctl servers, so no tokio runtime is involved.
+///
+/// `GET /metrics` returns the Prometheus text; every other path returns 404.
+pub async fn serve_metrics_tcp(
+    listen: String,
+    metrics: Arc<SnapshotterMetrics>,
+    cache: crate::cache::CacheManager,
+) -> anyhow::Result<()> {
+    use anyhow::Context as _;
+    let listener = compio::net::TcpListener::bind(&listen)
+        .await
+        .with_context(|| format!("bind metrics TCP listener on {listen}"))?;
+    let local_addr = listener
+        .local_addr()
+        .map(|addr| addr.to_string())
+        .unwrap_or_else(|_| listen.clone());
+    tracing::info!(address = %local_addr, "starting Prometheus metrics TCP endpoint");
+    let state = MetricsState { metrics, cache };
+    let app = axum::Router::new()
+        .route("/metrics", axum::routing::get(handle_metrics))
+        .with_state(state);
+    cyper_axum::serve(listener, app.into_make_service()).await?;
+    Ok(())
+}
+
+async fn handle_metrics(
+    axum::extract::State(state): axum::extract::State<MetricsState>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse as _;
+    let body = render_metrics_body(&state.metrics, &state.cache);
+    (
+        axum::http::StatusCode::OK,
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; version=0.0.4",
+        )],
+        body,
+    )
+        .into_response()
+}
+
+/// Render the Prometheus body for the TCP endpoint. Reports live cache-usage
+/// bytes (matching the sysctl endpoint's `snapshotter_cache_usage_kilobytes`)
+/// and delegates all metric-text generation to
+/// [`SnapshotterMetrics::render_prometheus`] — the GC counters
+/// (`deleted_blobs`/`deletion_errors`/`blobs_in_use`) are tracked by the sysctl
+/// controller and left at their defaults on this endpoint.
+fn render_metrics_body(metrics: &SnapshotterMetrics, cache: &crate::cache::CacheManager) -> String {
+    let total_bytes = cache.scan().map(|usage| usage.total_bytes).unwrap_or(0);
+    metrics.render_prometheus(CacheMetricSnapshot {
+        total_bytes,
+        ..Default::default()
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tcp_metrics_body_reuses_render_prometheus() {
+        let metrics = Arc::new(SnapshotterMetrics::new());
+        metrics.start_snapshot_operation("prepare").finish("ok");
+        // A missing cache root scans as empty (cheap first-boot path), so usage
+        // is reported as 0 without touching disk.
+        let cache =
+            crate::cache::CacheManager::new(std::path::PathBuf::from("/nonexistent-nydus-metrics"));
+        let body = render_metrics_body(&metrics, &cache);
+        // Identical Go-parity output to the UDS endpoint's renderer.
+        assert!(body.contains(
+            "snapshotter_snapshot_operation_total{snapshot_operation=\"prepare\",status=\"ok\"} 1"
+        ));
+        assert!(body.contains("snapshotter_run_time_seconds"));
+        assert!(body.contains("snapshotter_cache_usage_kilobytes 0"));
+    }
 
     #[test]
     fn renders_go_parity_snapshot_operation_metrics() {

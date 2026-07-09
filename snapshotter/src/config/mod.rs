@@ -63,6 +63,13 @@ pub struct SnapshotterSection {
     #[serde(default)]
     pub sysctl: SysctlConfig,
 
+    /// Optional Prometheus metrics listener. By default (no `[snapshotter.metrics]`
+    /// section, `listen = None`) metrics are exposed only over the sysctl UDS
+    /// `GET /metrics` endpoint; setting `listen` additionally binds a TCP
+    /// `GET /metrics` HTTP endpoint (parity with the Go snapshotter's TCP metrics).
+    #[serde(default)]
+    pub metrics: MetricsConfig,
+
     #[serde(default)]
     pub features: FeaturesConfig,
 
@@ -103,6 +110,7 @@ impl Default for SnapshotterSection {
             fs_drivers: default_fs_drivers(),
             cache: CacheConfig::default(),
             sysctl: SysctlConfig::default(),
+            metrics: MetricsConfig::default(),
             features: FeaturesConfig::default(),
             cgroup: CgroupConfig::default(),
             auto_zran: AutoZranConfig::default(),
@@ -470,6 +478,22 @@ impl Default for SysctlConfig {
             address: default_sysctl_address(),
         }
     }
+}
+
+/// Optional TCP Prometheus metrics listener configuration.
+///
+/// Additive and opt-in: with no `[snapshotter.metrics]` section `listen` is
+/// `None` and the snapshotter behaves exactly as before — metrics are served
+/// only over the sysctl UDS `GET /metrics` endpoint. Setting `listen` (e.g.
+/// `"127.0.0.1:9110"`) additionally binds a TCP `GET /metrics` HTTP endpoint
+/// that reuses the same `SnapshotterMetrics` rendering, restoring parity with
+/// the Go snapshotter's TCP metrics endpoint.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct MetricsConfig {
+    /// TCP socket address to bind the Prometheus `GET /metrics` endpoint on.
+    /// `None` (the default) means no TCP listener — UDS-only, today's behavior.
+    #[serde(default)]
+    pub listen: Option<String>,
 }
 
 /// Feature flags.
@@ -1250,6 +1274,32 @@ skip_verify = true
         assert_eq!(config.snapshotter.auto_zran.nice, 19);
         assert!(config.snapshotter.auto_zran.capture.enable);
         assert_eq!(config.snapshotter.containerd.namespace, "k8s.io");
+        // The TCP metrics endpoint is opt-in: with no `[snapshotter.metrics]`
+        // section the listener is unset, so behavior is UDS-only as before.
+        assert_eq!(config.snapshotter.metrics.listen, None);
+    }
+
+    #[test]
+    fn default_config_has_no_tcp_metrics_listener() {
+        // Parsing a config that omits `[snapshotter.metrics]` must leave the TCP
+        // metrics listener unset (no additive TCP endpoint), preserving today's
+        // UDS-only behavior.
+        let config: SnapshotterConfig =
+            toml::from_str("[snapshotter]\n").expect("parse config without metrics section");
+        assert_eq!(config.snapshotter.metrics.listen, None);
+    }
+
+    #[test]
+    fn parse_metrics_listen_config() {
+        let toml_str = r#"
+[snapshotter.metrics]
+listen = "127.0.0.1:9110"
+"#;
+        let config: SnapshotterConfig = toml::from_str(toml_str).expect("parse config");
+        assert_eq!(
+            config.snapshotter.metrics.listen.as_deref(),
+            Some("127.0.0.1:9110")
+        );
     }
 
     #[test]
