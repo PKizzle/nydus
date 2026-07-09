@@ -310,9 +310,7 @@ pub fn convert(
             .context("zran index blob has no file name")?
             .to_string_lossy()
             .into_owned();
-        std::fs::rename(&index, backend.join(&index_name))
-            .or_else(|_| std::fs::copy(&index, backend.join(&index_name)).map(|_| ()))
-            .with_context(|| "staging zran index blob into backend")?;
+        stage_blob(&index, &backend.join(&index_name), "zran index blob")?;
 
         layer_bootstraps.push(bootstrap);
         blob_ids.push(blob_id);
@@ -408,11 +406,27 @@ fn run_optimize(
         .context("prefetch blob has no file name")?
         .to_string_lossy()
         .into_owned();
-    std::fs::rename(&new_blob, backend.join(&blob_name))
-        .or_else(|_| std::fs::copy(&new_blob, backend.join(&blob_name)).map(|_| ()))
-        .with_context(|| "staging prefetch blob into backend")?;
+    stage_blob(&new_blob, &backend.join(&blob_name), "prefetch blob")?;
 
     Ok(blob_name)
+}
+
+/// Move `src` into the backend as `dst`, both of which live under the same
+/// per-image `work_dir` (so a plain rename normally succeeds). Falls back to a
+/// copy+remove ONLY on `EXDEV` (rename across filesystems), so a genuine rename
+/// failure -- `EACCES`, `ENOSPC`, a vanished source -- surfaces as itself instead
+/// of being masked by whatever the copy attempt then reports.
+fn stage_blob(src: &Path, dst: &Path, what: &str) -> Result<()> {
+    match std::fs::rename(src, dst) {
+        Ok(()) => Ok(()),
+        Err(e) if e.raw_os_error() == Some(libc::EXDEV) => {
+            std::fs::copy(src, dst)
+                .with_context(|| format!("copying {} across filesystems into backend", what))?;
+            let _ = std::fs::remove_file(src);
+            Ok(())
+        }
+        Err(e) => Err(e).with_context(|| format!("staging {} into backend", what)),
+    }
 }
 
 fn symlink_force(target: &Path, link: &Path) -> Result<()> {
@@ -570,6 +584,22 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let err = expect_single_output(tmp.path(), None).unwrap_err();
         assert!(err.to_string().contains("no output file"));
+    }
+
+    #[test]
+    fn stage_blob_moves_within_the_same_dir_and_surfaces_a_missing_source() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("new-blob");
+        std::fs::write(&src, b"payload").unwrap();
+        let dst = tmp.path().join("staged");
+
+        stage_blob(&src, &dst, "test blob").unwrap();
+        assert!(!src.exists(), "source should be consumed by the move");
+        assert_eq!(std::fs::read(&dst).unwrap(), b"payload");
+
+        // A genuine rename failure (source gone) surfaces as an error, not a mask.
+        let err = stage_blob(&tmp.path().join("absent"), &dst, "test blob").unwrap_err();
+        assert!(err.to_string().contains("staging test blob"));
     }
 
     #[test]

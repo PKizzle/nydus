@@ -275,7 +275,7 @@ impl Reconciler {
         let removed = sweep_stale_job_dirs(
             work_dir,
             *max_age,
-            manager.active_job_key().as_deref(),
+            |name| manager.active_job_key().as_deref() == Some(name),
             std::time::SystemTime::now(),
         )?;
         if removed > 0 {
@@ -299,22 +299,41 @@ impl Reconciler {
 }
 
 /// Remove immediate subdirectories of `work_dir` whose mtime is at least `max_age`
-/// old, skipping `active` (the currently-running job's directory name, if any) no
-/// matter how old it looks. Returns the number of directories removed. Pulled out
-/// of `Reconciler::check_stale_autozran_dirs` as a pure(-ish) function of its
-/// inputs (plus `now`, so tests don't depend on wall-clock timing) so the sweep
-/// logic is unit-testable without constructing a full `Reconciler` /
-/// `AutoZranManager`.
+/// old, skipping any dir the live worker is currently converting no matter how old
+/// it looks. Returns the number of directories removed. Pulled out of
+/// `Reconciler::check_stale_autozran_dirs` as a pure(-ish) function of its inputs
+/// (plus `now`, so tests don't depend on wall-clock timing) so the sweep logic is
+/// unit-testable without constructing a full `Reconciler` / `AutoZranManager`.
+///
+/// `is_active` is re-evaluated immediately before each `remove_dir_all`, NOT
+/// snapshotted once up front. Job keys are deterministic (`job_key(image)`), so a
+/// same-image conversion that starts mid-sweep reuses the exact dir we may have
+/// already decided is stale by mtime. Re-checking at delete time closes that TOCTOU:
+/// `mark_started()` (which flips `active_job_key()`) runs before the worker
+/// (re)creates the dir, so the delete-time check either sees the now-live job and
+/// skips, or the dir is still pure debris and is safe to remove (the worker will
+/// recreate a fresh one via `fresh_dir`).
+///
+/// The whole sweep is best-effort/non-fatal: an unreadable `work_dir` and per-dir
+/// removal failures are logged and skipped rather than propagated, so a transient
+/// filesystem hiccup never aborts a reconciliation pass.
 fn sweep_stale_job_dirs(
     work_dir: &Path,
     max_age: Duration,
-    active: Option<&str>,
+    is_active: impl Fn(&str) -> bool,
     now: std::time::SystemTime,
 ) -> Result<usize> {
     let entries = match std::fs::read_dir(work_dir) {
         Ok(e) => e,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
-        Err(e) => return Err(e).context("recon: failed to read auto-zran work dir"),
+        Err(e) => {
+            warn!(
+                work_dir = %work_dir.display(),
+                error = %e,
+                "recon: failed to read auto-zran work dir; skipping sweep"
+            );
+            return Ok(0);
+        }
     };
 
     let mut removed = 0usize;
@@ -326,9 +345,11 @@ fn sweep_stale_job_dirs(
         if !file_type.is_dir() {
             continue;
         }
-        if let Some(name) = path.file_name().and_then(|n| n.to_str())
-            && active == Some(name)
-        {
+        let name = match path.file_name().and_then(|n| n.to_str()) {
+            Some(n) => n.to_string(),
+            None => continue,
+        };
+        if is_active(&name) {
             continue;
         }
         let age = match entry
@@ -340,6 +361,11 @@ fn sweep_stale_job_dirs(
             Err(_) => continue,
         };
         if age < max_age {
+            continue;
+        }
+        // Re-check liveness right before deleting: a same-image job may have
+        // started (and reused this exact dir) since we read it above.
+        if is_active(&name) {
             continue;
         }
         match std::fs::remove_dir_all(&path) {
@@ -476,7 +502,7 @@ proc /proc proc rw,nosuid 0 0
         let removed = sweep_stale_job_dirs(
             tmp.path(),
             Duration::from_secs(3600),
-            None,
+            |_| false,
             std::time::SystemTime::now(),
         )
         .unwrap();
@@ -494,7 +520,7 @@ proc /proc proc rw,nosuid 0 0
         let removed = sweep_stale_job_dirs(
             tmp.path(),
             Duration::from_secs(3600),
-            Some("running-job"),
+            |n| n == "running-job",
             std::time::SystemTime::now(),
         )
         .unwrap();
@@ -504,13 +530,44 @@ proc /proc proc rw,nosuid 0 0
     }
 
     #[test]
+    fn sweep_stale_job_dirs_rechecks_liveness_at_delete_time() {
+        // Simulate a same-image conversion that starts mid-sweep: `is_active`
+        // returns false on the first (pre-mtime-filter) call but true on the
+        // delete-time re-check. The stale-by-mtime dir must be spared.
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = touch_dir_with_age(tmp.path(), "raced-job", Duration::from_secs(7200));
+        let calls = std::cell::Cell::new(0u32);
+
+        let removed = sweep_stale_job_dirs(
+            tmp.path(),
+            Duration::from_secs(3600),
+            |name| {
+                let n = calls.get();
+                calls.set(n + 1);
+                // First call (initial skip check): not yet active.
+                // Second call (delete-time re-check): job just started.
+                n >= 1 && name == "raced-job"
+            },
+            std::time::SystemTime::now(),
+        )
+        .unwrap();
+
+        assert_eq!(removed, 0, "delete-time re-check must spare a now-live job");
+        assert!(dir.exists());
+        assert!(
+            calls.get() >= 2,
+            "liveness must be checked again before delete"
+        );
+    }
+
+    #[test]
     fn sweep_stale_job_dirs_tolerates_a_missing_work_dir() {
         let tmp = tempfile::tempdir().unwrap();
         let missing = tmp.path().join("does-not-exist");
         let removed = sweep_stale_job_dirs(
             &missing,
             Duration::from_secs(3600),
-            None,
+            |_| false,
             std::time::SystemTime::now(),
         )
         .unwrap();
