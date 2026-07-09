@@ -483,6 +483,7 @@ async fn route_request(controller: &SystemController, request: HttpRequest) -> H
         },
         ("PUT", "/api/v1/auth") => handle_auth_put(&request.body),
         ("GET", "/metrics") => metrics_response(controller).await,
+        ("GET", "/debug/allocator") => json_response(200, AllocatorStatsResponse::collect()),
         _ => route_dynamic_request(controller, &request.method, path, &request.body).await,
     }
 }
@@ -1134,6 +1135,134 @@ fn usize_to_u64(value: usize) -> u64 {
 #[derive(Serialize)]
 struct ErrorResponse {
     error: String,
+}
+
+/// Response body for `GET /debug/allocator`.
+///
+/// The Go snapshotter exposed `net/http/pprof`; there is no idiomatic
+/// equivalent on compio (io_uring) and tokio-console doesn't apply either,
+/// so instead of porting pprof this endpoint surfaces cheap, read-only
+/// allocator/process memory stats. The binaries link `mimalloc` as the
+/// global allocator (see `bin/containerd-nydus.rs`), but the crate is
+/// pulled in *without* its `extended` feature, so `mi_stats_*` /
+/// `mi_process_info` are not reachable without a `Cargo.toml` change. Until
+/// that feature is opted in, this reports portable process RSS instead:
+/// `/proc/self/status` on Linux, `None` elsewhere. See `docs/operations.md`
+/// for `perf`/`samply` CPU-profiling guidance.
+#[derive(Clone, Debug, Default, Serialize)]
+struct AllocatorStatsResponse {
+    /// Where the numbers below came from, e.g. `"proc_self_status"` or
+    /// `"unavailable"`.
+    source: &'static str,
+    /// Whether mimalloc's own extended stats (`mi_process_info`,
+    /// `mi_stats_print_out`) are reachable in this build. Always `false`
+    /// today — the `mimalloc` dependency doesn't enable the `extended`
+    /// Cargo feature.
+    mimalloc_extended_stats_available: bool,
+    /// Current resident set size, in bytes (`VmRSS`).
+    current_rss_bytes: Option<u64>,
+    /// Peak resident set size ("high water mark"), in bytes (`VmHWM`).
+    peak_rss_bytes: Option<u64>,
+    /// Current virtual memory size, in bytes (`VmSize`).
+    virtual_size_bytes: Option<u64>,
+    /// Human-readable caveat about what is/isn't included.
+    note: &'static str,
+}
+
+impl AllocatorStatsResponse {
+    fn collect() -> Self {
+        let (source, current_rss_bytes, peak_rss_bytes, virtual_size_bytes, note) =
+            process_memory_stats();
+        Self {
+            source,
+            mimalloc_extended_stats_available: false,
+            current_rss_bytes,
+            peak_rss_bytes,
+            virtual_size_bytes,
+            note,
+        }
+    }
+}
+
+/// Portable process memory snapshot: `(source, current_rss, peak_rss, virtual_size, note)`.
+///
+/// Linux reads `/proc/self/status`, which reports resident/peak/virtual
+/// sizes in kB regardless of allocator; non-Linux targets (macOS dev boxes)
+/// have no equivalently cheap portable syscall wired up here, so they get
+/// an explicit `"unavailable"` source rather than silently-wrong zeros.
+#[cfg(target_os = "linux")]
+fn process_memory_stats() -> (
+    &'static str,
+    Option<u64>,
+    Option<u64>,
+    Option<u64>,
+    &'static str,
+) {
+    let status = match std::fs::read_to_string("/proc/self/status") {
+        Ok(s) => s,
+        Err(e) => {
+            warn!(error = %e, "failed to read /proc/self/status for /debug/allocator");
+            return (
+                "unavailable",
+                None,
+                None,
+                None,
+                "failed to read /proc/self/status",
+            );
+        }
+    };
+    let (current, peak, virt) = parse_proc_status_memory(&status);
+    (
+        "proc_self_status",
+        current,
+        peak,
+        virt,
+        "portable RSS via /proc/self/status; mimalloc extended stats not enabled",
+    )
+}
+
+#[cfg(not(target_os = "linux"))]
+fn process_memory_stats() -> (
+    &'static str,
+    Option<u64>,
+    Option<u64>,
+    Option<u64>,
+    &'static str,
+) {
+    (
+        "unavailable",
+        None,
+        None,
+        None,
+        "no portable RSS source wired up for this platform; mimalloc extended stats not enabled",
+    )
+}
+
+/// Parse `VmRSS`/`VmHWM`/`VmSize` (all in kB in `/proc/self/status`) into
+/// byte counts. Pure function so it can be unit-tested from a fixture
+/// string without touching `/proc` (and so it also runs on macOS CI).
+#[allow(dead_code)]
+fn parse_proc_status_memory(status: &str) -> (Option<u64>, Option<u64>, Option<u64>) {
+    let mut current = None;
+    let mut peak = None;
+    let mut virt = None;
+    for line in status.lines() {
+        if let Some(rest) = line.strip_prefix("VmRSS:") {
+            current = parse_status_kb_field(rest);
+        } else if let Some(rest) = line.strip_prefix("VmHWM:") {
+            peak = parse_status_kb_field(rest);
+        } else if let Some(rest) = line.strip_prefix("VmSize:") {
+            virt = parse_status_kb_field(rest);
+        }
+    }
+    (current, peak, virt)
+}
+
+/// Parse the `"  1234 kB"` tail of a `/proc/self/status` field into bytes.
+#[allow(dead_code)]
+fn parse_status_kb_field(field: &str) -> Option<u64> {
+    let kb: u64 = field.split_whitespace().next()?.parse().ok()?;
+    kb.checked_mul(1024)
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -1906,5 +2035,69 @@ mod tests {
     fn extract_lowerdir_is_none_for_non_overlay() {
         let line = "1 0 8:1 / / rw - ext4 /dev/sda1 rw";
         assert!(extract_lowerdir(line).is_none());
+    }
+
+    #[compio::test]
+    async fn route_debug_allocator_returns_parseable_stats() {
+        let dir = tempdir().unwrap();
+        let controller = test_controller(dir.path().to_path_buf());
+        let response = route_request(
+            &controller,
+            HttpRequest {
+                method: "GET".to_string(),
+                path: "/debug/allocator".to_string(),
+                body: Vec::new(),
+            },
+        )
+        .await;
+
+        assert_eq!(response.status, 200);
+        assert_eq!(response.content_type, "application/json");
+        let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+        // The numeric fields are platform-dependent (populated on Linux via
+        // /proc/self/status, absent elsewhere), but the shape and the
+        // "what did we actually read" fields must always be present.
+        assert!(body["source"].is_string());
+        assert_eq!(body["mimalloc_extended_stats_available"], false);
+        assert!(body["note"].is_string());
+        assert!(body.get("current_rss_bytes").is_some());
+        assert!(body.get("peak_rss_bytes").is_some());
+        assert!(body.get("virtual_size_bytes").is_some());
+
+        #[cfg(target_os = "linux")]
+        {
+            assert_eq!(body["source"], "proc_self_status");
+            assert!(
+                body["current_rss_bytes"].as_u64().unwrap() > 0,
+                "a live process should report nonzero RSS on Linux"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_proc_status_memory_reads_rss_hwm_and_vsize() {
+        let status = "\
+Name:\ttest\n\
+VmPeak:\t   10240 kB\n\
+VmSize:\t    8192 kB\n\
+VmHWM:\t     4096 kB\n\
+VmRSS:\t     2048 kB\n\
+Threads:\t4\n";
+        let (current, peak, virt) = parse_proc_status_memory(status);
+        assert_eq!(current, Some(2048 * 1024));
+        assert_eq!(peak, Some(4096 * 1024));
+        assert_eq!(virt, Some(8192 * 1024));
+    }
+
+    #[test]
+    fn parse_proc_status_memory_is_none_for_missing_fields() {
+        let status = "Name:\ttest\nThreads:\t1\n";
+        assert_eq!(parse_proc_status_memory(status), (None, None, None));
+    }
+
+    #[test]
+    fn parse_status_kb_field_parses_leading_integer() {
+        assert_eq!(parse_status_kb_field("   2048 kB"), Some(2048 * 1024));
+        assert_eq!(parse_status_kb_field("   not-a-number kB"), None);
     }
 }
