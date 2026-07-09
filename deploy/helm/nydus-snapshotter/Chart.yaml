@@ -5,7 +5,7 @@ description: >-
   fanotify/EROFS on-demand mounting, FUSE fallback, and node-local zran acceleration.
   Deploys a privileged DaemonSet; does NOT edit host containerd config by default.
 type: application
-version: 0.1.0
+version: 0.1.1
 appVersion: "3.0.0"
 keywords:
   - containerd

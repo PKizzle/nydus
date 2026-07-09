@@ -8,6 +8,11 @@ data:
   config.toml: |
     # Unified nydus snapshotter config (rendered by Helm). See snapshotter/src/config/.
     [snapshotter]
+    # Deployment profile: fills host-path defaults (containerd socket + content-store
+    # root) and the peer-mirror preset for any field left unset. Explicit values below
+    # always win. "auto" probes the well-known sockets at startup; "k3s"/"containerd"
+    # pin it. Overridable at runtime via NYDUS_SNAPSHOTTER_PROFILE / --profile.
+    profile = {{ .Values.config.profile | quote }}
     root = {{ .Values.config.root | quote }}
     address = {{ .Values.config.address | quote }}
     fs_driver_policy = "auto"
@@ -23,6 +28,26 @@ data:
     referrer_detect = {{ .Values.config.features.referrerDetect }}
     prefetch = {{ .Values.config.features.prefetch }}
     metrics = {{ .Values.config.features.metrics }}
+    # PLACEHOLDER: a TCP metrics endpoint (+ Service / Prometheus ServiceMonitor) is not
+    # exposed yet — it depends on the separate metrics-endpoint change (C1). Once that
+    # lands, surface `metrics_address = "0.0.0.0:<port>"` here and add the Service.
+
+    {{- with .Values.config.peerMirror }}
+    # Peer-mirror (registry-free P2P layer fetch via a node-local mirror, e.g. k3s'
+    # embedded Spegel). `preset` bundles endpoint + mTLS cert paths + peer-discovery;
+    # the k3s-spegel preset reproduces the historical [snapshotter.spegel_mirror]
+    # behaviour on k3s. Leave the rest unset to inherit the preset/profile defaults.
+    [snapshotter.peer_mirror]
+    {{- with .preset }}
+    preset = {{ . | quote }}
+    {{- end }}
+    {{- if kindIs "bool" .enable }}
+    enable = {{ .enable }}
+    {{- end }}
+    {{- with .endpoint }}
+    endpoint = {{ . | quote }}
+    {{- end }}
+    {{- end }}
 
     {{- range .Values.config.fsDrivers }}
     [[snapshotter.fs_drivers]]

@@ -35,7 +35,7 @@ path = "src/bin/nydus-optimizer-nri-plugin.rs"
 [dependencies]
 anyhow = "1"
 base64 = "0.22"
-clap = { version = "4", features = ["derive", "cargo"] }
+clap = { version = "4", features = ["derive", "cargo", "env"] }
 # Use the git version (not the crates.io 0.3.0): the published release is on
 # tonic 0.9 / http 0.2, but main is on tonic 0.14 / http 1.0, which is required
 # to serve the gRPC service over compio via cyper-axum (hyper 1.x / axum 0.8).

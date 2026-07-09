@@ -53,6 +53,12 @@ hostPaths:
 # Snapshotter unified TOML config (rendered into a ConfigMap, mounted at /etc/nydus/config.toml).
 # Only the most relevant knobs are surfaced; `config.extraToml` is appended verbatim for the rest.
 config:
+  # Deployment profile: fills host-path defaults (containerd socket + content-store root)
+  # and the peer-mirror preset for any field left unset. This chart targets k3s, so the
+  # default is "k3s". Stock-containerd users should set "containerd"; use "auto" to probe
+  # the well-known sockets at startup and pick automatically. Stamped into the configmap
+  # TOML; also overridable at container runtime via NYDUS_SNAPSHOTTER_PROFILE / --profile.
+  profile: "k3s"
   # gRPC proxy-plugin socket — MUST match the `address` in containerd's [proxy_plugins."nydus"].
   address: /run/containerd-nydus/containerd-nydus-grpc.sock
   root: /var/lib/containerd-nydus
@@ -66,7 +72,22 @@ config:
   features:
     referrerDetect: true
     prefetch: true
+    # Enables the in-snapshotter metrics collector. NOTE: the TCP metrics endpoint +
+    # its Service/ServiceMonitor are not wired here yet (depends on the metrics-endpoint
+    # change, C1) — see the commented placeholder in templates/configmap.yaml.
     metrics: true
+  # Peer-mirror (registry-free P2P layer fetch via a node-local mirror such as k3s'
+  # embedded Spegel). `preset` bundles endpoint + mTLS cert paths + peer-discovery:
+  #   k3s-spegel -> k3s' embedded Spegel (endpoint 127.0.0.1:6443 + k3s agent certs +
+  #                 kubernetes peer-discovery); the default for this k3s-targeted chart.
+  #   spegel     -> generic Spegel: local endpoint + ?ns= query, no k3s certs/discovery.
+  #   none       -> disabled unless you also set `enable: true` and an `endpoint`.
+  # Leave `enable`/`endpoint` unset (null) to inherit the preset/profile defaults; the
+  # canonical config key is `peer_mirror` (the old `spegel_mirror` name is a serde alias).
+  peerMirror:
+    preset: "k3s-spegel"
+    enable: null
+    endpoint: null
   # Node-local zran acceleration (transparent, no tag change). Binaries are bundled in the image.
   localAccel:
     enable: true

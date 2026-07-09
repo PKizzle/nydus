@@ -285,6 +285,8 @@ mount | grep -E 'erofs|fuse.*nydus'
 | --- | --- | --- |
 | `image.repository` / `image.tag` | `…/nydus-snapshotter` / chart appVersion | Image bundling `containerd-nydus` + `nydus-image`. |
 | `snapshotterMode` | `runtime-handler` | `runtime-handler` (per-pod RuntimeClass) or `global-default` (CRI default). |
+| `config.profile` | `k3s` | Deployment profile stamped into the config TOML: `auto`, `k3s`, or `containerd`. Overridable at runtime via `NYDUS_SNAPSHOTTER_PROFILE` / `--profile`. |
+| `config.peerMirror.preset` | `k3s-spegel` | Peer-mirror preset: `k3s-spegel`, `spegel`, or `none`. Canonical key `peer_mirror` (old `spegel_mirror` is a serde alias). |
 | `daemonset.privileged` | `true` | Required; see [Overview](#overview). |
 | `hostPaths.containerdSock` | `/run/k3s/containerd/containerd.sock` | Host containerd socket. |
 | `config.fsDrivers` | fanotify, blockdev(loop), fusedev | Ordered driver fallback chain. |

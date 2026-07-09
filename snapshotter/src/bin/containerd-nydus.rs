@@ -22,10 +22,30 @@ use futures::FutureExt;
 use std::sync::Arc;
 use tracing::{info, warn};
 
-use nydus_snapshotter::config::SnapshotterConfig;
+use nydus_snapshotter::config::{Profile, SnapshotterConfig};
 use nydus_snapshotter::daemon::DaemonSupervisor;
 
+/// Parse a deployment-profile string ("auto"/"k3s"/"containerd", case
+/// insensitive) into a [`Profile`]. Mirrors the `#[serde(rename_all =
+/// "lowercase")]` names the TOML `profile` field accepts, so the
+/// `--profile`/`NYDUS_SNAPSHOTTER_PROFILE` override and the config file agree.
+fn parse_profile(s: &str) -> Result<Profile, String> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "auto" => Ok(Profile::Auto),
+        "k3s" => Ok(Profile::K3s),
+        "containerd" => Ok(Profile::Containerd),
+        other => Err(format!(
+            "invalid profile {other:?}; expected one of: auto, k3s, containerd"
+        )),
+    }
+}
+
 /// Command-line arguments for the snapshotter.
+///
+/// Every override also reads a `NYDUS_SNAPSHOTTER_*` environment variable so the
+/// binary is configurable in a container without a mounted config file. clap's
+/// precedence applies: an explicit flag beats the env var, which beats the
+/// default (and, for `--profile`, the TOML `profile` field).
 #[derive(Parser, Debug)]
 #[command(
     name = "containerd-nydus",
@@ -33,20 +53,31 @@ use nydus_snapshotter::daemon::DaemonSupervisor;
 )]
 struct Args {
     /// Path to the unified TOML configuration file.
-    #[arg(short, long)]
+    #[arg(short, long, env = "NYDUS_SNAPSHOTTER_CONFIG")]
     config: Option<String>,
 
     /// Override the gRPC socket address.
-    #[arg(short, long)]
+    #[arg(short, long, env = "NYDUS_SNAPSHOTTER_ADDRESS")]
     address: Option<String>,
 
     /// Override the root directory.
-    #[arg(short, long)]
+    #[arg(short, long, env = "NYDUS_SNAPSHOTTER_ROOT")]
     root: Option<String>,
 
     /// Log level (trace, debug, info, warn, error).
-    #[arg(short, long, default_value = "info")]
+    #[arg(
+        short,
+        long,
+        env = "NYDUS_SNAPSHOTTER_LOG_LEVEL",
+        default_value = "info"
+    )]
     log_level: String,
+
+    /// Override the deployment profile (auto/k3s/containerd). Takes precedence
+    /// over the TOML `[snapshotter].profile` field and is applied before
+    /// profile resolution.
+    #[arg(long, env = "NYDUS_SNAPSHOTTER_PROFILE", value_parser = parse_profile)]
+    profile: Option<Profile>,
 }
 
 #[compio::main]
@@ -101,6 +132,12 @@ async fn main() -> Result<()> {
     }
     if let Some(root) = args.root {
         config.snapshotter.root = std::path::PathBuf::from(root);
+    }
+    // Override the TOML `[snapshotter].profile` from --profile /
+    // NYDUS_SNAPSHOTTER_PROFILE BEFORE resolve_profile runs, so the precedence
+    // is: explicit flag/env > TOML profile field > default auto.
+    if let Some(profile) = args.profile {
+        config.snapshotter.profile = profile;
     }
 
     // Resolve the deployment profile (auto/k3s/containerd) IN MEMORY: fills any
@@ -253,4 +290,45 @@ async fn main() -> Result<()> {
     }
     shutdown_supervisor.shutdown_all().await;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_profile_accepts_known_values_case_insensitively() {
+        assert_eq!(parse_profile("auto").unwrap(), Profile::Auto);
+        assert_eq!(parse_profile("k3s").unwrap(), Profile::K3s);
+        assert_eq!(parse_profile("containerd").unwrap(), Profile::Containerd);
+        // Case- and whitespace-insensitive, matching operator-typed env values.
+        assert_eq!(parse_profile("  K3S ").unwrap(), Profile::K3s);
+        assert_eq!(parse_profile("Containerd").unwrap(), Profile::Containerd);
+    }
+
+    #[test]
+    fn parse_profile_rejects_unknown_values() {
+        let err = parse_profile("kubernetes").unwrap_err();
+        assert!(err.contains("invalid profile"));
+        assert!(err.contains("auto, k3s, containerd"));
+    }
+
+    /// The `--profile` value_parser must accept exactly the same spellings the
+    /// TOML `profile` field does (serde `rename_all = "lowercase"`), so an env
+    /// override and a config file never disagree on what "k3s" means.
+    #[test]
+    fn parse_profile_matches_toml_deserialization() {
+        for name in ["auto", "k3s", "containerd"] {
+            let via_flag = parse_profile(name).unwrap();
+            let via_toml: Profile = toml::from_str(&format!("profile = {name:?}"))
+                .map(|w: ProfileWrap| w.profile)
+                .unwrap();
+            assert_eq!(via_flag, via_toml, "mismatch for {name}");
+        }
+    }
+
+    #[derive(serde::Deserialize)]
+    struct ProfileWrap {
+        profile: Profile,
+    }
 }
