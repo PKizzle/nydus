@@ -121,6 +121,13 @@ async fn main() -> Result<()> {
         "resolved deployment profile"
     );
 
+    // Reject backend configurations the in-process daemon cannot honour (e.g.
+    // an orphan [backends.localfs], or more than one pull backend) instead of
+    // silently ignoring them.
+    if let Err(e) = config.validate() {
+        anyhow::bail!("configuration error: {e}");
+    }
+
     // Fail fast with an actionable message if auto_zran is on but the resolved
     // containerd socket is missing — otherwise this surfaces as a late,
     // opaque gRPC connect error deep in the conversion path.

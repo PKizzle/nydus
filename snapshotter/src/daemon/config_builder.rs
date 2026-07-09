@@ -10,64 +10,46 @@
 
 use std::path::Path;
 
+use anyhow::Context;
 use nydus_api::{
     BLOB_CACHE_TYPE_META_BLOB, BackendConfigV2, BlobCacheEntry, BlobCacheEntryConfigV2,
-    CacheConfigV2, ConfigV2, FanotifyConfig, FileCacheConfig, LocalFsConfig, RafsConfigV2,
-    RegistryConfig,
+    CacheConfigV2, ConfigV2, FanotifyConfig, FileCacheConfig, HttpProxyConfig, LocalFsConfig,
+    OssConfig, RafsConfigV2, RegistryConfig, S3Config,
 };
 use serde_json::json;
 
-use crate::config::SnapshotterConfig;
+use crate::config::{
+    HttpProxyBackendConfig, OssBackendConfig, RegistryBackendConfig, S3BackendConfig,
+    SnapshotterConfig,
+};
 use crate::daemon::image_ref::ImageRef;
 
-/// Build a `ConfigV2` for the registry backend + filecache pair.
+/// Retry count applied to every daemon storage backend, matching the historical
+/// registry-backend value so the object-store / http-proxy backends inherit the
+/// same resilience.
+const BACKEND_RETRY_LIMIT: u8 = 3;
+/// Per-request / connect timeout (seconds) for the object-store and http-proxy
+/// backends when no per-backend timeout is expressed in the TOML. Mirrors the
+/// nydus-api `default_http_timeout`.
+const DEFAULT_HTTP_TIMEOUT_SECS: u32 = 5;
+
+/// Build a `ConfigV2` for the daemon pull path: the storage backend selected
+/// from the unified `[backends.*]` TOML config, paired with a filecache.
 ///
 /// `cache_work_dir` is the per-image directory that nydusd uses to materialise
 /// chunk caches. `auth` is the optional `base64(user:password)` blob from the
-/// configured pull-auth environment variable.
-pub fn build_registry_config(
+/// runtime auth store — only the registry backend consumes it.
+///
+/// Backend selection is delegated to [`build_backend_config`]; the cache + rafs
+/// sections are backend-independent.
+pub fn build_daemon_config(
     cfg: &SnapshotterConfig,
     image_ref: &ImageRef,
     cache_work_dir: &Path,
     auth: Option<String>,
     daemon_id: &str,
-) -> ConfigV2 {
-    let registry_cfg = cfg.backends.registry.as_ref();
-    let timeout_secs = parse_timeout_seconds(
-        registry_cfg
-            .map(|c| c.request_timeout.as_str())
-            .unwrap_or("30s"),
-    );
-    let scheme = if registry_cfg.map(|c| c.plain_http).unwrap_or(false) {
-        "http"
-    } else {
-        "https"
-    };
-    let registry = RegistryConfig {
-        scheme: scheme.to_string(),
-        host: image_ref.api_host.clone(),
-        repo: image_ref.repo.clone(),
-        auth,
-        skip_verify: registry_cfg.map(|c| c.skip_verify).unwrap_or(false),
-        ca_cert_files: Vec::new(),
-        timeout: timeout_secs,
-        connect_timeout: timeout_secs,
-        retry_limit: 3,
-        registry_token: None,
-        blob_url_scheme: String::new(),
-        blob_redirected_host: String::new(),
-        proxy: Default::default(),
-    };
-
-    let backend = BackendConfigV2 {
-        backend_type: "registry".to_string(),
-        localdisk: None,
-        localfs: None,
-        oss: None,
-        s3: None,
-        registry: Some(registry),
-        http_proxy: None,
-    };
+) -> anyhow::Result<ConfigV2> {
+    let backend = build_backend_config(cfg, image_ref, auth)?;
 
     let cache = CacheConfigV2 {
         cache_type: "filecache".to_string(),
@@ -95,7 +77,7 @@ pub fn build_registry_config(
         prefetch: Default::default(),
     };
 
-    ConfigV2 {
+    Ok(ConfigV2 {
         version: 2,
         id: daemon_id.to_string(),
         backend: Some(backend),
@@ -104,7 +86,192 @@ pub fn build_registry_config(
         rafs: Some(rafs),
         overlay: None,
         internal: Default::default(),
+    })
+}
+
+/// Select and build the storage `BackendConfigV2` that drives the daemon pull
+/// path from the `[backends.*]` config.
+///
+/// Selection precedence: at most one of `s3` / `oss` / `http-proxy` / `registry`
+/// may be configured (enforced loudly at startup by
+/// [`crate::config::BackendsConfig::validate`]). When none is set the image's
+/// own registry is used — the historical default. `[backends.localfs]` is NOT
+/// handled here: the `localfs` backend is reserved for the auto-accel sidecar
+/// path (see [`build_auto_accel_config`]).
+///
+/// `image_ref` / `auth` are consumed only by the registry backend; the object-
+/// store and http-proxy backends are described entirely by their TOML section.
+///
+/// NOTE: the s3 / oss / http-proxy mappings are unit-tested at the
+/// TOML-struct → `ConfigV2` level, but have NOT been integration-tested against
+/// a live S3 / OSS / http-proxy endpoint.
+pub fn build_backend_config(
+    cfg: &SnapshotterConfig,
+    image_ref: &ImageRef,
+    auth: Option<String>,
+) -> anyhow::Result<BackendConfigV2> {
+    let backends = &cfg.backends;
+    if let Some(s3) = backends.s3.as_ref() {
+        build_s3_backend(s3)
+    } else if let Some(oss) = backends.oss.as_ref() {
+        build_oss_backend(oss)
+    } else if let Some(http_proxy) = backends.http_proxy.as_ref() {
+        Ok(build_http_proxy_backend(http_proxy))
+    } else {
+        Ok(build_registry_backend(
+            backends.registry.as_ref(),
+            image_ref,
+            auth,
+        ))
     }
+}
+
+/// Build the registry `BackendConfigV2`. Preserves the historical behaviour:
+/// host/repo come from the image reference, `request_timeout` / `plain_http` /
+/// `skip_verify` from the optional `[backends.registry]` section (defaults used
+/// when absent).
+fn build_registry_backend(
+    registry_cfg: Option<&RegistryBackendConfig>,
+    image_ref: &ImageRef,
+    auth: Option<String>,
+) -> BackendConfigV2 {
+    let timeout_secs = parse_timeout_seconds(
+        registry_cfg
+            .map(|c| c.request_timeout.as_str())
+            .unwrap_or("30s"),
+    );
+    let scheme = if registry_cfg.map(|c| c.plain_http).unwrap_or(false) {
+        "http"
+    } else {
+        "https"
+    };
+    let registry = RegistryConfig {
+        scheme: scheme.to_string(),
+        host: image_ref.api_host.clone(),
+        repo: image_ref.repo.clone(),
+        auth,
+        skip_verify: registry_cfg.map(|c| c.skip_verify).unwrap_or(false),
+        ca_cert_files: Vec::new(),
+        timeout: timeout_secs,
+        connect_timeout: timeout_secs,
+        retry_limit: BACKEND_RETRY_LIMIT,
+        registry_token: None,
+        blob_url_scheme: String::new(),
+        blob_redirected_host: String::new(),
+        proxy: Default::default(),
+    };
+
+    BackendConfigV2 {
+        backend_type: "registry".to_string(),
+        localdisk: None,
+        localfs: None,
+        oss: None,
+        s3: None,
+        registry: Some(registry),
+        http_proxy: None,
+    }
+}
+
+/// Build the `s3` `BackendConfigV2`. Credentials are resolved from the named
+/// environment variables (`access_key_env` / `secret_key_env`); a referenced
+/// variable that is not set is a hard error.
+fn build_s3_backend(s3: &S3BackendConfig) -> anyhow::Result<BackendConfigV2> {
+    let access_key_id = resolve_credential_env(&s3.access_key_env)?;
+    let access_key_secret = resolve_credential_env(&s3.secret_key_env)?;
+    let s3_cfg = S3Config {
+        scheme: "https".to_string(),
+        endpoint: s3.endpoint.clone(),
+        region: s3.region.clone(),
+        bucket_name: s3.bucket.clone(),
+        object_prefix: String::new(),
+        access_key_id,
+        access_key_secret,
+        skip_verify: false,
+        ca_cert_files: Vec::new(),
+        timeout: DEFAULT_HTTP_TIMEOUT_SECS,
+        connect_timeout: DEFAULT_HTTP_TIMEOUT_SECS,
+        retry_limit: BACKEND_RETRY_LIMIT,
+        proxy: Default::default(),
+    };
+    Ok(BackendConfigV2 {
+        backend_type: "s3".to_string(),
+        localdisk: None,
+        localfs: None,
+        oss: None,
+        s3: Some(s3_cfg),
+        registry: None,
+        http_proxy: None,
+    })
+}
+
+/// Build the `oss` `BackendConfigV2`. Credentials are optional: an empty
+/// `access_key_env` / `secret_key_env` yields blank keys (anonymous / public
+/// bucket access); a non-empty name that is unset is a hard error.
+fn build_oss_backend(oss: &OssBackendConfig) -> anyhow::Result<BackendConfigV2> {
+    let access_key_id = resolve_credential_env(&oss.access_key_env)?;
+    let access_key_secret = resolve_credential_env(&oss.secret_key_env)?;
+    let oss_cfg = OssConfig {
+        scheme: "https".to_string(),
+        endpoint: oss.endpoint.clone(),
+        bucket_name: oss.bucket.clone(),
+        object_prefix: String::new(),
+        access_key_id,
+        access_key_secret,
+        skip_verify: false,
+        ca_cert_files: Vec::new(),
+        timeout: DEFAULT_HTTP_TIMEOUT_SECS,
+        connect_timeout: DEFAULT_HTTP_TIMEOUT_SECS,
+        retry_limit: BACKEND_RETRY_LIMIT,
+        proxy: Default::default(),
+    };
+    Ok(BackendConfigV2 {
+        backend_type: "oss".to_string(),
+        localdisk: None,
+        localfs: None,
+        oss: Some(oss_cfg),
+        s3: None,
+        registry: None,
+        http_proxy: None,
+    })
+}
+
+/// Build the `http-proxy` `BackendConfigV2`. The snapshotter section exposes
+/// only the proxy `url` (mapped to the api `addr`); the blob `path` prefix is
+/// left empty (correct for a unix-socket proxy; an http proxy that needs a
+/// non-empty blob path is not yet expressible in the snapshotter TOML).
+fn build_http_proxy_backend(http_proxy: &HttpProxyBackendConfig) -> BackendConfigV2 {
+    let http_proxy_cfg = HttpProxyConfig {
+        addr: http_proxy.url.clone(),
+        path: String::new(),
+        skip_verify: false,
+        ca_cert_files: Vec::new(),
+        timeout: DEFAULT_HTTP_TIMEOUT_SECS,
+        connect_timeout: DEFAULT_HTTP_TIMEOUT_SECS,
+        retry_limit: BACKEND_RETRY_LIMIT,
+        proxy: Default::default(),
+    };
+    BackendConfigV2 {
+        backend_type: "http-proxy".to_string(),
+        localdisk: None,
+        localfs: None,
+        oss: None,
+        s3: None,
+        registry: None,
+        http_proxy: Some(http_proxy_cfg),
+    }
+}
+
+/// Resolve a credential from the environment variable named `var_name`. An
+/// empty name means "no credential" (blank string). A non-empty name that is
+/// not present in the environment is a hard error, so a misconfigured backend
+/// fails loudly at daemon-config build time rather than at first blob fetch.
+fn resolve_credential_env(var_name: &str) -> anyhow::Result<String> {
+    if var_name.is_empty() {
+        return Ok(String::new());
+    }
+    std::env::var(var_name).with_context(|| {
+        format!("environment variable `{var_name}` referenced by a storage backend is not set")
+    })
 }
 
 /// Build a `ConfigV2` for the **auto-accel sidecar** mount: a `localfs`
@@ -217,7 +384,7 @@ pub fn build_blob_cache_entry(
     daemon_id: &str,
     bootstrap: &Path,
 ) -> anyhow::Result<BlobCacheEntry> {
-    let cfg_v2 = build_registry_config(cfg, image_ref, cache_work_dir, auth, daemon_id);
+    let cfg_v2 = build_daemon_config(cfg, image_ref, cache_work_dir, auth, daemon_id)?;
     let entry_config = BlobCacheEntryConfigV2 {
         version: cfg_v2.version,
         id: cfg_v2.id,
@@ -262,13 +429,14 @@ mod tests {
     fn build_config_for_dockerhub_image() {
         let cfg = SnapshotterConfig::default();
         let image = parse_image_ref("docker.io/library/nginx:latest").unwrap();
-        let cv2 = build_registry_config(
+        let cv2 = build_daemon_config(
             &cfg,
             &image,
             &PathBuf::from("/var/lib/containerd-nydus/cache/nginx"),
             Some("dXNlcjpwYXNz".to_string()),
             "test-daemon",
-        );
+        )
+        .unwrap();
         assert_eq!(cv2.version, 2);
         let backend = cv2.backend.as_ref().unwrap();
         assert_eq!(backend.backend_type, "registry");
@@ -318,5 +486,179 @@ mod tests {
         assert_eq!(parse_timeout_seconds("2m"), 120);
         assert_eq!(parse_timeout_seconds("45"), 45);
         assert_eq!(parse_timeout_seconds("garbage"), 30);
+    }
+
+    // ── B3: backend selection + s3/oss/http-proxy mapping ──────────────
+
+    use crate::config::{
+        HttpProxyBackendConfig, OssBackendConfig, RegistryBackendConfig, S3BackendConfig,
+    };
+
+    fn dummy_image() -> ImageRef {
+        parse_image_ref("docker.io/library/nginx:latest").unwrap()
+    }
+
+    #[test]
+    fn no_backend_section_defaults_to_registry() {
+        // Empty [backends] ⇒ the image's own registry drives the daemon.
+        let cfg = SnapshotterConfig::default();
+        let backend = build_backend_config(&cfg, &dummy_image(), None).unwrap();
+        assert_eq!(backend.backend_type, "registry");
+        assert!(backend.registry.is_some());
+        assert!(backend.s3.is_none() && backend.oss.is_none() && backend.http_proxy.is_none());
+    }
+
+    #[test]
+    fn registry_backend_maps_plain_http_and_skip_verify() {
+        let mut cfg = SnapshotterConfig::default();
+        cfg.backends.registry = Some(RegistryBackendConfig {
+            mirrors: Vec::new(),
+            skip_verify: true,
+            plain_http: true,
+            request_timeout: "45s".to_string(),
+        });
+        let backend =
+            build_backend_config(&cfg, &dummy_image(), Some("dXNlcjpwYXNz".to_string())).unwrap();
+        assert_eq!(backend.backend_type, "registry");
+        let reg = backend.registry.as_ref().unwrap();
+        assert_eq!(reg.scheme, "http");
+        assert!(reg.skip_verify);
+        assert_eq!(reg.timeout, 45);
+        assert_eq!(reg.connect_timeout, 45);
+        assert_eq!(reg.auth.as_deref(), Some("dXNlcjpwYXNz"));
+    }
+
+    #[test]
+    fn s3_backend_maps_fields_and_resolves_env_credentials() {
+        // Unique env var names to avoid cross-test interference.
+        unsafe {
+            std::env::set_var("B3_TEST_S3_AK", "AKIAEXAMPLE");
+            std::env::set_var("B3_TEST_S3_SK", "s3cr3t");
+        }
+        let mut cfg = SnapshotterConfig::default();
+        cfg.backends.s3 = Some(S3BackendConfig {
+            endpoint: "https://s3.us-east-1.amazonaws.com".to_string(),
+            region: "us-east-1".to_string(),
+            bucket: "my-nydus-blobs".to_string(),
+            access_key_env: "B3_TEST_S3_AK".to_string(),
+            secret_key_env: "B3_TEST_S3_SK".to_string(),
+        });
+        let backend = build_backend_config(&cfg, &dummy_image(), None).unwrap();
+        assert_eq!(backend.backend_type, "s3");
+        assert!(backend.registry.is_none());
+        let s3 = backend.s3.as_ref().unwrap();
+        assert_eq!(s3.endpoint, "https://s3.us-east-1.amazonaws.com");
+        assert_eq!(s3.region, "us-east-1");
+        assert_eq!(s3.bucket_name, "my-nydus-blobs");
+        assert_eq!(s3.access_key_id, "AKIAEXAMPLE");
+        assert_eq!(s3.access_key_secret, "s3cr3t");
+        assert_eq!(s3.scheme, "https");
+        assert_eq!(s3.retry_limit, BACKEND_RETRY_LIMIT);
+        // The mapped backend must pass nydus-api's own validator.
+        let bc = BackendConfigV2 {
+            backend_type: "s3".to_string(),
+            s3: backend.s3.clone(),
+            ..Default::default()
+        };
+        assert!(bc.validate());
+        unsafe {
+            std::env::remove_var("B3_TEST_S3_AK");
+            std::env::remove_var("B3_TEST_S3_SK");
+        }
+    }
+
+    #[test]
+    fn s3_backend_missing_env_var_is_hard_error() {
+        let mut cfg = SnapshotterConfig::default();
+        cfg.backends.s3 = Some(S3BackendConfig {
+            endpoint: "https://s3.example.com".to_string(),
+            region: "us-east-1".to_string(),
+            bucket: "b".to_string(),
+            access_key_env: "B3_TEST_DEFINITELY_UNSET_VAR".to_string(),
+            secret_key_env: "B3_TEST_DEFINITELY_UNSET_VAR_2".to_string(),
+        });
+        let err = build_backend_config(&cfg, &dummy_image(), None).unwrap_err();
+        assert!(
+            err.to_string().contains("B3_TEST_DEFINITELY_UNSET_VAR"),
+            "error should name the missing env var: {err}"
+        );
+    }
+
+    #[test]
+    fn oss_backend_maps_fields_anonymous() {
+        let mut cfg = SnapshotterConfig::default();
+        cfg.backends.oss = Some(OssBackendConfig {
+            endpoint: "https://oss-cn-hangzhou.aliyuncs.com".to_string(),
+            bucket: "nydus-bucket".to_string(),
+            access_key_env: String::new(),
+            secret_key_env: String::new(),
+        });
+        let backend = build_backend_config(&cfg, &dummy_image(), None).unwrap();
+        assert_eq!(backend.backend_type, "oss");
+        let oss = backend.oss.as_ref().unwrap();
+        assert_eq!(oss.endpoint, "https://oss-cn-hangzhou.aliyuncs.com");
+        assert_eq!(oss.bucket_name, "nydus-bucket");
+        assert_eq!(oss.access_key_id, "");
+        assert_eq!(oss.access_key_secret, "");
+        assert_eq!(oss.scheme, "https");
+        let bc = BackendConfigV2 {
+            backend_type: "oss".to_string(),
+            oss: backend.oss.clone(),
+            ..Default::default()
+        };
+        assert!(bc.validate());
+    }
+
+    #[test]
+    fn http_proxy_backend_maps_url_to_addr() {
+        let mut cfg = SnapshotterConfig::default();
+        cfg.backends.http_proxy = Some(HttpProxyBackendConfig {
+            url: "http://127.0.0.1:8000".to_string(),
+        });
+        let backend = build_backend_config(&cfg, &dummy_image(), None).unwrap();
+        assert_eq!(backend.backend_type, "http-proxy");
+        let hp = backend.http_proxy.as_ref().unwrap();
+        assert_eq!(hp.addr, "http://127.0.0.1:8000");
+        assert_eq!(hp.path, "");
+        assert_eq!(hp.retry_limit, BACKEND_RETRY_LIMIT);
+        let bc = BackendConfigV2 {
+            backend_type: "http-proxy".to_string(),
+            http_proxy: backend.http_proxy.clone(),
+            ..Default::default()
+        };
+        assert!(bc.validate());
+    }
+
+    #[test]
+    fn s3_takes_precedence_and_full_config_is_valid() {
+        // build_daemon_config wraps the selected backend with cache + rafs; the
+        // whole ConfigV2 must validate against nydus-api.
+        unsafe {
+            std::env::set_var("B3_TEST_S3_AK2", "AKIA");
+            std::env::set_var("B3_TEST_S3_SK2", "sec");
+        }
+        let mut cfg = SnapshotterConfig::default();
+        cfg.backends.s3 = Some(S3BackendConfig {
+            endpoint: "https://s3.example.com".to_string(),
+            region: "us-east-1".to_string(),
+            bucket: "b".to_string(),
+            access_key_env: "B3_TEST_S3_AK2".to_string(),
+            secret_key_env: "B3_TEST_S3_SK2".to_string(),
+        });
+        let cv2 = build_daemon_config(
+            &cfg,
+            &dummy_image(),
+            &PathBuf::from("/var/lib/containerd-nydus/cache/x"),
+            None,
+            "test-daemon",
+        )
+        .unwrap();
+        assert_eq!(cv2.backend.as_ref().unwrap().backend_type, "s3");
+        assert_eq!(cv2.cache.as_ref().unwrap().cache_type, "filecache");
+        assert!(cv2.validate());
+        unsafe {
+            std::env::remove_var("B3_TEST_S3_AK2");
+            std::env::remove_var("B3_TEST_S3_SK2");
+        }
     }
 }

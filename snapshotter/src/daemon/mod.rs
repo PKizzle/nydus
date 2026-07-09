@@ -41,7 +41,7 @@ use tracing::{debug, info, warn};
 
 use crate::config::{FsDriverType, SnapshotterConfig};
 use crate::daemon::config_builder::{
-    build_auto_accel_config, build_blob_cache_entry, build_registry_config,
+    build_auto_accel_config, build_blob_cache_entry, build_daemon_config,
 };
 use crate::daemon::image_ref::{ImageRef, parse_image_ref};
 use crate::prefetch_profile::runtime_prefetch_for_image;
@@ -926,7 +926,7 @@ impl DaemonSupervisor {
             }));
         }
 
-        let cfg_v2 = build_registry_config(&self.config, &parsed, &cache_dir, auth, &slug);
+        let cfg_v2 = build_daemon_config(&self.config, &parsed, &cache_dir, auth, &slug)?;
         let cfg_json =
             serde_json::to_string(&cfg_v2).context("failed to serialise ConfigV2 for nydusd")?;
 
@@ -1144,7 +1144,7 @@ impl DaemonSupervisor {
             Arc::new(Waker::new(poll.registry(), Token(1)).context("failed to create mio Waker")?);
         let poll = Arc::new(Mutex::new(poll));
 
-        let cfg_v2 = build_registry_config(&self.config, &parsed, &cache_dir, auth, slug);
+        let cfg_v2 = build_daemon_config(&self.config, &parsed, &cache_dir, auth, slug)?;
         let cfg_json = serde_json::to_string(&cfg_v2).context("serialise ConfigV2 for nydusd")?;
         let vfs = create_vfs_backend(FsBackendType::Rafs, true, false)
             .context("create RAFS VFS backend")?;

@@ -345,6 +345,19 @@ pub enum ConfigError {
          [snapshotter.containerd].address and [snapshotter].profile explicitly."
     )]
     NoContainerdSocket,
+    #[error(
+        "[backends.localfs] is configured but the localfs backend is reserved for the \
+         internal node-local acceleration (auto-accel) sidecar path and is not a pull \
+         backend the in-process daemon honours. Use [backends.registry], [backends.s3], \
+         [backends.oss], or [backends.http_proxy], or remove this section."
+    )]
+    LocalFsNotAPullBackend,
+    #[error(
+        "multiple pull backends are configured ({configured}); exactly one of \
+         [backends.registry], [backends.s3], [backends.oss], [backends.http_proxy] may \
+         drive the daemon. Remove the extra section(s)."
+    )]
+    MultiplePullBackends { configured: String },
 }
 
 /// Daemon lifecycle configuration.
@@ -878,6 +891,60 @@ pub struct BackendsConfig {
     pub http_proxy: Option<HttpProxyBackendConfig>,
 }
 
+impl BackendsConfig {
+    /// The `type` strings of the configured pull backends, in a stable order.
+    /// Everything except `localfs` (which is reserved for the auto-accel
+    /// sidecar path — see [`crate::daemon::config_builder`]). An empty result
+    /// means "no explicit pull backend": the daemon defaults to the image's
+    /// own registry.
+    pub fn pull_backends(&self) -> Vec<&'static str> {
+        let mut kinds = Vec::new();
+        if self.registry.is_some() {
+            kinds.push("registry");
+        }
+        if self.s3.is_some() {
+            kinds.push("s3");
+        }
+        if self.oss.is_some() {
+            kinds.push("oss");
+        }
+        if self.http_proxy.is_some() {
+            kinds.push("http-proxy");
+        }
+        kinds
+    }
+
+    /// Reject backend configurations the in-process daemon cannot honour,
+    /// turning what used to be a silent no-op into an actionable startup error:
+    ///
+    /// - `[backends.localfs]` is reserved for the auto-accel sidecar path and is
+    ///   never wired into the pull path, so a stray section is rejected rather
+    ///   than ignored.
+    /// - At most one pull backend (registry / s3 / oss / http-proxy) may drive
+    ///   the daemon; more than one is ambiguous.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.localfs.is_some() {
+            return Err(ConfigError::LocalFsNotAPullBackend);
+        }
+        let pulls = self.pull_backends();
+        if pulls.len() > 1 {
+            return Err(ConfigError::MultiplePullBackends {
+                configured: pulls.join(", "),
+            });
+        }
+        Ok(())
+    }
+}
+
+impl SnapshotterConfig {
+    /// Validate the parsed configuration after [`Self::resolve_profile`].
+    /// Currently checks the `[backends.*]` selection; extend as new
+    /// cross-section invariants appear.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        self.backends.validate()
+    }
+}
+
 /// Registry backend configuration.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct RegistryBackendConfig {
@@ -912,6 +979,14 @@ pub struct S3BackendConfig {
 pub struct OssBackendConfig {
     pub endpoint: String,
     pub bucket: String,
+    /// Name of the environment variable holding the OSS access-key id.
+    /// Empty (the default) means anonymous / public-bucket access — the
+    /// resolved credential is left blank. Mirrors [`S3BackendConfig`].
+    #[serde(default)]
+    pub access_key_env: String,
+    /// Name of the environment variable holding the OSS access-key secret.
+    #[serde(default)]
+    pub secret_key_env: String,
 }
 
 /// Local filesystem backend configuration.
@@ -1448,6 +1523,82 @@ query_template = ""
             config.snapshotter.peer_mirror.artifact_query("docker.io"),
             None
         );
+    }
+
+    // ── B3: backend selection validation ───────────────────────────────
+
+    #[test]
+    fn validate_rejects_orphan_localfs_backend() {
+        let toml_str = r#"
+[snapshotter]
+
+[backends.localfs]
+dir = "/var/lib/blobs"
+"#;
+        let config: SnapshotterConfig = toml::from_str(toml_str).expect("parse");
+        let err = config.validate().expect_err("localfs must be rejected");
+        assert!(matches!(err, ConfigError::LocalFsNotAPullBackend));
+    }
+
+    #[test]
+    fn validate_rejects_multiple_pull_backends() {
+        let toml_str = r#"
+[snapshotter]
+
+[backends.registry]
+skip_verify = true
+
+[backends.s3]
+endpoint = "https://s3.example.com"
+region = "us-east-1"
+bucket = "b"
+access_key_env = "AK"
+secret_key_env = "SK"
+"#;
+        let config: SnapshotterConfig = toml::from_str(toml_str).expect("parse");
+        let err = config
+            .validate()
+            .expect_err("registry + s3 must be ambiguous");
+        match err {
+            ConfigError::MultiplePullBackends { configured } => {
+                assert!(configured.contains("registry"));
+                assert!(configured.contains("s3"));
+            }
+            other => panic!("expected MultiplePullBackends, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_accepts_single_s3_backend() {
+        let toml_str = r#"
+[snapshotter]
+
+[backends.s3]
+endpoint = "https://s3.example.com"
+region = "us-east-1"
+bucket = "b"
+access_key_env = "AK"
+secret_key_env = "SK"
+"#;
+        let config: SnapshotterConfig = toml::from_str(toml_str).expect("parse");
+        config.validate().expect("single s3 backend is valid");
+        assert_eq!(config.backends.pull_backends(), vec!["s3"]);
+    }
+
+    #[test]
+    fn validate_accepts_empty_and_registry_only_backends() {
+        // Default (no backends) and registry-only both validate.
+        SnapshotterConfig::default()
+            .validate()
+            .expect("empty backends valid");
+        let toml_str = r#"
+[snapshotter]
+
+[backends.registry]
+skip_verify = true
+"#;
+        let config: SnapshotterConfig = toml::from_str(toml_str).expect("parse");
+        config.validate().expect("registry-only valid");
     }
 
     #[test]
