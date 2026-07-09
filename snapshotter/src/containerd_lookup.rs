@@ -710,10 +710,9 @@ fn manifest_info_via_cli(image_ref: &str, content_root: &std::path::Path) -> Res
                 break;
             }
         }
-        if matched_manifest.is_none() {
+        let Some(manifest_digest) = matched_manifest else {
             continue;
-        }
-        let manifest_digest = matched_manifest.unwrap();
+        };
         let (final_digest, gzip_layers) =
             resolve_gzip_layers_via_cli(&manifest_digest, content_root)?;
         return Ok(ManifestInfo {

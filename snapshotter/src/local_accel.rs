@@ -22,7 +22,7 @@
 //! The resulting `(bootstrap, backend_dir, work_dir)` feeds a fanotify `BlobCacheEntry`; the
 //! `FanotifyHandler` self-stages the EROFS device files and serves reads on demand.
 
-use std::ffi::{OsStr, OsString};
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -444,14 +444,10 @@ fn symlink_force(target: &Path, link: &Path) -> Result<()> {
     }
 }
 
-#[allow(dead_code)]
-fn os_str(s: &str) -> &OsStr {
-    OsStr::new(s)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsStr;
 
     #[test]
     fn blob_id_strips_algorithm_prefix() {
