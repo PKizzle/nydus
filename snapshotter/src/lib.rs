@@ -50,11 +50,11 @@ pub mod nri;
 pub mod nri_ttrpc;
 pub mod overlay;
 pub mod page_cache;
+pub mod peer_mirror;
 pub mod prefetch_profile;
 pub mod probe;
 pub mod recon;
 pub mod source;
-pub mod spegel;
 pub mod store;
 pub mod sysctl;
 

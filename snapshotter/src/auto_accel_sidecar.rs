@@ -8,15 +8,15 @@
 //! OCI image, [`SidecarLocator::resolve_or_pull`] asks containerd's content
 //! store whether an auto-accel manifest exists for the image's manifest
 //! digest. If one is mirrored locally (either because this node produced it
-//! or because a peer's spegel mirror served it), [`SidecarLocator::stage`]
+//! or because a peer's peer mirror served it), [`SidecarLocator::stage`]
 //! symlinks the gzip layers + per-layer zran indexes + optional prefetch
 //! blob into a fresh `backend/` directory and copies the merged bootstrap
 //! into a `stage/` directory. The result feeds straight into
 //! `DaemonSupervisor::ensure_instance_local`.
 //!
 //! The HTTP transport (endpoint failover, peer discovery, mTLS) lives in
-//! [`crate::spegel`]; this module owns the pull *protocol* — which paths to
-//! fetch, how to label what lands in the content store, and when to fall
+//! [`crate::peer_mirror`]; this module owns the pull *protocol* — which paths
+//! to fetch, how to label what lands in the content store, and when to fall
 //! back to the label-filter scan.
 
 use std::collections::HashMap;
@@ -36,9 +36,9 @@ use crate::auto_accel_oci::{
 // the import there rather than at the file top so a stale prod-side rename
 // doesn't fail the build only in test mode.
 use crate::auto_zran::AutoAccelManifest;
-use crate::config::SpegelMirrorConfig;
+use crate::config::PeerMirrorConfig;
 use crate::content_store::{ContentInfo, ContentStoreClient};
-use crate::spegel::{FetchResult, PullOutcome, SpegelMirror, build_spegel_mirror};
+use crate::peer_mirror::{FetchResult, PeerMirror, PullOutcome, build_peer_mirror};
 
 const LABEL_ROLE: &str = "containerd.io/snapshot/nydus.auto-accel.role";
 const LABEL_SUBJECT: &str = "containerd.io/gc.ref.content.subject";
@@ -46,7 +46,7 @@ const LABEL_DISTRIBUTION_SOURCE: &str = "containerd.io/distribution.source.nydus
 
 /// Accept header used on every manifest GET. We accept both the OCI media
 /// type our producer emits and the docker v2 manifest media type so a
-/// spegel that's been asked to fall back to upstream (or that's serving a
+/// mirror that's been asked to fall back to upstream (or that's serving a
 /// manifest we converted with a docker media type for any reason) still
 /// returns the body rather than 406.
 const ACCEPT_MANIFEST: &str = concat!(
@@ -75,52 +75,52 @@ pub struct SidecarLocator {
     /// Snapshotter root joined with `"auto-accel"`; per-image scratch dirs
     /// hang off this.
     stage_root: PathBuf,
-    /// Spegel mirror transport. `None` when the mirror is disabled by
+    /// Peer mirror transport. `None` when the mirror is disabled by
     /// config, or when the configured TLS material doesn't exist on disk
-    /// at startup. When `None`, `spegel_pull` is a no-op returning
+    /// at startup. When `None`, `peer_pull` is a no-op returning
     /// `PullOutcome::Disabled` so the locator falls through to the
     /// label-filter scan.
-    spegel: Option<Arc<SpegelMirror>>,
+    peer_mirror: Option<Arc<PeerMirror>>,
 }
 
 impl SidecarLocator {
     pub fn new(
         content_store: ContentStoreClient,
         snapshotter_root: &Path,
-        spegel_config: &SpegelMirrorConfig,
+        peer_mirror_config: &PeerMirrorConfig,
     ) -> Self {
-        let spegel = match build_spegel_mirror(spegel_config) {
+        let peer_mirror = match build_peer_mirror(peer_mirror_config) {
             Ok(mirror) => mirror,
             Err(e) => {
                 warn!(
                     error = ?e,
-                    "spegel mirror setup failed; cross-node auto-accel discovery disabled"
+                    "peer mirror setup failed; cross-node auto-accel discovery disabled"
                 );
                 None
             }
         };
-        if spegel.is_none() && spegel_config.enable {
+        if peer_mirror.is_none() && peer_mirror_config.is_enabled() {
             warn!(
-                endpoint = %spegel_config.endpoint,
-                ca = %spegel_config.ca_path.display(),
-                "spegel mirror enabled in config but client could not be constructed; \
+                endpoint = %peer_mirror_config.endpoint(),
+                ca = ?peer_mirror_config.ca_path(),
+                "peer mirror enabled in config but client could not be constructed; \
                  cross-node auto-accel discovery disabled"
             );
         }
         Self {
             content_store,
             stage_root: snapshotter_root.join("auto-accel"),
-            spegel,
+            peer_mirror,
         }
     }
 
     /// Resolve an auto-accel manifest for `manifest_digest`, pulling it
-    /// from a peer via spegel when not already local. Tries in order:
+    /// from a peer via the peer mirror when not already local. Tries in order:
     ///
     /// 1. Local `images.Get(synthetic-ref)` — hit on the producer node and
     ///    on any peer that already pulled this sidecar.
-    /// 2. Direct HTTPS GET against the local spegel mirror, then every
-    ///    discovered/configured peer mirror (see [`crate::spegel`] for the
+    /// 2. Direct HTTPS GET against the local peer mirror, then every
+    ///    discovered/configured peer mirror (see [`crate::peer_mirror`] for the
     ///    failover semantics). On a hit, the OCI manifest + its config +
     ///    every layer (bootstrap, zran indexes, prefetch blob) land in the
     ///    local content store and the Image record is registered. A
@@ -149,12 +149,12 @@ impl SidecarLocator {
             });
 
         if resolved.is_none() {
-            // Drive a direct HTTPS pull through spegel. If any mirror has
+            // Drive a direct HTTPS pull through the peer mirror. If any mirror has
             // the image record, this brings everything down in one
             // transfer.
-            match self.spegel_pull(manifest_digest, &image_name).await {
+            match self.peer_pull(manifest_digest, &image_name).await {
                 PullOutcome::Ok => {
-                    info!(image_name = %image_name, "auto-accel pulled via spegel mirror");
+                    info!(image_name = %image_name, "auto-accel pulled via peer mirror");
                     resolved = self
                         .content_store
                         .images_get(&image_name)
@@ -169,17 +169,17 @@ impl SidecarLocator {
                 }
                 PullOutcome::RegistryError { status, body } => {
                     // Real configuration failure — surface loudly. Without
-                    // this every pod on a misconfigured-spegel node would
+                    // this every pod on a misconfigured-mirror node would
                     // silently degrade to overlay forever.
                     warn!(
                         image_name = %image_name,
                         status,
                         body = %body,
-                        "auto-accel pull failed: registry/mirror error (spegel mTLS, auth, daemon down?). Cross-node discovery degraded until fixed."
+                        "auto-accel pull failed: registry/mirror error (peer mirror mTLS, auth, daemon down?). Cross-node discovery degraded until fixed."
                     );
                 }
                 PullOutcome::Disabled => {
-                    debug!(image_name = %image_name, "spegel mirror disabled or unconfigured; cross-node discovery skipped");
+                    debug!(image_name = %image_name, "peer mirror disabled or unconfigured; cross-node discovery skipped");
                 }
             }
         }
@@ -316,11 +316,11 @@ impl SidecarLocator {
     }
 
     /// Pull the auto-accel sidecar manifest + every referenced blob from
-    /// the spegel mirrors. Returns `PullOutcome::Disabled` when the
+    /// the peer mirrors. Returns `PullOutcome::Disabled` when the
     /// mirror isn't configured (silent fallback to overlay), otherwise
     /// maps the HTTP responses into one of the four outcomes.
-    async fn spegel_pull(&self, manifest_digest: &str, synthetic_ref: &str) -> PullOutcome {
-        let Some(spegel) = self.spegel.as_ref() else {
+    async fn peer_pull(&self, manifest_digest: &str, synthetic_ref: &str) -> PullOutcome {
+        let Some(mirror) = self.peer_mirror.as_ref() else {
             return PullOutcome::Disabled;
         };
 
@@ -334,9 +334,14 @@ impl SidecarLocator {
             }
         };
 
-        // 1. Manifest fetch (`?ns=` is the load-bearing query parameter).
-        let manifest_path = format!("/v2/{}/manifests/{}?ns={}", repo, tag, host);
-        let manifest_bytes = match spegel.fetch(&manifest_path, Some(ACCEPT_MANIFEST)).await {
+        // 1. Manifest fetch. The mirror's query template supplies the
+        //    load-bearing query parameter (Spegel's `?ns=<registry>`); an
+        //    empty template yields no query string.
+        let manifest_path = with_query(
+            &format!("/v2/{repo}/manifests/{tag}"),
+            &mirror.artifact_query(&host),
+        );
+        let manifest_bytes = match mirror.fetch(&manifest_path, Some(ACCEPT_MANIFEST)).await {
             FetchResult::Ok(b) => b,
             FetchResult::Outcome(o) => return o,
             FetchResult::NotFound => return PullOutcome::NotFound,
@@ -359,7 +364,7 @@ impl SidecarLocator {
             Err(e) => {
                 return PullOutcome::RegistryError {
                     status: 0,
-                    body: format!("parse oci manifest pulled from spegel: {e}"),
+                    body: format!("parse oci manifest pulled from the peer mirror: {e}"),
                 };
             }
         };
@@ -379,7 +384,7 @@ impl SidecarLocator {
             .write_bytes(
                 &manifest_bytes,
                 &format!(
-                    "nydus-auto-accel-spegel-manifest:{}",
+                    "nydus-auto-accel-peer-manifest:{}",
                     strip_sha256(manifest_digest)
                 ),
                 subject_labels,
@@ -397,8 +402,8 @@ impl SidecarLocator {
 
         // 2a. Config blob.
         if let Err(o) = self
-            .spegel_pull_blob(
-                spegel,
+            .peer_pull_blob(
+                mirror,
                 manifest_digest,
                 &host,
                 &repo,
@@ -420,8 +425,8 @@ impl SidecarLocator {
                 .get(AUTO_ACCEL_LAYER_DIGEST_ANNOTATION)
                 .cloned();
             if let Err(o) = self
-                .spegel_pull_blob(
-                    spegel,
+                .peer_pull_blob(
+                    mirror,
                     manifest_digest,
                     &host,
                     &repo,
@@ -455,20 +460,20 @@ impl SidecarLocator {
             warn!(
                 image_name = %synthetic_ref,
                 error = ?e,
-                "spegel pull wrote blobs but Image record registration failed"
+                "peer mirror pull wrote blobs but Image record registration failed"
             );
         }
 
         PullOutcome::Ok
     }
 
-    /// Pull one blob by digest via spegel and write it into the local
-    /// content store with the right role + layer-digest labels. Returns
+    /// Pull one blob by digest via the peer mirror and write it into the
+    /// local content store with the right role + layer-digest labels. Returns
     /// `Ok(())` on success or the `PullOutcome` to propagate on failure.
     #[allow(clippy::too_many_arguments)]
-    async fn spegel_pull_blob(
+    async fn peer_pull_blob(
         &self,
-        spegel: &Arc<SpegelMirror>,
+        mirror: &Arc<PeerMirror>,
         manifest_digest: &str,
         host: &str,
         repo: &str,
@@ -477,8 +482,11 @@ impl SidecarLocator {
         synthetic_ref: &str,
         layer_digest: Option<String>,
     ) -> std::result::Result<(), PullOutcome> {
-        let path = format!("/v2/{}/blobs/{}?ns={}", repo, blob_digest, host);
-        let bytes = match spegel.fetch(&path, None).await {
+        let path = with_query(
+            &format!("/v2/{repo}/blobs/{blob_digest}"),
+            &mirror.artifact_query(host),
+        );
+        let bytes = match mirror.fetch(&path, None).await {
             FetchResult::Ok(b) => b,
             FetchResult::Outcome(o) => return Err(o),
             FetchResult::NotFound => return Err(PullOutcome::NotFound),
@@ -491,7 +499,7 @@ impl SidecarLocator {
             .write_bytes(
                 &bytes,
                 &format!(
-                    "nydus-auto-accel-spegel-{}:{}",
+                    "nydus-auto-accel-peer-{}:{}",
                     role,
                     strip_sha256(blob_digest)
                 ),
@@ -526,7 +534,7 @@ fn pick_latest_manifest(blobs: &[ContentInfo]) -> Option<&ContentInfo> {
 fn ensure_present(path: &Path, kind: &str) -> Result<()> {
     if !path.is_file() {
         return Err(anyhow!(
-            "{kind} {} missing from content store (spegel cache miss?)",
+            "{kind} {} missing from content store (peer mirror cache miss?)",
             path.display()
         ));
     }
@@ -568,7 +576,7 @@ fn role_for_media_type(media_type: &str) -> &'static str {
 
 /// Build the label set the local content store expects for a pulled
 /// blob. Mirrors the producer side so an `images_get` after a
-/// spegel-pulled blob hands back the same shape a locally-converted blob
+/// peer-mirror-pulled blob hands back the same shape a locally-converted blob
 /// would.
 fn labels_for_role(
     manifest_digest: &str,
@@ -621,7 +629,7 @@ fn manifest_blob_labels(
 }
 
 /// Labels stamped on the Image record itself. The producer uses the same
-/// shape — keep it identical so an `images_get` after a spegel-pulled
+/// shape — keep it identical so an `images_get` after a peer-mirror-pulled
 /// record returns the same labels callers expect.
 fn image_record_labels(manifest_digest: &str) -> HashMap<String, String> {
     let mut m = HashMap::new();
@@ -631,9 +639,20 @@ fn image_record_labels(manifest_digest: &str) -> HashMap<String, String> {
     m
 }
 
+/// Append a peer-mirror query string to a `/v2/...` path. `None` (empty
+/// query template) yields the bare path; `Some(q)` yields `<path>?<q>`.
+/// The query is the mirror's [`PeerMirror::artifact_query`] output — for the
+/// Spegel presets that is the load-bearing `ns=<registry>`.
+fn with_query(path: &str, query: &Option<String>) -> String {
+    match query {
+        Some(q) => format!("{path}?{q}"),
+        None => path.to_string(),
+    }
+}
+
 /// Split a synthetic ref `<host>/<repo>:<tag>` into its three components.
 /// Returns `None` for any shape we can't parse — that surfaces as a
-/// `RegistryError { status: 0, ... }` in `spegel_pull`.
+/// `RegistryError { status: 0, ... }` in `peer_pull`.
 fn split_synthetic_ref(synthetic_ref: &str) -> Option<(String, String, String)> {
     let (host_and_repo, tag) = synthetic_ref.rsplit_once(':')?;
     let (host, repo) = host_and_repo.split_once('/')?;
@@ -664,13 +683,13 @@ impl AutoAccelDiscovery {
     pub fn new(
         content_store: ContentStoreClient,
         snapshotter_root: &Path,
-        spegel_config: &SpegelMirrorConfig,
+        peer_mirror_config: &PeerMirrorConfig,
     ) -> Self {
         Self {
             locator: Arc::new(SidecarLocator::new(
                 content_store,
                 snapshotter_root,
-                spegel_config,
+                peer_mirror_config,
             )),
         }
     }
@@ -755,7 +774,7 @@ mod tests {
     }
 
     /// `role_for_media_type` is the mediaType → role translation the
-    /// consumer uses when stamping labels on a spegel-pulled blob. Keep
+    /// consumer uses when stamping labels on a peer-mirror-pulled blob. Keep
     /// it pinned so a producer-side mediaType rename fails here, not at
     /// runtime when the wrong label lands on a blob.
     #[test]
@@ -783,7 +802,7 @@ mod tests {
 
     /// The GC-edge labels on the manifest blob are what keep the config
     /// and layer blobs alive across containerd GC passes. A missing edge
-    /// here resurfaces as a spegel 404 for a referenced blob on every
+    /// here resurfaces as a peer-mirror 404 for a referenced blob on every
     /// consumer node — pin the full shape.
     #[test]
     fn manifest_blob_labels_carry_gc_edges_for_all_references() {

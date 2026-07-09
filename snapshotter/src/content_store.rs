@@ -132,9 +132,9 @@ impl ContentStoreClient {
         let handle = rt.handle().clone();
         Ok(Self {
             inner: Arc::new(Inner {
-                socket: config.address.clone(),
+                socket: config.address(),
                 namespace: config.namespace.clone(),
-                content_root: config.content_root.clone(),
+                content_root: config.content_root(),
                 rt: Some(rt),
                 handle,
             }),
@@ -641,7 +641,9 @@ mod tests {
     #[test]
     fn blob_path_strips_sha256_prefix() {
         let cfg = ContainerdConfig {
-            content_root: PathBuf::from("/var/lib/containerd/io.containerd.content.v1.content"),
+            content_root: Some(PathBuf::from(
+                "/var/lib/containerd/io.containerd.content.v1.content",
+            )),
             ..Default::default()
         };
         let client = ContentStoreClient::new(&cfg).unwrap();

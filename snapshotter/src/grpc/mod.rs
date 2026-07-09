@@ -962,7 +962,7 @@ pub async fn serve_with_supervisor(
             let discovery = crate::auto_accel_sidecar::AutoAccelDiscovery::new(
                 content_store,
                 &config.snapshotter.root,
-                &config.snapshotter.spegel_mirror,
+                &config.snapshotter.peer_mirror,
             );
             (auto_zran, Some(discovery), Some(containerd_lookup))
         } else {
@@ -1034,7 +1034,7 @@ pub async fn serve_with_supervisor(
         auto_accel_discovery,
         containerd_lookup: containerd_lookup_for_discovery,
         containerd_content_root: if config.snapshotter.auto_zran.enable {
-            Some(config.snapshotter.containerd.content_root.clone())
+            Some(config.snapshotter.containerd.content_root())
         } else {
             None
         },

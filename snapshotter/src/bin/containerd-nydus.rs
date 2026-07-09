@@ -103,6 +103,39 @@ async fn main() -> Result<()> {
         config.snapshotter.root = std::path::PathBuf::from(root);
     }
 
+    // Resolve the deployment profile (auto/k3s/containerd) IN MEMORY: fills any
+    // profile- or preset-sensitive field the operator left unset (containerd
+    // socket + content root, peer-mirror preset + endpoint + cert paths).
+    // Explicit TOML values always win. Runs after CLI overrides and before the
+    // driver probe / DaemonSupervisor. Never writes config files.
+    let resolved_profile = match config.resolve_profile() {
+        Ok(rp) => rp,
+        Err(e) => anyhow::bail!("profile resolution failed: {e}"),
+    };
+    info!(
+        profile = ?resolved_profile.profile,
+        reason = %resolved_profile.reason,
+        containerd_socket = %config.snapshotter.containerd.address().display(),
+        content_root = %config.snapshotter.containerd.content_root().display(),
+        peer_mirror_preset = ?config.snapshotter.peer_mirror.preset,
+        "resolved deployment profile"
+    );
+
+    // Fail fast with an actionable message if auto_zran is on but the resolved
+    // containerd socket is missing — otherwise this surfaces as a late,
+    // opaque gRPC connect error deep in the conversion path.
+    if config.snapshotter.auto_zran.enable {
+        let sock = config.snapshotter.containerd.address();
+        if !sock.exists() {
+            anyhow::bail!(
+                "auto_zran is enabled but the containerd socket {} does not exist. \
+                 Start containerd/k3s, or fix [snapshotter.containerd].address / \
+                 [snapshotter].profile.",
+                sock.display()
+            );
+        }
+    }
+
     // Probe filesystem drivers and promote the selected one to the front of
     // `fs_drivers` — same call convention as `grpc::serve` (grpc/mod.rs)
     // — so the config we hand to `DaemonSupervisor` and `serve_with_supervisor`

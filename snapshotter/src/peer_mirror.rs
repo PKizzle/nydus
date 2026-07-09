@@ -2,22 +2,33 @@
 //
 // SPDX-License-Identifier: (Apache-2.0 AND BSD-3-Clause)
 
-//! HTTP client for k3s' embedded spegel registry mirror, with automatic
-//! peer discovery.
+//! HTTP client for a peer registry mirror, with optional automatic peer
+//! discovery. k3s' embedded Spegel is the reference implementation (the
+//! `k3s-spegel` preset); the transport here is mirror-agnostic.
 //!
-//! The auto-accel consumer pulls sidecar artifacts through spegel's
-//! distribution endpoint (`/v2/...?ns=<registry>` — the `ns` query
-//! parameter is load-bearing; without it spegel's distribution.go parser
-//! 404s every path). Spegel's own cross-node routing relies on a libp2p
-//! DHT whose provider-address records rot on long-lived clusters (the
-//! k3s-bundled spegel v0.7.x serves "could not find peer" /
-//! "empty list of address ports" for content that peers demonstrably
-//! hold), so this module bypasses libp2p entirely: it discovers the
-//! cluster's node IPs from the Kubernetes API — using the same mTLS
-//! identity the mirror endpoint already requires — and walks each peer's
-//! mirror endpoint directly.
+//! The auto-accel consumer pulls sidecar artifacts through the mirror's
+//! distribution endpoint (`/v2/...` plus the preset's query template — for
+//! Spegel that is the load-bearing `?ns=<registry>` parameter, without which
+//! Spegel's distribution.go parser 404s every path).
 //!
-//! Failover semantics live in [`SpegelMirror::fetch`]: primary (local
+//! ## Kubernetes peer discovery (documented workaround)
+//!
+//! `peer_discovery = kubernetes` bypasses the mirror's own libp2p routing:
+//! it discovers the cluster's node IPs from the Kubernetes API — using the
+//! same mTLS identity the mirror endpoint already requires — and walks each
+//! peer's mirror endpoint directly. This routes around provider-record rot
+//! observed on THIS cluster with the k3s-bundled **Spegel v0.4.0-k3s3** DHT
+//! ("could not find peer" / "empty list of address ports" for content that
+//! peers demonstrably hold). The cluster now runs **v0.7.1-k3s1**; whether
+//! native DHT routing is fixed there is unverified (the D4 exit test is
+//! pending). This whole node-fan-out path is a workaround for upstream
+//! Spegel DHT rot — delete it once the D4 exit test confirms native routing
+//! works, and default `peer_discovery` back to `off`.
+//!
+//! Only the `k3s-spegel` preset defaults to `kubernetes`; every other preset
+//! defaults to `off` (local-mirror-only), the general topology.
+//!
+//! Failover semantics live in [`PeerMirror::fetch`]: primary (local
 //! mirror) first, then discovered + static peers in rotated order, a
 //! short per-request timeout, and a cooldown that skips peers that
 //! recently failed at the transport layer.
@@ -43,14 +54,14 @@ use http::header::ACCEPT;
 use serde::Deserialize;
 use tracing::{debug, info, warn};
 
-use crate::config::{PeerDiscoveryMode, SpegelMirrorConfig};
+use crate::config::{PeerDiscoveryMode, PeerMirrorConfig};
 
 /// How long a peer that failed at the transport layer (refused, TLS
 /// error, timeout) is skipped before we try it again. Keeps a dead node
 /// from adding its full request timeout to every sidecar pull.
 const PEER_COOLDOWN: Duration = Duration::from_secs(60);
 
-/// Categorised outcome of a spegel pull attempt for the synthetic
+/// Categorised outcome of a Spegel pull attempt for the synthetic
 /// auto-accel ref. Discovery treats `NotFound` as a clean miss (no peer
 /// has the sidecar — fall back to overlay) but logs `RegistryError` at
 /// `warn!` so a broken mirror or stale mTLS doesn't silently disable
@@ -65,17 +76,17 @@ pub enum PullOutcome {
     NotFound,
     /// A non-success, non-404 status (401/403/5xx etc), or a
     /// transport-layer failure prevented the request from completing.
-    /// `status: 0` means the request never reached spegel (transport,
+    /// `status: 0` means the request never reached Spegel (transport,
     /// TLS, malformed ref, write-to-content-store failure, etc.).
     RegistryError { status: u16, body: String },
     /// Mirror is disabled by config, or the TLS material doesn't exist
     /// on disk. Quiet fallback — the locator falls through to its
     /// label-filter scan and the node behaves exactly as it did before
-    /// the spegel-pull path landed.
+    /// the Spegel-pull path landed.
     Disabled,
 }
 
-/// Intermediate result for one spegel GET (manifest or blob).
+/// Intermediate result for one Spegel GET (manifest or blob).
 pub enum FetchResult {
     Ok(Vec<u8>),
     NotFound,
@@ -114,17 +125,17 @@ thread_local! {
     /// `Runtime::current()` at client-build time and a `block_on` to run
     /// requests, so each blocking thread gets its own.
     static HTTP_RUNTIME: compio::runtime::Runtime = compio::runtime::Runtime::new()
-        .expect("spegel: failed to create compio HTTP runtime");
+        .expect("peer mirror: failed to create compio HTTP runtime");
 
     /// Per-thread cyper client cache, keyed by [`ClientKey`]. A fresh
     /// `cyper::Client` builds a rustls TLS config *and* a connection
-    /// pool; a multi-blob sidecar pull calls [`SpegelMirror::fetch`]
+    /// pool; a multi-blob sidecar pull calls [`PeerMirror::fetch`]
     /// (and `NodeDiscovery::fetch_nodes`) dozens of times in a row on
     /// the same blocking thread, so rebuilding per call was dozens of
     /// redundant TLS handshakes and pool setups. `cached_client`
     /// rebuilds only when the key changes (i.e. never in practice,
-    /// since `SpegelMirror` builds its `Arc<rustls::ClientConfig>` once
-    /// in [`build_spegel_mirror`] and holds it for its lifetime).
+    /// since `PeerMirror` builds its `Arc<rustls::ClientConfig>` once
+    /// in [`build_peer_mirror`] and holds it for its lifetime).
     static HTTP_CLIENT: RefCell<Option<(ClientKey, cyper::Client)>> = const { RefCell::new(None) };
 }
 
@@ -143,10 +154,10 @@ fn block_on_http<F: std::future::Future>(fut: F) -> F::Output {
 /// Identity key for the per-thread [`HTTP_CLIENT`] cache: which rustls
 /// `ClientConfig` — or "no TLS" — a cached client was built from. The
 /// `Arc<rustls::ClientConfig>` is constructed once in
-/// [`build_spegel_mirror`] and held for the mirror's lifetime (mirrored
+/// [`build_peer_mirror`] and held for the mirror's lifetime (mirrored
 /// into `NodeDiscovery`), so its identity is stable to key on; a `Client`
 /// is only ever rebuilt if that identity changes (e.g. a mirror
-/// reconfiguration, or a test constructing a second `SpegelMirror` on the
+/// reconfiguration, or a test constructing a second `PeerMirror` on the
 /// same thread).
 ///
 /// The `Tls` variant stores the `Arc` itself, not an erased pointer: the
@@ -192,7 +203,9 @@ fn build_client(tls: Option<Arc<rustls::ClientConfig>>) -> Result<cyper::Client>
         Some(tls) => builder.use_rustls(tls),
         None => builder,
     };
-    builder.build().context("build cyper client for spegel")
+    builder
+        .build()
+        .context("build cyper client for peer mirror")
 }
 
 /// Get-or-build the cyper client for the current blocking thread's
@@ -216,16 +229,19 @@ fn cached_client(tls: Option<Arc<rustls::ClientConfig>>) -> Result<cyper::Client
     })
 }
 
-/// k3s embedded spegel mirror with automatic peer discovery and
-/// failover. Cheap to clone via `Arc` by callers; internally all state
-/// is `Send + Sync`.
-pub struct SpegelMirror {
+/// Peer registry mirror (k3s' embedded Spegel is the reference preset) with
+/// optional automatic peer discovery and failover. Cheap to clone via `Arc`
+/// by callers; internally all state is `Send + Sync`.
+pub struct PeerMirror {
     /// `None` for plain-HTTP endpoints (tests, non-TLS mirrors); mTLS
     /// material for the k3s supervisor port otherwise.
     tls: Option<Arc<rustls::ClientConfig>>,
     /// The local mirror — always tried first so single-node clusters
     /// keep the cheap local hit and never touch the network.
     primary: String,
+    /// Query-parameter template appended to every `/v2/...` request (the
+    /// Spegel `?ns={registry}` quirk as data). Empty ⇒ no query parameter.
+    query_template: String,
     /// Operator-pinned peer endpoints from config. Tried after
     /// discovered peers; kept for clusters without API access or for
     /// pinning an order in tests.
@@ -244,7 +260,15 @@ pub struct SpegelMirror {
     cooldown: Mutex<HashMap<String, Instant>>,
 }
 
-impl SpegelMirror {
+impl PeerMirror {
+    /// Expand this mirror's query template for `registry_host`. Returns
+    /// `None` when the template is empty (no query parameter appended),
+    /// else the template with `{registry}` substituted. For the Spegel
+    /// presets this yields `ns=<registry>`.
+    pub fn artifact_query(&self, registry_host: &str) -> Option<String> {
+        crate::config::expand_query_template(&self.query_template, registry_host)
+    }
+
     /// Assemble the endpoint list for one fetch: primary, then
     /// discovered peers (rotated), then static peers; deduped, with
     /// cooled-down peers skipped (unless that would leave only the
@@ -273,7 +297,7 @@ impl SpegelMirror {
             if let Some(failed_at) = cooldown.get(&peer)
                 && now.duration_since(*failed_at) < PEER_COOLDOWN
             {
-                debug!(peer = %peer, "spegel: skipping cooled-down peer");
+                debug!(peer = %peer, "peer mirror: skipping cooled-down peer");
                 continue;
             }
             endpoints.push(peer);
@@ -334,14 +358,14 @@ impl SpegelMirror {
                 let mut last_outcome: Option<FetchResult> = None;
                 for endpoint in &endpoints {
                     let url = format!("{endpoint}{path}");
-                    debug!(target: "nydus_snapshotter::spegel", url = %url, "spegel attempt");
+                    debug!(target: "nydus_snapshotter::peer_mirror", url = %url, "peer mirror attempt");
                     let req_builder = match client.get(&url) {
                         Ok(r) => r,
                         Err(e) => {
-                            debug!(target: "nydus_snapshotter::spegel", url = %url, error = %e, "spegel: invalid URL");
+                            debug!(target: "nydus_snapshotter::peer_mirror", url = %url, error = %e, "peer mirror: invalid URL");
                             last_outcome = Some(FetchResult::Outcome(PullOutcome::RegistryError {
                                 status: 0,
-                                body: format!("invalid spegel URL {url}: {e}"),
+                                body: format!("invalid peer mirror URL {url}: {e}"),
                             }));
                             continue;
                         }
@@ -365,7 +389,7 @@ impl SpegelMirror {
                         match compio::time::timeout(this.request_timeout, req.send()).await {
                             Ok(Ok(r)) => r,
                             Ok(Err(e)) => {
-                                debug!(target: "nydus_snapshotter::spegel", url = %url, error = %e, "spegel: transport error");
+                                debug!(target: "nydus_snapshotter::peer_mirror", url = %url, error = %e, "peer mirror: transport error");
                                 this.mark_peer_failed(endpoint);
                                 last_outcome =
                                     Some(FetchResult::Outcome(PullOutcome::RegistryError {
@@ -375,18 +399,18 @@ impl SpegelMirror {
                                 continue;
                             }
                             Err(_) => {
-                                debug!(target: "nydus_snapshotter::spegel", url = %url, "spegel: request timeout");
+                                debug!(target: "nydus_snapshotter::peer_mirror", url = %url, "peer mirror: request timeout");
                                 this.mark_peer_failed(endpoint);
                                 last_outcome =
                                     Some(FetchResult::Outcome(PullOutcome::RegistryError {
                                         status: 0,
-                                        body: format!("spegel request timed out for {url}"),
+                                        body: format!("peer mirror request timed out for {url}"),
                                     }));
                                 continue;
                             }
                         };
                     let status = response.status();
-                    debug!(target: "nydus_snapshotter::spegel", url = %url, status = %status, "spegel: response");
+                    debug!(target: "nydus_snapshotter::peer_mirror", url = %url, status = %status, "peer mirror: response");
                     match http_status_to_outcome(status.as_u16()) {
                         StatusOutcome::Ok => match response.bytes().await {
                             Ok(b) => return FetchResult::Ok(b.to_vec()),
@@ -448,7 +472,7 @@ struct DiscoveryCache {
 impl NodeDiscovery {
     /// Cached peer list. Never blocks on the network — staleness is
     /// handled by [`refresh_if_stale`](Self::refresh_if_stale), which
-    /// `SpegelMirror::fetch` runs on its blocking thread before
+    /// `PeerMirror::fetch` runs on its blocking thread before
     /// assembling endpoints.
     fn peers(&self) -> Vec<String> {
         self.cache
@@ -460,7 +484,7 @@ impl NodeDiscovery {
 
     /// Refresh the node list when the cache is older than `ttl`. Runs on
     /// the blocking pool's compio runtime (called from inside
-    /// `SpegelMirror::fetch`). A failed refresh keeps the previous list
+    /// `PeerMirror::fetch`). A failed refresh keeps the previous list
     /// — a momentarily unreachable API server must not drop working
     /// peers mid-flight.
     async fn refresh_if_stale(&self) {
@@ -476,7 +500,7 @@ impl NodeDiscovery {
             Ok(peers) => {
                 let mut cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
                 if cache.peers != peers {
-                    info!(peers = ?peers, "spegel: discovered peer mirrors from kubernetes nodes");
+                    info!(peers = ?peers, "peer mirror: discovered peer mirrors from kubernetes nodes");
                 }
                 cache.peers = peers;
                 cache.refreshed_at = Some(Instant::now());
@@ -486,7 +510,7 @@ impl NodeDiscovery {
                 warn!(
                     error = %e,
                     stale_peers = cache.peers.len(),
-                    "spegel: kubernetes node discovery failed; keeping previous peer list"
+                    "peer mirror: kubernetes node discovery failed; keeping previous peer list"
                 );
                 // Still bump the timestamp so a down API server is
                 // retried once per TTL, not once per pull.
@@ -609,31 +633,45 @@ struct NodeCondition {
 ///
 /// `Ok(None)` is returned when the mirror is disabled by config, or
 /// when the endpoint is HTTPS but the TLS material doesn't exist on
-/// disk — both map to "skip the spegel-pull path" so a host without an
+/// disk — both map to "skip the Spegel-pull path" so a host without an
 /// embedded mirror runs exactly as before.
-pub fn build_spegel_mirror(cfg: &SpegelMirrorConfig) -> Result<Option<Arc<SpegelMirror>>> {
-    if !cfg.enable {
+pub fn build_peer_mirror(cfg: &PeerMirrorConfig) -> Result<Option<Arc<PeerMirror>>> {
+    if !cfg.is_enabled() {
         return Ok(None);
     }
-    let primary = cfg.endpoint.trim_end_matches('/').to_string();
+    let primary = cfg.endpoint().trim_end_matches('/').to_string();
     let plain_http = primary.starts_with("http://");
 
+    // A plain-HTTP endpoint needs no client auth. An HTTPS endpoint uses mTLS
+    // only when all three cert paths are configured AND present on disk;
+    // otherwise the mirror is silently disabled (the pre-existing "certs
+    // missing ⇒ silent fallback" contract). This lets a no-client-auth
+    // plain-HTTP mirror be expressed without any k3s cert files existing.
     let tls = if plain_http {
         None
     } else {
-        for path in [&cfg.ca_path, &cfg.client_cert_path, &cfg.client_key_path] {
+        let (Some(ca), Some(cert), Some(key)) =
+            (cfg.ca_path(), cfg.client_cert_path(), cfg.client_key_path())
+        else {
+            debug!(
+                endpoint = %primary,
+                "peer mirror TLS endpoint has no client cert material configured; mirror client disabled"
+            );
+            return Ok(None);
+        };
+        for path in [ca, cert, key] {
             if !path.is_file() {
                 debug!(
-                    ca = %cfg.ca_path.display(),
-                    cert = %cfg.client_cert_path.display(),
-                    key = %cfg.client_key_path.display(),
+                    ca = %ca.display(),
+                    cert = %cert.display(),
+                    key = %key.display(),
                     missing = %path.display(),
-                    "spegel cert file missing; mirror client disabled"
+                    "peer mirror cert file missing; mirror client disabled"
                 );
                 return Ok(None);
             }
         }
-        Some(Arc::new(build_tls_config(cfg)?))
+        Some(Arc::new(build_tls_config(ca, cert, key)?))
     };
 
     let static_peers: Vec<String> = cfg
@@ -646,7 +684,7 @@ pub fn build_spegel_mirror(cfg: &SpegelMirrorConfig) -> Result<Option<Arc<Spegel
     let request_timeout = crate::cache::parse_duration(&cfg.request_timeout)
         .unwrap_or_else(|_| Duration::from_secs(10));
 
-    let discovery = match (&cfg.peer_discovery, &tls) {
+    let discovery = match (cfg.peer_discovery(), &tls) {
         (PeerDiscoveryMode::Kubernetes, Some(tls)) => {
             let mirror_port = primary
                 .rsplit(':')
@@ -669,15 +707,16 @@ pub fn build_spegel_mirror(cfg: &SpegelMirrorConfig) -> Result<Option<Arc<Spegel
             })
         }
         (PeerDiscoveryMode::Kubernetes, None) => {
-            debug!("spegel peer discovery needs mTLS; disabled for plain-HTTP endpoint");
+            debug!("peer mirror discovery needs mTLS; disabled for plain-HTTP endpoint");
             None
         }
         (PeerDiscoveryMode::Static, _) | (PeerDiscoveryMode::Off, _) => None,
     };
 
-    Ok(Some(Arc::new(SpegelMirror {
+    Ok(Some(Arc::new(PeerMirror {
         tls,
         primary,
+        query_template: cfg.query_template.clone(),
         static_peers,
         discovery,
         request_timeout,
@@ -693,72 +732,75 @@ fn local_hostname() -> String {
         .unwrap_or_default()
 }
 
-fn build_tls_config(cfg: &SpegelMirrorConfig) -> Result<rustls::ClientConfig> {
-    // 1. Custom root CA (the k3s server CA — system trust store is not
-    //    used; the only things we authenticate are the embedded spegel
-    //    mirrors and the API server, all signed by this CA).
+fn build_tls_config(
+    ca_path: &std::path::Path,
+    client_cert_path: &std::path::Path,
+    client_key_path: &std::path::Path,
+) -> Result<rustls::ClientConfig> {
+    // 1. Custom root CA (for k3s-spegel: the k3s server CA — system trust
+    //    store is not used; the only things we authenticate are the embedded
+    //    Spegel mirrors and the API server, all signed by this CA).
     let mut roots = rustls::RootCertStore::empty();
     let mut ca_reader = BufReader::new(
-        File::open(&cfg.ca_path)
-            .with_context(|| format!("open spegel CA cert {}", cfg.ca_path.display()))?,
+        File::open(ca_path)
+            .with_context(|| format!("open peer mirror CA cert {}", ca_path.display()))?,
     );
     let mut ca_added = 0usize;
     for cert in rustls_pemfile::certs(&mut ca_reader) {
         let cert =
-            cert.with_context(|| format!("parse spegel CA cert {}", cfg.ca_path.display()))?;
+            cert.with_context(|| format!("parse peer mirror CA cert {}", ca_path.display()))?;
         roots
             .add(cert)
-            .with_context(|| format!("add spegel CA to root store {}", cfg.ca_path.display()))?;
+            .with_context(|| format!("add peer mirror CA to root store {}", ca_path.display()))?;
         ca_added += 1;
     }
     if ca_added == 0 {
-        return Err(anyhow!(
-            "no CA certificates found in {}",
-            cfg.ca_path.display()
-        ));
+        return Err(anyhow!("no CA certificates found in {}", ca_path.display()));
     }
 
-    // 2. Client identity for mTLS (k3s controller cert + key — same
-    //    identity k3s' own internal components use).
-    let mut cert_reader =
-        BufReader::new(File::open(&cfg.client_cert_path).with_context(|| {
-            format!("open spegel client cert {}", cfg.client_cert_path.display())
-        })?);
+    // 2. Client identity for mTLS (for k3s-spegel: the k3s controller cert +
+    //    key — same identity k3s' own internal components use).
+    let mut cert_reader = BufReader::new(File::open(client_cert_path).with_context(|| {
+        format!(
+            "open peer mirror client cert {}",
+            client_cert_path.display()
+        )
+    })?);
     let client_certs: Vec<rustls::pki_types::CertificateDer<'static>> =
         rustls_pemfile::certs(&mut cert_reader)
             .collect::<std::result::Result<_, _>>()
             .with_context(|| {
                 format!(
-                    "parse spegel client cert {}",
-                    cfg.client_cert_path.display()
+                    "parse peer mirror client cert {}",
+                    client_cert_path.display()
                 )
             })?;
     if client_certs.is_empty() {
         return Err(anyhow!(
             "no client certificates found in {}",
-            cfg.client_cert_path.display()
+            client_cert_path.display()
         ));
     }
 
     let mut key_reader =
-        BufReader::new(File::open(&cfg.client_key_path).with_context(|| {
-            format!("open spegel client key {}", cfg.client_key_path.display())
+        BufReader::new(File::open(client_key_path).with_context(|| {
+            format!("open peer mirror client key {}", client_key_path.display())
         })?);
     let client_key = rustls_pemfile::private_key(&mut key_reader)
-        .with_context(|| format!("parse spegel client key {}", cfg.client_key_path.display()))?
-        .ok_or_else(|| anyhow!("no private key found in {}", cfg.client_key_path.display()))?;
+        .with_context(|| format!("parse peer mirror client key {}", client_key_path.display()))?
+        .ok_or_else(|| anyhow!("no private key found in {}", client_key_path.display()))?;
 
     rustls::ClientConfig::builder()
         .with_root_certificates(roots)
         .with_client_auth_cert(client_certs, client_key)
-        .context("build rustls ClientConfig for spegel mirror")
+        .context("build rustls ClientConfig for peer mirror")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// `http_status_to_outcome` decides whether spegel's response is a
+    /// `http_status_to_outcome` decides whether Spegel's response is a
     /// clean "no peer has it" (silent fallback to overlay) or a real
     /// "mirror is broken" signal that needs operator attention.
     #[test]
@@ -775,7 +817,7 @@ mod tests {
 
     #[test]
     fn http_status_auth_failures_are_error() {
-        // 401/403 → spegel mTLS misconfigured, client cert expired, etc.
+        // 401/403 → Spegel mTLS misconfigured, client cert expired, etc.
         // Operator needs the signal — NOT a silent fallback.
         assert_eq!(http_status_to_outcome(401), StatusOutcome::Error);
         assert_eq!(http_status_to_outcome(403), StatusOutcome::Error);
@@ -790,7 +832,7 @@ mod tests {
 
     #[test]
     fn http_status_3xx_is_error() {
-        // We don't follow redirects through spegel — a peer that needs
+        // We don't follow redirects through Spegel — a peer that needs
         // to redirect us is a config bug to flag.
         assert_eq!(http_status_to_outcome(301), StatusOutcome::Error);
         assert_eq!(http_status_to_outcome(307), StatusOutcome::Error);
@@ -886,16 +928,28 @@ mod tests {
         assert_eq!(peers, vec!["https://10.0.0.8:6443"]);
     }
 
-    fn test_mirror(primary: &str, static_peers: &[&str]) -> Arc<SpegelMirror> {
-        Arc::new(SpegelMirror {
+    fn test_mirror(primary: &str, static_peers: &[&str]) -> Arc<PeerMirror> {
+        Arc::new(PeerMirror {
             tls: None,
             primary: primary.to_string(),
+            query_template: "ns={registry}".to_string(),
             static_peers: static_peers.iter().map(|s| s.to_string()).collect(),
             discovery: None,
             request_timeout: Duration::from_secs(2),
             rotation: AtomicUsize::new(0),
             cooldown: Mutex::new(HashMap::new()),
         })
+    }
+
+    /// `artifact_query` expands the mirror's template with the registry host;
+    /// the default `ns={registry}` yields Spegel's load-bearing `?ns=` param.
+    #[test]
+    fn artifact_query_expands_ns_template() {
+        let mirror = test_mirror("http://127.0.0.1:1", &[]);
+        assert_eq!(
+            mirror.artifact_query("registry.example:5000"),
+            Some("ns=registry.example:5000".to_string())
+        );
     }
 
     /// Endpoint assembly: primary always first, static peers after,
@@ -906,7 +960,7 @@ mod tests {
             "http://127.0.0.1:1",
             &["http://peer-a:1", "http://127.0.0.1:1", "http://peer-b:1"],
         );
-        // NOTE: build_spegel_mirror dedupes primary from static_peers at
+        // NOTE: build_peer_mirror dedupes primary from static_peers at
         // construction; endpoints_for_attempt dedupes again defensively.
         let endpoints = mirror.endpoints_for_attempt();
         assert_eq!(
@@ -975,7 +1029,7 @@ mod tests {
     }
 
     /// A change in TLS config identity (e.g. a test/caller building a
-    /// second `SpegelMirror` on the same thread with different TLS
+    /// second `PeerMirror` on the same thread with different TLS
     /// material) must evict the cached client and rebuild rather than
     /// silently reusing a client built for a different config.
     #[test]

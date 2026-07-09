@@ -24,6 +24,14 @@ pub struct SnapshotterConfig {
 /// `[snapshotter]` section.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct SnapshotterSection {
+    /// Deployment profile. Fills host-path defaults (containerd socket +
+    /// content-store root) and the peer-mirror preset when those fields are
+    /// left unset. `auto` (the default) probes the well-known containerd
+    /// sockets at startup; `k3s` / `containerd` pin the profile explicitly.
+    /// Explicit TOML values for the profile-sensitive fields always win over
+    /// the profile table — see [`SnapshotterConfig::resolve_profile`].
+    #[serde(default)]
+    pub profile: Profile,
     /// Root directory for snapshotter state (default `/var/lib/containerd-nydus`).
     #[serde(default = "default_root")]
     pub root: PathBuf,
@@ -72,18 +80,21 @@ pub struct SnapshotterSection {
     #[serde(default)]
     pub containerd: ContainerdConfig,
 
-    /// k3s embedded spegel mirror endpoint used by auto-accel cross-node
-    /// sidecar discovery. When enabled and reachable, a peer-node consumer
-    /// can fetch the OCI manifest + config + blobs for a converted sidecar
-    /// straight from spegel's `/v2/...?ns=<registry>` endpoint rather than
-    /// each node having to convert independently.
-    #[serde(default)]
-    pub spegel_mirror: SpegelMirrorConfig,
+    /// Peer registry-mirror endpoint used by auto-accel cross-node sidecar
+    /// discovery. When enabled and reachable, a peer-node consumer can fetch
+    /// the OCI manifest + config + blobs for a converted sidecar straight
+    /// from the mirror's `/v2/...` endpoint rather than each node having to
+    /// convert independently. k3s' embedded Spegel is the reference preset;
+    /// see [`PeerMirrorConfig`]. Accepts the legacy `[snapshotter.spegel_mirror]`
+    /// table name via serde alias for back-compat.
+    #[serde(default, alias = "spegel_mirror")]
+    pub peer_mirror: PeerMirrorConfig,
 }
 
 impl Default for SnapshotterSection {
     fn default() -> Self {
         Self {
+            profile: Profile::default(),
             root: default_root(),
             address: default_address(),
             cleanup_on_close: false,
@@ -96,9 +107,191 @@ impl Default for SnapshotterSection {
             cgroup: CgroupConfig::default(),
             auto_zran: AutoZranConfig::default(),
             containerd: ContainerdConfig::default(),
-            spegel_mirror: SpegelMirrorConfig::default(),
+            peer_mirror: PeerMirrorConfig::default(),
         }
     }
+}
+
+/// Deployment profile controlling host-path defaults (containerd socket +
+/// content-store root) and the peer-mirror preset. Only fills fields the
+/// operator left unset; explicit TOML values always win.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Profile {
+    /// Probe the well-known containerd sockets at startup and pick k3s or
+    /// stock-containerd accordingly (default).
+    #[default]
+    Auto,
+    /// k3s: `/run/k3s/containerd/containerd.sock`, k3s content-store root,
+    /// k3s-spegel peer-mirror preset.
+    K3s,
+    /// Stock containerd: `/run/containerd/containerd.sock`, standard content
+    /// root, no peer-mirror preset.
+    Containerd,
+}
+
+/// The concrete host-path + preset table a resolved [`Profile`] selects.
+/// `Profile::Auto` never appears here — it resolves to `K3s` or `Containerd`
+/// first.
+struct ProfileDefaults {
+    containerd_address: PathBuf,
+    content_root: PathBuf,
+    mirror_preset: MirrorPreset,
+}
+
+impl Profile {
+    /// Host-path + preset table for a concrete (non-`Auto`) profile. `Auto`
+    /// is treated as `Containerd` here as a defensive fallback, but callers
+    /// resolve `Auto` before reaching this.
+    fn defaults(self) -> ProfileDefaults {
+        match self {
+            Profile::K3s => ProfileDefaults {
+                containerd_address: PathBuf::from("/run/k3s/containerd/containerd.sock"),
+                content_root: PathBuf::from(
+                    "/var/lib/rancher/k3s/agent/containerd/io.containerd.content.v1.content",
+                ),
+                mirror_preset: MirrorPreset::K3sSpegel,
+            },
+            Profile::Auto | Profile::Containerd => ProfileDefaults {
+                containerd_address: PathBuf::from("/run/containerd/containerd.sock"),
+                content_root: PathBuf::from("/var/lib/containerd/io.containerd.content.v1.content"),
+                mirror_preset: MirrorPreset::None,
+            },
+        }
+    }
+}
+
+/// Well-known containerd socket probed for `Profile::Auto` k3s detection.
+pub const K3S_CONTAINERD_SOCKET: &str = "/run/k3s/containerd/containerd.sock";
+/// Well-known containerd socket probed for `Profile::Auto` stock detection.
+pub const STOCK_CONTAINERD_SOCKET: &str = "/run/containerd/containerd.sock";
+
+/// Outcome of profile resolution: the concrete profile chosen and a
+/// human-readable reason (logged at `info!` by the binary).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResolvedProfile {
+    pub profile: Profile,
+    pub reason: String,
+}
+
+impl SnapshotterConfig {
+    /// Resolve `[snapshotter].profile` in memory and fill any profile- or
+    /// preset-sensitive field the operator left unset. NEVER writes config
+    /// files — it only mutates the parsed struct. Run this after config load
+    /// + CLI overrides and before the driver probe / `DaemonSupervisor`.
+    ///
+    /// Explicit TOML values always win: a field that deserialised to `Some`
+    /// (or an explicit preset/discovery) is left untouched; only `None`
+    /// fields are filled from the resolved profile / preset table.
+    pub fn resolve_profile(&mut self) -> Result<ResolvedProfile, ConfigError> {
+        self.resolve_profile_with(|p: &std::path::Path| p.exists())
+    }
+
+    /// [`resolve_profile`](Self::resolve_profile) with an injectable socket
+    /// probe so unit tests never touch the real filesystem.
+    pub fn resolve_profile_with(
+        &mut self,
+        probe: impl Fn(&std::path::Path) -> bool,
+    ) -> Result<ResolvedProfile, ConfigError> {
+        let auto_zran_enabled = self.snapshotter.auto_zran.enable;
+        let resolved = match self.snapshotter.profile {
+            Profile::K3s => ResolvedProfile {
+                profile: Profile::K3s,
+                reason: "profile = k3s set explicitly".to_string(),
+            },
+            Profile::Containerd => ResolvedProfile {
+                profile: Profile::Containerd,
+                reason: "profile = containerd set explicitly".to_string(),
+            },
+            Profile::Auto => {
+                let k3s = probe(std::path::Path::new(K3S_CONTAINERD_SOCKET));
+                let stock = probe(std::path::Path::new(STOCK_CONTAINERD_SOCKET));
+                match (k3s, stock) {
+                    (true, true) => {
+                        return Err(ConfigError::AmbiguousProfile);
+                    }
+                    (true, false) => ResolvedProfile {
+                        profile: Profile::K3s,
+                        reason: format!("auto-detected k3s ({K3S_CONTAINERD_SOCKET} present)"),
+                    },
+                    (false, true) => ResolvedProfile {
+                        profile: Profile::Containerd,
+                        reason: format!(
+                            "auto-detected containerd ({STOCK_CONTAINERD_SOCKET} present)"
+                        ),
+                    },
+                    (false, false) => {
+                        if auto_zran_enabled {
+                            return Err(ConfigError::NoContainerdSocket);
+                        }
+                        ResolvedProfile {
+                            profile: Profile::Containerd,
+                            reason: "no containerd socket detected; defaulting to containerd \
+                                     (auto_zran disabled)"
+                                .to_string(),
+                        }
+                    }
+                }
+            }
+        };
+
+        let table = resolved.profile.defaults();
+
+        // Host-path defaults (containerd socket + content root). Explicit
+        // values stay untouched.
+        let containerd = &mut self.snapshotter.containerd;
+        if containerd.address.is_none() {
+            containerd.address = Some(table.containerd_address.clone());
+        }
+        if containerd.content_root.is_none() {
+            containerd.content_root = Some(table.content_root.clone());
+        }
+
+        // Peer-mirror preset (profile-derived when unset) then the
+        // preset-derived mirror fields.
+        let pm = &mut self.snapshotter.peer_mirror;
+        let preset = pm.preset.unwrap_or(table.mirror_preset);
+        pm.preset = Some(preset);
+        let mdef = preset.defaults();
+        if pm.enable.is_none() {
+            pm.enable = Some(mdef.enable);
+        }
+        if pm.endpoint.is_none() {
+            pm.endpoint = Some(mdef.endpoint);
+        }
+        if pm.peer_discovery.is_none() {
+            pm.peer_discovery = Some(mdef.peer_discovery);
+        }
+        if pm.ca_path.is_none() {
+            pm.ca_path = mdef.ca_path;
+        }
+        if pm.client_cert_path.is_none() {
+            pm.client_cert_path = mdef.client_cert_path;
+        }
+        if pm.client_key_path.is_none() {
+            pm.client_key_path = mdef.client_key_path;
+        }
+
+        Ok(resolved)
+    }
+}
+
+/// Errors from [`SnapshotterConfig::resolve_profile`]. Kept as a typed error
+/// so the binary can print an actionable, kubeadm-style message.
+#[derive(Debug, thiserror::Error)]
+pub enum ConfigError {
+    #[error(
+        "both k3s ({K3S_CONTAINERD_SOCKET}) and containerd ({STOCK_CONTAINERD_SOCKET}) \
+         sockets are present; profile detection is ambiguous. Set `profile` explicitly \
+         in [snapshotter] (profile = \"k3s\" or profile = \"containerd\")."
+    )]
+    AmbiguousProfile,
+    #[error(
+        "no containerd socket found at {K3S_CONTAINERD_SOCKET} or {STOCK_CONTAINERD_SOCKET}, \
+         but auto_zran is enabled and needs one. Start containerd/k3s, or set \
+         [snapshotter.containerd].address and [snapshotter].profile explicitly."
+    )]
+    NoContainerdSocket,
 }
 
 /// Daemon lifecycle configuration.
@@ -352,71 +545,111 @@ impl Default for AccessCaptureConfig {
 /// re-copying.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ContainerdConfig {
-    /// Path to containerd's gRPC socket.
-    #[serde(default = "default_containerd_address")]
-    pub address: PathBuf,
+    /// Path to containerd's gRPC socket. Profile-sensitive: `None` when the
+    /// operator didn't set it, filled from the resolved profile by
+    /// [`SnapshotterConfig::resolve_profile`]. Read via [`Self::address`].
+    #[serde(default)]
+    pub address: Option<PathBuf>,
     /// Containerd namespace to operate in. For k3s/CRI this is `k8s.io`.
     #[serde(default = "default_containerd_namespace")]
     pub namespace: String,
     /// Root of containerd's content store on disk. Used for `blob_path`
     /// resolution (so we can pass already-committed blobs into the fanotify
     /// backend dir as symlinks). The well-known layout is stable across
-    /// containerd 1.x and 2.x: `<root>/blobs/sha256/<hex>`.
-    #[serde(default = "default_containerd_content_root")]
-    pub content_root: PathBuf,
+    /// containerd 1.x and 2.x: `<root>/blobs/sha256/<hex>`. Profile-sensitive
+    /// like `address`; read via [`Self::content_root`].
+    #[serde(default)]
+    pub content_root: Option<PathBuf>,
 }
 
 impl Default for ContainerdConfig {
     fn default() -> Self {
         Self {
-            address: default_containerd_address(),
+            address: None,
             namespace: default_containerd_namespace(),
-            content_root: default_containerd_content_root(),
+            content_root: None,
         }
     }
 }
 
-/// k3s embedded spegel mirror endpoint configuration for cross-node
-/// auto-accel sidecar discovery. spegel listens on `127.0.0.1:6443/v2`
-/// behind mTLS, watches containerd image-store events, and serves locally
-/// present content directly while falling back to libp2p peer lookup for
-/// digests it doesn't have. The consumer-side `SidecarLocator::resolve_or_pull`
-/// hits this endpoint with the required `?ns=<registry>` query parameter
-/// — without that query string, spegel's distribution.go parser returns
-/// 404 for every path, even for content that IS local.
+impl ContainerdConfig {
+    /// Resolved containerd socket path. Falls back to the stock-containerd
+    /// socket when unresolved (i.e. `resolve_profile` wasn't run), which is
+    /// the safe generic default.
+    pub fn address(&self) -> PathBuf {
+        self.address
+            .clone()
+            .unwrap_or_else(|| PathBuf::from(STOCK_CONTAINERD_SOCKET))
+    }
+
+    /// Resolved content-store root. Falls back to the stock-containerd layout
+    /// when unresolved.
+    pub fn content_root(&self) -> PathBuf {
+        self.content_root.clone().unwrap_or_else(|| {
+            PathBuf::from("/var/lib/containerd/io.containerd.content.v1.content")
+        })
+    }
+}
+
+/// Peer registry-mirror endpoint configuration for cross-node auto-accel
+/// sidecar discovery. A peer mirror watches containerd image-store events,
+/// serves locally-present content over `/v2/...`, and (for Spegel) falls
+/// back to libp2p peer lookup for digests it doesn't have. The consumer-side
+/// `SidecarLocator::resolve_or_pull` hits this endpoint with the mirror's
+/// [`query_template`](Self::query_template) query parameter appended.
 ///
-/// When `enable = false` (or any of the cert files don't exist on disk at
-/// startup) the spegel-pull path is skipped silently and the locator falls
-/// straight through to the existing label-filter scan, preserving the
-/// pre-spegel behaviour on hosts without an embedded mirror.
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct SpegelMirrorConfig {
-    #[serde(default = "default_spegel_enable")]
-    pub enable: bool,
-    /// Mirror endpoint URL. k3s' embedded spegel binds to the API server
-    /// socket on `127.0.0.1:6443`; the `/v2/...` distribution endpoints
-    /// hang off the same TLS listener.
-    #[serde(default = "default_spegel_endpoint")]
-    pub endpoint: String,
-    /// How peer mirror endpoints are found when the local mirror misses.
-    /// k3s' embedded spegel (v0.7.x) relies on a libp2p DHT whose
-    /// provider-address records rot on long-lived clusters ("could not
-    /// find peer" / "empty list of address ports" for content peers
-    /// demonstrably hold), so the default `kubernetes` mode bypasses
-    /// libp2p: the snapshotter lists the cluster's nodes via the local
-    /// API server — using the same mTLS identity the mirror requires —
-    /// and tries each Ready node's mirror endpoint directly.
+/// k3s' embedded Spegel is the reference implementation and ships as the
+/// `k3s-spegel` [`MirrorPreset`]: it binds the API-server socket on
+/// `127.0.0.1:6443`, requires mTLS, and needs the load-bearing `?ns=<registry>`
+/// query (without it Spegel's distribution.go parser 404s every path). Other
+/// mirrors can be expressed by overriding `preset`, `endpoint`,
+/// `query_template`, and the auth fields.
+///
+/// The profile/preset-sensitive fields are `Option`: `None` means "operator
+/// didn't set it", filled from the resolved preset by
+/// [`SnapshotterConfig::resolve_profile`]. Read them via the accessor methods.
+///
+/// When the mirror is disabled, or the endpoint is HTTPS but the configured
+/// cert files don't exist on disk at startup, the pull path is skipped
+/// silently and the locator falls straight through to the existing
+/// label-filter scan, preserving the behaviour on hosts without a mirror.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct PeerMirrorConfig {
+    /// Mirror preset. `None` (the serde default) means "unset" — filled from
+    /// the resolved profile (k3s ⇒ `k3s-spegel`, containerd ⇒ `none`) by
+    /// `resolve_profile`. An explicit value overrides the profile default.
     #[serde(default)]
-    pub peer_discovery: PeerDiscoveryMode,
+    pub preset: Option<MirrorPreset>,
+    /// Whether the peer-mirror pull path is enabled. Preset-derived when unset.
+    #[serde(default)]
+    pub enable: Option<bool>,
+    /// Mirror endpoint URL. Preset-derived when unset. k3s' embedded Spegel
+    /// binds to the API-server socket on `127.0.0.1:6443`; the `/v2/...`
+    /// distribution endpoints hang off the same TLS listener.
+    #[serde(default)]
+    pub endpoint: Option<String>,
+    /// Query parameter appended to every `/v2/...` request, with `{registry}`
+    /// expanded to the target registry host. Spegel's load-bearing `?ns=`
+    /// quirk is expressed as the default template `ns={registry}`; an empty
+    /// string means "no query parameter". See [`Self::artifact_query`].
+    #[serde(default = "default_query_template")]
+    pub query_template: String,
+    /// How peer mirror endpoints are found when the local mirror misses.
+    /// Preset-derived when unset: the `k3s-spegel` preset defaults to
+    /// `kubernetes` (a documented workaround for Spegel DHT rot — see
+    /// [`crate::peer_mirror`]); every other preset defaults to `off`
+    /// (local-mirror-only).
+    #[serde(default)]
+    pub peer_discovery: Option<PeerDiscoveryMode>,
     /// How long a discovered node list is cached before it is refreshed
     /// from the API server. Refreshes run on the pull path's blocking
     /// thread, never on the snapshotter's gRPC runtime.
-    #[serde(default = "default_spegel_discovery_ttl")]
+    #[serde(default = "default_peer_mirror_discovery_ttl")]
     pub discovery_ttl: String,
     /// Per-endpoint timeout for one mirror request. Sidecar artifacts are
     /// small (bootstrap ≈ 1 MiB, indexes ≈ KiBs), so keep this short — a
     /// slow peer must not stall pod creation.
-    #[serde(default = "default_spegel_request_timeout")]
+    #[serde(default = "default_peer_mirror_request_timeout")]
     pub request_timeout: String,
     /// Statically-pinned peer mirror endpoints, tried after discovered
     /// peers (or alone with `peer_discovery = "static"`). Useful for
@@ -425,41 +658,144 @@ pub struct SpegelMirrorConfig {
     #[serde(default)]
     pub peer_endpoints: Vec<String>,
     /// PEM-encoded CA bundle for verifying the mirror endpoint's serving
-    /// cert. k3s ships its server CA at the path below.
-    #[serde(default = "default_spegel_ca_path")]
-    pub ca_path: PathBuf,
-    /// PEM-encoded client cert for mTLS to the mirror. k3s' standard
-    /// controller client cert works here — same identity its own internal
-    /// components use to call back through the API server.
-    #[serde(default = "default_spegel_client_cert_path")]
-    pub client_cert_path: PathBuf,
-    /// PEM-encoded private key matching `client_cert_path`.
-    #[serde(default = "default_spegel_client_key_path")]
-    pub client_key_path: PathBuf,
+    /// cert. Preset-derived when unset (k3s cert path only for `k3s-spegel`).
+    /// `None` on a non-k3s preset means "no client auth / plain HTTP" unless
+    /// the operator supplies one.
+    #[serde(default)]
+    pub ca_path: Option<PathBuf>,
+    /// PEM-encoded client cert for mTLS to the mirror. Preset-derived when
+    /// unset. k3s' standard controller client cert works for `k3s-spegel` —
+    /// the same identity its own internal components use.
+    #[serde(default)]
+    pub client_cert_path: Option<PathBuf>,
+    /// PEM-encoded private key matching `client_cert_path`. Preset-derived
+    /// when unset.
+    #[serde(default)]
+    pub client_key_path: Option<PathBuf>,
 }
 
-impl Default for SpegelMirrorConfig {
-    fn default() -> Self {
-        Self {
-            enable: default_spegel_enable(),
-            endpoint: default_spegel_endpoint(),
-            peer_discovery: PeerDiscoveryMode::default(),
-            discovery_ttl: default_spegel_discovery_ttl(),
-            request_timeout: default_spegel_request_timeout(),
-            peer_endpoints: Vec::new(),
-            ca_path: default_spegel_ca_path(),
-            client_cert_path: default_spegel_client_cert_path(),
-            client_key_path: default_spegel_client_key_path(),
+impl PeerMirrorConfig {
+    /// Whether the peer-mirror pull path is enabled. Defaults to disabled
+    /// when unresolved (safe generic — silent fallback to the label scan).
+    pub fn is_enabled(&self) -> bool {
+        self.enable.unwrap_or(false)
+    }
+
+    /// Resolved mirror endpoint URL. Falls back to the local Spegel endpoint
+    /// when unresolved.
+    pub fn endpoint(&self) -> &str {
+        self.endpoint.as_deref().unwrap_or("https://127.0.0.1:6443")
+    }
+
+    /// Resolved peer-discovery mode. Defaults to `off` (local-mirror-only)
+    /// when unresolved.
+    pub fn peer_discovery(&self) -> PeerDiscoveryMode {
+        self.peer_discovery.unwrap_or(PeerDiscoveryMode::Off)
+    }
+
+    /// CA cert path, if configured/resolved.
+    pub fn ca_path(&self) -> Option<&std::path::Path> {
+        self.ca_path.as_deref()
+    }
+
+    /// Client cert path, if configured/resolved.
+    pub fn client_cert_path(&self) -> Option<&std::path::Path> {
+        self.client_cert_path.as_deref()
+    }
+
+    /// Client key path, if configured/resolved.
+    pub fn client_key_path(&self) -> Option<&std::path::Path> {
+        self.client_key_path.as_deref()
+    }
+
+    /// Expand [`query_template`](Self::query_template) for `registry_host`.
+    /// Returns `None` for an empty template (no query parameter), otherwise
+    /// the template with every `{registry}` occurrence substituted.
+    pub fn artifact_query(&self, registry_host: &str) -> Option<String> {
+        expand_query_template(&self.query_template, registry_host)
+    }
+}
+
+/// Expand a mirror query template: `None` for empty, else `{registry}` →
+/// `registry_host`. Pure so unit tests pin the Spegel `ns=` behaviour.
+pub fn expand_query_template(template: &str, registry_host: &str) -> Option<String> {
+    if template.is_empty() {
+        return None;
+    }
+    Some(template.replace("{registry}", registry_host))
+}
+
+/// A named peer-mirror preset. Bundles the Spegel-specific quirks (endpoint,
+/// mTLS cert paths, discovery mode) as data so a mirror is configured by
+/// naming a preset rather than hard-coding behaviour.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub enum MirrorPreset {
+    /// k3s' embedded Spegel: `https://127.0.0.1:6443`, mTLS with the k3s agent
+    /// cert paths, `kubernetes` peer discovery. Reproduces the historical
+    /// `[snapshotter.spegel_mirror]` behaviour on k3s exactly.
+    K3sSpegel,
+    /// Generic Spegel: local `https://127.0.0.1:6443` endpoint, `?ns=` query,
+    /// but no k3s cert paths and no peer discovery (local-mirror-only). The
+    /// operator supplies auth material / discovery if needed.
+    Spegel,
+    /// No preset: the mirror is disabled unless the operator sets `enable`
+    /// and an `endpoint`. Local-mirror-only, no discovery, no default certs.
+    None,
+}
+
+/// Resolved preset defaults for the mirror fields.
+struct MirrorPresetDefaults {
+    enable: bool,
+    endpoint: String,
+    peer_discovery: PeerDiscoveryMode,
+    ca_path: Option<PathBuf>,
+    client_cert_path: Option<PathBuf>,
+    client_key_path: Option<PathBuf>,
+}
+
+impl MirrorPreset {
+    fn defaults(self) -> MirrorPresetDefaults {
+        match self {
+            MirrorPreset::K3sSpegel => MirrorPresetDefaults {
+                enable: true,
+                endpoint: "https://127.0.0.1:6443".to_string(),
+                peer_discovery: PeerDiscoveryMode::Kubernetes,
+                ca_path: Some(PathBuf::from("/var/lib/rancher/k3s/agent/server-ca.crt")),
+                client_cert_path: Some(PathBuf::from(
+                    "/var/lib/rancher/k3s/agent/client-k3s-controller.crt",
+                )),
+                client_key_path: Some(PathBuf::from(
+                    "/var/lib/rancher/k3s/agent/client-k3s-controller.key",
+                )),
+            },
+            MirrorPreset::Spegel => MirrorPresetDefaults {
+                enable: true,
+                endpoint: "https://127.0.0.1:6443".to_string(),
+                peer_discovery: PeerDiscoveryMode::Off,
+                ca_path: None,
+                client_cert_path: None,
+                client_key_path: None,
+            },
+            MirrorPreset::None => MirrorPresetDefaults {
+                enable: false,
+                endpoint: "https://127.0.0.1:6443".to_string(),
+                peer_discovery: PeerDiscoveryMode::Off,
+                ca_path: None,
+                client_cert_path: None,
+                client_key_path: None,
+            },
         }
     }
 }
 
-/// Where the spegel-pull path finds peer mirror endpoints.
+/// Where the peer-mirror pull path finds peer mirror endpoints.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub enum PeerDiscoveryMode {
     /// List the cluster's nodes from the local Kubernetes API server and
-    /// try each Ready node's mirror endpoint (default).
+    /// try each Ready node's mirror endpoint. Documented Spegel-DHT-rot
+    /// workaround; default only for the `k3s-spegel` preset.
     #[default]
     Kubernetes,
     /// Only the statically-configured `peer_endpoints`.
@@ -597,34 +933,17 @@ fn default_capture_exclude_globs() -> Vec<String> {
         "/var/run/**".to_string(),
     ]
 }
-fn default_containerd_address() -> PathBuf {
-    PathBuf::from("/run/k3s/containerd/containerd.sock")
-}
 fn default_containerd_namespace() -> String {
     "k8s.io".to_string()
 }
-fn default_containerd_content_root() -> PathBuf {
-    PathBuf::from("/var/lib/rancher/k3s/agent/containerd/io.containerd.content.v1.content")
+fn default_query_template() -> String {
+    // Spegel's load-bearing `?ns=<registry>` quirk, expressed as a template.
+    "ns={registry}".to_string()
 }
-fn default_spegel_enable() -> bool {
-    true
-}
-fn default_spegel_endpoint() -> String {
-    "https://127.0.0.1:6443".to_string()
-}
-fn default_spegel_ca_path() -> PathBuf {
-    PathBuf::from("/var/lib/rancher/k3s/agent/server-ca.crt")
-}
-fn default_spegel_client_cert_path() -> PathBuf {
-    PathBuf::from("/var/lib/rancher/k3s/agent/client-k3s-controller.crt")
-}
-fn default_spegel_client_key_path() -> PathBuf {
-    PathBuf::from("/var/lib/rancher/k3s/agent/client-k3s-controller.key")
-}
-fn default_spegel_discovery_ttl() -> String {
+fn default_peer_mirror_discovery_ttl() -> String {
     "5m".to_string()
 }
-fn default_spegel_request_timeout() -> String {
+fn default_peer_mirror_request_timeout() -> String {
     "10s".to_string()
 }
 
@@ -817,5 +1136,258 @@ type = "fscache"
 "#;
         let result = toml::from_str::<SnapshotterConfig>(toml_str);
         assert!(result.is_err(), "fscache driver type must be rejected");
+    }
+
+    // ── B1: profile resolution ─────────────────────────────────────────
+
+    /// Probe that reports the given set of present socket paths.
+    fn probe_present(present: &'static [&'static str]) -> impl Fn(&std::path::Path) -> bool {
+        move |p: &std::path::Path| present.iter().any(|s| std::path::Path::new(s) == p)
+    }
+
+    #[test]
+    fn resolve_profile_explicit_values_win() {
+        // Operator set both host paths AND profile = containerd; the k3s
+        // probe would say k3s, but explicit values must be untouched.
+        let toml_str = r#"
+[snapshotter]
+profile = "containerd"
+
+[snapshotter.containerd]
+address = "/custom/containerd.sock"
+content_root = "/custom/content"
+"#;
+        let mut config: SnapshotterConfig = toml::from_str(toml_str).expect("parse");
+        let rp = config
+            .resolve_profile_with(probe_present(&[
+                K3S_CONTAINERD_SOCKET,
+                STOCK_CONTAINERD_SOCKET,
+            ]))
+            .expect("resolve");
+        assert_eq!(rp.profile, Profile::Containerd);
+        assert_eq!(
+            config.snapshotter.containerd.address(),
+            PathBuf::from("/custom/containerd.sock")
+        );
+        assert_eq!(
+            config.snapshotter.containerd.content_root(),
+            PathBuf::from("/custom/content")
+        );
+    }
+
+    #[test]
+    fn resolve_profile_auto_detects_k3s() {
+        let mut config = SnapshotterConfig::default();
+        let rp = config
+            .resolve_profile_with(probe_present(&[K3S_CONTAINERD_SOCKET]))
+            .expect("resolve");
+        assert_eq!(rp.profile, Profile::K3s);
+        assert_eq!(
+            config.snapshotter.containerd.address(),
+            PathBuf::from(K3S_CONTAINERD_SOCKET)
+        );
+        assert_eq!(
+            config.snapshotter.containerd.content_root(),
+            PathBuf::from("/var/lib/rancher/k3s/agent/containerd/io.containerd.content.v1.content")
+        );
+        assert_eq!(
+            config.snapshotter.peer_mirror.preset,
+            Some(MirrorPreset::K3sSpegel)
+        );
+    }
+
+    #[test]
+    fn resolve_profile_auto_detects_containerd() {
+        let mut config = SnapshotterConfig::default();
+        let rp = config
+            .resolve_profile_with(probe_present(&[STOCK_CONTAINERD_SOCKET]))
+            .expect("resolve");
+        assert_eq!(rp.profile, Profile::Containerd);
+        assert_eq!(
+            config.snapshotter.containerd.address(),
+            PathBuf::from(STOCK_CONTAINERD_SOCKET)
+        );
+        assert_eq!(
+            config.snapshotter.containerd.content_root(),
+            PathBuf::from("/var/lib/containerd/io.containerd.content.v1.content")
+        );
+        assert_eq!(
+            config.snapshotter.peer_mirror.preset,
+            Some(MirrorPreset::None)
+        );
+    }
+
+    #[test]
+    fn resolve_profile_auto_both_sockets_is_ambiguous_error() {
+        let mut config = SnapshotterConfig::default();
+        let err = config
+            .resolve_profile_with(probe_present(&[
+                K3S_CONTAINERD_SOCKET,
+                STOCK_CONTAINERD_SOCKET,
+            ]))
+            .expect_err("both sockets must be ambiguous");
+        assert!(matches!(err, ConfigError::AmbiguousProfile));
+    }
+
+    #[test]
+    fn resolve_profile_auto_neither_socket_errors_when_auto_zran_enabled() {
+        let mut config = SnapshotterConfig::default();
+        config.snapshotter.auto_zran.enable = true;
+        let err = config
+            .resolve_profile_with(probe_present(&[]))
+            .expect_err("no socket + auto_zran must error");
+        assert!(matches!(err, ConfigError::NoContainerdSocket));
+    }
+
+    #[test]
+    fn resolve_profile_auto_neither_socket_defaults_containerd_when_auto_zran_disabled() {
+        let mut config = SnapshotterConfig::default();
+        assert!(!config.snapshotter.auto_zran.enable);
+        let rp = config
+            .resolve_profile_with(probe_present(&[]))
+            .expect("resolve");
+        assert_eq!(rp.profile, Profile::Containerd);
+    }
+
+    // ── B2: back-compat + preset + query template ──────────────────────
+
+    /// #1 ACCEPTANCE: an existing k3s config using the legacy
+    /// `[snapshotter.spegel_mirror]` table with only `enable = true`, on a
+    /// k3s host (auto → k3s), must reproduce today's Spegel behaviour byte
+    /// for byte: enable, endpoint, discovery, and mTLS cert paths.
+    #[test]
+    fn legacy_spegel_mirror_alias_reproduces_k3s_behaviour() {
+        let toml_str = r#"
+[snapshotter.containerd]
+address = "/run/k3s/containerd/containerd.sock"
+content_root = "/var/lib/rancher/k3s/agent/containerd/io.containerd.content.v1.content"
+
+[snapshotter.spegel_mirror]
+enable = true
+"#;
+        let mut config: SnapshotterConfig = toml::from_str(toml_str).expect("parse legacy config");
+        // Alias parsed into peer_mirror with enable explicitly set.
+        assert_eq!(config.snapshotter.peer_mirror.enable, Some(true));
+        // Resolve on a k3s host.
+        config
+            .resolve_profile_with(probe_present(&[K3S_CONTAINERD_SOCKET]))
+            .expect("resolve");
+        let pm = &config.snapshotter.peer_mirror;
+        assert_eq!(pm.preset, Some(MirrorPreset::K3sSpegel));
+        assert!(pm.is_enabled());
+        assert_eq!(pm.endpoint(), "https://127.0.0.1:6443");
+        assert_eq!(pm.peer_discovery(), PeerDiscoveryMode::Kubernetes);
+        assert_eq!(
+            pm.ca_path(),
+            Some(std::path::Path::new(
+                "/var/lib/rancher/k3s/agent/server-ca.crt"
+            ))
+        );
+        assert_eq!(
+            pm.client_cert_path(),
+            Some(std::path::Path::new(
+                "/var/lib/rancher/k3s/agent/client-k3s-controller.crt"
+            ))
+        );
+        assert_eq!(
+            pm.client_key_path(),
+            Some(std::path::Path::new(
+                "/var/lib/rancher/k3s/agent/client-k3s-controller.key"
+            ))
+        );
+        // The Spegel `?ns=` query is still emitted.
+        assert_eq!(
+            pm.artifact_query("example.com"),
+            Some("ns=example.com".to_string())
+        );
+    }
+
+    #[test]
+    fn preset_derives_discovery_default() {
+        // k3s-spegel ⇒ kubernetes; spegel ⇒ off; none ⇒ off.
+        for (preset, expected) in [
+            (MirrorPreset::K3sSpegel, PeerDiscoveryMode::Kubernetes),
+            (MirrorPreset::Spegel, PeerDiscoveryMode::Off),
+            (MirrorPreset::None, PeerDiscoveryMode::Off),
+        ] {
+            let mut config = SnapshotterConfig::default();
+            config.snapshotter.peer_mirror.preset = Some(preset);
+            config
+                .resolve_profile_with(probe_present(&[STOCK_CONTAINERD_SOCKET]))
+                .expect("resolve");
+            assert_eq!(
+                config.snapshotter.peer_mirror.peer_discovery(),
+                expected,
+                "preset {preset:?} discovery default"
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_peer_discovery_overrides_preset_default() {
+        let toml_str = r#"
+[snapshotter]
+profile = "k3s"
+
+[snapshotter.peer_mirror]
+peer_discovery = "off"
+"#;
+        let mut config: SnapshotterConfig = toml::from_str(toml_str).expect("parse");
+        config
+            .resolve_profile_with(probe_present(&[K3S_CONTAINERD_SOCKET]))
+            .expect("resolve");
+        // k3s-spegel would default kubernetes, but the operator pinned off.
+        assert_eq!(
+            config.snapshotter.peer_mirror.peer_discovery(),
+            PeerDiscoveryMode::Off
+        );
+    }
+
+    #[test]
+    fn query_template_expansion_and_empty() {
+        assert_eq!(
+            expand_query_template("ns={registry}", "docker.io"),
+            Some("ns=docker.io".to_string())
+        );
+        assert_eq!(expand_query_template("", "docker.io"), None);
+        // A template without the placeholder is emitted verbatim.
+        assert_eq!(
+            expand_query_template("static=1", "docker.io"),
+            Some("static=1".to_string())
+        );
+    }
+
+    #[test]
+    fn empty_query_template_yields_no_query() {
+        let toml_str = r#"
+[snapshotter.peer_mirror]
+query_template = ""
+"#;
+        let config: SnapshotterConfig = toml::from_str(toml_str).expect("parse");
+        assert_eq!(
+            config.snapshotter.peer_mirror.artifact_query("docker.io"),
+            None
+        );
+    }
+
+    #[test]
+    fn peer_mirror_new_name_also_parses() {
+        // The new canonical name works alongside the legacy alias.
+        let toml_str = r#"
+[snapshotter.peer_mirror]
+preset = "spegel"
+enable = true
+endpoint = "http://127.0.0.1:5000"
+"#;
+        let config: SnapshotterConfig = toml::from_str(toml_str).expect("parse");
+        assert_eq!(
+            config.snapshotter.peer_mirror.preset,
+            Some(MirrorPreset::Spegel)
+        );
+        assert_eq!(config.snapshotter.peer_mirror.enable, Some(true));
+        assert_eq!(
+            config.snapshotter.peer_mirror.endpoint(),
+            "http://127.0.0.1:5000"
+        );
     }
 }
