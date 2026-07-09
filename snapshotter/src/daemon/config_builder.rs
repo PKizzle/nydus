@@ -111,6 +111,16 @@ pub fn build_backend_config(
     auth: Option<String>,
 ) -> anyhow::Result<BackendConfigV2> {
     let backends = &cfg.backends;
+    // Defense in depth: `SnapshotterConfig::validate` rejects >1 pull backend
+    // at startup, but library callers (tests, embedders) may skip it and the
+    // `if let` chain below would then silently pick by precedence. Assert the
+    // invariant in debug builds so that path is caught in test.
+    debug_assert!(
+        backends.pull_backends().len() <= 1,
+        "build_backend_config called with multiple pull backends ({:?}); \
+         SnapshotterConfig::validate() must run first",
+        backends.pull_backends()
+    );
     if let Some(s3) = backends.s3.as_ref() {
         build_s3_backend(s3)
     } else if let Some(oss) = backends.oss.as_ref() {
@@ -174,16 +184,18 @@ fn build_registry_backend(
 
 /// Build the `s3` `BackendConfigV2`. Credentials are resolved from the named
 /// environment variables (`access_key_env` / `secret_key_env`); a referenced
-/// variable that is not set is a hard error.
+/// variable that is not set is a hard error. The `endpoint` is normalised to a
+/// bare host and the URL scheme selected via [`resolve_endpoint_scheme`].
 fn build_s3_backend(s3: &S3BackendConfig) -> anyhow::Result<BackendConfigV2> {
     let access_key_id = resolve_credential_env(&s3.access_key_env)?;
     let access_key_secret = resolve_credential_env(&s3.secret_key_env)?;
+    let (scheme, endpoint) = resolve_endpoint_scheme(&s3.endpoint, s3.insecure);
     let s3_cfg = S3Config {
-        scheme: "https".to_string(),
-        endpoint: s3.endpoint.clone(),
+        scheme,
+        endpoint,
         region: s3.region.clone(),
         bucket_name: s3.bucket.clone(),
-        object_prefix: String::new(),
+        object_prefix: s3.object_prefix.clone().unwrap_or_default(),
         access_key_id,
         access_key_secret,
         skip_verify: false,
@@ -206,15 +218,18 @@ fn build_s3_backend(s3: &S3BackendConfig) -> anyhow::Result<BackendConfigV2> {
 
 /// Build the `oss` `BackendConfigV2`. Credentials are optional: an empty
 /// `access_key_env` / `secret_key_env` yields blank keys (anonymous / public
-/// bucket access); a non-empty name that is unset is a hard error.
+/// bucket access); a non-empty name that is unset is a hard error. The
+/// `endpoint` is normalised to a bare host and the URL scheme selected via
+/// [`resolve_endpoint_scheme`].
 fn build_oss_backend(oss: &OssBackendConfig) -> anyhow::Result<BackendConfigV2> {
     let access_key_id = resolve_credential_env(&oss.access_key_env)?;
     let access_key_secret = resolve_credential_env(&oss.secret_key_env)?;
+    let (scheme, endpoint) = resolve_endpoint_scheme(&oss.endpoint, oss.insecure);
     let oss_cfg = OssConfig {
-        scheme: "https".to_string(),
-        endpoint: oss.endpoint.clone(),
+        scheme,
+        endpoint,
         bucket_name: oss.bucket.clone(),
-        object_prefix: String::new(),
+        object_prefix: oss.object_prefix.clone().unwrap_or_default(),
         access_key_id,
         access_key_secret,
         skip_verify: false,
@@ -233,6 +248,27 @@ fn build_oss_backend(oss: &OssBackendConfig) -> anyhow::Result<BackendConfigV2> 
         registry: None,
         http_proxy: None,
     })
+}
+
+/// Normalise an object-store `endpoint` into `(scheme, bare_host)`.
+///
+/// The storage backends build the object URL as `{scheme}://{endpoint}/...`, so
+/// `endpoint` must be a bare host with no scheme. If the operator nonetheless
+/// wrote a scheme-prefixed URL (`http://` / `https://`), the explicit prefix is
+/// stripped and wins over `insecure` (friendliest — a pasted URL still works,
+/// and never produces a malformed `https://https://…`). Otherwise `insecure`
+/// selects `http` vs `https`. A trailing `/` on the host is trimmed.
+fn resolve_endpoint_scheme(endpoint: &str, insecure: bool) -> (String, String) {
+    let (scheme, host) = if let Some(rest) = endpoint.strip_prefix("https://") {
+        ("https", rest)
+    } else if let Some(rest) = endpoint.strip_prefix("http://") {
+        ("http", rest)
+    } else if insecure {
+        ("http", endpoint)
+    } else {
+        ("https", endpoint)
+    };
+    (scheme.to_string(), host.trim_end_matches('/').to_string())
 }
 
 /// Build the `http-proxy` `BackendConfigV2`. The snapshotter section exposes
@@ -528,6 +564,20 @@ mod tests {
         assert_eq!(reg.auth.as_deref(), Some("dXNlcjpwYXNz"));
     }
 
+    /// Build an `S3BackendConfig` with the given endpoint/insecure/object_prefix
+    /// and no credentials, for the scheme/prefix mapping tests.
+    fn s3_cfg(endpoint: &str, insecure: bool, object_prefix: Option<&str>) -> S3BackendConfig {
+        S3BackendConfig {
+            endpoint: endpoint.to_string(),
+            region: "us-east-1".to_string(),
+            bucket: "b".to_string(),
+            access_key_env: String::new(),
+            secret_key_env: String::new(),
+            insecure,
+            object_prefix: object_prefix.map(str::to_string),
+        }
+    }
+
     #[test]
     fn s3_backend_maps_fields_and_resolves_env_credentials() {
         // Unique env var names to avoid cross-test interference.
@@ -537,22 +587,26 @@ mod tests {
         }
         let mut cfg = SnapshotterConfig::default();
         cfg.backends.s3 = Some(S3BackendConfig {
-            endpoint: "https://s3.us-east-1.amazonaws.com".to_string(),
+            // Bare host — the required form; scheme comes from `insecure`.
+            endpoint: "s3.us-east-1.amazonaws.com".to_string(),
             region: "us-east-1".to_string(),
             bucket: "my-nydus-blobs".to_string(),
             access_key_env: "B3_TEST_S3_AK".to_string(),
             secret_key_env: "B3_TEST_S3_SK".to_string(),
+            insecure: false,
+            object_prefix: Some("nydus/".to_string()),
         });
         let backend = build_backend_config(&cfg, &dummy_image(), None).unwrap();
         assert_eq!(backend.backend_type, "s3");
         assert!(backend.registry.is_none());
         let s3 = backend.s3.as_ref().unwrap();
-        assert_eq!(s3.endpoint, "https://s3.us-east-1.amazonaws.com");
+        assert_eq!(s3.endpoint, "s3.us-east-1.amazonaws.com");
+        assert_eq!(s3.scheme, "https");
         assert_eq!(s3.region, "us-east-1");
         assert_eq!(s3.bucket_name, "my-nydus-blobs");
+        assert_eq!(s3.object_prefix, "nydus/");
         assert_eq!(s3.access_key_id, "AKIAEXAMPLE");
         assert_eq!(s3.access_key_secret, "s3cr3t");
-        assert_eq!(s3.scheme, "https");
         assert_eq!(s3.retry_limit, BACKEND_RETRY_LIMIT);
         // The mapped backend must pass nydus-api's own validator.
         let bc = BackendConfigV2 {
@@ -568,15 +622,54 @@ mod tests {
     }
 
     #[test]
+    fn s3_bare_host_insecure_selects_http_scheme() {
+        // Bare MinIO host + insecure ⇒ http, endpoint stays the bare host.
+        let mut cfg = SnapshotterConfig::default();
+        cfg.backends.s3 = Some(s3_cfg("minio.local:9000", true, None));
+        let backend = build_backend_config(&cfg, &dummy_image(), None).unwrap();
+        let s3 = backend.s3.as_ref().unwrap();
+        assert_eq!(s3.scheme, "http");
+        assert_eq!(s3.endpoint, "minio.local:9000");
+        assert_eq!(s3.object_prefix, "");
+    }
+
+    #[test]
+    fn s3_scheme_prefixed_endpoint_is_stripped_not_malformed() {
+        // REGRESSION: a scheme-prefixed endpoint used to produce a malformed
+        // `https://https://…`. The prefix must be stripped and win over the
+        // `insecure` flag; the stored endpoint is a bare host.
+        for (endpoint, insecure, want_scheme) in [
+            ("https://s3.us-east-1.amazonaws.com", false, "https"),
+            ("http://minio.local:9000", false, "http"), // prefix wins over insecure=false
+            ("https://s3.example.com", true, "https"),  // prefix wins over insecure=true
+            ("https://s3.example.com/", false, "https"), // trailing slash trimmed
+        ] {
+            let mut cfg = SnapshotterConfig::default();
+            cfg.backends.s3 = Some(s3_cfg(endpoint, insecure, None));
+            let backend = build_backend_config(&cfg, &dummy_image(), None).unwrap();
+            let s3 = backend.s3.as_ref().unwrap();
+            assert_eq!(s3.scheme, want_scheme, "scheme for {endpoint}");
+            assert!(
+                !s3.endpoint.contains("://"),
+                "endpoint must be a bare host, got {:?}",
+                s3.endpoint
+            );
+            // The reconstructed URL prefix must be well-formed (no double scheme).
+            let url = format!("{}://{}", s3.scheme, s3.endpoint);
+            assert!(
+                url.matches("://").count() == 1,
+                "reconstructed URL must have exactly one scheme separator: {url}"
+            );
+        }
+    }
+
+    #[test]
     fn s3_backend_missing_env_var_is_hard_error() {
         let mut cfg = SnapshotterConfig::default();
-        cfg.backends.s3 = Some(S3BackendConfig {
-            endpoint: "https://s3.example.com".to_string(),
-            region: "us-east-1".to_string(),
-            bucket: "b".to_string(),
-            access_key_env: "B3_TEST_DEFINITELY_UNSET_VAR".to_string(),
-            secret_key_env: "B3_TEST_DEFINITELY_UNSET_VAR_2".to_string(),
-        });
+        let mut s3 = s3_cfg("s3.example.com", false, None);
+        s3.access_key_env = "B3_TEST_DEFINITELY_UNSET_VAR".to_string();
+        s3.secret_key_env = "B3_TEST_DEFINITELY_UNSET_VAR_2".to_string();
+        cfg.backends.s3 = Some(s3);
         let err = build_backend_config(&cfg, &dummy_image(), None).unwrap_err();
         assert!(
             err.to_string().contains("B3_TEST_DEFINITELY_UNSET_VAR"),
@@ -585,28 +678,48 @@ mod tests {
     }
 
     #[test]
-    fn oss_backend_maps_fields_anonymous() {
+    fn oss_backend_maps_fields_anonymous_with_scheme_and_prefix() {
         let mut cfg = SnapshotterConfig::default();
         cfg.backends.oss = Some(OssBackendConfig {
-            endpoint: "https://oss-cn-hangzhou.aliyuncs.com".to_string(),
+            endpoint: "oss-cn-hangzhou.aliyuncs.com".to_string(),
             bucket: "nydus-bucket".to_string(),
             access_key_env: String::new(),
             secret_key_env: String::new(),
+            insecure: false,
+            object_prefix: Some("blobs/".to_string()),
         });
         let backend = build_backend_config(&cfg, &dummy_image(), None).unwrap();
         assert_eq!(backend.backend_type, "oss");
         let oss = backend.oss.as_ref().unwrap();
-        assert_eq!(oss.endpoint, "https://oss-cn-hangzhou.aliyuncs.com");
+        assert_eq!(oss.endpoint, "oss-cn-hangzhou.aliyuncs.com");
+        assert_eq!(oss.scheme, "https");
         assert_eq!(oss.bucket_name, "nydus-bucket");
+        assert_eq!(oss.object_prefix, "blobs/");
         assert_eq!(oss.access_key_id, "");
         assert_eq!(oss.access_key_secret, "");
-        assert_eq!(oss.scheme, "https");
         let bc = BackendConfigV2 {
             backend_type: "oss".to_string(),
             oss: backend.oss.clone(),
             ..Default::default()
         };
         assert!(bc.validate());
+    }
+
+    #[test]
+    fn oss_scheme_prefixed_endpoint_is_stripped() {
+        let mut cfg = SnapshotterConfig::default();
+        cfg.backends.oss = Some(OssBackendConfig {
+            endpoint: "http://oss.local:9000".to_string(),
+            bucket: "b".to_string(),
+            access_key_env: String::new(),
+            secret_key_env: String::new(),
+            insecure: false,
+            object_prefix: None,
+        });
+        let backend = build_backend_config(&cfg, &dummy_image(), None).unwrap();
+        let oss = backend.oss.as_ref().unwrap();
+        assert_eq!(oss.scheme, "http");
+        assert_eq!(oss.endpoint, "oss.local:9000");
     }
 
     #[test]
@@ -630,21 +743,11 @@ mod tests {
     }
 
     #[test]
-    fn s3_takes_precedence_and_full_config_is_valid() {
+    fn s3_full_config_is_valid() {
         // build_daemon_config wraps the selected backend with cache + rafs; the
         // whole ConfigV2 must validate against nydus-api.
-        unsafe {
-            std::env::set_var("B3_TEST_S3_AK2", "AKIA");
-            std::env::set_var("B3_TEST_S3_SK2", "sec");
-        }
         let mut cfg = SnapshotterConfig::default();
-        cfg.backends.s3 = Some(S3BackendConfig {
-            endpoint: "https://s3.example.com".to_string(),
-            region: "us-east-1".to_string(),
-            bucket: "b".to_string(),
-            access_key_env: "B3_TEST_S3_AK2".to_string(),
-            secret_key_env: "B3_TEST_S3_SK2".to_string(),
-        });
+        cfg.backends.s3 = Some(s3_cfg("s3.example.com", false, None));
         let cv2 = build_daemon_config(
             &cfg,
             &dummy_image(),
@@ -656,9 +759,25 @@ mod tests {
         assert_eq!(cv2.backend.as_ref().unwrap().backend_type, "s3");
         assert_eq!(cv2.cache.as_ref().unwrap().cache_type, "filecache");
         assert!(cv2.validate());
-        unsafe {
-            std::env::remove_var("B3_TEST_S3_AK2");
-            std::env::remove_var("B3_TEST_S3_SK2");
-        }
+    }
+
+    #[test]
+    fn resolve_endpoint_scheme_matrix() {
+        assert_eq!(
+            resolve_endpoint_scheme("s3.example.com", false),
+            ("https".to_string(), "s3.example.com".to_string())
+        );
+        assert_eq!(
+            resolve_endpoint_scheme("s3.example.com", true),
+            ("http".to_string(), "s3.example.com".to_string())
+        );
+        assert_eq!(
+            resolve_endpoint_scheme("https://s3.example.com", true),
+            ("https".to_string(), "s3.example.com".to_string())
+        );
+        assert_eq!(
+            resolve_endpoint_scheme("http://minio.local:9000/", false),
+            ("http".to_string(), "minio.local:9000".to_string())
+        );
     }
 }

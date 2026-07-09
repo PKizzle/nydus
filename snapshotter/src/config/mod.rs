@@ -965,6 +965,13 @@ pub struct RegistryBackendConfig {
 }
 
 /// S3 backend configuration.
+///
+/// `endpoint` should be a BARE HOST (e.g. `s3.us-east-1.amazonaws.com` or
+/// `minio.local:9000`): the storage backend builds the object URL as
+/// `{scheme}://{endpoint}/...`, so the scheme is selected separately via
+/// `insecure`. As a convenience a scheme-prefixed endpoint (`http://` /
+/// `https://`) is accepted and the explicit prefix wins over `insecure` — see
+/// [`crate::daemon::config_builder`].
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct S3BackendConfig {
     pub endpoint: String,
@@ -972,9 +979,20 @@ pub struct S3BackendConfig {
     pub bucket: String,
     pub access_key_env: String,
     pub secret_key_env: String,
+    /// Use plain HTTP instead of HTTPS for a bare-host `endpoint` (e.g. an
+    /// on-prem MinIO served over http). Ignored when `endpoint` already
+    /// carries an explicit scheme. Default `false` (HTTPS).
+    #[serde(default)]
+    pub insecure: bool,
+    /// Optional object-key prefix simulating a subdirectory layout, e.g.
+    /// `nydus/` → object key `nydus/sha256:xxx`. `None` means no prefix.
+    #[serde(default)]
+    pub object_prefix: Option<String>,
 }
 
 /// OSS backend configuration.
+///
+/// `endpoint` follows the same BARE-HOST convention as [`S3BackendConfig`].
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct OssBackendConfig {
     pub endpoint: String,
@@ -987,6 +1005,14 @@ pub struct OssBackendConfig {
     /// Name of the environment variable holding the OSS access-key secret.
     #[serde(default)]
     pub secret_key_env: String,
+    /// Use plain HTTP instead of HTTPS for a bare-host `endpoint`. Ignored when
+    /// `endpoint` already carries an explicit scheme. Default `false` (HTTPS).
+    #[serde(default)]
+    pub insecure: bool,
+    /// Optional object-key prefix simulating a subdirectory layout, e.g.
+    /// `nydus/`. `None` means no prefix.
+    #[serde(default)]
+    pub object_prefix: Option<String>,
 }
 
 /// Local filesystem backend configuration.
