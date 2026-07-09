@@ -62,6 +62,12 @@ impl SnapshotterError {
         )))
     }
 
+    fn invalid_argument(message: impl Into<String>) -> Self {
+        Self(Box::new(snapshots::tonic::Status::invalid_argument(
+            message.into(),
+        )))
+    }
+
     fn status_label(&self) -> &'static str {
         match self.0.code() {
             snapshots::tonic::Code::Ok => "ok",
@@ -106,6 +112,168 @@ fn info_to_snapshots(si: SnapshotInfo) -> Info {
         created_at: SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(si.created_at as u64),
         updated_at: SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(si.updated_at as u64),
     }
+}
+
+/// How `update()` should apply the label field of an incoming `Info`, derived
+/// from containerd's protobuf `update_mask`.
+///
+/// containerd sends a field-mask whose paths select which mutable properties of
+/// a snapshot to write. For snapshots only labels are mutable, so we recognise
+/// exactly two shapes (mirroring containerd's own `metadata` snapshotter):
+///   * a bare `labels` path — replace the entire label set;
+///   * `labels.<key>` paths — merge only those keys, preserving every other
+///     existing label (crucially containerd's `containerd.io/gc.ref.*` GC roots).
+#[derive(Debug, PartialEq, Eq)]
+enum LabelMask {
+    /// Replace all labels with the incoming set (also the `fieldpaths == None`
+    /// default).
+    ReplaceAll,
+    /// Merge only these keys from the incoming set into the existing labels.
+    Merge(Vec<String>),
+}
+
+/// Parse containerd `update_mask` paths into a [`LabelMask`].
+///
+/// Returns `Err(path)` for the first path that is neither `labels` nor
+/// `labels.<key>` so the caller can answer with gRPC `InvalidArgument`, matching
+/// containerd's own snapshotter (`cannot update %q field`). A bare `labels`
+/// anywhere in the list wins (replace-all subsumes any per-key merge, exactly as
+/// containerd's sequential apply would end up), but every path is still validated
+/// so an unsupported field is never silently accepted.
+fn parse_label_mask(fieldpaths: &[String]) -> Result<LabelMask, String> {
+    let mut keys = Vec::new();
+    let mut replace_all = false;
+    for path in fieldpaths {
+        if path == "labels" {
+            replace_all = true;
+        } else if let Some(key) = path.strip_prefix("labels.") {
+            keys.push(key.to_string());
+        } else {
+            return Err(path.clone());
+        }
+    }
+    Ok(if replace_all {
+        LabelMask::ReplaceAll
+    } else {
+        LabelMask::Merge(keys)
+    })
+}
+
+/// Merge the masked `keys` from `incoming` onto a clone of `existing`, preserving
+/// all other existing labels. An absent key in `incoming` is written as the empty
+/// string, matching containerd's `updated.Labels[key] = info.Labels[key]` (a Go
+/// map miss yields "").
+fn merge_labels(
+    existing: &HashMap<String, String>,
+    incoming: &HashMap<String, String>,
+    keys: &[String],
+) -> HashMap<String, String> {
+    let mut merged = existing.clone();
+    for key in keys {
+        merged.insert(key.clone(), incoming.get(key).cloned().unwrap_or_default());
+    }
+    merged
+}
+
+/// A single `field==value` term of a containerd Walk filter.
+#[derive(Debug, PartialEq, Eq)]
+enum FilterTerm {
+    /// `name==` / `key==` — the snapshot key.
+    Name(String),
+    /// `parent==` — the parent key ("" when the snapshot has no parent).
+    Parent(String),
+    /// `kind==` — one of `active` / `committed` / `view`.
+    Kind(String),
+    /// `labels."<key>"==<value>` — a specific label's value.
+    Label { key: String, value: String },
+}
+
+/// Strip one pair of surrounding double quotes, if present. containerd's filter
+/// grammar allows both quoted and bare values/keys (`labels."k"==v`, `key==v`,
+/// `key=="v"`).
+fn unquote(s: &str) -> &str {
+    let s = s.trim();
+    if s.len() >= 2 && s.starts_with('"') && s.ends_with('"') {
+        &s[1..s.len() - 1]
+    } else {
+        s
+    }
+}
+
+/// Parse a single `field==value` term. Returns `None` for any unsupported field
+/// or operator so the whole filter falls back to unfiltered.
+fn parse_filter_term(term: &str) -> Option<FilterTerm> {
+    let (field, value) = term.trim().split_once("==")?;
+    let field = field.trim();
+    let value = unquote(value).to_string();
+    if let Some(rest) = field.strip_prefix("labels.") {
+        let key = unquote(rest).to_string();
+        if key.is_empty() {
+            return None;
+        }
+        return Some(FilterTerm::Label { key, value });
+    }
+    match field {
+        "name" | "key" => Some(FilterTerm::Name(value)),
+        "parent" => Some(FilterTerm::Parent(value)),
+        "kind" => Some(FilterTerm::Kind(value)),
+        _ => None,
+    }
+}
+
+/// Parse one comma-separated filter string into a conjunction (AND) of terms.
+/// An empty string is a valid filter that matches everything (empty conjunction).
+/// Returns `None` if any term is unsupported.
+fn parse_filter_expr(s: &str) -> Option<Vec<FilterTerm>> {
+    let mut terms = Vec::new();
+    for part in s.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        terms.push(parse_filter_term(part)?);
+    }
+    Some(terms)
+}
+
+/// Parse the containerd Walk `filters` vec into a disjunction (OR) of
+/// conjunctions (AND). Returns `None` if ANY filter string is unsupported, so the
+/// caller can safely fall back to the unfiltered list (containerd/ctr post-filter
+/// the stream anyway).
+fn parse_filters(filters: &[String]) -> Option<Vec<Vec<FilterTerm>>> {
+    filters.iter().map(|f| parse_filter_expr(f)).collect()
+}
+
+/// Map a stored snapshot kind (`kind_active` etc.) to the containerd filter
+/// token (`active` etc.).
+fn kind_filter_token(store_kind: &str) -> &'static str {
+    match store_kind {
+        "kind_active" => "active",
+        "kind_committed" => "committed",
+        "kind_view" => "view",
+        _ => "unknown",
+    }
+}
+
+fn term_matches(term: &FilterTerm, info: &SnapshotInfo) -> bool {
+    match term {
+        FilterTerm::Name(v) => info.key == *v,
+        FilterTerm::Parent(v) => info.parent.as_deref().unwrap_or("") == v,
+        FilterTerm::Kind(v) => kind_filter_token(&info.kind) == v,
+        FilterTerm::Label { key, value } => info.labels.get(key).is_some_and(|x| x == value),
+    }
+}
+
+/// A snapshot matches when it satisfies ALL terms of ANY filter expression
+/// (OR-of-ANDs). An empty expression list means no filter was supplied → match
+/// everything.
+fn snapshot_matches(info: &SnapshotInfo, exprs: &[Vec<FilterTerm>]) -> bool {
+    if exprs.is_empty() {
+        return true;
+    }
+    exprs
+        .iter()
+        .any(|terms| terms.iter().all(|t| term_matches(t, info)))
 }
 
 fn snapshot_status_label<T>(result: &Result<T, SnapshotterError>) -> &'static str {
@@ -166,6 +334,10 @@ pub struct NydusSnapshotter {
     overlay: OverlayEngine,
     supervisor: Arc<DaemonSupervisor>,
     metrics: Arc<SnapshotterMetrics>,
+    /// The reconciler, shared with the background reconciliation loop. The
+    /// Cleanup RPC (`clear()`) runs a single synchronous pass through it for
+    /// on-demand orphan reclamation.
+    reconciler: Arc<Reconciler>,
     /// Auto-accel access tracer. Disabled (no-op) when
     /// `auto_zran.capture.enable = false` or fanotify init fails; cheap
     /// (no-op) clone otherwise.
@@ -310,18 +482,47 @@ impl snapshots::Snapshotter for NydusSnapshotter {
     async fn update(
         &self,
         info: Info,
-        _fieldpaths: Option<Vec<String>>,
+        fieldpaths: Option<Vec<String>>,
     ) -> Result<Info, Self::Error> {
         let timer = self.metrics.start_snapshot_operation("update");
         let result = async {
-            info!(name = %info.name, fieldpaths = ?_fieldpaths, labels = ?info.labels, "update snapshot");
+            info!(name = %info.name, fieldpaths = ?fieldpaths, labels = ?info.labels, "update snapshot");
             let store = self.store.as_ref();
-            let labels: Vec<(String, String)> = info.labels.into_iter().collect();
+
+            // Honor containerd's field-mask. Absent mask (`None`) replaces all
+            // labels; a bare `labels` path does the same; `labels.<key>` paths
+            // merge only those keys, preserving every other existing label so a
+            // masked update never clobbers containerd's GC-root labels.
+            let mask = match fieldpaths.as_deref() {
+                None => LabelMask::ReplaceAll,
+                Some(paths) => parse_label_mask(paths).map_err(|path| {
+                    warn!(name = %info.name, %path, "update snapshot: unsupported fieldpath");
+                    SnapshotterError::invalid_argument(format!(
+                        "cannot update {path:?} field on snapshot {:?}",
+                        info.name
+                    ))
+                })?,
+            };
+
+            let new_labels = match mask {
+                LabelMask::ReplaceAll => info.labels.clone(),
+                LabelMask::Merge(keys) => {
+                    // Read the current labels to merge onto. NotFound here is the
+                    // right gRPC answer for updating a missing snapshot.
+                    let existing = store.stat(&info.name).map_err(|e| {
+                        warn!(name = %info.name, error = %e, "update snapshot: not found");
+                        SnapshotterError::not_found(e.to_string())
+                    })?;
+                    merge_labels(&existing.labels, &info.labels, &keys)
+                }
+            };
+
+            let labels: Vec<(String, String)> = new_labels.into_iter().collect();
             store.update(&info.name, &labels).map_err(|e| {
                 warn!(name = %info.name, error = %e, "update snapshot failed");
                 SnapshotterError::internal(e.to_string())
             })?;
-            // Re-fetch the updated info
+            // Re-fetch the updated info (with the bumped updated_at the store sets).
             store.stat(&info.name).map(info_to_snapshots).map_err(|e| {
                 warn!(name = %info.name, error = %e, "stat updated snapshot failed");
                 SnapshotterError::internal(e.to_string())
@@ -596,17 +797,59 @@ impl snapshots::Snapshotter for NydusSnapshotter {
     async fn list(
         &self,
         _snapshotter: String,
-        _filters: Vec<String>,
+        filters: Vec<String>,
     ) -> Result<Self::InfoStream, Self::Error> {
         let timer = self.metrics.start_snapshot_operation("list");
         let result = async {
             let store = self.store.as_ref();
+
+            // Parse containerd Walk filters (OR across the vec, AND within each
+            // comma-separated string). ANY unsupported filter falls back to the
+            // unfiltered list — safe because containerd/ctr post-filter the
+            // stream themselves. `None` means no filtering (either no filter was
+            // supplied, or the fallback path).
+            let exprs = if filters.is_empty() {
+                None
+            } else {
+                match parse_filters(&filters) {
+                    Some(exprs) => Some(exprs),
+                    None => {
+                        warn!(
+                            ?filters,
+                            "unsupported walk filter; returning unfiltered list"
+                        );
+                        None
+                    }
+                }
+            };
+
             let snapshots = store
                 .list()
                 .map_err(|e| SnapshotterError::internal(e.to_string()))?
                 .into_iter()
+                .filter(move |info| match &exprs {
+                    Some(exprs) => snapshot_matches(info, exprs),
+                    None => true,
+                })
                 .map(|info| Ok(info_to_snapshots(info)));
             Ok(Box::pin(futures::stream::iter(snapshots)) as Self::InfoStream)
+        }
+        .await;
+        timer.finish(snapshot_status_label(&result));
+        result
+    }
+
+    /// Cleanup RPC. containerd calls this for orphan reclamation; run a single
+    /// synchronous reconciler pass (recover daemons, sweep stale daemon dirs,
+    /// cache GC, auto-zran debris) rather than the default no-op.
+    async fn clear(&self) -> Result<(), Self::Error> {
+        let timer = self.metrics.start_snapshot_operation("clear");
+        let result = async {
+            info!("cleanup RPC: running one-shot reconciler pass");
+            self.reconciler.run_once().await.map_err(|e| {
+                warn!(error = %e, "cleanup reconciler pass failed");
+                SnapshotterError::internal(e.to_string())
+            })
         }
         .await;
         timer.finish(snapshot_status_label(&result));
@@ -763,8 +1006,12 @@ pub async fn serve_with_supervisor(
             manager,
         );
     }
+    // Share the reconciler between the background loop and the snapshotter's
+    // Cleanup RPC (`clear()` → `run_once()`).
+    let reconciler = Arc::new(reconciler);
+    let reconciler_loop = reconciler.clone();
     compio::runtime::spawn(async move {
-        if let Err(e) = reconciler.run().await {
+        if let Err(e) = reconciler_loop.run().await {
             warn!(error = %e, "reconciler exited unexpectedly");
         }
     })
@@ -775,6 +1022,7 @@ pub async fn serve_with_supervisor(
         overlay,
         supervisor,
         metrics,
+        reconciler,
         access_tracer,
         auto_accel_discovery,
         containerd_lookup: containerd_lookup_for_discovery,
@@ -817,14 +1065,20 @@ mod tests {
     fn test_snapshotter(root: &Path) -> NydusSnapshotter {
         let mut config = SnapshotterConfig::default();
         config.snapshotter.root = root.to_path_buf();
-        let store = SnapshotStore::open(&root.join("metadata.fjall")).unwrap();
+        let store = Arc::new(SnapshotStore::open(&root.join("metadata.fjall")).unwrap());
         let overlay = OverlayEngine::new(config.clone());
         let supervisor = Arc::new(DaemonSupervisor::new(config));
+        let reconciler = Arc::new(Reconciler::new(
+            supervisor.clone(),
+            store.clone(),
+            std::time::Duration::from_secs(3600),
+        ));
         NydusSnapshotter {
-            store: Arc::new(store),
+            store,
             overlay,
             supervisor,
             metrics: Arc::new(SnapshotterMetrics::new()),
+            reconciler,
             access_tracer: crate::access_tracer::AccessTracer::start(
                 Default::default(),
                 crate::prefetch_profile::PrefetchProfileStore::from_cache_root(root),
@@ -911,6 +1165,140 @@ mod tests {
         assert!(metrics.contains(
             "snapshotter_snapshot_operation_total{snapshot_operation=\"prepare\",status=\"already_exists\"}"
         ));
+    }
+
+    #[compio::test]
+    async fn update_masked_merge_preserves_gc_labels() {
+        use crate::store::SnapshotKind;
+        let dir = tempdir().unwrap();
+        let snapshotter = test_snapshotter(dir.path());
+        snapshotter
+            .store
+            .create(
+                "snap",
+                None,
+                SnapshotKind::Active,
+                "fusedev",
+                None,
+                &labels(&[
+                    ("containerd.io/gc.ref.content.0", "sha256:abc"),
+                    ("app", "old"),
+                ]),
+            )
+            .unwrap();
+
+        let mut info = Info {
+            name: "snap".to_string(),
+            ..Default::default()
+        };
+        info.labels = labels(&[("app", "new")]);
+        let updated = snapshotter
+            .update(info, Some(vec!["labels.app".to_string()]))
+            .await
+            .unwrap();
+
+        assert_eq!(updated.labels.get("app").map(String::as_str), Some("new"));
+        assert_eq!(
+            updated
+                .labels
+                .get("containerd.io/gc.ref.content.0")
+                .map(String::as_str),
+            Some("sha256:abc"),
+            "masked update must not clobber the GC-root label"
+        );
+    }
+
+    #[compio::test]
+    async fn update_replace_all_when_mask_absent() {
+        use crate::store::SnapshotKind;
+        let dir = tempdir().unwrap();
+        let snapshotter = test_snapshotter(dir.path());
+        snapshotter
+            .store
+            .create(
+                "snap",
+                None,
+                SnapshotKind::Active,
+                "fusedev",
+                None,
+                &labels(&[("old", "1")]),
+            )
+            .unwrap();
+
+        let info = Info {
+            name: "snap".to_string(),
+            labels: labels(&[("only", "kept")]),
+            ..Default::default()
+        };
+        let updated = snapshotter.update(info, None).await.unwrap();
+        assert!(!updated.labels.contains_key("old"));
+        assert_eq!(updated.labels.get("only").map(String::as_str), Some("kept"));
+    }
+
+    #[compio::test]
+    async fn update_unsupported_fieldpath_is_invalid_argument() {
+        use crate::store::SnapshotKind;
+        let dir = tempdir().unwrap();
+        let snapshotter = test_snapshotter(dir.path());
+        snapshotter
+            .store
+            .create(
+                "snap",
+                None,
+                SnapshotKind::Active,
+                "fusedev",
+                None,
+                &labels(&[]),
+            )
+            .unwrap();
+
+        let info = Info {
+            name: "snap".to_string(),
+            ..Default::default()
+        };
+        let err = snapshotter
+            .update(info, Some(vec!["parent".to_string()]))
+            .await
+            .expect_err("unsupported fieldpath must be rejected");
+        assert_eq!(status_code(err), snapshots::tonic::Code::InvalidArgument);
+    }
+
+    #[compio::test]
+    async fn clear_runs_a_reconciler_pass() {
+        // With no daemons/mounts the pass is a clean no-op, but it must return
+        // Ok — i.e. the Cleanup RPC is wired to the reconciler, not the default.
+        let dir = tempdir().unwrap();
+        let snapshotter = test_snapshotter(dir.path());
+        snapshotter.clear().await.unwrap();
+    }
+
+    #[compio::test]
+    async fn list_filters_by_key() {
+        use crate::store::SnapshotKind;
+        use futures::StreamExt as _;
+        let dir = tempdir().unwrap();
+        let snapshotter = test_snapshotter(dir.path());
+        for key in ["a", "b", "c"] {
+            snapshotter
+                .store
+                .create(
+                    key,
+                    None,
+                    SnapshotKind::Active,
+                    "fusedev",
+                    None,
+                    &labels(&[]),
+                )
+                .unwrap();
+        }
+
+        let stream = snapshotter
+            .list(String::new(), vec!["key==b".to_string()])
+            .await
+            .unwrap();
+        let got: Vec<_> = stream.collect().await;
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].as_ref().unwrap().name, "b");
     }
 
     /// End-to-end check of the gRPC transport: serve the containerd snapshots
@@ -1000,6 +1388,208 @@ ead2bc6bac86c94fd0bfe3dda6bd9c1dc39bf2bd2446f8048aee82f437584bb";
     #[test]
     fn parent_chain_digest_rejects_non_sha256_prefix() {
         assert_eq!(parent_chain_digest("k8s.io/18004/md5:abc"), None);
+    }
+
+    // ---- Field-mask merge (update) ----
+
+    fn labels(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn parse_label_mask_none_paths_replace_all() {
+        assert_eq!(
+            parse_label_mask(&["labels".to_string()]).unwrap(),
+            LabelMask::ReplaceAll
+        );
+    }
+
+    #[test]
+    fn parse_label_mask_collects_per_key_merges() {
+        assert_eq!(
+            parse_label_mask(&["labels.foo".to_string(), "labels.bar".to_string()]).unwrap(),
+            LabelMask::Merge(vec!["foo".to_string(), "bar".to_string()])
+        );
+    }
+
+    #[test]
+    fn parse_label_mask_bare_labels_wins_over_merge() {
+        // A bare `labels` alongside per-key paths collapses to replace-all, and
+        // every path is still validated (no early return hiding a bad field).
+        assert_eq!(
+            parse_label_mask(&["labels.foo".to_string(), "labels".to_string()]).unwrap(),
+            LabelMask::ReplaceAll
+        );
+    }
+
+    #[test]
+    fn parse_label_mask_rejects_unsupported_field() {
+        assert_eq!(
+            parse_label_mask(&["parent".to_string()]).unwrap_err(),
+            "parent".to_string()
+        );
+        assert_eq!(
+            parse_label_mask(&["labels.foo".to_string(), "kind".to_string()]).unwrap_err(),
+            "kind".to_string()
+        );
+    }
+
+    #[test]
+    fn merge_labels_preserves_unmasked_keys() {
+        // The GC-root clobber bug: a `labels.app` update must NOT drop an
+        // existing `containerd.io/gc.ref.content` label.
+        let existing = labels(&[
+            ("containerd.io/gc.ref.content.0", "sha256:abc"),
+            ("app", "old"),
+        ]);
+        let incoming = labels(&[("app", "new")]);
+        let merged = merge_labels(&existing, &incoming, &["app".to_string()]);
+        assert_eq!(merged.get("app").unwrap(), "new");
+        assert_eq!(
+            merged.get("containerd.io/gc.ref.content.0").unwrap(),
+            "sha256:abc"
+        );
+        assert_eq!(merged.len(), 2);
+    }
+
+    #[test]
+    fn merge_labels_absent_incoming_key_becomes_empty() {
+        // Matches containerd's `updated.Labels[key] = info.Labels[key]` (a Go map
+        // miss yields "").
+        let existing = labels(&[("keep", "yes")]);
+        let incoming = labels(&[]);
+        let merged = merge_labels(&existing, &incoming, &["gone".to_string()]);
+        assert_eq!(merged.get("keep").unwrap(), "yes");
+        assert_eq!(merged.get("gone").map(String::as_str), Some(""));
+    }
+
+    // ---- Walk filter parsing + matching (list) ----
+
+    fn snap(key: &str, parent: Option<&str>, kind: &str, lbls: &[(&str, &str)]) -> SnapshotInfo {
+        SnapshotInfo {
+            key: key.to_string(),
+            parent: parent.map(str::to_string),
+            kind: kind.to_string(),
+            fs_driver: "fusedev".to_string(),
+            image_ref: None,
+            created_at: 0,
+            updated_at: 0,
+            labels: labels(lbls),
+        }
+    }
+
+    #[test]
+    fn parse_filter_term_supports_all_fields() {
+        assert_eq!(
+            parse_filter_term("key==foo"),
+            Some(FilterTerm::Name("foo".to_string()))
+        );
+        assert_eq!(
+            parse_filter_term("name==foo"),
+            Some(FilterTerm::Name("foo".to_string()))
+        );
+        assert_eq!(
+            parse_filter_term("parent==p"),
+            Some(FilterTerm::Parent("p".to_string()))
+        );
+        assert_eq!(
+            parse_filter_term("kind==committed"),
+            Some(FilterTerm::Kind("committed".to_string()))
+        );
+        assert_eq!(
+            parse_filter_term(r#"labels."io.k8s/x"==v"#),
+            Some(FilterTerm::Label {
+                key: "io.k8s/x".to_string(),
+                value: "v".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn parse_filter_term_strips_quoted_values() {
+        assert_eq!(
+            parse_filter_term(r#"key=="quoted val""#),
+            Some(FilterTerm::Name("quoted val".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_filter_term_rejects_unsupported() {
+        assert_eq!(parse_filter_term("key~=regex"), None); // regex operator
+        assert_eq!(parse_filter_term("bogus==x"), None); // unknown field
+        assert_eq!(parse_filter_term("key"), None); // no operator/existence
+        assert_eq!(parse_filter_term(r#"labels.""==v"#), None); // empty label key
+    }
+
+    #[test]
+    fn parse_filters_and_within_a_string() {
+        let exprs = parse_filters(&["key==foo,parent==bar".to_string()]).unwrap();
+        assert_eq!(exprs.len(), 1);
+        assert_eq!(exprs[0].len(), 2);
+    }
+
+    #[test]
+    fn parse_filters_none_on_any_unsupported() {
+        assert!(parse_filters(&["key==foo".to_string(), "weird==x".to_string()]).is_none());
+    }
+
+    #[test]
+    fn snapshot_matches_and_semantics_within_expr() {
+        let exprs = parse_filters(&["key==k1,parent==p1".to_string()]).unwrap();
+        let hit = snap("k1", Some("p1"), "kind_active", &[]);
+        let miss = snap("k1", Some("other"), "kind_active", &[]);
+        assert!(snapshot_matches(&hit, &exprs));
+        assert!(!snapshot_matches(&miss, &exprs));
+    }
+
+    #[test]
+    fn snapshot_matches_or_semantics_across_strings() {
+        // Two filter strings are OR'd (containerd `ParseAll`).
+        let exprs = parse_filters(&["key==a".to_string(), "key==b".to_string()]).unwrap();
+        assert!(snapshot_matches(
+            &snap("a", None, "kind_active", &[]),
+            &exprs
+        ));
+        assert!(snapshot_matches(
+            &snap("b", None, "kind_active", &[]),
+            &exprs
+        ));
+        assert!(!snapshot_matches(
+            &snap("c", None, "kind_active", &[]),
+            &exprs
+        ));
+    }
+
+    #[test]
+    fn snapshot_matches_label_and_kind_and_parent() {
+        let exprs = parse_filters(&[r#"labels."role"==base,kind==committed"#.to_string()]).unwrap();
+        let hit = snap("k", Some("p"), "kind_committed", &[("role", "base")]);
+        let wrong_kind = snap("k", Some("p"), "kind_active", &[("role", "base")]);
+        let wrong_label = snap("k", Some("p"), "kind_committed", &[("role", "app")]);
+        assert!(snapshot_matches(&hit, &exprs));
+        assert!(!snapshot_matches(&wrong_kind, &exprs));
+        assert!(!snapshot_matches(&wrong_label, &exprs));
+    }
+
+    #[test]
+    fn snapshot_matches_empty_exprs_matches_all() {
+        assert!(snapshot_matches(&snap("x", None, "kind_active", &[]), &[]));
+    }
+
+    #[test]
+    fn snapshot_matches_parent_empty_string_for_rootless() {
+        let exprs = parse_filters(&["parent==".to_string()]).unwrap();
+        assert!(snapshot_matches(
+            &snap("root", None, "kind_committed", &[]),
+            &exprs
+        ));
+        assert!(!snapshot_matches(
+            &snap("child", Some("root"), "kind_active", &[]),
+            &exprs
+        ));
     }
 
     #[test]

@@ -108,6 +108,14 @@ impl Reconciler {
         }
     }
 
+    /// Run a single reconciliation pass on demand and return its result to the
+    /// caller (unlike [`Reconciler::run`], which loops and only logs errors).
+    /// Wired to the containerd Cleanup RPC so an operator/containerd can force
+    /// orphan reclamation synchronously instead of waiting for the next tick.
+    pub async fn run_once(&self) -> Result<()> {
+        self.reconcile().await
+    }
+
     /// Perform a single reconciliation pass.
     async fn reconcile(&self) -> Result<()> {
         debug!("starting reconciliation pass");
