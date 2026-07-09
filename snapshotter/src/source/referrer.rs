@@ -127,6 +127,38 @@ struct OciDescriptor {
 
 static REFERRER_CACHE: OnceLock<Mutex<ReferrerCache>> = OnceLock::new();
 
+thread_local! {
+    /// Per-thread compio runtime used by [`detect_referrer_blocking`] to drive
+    /// cyper from inside `blocking::unblock`. cyper's `Client` is `!Send`
+    /// (Rc-based, targets the compio current-thread runtime) and its HTTPS
+    /// plumbing needs `Runtime::current()` at build time plus a `block_on` to
+    /// run requests — the same threading model `peer_mirror.rs` uses.
+    static REFERRER_HTTP_RUNTIME: compio::runtime::Runtime = compio::runtime::Runtime::new()
+        .expect("referrer: failed to create compio HTTP runtime");
+}
+
+/// Run referrer detection off the caller's (gRPC) runtime.
+///
+/// cyper's `Client` is `!Send`, but the snapshotter trait requires `Send`
+/// futures, so all referrer HTTP runs inside `blocking::unblock` on a
+/// thread-local compio runtime (mirroring `peer_mirror.rs`). Only `Send`
+/// state (the owned `image_ref` + cloned `config`) crosses the boundary; the
+/// returned [`ReferrerInfo`] is owned and `Send`. Detection results are cached
+/// in the module-global LRU (both Nydus hits and StandardOci), so a given image
+/// ref costs at most one registry round-trip cluster-lifetime, not per-Prepare.
+pub async fn detect_referrer_blocking(
+    image_ref: &str,
+    config: &SnapshotterConfig,
+) -> Result<ReferrerInfo> {
+    let image_ref = image_ref.to_string();
+    let config = config.clone();
+    blocking::unblock(move || {
+        REFERRER_HTTP_RUNTIME
+            .with(|rt| rt.block_on(detect_referrer_with_config(&image_ref, &config)))
+    })
+    .await
+}
+
 /// Inspect an image reference for Nydus referrer descriptors.
 pub async fn detect_referrer(image_ref: &str) -> Result<ReferrerInfo> {
     detect_referrer_with_config(image_ref, &SnapshotterConfig::default()).await
@@ -651,5 +683,46 @@ mod tests {
             percent_encode_query("repository:team/app:pull"),
             "repository%3Ateam%2Fapp%3Apull"
         );
+    }
+
+    /// A cached NydusRafs result short-circuits `detect_referrer_with_config`
+    /// with zero registry interaction. This pins the "one lookup ever, not
+    /// per-Prepare" contract and lets the hot path assume a warm cache is free.
+    /// The image ref is deliberately unresolvable — if the cache were bypassed,
+    /// the call would attempt (and fail/hang on) a live registry round-trip.
+    #[compio::test]
+    async fn cached_nydus_hit_short_circuits_registry() {
+        let image_ref = "registry.invalid.test/cached/nydus:1";
+        let seeded = ReferrerInfo {
+            image_type: ImageType::NydusRafs,
+            bootstrap_digest: Some("sha256:cachedboot".to_string()),
+            fs_driver_hint: Some("fanotify".to_string()),
+        };
+        global_cache()
+            .lock()
+            .unwrap()
+            .insert(image_ref.to_string(), seeded.clone());
+
+        let info = detect_referrer_with_config(image_ref, &SnapshotterConfig::default())
+            .await
+            .expect("cached hit must resolve without a network call");
+        assert_eq!(info.image_type, ImageType::NydusRafs);
+        assert_eq!(info.bootstrap_digest.as_deref(), Some("sha256:cachedboot"));
+    }
+
+    /// StandardOci results are cached too, so a plain image also costs at most
+    /// one lookup — the cached miss returns instantly with no registry call.
+    #[compio::test]
+    async fn cached_standard_oci_short_circuits_registry() {
+        let image_ref = "registry.invalid.test/cached/plain:1";
+        global_cache()
+            .lock()
+            .unwrap()
+            .insert(image_ref.to_string(), standard_oci());
+
+        let info = detect_referrer_with_config(image_ref, &SnapshotterConfig::default())
+            .await
+            .expect("cached StandardOci must resolve without a network call");
+        assert_eq!(info.image_type, ImageType::StandardOci);
     }
 }

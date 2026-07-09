@@ -332,6 +332,10 @@ fn parent_chain_digest(parent: &str) -> Option<&str> {
 
 /// and daemon supervisor.
 pub struct NydusSnapshotter {
+    /// Snapshotter runtime config. Held so `prepare()` can read feature flags
+    /// (e.g. `features.referrer_detect`) and pass the config to the referrer
+    /// detector for registry auth/timeout.
+    config: SnapshotterConfig,
     store: Arc<SnapshotStore>,
     overlay: OverlayEngine,
     supervisor: Arc<DaemonSupervisor>,
@@ -661,6 +665,59 @@ impl snapshots::Snapshotter for NydusSnapshotter {
                         debug!(key, parent, mountpoint = %daemon_mnt.display(), "prepared auto-accel rootfs");
                         return Ok(self.rewrite_mounts_with_daemon(&key, &daemon_mnt, false));
                     }
+
+                    // Referrer detection (default-off, detection-only). When
+                    // `features.referrer_detect` is enabled, consult the OCI
+                    // referrers API to see whether this image ref is a
+                    // *published* nydus image (bootstrap distributed as a
+                    // referrer artifact, the nydusify / Go-snapshotter model).
+                    // Serving such images is NOT yet wired (bootstrap fetch +
+                    // daemon mount are deferred to B4b — see BACKLOG.md), so for
+                    // now we only log the detection so operators can observe it,
+                    // then fall through to the existing overlay / access-tracer
+                    // path. Like the auto-accel branch above, this is
+                    // best-effort and NON-FATAL: every detection / auth /
+                    // network error is swallowed here and we fall through, so a
+                    // pod is NEVER blocked on referrer detection. Runs off the
+                    // gRPC runtime (cyper is `!Send`) via
+                    // `detect_referrer_blocking`; the module-global LRU caches
+                    // both nydus hits and StandardOci misses, so a given image
+                    // ref costs at most one registry round-trip cluster-lifetime.
+                    if self.config.snapshotter.features.referrer_detect
+                        && let Some(image_ref) = image_ref.as_deref()
+                    {
+                        use crate::source::referrer::ImageType;
+                        match crate::source::referrer::detect_referrer_blocking(
+                            image_ref,
+                            &self.config,
+                        )
+                        .await
+                        {
+                            Ok(info) => match info.image_type {
+                                ImageType::NydusRafs => info!(
+                                    image = %image_ref,
+                                    bootstrap = info.bootstrap_digest.as_deref().unwrap_or("<none>"),
+                                    fs_driver_hint = info.fs_driver_hint.as_deref().unwrap_or("<none>"),
+                                    "published nydus image detected via OCI referrers; serving not yet wired (see B4b)"
+                                ),
+                                ImageType::OciBlockDevice => info!(
+                                    image = %image_ref,
+                                    fs_driver_hint = info.fs_driver_hint.as_deref().unwrap_or("<none>"),
+                                    "OCI block-device image detected via OCI referrers; serving not yet wired (see B4b)"
+                                ),
+                                ImageType::StandardOci => debug!(
+                                    image = %image_ref,
+                                    "referrer detection: standard OCI image (no nydus optimization)"
+                                ),
+                            },
+                            Err(e) => debug!(
+                                image = %image_ref,
+                                error = %e,
+                                "referrer detection failed; falling through to overlay"
+                            ),
+                        }
+                    }
+
                     // Auto-accel capture: no sidecar yet, so attach the
                     // tracer to the *lowest* lowerdir (the image's
                     // filesystem) and let it record reads during pod
@@ -1025,6 +1082,7 @@ pub async fn serve_with_supervisor(
     .detach();
 
     let snapshotter = NydusSnapshotter {
+        config: config.clone(),
         store,
         overlay,
         supervisor,
@@ -1072,15 +1130,20 @@ mod tests {
     fn test_snapshotter(root: &Path) -> NydusSnapshotter {
         let mut config = SnapshotterConfig::default();
         config.snapshotter.root = root.to_path_buf();
+        test_snapshotter_with_config(root, config)
+    }
+
+    fn test_snapshotter_with_config(root: &Path, config: SnapshotterConfig) -> NydusSnapshotter {
         let store = Arc::new(SnapshotStore::open(&root.join("metadata.fjall")).unwrap());
         let overlay = OverlayEngine::new(config.clone());
-        let supervisor = Arc::new(DaemonSupervisor::new(config));
+        let supervisor = Arc::new(DaemonSupervisor::new(config.clone()));
         let reconciler = Arc::new(Reconciler::new(
             supervisor.clone(),
             store.clone(),
             std::time::Duration::from_secs(3600),
         ));
         NydusSnapshotter {
+            config,
             store,
             overlay,
             supervisor,
@@ -1107,6 +1170,35 @@ mod tests {
     fn status_code(error: SnapshotterError) -> snapshots::tonic::Code {
         let status: snapshots::tonic::Status = error.into();
         status.code()
+    }
+
+    /// The #1 gating guarantee: referrer detection ships OFF, so a default-config
+    /// snapshotter behaves exactly as it did before B4 — a plain OCI prepare
+    /// (even with an image-ref label) returns the overlay mounts untouched and
+    /// performs zero referrer interaction. If the referrer branch were not gated
+    /// on the (default-false) flag, this prepare would instead attempt a live
+    /// registry round-trip for the bogus ref.
+    #[compio::test]
+    async fn prepare_with_referrer_detect_off_returns_overlay_mounts() {
+        let dir = tempdir().unwrap();
+        let snapshotter = test_snapshotter(dir.path());
+        assert!(
+            !snapshotter.config.snapshotter.features.referrer_detect,
+            "referrer_detect must default OFF so prepare behaves as today"
+        );
+
+        let labels = HashMap::from([(
+            crate::source::CRI_IMAGE_REF.to_string(),
+            "registry.invalid.test/team/app:1".to_string(),
+        )]);
+        let mounts = snapshotter
+            .prepare("prepare-plain".to_string(), String::new(), labels)
+            .await
+            .expect("plain prepare must succeed with referrer detection off");
+        assert!(
+            !mounts.is_empty(),
+            "flag-off prepare must return the overlay mounts unchanged"
+        );
     }
 
     #[compio::test]

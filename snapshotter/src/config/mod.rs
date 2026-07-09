@@ -475,7 +475,18 @@ impl Default for SysctlConfig {
 /// Feature flags.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct FeaturesConfig {
-    #[serde(default = "default_true")]
+    /// Detect *published* nydus images via the OCI referrers API (the
+    /// referrer-artifact distribution model nydusify / the Go snapshotter
+    /// produce).
+    ///
+    /// Off by default: currently **detection-only** — when enabled the
+    /// snapshotter logs that a published nydus image was detected during
+    /// `Prepare` but does NOT yet serve it (it falls through to plain overlay).
+    /// Enable it to observe detection on a node. Full serving (fetching the
+    /// bootstrap and mounting the daemon) is pending B4b (see BACKLOG.md) and an
+    /// e2e test against a live registry hosting a real referrer-published nydus
+    /// image; flip the default back to true once that e2e passes.
+    #[serde(default)]
     pub referrer_detect: bool,
     #[serde(default)]
     pub encryption: bool,
@@ -1133,6 +1144,26 @@ fn default_fs_drivers() -> Vec<FsDriverEntry> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Referrer detection ships OFF (detection-only until B4b + a live-registry
+    /// e2e). Pin both the struct default and the "field absent from TOML"
+    /// deserialize default so a config that never mentions the flag stays off.
+    #[test]
+    fn referrer_detect_defaults_off() {
+        assert!(
+            !SnapshotterConfig::default()
+                .snapshotter
+                .features
+                .referrer_detect,
+            "referrer_detect must default off"
+        );
+        let features: FeaturesConfig =
+            toml::from_str("").expect("empty features table must deserialize");
+        assert!(
+            !features.referrer_detect,
+            "an omitted referrer_detect must deserialize to off"
+        );
+    }
 
     #[test]
     fn parse_minimal_config() {
