@@ -30,6 +30,7 @@
 //! backend. Only `Send + Sync` state (rustls config, endpoint strings,
 //! cooldown map) is held across await points.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::BufReader;
@@ -114,14 +115,58 @@ thread_local! {
     /// requests, so each blocking thread gets its own.
     static HTTP_RUNTIME: compio::runtime::Runtime = compio::runtime::Runtime::new()
         .expect("spegel: failed to create compio HTTP runtime");
+
+    /// Per-thread cyper client cache, keyed by [`ClientKey`]. A fresh
+    /// `cyper::Client` builds a rustls TLS config *and* a connection
+    /// pool; a multi-blob sidecar pull calls [`SpegelMirror::fetch`]
+    /// (and `NodeDiscovery::fetch_nodes`) dozens of times in a row on
+    /// the same blocking thread, so rebuilding per call was dozens of
+    /// redundant TLS handshakes and pool setups. `cached_client`
+    /// rebuilds only when the key changes (i.e. never in practice,
+    /// since `SpegelMirror` builds its `Arc<rustls::ClientConfig>` once
+    /// in [`build_spegel_mirror`] and holds it for its lifetime).
+    static HTTP_CLIENT: RefCell<Option<(ClientKey, cyper::Client)>> = const { RefCell::new(None) };
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Counts real `cyper::Client` constructions on this thread — the
+    /// unit tests assert this stays at 1 across repeated
+    /// [`cached_client`] calls with the same key.
+    static CLIENT_BUILD_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 fn block_on_http<F: std::future::Future>(fut: F) -> F::Output {
     HTTP_RUNTIME.with(|rt| rt.block_on(fut))
 }
 
-/// Build a one-shot cyper client for the current blocking thread.
-/// `tls: None` means plain HTTP (tests, non-TLS mirrors).
+/// Identity key for the per-thread [`HTTP_CLIENT`] cache: which rustls
+/// `ClientConfig` (by `Arc` pointer) — or "no TLS" — a cached client was
+/// built from. The `Arc<rustls::ClientConfig>` is constructed once in
+/// [`build_spegel_mirror`] and held for the mirror's lifetime (mirrored
+/// into `NodeDiscovery`), so its pointer is a stable identity to key on;
+/// a `Client` is only ever rebuilt if that identity changes (e.g. a test
+/// constructing a second `SpegelMirror` on the same thread).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ClientKey {
+    Plain,
+    Tls(usize),
+}
+
+impl ClientKey {
+    fn for_tls(tls: &Option<Arc<rustls::ClientConfig>>) -> Self {
+        match tls {
+            Some(cfg) => ClientKey::Tls(Arc::as_ptr(cfg) as usize),
+            None => ClientKey::Plain,
+        }
+    }
+}
+
+/// Build a fresh cyper client. `tls: None` means plain HTTP (tests,
+/// non-TLS mirrors). Only called by [`cached_client`] on a cache miss —
+/// callers on the HTTP blocking thread should use `cached_client`
+/// instead so the connection pool and TLS session cache survive across
+/// requests.
 fn build_client(tls: Option<Arc<rustls::ClientConfig>>) -> Result<cyper::Client> {
     let builder = cyper::Client::builder();
     let builder = match tls {
@@ -129,6 +174,27 @@ fn build_client(tls: Option<Arc<rustls::ClientConfig>>) -> Result<cyper::Client>
         None => builder,
     };
     builder.build().context("build cyper client for spegel")
+}
+
+/// Get-or-build the cyper client for the current blocking thread's
+/// cache, keyed on `tls`'s identity (see [`ClientKey`]). `cyper::Client`
+/// clones cheaply (an internal `Rc` shares the connection pool and TLS
+/// session cache), so callers get their own handle without re-running
+/// TLS setup on every call.
+fn cached_client(tls: Option<Arc<rustls::ClientConfig>>) -> Result<cyper::Client> {
+    let key = ClientKey::for_tls(&tls);
+    HTTP_CLIENT.with(|cell| {
+        if let Some((cached_key, client)) = cell.borrow().as_ref()
+            && *cached_key == key
+        {
+            return Ok(client.clone());
+        }
+        let client = build_client(tls)?;
+        #[cfg(test)]
+        CLIENT_BUILD_COUNT.with(|c| c.set(c.get() + 1));
+        *cell.borrow_mut() = Some((key, client.clone()));
+        Ok(client)
+    })
 }
 
 /// k3s embedded spegel mirror with automatic peer discovery and
@@ -235,7 +301,7 @@ impl SpegelMirror {
                     // never waits on the Kubernetes API.
                     discovery.refresh_if_stale().await;
                 }
-                let client = match build_client(this.tls.clone()) {
+                let client = match cached_client(this.tls.clone()) {
                     Ok(c) => c,
                     Err(e) => {
                         return FetchResult::Outcome(PullOutcome::RegistryError {
@@ -411,7 +477,7 @@ impl NodeDiscovery {
     }
 
     async fn fetch_nodes(&self) -> Result<Vec<String>> {
-        let client = build_client(Some(self.tls.clone()))?;
+        let client = cached_client(Some(self.tls.clone()))?;
         let url = format!("{}/api/v1/nodes?limit=500", self.api_endpoint);
         let request = client
             .get(&url)
@@ -842,5 +908,71 @@ mod tests {
         mirror.mark_peer_failed("http://127.0.0.1:1");
         let endpoints = mirror.endpoints_for_attempt();
         assert_eq!(endpoints, vec!["http://127.0.0.1:1", "http://peer-b:1"]);
+    }
+
+    /// Minimal, cert-file-free rustls config for keying the client
+    /// cache — the process-default `CryptoProvider` (rustls' `ring`
+    /// cargo feature; see workspace `Cargo.toml`) is auto-installed on
+    /// first use, so no explicit `install_default()` is needed here.
+    fn dummy_tls_config() -> Arc<rustls::ClientConfig> {
+        Arc::new(
+            rustls::ClientConfig::builder()
+                .with_root_certificates(rustls::RootCertStore::empty())
+                .with_no_client_auth(),
+        )
+    }
+
+    /// Repeated [`cached_client`] calls on the same thread with the same
+    /// TLS identity must reuse one `cyper::Client` (pool + TLS session
+    /// cache), not rebuild per call — that rebuild was the whole
+    /// perf bug this cache fixes.
+    #[test]
+    fn cached_client_reused_for_same_tls_key() {
+        block_on_http(async {
+            CLIENT_BUILD_COUNT.with(|c| c.set(0));
+            let tls = dummy_tls_config();
+            for _ in 0..5 {
+                cached_client(Some(tls.clone())).expect("build cached client");
+            }
+            assert_eq!(
+                CLIENT_BUILD_COUNT.with(|c| c.get()),
+                1,
+                "client should only be built once for a stable TLS identity"
+            );
+        });
+    }
+
+    /// A `None` (plain-HTTP) key is likewise cached and distinct from
+    /// any TLS-backed client.
+    #[test]
+    fn cached_client_reused_for_plain_http() {
+        block_on_http(async {
+            CLIENT_BUILD_COUNT.with(|c| c.set(0));
+            for _ in 0..3 {
+                cached_client(None).expect("build cached plain client");
+            }
+            assert_eq!(CLIENT_BUILD_COUNT.with(|c| c.get()), 1);
+        });
+    }
+
+    /// A change in TLS config identity (e.g. a test/caller building a
+    /// second `SpegelMirror` on the same thread with different TLS
+    /// material) must evict the cached client and rebuild rather than
+    /// silently reusing a client built for a different config.
+    #[test]
+    fn cached_client_rebuilds_when_tls_key_changes() {
+        block_on_http(async {
+            CLIENT_BUILD_COUNT.with(|c| c.set(0));
+            let tls_a = dummy_tls_config();
+            let tls_b = dummy_tls_config();
+            cached_client(Some(tls_a.clone())).expect("build client a");
+            cached_client(Some(tls_a)).expect("reuse client a");
+            cached_client(Some(tls_b)).expect("build client b");
+            assert_eq!(
+                CLIENT_BUILD_COUNT.with(|c| c.get()),
+                2,
+                "distinct TLS identities must each build exactly one client"
+            );
+        });
     }
 }
