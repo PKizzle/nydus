@@ -4378,6 +4378,7 @@ dependencies = [
  "tokio-stream",
  "toml",
  "tonic",
+ "tonic-health",
  "tonic-prost",
  "tonic-prost-build",
  "tower",

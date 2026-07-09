@@ -1128,7 +1128,32 @@ pub async fn serve_with_supervisor(
     // involved — the whole snapshotter runs thread-per-core on compio/io_uring.
     let listener = compio::net::UnixListener::bind(&socket_path).await?;
     let grpc = snapshots::server(Arc::new(snapshotter));
-    let app = tonic::service::Routes::new(grpc).into_axum_router();
+
+    // Standard grpc.health.v1.Health service so containerd's proxy-plugin dialer
+    // and grpc_health_probe can check readiness. tonic-health is a
+    // runtime-agnostic tower service (tokio::sync primitives only, no runtime
+    // spawn), so its `HealthServer` composes with `tonic::service::Routes`
+    // exactly like the Snapshots service and rides the same cyper-axum
+    // (hyper-on-compio) server — no tokio runtime, no second transport.
+    let (health_reporter, health_service) = tonic_health::server::health_reporter();
+    // Mark both the overall server ("") and the Snapshots service SERVING now
+    // that the listener is bound. The empty service is what grpc_health_probe and
+    // containerd's dialer check by default. There is no graceful-shutdown signal
+    // wired into this serve loop (cyper-axum runs until the task is dropped), so
+    // there is no NOT_SERVING transition to set here.
+    health_reporter
+        .set_service_status("", tonic_health::ServingStatus::Serving)
+        .await;
+    health_reporter
+        .set_service_status(
+            "containerd.services.snapshots.v1.Snapshots",
+            tonic_health::ServingStatus::Serving,
+        )
+        .await;
+
+    let app = tonic::service::Routes::new(grpc)
+        .add_service(health_service)
+        .into_axum_router();
     cyper_axum::serve(listener, app.into_make_service()).await?;
 
     Ok(())

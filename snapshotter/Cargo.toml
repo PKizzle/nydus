@@ -96,6 +96,12 @@ tokio = { version = "1", features = ["full"] }
 tokio-stream = "0.1"
 tonic = { version = "0.14", features = ["transport"] }
 tonic-prost = "0.14"
+# Standard grpc.health.v1.Health service so containerd's proxy-plugin dialer and
+# grpc_health_probe can check readiness. tonic-health is a runtime-agnostic tower
+# service (tokio::sync primitives only, no runtime spawn), so it composes with the
+# existing tonic::service::Routes and rides the same cyper-axum (hyper-on-compio)
+# server as the Snapshots service — no tokio runtime, no second transport.
+tonic-health = "0.14"
 prost = "0.14"
 prost-types = "0.14"
 # UDS connector for the containerd Content gRPC client. tonic 0.14 transport
