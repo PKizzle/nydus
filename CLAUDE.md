@@ -141,4 +141,4 @@ See [ARCHITECTURE.md](./ARCHITECTURE.md) for the full design document.
 
 - **nydus-snapshotter (Go)**: The legacy Go snapshotter at `containerd/nydus-snapshotter`. Now in LTS mode; only critical bug fixes. All new development happens in `snapshotter/` here.
 - **containerd/rust-extensions**: Provides the `containerd-snapshots` crate used for the gRPC proxy-plugin server.
-- **nydusify**: Go tool for registry-side OCI→Nydus conversion (push flow). A Rust crate (`nydusify/`) exists but its containerd-converter backend is still a stub — it is **not** on the node-local accel path, which uses `snapshotter/src/local_accel.rs` instead (no push).
+- **nydusify**: registry-side OCI→Nydus conversion (push flow). The Rust `nydusify/` crate is **in scope for v1.0 and is the converter tool going forward**, replacing the Go nydusify; its containerd-converter backend is currently a stub being completed. Separate from the node-local accel path, which uses `snapshotter/src/local_accel.rs` (no push) — nydusify is the registry-publish flow, not the transparent accel flow.

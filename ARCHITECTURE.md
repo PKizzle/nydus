@@ -309,8 +309,12 @@ not lost if systemd `kill -9`s the successor mid-failover. `max_journaling_size`
 - Dragonfly P2P mirror integration
 - Windows/macOS support (runtime path is Linux-only; build/convert tooling compiles on macOS)
 
-A Rust rewrite of **nydusify** does exist as the `nydusify/` crate ("Rust rewrite of the Nydus
-image conversion utility"), but its containerd-converter backend is still a stub and it is **not**
-on the node-local acceleration path (which uses `snapshotter/src/local_accel.rs`, no registry push).
-The Go `nydusify` remains the production registry-side OCI→Nydus push tool. Completing the Rust
-`nydusify` converter backend is out of scope for v1.0.
+## In Scope (v1.0): Rust nydusify converter
+
+The Rust rewrite of **nydusify** — the `nydusify/` crate ("Rust rewrite of the Nydus image
+conversion utility") — **is in scope for v1.0 and is the converter tool going forward**, replacing
+the Go `nydusify`. Its containerd-converter backend is currently a stub and completing it is
+tracked work for v1.0. Note this is the registry-side OCI→Nydus **push/convert** tool and is
+distinct from the node-local, push-free acceleration path (`snapshotter/src/local_accel.rs`),
+which does not use nydusify; the two serve different flows (registry-published nydus images vs.
+transparent node-local acceleration).
