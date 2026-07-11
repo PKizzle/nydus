@@ -13,17 +13,27 @@ use crate::daemon::auth::resolve_auth;
 use crate::daemon::image_ref::{ImageRef, parse_image_ref};
 use anyhow::{Context, Result, anyhow, bail};
 use cyper::{Client, Response};
-use http::header::{ACCEPT, AUTHORIZATION, HeaderValue, WWW_AUTHENTICATE};
+use http::header::{ACCEPT, AUTHORIZATION, CONTENT_LENGTH, HeaderValue, WWW_AUTHENTICATE};
 use http::{Method, StatusCode};
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, VecDeque};
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 const DEFAULT_CACHE_CAPACITY: usize = 500;
 const NYDUS_BOOTSTRAP_ANNOTATION: &str = "containerd.io/snapshot/nydus-bootstrap";
 const NYDUS_FS_DRIVER_HINT: &str = "containerd.io/snapshot/nydus-fs-driver";
+/// Accept header for a raw blob (bootstrap) GET.
+const BLOB_ACCEPT: &str = "application/octet-stream";
+/// Upper bound on a registry body we will buffer into memory (manifest or
+/// bootstrap blob). A published nydus bootstrap is the merged RAFS metadata for
+/// the whole image, which stays comfortably under this even for large images;
+/// the cap only exists so a hostile or misbehaving registry cannot OOM the
+/// snapshotter. 512 MiB is deliberately generous.
+const MAX_REGISTRY_BODY_BYTES: u64 = 512 * 1024 * 1024;
 const OCI_INDEX_ACCEPT: &str = concat!(
     "application/vnd.oci.image.index.v1+json, ",
     "application/vnd.docker.distribution.manifest.list.v2+json, ",
@@ -447,6 +457,81 @@ impl RegistryReferrerClient {
             self.scheme, image.api_host, image.repo, digest
         )
     }
+
+    fn blob_url(&self, image: &ImageRef, digest: &str) -> String {
+        format!(
+            "{}://{}/v2/{}/blobs/{}",
+            self.scheme, image.api_host, image.repo, digest
+        )
+    }
+
+    /// GET an OCI manifest by digest (`/v2/<repo>/manifests/<digest>`). Reuses
+    /// the same bearer/WWW-Authenticate dance as every other registry request.
+    /// Errors on any non-success status so the caller can fall back to treating
+    /// the digest as a bootstrap blob (a bare blob digest 404s here).
+    async fn fetch_manifest_by_digest(
+        &self,
+        image: &ImageRef,
+        digest: &str,
+        auth: Option<&str>,
+    ) -> Result<Vec<u8>> {
+        let url = self.manifest_url(image, digest);
+        let response = self
+            .registry_request(Method::GET, &url, OCI_INDEX_ACCEPT, image, auth)
+            .await?;
+        if !response.status().is_success() {
+            bail!(
+                "registry manifest fetch for {digest} failed with HTTP {}",
+                response.status()
+            );
+        }
+        read_bounded(response).await
+    }
+
+    /// GET a blob by digest (`/v2/<repo>/blobs/<digest>`). Same bearer dance,
+    /// blob Accept header, bounded read.
+    async fn fetch_blob(
+        &self,
+        image: &ImageRef,
+        digest: &str,
+        auth: Option<&str>,
+    ) -> Result<Vec<u8>> {
+        let url = self.blob_url(image, digest);
+        let response = self
+            .registry_request(Method::GET, &url, BLOB_ACCEPT, image, auth)
+            .await?;
+        if !response.status().is_success() {
+            bail!(
+                "registry blob fetch for {digest} failed with HTTP {}",
+                response.status()
+            );
+        }
+        read_bounded(response).await
+    }
+}
+
+/// Read a registry response body into memory, rejecting anything larger than
+/// [`MAX_REGISTRY_BODY_BYTES`] (checked against the advertised Content-Length up
+/// front and against the actual body length after buffering, so a lying header
+/// cannot slip a huge body past the cap).
+async fn read_bounded(response: Response) -> Result<Vec<u8>> {
+    if let Some(len) = response
+        .headers()
+        .get(CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+        && len > MAX_REGISTRY_BODY_BYTES
+    {
+        bail!("registry body of {len} bytes exceeds cap of {MAX_REGISTRY_BODY_BYTES} bytes");
+    }
+    let bytes = response.bytes().await?;
+    if bytes.len() as u64 > MAX_REGISTRY_BODY_BYTES {
+        bail!(
+            "registry body of {} bytes exceeds cap of {MAX_REGISTRY_BODY_BYTES} bytes",
+            bytes.len()
+        );
+    }
+    Ok(bytes.to_vec())
 }
 
 /// Classify an OCI referrer response or index/manifest JSON payload. This is
@@ -502,6 +587,169 @@ fn standard_oci() -> ReferrerInfo {
         bootstrap_digest: None,
         fs_driver_hint: None,
     }
+}
+
+/// If `manifest_bytes` parses as an OCI manifest with a non-empty `layers`
+/// array, return the digest of its nydus-bootstrap layer (the layer that
+/// [`classify_descriptor`] flags as `NydusRafs` — same predicate used for
+/// referrer classification). Returns `None` when the bytes are not a manifest
+/// with layers (e.g. a raw bootstrap blob), so the caller falls back to the
+/// direct-blob path.
+fn select_nydus_bootstrap_layer(manifest_bytes: &[u8]) -> Option<String> {
+    let manifest = serde_json::from_slice::<OciManifest>(manifest_bytes).ok()?;
+    if manifest.layers.is_empty() {
+        return None;
+    }
+    manifest.layers.iter().find_map(|desc| {
+        classify_descriptor(desc)
+            .filter(|info| info.image_type == ImageType::NydusRafs)
+            .map(|_| desc.digest.clone())
+    })
+}
+
+/// Verify `bytes` hash to `expected` (a `sha256:<hex>` digest). Security-
+/// critical: a bootstrap that fails this is never written or mounted.
+fn verify_bootstrap_digest(bytes: &[u8], expected: &str) -> Result<()> {
+    let want = expected.strip_prefix("sha256:").ok_or_else(|| {
+        anyhow!("unsupported bootstrap digest {expected}; only sha256 is supported")
+    })?;
+    let got = hex::encode(Sha256::digest(bytes));
+    if !got.eq_ignore_ascii_case(want) {
+        bail!("bootstrap digest mismatch: expected {expected}, computed sha256:{got}");
+    }
+    Ok(())
+}
+
+/// Digest-named on-disk path for a materialized bootstrap.
+fn bootstrap_cache_path(dir: &Path, digest: &str) -> PathBuf {
+    dir.join(format!("{}.boot", digest.replace(':', "-")))
+}
+
+/// Return the cached bootstrap path if it already exists on disk. Content-
+/// addressed + written atomically, so mere existence implies a complete,
+/// digest-verified file.
+fn cached_bootstrap(dir: &Path, digest: &str) -> Option<PathBuf> {
+    let path = bootstrap_cache_path(dir, digest);
+    path.is_file().then_some(path)
+}
+
+/// Write a digest-verified bootstrap to its content-addressed cache path,
+/// idempotently. If a same-size file is already present it is reused; otherwise
+/// the bytes are written to a temp file and atomically renamed so a partial
+/// write can never masquerade as a valid bootstrap.
+fn write_bootstrap(dir: &Path, digest: &str, bytes: &[u8]) -> Result<PathBuf> {
+    std::fs::create_dir_all(dir)
+        .with_context(|| format!("create referrer bootstrap dir {}", dir.display()))?;
+    let path = bootstrap_cache_path(dir, digest);
+    if let Ok(meta) = std::fs::metadata(&path)
+        && meta.is_file()
+        && meta.len() == bytes.len() as u64
+    {
+        return Ok(path);
+    }
+    let tmp = path.with_extension("boot.tmp");
+    std::fs::write(&tmp, bytes)
+        .with_context(|| format!("write referrer bootstrap {}", tmp.display()))?;
+    std::fs::rename(&tmp, &path)
+        .with_context(|| format!("rename referrer bootstrap into place {}", path.display()))?;
+    Ok(path)
+}
+
+/// Fetch and materialize the bootstrap for a published (referrer-distributed)
+/// nydus image, returning the on-disk path to the digest-verified bootstrap.
+///
+/// `bootstrap_digest` (from [`ReferrerInfo`]) is EITHER an artifact-manifest
+/// digest (referrers-index path) or a bootstrap-blob digest (manifest-layers
+/// path). We probe the manifest endpoint first: if the digest resolves to an
+/// OCI manifest carrying a nydus-bootstrap layer, that layer's blob is the
+/// bootstrap; otherwise `bootstrap_digest` is itself the bootstrap blob and we
+/// fetch it directly. The final blob is sha256-verified before it touches disk.
+pub async fn materialize_bootstrap(
+    image_ref: &str,
+    bootstrap_digest: &str,
+    config: &SnapshotterConfig,
+    cache_dir: &Path,
+) -> Result<PathBuf> {
+    let parsed = parse_image_ref(image_ref).context("invalid image reference")?;
+    let auth = resolve_auth(config, &parsed);
+    let client = RegistryReferrerClient::from_config(config)?;
+    let dir = cache_dir.join("referrer-bootstraps");
+
+    // Fast path: the referrer digest may itself be the (already-materialized)
+    // bootstrap blob (manifest-layers path). Avoids any network round-trip.
+    if let Some(path) = cached_bootstrap(&dir, bootstrap_digest) {
+        debug!(image = %image_ref, bootstrap = bootstrap_digest, "reusing cached referrer bootstrap");
+        return Ok(path);
+    }
+
+    // Probe the manifest endpoint. A bootstrap-blob digest 404s here, so an
+    // error just routes us to the direct-blob branch below.
+    let layer_digest = match client
+        .fetch_manifest_by_digest(&parsed, bootstrap_digest, auth.as_deref())
+        .await
+    {
+        Ok(manifest) => select_nydus_bootstrap_layer(&manifest),
+        Err(e) => {
+            debug!(image = %image_ref, bootstrap = bootstrap_digest, error = %e, "manifest probe failed; treating referrer digest as a bootstrap blob");
+            None
+        }
+    };
+
+    let (final_digest, bytes) = match layer_digest {
+        Some(layer_digest) => {
+            // Artifact-manifest path: the bootstrap is the nydus layer blob.
+            if let Some(path) = cached_bootstrap(&dir, &layer_digest) {
+                debug!(image = %image_ref, bootstrap = %layer_digest, "reusing cached referrer bootstrap layer");
+                return Ok(path);
+            }
+            let bytes = client
+                .fetch_blob(&parsed, &layer_digest, auth.as_deref())
+                .await
+                .with_context(|| format!("fetch nydus bootstrap layer {layer_digest}"))?;
+            (layer_digest, bytes)
+        }
+        None => {
+            // Direct-blob path: bootstrap_digest is the bootstrap blob.
+            let bytes = client
+                .fetch_blob(&parsed, bootstrap_digest, auth.as_deref())
+                .await
+                .with_context(|| format!("fetch referrer bootstrap blob {bootstrap_digest}"))?;
+            (bootstrap_digest.to_string(), bytes)
+        }
+    };
+
+    // Never write or mount an unverified bootstrap.
+    verify_bootstrap_digest(&bytes, &final_digest)?;
+    let path = write_bootstrap(&dir, &final_digest, &bytes)?;
+    info!(image = %image_ref, bootstrap = %final_digest, path = %path.display(), "materialized referrer bootstrap");
+    Ok(path)
+}
+
+/// Blocking wrapper around [`materialize_bootstrap`], mirroring
+/// [`detect_referrer_blocking`]: all cyper HTTP runs inside `blocking::unblock`
+/// on the thread-local compio runtime (cyper's `Client` is `!Send`). Only
+/// `Send` state crosses the boundary; the returned `PathBuf` is `Send`.
+pub async fn materialize_bootstrap_blocking(
+    image_ref: &str,
+    bootstrap_digest: &str,
+    config: &SnapshotterConfig,
+    cache_dir: &Path,
+) -> Result<PathBuf> {
+    let image_ref = image_ref.to_string();
+    let bootstrap_digest = bootstrap_digest.to_string();
+    let config = config.clone();
+    let cache_dir = cache_dir.to_path_buf();
+    blocking::unblock(move || {
+        REFERRER_HTTP_RUNTIME.with(|rt| {
+            rt.block_on(materialize_bootstrap(
+                &image_ref,
+                &bootstrap_digest,
+                &config,
+                &cache_dir,
+            ))
+        })
+    })
+    .await
 }
 
 #[derive(Debug, Deserialize)]
@@ -708,6 +956,77 @@ mod tests {
             .expect("cached hit must resolve without a network call");
         assert_eq!(info.image_type, ImageType::NydusRafs);
         assert_eq!(info.bootstrap_digest.as_deref(), Some("sha256:cachedboot"));
+    }
+
+    fn sha256_digest(bytes: &[u8]) -> String {
+        format!("sha256:{}", hex::encode(Sha256::digest(bytes)))
+    }
+
+    /// (i) Direct-blob case: a raw bootstrap blob is not JSON, so layer
+    /// selection returns None and `materialize_bootstrap` takes the direct path.
+    #[test]
+    fn select_layer_returns_none_for_raw_bootstrap_blob() {
+        // Arbitrary binary that is not valid OCI-manifest JSON.
+        let blob = [0u8, 1, 2, 3, 0xff, 0xfe, b'{', b'x'];
+        assert_eq!(select_nydus_bootstrap_layer(&blob), None);
+        // An empty-layers manifest is also treated as a direct blob.
+        let empty = br#"{"layers":[]}"#;
+        assert_eq!(select_nydus_bootstrap_layer(empty), None);
+    }
+
+    /// (ii) Artifact-manifest case: pick the nydus-bootstrap layer's digest out
+    /// of a manifest that also carries a plain (non-nydus) layer.
+    #[test]
+    fn select_layer_picks_the_nydus_bootstrap_layer() {
+        let manifest = br#"{
+            "layers":[
+                {"mediaType":"application/vnd.oci.image.layer.v1.tar+gzip","digest":"sha256:plainlayer"},
+                {
+                    "mediaType":"application/vnd.oci.image.layer.nydus.bootstrap.v1",
+                    "digest":"sha256:bootlayer",
+                    "annotations":{"containerd.io/snapshot/nydus-bootstrap":"true"}
+                }
+            ]
+        }"#;
+        assert_eq!(
+            select_nydus_bootstrap_layer(manifest).as_deref(),
+            Some("sha256:bootlayer")
+        );
+    }
+
+    /// (iii) A tampered bootstrap fails digest verification and is rejected.
+    #[test]
+    fn verify_bootstrap_digest_rejects_mismatch() {
+        let bytes = b"the real bootstrap bytes";
+        let good = sha256_digest(bytes);
+        verify_bootstrap_digest(bytes, &good).expect("matching digest must verify");
+        verify_bootstrap_digest(b"tampered bytes", &good)
+            .expect_err("mismatched digest must be rejected");
+        // Non-sha256 algorithms are unsupported.
+        verify_bootstrap_digest(bytes, "sha512:deadbeef")
+            .expect_err("non-sha256 digest must be rejected");
+    }
+
+    /// (iv) Writing is idempotent: a second write reuses the existing digest-
+    /// named file and `cached_bootstrap` finds it without a fetch.
+    #[test]
+    fn write_bootstrap_is_idempotent_and_cacheable() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("referrer-bootstraps");
+        let bytes = b"bootstrap contents";
+        let digest = sha256_digest(bytes);
+
+        assert!(cached_bootstrap(&root, &digest).is_none());
+        let first = write_bootstrap(&root, &digest, bytes).unwrap();
+        assert!(first.is_file());
+        // Reuse: cached lookup finds the same path, no temp files linger.
+        assert_eq!(
+            cached_bootstrap(&root, &digest).as_deref(),
+            Some(first.as_path())
+        );
+        let second = write_bootstrap(&root, &digest, bytes).unwrap();
+        assert_eq!(first, second);
+        assert_eq!(std::fs::read(&second).unwrap(), bytes);
     }
 
     /// StandardOci results are cached too, so a plain image also costs at most

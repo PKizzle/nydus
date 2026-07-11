@@ -503,13 +503,15 @@ pub struct FeaturesConfig {
     /// referrer-artifact distribution model nydusify / the Go snapshotter
     /// produce).
     ///
-    /// Off by default: currently **detection-only** — when enabled the
-    /// snapshotter logs that a published nydus image was detected during
-    /// `Prepare` but does NOT yet serve it (it falls through to plain overlay).
-    /// Enable it to observe detection on a node. Full serving (fetching the
-    /// bootstrap and mounting the daemon) is pending B4b (see BACKLOG.md) and an
-    /// e2e test against a live registry hosting a real referrer-published nydus
-    /// image; flip the default back to true once that e2e passes.
+    /// Off by default, opt-in. Serving IS now implemented (B4b): when enabled,
+    /// on a `Prepare` for a published nydus image the snapshotter fetches and
+    /// sha256-verifies the bootstrap and mounts the daemon via the shared
+    /// `ensure_instance` path (nydusd's registry backend then serves data blobs
+    /// on demand). Every step is best-effort and NON-FATAL — any detection /
+    /// fetch / mount error falls through to plain overlay, so a pod is never
+    /// blocked. Verified end-to-end in the Linux runtime; left default-off
+    /// pending a production soak against live referrer-published registries.
+    /// Flip the default to true once that soak passes.
     #[serde(default)]
     pub referrer_detect: bool,
     #[serde(default)]

@@ -666,23 +666,29 @@ impl snapshots::Snapshotter for NydusSnapshotter {
                         return Ok(self.rewrite_mounts_with_daemon(&key, &daemon_mnt, false));
                     }
 
-                    // Referrer detection (default-off, detection-only). When
+                    // Referrer serving (default-off, opt-in). When
                     // `features.referrer_detect` is enabled, consult the OCI
                     // referrers API to see whether this image ref is a
                     // *published* nydus image (bootstrap distributed as a
                     // referrer artifact, the nydusify / Go-snapshotter model).
-                    // Serving such images is NOT yet wired (bootstrap fetch +
-                    // daemon mount are deferred to B4b — see BACKLOG.md), so for
-                    // now we only log the detection so operators can observe it,
-                    // then fall through to the existing overlay / access-tracer
-                    // path. Like the auto-accel branch above, this is
-                    // best-effort and NON-FATAL: every detection / auth /
-                    // network error is swallowed here and we fall through, so a
-                    // pod is NEVER blocked on referrer detection. Runs off the
-                    // gRPC runtime (cyper is `!Send`) via
-                    // `detect_referrer_blocking`; the module-global LRU caches
-                    // both nydus hits and StandardOci misses, so a given image
-                    // ref costs at most one registry round-trip cluster-lifetime.
+                    // On a NydusRafs hit we fetch + digest-verify the bootstrap
+                    // (`materialize_bootstrap_blocking`) and mount the daemon
+                    // via the shared `ensure_instance` path — the very same
+                    // mount used by `resolve_nydus_mount` — then substitute the
+                    // daemon mount for the overlay. nydusd's registry backend
+                    // (built from `image_ref`) serves every data blob on demand
+                    // from `/v2/<repo>/blobs/sha256:<blob_id>`, so the bootstrap
+                    // is the only thing we materialize here.
+                    //
+                    // Like the auto-accel branch above, this is best-effort and
+                    // NON-FATAL: every detection / auth / network / materialize
+                    // / daemon-start error is swallowed here and we fall through
+                    // to the overlay / access-tracer path, so a pod is NEVER
+                    // blocked on referrer serving. Runs off the gRPC runtime
+                    // (cyper is `!Send`) via the `*_blocking` helpers; the
+                    // module-global LRU caches both nydus hits and StandardOci
+                    // misses, so detection costs at most one registry round-trip
+                    // cluster-lifetime and the bootstrap is cached on disk.
                     if self.config.snapshotter.features.referrer_detect
                         && let Some(image_ref) = image_ref.as_deref()
                     {
@@ -694,12 +700,56 @@ impl snapshots::Snapshotter for NydusSnapshotter {
                         .await
                         {
                             Ok(info) => match info.image_type {
-                                ImageType::NydusRafs => info!(
-                                    image = %image_ref,
-                                    bootstrap = info.bootstrap_digest.as_deref().unwrap_or("<none>"),
-                                    fs_driver_hint = info.fs_driver_hint.as_deref().unwrap_or("<none>"),
-                                    "published nydus image detected via OCI referrers; serving not yet wired (see B4b)"
-                                ),
+                                ImageType::NydusRafs => {
+                                    if let Some(bootstrap_digest) = info.bootstrap_digest.as_deref() {
+                                        match crate::source::referrer::materialize_bootstrap_blocking(
+                                            image_ref,
+                                            bootstrap_digest,
+                                            &self.config,
+                                            &self.config.snapshotter.root,
+                                        )
+                                        .await
+                                        {
+                                            Ok(bootstrap) => match self
+                                                .supervisor
+                                                .ensure_instance(image_ref, &bootstrap)
+                                                .await
+                                            {
+                                                Ok(handle) => {
+                                                    let mountpoint =
+                                                        handle.mountpoint().to_path_buf();
+                                                    info!(
+                                                        image = %image_ref,
+                                                        bootstrap = bootstrap_digest,
+                                                        mountpoint = %mountpoint.display(),
+                                                        "serving published nydus image via OCI referrers (B4b)"
+                                                    );
+                                                    return Ok(self.rewrite_mounts_with_daemon(
+                                                        &key,
+                                                        &mountpoint,
+                                                        false,
+                                                    ));
+                                                }
+                                                Err(e) => warn!(
+                                                    image = %image_ref,
+                                                    error = format!("{e:#}"),
+                                                    "referrer nydus daemon failed to start; falling back to overlay"
+                                                ),
+                                            },
+                                            Err(e) => warn!(
+                                                image = %image_ref,
+                                                bootstrap = bootstrap_digest,
+                                                error = format!("{e:#}"),
+                                                "failed to materialize referrer bootstrap; falling back to overlay"
+                                            ),
+                                        }
+                                    } else {
+                                        warn!(
+                                            image = %image_ref,
+                                            "published nydus image detected via OCI referrers but referrer carried no bootstrap digest; falling back to overlay"
+                                        );
+                                    }
+                                }
                                 ImageType::OciBlockDevice => info!(
                                     image = %image_ref,
                                     fs_driver_hint = info.fs_driver_hint.as_deref().unwrap_or("<none>"),
