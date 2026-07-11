@@ -1,0 +1,50 @@
+[package]
+name = "registry-client"
+version = "0.1.0"
+description = "OCI Distribution client (pull + push) on compio/cyper for Nydus tooling"
+authors = ["The Nydus Developers"]
+license = "Apache-2.0 OR BSD-3-Clause"
+homepage = "https://nydus.dev/"
+repository = "https://github.com/dragonflyoss/nydus"
+edition = "2024"
+
+[dependencies]
+anyhow = "1"
+base64 = "0.22"
+# compio runtime pieces used directly by this crate: `fs`/`io` for streaming
+# blob upload/download, `time` for per-request timeouts (cyper has no client
+# timeout), `bytes` so `bytes::Bytes` chunks from cyper's response stream
+# implement `IoBuf` for zero-copy file writes, `ring` to select the rustls
+# crypto provider (matches nydus-storage / nydus-snapshotter), and
+# `macros` for `#[compio::test]` / `#[compio::main]` consumers.
+compio = { version = "0.19", default-features = false, features = [
+    "macros",
+    "runtime",
+    "io",
+    "fs",
+    "time",
+    "bytes",
+    "io-uring",
+    "polling",
+    "ring",
+] }
+# cyper HTTP client. Git-pinned to the SAME rev as snapshotter/Cargo.toml:
+# cyper 0.9 tracks compio 0.19, but the published crates.io release still
+# targets compio 0.18. Drop trigger: cyper publishes a crates.io release built
+# against compio 0.19+, then move to a version req; see docs/dependencies.md.
+cyper = { git = "https://github.com/compio-rs/cyper", rev = "d1c8aff18dd81c4b1f817d0e8e0e05408c15a04c", default-features = false, features = [
+    "rustls",
+    "json",
+    "http2",
+    "stream",
+] }
+futures = "0.3"
+hex = "0.4"
+http = "1.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.11"
+tracing = "0.1"
+
+[dev-dependencies]
+tempfile = "3"

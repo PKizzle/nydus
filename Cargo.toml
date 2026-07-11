@@ -139,6 +139,7 @@ members = [
     "builder",
     "clib",
     "rafs",
+    "registry-client",
     "snapshotter",
     "nydusify",
     "storage",
