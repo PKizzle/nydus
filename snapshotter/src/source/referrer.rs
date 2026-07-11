@@ -211,6 +211,21 @@ impl RegistryReferrerClient {
             .and_then(|cfg| parse_duration(&cfg.request_timeout).ok())
             .unwrap_or_else(|| Duration::from_secs(30));
         let skip_verify = registry.map(|cfg| cfg.skip_verify).unwrap_or(false);
+        // Transport scheme. HTTPS by default (secure). `[backends.registry]
+        // plain_http = true` opts the registry into cleartext HTTP, mirroring
+        // the same opt-in the storage backend already honors.
+        //
+        // SECURITY: plain HTTP disables transport encryption AND server
+        // authentication, so an on-path attacker can read and *tamper with*
+        // referrer manifests and bootstrap blobs. Because the artifact manifest
+        // — which declares the bootstrap's expected digest — is fetched over the
+        // same cleartext channel, B4b's bootstrap digest verification does NOT
+        // protect against a MITM here: they control both the declared digest and
+        // the served bytes, so a forged bootstrap verifies fine. This is the same
+        // exposure as any plain-HTTP image pull; only enable it for registries on
+        // a trusted network (loopback, air-gapped, private LAN).
+        let plain_http = registry.map(|cfg| cfg.plain_http).unwrap_or(false);
+        let scheme = if plain_http { "http" } else { "https" };
         // cyper has no client-level timeout; it is applied per request via
         // `compio::time::timeout` in `send_once` / `fetch_bearer_token`.
         let client = Client::builder()
@@ -220,7 +235,7 @@ impl RegistryReferrerClient {
             .context("failed to build registry referrer HTTP client")?;
         Ok(Self {
             client,
-            scheme: "https",
+            scheme,
             timeout,
         })
     }
@@ -932,6 +947,38 @@ mod tests {
         assert_eq!(
             client.referrers_url(&image, "sha256:abc"),
             "https://registry.local:5000/v2/team/app/referrers/sha256:abc"
+        );
+    }
+
+    #[compio::test]
+    async fn from_config_scheme_defaults_https_and_honors_plain_http() {
+        let image = parse_image_ref("registry.local:5000/team/app:1").unwrap();
+
+        // Default (no [backends.registry]) => secure HTTPS.
+        let config = SnapshotterConfig::default();
+        let client = RegistryReferrerClient::from_config(&config).unwrap();
+        assert!(
+            client.manifest_url(&image, "1").starts_with("https://"),
+            "default referrer scheme must be https"
+        );
+
+        // plain_http = true => cleartext HTTP for both manifest and blob fetches.
+        let mut config = SnapshotterConfig::default();
+        config.backends.registry = Some(crate::config::RegistryBackendConfig {
+            mirrors: Vec::new(),
+            skip_verify: false,
+            ca_cert_files: Vec::new(),
+            plain_http: true,
+            request_timeout: "30s".to_string(),
+        });
+        let client = RegistryReferrerClient::from_config(&config).unwrap();
+        assert_eq!(
+            client.manifest_url(&image, "1"),
+            "http://registry.local:5000/v2/team/app/manifests/1"
+        );
+        assert!(
+            client.blob_url(&image, "sha256:abc").starts_with("http://"),
+            "plain_http must apply to blob fetches too"
         );
     }
 
