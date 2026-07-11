@@ -64,10 +64,32 @@ pub(crate) fn runtime() -> &'static Runtime {
         .expect("proxy tokio runtime failed to initialize")
 }
 
+// `SyncAdapter` is only constructed by `backend/request.rs`, which is compiled
+// solely when a network backend feature is enabled. With
+// `backend-dragonfly-proxy` alone it is unused in the lib target (the in-file
+// tests still exercise it), so allow dead_code for that feature combination.
+#[cfg_attr(
+    not(any(
+        feature = "backend-oss",
+        feature = "backend-registry",
+        feature = "backend-s3",
+        feature = "backend-http-proxy",
+    )),
+    allow(dead_code)
+)]
 pub(crate) struct SyncAdapter<R> {
     inner: R,
 }
 
+#[cfg_attr(
+    not(any(
+        feature = "backend-oss",
+        feature = "backend-registry",
+        feature = "backend-s3",
+        feature = "backend-http-proxy",
+    )),
+    allow(dead_code)
+)]
 impl<R> SyncAdapter<R> {
     pub fn new(inner: R) -> Self {
         Self { inner }

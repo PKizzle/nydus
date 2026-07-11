@@ -72,13 +72,16 @@ sha1 = { version = "0.11.0", optional = true }
 sha2 = { version = "0.11.0", optional = true }
 tar = "0.4.46"
 time = { version = "0.3.47", features = ["formatting"], optional = true }
+# Only the Dragonfly SDK proxy path (`backend/proxy.rs` + the ProxySDK arms in
+# `backend/request.rs`) needs a real tokio runtime; the default build runs
+# solely on compio. Kept in [dev-dependencies] for the http-proxy test mocks.
 tokio = { version = "1.52.3", features = [
     "macros",
     "rt",
     "rt-multi-thread",
     "sync",
     "time",
-] }
+], optional = true }
 url = { version = "2.1.1", optional = true }
 vm-memory = { workspace = true }
 fuse-backend-rs = { workspace = true }
@@ -136,7 +139,13 @@ backend-http-proxy = [
 ]
 dedup = ["rusqlite", "r2d2", "r2d2_sqlite"]
 
-backend-dragonfly-proxy = ["cyper", "dragonfly-client-util", "http", "url"]
+backend-dragonfly-proxy = [
+    "cyper",
+    "dep:tokio",
+    "dragonfly-client-util",
+    "http",
+    "url",
+]
 
 [package.metadata.docs.rs]
 all-features = true
