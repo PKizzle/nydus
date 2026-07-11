@@ -12,14 +12,13 @@ documentation = "https://docs.rs/bbolt-rs/latest/bbolt_rs/"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
-# There's no SIMD support for aarch64 yet
-[target.'cfg(target_arch = "aarch64")'.dependencies]
-aligners = { version = "0.0.10", default-features = false }
-
-[target.'cfg(not(target_arch = "aarch64"))'.dependencies]
-aligners = "0.0.10"
-
 [dependencies]
+# `default-features = false` unconditionally: this crate only uses
+# `aligners::alignment::Page` / `AlignedBytes` (plain aligned allocation), never
+# the SIMD block types, so aligners' default `simd` feature buys nothing here —
+# and it fails to compile on ppc64le/riscv64, which would otherwise force
+# downstream users (nydus-snapshotter's `migrate` feature) to gate per-arch.
+aligners = { version = "0.0.10", default-features = false }
 # Until the aligners miri fix is in crates.io depend on the git main branch
 # Swap 0.0.10 for the git version to run the miri test
 # aligners = {git = "https://github.com/V0ldek/aligners.git"}
