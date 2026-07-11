@@ -15,9 +15,8 @@ path = "src/bin/containerd-nydus.rs"
 [[bin]]
 name = "nydus-migrate"
 path = "src/bin/nydus-migrate.rs"
-# Pulls bbolt-rs -> aligners, whose `simd` feature only compiles on x86_64/aarch64.
-# Gate the legacy-migration tool behind `migrate` so the core snapshotter still
-# builds on ppc64le/riscv64 (where it is not a release target).
+# `migrate` is a default feature (see [features]); the gate remains so
+# `--no-default-features` builds skip this tool along with its bbolt-rs dep.
 required-features = ["migrate"]
 
 [[bin]]
@@ -129,8 +128,9 @@ ttrpc = "0.9.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 fjall = "3.1.4"
-# Only used by the `nydus-migrate` legacy-import tool; optional so the snapshotter
-# builds on ppc64le/riscv64 (bbolt-rs -> aligners `simd` fails to compile there).
+# Used by the `nydus-migrate` legacy-import tool and the automatic startup
+# migration in src/migrate.rs; optional behind the default-on `migrate` feature
+# so a `--no-default-features` build can drop the legacy-import path entirely.
 #
 # `compat` is REQUIRED so bbolt-rs reads files written by Go's bbolt (the format
 # the legacy Go nydus-snapshotter uses for `metadata.db`). Without it, bbolt-rs
@@ -193,6 +193,7 @@ default = [
     "backend-s3",
     "backend-http-proxy",
     "backend-localdisk",
+    "migrate",
 ]
 
 backend-http-proxy = ["nydus-storage/backend-http-proxy"]
@@ -201,6 +202,9 @@ backend-oss = ["nydus-storage/backend-oss"]
 backend-registry = ["nydus-storage/backend-registry"]
 backend-s3 = ["nydus-storage/backend-s3"]
 
-# Build the `nydus-migrate` legacy-bbolt -> fjall import tool. Off by default and
-# left off for ppc64le/riscv64, whose `aligners` (via bbolt-rs) does not compile.
+# Legacy bbolt -> fjall migration: the `nydus-migrate` import tool plus the
+# snapshotter's automatic startup import (src/migrate.rs). Default-on: the
+# vendored bbolt-rs now pins `aligners` with `default-features = false`
+# everywhere (it only uses `alignment::Page`, never SIMD), so bbolt-rs
+# compiles on ppc64le/riscv64 too and no longer needs a per-arch gate.
 migrate = ["dep:bbolt-rs"]

@@ -46,6 +46,8 @@ pub mod fdstore;
 pub mod grpc;
 pub mod local_accel;
 pub mod metrics;
+#[cfg(feature = "migrate")]
+pub mod migrate;
 pub mod nri;
 pub mod nri_ttrpc;
 pub mod overlay;

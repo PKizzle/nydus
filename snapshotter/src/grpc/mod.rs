@@ -1022,8 +1022,15 @@ pub async fn serve(mut config: SnapshotterConfig) -> Result<()> {
 /// before its inner Drops fire.
 pub fn open_store_for_config(config: &SnapshotterConfig) -> Result<Arc<SnapshotStore>> {
     std::fs::create_dir_all(&config.snapshotter.root)?;
-    let store_path = PathBuf::from(&config.snapshotter.root).join("metadata.fjall");
-    Ok(Arc::new(SnapshotStore::open(&store_path)?))
+    let root = PathBuf::from(&config.snapshotter.root);
+    let store = Arc::new(SnapshotStore::open(&root.join("metadata.fjall"))?);
+    // Import a legacy Go-snapshotter bbolt `metadata.db` (if one sits under
+    // the root and the fjall store is fresh) so operators don't have to run
+    // `nydus-migrate store` by hand. Logs and degrades on failure; when no
+    // legacy db exists this is a single existence check.
+    #[cfg(feature = "migrate")]
+    crate::migrate::auto_migrate_at_startup(&root, &store);
+    Ok(store)
 }
 
 /// Start the gRPC server with a caller-provided supervisor so that the binary

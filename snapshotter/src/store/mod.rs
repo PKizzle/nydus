@@ -242,6 +242,18 @@ impl SnapshotStore {
             .with_context(|| format!("failed to check whether snapshot {key} exists"))
     }
 
+    /// Check whether the store holds zero snapshot records.
+    ///
+    /// Used by the startup auto-migration gate: a legacy bbolt `metadata.db`
+    /// is only imported into a *fresh* store, and `open()` auto-creates an
+    /// empty store, so "directory absent" is not a usable signal. This peeks
+    /// at the first key of the snapshots keyspace instead of materializing a
+    /// full `list()`, so it stays O(1) regardless of store size.
+    pub fn is_empty(&self) -> Result<bool> {
+        let read_tx = self.db.read_tx();
+        Ok(read_tx.iter(&self.snapshots).next().is_none())
+    }
+
     /// Count snapshots that directly use `key` as their parent.
     pub fn child_count(&self, key: &str) -> Result<i64> {
         let read_tx = self.db.read_tx();
@@ -438,6 +450,29 @@ mod tests {
         let store = SnapshotStore::open(&store_path).unwrap();
         assert!(store_path.is_dir());
         assert_eq!(store.list().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn is_empty_reflects_snapshot_records() {
+        let dir = tempdir().unwrap();
+        let store_path = dir.path().join("metadata.fjall");
+        let store = SnapshotStore::open(&store_path).unwrap();
+        assert!(store.is_empty().unwrap());
+
+        store
+            .create(
+                "active-key",
+                None,
+                SnapshotKind::Active,
+                "fusedev",
+                None,
+                &HashMap::new(),
+            )
+            .unwrap();
+        assert!(!store.is_empty().unwrap());
+
+        store.remove("active-key").unwrap();
+        assert!(store.is_empty().unwrap());
     }
 
     #[test]
