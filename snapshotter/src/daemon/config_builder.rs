@@ -161,7 +161,9 @@ fn build_registry_backend(
         repo: image_ref.repo.clone(),
         auth,
         skip_verify: registry_cfg.map(|c| c.skip_verify).unwrap_or(false),
-        ca_cert_files: Vec::new(),
+        ca_cert_files: registry_cfg
+            .map(|c| c.ca_cert_files.clone())
+            .unwrap_or_default(),
         timeout: timeout_secs,
         connect_timeout: timeout_secs,
         retry_limit: BACKEND_RETRY_LIMIT,
@@ -198,8 +200,8 @@ fn build_s3_backend(s3: &S3BackendConfig) -> anyhow::Result<BackendConfigV2> {
         object_prefix: s3.object_prefix.clone().unwrap_or_default(),
         access_key_id,
         access_key_secret,
-        skip_verify: false,
-        ca_cert_files: Vec::new(),
+        skip_verify: s3.skip_verify,
+        ca_cert_files: s3.ca_cert_files.clone(),
         timeout: DEFAULT_HTTP_TIMEOUT_SECS,
         connect_timeout: DEFAULT_HTTP_TIMEOUT_SECS,
         retry_limit: BACKEND_RETRY_LIMIT,
@@ -232,8 +234,8 @@ fn build_oss_backend(oss: &OssBackendConfig) -> anyhow::Result<BackendConfigV2> 
         object_prefix: oss.object_prefix.clone().unwrap_or_default(),
         access_key_id,
         access_key_secret,
-        skip_verify: false,
-        ca_cert_files: Vec::new(),
+        skip_verify: oss.skip_verify,
+        ca_cert_files: oss.ca_cert_files.clone(),
         timeout: DEFAULT_HTTP_TIMEOUT_SECS,
         connect_timeout: DEFAULT_HTTP_TIMEOUT_SECS,
         retry_limit: BACKEND_RETRY_LIMIT,
@@ -271,16 +273,17 @@ fn resolve_endpoint_scheme(endpoint: &str, insecure: bool) -> (String, String) {
     (scheme.to_string(), host.trim_end_matches('/').to_string())
 }
 
-/// Build the `http-proxy` `BackendConfigV2`. The snapshotter section exposes
-/// only the proxy `url` (mapped to the api `addr`); the blob `path` prefix is
-/// left empty (correct for a unix-socket proxy; an http proxy that needs a
-/// non-empty blob path is not yet expressible in the snapshotter TOML).
+/// Build the `http-proxy` `BackendConfigV2`. The proxy `url` maps to the api
+/// `addr`; the optional blob `path` prefix maps to `path` (empty when unset —
+/// correct for a unix-socket proxy, which ignores it). TLS knobs (`skip_verify`
+/// / `ca_cert_files`) map through for an HTTPS proxy served with a self-signed
+/// / private CA cert.
 fn build_http_proxy_backend(http_proxy: &HttpProxyBackendConfig) -> BackendConfigV2 {
     let http_proxy_cfg = HttpProxyConfig {
         addr: http_proxy.url.clone(),
-        path: String::new(),
-        skip_verify: false,
-        ca_cert_files: Vec::new(),
+        path: http_proxy.path.clone().unwrap_or_default(),
+        skip_verify: http_proxy.skip_verify,
+        ca_cert_files: http_proxy.ca_cert_files.clone(),
         timeout: DEFAULT_HTTP_TIMEOUT_SECS,
         connect_timeout: DEFAULT_HTTP_TIMEOUT_SECS,
         retry_limit: BACKEND_RETRY_LIMIT,
@@ -550,6 +553,7 @@ mod tests {
         cfg.backends.registry = Some(RegistryBackendConfig {
             mirrors: Vec::new(),
             skip_verify: true,
+            ca_cert_files: Vec::new(),
             plain_http: true,
             request_timeout: "45s".to_string(),
         });
@@ -564,6 +568,22 @@ mod tests {
         assert_eq!(reg.auth.as_deref(), Some("dXNlcjpwYXNz"));
     }
 
+    #[test]
+    fn registry_backend_maps_ca_cert_files() {
+        let mut cfg = SnapshotterConfig::default();
+        cfg.backends.registry = Some(RegistryBackendConfig {
+            mirrors: Vec::new(),
+            skip_verify: false,
+            ca_cert_files: vec!["/etc/ca.pem".to_string()],
+            plain_http: false,
+            request_timeout: "30s".to_string(),
+        });
+        let backend = build_backend_config(&cfg, &dummy_image(), None).unwrap();
+        let reg = backend.registry.as_ref().unwrap();
+        assert_eq!(reg.ca_cert_files, vec!["/etc/ca.pem".to_string()]);
+        assert!(!reg.skip_verify);
+    }
+
     /// Build an `S3BackendConfig` with the given endpoint/insecure/object_prefix
     /// and no credentials, for the scheme/prefix mapping tests.
     fn s3_cfg(endpoint: &str, insecure: bool, object_prefix: Option<&str>) -> S3BackendConfig {
@@ -575,6 +595,8 @@ mod tests {
             secret_key_env: String::new(),
             insecure,
             object_prefix: object_prefix.map(str::to_string),
+            skip_verify: false,
+            ca_cert_files: Vec::new(),
         }
     }
 
@@ -595,6 +617,8 @@ mod tests {
             secret_key_env: "B3_TEST_S3_SK".to_string(),
             insecure: false,
             object_prefix: Some("nydus/".to_string()),
+            skip_verify: false,
+            ca_cert_files: Vec::new(),
         });
         let backend = build_backend_config(&cfg, &dummy_image(), None).unwrap();
         assert_eq!(backend.backend_type, "s3");
@@ -687,6 +711,8 @@ mod tests {
             secret_key_env: String::new(),
             insecure: false,
             object_prefix: Some("blobs/".to_string()),
+            skip_verify: false,
+            ca_cert_files: Vec::new(),
         });
         let backend = build_backend_config(&cfg, &dummy_image(), None).unwrap();
         assert_eq!(backend.backend_type, "oss");
@@ -715,6 +741,8 @@ mod tests {
             secret_key_env: String::new(),
             insecure: false,
             object_prefix: None,
+            skip_verify: false,
+            ca_cert_files: Vec::new(),
         });
         let backend = build_backend_config(&cfg, &dummy_image(), None).unwrap();
         let oss = backend.oss.as_ref().unwrap();
@@ -723,17 +751,91 @@ mod tests {
     }
 
     #[test]
+    fn s3_backend_maps_skip_verify_and_ca_cert_files() {
+        let mut cfg = SnapshotterConfig::default();
+        let mut s3 = s3_cfg("s3.example.com", false, None);
+        s3.skip_verify = true;
+        s3.ca_cert_files = vec!["/etc/s3-ca.pem".to_string()];
+        cfg.backends.s3 = Some(s3);
+        let backend = build_backend_config(&cfg, &dummy_image(), None).unwrap();
+        let s3c = backend.s3.as_ref().unwrap();
+        assert!(s3c.skip_verify);
+        assert_eq!(s3c.ca_cert_files, vec!["/etc/s3-ca.pem".to_string()]);
+        // The TLS-configured backend must still pass nydus-api's validator.
+        let bc = BackendConfigV2 {
+            backend_type: "s3".to_string(),
+            s3: backend.s3.clone(),
+            ..Default::default()
+        };
+        assert!(bc.validate());
+    }
+
+    #[test]
+    fn oss_backend_maps_skip_verify_and_ca_cert_files() {
+        let mut cfg = SnapshotterConfig::default();
+        cfg.backends.oss = Some(OssBackendConfig {
+            endpoint: "oss-cn-hangzhou.aliyuncs.com".to_string(),
+            bucket: "b".to_string(),
+            access_key_env: String::new(),
+            secret_key_env: String::new(),
+            insecure: false,
+            object_prefix: None,
+            skip_verify: true,
+            ca_cert_files: vec!["/etc/oss-ca.pem".to_string()],
+        });
+        let backend = build_backend_config(&cfg, &dummy_image(), None).unwrap();
+        let oss = backend.oss.as_ref().unwrap();
+        assert!(oss.skip_verify);
+        assert_eq!(oss.ca_cert_files, vec!["/etc/oss-ca.pem".to_string()]);
+        let bc = BackendConfigV2 {
+            backend_type: "oss".to_string(),
+            oss: backend.oss.clone(),
+            ..Default::default()
+        };
+        assert!(bc.validate());
+    }
+
+    #[test]
     fn http_proxy_backend_maps_url_to_addr() {
         let mut cfg = SnapshotterConfig::default();
         cfg.backends.http_proxy = Some(HttpProxyBackendConfig {
             url: "http://127.0.0.1:8000".to_string(),
+            path: None,
+            skip_verify: false,
+            ca_cert_files: Vec::new(),
         });
         let backend = build_backend_config(&cfg, &dummy_image(), None).unwrap();
         assert_eq!(backend.backend_type, "http-proxy");
         let hp = backend.http_proxy.as_ref().unwrap();
         assert_eq!(hp.addr, "http://127.0.0.1:8000");
+        // Default (no path) maps to an empty path prefix.
         assert_eq!(hp.path, "");
+        assert!(!hp.skip_verify);
+        assert!(hp.ca_cert_files.is_empty());
         assert_eq!(hp.retry_limit, BACKEND_RETRY_LIMIT);
+        let bc = BackendConfigV2 {
+            backend_type: "http-proxy".to_string(),
+            http_proxy: backend.http_proxy.clone(),
+            ..Default::default()
+        };
+        assert!(bc.validate());
+    }
+
+    #[test]
+    fn http_proxy_backend_maps_path_and_tls_knobs() {
+        let mut cfg = SnapshotterConfig::default();
+        cfg.backends.http_proxy = Some(HttpProxyBackendConfig {
+            url: "https://proxy.example.com".to_string(),
+            path: Some("/blobs".to_string()),
+            skip_verify: true,
+            ca_cert_files: vec!["/etc/proxy-ca.pem".to_string()],
+        });
+        let backend = build_backend_config(&cfg, &dummy_image(), None).unwrap();
+        let hp = backend.http_proxy.as_ref().unwrap();
+        assert_eq!(hp.addr, "https://proxy.example.com");
+        assert_eq!(hp.path, "/blobs");
+        assert!(hp.skip_verify);
+        assert_eq!(hp.ca_cert_files, vec!["/etc/proxy-ca.pem".to_string()]);
         let bc = BackendConfigV2 {
             backend_type: "http-proxy".to_string(),
             http_proxy: backend.http_proxy.clone(),

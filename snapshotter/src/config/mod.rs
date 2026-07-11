@@ -986,9 +986,16 @@ pub struct RegistryBackendConfig {
     /// Mirror endpoints.
     #[serde(default)]
     pub mirrors: Vec<String>,
-    /// Skip TLS verification.
+    /// Skip TLS verification. Disables validation of the registry's serving
+    /// certificate. SECURITY: only for trusted networks / test registries — a
+    /// MITM can impersonate the registry when this is on.
     #[serde(default)]
     pub skip_verify: bool,
+    /// Paths to PEM-encoded CA certificate bundle files to trust in addition to
+    /// the system CA store. Use this (rather than `skip_verify`) for a registry
+    /// served with a self-signed / private-CA certificate.
+    #[serde(default)]
+    pub ca_cert_files: Vec<String>,
     /// Use plain HTTP (no TLS) when the daemon pulls blobs from the registry.
     /// Needed for insecure/local registries (e.g. CI test registries); the daemon
     /// otherwise defaults to HTTPS.
@@ -1023,6 +1030,16 @@ pub struct S3BackendConfig {
     /// `nydus/` → object key `nydus/sha256:xxx`. `None` means no prefix.
     #[serde(default)]
     pub object_prefix: Option<String>,
+    /// Skip TLS verification for an HTTPS endpoint. SECURITY: only for trusted
+    /// networks — a MITM can impersonate the endpoint when this is on. Prefer
+    /// `ca_cert_files` for a self-signed / private-CA endpoint.
+    #[serde(default)]
+    pub skip_verify: bool,
+    /// Paths to PEM-encoded CA certificate bundle files to trust in addition to
+    /// the system CA store, for an endpoint served with a self-signed / private
+    /// CA certificate.
+    #[serde(default)]
+    pub ca_cert_files: Vec<String>,
 }
 
 /// OSS backend configuration.
@@ -1048,6 +1065,16 @@ pub struct OssBackendConfig {
     /// `nydus/`. `None` means no prefix.
     #[serde(default)]
     pub object_prefix: Option<String>,
+    /// Skip TLS verification for an HTTPS endpoint. SECURITY: only for trusted
+    /// networks — a MITM can impersonate the endpoint when this is on. Prefer
+    /// `ca_cert_files` for a self-signed / private-CA endpoint.
+    #[serde(default)]
+    pub skip_verify: bool,
+    /// Paths to PEM-encoded CA certificate bundle files to trust in addition to
+    /// the system CA store, for an endpoint served with a self-signed / private
+    /// CA certificate.
+    #[serde(default)]
+    pub ca_cert_files: Vec<String>,
 }
 
 /// Local filesystem backend configuration.
@@ -1059,7 +1086,26 @@ pub struct LocalFsBackendConfig {
 /// HTTP proxy backend configuration.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct HttpProxyBackendConfig {
+    /// Address of the http proxy server, like `http://host:port`,
+    /// `https://host:port`, or a `/path/to/unix.sock`. Maps to the api
+    /// `HttpProxyConfig::addr`.
     pub url: String,
+    /// Blob path prefix appended to the proxy URL, like `/<namespace>/<repo>/blobs`.
+    /// `None` (the default) maps to an empty path — correct for a unix-socket
+    /// proxy, which ignores the path entirely. Set it for an http proxy that
+    /// serves blobs under a non-root prefix.
+    #[serde(default)]
+    pub path: Option<String>,
+    /// Skip TLS verification for an HTTPS proxy URL. SECURITY: only for trusted
+    /// networks — a MITM can impersonate the proxy when this is on. Prefer
+    /// `ca_cert_files` for a self-signed / private-CA proxy.
+    #[serde(default)]
+    pub skip_verify: bool,
+    /// Paths to PEM-encoded CA certificate bundle files to trust in addition to
+    /// the system CA store, for an HTTPS proxy served with a self-signed /
+    /// private CA certificate.
+    #[serde(default)]
+    pub ca_cert_files: Vec<String>,
 }
 
 // ── Default value helpers ──────────────────────────────────────────────
@@ -1706,6 +1752,80 @@ skip_verify = true
 "#;
         let config: SnapshotterConfig = toml::from_str(toml_str).expect("parse");
         config.validate().expect("registry-only valid");
+    }
+
+    // ── Backend TLS / path knobs (additive, back-compat) ───────────────
+
+    #[test]
+    fn backend_tls_fields_default_when_omitted() {
+        // Back-compat: existing configs that never mention the new TLS/path
+        // fields must still parse, with the fields at their inert defaults
+        // (skip_verify=false, ca_cert_files empty, http-proxy path None).
+        let toml_str = r#"
+[snapshotter]
+
+[backends.registry]
+skip_verify = true
+
+[backends.s3]
+endpoint = "s3.example.com"
+region = "us-east-1"
+bucket = "b"
+access_key_env = "AK"
+secret_key_env = "SK"
+
+[backends.oss]
+endpoint = "oss.example.com"
+bucket = "b"
+
+[backends.http_proxy]
+url = "http://127.0.0.1:8000"
+"#;
+        let config: SnapshotterConfig = toml::from_str(toml_str).expect("parse config");
+        let reg = config.backends.registry.as_ref().unwrap();
+        assert!(reg.ca_cert_files.is_empty());
+        let s3 = config.backends.s3.as_ref().unwrap();
+        assert!(!s3.skip_verify);
+        assert!(s3.ca_cert_files.is_empty());
+        let oss = config.backends.oss.as_ref().unwrap();
+        assert!(!oss.skip_verify);
+        assert!(oss.ca_cert_files.is_empty());
+        let hp = config.backends.http_proxy.as_ref().unwrap();
+        assert_eq!(hp.path, None);
+        assert!(!hp.skip_verify);
+        assert!(hp.ca_cert_files.is_empty());
+    }
+
+    #[test]
+    fn backend_tls_fields_parse_when_present() {
+        let toml_str = r#"
+[snapshotter]
+
+[backends.http_proxy]
+url = "https://proxy.example.com"
+path = "/blobs"
+skip_verify = true
+ca_cert_files = ["/etc/proxy-ca.pem"]
+"#;
+        let config: SnapshotterConfig = toml::from_str(toml_str).expect("parse config");
+        let hp = config.backends.http_proxy.as_ref().unwrap();
+        assert_eq!(hp.url, "https://proxy.example.com");
+        assert_eq!(hp.path.as_deref(), Some("/blobs"));
+        assert!(hp.skip_verify);
+        assert_eq!(hp.ca_cert_files, vec!["/etc/proxy-ca.pem".to_string()]);
+    }
+
+    #[test]
+    fn registry_ca_cert_files_parse() {
+        let toml_str = r#"
+[snapshotter]
+
+[backends.registry]
+ca_cert_files = ["/etc/ca.pem"]
+"#;
+        let config: SnapshotterConfig = toml::from_str(toml_str).expect("parse config");
+        let reg = config.backends.registry.as_ref().unwrap();
+        assert_eq!(reg.ca_cert_files, vec!["/etc/ca.pem".to_string()]);
     }
 
     #[test]
