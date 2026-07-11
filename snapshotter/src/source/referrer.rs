@@ -590,21 +590,49 @@ fn standard_oci() -> ReferrerInfo {
 }
 
 /// If `manifest_bytes` parses as an OCI manifest with a non-empty `layers`
-/// array, return the digest of its nydus-bootstrap layer (the layer that
-/// [`classify_descriptor`] flags as `NydusRafs` — same predicate used for
-/// referrer classification). Returns `None` when the bytes are not a manifest
-/// with layers (e.g. a raw bootstrap blob), so the caller falls back to the
+/// array, return the digest of its nydus **bootstrap** layer. Returns `None`
+/// when the bytes are not a manifest with layers (e.g. a raw bootstrap blob) or
+/// when no layer qualifies as the bootstrap, so the caller falls back to the
 /// direct-blob path.
+///
+/// This deliberately does NOT reuse `classify_descriptor`'s loose "contains
+/// nydus/rafs" predicate: a published nydus artifact lists its **data-blob**
+/// layers with mediaType `application/vnd.oci.image.layer.nydus.blob.v1`, which
+/// also contains "nydus". Selecting the first such match would pick a data blob
+/// (typically listed before the bootstrap) and hand `ensure_instance` a blob
+/// that is not a valid RAFS bootstrap. Instead we target the bootstrap layer
+/// specifically, preferring the reliable annotation over a media-type match:
+///   1. a layer annotated `containerd.io/snapshot/nydus-bootstrap == "true"`;
+///   2. else a layer whose mediaType/artifactType contains "bootstrap"
+///      (nydus bootstrap layers use a `...bootstrap.nydus...` media type,
+///      distinct from `...layer.nydus.blob...` data blobs).
 fn select_nydus_bootstrap_layer(manifest_bytes: &[u8]) -> Option<String> {
     let manifest = serde_json::from_slice::<OciManifest>(manifest_bytes).ok()?;
     if manifest.layers.is_empty() {
         return None;
     }
-    manifest.layers.iter().find_map(|desc| {
-        classify_descriptor(desc)
-            .filter(|info| info.image_type == ImageType::NydusRafs)
-            .map(|_| desc.digest.clone())
-    })
+    let is_bootstrap = |desc: &OciDescriptor| {
+        desc.annotations
+            .get(NYDUS_BOOTSTRAP_ANNOTATION)
+            .map(|v| v == "true")
+            .unwrap_or(false)
+    };
+    let has_bootstrap_media = |desc: &OciDescriptor| {
+        format!("{} {}", desc.media_type, desc.artifact_type).contains("bootstrap")
+    };
+    // Annotation is authoritative; fall back to the media-type marker only when
+    // no layer carries the annotation.
+    manifest
+        .layers
+        .iter()
+        .find(|desc| is_bootstrap(desc))
+        .or_else(|| {
+            manifest
+                .layers
+                .iter()
+                .find(|desc| has_bootstrap_media(desc))
+        })
+        .map(|desc| desc.digest.clone())
 }
 
 /// Verify `bytes` hash to `expected` (a `sha256:<hex>` digest). Security-
@@ -725,31 +753,32 @@ pub async fn materialize_bootstrap(
     Ok(path)
 }
 
-/// Blocking wrapper around [`materialize_bootstrap`], mirroring
-/// [`detect_referrer_blocking`]: all cyper HTTP runs inside `blocking::unblock`
-/// on the thread-local compio runtime (cyper's `Client` is `!Send`). Only
-/// `Send` state crosses the boundary; the returned `PathBuf` is `Send`.
-pub async fn materialize_bootstrap_blocking(
+/// Synchronous (blocking) entry point for [`materialize_bootstrap`]: drives all
+/// cyper HTTP on the thread-local compio runtime and blocks the calling thread
+/// until it completes (cyper's `Client` is `!Send`, so it must run to
+/// completion on one thread that owns the runtime).
+///
+/// A plain synchronous caller (integration tests, tools) can call this
+/// directly. A caller already on an async runtime — e.g. the gRPC `prepare`
+/// task on compio — MUST offload it via `blocking::unblock` so it neither
+/// blocks the reactor nor nests a `block_on` inside the running runtime. This
+/// is the same threading model as [`detect_referrer_blocking`], just with the
+/// `blocking::unblock` hop moved to the call site so the function itself stays
+/// usable from ordinary synchronous code.
+pub fn materialize_bootstrap_blocking(
     image_ref: &str,
     bootstrap_digest: &str,
     config: &SnapshotterConfig,
     cache_dir: &Path,
 ) -> Result<PathBuf> {
-    let image_ref = image_ref.to_string();
-    let bootstrap_digest = bootstrap_digest.to_string();
-    let config = config.clone();
-    let cache_dir = cache_dir.to_path_buf();
-    blocking::unblock(move || {
-        REFERRER_HTTP_RUNTIME.with(|rt| {
-            rt.block_on(materialize_bootstrap(
-                &image_ref,
-                &bootstrap_digest,
-                &config,
-                &cache_dir,
-            ))
-        })
+    REFERRER_HTTP_RUNTIME.with(|rt| {
+        rt.block_on(materialize_bootstrap(
+            image_ref,
+            bootstrap_digest,
+            config,
+            cache_dir,
+        ))
     })
-    .await
 }
 
 #[derive(Debug, Deserialize)]
@@ -991,6 +1020,63 @@ mod tests {
         assert_eq!(
             select_nydus_bootstrap_layer(manifest).as_deref(),
             Some("sha256:bootlayer")
+        );
+    }
+
+    /// Regression: a real published nydus artifact lists its data-blob layers
+    /// (mediaType `...layer.nydus.blob.v1`, which contains "nydus") BEFORE the
+    /// bootstrap layer. A loose "contains nydus" match would return the first
+    /// data blob; we must select the annotated bootstrap layer instead — else
+    /// `ensure_instance` is handed a data blob and the feature degrades to
+    /// overlay on exactly the multi-blob artifacts B4b targets.
+    #[test]
+    fn select_layer_skips_data_blobs_before_the_bootstrap() {
+        let manifest = br#"{
+            "layers":[
+                {"mediaType":"application/vnd.oci.image.layer.nydus.blob.v1","digest":"sha256:datablob0"},
+                {"mediaType":"application/vnd.oci.image.layer.nydus.blob.v1","digest":"sha256:datablob1"},
+                {
+                    "mediaType":"application/vnd.oci.image.layer.nydus.bootstrap.v1",
+                    "digest":"sha256:realboot",
+                    "annotations":{"containerd.io/snapshot/nydus-bootstrap":"true"}
+                }
+            ]
+        }"#;
+        assert_eq!(
+            select_nydus_bootstrap_layer(manifest).as_deref(),
+            Some("sha256:realboot"),
+            "must select the bootstrap layer, not a leading data blob"
+        );
+    }
+
+    /// When the manifest lists only data-blob layers and no bootstrap (neither
+    /// annotation nor a `bootstrap` media type), selection returns None so the
+    /// caller falls back to the direct-blob path rather than mounting a data
+    /// blob as if it were a bootstrap.
+    #[test]
+    fn select_layer_returns_none_without_a_bootstrap_layer() {
+        let manifest = br#"{
+            "layers":[
+                {"mediaType":"application/vnd.oci.image.layer.nydus.blob.v1","digest":"sha256:datablob0"},
+                {"mediaType":"application/vnd.oci.image.layer.nydus.blob.v1","digest":"sha256:datablob1"}
+            ]
+        }"#;
+        assert_eq!(select_nydus_bootstrap_layer(manifest), None);
+    }
+
+    /// The media-type fallback selects a `...bootstrap.nydus...` layer even when
+    /// the reliable annotation is absent.
+    #[test]
+    fn select_layer_falls_back_to_bootstrap_media_type() {
+        let manifest = br#"{
+            "layers":[
+                {"mediaType":"application/vnd.oci.image.layer.nydus.blob.v1","digest":"sha256:datablob0"},
+                {"mediaType":"application/vnd.oci.image.layer.bootstrap.nydus.v1","digest":"sha256:mediaboot"}
+            ]
+        }"#;
+        assert_eq!(
+            select_nydus_bootstrap_layer(manifest).as_deref(),
+            Some("sha256:mediaboot")
         );
     }
 

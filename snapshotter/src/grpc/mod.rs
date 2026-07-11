@@ -702,14 +702,30 @@ impl snapshots::Snapshotter for NydusSnapshotter {
                             Ok(info) => match info.image_type {
                                 ImageType::NydusRafs => {
                                     if let Some(bootstrap_digest) = info.bootstrap_digest.as_deref() {
-                                        match crate::source::referrer::materialize_bootstrap_blocking(
-                                            image_ref,
-                                            bootstrap_digest,
-                                            &self.config,
-                                            &self.config.snapshotter.root,
-                                        )
-                                        .await
-                                        {
+                                        // `materialize_bootstrap_blocking` is
+                                        // synchronous and blocks its thread on
+                                        // the compio HTTP runtime; offload it
+                                        // via `blocking::unblock` so the gRPC
+                                        // reactor is never blocked and no
+                                        // `block_on` nests inside the running
+                                        // runtime (same model as
+                                        // `detect_referrer_blocking`).
+                                        let materialized = {
+                                            let image_ref = image_ref.to_string();
+                                            let bootstrap_digest = bootstrap_digest.to_string();
+                                            let config = self.config.clone();
+                                            let root = self.config.snapshotter.root.clone();
+                                            blocking::unblock(move || {
+                                                crate::source::referrer::materialize_bootstrap_blocking(
+                                                    &image_ref,
+                                                    &bootstrap_digest,
+                                                    &config,
+                                                    &root,
+                                                )
+                                            })
+                                            .await
+                                        };
+                                        match materialized {
                                             Ok(bootstrap) => match self
                                                 .supervisor
                                                 .ensure_instance(image_ref, &bootstrap)
