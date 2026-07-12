@@ -67,7 +67,8 @@ use containerd::services::content::v1::{
 };
 
 use containerd::services::images::v1::{
-    CreateImageRequest, GetImageRequest, Image, ListImagesRequest, images_client::ImagesClient,
+    CreateImageRequest, GetImageRequest, Image, ListImagesRequest, UpdateImageRequest,
+    images_client::ImagesClient,
 };
 
 use containerd::types as types_proto;
@@ -475,6 +476,70 @@ impl ContentStoreClient {
                 match client.create(request).await {
                     Ok(_) => Ok(()),
                     Err(status) if status.code() == Code::AlreadyExists => Ok(()),
+                    Err(status) => Err(anyhow::anyhow!(
+                        "containerd Images.Create({name}) failed: {status}"
+                    )),
+                }
+            })
+        })
+        .await
+    }
+
+    /// Create the sidecar Image record, or—if it already exists—repoint it at
+    /// `digest` (with fresh `labels`). Containerd's `Images.Create` returns
+    /// `AlreadyExists` and does NOT update the target, so the two-stage
+    /// auto-accel pipeline needs this upsert to promote a base sidecar record
+    /// to the optimized manifest on stage 2. The `Update` uses a field mask of
+    /// `target` + `labels` so timestamps and other server-managed fields are
+    /// left untouched. Idempotent: a create/update to the same target is a
+    /// no-op from the caller's perspective.
+    pub async fn images_upsert(
+        &self,
+        name: &str,
+        digest: &str,
+        size: u64,
+        media_type: &str,
+        labels: HashMap<String, String>,
+    ) -> Result<()> {
+        let inner = self.inner.clone();
+        let name = name.to_string();
+        let digest = digest.to_string();
+        let media_type = media_type.to_string();
+        blocking::unblock(move || {
+            inner.handle.block_on(async {
+                let mut client = connect_images(&inner).await?;
+                let image = Image {
+                    name: name.clone(),
+                    labels: labels.clone(),
+                    target: Some(types_proto::Descriptor {
+                        media_type: media_type.clone(),
+                        digest: digest.clone(),
+                        size: size as i64,
+                        annotations: HashMap::new(),
+                    }),
+                    created_at: None,
+                    updated_at: None,
+                };
+                let mut create = tonic::Request::new(CreateImageRequest {
+                    image: Some(image.clone()),
+                    source_date_epoch: None,
+                });
+                attach_namespace(&mut create, &inner.namespace)?;
+                match client.create(create).await {
+                    Ok(_) => Ok(()),
+                    Err(status) if status.code() == Code::AlreadyExists => {
+                        let mut update = tonic::Request::new(UpdateImageRequest {
+                            image: Some(image),
+                            update_mask: Some(prost_types::FieldMask {
+                                paths: vec!["target".to_string(), "labels".to_string()],
+                            }),
+                            source_date_epoch: None,
+                        });
+                        attach_namespace(&mut update, &inner.namespace)?;
+                        client.update(update).await.map(|_| ()).map_err(|status| {
+                            anyhow::anyhow!("containerd Images.Update({name}) failed: {status}")
+                        })
+                    }
                     Err(status) => Err(anyhow::anyhow!(
                         "containerd Images.Create({name}) failed: {status}"
                     )),

@@ -18,12 +18,15 @@ use crate::access_tracer::AccessTracer;
 use crate::config::{AutoZranConfig, ContainerdConfig, SchedClass as ConfigSchedClass};
 use crate::containerd_lookup::ContainerdLookup;
 use crate::content_store::ContentStoreClient;
-use crate::local_accel::{self, LocalAccelConfig, SchedClass as AccelSchedClass};
+use crate::local_accel::{
+    self, LocalAccelConfig, NodeLocalArtifact, SchedClass as AccelSchedClass,
+};
 use crate::prefetch_profile::PrefetchProfile;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -128,18 +131,63 @@ pub struct ConversionDeps {
     pub access_tracer: Arc<AccessTracer>,
 }
 
+/// Which half of the two-stage conversion a job represents.
+///
+/// Both stages share one per-image on-disk `work_dir` (keyed by `job_key`), so
+/// stage 2 can reuse stage 1's create+merge output. They are deduped
+/// independently (see [`dedupe_key`]) so a `Base` enqueue at prepare and an
+/// `Optimize` enqueue at tracer settle for the same image can both be queued.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub enum AutoZranStage {
+    /// create + merge with an EMPTY prefetch list → a fully servable sidecar
+    /// (the optimize step is skipped, see `local_accel::convert`). Enqueued
+    /// immediately at the first eligible `prepare` so peers can fetch a
+    /// sidecar as soon as it lands, long before this pod's tracer settles.
+    Base,
+    /// The `nydus-image optimize` step (prefetch bootstrap + packed prefetch
+    /// blob). Enqueued on tracer settle. Reuses the `Base` stage's on-disk
+    /// `work_dir` when present (optimize only); otherwise runs the full
+    /// pipeline once WITH prefetch (handles "settle arrived before base").
+    Optimize,
+}
+
+impl AutoZranStage {
+    /// Short, dedupe-key-safe discriminant tag.
+    fn tag(self) -> &'static str {
+        match self {
+            AutoZranStage::Base => "base",
+            AutoZranStage::Optimize => "opt",
+        }
+    }
+}
+
 /// Conversion job persisted in memory while waiting for the worker.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct AutoZranJob {
     pub image: String,
+    pub stage: AutoZranStage,
+    /// Empty for [`AutoZranStage::Base`]; the captured access profile (in
+    /// first-seen order) for [`AutoZranStage::Optimize`].
     pub prefetch_files: Vec<String>,
 }
 
 impl AutoZranJob {
+    /// A stage-1 base job: empty prefetch, verified servable.
+    pub fn base(image: String) -> Self {
+        Self {
+            image,
+            stage: AutoZranStage::Base,
+            prefetch_files: Vec::new(),
+        }
+    }
+
+    /// A stage-2 optimize job from a settled prefetch profile. `None` when the
+    /// profile captured no files (nothing to optimize for).
     pub fn from_profile(profile: &PrefetchProfile) -> Option<Self> {
         let prefetch_files = profile.prefetch_files();
         (!prefetch_files.is_empty()).then(|| Self {
             image: profile.image.clone(),
+            stage: AutoZranStage::Optimize,
             prefetch_files,
         })
     }
@@ -210,7 +258,7 @@ impl AutoZranState {
         } else {
             self.metrics.failed_total.fetch_add(1, Ordering::Relaxed);
             if let Ok(mut seen) = self.queued_or_done.lock() {
-                seen.remove(&job_key(&job.image));
+                seen.remove(&dedupe_key(&job.image, job.stage));
             }
         }
         if let Ok(mut active) = self.active_image.lock()
@@ -295,7 +343,18 @@ impl AutoZranManager {
             .map(|image| job_key(&image))
     }
 
-    /// Try to enqueue a profile without blocking the sysctl request path.
+    /// Enqueue the stage-1 BASE conversion for `image` without blocking the
+    /// caller (the gRPC `prepare` path). Non-blocking channel push; deduped by
+    /// the base job key so repeated prepares of the same image enqueue at most
+    /// one base job. A no-op (dropped, counted) when the queue is full.
+    pub fn try_enqueue_base(&self, image: &str) {
+        self.enqueue(AutoZranJob::base(image.to_string()));
+    }
+
+    /// Enqueue the stage-2 OPTIMIZE conversion from a settled prefetch profile
+    /// without blocking the sysctl request path. Deduped independently of the
+    /// base stage, so this queues even when a base job for the same image is
+    /// already queued/done.
     pub fn try_enqueue_profile(&self, profile: &PrefetchProfile) {
         let Some(job) = AutoZranJob::from_profile(profile) else {
             self.state
@@ -305,8 +364,15 @@ impl AutoZranManager {
             debug!(image = %profile.image, "auto-zran skipped empty prefetch profile");
             return;
         };
+        self.enqueue(job);
+    }
 
-        let key = job_key(&job.image);
+    /// Shared, non-blocking enqueue path for both stages. Dedupes on
+    /// `(image, stage)` via `queued_or_done`, then `try_send`s onto the
+    /// bounded channel, rolling the dedupe key back if the send fails so the
+    /// job can be retried later.
+    fn enqueue(&self, job: AutoZranJob) {
+        let key = dedupe_key(&job.image, job.stage);
         match self.state.queued_or_done.lock() {
             Ok(mut seen) => {
                 if !seen.insert(key.clone()) {
@@ -314,7 +380,7 @@ impl AutoZranManager {
                         .metrics
                         .skipped_total
                         .fetch_add(1, Ordering::Relaxed);
-                    debug!(image = %job.image, "auto-zran job already queued");
+                    debug!(image = %job.image, stage = job.stage.tag(), "auto-zran job already queued");
                     return;
                 }
             }
@@ -328,12 +394,14 @@ impl AutoZranManager {
             }
         }
 
+        let image = job.image.clone();
+        let stage = job.stage;
         if let Err(e) = self.sender.try_send(job) {
             self.state
                 .metrics
                 .dropped_total
                 .fetch_add(1, Ordering::Relaxed);
-            warn!(error = %e, "auto-zran queue is full or closed; dropping profile");
+            warn!(error = %e, image = %image, stage = stage.tag(), "auto-zran queue is full or closed; dropping job");
             if let Ok(mut seen) = self.state.queued_or_done.lock() {
                 seen.remove(&key);
             }
@@ -373,20 +441,26 @@ fn map_sched(class: ConfigSchedClass) -> AccelSchedClass {
     }
 }
 
-/// Drive a single conversion job end-to-end:
-/// 1. Resolve the manifest digest + ordered gzip-layer paths via
-///    `ContainerdLookup::manifest_info`.
-/// 2. Skip if a sidecar for this manifest is already in the content store
-///    (idempotent across racing pods on the same node).
-/// 3. Run `local_accel::convert(cfg, layers, prefetch_files)` on a blocking
-///    thread (CPU-bound; mustn't tie up the compio runtime).
-/// 4. Upload bootstrap + zran indexes + (optional) prefetch blob via the
-///    content_store client with `containerd.io/gc.ref.content.subject` +
-///    auto-accel role labels.
-/// 5. Build and upload the small auto-accel manifest JSON; register under the
-///    deterministic ref `nydus-auto-accel:v1:<subject_manifest_digest>`.
-/// 6. Tell the access tracer to stop capturing for this image and clean up
-///    the per-image work_dir.
+/// Which servable form of a sidecar already exists in the content store for a
+/// given subject manifest.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SidecarState {
+    /// No complete sidecar (absent, or present-but-missing-blobs → re-convert).
+    Absent,
+    /// A complete BASE sidecar (no prefetch blob): servable, upgradeable.
+    Base,
+    /// A complete OPTIMIZED sidecar (has a packed prefetch blob).
+    Optimized,
+}
+
+/// Dispatch a job to its stage. Shared prologue: resolve the manifest + layers
+/// and probe the existing sidecar state once, then hand off.
+///
+/// Ordering-race handling (both are correct):
+/// * settle AFTER base done — the base job left `work_dir` + `artifact.json` on
+///   disk, so the optimize stage runs ONLY `nydus-image optimize`.
+/// * settle BEFORE base done — no base output on disk, so the optimize stage
+///   runs the full pipeline once WITH prefetch (the profile is never lost).
 async fn run_conversion(
     config: &AutoZranConfig,
     deps: &ConversionDeps,
@@ -399,76 +473,272 @@ async fn run_conversion(
         .await
         .with_context(|| format!("resolve manifest for {}", job.image))?;
     let manifest_digest = info.manifest_digest.clone();
+    let image_name = auto_accel_image_name(&manifest_digest);
     info!(
         image = %job.image,
+        stage = job.stage.tag(),
         manifest = %manifest_digest,
         layers = info.layers.len(),
         prefetch_files = job.prefetch_files.len(),
         "auto-zran starting conversion"
     );
 
-    // (2) Skip if already done — AND every referenced blob is still
-    // present. The old version checked `info(auto_accel_manifest_ref)`,
-    // but `info()` takes a digest not a ref, so the call always
-    // returned NotFound and the skip path was dead code (every run
-    // re-converted). The new check uses `images_get(synthetic_ref)` and
-    // round-trips each referenced descriptor through `info()` so we
-    // detect half-uploaded sidecars (snapshotter killed mid-write, GC
-    // raced) rather than mark-accelerated-then-fail-to-mount.
-    let image_name = auto_accel_image_name(&manifest_digest);
-    match deps.content_store.images_get(&image_name).await {
-        Ok(Some(existing)) => match completeness_check(deps, &existing.digest).await {
-            Ok(true) => {
-                info!(
-                    image = %job.image,
-                    image_name = %image_name,
-                    manifest_digest = %existing.digest,
-                    "auto-accel sidecar already present and complete; skipping conversion"
-                );
-                deps.access_tracer.mark_image_accelerated(&job.image);
-                return Ok(());
-            }
-            Ok(false) => {
-                warn!(
-                    image = %job.image,
-                    image_name = %image_name,
-                    "auto-accel sidecar is present but some referenced blobs are missing; re-converting"
-                );
-            }
-            Err(e) => {
-                warn!(
-                    image = %job.image,
-                    error = ?e,
-                    "auto-accel sidecar completeness check failed; re-converting to be safe"
-                );
-            }
-        },
-        Ok(None) => { /* no record yet — proceed with conversion */ }
-        Err(e) => {
-            warn!(
-                image = %job.image,
-                error = ?e,
-                "auto-accel images.Get failed; proceeding with conversion"
-            );
+    // Probe whether a sidecar already exists (and, if so, whether it is
+    // already optimized). Half-uploaded sidecars (snapshotter killed
+    // mid-write, GC raced) read back as `Absent` so we re-convert rather
+    // than mark-accelerated-then-fail-to-mount.
+    let existing = existing_sidecar_state(deps, &image_name).await;
+
+    match job.stage {
+        AutoZranStage::Base => {
+            run_base_stage(
+                config,
+                deps,
+                job,
+                info.layers,
+                &manifest_digest,
+                &image_name,
+                existing,
+            )
+            .await
+        }
+        AutoZranStage::Optimize => {
+            run_optimize_stage(
+                config,
+                deps,
+                job,
+                info.layers,
+                &manifest_digest,
+                &image_name,
+                existing,
+            )
+            .await
         }
     }
+}
 
-    // (3) Convert on a blocking thread.
+/// Stage 1: create + merge with an EMPTY prefetch list → a fully servable base
+/// sidecar. Uploads it, then RETAINS the work dir (and a serialized
+/// `artifact.json`) so the optimize stage can reuse the create+merge output.
+/// Deliberately does NOT mark the image accelerated: the access tracer must
+/// keep capturing to drive stage 2.
+#[allow(clippy::too_many_arguments)]
+async fn run_base_stage(
+    config: &AutoZranConfig,
+    deps: &ConversionDeps,
+    job: &AutoZranJob,
+    layers: Vec<local_accel::GzipLayer>,
+    manifest_digest: &str,
+    image_name: &str,
+    existing: SidecarState,
+) -> Result<()> {
+    if existing != SidecarState::Absent {
+        // A base or optimized sidecar already exists — base is redundant.
+        // Do NOT mark accelerated: leave the tracer capturing so the optimize
+        // stage still fires (it will skip if already optimized).
+        info!(image = %job.image, ?existing, "auto-zran base skip: sidecar already present");
+        return Ok(());
+    }
+
     let work_dir = job_work_dir(config, &job.image);
     std::fs::create_dir_all(&work_dir)
         .with_context(|| format!("create work dir {}", work_dir.display()))?;
-    let local_cfg = LocalAccelConfig {
-        nydus_image: config.nydus_image.clone(),
-        work_dir: work_dir.clone(),
-        sched: map_sched(config.sched_class),
-        nice: config.nice,
-    };
-    let layers = info.layers;
+    let local_cfg = local_accel_config(config, &work_dir);
+    let artifact = blocking::unblock(move || local_accel::convert(&local_cfg, &layers, &[]))
+        .await
+        .context("local_accel::convert (base) failed")?;
+
+    // Persist the base artifact so stage 2 can reuse it. Non-fatal on failure:
+    // stage 2 falls back to the full pipeline when it can't reload the base.
+    if let Err(e) = write_base_artifact(&work_dir, &artifact) {
+        warn!(image = %job.image, error = ?e, "auto-zran failed to persist base artifact; optimize will re-run the full pipeline");
+    }
+
+    upload_artifact(deps, job, manifest_digest, image_name, &artifact).await?;
+
+    // IMPORTANT: do NOT mark accelerated and do NOT remove work_dir — the
+    // tracer keeps capturing, and stage 2 reuses this work_dir. A pod that
+    // dies before settle leaves the dir for the recon stale-dir sweep.
+    info!(image = %job.image, "auto-zran base conversion complete; work dir retained for optimize");
+    Ok(())
+}
+
+/// Stage 2: run the `nydus-image optimize` step and re-upload the (now
+/// optimized) sidecar, promoting the Image record from the base manifest to the
+/// optimized one. Reuses stage 1's on-disk work dir when present (optimize
+/// only); otherwise runs the full pipeline once WITH prefetch.
+#[allow(clippy::too_many_arguments)]
+async fn run_optimize_stage(
+    config: &AutoZranConfig,
+    deps: &ConversionDeps,
+    job: &AutoZranJob,
+    layers: Vec<local_accel::GzipLayer>,
+    manifest_digest: &str,
+    image_name: &str,
+    existing: SidecarState,
+) -> Result<()> {
+    if existing == SidecarState::Optimized {
+        info!(image = %job.image, "auto-zran optimize skip: sidecar already optimized");
+        deps.access_tracer.mark_image_accelerated(&job.image);
+        cleanup_work_dir(config, &job.image);
+        return Ok(());
+    }
+
+    let work_dir = job_work_dir(config, &job.image);
+    std::fs::create_dir_all(&work_dir)
+        .with_context(|| format!("create work dir {}", work_dir.display()))?;
+    let local_cfg = local_accel_config(config, &work_dir);
     let prefetch_files = job.prefetch_files.clone();
-    let artifact =
+
+    let artifact = if let Some(base) = load_reusable_base_artifact(&work_dir) {
+        // Stage 1 output is on disk: run ONLY optimize (create/merge skipped).
+        info!(image = %job.image, "auto-zran optimize: reusing base work dir (create/merge skipped)");
+        blocking::unblock(move || {
+            local_accel::optimize_existing(&local_cfg, &base, &prefetch_files)
+        })
+        .await
+        .context("local_accel::optimize_existing failed")?
+    } else {
+        // No reusable base (settle beat base, or the dir was swept): run the
+        // full pipeline once WITH prefetch so the captured profile isn't lost.
+        info!(image = %job.image, "auto-zran optimize: no reusable base work dir; running full pipeline with prefetch");
         blocking::unblock(move || local_accel::convert(&local_cfg, &layers, &prefetch_files))
             .await
-            .context("local_accel::convert failed")?;
+            .context("local_accel::convert (optimize full) failed")?
+    };
+
+    let image_record_ok =
+        upload_artifact(deps, job, manifest_digest, image_name, &artifact).await?;
+
+    // Tell the tracer to stop capturing ONLY when the cross-node advertisement
+    // is also wired (mirrors the original single-stage invariant): with
+    // image_record_ok=false peers can never discover the sidecar, so keep
+    // capture alive to retry the registration on a later cycle.
+    if image_record_ok {
+        deps.access_tracer.mark_image_accelerated(&job.image);
+    }
+    cleanup_work_dir(config, &job.image);
+    Ok(())
+}
+
+/// Build a `LocalAccelConfig` for a job's per-image `work_dir`.
+fn local_accel_config(config: &AutoZranConfig, work_dir: &Path) -> LocalAccelConfig {
+    LocalAccelConfig {
+        nydus_image: config.nydus_image.clone(),
+        work_dir: work_dir.to_path_buf(),
+        sched: map_sched(config.sched_class),
+        nice: config.nice,
+    }
+}
+
+/// Best-effort removal of a completed job's per-image work dir.
+fn cleanup_work_dir(config: &AutoZranConfig, image: &str) {
+    let work_dir = job_work_dir(config, image);
+    if let Err(e) = std::fs::remove_dir_all(&work_dir)
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        warn!(error = %e, work_dir = %work_dir.display(), "auto-zran work_dir cleanup failed (non-fatal)");
+    }
+}
+
+/// File under a job's work dir holding the serialized base [`NodeLocalArtifact`].
+const BASE_ARTIFACT_FILE: &str = "artifact.json";
+
+fn base_artifact_path(work_dir: &Path) -> PathBuf {
+    work_dir.join(BASE_ARTIFACT_FILE)
+}
+
+/// Persist a base-stage artifact so the optimize stage can reload it and skip
+/// create/merge.
+fn write_base_artifact(work_dir: &Path, artifact: &NodeLocalArtifact) -> Result<()> {
+    let path = base_artifact_path(work_dir);
+    let bytes = serde_json::to_vec(artifact).context("serialize base artifact")?;
+    std::fs::write(&path, bytes).with_context(|| format!("write {}", path.display()))
+}
+
+/// Load a persisted base artifact IF its on-disk inputs (merged bootstrap +
+/// backend dir) are still present. This is the seam that decides stage-2
+/// behavior: `Some` ⇒ reuse (optimize only, create/merge skipped); `None` ⇒
+/// run the full pipeline.
+fn load_reusable_base_artifact(work_dir: &Path) -> Option<NodeLocalArtifact> {
+    let bytes = std::fs::read(base_artifact_path(work_dir)).ok()?;
+    let artifact: NodeLocalArtifact = serde_json::from_slice(&bytes).ok()?;
+    (artifact.bootstrap.is_file() && artifact.backend_dir.is_dir()).then_some(artifact)
+}
+
+/// Probe whether a complete sidecar already exists for `image_name`, and if so
+/// whether it already carries a prefetch blob (i.e. is optimized). Any RPC /
+/// completeness failure resolves to `Absent` (re-convert) or `Base` (allow
+/// optimize) so a transient error never wedges the pipeline.
+async fn existing_sidecar_state(deps: &ConversionDeps, image_name: &str) -> SidecarState {
+    let existing = match deps.content_store.images_get(image_name).await {
+        Ok(Some(e)) => e,
+        Ok(None) => return SidecarState::Absent,
+        Err(e) => {
+            warn!(image_name = %image_name, error = ?e, "auto-accel images.Get failed; treating sidecar as absent");
+            return SidecarState::Absent;
+        }
+    };
+    match completeness_check(deps, &existing.digest).await {
+        Ok(true) => {}
+        Ok(false) => {
+            warn!(image_name = %image_name, "auto-accel sidecar present but some referenced blobs are missing; re-converting");
+            return SidecarState::Absent;
+        }
+        Err(e) => {
+            warn!(image_name = %image_name, error = ?e, "auto-accel sidecar completeness check failed; re-converting to be safe");
+            return SidecarState::Absent;
+        }
+    }
+    match sidecar_has_prefetch(deps, &existing.digest).await {
+        Ok(true) => SidecarState::Optimized,
+        Ok(false) => SidecarState::Base,
+        Err(e) => {
+            // Conservative: treat as base so the optimize stage still runs.
+            debug!(image_name = %image_name, error = ?e, "auto-accel prefetch-state probe failed; treating sidecar as base");
+            SidecarState::Base
+        }
+    }
+}
+
+/// Parse an on-store OCI sidecar manifest → its config blob (our
+/// `AutoAccelManifest`) → report whether it carries a prefetch blob.
+async fn sidecar_has_prefetch(deps: &ConversionDeps, oci_manifest_digest: &str) -> Result<bool> {
+    let manifest_bytes = deps.content_store.fetch_bytes(oci_manifest_digest).await?;
+    let oci: serde_json::Value = serde_json::from_slice(&manifest_bytes)
+        .with_context(|| format!("parse OCI manifest {oci_manifest_digest}"))?;
+    let config_digest = oci
+        .get("config")
+        .and_then(|c| c.get("digest"))
+        .and_then(|d| d.as_str())
+        .ok_or_else(|| {
+            anyhow::anyhow!("oci manifest {oci_manifest_digest} missing config.digest")
+        })?;
+    let config_bytes = deps.content_store.fetch_bytes(config_digest).await?;
+    let manifest: AutoAccelManifest = serde_json::from_slice(&config_bytes)
+        .with_context(|| format!("parse auto-accel config blob {config_digest}"))?;
+    Ok(manifest.prefetch_blob.is_some())
+}
+
+/// Upload a converted artifact as a content-store sidecar (bootstrap + zran
+/// indexes + optional prefetch blob + config + OCI manifest) and create-or-
+/// update the sidecar Image record. Shared by both stages. Returns whether the
+/// Image record registration succeeded (`image_record_ok`).
+///
+/// The `images_upsert` at the end is what lets stage 2 PROMOTE the record from
+/// the base manifest to the optimized one — `Images.Create` alone swallows
+/// AlreadyExists without repointing the target. All blobs are content-addressed
+/// (`write_blob`/`write_bytes`), so re-uploading never corrupts a
+/// concurrently-fetched artifact; only the Image record's target moves.
+async fn upload_artifact(
+    deps: &ConversionDeps,
+    job: &AutoZranJob,
+    manifest_digest: &str,
+    image_name: &str,
+    artifact: &NodeLocalArtifact,
+) -> Result<bool> {
+    // Own the digest so the step-4/5 label helpers below can `.clone()` it.
+    let manifest_digest = manifest_digest.to_string();
 
     // (4) Upload artifacts. Labels:
     //   - gc.ref.content.subject  pins lifetime to the original manifest
@@ -660,8 +930,8 @@ async fn run_conversion(
     );
     let image_record_ok = match deps
         .content_store
-        .images_create(
-            &image_name,
+        .images_upsert(
+            image_name,
             &manifest_digest_in_store,
             manifest_bytes.len() as u64,
             OCI_MANIFEST_MEDIATYPE,
@@ -687,27 +957,12 @@ async fn run_conversion(
         auto_accel_manifest = %manifest_digest_in_store,
         image_name = %image_name,
         image_record = image_record_ok,
-        "auto-zran conversion complete"
+        "auto-zran sidecar uploaded"
     );
 
-    // (6) Tell the tracer to stop capturing + clean up scratch — but
-    // ONLY if the cross-node advertisement is also wired. With
-    // image_record_ok=false this node would serve the next pod locally
-    // via label scan, but peers can never discover it; marking the image
-    // accelerated would also stop us from re-attempting the
-    // image-record creation on subsequent capture cycles. Keep capture
-    // alive so the next conversion retries the registration.
-    if image_record_ok {
-        deps.access_tracer.mark_image_accelerated(&job.image);
-    }
-    if let Err(e) = std::fs::remove_dir_all(&work_dir) {
-        warn!(
-            error = %e,
-            work_dir = %work_dir.display(),
-            "auto-zran work_dir cleanup failed (non-fatal)"
-        );
-    }
-    Ok(())
+    // The stage caller decides whether to mark the image accelerated and clean
+    // up the work dir (base retains it for stage 2; optimize tears it down).
+    Ok(image_record_ok)
 }
 
 /// Per-image scratch dir under `auto_zran.work_dir`. We use a sha256 of the
@@ -793,6 +1048,15 @@ fn job_key(image: &str) -> String {
         .collect()
 }
 
+/// Dedupe key for the in-flight `queued_or_done` set. It carries the stage
+/// discriminant so a `Base` and an `Optimize` job for the SAME image are
+/// deduped independently (both can be queued), while repeated enqueues of the
+/// same stage collapse. Distinct from `job_key` (which names the shared,
+/// stage-agnostic on-disk work dir the recon sweep watches).
+fn dedupe_key(image: &str, stage: AutoZranStage) -> String {
+    format!("{}:{}", stage.tag(), job_key(image))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -816,7 +1080,35 @@ mod tests {
         let profile = profile("registry.local/app:1");
         let job = AutoZranJob::from_profile(&profile).unwrap();
         assert_eq!(job.image, "registry.local/app:1");
+        assert_eq!(job.stage, AutoZranStage::Optimize);
         assert_eq!(job.prefetch_files, vec!["/bin/app"]);
+    }
+
+    #[test]
+    fn base_job_has_empty_prefetch_and_base_stage() {
+        // A base job carries no prefetch → `local_accel::convert` skips the
+        // optimize step and produces a fully servable sidecar.
+        let job = AutoZranJob::base("registry.local/app:1".to_string());
+        assert_eq!(job.image, "registry.local/app:1");
+        assert_eq!(job.stage, AutoZranStage::Base);
+        assert!(job.prefetch_files.is_empty());
+    }
+
+    #[test]
+    fn dedupe_key_separates_stages_but_is_stable_per_stage() {
+        let img = "registry.local/app:1";
+        assert_eq!(
+            dedupe_key(img, AutoZranStage::Base),
+            dedupe_key(img, AutoZranStage::Base)
+        );
+        assert_ne!(
+            dedupe_key(img, AutoZranStage::Base),
+            dedupe_key(img, AutoZranStage::Optimize)
+        );
+        // The stage-agnostic work-dir key (what the recon sweep watches) is the
+        // same for both stages so they share one on-disk work dir.
+        assert!(dedupe_key(img, AutoZranStage::Base).ends_with(&job_key(img)));
+        assert!(dedupe_key(img, AutoZranStage::Optimize).ends_with(&job_key(img)));
     }
 
     #[test]
@@ -824,13 +1116,14 @@ mod tests {
         let state = AutoZranState::new(8);
         let success_job = AutoZranJob {
             image: "registry.local/success:1".to_string(),
+            stage: AutoZranStage::Optimize,
             prefetch_files: vec!["/bin/app".to_string()],
         };
         state
             .queued_or_done
             .lock()
             .unwrap()
-            .insert(job_key(&success_job.image));
+            .insert(dedupe_key(&success_job.image, success_job.stage));
 
         state.mark_started(&success_job);
         let status = state.status();
@@ -851,13 +1144,14 @@ mod tests {
 
         let failed_job = AutoZranJob {
             image: "registry.local/fail:1".to_string(),
+            stage: AutoZranStage::Optimize,
             prefetch_files: vec!["/bin/app".to_string()],
         };
         state
             .queued_or_done
             .lock()
             .unwrap()
-            .insert(job_key(&failed_job.image));
+            .insert(dedupe_key(&failed_job.image, failed_job.stage));
         state.mark_started(&failed_job);
         state.mark_finished(&failed_job, false);
         let status = state.status();
@@ -881,9 +1175,12 @@ mod tests {
 
         let job = AutoZranJob {
             image: "registry.local/app:1".to_string(),
+            stage: AutoZranStage::Optimize,
             prefetch_files: vec!["/bin/app".to_string()],
         };
         state.mark_started(&job);
+        // active_job_key is the stage-AGNOSTIC work-dir key (both stages share
+        // one work dir), so the recon sweep can exclude it regardless of stage.
         assert_eq!(manager.active_job_key(), Some(job_key(&job.image)));
 
         state.mark_finished(&job, true);
@@ -929,13 +1226,113 @@ mod tests {
         assert_eq!(status.queued_total, 1);
         assert_eq!(status.dropped_total, 1);
         assert_eq!(status.known_jobs, 1);
+        assert!(!state.queued_or_done.lock().unwrap().contains(&dedupe_key(
+            "registry.local/second:1",
+            AutoZranStage::Optimize
+        )));
+    }
+
+    #[test]
+    fn enqueue_base_deduplicates_same_image() {
+        let (sender, receiver) = async_channel::bounded(4);
+        let state = Arc::new(AutoZranState::new(4));
+        let manager = AutoZranManager {
+            sender,
+            state: state.clone(),
+        };
+
+        manager.try_enqueue_base("registry.local/app:1");
+        manager.try_enqueue_base("registry.local/app:1");
+
+        let queued = receiver.try_recv().unwrap();
+        assert_eq!(queued.image, "registry.local/app:1");
+        assert_eq!(queued.stage, AutoZranStage::Base);
+        assert!(queued.prefetch_files.is_empty());
+        let status = manager.status();
+        assert_eq!(status.queued_total, 1);
+        assert_eq!(status.skipped_total, 1);
+        assert!(receiver.try_recv().is_err());
+    }
+
+    /// Base and optimize dedupe INDEPENDENTLY: a base enqueue at prepare and an
+    /// optimize enqueue at settle for the same image both make it onto the
+    /// queue. Verified for BOTH orderings (prepare-then-settle and the reverse
+    /// race where settle wins).
+    #[test]
+    fn base_and_optimize_enqueue_independently_in_either_order() {
+        for base_first in [true, false] {
+            let (sender, receiver) = async_channel::bounded(4);
+            let state = Arc::new(AutoZranState::new(4));
+            let manager = AutoZranManager {
+                sender,
+                state: state.clone(),
+            };
+            let prof = profile("registry.local/app:1");
+
+            if base_first {
+                manager.try_enqueue_base("registry.local/app:1");
+                manager.try_enqueue_profile(&prof);
+            } else {
+                manager.try_enqueue_profile(&prof);
+                manager.try_enqueue_base("registry.local/app:1");
+            }
+
+            let status = manager.status();
+            assert_eq!(
+                status.queued_total, 2,
+                "both stages queue (base_first={base_first})"
+            );
+            assert_eq!(status.skipped_total, 0);
+
+            let mut stages: Vec<AutoZranStage> = Vec::new();
+            while let Ok(job) = receiver.try_recv() {
+                assert_eq!(job.image, "registry.local/app:1");
+                stages.push(job.stage);
+            }
+            assert_eq!(stages.len(), 2);
+            assert!(stages.contains(&AutoZranStage::Base));
+            assert!(stages.contains(&AutoZranStage::Optimize));
+        }
+    }
+
+    /// Stage-2 reuse seam: with a persisted base artifact whose referenced
+    /// on-disk inputs exist, `load_reusable_base_artifact` returns `Some`
+    /// (⇒ optimize-only path, create/merge SKIPPED); without them it returns
+    /// `None` (⇒ full pipeline).
+    #[test]
+    fn load_reusable_base_artifact_gates_on_disk_inputs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let work_dir = tmp.path();
+        let backend = work_dir.join("backend");
+        std::fs::create_dir_all(&backend).unwrap();
+        let bootstrap = work_dir.join("bootstrap");
+        std::fs::write(&bootstrap, b"merged-bootstrap").unwrap();
+
+        let artifact = NodeLocalArtifact {
+            bootstrap: bootstrap.clone(),
+            backend_dir: backend.clone(),
+            work_dir: work_dir.to_path_buf(),
+            layer_blob_ids: vec!["deadbeef".to_string()],
+            zran_index_blob_ids: vec!["cafef00d".to_string()],
+            prefetch_blob_id: None,
+        };
+
+        // No artifact.json yet → full pipeline.
+        assert!(load_reusable_base_artifact(work_dir).is_none());
+
+        write_base_artifact(work_dir, &artifact).unwrap();
+        let reused = load_reusable_base_artifact(work_dir).expect("base artifact reusable");
+        assert_eq!(reused, artifact);
         assert!(
-            !state
-                .queued_or_done
-                .lock()
-                .unwrap()
-                .contains(&job_key("registry.local/second:1"))
+            reused.prefetch_blob_id.is_none(),
+            "base has no prefetch blob"
         );
+
+        // If the merged bootstrap is gone the base is NOT reusable even though
+        // artifact.json remains → force the full pipeline rather than optimize
+        // against a missing input.
+        std::fs::remove_file(&bootstrap).unwrap();
+        assert!(load_reusable_base_artifact(work_dir).is_none());
     }
 
     #[test]

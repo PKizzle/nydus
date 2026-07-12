@@ -20,6 +20,7 @@ syntax = "proto3";
 
 package containerd.services.images.v1;
 
+import "google/protobuf/field_mask.proto";
 import "google/protobuf/timestamp.proto";
 
 import "containerd/api/types/descriptor.proto";
@@ -57,8 +58,24 @@ message ListImagesResponse {
     repeated Image images = 1;
 }
 
+message UpdateImageRequest {
+    Image image = 1;
+    // If provided, only the paths named here are mutated (e.g. `target`,
+    // `labels`). An absent mask replaces the whole record.
+    google.protobuf.FieldMask update_mask = 2;
+    optional google.protobuf.Timestamp source_date_epoch = 3;
+}
+
+message UpdateImageResponse {
+    Image image = 1;
+}
+
 service Images {
     rpc Get(GetImageRequest) returns (GetImageResponse);
     rpc List(ListImagesRequest) returns (ListImagesResponse);
     rpc Create(CreateImageRequest) returns (CreateImageResponse);
+    // Used by the two-stage auto-accel pipeline to repoint an existing
+    // sidecar Image record from the base manifest to the optimized one on
+    // stage 2 (Create swallows AlreadyExists without updating the target).
+    rpc Update(UpdateImageRequest) returns (UpdateImageResponse);
 }

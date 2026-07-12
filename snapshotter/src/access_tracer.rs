@@ -19,6 +19,12 @@
 //! the sysctl `/api/v1/prefetch/profile` endpoint — which persists it and
 //! enqueues a conversion job in [`AutoZranManager`].
 //!
+//! In the two-stage auto-accel model this settle-driven enqueue is STAGE 2
+//! (`AutoZranStage::Optimize`): stage 1 (`Base`, empty prefetch) is enqueued
+//! eagerly at the first eligible `prepare`, so a servable base sidecar can land
+//! before the tracer even settles. Settle then triggers the optimize step,
+//! which reuses stage 1's work dir when present (see `auto_zran`).
+//!
 //! Concurrency note (CLAUDE.md gotcha #1): the event loop runs on its own OS
 //! thread (`std::thread::Builder`), not on the gRPC compio runtime. Each
 //! fanotify event is processed synchronously; we never block the snapshotter's

@@ -27,6 +27,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context, Result, bail};
+use serde::{Deserialize, Serialize};
 
 /// A gzip layer of the source image as it exists in containerd's content store.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -102,7 +103,12 @@ pub struct LocalAccelConfig {
 
 /// Result of a node-local conversion, ready to feed a fanotify `BlobCacheEntry`
 /// and uploaded as a content-store sidecar by the auto-zran worker.
-#[derive(Clone, Debug, Eq, PartialEq)]
+///
+/// Serializable so the two-stage auto-accel pipeline can persist a base
+/// artifact (`convert` with empty prefetch) to `work_dir/artifact.json` and
+/// reload it on stage 2 to run `optimize_existing` without re-running
+/// create/merge.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct NodeLocalArtifact {
     /// Merged RAFS v6 bootstrap (the fanotify staging dir's `bootstrap`). When
     /// `prefetch_files` was non-empty this is the OPTIMIZED bootstrap produced
@@ -340,6 +346,50 @@ pub fn convert(
         layer_blob_ids: blob_ids,
         zran_index_blob_ids,
         prefetch_blob_id,
+    })
+}
+
+/// Run ONLY the `nydus-image optimize` step against an artifact produced by an
+/// earlier [`convert`] call (with empty `prefetch_files`) whose `work_dir` is
+/// still on disk. This is the stage-2 half of the two-stage auto-accel
+/// pipeline: it reuses the merged bootstrap and the staged backend blobs in
+/// `artifact.work_dir`, so create/merge are NOT re-run. The merged bootstrap is
+/// replaced in place with the optimized one and a packed prefetch blob is added
+/// to the backend; the returned artifact is the input with `prefetch_blob_id`
+/// set.
+///
+/// `config.work_dir` MUST equal `artifact.work_dir` (the optimize step stages
+/// its scratch — `prefetch.json`, `optimize-out/`, `bootstrap.optimized` —
+/// under `config.work_dir`).
+pub fn optimize_existing(
+    config: &LocalAccelConfig,
+    artifact: &NodeLocalArtifact,
+    prefetch_files: &[String],
+) -> Result<NodeLocalArtifact> {
+    if prefetch_files.is_empty() {
+        bail!("optimize_existing requires a non-empty prefetch file list");
+    }
+    if !artifact.bootstrap.is_file() {
+        bail!(
+            "merged bootstrap missing at {}; cannot optimize in place",
+            artifact.bootstrap.display()
+        );
+    }
+    if !artifact.backend_dir.is_dir() {
+        bail!(
+            "backend dir missing at {}; cannot optimize in place",
+            artifact.backend_dir.display()
+        );
+    }
+    let prefetch_blob_id = run_optimize(
+        config,
+        &artifact.backend_dir,
+        &artifact.bootstrap,
+        prefetch_files,
+    )?;
+    Ok(NodeLocalArtifact {
+        prefetch_blob_id: Some(prefetch_blob_id),
+        ..artifact.clone()
     })
 }
 

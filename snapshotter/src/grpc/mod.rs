@@ -348,6 +348,11 @@ pub struct NydusSnapshotter {
     /// `auto_zran.capture.enable = false` or fanotify init fails; cheap
     /// (no-op) clone otherwise.
     access_tracer: Arc<crate::access_tracer::AccessTracer>,
+    /// Conversion-queue manager. `Some` when `auto_zran.enable` is on. Used by
+    /// `prepare` to enqueue the stage-1 BASE conversion the moment an image
+    /// becomes eligible, so peers can fetch a sidecar long before this pod's
+    /// access tracer settles (which drives stage 2). Non-blocking channel push.
+    auto_zran: Option<Arc<AutoZranManager>>,
     /// Auto-accel sidecar discovery + staging. `Some` when `auto_zran.enable`
     /// is on (with a containerd content-store client behind it); `None`
     /// otherwise — in which case `resolve_auto_accel_mount` is a no-op.
@@ -784,11 +789,25 @@ impl snapshots::Snapshotter for NydusSnapshotter {
                         }
                     }
 
-                    // Auto-accel capture: no sidecar yet, so attach the
-                    // tracer to the *lowest* lowerdir (the image's
-                    // filesystem) and let it record reads during pod
-                    // startup. On settle, a conversion job runs and lands
-                    // the sidecar that the next pod (or peer node) picks up
+                    // Two-stage auto-accel, stage 1: no sidecar exists yet, so
+                    // enqueue the BASE conversion immediately (empty prefetch →
+                    // a fully servable sidecar). This is a non-blocking channel
+                    // push; prepare NEVER awaits conversion and still returns the
+                    // overlay mounts below. The worker uploads the base sidecar
+                    // ASAP so peers requesting this image early can fetch it,
+                    // instead of waiting the full pod-start + tracer-settle
+                    // (5-60s) + convert window and hitting NotFound → overlay.
+                    if let (Some(manager), Some(image_ref)) =
+                        (self.auto_zran.as_ref(), image_ref.as_deref())
+                    {
+                        manager.try_enqueue_base(image_ref);
+                    }
+
+                    // Auto-accel capture (stage 2 trigger): attach the tracer to
+                    // the *lowest* lowerdir (the image's filesystem) and let it
+                    // record reads during pod startup. On settle the OPTIMIZE
+                    // stage runs (reusing stage 1's work dir) and re-uploads the
+                    // optimized sidecar that the next pod (or peer node) picks up
                     // via the resolve_auto_accel_mount branch above.
                     if let (Some(image_ref), Some(image_root)) = (image_ref, first_lowerdir(&mounts))
                         && let Err(e) = self.access_tracer.attach(&image_ref, &image_root)
@@ -1234,6 +1253,7 @@ pub async fn serve_with_supervisor(
         metrics,
         reconciler,
         access_tracer,
+        auto_zran,
         auto_accel_discovery,
         containerd_lookup: containerd_lookup_for_discovery,
         containerd_content_root: if config.snapshotter.auto_zran.enable {
@@ -1324,6 +1344,7 @@ mod tests {
                 crate::prefetch_profile::PrefetchProfileStore::from_cache_root(root),
                 None,
             ),
+            auto_zran: None,
             auto_accel_discovery: None,
             containerd_lookup: None,
             containerd_content_root: None,
