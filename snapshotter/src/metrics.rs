@@ -26,6 +26,13 @@ const SLOW_OPERATION_THRESHOLD: Duration = Duration::from_secs(1);
 pub struct SnapshotterMetrics {
     started_at: Instant,
     snapshot_operations: Mutex<BTreeMap<&'static str, SnapshotOperationStats>>,
+    /// Last result of the peer-mirror local self-check: `Some(true)` healthy,
+    /// `Some(false)` the local mirror is not advertising local content (or is
+    /// unreachable), `None` no probe has run yet (nothing local to probe, or
+    /// the mirror is disabled). Rendered as `snapshotter_peer_mirror_selfcheck_ok`
+    /// only once it holds a value, so a "never probed" node is distinguishable
+    /// from a failing one by the metric's absence.
+    peer_mirror_selfcheck_ok: Mutex<Option<bool>>,
 }
 
 #[derive(Clone, Debug)]
@@ -63,6 +70,17 @@ impl SnapshotterMetrics {
         Self {
             started_at: Instant::now(),
             snapshot_operations: Mutex::new(BTreeMap::new()),
+            peer_mirror_selfcheck_ok: Mutex::new(None),
+        }
+    }
+
+    /// Record the outcome of the latest peer-mirror local self-check. `true`
+    /// means the local mirror served a known-local digest (advertising works);
+    /// `false` means it did not (404 = not advertising, or unreachable). Feeds
+    /// the `snapshotter_peer_mirror_selfcheck_ok` gauge (see [`crate::peer_mirror_selfcheck`]).
+    pub fn set_peer_mirror_selfcheck(&self, ok: bool) {
+        if let Ok(mut slot) = self.peer_mirror_selfcheck_ok.lock() {
+            *slot = Some(ok);
         }
     }
 
@@ -147,7 +165,28 @@ impl SnapshotterMetrics {
         self.render_snapshot_operations(&mut out);
         self.render_process_metrics(&mut out);
         self.render_cache_metrics(&mut out, cache);
+        self.render_peer_mirror_selfcheck(&mut out);
         out
+    }
+
+    /// Render the peer-mirror self-check gauge. Emitted only once a probe has
+    /// run (the `Option` holds a value) so operators can alert on
+    /// `snapshotter_peer_mirror_selfcheck_ok == 0` for the "local mirror not
+    /// advertising local content" failure class without a "never probed" node
+    /// firing a false positive.
+    fn render_peer_mirror_selfcheck(&self, out: &mut String) {
+        let value = match self.peer_mirror_selfcheck_ok.lock() {
+            Ok(slot) => *slot,
+            Err(_) => None,
+        };
+        if let Some(ok) = value {
+            push_help_gauge(
+                out,
+                "snapshotter_peer_mirror_selfcheck_ok",
+                "Whether the local peer mirror served a digest known to be in this node's content store (1) or not (0).",
+            );
+            push_metric(out, "snapshotter_peer_mirror_selfcheck_ok", ok as u64);
+        }
     }
 
     fn render_snapshot_operations(&self, out: &mut String) {
@@ -631,6 +670,28 @@ mod tests {
                 "snapshotter_snapshot_operation_inflight{snapshot_operation=\"prepare\"} 0"
             )
         );
+    }
+
+    #[test]
+    fn peer_mirror_selfcheck_gauge_absent_until_probed_then_reflects_result() {
+        // Before any probe: the gauge is absent so a "never probed" node does
+        // not read as a failure.
+        let metrics = SnapshotterMetrics::new();
+        let body = metrics.render_prometheus(CacheMetricSnapshot::default());
+        assert!(
+            !body.contains("snapshotter_peer_mirror_selfcheck_ok"),
+            "gauge must be absent before the first probe"
+        );
+
+        // A failing probe renders 0 (the alertable "not advertising" state).
+        metrics.set_peer_mirror_selfcheck(false);
+        let body = metrics.render_prometheus(CacheMetricSnapshot::default());
+        assert!(body.contains("snapshotter_peer_mirror_selfcheck_ok 0"));
+
+        // A subsequent healthy probe flips it to 1.
+        metrics.set_peer_mirror_selfcheck(true);
+        let body = metrics.render_prometheus(CacheMetricSnapshot::default());
+        assert!(body.contains("snapshotter_peer_mirror_selfcheck_ok 1"));
     }
 
     #[test]

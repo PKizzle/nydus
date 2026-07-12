@@ -1049,6 +1049,22 @@ pub async fn serve_with_supervisor(
     let cache_manager = CacheManager::from_config(&config);
     let metrics = Arc::new(SnapshotterMetrics::new());
 
+    // Deprecation notice for the Kubernetes node fan-out. Native Spegel libp2p
+    // routing (v0.7.1+) is verified working and is now the default
+    // (`peer_discovery = "off"` for every preset); the fan-out is an opt-in
+    // resilience fallback scheduled for removal after a production soak of
+    // default-off. The code is retained until then — this only warns.
+    if config.snapshotter.peer_mirror.peer_discovery()
+        == crate::config::PeerDiscoveryMode::Kubernetes
+    {
+        warn!(
+            "peer_discovery = \"kubernetes\" is enabled: the Kubernetes node fan-out is a \
+             DEPRECATED resilience fallback. Native Spegel libp2p routing is verified working \
+             and is the default (peer_discovery = \"off\"); the fan-out is scheduled for removal \
+             after a production soak. Remove the explicit setting to rely on native routing."
+        );
+    }
+
     // Optional TCP Prometheus endpoint (opt-in via `[snapshotter.metrics]`).
     // Additive: when `listen` is unset this block is skipped and metrics stay
     // UDS-only, exactly as before. When set, a one-route cyper-axum server
@@ -1104,6 +1120,24 @@ pub async fn serve_with_supervisor(
             // enqueue into the conversion worker.
             if let Some(ref manager) = auto_zran {
                 access_tracer.set_auto_zran(manager.clone());
+            }
+            // Peer-mirror local self-check: turns the silent "local mirror not
+            // advertising local content" failure (the canary-node
+            // registries.yaml incident) into a loud, diagnosable warning + the
+            // `snapshotter_peer_mirror_selfcheck_ok` gauge. It probes a
+            // node-local auto-accel sidecar digest against ONLY the local mirror
+            // endpoint, so it can only run on the auto_zran path (where a
+            // content store and locally-produced sidecars exist). Best-effort,
+            // detached background loop — never blocks or crashes startup.
+            if config.snapshotter.peer_mirror.is_enabled()
+                && let Some(selfcheck) =
+                    crate::peer_mirror_selfcheck::PeerMirrorSelfCheck::from_config(
+                        content_store.clone(),
+                        &config.snapshotter.peer_mirror,
+                        metrics.clone(),
+                    )
+            {
+                compio::runtime::spawn(async move { selfcheck.run_loop().await }).detach();
             }
             let discovery = crate::auto_accel_sidecar::AutoAccelDiscovery::new(
                 content_store,
@@ -1286,19 +1320,22 @@ mod tests {
         status.code()
     }
 
-    /// The #1 gating guarantee: referrer detection ships OFF, so a default-config
-    /// snapshotter behaves exactly as it did before B4 — a plain OCI prepare
-    /// (even with an image-ref label) returns the overlay mounts untouched and
-    /// performs zero referrer interaction. If the referrer branch were not gated
-    /// on the (default-false) flag, this prepare would instead attempt a live
-    /// registry round-trip for the bogus ref.
+    /// The gating guarantee for the OFF path: with referrer detection disabled,
+    /// a plain OCI prepare (even with an image-ref label) returns the overlay
+    /// mounts untouched and performs zero referrer interaction. If the referrer
+    /// branch were not gated on the flag, this prepare would instead attempt a
+    /// live registry round-trip for the bogus ref. (The flag now defaults ON, so
+    /// this test disables it explicitly to exercise the fall-through path.)
     #[compio::test]
     async fn prepare_with_referrer_detect_off_returns_overlay_mounts() {
         let dir = tempdir().unwrap();
-        let snapshotter = test_snapshotter(dir.path());
+        let mut config = SnapshotterConfig::default();
+        config.snapshotter.root = dir.path().to_path_buf();
+        config.snapshotter.features.referrer_detect = false;
+        let snapshotter = test_snapshotter_with_config(dir.path(), config);
         assert!(
             !snapshotter.config.snapshotter.features.referrer_detect,
-            "referrer_detect must default OFF so prepare behaves as today"
+            "referrer_detect must be off for this fall-through test"
         );
 
         let labels = HashMap::from([(

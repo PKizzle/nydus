@@ -11,7 +11,7 @@
 //! Spegel that is the load-bearing `?ns=<registry>` parameter, without which
 //! Spegel's distribution.go parser 404s every path).
 //!
-//! ## Kubernetes peer discovery (documented workaround)
+//! ## Kubernetes peer discovery (opt-in resilience fallback)
 //!
 //! `peer_discovery = kubernetes` bypasses the mirror's own libp2p routing:
 //! it discovers the cluster's node IPs from the Kubernetes API — using the
@@ -19,14 +19,26 @@
 //! peer's mirror endpoint directly. This routes around provider-record rot
 //! observed on THIS cluster with the k3s-bundled **Spegel v0.4.0-k3s3** DHT
 //! ("could not find peer" / "empty list of address ports" for content that
-//! peers demonstrably hold). The cluster now runs **v0.7.1-k3s1**; whether
-//! native DHT routing is fixed there is unverified (the D4 exit test is
-//! pending). This whole node-fan-out path is a workaround for upstream
-//! Spegel DHT rot — delete it once the D4 exit test confirms native routing
-//! works, and default `peer_discovery` back to `off`.
+//! peers demonstrably hold).
 //!
-//! Only the `k3s-spegel` preset defaults to `kubernetes`; every other preset
-//! defaults to `off` (local-mirror-only), the general topology.
+//! Native DHT routing is now **verified working** on the cluster's current
+//! **Spegel v0.7.1-k3s1**, so `peer_discovery` defaults to `off` for EVERY
+//! preset (including `k3s-spegel`): the local mirror plus Spegel's own libp2p
+//! routing is the primary path. The `kubernetes` node fan-out remains an
+//! explicit operator opt-in — a resilience fallback for per-node Spegel
+//! failure — and is scheduled for removal after a production soak of
+//! default-off (the code is kept until then). When it is enabled, the
+//! snapshotter logs a one-time deprecation warning at startup.
+//!
+//! ## Local-mirror self-check
+//!
+//! [`PeerMirror::probe_local`] issues a GET against ONLY the local (primary)
+//! endpoint — no peer fan-out — so a caller can verify the embedded mirror is
+//! advertising a digest known to be in this node's content store. This
+//! diagnoses the silent-failure class where a mistyped `registries.yaml`
+//! `mirrors:` key (a stray `"+"` instead of `"*"`) leaves the local mirror
+//! serving nothing, invisibly disabling cross-node acceleration. See
+//! [`crate::peer_mirror_selfcheck`].
 //!
 //! Failover semantics live in [`PeerMirror::fetch`]: primary (local
 //! mirror) first, then discovered + static peers in rotated order, a
@@ -439,6 +451,99 @@ impl PeerMirror {
                 // over a NotFound, since NotFound is the expected
                 // "nobody has it" case.
                 last_error.or(last_outcome).unwrap_or(FetchResult::NotFound)
+            })
+        })
+        .await
+    }
+
+    /// The local (primary) mirror endpoint — always tried first by
+    /// [`fetch`](Self::fetch), and the only endpoint [`probe_local`](Self::probe_local)
+    /// touches. Exposed for diagnostic logging (self-check).
+    pub fn primary_endpoint(&self) -> &str {
+        &self.primary
+    }
+
+    /// GET `path_and_query` against ONLY the local (primary) mirror endpoint —
+    /// no discovered/static peer fan-out, no cooldown bookkeeping.
+    ///
+    /// This is the transport for the local-mirror self-check: probing a digest
+    /// known to be in this node's own content store against the local mirror
+    /// tells us whether the embedded registry is advertising local content.
+    /// A peer answering would defeat the purpose (it says nothing about the
+    /// LOCAL mirror), so the peer list is deliberately not consulted.
+    ///
+    /// `path_and_query` MUST start with `/v2/...` and include the load-bearing
+    /// `?ns=<registry>` query parameter (see [`Self::artifact_query`]).
+    pub async fn probe_local(&self, path_and_query: &str, accept: Option<&str>) -> FetchResult {
+        let tls = self.tls.clone();
+        let url = format!("{}{}", self.primary, path_and_query);
+        let timeout = self.request_timeout;
+        let accept = accept.map(str::to_string);
+        blocking::unblock(move || {
+            block_on_http(async move {
+                let client = match cached_client(tls) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        return FetchResult::Outcome(PullOutcome::RegistryError {
+                            status: 0,
+                            body: e.to_string(),
+                        });
+                    }
+                };
+                let req_builder = match client.get(&url) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        return FetchResult::Outcome(PullOutcome::RegistryError {
+                            status: 0,
+                            body: format!("invalid local mirror URL {url}: {e}"),
+                        });
+                    }
+                };
+                let req = match accept {
+                    Some(ref accept) => match req_builder.header(ACCEPT, accept.as_str()) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            return FetchResult::Outcome(PullOutcome::RegistryError {
+                                status: 0,
+                                body: format!("invalid Accept header for {url}: {e}"),
+                            });
+                        }
+                    },
+                    None => req_builder,
+                };
+                let response = match compio::time::timeout(timeout, req.send()).await {
+                    Ok(Ok(r)) => r,
+                    Ok(Err(e)) => {
+                        return FetchResult::Outcome(PullOutcome::RegistryError {
+                            status: 0,
+                            body: format!("transport error for {url}: {e}"),
+                        });
+                    }
+                    Err(_) => {
+                        return FetchResult::Outcome(PullOutcome::RegistryError {
+                            status: 0,
+                            body: format!("local mirror request timed out for {url}"),
+                        });
+                    }
+                };
+                let status = response.status();
+                match http_status_to_outcome(status.as_u16()) {
+                    StatusOutcome::Ok => match response.bytes().await {
+                        Ok(b) => FetchResult::Ok(b.to_vec()),
+                        Err(e) => FetchResult::Outcome(PullOutcome::RegistryError {
+                            status: status.as_u16(),
+                            body: format!("read body for {url}: {e}"),
+                        }),
+                    },
+                    StatusOutcome::NotFound => FetchResult::NotFound,
+                    StatusOutcome::Error => {
+                        let body = response.text().await.unwrap_or_default();
+                        FetchResult::Error {
+                            status: status.as_u16(),
+                            body,
+                        }
+                    }
+                }
             })
         })
         .await

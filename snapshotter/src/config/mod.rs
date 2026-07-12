@@ -497,22 +497,21 @@ pub struct MetricsConfig {
 }
 
 /// Feature flags.
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct FeaturesConfig {
     /// Detect *published* nydus images via the OCI referrers API (the
     /// referrer-artifact distribution model nydusify / the Go snapshotter
     /// produce).
     ///
-    /// Off by default, opt-in. Serving IS now implemented (B4b): when enabled,
-    /// on a `Prepare` for a published nydus image the snapshotter fetches and
+    /// ON by default. Serving is implemented (B4b) and e2e-verified: on a
+    /// `Prepare` for a published nydus image the snapshotter fetches and
     /// sha256-verifies the bootstrap and mounts the daemon via the shared
     /// `ensure_instance` path (nydusd's registry backend then serves data blobs
     /// on demand). Every step is best-effort and NON-FATAL — any detection /
     /// fetch / mount error falls through to plain overlay, so a pod is never
-    /// blocked. Verified end-to-end in the Linux runtime; left default-off
-    /// pending a production soak against live referrer-published registries.
-    /// Flip the default to true once that soak passes.
-    #[serde(default)]
+    /// blocked, and results are cached. Set to `false` to disable referrer
+    /// probing entirely.
+    #[serde(default = "default_true")]
     pub referrer_detect: bool,
     #[serde(default)]
     pub encryption: bool,
@@ -522,6 +521,21 @@ pub struct FeaturesConfig {
     pub metrics: bool,
     #[serde(default)]
     pub erofs_page_cache_sharing: bool,
+}
+
+impl Default for FeaturesConfig {
+    fn default() -> Self {
+        // Match the serde field defaults so `FeaturesConfig::default()` (used by
+        // `SnapshotterConfig::default()`) and an omitted `[snapshotter.features]`
+        // table agree: referrer detection, prefetch, and metrics all default ON.
+        Self {
+            referrer_detect: true,
+            encryption: false,
+            prefetch: true,
+            metrics: true,
+            erofs_page_cache_sharing: false,
+        }
+    }
 }
 
 /// Cgroup configuration.
@@ -744,10 +758,10 @@ pub struct PeerMirrorConfig {
     #[serde(default = "default_query_template")]
     pub query_template: String,
     /// How peer mirror endpoints are found when the local mirror misses.
-    /// Preset-derived when unset: the `k3s-spegel` preset defaults to
-    /// `kubernetes` (a documented workaround for Spegel DHT rot — see
-    /// [`crate::peer_mirror`]); every other preset defaults to `off`
-    /// (local-mirror-only).
+    /// Preset-derived when unset: every preset now defaults to `off`
+    /// (local-mirror-only + native Spegel libp2p routing). `kubernetes` node
+    /// fan-out remains an explicit operator opt-in — a documented resilience
+    /// fallback for Spegel DHT rot, see [`crate::peer_mirror`].
     #[serde(default)]
     pub peer_discovery: Option<PeerDiscoveryMode>,
     /// How long a discovered node list is cached before it is refreshed
@@ -841,8 +855,9 @@ pub fn expand_query_template(template: &str, registry_host: &str) -> Option<Stri
 #[serde(rename_all = "kebab-case")]
 pub enum MirrorPreset {
     /// k3s' embedded Spegel: `https://127.0.0.1:6443`, mTLS with the k3s agent
-    /// cert paths, `kubernetes` peer discovery. Reproduces the historical
-    /// `[snapshotter.spegel_mirror]` behaviour on k3s exactly.
+    /// cert paths, and `off` peer discovery (native Spegel libp2p routing).
+    /// Set `peer_discovery = "kubernetes"` explicitly to re-enable the node
+    /// fan-out resilience fallback.
     K3sSpegel,
     /// Generic Spegel: local `https://127.0.0.1:6443` endpoint, `?ns=` query,
     /// but no k3s cert paths and no peer discovery (local-mirror-only). The
@@ -869,7 +884,13 @@ impl MirrorPreset {
             MirrorPreset::K3sSpegel => MirrorPresetDefaults {
                 enable: true,
                 endpoint: DEFAULT_MIRROR_ENDPOINT.to_string(),
-                peer_discovery: PeerDiscoveryMode::Kubernetes,
+                // Default OFF: native Spegel routing (v0.7.1+) is verified
+                // working, so the local mirror + libp2p peer lookup is the
+                // primary path. `kubernetes` node fan-out stays available as an
+                // explicit operator opt-in resilience fallback (see
+                // [`crate::peer_mirror`]); it is scheduled for removal after a
+                // production soak of default-off.
+                peer_discovery: PeerDiscoveryMode::Off,
                 ca_path: Some(PathBuf::from("/var/lib/rancher/k3s/agent/server-ca.crt")),
                 client_cert_path: Some(PathBuf::from(
                     "/var/lib/rancher/k3s/agent/client-k3s-controller.crt",
@@ -904,13 +925,14 @@ impl MirrorPreset {
 pub enum PeerDiscoveryMode {
     /// List the cluster's nodes from the local Kubernetes API server and
     /// try each Ready node's mirror endpoint. Documented Spegel-DHT-rot
-    /// workaround; default only for the `k3s-spegel` preset.
-    #[default]
+    /// resilience fallback; opt-in only (no preset defaults to it any more).
     Kubernetes,
+    /// No peers — only the local mirror endpoint is tried. The default
+    /// discovery mode for every preset.
+    #[default]
+    Off,
     /// Only the statically-configured `peer_endpoints`.
     Static,
-    /// No peers — only the local mirror endpoint is tried.
-    Off,
 }
 
 /// All backend sections under `[backends.*]`.
@@ -1217,23 +1239,31 @@ fn default_fs_drivers() -> Vec<FsDriverEntry> {
 mod tests {
     use super::*;
 
-    /// Referrer detection ships OFF (detection-only until B4b + a live-registry
-    /// e2e). Pin both the struct default and the "field absent from TOML"
-    /// deserialize default so a config that never mentions the flag stays off.
+    /// Referrer detection now ships ON (serving is implemented + e2e-verified;
+    /// every failure falls through to overlay). Pin both the struct default and
+    /// the "field absent from TOML" deserialize default so a config that never
+    /// mentions the flag gets detection enabled, and the two paths agree.
     #[test]
-    fn referrer_detect_defaults_off() {
+    fn referrer_detect_defaults_on() {
         assert!(
-            !SnapshotterConfig::default()
+            SnapshotterConfig::default()
                 .snapshotter
                 .features
                 .referrer_detect,
-            "referrer_detect must default off"
+            "referrer_detect must default on"
         );
         let features: FeaturesConfig =
             toml::from_str("").expect("empty features table must deserialize");
         assert!(
-            !features.referrer_detect,
-            "an omitted referrer_detect must deserialize to off"
+            features.referrer_detect,
+            "an omitted referrer_detect must deserialize to on"
+        );
+        // An explicit opt-out must still be honoured.
+        let disabled: FeaturesConfig =
+            toml::from_str("referrer_detect = false").expect("explicit opt-out must deserialize");
+        assert!(
+            !disabled.referrer_detect,
+            "an explicit referrer_detect = false must stay off"
         );
     }
 
@@ -1586,7 +1616,9 @@ enable = true
         assert_eq!(pm.preset, Some(MirrorPreset::K3sSpegel));
         assert!(pm.is_enabled());
         assert_eq!(pm.endpoint(), "https://127.0.0.1:6443");
-        assert_eq!(pm.peer_discovery(), PeerDiscoveryMode::Kubernetes);
+        // Discovery now defaults OFF (native Spegel routing); the enable /
+        // endpoint / mTLS cert paths are still reproduced byte-for-byte.
+        assert_eq!(pm.peer_discovery(), PeerDiscoveryMode::Off);
         assert_eq!(
             pm.ca_path(),
             Some(std::path::Path::new(
@@ -1614,9 +1646,10 @@ enable = true
 
     #[test]
     fn preset_derives_discovery_default() {
-        // k3s-spegel ⇒ kubernetes; spegel ⇒ off; none ⇒ off.
+        // Every preset now defaults discovery ⇒ off (native Spegel routing);
+        // `kubernetes` is opt-in only.
         for (preset, expected) in [
-            (MirrorPreset::K3sSpegel, PeerDiscoveryMode::Kubernetes),
+            (MirrorPreset::K3sSpegel, PeerDiscoveryMode::Off),
             (MirrorPreset::Spegel, PeerDiscoveryMode::Off),
             (MirrorPreset::None, PeerDiscoveryMode::Off),
         ] {
@@ -1640,16 +1673,17 @@ enable = true
 profile = "k3s"
 
 [snapshotter.peer_mirror]
-peer_discovery = "off"
+peer_discovery = "kubernetes"
 "#;
         let mut config: SnapshotterConfig = toml::from_str(toml_str).expect("parse");
         config
             .resolve_profile_with(probe_present(&[K3S_CONTAINERD_SOCKET]))
             .expect("resolve");
-        // k3s-spegel would default kubernetes, but the operator pinned off.
+        // k3s-spegel now defaults off, but the operator opted into the
+        // kubernetes node fan-out fallback explicitly.
         assert_eq!(
             config.snapshotter.peer_mirror.peer_discovery(),
-            PeerDiscoveryMode::Off
+            PeerDiscoveryMode::Kubernetes
         );
     }
 
