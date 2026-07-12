@@ -40,7 +40,7 @@ pub enum PrefetchInput {
     StdinPatterns,
 }
 
-pub fn run(args: ConvertArgs) -> Result<()> {
+pub async fn run(args: ConvertArgs) -> Result<()> {
     let plan = plan(&args)?;
     let prefetch_patterns = read_prefetch_patterns(&plan)?;
     let request = ConvertRequest::from_convert_args(&args, &plan, prefetch_patterns)?;
@@ -52,7 +52,7 @@ pub fn run(args: ConvertArgs) -> Result<()> {
         effective_oci = plan.effective_oci,
         "validated nydusify-rs convert request"
     );
-    ContainerdConverter.convert(request)
+    ContainerdConverter.convert(request).await
 }
 
 pub fn plan(args: &ConvertArgs) -> Result<ConvertPlan> {

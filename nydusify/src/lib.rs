@@ -14,11 +14,11 @@ use clap::Parser;
 
 pub use cli::{Cli, Commands};
 
-pub fn run_from_args() -> Result<()> {
-    run(Cli::parse())
+pub async fn run_from_args() -> Result<()> {
+    run(Cli::parse()).await
 }
 
-pub fn run(cli: Cli) -> Result<()> {
+pub async fn run(cli: Cli) -> Result<()> {
     logging::init(cli.debug, cli.log_level.as_str(), cli.log_file.as_deref())?;
-    commands::execute(cli.command)
+    commands::execute(cli.command).await
 }

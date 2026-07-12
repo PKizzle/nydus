@@ -20,7 +20,7 @@ pub struct CopyPlan {
     pub push_chunk_size: String,
 }
 
-pub fn run(args: CopyArgs) -> Result<()> {
+pub async fn run(args: CopyArgs) -> Result<()> {
     let plan = plan(&args)?;
     info!(source = %plan.source, target = ?plan.target, "validated nydusify-rs copy request");
     Err(pending_operation("copy"))

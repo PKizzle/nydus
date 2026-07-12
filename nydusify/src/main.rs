@@ -4,8 +4,9 @@
 
 #![deny(warnings)]
 
-fn main() {
-    if let Err(err) = nydusify::run_from_args() {
+#[compio::main]
+async fn main() {
+    if let Err(err) = nydusify::run_from_args().await {
         eprintln!("nydusify: {err:#}");
         std::process::exit(1);
     }

@@ -23,15 +23,20 @@ use crate::cli::{BackendType, ConvertArgs};
 use crate::commands::common::{parse_chunk_dict_reference, resolve_backend_config};
 use crate::commands::convert::{ConversionMode, ConvertPlan};
 
+/// Converter backend contract. `convert` is an `async fn` in the trait (AFIT);
+/// the single implementor ([`ContainerdConverter`]) is dispatched statically,
+/// so no `Send` bound is required and the `!Send` compio registry client can be
+/// held directly across awaits.
+#[allow(async_fn_in_trait)]
 pub trait ImageConverter {
-    fn convert(&self, request: ConvertRequest) -> Result<()>;
+    async fn convert(&self, request: ConvertRequest) -> Result<()>;
 }
 
 #[derive(Clone, Debug, Default)]
 pub struct ContainerdConverter;
 
 impl ImageConverter for ContainerdConverter {
-    fn convert(&self, request: ConvertRequest) -> Result<()> {
+    async fn convert(&self, request: ConvertRequest) -> Result<()> {
         let workspace = request.prepare_workspace()?;
         info!(
             source = %request.source,
@@ -43,9 +48,7 @@ impl ImageConverter for ContainerdConverter {
             "prepared containerd-converter request"
         );
 
-        bail!(
-            "containerd-converter Rust backend is not linked yet; prepared driver config for `nydus` without acceleration-service dependency"
-        )
+        crate::engine::converter::run_conversion(&request, workspace.path()).await
     }
 }
 

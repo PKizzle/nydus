@@ -22,7 +22,7 @@ pub struct MountPlan {
     pub platform: String,
 }
 
-pub fn run(args: MountArgs) -> Result<()> {
+pub async fn run(args: MountArgs) -> Result<()> {
     let plan = plan(&args)?;
     info!(target = %plan.target, mount_path = %plan.mount_path.display(), "validated nydusify-rs mount request");
     Err(pending_operation("mount"))

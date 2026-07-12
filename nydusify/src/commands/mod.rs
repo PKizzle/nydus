@@ -12,12 +12,12 @@ use anyhow::{Result, anyhow};
 
 use crate::cli::Commands;
 
-pub fn execute(command: Commands) -> Result<()> {
+pub async fn execute(command: Commands) -> Result<()> {
     match command {
-        Commands::Convert(args) => convert::run(*args),
-        Commands::Check(args) => check::run(*args),
-        Commands::Mount(args) => mount::run(*args),
-        Commands::Copy(args) => copy::run(*args),
+        Commands::Convert(args) => convert::run(*args).await,
+        Commands::Check(args) => check::run(*args).await,
+        Commands::Mount(args) => mount::run(*args).await,
+        Commands::Copy(args) => copy::run(*args).await,
     }
 }
 

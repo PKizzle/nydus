@@ -19,7 +19,7 @@ pub struct CheckPlan {
     pub multi_platform: bool,
 }
 
-pub fn run(args: CheckArgs) -> Result<()> {
+pub async fn run(args: CheckArgs) -> Result<()> {
     let plan = plan(&args)?;
     info!(target = %plan.target, platform = %plan.platform, "validated nydusify-rs check request");
     Err(pending_operation("check"))

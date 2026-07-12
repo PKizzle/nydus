@@ -4491,7 +4491,10 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "compio",
+ "registry-client",
  "serde",
+ "serde_json",
  "tempfile",
  "tracing",
  "tracing-subscriber",
