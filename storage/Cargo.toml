@@ -48,11 +48,18 @@ nix = { version = "0.31.3", features = ["fs", "uio", "zerocopy"] }
 cyper = { git = "https://github.com/compio-rs/cyper", rev = "d1c8aff18dd81c4b1f817d0e8e0e05408c15a04c", default-features = false, features = [
     "rustls",
     "http2",
-    # HTTP/3 over QUIC (compio-quic + h3). `http3-altsvc` auto-upgrades to h3
-    # when a registry/CDN advertises it via Alt-Svc; falls back to h2/h1
-    # otherwise. Pure-Rust (quinn/rustls), so musl-static stays clean.
-    "http3",
-    "http3-altsvc",
+    # HTTP/3 over QUIC is deliberately NOT enabled by default. With
+    # `http3-altsvc`, a CDN advertising h3 via Alt-Svc (Docker Hub's
+    # CloudFront does) silently upgrades the blob data path to QUIC — and
+    # cyper's h3 pool has a wedge: the per-origin `connecting` marker is
+    # removed only on the SUCCESS path (cyper/src/http3.rs Pool::connecting
+    # vs new_connection), so one failed/hung QUIC handshake permanently
+    # poisons the origin ("HTTP/3 connecting already in progress") and
+    # concurrent requests during a legitimate connect error instead of
+    # waiting. On the fanotify data path that turned every chunk read into
+    # EIO (the 0.2.9-nydus mirrors incident). Opt back in via the
+    # `backend-http3` feature once upstream is fixed — see BACKLOG.md
+    # "cyper HTTP/3 pool wedge".
     "hickory-dns",
     "stream",
 ], optional = true }
@@ -128,6 +135,12 @@ backend-localdisk-gpt = ["gpt", "backend-localdisk"]
 backend-localfs = []
 backend-oss = ["base64", "cyper", "http", "httpdate", "hmac", "sha1", "url"]
 backend-registry = ["base64", "cyper", "http", "url"]
+# Opt-in HTTP/3 (QUIC) for the cyper-based backends. OFF by default: cyper's
+# h3 pool wedges an origin after a failed/hung QUIC connect and Alt-Svc makes
+# the upgrade automatic — see the cyper dependency comment above and
+# BACKLOG.md "cyper HTTP/3 pool wedge". Enable only against registries whose
+# h3 endpoint you trust once the upstream pool fix lands.
+backend-http3 = ["cyper/http3", "cyper/http3-altsvc"]
 backend-s3 = ["base64", "cyper", "hmac", "http", "sha2", "time", "url"]
 backend-http-proxy = [
     "cyper",
