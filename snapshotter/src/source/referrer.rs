@@ -711,8 +711,14 @@ fn cached_bootstrap(dir: &Path, digest: &str) -> Option<PathBuf> {
 
 /// Write a digest-verified bootstrap to its content-addressed cache path,
 /// idempotently. If a same-size file is already present it is reused; otherwise
-/// the bytes are written to a temp file and atomically renamed so a partial
-/// write can never masquerade as a valid bootstrap.
+/// the bytes are written to a **uniquely named** temp file and atomically
+/// renamed so a partial write can never masquerade as a valid bootstrap.
+///
+/// The temp file must be unique per writer: two concurrent `Prepare`s of the
+/// same image both reach here, and a shared `<digest>.boot.tmp` name lets
+/// writer A rename writer B's half-written file into the content-addressed
+/// path — which `cached_bootstrap` then trusts forever ("existence implies a
+/// complete, digest-verified file").
 fn write_bootstrap(dir: &Path, digest: &str, bytes: &[u8]) -> Result<PathBuf> {
     std::fs::create_dir_all(dir)
         .with_context(|| format!("create referrer bootstrap dir {}", dir.display()))?;
@@ -723,10 +729,16 @@ fn write_bootstrap(dir: &Path, digest: &str, bytes: &[u8]) -> Result<PathBuf> {
     {
         return Ok(path);
     }
-    let tmp = path.with_extension("boot.tmp");
-    std::fs::write(&tmp, bytes)
-        .with_context(|| format!("write referrer bootstrap {}", tmp.display()))?;
-    std::fs::rename(&tmp, &path)
+    let mut tmp = tempfile::Builder::new()
+        .prefix(".boot.tmp.")
+        .tempfile_in(dir)
+        .with_context(|| format!("create referrer bootstrap temp file in {}", dir.display()))?;
+    std::io::Write::write_all(&mut tmp, bytes)
+        .with_context(|| format!("write referrer bootstrap {}", tmp.path().display()))?;
+    tmp.as_file()
+        .sync_all()
+        .with_context(|| format!("sync referrer bootstrap {}", tmp.path().display()))?;
+    tmp.persist(&path)
         .with_context(|| format!("rename referrer bootstrap into place {}", path.display()))?;
     Ok(path)
 }

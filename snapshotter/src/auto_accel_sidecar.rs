@@ -81,6 +81,12 @@ pub struct SidecarLocator {
     /// `PullOutcome::Disabled` so the locator falls through to the
     /// label-filter scan.
     peer_mirror: Option<Arc<PeerMirror>>,
+    /// Per-manifest staging locks (shared across clones). Two pods of the same
+    /// image scheduling together both reach `stage()` for the same manifest;
+    /// without serialization their writes into the shared `work_dir` interleave.
+    /// Entries are never evicted — the map is bounded by the number of distinct
+    /// accelerated images on the node and each entry is a few dozen bytes.
+    stage_locks: Arc<async_lock::Mutex<HashMap<String, Arc<async_lock::Mutex<()>>>>>,
 }
 
 impl SidecarLocator {
@@ -111,6 +117,7 @@ impl SidecarLocator {
             content_store,
             stage_root: snapshotter_root.join("auto-accel"),
             peer_mirror,
+            stage_locks: Arc::default(),
         }
     }
 
@@ -242,11 +249,25 @@ impl SidecarLocator {
     /// containerd's content store, copy the merged bootstrap into a
     /// `stage/bootstrap` file. Idempotent: re-staging the same manifest
     /// is a no-op (the symlinks are recreated, the bootstrap is overwritten).
+    ///
+    /// Serialized per manifest digest: the `work_dir` is shared and live (a
+    /// just-started daemon may already be reading `backend/`), so all writes
+    /// below are atomic (write-temp + rename) and concurrent stagings of the
+    /// same manifest take turns instead of interleaving.
     pub async fn stage(
         &self,
         manifest_digest: &str,
         manifest: &AutoAccelManifest,
     ) -> Result<StagedSidecar> {
+        let stage_lock = {
+            let mut locks = self.stage_locks.lock().await;
+            locks
+                .entry(manifest_digest.to_string())
+                .or_default()
+                .clone()
+        };
+        let _guard = stage_lock.lock().await;
+
         let work_dir = self.stage_root.join(slug_for_digest(manifest_digest));
         let backend_dir = work_dir.join("backend");
         let stage_dir = work_dir.join("stage");
@@ -286,13 +307,7 @@ impl SidecarLocator {
         let bootstrap_src = self.content_store.blob_path(&manifest.bootstrap.digest);
         ensure_present(&bootstrap_src, "bootstrap")?;
         let bootstrap_dst = stage_dir.join("bootstrap");
-        std::fs::copy(&bootstrap_src, &bootstrap_dst).with_context(|| {
-            format!(
-                "copy bootstrap {} -> {}",
-                bootstrap_src.display(),
-                bootstrap_dst.display()
-            )
-        })?;
+        copy_atomic(&bootstrap_src, &bootstrap_dst)?;
         // 5. The daemon's fanotify service discovers its inputs from the
         //    backend dir alone (`service/src/fanotify.rs::discover_blobs`
         //    requires a file literally named `bootstrap` next to the data
@@ -300,13 +315,7 @@ impl SidecarLocator {
         //    without it `ensure_instance_local` fails with "no bootstrap
         //    file in blob directory" on every node.
         let backend_bootstrap = backend_dir.join("bootstrap");
-        std::fs::copy(&bootstrap_src, &backend_bootstrap).with_context(|| {
-            format!(
-                "copy bootstrap {} -> {}",
-                bootstrap_src.display(),
-                backend_bootstrap.display()
-            )
-        })?;
+        copy_atomic(&bootstrap_src, &backend_bootstrap)?;
 
         Ok(StagedSidecar {
             bootstrap: bootstrap_dst,
@@ -349,6 +358,17 @@ impl SidecarLocator {
                 return PullOutcome::RegistryError { status, body };
             }
         };
+        // Verify before anything touches the content store: `write_bytes` computes
+        // the store key from the *received* bytes, so without this check corrupt
+        // peer data "succeeds" under its own digest, the Image record registers,
+        // `resolve_or_pull` never re-pulls (record exists), and `stage()` fails on
+        // the missing real digest forever — silently degrading the node to overlay.
+        if let Err(e) = verify_sha256(&manifest_bytes, manifest_digest) {
+            return PullOutcome::RegistryError {
+                status: 0,
+                body: format!("peer mirror returned corrupt manifest: {e}"),
+            };
+        }
 
         // 2. Parse the OCI wrapper first so the manifest write below can
         //    carry `gc.ref.content.config` + `gc.ref.content.l.<n>`
@@ -494,6 +514,14 @@ impl SidecarLocator {
                 return Err(PullOutcome::RegistryError { status, body });
             }
         };
+        // See peer_pull(): unverified bytes would be committed under their own
+        // (wrong) digest and permanently poison this node's sidecar for the image.
+        if let Err(e) = verify_sha256(&bytes, blob_digest) {
+            return Err(PullOutcome::RegistryError {
+                status: 0,
+                body: format!("peer mirror returned corrupt blob: {e}"),
+            });
+        }
         let labels = labels_for_role(manifest_digest, role, synthetic_ref, layer_digest);
         self.content_store
             .write_bytes(
@@ -541,23 +569,65 @@ fn ensure_present(path: &Path, kind: &str) -> Result<()> {
     Ok(())
 }
 
+/// (Re)point `link` at `target` without any window where the name is missing:
+/// the symlink is created under a temp name and `rename(2)`d over the final
+/// one. A remove+create pair would briefly leave the blob name dangling for a
+/// daemon that is already serving out of this backend dir.
 fn symlink_force(target: &Path, link: &Path) -> Result<()> {
-    let _ = std::fs::remove_file(link);
     #[cfg(unix)]
     {
-        std::os::unix::fs::symlink(target, link)
-            .with_context(|| format!("symlink {} -> {}", link.display(), target.display()))
+        let tmp = link.with_extension("tmp-link");
+        let _ = std::fs::remove_file(&tmp);
+        std::os::unix::fs::symlink(target, &tmp)
+            .with_context(|| format!("symlink {} -> {}", tmp.display(), target.display()))?;
+        std::fs::rename(&tmp, link).with_context(|| {
+            format!(
+                "rename symlink {} into place at {}",
+                tmp.display(),
+                link.display()
+            )
+        })
     }
     #[cfg(not(unix))]
     {
-        std::fs::copy(target, link)
-            .map(|_| ())
-            .with_context(|| format!("copy {} -> {}", link.display(), target.display()))
+        copy_atomic(target, link)
     }
+}
+
+/// Copy `src` to `dst` atomically (write to a temp name in the destination
+/// directory, then `rename(2)`), so a reader never observes a half-written
+/// `dst`. Callers serialize per destination via the stage lock, so the fixed
+/// temp suffix cannot collide.
+fn copy_atomic(src: &Path, dst: &Path) -> Result<()> {
+    let tmp = dst.with_extension("tmp-copy");
+    std::fs::copy(src, &tmp)
+        .with_context(|| format!("copy {} -> {}", src.display(), tmp.display()))?;
+    std::fs::rename(&tmp, dst)
+        .with_context(|| format!("rename {} into place at {}", tmp.display(), dst.display()))
 }
 
 fn strip_sha256(digest: &str) -> &str {
     digest.strip_prefix("sha256:").unwrap_or(digest)
+}
+
+/// Verify that `bytes` hash to the expected `sha256:<hex>` digest. Peer-mirror
+/// responses are untrusted input: everything pulled from a peer must pass this
+/// before it is written to the content store or parsed further.
+fn verify_sha256(bytes: &[u8], expected: &str) -> std::result::Result<(), String> {
+    use sha2::{Digest, Sha256};
+    let Some(want) = expected.strip_prefix("sha256:") else {
+        return Err(format!(
+            "unsupported digest algorithm in {expected}; only sha256 is supported"
+        ));
+    };
+    let got = hex::encode(Sha256::digest(bytes));
+    if got.eq_ignore_ascii_case(want) {
+        Ok(())
+    } else {
+        Err(format!(
+            "digest mismatch: expected {expected}, computed sha256:{got}"
+        ))
+    }
 }
 
 /// Map an OCI layer mediaType from our producer to the `role` label we
@@ -718,6 +788,18 @@ pub fn auto_accel_labels(subject: &str, role: &str) -> HashMap<String, String> {
 mod tests {
     use super::*;
     use crate::auto_accel_oci::{AUTO_ACCEL_INDEX_MEDIATYPE, OciDescriptor};
+
+    #[test]
+    fn verify_sha256_accepts_matching_and_rejects_corrupt_bytes() {
+        // sha256("hello") — a peer-mirror response must match the digest it was
+        // requested under before it may touch the content store.
+        let digest = "sha256:2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824";
+        assert!(verify_sha256(b"hello", digest).is_ok());
+        assert!(verify_sha256(b"hello", &digest.to_uppercase().replace("SHA256", "sha256")).is_ok());
+        let err = verify_sha256(b"corrupted", digest).unwrap_err();
+        assert!(err.contains("digest mismatch"), "{err}");
+        assert!(verify_sha256(b"hello", "sha512:abc").is_err());
+    }
 
     #[test]
     fn pick_latest_prefers_larger_size_then_digest() {
