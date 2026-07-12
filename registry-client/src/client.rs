@@ -36,6 +36,7 @@ use http::{Method, StatusCode};
 use sha2::{Digest as _, Sha256};
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tracing::{debug, warn};
 
@@ -48,6 +49,16 @@ const MAX_REGISTRY_BODY_BYTES: u64 = 512 * 1024 * 1024;
 
 /// Chunk size for hashing local files before upload.
 const FILE_HASH_CHUNK: usize = 1024 * 1024;
+
+/// Per-call disambiguator for [`RegistryClient::get_blob_to_file`]'s temp
+/// file name, on top of the process id. The pid alone only makes the name
+/// unique per *process*: two concurrent `get_blob_to_file` calls in the same
+/// process targeting the same destination path (e.g. a future concurrent
+/// pull/copy that fetches the same digest twice) would otherwise share one
+/// `part.<pid>` temp file and race on `File::create`'s truncation. This
+/// counter is bumped on every call, making each call's temp path unique
+/// regardless of in-process concurrency.
+static TEMP_FILE_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// Options for [`RegistryClient::new`].
 #[derive(Clone, Debug)]
@@ -203,7 +214,7 @@ impl RegistryClient {
             .get("docker-content-digest")
             .and_then(|value| value.to_str().ok())
             .map(str::to_string);
-        let bytes = read_bounded(response).await?;
+        let bytes = read_bounded(response, &url, MAX_REGISTRY_BODY_BYTES).await?;
         if reference.starts_with("sha256:") {
             verify_digest(&bytes, reference)
                 .with_context(|| format!("manifest {reference} failed digest verification"))?;
@@ -225,8 +236,9 @@ impl RegistryClient {
     /// [`MAX_REGISTRY_BODY_BYTES`] and digest-verified. For large blobs use
     /// [`get_blob_to_file`](Self::get_blob_to_file).
     pub async fn get_blob(&self, repo: &str, digest: &str) -> Result<Vec<u8>> {
+        let url = self.blob_url(repo, digest);
         let response = self.get_blob_response(repo, digest).await?;
-        let bytes = read_bounded(response).await?;
+        let bytes = read_bounded(response, &url, MAX_REGISTRY_BODY_BYTES).await?;
         verify_digest(&bytes, digest)
             .with_context(|| format!("blob {digest} failed digest verification"))?;
         Ok(bytes)
@@ -243,7 +255,8 @@ impl RegistryClient {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("create blob directory {}", parent.display()))?;
         }
-        let tmp = path.with_extension(format!("part.{}", std::process::id()));
+        let seq = TEMP_FILE_SEQ.fetch_add(1, Ordering::Relaxed);
+        let tmp = path.with_extension(format!("part.{}.{seq}", std::process::id()));
         let mut file = compio::fs::File::create(&tmp)
             .await
             .with_context(|| format!("create blob temp file {}", tmp.display()))?;
@@ -717,28 +730,67 @@ pub fn append_query_param(url: &str, key: &str, value: &str) -> String {
     format!("{url}{sep}{key}={}", percent_encode_query(value))
 }
 
-/// Read a response body into memory, rejecting anything larger than
-/// [`MAX_REGISTRY_BODY_BYTES`] (checked against the advertised Content-Length
-/// up front and against the actual body length after buffering, so a lying
-/// header cannot slip a huge body past the cap).
-async fn read_bounded(response: Response) -> Result<Vec<u8>> {
+/// Read a response body into memory, enforcing `max_bytes` **while
+/// streaming** rather than after the fact.
+///
+/// A `Content-Length` pre-check alone cannot stop a registry that omits or
+/// lies about the header, or that uses chunked transfer-encoding (no length
+/// header at all): a naive implementation would call `.bytes()` — which
+/// buffers the entire body — before any check ever ran, so a hostile body of
+/// unbounded size would already be fully collected in memory by the time the
+/// post-hoc length check fires. Instead this reads the body chunk-by-chunk
+/// via [`Response::bytes_stream`] (the same streaming accessor
+/// [`RegistryClient::get_blob_to_file`] uses to write to disk) through
+/// [`collect_bounded`], which tracks the running total and bails the moment
+/// it crosses `max_bytes` — so at most one in-flight chunk over the cap is
+/// ever buffered, regardless of what the registry claims or how it frames
+/// the response.
+///
+/// The `Content-Length` check is kept as a cheap fast-path rejection (skip
+/// opening the stream at all when the registry honestly advertises an
+/// oversized body up front); it is not load-bearing for the guarantee above.
+async fn read_bounded(response: Response, url: &str, max_bytes: u64) -> Result<Vec<u8>> {
     if let Some(len) = response
         .headers()
         .get(CONTENT_LENGTH)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.parse::<u64>().ok())
-        && len > MAX_REGISTRY_BODY_BYTES
+        && len > max_bytes
     {
-        bail!("registry body of {len} bytes exceeds cap of {MAX_REGISTRY_BODY_BYTES} bytes");
+        bail!("registry body at {url} of {len} bytes exceeds cap of {max_bytes} bytes");
     }
-    let bytes = response.bytes().await?;
-    if bytes.len() as u64 > MAX_REGISTRY_BODY_BYTES {
-        bail!(
-            "registry body of {} bytes exceeds cap of {MAX_REGISTRY_BODY_BYTES} bytes",
-            bytes.len()
-        );
+    collect_bounded(response.bytes_stream(), max_bytes, url).await
+}
+
+/// Collect a byte stream into memory, bailing the moment the running total
+/// exceeds `max_bytes` — checked chunk-by-chunk as bytes arrive, never after
+/// a full collect. `label` identifies the source (typically the request URL)
+/// for the error message.
+///
+/// Generic over the chunk type (anything `AsRef<[u8]>`, e.g. `bytes::Bytes`
+/// as yielded by [`Response::bytes_stream`]) and the stream's error type, so
+/// this needs no direct dependency on the `bytes` crate and is exercisable
+/// in tests against a plain `futures::stream::iter` of `Vec<u8>` chunks
+/// without a live server. The stream is boxed internally (mirroring
+/// [`RegistryClient::get_blob_to_file`]'s existing pattern) so callers don't
+/// need to prove `Unpin` themselves.
+async fn collect_bounded<S, B, E>(stream: S, max_bytes: u64, label: &str) -> Result<Vec<u8>>
+where
+    S: futures::Stream<Item = std::result::Result<B, E>>,
+    B: AsRef<[u8]>,
+    E: std::error::Error + Send + Sync + 'static,
+{
+    let mut stream = Box::pin(stream);
+    let mut buf: Vec<u8> = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.with_context(|| format!("read chunk while streaming {label}"))?;
+        let chunk = chunk.as_ref();
+        if buf.len() as u64 + chunk.len() as u64 > max_bytes {
+            bail!("{label} exceeds cap of {max_bytes} bytes");
+        }
+        buf.extend_from_slice(chunk);
     }
-    Ok(bytes.to_vec())
+    Ok(buf)
 }
 
 #[cfg(test)]
@@ -887,6 +939,54 @@ mod tests {
             client.file_digest(&path).await.unwrap(),
             sha256_digest(&data)
         );
+    }
+
+    #[compio::test]
+    async fn collect_bounded_bails_as_soon_as_running_total_exceeds_cap() {
+        // Three 10-byte chunks against a 25-byte cap: the running total
+        // crosses the cap on the third chunk (30 > 25), so the call must
+        // bail there rather than after collecting all chunks.
+        let chunks: Vec<std::result::Result<Vec<u8>, std::io::Error>> =
+            vec![Ok(vec![0u8; 10]), Ok(vec![0u8; 10]), Ok(vec![0u8; 10])];
+        let stream = futures::stream::iter(chunks);
+        let err = collect_bounded(stream, 25, "https://registry.local/v2/x/blobs/sha256:abc")
+            .await
+            .unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("exceeds cap of 25 bytes"), "{message}");
+        assert!(
+            message.contains("https://registry.local/v2/x/blobs/sha256:abc"),
+            "{message}"
+        );
+    }
+
+    #[compio::test]
+    async fn collect_bounded_accepts_a_body_exactly_at_the_cap() {
+        let chunks: Vec<std::result::Result<Vec<u8>, std::io::Error>> =
+            vec![Ok(vec![1u8; 10]), Ok(vec![2u8; 10])];
+        let stream = futures::stream::iter(chunks);
+        let bytes = collect_bounded(stream, 20, "test").await.unwrap();
+        assert_eq!(bytes.len(), 20);
+        assert_eq!(&bytes[..10], &[1u8; 10]);
+        assert_eq!(&bytes[10..], &[2u8; 10]);
+    }
+
+    #[compio::test]
+    async fn collect_bounded_never_had_content_length_to_lean_on() {
+        // Regression guard for the bug this fixes: with no Content-Length
+        // header available at all (chunked transfer-encoding), the cap must
+        // still be enforced purely from the running total of streamed
+        // chunks. Simulate a body that is one byte over the cap and confirm
+        // it is rejected even though nothing here ever consulted a length
+        // header.
+        let cap = 1024u64;
+        let chunks: Vec<std::result::Result<Vec<u8>, std::io::Error>> =
+            vec![Ok(vec![0u8; 1024]), Ok(vec![0u8; 1])];
+        let stream = futures::stream::iter(chunks);
+        let err = collect_bounded(stream, cap, "chunked body")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("exceeds cap of 1024 bytes"));
     }
 
     #[test]
