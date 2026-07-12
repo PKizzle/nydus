@@ -311,6 +311,19 @@ fn migrate_store(args: StoreArgs) -> Result<()> {
         "starting store migration"
     );
 
+    // Validate the legacy bbolt db BEFORE opening the destination fjall
+    // store. `SnapshotStore::open` creates `metadata.fjall` on first touch
+    // (fjall materializes the directory eagerly), so opening it first would
+    // leave a stray empty output directory behind when `--bbolt-db` turns
+    // out to be missing or unreadable — the old Go-era bin read bbolt first
+    // and failed fast with no side effect; keep that property here.
+    nydus_snapshotter::migrate::validate_legacy_bbolt_db(&args.bbolt_db).with_context(|| {
+        format!(
+            "legacy bbolt db {} is not a readable bbolt database",
+            args.bbolt_db.display()
+        )
+    })?;
+
     // The import core lives in `nydus_snapshotter::migrate` so the
     // snapshotter can run the same migration automatically at startup; this
     // subcommand keeps the operator-facing dry-run/commit/strict semantics
@@ -782,6 +795,54 @@ fn parent_or_current(path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn migrate_store_bad_bbolt_db_does_not_create_output_dir() {
+        let dir = tempdir().unwrap();
+        let bbolt_db = dir.path().join("does-not-exist.db");
+        let output_db = dir.path().join("metadata.fjall");
+
+        let args = StoreArgs {
+            bbolt_db,
+            legacy_root: None,
+            output_db: output_db.clone(),
+            output_root: None,
+            fs_driver: MigrationFsDriver::Fusedev,
+            strict: false,
+            commit: false,
+        };
+
+        assert!(migrate_store(args).is_err());
+        assert!(
+            !output_db.exists(),
+            "a bad --bbolt-db must not leave an empty metadata.fjall directory behind"
+        );
+    }
+
+    #[test]
+    fn migrate_store_garbage_bbolt_db_does_not_create_output_dir() {
+        let dir = tempdir().unwrap();
+        let bbolt_db = dir.path().join("garbage.db");
+        std::fs::write(&bbolt_db, b"not a bolt database").unwrap();
+        let output_db = dir.path().join("metadata.fjall");
+
+        let args = StoreArgs {
+            bbolt_db,
+            legacy_root: None,
+            output_db: output_db.clone(),
+            output_root: None,
+            fs_driver: MigrationFsDriver::Fusedev,
+            strict: false,
+            commit: true,
+        };
+
+        assert!(migrate_store(args).is_err());
+        assert!(
+            !output_db.exists(),
+            "a garbage --bbolt-db must not leave an empty metadata.fjall directory behind"
+        );
+    }
 
     #[test]
     fn parses_content_snapshot_label() {

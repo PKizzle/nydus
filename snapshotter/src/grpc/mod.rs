@@ -1028,8 +1028,30 @@ pub fn open_store_for_config(config: &SnapshotterConfig) -> Result<Arc<SnapshotS
     // the root and the fjall store is fresh) so operators don't have to run
     // `nydus-migrate store` by hand. Logs and degrades on failure; when no
     // legacy db exists this is a single existence check.
+    //
+    // Stamp imported records with the node's actual resolved driver —
+    // `config.snapshotter.fs_drivers.first()`, already reordered to the
+    // probed/promoted driver by `probe_and_promote_driver`, which both
+    // `serve()` (above) and `containerd-nydus.rs` run before calling this
+    // function — instead of a hardcoded guess. The label is
+    // non-authoritative (the live mount driver always comes from the node's
+    // probed driver, never from a snapshot record; see
+    // `migrate::auto_migrate_if_needed`), but a wrong label is still
+    // misleading to an operator inspecting the store directly.
     #[cfg(feature = "migrate")]
-    crate::migrate::auto_migrate_at_startup(&root, &store);
+    {
+        let fs_driver = config
+            .snapshotter
+            .fs_drivers
+            .first()
+            .map(|driver| match driver.driver_type {
+                crate::config::FsDriverType::Fanotify => "fanotify",
+                crate::config::FsDriverType::Fusedev => "fusedev",
+                crate::config::FsDriverType::Blockdev => "blockdev",
+            })
+            .unwrap_or("fusedev");
+        crate::migrate::auto_migrate_at_startup(&root, &store, fs_driver);
+    }
     Ok(store)
 }
 

@@ -45,12 +45,6 @@ pub const LEGACY_BBOLT_DB_FILE: &str = "metadata.db";
 /// root. Mirrors the path `open_store_for_config` opens.
 pub const FJALL_DB_DIR: &str = "metadata.fjall";
 
-/// Filesystem-driver label stamped on auto-imported records. Matches the
-/// `nydus-migrate store --fs-driver` default: legacy Go-snapshotter records
-/// predate the fanotify path, so fusedev is the conservative choice; the
-/// reconciler re-drives snapshots with the live driver on next use.
-const AUTO_MIGRATE_FS_DRIVER: &str = "fusedev";
-
 /// A snapshot record decoded from the legacy bbolt metadata database.
 #[derive(Debug)]
 struct LegacySnapshot {
@@ -96,7 +90,15 @@ pub struct StoreMigrationParams<'a> {
     pub output_db: &'a Path,
     /// New Rust snapshotter root (receives `snapshots/<stable-key>/`).
     pub output_root: &'a Path,
-    /// Filesystem-driver label to stamp on imported records.
+    /// Filesystem-driver label to stamp on imported records. This is a
+    /// non-authoritative label only: the live mount driver a snapshot
+    /// actually gets served with is always the node's probed/promoted
+    /// driver (`DaemonSupervisor::active_fs_driver()`, i.e.
+    /// `config.snapshotter.fs_drivers.first()`), never read back from a
+    /// snapshot record. Callers should still pass the node's real resolved
+    /// driver rather than a hardcoded guess, so operators reading the
+    /// fjall record or the `nydus-migrate store` report see an accurate
+    /// label instead of a stale one.
     pub fs_driver: &'a str,
     /// Write fjall records and copy/hardlink snapshot directories. When
     /// false (dry-run) nothing is mutated and would-be imports are counted
@@ -194,9 +196,15 @@ pub fn migrate_store(
 ///
 /// Cost when no legacy db exists: a single `is_file` check. The legacy
 /// database is never deleted; the operator removes it once satisfied.
+///
+/// `fs_driver` is the label stamped on every imported record (see
+/// [`StoreMigrationParams::fs_driver`]) — pass the node's actual
+/// probed/promoted driver (`config.snapshotter.fs_drivers.first()`), not a
+/// hardcoded guess.
 pub fn auto_migrate_if_needed(
     root: &Path,
     store: &SnapshotStore,
+    fs_driver: &str,
 ) -> Result<Option<StoreMigrationReport>> {
     let bbolt_db = root.join(LEGACY_BBOLT_DB_FILE);
     if !bbolt_db.is_file() {
@@ -220,7 +228,7 @@ pub fn auto_migrate_if_needed(
         legacy_root: root,
         output_db: &output_db,
         output_root: root,
-        fs_driver: AUTO_MIGRATE_FS_DRIVER,
+        fs_driver,
         commit: true,
     };
     migrate_store(store, &params).map(Some)
@@ -229,9 +237,10 @@ pub fn auto_migrate_if_needed(
 /// Startup hook wrapper around [`auto_migrate_if_needed`] that logs the
 /// outcome and never fails: a broken legacy database must not block the
 /// snapshotter from serving (the store is empty either way, and the manual
-/// tool remains available).
-pub fn auto_migrate_at_startup(root: &Path, store: &SnapshotStore) {
-    match auto_migrate_if_needed(root, store) {
+/// tool remains available). See [`auto_migrate_if_needed`] for the meaning
+/// of `fs_driver`.
+pub fn auto_migrate_at_startup(root: &Path, store: &SnapshotStore, fs_driver: &str) {
+    match auto_migrate_if_needed(root, store, fs_driver) {
         Ok(None) => {}
         Ok(Some(report)) => {
             if report.errors.is_empty() {
@@ -269,6 +278,30 @@ pub fn auto_migrate_at_startup(root: &Path, store: &SnapshotStore) {
             );
         }
     }
+}
+
+/// Confirm `path` is an openable, well-formed legacy bbolt snapshot metadata
+/// database (i.e. it opens and has a `v1/snapshots` bucket) without decoding
+/// any records. Cheap fail-fast check for callers — namely the
+/// `nydus-migrate store` CLI — that must validate `--bbolt-db` *before*
+/// opening (and thereby creating) the destination fjall store, so a bad
+/// legacy path never leaves behind an empty `metadata.fjall` directory.
+pub fn validate_legacy_bbolt_db(path: &Path) -> Result<()> {
+    let db = Bolt::open_ro(path).with_context(|| {
+        format!(
+            "failed to open legacy bbolt snapshot metadata at {}",
+            path.display()
+        )
+    })?;
+    let tx = db
+        .begin()
+        .context("failed to begin bbolt read transaction")?;
+    let v1 = tx
+        .bucket("v1")
+        .context("legacy metadata is missing v1 bucket")?;
+    v1.bucket("snapshots")
+        .context("legacy metadata is missing v1/snapshots bucket")?;
+    Ok(())
 }
 
 fn read_legacy_snapshots(path: &Path) -> Result<Vec<LegacySnapshot>> {
@@ -557,7 +590,12 @@ mod tests {
         default_fixture(root);
         let store = SnapshotStore::open(&root.join(FJALL_DB_DIR)).unwrap();
 
-        let report = auto_migrate_if_needed(root, &store).unwrap().unwrap();
+        // Use a driver other than the old hardcoded default ("fusedev") to
+        // prove the resolved node driver is actually threaded through and
+        // stamped, not a hardcoded guess.
+        let report = auto_migrate_if_needed(root, &store, "fanotify")
+            .unwrap()
+            .unwrap();
         assert!(!report.dry_run);
         assert_eq!(report.discovered, 2);
         assert_eq!(report.imported, 2);
@@ -567,7 +605,7 @@ mod tests {
 
         let committed = store.stat("sha256:aaaa").unwrap();
         assert_eq!(committed.kind, SnapshotKind::Committed.as_str());
-        assert_eq!(committed.fs_driver, AUTO_MIGRATE_FS_DRIVER);
+        assert_eq!(committed.fs_driver, "fanotify");
         assert_eq!(
             committed.image_ref.as_deref(),
             Some("docker.io/example/image:tag")
@@ -591,7 +629,11 @@ mod tests {
         assert!(root.join(LEGACY_BBOLT_DB_FILE).is_file());
 
         // Second startup: the store is populated now, so the gate skips.
-        assert!(auto_migrate_if_needed(root, &store).unwrap().is_none());
+        assert!(
+            auto_migrate_if_needed(root, &store, "fanotify")
+                .unwrap()
+                .is_none()
+        );
         assert_eq!(store.list().unwrap().len(), 2);
     }
 
@@ -602,7 +644,9 @@ mod tests {
         default_fixture(root);
         let store = SnapshotStore::open(&root.join(FJALL_DB_DIR)).unwrap();
 
-        auto_migrate_if_needed(root, &store).unwrap().unwrap();
+        auto_migrate_if_needed(root, &store, "fanotify")
+            .unwrap()
+            .unwrap();
 
         // Manual re-run against the populated store: everything is skipped,
         // nothing is duplicated or overwritten.
@@ -615,7 +659,7 @@ mod tests {
                 legacy_root: root,
                 output_db: &output_db,
                 output_root: root,
-                fs_driver: AUTO_MIGRATE_FS_DRIVER,
+                fs_driver: "fanotify",
                 commit: true,
             },
         )
@@ -644,7 +688,7 @@ mod tests {
                 legacy_root: root,
                 output_db: &output_db,
                 output_root: root,
-                fs_driver: AUTO_MIGRATE_FS_DRIVER,
+                fs_driver: "fusedev",
                 commit: false,
             },
         )
@@ -679,7 +723,11 @@ mod tests {
             )
             .unwrap();
 
-        assert!(auto_migrate_if_needed(root, &store).unwrap().is_none());
+        assert!(
+            auto_migrate_if_needed(root, &store, "fanotify")
+                .unwrap()
+                .is_none()
+        );
         let records = store.list().unwrap();
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].key, "existing-key");
@@ -690,7 +738,11 @@ mod tests {
         let dir = tempdir().unwrap();
         let root = dir.path();
         let store = SnapshotStore::open(&root.join(FJALL_DB_DIR)).unwrap();
-        assert!(auto_migrate_if_needed(root, &store).unwrap().is_none());
+        assert!(
+            auto_migrate_if_needed(root, &store, "fusedev")
+                .unwrap()
+                .is_none()
+        );
         assert!(store.is_empty().unwrap());
     }
 
@@ -701,8 +753,35 @@ mod tests {
         std::fs::write(root.join(LEGACY_BBOLT_DB_FILE), b"not a bolt database").unwrap();
         let store = SnapshotStore::open(&root.join(FJALL_DB_DIR)).unwrap();
         // Must not panic and must not block: the wrapper degrades to a warn.
-        auto_migrate_at_startup(root, &store);
+        auto_migrate_at_startup(root, &store, "fusedev");
         assert!(store.is_empty().unwrap());
+    }
+
+    #[test]
+    fn validate_legacy_bbolt_db_rejects_missing_and_garbage_files() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+
+        // Nonexistent file.
+        assert!(validate_legacy_bbolt_db(&root.join("missing.db")).is_err());
+
+        // Garbage file (not a bbolt database at all).
+        let garbage = root.join("garbage.db");
+        std::fs::write(&garbage, b"not a bolt database").unwrap();
+        assert!(validate_legacy_bbolt_db(&garbage).is_err());
+
+        // Valid legacy fixture passes.
+        let good = root.join(LEGACY_BBOLT_DB_FILE);
+        write_legacy_fixture(
+            &good,
+            &[FixtureSnapshot {
+                key: "sha256:aaaa",
+                id: 1,
+                kind: KIND_COMMITTED,
+                parent: None,
+            }],
+        );
+        assert!(validate_legacy_bbolt_db(&good).is_ok());
     }
 
     #[test]
