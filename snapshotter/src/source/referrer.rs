@@ -558,12 +558,65 @@ pub fn detect_from_oci_json(payload: &[u8]) -> Result<ReferrerInfo> {
     {
         return Ok(info);
     }
-    if let Ok(manifest) = serde_json::from_slice::<OciManifest>(payload)
-        && let Some(info) = manifest.layers.iter().find_map(classify_descriptor)
-    {
-        return Ok(info);
+    if let Ok(manifest) = serde_json::from_slice::<OciManifest>(payload) {
+        // A `layers` array is the artifact MANIFEST itself (the fallback-tag
+        // path fetches it directly). Its layers list data blobs
+        // (`...layer.nydus.blob.v1`) BEFORE the bootstrap by convention, and
+        // data-blob media types also contain "nydus" — so the loose
+        // `classify_descriptor` predicate must NOT be used here: it would
+        // return the first data blob's digest as the "bootstrap" and the
+        // serving path would mount data bytes as RAFS metadata. Target the
+        // bootstrap layer specifically (annotation first, then a "bootstrap"
+        // media type), exactly like `select_nydus_bootstrap_layer`.
+        if let Some(boot) = bootstrap_layer_of(&manifest.layers) {
+            return Ok(ReferrerInfo {
+                image_type: ImageType::NydusRafs,
+                bootstrap_digest: Some(boot.digest.clone()),
+                fs_driver_hint: boot.annotations.get(NYDUS_FS_DRIVER_HINT).cloned(),
+            });
+        }
+        // EROFS/blockdev artifacts have no bootstrap layer; they are still
+        // recognized by their distinctive media types (never "nydus.blob").
+        if let Some(info) = manifest
+            .layers
+            .iter()
+            .find(|desc| {
+                let media = format!("{} {}", desc.media_type, desc.artifact_type);
+                media.contains("erofs") || media.contains("blockdev")
+            })
+            .and_then(classify_descriptor)
+        {
+            return Ok(info);
+        }
+        // Deliberately NO loose "contains nydus/rafs" fallback for layers: a
+        // manifest with nydus data blobs but no identifiable bootstrap is not
+        // servable — StandardOci (plain overlay) is the safe answer.
     }
     Ok(standard_oci())
+}
+
+/// Priority-select the nydus bootstrap layer from a manifest's `layers`:
+///   1. a layer annotated `containerd.io/snapshot/nydus-bootstrap == "true"`
+///      (authoritative — nydusify and the Go tooling both set it);
+///   2. else a layer whose mediaType/artifactType contains "bootstrap"
+///      (`...bootstrap.nydus...` is distinct from `...layer.nydus.blob...`).
+///
+/// Returns `None` when no layer qualifies. Callers must treat that as "not a
+/// servable nydus artifact" and must NEVER fall back to a loose
+/// "contains nydus" match over layers — data blobs match that too, and the
+/// artifact convention orders them before the bootstrap.
+fn bootstrap_layer_of(layers: &[OciDescriptor]) -> Option<&OciDescriptor> {
+    let annotated = layers.iter().find(|desc| {
+        desc.annotations
+            .get(NYDUS_BOOTSTRAP_ANNOTATION)
+            .map(|v| v == "true")
+            .unwrap_or(false)
+    });
+    annotated.or_else(|| {
+        layers.iter().find(|desc| {
+            format!("{} {}", desc.media_type, desc.artifact_type).contains("bootstrap")
+        })
+    })
 }
 
 fn classify_descriptor(desc: &OciDescriptor) -> Option<ReferrerInfo> {
@@ -623,31 +676,11 @@ fn standard_oci() -> ReferrerInfo {
 ///      distinct from `...layer.nydus.blob...` data blobs).
 fn select_nydus_bootstrap_layer(manifest_bytes: &[u8]) -> Option<String> {
     let manifest = serde_json::from_slice::<OciManifest>(manifest_bytes).ok()?;
-    if manifest.layers.is_empty() {
-        return None;
-    }
-    let is_bootstrap = |desc: &OciDescriptor| {
-        desc.annotations
-            .get(NYDUS_BOOTSTRAP_ANNOTATION)
-            .map(|v| v == "true")
-            .unwrap_or(false)
-    };
-    let has_bootstrap_media = |desc: &OciDescriptor| {
-        format!("{} {}", desc.media_type, desc.artifact_type).contains("bootstrap")
-    };
-    // Annotation is authoritative; fall back to the media-type marker only when
-    // no layer carries the annotation.
-    manifest
-        .layers
-        .iter()
-        .find(|desc| is_bootstrap(desc))
-        .or_else(|| {
-            manifest
-                .layers
-                .iter()
-                .find(|desc| has_bootstrap_media(desc))
-        })
-        .map(|desc| desc.digest.clone())
+    // Shared priority selection (annotation → bootstrap media type) with
+    // `detect_from_oci_json`'s layers branch, so the two consume-side paths
+    // (initial detection via the fallback tag, and the materialize-time
+    // artifact-manifest walk) can never drift apart again.
+    bootstrap_layer_of(&manifest.layers).map(|desc| desc.digest.clone())
 }
 
 /// Verify `bytes` hash to `expected` (a `sha256:<hex>` digest). Security-
@@ -917,6 +950,60 @@ mod tests {
         assert_eq!(info.image_type, ImageType::NydusRafs);
         assert_eq!(info.bootstrap_digest.as_deref(), Some("sha256:boot"));
         assert_eq!(info.fs_driver_hint.as_deref(), Some("fanotify"));
+    }
+
+    /// REGRESSION (P4c/P4d review): on the fallback-tag path the artifact
+    /// MANIFEST is what gets classified, and its layers list data blobs
+    /// (media type also containing "nydus") BEFORE the bootstrap. The old
+    /// loose first-match returned the data blob's digest as the "bootstrap",
+    /// and the serving path then mounted data bytes as RAFS metadata.
+    #[test]
+    fn detects_bootstrap_not_data_blob_from_artifact_manifest_layers() {
+        let payload = br#"{
+            "schemaVersion":2,
+            "mediaType":"application/vnd.oci.image.manifest.v1+json",
+            "artifactType":"application/vnd.oci.image.layer.nydus.blob.v1",
+            "layers":[
+                {"mediaType":"application/vnd.oci.image.layer.nydus.blob.v1","digest":"sha256:DATABLOB"},
+                {"mediaType":"application/vnd.oci.image.bootstrap.nydus.v1","digest":"sha256:BOOTSTRAP",
+                 "annotations":{"containerd.io/snapshot/nydus-bootstrap":"true"}}
+            ]
+        }"#;
+        let info = detect_from_oci_json(payload).unwrap();
+        assert_eq!(info.image_type, ImageType::NydusRafs);
+        assert_eq!(
+            info.bootstrap_digest.as_deref(),
+            Some("sha256:BOOTSTRAP"),
+            "layers branch must select the bootstrap layer, never the leading data blob"
+        );
+    }
+
+    /// Media-type fallback (no annotation) must also pick the bootstrap over
+    /// the data blob, and a blobs-only manifest (no identifiable bootstrap)
+    /// must classify StandardOci — safe overlay, never a garbage mount.
+    #[test]
+    fn artifact_manifest_without_bootstrap_layer_is_standard_oci() {
+        let no_annotation = br#"{
+            "layers":[
+                {"mediaType":"application/vnd.oci.image.layer.nydus.blob.v1","digest":"sha256:DATABLOB"},
+                {"mediaType":"application/vnd.oci.image.bootstrap.nydus.v1","digest":"sha256:BOOTSTRAP"}
+            ]
+        }"#;
+        let info = detect_from_oci_json(no_annotation).unwrap();
+        assert_eq!(info.bootstrap_digest.as_deref(), Some("sha256:BOOTSTRAP"));
+
+        let blobs_only = br#"{
+            "layers":[
+                {"mediaType":"application/vnd.oci.image.layer.nydus.blob.v1","digest":"sha256:DATABLOB1"},
+                {"mediaType":"application/vnd.oci.image.layer.nydus.blob.v1","digest":"sha256:DATABLOB2"}
+            ]
+        }"#;
+        let info = detect_from_oci_json(blobs_only).unwrap();
+        assert_eq!(
+            info.image_type,
+            ImageType::StandardOci,
+            "nydus data blobs with no identifiable bootstrap must fall back to overlay"
+        );
     }
 
     #[test]
