@@ -19,6 +19,7 @@
 
 use std::collections::BTreeMap;
 
+use anyhow::{Result, anyhow, bail};
 use registry_client::Descriptor;
 use registry_client::types::{
     MEDIA_TYPE_DOCKER_CONFIG, MEDIA_TYPE_DOCKER_MANIFEST, MEDIA_TYPE_NYDUS_BLOB,
@@ -101,10 +102,70 @@ pub fn assemble_manifest(
     }
 }
 
+/// Locate the nydus bootstrap layer in a (pulled) nydus image manifest.
+///
+/// Prefers a layer annotated `containerd.io/snapshot/nydus-bootstrap = "true"`
+/// (the canonical marker both the Go and Rust nydusify emit and the snapshotter
+/// keys on), falling back to a layer whose media type names a nydus bootstrap
+/// (`...bootstrap.nydus...` / `...nydus.bootstrap...`).
+pub fn find_bootstrap_layer(manifest: &Manifest) -> Option<&Descriptor> {
+    manifest
+        .layers
+        .iter()
+        .find(|layer| {
+            layer
+                .annotations
+                .as_ref()
+                .and_then(|a| a.get(ANNOTATION_NYDUS_BOOTSTRAP))
+                .map(|v| v == "true")
+                .unwrap_or(false)
+        })
+        .or_else(|| {
+            manifest.layers.iter().find(|layer| {
+                let m = &layer.media_type;
+                m.contains("bootstrap") && m.contains("nydus")
+            })
+        })
+}
+
+/// Whether `layer` is a nydus data-blob layer (media type
+/// `...layer.nydus.blob.v1` or the `nydus-blob` annotation).
+fn is_nydus_data_layer(layer: &Descriptor) -> bool {
+    layer.media_type == MEDIA_TYPE_NYDUS_BLOB
+        || layer
+            .annotations
+            .as_ref()
+            .and_then(|a| a.get(ANNOTATION_NYDUS_DATA))
+            .map(|v| v == "true")
+            .unwrap_or(false)
+}
+
+/// Validate that `manifest` describes a nydus image: it must carry a bootstrap
+/// layer and at least one nydus data-blob layer. Returns the bootstrap
+/// descriptor so the caller can download and inspect it.
+pub fn validate_nydus_manifest(manifest: &Manifest) -> Result<&Descriptor> {
+    if manifest.layers.is_empty() {
+        bail!("manifest has no layers; not a nydus image");
+    }
+    let bootstrap = find_bootstrap_layer(manifest).ok_or_else(|| {
+        anyhow!(
+            "no nydus bootstrap layer found (expected a layer annotated \
+             {ANNOTATION_NYDUS_BOOTSTRAP}=true or a *.bootstrap.nydus.* media type)"
+        )
+    })?;
+    if !manifest.layers.iter().any(is_nydus_data_layer) {
+        bail!(
+            "manifest has a bootstrap layer but no nydus data-blob layer \
+             ({MEDIA_TYPE_NYDUS_BLOB}); not a valid nydus image"
+        );
+    }
+    Ok(bootstrap)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use registry_client::types::MEDIA_TYPE_DOCKER_MANIFEST_LIST;
+    use registry_client::types::{MEDIA_TYPE_DOCKER_MANIFEST_LIST, MEDIA_TYPE_OCI_LAYER_TAR_GZIP};
 
     #[test]
     fn media_types_switch_on_docker2oci() {
@@ -169,5 +230,67 @@ mod tests {
         let reparsed: Manifest = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(reparsed, manifest);
         assert!(reparsed.subject.is_none());
+    }
+
+    fn nydus_manifest() -> Manifest {
+        let config = Descriptor::for_bytes(MEDIA_TYPE_OCI_CONFIG, b"{}");
+        let data = data_blob_descriptor("sha256:data".into(), 100);
+        let boot = bootstrap_descriptor("sha256:boot".into(), 50);
+        assemble_manifest(true, config, vec![data], boot)
+    }
+
+    #[test]
+    fn finds_bootstrap_by_annotation() {
+        let manifest = nydus_manifest();
+        let bootstrap = find_bootstrap_layer(&manifest).unwrap();
+        assert_eq!(bootstrap.digest, "sha256:boot");
+    }
+
+    #[test]
+    fn finds_bootstrap_by_media_type_without_annotation() {
+        // A bootstrap layer identified only by media type (no annotation).
+        let mut manifest = nydus_manifest();
+        let boot = manifest.layers.last_mut().unwrap();
+        boot.annotations = None;
+        boot.media_type = "application/vnd.oci.image.bootstrap.nydus.v1".to_string();
+        let bootstrap = find_bootstrap_layer(&manifest).unwrap();
+        assert_eq!(bootstrap.digest, "sha256:boot");
+    }
+
+    #[test]
+    fn validate_accepts_a_nydus_manifest_and_returns_bootstrap() {
+        let manifest = nydus_manifest();
+        let bootstrap = validate_nydus_manifest(&manifest).unwrap();
+        assert_eq!(bootstrap.digest, "sha256:boot");
+    }
+
+    #[test]
+    fn validate_rejects_a_plain_oci_manifest() {
+        // A standard OCI image: gzip layers, no nydus bootstrap.
+        let mut manifest = nydus_manifest();
+        for layer in &mut manifest.layers {
+            layer.media_type = MEDIA_TYPE_OCI_LAYER_TAR_GZIP.to_string();
+            layer.annotations = None;
+        }
+        let err = validate_nydus_manifest(&manifest).unwrap_err();
+        assert!(err.to_string().contains("no nydus bootstrap layer"));
+    }
+
+    #[test]
+    fn validate_rejects_bootstrap_without_data_blob() {
+        let config = Descriptor::for_bytes(MEDIA_TYPE_OCI_CONFIG, b"{}");
+        let boot = bootstrap_descriptor("sha256:boot".into(), 50);
+        // Only a bootstrap layer, no data blob.
+        let manifest = Manifest {
+            schema_version: 2,
+            media_type: Some(MEDIA_TYPE_OCI_MANIFEST.to_string()),
+            artifact_type: None,
+            config,
+            layers: vec![boot],
+            subject: None,
+            annotations: None,
+        };
+        let err = validate_nydus_manifest(&manifest).unwrap_err();
+        assert!(err.to_string().contains("no nydus data-blob layer"));
     }
 }

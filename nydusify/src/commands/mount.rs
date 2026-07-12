@@ -2,16 +2,26 @@
 //
 // SPDX-License-Identifier: (Apache-2.0 AND BSD-3-Clause)
 
-use std::path::PathBuf;
+//! `nydusify mount`: pull a nydus image's bootstrap, spawn a foreground
+//! `nydusd` FUSE daemon backed by the image's registry, and hold the mount
+//! until the process receives SIGINT/SIGTERM — then unmount and stop nydusd.
 
-use anyhow::Result;
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command};
+use std::time::Duration;
+
+use anyhow::{Context, Result, bail};
+use registry_client::types::Manifest;
+use registry_client::{ImageReference, RegistryClient};
 use serde::Serialize;
-use tracing::info;
+use serde_json::{Value, json};
+use tracing::{info, warn};
 
 use crate::cli::{BackendType, MountArgs};
+use crate::engine::manifest::validate_nydus_manifest;
+use crate::engine::oci::{client_options, fetch_platform_manifest};
 
 use super::common::resolve_backend_config;
-use super::pending_operation;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct MountPlan {
@@ -24,8 +34,91 @@ pub struct MountPlan {
 
 pub async fn run(args: MountArgs) -> Result<()> {
     let plan = plan(&args)?;
-    info!(target = %plan.target, mount_path = %plan.mount_path.display(), "validated nydusify-rs mount request");
-    Err(pending_operation("mount"))
+    if plan.backend_type != "registry" {
+        bail!(
+            "--backend-type {} is not yet supported by `nydusify mount`; only `registry` is implemented (follow-up)",
+            plan.backend_type
+        );
+    }
+
+    let target_ref = ImageReference::parse(&plan.target)
+        .with_context(|| format!("parse --target {}", plan.target))?;
+    let client = RegistryClient::new(
+        &target_ref.api_host,
+        client_options(args.target_insecure, false),
+    )
+    .context("build registry client")?;
+
+    // Resolve to a single-platform nydus image manifest and locate the bootstrap.
+    let fetched = fetch_platform_manifest(
+        &client,
+        &target_ref.repo,
+        target_ref.manifest_reference(),
+        &plan.platform,
+    )
+    .await
+    .with_context(|| format!("fetch manifest {target_ref}"))?;
+    let manifest: Manifest =
+        serde_json::from_slice(&fetched.bytes).context("parse image manifest")?;
+    let bootstrap = validate_nydus_manifest(&manifest)
+        .with_context(|| format!("{target_ref} is not a valid nydus image"))?;
+
+    // Stage: bootstrap file, nydusd config, and a cache dir.
+    ensure_dir(&args.work_dir)?;
+    let cache_dir = args.work_dir.join("cache");
+    ensure_dir(&cache_dir)?;
+    let bootstrap_path = args.work_dir.join("bootstrap");
+    client
+        .get_blob_to_file(&target_ref.repo, &bootstrap.digest, &bootstrap_path)
+        .await
+        .with_context(|| format!("download bootstrap {}", bootstrap.digest))?;
+
+    let config = build_nydusd_config(
+        &target_ref.api_host,
+        &target_ref.repo,
+        &cache_dir,
+        args.target_insecure,
+        args.prefetch,
+    );
+    let config_path = args.work_dir.join("nydusd-config.json");
+    std::fs::write(&config_path, serde_json::to_vec_pretty(&config)?)
+        .with_context(|| format!("write nydusd config {}", config_path.display()))?;
+
+    ensure_dir(&plan.mount_path)?;
+
+    info!(
+        target = %target_ref,
+        mount_path = %plan.mount_path.display(),
+        nydusd = %args.nydusd.display(),
+        "mounting nydus image (Ctrl-C to unmount and exit)"
+    );
+
+    let mut child = spawn_nydusd(
+        &args.nydusd,
+        &config_path,
+        &plan.mount_path,
+        &bootstrap_path,
+    )?;
+
+    #[cfg(unix)]
+    signal::install();
+
+    // Foreground: hold the mount until a signal arrives or nydusd exits.
+    let exit = supervise(&mut child).await;
+
+    // Best-effort teardown regardless of how we got here.
+    unmount(&plan.mount_path);
+    let _ = child.kill();
+    let _ = child.wait();
+
+    match exit {
+        Supervised::Signalled => {
+            info!("received termination signal; unmounted and stopped nydusd");
+            Ok(())
+        }
+        Supervised::ChildExited(status) if status.success() => Ok(()),
+        Supervised::ChildExited(status) => bail!("nydusd exited unexpectedly: {status}"),
+    }
 }
 
 pub fn plan(args: &MountArgs) -> Result<MountPlan> {
@@ -44,6 +137,145 @@ pub fn plan(args: &MountArgs) -> Result<MountPlan> {
         prefetch: args.prefetch,
         platform: args.platform.clone(),
     })
+}
+
+/// Build the nydusd fusedev config (legacy `device` shape) for a registry
+/// backend serving the image's own repo. The bootstrap is supplied to nydusd
+/// via `--bootstrap` on the command line, not embedded here.
+fn build_nydusd_config(
+    host: &str,
+    repo: &str,
+    cache_dir: &Path,
+    skip_verify: bool,
+    prefetch: bool,
+) -> Value {
+    json!({
+        "device": {
+            "backend": {
+                "type": "registry",
+                "config": {
+                    // Empty scheme lets nydusd auto-detect https/http (and, with
+                    // skip_verify, fall back to http on TLS errors).
+                    "scheme": "",
+                    "host": host,
+                    "repo": repo,
+                    "skip_verify": skip_verify
+                }
+            },
+            "cache": {
+                "type": "blobcache",
+                "config": { "work_dir": cache_dir.display().to_string() }
+            }
+        },
+        "mode": "direct",
+        "digest_validate": false,
+        "iostats_files": false,
+        "enable_xattr": true,
+        "fs_prefetch": {
+            "enable": prefetch,
+            "threads_count": 4,
+            "merging_size": 1048576,
+            "prefetch_all": true
+        }
+    })
+}
+
+fn spawn_nydusd(
+    nydusd: &Path,
+    config: &Path,
+    mountpoint: &Path,
+    bootstrap: &Path,
+) -> Result<Child> {
+    Command::new(nydusd)
+        .arg("--config")
+        .arg(config)
+        .arg("--mountpoint")
+        .arg(mountpoint)
+        .arg("--bootstrap")
+        .arg(bootstrap)
+        .arg("--log-level")
+        .arg("info")
+        .spawn()
+        .with_context(|| format!("spawn nydusd `{}`", nydusd.display()))
+}
+
+/// Outcome of supervising the nydusd child.
+enum Supervised {
+    /// A termination signal was received; the mount should be torn down.
+    Signalled,
+    /// nydusd exited on its own.
+    ChildExited(std::process::ExitStatus),
+}
+
+/// Poll the child and the signal flag until either fires. Uses a short async
+/// sleep so the compio runtime stays responsive without busy-spinning.
+async fn supervise(child: &mut Child) -> Supervised {
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Supervised::ChildExited(status),
+            Ok(None) => {}
+            Err(e) => {
+                warn!(error = %e, "failed to poll nydusd; tearing down");
+                return Supervised::Signalled;
+            }
+        }
+        #[cfg(unix)]
+        if signal::terminated() {
+            return Supervised::Signalled;
+        }
+        compio::time::sleep(Duration::from_millis(300)).await;
+    }
+}
+
+/// Best-effort unmount of a FUSE mountpoint, trying the usual tools in order.
+fn unmount(mountpoint: &Path) {
+    for (prog, args) in [
+        ("fusermount3", vec!["-u", "-z"]),
+        ("fusermount", vec!["-u", "-z"]),
+        ("umount", vec!["-l"]),
+    ] {
+        let ok = Command::new(prog)
+            .args(&args)
+            .arg(mountpoint)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if ok {
+            return;
+        }
+    }
+    warn!(mountpoint = %mountpoint.display(), "could not unmount cleanly; may need a manual `umount`");
+}
+
+fn ensure_dir(path: &Path) -> Result<()> {
+    std::fs::create_dir_all(path).with_context(|| format!("create directory {}", path.display()))
+}
+
+/// SIGINT/SIGTERM handling for the foreground mount. A tiny async-signal-safe
+/// handler flips an atomic flag that [`supervise`] polls.
+#[cfg(unix)]
+mod signal {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    static TERMINATED: AtomicBool = AtomicBool::new(false);
+
+    extern "C" fn handle(_sig: libc::c_int) {
+        TERMINATED.store(true, Ordering::SeqCst);
+    }
+
+    pub fn install() {
+        // SAFETY: `handle` only performs an atomic store, which is
+        // async-signal-safe.
+        let handler = handle as *const () as libc::sighandler_t;
+        unsafe {
+            libc::signal(libc::SIGINT, handler);
+            libc::signal(libc::SIGTERM, handler);
+        }
+    }
+
+    pub fn terminated() -> bool {
+        TERMINATED.load(Ordering::SeqCst)
+    }
 }
 
 #[cfg(test)]
@@ -88,5 +320,34 @@ mod tests {
         let err = plan(&args).unwrap_err();
 
         assert!(err.to_string().contains("--backend-config"));
+    }
+
+    #[test]
+    fn nydusd_config_has_registry_backend_and_cache() {
+        let config = build_nydusd_config(
+            "registry.example.com",
+            "team/app",
+            Path::new("/w/cache"),
+            true,
+            true,
+        );
+        let backend = &config["device"]["backend"];
+        assert_eq!(backend["type"], "registry");
+        assert_eq!(backend["config"]["host"], "registry.example.com");
+        assert_eq!(backend["config"]["repo"], "team/app");
+        assert_eq!(backend["config"]["skip_verify"], true);
+        // Empty scheme -> nydusd auto-detects https/http.
+        assert_eq!(backend["config"]["scheme"], "");
+        assert_eq!(config["device"]["cache"]["config"]["work_dir"], "/w/cache");
+        assert_eq!(config["device"]["cache"]["type"], "blobcache");
+        assert_eq!(config["fs_prefetch"]["enable"], true);
+        assert_eq!(config["mode"], "direct");
+    }
+
+    #[test]
+    fn nydusd_config_prefetch_toggles_off() {
+        let config = build_nydusd_config("r.io", "a/b", Path::new("/c"), false, false);
+        assert_eq!(config["fs_prefetch"]["enable"], false);
+        assert_eq!(config["device"]["backend"]["config"]["skip_verify"], false);
     }
 }

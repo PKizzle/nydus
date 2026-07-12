@@ -2,14 +2,18 @@
 //
 // SPDX-License-Identifier: (Apache-2.0 AND BSD-3-Clause)
 
-use anyhow::Result;
+use std::path::Path;
+
+use anyhow::{Context, Result, anyhow, bail};
+use registry_client::types::{MEDIA_TYPE_OCI_MANIFEST, Manifest};
+use registry_client::{ImageReference, RegistryClient};
 use serde::Serialize;
-use tracing::info;
+use tracing::{debug, info};
 
 use crate::cli::CopyArgs;
+use crate::engine::oci::{blob_hex, client_options, fetch_platform_manifest};
 
 use super::common::{resolve_backend_config, resolve_platform, validate_platform_selection};
-use super::pending_operation;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct CopyPlan {
@@ -22,8 +26,142 @@ pub struct CopyPlan {
 
 pub async fn run(args: CopyArgs) -> Result<()> {
     let plan = plan(&args)?;
-    info!(source = %plan.source, target = ?plan.target, "validated nydusify-rs copy request");
-    Err(pending_operation("copy"))
+    if plan.all_platforms {
+        bail!(
+            "--all-platforms is not yet supported by nydusify-rs; copy one platform at a time with --platform (follow-up)"
+        );
+    }
+    let target = plan
+        .target
+        .clone()
+        .ok_or_else(|| anyhow!("copy requires --target"))?;
+
+    let source_ref = ImageReference::parse(&plan.source)
+        .with_context(|| format!("parse --source {}", plan.source))?;
+    let target_ref =
+        ImageReference::parse(&target).with_context(|| format!("parse --target {target}"))?;
+
+    let source_client = RegistryClient::new(
+        &source_ref.api_host,
+        client_options(args.source_insecure, false),
+    )
+    .context("build source registry client")?;
+    let target_client = RegistryClient::new(
+        &target_ref.api_host,
+        client_options(args.target_insecure, false),
+    )
+    .context("build target registry client")?;
+    let same_registry = source_ref.api_host == target_ref.api_host;
+
+    info!(source = %source_ref, target = %target_ref, platform = %plan.platform, "copying image");
+
+    // Resolve to a single-platform image manifest (index -> select).
+    let fetched = fetch_platform_manifest(
+        &source_client,
+        &source_ref.repo,
+        source_ref.manifest_reference(),
+        &plan.platform,
+    )
+    .await
+    .with_context(|| format!("fetch source manifest {source_ref}"))?;
+    let manifest: Manifest =
+        serde_json::from_slice(&fetched.bytes).context("parse source image manifest")?;
+
+    // Staging dir for blobs that must be downloaded then re-pushed.
+    ensure_dir(&args.work_dir)?;
+    let staging = tempfile::Builder::new()
+        .prefix("nydusify-copy-")
+        .tempdir_in(&args.work_dir)
+        .with_context(|| format!("create staging dir in {}", args.work_dir.display()))?;
+
+    // Copy the config blob and every layer.
+    copy_blob(
+        &source_client,
+        &source_ref.repo,
+        &target_client,
+        &target_ref.repo,
+        same_registry,
+        &manifest.config.digest,
+        staging.path(),
+    )
+    .await
+    .with_context(|| format!("copy image config {}", manifest.config.digest))?;
+    for layer in &manifest.layers {
+        copy_blob(
+            &source_client,
+            &source_ref.repo,
+            &target_client,
+            &target_ref.repo,
+            same_registry,
+            &layer.digest,
+            staging.path(),
+        )
+        .await
+        .with_context(|| format!("copy layer {}", layer.digest))?;
+    }
+
+    // Push the manifest last (its blobs now all exist in the target repo).
+    let media_type = fetched
+        .content_type
+        .as_deref()
+        .unwrap_or(MEDIA_TYPE_OCI_MANIFEST);
+    let pushed = target_client
+        .push_manifest(
+            &target_ref.repo,
+            target_ref.manifest_reference(),
+            media_type,
+            &fetched.bytes,
+        )
+        .await
+        .with_context(|| format!("push manifest to {target_ref}"))?;
+
+    info!(target = %target_ref, manifest = %pushed, layers = manifest.layers.len(), "copy complete");
+    Ok(())
+}
+
+/// Copy one blob from the source repo to the target repo. Order of preference:
+/// skip if the target already has it (HEAD-dedup), cross-repo mount when both
+/// repos are on the same registry, else download to `staging` and re-push.
+#[allow(clippy::too_many_arguments)]
+async fn copy_blob(
+    source_client: &RegistryClient,
+    source_repo: &str,
+    target_client: &RegistryClient,
+    target_repo: &str,
+    same_registry: bool,
+    digest: &str,
+    staging: &Path,
+) -> Result<()> {
+    if target_client.head_blob(target_repo, digest).await? {
+        debug!(%digest, "blob already present in target; skipping");
+        return Ok(());
+    }
+    if same_registry
+        && source_repo != target_repo
+        && target_client
+            .mount_blob(target_repo, digest, source_repo)
+            .await
+            .unwrap_or(false)
+    {
+        debug!(%digest, from = %source_repo, "cross-repo mounted blob");
+        return Ok(());
+    }
+    let tmp = staging.join(blob_hex(digest));
+    source_client
+        .get_blob_to_file(source_repo, digest, &tmp)
+        .await
+        .with_context(|| format!("download blob {digest}"))?;
+    target_client
+        .push_blob_file(target_repo, &tmp)
+        .await
+        .with_context(|| format!("push blob {digest}"))?;
+    let _ = std::fs::remove_file(&tmp);
+    Ok(())
+}
+
+fn ensure_dir(path: &Path) -> Result<()> {
+    std::fs::create_dir_all(path)
+        .with_context(|| format!("create work directory {}", path.display()))
 }
 
 pub fn plan(args: &CopyArgs) -> Result<CopyPlan> {

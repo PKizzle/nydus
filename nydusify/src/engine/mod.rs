@@ -6,3 +6,4 @@ pub mod artifact;
 pub mod containerd_converter;
 pub mod converter;
 pub mod manifest;
+pub mod oci;

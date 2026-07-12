@@ -32,7 +32,7 @@ use std::process::Command;
 
 use anyhow::{Context, Result, anyhow, bail};
 use registry_client::types::Manifest;
-use registry_client::{Descriptor, ImageReference, Index, RegistryClient, RegistryClientOptions};
+use registry_client::{Descriptor, ImageReference, Index, RegistryClient};
 use tracing::{debug, info, warn};
 
 use crate::commands::convert::ConversionMode;
@@ -42,6 +42,7 @@ use crate::engine::manifest::{
     assemble_manifest, bootstrap_descriptor, config_media_type, data_blob_descriptor,
     manifest_media_type,
 };
+use crate::engine::oci::{blob_hex, client_options, is_index, select_platform};
 
 /// A source rootfs layer pulled to disk.
 #[derive(Clone, Debug)]
@@ -184,14 +185,6 @@ fn reject_unsupported(request: &ConvertRequest) -> Result<()> {
     Ok(())
 }
 
-fn client_options(insecure: bool, plain_http: bool) -> RegistryClientOptions {
-    RegistryClientOptions {
-        plain_http,
-        insecure_tls: insecure,
-        ..RegistryClientOptions::default()
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Pull
 // ---------------------------------------------------------------------------
@@ -264,69 +257,6 @@ async fn pull_source(
         config_bytes,
         layers,
     })
-}
-
-/// Whether a fetched manifest is an image index / manifest list. Uses the
-/// declared content type when present, else a structural fallback.
-fn is_index(content_type: Option<&str>, bytes: &[u8]) -> bool {
-    if let Some(ct) = content_type {
-        if ct.contains("index") || ct.contains("manifest.list") {
-            return true;
-        }
-        if ct.contains("manifest.v") {
-            return false;
-        }
-    }
-    // Structural fallback: an index has a non-empty `manifests` array and no
-    // `config` (which every image manifest has).
-    match serde_json::from_slice::<serde_json::Value>(bytes) {
-        Ok(v) => v.get("config").is_none() && v.get("manifests").is_some_and(|m| m.is_array()),
-        Err(_) => false,
-    }
-}
-
-/// Parse a `os/arch[/variant]` platform selector.
-fn parse_platform(selector: &str) -> Result<(String, String, Option<String>)> {
-    let mut parts = selector.split('/');
-    let os = parts
-        .next()
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| anyhow!("empty platform selector"))?;
-    let arch = parts.next().filter(|s| !s.is_empty()).ok_or_else(|| {
-        anyhow!("platform {selector:?} is missing an architecture (want os/arch)")
-    })?;
-    let variant = parts.next().filter(|s| !s.is_empty()).map(str::to_string);
-    Ok((os.to_string(), arch.to_string(), variant))
-}
-
-/// Select the manifest descriptor matching `platform_selector` from an index.
-fn select_platform<'a>(index: &'a Index, platform_selector: &str) -> Result<&'a Descriptor> {
-    let (os, arch, variant) = parse_platform(platform_selector)?;
-    let matches = |d: &&Descriptor| {
-        d.platform.as_ref().is_some_and(|p| {
-            p.os == os
-                && p.architecture == arch
-                && variant
-                    .as_ref()
-                    .is_none_or(|v| p.variant.as_deref() == Some(v.as_str()))
-        })
-    };
-    if let Some(found) = index.manifests.iter().find(matches) {
-        return Ok(found);
-    }
-    let available: Vec<String> = index
-        .manifests
-        .iter()
-        .filter_map(|d| d.platform.as_ref())
-        .map(|p| match &p.variant {
-            Some(v) => format!("{}/{}/{}", p.os, p.architecture, v),
-            None => format!("{}/{}", p.os, p.architecture),
-        })
-        .collect();
-    bail!(
-        "no manifest in the source index matches platform {platform_selector:?}; available: [{}]",
-        available.join(", ")
-    )
 }
 
 // ---------------------------------------------------------------------------
@@ -651,15 +581,6 @@ fn write_output_json(
 // Subprocess + fs helpers (mirrors local_accel.rs)
 // ---------------------------------------------------------------------------
 
-/// Bare lowercase hex of an OCI digest (strips an `algo:` prefix). This is how
-/// nydus names data blobs and keys the localfs/registry backend.
-fn blob_hex(digest: &str) -> &str {
-    match digest.split_once(':') {
-        Some((_algo, hex)) => hex,
-        None => digest,
-    }
-}
-
 fn file_len(path: &Path) -> Result<u64> {
     Ok(std::fs::metadata(path)
         .with_context(|| format!("stat {}", path.display()))?
@@ -736,19 +657,11 @@ fn link_or_copy(target: &Path, link: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use registry_client::Platform;
-    use registry_client::types::{MEDIA_TYPE_OCI_INDEX, MEDIA_TYPE_OCI_MANIFEST};
 
     fn to_strings(args: &[OsString]) -> Vec<String> {
         args.iter()
             .map(|a| a.to_string_lossy().into_owned())
             .collect()
-    }
-
-    #[test]
-    fn blob_hex_strips_algorithm() {
-        assert_eq!(blob_hex("sha256:deadbeef"), "deadbeef");
-        assert_eq!(blob_hex("cafef00d"), "cafef00d");
     }
 
     #[test]
@@ -819,81 +732,5 @@ mod tests {
             parse_prefetch_files("/a, /b ,/"),
             vec!["/a".to_string(), "/b".to_string()]
         );
-    }
-
-    #[test]
-    fn index_detection_by_content_type_and_structure() {
-        assert!(is_index(Some(MEDIA_TYPE_OCI_INDEX), b"{}"));
-        assert!(is_index(
-            Some("application/vnd.docker.distribution.manifest.list.v2+json"),
-            b"{}"
-        ));
-        assert!(!is_index(Some(MEDIA_TYPE_OCI_MANIFEST), b"{}"));
-        // Structural fallback (no content type): manifests[] and no config.
-        assert!(is_index(None, br#"{"manifests":[{"digest":"sha256:a"}]}"#));
-        assert!(!is_index(
-            None,
-            br#"{"config":{"digest":"sha256:c"},"layers":[]}"#
-        ));
-    }
-
-    fn platform_desc(os: &str, arch: &str, variant: Option<&str>, digest: &str) -> Descriptor {
-        Descriptor {
-            media_type: MEDIA_TYPE_OCI_MANIFEST.to_string(),
-            digest: digest.to_string(),
-            platform: Some(Platform {
-                architecture: arch.to_string(),
-                os: os.to_string(),
-                variant: variant.map(str::to_string),
-                ..Platform::default()
-            }),
-            ..Descriptor::default()
-        }
-    }
-
-    fn index_of(descs: Vec<Descriptor>) -> Index {
-        Index {
-            schema_version: 2,
-            media_type: Some(MEDIA_TYPE_OCI_INDEX.to_string()),
-            manifests: descs,
-            annotations: None,
-        }
-    }
-
-    #[test]
-    fn select_platform_matches_os_arch_and_variant() {
-        let index = index_of(vec![
-            platform_desc("linux", "amd64", None, "sha256:amd"),
-            platform_desc("linux", "arm64", Some("v8"), "sha256:arm"),
-        ]);
-        assert_eq!(
-            select_platform(&index, "linux/amd64").unwrap().digest,
-            "sha256:amd"
-        );
-        assert_eq!(
-            select_platform(&index, "linux/arm64").unwrap().digest,
-            "sha256:arm"
-        );
-        assert_eq!(
-            select_platform(&index, "linux/arm64/v8").unwrap().digest,
-            "sha256:arm"
-        );
-    }
-
-    #[test]
-    fn select_platform_reports_available_on_miss() {
-        let index = index_of(vec![platform_desc("linux", "amd64", None, "sha256:amd")]);
-        let err = select_platform(&index, "linux/ppc64le").unwrap_err();
-        let msg = err.to_string();
-        assert!(msg.contains("linux/ppc64le"));
-        assert!(msg.contains("linux/amd64"));
-    }
-
-    #[test]
-    fn parse_platform_requires_arch() {
-        assert!(parse_platform("linux").is_err());
-        let (os, arch, variant) = parse_platform("linux/arm/v7").unwrap();
-        assert_eq!((os.as_str(), arch.as_str()), ("linux", "arm"));
-        assert_eq!(variant.as_deref(), Some("v7"));
     }
 }

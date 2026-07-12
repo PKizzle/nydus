@@ -4492,6 +4492,7 @@ dependencies = [
  "anyhow",
  "clap",
  "compio",
+ "libc",
  "registry-client",
  "serde",
  "serde_json",
