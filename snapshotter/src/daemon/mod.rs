@@ -14,13 +14,13 @@ pub(crate) mod auth;
 pub mod config_builder;
 pub mod image_ref;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io;
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
@@ -153,6 +153,14 @@ struct DaemonInstance {
     bootstrap: PathBuf,
     daemon: Arc<dyn NydusDaemon>,
     refcount: AtomicUsize,
+    /// Snapshot keys currently holding a reference on this daemon. Acquisition
+    /// is idempotent per key (`acquire_holder`), so repeated `Mounts` RPCs for
+    /// the same snapshot no longer inflate `refcount` — the drift that used to
+    /// make daemons immortal. `refcount` can exceed `holders.len()` after a
+    /// restore: the persisted record carries only a count, not the keys, so the
+    /// difference is "ballast" that `release_holder` drains on releases for
+    /// unknown keys (pre-restart holders being removed).
+    holders: StdMutex<HashSet<String>>,
     /// Mio poller kept alive for the entire lifetime of the daemon - the
     /// `Waker` we pass into `create_fuse_daemon` borrows its registry.
     _poll: Arc<Mutex<Poll>>,
@@ -160,6 +168,37 @@ struct DaemonInstance {
     /// a successor can take its mount over. When false, the mount must be
     /// unmounted on shutdown rather than left held (which would wedge in D-state).
     failover_armed: AtomicBool,
+}
+
+impl DaemonInstance {
+    /// Idempotently register `holder` (a snapshot key) as a user of this
+    /// daemon. Only the first acquisition per key bumps `refcount`.
+    fn acquire_holder(&self, holder: &str) {
+        let mut holders = self.holders.lock().unwrap();
+        if holders.insert(holder.to_string()) {
+            self.refcount.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    /// Drop `holder`'s reference and return the remaining refcount.
+    ///
+    /// A release for a key that never acquired is a no-op — unless `refcount`
+    /// still exceeds the tracked holder count, in which case the release drains
+    /// restore ballast (see the `holders` field docs) so restored daemons can
+    /// still reach zero and tear down.
+    fn release_holder(&self, holder: &str) -> usize {
+        let mut holders = self.holders.lock().unwrap();
+        let tracked = holders.remove(holder);
+        let current = self.refcount.load(Ordering::SeqCst);
+        if tracked || current > holders.len() {
+            if current == 0 {
+                return 0;
+            }
+            self.refcount.fetch_sub(1, Ordering::SeqCst).saturating_sub(1)
+        } else {
+            current
+        }
+    }
 }
 
 /// Lightweight daemon facade for the host-mounted blockdev/EROFS path.
@@ -251,6 +290,14 @@ pub struct DaemonSupervisor {
     config: SnapshotterConfig,
     build_info: BuildTimeInfo,
     instances: RwLock<HashMap<String, Arc<DaemonInstance>>>,
+    /// Per-image startup serialization. Daemon startup (mount syscalls plus a
+    /// wait-for-RUNNING loop of up to `startup_timeout`) must never run while
+    /// holding the global `instances` write lock — that stalled every other
+    /// gRPC RPC behind one slow daemon. Instead, concurrent ensures of the
+    /// *same* image take turns on its entry here while ensures of other images
+    /// proceed untouched. Entries are never evicted; the map is bounded by the
+    /// number of distinct images the node has served.
+    start_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     startup_timeout: Duration,
 }
 
@@ -270,17 +317,89 @@ impl DaemonSupervisor {
                 rustc: String::new(),
             },
             instances: RwLock::new(HashMap::new()),
+            start_locks: Mutex::new(HashMap::new()),
             startup_timeout: Duration::from_secs(30),
         }
     }
 
+    /// Take the per-image startup lock for `image_ref` (see `start_locks`).
+    async fn start_lock(&self, image_ref: &str) -> Arc<Mutex<()>> {
+        let mut locks = self.start_locks.lock().await;
+        locks.entry(image_ref.to_string()).or_default().clone()
+    }
+
+    /// Fast path shared by the `ensure_*` entry points: if a healthy daemon for
+    /// `image_ref` already serves `bootstrap`, register `holder` on it and
+    /// return a handle. `None` means the caller must take the slow (startup)
+    /// path.
+    async fn try_reuse_instance(
+        &self,
+        image_ref: &str,
+        bootstrap: &Path,
+        holder: &str,
+    ) -> Option<Arc<MountHandle>> {
+        let instances = self.instances.read().await;
+        let inst = instances.get(image_ref)?;
+        if inst.bootstrap != bootstrap
+            || !matches!(
+                inst.daemon.get_state(),
+                DaemonState::RUNNING | DaemonState::READY
+            )
+        {
+            return None;
+        }
+        inst.acquire_holder(holder);
+        if let Err(e) = self.persist_instance_record(inst, true) {
+            warn!(image_ref, error = %e, "failed to persist daemon record");
+        }
+        Some(Arc::new(MountHandle {
+            image_ref: image_ref.to_string(),
+            mountpoint: inst.mountpoint.clone(),
+            daemon: inst.daemon.clone(),
+        }))
+    }
+
+    /// Slow-path guard shared by the `ensure_*` entry points, run under the
+    /// per-image start lock: refuse to replace a *healthy* daemon that serves
+    /// different content (its mount is live — replacing would leak its FUSE
+    /// threads and stack a new mount over the held one), and stop + remove an
+    /// unhealthy one before the caller starts a replacement. Mirrors
+    /// `spawn_instance`.
+    async fn evict_replaceable_instance(&self, image_ref: &str, bootstrap: &Path) -> Result<()> {
+        let mut instances = self.instances.write().await;
+        if let Some(inst) = instances.get(image_ref) {
+            if is_healthy_state(inst.daemon.get_state()) {
+                bail!(
+                    "daemon {image_ref} is already serving bootstrap {}; refusing to replace it \
+                     with {} while it is healthy",
+                    inst.bootstrap.display(),
+                    bootstrap.display()
+                );
+            }
+            if let Some(old) = instances.remove(image_ref) {
+                warn!(image_ref, "replacing unhealthy daemon");
+                if let Err(e) = stop_instance(&old) {
+                    warn!(image_ref, error = %e, "failed to stop unhealthy daemon before replacement");
+                }
+                if let Err(e) = self.persist_instance_record(&old, false) {
+                    warn!(image_ref, error = %e, "failed to persist stopped daemon record");
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Start or retrieve a FUSE daemon serving `image_ref` from `bootstrap`.
     ///
-    /// Increments the reference count on every call.
+    /// `holder` is the snapshot key requesting the mount; acquisition is
+    /// idempotent per key, so repeated calls for the same snapshot (containerd
+    /// re-issues `Mounts` on every container restart) do not inflate the
+    /// refcount. Balance with [`release`](Self::release) using the same key.
     pub async fn ensure_instance(
         &self,
         image_ref: &str,
         bootstrap: &Path,
+        holder: &str,
     ) -> Result<Arc<MountHandle>> {
         if image_ref.is_empty() {
             bail!("image reference must be non-empty to mount a Nydus image");
@@ -292,56 +411,31 @@ impl DaemonSupervisor {
             );
         }
 
-        {
-            let instances = self.instances.read().await;
-            if let Some(inst) = instances.get(image_ref)
-                && inst.bootstrap == bootstrap
-                && matches!(
-                    inst.daemon.get_state(),
-                    DaemonState::RUNNING | DaemonState::READY
-                )
-            {
-                inst.refcount.fetch_add(1, Ordering::SeqCst);
-                if let Err(e) = self.persist_instance_record(inst, true) {
-                    warn!(image_ref, error = %e, "failed to persist daemon record");
-                }
-                return Ok(Arc::new(MountHandle {
-                    image_ref: image_ref.to_string(),
-                    mountpoint: inst.mountpoint.clone(),
-                    daemon: inst.daemon.clone(),
-                }));
-            }
+        if let Some(handle) = self.try_reuse_instance(image_ref, bootstrap, holder).await {
+            return Ok(handle);
         }
 
-        let mut instances = self.instances.write().await;
-        if let Some(inst) = instances.get(image_ref)
-            && inst.bootstrap == bootstrap
-            && matches!(
-                inst.daemon.get_state(),
-                DaemonState::RUNNING | DaemonState::READY
-            )
-        {
-            inst.refcount.fetch_add(1, Ordering::SeqCst);
-            if let Err(e) = self.persist_instance_record(inst, true) {
-                warn!(image_ref, error = %e, "failed to persist daemon record");
-            }
-            return Ok(Arc::new(MountHandle {
-                image_ref: image_ref.to_string(),
-                mountpoint: inst.mountpoint.clone(),
-                daemon: inst.daemon.clone(),
-            }));
+        // Startup path: serialize per image, never under the global lock.
+        let start_lock = self.start_lock(image_ref).await;
+        let _guard = start_lock.lock().await;
+
+        if let Some(handle) = self.try_reuse_instance(image_ref, bootstrap, holder).await {
+            return Ok(handle);
         }
+        self.evict_replaceable_instance(image_ref, bootstrap)
+            .await?;
 
         let instance = self
             .start_instance(image_ref, bootstrap)
             .await
             .with_context(|| format!("failed to start nydus daemon for {image_ref}"))?;
-        instance.refcount.fetch_add(1, Ordering::SeqCst);
+        instance.acquire_holder(holder);
         let handle = MountHandle {
             image_ref: image_ref.to_string(),
             mountpoint: instance.mountpoint.clone(),
             daemon: instance.daemon.clone(),
         };
+        let mut instances = self.instances.write().await;
         instances.insert(image_ref.to_string(), instance);
         if let Some(inst) = instances.get(image_ref)
             && let Err(e) = self.persist_instance_record(inst, true)
@@ -359,16 +453,18 @@ impl DaemonSupervisor {
     /// optional packed prefetch blob).
     ///
     /// Dedup is by `image_ref`, same as `ensure_instance`. A daemon already
-    /// running with a *registry* backend for the same image cannot be reused
-    /// (different mount source); the auto-accel call replaces it on the next
-    /// snapshot release. For now we require the existing instance — if any —
-    /// to already be the local variant; otherwise we bail out and the caller
-    /// falls back to the overlay path.
+    /// running with a different mount source for the same image (e.g. a
+    /// *registry*-backend daemon from the referrer path) is never replaced
+    /// while healthy — `evict_replaceable_instance` bails and the caller falls
+    /// back to the overlay path; an unhealthy one is stopped and replaced.
+    /// `holder` follows the same idempotent-per-snapshot-key contract as
+    /// [`ensure_instance`](Self::ensure_instance).
     pub async fn ensure_instance_local(
         &self,
         image_ref: &str,
         bootstrap: &Path,
         backend_dir: &Path,
+        holder: &str,
     ) -> Result<Arc<MountHandle>> {
         if image_ref.is_empty() {
             bail!("image reference must be non-empty to mount an auto-accel sidecar");
@@ -386,56 +482,30 @@ impl DaemonSupervisor {
             );
         }
 
-        {
-            let instances = self.instances.read().await;
-            if let Some(inst) = instances.get(image_ref)
-                && inst.bootstrap == bootstrap
-                && matches!(
-                    inst.daemon.get_state(),
-                    DaemonState::RUNNING | DaemonState::READY
-                )
-            {
-                inst.refcount.fetch_add(1, Ordering::SeqCst);
-                if let Err(e) = self.persist_instance_record(inst, true) {
-                    warn!(image_ref, error = %e, "failed to persist daemon record");
-                }
-                return Ok(Arc::new(MountHandle {
-                    image_ref: image_ref.to_string(),
-                    mountpoint: inst.mountpoint.clone(),
-                    daemon: inst.daemon.clone(),
-                }));
-            }
+        if let Some(handle) = self.try_reuse_instance(image_ref, bootstrap, holder).await {
+            return Ok(handle);
         }
 
-        let mut instances = self.instances.write().await;
-        if let Some(inst) = instances.get(image_ref)
-            && inst.bootstrap == bootstrap
-            && matches!(
-                inst.daemon.get_state(),
-                DaemonState::RUNNING | DaemonState::READY
-            )
-        {
-            inst.refcount.fetch_add(1, Ordering::SeqCst);
-            if let Err(e) = self.persist_instance_record(inst, true) {
-                warn!(image_ref, error = %e, "failed to persist daemon record");
-            }
-            return Ok(Arc::new(MountHandle {
-                image_ref: image_ref.to_string(),
-                mountpoint: inst.mountpoint.clone(),
-                daemon: inst.daemon.clone(),
-            }));
+        let start_lock = self.start_lock(image_ref).await;
+        let _guard = start_lock.lock().await;
+
+        if let Some(handle) = self.try_reuse_instance(image_ref, bootstrap, holder).await {
+            return Ok(handle);
         }
+        self.evict_replaceable_instance(image_ref, bootstrap)
+            .await?;
 
         let instance = self
             .start_local_instance(image_ref, bootstrap, backend_dir)
             .await
             .with_context(|| format!("failed to start auto-accel daemon for {image_ref}"))?;
-        instance.refcount.fetch_add(1, Ordering::SeqCst);
+        instance.acquire_holder(holder);
         let handle = MountHandle {
             image_ref: image_ref.to_string(),
             mountpoint: instance.mountpoint.clone(),
             daemon: instance.daemon.clone(),
         };
+        let mut instances = self.instances.write().await;
         instances.insert(image_ref.to_string(), instance);
         if let Some(inst) = instances.get(image_ref)
             && let Err(e) = self.persist_instance_record(inst, true)
@@ -521,7 +591,9 @@ impl DaemonSupervisor {
         )
         .map_err(|e| anyhow::anyhow!("failed to create auto-accel fanotify daemon: {e}"))?;
 
-        wait_for_running(&*daemon, self.startup_timeout).with_context(|| {
+        wait_for_running_off_reactor(daemon.clone(), self.startup_timeout)
+            .await
+            .with_context(|| {
             format!("auto-accel daemon for {image_ref_str} never reached RUNNING")
         })?;
 
@@ -546,6 +618,7 @@ impl DaemonSupervisor {
             bootstrap: bootstrap.to_path_buf(),
             daemon,
             refcount: AtomicUsize::new(0),
+            holders: StdMutex::new(HashSet::new()),
             failover_armed: AtomicBool::new(armed),
             _poll: poll,
         }))
@@ -607,17 +680,14 @@ impl DaemonSupervisor {
         Ok(record)
     }
 
-    /// Decrement the reference count and tear the daemon down if no callers
-    /// remain.
-    pub async fn release(&self, image_ref: &str) -> Result<()> {
+    /// Drop `holder`'s reference on the daemon serving `image_ref` and tear the
+    /// daemon down if no holders remain. A release for a key that never
+    /// acquired is a no-op (modulo restore ballast — see `DaemonInstance::holders`),
+    /// so double-removes cannot underflow another snapshot's reference.
+    pub async fn release(&self, image_ref: &str, holder: &str) -> Result<()> {
         let mut instances = self.instances.write().await;
         let should_stop = if let Some(inst) = instances.get(image_ref) {
-            let prev = inst.refcount.load(Ordering::SeqCst);
-            if prev == 0 {
-                false
-            } else {
-                inst.refcount.fetch_sub(1, Ordering::SeqCst) <= 1
-            }
+            inst.release_holder(holder) == 0
         } else {
             return Ok(());
         };
@@ -926,6 +996,7 @@ impl DaemonSupervisor {
                 bootstrap: bootstrap.to_path_buf(),
                 daemon,
                 refcount: AtomicUsize::new(0),
+            holders: StdMutex::new(HashSet::new()),
                 _poll: poll,
                 // Blockdev/EROFS export has no fuse fd to preserve.
                 failover_armed: AtomicBool::new(false),
@@ -973,7 +1044,8 @@ impl DaemonSupervisor {
         )
         .with_context(|| format!("failed to create fuse daemon at {}", mountpoint.display()))?;
 
-        wait_for_running(&*daemon, self.startup_timeout)
+        wait_for_running_off_reactor(daemon.clone(), self.startup_timeout)
+            .await
             .with_context(|| format!("nydus daemon for {image_ref_str} never reached RUNNING"))?;
 
         info!(
@@ -996,6 +1068,7 @@ impl DaemonSupervisor {
             bootstrap: bootstrap.to_path_buf(),
             daemon,
             refcount: AtomicUsize::new(0),
+            holders: StdMutex::new(HashSet::new()),
             failover_armed: AtomicBool::new(armed),
             _poll: poll,
         }))
@@ -1200,7 +1273,9 @@ impl DaemonSupervisor {
         daemon
             .trigger_start()
             .map_err(|e| anyhow::anyhow!("trigger_start: {e}"))?;
-        wait_for_running(&*daemon, self.startup_timeout).with_context(|| {
+        wait_for_running_off_reactor(daemon.clone(), self.startup_timeout)
+            .await
+            .with_context(|| {
             format!("restored daemon for {image_ref_str} never reached RUNNING")
         })?;
 
@@ -1210,6 +1285,7 @@ impl DaemonSupervisor {
             bootstrap,
             daemon,
             refcount: AtomicUsize::new(record.refcount.max(1)),
+            holders: StdMutex::new(HashSet::new()),
             _poll: poll,
             // The fd stays in systemd's store across restarts, so this daemon is
             // still recoverable by the next successor.
@@ -1580,6 +1656,12 @@ fn stop_instance(inst: &DaemonInstance) -> Result<()> {
     Ok(())
 }
 
+/// Poll the daemon state machine until RUNNING (or failure/timeout).
+///
+/// This can spin for up to `timeout` (30 s) and the ensure paths run on the
+/// shared compio gRPC runtime, so callers MUST go through
+/// [`wait_for_running_off_reactor`] — a `thread::sleep` inline on the reactor
+/// stalled every in-flight RPC behind one slow daemon start.
 fn wait_for_running(daemon: &dyn NydusDaemon, timeout: Duration) -> Result<()> {
     let deadline = Instant::now() + timeout;
     loop {
@@ -1593,6 +1675,16 @@ fn wait_for_running(daemon: &dyn NydusDaemon, timeout: Duration) -> Result<()> {
         }
         std::thread::sleep(Duration::from_millis(50));
     }
+}
+
+/// Run [`wait_for_running`] on the blocking pool. Deliberately NOT a
+/// `compio::time::sleep` loop: compio futures are `!Send`, and the ensure
+/// paths must stay `Send` for the tonic `Snapshots` trait's futures.
+async fn wait_for_running_off_reactor(
+    daemon: Arc<dyn NydusDaemon>,
+    timeout: Duration,
+) -> Result<()> {
+    blocking::unblock(move || wait_for_running(&*daemon, timeout)).await
 }
 
 /// Runtime directory for failover supervisor sockets. Kept short and on a
@@ -1649,6 +1741,61 @@ mod tests {
             slug_for("docker.io/library/nginx:1"),
             slug_for("docker.io/library/nginx:2")
         );
+    }
+
+    fn test_instance() -> DaemonInstance {
+        let daemon: Arc<dyn NydusDaemon> = Arc::new(BlockdevDaemon::new(
+            "holder-test".to_string(),
+            PathBuf::from("/tmp/nydus-holder-test"),
+            BuildTimeInfo {
+                package_ver: "test".to_string(),
+                git_commit: String::new(),
+                build_time: String::new(),
+                profile: "test".to_string(),
+                rustc: String::new(),
+            },
+        ));
+        DaemonInstance {
+            image_ref: "img".into(),
+            mountpoint: PathBuf::from("/tmp/nydus-holder-test"),
+            bootstrap: PathBuf::from("/tmp/bootstrap"),
+            daemon,
+            refcount: AtomicUsize::new(0),
+            holders: StdMutex::new(HashSet::new()),
+            _poll: Arc::new(Mutex::new(Poll::new().unwrap())),
+            failover_armed: AtomicBool::new(false),
+        }
+    }
+
+    #[test]
+    fn holder_acquisition_is_idempotent_per_key() {
+        // Regression: refcount used to bump on every ensure call, so repeated
+        // Mounts RPCs for the same snapshot made daemons immortal.
+        let inst = test_instance();
+        inst.acquire_holder("snap-a");
+        inst.acquire_holder("snap-a");
+        inst.acquire_holder("snap-a");
+        inst.acquire_holder("snap-b");
+        assert_eq!(inst.refcount.load(Ordering::SeqCst), 2);
+
+        // Releasing an unknown key is a no-op (no ballast present).
+        assert_eq!(inst.release_holder("never-acquired"), 2);
+        assert_eq!(inst.release_holder("snap-a"), 1);
+        // Double-release of the same key cannot underflow another key's ref.
+        assert_eq!(inst.release_holder("snap-a"), 1);
+        assert_eq!(inst.release_holder("snap-b"), 0);
+    }
+
+    #[test]
+    fn release_drains_restore_ballast_for_unknown_keys() {
+        // A restored record carries only a count; releases for pre-restart
+        // keys (which we can't identify) must still drain it to zero so
+        // restored daemons can tear down.
+        let inst = test_instance();
+        inst.refcount.store(2, Ordering::SeqCst);
+        assert_eq!(inst.release_holder("old-snap-1"), 1);
+        assert_eq!(inst.release_holder("old-snap-2"), 0);
+        assert_eq!(inst.release_holder("old-snap-3"), 0);
     }
 
     #[test]

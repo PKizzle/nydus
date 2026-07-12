@@ -372,10 +372,15 @@ impl NydusSnapshotter {
     /// Ensure the Nydus daemon for `parent`'s rootfs is mounted, then return
     /// its mountpoint and a snapshot of the underlying meta info. Returns
     /// `Ok(None)` when the parent chain does not include a Nydus meta layer.
+    ///
+    /// `holder` is the snapshot key on whose behalf the daemon is resolved; the
+    /// supervisor registers it idempotently, so repeated `Mounts` RPCs for a
+    /// key no longer inflate the daemon refcount.
     async fn resolve_nydus_mount(
         &self,
         parent: &str,
         call_labels: &HashMap<String, String>,
+        holder: &str,
     ) -> Result<Option<(NydusMetaInfo, PathBuf)>, SnapshotterError> {
         let store = self.store.as_ref();
         let meta = self
@@ -387,7 +392,7 @@ impl NydusSnapshotter {
         };
         let handle = self
             .supervisor
-            .ensure_instance(&meta.image_ref, &meta.bootstrap)
+            .ensure_instance(&meta.image_ref, &meta.bootstrap, holder)
             .await
             .map_err(|e| {
                 warn!(image_ref = %meta.image_ref, error = %e, "failed to start nydus daemon");
@@ -395,6 +400,33 @@ impl NydusSnapshotter {
             })?;
         let mountpoint = handle.mountpoint().to_path_buf();
         Ok(Some((meta, mountpoint)))
+    }
+
+    /// Stamp `image_ref` into the [`labels::NYDUS_DAEMON_IMAGE_REF`] label of
+    /// snapshot `key`, so `remove(key)` can release the daemon reference the
+    /// key acquired. Best-effort: on failure the daemon simply stays referenced
+    /// (the pre-existing behaviour for these mount types), which is logged.
+    fn stamp_daemon_ref_label(&self, key: &str, image_ref: &str) {
+        use crate::source::labels::NYDUS_DAEMON_IMAGE_REF;
+        let store = self.store.as_ref();
+        let merged = store.stat(key).map(|info| {
+            let mut labels: Vec<(String, String)> = info
+                .labels
+                .into_iter()
+                .filter(|(k, _)| k != NYDUS_DAEMON_IMAGE_REF)
+                .collect();
+            labels.push((NYDUS_DAEMON_IMAGE_REF.to_string(), image_ref.to_string()));
+            labels
+        });
+        let result = merged.and_then(|labels| store.update(key, &labels));
+        if let Err(e) = result {
+            warn!(
+                key,
+                image_ref,
+                error = %e,
+                "failed to stamp daemon-ref label; daemon release on remove() will miss this key"
+            );
+        }
     }
 
     /// Resolve a sidecar-backed auto-accel mount for `image_ref` if one is
@@ -410,6 +442,7 @@ impl NydusSnapshotter {
     async fn resolve_auto_accel_mount(
         &self,
         image_ref: &str,
+        holder: &str,
     ) -> Result<Option<PathBuf>, SnapshotterError> {
         let (Some(discovery), Some(lookup), Some(content_root)) = (
             self.auto_accel_discovery.as_ref(),
@@ -441,7 +474,7 @@ impl NydusSnapshotter {
         // tells the operator why acceleration is off.
         let handle = match self
             .supervisor
-            .ensure_instance_local(image_ref, &staged.bootstrap, &staged.backend_dir)
+            .ensure_instance_local(image_ref, &staged.bootstrap, &staged.backend_dir, holder)
             .await
         {
             Ok(handle) => handle,
@@ -558,11 +591,17 @@ impl snapshots::Snapshotter for NydusSnapshotter {
         let timer = self.metrics.start_snapshot_operation("usage");
         let result = async {
             debug!(key, "usage snapshot");
-            let store = self.store.as_ref();
-            let (size, inodes) = self.overlay.usage(store, &key).map_err(|e| {
-                warn!(key, error = %e, "usage snapshot failed");
-                SnapshotterError::internal(e.to_string())
-            })?;
+            // Full recursive stat walk of the snapshot tree — offload it so a
+            // large snapshot cannot stall the shared gRPC reactor thread.
+            let overlay = self.overlay.clone();
+            let store = Arc::clone(&self.store);
+            let walk_key = key.clone();
+            let (size, inodes) = blocking::unblock(move || overlay.usage(&store, &walk_key))
+                .await
+                .map_err(|e| {
+                    warn!(key, error = %e, "usage snapshot failed");
+                    SnapshotterError::internal(e.to_string())
+                })?;
             Ok(Usage { inodes, size })
         }
         .await;
@@ -582,7 +621,7 @@ impl snapshots::Snapshotter for NydusSnapshotter {
             let parent = info.parent.clone().unwrap_or_default();
             let labels = info.labels.clone();
 
-            if let Some((_, daemon_mnt)) = self.resolve_nydus_mount(&parent, &labels).await? {
+            if let Some((_, daemon_mnt)) = self.resolve_nydus_mount(&parent, &labels, &key).await? {
                 return Ok(self.rewrite_mounts_with_daemon(&key, &daemon_mnt, readonly));
             }
 
@@ -621,7 +660,7 @@ impl snapshots::Snapshotter for NydusSnapshotter {
 
             match outcome {
                 PrepareOutcome::Mounts(mounts) => {
-                    if let Some((_, daemon_mnt)) = self.resolve_nydus_mount(&parent, &labels).await? {
+                    if let Some((_, daemon_mnt)) = self.resolve_nydus_mount(&parent, &labels, &key).await? {
                         debug!(key, parent, mountpoint = %daemon_mnt.display(), "prepared nydus rootfs");
                         return Ok(self.rewrite_mounts_with_daemon(&key, &daemon_mnt, false));
                     }
@@ -670,9 +709,13 @@ impl snapshots::Snapshotter for NydusSnapshotter {
                     // original gzip layers stay where they are; the daemon
                     // serves them on demand from the merged bootstrap.
                     if let Some(image_ref) = image_ref.as_deref()
-                        && let Some(daemon_mnt) = self.resolve_auto_accel_mount(image_ref).await?
+                        && let Some(daemon_mnt) =
+                            self.resolve_auto_accel_mount(image_ref, &key).await?
                     {
                         debug!(key, parent, mountpoint = %daemon_mnt.display(), "prepared auto-accel rootfs");
+                        // No nydus meta layer exists in this chain for remove()
+                        // to find the daemon by — record it on the snapshot.
+                        self.stamp_daemon_ref_label(&key, image_ref);
                         return Ok(self.rewrite_mounts_with_daemon(&key, &daemon_mnt, false));
                     }
 
@@ -738,7 +781,7 @@ impl snapshots::Snapshotter for NydusSnapshotter {
                                         match materialized {
                                             Ok(bootstrap) => match self
                                                 .supervisor
-                                                .ensure_instance(image_ref, &bootstrap)
+                                                .ensure_instance(image_ref, &bootstrap, &key)
                                                 .await
                                             {
                                                 Ok(handle) => {
@@ -750,6 +793,10 @@ impl snapshots::Snapshotter for NydusSnapshotter {
                                                         mountpoint = %mountpoint.display(),
                                                         "serving published nydus image via OCI referrers (B4b)"
                                                     );
+                                                    // Like the auto-accel branch:
+                                                    // no meta layer for remove()
+                                                    // to find the daemon by.
+                                                    self.stamp_daemon_ref_label(&key, image_ref);
                                                     return Ok(self.rewrite_mounts_with_daemon(
                                                         &key,
                                                         &mountpoint,
@@ -876,7 +923,7 @@ impl snapshots::Snapshotter for NydusSnapshotter {
                     SnapshotterError::internal(e.to_string())
                 })?;
 
-            if let Some((_, daemon_mnt)) = self.resolve_nydus_mount(&parent, &labels).await? {
+            if let Some((_, daemon_mnt)) = self.resolve_nydus_mount(&parent, &labels, &key).await? {
                 return Ok(self.rewrite_mounts_with_daemon(&key, &daemon_mnt, true));
             }
             Ok(mounts)
@@ -929,17 +976,32 @@ impl snapshots::Snapshotter for NydusSnapshotter {
             } else {
                 None
             };
-            self.overlay
-                .remove(store, &key)
-                .inspect(|_| debug!(key, "removed snapshot"))
-                .map_err(|e| {
-                    warn!(key, error = %e, "remove snapshot failed");
-                    SnapshotterError::internal(e.to_string())
-                })?;
-            if let Some(image_ref) = release_target
-                && let Err(e) = self.supervisor.release(&image_ref).await
+            // Auto-accel / referrer mounts have no nydus meta layer in their
+            // chain; prepare() stamped the serving image on the snapshot.
+            let stamped_target = labels
+                .get(crate::source::labels::NYDUS_DAEMON_IMAGE_REF)
+                .cloned();
             {
-                warn!(image_ref, error = %e, "failed to release nydus daemon refcount");
+                // remove_dir_all over an arbitrarily large snapshot tree —
+                // never inline on the shared gRPC reactor thread.
+                let overlay = self.overlay.clone();
+                let store = Arc::clone(&self.store);
+                let remove_key = key.clone();
+                blocking::unblock(move || overlay.remove(&store, &remove_key))
+                    .await
+                    .inspect(|_| debug!(key, "removed snapshot"))
+                    .map_err(|e| {
+                        warn!(key, error = %e, "remove snapshot failed");
+                        SnapshotterError::internal(e.to_string())
+                    })?;
+            }
+            for image_ref in release_target
+                .iter()
+                .chain(stamped_target.iter().filter(|s| release_target.as_ref() != Some(s)))
+            {
+                if let Err(e) = self.supervisor.release(image_ref, &key).await {
+                    warn!(image_ref, error = %e, "failed to release nydus daemon refcount");
+                }
             }
             Ok(())
         }

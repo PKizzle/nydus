@@ -51,6 +51,9 @@ pub enum PrepareOutcome {
 }
 
 /// Overlay engine coordinates snapshot lifecycle with mount generation.
+/// `Clone` is cheap (a config clone plus an `Arc`) and lets gRPC handlers move
+/// an engine into `blocking::unblock` closures for fs-heavy operations.
+#[derive(Clone)]
 pub struct OverlayEngine {
     config: SnapshotterConfig,
     /// Shared with the gRPC layer's async prepare path; this engine only

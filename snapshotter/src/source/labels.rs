@@ -39,6 +39,14 @@ pub const CRI_LAYER_DIGEST: &str = "containerd.io/snapshot/cri.layer-digest";
 /// image whose chain this snapshot belongs to.
 pub const CRI_IMAGE_REF: &str = "containerd.io/snapshot/cri.image-ref";
 
+/// Set by this snapshotter on a prepared snapshot whose mounts were rewritten
+/// to a nydus daemon that the *snapshot key itself* holds a reference on
+/// (auto-accel sidecar and referrer-served mounts — the paths where the parent
+/// chain carries no nydus meta layer that `remove()` could otherwise use to
+/// find the daemon). `remove()` reads this label to release the daemon
+/// reference held by the key.
+pub const NYDUS_DAEMON_IMAGE_REF: &str = "containerd.io/snapshot/nydus-daemon-image-ref";
+
 /// Classification of a snapshot's underlying layer based on its labels.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LayerKind {
