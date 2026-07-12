@@ -79,10 +79,17 @@ impl TryFrom<String> for Keys {
 /// config::set("/mount", &Keys::RegistryAuth, "basic:xxx".to_string());
 /// ```
 pub fn set(id: &str, key: &Keys, value: String) {
-    let mut map = (**CONFIG_MAP.load()).clone();
     let key_str: String = key.into();
-    map.insert(format!("{}:{}", id, key_str), value);
-    CONFIG_MAP.store(Arc::new(map));
+    let full_key = format!("{}:{}", id, key_str);
+    // `rcu` retries the clone+insert until the compare-and-swap wins. A plain
+    // `load`/clone/`store` here loses updates: two concurrent writers each clone
+    // the old map and the second `store` silently discards the first writer's
+    // entry (registry auth, proxy URL, ...).
+    CONFIG_MAP.rcu(|map| {
+        let mut m = HashMap::clone(map);
+        m.insert(full_key.clone(), value.clone());
+        m
+    });
 }
 
 /// Set the value of the key only if it is not already set (or is empty).
@@ -90,10 +97,24 @@ pub fn set(id: &str, key: &Keys, value: String) {
 /// This is useful for registering initial configuration values without
 /// overwriting values that may have been set by earlier initialization.
 pub fn set_if_empty(id: &str, key: &Keys, value: String) {
-    let current = get(id, key);
-    if current.is_empty() && !value.is_empty() {
-        set(id, key, value);
+    if value.is_empty() {
+        return;
     }
+    let key_str: String = key.into();
+    let full_key = format!("{}:{}", id, key_str);
+    // The emptiness check runs inside the `rcu` closure so check + insert are one
+    // atomic step; a separate get() followed by set() would race a concurrent writer.
+    CONFIG_MAP.rcu(|map| {
+        let mut m = HashMap::clone(map);
+        m.entry(full_key.clone())
+            .and_modify(|v| {
+                if v.is_empty() {
+                    *v = value.clone();
+                }
+            })
+            .or_insert_with(|| value.clone());
+        m
+    });
 }
 
 /// Return the value of the key and whether it has changed compared to previous value.
@@ -177,11 +198,16 @@ pub fn get(id: &str, key: &Keys) -> String {
 /// }
 /// ```
 pub fn remove(id: &str, key: &Keys) -> Option<String> {
-    let mut map = (**CONFIG_MAP.load()).clone();
     let key_str: String = key.into();
     let full_key = format!("{}:{}", id, key_str);
-    let removed = map.remove(&full_key);
-    CONFIG_MAP.store(Arc::new(map));
+    let mut removed = None;
+    // The closure may run more than once under contention; `removed` reflects the
+    // attempt that won the compare-and-swap (later runs observe the freshest map).
+    CONFIG_MAP.rcu(|map| {
+        let mut m = HashMap::clone(map);
+        removed = m.remove(&full_key);
+        m
+    });
     removed
 }
 
@@ -325,6 +351,46 @@ mod tests {
         set(id, &key, "test_value".to_string());
         let value = get(id, &key);
         assert_eq!(value, "test_value");
+
+        clear();
+    }
+
+    #[test]
+    fn test_concurrent_writers_lose_no_updates() {
+        // Regression: `set`/`remove` used load→clone→store on the ArcSwap map, so two
+        // concurrent writers each cloned the old map and the second `store` silently
+        // dropped the first writer's entry (the cause of the flaky
+        // `test_dragonfly_scheduler_endpoint` failure under parallel test runs, and a
+        // real registry-auth-loss race in production).
+        let _guard = test_sync::TEST_LOCK.lock().unwrap();
+        clear();
+
+        const WRITERS: usize = 8;
+        const KEYS_PER_WRITER: usize = 50;
+        let barrier = std::sync::Barrier::new(WRITERS);
+        std::thread::scope(|s| {
+            for w in 0..WRITERS {
+                let barrier = &barrier;
+                s.spawn(move || {
+                    barrier.wait();
+                    for k in 0..KEYS_PER_WRITER {
+                        let id = format!("writer-{w}-{k}");
+                        set_if_empty(&id, &Keys::RegistryAuth, format!("v-{w}-{k}"));
+                    }
+                });
+            }
+        });
+
+        for w in 0..WRITERS {
+            for k in 0..KEYS_PER_WRITER {
+                let id = format!("writer-{w}-{k}");
+                assert_eq!(
+                    get(&id, &Keys::RegistryAuth),
+                    format!("v-{w}-{k}"),
+                    "entry written by writer {w} was lost"
+                );
+            }
+        }
 
         clear();
     }
