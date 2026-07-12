@@ -20,6 +20,7 @@ syntax = "proto3";
 
 package containerd.services.images.v1;
 
+import "google/protobuf/empty.proto";
 import "google/protobuf/field_mask.proto";
 import "google/protobuf/timestamp.proto";
 
@@ -70,6 +71,13 @@ message UpdateImageResponse {
     Image image = 1;
 }
 
+message DeleteImageRequest {
+    string name = 1;
+    // Sync indicates that the image deletion and removal of unreferenced
+    // resources should occur synchronously before returning a response.
+    bool sync = 2;
+}
+
 service Images {
     rpc Get(GetImageRequest) returns (GetImageResponse);
     rpc List(ListImagesRequest) returns (ListImagesResponse);
@@ -78,4 +86,9 @@ service Images {
     // sidecar Image record from the base manifest to the optimized one on
     // stage 2 (Create swallows AlreadyExists without updating the target).
     rpc Update(UpdateImageRequest) returns (UpdateImageResponse);
+    // Used by the reconciler's sidecar sweep to delete auto-accel Image
+    // records whose subject image no longer exists on the node, so
+    // containerd's GC can collect the sidecar blob tree (and, transitively,
+    // release the original gzip layers the sidecar pinned).
+    rpc Delete(DeleteImageRequest) returns (google.protobuf.Empty);
 }

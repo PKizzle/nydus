@@ -67,7 +67,8 @@ use containerd::services::content::v1::{
 };
 
 use containerd::services::images::v1::{
-    CreateImageRequest, GetImageRequest, Image, ListImagesRequest, UpdateImageRequest,
+    CreateImageRequest, DeleteImageRequest, GetImageRequest, Image, ListImagesRequest,
+    UpdateImageRequest,
     images_client::ImagesClient,
 };
 
@@ -613,6 +614,35 @@ impl ContentStoreClient {
                     })
                     .collect();
                 Ok(records)
+            })
+        })
+        .await
+    }
+
+    /// Delete a containerd Image record by name. Idempotent: NotFound is
+    /// success. Used by the reconciler's sidecar sweep — dropping the record
+    /// un-roots the sidecar blob tree so containerd's (asynchronous) GC can
+    /// collect it, which in turn releases the original gzip layers the
+    /// sidecar's `gc.ref.content.*` labels were keeping alive.
+    #[instrument(level = "debug", skip(self), err)]
+    pub async fn images_delete(&self, name: &str) -> Result<()> {
+        let inner = self.inner.clone();
+        let name = name.to_string();
+        blocking::unblock(move || {
+            inner.handle.block_on(async {
+                let mut client = connect_images(&inner).await?;
+                let mut request = tonic::Request::new(DeleteImageRequest {
+                    name: name.clone(),
+                    sync: false,
+                });
+                attach_namespace(&mut request, &inner.namespace)?;
+                match client.delete(request).await {
+                    Ok(_) => Ok(()),
+                    Err(status) if status.code() == Code::NotFound => Ok(()),
+                    Err(status) => Err(anyhow::anyhow!(
+                        "containerd Images.Delete({name}) failed: {status}"
+                    )),
+                }
             })
         })
         .await

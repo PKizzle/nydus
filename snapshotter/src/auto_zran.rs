@@ -257,6 +257,12 @@ struct AutoZranState {
     /// Negative cache: image → consecutive-failure record. Guards BOTH stages'
     /// enqueue paths (see [`MAX_CONVERSION_FAILURES`]). Memory-only by design.
     failures: Mutex<HashMap<String, ImageFailures>>,
+    /// image ref → the manifest digest we last saw it resolve to. All other
+    /// per-image state (`queued_or_done`, `failures`) is keyed by *ref*, so a
+    /// tag repointed to new content would stay deduped/suppressed forever;
+    /// [`AutoZranManager::note_sidecar_missing`] uses this map to detect the
+    /// repoint and clear the stale state.
+    last_manifest: Mutex<HashMap<String, String>>,
     metrics: AutoZranMetrics,
 }
 
@@ -267,6 +273,7 @@ impl AutoZranState {
             queued_or_done: Mutex::new(HashSet::new()),
             active_image: Mutex::new(None),
             failures: Mutex::new(HashMap::new()),
+            last_manifest: Mutex::new(HashMap::new()),
             metrics: AutoZranMetrics::default(),
         }
     }
@@ -422,6 +429,39 @@ impl AutoZranManager {
     /// one base job. A no-op (dropped, counted) when the queue is full.
     pub fn try_enqueue_base(&self, image: &str) {
         self.enqueue(AutoZranJob::base(image.to_string()));
+    }
+
+    /// Record that a `prepare` for `image` resolved to `manifest_digest` and
+    /// found no sidecar. Returns `true` when this reveals a **tag repoint**
+    /// (the ref previously resolved to different content): in that case the
+    /// per-ref dedupe keys and failure backoff are cleared so the new content
+    /// can be converted, instead of staying suppressed until a snapshotter
+    /// restart. The caller should also clear the access tracer's skip entry.
+    pub fn note_sidecar_missing(&self, image: &str, manifest_digest: &str) -> bool {
+        let mut last = match self.state.last_manifest.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        match last.insert(image.to_string(), manifest_digest.to_string()) {
+            Some(prev) if prev != manifest_digest => {
+                drop(last);
+                info!(
+                    image,
+                    previous = %prev,
+                    current = %manifest_digest,
+                    "auto-zran: tag repointed to new content; clearing stale conversion state"
+                );
+                if let Ok(mut seen) = self.state.queued_or_done.lock() {
+                    seen.remove(&dedupe_key(image, AutoZranStage::Base));
+                    seen.remove(&dedupe_key(image, AutoZranStage::Optimize));
+                }
+                if let Ok(mut failures) = self.state.failures.lock() {
+                    failures.remove(image);
+                }
+                true
+            }
+            _ => false,
+        }
     }
 
     /// Enqueue the stage-2 OPTIMIZE conversion from a settled prefetch profile
@@ -895,7 +935,17 @@ async fn upload_artifact(
     let manifest_digest = manifest_digest.to_string();
 
     // (4) Upload artifacts. Labels:
-    //   - gc.ref.content.subject  pins lifetime to the original manifest
+    //   - gc.ref.content.subject  is an OUTGOING GC edge (blob → referenced
+    //     digest): it keeps the ORIGINAL manifest — and, via containerd's
+    //     pull-time labels on that manifest, the original gzip layers — alive
+    //     for as long as this sidecar blob exists. That direction is
+    //     deliberate: the zran indexes read the original gzip layers out of
+    //     the content store at serve time, so the sidecar must pin them. It
+    //     does NOT make the sidecar follow the original's lifetime — the
+    //     sidecar itself is rooted by its synthetic Image record, which the
+    //     reconciler's sidecar sweep deletes once the subject image is gone
+    //     (recon::check_orphan_sidecars); only then can GC collect the sidecar
+    //     tree and, transitively, release the pinned original layers.
     //   - nydus.auto-accel.role   identifies bootstrap / index / prefetch-blob
     //   - nydus.auto-accel.layer-digest (index/prefetch only) links to the
     //     original gzip layer the blob accelerates
@@ -1296,6 +1346,54 @@ mod tests {
         // same for both stages so they share one on-disk work dir.
         assert!(dedupe_key(img, AutoZranStage::Base).ends_with(&job_key(img)));
         assert!(dedupe_key(img, AutoZranStage::Optimize).ends_with(&job_key(img)));
+    }
+
+    #[test]
+    fn note_sidecar_missing_clears_state_only_on_repoint() {
+        let (sender, _receiver) = async_channel::bounded(1);
+        let manager = AutoZranManager {
+            sender,
+            state: Arc::new(AutoZranState::new(1)),
+        };
+        let img = "registry.local/app:latest";
+
+        // First sighting: records the digest, nothing to clear.
+        assert!(!manager.note_sidecar_missing(img, "sha256:aaa"));
+
+        // Simulate a completed conversion for digest aaa.
+        manager
+            .state
+            .queued_or_done
+            .lock()
+            .unwrap()
+            .insert(dedupe_key(img, AutoZranStage::Base));
+        manager
+            .state
+            .queued_or_done
+            .lock()
+            .unwrap()
+            .insert(dedupe_key(img, AutoZranStage::Optimize));
+        manager.state.record_failure(img);
+
+        // Same digest again: state untouched (still deduped).
+        assert!(!manager.note_sidecar_missing(img, "sha256:aaa"));
+        assert!(
+            manager
+                .state
+                .queued_or_done
+                .lock()
+                .unwrap()
+                .contains(&dedupe_key(img, AutoZranStage::Base))
+        );
+
+        // Tag repointed to new content: dedupe keys + failure backoff cleared
+        // so the new manifest can be converted without a restart.
+        assert!(manager.note_sidecar_missing(img, "sha256:bbb"));
+        let seen = manager.state.queued_or_done.lock().unwrap();
+        assert!(!seen.contains(&dedupe_key(img, AutoZranStage::Base)));
+        assert!(!seen.contains(&dedupe_key(img, AutoZranStage::Optimize)));
+        drop(seen);
+        assert!(manager.state.failures.lock().unwrap().get(img).is_none());
     }
 
     #[test]

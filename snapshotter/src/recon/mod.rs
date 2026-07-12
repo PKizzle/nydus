@@ -49,12 +49,21 @@ enum ReconcileProbeError {
     ReadProcMounts(#[source] std::io::Error),
 }
 
+/// Dependencies for the auto-accel sidecar GC sweep (see
+/// [`Reconciler::with_sidecar_gc`]).
+pub struct SidecarGcDeps {
+    pub content_store: crate::content_store::ContentStoreClient,
+    pub lookup: Arc<crate::containerd_lookup::ContainerdLookup>,
+    pub content_root: PathBuf,
+}
+
 /// Reconciler that periodically checks and repairs system state.
 pub struct Reconciler {
     supervisor: Arc<DaemonSupervisor>,
     store: Arc<SnapshotStore>,
     cache_gc: Option<(CacheManager, CacheGcPolicy)>,
     auto_zran_sweep: Option<(PathBuf, Duration, Arc<crate::auto_zran::AutoZranManager>)>,
+    sidecar_gc: Option<SidecarGcDeps>,
     interval: Duration,
 }
 
@@ -70,8 +79,20 @@ impl Reconciler {
             store,
             cache_gc: None,
             auto_zran_sweep: None,
+            sidecar_gc: None,
             interval,
         }
+    }
+
+    /// Enable the auto-accel sidecar GC sweep. Deletes sidecar Image records
+    /// (`nydus.auto-accel.local/sidecar:<hex>`) whose subject image no longer
+    /// exists on the node, so containerd's GC can collect the sidecar blob tree
+    /// — and, transitively, release the original gzip layers the sidecar's
+    /// `gc.ref.content.*` labels keep alive for its own data path. Without this
+    /// sweep, deleting an accelerated image frees no disk, ever.
+    pub fn with_sidecar_gc(mut self, deps: SidecarGcDeps) -> Self {
+        self.sidecar_gc = Some(deps);
+        self
     }
 
     /// Enable a cache-GC pass as part of each reconciliation tick.
@@ -141,7 +162,87 @@ impl Reconciler {
         // 5. Sweep orphaned auto-zran per-job scratch dirs left by a crash.
         self.check_stale_autozran_dirs().await?;
 
+        // 6. Sweep sidecar Image records whose subject image is gone.
+        self.check_orphan_sidecars().await?;
+
         debug!("reconciliation pass complete");
+        Ok(())
+    }
+
+    /// Delete auto-accel sidecar Image records whose subject image no longer
+    /// exists on the node (see [`Reconciler::with_sidecar_gc`]). Best-effort
+    /// and conservative: any failure to enumerate or resolve images aborts the
+    /// pass without deleting anything, so a transient containerd hiccup can
+    /// never sweep a live sidecar.
+    async fn check_orphan_sidecars(&self) -> Result<()> {
+        let Some(deps) = &self.sidecar_gc else {
+            return Ok(());
+        };
+        const SIDECAR_PREFIX: &str = "nydus.auto-accel.local/sidecar:";
+
+        let images = match deps.content_store.images_list().await {
+            Ok(images) => images,
+            Err(e) => {
+                debug!(error = %e, "recon: images list failed; skipping sidecar sweep");
+                return Ok(());
+            }
+        };
+        let sidecars: Vec<_> = images
+            .iter()
+            .filter(|img| img.name.starts_with(SIDECAR_PREFIX))
+            .collect();
+        if sidecars.is_empty() {
+            return Ok(());
+        }
+
+        // Resolve every non-sidecar image to the platform-manifest digest that
+        // auto-accel uses as the sidecar subject (`manifest_info` performs the
+        // same tag → index → platform-manifest resolution the producer did).
+        let mut live_subjects = std::collections::HashSet::new();
+        for img in images.iter().filter(|i| !i.name.starts_with(SIDECAR_PREFIX)) {
+            match deps.lookup.manifest_info(&img.name, &deps.content_root).await {
+                Ok(info) => {
+                    live_subjects.insert(info.manifest_digest);
+                }
+                Err(e) => {
+                    // Unresolvable image ⇒ unknown subject ⇒ deleting anything
+                    // now could sweep a live sidecar. Try again next tick.
+                    debug!(
+                        image = %img.name,
+                        error = %e,
+                        "recon: image unresolvable; aborting sidecar sweep for this pass"
+                    );
+                    return Ok(());
+                }
+            }
+        }
+
+        let mut removed = 0usize;
+        for sidecar in sidecars {
+            let subject_hex = &sidecar.name[SIDECAR_PREFIX.len()..];
+            let subject = format!("sha256:{subject_hex}");
+            if live_subjects.contains(&subject) {
+                continue;
+            }
+            match deps.content_store.images_delete(&sidecar.name).await {
+                Ok(()) => {
+                    removed += 1;
+                    info!(
+                        sidecar = %sidecar.name,
+                        subject = %subject,
+                        "recon: removed orphan auto-accel sidecar record (subject image gone)"
+                    );
+                }
+                Err(e) => warn!(
+                    sidecar = %sidecar.name,
+                    error = %e,
+                    "recon: failed to remove orphan sidecar record"
+                ),
+            }
+        }
+        if removed > 0 {
+            info!(removed, "recon: orphan sidecar sweep completed");
+        }
         Ok(())
     }
 

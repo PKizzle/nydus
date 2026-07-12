@@ -444,6 +444,22 @@ impl AccessTracer {
         }
     }
 
+    /// Forget a prior [`mark_image_accelerated`](Self::mark_image_accelerated)
+    /// for `image_ref`, re-enabling capture. Called when a tag is repointed to
+    /// new content: the skip entry belongs to the *old* content's conversion,
+    /// and keeping it would silently prevent the new content from ever getting
+    /// an access profile.
+    pub fn clear_image_skip(&self, image_ref: &str) {
+        let mut skip = self
+            .inner
+            .skip_images
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if skip.remove(image_ref) {
+            debug!(image = %image_ref, "access_tracer: cleared accelerated-skip after tag repoint");
+        }
+    }
+
     pub fn mark_image_accelerated(&self, image_ref: &str) {
         // Mutex poisoning means a previous holder panicked. We can still
         // safely manipulate the inner state: the worst case is a stale

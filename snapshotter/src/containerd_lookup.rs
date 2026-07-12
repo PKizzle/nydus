@@ -503,9 +503,12 @@ fn register_chain_ids(
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ManifestInfo {
     /// The image's manifest digest (`sha256:...`). The auto-accel sidecar
-    /// uses this as the `containerd.io/gc.ref.content.subject` label so
-    /// containerd's GC keeps the sidecar alive as long as the original
-    /// manifest exists.
+    /// uses this as the `containerd.io/gc.ref.content.subject` label — an
+    /// *outgoing* GC edge that keeps the original manifest (and its layers)
+    /// alive while the sidecar exists, because the zran indexes read the
+    /// original gzip layers from the content store at serve time. The
+    /// sidecar's own lifetime is bounded by its synthetic Image record, which
+    /// the reconciler deletes once the subject image is gone.
     pub manifest_digest: String,
     /// Gzip layers in device-table order with their on-disk content-store
     /// paths already resolved.

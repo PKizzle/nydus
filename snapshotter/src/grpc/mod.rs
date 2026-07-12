@@ -460,7 +460,19 @@ impl NydusSnapshotter {
         };
         let staged = match discovery.resolve(&info.manifest_digest).await {
             Ok(Some(s)) => s,
-            Ok(None) => return Ok(None),
+            Ok(None) => {
+                // No sidecar for this manifest. If the ref previously resolved
+                // to different content (tag repoint), clear the per-ref
+                // conversion dedupe + tracer skip so the new content gets
+                // converted and captured instead of staying suppressed until a
+                // snapshotter restart.
+                if let Some(manager) = self.auto_zran.as_ref()
+                    && manager.note_sidecar_missing(image_ref, &info.manifest_digest)
+                {
+                    self.access_tracer.clear_image_skip(image_ref);
+                }
+                return Ok(None);
+            }
             Err(e) => {
                 warn!(image_ref, error = %e, "auto-accel discovery failed; falling back to overlay");
                 return Ok(None);
@@ -1202,7 +1214,7 @@ pub async fn serve_with_supervisor(
         profile_store,
         None, // back-filled below once AutoZranManager exists
     );
-    let (auto_zran, auto_accel_discovery, containerd_lookup_for_discovery) =
+    let (auto_zran, auto_accel_discovery, containerd_lookup_for_discovery, content_store_for_recon) =
         if config.snapshotter.auto_zran.enable {
             let content_store =
                 crate::content_store::ContentStoreClient::new(&config.snapshotter.containerd)
@@ -1248,13 +1260,18 @@ pub async fn serve_with_supervisor(
                 compio::runtime::spawn(async move { selfcheck.run_loop().await }).detach();
             }
             let discovery = crate::auto_accel_sidecar::AutoAccelDiscovery::new(
-                content_store,
+                content_store.clone(),
                 &config.snapshotter.root,
                 &config.snapshotter.peer_mirror,
             );
-            (auto_zran, Some(discovery), Some(containerd_lookup))
+            (
+                auto_zran,
+                Some(discovery),
+                Some(containerd_lookup),
+                Some(content_store),
+            )
         } else {
-            (None, None, None)
+            (None, None, None, None)
         };
 
     // The overlay engine shares the gRPC layer's lookup so its sync
@@ -1303,6 +1320,19 @@ pub async fn serve_with_supervisor(
             AUTO_ZRAN_STALE_JOB_MAX_AGE,
             manager,
         );
+    }
+    // Sidecar GC: without this sweep a deleted (or repointed) image's sidecar
+    // record lives forever — and it transitively pins the original gzip layer
+    // tree via its `gc.ref.content.*` labels, so image churn never frees disk.
+    if let (Some(content_store), Some(lookup)) = (
+        content_store_for_recon,
+        containerd_lookup_for_discovery.clone(),
+    ) {
+        reconciler = reconciler.with_sidecar_gc(crate::recon::SidecarGcDeps {
+            content_store,
+            lookup,
+            content_root: config.snapshotter.containerd.content_root(),
+        });
     }
     // Share the reconciler between the background loop and the snapshotter's
     // Cleanup RPC (`clear()` → `run_once()`).
