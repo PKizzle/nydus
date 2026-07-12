@@ -269,12 +269,19 @@ impl Reconciler {
         Ok(())
     }
 
-    /// Remove `{auto_zran.work_dir}/<job-key>/` scratch directories left behind by
-    /// a crashed conversion. `local_accel::convert` already gives every
+    /// Remove `{auto_zran.work_dir}/<job-key>/` scratch directories that have
+    /// been abandoned. A surviving dir is NOT necessarily crash debris: a
+    /// successful BASE stage deliberately retains its job dir (and
+    /// `artifact.json`) so the optimize stage can reuse the create+merge
+    /// output, and only a completed OPTIMIZE stage deletes it
+    /// (`auto_zran::cleanup_work_dir`). This sweep is the fallback when settle
+    /// never arrives (pod died pre-settle, worker crashed mid-conversion).
+    /// Sweeping a retained base dir is safe: a later optimize job finds no
+    /// reusable base (`auto_zran::load_reusable_base_artifact` → `None`) and
+    /// runs the full pipeline instead. `local_accel::convert` gives every
     /// `nydus-image` invocation a fresh per-layer subdirectory (see
-    /// `local_accel::fresh_dir`), so leftovers here are always whole job dirs a
-    /// prior process died before cleaning up, never a live worker's in-progress
-    /// output.
+    /// `local_accel::fresh_dir`), so sweeping only whole job dirs never
+    /// truncates a live worker's in-progress output.
     ///
     /// Staleness is judged by top-level job-dir mtime (which is bumped whenever a
     /// direct child -- `backend/`, `convert/`, the merged `bootstrap`,

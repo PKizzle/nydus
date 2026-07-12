@@ -27,13 +27,18 @@ use std::time::SystemTime;
 use tracing::{debug, info, warn};
 
 /// How old an auto-zran per-job scratch directory's mtime must be before the
-/// reconciler treats it as crash debris and removes it. A successful conversion
-/// deletes its own job dir (see `auto_zran::run_conversion` step 6), so any dir
-/// that survives is either the live job (excluded via `active_job_key()`) or a
-/// leftover from a worker that died mid-conversion. Six hours is deliberately
-/// generous: conversions run at idle scheduling priority and a large multi-layer
-/// image can legitimately churn for a long time, so the sweep must never race a
-/// slow-but-healthy job.
+/// reconciler treats it as abandoned and removes it. A successful BASE stage
+/// deliberately RETAINS its job dir (plus `artifact.json`) so the optimize
+/// stage can reuse the create+merge output; only a completed OPTIMIZE stage
+/// removes the dir (`auto_zran::cleanup_work_dir`). This sweep is the fallback
+/// for jobs whose settle never arrives (pod died pre-settle, worker crashed
+/// mid-conversion). Sweeping a retained base dir is safe: a late optimize job
+/// simply finds no reusable base (`auto_zran::load_reusable_base_artifact` →
+/// `None`) and degrades to the full pipeline. Six hours is deliberately
+/// generous: conversions run at idle scheduling priority and a large
+/// multi-layer image can legitimately churn for a long time, so the sweep must
+/// never race a slow-but-healthy job (the live job is additionally excluded
+/// via `active_job_key()`).
 const AUTO_ZRAN_STALE_JOB_MAX_AGE: std::time::Duration =
     std::time::Duration::from_secs(6 * 60 * 60);
 
@@ -1222,11 +1227,14 @@ pub async fn serve_with_supervisor(
         parse_duration(&config.snapshotter.cache.gc_period)?,
     )
     .with_cache_gc(cache_manager, cache_gc_policy);
-    // A successful conversion removes its own job dir (see
-    // `auto_zran::run_conversion` step 6); anything that outlives
-    // `AUTO_ZRAN_STALE_JOB_MAX_AGE` is debris from a crashed worker. The threshold
-    // is generous because conversions run at (possibly) idle scheduling priority
-    // and large multi-layer images can legitimately take a long time.
+    // Job dirs are retained on purpose after a successful BASE stage (the
+    // optimize stage reuses the create+merge output) and removed only when the
+    // OPTIMIZE stage completes; this sweep is the fallback for images whose
+    // settle never arrives. Sweeping is safe — a late optimize degrades to the
+    // full pipeline via the `auto_zran::load_reusable_base_artifact` None seam.
+    // The threshold is generous because conversions run at (possibly) idle
+    // scheduling priority and large multi-layer images can legitimately take a
+    // long time.
     if let Some(manager) = auto_zran.clone() {
         reconciler = reconciler.with_auto_zran_sweep(
             config.snapshotter.auto_zran.work_dir.clone(),

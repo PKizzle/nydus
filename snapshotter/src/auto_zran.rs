@@ -29,6 +29,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use async_channel::{Receiver, Sender};
 use tracing::{debug, info, warn};
@@ -215,6 +216,29 @@ impl AutoZranStatus {
     }
 }
 
+/// After this many consecutive conversion failures for one image, stop
+/// enqueueing new jobs for it entirely (either stage). The negative cache is
+/// memory-only: a snapshotter restart clears it, which is the intended manual
+/// escape hatch for images that become convertible again (e.g. after a
+/// `nydus-image` upgrade). Without this cap, a deterministically failing image
+/// (zstd layers, a broken `nydus-image` binary, …) would re-run the full
+/// conversion pipeline at EVERY pod prepare, forever — `try_enqueue_base`
+/// fires on each prepare and a failed job releases its dedupe key.
+const MAX_CONVERSION_FAILURES: u32 = 3;
+
+/// Spacing between retries before [`MAX_CONVERSION_FAILURES`] is reached;
+/// doubles per recorded failure (5m after the first failure, 10m after the
+/// second), so transient failures (containerd hiccup, disk pressure) retry
+/// soon-ish while a hard-failing image doesn't burn CPU on every pod start.
+const FAILURE_BACKOFF_BASE: Duration = Duration::from_secs(5 * 60);
+
+/// Per-image record of consecutive conversion failures (both stages share it:
+/// a base failure and an optimize failure both count against the image).
+struct ImageFailures {
+    count: u32,
+    last_failure: Instant,
+}
+
 #[derive(Default)]
 struct AutoZranMetrics {
     queued_total: AtomicU64,
@@ -230,6 +254,9 @@ struct AutoZranState {
     queue_depth: usize,
     queued_or_done: Mutex<HashSet<String>>,
     active_image: Mutex<Option<String>>,
+    /// Negative cache: image → consecutive-failure record. Guards BOTH stages'
+    /// enqueue paths (see [`MAX_CONVERSION_FAILURES`]). Memory-only by design.
+    failures: Mutex<HashMap<String, ImageFailures>>,
     metrics: AutoZranMetrics,
 }
 
@@ -239,6 +266,7 @@ impl AutoZranState {
             queue_depth,
             queued_or_done: Mutex::new(HashSet::new()),
             active_image: Mutex::new(None),
+            failures: Mutex::new(HashMap::new()),
             metrics: AutoZranMetrics::default(),
         }
     }
@@ -255,17 +283,62 @@ impl AutoZranState {
         self.metrics.running_jobs.fetch_sub(1, Ordering::Relaxed);
         if success {
             self.metrics.succeeded_total.fetch_add(1, Ordering::Relaxed);
+            // Any successful stage resets the negative cache for the image.
+            if let Ok(mut failures) = self.failures.lock() {
+                failures.remove(&job.image);
+            }
         } else {
             self.metrics.failed_total.fetch_add(1, Ordering::Relaxed);
             if let Ok(mut seen) = self.queued_or_done.lock() {
                 seen.remove(&dedupe_key(&job.image, job.stage));
             }
+            self.record_failure(&job.image);
         }
         if let Ok(mut active) = self.active_image.lock()
             && active.as_deref() == Some(job.image.as_str())
         {
             *active = None;
         }
+    }
+
+    /// Bump the per-image consecutive-failure count. Logs at warn exactly once
+    /// when the count crosses [`MAX_CONVERSION_FAILURES`]; subsequent
+    /// suppressed enqueues only log at debug.
+    fn record_failure(&self, image: &str) {
+        let Ok(mut failures) = self.failures.lock() else {
+            return;
+        };
+        let record = failures.entry(image.to_string()).or_insert(ImageFailures {
+            count: 0,
+            last_failure: Instant::now(),
+        });
+        record.count = record.count.saturating_add(1);
+        record.last_failure = Instant::now();
+        if record.count == MAX_CONVERSION_FAILURES {
+            warn!(
+                image = %image,
+                failures = record.count,
+                "auto-zran conversion keeps failing; image marked non-convertible until snapshotter restart"
+            );
+        }
+    }
+
+    /// Whether an enqueue for `image` is suppressed by the failure negative
+    /// cache: permanently once [`MAX_CONVERSION_FAILURES`] is reached, or
+    /// temporarily while inside the exponential backoff window between
+    /// earlier failures. `now` is injected for testability.
+    fn enqueue_suppressed(&self, image: &str, now: Instant) -> bool {
+        let Ok(failures) = self.failures.lock() else {
+            return false;
+        };
+        let Some(record) = failures.get(image) else {
+            return false;
+        };
+        if record.count >= MAX_CONVERSION_FAILURES {
+            return true;
+        }
+        let window = FAILURE_BACKOFF_BASE * 2u32.saturating_pow(record.count.saturating_sub(1));
+        now.saturating_duration_since(record.last_failure) < window
     }
 
     fn status(&self) -> AutoZranStatus {
@@ -367,11 +440,24 @@ impl AutoZranManager {
         self.enqueue(job);
     }
 
-    /// Shared, non-blocking enqueue path for both stages. Dedupes on
-    /// `(image, stage)` via `queued_or_done`, then `try_send`s onto the
-    /// bounded channel, rolling the dedupe key back if the send fails so the
-    /// job can be retried later.
+    /// Shared, non-blocking enqueue path for both stages. Consults the
+    /// per-image failure negative cache first (see
+    /// [`MAX_CONVERSION_FAILURES`]), then dedupes on `(image, stage)` via
+    /// `queued_or_done`, then `try_send`s onto the bounded channel, rolling
+    /// the dedupe key back if the send fails so the job can be retried later.
     fn enqueue(&self, job: AutoZranJob) {
+        if self.state.enqueue_suppressed(&job.image, Instant::now()) {
+            self.state
+                .metrics
+                .skipped_total
+                .fetch_add(1, Ordering::Relaxed);
+            debug!(
+                image = %job.image,
+                stage = job.stage.tag(),
+                "auto-zran enqueue suppressed by failure backoff"
+            );
+            return;
+        }
         let key = dedupe_key(&job.image, job.stage);
         match self.state.queued_or_done.lock() {
             Ok(mut seen) => {
@@ -487,7 +573,7 @@ async fn run_conversion(
     // already optimized). Half-uploaded sidecars (snapshotter killed
     // mid-write, GC raced) read back as `Absent` so we re-convert rather
     // than mark-accelerated-then-fail-to-mount.
-    let existing = existing_sidecar_state(deps, &image_name).await;
+    let (existing, existing_manifest) = existing_sidecar_state(deps, &image_name).await;
 
     match job.stage {
         AutoZranStage::Base => {
@@ -511,6 +597,7 @@ async fn run_conversion(
                 &manifest_digest,
                 &image_name,
                 existing,
+                existing_manifest,
             )
             .await
         }
@@ -554,7 +641,7 @@ async fn run_base_stage(
         warn!(image = %job.image, error = ?e, "auto-zran failed to persist base artifact; optimize will re-run the full pipeline");
     }
 
-    upload_artifact(deps, job, manifest_digest, image_name, &artifact).await?;
+    upload_artifact(deps, job, manifest_digest, image_name, &artifact, None).await?;
 
     // IMPORTANT: do NOT mark accelerated and do NOT remove work_dir — the
     // tracer keeps capturing, and stage 2 reuses this work_dir. A pod that
@@ -567,6 +654,15 @@ async fn run_base_stage(
 /// optimized) sidecar, promoting the Image record from the base manifest to the
 /// optimized one. Reuses stage 1's on-disk work dir when present (optimize
 /// only); otherwise runs the full pipeline once WITH prefetch.
+///
+/// Known limitation (wedge-at-Base): this stage has exactly two drivers — the
+/// access tracer's settle and the NRI `StopContainer` force-settle. If the
+/// first pod dies before either fires, or the (single) settle-driven optimize
+/// upload fails past the failure backoff, the image keeps serving the BASE
+/// sidecar until the snapshotter restarts. Accepted: Base already beats plain
+/// overlay, and a future recon-driven re-optimize trigger is tracked in
+/// BACKLOG.md ("Two-stage auto-accel: re-optimize trigger for images stuck at
+/// Base").
 #[allow(clippy::too_many_arguments)]
 async fn run_optimize_stage(
     config: &AutoZranConfig,
@@ -576,8 +672,12 @@ async fn run_optimize_stage(
     manifest_digest: &str,
     image_name: &str,
     existing: SidecarState,
+    existing_manifest: Option<String>,
 ) -> Result<()> {
     if existing == SidecarState::Optimized {
+        // A peer's (or an earlier local) optimize won the race; this node's
+        // freshly captured profile is discarded — intentional: the first
+        // settled profile wins, re-optimization is a BACKLOG item.
         info!(image = %job.image, "auto-zran optimize skip: sidecar already optimized");
         deps.access_tracer.mark_image_accelerated(&job.image);
         cleanup_work_dir(config, &job.image);
@@ -591,13 +691,33 @@ async fn run_optimize_stage(
     let prefetch_files = job.prefetch_files.clone();
 
     let artifact = if let Some(base) = load_reusable_base_artifact(&work_dir) {
-        // Stage 1 output is on disk: run ONLY optimize (create/merge skipped).
-        info!(image = %job.image, "auto-zran optimize: reusing base work dir (create/merge skipped)");
-        blocking::unblock(move || {
-            local_accel::optimize_existing(&local_cfg, &base, &prefetch_files)
-        })
-        .await
-        .context("local_accel::optimize_existing failed")?
+        if base.prefetch_blob_id.is_some() {
+            // A prior optimize run already rewrote the merged bootstrap in
+            // place and persisted the optimized artifact.json, but its upload
+            // failed. Re-running `nydus-image optimize` against the
+            // already-optimized bootstrap would be wrong, so go straight to
+            // the (re-)upload with the persisted artifact.
+            info!(image = %job.image, "auto-zran optimize: reusing already-optimized artifact (upload retry)");
+            base
+        } else {
+            // Stage 1 output is on disk: run ONLY optimize (create/merge
+            // skipped).
+            info!(image = %job.image, "auto-zran optimize: reusing base work dir (create/merge skipped)");
+            let optimized = blocking::unblock(move || {
+                local_accel::optimize_existing(&local_cfg, &base, &prefetch_files)
+            })
+            .await
+            .context("local_accel::optimize_existing failed")?;
+            // `optimize_existing` replaced the merged bootstrap IN PLACE, so
+            // persist the optimized artifact BEFORE the upload: if the upload
+            // fails and the job is retried, artifact.json would otherwise
+            // still claim `prefetch_blob_id: None` and the retry would
+            // re-optimize an already-optimized bootstrap.
+            if let Err(e) = write_base_artifact(&work_dir, &optimized) {
+                warn!(image = %job.image, error = ?e, "auto-zran failed to persist optimized artifact; an upload-failure retry may re-optimize");
+            }
+            optimized
+        }
     } else {
         // No reusable base (settle beat base, or the dir was swept): run the
         // full pipeline once WITH prefetch so the captured profile isn't lost.
@@ -607,8 +727,21 @@ async fn run_optimize_stage(
             .context("local_accel::convert (optimize full) failed")?
     };
 
-    let image_record_ok =
-        upload_artifact(deps, job, manifest_digest, image_name, &artifact).await?;
+    // When a BASE sidecar record existed pre-promotion, pin its manifest tree
+    // from the optimized manifest so a peer mid-pull of the base sidecar can't
+    // have its blobs GC'd out from under it (see `manifest_gc_labels`).
+    let base_manifest = (existing == SidecarState::Base)
+        .then_some(existing_manifest)
+        .flatten();
+    let image_record_ok = upload_artifact(
+        deps,
+        job,
+        manifest_digest,
+        image_name,
+        &artifact,
+        base_manifest.as_deref(),
+    )
+    .await?;
 
     // Tell the tracer to stop capturing ONLY when the cross-node advertisement
     // is also wired (mirrors the original single-stage invariant): with
@@ -657,40 +790,55 @@ fn write_base_artifact(work_dir: &Path, artifact: &NodeLocalArtifact) -> Result<
 }
 
 /// Load a persisted base artifact IF its on-disk inputs (merged bootstrap +
-/// backend dir) are still present. This is the seam that decides stage-2
-/// behavior: `Some` ⇒ reuse (optimize only, create/merge skipped); `None` ⇒
-/// run the full pipeline.
+/// backend dir, plus the prefetch blob when the artifact claims one) are
+/// still present. This is the seam that decides stage-2 behavior: `Some` ⇒
+/// reuse (optimize only — or upload-only when `prefetch_blob_id` is already
+/// set by a prior optimize whose upload failed); `None` ⇒ run the full
+/// pipeline.
 fn load_reusable_base_artifact(work_dir: &Path) -> Option<NodeLocalArtifact> {
     let bytes = std::fs::read(base_artifact_path(work_dir)).ok()?;
     let artifact: NodeLocalArtifact = serde_json::from_slice(&bytes).ok()?;
-    (artifact.bootstrap.is_file() && artifact.backend_dir.is_dir()).then_some(artifact)
+    let prefetch_ok = artifact
+        .prefetch_blob_id
+        .as_ref()
+        .is_none_or(|id| artifact.backend_dir.join(id).is_file());
+    (artifact.bootstrap.is_file() && artifact.backend_dir.is_dir() && prefetch_ok)
+        .then_some(artifact)
 }
 
 /// Probe whether a complete sidecar already exists for `image_name`, and if so
 /// whether it already carries a prefetch blob (i.e. is optimized). Any RPC /
 /// completeness failure resolves to `Absent` (re-convert) or `Base` (allow
 /// optimize) so a transient error never wedges the pipeline.
-async fn existing_sidecar_state(deps: &ConversionDeps, image_name: &str) -> SidecarState {
+///
+/// The second tuple element is the existing sidecar OCI manifest digest (the
+/// Image record's target) whenever a complete sidecar exists — the optimize
+/// stage uses it to keep the pre-promotion BASE manifest tree GC-rooted (see
+/// `manifest_gc_labels`).
+async fn existing_sidecar_state(
+    deps: &ConversionDeps,
+    image_name: &str,
+) -> (SidecarState, Option<String>) {
     let existing = match deps.content_store.images_get(image_name).await {
         Ok(Some(e)) => e,
-        Ok(None) => return SidecarState::Absent,
+        Ok(None) => return (SidecarState::Absent, None),
         Err(e) => {
             warn!(image_name = %image_name, error = ?e, "auto-accel images.Get failed; treating sidecar as absent");
-            return SidecarState::Absent;
+            return (SidecarState::Absent, None);
         }
     };
     match completeness_check(deps, &existing.digest).await {
         Ok(true) => {}
         Ok(false) => {
             warn!(image_name = %image_name, "auto-accel sidecar present but some referenced blobs are missing; re-converting");
-            return SidecarState::Absent;
+            return (SidecarState::Absent, None);
         }
         Err(e) => {
             warn!(image_name = %image_name, error = ?e, "auto-accel sidecar completeness check failed; re-converting to be safe");
-            return SidecarState::Absent;
+            return (SidecarState::Absent, None);
         }
     }
-    match sidecar_has_prefetch(deps, &existing.digest).await {
+    let state = match sidecar_has_prefetch(deps, &existing.digest).await {
         Ok(true) => SidecarState::Optimized,
         Ok(false) => SidecarState::Base,
         Err(e) => {
@@ -698,7 +846,8 @@ async fn existing_sidecar_state(deps: &ConversionDeps, image_name: &str) -> Side
             debug!(image_name = %image_name, error = ?e, "auto-accel prefetch-state probe failed; treating sidecar as base");
             SidecarState::Base
         }
-    }
+    };
+    (state, Some(existing.digest))
 }
 
 /// Parse an on-store OCI sidecar manifest → its config blob (our
@@ -730,12 +879,17 @@ async fn sidecar_has_prefetch(deps: &ConversionDeps, oci_manifest_digest: &str) 
 /// AlreadyExists without repointing the target. All blobs are content-addressed
 /// (`write_blob`/`write_bytes`), so re-uploading never corrupts a
 /// concurrently-fetched artifact; only the Image record's target moves.
+///
+/// `base_manifest_digest` (optimize stage only, when a BASE sidecar record
+/// existed) pins the pre-promotion base manifest tree via a
+/// `containerd.io/gc.ref.content.base` label on the new manifest.
 async fn upload_artifact(
     deps: &ConversionDeps,
     job: &AutoZranJob,
     manifest_digest: &str,
     image_name: &str,
     artifact: &NodeLocalArtifact,
+    base_manifest_digest: Option<&str>,
 ) -> Result<bool> {
     // Own the digest so the step-4/5 label helpers below can `.clone()` it.
     let manifest_digest = manifest_digest.to_string();
@@ -876,40 +1030,14 @@ async fn upload_artifact(
     let manifest_bytes =
         serde_json::to_vec(&oci_manifest).context("serialize auto-accel oci manifest")?;
     let manifest_oci_ref = format!("nydus-auto-accel-oci:v1:{manifest_digest}");
-    // Containerd's GC roots a manifest blob through its Image record, then
-    // walks the manifest's outgoing `gc.ref.content.*` labels to find its
-    // config + layer blobs. Without these labels the just-written
-    // config/bootstrap/index/prefetch blobs become orphans the moment GC
-    // runs (which happens on every container/image churn), even though
-    // the manifest body itself names them by digest — containerd does NOT
-    // parse the manifest JSON for GC; it relies on operators to mirror
-    // those references into labels. Add them here so the artifact
-    // survives until the original image (`gc.ref.content.subject`) is
-    // pruned.
-    let mut manifest_labels = base_labels("manifest");
-    manifest_labels.insert(
-        "containerd.io/gc.ref.content.config".to_string(),
-        config_digest.clone(),
+    let manifest_labels = manifest_gc_labels(
+        base_labels("manifest"),
+        &config_digest,
+        &bootstrap_digest,
+        &zran_descriptors,
+        prefetch_descriptor.as_ref(),
+        base_manifest_digest,
     );
-    manifest_labels.insert(
-        "containerd.io/gc.ref.content.l.0".to_string(),
-        bootstrap_digest.clone(),
-    );
-    for (i, layer) in zran_descriptors.iter().enumerate() {
-        manifest_labels.insert(
-            format!("containerd.io/gc.ref.content.l.{}", i + 1),
-            layer.digest.clone(),
-        );
-    }
-    if let Some(prefetch) = &prefetch_descriptor {
-        manifest_labels.insert(
-            format!(
-                "containerd.io/gc.ref.content.l.{}",
-                zran_descriptors.len() + 1
-            ),
-            prefetch.digest.clone(),
-        );
-    }
     let manifest_digest_in_store = deps
         .content_store
         .write_bytes(&manifest_bytes, &manifest_oci_ref, manifest_labels)
@@ -963,6 +1091,65 @@ async fn upload_artifact(
     // The stage caller decides whether to mark the image accelerated and clean
     // up the work dir (base retains it for stage 2; optimize tears it down).
     Ok(image_record_ok)
+}
+
+/// GC labels stamped onto the sidecar OCI manifest blob.
+///
+/// Containerd's GC roots a manifest blob through its Image record, then walks
+/// the manifest's outgoing `gc.ref.content.*` labels to find its config +
+/// layer blobs. Without these labels the just-written
+/// config/bootstrap/index/prefetch blobs become orphans the moment GC runs
+/// (which happens on every container/image churn), even though the manifest
+/// body itself names them by digest — containerd does NOT parse the manifest
+/// JSON for GC; it relies on operators to mirror those references into
+/// labels. Adding them here keeps the artifact alive until the original image
+/// (`gc.ref.content.subject`) is pruned.
+///
+/// `base_manifest_digest` covers the base→optimized promotion window: the
+/// promotion repoints the sidecar Image record at the optimized manifest, so
+/// nothing would root the BASE manifest anymore and a peer that resolved the
+/// base digest just before promotion could 404 mid-pull after a GC pass.
+/// `containerd.io/gc.ref.content.base` keeps the base manifest — and,
+/// transitively via that manifest's own `gc.ref.content.*` labels, its whole
+/// blob tree — GC-rooted for as long as the optimized sidecar lives.
+fn manifest_gc_labels(
+    mut labels: HashMap<String, String>,
+    config_digest: &str,
+    bootstrap_digest: &str,
+    zran_descriptors: &[AutoAccelLayerDescriptor],
+    prefetch_descriptor: Option<&AutoAccelDescriptor>,
+    base_manifest_digest: Option<&str>,
+) -> HashMap<String, String> {
+    labels.insert(
+        "containerd.io/gc.ref.content.config".to_string(),
+        config_digest.to_string(),
+    );
+    labels.insert(
+        "containerd.io/gc.ref.content.l.0".to_string(),
+        bootstrap_digest.to_string(),
+    );
+    for (i, layer) in zran_descriptors.iter().enumerate() {
+        labels.insert(
+            format!("containerd.io/gc.ref.content.l.{}", i + 1),
+            layer.digest.clone(),
+        );
+    }
+    if let Some(prefetch) = prefetch_descriptor {
+        labels.insert(
+            format!(
+                "containerd.io/gc.ref.content.l.{}",
+                zran_descriptors.len() + 1
+            ),
+            prefetch.digest.clone(),
+        );
+    }
+    if let Some(base) = base_manifest_digest {
+        labels.insert(
+            "containerd.io/gc.ref.content.base".to_string(),
+            base.to_string(),
+        );
+    }
+    labels
 }
 
 /// Per-image scratch dir under `auto_zran.work_dir`. We use a sha256 of the
@@ -1333,6 +1520,182 @@ mod tests {
         // against a missing input.
         std::fs::remove_file(&bootstrap).unwrap();
         assert!(load_reusable_base_artifact(work_dir).is_none());
+    }
+
+    /// Fix for the "retry after failed optimize upload" seam: a persisted
+    /// artifact that already claims a prefetch blob is only reusable when the
+    /// blob file is actually present; otherwise stage 2 must fall back to the
+    /// full pipeline instead of uploading a dangling reference.
+    #[test]
+    fn load_reusable_artifact_gates_on_prefetch_blob_presence() {
+        let tmp = tempfile::tempdir().unwrap();
+        let work_dir = tmp.path();
+        let backend = work_dir.join("backend");
+        std::fs::create_dir_all(&backend).unwrap();
+        let bootstrap = work_dir.join("bootstrap");
+        std::fs::write(&bootstrap, b"optimized-bootstrap").unwrap();
+
+        let artifact = NodeLocalArtifact {
+            bootstrap,
+            backend_dir: backend.clone(),
+            work_dir: work_dir.to_path_buf(),
+            layer_blob_ids: vec!["deadbeef".to_string()],
+            zran_index_blob_ids: vec!["cafef00d".to_string()],
+            prefetch_blob_id: Some("prefetch01".to_string()),
+        };
+        write_base_artifact(work_dir, &artifact).unwrap();
+
+        // artifact.json claims a prefetch blob that is not on disk → None.
+        assert!(load_reusable_base_artifact(work_dir).is_none());
+
+        std::fs::write(backend.join("prefetch01"), b"packed-chunks").unwrap();
+        let reused = load_reusable_base_artifact(work_dir).expect("optimized artifact reusable");
+        assert_eq!(reused, artifact);
+        assert!(reused.prefetch_blob_id.is_some());
+    }
+
+    /// Fix 1 (negative cache): after `MAX_CONVERSION_FAILURES` consecutive
+    /// failures for an image, BOTH stages' enqueue paths are suppressed; any
+    /// subsequent success for the image resets the count.
+    #[test]
+    fn enqueue_suppressed_after_max_failures_until_a_success_resets() {
+        let (sender, receiver) = async_channel::bounded(8);
+        let state = Arc::new(AutoZranState::new(8));
+        let manager = AutoZranManager {
+            sender,
+            state: state.clone(),
+        };
+        let image = "registry.local/broken:1";
+        let job = AutoZranJob::base(image.to_string());
+
+        // Simulate MAX consecutive failures through the real worker path
+        // (mark_finished(false) both releases the dedupe key and records the
+        // failure).
+        for _ in 0..MAX_CONVERSION_FAILURES {
+            state.mark_started(&job);
+            state.mark_finished(&job, false);
+        }
+
+        // Both stages are suppressed permanently (no temporal component once
+        // the cutoff is reached).
+        manager.try_enqueue_base(image);
+        manager.try_enqueue_profile(&profile(image));
+        assert!(
+            receiver.try_recv().is_err(),
+            "suppressed image must not queue"
+        );
+        let status = manager.status();
+        assert_eq!(status.queued_total, 0);
+        assert_eq!(status.skipped_total, 2);
+
+        // Unrelated images are unaffected.
+        manager.try_enqueue_base("registry.local/healthy:1");
+        assert_eq!(
+            receiver.try_recv().unwrap().image,
+            "registry.local/healthy:1"
+        );
+
+        // A success (e.g. a queued-before-cutoff job completing) resets the
+        // negative cache → enqueue works again immediately.
+        state.mark_started(&job);
+        state.mark_finished(&job, true);
+        manager.try_enqueue_base(image);
+        let queued = receiver.try_recv().expect("reset image queues again");
+        assert_eq!(queued.image, image);
+        assert_eq!(queued.stage, AutoZranStage::Base);
+    }
+
+    /// Fix 1 (backoff spacing): before the permanent cutoff, retries are
+    /// spaced exponentially (base, 2×base) from the last failure.
+    #[test]
+    fn failure_backoff_spacing_is_exponential_before_permanent_cutoff() {
+        let state = AutoZranState::new(2);
+        let image = "registry.local/flaky:1";
+        let job = AutoZranJob::base(image.to_string());
+        let last_failure = |state: &AutoZranState| {
+            state
+                .failures
+                .lock()
+                .unwrap()
+                .get(image)
+                .expect("failure recorded")
+                .last_failure
+        };
+
+        state.mark_started(&job);
+        state.mark_finished(&job, false); // count = 1 → window = base
+        let failed_at = last_failure(&state);
+        assert!(state.enqueue_suppressed(image, failed_at));
+        assert!(state.enqueue_suppressed(
+            image,
+            failed_at + FAILURE_BACKOFF_BASE - Duration::from_secs(1)
+        ));
+        assert!(!state.enqueue_suppressed(image, failed_at + FAILURE_BACKOFF_BASE));
+
+        state.mark_started(&job);
+        state.mark_finished(&job, false); // count = 2 → window = 2×base
+        let failed_at = last_failure(&state);
+        assert!(state.enqueue_suppressed(image, failed_at + FAILURE_BACKOFF_BASE));
+        assert!(!state.enqueue_suppressed(image, failed_at + 2 * FAILURE_BACKOFF_BASE));
+
+        state.mark_started(&job);
+        state.mark_finished(&job, false); // count = 3 → permanent
+        let failed_at = last_failure(&state);
+        assert!(
+            state.enqueue_suppressed(image, failed_at + Duration::from_secs(365 * 24 * 60 * 60))
+        );
+
+        // Images without a failure record are never suppressed.
+        assert!(!state.enqueue_suppressed("registry.local/other:1", failed_at));
+    }
+
+    /// Fix 2 (GC pinning across promotion): the manifest GC labels reference
+    /// config + every data blob, and — only when a base record existed —
+    /// carry `gc.ref.content.base` pointing at the pre-promotion base
+    /// manifest so its tree stays GC-rooted while the optimized sidecar
+    /// lives.
+    #[test]
+    fn manifest_gc_labels_pin_blobs_and_optionally_the_base_manifest() {
+        let zran = vec![AutoAccelLayerDescriptor {
+            layer_digest: "sha256:aaa".to_string(),
+            digest: "sha256:idx0".to_string(),
+            size: 1,
+        }];
+        let prefetch = AutoAccelDescriptor {
+            digest: "sha256:pf".to_string(),
+            size: 2,
+        };
+
+        // Optimize-stage shape: prefetch blob + pre-existing base manifest.
+        let labels = manifest_gc_labels(
+            HashMap::new(),
+            "sha256:cfg",
+            "sha256:boot",
+            &zran,
+            Some(&prefetch),
+            Some("sha256:base-manifest"),
+        );
+        assert_eq!(labels["containerd.io/gc.ref.content.config"], "sha256:cfg");
+        assert_eq!(labels["containerd.io/gc.ref.content.l.0"], "sha256:boot");
+        assert_eq!(labels["containerd.io/gc.ref.content.l.1"], "sha256:idx0");
+        assert_eq!(labels["containerd.io/gc.ref.content.l.2"], "sha256:pf");
+        assert_eq!(
+            labels["containerd.io/gc.ref.content.base"],
+            "sha256:base-manifest"
+        );
+
+        // Base-stage shape: no prefetch blob, no base pin.
+        let labels = manifest_gc_labels(
+            HashMap::new(),
+            "sha256:cfg",
+            "sha256:boot",
+            &zran,
+            None,
+            None,
+        );
+        assert_eq!(labels["containerd.io/gc.ref.content.l.1"], "sha256:idx0");
+        assert!(!labels.contains_key("containerd.io/gc.ref.content.l.2"));
+        assert!(!labels.contains_key("containerd.io/gc.ref.content.base"));
     }
 
     #[test]
