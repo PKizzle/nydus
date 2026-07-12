@@ -7,10 +7,13 @@
 //! [`FanotifyHandler`] replaces the deprecated fscache-based on-demand path.
 //! It works by:
 //! 1. Creating a fanotify group with `FAN_CLASS_PRE_CONTENT`.
-//! 2. Placing marks (`FAN_PRE_ACCESS | FAN_OPEN_PERM`) on sparse blob files in a
-//!    staging directory.
-//! 3. Issuing an EROFS mount that references the same blob files via
-//!    `mount("none", mountpoint, "erofs", 0, "device=<bootstrap>,device=blob0,...")`.
+//! 2. Placing marks (`FAN_PRE_ACCESS` **only** — never `FAN_OPEN_PERM`, which would
+//!    block every open including the daemon's own) on the sparse data-blob device
+//!    files (hardlinks of each blob's `.blob.data` cache file — same inode).
+//! 3. Issuing a file-backed EROFS mount with the **bootstrap as the mount source**
+//!    and the data blobs as `device=` options:
+//!    `mount("<bootstrap>", mountpoint, "erofs", 0, "device=blob_0,device=blob_1,...")`
+//!    (a NULL/`none` source fails with `EINVAL`).
 //! 4. Polling the fanotify fd; when a `FAN_PRE_ACCESS` event arrives, the handler
 //!    fetches the missing chunk data from the [`BlobCacheMgr`], writes it into the
 //!    sparse blob via `pwrite(2)`, and responds `FAN_ALLOW`.
@@ -66,6 +69,34 @@ fn fd_identity(fd: RawFd) -> Result<(u64, u64)> {
     Ok((st.st_dev as u64, st.st_ino as u64))
 }
 
+/// Scoped thread-safety assertion for [`DataBlob`].
+///
+/// `DataBlob` holds a compio `File` (an `Rc`-based `SharedFd`), which makes it `!Send + !Sync`.
+/// Within the fanotify handler the compio handle is only ever used for `as_raw_fd()` (fd
+/// identity, hardlink staging, `fallocate` cache culls) — its `Rc` refcount is touched solely
+/// at construction (`assemble`, single-threaded) and on handler drop. Worker threads never
+/// clone it or await on it. Keep it that way: do NOT call `async_read`/`async_fetch` (or
+/// anything else that clones the compio fd) on a [`BlobBacking`] from `run_loop` workers —
+/// range fills go through `blob().get_blob_object()` instead.
+///
+/// This deliberately replaces the previous blanket `unsafe impl Send/Sync for FanotifyHandler`,
+/// which vouched for every present and future field; scoping the assertion to the one field
+/// that needs it keeps the compiler checking the rest.
+struct AssertBlobThreadSafe(DataBlob);
+
+// SAFETY: see the type-level comment — raw-fd-only access from worker threads; the inner
+// compio fd's refcount is never mutated concurrently.
+unsafe impl Send for AssertBlobThreadSafe {}
+unsafe impl Sync for AssertBlobThreadSafe {}
+
+impl std::ops::Deref for AssertBlobThreadSafe {
+    type Target = DataBlob;
+
+    fn deref(&self) -> &DataBlob {
+        &self.0
+    }
+}
+
 /// A data blob whose sparse backing file is mounted as an EROFS device and serviced on demand.
 ///
 /// `dev`/`ino` identify the backing cache file so an incoming event fd can be resolved to the
@@ -73,7 +104,7 @@ fn fd_identity(fd: RawFd) -> Result<(u64, u64)> {
 struct BlobBacking {
     dev: u64,
     ino: u64,
-    blob: DataBlob,
+    blob: AssertBlobThreadSafe,
 }
 
 /// Handler that serves RAFS v6 blob data through fanotify pre-content hooks.
@@ -310,11 +341,10 @@ impl FanotifyHandler {
         // `DataBlob` owns a handle to its sparse backing file; we record that file's identity so
         // an incoming event fd can be resolved back to the blob without relying on path names.
         let mut blob_backings = Vec::new();
+        let runtime = compio::runtime::Runtime::new()
+            .map_err(|e| std::io::Error::other(format!("fanotify: compio runtime: {}", e)))?;
         for cfg in blob_cache_mgr.get_all_data_blobs() {
-            let blob = match compio::runtime::Runtime::new()
-                .unwrap()
-                .block_on(DataBlob::new(&cfg))
-            {
+            let blob = match runtime.block_on(DataBlob::new(&cfg)) {
                 Ok(b) => b,
                 Err(e) => {
                     warn!(
@@ -326,7 +356,11 @@ impl FanotifyHandler {
                 }
             };
             match fd_identity(blob.file().as_raw_fd()) {
-                Ok((dev, ino)) => blob_backings.push(BlobBacking { dev, ino, blob }),
+                Ok((dev, ino)) => blob_backings.push(BlobBacking {
+                    dev,
+                    ino,
+                    blob: AssertBlobThreadSafe(blob),
+                }),
                 Err(e) => warn!(
                     "fanotify: failed to stat backing file for blob {}: {}",
                     cfg.blob_info().blob_id(),
@@ -356,7 +390,9 @@ impl FanotifyHandler {
                 })?;
             let device_path = cache_path.with_file_name(format!("blob_{i}"));
             // Re-link defensively so a stale `blob_<i>` from a previous run cannot point at the
-            // wrong inode. Nothing is mounted yet, so removing the name here is safe.
+            // wrong inode. Removing the name is safe on both construction paths: on `new()` nothing
+            // is mounted yet, and on `from_restored_fd()` (EROFS mount still live) the kernel holds
+            // the device by inode, not by name — and the re-link targets that same inode.
             let _ = std::fs::remove_file(&device_path);
             std::fs::hard_link(&cache_path, &device_path).map_err(|e| {
                 std::io::Error::other(format!(
@@ -395,8 +431,19 @@ impl FanotifyHandler {
         let mask = FAN_PRE_ACCESS;
         let mark_flags = libc::FAN_MARK_ADD;
         for blob_path in self.device_blobs.iter() {
+            // A missing device file is always pathological — assemble() just created
+            // every entry in `device_blobs`. Skipping it would leave the sparse file
+            // unmarked, and EROFS would then silently serve zeros for that blob (the
+            // exact corruption class the pre-content path exists to prevent).
             if !blob_path.exists() {
-                continue;
+                return Err(std::io::Error::new(
+                    ErrorKind::NotFound,
+                    format!(
+                        "fanotify: device file {:?} vanished before arming; refusing to \
+                         serve a mount that would read zero-filled data",
+                        blob_path
+                    ),
+                ));
             }
             let path_c = std::ffi::CString::new(blob_path.as_os_str().as_encoded_bytes())
                 .map_err(|e| std::io::Error::new(ErrorKind::InvalidInput, e))?;
@@ -440,9 +487,13 @@ impl FanotifyHandler {
     }
 
     /// Get a clone of the underlying fanotify fd for upgrade/restore paths.
+    ///
+    /// Duplicated with `F_DUPFD_CLOEXEC` (plain `dup(2)` clears close-on-exec) so the
+    /// copy cannot leak into spawned children such as `modprobe` or `nydus-image`;
+    /// the upgrade path passes it explicitly via `SCM_RIGHTS` instead.
     pub fn get_file(&self) -> Result<File> {
         let raw = self.fan_fd.as_raw_fd();
-        let fd = unsafe { libc::dup(raw) };
+        let fd = unsafe { libc::fcntl(raw, libc::F_DUPFD_CLOEXEC, 0) };
         if fd < 0 {
             return Err(std::io::Error::last_os_error());
         }
@@ -465,7 +516,31 @@ impl FanotifyHandler {
     /// Run the fanotify event loop on a single worker thread.
     ///
     /// Blocks until `stop()` is called or an unrecoverable error occurs.
+    ///
+    /// Every exit path — clean shutdown *and* error — participates in the shutdown
+    /// barrier. The barrier is sized `threads + 1` and [`stop`](Self::stop) blocks on
+    /// it, so a worker that returned early without waiting would deadlock `stop()`
+    /// forever (and, because the singleton calls `stop()` while holding its handlers
+    /// mutex, wedge every subsequent register/unregister daemon-wide). An erroring
+    /// worker therefore logs, wakes a sibling, and parks on the barrier until
+    /// `stop()` supplies the final waiter.
     pub fn run_loop(&self) -> Result<()> {
+        let result = self.run_loop_inner();
+        if let Err(ref e) = result {
+            error!(
+                "fanotify: worker exiting on error ({}); remaining workers keep serving, \
+                 parking on the shutdown barrier so stop() can complete",
+                e
+            );
+            // The cascade wake below is for the *clean* path; on error the group is
+            // still active, so this wake is a harmless no-op for siblings.
+        }
+        let _ = self.waker.wake();
+        self.barrier.wait();
+        result
+    }
+
+    fn run_loop_inner(&self) -> Result<()> {
         let mut events = Events::with_capacity(MAX_EVENTS_PER_POLL);
         let mut buf = vec![0u8; EVENT_BUF_SIZE];
 
@@ -489,8 +564,6 @@ impl FanotifyHandler {
                         self.drain_events(&mut buf)?;
                     }
                     Token(TOKEN_EVENT_WAKER) if !self.active.load(Ordering::Acquire) => {
-                        let _ = self.waker.wake();
-                        self.barrier.wait();
                         return Ok(());
                     }
                     _ => {}
@@ -500,6 +573,10 @@ impl FanotifyHandler {
     }
 
     /// Read and process all pending fanotify events in a non-blocking loop.
+    ///
+    /// The mio registration is edge-triggered, so this must keep reading until
+    /// `EAGAIN` — returning early with events still queued would strand them until
+    /// an unrelated new event re-arms the readiness edge.
     fn drain_events(&self, buf: &mut [u8]) -> Result<()> {
         loop {
             let n = unsafe {
@@ -514,9 +591,28 @@ impl FanotifyHandler {
                 n if n > 0 => self.process_event_buffer(&buf[..n as usize])?,
                 _ => {
                     let err = std::io::Error::last_os_error();
-                    match err.kind() {
-                        ErrorKind::Interrupted => continue,
-                        ErrorKind::WouldBlock => return Ok(()),
+                    match err.raw_os_error() {
+                        Some(libc::EINTR) => continue,
+                        Some(libc::EAGAIN) => return Ok(()),
+                        // Without FAN_REPORT_FD_ERROR the kernel fails the read()
+                        // itself when it cannot allocate the per-event fd. fd/memory
+                        // pressure is transient node sickness, not a broken group —
+                        // killing the worker here would deadlock stop() and wedge the
+                        // daemon (see run_loop). Back off briefly and retry so the
+                        // still-queued permission events eventually get answered.
+                        Some(libc::EMFILE) | Some(libc::ENFILE) | Some(libc::ENOMEM) => {
+                            // Stay responsive to stop(): the waker can't reach us
+                            // while we're off the poll loop.
+                            if !self.active.load(Ordering::Acquire) {
+                                return Ok(());
+                            }
+                            warn!(
+                                "fanotify: transient {} reading events; retrying after backoff",
+                                err
+                            );
+                            std::thread::sleep(std::time::Duration::from_millis(10));
+                            continue;
+                        }
                         _ => return Err(err),
                     }
                 }
@@ -531,6 +627,16 @@ impl FanotifyHandler {
             // SAFETY: we verified the buffer has enough bytes.
             let meta =
                 unsafe { &*(buf.as_ptr().add(offset) as *const libc::fanotify_event_metadata) };
+
+            // fanotify(7) mandates checking the metadata version before consuming an
+            // event; a mismatched kernel ABI must fail loudly, not be misparsed.
+            if meta.vers != libc::FANOTIFY_METADATA_VERSION {
+                return Err(std::io::Error::other(format!(
+                    "fanotify: metadata version {} != expected {}; kernel ABI mismatch",
+                    meta.vers,
+                    libc::FANOTIFY_METADATA_VERSION
+                )));
+            }
 
             let meta_len = meta.event_len as usize;
             if meta_len == 0 || meta_len < std::mem::size_of::<libc::fanotify_event_metadata>() {
@@ -567,6 +673,10 @@ impl FanotifyHandler {
     }
 
     /// Write a permission response (`FAN_ALLOW` / `FAN_DENY_ERRNO`) for `event_fd`.
+    ///
+    /// A response that never reaches the kernel leaves the accessing task blocked in
+    /// `D` state indefinitely, so `EINTR` is retried rather than dropped; any other
+    /// failure is logged loudly (there is no recovery — the fd is closed either way).
     fn write_response(&self, event_fd: RawFd, response: u32) {
         let resp = fanotify_response {
             fd: event_fd,
@@ -578,18 +688,27 @@ impl FanotifyHandler {
                 std::mem::size_of::<fanotify_response>(),
             )
         };
-        let ret = unsafe {
-            libc::write(
-                self.fan_fd.as_raw_fd(),
-                resp_buf.as_ptr() as *const libc::c_void,
-                resp_buf.len(),
-            )
-        };
-        if ret < 0 {
-            warn!(
-                "fanotify: failed to write permission response: {}",
-                std::io::Error::last_os_error()
+        loop {
+            let ret = unsafe {
+                libc::write(
+                    self.fan_fd.as_raw_fd(),
+                    resp_buf.as_ptr() as *const libc::c_void,
+                    resp_buf.len(),
+                )
+            };
+            if ret >= 0 {
+                return;
+            }
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            error!(
+                "fanotify: failed to write permission response for fd {}: {}; \
+                 the blocked reader will stall until the group closes",
+                event_fd, err
             );
+            return;
         }
     }
 
@@ -670,6 +789,18 @@ impl FanotifyHandler {
             range.count
         );
 
+        // Clamp the kernel-reported range to the blob's uncompressed size before
+        // fetching. fanotify(7) documents pre-content ranges as block-aligned and
+        // possibly extending beyond EOF (and page-cache large-folio work keeps
+        // widening read granularity), while `get_chunks_uncompressed` hard-errors on
+        // any range past the end — without the clamp a legitimate read of the last
+        // partial block would be answered FAN_DENY_ERRNO(EIO).
+        let blob_size = backing.blob.blob_info().uncompressed_size();
+        if range.offset >= blob_size {
+            return Ok(());
+        }
+        let count = range.count.min(blob_size - range.offset);
+
         // Download and decompress the requested range into the sparse backing file.
         let obj = backing.blob.blob().get_blob_object().ok_or_else(|| {
             std::io::Error::other(format!(
@@ -677,7 +808,7 @@ impl FanotifyHandler {
                 backing.blob.blob_info().blob_id()
             ))
         })?;
-        obj.fetch_range_uncompressed(range.offset, range.count)?;
+        obj.fetch_range_uncompressed(range.offset, count)?;
 
         Ok(())
     }
@@ -731,10 +862,9 @@ fn fd_file_size(fd: RawFd) -> Result<u64> {
     Ok(st.st_size as u64)
 }
 
-// The fanotify fd is closed when OwnedFd drops.
-// SAFETY: fanotify fd is safe to send across threads.
-unsafe impl Send for FanotifyHandler {}
-unsafe impl Sync for FanotifyHandler {}
+// The fanotify fd is closed when OwnedFd drops. `FanotifyHandler` derives Send/Sync
+// automatically from its fields — do not add blanket `unsafe impl`s here: they would
+// silently vouch for any future non-thread-safe field.
 
 #[cfg(test)]
 mod tests {

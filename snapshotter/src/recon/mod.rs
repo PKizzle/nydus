@@ -218,12 +218,6 @@ impl Reconciler {
     /// in use by checking `/proc/mounts` first.
     async fn check_stale_daemon_dirs(&self) -> Result<()> {
         let daemons_root = self.supervisor.daemons_root();
-        let entries = match std::fs::read_dir(&daemons_root) {
-            Ok(e) => e,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(e) => return Err(e).context("recon: failed to read daemons root"),
-        };
-
         let active = self.supervisor.active_slugs().await;
         let busy = read_proc_mounts()
             .map(|m| {
@@ -233,36 +227,7 @@ impl Reconciler {
             })
             .unwrap_or_default();
 
-        let mut removed = 0usize;
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let name = match path.file_name().and_then(|n| n.to_str()) {
-                Some(n) => n.to_string(),
-                None => continue,
-            };
-            if active.contains(&name) {
-                continue;
-            }
-            // Skip if anything under this dir is still mounted.
-            if busy.iter().any(|m| m.starts_with(&path)) {
-                warn!(
-                    dir = %path.display(),
-                    "recon: stale daemon dir still has active mount; leaving in place"
-                );
-                continue;
-            }
-            match std::fs::remove_dir_all(&path) {
-                Ok(()) => {
-                    removed += 1;
-                    info!(dir = %path.display(), "recon: removed stale daemon dir");
-                }
-                Err(e) => warn!(
-                    dir = %path.display(),
-                    error = %e,
-                    "recon: failed to remove stale daemon dir"
-                ),
-            }
-        }
+        let removed = sweep_stale_daemon_dirs(&daemons_root, &active, &busy)?;
         if removed > 0 {
             info!(removed, "recon: stale daemon dir sweep completed");
         }
@@ -408,6 +373,71 @@ fn sweep_stale_job_dirs(
     Ok(removed)
 }
 
+/// `Reconciler::check_stale_daemon_dirs` as a function of its inputs so the
+/// sweep decision is unit-testable without a full `Reconciler`/`DaemonSupervisor`.
+///
+/// Removes `{root}/daemons/<slug>/` directories that belong to no live daemon
+/// instance and have nothing mounted beneath them. Two classes of entries are
+/// never touched:
+/// - the [`DaemonSupervisor::RECORDS_DIRNAME`] directory: it holds the persisted
+///   `DaemonStatusRecord` JSONs that failover restore pairs with preserved fds —
+///   sweeping it between a reconcile tick and the next persist would make a
+///   `kill -9` drop parked FUSE fds and leave live mounts serverless;
+/// - non-directory entries (stray files are not daemon state and `remove_dir_all`
+///   would fail on them anyway).
+fn sweep_stale_daemon_dirs(
+    daemons_root: &Path,
+    active_slugs: &HashSet<String>,
+    busy_mounts: &HashSet<PathBuf>,
+) -> Result<usize> {
+    let entries = match std::fs::read_dir(daemons_root) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => return Err(e).context("recon: failed to read daemons root"),
+    };
+
+    let mut removed = 0usize;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if !file_type.is_dir() {
+            continue;
+        }
+        let name = match path.file_name().and_then(|n| n.to_str()) {
+            Some(n) => n.to_string(),
+            None => continue,
+        };
+        if name == crate::daemon::DaemonSupervisor::RECORDS_DIRNAME {
+            continue;
+        }
+        if active_slugs.contains(&name) {
+            continue;
+        }
+        // Skip if anything under this dir is still mounted.
+        if busy_mounts.iter().any(|m| m.starts_with(&path)) {
+            warn!(
+                dir = %path.display(),
+                "recon: stale daemon dir still has active mount; leaving in place"
+            );
+            continue;
+        }
+        match std::fs::remove_dir_all(&path) {
+            Ok(()) => {
+                removed += 1;
+                info!(dir = %path.display(), "recon: removed stale daemon dir");
+            }
+            Err(e) => warn!(
+                dir = %path.display(),
+                error = %e,
+                "recon: failed to remove stale daemon dir"
+            ),
+        }
+    }
+    Ok(removed)
+}
+
 /// One row of `/proc/mounts` that the reconciler cares about.
 #[derive(Clone, Debug)]
 struct MountEntry {
@@ -512,6 +542,48 @@ proc /proc proc rw,nosuid 0 0
         let f = std::fs::File::open(&dir).unwrap();
         f.set_modified(stale_time).unwrap();
         dir
+    }
+
+    #[test]
+    fn sweep_stale_daemon_dirs_never_removes_the_records_dir() {
+        // Regression: the persisted DaemonStatusRecord directory is not a slug
+        // and has no mounts, so the pre-fix sweep deleted it on every pass —
+        // breaking failover restore after a kill -9.
+        let tmp = tempfile::tempdir().unwrap();
+        let records = tmp
+            .path()
+            .join(crate::daemon::DaemonSupervisor::RECORDS_DIRNAME);
+        std::fs::create_dir_all(&records).unwrap();
+        std::fs::write(records.join("abc.json"), b"{}").unwrap();
+        let stale = tmp.path().join("deadbeef-old-image");
+        std::fs::create_dir_all(&stale).unwrap();
+
+        let removed =
+            sweep_stale_daemon_dirs(tmp.path(), &HashSet::new(), &HashSet::new()).unwrap();
+
+        assert_eq!(removed, 1);
+        assert!(records.join("abc.json").exists(), "records dir must survive");
+        assert!(!stale.exists(), "stale slug dir must still be swept");
+    }
+
+    #[test]
+    fn sweep_stale_daemon_dirs_spares_active_and_mounted_dirs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let active_dir = tmp.path().join("aaaa-live");
+        let mounted_dir = tmp.path().join("bbbb-mounted");
+        std::fs::create_dir_all(&active_dir).unwrap();
+        std::fs::create_dir_all(mounted_dir.join("mnt")).unwrap();
+        std::fs::write(tmp.path().join("stray-file"), b"x").unwrap();
+
+        let active: HashSet<String> = ["aaaa-live".to_string()].into();
+        let busy: HashSet<PathBuf> = [mounted_dir.join("mnt")].into();
+
+        let removed = sweep_stale_daemon_dirs(tmp.path(), &active, &busy).unwrap();
+
+        assert_eq!(removed, 0);
+        assert!(active_dir.exists());
+        assert!(mounted_dir.exists());
+        assert!(tmp.path().join("stray-file").exists());
     }
 
     #[test]

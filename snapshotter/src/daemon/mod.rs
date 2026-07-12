@@ -804,6 +804,12 @@ impl DaemonSupervisor {
         self.config.snapshotter.root.join("daemons")
     }
 
+    /// Name of the subdirectory of [`Self::daemons_root`] that holds persisted
+    /// [`DaemonStatusRecord`] JSONs. It is not a per-image slug directory, so
+    /// the reconciler's stale-daemon-dir sweep must never remove it — failover
+    /// restore pairs these records with preserved fds after a crash.
+    pub const RECORDS_DIRNAME: &'static str = "records";
+
     /// Unmount every running instance. Called on graceful shutdown.
     pub async fn shutdown_all(&self) {
         let mut instances = self.instances.write().await;
@@ -1339,7 +1345,7 @@ impl DaemonSupervisor {
     }
 
     fn record_dir(&self) -> PathBuf {
-        self.daemons_root().join("records")
+        self.daemons_root().join(Self::RECORDS_DIRNAME)
     }
 
     fn record_path(&self, slug: &str) -> PathBuf {

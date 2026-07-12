@@ -45,7 +45,9 @@ pub const FAN_PRE_ACCESS: u64 = 0x0010_0000;
 
 /// Construct a deny-with-errno response (`FAN_DENY_ERRNO(e)` macro from the kernel).
 ///
-/// Kernel ≥ 6.13 supports denying with an errno other than `EPERM`. The kernel macro is
+/// Kernel ≥ 6.14 supports denying with an errno other than `EPERM` (the `FAN_DENY_ERRNO`
+/// response encoding merged with the pre-content series in 6.14; 6.13 added the separate
+/// `FAN_REPORT_FD_ERROR` init flag). The kernel macro is
 /// `FAN_DENY | ((err & FAN_ERRNO_MASK) << FAN_ERRNO_SHIFT)` with `FAN_ERRNO_BITS = 8`, i.e.
 /// the errno occupies the top 8 bits (`FAN_ERRNO_SHIFT = 32 - 8 = 24`).
 /// Common choices: `libc::EIO`, `libc::EBUSY`, `libc::ENOSPC`.
