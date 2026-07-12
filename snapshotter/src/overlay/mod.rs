@@ -246,15 +246,29 @@ impl OverlayEngine {
                 // Cache-only: this is sync code on the gRPC runtime, so it
                 // must never trigger an image-store walk. The cache is
                 // shared with (and populated by) the async prepare path.
+                // Guarded like `stored`: a cache populated by an older binary
+                // can map a chain to a bare image-ID record (`sha256:…`), and
+                // a daemon built from that fetches blobs from repo
+                // "library/sha256" — every data read EIOs (the 0.2.9-nydus
+                // mirrors incident).
                 bootstrap_digest_from_key(&snap.key)
                     .and_then(|d| self.containerd_lookup.as_ref()?.lookup_cached(d))
+                    .filter(|s| is_image_ref_like(s))
             } else {
                 None
             };
+            // Every candidate is digest-guarded: call/stored/from_containerd
+            // via `is_image_ref_like`, the snapshot CRI label inline here.
             let image_ref = call_image_ref
                 .clone()
+                .filter(|s| is_image_ref_like(s))
                 .or_else(|| stored.clone())
-                .or_else(|| snap.labels.get(CRI_IMAGE_REF).cloned())
+                .or_else(|| {
+                    snap.labels
+                        .get(CRI_IMAGE_REF)
+                        .cloned()
+                        .filter(|s| is_image_ref_like(s))
+                })
                 .or(from_containerd.clone());
             let Some(image_ref) = image_ref else {
                 info!(

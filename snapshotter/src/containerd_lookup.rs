@@ -306,9 +306,37 @@ struct RecordGroup {
     display_ref: String,
 }
 
-/// Group image records by target digest, preferring a tag-form name
-/// (`name:tag`) over a digest-form one (`name@sha256:...`) as the display
-/// ref — mirrors the legacy `preferred_ref` (crictl repoTags first).
+/// Rank an image-record name by its usefulness as a registry reference.
+/// Higher is better:
+///   3 — tag-form full ref (`host/repo:tag`)
+///   2 — digest-form ref (`host/repo@sha256:...` — repo still resolvable)
+///   1 — name-only ref (`host/repo`)
+///   0 — bare digest / image-ID record (`sha256:<hex>`): containerd's CRI
+///       plugin stores one of these for EVERY pulled image, and it is
+///       USELESS as a registry ref — parsing it yields repo "sha256"
+///       (docker.io-normalized to "library/sha256"), so a daemon built from
+///       it fails every blob fetch with UNAUTHORIZED and containers EIO.
+fn ref_name_rank(name: &str) -> u8 {
+    if name.starts_with("sha256:") || name.starts_with("sha512:") {
+        return 0;
+    }
+    if name.contains('@') {
+        return 2;
+    }
+    // Tag split as in record_matches_ref: the last `:` is a tag separator
+    // only when the remainder has no `/` (registry ports are not tags).
+    match name.rsplit_once(':') {
+        Some((_, tag)) if !tag.is_empty() && !tag.contains('/') => 3,
+        _ => 1,
+    }
+}
+
+/// Group image records by target digest, choosing the highest-ranked name
+/// (see [`ref_name_rank`]) as the display ref — real tag refs first, then
+/// `repo@digest` refs; bare image-ID records (`sha256:...`) never win, and a
+/// group consisting ONLY of image-ID records is dropped entirely: mapping a
+/// chain to a bare digest poisons every consumer downstream (registry
+/// backend, auto-accel routing, capture).
 fn group_records_by_target(records: &[ImageRecord]) -> Vec<RecordGroup> {
     let mut by_target: HashMap<&str, &str> = HashMap::new();
     for record in records {
@@ -318,9 +346,7 @@ fn group_records_by_target(records: &[ImageRecord]) -> Vec<RecordGroup> {
                 v.insert(record.name.as_str());
             }
             std::collections::hash_map::Entry::Occupied(mut o) => {
-                let current_is_digest_form = o.get().contains('@');
-                let new_is_tag_form = !record.name.contains('@');
-                if current_is_digest_form && new_is_tag_form {
+                if ref_name_rank(record.name.as_str()) > ref_name_rank(o.get()) {
                     o.insert(record.name.as_str());
                 }
             }
@@ -328,9 +354,19 @@ fn group_records_by_target(records: &[ImageRecord]) -> Vec<RecordGroup> {
     }
     by_target
         .into_iter()
-        .map(|(target, display)| RecordGroup {
-            target: target.to_string(),
-            display_ref: display.to_string(),
+        .filter_map(|(target, chosen)| {
+            if ref_name_rank(chosen) == 0 {
+                debug!(
+                    target,
+                    name = chosen,
+                    "skipping image group with only image-ID records (no usable ref)"
+                );
+                return None;
+            }
+            Some(RecordGroup {
+                target: target.to_string(),
+                display_ref: chosen.to_string(),
+            })
         })
         .collect()
 }
@@ -884,5 +920,61 @@ mod tests {
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].display_ref, "docker.io/library/nginx:1.27");
         assert_eq!(groups[0].target, "sha256:abc");
+    }
+
+    /// REGRESSION (0.2.9-nydus mirrors EIO): containerd's CRI plugin stores a
+    /// bare image-ID record (`sha256:<config digest>`) for every pulled
+    /// image. The old `contains('@')` heuristic classified it as "tag form",
+    /// so it could win as the display ref — and a daemon built from it
+    /// fetched blobs from repo "library/sha256" (UNAUTHORIZED → EIO). The
+    /// image-ID record must NEVER win, in either insertion order.
+    #[test]
+    fn group_records_never_selects_bare_image_id() {
+        for order in [true, false] {
+            let mut records = vec![
+                ImageRecord {
+                    name: "sha256:0c0da3558734bbf673448b752bb6c139cbd3ece8060c6589370280b8ba631d9e"
+                        .to_string(),
+                    target_digest: "sha256:tgt".to_string(),
+                },
+                ImageRecord {
+                    name: "docker.io/thegrandpkizzle/mirrors@sha256:2a25".to_string(),
+                    target_digest: "sha256:tgt".to_string(),
+                },
+            ];
+            if order {
+                records.reverse();
+            }
+            let groups = group_records_by_target(&records);
+            assert_eq!(groups.len(), 1);
+            assert_eq!(
+                groups[0].display_ref, "docker.io/thegrandpkizzle/mirrors@sha256:2a25",
+                "repo@digest ref must beat the image-ID record (order={order})"
+            );
+        }
+    }
+
+    /// A target known ONLY by image-ID records has no usable ref — the group
+    /// is dropped rather than poisoning the chain map with a bare digest.
+    #[test]
+    fn group_records_drops_image_id_only_groups() {
+        let records = vec![ImageRecord {
+            name: "sha256:0c0da3558734bbf673448b752bb6c139cbd3ece8060c6589370280b8ba631d9e"
+                .to_string(),
+            target_digest: "sha256:tgt".to_string(),
+        }];
+        assert!(group_records_by_target(&records).is_empty());
+    }
+
+    #[test]
+    fn ref_name_rank_orders_tag_over_digest_over_bare() {
+        assert_eq!(ref_name_rank("docker.io/library/nginx:1.27"), 3);
+        assert_eq!(ref_name_rank("docker.io/library/nginx@sha256:abc"), 2);
+        assert_eq!(ref_name_rank("docker.io/library/nginx"), 1);
+        assert_eq!(ref_name_rank("localhost:5000/img"), 1); // port, not tag
+        assert_eq!(
+            ref_name_rank("sha256:0c0da3558734bbf673448b752bb6c139cbd3ece806"),
+            0
+        );
     }
 }

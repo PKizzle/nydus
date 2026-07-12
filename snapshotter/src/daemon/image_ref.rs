@@ -33,6 +33,20 @@ pub fn parse_image_ref(reference: &str) -> Option<ImageRef> {
         return None;
     }
 
+    // A bare digest / image-ID (`sha256:<hex>`) is NOT a reference. Without
+    // this guard it parses as repo "sha256" + tag "<hex>", which docker.io
+    // normalizes to "library/sha256" — a nonexistent repository every blob
+    // fetch 401s against (the 0.2.9-nydus mirrors EIO incident). containerd's
+    // CRI plugin stores such an image-ID record for every pulled image, so
+    // these strings genuinely show up where refs are expected.
+    if let Some((algo, hex)) = trimmed.split_once(':')
+        && matches!(algo, "sha256" | "sha512")
+        && hex.len() >= 32
+        && hex.bytes().all(|b| b.is_ascii_hexdigit())
+    {
+        return None;
+    }
+
     let (rest, digest) = match trimmed.split_once('@') {
         Some((head, d)) if !d.is_empty() => (head, Some(d.to_string())),
         _ => (trimmed, None),
@@ -126,5 +140,29 @@ mod tests {
     fn parse_empty_returns_none() {
         assert!(parse_image_ref("").is_none());
         assert!(parse_image_ref("   ").is_none());
+    }
+
+    /// REGRESSION (0.2.9-nydus mirrors EIO): a bare image-ID must not parse
+    /// into repo "sha256" / "library/sha256" — it is not a reference at all.
+    #[test]
+    fn parse_bare_digest_returns_none() {
+        assert!(
+            parse_image_ref(
+                "sha256:0c0da3558734bbf673448b752bb6c139cbd3ece8060c6589370280b8ba631d9e"
+            )
+            .is_none()
+        );
+        assert!(
+            parse_image_ref(
+                "sha512:6015a4142a432c74338d5f45f4675dd530b26186fdad2e2377cfb692e9ecd7a3\
+                 6015a4142a432c74338d5f45f4675dd530b26186fdad2e2377cfb692e9ecd7a3"
+            )
+            .is_none()
+        );
+        // Real refs that merely CONTAIN a digest still parse.
+        assert!(parse_image_ref("ghcr.io/foo/bar@sha256:deadbeef").is_some());
+        // A genuine repo named "sha256" with a short non-hex tag still parses
+        // (the guard requires >=32 hex chars).
+        assert!(parse_image_ref("sha256:latest").is_some());
     }
 }
