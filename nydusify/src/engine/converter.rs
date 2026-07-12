@@ -121,8 +121,25 @@ pub async fn run_conversion(request: &ConvertRequest, workspace: &Path) -> Resul
     )
     .await?;
 
-    // ---- P4c seam (no-op unless --with-referrer) ----
-    maybe_push_referrer(request.driver.with_referrer, &pushed, &source.manifest_desc)?;
+    // ---- P4c: attach a referrer artifact to the source image ----
+    // Data blobs in image-layer order: reused gzip layers (oci-ref) then the
+    // newly-built nydus blobs. Pushed to the source repo so the referrer
+    // resolves alongside its subject.
+    let mut data_blob_files: Vec<PathBuf> = output
+        .reused_layers
+        .iter()
+        .map(|l| l.path.clone())
+        .collect();
+    data_blob_files.extend(output.new_blobs.iter().cloned());
+    maybe_push_referrer(
+        request.driver.with_referrer,
+        &source_client,
+        &source_ref.repo,
+        &data_blob_files,
+        &output.bootstrap,
+        &source.manifest_desc,
+    )
+    .await?;
 
     if let Some(path) = &request.output_json {
         write_output_json(path, &target_ref, &pushed, &output)?;
