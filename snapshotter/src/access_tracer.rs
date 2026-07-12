@@ -125,6 +125,10 @@ struct Inner {
     /// exist. `OnceLock` keeps this single-writer / many-reader without a
     /// lock on the hot event-loop path.
     auto_zran: std::sync::OnceLock<Arc<AutoZranManager>>,
+    /// Set the first time `flush_profile` observes `auto_zran` still empty at
+    /// settle time, so the "wiring never happened" warning below fires once
+    /// per process instead of once per settled image.
+    warned_auto_zran_unset: std::sync::atomic::AtomicBool,
     /// Keyed by mount_root canonical path.
     mounts: Mutex<HashMap<PathBuf, ImageCapture>>,
     skip_images: Mutex<HashSet<String>>,
@@ -164,6 +168,7 @@ impl AccessTracer {
                     exclude_patterns,
                     profile_store,
                     auto_zran: auto_zran_cell,
+                    warned_auto_zran_unset: std::sync::atomic::AtomicBool::new(false),
                     mounts: Mutex::new(HashMap::new()),
                     skip_images: Mutex::new(HashSet::new()),
                     fanotify: None,
@@ -194,6 +199,7 @@ impl AccessTracer {
             exclude_patterns,
             profile_store,
             auto_zran: auto_zran_cell,
+            warned_auto_zran_unset: std::sync::atomic::AtomicBool::new(false),
             mounts: Mutex::new(HashMap::new()),
             skip_images: Mutex::new(HashSet::new()),
             fanotify,
@@ -756,6 +762,22 @@ fn flush_profile(inner: &Inner, image_ref: &str, files: Vec<String>) -> Result<(
         auto_zran.try_enqueue_profile(&profile);
         true
     } else {
+        // `set_auto_zran` was never back-filled (see its doc comment): the
+        // capture side is fully working (we just persisted a profile), but
+        // nothing will ever pick it up for conversion. This is a wiring bug,
+        // not a runtime condition, so warn loudly — but only once per
+        // process, since every future settle would hit the same empty
+        // OnceLock and we don't want to spam the log per image.
+        if !inner
+            .warned_auto_zran_unset
+            .swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
+            warn!(
+                "access_tracer settled a prefetch profile but auto_zran was never wired via \
+                 set_auto_zran; profiles will keep persisting to disk but no conversion job \
+                 will ever be enqueued for this process"
+            );
+        }
         false
     };
     info!(

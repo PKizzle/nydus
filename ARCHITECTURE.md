@@ -1,7 +1,7 @@
 # Nydus Architecture
 
 > **Version:** 3.0 (Rust snapshotter rewrite)
-> **Last updated:** 2026-07-09
+> **Last updated:** 2026-07-12
 > **Status:** Implementation in progress
 
 ## Overview
@@ -77,10 +77,18 @@ fanotify (≥6.14, CAP_SYS_ADMIN) → fusedev (/dev/fuse) → blockdev (loop/NBD
   `grpc.health.v1.Health` service are served by **cyper-axum** (hyper-on-compio) over a `tonic`
   `Routes` router — no tokio runtime, no second transport (`snapshotter/src/grpc/mod.rs`). The same
   hyper-on-compio server backs the sysctl UDS admin API (`snapshotter/src/sysctl.rs`).
-- **In-process nydus-service (FUSE/fanotify) I/O**: still uses a **current-thread tokio** runtime,
-  required for the FUSE/fanotify io-uring event loop (see CLAUDE.md gotcha #1). This is the
-  `service/` crate linked in-process; only the FUSE/fanotify session thread is tokio, and it must
-  never be handed a multi-thread tokio handle.
+- **In-process nydus-service (FUSE/fanotify) I/O**: has **zero tokio** (see CLAUDE.md gotcha #1).
+  This is the `service/` crate, linked in-process. The fanotify event loop is `mio`-poll plus
+  blocking libc reads on its own OS thread (`service/src/fanotify.rs`); FUSE runs synchronous
+  `svc_loop` std threads (`service/src/fusedev.rs`); blob io_uring reads (`blob_cache.rs`) and the
+  block-device (uffd/nbd) event loops run on **compio**, using `async-broadcast` + `futures-util`
+  in place of tokio's `select!`/broadcast/time. `service/Cargo.toml` carries no tokio dependency at
+  all. `nydus-storage`'s default build is likewise tokio-free — `tokio` is `optional = true`,
+  gated behind the non-default `backend-dragonfly-proxy` feature (own tokio runtime for the
+  Dragonfly SDK proxy path only). The `tokio` crate still shows up in `cargo tree` for the
+  `containerd-nydus` binary because `h2`/`hyper`/`tonic`/`cyper-axum` pull it in for trait/type
+  compatibility, but nothing spawns a tokio runtime anywhere in this graph — compio drives it all.
+  Never hand any nydusd session thread a tokio runtime handle.
 - **Metadata store**: **fjall** — an embedded LSM key/value store — one serialized snapshot record
   per key (`snapshotter/src/store/mod.rs`, on-disk dir `metadata.fjall`). Replaces the Go
   snapshotter's bbolt `MetaStore`; there is no SQL/relational schema and no SQLite. The journal is
@@ -124,9 +132,24 @@ auto-accel sidecar path) instead of ignoring it.
 **Peer mirror.** `[snapshotter.peer_mirror]` (serde alias `spegel_mirror` kept for back-compat) is
 mirror-agnostic. It selects a `preset` (`k3s-spegel` | `spegel` | `none`), a `query_template` for
 the mirror's `?ns=<registry>` parameter, and a `peer_discovery` mode. Spegel is the *reference*
-preset, not a hardcoded assumption. Kubernetes peer-discovery defaults **off** except under the
-`k3s-spegel` preset, where it is a documented workaround for the k3s-bundled Spegel `v0.4.0-k3s3`
-DHT rot (removable once k3s ships Spegel ≥ v0.7.1 — tracked in BACKLOG.md).
+preset, not a hardcoded assumption. **`peer_discovery` defaults to `off` for every preset**,
+including `k3s-spegel`: live cluster testing (k3s v1.36.2, Spegel v0.7.1-k3s1) verified native
+libp2p peer routing works once Spegel is healthy (bootstrap 0.3–6s, cross-node resolves passing).
+Setting `peer_discovery = "kubernetes"` re-enables the snapshotter's own Kubernetes-API node
+fan-out as an explicit, **deprecated** opt-in resilience fallback (a startup `warn!` fires when
+it's set) — kept only because a misconfigured or unhealthy Spegel instance (e.g. a
+`registries.yaml` typo, or a Cilium XDP path degrading etcd) can silently stop advertising a node's
+content, and the fan-out routed around that class of failure during the same testing. It is
+scheduled for removal after a production soak of default-off (tracked in BACKLOG.md).
+
+**Peer-mirror self-check.** When peer_mirror is enabled, `PeerMirrorSelfCheck`
+(`snapshotter/src/peer_mirror_selfcheck.rs`) periodically probes the *local* mirror endpoint for a
+digest already known to be in the *local* content store. A miss (404) means the node's embedded
+registry mirror is not advertising local content — the silent-failure class that caused the
+`registries.yaml` typo incident — and is surfaced two ways: a loud, actionable log naming the
+concrete causes (mirror config typo, node/etcd health) and the `snapshotter_peer_mirror_selfcheck_ok`
+Prometheus gauge (0/1), so it is diagnosable and alertable instead of silently degrading to
+full-image pulls.
 
 **Environment overrides.** `containerd-nydus` reads `NYDUS_SNAPSHOTTER_{CONFIG,ADDRESS,ROOT,LOG_LEVEL,PROFILE}`
 so the binary is configurable in a container with no mounted config file (clap precedence: explicit
@@ -145,17 +168,66 @@ against containerd's full-layer *extraction*, not download (spegel already makes
 The alternative referrer/tag-suffix approach was rejected: it changes the tag and the snapshotter
 never consults referrers.
 
-### 8. Referrer Detection (detection-only, default-off)
+### 8. Referrer Detection and Serving (default-on)
 
-The snapshotter can detect *published* nydus images (the OCI-referrer distribution model nydusify /
-the Go snapshotter produce) via the OCI referrers API, gated behind `[snapshotter.features].referrer_detect`
-(**default off**, `snapshotter/src/source/referrer.rs`). When enabled it **only logs** that a
-published nydus image was detected during `Prepare` and falls through to plain overlay — it does not
-yet fetch the bootstrap or mount a daemon. Serving is deferred to backlog item **B4b** (see
-[BACKLOG.md](./BACKLOG.md)). Note this is orthogonal to *transparent* node-local acceleration
-(Decision 7), which never consults referrers.
+The snapshotter detects and **serves** *published* nydus images (the OCI-referrer distribution
+model nydusify / the Go snapshotter produce) via the OCI referrers API, gated behind
+`[snapshotter.features].referrer_detect` (**default on**, `snapshotter/src/source/referrer.rs`).
+Serving (backlog item **B4b**) is implemented and e2e-verified: on detecting a published nydus
+image during `Prepare`, the snapshotter fetches the referrer artifact manifest, resolves the
+bootstrap blob digest (detection and materialization share one priority selector — the
+`nydus-bootstrap` annotation first, then the bootstrap media type — so a data blob can never be
+mistaken for the bootstrap; a manifest with nydus blobs but no identifiable bootstrap classifies
+as standard OCI and falls through safely), downloads and digest-verifies the bootstrap, then
+mounts it via `DaemonSupervisor::ensure_instance` — including full registry-backend serving of the
+data blobs.
+Every failure in that path falls through to a plain overlay mount, so referrer resolution never
+blocks a pod. Note this is orthogonal to *transparent* node-local acceleration (Decision 7), which
+never consults referrers. The push side of the loop is the Rust `nydusify convert --with-referrer`
+(see "In Scope (v1.0): Rust nydusify converter" below) — it publishes exactly the artifact shape
+this section consumes.
 
-### 9. Observability
+### 9. Auto-Accel Timing (Two-Stage Conversion)
+
+Node-local acceleration (Decision 7) never delays the pod that triggers it, and the window during
+which peers see `NotFound` (and fall back to a plain, full-layer overlay pull) is bounded to
+roughly one conversion, not one conversion *plus* a settle timer:
+
+1. **First `prepare` for an eligible image**: `prepare()` is a linear fall-through
+   (`snapshotter/src/grpc/mod.rs`) — if no sidecar exists yet, the pod gets a plain overlay mount
+   immediately. The only auto-accel action is a non-blocking access-tracer attach
+   (`AccessTracer::attach`). Nothing here blocks pod start.
+2. **Base conversion, enqueued immediately** (`AutoZranStage::Base`): the same `prepare` call
+   enqueues a base conversion job with an *empty* prefetch list (channel push only). A background
+   worker thread (nice-19 / idle `SchedClass`, `snapshotter/src/auto_zran.rs`) runs
+   `nydus-image create --type targz-ref` + `merge` with no access profile — `local_accel::convert`
+   with empty `prefetch_files` produces a fully servable artifact (the optimize step is skipped).
+   As soon as this lands, the sidecar Image record is created/updated
+   (`images_upsert`) and peers can fetch it — the peer-visible window shrinks to ≈ the base
+   conversion's duration alone, not conversion + tracer settle.
+3. **Access tracing continues in parallel**: the fanotify `FAN_CLASS_NOTIF` tracer
+   (`snapshotter/src/access_tracer.rs`) records first-access file order for the running container
+   (order-preserving, `settle_idle` / `settle_max` bounded). A second source — the NRI optimizer
+   plugin (`snapshotter/src/nri.rs`) — posts profiles to the sysctl API directly and force-settles
+   on `StopContainer`.
+4. **Optimize stage on settle** (`AutoZranStage::Optimize`): once the tracer (or NRI) settles, the
+   *same* job key reuses stage 1's work directory — only `nydus-image optimize --prefetch-files`
+   re-runs, replacing the bootstrap and staging a packed prefetch blob. The sidecar is re-uploaded
+   and `images_upsert` **promotes** the Image record from the base manifest to the optimized one.
+   Nodes that already fetched the base sidecar keep working; new fetches get the optimized
+   artifact.
+5. **Running pods are never switched over.** There is no remount mechanism by design — the
+   daemon-mounted, accelerated path only benefits the *next* pod (and peers), never the pod whose
+   own access pattern produced the profile.
+
+The two-stage split means the fragile wiring point is the `AccessTracer` ↔ `AutoZranManager` link:
+`AutoZranManager`'s `ConversionDeps` borrow the tracer, so the tracer is constructed first with an
+empty `OnceLock`, and `AccessTracer::set_auto_zran` back-fills it once the manager exists
+(`open_store_for_config`'s caller in `containerd-nydus.rs`). If that back-fill is ever skipped,
+profiles still capture and persist to disk, but nothing enqueues a conversion job for them —
+`flush_profile` (`access_tracer.rs`) now `warn!`s once per process when it observes this.
+
+### 10. Observability
 
 - **Prometheus metrics**: always served over the sysctl UDS at `GET /metrics`; `[snapshotter.metrics].listen`
   (e.g. `"127.0.0.1:9110"`) additionally binds a TCP `GET /metrics` endpoint reusing the same
@@ -167,7 +239,7 @@ yet fetch the bootstrap or mount a daemon. Serving is deferred to backlog item *
   (`snapshotter/src/sysctl.rs`). See [docs/operations.md](./docs/operations.md) for the ops runbook
   (memory stats, CPU profiling with perf/samply).
 
-### 10. Containerd Contract Fidelity
+### 11. Containerd Contract Fidelity
 
 The proxy-plugin server honors the full containerd snapshotter contract: `Update` respects
 field-masks, `List` respects Walk filters, and the `Cleanup` RPC is wired through `clear()` into the
@@ -190,7 +262,7 @@ nydus/
 │   ├── src/
 │   │   ├── bin/
 │   │   │   ├── containerd-nydus.rs   # Main binary
-│   │   │   └── nydus-migrate.rs     # Config migration tool
+│   │   │   └── nydus-migrate.rs     # Store migration tool (manual/advanced subcommands)
 │   │   ├── config/    # Unified TOML config
 │   │   ├── daemon/    # In-process daemon supervisor
 │   │   ├── grpc/      # containerd proxy-plugin server
@@ -198,8 +270,11 @@ nydus/
 │   │   ├── probe/     # Kernel capability probe
 │   │   ├── recon/     # Reconciler loop
 │   │   ├── source/    # Image source detection (referrer, encryption)
-│   │   └── store/     # fjall (LSM) snapshot metadata store (metadata.fjall)
+│   │   ├── store/     # fjall (LSM) snapshot metadata store (metadata.fjall)
+│   │   └── migrate.rs # Legacy bbolt→fjall auto-migration at startup (feature "migrate")
 │   └── Cargo.toml
+├── nydusify/         # Rust nydusify: convert/check/copy/mount CLI (registry-publish flow)
+├── registry-client/  # OCI distribution client (pull+push, bearer auth) used by nydusify
 ├── storage/          # Core storage subsystem
 ├── utils/            # Common utilities
 └── upgrade/          # Hot upgrade state machine
@@ -311,10 +386,36 @@ not lost if systemd `kill -9`s the successor mid-failover. `max_journaling_size`
 
 ## In Scope (v1.0): Rust nydusify converter
 
-The Rust rewrite of **nydusify** — the `nydusify/` crate ("Rust rewrite of the Nydus image
-conversion utility") — **is in scope for v1.0 and is the converter tool going forward**, replacing
-the Go `nydusify`. Its containerd-converter backend is currently a stub and completing it is
-tracked work for v1.0. Note this is the registry-side OCI→Nydus **push/convert** tool and is
-distinct from the node-local, push-free acceleration path (`snapshotter/src/local_accel.rs`),
-which does not use nydusify; the two serve different flows (registry-published nydus images vs.
-transparent node-local acceleration).
+The Rust rewrite of **nydusify** — the `nydusify/` crate — **is in scope for v1.0 and is the
+converter tool going forward**, replacing the Go `nydusify`. All four subcommands are real,
+working implementations, not stubs:
+
+- **`convert`** — two modes. `--oci-ref` (zran): `nydus-image create --type targz-ref` per layer +
+  `merge --original-blob-ids`, so the pushed data blobs are the *original gzip layers* (mounted
+  from the source repo when target and source coincide, else re-pushed) plus tiny zran index
+  blobs — the same artifact shape B4b consumes. Standard mode: `nydus-image create --type
+  targz-rafs` + `merge`, producing new nydus data blobs. `--with-referrer` additionally pushes an
+  OCI 1.1 referrer artifact (`subject` = the source manifest descriptor) to the source repo, by
+  digest and under the `sha256-<hex>` fallback tag for registries without native referrers-API
+  support.
+- **`check`** — validates manifest/media-type/annotations, referrer linkage (fallback-tag lookup
+  only today — see BACKLOG.md), downloads the bootstrap, and runs `nydus-image check` on it.
+- **`copy`** — pulls and re-pushes an image between repositories with `HEAD`-based blob dedup and
+  same-registry `mount_blob`.
+- **`mount`** — pulls the bootstrap via `registry-client` and spawns a foreground `nydusd` fusedev
+  process backed by a registry backend, unmounting on SIGINT/SIGTERM. Registry backend only today
+  (oss/s3/localfs are validated-but-rejected, follow-up); Linux-only in practice, since `nydusd`'s
+  FUSE serving path is part of the Linux-only runtime surface (see the platform note at the top of
+  CLAUDE.md).
+
+All four are built on the new `registry-client/` crate (bearer-auth OCI distribution client: pull,
+push, `HEAD`/mount-blob dedup — the piece that never existed anywhere in the Rust workspace before)
+and drive `nydus-image`/`nydusd` as subprocesses, mirroring the `local_accel.rs` convention. See
+[docs/nydusify-rust.md](./docs/nydusify-rust.md) for usage and the ecosystem loop (`convert
+--with-referrer` → the snapshotter's default-on referrer serving, Decision 8). Live end-to-end
+verification against a real registry is still pending.
+
+This is the registry-side OCI→Nydus **push/convert** tool and is distinct from the node-local,
+push-free acceleration path (`snapshotter/src/local_accel.rs`), which does not use nydusify; the
+two serve different flows (registry-published nydus images vs. transparent node-local
+acceleration).
