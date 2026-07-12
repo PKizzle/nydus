@@ -34,6 +34,13 @@
 //! The whole thing is best-effort: every failure is logged and swallowed, and
 //! it runs on its own detached background loop so it can never block or crash
 //! startup.
+//!
+//! **Scope limitation:** because the only guaranteed-local, Spegel-advertised
+//! digest we can probe is a node-local auto-accel sidecar, the loop is wired
+//! (in `grpc::serve_with_supervisor`) inside the `auto_zran.enable` block — a
+//! node running `peer_mirror` *without* `auto_zran` never self-checks. That is
+//! inherent to the digest-source design, not an oversight: without a locally
+//! produced artifact there is nothing the mirror is expected to advertise.
 
 use std::sync::Arc;
 use std::time::Duration;

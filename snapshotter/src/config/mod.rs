@@ -1267,6 +1267,38 @@ mod tests {
         );
     }
 
+    /// Pins the manual `Default for FeaturesConfig` to the serde field
+    /// defaults for EVERY field, so the derive-vs-serde drift that once made
+    /// `SnapshotterConfig::default()` disagree with an empty `[features]`
+    /// table (prefetch/metrics silently false) cannot recur when a field is
+    /// added or its default changes.
+    #[test]
+    fn features_default_matches_empty_toml_for_all_fields() {
+        let structural = FeaturesConfig::default();
+        let deserialized: FeaturesConfig =
+            toml::from_str("").expect("empty features table must deserialize");
+        assert_eq!(
+            structural.referrer_detect, deserialized.referrer_detect,
+            "referrer_detect: Default and serde default diverge"
+        );
+        assert_eq!(
+            structural.encryption, deserialized.encryption,
+            "encryption: Default and serde default diverge"
+        );
+        assert_eq!(
+            structural.prefetch, deserialized.prefetch,
+            "prefetch: Default and serde default diverge"
+        );
+        assert_eq!(
+            structural.metrics, deserialized.metrics,
+            "metrics: Default and serde default diverge"
+        );
+        assert_eq!(
+            structural.erofs_page_cache_sharing, deserialized.erofs_page_cache_sharing,
+            "erofs_page_cache_sharing: Default and serde default diverge"
+        );
+    }
+
     #[test]
     fn parse_minimal_config() {
         let toml_str = r#"
