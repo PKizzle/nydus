@@ -54,6 +54,16 @@ pub struct SnapshotOperationTimer {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct CacheMetricSnapshot {
     pub total_bytes: u64,
+    /// GC counters, `Some` only for the sysctl UDS renderer (which owns them).
+    /// The TCP endpoint can't reach the sysctl controller's counters, so it
+    /// leaves this `None` and the GC-counter families are OMITTED rather than
+    /// emitted frozen at 0 — a permanently-zero counter on a second scrape
+    /// target is worse than an absent one.
+    pub gc: Option<CacheGcCounters>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CacheGcCounters {
     pub deleted_blobs: u64,
     pub deletion_errors: u64,
     pub blobs_in_use: u64,
@@ -319,26 +329,27 @@ impl SnapshotterMetrics {
             "snapshotter_cache_usage_kilobytes",
             cache.total_bytes / 1024,
         );
-        out.push_str("# HELP snapshotter_cache_blobs_deleted_total Total number of cache blobs deleted during cleanup.\n");
-        out.push_str("# TYPE snapshotter_cache_blobs_deleted_total counter\n");
-        push_metric(
-            out,
-            "snapshotter_cache_blobs_deleted_total",
-            cache.deleted_blobs,
-        );
-        push_help_gauge(
-            out,
-            "snapshotter_cache_blobs_in_use",
-            "Number of cache blobs currently in use by running daemons.",
-        );
-        push_metric(out, "snapshotter_cache_blobs_in_use", cache.blobs_in_use);
-        out.push_str("# HELP snapshotter_cache_blob_deletion_errors_total Total number of errors encountered while deleting cache blobs.\n");
-        out.push_str("# TYPE snapshotter_cache_blob_deletion_errors_total counter\n");
-        push_metric(
-            out,
-            "snapshotter_cache_blob_deletion_errors_total",
-            cache.deletion_errors,
-        );
+        // GC counters live in the sysctl controller; only render them when the
+        // caller actually has them (the UDS endpoint). The TCP renderer passes
+        // `None` so these families are absent there rather than frozen at 0.
+        if let Some(gc) = cache.gc {
+            out.push_str("# HELP snapshotter_cache_blobs_deleted_total Total number of cache blobs deleted during cleanup.\n");
+            out.push_str("# TYPE snapshotter_cache_blobs_deleted_total counter\n");
+            push_metric(out, "snapshotter_cache_blobs_deleted_total", gc.deleted_blobs);
+            push_help_gauge(
+                out,
+                "snapshotter_cache_blobs_in_use",
+                "Number of cache blobs currently in use by running daemons.",
+            );
+            push_metric(out, "snapshotter_cache_blobs_in_use", gc.blobs_in_use);
+            out.push_str("# HELP snapshotter_cache_blob_deletion_errors_total Total number of errors encountered while deleting cache blobs.\n");
+            out.push_str("# TYPE snapshotter_cache_blob_deletion_errors_total counter\n");
+            push_metric(
+                out,
+                "snapshotter_cache_blob_deletion_errors_total",
+                gc.deletion_errors,
+            );
+        }
     }
 }
 
@@ -699,14 +710,29 @@ mod tests {
         let metrics = SnapshotterMetrics::new();
         let body = metrics.render_prometheus(CacheMetricSnapshot {
             total_bytes: 4096,
-            deleted_blobs: 2,
-            deletion_errors: 1,
-            blobs_in_use: 3,
+            gc: Some(CacheGcCounters {
+                deleted_blobs: 2,
+                deletion_errors: 1,
+                blobs_in_use: 3,
+            }),
         });
         assert!(body.contains("snapshotter_run_time_seconds"));
         assert!(body.contains("snapshotter_cache_usage_kilobytes 4"));
         assert!(body.contains("snapshotter_cache_blobs_deleted_total 2"));
         assert!(body.contains("snapshotter_cache_blob_deletion_errors_total 1"));
         assert!(body.contains("snapshotter_cache_blobs_in_use 3"));
+    }
+
+    #[test]
+    fn tcp_renderer_omits_sysctl_only_gc_counters() {
+        // With `gc: None` (the TCP endpoint's snapshot) the GC-counter families
+        // must be ABSENT, not emitted frozen at 0 — a permanently-zero counter
+        // on a second scrape target misleads alerting.
+        let metrics = SnapshotterMetrics::new();
+        let body = render_metrics_body(&metrics, 4096);
+        assert!(body.contains("snapshotter_cache_usage_kilobytes 4"));
+        assert!(!body.contains("snapshotter_cache_blobs_deleted_total"));
+        assert!(!body.contains("snapshotter_cache_blob_deletion_errors_total"));
+        assert!(!body.contains("snapshotter_cache_blobs_in_use"));
     }
 }

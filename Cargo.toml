@@ -9,6 +9,10 @@ homepage = "https://nydus.dev/"
 repository = "https://github.com/dragonflyoss/nydus"
 exclude = ["contrib/", "smoke/", "tests/"]
 edition = "2024"
+# Edition 2024 requires rustc >= 1.85; the toolchain is pinned in
+# rust-toolchain.toml (1.96). Declared so a too-old rustc fails with a clear
+# MSRV error instead of a confusing edition/feature parse error.
+rust-version = "1.85"
 build = "build.rs"
 
 [profile.release]

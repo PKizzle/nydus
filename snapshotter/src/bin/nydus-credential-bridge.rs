@@ -10,6 +10,9 @@
 //! response into the Nydus runtime auth endpoint, and then writes the original
 //! provider response back to stdout unchanged.
 
+#![deny(warnings)]
+#![warn(clippy::all)]
+
 use anyhow::{Context, Result, bail};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use clap::{Parser, Subcommand, ValueEnum};

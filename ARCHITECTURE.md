@@ -85,10 +85,14 @@ fanotify (≥6.14, CAP_SYS_ADMIN) → fusedev (/dev/fuse) → blockdev (loop/NBD
   in place of tokio's `select!`/broadcast/time. `service/Cargo.toml` carries no tokio dependency at
   all. `nydus-storage`'s default build is likewise tokio-free — `tokio` is `optional = true`,
   gated behind the non-default `backend-dragonfly-proxy` feature (own tokio runtime for the
-  Dragonfly SDK proxy path only). The `tokio` crate still shows up in `cargo tree` for the
-  `containerd-nydus` binary because `h2`/`hyper`/`tonic`/`cyper-axum` pull it in for trait/type
-  compatibility, but nothing spawns a tokio runtime anywhere in this graph — compio drives it all.
-  Never hand any nydusd session thread a tokio runtime handle.
+  Dragonfly SDK proxy path only). The one deliberately-spawned tokio runtime is the isolated
+  2-worker runtime in `snapshotter/src/content_store.rs` that drives the tonic *client* to
+  containerd's Content/Images gRPC (tonic transport pins its futures to a tokio reactor); it is
+  quarantined behind `blocking::unblock` + `handle.block_on` and dropped on teardown, so it never
+  runs on a nydusd session thread and compio still owns the snapshotter's event loop. Otherwise the
+  `tokio` crate shows up in `cargo tree` for the `containerd-nydus` binary only because
+  `h2`/`hyper`/`tonic`/`cyper-axum` pull it in for trait/type compatibility — nothing else spawns a
+  runtime. Never hand any nydusd session thread a tokio runtime handle.
 - **Metadata store**: **fjall** — an embedded LSM key/value store — one serialized snapshot record
   per key (`snapshotter/src/store/mod.rs`, on-disk dir `metadata.fjall`). Replaces the Go
   snapshotter's bbolt `MetaStore`; there is no SQL/relational schema and no SQLite. The journal is

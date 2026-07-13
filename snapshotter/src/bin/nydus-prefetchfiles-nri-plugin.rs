@@ -8,6 +8,9 @@
 //! containing image annotations; the binary normalizes them and forwards the
 //! resulting hints to the Nydus system-controller.
 
+#![deny(warnings)]
+#![warn(clippy::all)]
+
 use anyhow::{Context, Result, bail};
 use clap::Parser;
 use nydus_snapshotter::nri::{

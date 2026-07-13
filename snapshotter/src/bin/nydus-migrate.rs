@@ -9,6 +9,9 @@
 //! imports the old `metadata.db` records into the new `metadata.fjall` store and
 //! relocates old numeric snapshot directories to the Rust stable-key layout.
 
+#![deny(warnings)]
+#![warn(clippy::all)]
+
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 use nydus_snapshotter::migrate::StoreMigrationParams;

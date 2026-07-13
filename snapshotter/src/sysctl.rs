@@ -97,12 +97,18 @@ impl ControllerMetrics {
             .fetch_add(1, Ordering::Relaxed);
     }
 
-    fn record_cache_gc(&self, report: &CacheGcReport) {
+    fn record_cache_gc(&self, report: &CacheGcReport, dry_run: bool) {
         self.cache_gc_runs_total.fetch_add(1, Ordering::Relaxed);
-        self.cache_gc_removed_files_total
-            .fetch_add(usize_to_u64(report.removed_files), Ordering::Relaxed);
-        self.cache_gc_removed_bytes_total
-            .fetch_add(report.removed_bytes, Ordering::Relaxed);
+        // A dry run reports what *would* be removed but deletes nothing, so it
+        // must not inflate the "removed" counters — those feed
+        // `snapshotter_cache_blobs_deleted_total`, which alerting reads as
+        // actual reclaimed space.
+        if !dry_run {
+            self.cache_gc_removed_files_total
+                .fetch_add(usize_to_u64(report.removed_files), Ordering::Relaxed);
+            self.cache_gc_removed_bytes_total
+                .fetch_add(report.removed_bytes, Ordering::Relaxed);
+        }
         self.cache_gc_failures_total
             .fetch_add(usize_to_u64(report.failures.len()), Ordering::Relaxed);
     }
@@ -271,7 +277,8 @@ impl SystemController {
     /// Trigger cache GC using the controller's configured policy.
     pub fn cache_gc(&self) -> Result<CacheGcReport> {
         let report = self.cache.garbage_collect(&self.cache_policy)?;
-        self.metrics.record_cache_gc(&report);
+        self.metrics
+            .record_cache_gc(&report, self.cache_policy.dry_run);
         Ok(report)
     }
 
@@ -280,7 +287,7 @@ impl SystemController {
     /// config.
     pub fn cache_gc_with_policy(&self, policy: &CacheGcPolicy) -> Result<CacheGcReport> {
         let report = self.cache.garbage_collect(policy)?;
-        self.metrics.record_cache_gc(&report);
+        self.metrics.record_cache_gc(&report, policy.dry_run);
         Ok(report)
     }
 
@@ -752,7 +759,17 @@ async fn route_dynamic_request(
     if let Some(id) = path.strip_prefix("/api/v1/daemons/") {
         if let Some((id, suffix)) = id.split_once('/') {
             if method == "POST" && suffix == "cache/gc" {
-                return handle_cache_gc(controller, body);
+                // The blob cache is a single global root shared by every daemon;
+                // there is no per-daemon partition to GC. Silently running a
+                // global GC here misrepresented what happened, so point callers
+                // at the global endpoint instead.
+                return error_response(
+                    400,
+                    format!(
+                        "per-daemon cache GC is not supported (the blob cache is global); \
+                         use POST /api/v1/cache/gc instead of /api/v1/daemons/{id}/cache/gc"
+                    ),
+                );
             }
             if method == "POST" && suffix == "upgrade" {
                 return handle_daemon_upgrade(controller, Some(id), body).await;
@@ -1056,9 +1073,11 @@ async fn metrics_response(controller: &SystemController) -> HttpResponse {
             .snapshotter_metrics
             .render_prometheus(CacheMetricSnapshot {
                 total_bytes: cache.total_bytes,
-                deleted_blobs: metrics.cache_gc_removed_files_total,
-                deletion_errors: metrics.cache_gc_failures_total,
-                blobs_in_use: blob_data_files,
+                gc: Some(crate::metrics::CacheGcCounters {
+                    deleted_blobs: metrics.cache_gc_removed_files_total,
+                    deletion_errors: metrics.cache_gc_failures_total,
+                    blobs_in_use: blob_data_files,
+                }),
             }),
     );
 
@@ -1916,8 +1935,10 @@ mod tests {
         assert!(body.contains("nydus_snapshotter_cache_artifact_bytes{kind=\"blob_data\"} 4"));
         assert!(body.contains("nydus_snapshotter_cache_artifact_files{kind=\"blob_data\"} 1"));
         assert!(body.contains("nydus_snapshotter_cache_gc_runs_total 1"));
-        assert!(body.contains("nydus_snapshotter_cache_gc_removed_files_total 1"));
-        assert!(body.contains("nydus_snapshotter_cache_gc_removed_bytes_total 4"));
+        // The GC above was a DRY RUN — it deleted nothing, so the "removed"
+        // counters must stay at 0 (they feed reclaimed-space alerting).
+        assert!(body.contains("nydus_snapshotter_cache_gc_removed_files_total 0"));
+        assert!(body.contains("nydus_snapshotter_cache_gc_removed_bytes_total 0"));
         assert!(body.contains("nydus_snapshotter_cache_gc_failures_total 0"));
         assert!(body.contains("nydusd_counts{version=\"in-process\"} 0"));
         assert!(body.contains("nydusd_lifetime_event_counts{event=\"spawn\"} 0"));

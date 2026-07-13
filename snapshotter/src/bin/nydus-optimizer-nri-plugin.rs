@@ -19,6 +19,9 @@
 //!    sidecar) into a Nydus prefetch profile and submits it to the
 //!    system-controller's `/api/v1/prefetch/profile` endpoint.
 
+#![deny(warnings)]
+#![warn(clippy::all)]
+
 use anyhow::{Context, Result, bail};
 use clap::Parser;
 use nydus_snapshotter::nri::{AccessProfileRecord, DEFAULT_SYSCTL_SOCKET, SysctlClient};

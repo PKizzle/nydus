@@ -7,6 +7,9 @@
 //! Single binary that embeds the nydusd daemon in-process and serves
 //! containerd's proxy-plugin gRPC protocol.
 
+#![deny(warnings)]
+#![warn(clippy::all)]
+
 // mimalloc global allocator: compio's completion I/O (gRPC + in-process daemon
 // blob reads) is owned-buffer-per-op; mimalloc's thread-local pools cut the
 // small-buffer allocation overhead.

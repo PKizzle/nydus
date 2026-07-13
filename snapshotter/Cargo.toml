@@ -98,9 +98,15 @@ async-channel = "2.3"
 blocking = "1.6"
 futures = "0.3"
 signal-hook = "0.3"
-# tokio is still pulled by the peripheral NRI plugin (ttrpc) and transitively by
-# tonic/hyper-util (sync types only); no tokio runtime executes in the main
-# snapshotter, which runs on compio.
+# The snapshotter's own event loop runs on compio; the ONE sanctioned tokio
+# runtime is the isolated 2-worker runtime `content_store.rs` builds solely to
+# drive the tonic *client* to containerd's Content/Images gRPC services (tonic's
+# transport pins its futures to a tokio reactor). It is fully quarantined behind
+# `blocking::unblock` + `handle.block_on` and shut down in `Drop`, so no tokio
+# task ever touches a nydusd session thread. tokio is also pulled by the
+# peripheral NRI plugin (ttrpc) and transitively by tonic/hyper-util for sync
+# types. See ARCHITECTURE.md Decision 3 and CLAUDE.md gotcha #1 for the full
+# rule and this exception.
 tokio = { version = "1", features = ["full"] }
 tokio-stream = "0.1"
 tonic = { version = "0.14", features = ["transport"] }
