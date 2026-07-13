@@ -11,13 +11,13 @@
 use std::path::Path;
 
 use anyhow::Context;
-use tracing::warn;
 use nydus_api::{
     BLOB_CACHE_TYPE_META_BLOB, BackendConfigV2, BlobCacheEntry, BlobCacheEntryConfigV2,
     CacheConfigV2, ConfigV2, FanotifyConfig, FileCacheConfig, HttpProxyConfig, LocalFsConfig,
     OssConfig, RafsConfigV2, RegistryConfig, S3Config,
 };
 use serde_json::json;
+use tracing::warn;
 
 use crate::config::{
     HttpProxyBackendConfig, OssBackendConfig, RegistryBackendConfig, S3BackendConfig,

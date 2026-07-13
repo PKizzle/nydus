@@ -194,7 +194,9 @@ impl DaemonInstance {
             if current == 0 {
                 return 0;
             }
-            self.refcount.fetch_sub(1, Ordering::SeqCst).saturating_sub(1)
+            self.refcount
+                .fetch_sub(1, Ordering::SeqCst)
+                .saturating_sub(1)
         } else {
             current
         }
@@ -594,8 +596,8 @@ impl DaemonSupervisor {
         wait_for_running_off_reactor(daemon.clone(), self.startup_timeout)
             .await
             .with_context(|| {
-            format!("auto-accel daemon for {image_ref_str} never reached RUNNING")
-        })?;
+                format!("auto-accel daemon for {image_ref_str} never reached RUNNING")
+            })?;
 
         info!(
             image_ref = %image_ref_str,
@@ -996,7 +998,7 @@ impl DaemonSupervisor {
                 bootstrap: bootstrap.to_path_buf(),
                 daemon,
                 refcount: AtomicUsize::new(0),
-            holders: StdMutex::new(HashSet::new()),
+                holders: StdMutex::new(HashSet::new()),
                 _poll: poll,
                 // Blockdev/EROFS export has no fuse fd to preserve.
                 failover_armed: AtomicBool::new(false),
@@ -1276,8 +1278,8 @@ impl DaemonSupervisor {
         wait_for_running_off_reactor(daemon.clone(), self.startup_timeout)
             .await
             .with_context(|| {
-            format!("restored daemon for {image_ref_str} never reached RUNNING")
-        })?;
+                format!("restored daemon for {image_ref_str} never reached RUNNING")
+            })?;
 
         let instance = Arc::new(DaemonInstance {
             image_ref: image_ref_str.to_string(),

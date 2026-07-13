@@ -335,7 +335,11 @@ impl SnapshotterMetrics {
         if let Some(gc) = cache.gc {
             out.push_str("# HELP snapshotter_cache_blobs_deleted_total Total number of cache blobs deleted during cleanup.\n");
             out.push_str("# TYPE snapshotter_cache_blobs_deleted_total counter\n");
-            push_metric(out, "snapshotter_cache_blobs_deleted_total", gc.deleted_blobs);
+            push_metric(
+                out,
+                "snapshotter_cache_blobs_deleted_total",
+                gc.deleted_blobs,
+            );
             push_help_gauge(
                 out,
                 "snapshotter_cache_blobs_in_use",

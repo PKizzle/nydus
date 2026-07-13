@@ -340,7 +340,10 @@ impl RegistryReferrerClient {
             }
         }
         let body = read_bounded(response).await?;
-        Ok(Some(format!("sha256:{}", hex::encode(Sha256::digest(&body)))))
+        Ok(Some(format!(
+            "sha256:{}",
+            hex::encode(Sha256::digest(&body))
+        )))
     }
 
     async fn fetch_referrers(

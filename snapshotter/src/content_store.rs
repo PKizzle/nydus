@@ -68,8 +68,7 @@ use containerd::services::content::v1::{
 
 use containerd::services::images::v1::{
     CreateImageRequest, DeleteImageRequest, GetImageRequest, Image, ListImagesRequest,
-    UpdateImageRequest,
-    images_client::ImagesClient,
+    UpdateImageRequest, images_client::ImagesClient,
 };
 
 use containerd::types as types_proto;

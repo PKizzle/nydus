@@ -810,9 +810,9 @@ fn record_event(inner: &Inner, path: &Path) -> Result<()> {
     let mut matched: Option<&mut ImageCapture> = None;
     for state in mounts.values_mut() {
         if canonical.starts_with(&state.mount_root)
-            && matched
-                .as_ref()
-                .is_none_or(|best| state.mount_root.as_os_str().len() > best.mount_root.as_os_str().len())
+            && matched.as_ref().is_none_or(|best| {
+                state.mount_root.as_os_str().len() > best.mount_root.as_os_str().len()
+            })
         {
             matched = Some(state);
         }

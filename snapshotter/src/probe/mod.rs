@@ -41,7 +41,10 @@ pub struct ProbeResult {
 /// which callers that then serve traffic off the same config must use so the
 /// running driver matches what was probed. This function is `pub(crate)`
 /// (test/diagnostic use only) for that reason.
-pub(crate) fn probe_drivers(drivers: &[FsDriverEntry], work_dir: Option<&Path>) -> Vec<ProbeResult> {
+pub(crate) fn probe_drivers(
+    drivers: &[FsDriverEntry],
+    work_dir: Option<&Path>,
+) -> Vec<ProbeResult> {
     // Best-effort load erofs once before per-driver probing so both
     // fanotify and blockdev see it. Distros that compile erofs as a
     // module (Raspberry Pi OS' upstream kernels do — `CONFIG_EROFS_FS=m`)

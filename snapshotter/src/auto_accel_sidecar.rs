@@ -795,7 +795,9 @@ mod tests {
         // requested under before it may touch the content store.
         let digest = "sha256:2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824";
         assert!(verify_sha256(b"hello", digest).is_ok());
-        assert!(verify_sha256(b"hello", &digest.to_uppercase().replace("SHA256", "sha256")).is_ok());
+        assert!(
+            verify_sha256(b"hello", &digest.to_uppercase().replace("SHA256", "sha256")).is_ok()
+        );
         let err = verify_sha256(b"corrupted", digest).unwrap_err();
         assert!(err.contains("digest mismatch"), "{err}");
         assert!(verify_sha256(b"hello", "sha512:abc").is_err());

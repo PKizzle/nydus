@@ -199,8 +199,15 @@ impl Reconciler {
         // auto-accel uses as the sidecar subject (`manifest_info` performs the
         // same tag → index → platform-manifest resolution the producer did).
         let mut live_subjects = std::collections::HashSet::new();
-        for img in images.iter().filter(|i| !i.name.starts_with(SIDECAR_PREFIX)) {
-            match deps.lookup.manifest_info(&img.name, &deps.content_root).await {
+        for img in images
+            .iter()
+            .filter(|i| !i.name.starts_with(SIDECAR_PREFIX))
+        {
+            match deps
+                .lookup
+                .manifest_info(&img.name, &deps.content_root)
+                .await
+            {
                 Ok(info) => {
                     live_subjects.insert(info.manifest_digest);
                 }
@@ -663,7 +670,10 @@ proc /proc proc rw,nosuid 0 0
             sweep_stale_daemon_dirs(tmp.path(), &HashSet::new(), &HashSet::new()).unwrap();
 
         assert_eq!(removed, 1);
-        assert!(records.join("abc.json").exists(), "records dir must survive");
+        assert!(
+            records.join("abc.json").exists(),
+            "records dir must survive"
+        );
         assert!(!stale.exists(), "stale slug dir must still be swept");
     }
 

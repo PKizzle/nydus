@@ -1017,10 +1017,11 @@ impl snapshots::Snapshotter for NydusSnapshotter {
                         SnapshotterError::internal(e.to_string())
                     })?;
             }
-            for image_ref in release_target
-                .iter()
-                .chain(stamped_target.iter().filter(|s| release_target.as_ref() != Some(s)))
-            {
+            for image_ref in release_target.iter().chain(
+                stamped_target
+                    .iter()
+                    .filter(|s| release_target.as_ref() != Some(s)),
+            ) {
                 if let Err(e) = self.supervisor.release(image_ref, &key).await {
                     warn!(image_ref, error = %e, "failed to release nydus daemon refcount");
                 }
