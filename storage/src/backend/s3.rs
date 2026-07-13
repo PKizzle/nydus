@@ -257,14 +257,16 @@ fn hmac_hash_hex(key: &[u8], data: &[u8]) -> String {
 // modified based on https://github.com/minio/minio-rs/blob/5fea81d68d381fd2a4c27e4d259f7012de08ab77/src/s3/utils.rs#L66-L68
 // under apache 2.0 license
 fn to_signer_date(date: &OffsetDateTime) -> String {
-    let format = format_description::parse("[year][month][day]").unwrap();
+    let format = format_description::parse_borrowed::<2>("[year][month][day]").unwrap();
     date.format(&format).unwrap()
 }
 
 // modified based on https://github.com/minio/minio-rs/blob/5fea81d68d381fd2a4c27e4d259f7012de08ab77/src/s3/utils.rs#L70-L72
 // under apache 2.0 license
 fn to_awz_date(date: &OffsetDateTime) -> String {
-    let format = format_description::parse("[year][month][day]T[hour][minute][second]Z").unwrap();
+    let format =
+        format_description::parse_borrowed::<2>("[year][month][day]T[hour][minute][second]Z")
+            .unwrap();
     date.format(&format).unwrap()
 }
 

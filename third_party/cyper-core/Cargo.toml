@@ -17,15 +17,15 @@ all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]
-compio = { version = "0.19.0", default-features = false, features = [
+compio = { version = "0.19.1", default-features = false, features = [
     "io",
     "time",
     "tls",
 ] }
 
-futures-util = "0.3.30"
-hyper = "1.4.1"
-send_wrapper = { version = "0.6", features = ["futures"] }
+futures-util = "0.3.32"
+hyper = "1.10.1"
+send_wrapper = { version = "0.6.0", features = ["futures"] }
 
 [features]
 default = []

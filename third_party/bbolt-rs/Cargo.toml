@@ -13,40 +13,43 @@ documentation = "https://docs.rs/bbolt-rs/latest/bbolt_rs/"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-# `default-features = false` unconditionally: this crate only uses
-# `aligners::alignment::Page` / `AlignedBytes` (plain aligned allocation), never
-# the SIMD block types, so aligners' default `simd` feature buys nothing here —
-# and it fails to compile on ppc64le/riscv64, which would otherwise force
-# downstream users (nydus-snapshotter's `migrate` feature) to gate per-arch.
+# `default-features = false` unconditionally — do NOT re-enable `simd` per-arch
+# "for speed on x86". This crate uses only `aligners::alignment::Page` /
+# `AlignedBytes` (plain page-aligned allocation, i.e. posix_memalign-style); it
+# never touches aligners' SIMD block-scanning types, so the `simd` feature runs
+# ZERO extra machine code in our path and yields no speedup on any target. Its
+# only effects would be (a) an added SIMD dependency and (b) a compile failure on
+# ppc64le/riscv64, which would force downstream users (nydus-snapshotter's
+# `migrate` feature) to gate per-arch for no benefit.
 aligners = { version = "0.0.10", default-features = false }
 # Until the aligners miri fix is in crates.io depend on the git main branch
 # Swap 0.0.10 for the git version to run the miri test
 # aligners = {git = "https://github.com/V0ldek/aligners.git"}
-bumpalo = { version = "3.16", features = ["collections", "allocator-api2"]}
-hashbrown = "0.14.5"
-memmap2 = "0.9.4"
+bumpalo = { version = "3.20.3", features = ["collections", "allocator-api2"]}
+hashbrown = "0.17.1"
+memmap2 = "0.9.11"
 page_size = "0.6.0"
-itertools = "0.13.0"
-bytemuck = { version = "1.18", features = ["derive"] }
-size = "0.4.1"
-getset = "0.1.3"
-once_cell = "1.19.0"
-fnv_rs = "0.4.3"
-thiserror = "1.0.63"
-anyhow = "1.0.89"
-fs4 = { version = "0.9", features = ["sync"] }
-parking_lot = "0.12.3"
+itertools = "0.15.0"
+bytemuck = { version = "1.25.1", features = ["derive"] }
+size = "0.5.0"
+getset = "0.1.7"
+once_cell = "1.21.4"
+fnv_rs = "0.4.4"
+thiserror = "2.0.18"
+anyhow = "1.0.103"
+fs4 = { version = "1.1.0", features = ["sync"] }
+parking_lot = "0.12.5"
 aliasable = "0.1.3"
-pin-project = "1.1.5"
-typed-builder = "0.20"
-rand = "0.8.5"
-tempfile = "3.12"
-clap = { version = "4.5", features = ["derive"] }
+pin-project = "1.1.13"
+typed-builder = "0.23.2"
+rand = "0.10.2"
+tempfile = "3.27.0"
+clap = { version = "4.6.1", features = ["derive"] }
 byteorder = "1.5.0"
 monotonic-timer = "1.0.0"
-document-features = "0.2.10"
-fake = { version = "2.9.2", features = ["derive"] }
-log = "0.4.22"
+document-features = "0.2.12"
+fake = { version = "5.1.0", features = ["derive"] }
+log = "0.4.33"
 # only for testing
 
 

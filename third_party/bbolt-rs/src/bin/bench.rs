@@ -8,7 +8,7 @@ use byteorder::{BigEndian, ByteOrder};
 use clap::{Parser, ValueEnum};
 use rand::rngs::StdRng;
 use rand::seq::SliceRandom;
-use rand::{RngCore, SeedableRng};
+use rand::{Rng, SeedableRng};
 use tempfile::Builder;
 
 use bbolt_rs::{
@@ -143,7 +143,8 @@ fn main() -> bbolt_rs::Result<()> {
     (Some(tmp_file), BoltOptions::default().open(path)?)
   };
 
-  let mut rng = StdRng::from_entropy();
+  let mut rng = StdRng::try_from_rng(&mut rand::rngs::SysRng)
+    .expect("seed StdRng from OS entropy");
   let mut write_results = BenchResults::default();
   let mut n_keys = run_writes(&mut db, &bench, &mut write_results, &mut rng)?;
   if let Some(keys) = n_keys.as_mut() {

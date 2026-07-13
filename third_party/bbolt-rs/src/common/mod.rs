@@ -1,6 +1,8 @@
 pub use bumpalo::collections::Vec as BVec;
 use bumpalo::Bump;
-use hashbrown::hash_map::DefaultHashBuilder;
+// hashbrown 0.15+ moved `DefaultHashBuilder` from `hash_map` to the crate root
+// (gated behind the default-on `default-hasher` feature).
+use hashbrown::DefaultHashBuilder;
 
 pub mod bucket;
 pub mod defaults;
