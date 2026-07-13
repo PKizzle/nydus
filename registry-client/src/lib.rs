@@ -48,4 +48,7 @@ pub mod types;
 
 pub use client::{FetchedManifest, RegistryClient, RegistryClientOptions};
 pub use reference::ImageReference;
-pub use types::{Descriptor, Index, Manifest, Platform, sha256_digest, verify_digest};
+pub use types::{
+    Descriptor, History, ImageConfig, Index, Manifest, Platform, RootFs, sha256_digest,
+    verify_digest,
+};

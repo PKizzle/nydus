@@ -40,6 +40,8 @@ use registry_client::types::{
 use registry_client::{Descriptor, RegistryClient};
 use tracing::info;
 
+use crate::engine::retry::RetryPolicy;
+
 /// The referrer artifact's `artifactType`: the nydus data-blob media type. This
 /// is the value the snapshotter matches on ("nydus" substring) when classifying
 /// an artifact descriptor.
@@ -60,6 +62,7 @@ pub const REFERRER_CONFIG_BYTES: &[u8] = b"{}";
 /// * `bootstrap_file` — the merged RAFS bootstrap file.
 /// * `subject` — descriptor of the source image manifest; becomes the
 ///   referrer artifact's `subject`.
+/// * `retry` — retry policy applied to each idempotent push.
 ///
 /// Returns the pushed artifact descriptor on success.
 pub async fn maybe_push_referrer(
@@ -69,6 +72,7 @@ pub async fn maybe_push_referrer(
     data_blob_files: &[PathBuf],
     bootstrap_file: &Path,
     subject: &Descriptor,
+    retry: &RetryPolicy,
 ) -> Result<Option<Descriptor>> {
     if !with_referrer {
         return Ok(None);
@@ -80,21 +84,27 @@ pub async fn maybe_push_referrer(
     // the original gzip layers that already live here).
     let mut data_blobs = Vec::with_capacity(data_blob_files.len());
     for file in data_blob_files {
-        let digest = source_client
-            .push_blob_file(source_repo, file)
+        let digest = retry
+            .run("push referrer data blob", || {
+                source_client.push_blob_file(source_repo, file)
+            })
             .await
             .with_context(|| format!("push referrer data blob {}", file.display()))?;
         data_blobs.push(referrer_data_blob_descriptor(digest, file_len(file)?));
     }
 
-    let boot_digest = source_client
-        .push_blob_file(source_repo, bootstrap_file)
+    let boot_digest = retry
+        .run("push referrer bootstrap", || {
+            source_client.push_blob_file(source_repo, bootstrap_file)
+        })
         .await
         .context("push referrer bootstrap blob")?;
     let bootstrap = referrer_bootstrap_descriptor(boot_digest, file_len(bootstrap_file)?);
 
-    let config_digest = source_client
-        .push_blob_bytes(source_repo, REFERRER_CONFIG_BYTES)
+    let config_digest = retry
+        .run("push referrer config", || {
+            source_client.push_blob_bytes(source_repo, REFERRER_CONFIG_BYTES)
+        })
         .await
         .context("push referrer artifact config")?;
     let config = Descriptor {
@@ -110,20 +120,24 @@ pub async fn maybe_push_referrer(
 
     // (1) By digest: registries with native referrers-API support index this via
     // the subject; the immutable digest is the canonical address.
-    source_client
-        .push_manifest(
-            source_repo,
-            &artifact.digest,
-            MEDIA_TYPE_OCI_MANIFEST,
-            &bytes,
-        )
+    retry
+        .run("push referrer manifest", || {
+            source_client.push_manifest(
+                source_repo,
+                &artifact.digest,
+                MEDIA_TYPE_OCI_MANIFEST,
+                &bytes,
+            )
+        })
         .await
         .context("push referrer artifact manifest by digest")?;
     // (2) Fallback tag: the referrers-API fallback for registries without native
     // support — the snapshotter GETs `sha256-<subject-hex>` when /referrers 404s.
     let fallback = fallback_referrers_tag(&subject.digest);
-    source_client
-        .push_manifest(source_repo, &fallback, MEDIA_TYPE_OCI_MANIFEST, &bytes)
+    retry
+        .run("push referrer fallback tag", || {
+            source_client.push_manifest(source_repo, &fallback, MEDIA_TYPE_OCI_MANIFEST, &bytes)
+        })
         .await
         .with_context(|| format!("push referrer fallback tag {fallback}"))?;
 
@@ -291,7 +305,16 @@ mod tests {
         )
         .unwrap();
         let subject = subject_desc();
-        let fut = maybe_push_referrer(false, &client, "team/app", &[], Path::new("/x"), &subject);
+        let retry = RetryPolicy::default();
+        let fut = maybe_push_referrer(
+            false,
+            &client,
+            "team/app",
+            &[],
+            Path::new("/x"),
+            &subject,
+            &retry,
+        );
         let result = compio::runtime::Runtime::new()
             .unwrap()
             .block_on(fut)

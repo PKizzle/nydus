@@ -40,9 +40,10 @@ use crate::engine::artifact::maybe_push_referrer;
 use crate::engine::containerd_converter::ConvertRequest;
 use crate::engine::manifest::{
     assemble_manifest, bootstrap_descriptor, config_media_type, data_blob_descriptor,
-    manifest_media_type,
+    manifest_media_type, rebuild_image_config,
 };
 use crate::engine::oci::{blob_hex, client_options, is_index, select_platform};
+use crate::engine::retry::RetryPolicy;
 
 /// A source rootfs layer pulled to disk.
 #[derive(Clone, Debug)]
@@ -55,8 +56,12 @@ struct PulledLayer {
 
 /// The pulled source image (single platform).
 struct PulledSource {
-    /// Descriptor of the source image manifest (captured for the P4c referrer
-    /// seam: it becomes the referrer artifact `subject`).
+    /// Descriptor of the **top-level** source reference (captured for the P4c
+    /// referrer seam: it becomes the referrer artifact `subject` and drives the
+    /// `sha256-<hex>` fallback tag). For a multi-arch source this is the image
+    /// INDEX descriptor, not the platform-resolved manifest — `nydusify check`
+    /// and the snapshotter both resolve the top-level digest, so the referrer
+    /// must be published under it.
     manifest_desc: Descriptor,
     /// Raw image-config JSON, reused verbatim as the nydus image config.
     config_bytes: Vec<u8>,
@@ -111,6 +116,9 @@ pub async fn run_conversion(request: &ConvertRequest, workspace: &Path) -> Resul
     .context("build target registry client")?;
     let same_registry = source_ref.api_host == target_ref.api_host;
 
+    // Retries for idempotent (digest-addressed) pushes, honoring the CLI flags.
+    let retry = RetryPolicy::from_flags(request.push_retry_count, &request.push_retry_delay);
+
     let pushed = push_artifact(
         request,
         &target_client,
@@ -119,6 +127,7 @@ pub async fn run_conversion(request: &ConvertRequest, workspace: &Path) -> Resul
         same_registry,
         &source,
         &output,
+        &retry,
     )
     .await?;
 
@@ -139,6 +148,7 @@ pub async fn run_conversion(request: &ConvertRequest, workspace: &Path) -> Resul
         &data_blob_files,
         &output.bootstrap,
         &source.manifest_desc,
+        &retry,
     )
     .await?;
 
@@ -182,12 +192,66 @@ fn reject_unsupported(request: &ConvertRequest) -> Result<()> {
             "--backend-type {target_backend} is not yet supported by nydusify-rs; only `registry` (default) is implemented (follow-up)"
         );
     }
+
+    // Flags parsed by the CLI but not yet honored by the converter. Reject them
+    // loudly rather than silently dropping them and producing an image that
+    // does not reflect what the user asked for.
+    let d = &request.driver;
+    if !d.chunk_dict_ref.is_empty() {
+        bail!("--chunk-dict is not yet supported by nydusify-rs (follow-up)");
+    }
+    if !d.cache_ref.is_empty() {
+        bail!("--build-cache is not yet supported by nydusify-rs (follow-up)");
+    }
+    if d.merge_manifest {
+        bail!(
+            "--merge-platform/--multi-platform is not yet supported by nydusify-rs; convert one platform at a time (follow-up)"
+        );
+    }
+    if d.backend_force_push {
+        bail!("--backend-force-push is not yet supported by nydusify-rs (follow-up)");
+    }
+    if d.fs_align_chunk {
+        bail!(
+            "--fs-align-chunk/--backend-aligned-chunk is not yet supported by nydusify-rs (follow-up)"
+        );
+    }
+    // Non-default build-tuning knobs are not plumbed into the nydus-image
+    // invocation yet; only their defaults are safe to accept silently.
+    if d.fs_chunk_size != "0x100000" {
+        bail!(
+            "--fs-chunk-size {} is not yet supported by nydusify-rs; only the default 0x100000 is used (follow-up)",
+            d.fs_chunk_size
+        );
+    }
+    if d.batch_size != "0" {
+        bail!(
+            "--batch-size {} is not yet supported by nydusify-rs (follow-up)",
+            d.batch_size
+        );
+    }
     Ok(())
 }
 
 // ---------------------------------------------------------------------------
 // Pull
 // ---------------------------------------------------------------------------
+
+/// Build the referrer `subject` descriptor from the top-level fetched
+/// reference. For a multi-arch source this describes the image INDEX (the
+/// digest `nydusify check` and the snapshotter resolve), not the
+/// platform-resolved manifest.
+fn top_level_subject_descriptor(fetched: &registry_client::FetchedManifest) -> Descriptor {
+    Descriptor {
+        media_type: fetched
+            .content_type
+            .clone()
+            .unwrap_or_else(|| manifest_media_type(true).to_string()),
+        digest: fetched.digest.clone(),
+        size: fetched.bytes.len() as u64,
+        ..Descriptor::default()
+    }
+}
 
 async fn pull_source(
     request: &ConvertRequest,
@@ -201,35 +265,31 @@ async fn pull_source(
         .await
         .with_context(|| format!("fetch source manifest {source_ref}"))?;
 
+    // The referrer subject / fallback tag is derived from the TOP-LEVEL fetched
+    // reference (the index digest for a multi-arch source), captured before any
+    // index->platform resolution so convert and `nydusify check` agree.
+    let manifest_desc = top_level_subject_descriptor(&fetched);
+
     // Resolve an index/manifest-list down to a single platform manifest.
-    let (image_bytes, image_digest, image_content_type) =
-        if is_index(fetched.content_type.as_deref(), &fetched.bytes) {
-            let index: Index =
-                serde_json::from_slice(&fetched.bytes).context("parse source image index")?;
-            let selected = select_platform(&index, &request.platforms)?;
-            let img = client
-                .get_manifest(repo, &selected.digest)
-                .await
-                .with_context(|| format!("fetch platform manifest {}", selected.digest))?;
-            (img.bytes, img.digest, img.content_type)
-        } else {
-            (fetched.bytes, fetched.digest, fetched.content_type)
-        };
+    let (image_bytes, image_digest) = if is_index(fetched.content_type.as_deref(), &fetched.bytes) {
+        let index: Index =
+            serde_json::from_slice(&fetched.bytes).context("parse source image index")?;
+        let selected = select_platform(&index, &request.platforms)?;
+        let img = client
+            .get_manifest(repo, &selected.digest)
+            .await
+            .with_context(|| format!("fetch platform manifest {}", selected.digest))?;
+        (img.bytes, img.digest)
+    } else {
+        (fetched.bytes, fetched.digest)
+    };
 
     let manifest: Manifest =
         serde_json::from_slice(&image_bytes).context("parse source image manifest")?;
     if manifest.layers.is_empty() {
         bail!("source image manifest {image_digest} has no layers");
     }
-
-    let manifest_desc = Descriptor {
-        media_type: image_content_type
-            .clone()
-            .unwrap_or_else(|| manifest_media_type(true).to_string()),
-        digest: image_digest.clone(),
-        size: image_bytes.len() as u64,
-        ..Descriptor::default()
-    };
+    validate_layer_media_types(&manifest)?;
 
     let config_bytes = client
         .get_blob(repo, &manifest.config.digest)
@@ -257,6 +317,40 @@ async fn pull_source(
         config_bytes,
         layers,
     })
+}
+
+/// Reject source layers `nydus-image create --type targz-*` cannot ingest.
+///
+/// The converter feeds each layer to `nydus-image` as a gzip'd (or plain) tar
+/// stream. zstd-compressed layers, foreign/non-distributable layers, and any
+/// non-tar layer media type would silently mis-convert or fail deep in the
+/// subprocess; reject them up front with a clear message.
+fn validate_layer_media_types(manifest: &Manifest) -> Result<()> {
+    for layer in &manifest.layers {
+        let mt = layer.media_type.as_str();
+        let lower = mt.to_ascii_lowercase();
+        if lower.contains("zstd") {
+            bail!(
+                "source layer {} has media type {mt}: zstd-compressed layers are not supported by nydusify-rs (only gzip/uncompressed tar layers)",
+                layer.digest
+            );
+        }
+        if lower.contains("foreign") || lower.contains("nondistributable") {
+            bail!(
+                "source layer {} has media type {mt}: foreign/non-distributable layers cannot be converted",
+                layer.digest
+            );
+        }
+        // Must be a tar-based layer (…tar or …tar+gzip / …tar.gzip).
+        let is_tar = lower.contains(".tar") || lower.ends_with("tar+gzip");
+        if !is_tar {
+            bail!(
+                "source layer {} has unsupported media type {mt}: expected a tar or gzip'd-tar image layer",
+                layer.digest
+            );
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -486,21 +580,10 @@ async fn push_artifact(
     same_registry: bool,
     source: &PulledSource,
     output: &ConversionOutput,
+    retry: &RetryPolicy,
 ) -> Result<Descriptor> {
     let repo = &target_ref.repo;
     let docker2oci = request.driver.docker2oci;
-
-    // Config blob (reused verbatim from the source image).
-    let config_digest = client
-        .push_blob_bytes(repo, &source.config_bytes)
-        .await
-        .context("push image config")?;
-    let config = Descriptor {
-        media_type: config_media_type(docker2oci).to_string(),
-        digest: config_digest,
-        size: source.config_bytes.len() as u64,
-        ..Descriptor::default()
-    };
 
     let mut data_blobs = Vec::new();
 
@@ -516,8 +599,10 @@ async fn push_artifact(
             same_registry
         };
         if !mounted {
-            client
-                .push_blob_file(repo, &layer.path)
+            retry
+                .run("push reused layer", || {
+                    client.push_blob_file(repo, &layer.path)
+                })
                 .await
                 .with_context(|| format!("push reused layer {}", layer.digest))?;
         } else {
@@ -529,27 +614,55 @@ async fn push_artifact(
 
     // Newly-created nydus data blobs.
     for blob in &output.new_blobs {
-        let digest = client
-            .push_blob_file(repo, blob)
+        let digest = retry
+            .run("push nydus blob", || client.push_blob_file(repo, blob))
             .await
             .with_context(|| format!("push nydus blob {}", blob.display()))?;
         data_blobs.push(data_blob_descriptor(digest, file_len(blob)?));
     }
 
     // Bootstrap.
-    let boot_digest = client
-        .push_blob_file(repo, &output.bootstrap)
+    let boot_digest = retry
+        .run("push nydus bootstrap", || {
+            client.push_blob_file(repo, &output.bootstrap)
+        })
         .await
         .context("push nydus bootstrap")?;
     let bootstrap = bootstrap_descriptor(boot_digest, file_len(&output.bootstrap)?);
+
+    // Rebuild the image config so `rootfs.diff_ids` has exactly one entry per
+    // pushed manifest layer (data blobs first, bootstrap last) — otherwise
+    // containerd rejects the image with "mismatched image rootfs and manifest
+    // layers". Push the NEW config blob and reference it in the manifest.
+    let layer_digests: Vec<String> = data_blobs
+        .iter()
+        .map(|d| d.digest.clone())
+        .chain(std::iter::once(bootstrap.digest.clone()))
+        .collect();
+    let config_bytes = rebuild_image_config(&source.config_bytes, &layer_digests)
+        .context("rewrite image config diff_ids/history for nydus layer set")?;
+    let config_digest = retry
+        .run("push image config", || {
+            client.push_blob_bytes(repo, &config_bytes)
+        })
+        .await
+        .context("push rewritten image config")?;
+    let config = Descriptor {
+        media_type: config_media_type(docker2oci).to_string(),
+        digest: config_digest,
+        size: config_bytes.len() as u64,
+        ..Descriptor::default()
+    };
 
     // Manifest.
     let manifest = assemble_manifest(docker2oci, config, data_blobs, bootstrap);
     let manifest_bytes = serde_json::to_vec(&manifest).context("serialize nydus manifest")?;
     let media_type = manifest_media_type(docker2oci);
     let reference = target_ref.manifest_reference();
-    let manifest_digest = client
-        .push_manifest(repo, reference, media_type, &manifest_bytes)
+    let manifest_digest = retry
+        .run("push nydus manifest", || {
+            client.push_manifest(repo, reference, media_type, &manifest_bytes)
+        })
         .await
         .with_context(|| format!("push nydus manifest to {target_ref}"))?;
 
@@ -718,6 +831,97 @@ mod tests {
         // Sources still follow, lower then upper.
         assert_eq!(standard[standard.len() - 2], "/w/l0/bootstrap");
         assert_eq!(standard[standard.len() - 1], "/w/l1/bootstrap");
+    }
+
+    #[test]
+    fn subject_descriptor_uses_top_level_index_digest_for_multi_arch() {
+        use registry_client::FetchedManifest;
+        use registry_client::types::{MEDIA_TYPE_OCI_INDEX, sha256_digest};
+
+        // Simulate the top-level fetch of a multi-arch image: an index whose own
+        // digest is what `nydusify check` / the snapshotter resolve. The
+        // referrer subject MUST be this index digest, not a platform manifest's.
+        let index_bytes = br#"{"schemaVersion":2,"manifests":[]}"#.to_vec();
+        let index_digest = sha256_digest(&index_bytes);
+        let fetched = FetchedManifest {
+            bytes: index_bytes.clone(),
+            digest: index_digest.clone(),
+            content_type: Some(MEDIA_TYPE_OCI_INDEX.to_string()),
+        };
+
+        let subject = top_level_subject_descriptor(&fetched);
+        assert_eq!(subject.digest, index_digest);
+        assert_eq!(subject.media_type, MEDIA_TYPE_OCI_INDEX);
+        assert_eq!(subject.size, index_bytes.len() as u64);
+
+        // The fallback tag convert publishes under equals the one `check` looks
+        // up (both from this top-level digest).
+        assert_eq!(
+            crate::engine::artifact::fallback_referrers_tag(&subject.digest),
+            index_digest.replace(':', "-")
+        );
+    }
+
+    #[test]
+    fn subject_descriptor_defaults_media_type_when_absent() {
+        use registry_client::FetchedManifest;
+        let fetched = FetchedManifest {
+            bytes: b"{}".to_vec(),
+            digest: "sha256:abc".to_string(),
+            content_type: None,
+        };
+        let subject = top_level_subject_descriptor(&fetched);
+        assert_eq!(subject.media_type, manifest_media_type(true));
+    }
+
+    fn manifest_with_layer_media_type(mt: &str) -> Manifest {
+        use registry_client::types::MEDIA_TYPE_OCI_CONFIG;
+        let mut layer = Descriptor::for_bytes(mt, b"x");
+        layer.media_type = mt.to_string();
+        Manifest {
+            schema_version: 2,
+            media_type: None,
+            artifact_type: None,
+            config: Descriptor::for_bytes(MEDIA_TYPE_OCI_CONFIG, b"{}"),
+            layers: vec![layer],
+            subject: None,
+            annotations: None,
+        }
+    }
+
+    #[test]
+    fn validate_layer_media_types_accepts_gzip_and_tar() {
+        use registry_client::types::{
+            MEDIA_TYPE_DOCKER_LAYER_TAR_GZIP, MEDIA_TYPE_OCI_LAYER_TAR,
+            MEDIA_TYPE_OCI_LAYER_TAR_GZIP,
+        };
+        for mt in [
+            MEDIA_TYPE_OCI_LAYER_TAR_GZIP,
+            MEDIA_TYPE_OCI_LAYER_TAR,
+            MEDIA_TYPE_DOCKER_LAYER_TAR_GZIP,
+        ] {
+            assert!(validate_layer_media_types(&manifest_with_layer_media_type(mt)).is_ok());
+        }
+    }
+
+    #[test]
+    fn validate_layer_media_types_rejects_zstd_and_foreign() {
+        let zstd = validate_layer_media_types(&manifest_with_layer_media_type(
+            "application/vnd.oci.image.layer.v1.tar+zstd",
+        ))
+        .unwrap_err();
+        assert!(zstd.to_string().contains("zstd"));
+
+        let foreign = validate_layer_media_types(&manifest_with_layer_media_type(
+            "application/vnd.docker.image.rootfs.foreign.diff.tar.gzip",
+        ))
+        .unwrap_err();
+        assert!(foreign.to_string().contains("foreign"));
+
+        let bogus =
+            validate_layer_media_types(&manifest_with_layer_media_type("application/octet-stream"))
+                .unwrap_err();
+        assert!(bogus.to_string().contains("unsupported media type"));
     }
 
     #[test]

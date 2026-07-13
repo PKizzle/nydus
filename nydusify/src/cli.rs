@@ -315,7 +315,26 @@ pub struct CopyArgs {
 }
 
 pub fn default_platform() -> String {
-    format!("linux/{}", std::env::consts::ARCH)
+    format!("linux/{}", go_arch(std::env::consts::ARCH))
+}
+
+/// Map a rustc target arch (`std::env::consts::ARCH`) to the GOARCH name used
+/// in OCI image indexes. OCI/containerd platforms use Go's arch vocabulary
+/// (`amd64`, `arm64`, …), not rustc's (`x86_64`, `aarch64`, …); emitting the
+/// rustc name makes `select_platform` miss every multi-arch image. Unknown
+/// arches pass through unchanged.
+fn go_arch(arch: &str) -> &str {
+    match arch {
+        "x86_64" => "amd64",
+        "aarch64" => "arm64",
+        "arm" => "arm",
+        // rustc reports both ppc64 and ppc64le as "powerpc64"; the Linux
+        // containers Nydus targets are little-endian (GOARCH ppc64le).
+        "powerpc64" | "powerpc64le" => "ppc64le",
+        "riscv64" => "riscv64",
+        "s390x" => "s390x",
+        other => other,
+    }
 }
 
 #[cfg(test)]
@@ -340,5 +359,27 @@ mod tests {
         };
         assert!(args.oci_ref);
         assert_eq!(args.target_suffix.as_deref(), Some("-nydus-oci-ref"));
+    }
+
+    #[test]
+    fn go_arch_maps_rustc_arch_to_goarch() {
+        assert_eq!(go_arch("x86_64"), "amd64");
+        assert_eq!(go_arch("aarch64"), "arm64");
+        assert_eq!(go_arch("arm"), "arm");
+        assert_eq!(go_arch("powerpc64"), "ppc64le");
+        assert_eq!(go_arch("powerpc64le"), "ppc64le");
+        assert_eq!(go_arch("riscv64"), "riscv64");
+        assert_eq!(go_arch("s390x"), "s390x");
+        // Unknown arches pass through untouched.
+        assert_eq!(go_arch("mips64"), "mips64");
+    }
+
+    #[test]
+    fn default_platform_uses_goarch_names() {
+        let platform = default_platform();
+        assert!(platform.starts_with("linux/"));
+        // Never a rustc arch name.
+        assert!(!platform.contains("x86_64"));
+        assert!(!platform.contains("aarch64"));
     }
 }

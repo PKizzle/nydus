@@ -73,12 +73,26 @@ pub async fn run(args: MountArgs) -> Result<()> {
         .await
         .with_context(|| format!("download bootstrap {}", bootstrap.digest))?;
 
+    // Resolve the target registry's docker-config credentials so nydusd's
+    // registry backend can authenticate its on-demand blob fetches; without
+    // this the daemon does anonymous GETs and 401s at first read on any private
+    // repo. Same source of truth (`~/.docker/config.json`) the RegistryClient
+    // uses to pull the bootstrap above.
+    let auth = registry_client::auth::docker_config_auth(None, &target_ref.api_host);
+    if auth.is_none() {
+        warn!(
+            host = %target_ref.api_host,
+            "no docker-config credentials found for target; nydusd will fetch blobs anonymously"
+        );
+    }
+
     let config = build_nydusd_config(
         &target_ref.api_host,
         &target_ref.repo,
         &cache_dir,
         args.target_insecure,
         args.prefetch,
+        auth.as_deref(),
     );
     let config_path = args.work_dir.join("nydusd-config.json");
     std::fs::write(&config_path, serde_json::to_vec_pretty(&config)?)
@@ -98,6 +112,7 @@ pub async fn run(args: MountArgs) -> Result<()> {
         &config_path,
         &plan.mount_path,
         &bootstrap_path,
+        auth.as_deref(),
     )?;
 
     #[cfg(unix)]
@@ -116,8 +131,21 @@ pub async fn run(args: MountArgs) -> Result<()> {
             info!("received termination signal; unmounted and stopped nydusd");
             Ok(())
         }
-        Supervised::ChildExited(status) if status.success() => Ok(()),
-        Supervised::ChildExited(status) => bail!("nydusd exited unexpectedly: {status}"),
+        Supervised::ChildExited(status) => {
+            // A child death observed just after a termination signal is part of
+            // the deliberate teardown, not a failure — report success.
+            #[cfg(unix)]
+            if signal::terminated() {
+                info!("received termination signal; unmounted and stopped nydusd");
+                return Ok(());
+            }
+            if status.success() {
+                Ok(())
+            } else {
+                bail!("nydusd exited unexpectedly: {status}")
+            }
+        }
+        Supervised::PollFailed(e) => bail!("failed to poll nydusd: {e}"),
     }
 }
 
@@ -148,19 +176,26 @@ fn build_nydusd_config(
     cache_dir: &Path,
     skip_verify: bool,
     prefetch: bool,
+    auth: Option<&str>,
 ) -> Value {
+    let mut backend_config = json!({
+        // Empty scheme lets nydusd auto-detect https/http (and, with
+        // skip_verify, fall back to http on TLS errors).
+        "scheme": "",
+        "host": host,
+        "repo": repo,
+        "skip_verify": skip_verify
+    });
+    // base64 `user:password` for the registry backend's Basic auth. Matches how
+    // the Go nydusify mount injects credentials into the backend config.
+    if let Some(auth) = auth {
+        backend_config["auth"] = json!(auth);
+    }
     json!({
         "device": {
             "backend": {
                 "type": "registry",
-                "config": {
-                    // Empty scheme lets nydusd auto-detect https/http (and, with
-                    // skip_verify, fall back to http on TLS errors).
-                    "scheme": "",
-                    "host": host,
-                    "repo": repo,
-                    "skip_verify": skip_verify
-                }
+                "config": backend_config
             },
             "cache": {
                 "type": "blobcache",
@@ -185,8 +220,10 @@ fn spawn_nydusd(
     config: &Path,
     mountpoint: &Path,
     bootstrap: &Path,
+    auth: Option<&str>,
 ) -> Result<Child> {
-    Command::new(nydusd)
+    let mut command = Command::new(nydusd);
+    command
         .arg("--config")
         .arg(config)
         .arg("--mountpoint")
@@ -194,7 +231,28 @@ fn spawn_nydusd(
         .arg("--bootstrap")
         .arg(bootstrap)
         .arg("--log-level")
-        .arg("info")
+        .arg("info");
+    // Also surface the credential via the env var nydusd reads for registry
+    // auth, belt-and-suspenders with the config `auth` field.
+    if let Some(auth) = auth {
+        command.env("IMAGE_PULL_AUTH", auth);
+    }
+    // Run nydusd in its own process group so a Ctrl-C delivered to the terminal
+    // reaches nydusify (which tears the mount down deliberately) and does not
+    // also race a SIGINT straight into the daemon.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        // SAFETY: setsid() is async-signal-safe and only detaches the child
+        // into a new session/process group before exec.
+        unsafe {
+            command.pre_exec(|| {
+                libc::setsid();
+                Ok(())
+            });
+        }
+    }
+    command
         .spawn()
         .with_context(|| format!("spawn nydusd `{}`", nydusd.display()))
 }
@@ -205,23 +263,27 @@ enum Supervised {
     Signalled,
     /// nydusd exited on its own.
     ChildExited(std::process::ExitStatus),
+    /// Polling the child failed (distinct from a clean signal shutdown).
+    PollFailed(std::io::Error),
 }
 
 /// Poll the child and the signal flag until either fires. Uses a short async
 /// sleep so the compio runtime stays responsive without busy-spinning.
 async fn supervise(child: &mut Child) -> Supervised {
     loop {
-        match child.try_wait() {
-            Ok(Some(status)) => return Supervised::ChildExited(status),
-            Ok(None) => {}
-            Err(e) => {
-                warn!(error = %e, "failed to poll nydusd; tearing down");
-                return Supervised::Signalled;
-            }
-        }
+        // Check the signal flag BEFORE polling the child: a pending termination
+        // request must win over (and correctly attribute) nydusd's own
+        // signal-induced exit.
         #[cfg(unix)]
         if signal::terminated() {
             return Supervised::Signalled;
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => return Supervised::ChildExited(status),
+            Ok(None) => {}
+            // A failed poll is an error in its own right, never mapped to a
+            // clean signal shutdown.
+            Err(e) => return Supervised::PollFailed(e),
         }
         compio::time::sleep(Duration::from_millis(300)).await;
     }
@@ -330,6 +392,7 @@ mod tests {
             Path::new("/w/cache"),
             true,
             true,
+            Some("dXNlcjpwYXNz"),
         );
         let backend = &config["device"]["backend"];
         assert_eq!(backend["type"], "registry");
@@ -338,6 +401,8 @@ mod tests {
         assert_eq!(backend["config"]["skip_verify"], true);
         // Empty scheme -> nydusd auto-detects https/http.
         assert_eq!(backend["config"]["scheme"], "");
+        // Credentials are injected so nydusd's blob fetches authenticate.
+        assert_eq!(backend["config"]["auth"], "dXNlcjpwYXNz");
         assert_eq!(config["device"]["cache"]["config"]["work_dir"], "/w/cache");
         assert_eq!(config["device"]["cache"]["type"], "blobcache");
         assert_eq!(config["fs_prefetch"]["enable"], true);
@@ -346,8 +411,14 @@ mod tests {
 
     #[test]
     fn nydusd_config_prefetch_toggles_off() {
-        let config = build_nydusd_config("r.io", "a/b", Path::new("/c"), false, false);
+        let config = build_nydusd_config("r.io", "a/b", Path::new("/c"), false, false, None);
         assert_eq!(config["fs_prefetch"]["enable"], false);
         assert_eq!(config["device"]["backend"]["config"]["skip_verify"], false);
+    }
+
+    #[test]
+    fn nydusd_config_omits_auth_when_no_credentials() {
+        let config = build_nydusd_config("r.io", "a/b", Path::new("/c"), false, false, None);
+        assert!(config["device"]["backend"]["config"].get("auth").is_none());
     }
 }

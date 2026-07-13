@@ -19,11 +19,12 @@
 
 use std::collections::BTreeMap;
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use registry_client::Descriptor;
 use registry_client::types::{
-    MEDIA_TYPE_DOCKER_CONFIG, MEDIA_TYPE_DOCKER_MANIFEST, MEDIA_TYPE_NYDUS_BLOB,
-    MEDIA_TYPE_NYDUS_BOOTSTRAP_LAYER, MEDIA_TYPE_OCI_CONFIG, MEDIA_TYPE_OCI_MANIFEST, Manifest,
+    History, ImageConfig, MEDIA_TYPE_DOCKER_CONFIG, MEDIA_TYPE_DOCKER_MANIFEST,
+    MEDIA_TYPE_NYDUS_BLOB, MEDIA_TYPE_NYDUS_BOOTSTRAP_LAYER, MEDIA_TYPE_OCI_CONFIG,
+    MEDIA_TYPE_OCI_MANIFEST, Manifest,
 };
 
 /// Annotation set on nydus data-blob layers so containerd's snapshotter
@@ -78,6 +79,46 @@ pub fn bootstrap_descriptor(digest: String, size: u64) -> Descriptor {
         )])),
         ..Descriptor::default()
     }
+}
+
+/// `created_by` recorded on the appended bootstrap-layer history entry.
+/// Mirrors the Go nydus converter (`pkg/converter/convert_unix.go`).
+pub const BOOTSTRAP_HISTORY_CREATED_BY: &str = "Nydus Converter";
+/// `comment` recorded on the appended bootstrap-layer history entry.
+pub const BOOTSTRAP_HISTORY_COMMENT: &str = "Nydus Bootstrap Layer";
+
+/// Rebuild the source image config so its `rootfs.diff_ids` matches the nydus
+/// image's new layer set exactly.
+///
+/// containerd's image unpacker requires
+/// `len(config.rootfs.diff_ids) == len(manifest.layers)` (else it fails with
+/// "mismatched image rootfs and manifest layers"). The convert pipeline
+/// replaces the original gzip layers with nydus data blobs + a bootstrap, so
+/// the reused config's original diff_ids no longer match. This rewrites them.
+///
+/// `layer_digests` are the digests of the pushed manifest layers, in order
+/// (data blobs first, bootstrap last). Following the Go converter
+/// (`makeNewConfig` in `pkg/converter/convert_unix.go`), for the registry
+/// (no-backend) case each layer's diff_id is set to the layer's own
+/// `LayerAnnotationUncompressed` value — which for nydus data blobs and an
+/// uncompressed bootstrap equals the layer's own content digest. A single
+/// bootstrap history entry is appended (original history is preserved).
+pub fn rebuild_image_config(config_bytes: &[u8], layer_digests: &[String]) -> Result<Vec<u8>> {
+    let mut config: ImageConfig =
+        serde_json::from_slice(config_bytes).context("parse source image config JSON")?;
+
+    if config.rootfs.type_.is_empty() {
+        config.rootfs.type_ = "layers".to_string();
+    }
+    config.rootfs.diff_ids = layer_digests.to_vec();
+
+    config.history.push(History {
+        created_by: Some(BOOTSTRAP_HISTORY_CREATED_BY.to_string()),
+        comment: Some(BOOTSTRAP_HISTORY_COMMENT.to_string()),
+        ..History::default()
+    });
+
+    serde_json::to_vec(&config).context("serialize rewritten nydus image config")
 }
 
 /// Assemble the nydus image [`Manifest`] from an already-pushed config
@@ -274,6 +315,122 @@ mod tests {
         }
         let err = validate_nydus_manifest(&manifest).unwrap_err();
         assert!(err.to_string().contains("no nydus bootstrap layer"));
+    }
+
+    /// A synthetic source image config with `n` original gzip diff_ids and one
+    /// history entry per layer.
+    fn source_config_json(n: usize) -> Vec<u8> {
+        let diff_ids: Vec<String> = (0..n).map(|i| format!("sha256:orig{i}")).collect();
+        let history: Vec<serde_json::Value> = (0..n)
+            .map(|i| serde_json::json!({ "created_by": format!("RUN step {i}") }))
+            .collect();
+        serde_json::to_vec(&serde_json::json!({
+            "architecture": "amd64",
+            "os": "linux",
+            "config": { "Env": ["PATH=/usr/bin"], "Cmd": ["/bin/sh"] },
+            "rootfs": { "type": "layers", "diff_ids": diff_ids },
+            "history": history,
+        }))
+        .unwrap()
+    }
+
+    fn parse_config(bytes: &[u8]) -> serde_json::Value {
+        serde_json::from_slice(bytes).unwrap()
+    }
+
+    #[test]
+    fn rebuild_config_standard_mode_diffids_match_layer_count() {
+        // Standard mode: N new nydus data blobs + 1 bootstrap => N+1 layers.
+        let n = 3;
+        let source = source_config_json(n);
+
+        let mut data_blobs = Vec::new();
+        for i in 0..n {
+            data_blobs.push(data_blob_descriptor(format!("sha256:nydus{i}"), 100));
+        }
+        let bootstrap = bootstrap_descriptor("sha256:boot".into(), 50);
+
+        let layer_digests: Vec<String> = data_blobs
+            .iter()
+            .chain(std::iter::once(&bootstrap))
+            .map(|d| d.digest.clone())
+            .collect();
+
+        let new_config = rebuild_image_config(&source, &layer_digests).unwrap();
+        let config = Descriptor::for_bytes(MEDIA_TYPE_OCI_CONFIG, &new_config);
+        let manifest = assemble_manifest(true, config, data_blobs, bootstrap);
+
+        let parsed = parse_config(&new_config);
+        let diff_ids = parsed["rootfs"]["diff_ids"].as_array().unwrap();
+
+        // The core invariant containerd enforces.
+        assert_eq!(diff_ids.len(), manifest.layers.len());
+        assert_eq!(diff_ids.len(), n + 1);
+        // diff_ids are, in order, exactly the pushed layer digests.
+        for (diff_id, layer) in diff_ids.iter().zip(&manifest.layers) {
+            assert_eq!(diff_id.as_str().unwrap(), layer.digest);
+        }
+        // Original config fields survive the rewrite.
+        assert_eq!(parsed["architecture"], "amd64");
+        assert_eq!(parsed["config"]["Cmd"][0], "/bin/sh");
+        // One bootstrap history entry appended after the originals.
+        let history = parsed["history"].as_array().unwrap();
+        assert_eq!(history.len(), n + 1);
+        let last = history.last().unwrap();
+        assert_eq!(last["created_by"], BOOTSTRAP_HISTORY_CREATED_BY);
+        assert_eq!(last["comment"], BOOTSTRAP_HISTORY_COMMENT);
+    }
+
+    #[test]
+    fn rebuild_config_oci_ref_mode_diffids_match_layer_count() {
+        // oci-ref/zran mode: N reused gzip layers + N zran-index blobs + 1
+        // bootstrap => 2N+1 layers. diff_ids must still match exactly.
+        let n = 2;
+        let source = source_config_json(n);
+
+        let mut data_blobs = Vec::new();
+        for i in 0..n {
+            // Reused original gzip layer (its own digest is the nydus blob id).
+            data_blobs.push(data_blob_descriptor(format!("sha256:orig{i}"), 900));
+        }
+        for i in 0..n {
+            // Tiny per-layer zran index blob.
+            data_blobs.push(data_blob_descriptor(format!("sha256:zran{i}"), 20));
+        }
+        let bootstrap = bootstrap_descriptor("sha256:boot".into(), 50);
+
+        let layer_digests: Vec<String> = data_blobs
+            .iter()
+            .chain(std::iter::once(&bootstrap))
+            .map(|d| d.digest.clone())
+            .collect();
+
+        let new_config = rebuild_image_config(&source, &layer_digests).unwrap();
+        let config = Descriptor::for_bytes(MEDIA_TYPE_OCI_CONFIG, &new_config);
+        let manifest = assemble_manifest(true, config, data_blobs, bootstrap);
+
+        let parsed = parse_config(&new_config);
+        let diff_ids = parsed["rootfs"]["diff_ids"].as_array().unwrap();
+
+        assert_eq!(diff_ids.len(), manifest.layers.len());
+        assert_eq!(diff_ids.len(), 2 * n + 1);
+        for (diff_id, layer) in diff_ids.iter().zip(&manifest.layers) {
+            assert_eq!(diff_id.as_str().unwrap(), layer.digest);
+        }
+    }
+
+    #[test]
+    fn rebuild_config_defaults_rootfs_type_when_absent() {
+        let source = serde_json::to_vec(&serde_json::json!({
+            "architecture": "arm64",
+            "os": "linux",
+        }))
+        .unwrap();
+        let layer_digests = vec!["sha256:a".to_string(), "sha256:boot".to_string()];
+        let new_config = rebuild_image_config(&source, &layer_digests).unwrap();
+        let parsed = parse_config(&new_config);
+        assert_eq!(parsed["rootfs"]["type"], "layers");
+        assert_eq!(parsed["rootfs"]["diff_ids"].as_array().unwrap().len(), 2);
     }
 
     #[test]

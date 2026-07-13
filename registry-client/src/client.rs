@@ -293,8 +293,11 @@ impl RegistryClient {
             let _ = std::fs::remove_file(&tmp);
             return Err(e);
         }
-        std::fs::rename(&tmp, path)
-            .with_context(|| format!("rename blob into place at {}", path.display()))?;
+        if let Err(e) = std::fs::rename(&tmp, path) {
+            // Don't leave the `.part` temp file behind on a failed rename.
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e).with_context(|| format!("rename blob into place at {}", path.display()));
+        }
         Ok(written)
     }
 

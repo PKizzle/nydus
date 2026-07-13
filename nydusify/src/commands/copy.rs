@@ -6,12 +6,13 @@ use std::path::Path;
 
 use anyhow::{Context, Result, anyhow, bail};
 use registry_client::types::{MEDIA_TYPE_OCI_MANIFEST, Manifest};
-use registry_client::{ImageReference, RegistryClient};
+use registry_client::{ImageReference, Index, RegistryClient};
 use serde::Serialize;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::cli::CopyArgs;
-use crate::engine::oci::{blob_hex, client_options, fetch_platform_manifest};
+use crate::engine::oci::{blob_hex, client_options, is_index, select_platform};
+use crate::engine::retry::RetryPolicy;
 
 use super::common::{resolve_backend_config, resolve_platform, validate_platform_selection};
 
@@ -29,6 +30,12 @@ pub async fn run(args: CopyArgs) -> Result<()> {
     if plan.all_platforms {
         bail!(
             "--all-platforms is not yet supported by nydusify-rs; copy one platform at a time with --platform (follow-up)"
+        );
+    }
+    if plan.push_chunk_size != "0MB" {
+        bail!(
+            "--push-chunk-size {} is not yet supported by nydusify-rs; chunked uploads are out of scope (follow-up)",
+            plan.push_chunk_size
         );
     }
     let target = plan
@@ -55,15 +62,32 @@ pub async fn run(args: CopyArgs) -> Result<()> {
 
     info!(source = %source_ref, target = %target_ref, platform = %plan.platform, "copying image");
 
-    // Resolve to a single-platform image manifest (index -> select).
-    let fetched = fetch_platform_manifest(
-        &source_client,
-        &source_ref.repo,
-        source_ref.manifest_reference(),
-        &plan.platform,
-    )
-    .await
-    .with_context(|| format!("fetch source manifest {source_ref}"))?;
+    let retry = RetryPolicy::default();
+
+    // Fetch the top-level reference; if it is a multi-platform index, resolve to
+    // a single platform manifest and warn loudly that the copied tag will NOT be
+    // multi-arch (a real degradation of the source).
+    let top = source_client
+        .get_manifest(&source_ref.repo, source_ref.manifest_reference())
+        .await
+        .with_context(|| format!("fetch source manifest {source_ref}"))?;
+    let fetched = if is_index(top.content_type.as_deref(), &top.bytes) {
+        warn!(
+            source = %source_ref,
+            platform = %plan.platform,
+            "source is a multi-platform index; copying only the {} manifest — the copied tag will be single-arch, not a full index",
+            plan.platform
+        );
+        let index: Index =
+            serde_json::from_slice(&top.bytes).context("parse source image index")?;
+        let selected = select_platform(&index, &plan.platform)?;
+        source_client
+            .get_manifest(&source_ref.repo, &selected.digest)
+            .await
+            .with_context(|| format!("fetch platform manifest {}", selected.digest))?
+    } else {
+        top
+    };
     let manifest: Manifest =
         serde_json::from_slice(&fetched.bytes).context("parse source image manifest")?;
 
@@ -83,6 +107,7 @@ pub async fn run(args: CopyArgs) -> Result<()> {
         same_registry,
         &manifest.config.digest,
         staging.path(),
+        &retry,
     )
     .await
     .with_context(|| format!("copy image config {}", manifest.config.digest))?;
@@ -95,23 +120,30 @@ pub async fn run(args: CopyArgs) -> Result<()> {
             same_registry,
             &layer.digest,
             staging.path(),
+            &retry,
         )
         .await
         .with_context(|| format!("copy layer {}", layer.digest))?;
     }
 
-    // Push the manifest last (its blobs now all exist in the target repo).
-    let media_type = fetched
-        .content_type
+    // Push the manifest last (its blobs now all exist in the target repo). Use
+    // the manifest's own embedded mediaType so a docker schema-2 manifest is not
+    // silently re-typed as OCI; fall back to the response Content-Type, then to
+    // OCI as a last resort.
+    let media_type = manifest
+        .media_type
         .as_deref()
+        .or(fetched.content_type.as_deref())
         .unwrap_or(MEDIA_TYPE_OCI_MANIFEST);
-    let pushed = target_client
-        .push_manifest(
-            &target_ref.repo,
-            target_ref.manifest_reference(),
-            media_type,
-            &fetched.bytes,
-        )
+    let pushed = retry
+        .run("push manifest", || {
+            target_client.push_manifest(
+                &target_ref.repo,
+                target_ref.manifest_reference(),
+                media_type,
+                &fetched.bytes,
+            )
+        })
         .await
         .with_context(|| format!("push manifest to {target_ref}"))?;
 
@@ -131,6 +163,7 @@ async fn copy_blob(
     same_registry: bool,
     digest: &str,
     staging: &Path,
+    retry: &RetryPolicy,
 ) -> Result<()> {
     if target_client.head_blob(target_repo, digest).await? {
         debug!(%digest, "blob already present in target; skipping");
@@ -151,8 +184,10 @@ async fn copy_blob(
         .get_blob_to_file(source_repo, digest, &tmp)
         .await
         .with_context(|| format!("download blob {digest}"))?;
-    target_client
-        .push_blob_file(target_repo, &tmp)
+    retry
+        .run("copy blob", || {
+            target_client.push_blob_file(target_repo, &tmp)
+        })
         .await
         .with_context(|| format!("push blob {digest}"))?;
     let _ = std::fs::remove_file(&tmp);

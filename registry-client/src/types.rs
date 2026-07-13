@@ -170,6 +170,62 @@ pub struct Index {
     pub annotations: Option<BTreeMap<String, String>>,
 }
 
+/// An OCI image config (the blob referenced by a manifest's `config`
+/// descriptor).
+///
+/// Only the two fields nydusify rewrites during conversion — [`rootfs`](Self::
+/// rootfs) (its `diff_ids`) and [`history`](Self::history) — are typed. Every
+/// other field (`architecture`, `os`, `config`, `created`, `variant`, …) is
+/// preserved verbatim through [`extra`](Self::extra) so re-serializing the
+/// rewritten config keeps the rest of the image config byte-for-byte
+/// equivalent in content.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct ImageConfig {
+    /// The layer filesystem, whose `diff_ids` must have exactly one entry per
+    /// manifest layer (containerd's unpacker rejects a mismatch).
+    #[serde(default)]
+    pub rootfs: RootFs,
+    /// Build history; the nydus converter appends one bootstrap-layer entry.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub history: Vec<History>,
+    /// All other image-config fields, preserved as-is.
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, serde_json::Value>,
+}
+
+/// The `rootfs` section of an OCI image config.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RootFs {
+    /// Always `"layers"` for the layer rootfs type.
+    #[serde(rename = "type")]
+    pub type_: String,
+    /// The per-layer diff ids (uncompressed-layer digests), one per manifest
+    /// layer, in order.
+    #[serde(default)]
+    pub diff_ids: Vec<String>,
+}
+
+/// One entry in an OCI image config's `history` array.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct History {
+    /// Creation timestamp (RFC 3339).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created: Option<String>,
+    /// The command that created the layer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_by: Option<String>,
+    /// Author of the build step.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author: Option<String>,
+    /// Free-form comment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comment: Option<String>,
+    /// Whether this history entry corresponds to an empty (non-filesystem)
+    /// layer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub empty_layer: Option<bool>,
+}
+
 /// Compute the OCI digest string (`sha256:<hex>`) of `bytes`.
 pub fn sha256_digest(bytes: &[u8]) -> String {
     format!("sha256:{}", hex::encode(Sha256::digest(bytes)))
