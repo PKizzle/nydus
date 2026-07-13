@@ -342,7 +342,10 @@ impl SystemController {
         };
         let rootfs = host_rootfs_for_pid(pid)
             .with_context(|| format!("resolve host rootfs for pid {pid}"))?;
-        tracer.attach(image_ref, &rootfs)?;
+        // The holder is synthetic (there is no snapshot key on this path);
+        // cleanup happens via mark_image_accelerated on conversion, or the
+        // empty-capture settle for pods that die without producing events.
+        tracer.attach(image_ref, &rootfs, &format!("nri-rootfs-pid-{pid}"))?;
         Ok(true)
     }
 

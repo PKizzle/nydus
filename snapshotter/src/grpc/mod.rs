@@ -294,31 +294,34 @@ fn snapshot_status_label<T>(result: &Result<T, SnapshotterError>) -> &'static st
 ///
 /// Bridges containerd's gRPC proxy-plugin protocol to the overlay engine
 /// Parse `lowerdir=…` out of the first overlay mount in `mounts`, returning
-/// the *lowest* (closest to the image rootfs) directory in the list. Used by
-/// the access tracer to FAN_MARK_MOUNT the image's filesystem rather than
-/// the overlay's merged view (which includes the writable upper).
+/// **every** layer directory in the list. Used by the access tracer, which
+/// must register each lowerdir as an attribution root: while a single
+/// `FAN_MARK_MOUNT` mark covers event *delivery* for the whole host mount,
+/// the tracer attributes an event to an image by mount-root *prefix* — an
+/// open that resolves into a sibling layer's `…/snapshots/<other>/fs/…`
+/// directory matches no registered root and is dropped, so registering only
+/// lowerdir[0] systematically truncated multi-layer images' profiles.
 ///
 /// containerd overlay mounts encode the layer stack as
 /// `lowerdir=L0:L1:…:Ln,upperdir=U,workdir=W`, where `L0` is the layer
-/// closest to the rootfs read order. For a multi-layer image any of the
-/// L0..Ln directories live on the same filesystem (the snapshotter's
-/// snapshots root), so marking any one of them with `FAN_MARK_MOUNT`
-/// captures opens across the whole stack on that mount.
-fn first_lowerdir(mounts: &[snapshots::api::types::Mount]) -> Option<PathBuf> {
+/// closest to the rootfs read order. The writable upper is deliberately not
+/// included — it has nothing to do with the image's access pattern.
+fn all_lowerdirs(mounts: &[snapshots::api::types::Mount]) -> Vec<PathBuf> {
     for mount in mounts {
         if mount.r#type != "overlay" {
             continue;
         }
         for opt in &mount.options {
-            if let Some(rest) = opt.strip_prefix("lowerdir=")
-                && let Some(first) = rest.split(':').next()
-                && !first.is_empty()
-            {
-                return Some(PathBuf::from(first));
+            if let Some(rest) = opt.strip_prefix("lowerdir=") {
+                return rest
+                    .split(':')
+                    .filter(|dir| !dir.is_empty())
+                    .map(PathBuf::from)
+                    .collect();
             }
         }
     }
-    None
+    Vec::new()
 }
 
 /// Extract the chainID digest from a snapshot parent string. containerd's
@@ -868,15 +871,22 @@ impl snapshots::Snapshotter for NydusSnapshotter {
                     }
 
                     // Auto-accel capture (stage 2 trigger): attach the tracer to
-                    // the *lowest* lowerdir (the image's filesystem) and let it
-                    // record reads during pod startup. On settle the OPTIMIZE
-                    // stage runs (reusing stage 1's work dir) and re-uploads the
-                    // optimized sidecar that the next pod (or peer node) picks up
-                    // via the resolve_auto_accel_mount branch above.
-                    if let (Some(image_ref), Some(image_root)) = (image_ref, first_lowerdir(&mounts))
-                        && let Err(e) = self.access_tracer.attach(&image_ref, &image_root)
-                    {
-                        debug!(image = %image_ref, error = %e, "access_tracer attach failed");
+                    // EVERY lowerdir of the chain (event attribution is by
+                    // mount-root prefix — see `all_lowerdirs`) and let it record
+                    // reads during pod startup. On settle the OPTIMIZE stage
+                    // runs (reusing stage 1's work dir) and re-uploads the
+                    // optimized sidecar that the next pod (or peer node) picks
+                    // up via the resolve_auto_accel_mount branch above. The
+                    // snapshot key is the holder so remove() shrinks tracer
+                    // state via detach_holder.
+                    if let Some(image_ref) = image_ref {
+                        for image_root in all_lowerdirs(&mounts) {
+                            if let Err(e) =
+                                self.access_tracer.attach(&image_ref, &image_root, &key)
+                            {
+                                debug!(image = %image_ref, root = %image_root.display(), error = %e, "access_tracer attach failed");
+                            }
+                        }
                     }
                     debug!(key, parent, mounts = mounts.len(), "prepared snapshot");
                     Ok(mounts)
@@ -1015,6 +1025,9 @@ impl snapshots::Snapshotter for NydusSnapshotter {
                     warn!(image_ref, error = %e, "failed to release nydus daemon refcount");
                 }
             }
+            // Shrink tracer state with the snapshot that attached it (no-op
+            // for keys that never attached).
+            self.access_tracer.detach_holder(&key);
             Ok(())
         }
         .await;

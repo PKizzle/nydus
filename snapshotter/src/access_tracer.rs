@@ -68,6 +68,13 @@ type Fanotify = ();
 struct ImageCapture {
     image_ref: String,
     mount_root: PathBuf,
+    /// `st_dev` of `mount_root`, identifying the *vfsmount* the kernel mark
+    /// lives on. `FAN_MARK_MOUNT` marks are per-vfsmount, not per-directory:
+    /// every capture whose root sits on the same host filesystem shares one
+    /// kernel mark, so mark add/remove must be refcounted per device (see
+    /// `Inner::mount_marks`) — removing it when *one* image finishes used to
+    /// silently end event delivery for every other in-flight capture.
+    mark_dev: u64,
     first_seen: Instant,
     last_event: Instant,
     /// Ordered list of first-seen paths (relative to mount_root, image-root style: `/bin/app`).
@@ -82,11 +89,12 @@ struct ImageCapture {
 }
 
 impl ImageCapture {
-    fn new(image_ref: String, mount_root: PathBuf) -> Self {
+    fn new(image_ref: String, mount_root: PathBuf, mark_dev: u64) -> Self {
         let now = Instant::now();
         Self {
             image_ref,
             mount_root,
+            mark_dev,
             first_seen: now,
             last_event: now,
             files: Vec::new(),
@@ -131,6 +139,14 @@ struct Inner {
     warned_auto_zran_unset: std::sync::atomic::AtomicBool,
     /// Keyed by mount_root canonical path.
     mounts: Mutex<HashMap<PathBuf, ImageCapture>>,
+    /// vfsmount (`st_dev`) → number of live `ImageCapture`s on it. The kernel
+    /// `FAN_MARK_MOUNT` mark for a device is added when its count goes 0→1 and
+    /// removed only when it returns to 0 — see `ImageCapture::mark_dev`.
+    mount_marks: Mutex<HashMap<u64, usize>>,
+    /// Snapshot key → capture roots it attached. `detach_holder` (called from
+    /// the gRPC `remove()` path) uses this to drop the key's references without
+    /// the caller having to recompute overlay lowerdirs at removal time.
+    holders: Mutex<HashMap<String, Vec<PathBuf>>>,
     skip_images: Mutex<HashSet<String>>,
     fanotify: Option<Fanotify>,
     metrics: Metrics,
@@ -170,6 +186,8 @@ impl AccessTracer {
                     auto_zran: auto_zran_cell,
                     warned_auto_zran_unset: std::sync::atomic::AtomicBool::new(false),
                     mounts: Mutex::new(HashMap::new()),
+                    mount_marks: Mutex::new(HashMap::new()),
+                    holders: Mutex::new(HashMap::new()),
                     skip_images: Mutex::new(HashSet::new()),
                     fanotify: None,
                     metrics: Metrics::default(),
@@ -201,6 +219,8 @@ impl AccessTracer {
             auto_zran: auto_zran_cell,
             warned_auto_zran_unset: std::sync::atomic::AtomicBool::new(false),
             mounts: Mutex::new(HashMap::new()),
+            mount_marks: Mutex::new(HashMap::new()),
+            holders: Mutex::new(HashMap::new()),
             skip_images: Mutex::new(HashSet::new()),
             fanotify,
             metrics: Metrics::default(),
@@ -232,15 +252,19 @@ impl AccessTracer {
         Arc::new(Self { inner })
     }
 
-    /// Attach the tracer to a freshly-prepared overlay mount for an image
-    /// that does NOT yet have a sidecar artifact. Idempotent under restart of
-    /// the same pod: bumps the refcount if already attached.
+    /// Attach the tracer to one lowerdir of a freshly-prepared overlay mount
+    /// for an image that does NOT yet have a sidecar artifact. Idempotent per
+    /// `(holder, mount_root)`: repeat calls bump nothing.
     ///
-    /// `mount_root` should be the lowerdir of the overlay (where the image
-    /// contents live). Capturing on the merged dir would include the
-    /// writable upper as well, which has nothing to do with the image's
-    /// access patterns.
-    pub fn attach(&self, image_ref: &str, mount_root: &Path) -> Result<()> {
+    /// Callers should attach **every** lowerdir of the image's chain (see the
+    /// gRPC prepare path): events are attributed to a capture by mount-root
+    /// prefix, so a mark that only covers lowerdir[0] silently drops opens of
+    /// files that physically live in the other layers — multi-layer images
+    /// ended up with systematically truncated prefetch profiles.
+    ///
+    /// `holder` is the snapshot key attaching; its removal drops the reference
+    /// via [`detach_holder`](Self::detach_holder).
+    pub fn attach(&self, image_ref: &str, mount_root: &Path, holder: &str) -> Result<()> {
         if self.inner.fanotify.is_none() {
             return Ok(());
         }
@@ -258,6 +282,21 @@ impl AccessTracer {
         let canonical = std::fs::canonicalize(mount_root)
             .with_context(|| format!("canonicalize {}", mount_root.display()))?;
 
+        // Record the holder → root reference first; bail (idempotent) if this
+        // holder already attached this root.
+        {
+            let mut holders = self
+                .inner
+                .holders
+                .lock()
+                .map_err(|_| anyhow::anyhow!("access_tracer holders mutex poisoned"))?;
+            let roots = holders.entry(holder.to_string()).or_default();
+            if roots.contains(&canonical) {
+                return Ok(());
+            }
+            roots.push(canonical.clone());
+        }
+
         let mut mounts = self
             .inner
             .mounts
@@ -274,8 +313,21 @@ impl AccessTracer {
             return Ok(());
         }
 
+        let mark_dev = mount_dev(&canonical)?;
+        // The kernel FAN_MARK_MOUNT mark is per-vfsmount and shared by every
+        // capture on the same device — only add it on the 0→1 transition.
+        let needs_mark = {
+            let mut marks = self
+                .inner
+                .mount_marks
+                .lock()
+                .map_err(|_| anyhow::anyhow!("access_tracer mount_marks mutex poisoned"))?;
+            let count = marks.entry(mark_dev).or_insert(0);
+            *count += 1;
+            *count == 1
+        };
         #[cfg(target_os = "linux")]
-        {
+        if needs_mark {
             let fanotify = self
                 .inner
                 .fanotify
@@ -285,7 +337,7 @@ impl AccessTracer {
             // looked up. Pass AT_FDCWD (the kernel sentinel) so the path is
             // resolved as-is.
             let at_cwd = unsafe { std::os::fd::BorrowedFd::borrow_raw(libc::AT_FDCWD) };
-            fanotify
+            if let Err(err) = fanotify
                 .mark(
                     MarkFlags::FAN_MARK_ADD | MarkFlags::FAN_MARK_MOUNT,
                     MaskFlags::FAN_OPEN | MaskFlags::FAN_ACCESS,
@@ -294,21 +346,58 @@ impl AccessTracer {
                 )
                 .with_context(|| {
                     format!("FAN_MARK_ADD | FAN_MARK_MOUNT on {}", canonical.display())
-                })?;
+                })
+            {
+                // Roll back the refcount we just took.
+                if let Ok(mut marks) = self.inner.mount_marks.lock()
+                    && let Some(count) = marks.get_mut(&mark_dev)
+                {
+                    *count = count.saturating_sub(1);
+                    if *count == 0 {
+                        marks.remove(&mark_dev);
+                    }
+                }
+                return Err(err);
+            }
         }
+        #[cfg(not(target_os = "linux"))]
+        let _ = needs_mark;
         mounts.insert(
             canonical.clone(),
-            ImageCapture::new(image_ref.to_string(), canonical.clone()),
+            ImageCapture::new(image_ref.to_string(), canonical.clone(), mark_dev),
         );
         info!(image = image_ref, mount = %canonical.display(), "access_tracer attached");
         Ok(())
     }
 
-    /// Decrement the refcount for a mount. When it reaches zero AND the
-    /// image has not been settled yet, drop the in-flight state without
-    /// flushing (the pod went away before the image settled — try again
-    /// next time). When the image HAS been settled the mark is removed
-    /// immediately because the conversion is either queued or done.
+    /// Drop every capture reference `holder` (a snapshot key) attached, tearing
+    /// down captures whose refcount reaches zero. Called from the gRPC
+    /// `remove()` path so tracer state shrinks with the snapshots that created
+    /// it instead of growing for the life of the process.
+    pub fn detach_holder(&self, holder: &str) {
+        if self.inner.fanotify.is_none() {
+            return;
+        }
+        let roots = {
+            let mut holders = self
+                .inner
+                .holders
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            holders.remove(holder)
+        };
+        for root in roots.into_iter().flatten() {
+            if let Err(e) = self.detach(&root) {
+                debug!(holder, root = %root.display(), error = %e, "access_tracer detach failed");
+            }
+        }
+    }
+
+    /// Decrement the refcount for a mount. When it reaches zero the capture
+    /// state is dropped (unflushed captures are discarded — the pod went away
+    /// before the image settled; the next pod tries again) and the shared
+    /// kernel mark is removed only if no other capture lives on the same
+    /// vfsmount.
     pub fn detach(&self, mount_root: &Path) -> Result<()> {
         if self.inner.fanotify.is_none() {
             return Ok(());
@@ -327,11 +416,37 @@ impl AccessTracer {
             }
             None => false,
         };
-        if remove {
-            mounts.remove(&canonical);
-            self.try_remove_mark(&canonical);
+        if remove && let Some(state) = mounts.remove(&canonical) {
+            self.release_mark(state.mark_dev, &canonical);
         }
         Ok(())
+    }
+
+    /// Drop one refcount on the shared vfsmount mark for `mark_dev`, removing
+    /// the kernel mark only when no capture on that device remains.
+    fn release_mark(&self, mark_dev: u64, mount_root: &Path) {
+        let last = {
+            let mut marks = self
+                .inner
+                .mount_marks
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match marks.get_mut(&mark_dev) {
+                Some(count) => {
+                    *count = count.saturating_sub(1);
+                    if *count == 0 {
+                        marks.remove(&mark_dev);
+                        true
+                    } else {
+                        false
+                    }
+                }
+                None => false,
+            }
+        };
+        if last {
+            self.try_remove_mark(mount_root);
+        }
     }
 
     /// Reset the `first_seen`/`last_event` baseline for every active mount of
@@ -488,8 +603,12 @@ impl AccessTracer {
             .map(|(k, _)| k.clone())
             .collect();
         for path in to_remove {
-            mounts.remove(&path);
-            self.try_remove_mark(&path);
+            if let Some(state) = mounts.remove(&path) {
+                // Refcounted: other images' captures share the same vfsmount
+                // mark, so removing it outright here used to silently end
+                // event delivery for every other in-flight capture.
+                self.release_mark(state.mark_dev, &path);
+            }
         }
     }
 
@@ -549,6 +668,23 @@ impl AccessTracer {
 
     #[cfg(not(target_os = "linux"))]
     fn try_remove_mark(&self, _mount_root: &Path) {}
+}
+
+/// `st_dev` of a path, identifying the vfsmount a `FAN_MARK_MOUNT` mark on it
+/// would cover. (Two distinct bind mounts of the same device would alias here;
+/// the consequence is only that their shared mark outlives the first of them —
+/// safe in the conservative direction.)
+#[cfg(target_os = "linux")]
+fn mount_dev(path: &Path) -> Result<u64> {
+    use std::os::unix::fs::MetadataExt;
+    Ok(std::fs::metadata(path)
+        .with_context(|| format!("stat {}", path.display()))?
+        .dev())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn mount_dev(_path: &Path) -> Result<u64> {
+    Ok(0)
 }
 
 fn compile_exclude_patterns(globs: &[String]) -> Vec<Pattern> {
@@ -631,10 +767,11 @@ fn process_events(inner: &Inner, events: Vec<nix::sys::fanotify::FanotifyEvent>)
             .events_total
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-        // FAN_CLASS_NOTIF events carry an fd; resolve to a path, then close.
-        // (`FanotifyEvent` doesn't close the fd on drop in nix 0.31 for
-        // notify-class events; we must close it ourselves to avoid an fd
-        // leak — see <https://docs.rs/nix/0.31/nix/sys/fanotify/struct.FanotifyEvent.html>.)
+        // FAN_CLASS_NOTIF events carry an fd; resolve it to a path via
+        // /proc/self/fd. Do NOT close it manually: nix 0.31's `FanotifyEvent`
+        // owns the fd and closes it on `Drop` (and would panic on the EBADF a
+        // double-close causes) — verified against nix-0.31.3
+        // `src/sys/fanotify.rs`'s `Drop for FanotifyEvent`.
         let Some(fd) = event.fd() else {
             continue;
         };
@@ -667,13 +804,17 @@ fn record_event(inner: &Inner, path: &Path) -> Result<()> {
         .mounts
         .lock()
         .map_err(|_| anyhow::anyhow!("mounts mutex poisoned"))?;
-    // Find the longest matching mount_root prefix.
+    // Find the longest matching mount_root prefix (HashMap iteration order is
+    // arbitrary, and nested roots must resolve to the most specific capture).
     let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     let mut matched: Option<&mut ImageCapture> = None;
     for state in mounts.values_mut() {
-        if canonical.starts_with(&state.mount_root) {
+        if canonical.starts_with(&state.mount_root)
+            && matched
+                .as_ref()
+                .is_none_or(|best| state.mount_root.as_os_str().len() > best.mount_root.as_os_str().len())
+        {
             matched = Some(state);
-            break;
         }
     }
     let state =
@@ -717,7 +858,7 @@ fn check_settle(inner: &Inner, settle_idle: Duration, settle_max: Duration) {
         // (different snapshot keys) and we want one flush per image with
         // de-duplicated paths preserving first-seen order across mounts.
         let mut to_settle: BTreeMap<String, Vec<String>> = BTreeMap::new();
-        for state in mounts.values() {
+        for state in mounts.values_mut() {
             if state.settled {
                 continue;
             }
@@ -725,8 +866,16 @@ fn check_settle(inner: &Inner, settle_idle: Duration, settle_max: Duration) {
             let elapsed = now.duration_since(state.first_seen);
             if state.files.is_empty() {
                 if elapsed >= settle_max {
-                    // Nothing captured at all; mark settled to stop trying.
-                    // (We don't have &mut here; do this in a follow-up pass.)
+                    // Nothing captured at all within the window (idle pod, or
+                    // every access filtered): mark settled so this capture
+                    // stops being rescanned every tick. There is no profile to
+                    // flush; the kernel mark is released on detach.
+                    state.settled = true;
+                    debug!(
+                        image = %state.image_ref,
+                        mount = %state.mount_root.display(),
+                        "access_tracer: empty capture settled without a profile"
+                    );
                 }
                 continue;
             }
