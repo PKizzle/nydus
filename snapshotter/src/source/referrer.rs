@@ -187,21 +187,30 @@ pub async fn detect_referrer_with_config(
     {
         return Ok(cached);
     }
-    let info = match RegistryReferrerClient::from_config(config)?
+    // Only *resolved* outcomes are cached (the "one lookup per image
+    // cluster-lifetime" contract): a genuine nydus hit, and a genuine "no
+    // referrer artifact exists" miss. A transient registry error (network
+    // blip, registry restart, DNS hiccup at pod start) must NOT be cached as
+    // StandardOci — doing so permanently disabled referrer serving for the
+    // image until the process restarted. On error we return the StandardOci
+    // fallback (so the pod still schedules via overlay) but leave the cache
+    // empty so the next prepare retries.
+    match RegistryReferrerClient::from_config(config)?
         .detect(image_ref, config)
         .await
     {
-        Ok(Some(info)) => info,
-        Ok(None) => standard_oci(),
-        Err(e) => {
-            debug!(%image_ref, error = %e, "referrer registry query failed; using StandardOci fallback");
-            standard_oci()
+        Ok(info) => {
+            let info = info.unwrap_or_else(standard_oci);
+            if let Ok(mut cache) = global_cache().lock() {
+                cache.insert(image_ref.to_string(), info.clone());
+            }
+            Ok(info)
         }
-    };
-    if let Ok(mut cache) = global_cache().lock() {
-        cache.insert(image_ref.to_string(), info.clone());
+        Err(e) => {
+            debug!(%image_ref, error = %e, "referrer registry query failed; using StandardOci fallback (not cached, will retry)");
+            Ok(standard_oci())
+        }
     }
-    Ok(info)
 }
 
 impl RegistryReferrerClient {
@@ -283,10 +292,12 @@ impl RegistryReferrerClient {
         };
 
         let url = self.manifest_url(image, reference);
+        let mut used_get = false;
         let mut response = self
             .registry_request(Method::HEAD, &url, OCI_INDEX_ACCEPT, image, auth)
             .await?;
         if response.status() == StatusCode::METHOD_NOT_ALLOWED {
+            used_get = true;
             response = self
                 .registry_request(Method::GET, &url, OCI_INDEX_ACCEPT, image, auth)
                 .await?;
@@ -300,11 +311,36 @@ impl RegistryReferrerClient {
                 response.status()
             );
         }
-        Ok(response
+        if let Some(digest) = response
             .headers()
             .get("docker-content-digest")
             .and_then(|value| value.to_str().ok())
-            .map(str::to_string))
+            .map(str::to_string)
+        {
+            return Ok(Some(digest));
+        }
+        // Registries are not required to send Docker-Content-Digest (the OCI
+        // distribution spec makes it optional). Fall back to fetching the
+        // manifest body and hashing it — a HEAD gave us no body, so re-issue as
+        // a GET. Without this, such a registry classified every image as
+        // StandardOci (and, before the negative-cache fix, cached that
+        // permanently).
+        if !used_get {
+            response = self
+                .registry_request(Method::GET, &url, OCI_INDEX_ACCEPT, image, auth)
+                .await?;
+            if response.status() == StatusCode::NOT_FOUND {
+                return Ok(None);
+            }
+            if !response.status().is_success() {
+                bail!(
+                    "registry manifest GET (digest fallback) failed with HTTP {}",
+                    response.status()
+                );
+            }
+        }
+        let body = read_bounded(response).await?;
+        Ok(Some(format!("sha256:{}", hex::encode(Sha256::digest(&body)))))
     }
 
     async fn fetch_referrers(
@@ -318,11 +354,11 @@ impl RegistryReferrerClient {
             .registry_request(Method::GET, &url, OCI_INDEX_ACCEPT, image, auth)
             .await?;
         match response.status() {
-            StatusCode::OK => Ok(Some(response.bytes().await?.to_vec())),
+            StatusCode::OK => Ok(Some(read_bounded(response).await?)),
             StatusCode::NOT_FOUND | StatusCode::METHOD_NOT_ALLOWED | StatusCode::BAD_REQUEST => {
                 Ok(None)
             }
-            status if status.is_success() => Ok(Some(response.bytes().await?.to_vec())),
+            status if status.is_success() => Ok(Some(read_bounded(response).await?)),
             status => {
                 warn!(%status, "registry referrers query returned non-success status");
                 Ok(None)
@@ -342,11 +378,11 @@ impl RegistryReferrerClient {
             .registry_request(Method::GET, &url, OCI_INDEX_ACCEPT, image, auth)
             .await?;
         match response.status() {
-            StatusCode::OK => Ok(Some(response.bytes().await?.to_vec())),
+            StatusCode::OK => Ok(Some(read_bounded(response).await?)),
             StatusCode::NOT_FOUND | StatusCode::METHOD_NOT_ALLOWED | StatusCode::BAD_REQUEST => {
                 Ok(None)
             }
-            status if status.is_success() => Ok(Some(response.bytes().await?.to_vec())),
+            status if status.is_success() => Ok(Some(read_bounded(response).await?)),
             _ => Ok(None),
         }
     }
