@@ -11,6 +11,7 @@
 use std::path::Path;
 
 use anyhow::Context;
+use tracing::warn;
 use nydus_api::{
     BLOB_CACHE_TYPE_META_BLOB, BackendConfigV2, BlobCacheEntry, BlobCacheEntryConfigV2,
     CacheConfigV2, ConfigV2, FanotifyConfig, FileCacheConfig, HttpProxyConfig, LocalFsConfig,
@@ -442,20 +443,27 @@ pub fn build_blob_cache_entry(
 }
 
 fn parse_timeout_seconds(value: &str) -> u32 {
-    let value = value.trim();
-    if let Some(num) = value.strip_suffix("ms") {
-        return num.parse::<u32>().map(|n| n.max(1) / 1000).unwrap_or(30);
-    }
-    if let Some(num) = value.strip_suffix('s') {
-        return num.parse::<u32>().unwrap_or(30);
-    }
-    if let Some(num) = value.strip_suffix('m') {
-        return num
-            .parse::<u32>()
-            .map(|n| n.saturating_mul(60))
-            .unwrap_or(30);
-    }
-    value.parse::<u32>().unwrap_or(30)
+    let trimmed = value.trim();
+    let parsed = if let Some(num) = trimmed.strip_suffix("ms") {
+        // Round sub-second values UP to 1s: the storage backend treats a
+        // timeout of 0 as "no timeout at all" (connection.rs maps 0 -> None),
+        // so the old truncation turned an operator's fail-fast "500ms" into
+        // an UNBOUNDED request timeout.
+        num.parse::<u32>().ok().map(|n| n.div_ceil(1000).max(1))
+    } else if let Some(num) = trimmed.strip_suffix('s') {
+        num.parse::<u32>().ok()
+    } else if let Some(num) = trimmed.strip_suffix('m') {
+        num.parse::<u32>().ok().map(|n| n.saturating_mul(60))
+    } else {
+        trimmed.parse::<u32>().ok()
+    };
+    parsed.unwrap_or_else(|| {
+        warn!(
+            value,
+            "unparseable timeout value; falling back to 30 seconds"
+        );
+        30
+    })
 }
 
 #[cfg(test)]
@@ -525,6 +533,12 @@ mod tests {
         assert_eq!(parse_timeout_seconds("2m"), 120);
         assert_eq!(parse_timeout_seconds("45"), 45);
         assert_eq!(parse_timeout_seconds("garbage"), 30);
+        // Sub-second values must round UP to 1s, never to 0 (0 = no timeout in
+        // the storage backend), so "fail fast" cannot become "wait forever".
+        assert_eq!(parse_timeout_seconds("500ms"), 1);
+        assert_eq!(parse_timeout_seconds("1ms"), 1);
+        assert_eq!(parse_timeout_seconds("1500ms"), 2);
+        assert_eq!(parse_timeout_seconds("2000ms"), 2);
     }
 
     // ── B3: backend selection + s3/oss/http-proxy mapping ──────────────

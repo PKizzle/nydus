@@ -1100,9 +1100,11 @@ impl snapshots::Snapshotter for NydusSnapshotter {
 
 /// Start the gRPC proxy-plugin server on the configured Unix socket.
 pub async fn serve(mut config: SnapshotterConfig) -> Result<()> {
+    let work_dir = config.snapshotter.cache.work_dir.clone();
     let (probe_results, selected) = crate::probe::probe_and_promote_driver(
         &mut config.snapshotter.fs_drivers,
         config.snapshotter.fs_driver_policy,
+        Some(&work_dir),
     );
     for result in &probe_results {
         info!(

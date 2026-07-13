@@ -374,6 +374,13 @@ impl SystemController {
 }
 
 /// Serve the system-controller HTTP API on a Unix domain socket.
+///
+/// The API is unauthenticated by design (it includes `PUT /api/v1/auth` for
+/// registry-credential injection and daemon spawn/upgrade controls), so
+/// transport-level protection is the only protection: the socket is chmodded
+/// to `0600` immediately after bind (a permissive umask must not widen it),
+/// and a pre-existing socket that still answers connections is treated as a
+/// live instance rather than silently hijacked.
 pub async fn serve_unix(path: PathBuf, controller: SystemController) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).with_context(|| {
@@ -384,12 +391,26 @@ pub async fn serve_unix(path: PathBuf, controller: SystemController) -> Result<(
         })?;
     }
     if path.exists() {
+        // Only reclaim the path if nothing is accepting on it (stale socket
+        // from a crashed predecessor). Stealing a live instance's admin socket
+        // silently redirects credential pushes to the wrong process.
+        if std::os::unix::net::UnixStream::connect(&path).is_ok() {
+            anyhow::bail!(
+                "sysctl socket {} is already served by a live process; refusing to steal it",
+                path.display()
+            );
+        }
         std::fs::remove_file(&path)
             .with_context(|| format!("failed to remove stale sysctl socket {}", path.display()))?;
     }
     let listener = UnixListener::bind(&path)
         .await
         .with_context(|| format!("failed to bind sysctl socket {}", path.display()))?;
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("failed to chmod sysctl socket {} to 0600", path.display()))?;
+    }
     info!(path = %path.display(), "starting nydus system-controller API");
 
     // Serve over cyper-axum (hyper-on-compio) like the gRPC server, instead of a raw

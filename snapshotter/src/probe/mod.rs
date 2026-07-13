@@ -14,6 +14,8 @@
 //! - cgroup v2 delegation
 
 use crate::config::{FsDriverEntry, FsDriverSelectionPolicy, FsDriverType};
+#[cfg(target_os = "linux")]
+use anyhow::Context;
 use anyhow::{Result, bail};
 use std::fs;
 use std::path::Path;
@@ -39,7 +41,7 @@ pub struct ProbeResult {
 /// which callers that then serve traffic off the same config must use so the
 /// running driver matches what was probed. This function is `pub(crate)`
 /// (test/diagnostic use only) for that reason.
-pub(crate) fn probe_drivers(drivers: &[FsDriverEntry]) -> Vec<ProbeResult> {
+pub(crate) fn probe_drivers(drivers: &[FsDriverEntry], work_dir: Option<&Path>) -> Vec<ProbeResult> {
     // Best-effort load erofs once before per-driver probing so both
     // fanotify and blockdev see it. Distros that compile erofs as a
     // module (Raspberry Pi OS' upstream kernels do — `CONFIG_EROFS_FS=m`)
@@ -49,7 +51,10 @@ pub(crate) fn probe_drivers(drivers: &[FsDriverEntry]) -> Vec<ProbeResult> {
     // failures (missing binary, missing CAP_SYS_MODULE, already
     // built-in) are silent.
     ensure_erofs_loaded_once();
-    drivers.iter().map(probe_single).collect()
+    drivers
+        .iter()
+        .map(|entry| probe_single(entry, work_dir))
+        .collect()
 }
 
 /// Probe configured filesystem drivers and promote the first available driver
@@ -61,9 +66,10 @@ pub(crate) fn probe_drivers(drivers: &[FsDriverEntry]) -> Vec<ProbeResult> {
 pub fn probe_and_promote_driver(
     drivers: &mut Vec<FsDriverEntry>,
     policy: FsDriverSelectionPolicy,
+    work_dir: Option<&Path>,
 ) -> (Vec<ProbeResult>, Option<FsDriverType>) {
     apply_driver_selection_policy(drivers, policy);
-    let results = probe_drivers(drivers);
+    let results = probe_drivers(drivers, work_dir);
     let selected = promote_selected_driver(drivers, &results);
     (results, selected)
 }
@@ -108,15 +114,15 @@ fn driver_auto_rank(driver: &FsDriverType) -> u8 {
     }
 }
 
-fn probe_single(entry: &FsDriverEntry) -> ProbeResult {
+fn probe_single(entry: &FsDriverEntry, work_dir: Option<&Path>) -> ProbeResult {
     match entry.driver_type {
-        FsDriverType::Fanotify => probe_fanotify(entry),
+        FsDriverType::Fanotify => probe_fanotify(entry, work_dir),
         FsDriverType::Fusedev => probe_fusedev(entry),
         FsDriverType::Blockdev => probe_blockdev(entry),
     }
 }
 
-fn probe_fanotify(entry: &FsDriverEntry) -> ProbeResult {
+fn probe_fanotify(entry: &FsDriverEntry, work_dir: Option<&Path>) -> ProbeResult {
     // 1. Check kernel version ≥ 6.14
     if let Err(e) = check_kernel_version("6.14") {
         return ProbeResult {
@@ -150,6 +156,22 @@ fn probe_fanotify(entry: &FsDriverEntry) -> ProbeResult {
             driver_type: FsDriverType::Fanotify,
             available: false,
             reason: format!("fanotify init failed: {}", e),
+        };
+    }
+
+    // 5. Try placing an actual FAN_PRE_ACCESS mark on a temp file inside the
+    //    configured work_dir. This is the real 6.14 gate: FAN_CLASS_PRE_CONTENT
+    //    groups have been accepted since 2.6.37 (CONFIG_FANOTIFY_ACCESS_PERMISSIONS),
+    //    so step 4 alone passes on kernels that cannot serve pre-content events
+    //    at all — and it also catches an unsupported work_dir filesystem
+    //    (tmpfs -> ENOTSUP), which previously only surfaced at serve time.
+    if let Some(dir) = work_dir
+        && let Err(e) = try_fanotify_pre_content_mark(dir)
+    {
+        return ProbeResult {
+            driver_type: FsDriverType::Fanotify,
+            available: false,
+            reason: format!("fanotify pre-content mark probe failed: {}", e),
         };
     }
 
@@ -540,6 +562,85 @@ fn try_fanotify_init() -> Result<()> {
     Ok(())
 }
 
+/// Attempt a real `FAN_PRE_ACCESS` mark on a temp file inside `work_dir`.
+///
+/// - `EINVAL` from `fanotify_mark` means the kernel does not know the
+///   pre-content mask (< 6.14) — the uname check can be fooled by distro
+///   backport version strings, this cannot.
+/// - `ENOTSUP`/`EOPNOTSUPP` means the work_dir's filesystem does not support
+///   pre-content marks (tmpfs is the canonical case; ext4 works).
+///
+/// Both must fail the probe so the driver chain falls through to fusedev
+/// cleanly instead of failing at first mount/serve.
+#[cfg(target_os = "linux")]
+fn try_fanotify_pre_content_mark(work_dir: &Path) -> Result<()> {
+    const FAN_CLASS_PRE_CONTENT: u32 = 0x0000_0008;
+    /// From include/uapi/linux/fanotify.h (6.14): pre-content access event.
+    const FAN_PRE_ACCESS: u64 = 0x0010_0000;
+
+    std::fs::create_dir_all(work_dir)
+        .with_context(|| format!("create work_dir {}", work_dir.display()))?;
+    let probe_file = tempfile::Builder::new()
+        .prefix(".nydus-fanotify-probe.")
+        .tempfile_in(work_dir)
+        .with_context(|| format!("create probe file in {}", work_dir.display()))?;
+
+    let fd = unsafe { libc::fanotify_init(FAN_CLASS_PRE_CONTENT, 0) };
+    if fd < 0 {
+        bail!(
+            "fanotify_init(FAN_CLASS_PRE_CONTENT) failed: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+    // Ensure the group fd is closed on every path below.
+    struct FdGuard(i32);
+    impl Drop for FdGuard {
+        fn drop(&mut self) {
+            unsafe { libc::close(self.0) };
+        }
+    }
+    let _guard = FdGuard(fd);
+
+    let path_c = std::ffi::CString::new(probe_file.path().as_os_str().as_encoded_bytes())
+        .context("probe file path contains NUL")?;
+    let ret = unsafe {
+        libc::fanotify_mark(
+            fd,
+            libc::FAN_MARK_ADD,
+            FAN_PRE_ACCESS,
+            libc::AT_FDCWD,
+            path_c.as_ptr(),
+        )
+    };
+    if ret != 0 {
+        let err = std::io::Error::last_os_error();
+        match err.raw_os_error() {
+            Some(libc::EINVAL) => bail!(
+                "kernel rejected FAN_PRE_ACCESS (EINVAL): pre-content fanotify (>= 6.14) \
+                 not supported"
+            ),
+            Some(libc::ENOTSUP) => bail!(
+                "work_dir {} is on a filesystem without pre-content mark support \
+                 (tmpfs? use ext4): {}",
+                work_dir.display(),
+                err
+            ),
+            _ => bail!(
+                "fanotify_mark(FAN_PRE_ACCESS) on {} failed: {}",
+                probe_file.path().display(),
+                err
+            ),
+        }
+    }
+    // Group fd close (FdGuard) removes the mark; the temp file unlinks on drop.
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn try_fanotify_pre_content_mark(_work_dir: &Path) -> Result<()> {
+    bail!("fanotify is only available on Linux")
+}
+
 #[cfg(test)]
 mod fanotify_const_tests {
     /// Pin the on-the-wire value of `FAN_CLASS_PRE_CONTENT`. Mirrors the
@@ -594,7 +695,7 @@ mod tests {
                 mode: None,
             },
         ];
-        let results = probe_drivers(&drivers);
+        let results = probe_drivers(&drivers, None);
         assert_eq!(results.len(), 2);
         // At least fusedev should be available on most Linux hosts.
         assert!(

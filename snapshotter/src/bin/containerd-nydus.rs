@@ -187,9 +187,11 @@ async fn main() -> Result<()> {
     // Must run before `config` is cloned into the supervisor:
     // `serve_with_supervisor` assumes its caller already normalized the driver
     // list (see its doc comment).
+    let work_dir = config.snapshotter.cache.work_dir.clone();
     let (probe_results, selected) = nydus_snapshotter::probe::probe_and_promote_driver(
         &mut config.snapshotter.fs_drivers,
         config.snapshotter.fs_driver_policy,
+        Some(&work_dir),
     );
     for result in &probe_results {
         info!(

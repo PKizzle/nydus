@@ -28,12 +28,19 @@ use anyhow::{Context, Result, bail};
 use bbolt_rs::{Bolt, BucketApi, DbApi, TxApi};
 use serde::Serialize;
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{debug, info, warn};
 
 const LABEL_SNAPSHOT_REF: &str = "containerd.io/snapshot.ref";
 const LABEL_CONFIG_REF: &str = "containerd.io/gc.ref.content.config";
+/// The CRI-stamped image reference — the only label that reliably carries a
+/// human image ref (`docker.io/library/nginx:latest`) in real containerd
+/// data. `containerd.io/snapshot.ref` is the target snapshot name (a chain
+/// digest) and `gc.ref.content.config` is a config-blob digest; stamping
+/// either into `image_ref` recreates the digest-as-image-ref corruption the
+/// `set_image_ref` repair path exists to fix.
+const LABEL_CRI_IMAGE_REF: &str = "containerd.io/snapshot/cri.image-ref";
 const UNIX_TO_INTERNAL_SECONDS: i64 = (1969 * 365 + 1969 / 4 - 1969 / 100 + 1969 / 400) * 86_400;
 
 /// File name of the legacy Go snapshotter's bbolt metadata database, relative
@@ -44,6 +51,12 @@ pub const LEGACY_BBOLT_DB_FILE: &str = "metadata.db";
 /// File name of the fjall metadata directory, relative to the snapshotter
 /// root. Mirrors the path `open_store_for_config` opens.
 pub const FJALL_DB_DIR: &str = "metadata.fjall";
+
+/// Marker written next to the fjall store after a clean (error-free)
+/// auto-migration, so later startups can tell "migration finished, the
+/// operator just hasn't removed metadata.db yet" (quiet) apart from
+/// "migration was interrupted and records are stranded in bbolt" (loud).
+pub const MIGRATION_COMPLETE_MARKER: &str = ".bbolt-migration-complete";
 
 /// A snapshot record decoded from the legacy bbolt metadata database.
 #[derive(Debug)]
@@ -214,11 +227,27 @@ pub fn auto_migrate_if_needed(
         .is_empty()
         .context("failed to check whether the fjall store is empty")?
     {
-        debug!(
-            legacy_db = %bbolt_db.display(),
-            "legacy bbolt metadata present but fjall store already has records; \
-             skipping auto-migration (run `nydus-migrate store` for a manual import)"
-        );
+        // Per-record imports fsync individually, so a crash mid-migration
+        // leaves the store non-empty with records still stranded in bbolt —
+        // and this branch used to skip them with only a debug!. The completion
+        // marker distinguishes "migration finished cleanly" (quiet) from
+        // "interrupted / errored" (loud, actionable).
+        if root.join(MIGRATION_COMPLETE_MARKER).is_file() {
+            debug!(
+                legacy_db = %bbolt_db.display(),
+                "legacy bbolt metadata present but migration already completed; \
+                 remove metadata.db once verified"
+            );
+        } else {
+            warn!(
+                legacy_db = %bbolt_db.display(),
+                "legacy bbolt metadata.db sits next to a NON-EMPTY fjall store with no \
+                 migration-complete marker — a previous migration may have been \
+                 interrupted, leaving records stranded in bbolt. Auto-migration only \
+                 imports into an empty store; run `nydus-migrate store` to inspect and \
+                 import the remainder, then remove metadata.db"
+            );
+        }
         return Ok(None);
     }
 
@@ -231,7 +260,13 @@ pub fn auto_migrate_if_needed(
         fs_driver,
         commit: true,
     };
-    migrate_store(store, &params).map(Some)
+    let report = migrate_store(store, &params)?;
+    if report.errors.is_empty()
+        && let Err(e) = std::fs::write(root.join(MIGRATION_COMPLETE_MARKER), b"ok\n")
+    {
+        warn!(error = %e, "failed to write migration-complete marker");
+    }
+    Ok(Some(report))
 }
 
 /// Startup hook wrapper around [`auto_migrate_if_needed`] that logs the
@@ -379,7 +414,10 @@ fn ensure_snapshot_dir(
     commit: bool,
     report: &mut StoreMigrationReport,
 ) -> Result<bool> {
-    if target_dir.join("fs").is_dir() || target_dir.is_dir() {
+    // An existing target dir is trustworthy because commits below copy into a
+    // temp name and rename atomically — a crash mid-copy can no longer leave a
+    // half-populated dir under the final name.
+    if target_dir.is_dir() {
         report.reused_dirs += 1;
         return Ok(true);
     }
@@ -397,10 +435,23 @@ fn ensure_snapshot_dir(
     }
 
     if commit {
-        copy_dir_recursive(source_dir, target_dir).with_context(|| {
+        let tmp_dir = PathBuf::from(format!("{}.migrate-tmp", target_dir.display()));
+        if tmp_dir.exists() {
+            // Debris from a previous interrupted run; start over.
+            std::fs::remove_dir_all(&tmp_dir).with_context(|| {
+                format!("failed to remove stale temp dir {}", tmp_dir.display())
+            })?;
+        }
+        copy_dir_recursive(source_dir, &tmp_dir).with_context(|| {
             format!(
                 "failed to copy legacy snapshot directory {} to {}",
                 source_dir.display(),
+                tmp_dir.display()
+            )
+        })?;
+        std::fs::rename(&tmp_dir, target_dir).with_context(|| {
+            format!(
+                "failed to move copied snapshot directory into place at {}",
                 target_dir.display()
             )
         })?;
@@ -503,11 +554,26 @@ fn read_go_time_unix(bytes: Option<&[u8]>) -> Option<i64> {
     Some(sec.saturating_sub(UNIX_TO_INTERNAL_SECONDS))
 }
 
+/// Extract a usable image reference from a legacy record's labels, or `None`.
+///
+/// Candidates are tried in order of trustworthiness, and any bare digest is
+/// rejected: `containerd.io/snapshot.ref` holds the *chain digest* in real
+/// containerd data (this repo's own `source/labels.rs` tests pin that), and
+/// `gc.ref.content.config` is a config-blob digest — a migrated record with a
+/// digest-valued `image_ref` is worse than one with none.
 fn image_ref(labels: &HashMap<String, String>) -> Option<&str> {
-    labels
-        .get(LABEL_SNAPSHOT_REF)
-        .or_else(|| labels.get(LABEL_CONFIG_REF))
+    [LABEL_CRI_IMAGE_REF, LABEL_SNAPSHOT_REF, LABEL_CONFIG_REF]
+        .iter()
+        .filter_map(|key| labels.get(*key))
         .map(String::as_str)
+        .find(|candidate| !is_bare_digest(candidate))
+}
+
+/// True for `sha256:<64 hex>` (any case) — a content digest, never an image ref.
+fn is_bare_digest(value: &str) -> bool {
+    value
+        .strip_prefix("sha256:")
+        .is_some_and(|hex| hex.len() == 64 && hex.chars().all(|c| c.is_ascii_hexdigit()))
 }
 
 fn now_unix() -> i64 {
@@ -581,6 +647,63 @@ mod tests {
         );
         seed_legacy_snapshot_dir(root, 1);
         seed_legacy_snapshot_dir(root, 2);
+    }
+
+    #[test]
+    fn image_ref_prefers_cri_label_and_rejects_bare_digests() {
+        // Regression: real containerd data holds the CHAIN DIGEST under
+        // containerd.io/snapshot.ref and a config-blob digest under
+        // gc.ref.content.config; stamping either into image_ref recreated the
+        // digest-as-image-ref corruption commit 77e3fdc3 repaired.
+        let digest = "sha256:".to_string() + &"a".repeat(64);
+
+        let mut labels = HashMap::new();
+        labels.insert(LABEL_SNAPSHOT_REF.to_string(), digest.clone());
+        labels.insert(LABEL_CONFIG_REF.to_string(), digest.clone());
+        assert_eq!(image_ref(&labels), None, "digest-only labels yield None");
+
+        labels.insert(
+            LABEL_CRI_IMAGE_REF.to_string(),
+            "docker.io/library/nginx:latest".to_string(),
+        );
+        assert_eq!(image_ref(&labels), Some("docker.io/library/nginx:latest"));
+
+        // A genuine (non-digest) value in snapshot.ref is still usable when
+        // the CRI label is absent.
+        let mut tag_only = HashMap::new();
+        tag_only.insert(
+            LABEL_SNAPSHOT_REF.to_string(),
+            "docker.io/example/image:tag".to_string(),
+        );
+        assert_eq!(image_ref(&tag_only), Some("docker.io/example/image:tag"));
+
+        assert!(is_bare_digest(&digest));
+        assert!(!is_bare_digest("docker.io/library/nginx:latest"));
+        assert!(!is_bare_digest("sha256:zzzz"));
+    }
+
+    #[test]
+    fn auto_migrate_writes_completion_marker_and_second_run_is_quiet() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        default_fixture(root);
+        let store = SnapshotStore::open(&root.join(FJALL_DB_DIR)).unwrap();
+
+        let report = auto_migrate_if_needed(root, &store, "fanotify")
+            .unwrap()
+            .unwrap();
+        assert!(report.errors.is_empty());
+        assert!(
+            root.join(MIGRATION_COMPLETE_MARKER).is_file(),
+            "clean migration must write the completion marker"
+        );
+
+        // Second startup: store non-empty + marker present → clean skip.
+        assert!(
+            auto_migrate_if_needed(root, &store, "fanotify")
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

@@ -16,6 +16,11 @@ use std::path::PathBuf;
 /// Top-level configuration loaded from `/etc/nydus/config.toml`.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct SnapshotterConfig {
+    // `#[serde(default)]` so a config with no `[snapshotter]` table at all
+    // (e.g. one that only sets `[backends.registry]`, or an empty file) still
+    // parses: every field inside `SnapshotterSection` already has a serde
+    // default and the section has a `Default` impl.
+    #[serde(default)]
     pub snapshotter: SnapshotterSection,
     #[serde(default, rename = "backends")]
     pub backends: BackendsConfig,
@@ -171,6 +176,15 @@ impl Profile {
 pub const K3S_CONTAINERD_SOCKET: &str = "/run/k3s/containerd/containerd.sock";
 /// Well-known containerd socket probed for `Profile::Auto` stock detection.
 pub const STOCK_CONTAINERD_SOCKET: &str = "/run/containerd/containerd.sock";
+/// Boot-stable k3s installation artifacts, probed when neither socket exists
+/// yet. Standard unit ordering starts the proxy snapshotter BEFORE
+/// containerd/k3s (containerd waits for the snapshotter's socket), so on a
+/// clean boot the socket probes see nothing — these paths survive reboots and
+/// identify a k3s node regardless of service start order.
+pub const K3S_DATA_DIR: &str = "/var/lib/rancher/k3s";
+/// See [`K3S_DATA_DIR`]; `/etc/rancher/k3s` holds the k3s config and is
+/// likewise boot-stable.
+pub const K3S_ETC_DIR: &str = "/etc/rancher/k3s";
 /// k3s content-store root (profile default + nothing else — no accessor
 /// fallback uses it, but kept next to its socket for symmetry).
 pub const K3S_CONTENT_ROOT: &str =
@@ -239,14 +253,37 @@ impl SnapshotterConfig {
                         ),
                     },
                     (false, false) => {
-                        if auto_zran_enabled {
+                        // Clean-boot ordering: the snapshotter usually starts
+                        // before containerd/k3s, so missing sockets do NOT
+                        // mean "not a k3s node". Check boot-stable k3s
+                        // installation artifacts before defaulting — silently
+                        // resolving a k3s node to `containerd` loses the
+                        // content root and disables the peer-mirror preset on
+                        // every boot.
+                        let k3s_installed = probe(std::path::Path::new(K3S_DATA_DIR))
+                            || probe(std::path::Path::new(K3S_ETC_DIR));
+                        if k3s_installed {
+                            ResolvedProfile {
+                                profile: Profile::K3s,
+                                reason: format!(
+                                    "auto-detected k3s ({K3S_DATA_DIR} present; no containerd \
+                                     socket yet — snapshotter started before k3s)"
+                                ),
+                            }
+                        } else if auto_zran_enabled {
                             return Err(ConfigError::NoContainerdSocket);
-                        }
-                        ResolvedProfile {
-                            profile: Profile::Containerd,
-                            reason: "no containerd socket detected; defaulting to containerd \
-                                     (auto_zran disabled)"
-                                .to_string(),
+                        } else {
+                            tracing::warn!(
+                                "profile = auto found no containerd socket and no k3s \
+                                 installation; defaulting to the `containerd` profile. If this \
+                                 is wrong, set [snapshotter].profile explicitly."
+                            );
+                            ResolvedProfile {
+                                profile: Profile::Containerd,
+                                reason: "no containerd socket or k3s installation detected; \
+                                         defaulting to containerd (auto_zran disabled)"
+                                    .to_string(),
+                            }
                         }
                     }
                 }
@@ -1588,6 +1625,29 @@ content_root = "/custom/content"
             .resolve_profile_with(probe_present(&[]))
             .expect_err("no socket + auto_zran must error");
         assert!(matches!(err, ConfigError::NoContainerdSocket));
+    }
+
+    #[test]
+    fn resolve_profile_auto_detects_k3s_by_install_dir_before_socket_exists() {
+        // Clean-boot ordering: the snapshotter starts before k3s, so the k3s
+        // socket doesn't exist yet — but the boot-stable install dir does. The
+        // node must still resolve to the k3s profile (not silently to
+        // containerd), even with auto_zran enabled.
+        let mut config = SnapshotterConfig::default();
+        config.snapshotter.auto_zran.enable = true;
+        let rp = config
+            .resolve_profile_with(probe_present(&[K3S_DATA_DIR]))
+            .expect("k3s install dir must resolve to k3s profile");
+        assert_eq!(rp.profile, Profile::K3s);
+    }
+
+    #[test]
+    fn resolve_profile_auto_k3s_etc_dir_also_detects_k3s() {
+        let mut config = SnapshotterConfig::default();
+        let rp = config
+            .resolve_profile_with(probe_present(&[K3S_ETC_DIR]))
+            .expect("k3s etc dir must resolve to k3s profile");
+        assert_eq!(rp.profile, Profile::K3s);
     }
 
     #[test]
