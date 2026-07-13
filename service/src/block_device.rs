@@ -43,6 +43,29 @@ enum BlockRange {
     DataBlob(Rc<DataBlob>),
 }
 
+/// dm-verity parameters for a block image exported with `verity = true`.
+///
+/// These are exactly the values needed for the standard `veritysetup open`
+/// invocation the upstream nydus tarfs flow documents (see `docs/nydus-image.md`):
+/// `--no-superblock --format=1 -s "" --hash=sha256
+///  --data-block-size=<data_block_size> --hash-block-size=4096
+///  --data-blocks=<data_blocks> --hash-offset=<hash_offset> <dev> <name> <dev> <root_digest>`.
+/// The Merkle hash tree is appended to the same `.disk` file after `hash_offset`.
+/// Surfacing them (rather than only printing) lets the snapshotter automate the
+/// veritysetup activation while remaining byte-compatible with an image exported
+/// by the upstream `nydus-image export --block --verity` CLI.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BlockDeviceVerityInfo {
+    /// Data block size in bytes (512 for tarfs, 4096 otherwise).
+    pub data_block_size: u64,
+    /// Number of data blocks the hash tree covers.
+    pub data_blocks: u32,
+    /// Byte offset of the hash tree within the `.disk` file.
+    pub hash_offset: u64,
+    /// Root Merkle digest, lowercase hex (sha256).
+    pub root_digest: String,
+}
+
 /// A block device composed up from a RAFSv6 image.
 ///
 /// RAFSv6 metadata has two encoding schemes:
@@ -441,13 +464,20 @@ impl BlockDevice {
     }
 
     /// Export a RAFS filesystem as a raw block disk image.
+    /// Export the RAFS v6 image referenced by `blob_entry` as a flat EROFS block
+    /// image (a `.disk` file). When `verity` is set, a dm-verity Merkle hash tree
+    /// is appended and the [`BlockDeviceVerityInfo`] needed to activate it is
+    /// returned (`Ok(Some(..))`); otherwise `Ok(None)`. The on-disk layout and
+    /// verity parameters match the upstream `nydus-image export --block` output
+    /// byte-for-byte, so an image exported here is interchangeable with one from
+    /// the upstream CLI.
     pub fn export(
         blob_entry: BlobCacheEntry,
         output: Option<String>,
         data_dir: Option<String>,
         threads: u32,
         verity: bool,
-    ) -> Result<()> {
+    ) -> Result<Option<BlockDeviceVerityInfo>> {
         let block_device = compio::runtime::Runtime::new()
             .unwrap()
             .block_on(BlockDevice::new(blob_entry))?;
@@ -631,16 +661,15 @@ impl BlockDevice {
                 .data
                 .iter()
                 .fold(String::new(), |acc, v| acc + &format!("{:02x}", v));
-            println!(
-                "dm-verity options: --no-superblock --format=1 -s \"\" --hash=sha256 --data-block-size={} --hash-block-size=4096 --data-blocks {} --hash-offset {} {}",
-                block_device.block_size(),
-                blocks,
-                verity_offset,
-                root_digest
-            );
+            return Ok(Some(BlockDeviceVerityInfo {
+                data_block_size: block_device.block_size(),
+                data_blocks: blocks,
+                hash_offset: verity_offset,
+                root_digest,
+            }));
         }
 
-        Ok(())
+        Ok(None)
     }
 
     async fn do_export(
@@ -945,7 +974,11 @@ mod tests {
         let tmp_dir = TempDir::new().unwrap();
         let data_dir = Some(String::from(tmp_dir.as_path().to_str().unwrap()));
 
-        assert!(BlockDevice::export(entry, None, data_dir, thread, true).is_ok());
+        // verity = true must now return the dm-verity parameters.
+        let verity = BlockDevice::export(entry, None, data_dir, thread, true)?;
+        let verity = verity.expect("verity export must return BlockDeviceVerityInfo");
+        assert_eq!(verity.data_block_size, 4096);
+        assert_eq!(verity.root_digest.len(), 64);
 
         let mut disk_path = PathBuf::from(tmp_dir.as_path());
         disk_path.push("rafs-v6-2.2.boot.disk");

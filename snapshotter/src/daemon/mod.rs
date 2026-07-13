@@ -287,6 +287,127 @@ impl NydusDaemon for BlockdevDaemon {
     }
 }
 
+/// Platform-agnostic mirror of `nydus_service::block_device::BlockDeviceVerityInfo`
+/// (which is Linux-only). Kept local so the tarfs serving branch and its helpers
+/// — which compile on every platform — never name the Linux-gated type; only the
+/// `#[cfg(target_os = "linux")]` export path converts from it.
+#[derive(Clone, Debug)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+struct TarfsVerityParams {
+    data_block_size: u64,
+    data_blocks: u32,
+    hash_offset: u64,
+    root_digest: String,
+}
+
+/// What was set up to back a tarfs mount, tracked so teardown can undo it in
+/// the reverse order (umount → veritysetup close → losetup detach).
+#[derive(Clone, Debug, Default)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+struct TarfsMount {
+    /// Loop device the `.disk` was attached to (verity path only; the plain
+    /// path lets the kernel attach the loop implicitly at mount time).
+    loop_dev: Option<String>,
+    /// dm-verity mapping name opened over the loop device (verity path only).
+    verity_name: Option<String>,
+}
+
+/// Lightweight daemon facade for the host-mounted tarfs/EROFS(+dm-verity) path.
+/// Like [`BlockdevDaemon`] it is just a lifecycle shell over a kernel mount, but
+/// its `umount()` additionally tears down the dm-verity mapping and loop device.
+struct TarfsDaemon {
+    id: String,
+    mountpoint: PathBuf,
+    build_info: BuildTimeInfo,
+    state: AtomicI32,
+    mount: TarfsMount,
+    config: crate::config::TarfsConfig,
+}
+
+impl TarfsDaemon {
+    fn new(
+        id: String,
+        mountpoint: PathBuf,
+        build_info: BuildTimeInfo,
+        mount: TarfsMount,
+        config: crate::config::TarfsConfig,
+    ) -> Self {
+        Self {
+            id,
+            mountpoint,
+            build_info,
+            state: AtomicI32::new(DaemonState::RUNNING as i32),
+            mount,
+            config,
+        }
+    }
+}
+
+impl DaemonStateMachineSubscriber for TarfsDaemon {
+    fn on_event(&self, event: DaemonStateMachineInput) -> nydus_service::Result<()> {
+        match event {
+            DaemonStateMachineInput::Mount => self.set_state(DaemonState::READY),
+            DaemonStateMachineInput::Start => self.set_state(DaemonState::RUNNING),
+            DaemonStateMachineInput::Stop | DaemonStateMachineInput::Exit => {
+                self.set_state(DaemonState::STOPPED)
+            }
+            DaemonStateMachineInput::Takeover => self.set_state(DaemonState::READY),
+        }
+        Ok(())
+    }
+}
+
+impl NydusDaemon for TarfsDaemon {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn id(&self) -> Option<String> {
+        Some(self.id.clone())
+    }
+
+    fn version(&self) -> BuildTimeInfo {
+        self.build_info.clone()
+    }
+
+    fn get_state(&self) -> DaemonState {
+        self.state.load(Ordering::Relaxed).into()
+    }
+
+    fn set_state(&self, state: DaemonState) {
+        self.state.store(state as i32, Ordering::Relaxed);
+    }
+
+    fn start(&self) -> nydus_service::Result<()> {
+        self.set_state(DaemonState::RUNNING);
+        Ok(())
+    }
+
+    fn umount(&self) -> nydus_service::Result<()> {
+        teardown_tarfs_mount(&self.config, &self.mount, &self.mountpoint).map_err(service_io_error)
+    }
+
+    fn stop(&self) {
+        self.set_state(DaemonState::STOPPED);
+    }
+
+    fn wait(&self) -> nydus_service::Result<()> {
+        Ok(())
+    }
+
+    fn supervisor(&self) -> Option<String> {
+        None
+    }
+
+    fn save(&self) -> nydus_service::Result<()> {
+        Ok(())
+    }
+
+    fn restore(&self) -> nydus_service::Result<()> {
+        Ok(())
+    }
+}
+
 /// The daemon supervisor manages all in-process nydus-service instances.
 pub struct DaemonSupervisor {
     config: SnapshotterConfig,
@@ -397,11 +518,16 @@ impl DaemonSupervisor {
     /// idempotent per key, so repeated calls for the same snapshot (containerd
     /// re-issues `Mounts` on every container restart) do not inflate the
     /// refcount. Balance with [`release`](Self::release) using the same key.
+    /// `driver_override` forces a specific fs driver for this image (from the
+    /// per-image `containerd.io/snapshot/nydus-fs-driver` label); `None` uses
+    /// the node's promoted default. Only honored on the fresh-start path — a
+    /// reused instance keeps whatever driver it was started with.
     pub async fn ensure_instance(
         &self,
         image_ref: &str,
         bootstrap: &Path,
         holder: &str,
+        driver_override: Option<FsDriverType>,
     ) -> Result<Arc<MountHandle>> {
         if image_ref.is_empty() {
             bail!("image reference must be non-empty to mount a Nydus image");
@@ -428,7 +554,7 @@ impl DaemonSupervisor {
             .await?;
 
         let instance = self
-            .start_instance(image_ref, bootstrap)
+            .start_instance(image_ref, bootstrap, driver_override)
             .await
             .with_context(|| format!("failed to start nydus daemon for {image_ref}"))?;
         instance.acquire_holder(holder);
@@ -669,7 +795,7 @@ impl DaemonSupervisor {
         }
 
         let instance = self
-            .start_instance(image_ref, bootstrap)
+            .start_instance(image_ref, bootstrap, None)
             .await
             .with_context(|| format!("failed to spawn nydus daemon for {image_ref}"))?;
         let record = self.record_for_instance(&instance, true);
@@ -750,7 +876,7 @@ impl DaemonSupervisor {
                 warn!(image_ref, error = %e, "failed to persist stopped daemon record");
             }
 
-            match self.start_instance(&image_ref, &bootstrap).await {
+            match self.start_instance(&image_ref, &bootstrap, None).await {
                 Ok(instance) => {
                     instance.refcount.store(refcount, Ordering::SeqCst);
                     let after_state = format!("{:?}", instance.daemon.get_state());
@@ -922,6 +1048,7 @@ impl DaemonSupervisor {
         &self,
         image_ref_str: &str,
         bootstrap: &Path,
+        driver_override: Option<FsDriverType>,
     ) -> Result<Arc<DaemonInstance>> {
         let parsed = parse_image_ref(image_ref_str)
             .with_context(|| format!("invalid image reference '{image_ref_str}'"))?;
@@ -930,7 +1057,7 @@ impl DaemonSupervisor {
         let daemon_root = self.config.snapshotter.root.join("daemons").join(&slug);
         let mountpoint = daemon_root.join("mnt");
         let cache_dir = self.config.snapshotter.cache.work_dir.join(&slug);
-        let active_driver = self.active_fs_driver();
+        let active_driver = driver_override.unwrap_or_else(|| self.active_fs_driver());
         fs::create_dir_all(&mountpoint).with_context(|| {
             format!(
                 "failed to create daemon mountpoint {}",
@@ -1001,6 +1128,81 @@ impl DaemonSupervisor {
                 holders: StdMutex::new(HashSet::new()),
                 _poll: poll,
                 // Blockdev/EROFS export has no fuse fd to preserve.
+                failover_armed: AtomicBool::new(false),
+            }));
+        }
+
+        if active_driver == FsDriverType::Tarfs {
+            let tarfs_cfg = self.config.snapshotter.tarfs.clone();
+            let tarfs_dir = daemon_root.join("tarfs");
+            fs::create_dir_all(&tarfs_dir).with_context(|| {
+                format!("failed to create tarfs directory {}", tarfs_dir.display())
+            })?;
+            let disk_image = tarfs_dir.join("image.erofs");
+            // The bootstrap must be a tarfs (TARTFS_MODE) RAFS v6 image; the
+            // 512-byte block mode is auto-detected downstream from that flag, so
+            // the export/mount below are byte-compatible with an upstream
+            // `nydus-image export --block` artifact.
+            let entry = build_blob_cache_entry(
+                &self.config,
+                &parsed,
+                &cache_dir,
+                auth,
+                &daemon_id,
+                bootstrap,
+            )
+            .context("failed to build blob cache entry for tarfs export")?;
+
+            let export_disk = disk_image.clone();
+            let verity = tarfs_cfg.verity;
+            let verity_info =
+                blocking::unblock(move || export_tarfs_image(entry, export_disk, threads, verity))
+                    .await
+                    .context("tarfs export failed")?;
+
+            let dm_name = tarfs_dm_name(&slug);
+            let mount_disk = disk_image.clone();
+            let mount_target = mountpoint.clone();
+            let cfg_for_mount = tarfs_cfg.clone();
+            let dm_for_mount = dm_name.clone();
+            let verity_for_mount = verity_info.clone();
+            let tarfs_mount = blocking::unblock(move || {
+                setup_and_mount_tarfs(
+                    &cfg_for_mount,
+                    &mount_disk,
+                    &mount_target,
+                    &dm_for_mount,
+                    verity_for_mount.as_ref(),
+                )
+            })
+            .await
+            .context("tarfs mount failed")?;
+
+            let daemon: Arc<dyn NydusDaemon> = Arc::new(TarfsDaemon::new(
+                daemon_id,
+                mountpoint.clone(),
+                bti,
+                tarfs_mount,
+                tarfs_cfg,
+            ));
+
+            info!(
+                image_ref = %image_ref_str,
+                mountpoint = %mountpoint.display(),
+                disk = %disk_image.display(),
+                verity = verity_info.is_some(),
+                "nydus tarfs EROFS mount ready"
+            );
+
+            return Ok(Arc::new(DaemonInstance {
+                image_ref: image_ref_str.to_string(),
+                mountpoint,
+                bootstrap: bootstrap.to_path_buf(),
+                daemon,
+                refcount: AtomicUsize::new(0),
+                holders: StdMutex::new(HashSet::new()),
+                _poll: poll,
+                // Tarfs is a kernel mount; there is no fuse fd to preserve.
                 failover_armed: AtomicBool::new(false),
             }));
         }
@@ -1305,7 +1507,7 @@ impl DaemonSupervisor {
             .snapshotter
             .fs_drivers
             .first()
-            .map(|driver| driver.driver_type.clone())
+            .map(|driver| driver.driver_type)
             .unwrap_or(FsDriverType::Fusedev)
     }
 
@@ -1380,7 +1582,7 @@ impl DaemonSupervisor {
                 warn!(image_ref, error = %e, "failed to persist stopped daemon record");
             }
 
-            match self.start_instance(&image_ref, &bootstrap).await {
+            match self.start_instance(&image_ref, &bootstrap, None).await {
                 Ok(instance) => {
                     instance.refcount.store(refcount, Ordering::SeqCst);
                     let after_state = format!("{:?}", instance.daemon.get_state());
@@ -1618,6 +1820,301 @@ fn unmount_blockdev_erofs(mountpoint: &Path) -> io::Result<()> {
 
 #[cfg(not(target_os = "linux"))]
 fn unmount_blockdev_erofs(_mountpoint: &Path) -> io::Result<()> {
+    Ok(())
+}
+
+/// dm-verity mapping name for a tarfs image (`/dev/mapper/<name>`). Slug is
+/// already filesystem-safe (alnum + `.-_`) and short, so it is a valid dm name.
+fn tarfs_dm_name(slug: &str) -> String {
+    format!("nydus-tarfs-{slug}")
+}
+
+/// Export the tarfs RAFS v6 bootstrap to a flat EROFS `.disk`, generating the
+/// dm-verity hash tree when `verity` is set. Returns the verity parameters
+/// (`Some`) when verity was generated, else `None`.
+///
+/// Idempotent + restart-safe: the verity parameters (which include the root
+/// hash) are persisted next to the disk as `<disk>.verity.json`, so a
+/// snapshotter restart can re-activate an existing image's dm-verity mapping
+/// without re-exporting. The export itself is byte-compatible with an upstream
+/// `nydus-image export --block --verity` artifact.
+#[cfg(target_os = "linux")]
+fn export_tarfs_image(
+    entry: nydus_api::BlobCacheEntry,
+    disk_image: PathBuf,
+    threads: u32,
+    verity: bool,
+) -> Result<Option<TarfsVerityParams>> {
+    let sidecar = verity_sidecar_path(&disk_image);
+    let disk_ready =
+        disk_image.is_file() && disk_image.metadata().map(|m| m.len()).unwrap_or(0) > 0;
+    if disk_ready {
+        if !verity {
+            return Ok(None);
+        }
+        if let Some(info) = load_verity_sidecar(&sidecar) {
+            return Ok(Some(info));
+        }
+        // Disk present but no cached verity params — fall through and re-export
+        // to regenerate them (the export overwrites the disk in place).
+    }
+    if let Some(parent) = disk_image.parent() {
+        fs::create_dir_all(parent).with_context(|| {
+            format!("failed to create tarfs disk directory {}", parent.display())
+        })?;
+    }
+    let info = BlockDevice::export(
+        entry,
+        Some(disk_image.display().to_string()),
+        None,
+        threads,
+        verity,
+    )
+    .with_context(|| format!("failed to export tarfs disk image {}", disk_image.display()))?
+    .map(|v| TarfsVerityParams {
+        data_block_size: v.data_block_size,
+        data_blocks: v.data_blocks,
+        hash_offset: v.hash_offset,
+        root_digest: v.root_digest,
+    });
+    if let Some(info) = info.as_ref() {
+        store_verity_sidecar(&sidecar, info);
+    }
+    Ok(info)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn export_tarfs_image(
+    _entry: nydus_api::BlobCacheEntry,
+    _disk_image: PathBuf,
+    _threads: u32,
+    _verity: bool,
+) -> Result<Option<TarfsVerityParams>> {
+    bail!("tarfs EROFS export requires Linux")
+}
+
+#[cfg(target_os = "linux")]
+fn verity_sidecar_path(disk_image: &Path) -> PathBuf {
+    let mut name = disk_image.as_os_str().to_os_string();
+    name.push(".verity.json");
+    PathBuf::from(name)
+}
+
+#[cfg(target_os = "linux")]
+fn load_verity_sidecar(path: &Path) -> Option<TarfsVerityParams> {
+    let bytes = fs::read(path).ok()?;
+    let v: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    Some(TarfsVerityParams {
+        data_block_size: v.get("data_block_size")?.as_u64()?,
+        data_blocks: v.get("data_blocks")?.as_u64()? as u32,
+        hash_offset: v.get("hash_offset")?.as_u64()?,
+        root_digest: v.get("root_digest")?.as_str()?.to_string(),
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn store_verity_sidecar(path: &Path, info: &TarfsVerityParams) {
+    let json = serde_json::json!({
+        "data_block_size": info.data_block_size,
+        "data_blocks": info.data_blocks,
+        "hash_offset": info.hash_offset,
+        "root_digest": info.root_digest,
+    });
+    if let Err(e) = serde_json::to_vec(&json)
+        .map_err(io::Error::other)
+        .and_then(|b| fs::write(path, b))
+    {
+        warn!(path = %path.display(), error = %e, "failed to persist tarfs verity sidecar; a restart will re-export");
+    }
+}
+
+/// Attach + verity-open (if `verity_info` is `Some`) and mount the tarfs EROFS
+/// image read-only. On the verity path the `.disk` is attached to a loop
+/// device, `veritysetup open` maps `/dev/mapper/<dm_name>` over it (using the
+/// standard upstream parameters), and that dm device is mounted; the returned
+/// [`TarfsMount`] records both so teardown can reverse them. On the plain path
+/// the kernel attaches the loop implicitly at `mount -t erofs` time, exactly
+/// like the blockdev driver.
+#[cfg(target_os = "linux")]
+fn setup_and_mount_tarfs(
+    cfg: &crate::config::TarfsConfig,
+    disk_image: &Path,
+    mountpoint: &Path,
+    dm_name: &str,
+    verity_info: Option<&TarfsVerityParams>,
+) -> Result<TarfsMount> {
+    fs::create_dir_all(mountpoint).with_context(|| {
+        format!(
+            "failed to create tarfs EROFS mountpoint {}",
+            mountpoint.display()
+        )
+    })?;
+    if is_mounted_at(mountpoint) {
+        // Already mounted (e.g. a crash-recovery re-entry). We can't recover the
+        // loop/dm identities here; teardown will still umount, and the leftover
+        // loop/dm are cleaned by the reconciler / next boot.
+        return Ok(TarfsMount::default());
+    }
+
+    let Some(verity) = verity_info else {
+        // Plain path: kernel-loop erofs mount of the .disk, no dm-verity.
+        mount_blockdev_erofs(disk_image.to_path_buf(), mountpoint.to_path_buf())?;
+        return Ok(TarfsMount::default());
+    };
+
+    // 1. Attach the .disk to a loop device (veritysetup needs a block device).
+    let loop_dev = losetup_attach(cfg, disk_image)?;
+    let mut mount = TarfsMount {
+        loop_dev: Some(loop_dev.clone()),
+        verity_name: None,
+    };
+
+    // 2. veritysetup open over the loop device (hash tree is in the same file).
+    if let Err(e) = veritysetup_open(cfg, &loop_dev, dm_name, verity) {
+        let _ = teardown_tarfs_mount(cfg, &mount, mountpoint);
+        return Err(e);
+    }
+    mount.verity_name = Some(dm_name.to_string());
+
+    // 3. Mount the verified dm device read-only.
+    let dm_path = PathBuf::from(format!("/dev/mapper/{dm_name}"));
+    if let Err(e) = mount_blockdev_erofs(dm_path, mountpoint.to_path_buf()) {
+        let _ = teardown_tarfs_mount(cfg, &mount, mountpoint);
+        return Err(e);
+    }
+    Ok(mount)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn setup_and_mount_tarfs(
+    _cfg: &crate::config::TarfsConfig,
+    _disk_image: &Path,
+    _mountpoint: &Path,
+    _dm_name: &str,
+    _verity_info: Option<&TarfsVerityParams>,
+) -> Result<TarfsMount> {
+    bail!("tarfs mount requires Linux")
+}
+
+#[cfg(target_os = "linux")]
+fn losetup_attach(cfg: &crate::config::TarfsConfig, disk_image: &Path) -> Result<String> {
+    let output = std::process::Command::new(&cfg.losetup_path)
+        .args(["--find", "--show", "--read-only"])
+        .arg(disk_image)
+        .output()
+        .with_context(|| format!("failed to spawn {}", cfg.losetup_path.display()))?;
+    if !output.status.success() {
+        bail!(
+            "losetup --find --show {} failed ({}): {}",
+            disk_image.display(),
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    let dev = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if dev.is_empty() {
+        bail!("losetup returned an empty loop device path");
+    }
+    Ok(dev)
+}
+
+#[cfg(target_os = "linux")]
+fn veritysetup_open(
+    cfg: &crate::config::TarfsConfig,
+    loop_dev: &str,
+    dm_name: &str,
+    v: &TarfsVerityParams,
+) -> Result<()> {
+    // Standard upstream parameters (see docs/nydus-image.md): data device and
+    // hash device are the same loop device; the hash tree lives after
+    // `hash_offset` in that file. Positional args: <data_dev> <name> <hash_dev> <root>.
+    let output = std::process::Command::new(&cfg.veritysetup_path)
+        .args([
+            "open",
+            "--no-superblock",
+            "--format=1",
+            "-s",
+            "",
+            "--hash=sha256",
+            &format!("--data-block-size={}", v.data_block_size),
+            "--hash-block-size=4096",
+            &format!("--data-blocks={}", v.data_blocks),
+            &format!("--hash-offset={}", v.hash_offset),
+            loop_dev,
+            dm_name,
+            loop_dev,
+            &v.root_digest,
+        ])
+        .output()
+        .with_context(|| format!("failed to spawn {}", cfg.veritysetup_path.display()))?;
+    if !output.status.success() {
+        bail!(
+            "veritysetup open {dm_name} failed ({}): {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
+/// Reverse [`setup_and_mount_tarfs`]: umount, close the dm-verity mapping, then
+/// detach the loop device. Every step is best-effort and independent so a
+/// failure in one still attempts the rest.
+#[cfg(target_os = "linux")]
+fn teardown_tarfs_mount(
+    cfg: &crate::config::TarfsConfig,
+    mount: &TarfsMount,
+    mountpoint: &Path,
+) -> io::Result<()> {
+    let mut first_err: Option<io::Error> = None;
+    if let Err(e) = unmount_blockdev_erofs(mountpoint) {
+        warn!(mountpoint = %mountpoint.display(), error = %e, "tarfs umount failed");
+        first_err.get_or_insert(e);
+    }
+    if let Some(name) = mount.verity_name.as_deref() {
+        let out = std::process::Command::new(&cfg.veritysetup_path)
+            .args(["close", name])
+            .output();
+        match out {
+            Ok(o) if !o.status.success() => {
+                warn!(
+                    dm = name,
+                    "veritysetup close failed: {}",
+                    String::from_utf8_lossy(&o.stderr).trim()
+                );
+            }
+            Err(e) => warn!(dm = name, error = %e, "failed to spawn veritysetup close"),
+            _ => {}
+        }
+    }
+    if let Some(dev) = mount.loop_dev.as_deref() {
+        let out = std::process::Command::new(&cfg.losetup_path)
+            .args(["-d", dev])
+            .output();
+        match out {
+            Ok(o) if !o.status.success() => {
+                warn!(
+                    loop_dev = dev,
+                    "losetup -d failed: {}",
+                    String::from_utf8_lossy(&o.stderr).trim()
+                );
+            }
+            Err(e) => warn!(loop_dev = dev, error = %e, "failed to spawn losetup -d"),
+            _ => {}
+        }
+    }
+    match first_err {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn teardown_tarfs_mount(
+    _cfg: &crate::config::TarfsConfig,
+    _mount: &TarfsMount,
+    _mountpoint: &Path,
+) -> io::Result<()> {
     Ok(())
 }
 

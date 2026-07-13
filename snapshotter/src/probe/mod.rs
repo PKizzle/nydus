@@ -97,7 +97,7 @@ pub fn promote_selected_driver(
         return None;
     }
     let selected = drivers.remove(idx);
-    let driver_type = selected.driver_type.clone();
+    let driver_type = selected.driver_type;
     drivers.insert(0, selected);
     Some(driver_type)
 }
@@ -114,6 +114,11 @@ fn driver_auto_rank(driver: &FsDriverType) -> u8 {
         FsDriverType::Blockdev => 1,
         // Fusedev remains the safest compatibility fallback.
         FsDriverType::Fusedev => 2,
+        // Tarfs is opt-in only (integrity path, not a startup-speed win — see
+        // BACKLOG.md); ranked last so `auto` never promotes it ahead of the
+        // general-purpose drivers even when it's listed. It serves only when
+        // explicitly configured or requested per-image.
+        FsDriverType::Tarfs => 3,
     }
 }
 
@@ -122,6 +127,7 @@ fn probe_single(entry: &FsDriverEntry, work_dir: Option<&Path>) -> ProbeResult {
         FsDriverType::Fanotify => probe_fanotify(entry, work_dir),
         FsDriverType::Fusedev => probe_fusedev(entry),
         FsDriverType::Blockdev => probe_blockdev(entry),
+        FsDriverType::Tarfs => probe_tarfs(entry),
     }
 }
 
@@ -284,6 +290,76 @@ fn probe_blockdev_platform(_entry: &FsDriverEntry) -> ProbeResult {
         driver_type: FsDriverType::Blockdev,
         available: false,
         reason: "blockdev requires Linux EROFS and loop device support".to_string(),
+    }
+}
+
+fn probe_tarfs(entry: &FsDriverEntry) -> ProbeResult {
+    probe_tarfs_platform(entry)
+}
+
+/// Probe the tarfs driver. Tarfs rides the same EROFS-over-loop machinery as
+/// blockdev, plus dm-verity for its integrity path — so it needs erofs, loop,
+/// CAP_SYS_ADMIN, AND (because verity is on by default) the device-mapper
+/// verity target and the `losetup`/`veritysetup` binaries. The probe is strict
+/// about the verity prerequisites: a node that can't activate dm-verity can't
+/// serve the tarfs driver's default (integrity) mode, and falling through to a
+/// non-verified mount would silently drop the guarantee tarfs exists to provide.
+/// An operator who deliberately runs tarfs with `[snapshotter.tarfs] verity =
+/// false` on a host without veritysetup should use the `blockdev` driver
+/// instead.
+#[cfg(target_os = "linux")]
+fn probe_tarfs_platform(entry: &FsDriverEntry) -> ProbeResult {
+    let unavailable = |reason: String| ProbeResult {
+        driver_type: FsDriverType::Tarfs,
+        available: false,
+        reason,
+    };
+
+    if !has_filesystem("erofs") {
+        return unavailable("EROFS filesystem module not available".to_string());
+    }
+    if !has_caps(&entry.require_caps) {
+        return unavailable(format!(
+            "missing required capabilities: {:?}",
+            entry.require_caps
+        ));
+    }
+    if !Path::new("/dev/loop-control").exists()
+        && !Path::new("/sys/module/loop").exists()
+        && !Path::new("/dev/loop0").exists()
+    {
+        return unavailable("loop device support not available".to_string());
+    }
+    // dm-verity target: the device-mapper control node plus the verity module
+    // (built-in shows up under /sys/module/dm_verity once used, or is available
+    // via the dm ioctl once veritysetup loads it).
+    if !Path::new("/dev/mapper/control").exists() {
+        return unavailable(
+            "device-mapper (/dev/mapper/control) not available; dm-verity cannot be set up"
+                .to_string(),
+        );
+    }
+    for tool in ["losetup", "veritysetup"] {
+        if which::which(tool).is_err() {
+            return unavailable(format!(
+                "`{tool}` binary not found on PATH; required for the tarfs dm-verity mount path"
+            ));
+        }
+    }
+    info!("tarfs driver probe passed (erofs + loop + dm-verity + losetup/veritysetup)");
+    ProbeResult {
+        driver_type: FsDriverType::Tarfs,
+        available: true,
+        reason: "erofs, loop, device-mapper, and losetup/veritysetup probes passed".to_string(),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn probe_tarfs_platform(_entry: &FsDriverEntry) -> ProbeResult {
+    ProbeResult {
+        driver_type: FsDriverType::Tarfs,
+        available: false,
+        reason: "tarfs requires Linux EROFS, loop, and dm-verity support".to_string(),
     }
 }
 
@@ -784,6 +860,42 @@ mod tests {
         assert_eq!(drivers[0].driver_type, FsDriverType::Fanotify);
         assert_eq!(drivers[1].driver_type, FsDriverType::Blockdev);
         assert_eq!(drivers[2].driver_type, FsDriverType::Fusedev);
+    }
+
+    #[test]
+    fn tarfs_is_ranked_last_so_auto_never_promotes_it() {
+        // Tarfs is opt-in (integrity path); auto-selection must always prefer
+        // the general-purpose drivers over it, even when it's listed first.
+        let mut drivers = vec![
+            FsDriverEntry {
+                driver_type: FsDriverType::Tarfs,
+                min_kernel: None,
+                require_caps: vec!["CAP_SYS_ADMIN".to_string()],
+                mode: None,
+            },
+            FsDriverEntry {
+                driver_type: FsDriverType::Fusedev,
+                min_kernel: None,
+                require_caps: vec![],
+                mode: None,
+            },
+        ];
+        apply_driver_selection_policy(&mut drivers, FsDriverSelectionPolicy::Auto);
+        assert_eq!(drivers[0].driver_type, FsDriverType::Fusedev);
+        assert_eq!(drivers[1].driver_type, FsDriverType::Tarfs);
+        assert!(driver_auto_rank(&FsDriverType::Tarfs) > driver_auto_rank(&FsDriverType::Fusedev));
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn tarfs_probe_is_not_available_off_linux() {
+        let entry = FsDriverEntry {
+            driver_type: FsDriverType::Tarfs,
+            min_kernel: None,
+            require_caps: vec!["CAP_SYS_ADMIN".to_string()],
+            mode: None,
+        };
+        assert!(!probe_tarfs(&entry).available);
     }
 
     #[cfg(not(target_os = "linux"))]

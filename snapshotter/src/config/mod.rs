@@ -78,6 +78,11 @@ pub struct SnapshotterSection {
     #[serde(default)]
     pub features: FeaturesConfig,
 
+    /// Tarfs driver options (dm-verity, subprocess tool paths). Only consulted
+    /// when the tarfs driver actually serves an image.
+    #[serde(default)]
+    pub tarfs: TarfsConfig,
+
     #[serde(default)]
     pub cgroup: CgroupConfig,
 
@@ -117,6 +122,7 @@ impl Default for SnapshotterSection {
             sysctl: SysctlConfig::default(),
             metrics: MetricsConfig::default(),
             features: FeaturesConfig::default(),
+            tarfs: TarfsConfig::default(),
             cgroup: CgroupConfig::default(),
             auto_zran: AutoZranConfig::default(),
             containerd: ContainerdConfig::default(),
@@ -441,12 +447,46 @@ pub struct FsDriverEntry {
 }
 
 /// Supported filesystem driver types.
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum FsDriverType {
     Fanotify,
     Fusedev,
     Blockdev,
+    /// Kernel-only tarfs read path: the RAFS v6 bootstrap is exported to a flat
+    /// EROFS `.disk` in 512-byte tarfs mode (auto-detected from the bootstrap's
+    /// `TARTFS_MODE` flag) and mounted directly by the kernel EROFS driver,
+    /// optionally behind dm-verity. Distinct from `Blockdev` only in that it is
+    /// the integrity-oriented path (dm-verity on by default) and its data blob
+    /// is the original uncompressed tar. Opt-in: never auto-selected ahead of
+    /// fanotify — reached via explicit config or the per-image
+    /// `containerd.io/snapshot/nydus-fs-driver = "tarfs"` label.
+    Tarfs,
+}
+
+impl FsDriverType {
+    /// The lowercase driver name (matches the serde representation).
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Fanotify => "fanotify",
+            Self::Fusedev => "fusedev",
+            Self::Blockdev => "blockdev",
+            Self::Tarfs => "tarfs",
+        }
+    }
+
+    /// Parse the value of the per-image `containerd.io/snapshot/nydus-fs-driver`
+    /// label (case-insensitive) into a driver override, or `None` if it names
+    /// no known driver.
+    pub fn from_hint(hint: &str) -> Option<Self> {
+        match hint.trim().to_ascii_lowercase().as_str() {
+            "fanotify" => Some(Self::Fanotify),
+            "fusedev" => Some(Self::Fusedev),
+            "blockdev" => Some(Self::Blockdev),
+            "tarfs" => Some(Self::Tarfs),
+            _ => None,
+        }
+    }
 }
 
 /// How the snapshotter chooses among configured filesystem driver candidates.
@@ -571,6 +611,42 @@ impl Default for FeaturesConfig {
             prefetch: true,
             metrics: true,
             erofs_page_cache_sharing: false,
+        }
+    }
+}
+
+/// `[snapshotter.tarfs]` — options for the tarfs (dm-verity block) driver.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct TarfsConfig {
+    /// Generate and activate a dm-verity mapping over the exported EROFS image.
+    /// Default **on**: cryptographically-verified read-only integrity is the
+    /// reason to choose tarfs over the plain blockdev driver. When off, tarfs
+    /// falls back to a plain kernel-loop EROFS mount of the `.disk` (still
+    /// 512-byte tarfs mode, just without block-level integrity).
+    #[serde(default = "default_true")]
+    pub verity: bool,
+    /// Path to the `veritysetup` binary used to activate the dm-verity mapping.
+    #[serde(default = "default_veritysetup_path")]
+    pub veritysetup_path: PathBuf,
+    /// Path to the `losetup` binary used to attach the `.disk` to a loop device
+    /// (dm-verity needs a block device, not a file, as its data device).
+    #[serde(default = "default_losetup_path")]
+    pub losetup_path: PathBuf,
+}
+
+fn default_veritysetup_path() -> PathBuf {
+    PathBuf::from("veritysetup")
+}
+fn default_losetup_path() -> PathBuf {
+    PathBuf::from("losetup")
+}
+
+impl Default for TarfsConfig {
+    fn default() -> Self {
+        Self {
+            verity: true,
+            veritysetup_path: default_veritysetup_path(),
+            losetup_path: default_losetup_path(),
         }
     }
 }
@@ -1275,6 +1351,54 @@ fn default_fs_drivers() -> Vec<FsDriverEntry> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fs_driver_type_hint_roundtrip_and_tarfs() {
+        for d in [
+            FsDriverType::Fanotify,
+            FsDriverType::Fusedev,
+            FsDriverType::Blockdev,
+            FsDriverType::Tarfs,
+        ] {
+            assert_eq!(FsDriverType::from_hint(d.as_str()), Some(d));
+        }
+        // Case-insensitive + trimmed, matching the label value in the wild.
+        assert_eq!(
+            FsDriverType::from_hint("  TARFS "),
+            Some(FsDriverType::Tarfs)
+        );
+        assert_eq!(FsDriverType::from_hint("nope"), None);
+        assert_eq!(FsDriverType::Tarfs.as_str(), "tarfs");
+    }
+
+    #[test]
+    fn tarfs_config_defaults_verity_on() {
+        let cfg = TarfsConfig::default();
+        assert!(cfg.verity, "dm-verity must default on for tarfs");
+        assert_eq!(cfg.veritysetup_path, PathBuf::from("veritysetup"));
+        assert_eq!(cfg.losetup_path, PathBuf::from("losetup"));
+        // An omitted `[snapshotter.tarfs]` table deserializes to the same.
+        let de: TarfsConfig = toml::from_str("").unwrap();
+        assert!(de.verity);
+    }
+
+    #[test]
+    fn tarfs_driver_deserializes_from_config() {
+        let toml = r#"
+            [[snapshotter.fs_drivers]]
+            type = "tarfs"
+            require_caps = ["CAP_SYS_ADMIN"]
+
+            [snapshotter.tarfs]
+            verity = false
+        "#;
+        let cfg: SnapshotterConfig = toml::from_str(toml).unwrap();
+        assert_eq!(
+            cfg.snapshotter.fs_drivers[0].driver_type,
+            FsDriverType::Tarfs
+        );
+        assert!(!cfg.snapshotter.tarfs.verity);
+    }
 
     /// Referrer detection now ships ON (serving is implemented + e2e-verified;
     /// every failure falls through to overlay). Pin both the struct default and

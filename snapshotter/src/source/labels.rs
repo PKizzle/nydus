@@ -39,6 +39,12 @@ pub const CRI_LAYER_DIGEST: &str = "containerd.io/snapshot/cri.layer-digest";
 /// image whose chain this snapshot belongs to.
 pub const CRI_IMAGE_REF: &str = "containerd.io/snapshot/cri.image-ref";
 
+/// Per-image filesystem-driver override. When present on a Prepare's labels,
+/// its value (`fanotify` / `fusedev` / `blockdev` / `tarfs`) forces that driver
+/// for the image regardless of the node's promoted default. Mirrors the Go
+/// snapshotter's `containerd.io/snapshot/nydus-fs-driver` annotation.
+pub const NYDUS_FS_DRIVER: &str = "containerd.io/snapshot/nydus-fs-driver";
+
 /// Set by this snapshotter on a prepared snapshot whose mounts were rewritten
 /// to a nydus daemon that the *snapshot key itself* holds a reference on
 /// (auto-accel sidecar and referrer-served mounts — the paths where the parent

@@ -2350,14 +2350,23 @@ impl Command {
         let output = subargs.value_of("output").map(|v| v.to_string());
         let verity = subargs.is_present("verity");
 
-        nydus_service::block_device::BlockDevice::export(
+        let verity_info = nydus_service::block_device::BlockDevice::export(
             entry,
             output,
             localfs_dir,
             threads,
             verity,
         )
-        .context("failed to export RAFS filesystem as raw block device image")
+        .context("failed to export RAFS filesystem as raw block device image")?;
+        // Preserve the CLI's dm-verity hint output (the exported `.disk` plus
+        // this line are all the operator needs for `veritysetup open`).
+        if let Some(v) = verity_info {
+            println!(
+                "dm-verity options: --no-superblock --format=1 -s \"\" --hash=sha256 --data-block-size={} --hash-block-size=4096 --data-blocks {} --hash-offset {} {}",
+                v.data_block_size, v.data_blocks, v.hash_offset, v.root_digest
+            );
+        }
+        Ok(())
     }
 
     fn thread_validator(v: &str) -> std::result::Result<String, String> {

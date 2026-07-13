@@ -442,11 +442,7 @@ impl OverlayEngine {
             .snapshotter
             .fs_drivers
             .first()
-            .map(|driver| match driver.driver_type {
-                crate::config::FsDriverType::Fanotify => "fanotify",
-                crate::config::FsDriverType::Fusedev => "fusedev",
-                crate::config::FsDriverType::Blockdev => "blockdev",
-            })
+            .map(|driver| driver.driver_type.as_str())
             .unwrap_or("fusedev")
     }
 }

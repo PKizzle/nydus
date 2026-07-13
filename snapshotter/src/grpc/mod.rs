@@ -324,6 +324,16 @@ fn all_lowerdirs(mounts: &[snapshots::api::types::Mount]) -> Vec<PathBuf> {
     Vec::new()
 }
 
+/// Resolve a per-image fs-driver override from a Prepare's labels, if the
+/// `containerd.io/snapshot/nydus-fs-driver` label names a known driver.
+fn driver_override_from_labels(
+    labels: &HashMap<String, String>,
+) -> Option<crate::config::FsDriverType> {
+    labels
+        .get(crate::source::labels::NYDUS_FS_DRIVER)
+        .and_then(|hint| crate::config::FsDriverType::from_hint(hint))
+}
+
 /// Extract the chainID digest from a snapshot parent string. containerd's
 /// proxy-plugin protocol prefixes the snapshot key with the namespace and an
 /// incrementing id (e.g. `k8s.io/18004/sha256:ead2…64hex`), so the actual
@@ -393,9 +403,12 @@ impl NydusSnapshotter {
         let Some(meta) = meta else {
             return Ok(None);
         };
+        // Per-image driver override from the `nydus-fs-driver` label (e.g.
+        // `tarfs`) supplied on this RPC's call labels.
+        let driver_override = driver_override_from_labels(call_labels);
         let handle = self
             .supervisor
-            .ensure_instance(&meta.image_ref, &meta.bootstrap, holder)
+            .ensure_instance(&meta.image_ref, &meta.bootstrap, holder, driver_override)
             .await
             .map_err(|e| {
                 warn!(image_ref = %meta.image_ref, error = %e, "failed to start nydus daemon");
@@ -793,10 +806,18 @@ impl snapshots::Snapshotter for NydusSnapshotter {
                                             })
                                             .await
                                         };
+                                        // A published nydus image may pin its
+                                        // serving driver via the referrer's
+                                        // `nydus-fs-driver` annotation (e.g. a
+                                        // tarfs/dm-verity image).
+                                        let driver_override = info
+                                            .fs_driver_hint
+                                            .as_deref()
+                                            .and_then(crate::config::FsDriverType::from_hint);
                                         match materialized {
                                             Ok(bootstrap) => match self
                                                 .supervisor
-                                                .ensure_instance(image_ref, &bootstrap, &key)
+                                                .ensure_instance(image_ref, &bootstrap, &key, driver_override)
                                                 .await
                                             {
                                                 Ok(handle) => {
@@ -1162,6 +1183,7 @@ pub fn open_store_for_config(config: &SnapshotterConfig) -> Result<Arc<SnapshotS
                 crate::config::FsDriverType::Fanotify => "fanotify",
                 crate::config::FsDriverType::Fusedev => "fusedev",
                 crate::config::FsDriverType::Blockdev => "blockdev",
+                crate::config::FsDriverType::Tarfs => "tarfs",
             })
             .unwrap_or("fusedev");
         crate::migrate::auto_migrate_at_startup(&root, &store, fs_driver);
