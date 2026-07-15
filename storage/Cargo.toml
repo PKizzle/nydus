@@ -29,6 +29,15 @@ compio = { version = "0.19", default-features = false, features = [
 ] }
 governor = "0.10"
 base64 = { version = "0.22.1", optional = true }
+# rustls + platform verifier so `[backends.*].ca_cert_files` can extend the
+# trust store on the cyper path (build_connection). Version-unified with the
+# rustls cyper/compio re-export; ring matches the provider pinned above.
+rustls = { version = "0.23", default-features = false, features = [
+    "ring",
+    "std",
+    "tls12",
+], optional = true }
+rustls-platform-verifier = { version = "0.7", optional = true }
 bitflags = { version = "2.11.1", features = ["serde"] }
 hex = "0.4.3"
 hmac = { version = "0.13.0", optional = true }
@@ -133,15 +142,42 @@ required-features = ["backend-s3"]
 backend-localdisk = []
 backend-localdisk-gpt = ["gpt", "backend-localdisk"]
 backend-localfs = []
-backend-oss = ["base64", "cyper", "http", "httpdate", "hmac", "sha1", "url"]
-backend-registry = ["base64", "cyper", "http", "url"]
+backend-oss = [
+    "base64",
+    "cyper",
+    "http",
+    "httpdate",
+    "hmac",
+    "sha1",
+    "url",
+    "rustls",
+    "rustls-platform-verifier",
+]
+backend-registry = [
+    "base64",
+    "cyper",
+    "http",
+    "url",
+    "rustls",
+    "rustls-platform-verifier",
+]
 # Opt-in HTTP/3 (QUIC) for the cyper-based backends. OFF by default: cyper's
 # h3 pool wedges an origin after a failed/hung QUIC connect and Alt-Svc makes
 # the upgrade automatic — see the cyper dependency comment above and
 # BACKLOG.md "cyper HTTP/3 pool wedge". Enable only against registries whose
 # h3 endpoint you trust once the upstream pool fix lands.
 backend-http3 = ["cyper/http3", "cyper/http3-altsvc"]
-backend-s3 = ["base64", "cyper", "hmac", "http", "sha2", "time", "url"]
+backend-s3 = [
+    "base64",
+    "cyper",
+    "hmac",
+    "http",
+    "sha2",
+    "time",
+    "url",
+    "rustls",
+    "rustls-platform-verifier",
+]
 backend-http-proxy = [
     "cyper",
     "cyper-core",
@@ -149,6 +185,8 @@ backend-http-proxy = [
     "http",
     "http-body-util",
     "url",
+    "rustls",
+    "rustls-platform-verifier",
 ]
 dedup = ["rusqlite", "r2d2", "r2d2_sqlite"]
 

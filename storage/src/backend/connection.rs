@@ -612,22 +612,18 @@ impl Connection {
             // round-trip on subsequent chunk reads from the same blob.
             .redirect(cyper::redirect::Policy::none())
             // Resolve DNS through cyper's bundled hickory resolver.
-            .hickory_dns(true)
-            .use_rustls_default();
+            .hickory_dns(true);
 
-        if config.skip_verify {
-            cb = cb.danger_accept_invalid_certs(true);
-        }
-
-        if !config.ca_cert_files.is_empty() {
-            // TODO: honor custom CA roots on the cyper path via
-            // `use_rustls(ClientConfig)` built from rustls-platform-verifier's
-            // `new_with_extra_roots`. Tracked as a follow-up in this stage.
-            warn!(
-                "connection: {} custom CA cert file(s) configured but not yet honored on the cyper path",
-                config.ca_cert_files.len()
-            );
-        }
+        // TLS trust: `skip_verify` wins (verification is off entirely, extra
+        // roots would be meaningless), then `ca_cert_files` extends the
+        // platform store, then the cyper default (platform store only).
+        cb = if config.skip_verify {
+            cb.use_rustls_default().danger_accept_invalid_certs(true)
+        } else if !config.ca_cert_files.is_empty() {
+            cb.use_rustls(client_config_with_extra_roots(&config.ca_cert_files)?)
+        } else {
+            cb.use_rustls_default()
+        };
 
         if !proxy.is_empty() {
             cb = cb.proxy(cyper::proxy::Proxy::all(proxy).map_err(|e| einval!(e))?)
@@ -926,6 +922,48 @@ impl Connection {
             self.call_stream_status_err(method, url, query, headers, skip_proxy, dst)?;
         Ok((status, written))
     }
+}
+
+/// rustls `ClientConfig` trusting the platform verifier's roots plus the PEM
+/// roots in `ca_cert_files` (for registries signed by a private CA). Mirrors
+/// what cyper builds for `use_rustls_default()` — platform verifier, ring
+/// provider, ALPN `h2` + `http/1.1` — so behaviour differs only by the extra
+/// roots. ALPN must be set here: cyper passes a custom config through
+/// untouched, and omitting it silently downgrades HTTP/2 negotiation.
+/// (Same helper as `registry_client::tls`; duplicated because storage sits
+/// below the OCI client in the crate graph.)
+fn client_config_with_extra_roots(
+    ca_cert_files: &[String],
+) -> Result<std::sync::Arc<rustls::ClientConfig>> {
+    use rustls::pki_types::CertificateDer;
+    use rustls::pki_types::pem::PemObject;
+
+    let mut extra_roots: Vec<CertificateDer<'static>> = Vec::new();
+    for path in ca_cert_files {
+        let before = extra_roots.len();
+        let certs = CertificateDer::pem_file_iter(path)
+            .map_err(|e| einval!(format!("open CA cert file {path}: {e}")))?;
+        for cert in certs {
+            extra_roots.push(cert.map_err(|e| einval!(format!("parse CA cert file {path}: {e}")))?);
+        }
+        if extra_roots.len() == before {
+            return Err(einval!(format!("no CA certificates found in {path}")));
+        }
+    }
+
+    let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
+    let verifier =
+        rustls_platform_verifier::Verifier::new_with_extra_roots(extra_roots, provider.clone())
+            .map_err(|e| einval!(format!("build certificate verifier with extra roots: {e}")))?;
+
+    let mut config = rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .map_err(|e| einval!(format!("select rustls protocol versions: {e}")))?
+        .dangerous()
+        .with_custom_certificate_verifier(std::sync::Arc::new(verifier))
+        .with_no_client_auth();
+    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    Ok(std::sync::Arc::new(config))
 }
 
 #[cfg(test)]
