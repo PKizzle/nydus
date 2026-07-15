@@ -356,6 +356,7 @@ impl OverlayEngine {
             return Ok(vec![bind_mount(&lowerdirs[0], true)]);
         }
 
+        mounts::ensure_lowerdir_budget(&lowerdirs)?;
         Ok(vec![overlay_mount(
             &lowerdirs,
             (!readonly).then_some(fs_dir.as_path()),
