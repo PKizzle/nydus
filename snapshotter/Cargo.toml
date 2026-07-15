@@ -92,6 +92,10 @@ rustls = { version = "0.23", default-features = false, features = [
     "std",
     "tls12",
 ] }
+# Platform verifier + extra PEM roots for the referrer client, so
+# `[backends.registry].ca_cert_files` also covers referrer detection
+# (not just the storage blob backend) on private-CA registries.
+rustls-platform-verifier = "0.7"
 http = "1.4"
 axum = { version = "0.8.1", default-features = false }
 async-lock = "3.4"

@@ -235,11 +235,25 @@ impl RegistryReferrerClient {
         // a trusted network (loopback, air-gapped, private LAN).
         let plain_http = registry.map(|cfg| cfg.plain_http).unwrap_or(false);
         let scheme = if plain_http { "http" } else { "https" };
+        // TLS trust mirrors the storage blob backend: `skip_verify` wins,
+        // then `ca_cert_files` extends the platform store, then the cyper
+        // default. Without the middle branch a private-CA registry could
+        // serve blobs but silently fail referrer detection.
+        let ca_cert_files = registry
+            .map(|cfg| cfg.ca_cert_files.as_slice())
+            .unwrap_or_default();
         // cyper has no client-level timeout; it is applied per request via
         // `compio::time::timeout` in `send_once` / `fetch_bearer_token`.
-        let client = Client::builder()
-            .use_rustls_default()
-            .danger_accept_invalid_certs(skip_verify)
+        let builder = if skip_verify {
+            Client::builder()
+                .use_rustls_default()
+                .danger_accept_invalid_certs(true)
+        } else if !ca_cert_files.is_empty() {
+            Client::builder().use_rustls(client_config_with_extra_roots(ca_cert_files)?)
+        } else {
+            Client::builder().use_rustls_default()
+        };
+        let client = builder
             .build()
             .context("failed to build registry referrer HTTP client")?;
         Ok(Self {
@@ -967,6 +981,48 @@ fn fallback_referrers_tag(digest: &str) -> String {
 
 fn global_cache() -> &'static Mutex<ReferrerCache> {
     REFERRER_CACHE.get_or_init(|| Mutex::new(ReferrerCache::new(DEFAULT_CACHE_CAPACITY)))
+}
+
+/// rustls `ClientConfig` trusting the platform verifier's roots plus the PEM
+/// roots in `ca_cert_files` (for registries signed by a private CA). Mirrors
+/// what cyper builds for `use_rustls_default()` — platform verifier, ring
+/// provider, ALPN `h2` + `http/1.1` — so behaviour differs only by the extra
+/// roots. ALPN must be set here: cyper passes a custom config through
+/// untouched, and omitting it silently downgrades HTTP/2 negotiation.
+/// (Same helper as `registry_client::tls` and the storage backend's copy; the
+/// snapshotter depends on neither, hence the duplication.)
+fn client_config_with_extra_roots(
+    ca_cert_files: &[String],
+) -> Result<std::sync::Arc<rustls::ClientConfig>> {
+    use rustls::pki_types::CertificateDer;
+    use rustls::pki_types::pem::PemObject;
+
+    let mut extra_roots: Vec<CertificateDer<'static>> = Vec::new();
+    for path in ca_cert_files {
+        let before = extra_roots.len();
+        let certs = CertificateDer::pem_file_iter(path)
+            .with_context(|| format!("open CA cert file {path}"))?;
+        for cert in certs {
+            extra_roots.push(cert.with_context(|| format!("parse CA cert file {path}"))?);
+        }
+        if extra_roots.len() == before {
+            bail!("no CA certificates found in {path}");
+        }
+    }
+
+    let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
+    let verifier =
+        rustls_platform_verifier::Verifier::new_with_extra_roots(extra_roots, provider.clone())
+            .context("build platform certificate verifier with extra CA roots")?;
+
+    let mut config = rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .context("select rustls protocol versions")?
+        .dangerous()
+        .with_custom_certificate_verifier(std::sync::Arc::new(verifier))
+        .with_no_client_auth();
+    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    Ok(std::sync::Arc::new(config))
 }
 
 #[cfg(test)]
