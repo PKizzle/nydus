@@ -42,6 +42,7 @@
 pub mod auth;
 pub mod client;
 pub mod reference;
+pub mod tls;
 pub mod types;
 
 pub use client::{FetchedManifest, RegistryClient, RegistryClientOptions};

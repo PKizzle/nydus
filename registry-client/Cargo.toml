@@ -41,6 +41,16 @@ cyper = { git = "https://github.com/compio-rs/cyper", rev = "d1c8aff18dd81c4b1f8
 futures = "0.3"
 hex = "0.4"
 http = "1.4"
+# rustls + platform verifier for `tls::client_config_with_extra_roots`
+# (private-CA support). Must stay version-unified with the rustls that
+# cyper/compio re-export, or `use_rustls(config)` won't type-check; the
+# `ring` feature matches the provider compio's `ring` feature selects.
+rustls = { version = "0.23", default-features = false, features = [
+    "ring",
+    "std",
+    "tls12",
+] }
+rustls-platform-verifier = "0.7"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.11"

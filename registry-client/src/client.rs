@@ -72,6 +72,11 @@ pub struct RegistryClientOptions {
     /// (`danger_accept_invalid_certs`). Same MITM exposure caveat as
     /// [`plain_http`](Self::plain_http).
     pub insecure_tls: bool,
+    /// Extra PEM CA root files trusted in addition to the platform store
+    /// (for registries signed by a private CA). Ignored when
+    /// [`insecure_tls`](Self::insecure_tls) is set — verification is off
+    /// entirely then, so extra roots would be misleading.
+    pub ca_cert_files: Vec<PathBuf>,
     /// Per-request timeout for metadata requests (manifest GET/PUT, HEAD,
     /// upload POST, token fetch) and for each streamed download chunk. cyper
     /// has no client-level timeout, so it is applied per request via
@@ -98,6 +103,7 @@ impl Default for RegistryClientOptions {
         Self {
             plain_http: false,
             insecure_tls: false,
+            ca_cert_files: Vec::new(),
             timeout: Some(Duration::from_secs(30)),
             upload_timeout: None,
             credentials: None,
@@ -159,9 +165,18 @@ impl RegistryClient {
     /// anonymous and rely on the bearer-token flow.
     pub fn new(registry: &str, opts: RegistryClientOptions) -> Result<Self> {
         let scheme = if opts.plain_http { "http" } else { "https" };
-        let client = Client::builder()
-            .use_rustls_default()
-            .danger_accept_invalid_certs(opts.insecure_tls)
+        let builder = if opts.insecure_tls {
+            Client::builder()
+                .use_rustls_default()
+                .danger_accept_invalid_certs(true)
+        } else if !opts.ca_cert_files.is_empty() {
+            Client::builder().use_rustls(crate::tls::client_config_with_extra_roots(
+                &opts.ca_cert_files,
+            )?)
+        } else {
+            Client::builder().use_rustls_default()
+        };
+        let client = builder
             .build()
             .context("failed to build registry HTTP client")?;
         let basic_auth = match opts.credentials.as_ref() {
