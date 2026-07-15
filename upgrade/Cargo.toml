@@ -9,7 +9,7 @@ repository = "https://github.com/dragonflyoss/nydus"
 edition = "2024"
 
 [dependencies]
-sendfd = "0.4.3"
+sendfd = "0.4.4"
 dbs-snapshot = "1.5.2"
 thiserror = "2.0.18"
 versionize_derive = "0.1.6"

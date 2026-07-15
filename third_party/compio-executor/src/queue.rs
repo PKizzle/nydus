@@ -237,8 +237,10 @@ impl Inner {
         item.next = None;
         item.is_hot = HOT;
 
-        if let Some(tail_key) = old_tail {
-            self.map.get_mut(tail_key).expect("tail exists").next = Some(key);
+        if let Some(tail_key) = old_tail
+            && let Some(tail_item) = self.map.get_mut(tail_key)
+        {
+            tail_item.next = Some(key);
         }
     }
 
@@ -246,7 +248,12 @@ impl Inner {
         let list = if HOT { &mut self.hot } else { &mut self.cold };
 
         let (prev, next) = {
-            // NYDUS LOCAL PATCH: tolerate an already-removed key.
+            // NYDUS LOCAL PATCH: tolerate an already-removed key. Under cyper's
+            // connection-teardown task pattern the hot/cold lists can transiently
+            // reference a task that was already removed from the map; skipping
+            // the relink keeps the scheduler alive (the stale node is gone, so
+            // its dangling links are inert and get repaired as the remaining
+            // nodes are unlinked).
             let Some(item) = self.map.get(key) else {
                 return;
             };
@@ -261,21 +268,15 @@ impl Inner {
             list.tail = prev;
         }
 
-        // NYDUS LOCAL PATCH: tolerate stale neighbour pointers rather than
-        // aborting. Under cyper's connection-teardown task pattern the hot/cold
-        // lists can transiently reference a task that was already removed from
-        // the map; skipping the relink keeps the scheduler alive (the stale node
-        // is gone, so its dangling links are inert and get repaired as the
-        // remaining nodes are unlinked).
-        if let Some(prev_key) = prev {
-            if let Some(item) = self.map.get_mut(prev_key) {
-                item.next = next;
-            }
+        if let Some(prev_key) = prev
+            && let Some(prev_item) = self.map.get_mut(prev_key)
+        {
+            prev_item.next = next;
         }
-        if let Some(next_key) = next {
-            if let Some(item) = self.map.get_mut(next_key) {
-                item.prev = prev;
-            }
+        if let Some(next_key) = next
+            && let Some(next_item) = self.map.get_mut(next_key)
+        {
+            next_item.prev = prev;
         }
     }
 

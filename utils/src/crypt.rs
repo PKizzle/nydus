@@ -9,12 +9,12 @@ use std::io::Error;
 use std::str::FromStr;
 use std::sync::Arc;
 
-use aes::cipher::generic_array::GenericArray;
-use aes::cipher::generic_array::typenum::{U12, U16};
-use aes::cipher::{BlockCipher, BlockDecrypt, BlockEncrypt, KeyInit};
+use aes::cipher::typenum::{U12, U16};
+use aes::cipher::{Array, BlockCipherDecrypt, BlockCipherEncrypt, BlockSizeUser, KeyInit};
 use aes::{Aes128, Aes256};
 use aes_gcm::AesGcm;
-use aes_gcm::aead::AeadInPlace;
+use aes_gcm::aead::AeadInOut;
+use aes_gcm::aead::inout::InOutBuf;
 use xts_mode::Xts128;
 
 /// AES-256-GCM with a 16-byte IV and 12-byte tag, matching the sizes nydus
@@ -343,7 +343,7 @@ impl Cipher {
         encrypt: bool,
     ) -> Result<Vec<u8>, Error>
     where
-        C: KeyInit + BlockEncrypt + BlockDecrypt + BlockCipher,
+        C: KeyInit + BlockSizeUser<BlockSize = U16> + BlockCipherEncrypt + BlockCipherDecrypt,
     {
         let iv = iv.ok_or_else(|| einval!("XTS mode requires an IV"))?;
         let tweak: [u8; AES_XTS_IV_LENGTH] = iv
@@ -357,9 +357,9 @@ impl Cipher {
         let xts = Xts128::new(cipher_1, cipher_2);
         let mut buf = data.to_vec();
         if encrypt {
-            xts.encrypt_sector(&mut buf, tweak);
+            xts.encrypt_sector(&mut buf, tweak.into());
         } else {
-            xts.decrypt_sector(&mut buf, tweak);
+            xts.decrypt_sector(&mut buf, tweak.into());
         }
         Ok(buf)
     }
@@ -371,18 +371,14 @@ impl Cipher {
         tag: &mut [u8],
     ) -> Result<Vec<u8>, Error> {
         let iv = iv.ok_or_else(|| einval!("GCM mode requires an IV"))?;
-        if iv.len() != AES_XTS_IV_LENGTH {
-            return Err(einval!(format!(
-                "GCM IV must be {} bytes",
-                AES_XTS_IV_LENGTH
-            )));
-        }
-        let nonce = GenericArray::<u8, U16>::from_slice(iv);
+        let nonce: &Array<u8, U16> = iv
+            .try_into()
+            .map_err(|_| einval!(format!("GCM IV must be {} bytes", AES_XTS_IV_LENGTH)))?;
         let cipher =
             Aes256GcmCipher::new_from_slice(key).map_err(|_| einval!("invalid GCM key length"))?;
         let mut buf = data.to_vec();
         let out_tag = cipher
-            .encrypt_in_place_detached(nonce, &[], &mut buf)
+            .encrypt_inout_detached(nonce, &[], InOutBuf::from(&mut buf[..]))
             .map_err(|e| eother!(format!("failed to encrypt data, {}", e)))?;
         if tag.len() != out_tag.len() {
             return Err(einval!(format!(
@@ -401,22 +397,17 @@ impl Cipher {
         tag: &[u8],
     ) -> Result<Vec<u8>, Error> {
         let iv = iv.ok_or_else(|| einval!("GCM mode requires an IV"))?;
-        if iv.len() != AES_XTS_IV_LENGTH {
-            return Err(einval!(format!(
-                "GCM IV must be {} bytes",
-                AES_XTS_IV_LENGTH
-            )));
-        }
-        if tag.len() != 12 {
-            return Err(einval!("GCM tag must be 12 bytes"));
-        }
-        let nonce = GenericArray::<u8, U16>::from_slice(iv);
-        let tag = GenericArray::<u8, U12>::from_slice(tag);
+        let nonce: &Array<u8, U16> = iv
+            .try_into()
+            .map_err(|_| einval!(format!("GCM IV must be {} bytes", AES_XTS_IV_LENGTH)))?;
+        let tag: &Array<u8, U12> = tag
+            .try_into()
+            .map_err(|_| einval!("GCM tag must be 12 bytes"))?;
         let cipher =
             Aes256GcmCipher::new_from_slice(key).map_err(|_| einval!("invalid GCM key length"))?;
         let mut buf = data.to_vec();
         cipher
-            .decrypt_in_place_detached(nonce, &[], &mut buf, tag)
+            .decrypt_inout_detached(nonce, &[], InOutBuf::from(&mut buf[..]), tag)
             .map_err(|e| eother!(format!("failed to decrypt data, {}", e)))?;
         Ok(buf)
     }

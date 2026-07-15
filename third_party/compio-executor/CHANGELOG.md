@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## 0.1.3 - 2026-07-06
+
+### Added
+
+- *(executor)* implement is_finished for JoinHandle ([#958](https://github.com/compio-rs/compio/pull/958))
+
+## 0.1.2 - 2026-06-14
+
+### Fixed
+
+- *(executor)* remove is_scheduling() guard from Remote::schedule ([#949](https://github.com/compio-rs/compio/pull/949))
+
+## [0.1.1](https://github.com/compio-rs/compio/compare/compio-executor-v0.1.0...compio-executor-v0.1.1) - 2026-06-01
+
+### Fixed
+
+- *(executor)* reduce panic on drop ([#937](https://github.com/compio-rs/compio/pull/937))
+
 ## 0.1.0 - 2026-05-27
 
 ### Changed

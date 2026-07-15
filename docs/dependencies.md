@@ -13,7 +13,7 @@ cuts a release that lets us switch to a version requirement.
 
 ## Vendored/patched crates (`[patch]` in root `Cargo.toml`)
 
-### compio-executor (patches 0.1.0)
+### compio-executor (patches 0.1.3)
 
 - **Upstream**: https://github.com/compio-rs/compio
 - **Local copy**: `third_party/compio-executor/`
@@ -23,11 +23,23 @@ cuts a release that lets us switch to a version requirement.
   invalidating the iteration cursor and causing a "prev exists" panic. This
   triggers in practice when a cyper HTTP connection task tears down and wakes
   its request task. The vendored copy snapshots the hot task ids before
-  running them (`third_party/compio-executor/src/lib.rs`, see the "NYDUS LOCAL
-  PATCH" comment around line 181) so the mutation during iteration is safe.
+  running them and tolerates a stale key in `tick()`'s `take` and in
+  `TaskQueue::unlink` (see the "NYDUS LOCAL PATCH" comments in
+  `third_party/compio-executor/src/lib.rs` and `src/queue.rs`).
+- **History**: originally patched 0.1.0. Upstream 0.1.1–0.1.3 independently
+  hardened the *neighbour relinks* in `unlink`/`link_tail` (half the fix) but
+  kept the live hot-list iteration and the stale-key `expect`s, so the patch
+  is still required; it was rebased onto the 0.1.3 sources 2026-07. **The
+  vendored `version` must track whatever compio-runtime resolves to** — when a
+  `cargo update` moves compio-executor past the vendored version, cargo
+  silently demotes the patch to `[[patch.unused]]` (warning only) and ships
+  the unfixed registry crate. That happened with the 0.1.0→0.1.3 lock bump
+  (caught 2026-07-15); after any compio update, verify
+  `cargo tree -i compio-executor` shows the `third_party/` path crate and
+  `Cargo.lock` has no `[[patch.unused]]` entry for it.
 - **Upstream PR/issue status**: **NOT YET FILED.**
 - **Drop trigger**: upstream fixes the tick() cursor invalidation and releases
-  compio-executor > 0.1.0 with the fix; bump the workspace's `compio` version
+  compio-executor > 0.1.3 with the fix; bump the workspace's `compio` version
   requirement past it and delete `third_party/compio-executor/` + the
   `[patch.crates-io]` entry.
 

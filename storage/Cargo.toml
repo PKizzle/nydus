@@ -70,9 +70,9 @@ cyper = { git = "https://github.com/compio-rs/cyper", rev = "d1c8aff18dd81c4b1f8
 # zero-fill fix landing upstream (see the `[patch]` comment in the workspace
 # root Cargo.toml).
 cyper-core = { git = "https://github.com/compio-rs/cyper", rev = "d1c8aff18dd81c4b1f817d0e8e0e05408c15a04c", default-features = false, optional = true }
-rusqlite = { version = "0.39.0", features = ["bundled"], optional = true }
+rusqlite = { version = "0.40.1", features = ["bundled"], optional = true }
 r2d2 = { version = "0.8", optional = true }
-r2d2_sqlite = { version = "0.34.0", optional = true }
+r2d2_sqlite = { version = "0.35.0", optional = true }
 serde = { version = "1.0.110", features = ["serde_derive", "rc"] }
 serde_json = "1.0.53"
 sha1 = { version = "0.11.0", optional = true }

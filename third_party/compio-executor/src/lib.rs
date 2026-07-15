@@ -192,7 +192,8 @@ impl Executor {
             .collect();
         for id in ids {
             queue.make_cold(id);
-            // A previously-run task's waker may have already removed this one.
+            // NYDUS LOCAL PATCH: a previously-run task's waker may have already
+            // removed this one — skip it instead of panicking.
             let Some(task) = queue.take(id) else { continue };
             let res = unsafe { task.run() };
             if res.is_ready() {
