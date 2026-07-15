@@ -1326,7 +1326,7 @@ impl DaemonSupervisor {
         };
 
         let state_path = daemon_root.join("upgrade.state");
-        if let Err(e) = fs::write(&state_path, &state) {
+        if let Err(e) = atomic_write(&state_path, &state) {
             warn!(slug, error = %e, "failed to persist failover state blob; failover disabled for this image");
             return false;
         }
@@ -1667,7 +1667,7 @@ impl DaemonSupervisor {
         })?;
         let encoded =
             serde_json::to_vec_pretty(&record).context("failed to encode daemon record")?;
-        fs::write(self.record_path(&record.slug), encoded).with_context(|| {
+        atomic_write(&self.record_path(&record.slug), &encoded).with_context(|| {
             format!(
                 "failed to persist daemon record {}",
                 self.record_path(&record.slug).display()
@@ -1686,6 +1686,10 @@ impl DaemonSupervisor {
         };
         let mut out = Vec::new();
         for entry in entries.flatten() {
+            // Skip tmp files left behind by a crash inside `atomic_write`.
+            if entry.path().extension().is_some_and(|e| e == "tmp") {
+                continue;
+            }
             match fs::read(entry.path())
                 .ok()
                 .and_then(|bytes| serde_json::from_slice::<DaemonStatusRecord>(&bytes).ok())
@@ -1703,6 +1707,40 @@ fn unix_now() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs() as i64
+}
+
+/// Crash-safe small-file write: write `<path>.tmp`, fsync, rename over `path`,
+/// then fsync the parent directory. The records written through here (daemon
+/// status records, `upgrade.state`, the tarfs verity sidecar) gate mount
+/// takeover after a crash, so a torn write is worse than no file at all —
+/// a truncated record silently disables failover on the next start.
+///
+/// The tmp file lives in the same directory as the target so the rename never
+/// crosses filesystems. Callers stay synchronous: these are sub-KiB writes on
+/// rare state transitions, and ordering with the systemd fd-store push matters.
+fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    use std::io::Write;
+
+    let mut tmp = path.as_os_str().to_os_string();
+    tmp.push(".tmp");
+    let tmp = PathBuf::from(tmp);
+
+    let mut file = fs::File::create(&tmp)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    drop(file);
+
+    if let Err(e) = fs::rename(&tmp, path) {
+        let _ = fs::remove_file(&tmp);
+        return Err(e);
+    }
+
+    // Persist the rename itself: without the directory fsync a crash can
+    // still lose the new entry (or resurrect the old one).
+    if let Some(parent) = path.parent() {
+        fs::File::open(parent)?.sync_all()?;
+    }
+    Ok(())
 }
 
 fn validate_spawn_request(image_ref: &str, bootstrap: &Path) -> Result<()> {
@@ -1923,7 +1961,7 @@ fn store_verity_sidecar(path: &Path, info: &TarfsVerityParams) {
     });
     if let Err(e) = serde_json::to_vec(&json)
         .map_err(io::Error::other)
-        .and_then(|b| fs::write(path, b))
+        .and_then(|b| atomic_write(path, &b))
     {
         warn!(path = %path.display(), error = %e, "failed to persist tarfs verity sidecar; a restart will re-export");
     }
@@ -2229,6 +2267,25 @@ mod tests {
     use super::*;
 
     #[test]
+    fn atomic_write_round_trip_and_overwrite() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("record.json");
+
+        atomic_write(&path, b"first").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"first");
+
+        atomic_write(&path, b"second, longer payload").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"second, longer payload");
+
+        // No tmp residue on the success path.
+        let names: Vec<_> = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names, vec![std::ffi::OsString::from("record.json")]);
+    }
+
+    #[test]
     fn slug_is_deterministic_and_sanitised() {
         let a = slug_for("docker.io/library/nginx:latest");
         let b = slug_for("docker.io/library/nginx:latest");
@@ -2344,6 +2401,33 @@ mod tests {
             updated_at: 0,
             pid: 0,
         }
+    }
+
+    #[test]
+    fn read_persisted_records_skips_atomic_write_leftovers() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = SnapshotterConfig::default();
+        config.snapshotter.root = dir.path().to_path_buf();
+        let supervisor = DaemonSupervisor::new(config);
+
+        fs::create_dir_all(supervisor.record_dir()).unwrap();
+        let record = sample_record(PathBuf::from("/tmp/bootstrap"));
+        fs::write(
+            supervisor.record_path(&record.slug),
+            serde_json::to_vec(&record).unwrap(),
+        )
+        .unwrap();
+        // A crash inside atomic_write leaves a partial tmp file behind; the
+        // reader must ignore it rather than warn on (or worse, decode) it.
+        fs::write(
+            supervisor.record_dir().join("other-app.json.tmp"),
+            b"{\"image_ref\":\"tru",
+        )
+        .unwrap();
+
+        let records = supervisor.read_persisted_records();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].slug, record.slug);
     }
 
     #[test]
