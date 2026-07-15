@@ -296,28 +296,36 @@ mod tests {
     fn no_op_when_flag_unset() {
         // With the flag unset the seam must not touch the network; a client
         // pointed at an unroutable host proves nothing is sent.
-        let client = RegistryClient::new(
-            "registry.invalid:5000",
-            registry_client::RegistryClientOptions {
-                use_docker_config: false,
-                ..Default::default()
-            },
-        )
-        .unwrap();
-        let subject = subject_desc();
-        let retry = RetryPolicy::default();
-        let fut = maybe_push_referrer(
-            false,
-            &client,
-            "team/app",
-            &[],
-            Path::new("/x"),
-            &subject,
-            &retry,
-        );
+        //
+        // `RegistryClient::new` must run INSIDE the compio runtime: when the
+        // workspace unifies cyper's `hickory-dns` feature (nydus-storage
+        // enables it), building a client constructs the Hickory resolver via
+        // `Runtime::current()`. Production matches — `#[compio::main]` wraps
+        // every construction site — so the test does too.
         let result = compio::runtime::Runtime::new()
             .unwrap()
-            .block_on(fut)
+            .block_on(async {
+                let client = RegistryClient::new(
+                    "registry.invalid:5000",
+                    registry_client::RegistryClientOptions {
+                        use_docker_config: false,
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+                let subject = subject_desc();
+                let retry = RetryPolicy::default();
+                maybe_push_referrer(
+                    false,
+                    &client,
+                    "team/app",
+                    &[],
+                    Path::new("/x"),
+                    &subject,
+                    &retry,
+                )
+                .await
+            })
             .unwrap();
         assert!(result.is_none());
     }
