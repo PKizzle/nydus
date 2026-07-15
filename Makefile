@@ -84,8 +84,6 @@ endif
 endif
 TARGET_DIR := $(if $(CARGO_TARGET_DIR),$(CARGO_TARGET_DIR),$(CURDIR)/target)
 
-NYDUSIFY_PATH = contrib/nydusify
-NYDUS-OVERLAYFS_PATH = contrib/nydus-overlayfs
 LLVM_PROFILE_FILE := $(PWD)/coverage/nydus-%p-%m.profraw
 DEBUG_BINARY_DIR := $(TARGET_DIR)/debug/
 GRCOV_ARGS := --binary-path ${DEBUG_BINARY_DIR} -s . \
@@ -208,50 +206,38 @@ coverage-codecov:
 	TEST_WORKDIR_PREFIX=$(TEST_WORKDIR_PREFIX) ${RUSTUP} run stable cargo llvm-cov --codecov --output-path codecov.json --workspace $(EXCLUDE_PACKAGES) $(CARGO_COMMON) $(CARGO_BUILD_FLAGS) -- --skip integration --nocapture --test-threads=8
 
 
-contrib-build: nydusify nydus-overlayfs
+# The Go contrib tools (contrib/nydusify, contrib/nydus-overlayfs) were removed;
+# nydusify is now the Rust workspace crate `nydusify/`. The contrib-* target names
+# are kept because CI workflows call them, but they now cover only the Rust
+# nydusify build (contrib/nydus-backend-proxy is opt-in and unaffected).
+contrib-build: nydusify
 
-contrib-release: nydusify-release nydus-overlayfs-release
+contrib-release: nydusify-release
 
-contrib-test: nydusify-test nydus-overlayfs-test
+contrib-test: nydusify-test
 
-contrib-lint: nydusify-lint nydus-overlayfs-lint
+contrib-lint: nydusify-lint
 
-contrib-clean: nydusify-clean nydus-overlayfs-clean
+contrib-clean: nydusify-clean
 
-contrib-install:
+contrib-install: nydusify-release
 	@sudo mkdir -m 755 -p $(INSTALL_DIR_PREFIX)
-	@sudo install -m 755 contrib/nydus-overlayfs/bin/nydus-overlayfs $(INSTALL_DIR_PREFIX)/nydus-overlayfs
-	@sudo install -m 755 contrib/nydusify/cmd/nydusify $(INSTALL_DIR_PREFIX)/nydusify
+	@sudo install -m 755 $(TARGET_DIR)/release/nydusify $(INSTALL_DIR_PREFIX)/nydusify
 
 nydusify:
-	$(call build_golang,${NYDUSIFY_PATH},make)
+	${CARGO} build -p nydusify
 
 nydusify-release:
-	$(call build_golang,${NYDUSIFY_PATH},make release)
+	${CARGO} build --release -p nydusify
 
 nydusify-test:
-	$(call build_golang,${NYDUSIFY_PATH},make test)
+	${CARGO} test -p nydusify
 
 nydusify-clean:
-	$(call build_golang,${NYDUSIFY_PATH},make clean)
+	${CARGO} clean -p nydusify
 
 nydusify-lint:
-	$(call build_golang,${NYDUSIFY_PATH},make lint)
-
-nydus-overlayfs:
-	$(call build_golang,${NYDUS-OVERLAYFS_PATH},make)
-
-nydus-overlayfs-release:
-	$(call build_golang,${NYDUS-OVERLAYFS_PATH},make release)
-
-nydus-overlayfs-test:
-	$(call build_golang,${NYDUS-OVERLAYFS_PATH},make test)
-
-nydus-overlayfs-clean:
-	$(call build_golang,${NYDUS-OVERLAYFS_PATH},make clean)
-
-nydus-overlayfs-lint:
-	$(call build_golang,${NYDUS-OVERLAYFS_PATH},make lint)
+	${CARGO} clippy -p nydusify --all-targets -- -D warnings
 
 docker-static:
 	docker build -t nydus-rs-static --build-arg RUST_TARGET=${RUST_TARGET_STATIC} misc/musl-static

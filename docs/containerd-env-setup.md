@@ -34,7 +34,7 @@ Note: For private registry repo, please make sure you are authorized to pull and
 sudo nydusify convert --source ubuntu --target localhost:5000/ubuntu-nydus
 ```
 
-For more details about how to build nydus image, please refer to [Nydusify](https://github.com/dragonflyoss/nydus/blob/master/docs/nydusify.md) conversion tool, [Acceld](https://github.com/goharbor/acceleration-service) conversion service or [Nerdctl](https://github.com/containerd/nerdctl/blob/master/docs/nydus.md#build-nydus-image-using-nerdctl-image-convert).
+For more details about how to build nydus image, please refer to [Nydusify](https://github.com/dragonflyoss/nydus/blob/master/docs/nydusify-rust.md) conversion tool, [Acceld](https://github.com/goharbor/acceleration-service) conversion service or [Nerdctl](https://github.com/containerd/nerdctl/blob/master/docs/nydus.md#build-nydus-image-using-nerdctl-image-convert).
 
 ## Start Nydus Snapshotter
 

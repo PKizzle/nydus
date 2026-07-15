@@ -52,10 +52,8 @@ The following Benchmarking results demonstrate that Nydus images significantly o
 | -------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | [nydusd](https://github.com/dragonflyoss/nydus/blob/master/docs/nydusd.md)                   | Nydus user-space daemon, it processes all fanotify/FUSE messages from the kernel and parses Nydus images to fullfil those requests                          |
 | [nydus-image](https://github.com/dragonflyoss/nydus/blob/master/docs/nydus-image.md)         | Convert a single layer of OCI format container image into a nydus format container image generating meta part file and data part file respectively         |
-| [nydusify](https://github.com/dragonflyoss/nydus/blob/master/docs/nydusify.md)               | It pulls OCI image down and unpack it, invokes `nydus-image create` to convert image and then pushes the converted image back to registry and data storage |
+| [nydusify](./docs/nydusify-rust.md)                                                          | The Rust converter CLI (`nydusify/` crate). It pulls an OCI image, invokes `nydus-image create` to convert it, and pushes the converted image back to registry and data storage |
 | [nydusctl](https://github.com/dragonflyoss/nydus/blob/master/docs/nydus-image.md)            | Nydusd CLI client (`nydus-image inspect`), query daemon's working status/metrics and configure it                                                          |
-| [nydus-docker-graphdriver](https://github.com/nydusaccelerator/docker-nydus-graphdriver)     | [Experimental] Works as a `docker` remote graph driver to control how images and containers are stored and managed                                         |
-| [nydus-overlayfs](https://github.com/dragonflyoss/nydus/tree/master/contrib/nydus-overlayfs) | `Containerd` mount helper to invoke overlayfs mount with tweaking mount options a bit. So nydus prerequisites can be passed to vm-based runtime            |
 | [nydus-backend-proxy](./contrib/nydus-backend-proxy/README.md)                               | A simple HTTP server to serve local directory as a blob backend for nydusd                                                                                 |
 
 ### Supported platforms
@@ -88,7 +86,7 @@ make docker-static
 
 ### Build Nydus Image
 
-Convert OCIv1 image to Nydus image: [Nydusify](./docs/nydusify.md), [Acceld](https://github.com/goharbor/acceleration-service) or [Nerdctl](https://github.com/containerd/nerdctl/blob/master/docs/nydus.md#build-nydus-image-using-nerdctl-image-convert).
+Convert OCIv1 image to Nydus image: [Nydusify](./docs/nydusify-rust.md), [Acceld](https://github.com/goharbor/acceleration-service) or [Nerdctl](https://github.com/containerd/nerdctl/blob/master/docs/nydus.md#build-nydus-image-using-nerdctl-image-convert).
 
 Build Nydus image from Dockerfile directly: [Buildkit](https://github.com/nydusaccelerator/buildkit/blob/master/docs/nydus.md).
 

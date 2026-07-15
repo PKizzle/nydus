@@ -1,8 +1,8 @@
 # Nydusify (Rust)
 
-`nydusify/` is the Rust rewrite of the Nydus image conversion utility. It is the **registry-side
-push/convert tool** going forward, replacing the Go `nydusify` (`contrib/nydusify/`, documented at
-[nydusify.md](./nydusify.md)). It is unrelated to *transparent* node-local acceleration
+`nydusify/` is the Rust rewrite of the Nydus image conversion utility, and is now **the** nydusify:
+the **registry-side push/convert tool**. The Go `nydusify` (formerly `contrib/nydusify/`) has been
+removed from this repository. `nydusify` is unrelated to *transparent* node-local acceleration
 (`snapshotter/src/local_accel.rs`, see [ARCHITECTURE.md](../ARCHITECTURE.md) Decision 7), which
 never pushes anything to a registry.
 
@@ -60,7 +60,7 @@ Useful flags (see `--help` for the full list; `nydusify/src/cli.rs` is the sourc
 - `--target-suffix <suffix>` — derive `--target` from `--source` by appending a suffix, instead of
   specifying `--target` explicitly (mutually exclusive with `--target`).
 - `--fs-version {5,6}` (default `6`), `--compressor` (default `zstd`), `--fs-chunk-size` /
-  `--chunk-size` (default `0x100000`), `--batch-size`.
+  `--chunk-size` (default `0x100000`).
 - `--prefetch-dir` / `--prefetch-patterns` (read patterns from stdin) — honored via `nydus-image
   optimize --prefetch-files` in both modes, baking prefetch hints into the bootstrap.
 - `--backend-type {registry,oss,s3,localfs}` + `--backend-config`/`--backend-config-file` — **only

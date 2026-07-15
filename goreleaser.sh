@@ -30,18 +30,6 @@ builds:
       post:
         - cp nydus-static/{{ .Name }} dist/{{ .Name }}_{{ .Target }}/{{ .Name }}
   - main: contrib/goreleaser/main.go
-    id: nydus-overlayfs
-    binary: nydus-overlayfs
-    goos:
-      - $GOOS
-    goarch:
-      - $GOARCH
-    env:
-      - CGO_ENABLED=0
-    hooks:
-      post:
-        - cp nydus-static/{{ .Name }} dist/{{ .Name }}_{{ .Target }}/{{ .Name }}
-  - main: contrib/goreleaser/main.go
     id: nydus-image
     binary: nydus-image
     goos:
@@ -105,7 +93,6 @@ nfpms:
     bindir: /usr/bin
     ids:
       - nydusify
-      - nydus-overlayfs
       - nydus-image
       - nydusctl
       - nydusd

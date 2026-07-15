@@ -67,6 +67,7 @@ jobs:
         sudo mv target/$RUST_TARGET/release/nydusd nydusd
         sudo mv target/$RUST_TARGET/release/nydus-image .
         sudo mv target/$RUST_TARGET/release/nydusctl .
+        sudo mv target/$RUST_TARGET/release/nydusify .
         sudo cp -r misc/configs .
         sudo chown -R $(id -un):$(id -gn) . ~/.cargo/
     - name: store-artifacts
@@ -77,6 +78,7 @@ jobs:
           nydusd
           nydus-image
           nydusctl
+          nydusify
           configs
 
   nydus-macos:
@@ -116,41 +118,13 @@ jobs:
           nydusd
           configs
 
-  contrib-linux:
-    runs-on: ${{ vars.RUNNER_OS || 'ubuntu-latest' }}
-    strategy:
-      matrix:
-        arch: [amd64, arm64, ppc64le, riscv64]
-    env:
-      DOCKER: false
-    steps:
-    - uses: actions/checkout@v6
-    - name: Setup Golang
-      uses: actions/setup-go@v6
-      with:
-        go-version-file: 'go.work'
-        cache-dependency-path: "**/*.sum"
-    - name: build contrib go components
-      run: |
-        make -e GOARCH=${{ matrix.arch }} contrib-release
-        sudo mv contrib/nydusify/cmd/nydusify .
-        sudo mv contrib/nydus-overlayfs/bin/nydus-overlayfs .
-    - name: store-artifacts
-      uses: actions/upload-artifact@v6
-      with:
-        name: nydus-artifacts-linux-${{ matrix.arch }}-contrib
-        path: |
-          nydusify
-          nydus-overlayfs
-          containerd-nydus-grpc
-
   prepare-tarball-linux:
     runs-on: ${{ vars.RUNNER_OS || 'ubuntu-latest' }}
     strategy:
       matrix:
         arch: [amd64, arm64, ppc64le, riscv64]
         os: [linux]
-    needs: [nydus-linux, contrib-linux]
+    needs: [nydus-linux]
     steps:
     - name: download artifacts
       uses: actions/download-artifact@v7
@@ -246,7 +220,7 @@ jobs:
       matrix:
         arch: [amd64, arm64]
         os: [linux]
-    needs: [nydus-linux, contrib-linux]
+    needs: [nydus-linux]
     permissions:
       contents: write
     runs-on: ${{ vars.RUNNER_OS || 'ubuntu-latest' }}

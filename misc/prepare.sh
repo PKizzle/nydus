@@ -16,7 +16,8 @@ readonly NERDCTL_VERSION=1.7.6
 readonly CNI_PLUGINS_VERSION=`curl -s https://api.github.com/repos/containernetworking/plugins/releases/latest | grep tag_name | cut -f4 -d "\""`
 
 # setup nerdctl and nydusd env
-sudo install -D -m 755 contrib/nydusify/cmd/nydusify /usr/local/bin
+# nydusify is now the in-repo Rust crate (cargo build -p nydusify); the Go contrib/nydusify is gone.
+sudo install -D -m 755 target/$INSTALL_TARGET_TYPE/nydusify /usr/local/bin
 sudo install -D -m 755 target/$INSTALL_TARGET_TYPE/nydusd target/$INSTALL_TARGET_TYPE/nydus-image /usr/local/bin
 # Install the in-repo Rust nydus snapshotter (containerd-nydus). It links nydus-service and runs the
 # daemon in-process from a single unified TOML config, replacing the legacy Go containerd-nydus-grpc
