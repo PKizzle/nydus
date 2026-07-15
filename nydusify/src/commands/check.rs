@@ -34,7 +34,7 @@ pub async fn run(args: CheckArgs) -> Result<()> {
         .with_context(|| format!("parse --target {}", plan.target))?;
     let target_client = RegistryClient::new(
         &target_ref.api_host,
-        client_options(args.target_insecure, false),
+        client_options(args.target_insecure, false, &args.ca_cert),
     )
     .context("build target registry client")?;
 
@@ -59,7 +59,11 @@ pub async fn run(args: CheckArgs) -> Result<()> {
     // attached to the source image as a referrer artifact. Verify it exists and
     // its subject matches the source manifest digest.
     if let Some(source) = &plan.source {
-        check_referrer_linkage(&source_client_for(source, args.source_insecure)?, source).await?;
+        check_referrer_linkage(
+            &source_client_for(source, args.source_insecure, &args.ca_cert)?,
+            source,
+        )
+        .await?;
     }
 
     // (3) Download the bootstrap and run `nydus-image check` on it.
@@ -78,11 +82,18 @@ pub async fn run(args: CheckArgs) -> Result<()> {
 }
 
 /// Build a registry client for the source image reference.
-fn source_client_for(source: &str, insecure: bool) -> Result<(RegistryClient, ImageReference)> {
+fn source_client_for(
+    source: &str,
+    insecure: bool,
+    ca_cert_files: &[std::path::PathBuf],
+) -> Result<(RegistryClient, ImageReference)> {
     let source_ref =
         ImageReference::parse(source).with_context(|| format!("parse --source {source}"))?;
-    let client = RegistryClient::new(&source_ref.api_host, client_options(insecure, false))
-        .context("build source registry client")?;
+    let client = RegistryClient::new(
+        &source_ref.api_host,
+        client_options(insecure, false, ca_cert_files),
+    )
+    .context("build source registry client")?;
     Ok((client, source_ref))
 }
 
@@ -196,6 +207,7 @@ mod tests {
             target: "registry.example.com/base:latest-nydus".to_string(),
             source_insecure: false,
             target_insecure: false,
+            ca_cert: Vec::new(),
             source_backend_type: None,
             source_backend_config: None,
             source_backend_config_file: None,

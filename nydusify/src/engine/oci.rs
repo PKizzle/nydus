@@ -6,15 +6,26 @@
 //! registry-client option construction, manifest-vs-index detection, platform
 //! selection out of an image index, and blob-id derivation.
 
+use std::path::Path;
+
 use anyhow::{Result, anyhow, bail};
 use registry_client::{Descriptor, FetchedManifest, Index, RegistryClient, RegistryClientOptions};
 
-/// Build [`RegistryClientOptions`] from the CLI's `--*-insecure` / `--plain-http`
-/// switches, keeping the secure, time-bounded defaults for everything else.
-pub fn client_options(insecure: bool, plain_http: bool) -> RegistryClientOptions {
+/// Build [`RegistryClientOptions`] from the CLI's `--*-insecure` /
+/// `--plain-http` / `--ca-cert` switches, keeping the secure, time-bounded
+/// defaults for everything else.
+pub fn client_options(
+    insecure: bool,
+    plain_http: bool,
+    ca_cert_files: &[impl AsRef<Path>],
+) -> RegistryClientOptions {
     RegistryClientOptions {
         plain_http,
         insecure_tls: insecure,
+        ca_cert_files: ca_cert_files
+            .iter()
+            .map(|p| p.as_ref().to_path_buf())
+            .collect(),
         ..RegistryClientOptions::default()
     }
 }

@@ -45,7 +45,7 @@ pub async fn run(args: MountArgs) -> Result<()> {
         .with_context(|| format!("parse --target {}", plan.target))?;
     let client = RegistryClient::new(
         &target_ref.api_host,
-        client_options(args.target_insecure, false),
+        client_options(args.target_insecure, false, &args.ca_cert),
     )
     .context("build registry client")?;
 
@@ -351,6 +351,7 @@ mod tests {
         MountArgs {
             target: "registry.example.com/base:latest-nydus".to_string(),
             target_insecure: false,
+            ca_cert: Vec::new(),
             backend_type: None,
             backend_config: None,
             backend_config_file: None,

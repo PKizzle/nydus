@@ -105,6 +105,11 @@ pub struct ConvertArgs {
     pub source_insecure: bool,
     #[arg(long = "target-insecure", env = "TARGET_INSECURE")]
     pub target_insecure: bool,
+    /// Extra PEM CA certificate file(s) trusted in addition to the system
+    /// store, for registries signed by a private CA (applies to both source
+    /// and target). Repeatable; ignored when `--*-insecure` is set.
+    #[arg(long = "ca-cert", env = "CA_CERT", value_delimiter = ',')]
+    pub ca_cert: Vec<PathBuf>,
     #[arg(long = "source-backend-type", value_enum, env = "SOURCE_BACKEND_TYPE")]
     pub source_backend_type: Option<BackendType>,
     #[arg(long = "source-backend-config", env = "SOURCE_BACKEND_CONFIG")]
@@ -220,6 +225,11 @@ pub struct CheckArgs {
     pub source_insecure: bool,
     #[arg(long = "target-insecure", env = "TARGET_INSECURE")]
     pub target_insecure: bool,
+    /// Extra PEM CA certificate file(s) trusted in addition to the system
+    /// store, for registries signed by a private CA (applies to both source
+    /// and target). Repeatable; ignored when `--*-insecure` is set.
+    #[arg(long = "ca-cert", env = "CA_CERT", value_delimiter = ',')]
+    pub ca_cert: Vec<PathBuf>,
     #[arg(long = "source-backend-type", value_enum, env = "SOURCE_BACKEND_TYPE")]
     pub source_backend_type: Option<BackendType>,
     #[arg(long = "source-backend-config", env = "SOURCE_BACKEND_CONFIG")]
@@ -260,6 +270,11 @@ pub struct MountArgs {
     pub target: String,
     #[arg(long = "target-insecure", env = "TARGET_INSECURE")]
     pub target_insecure: bool,
+    /// Extra PEM CA certificate file(s) trusted in addition to the system
+    /// store, for registries signed by a private CA. Repeatable; ignored
+    /// when `--target-insecure` is set.
+    #[arg(long = "ca-cert", env = "CA_CERT", value_delimiter = ',')]
+    pub ca_cert: Vec<PathBuf>,
     #[arg(long = "backend-type", value_enum, env = "BACKEND_TYPE")]
     pub backend_type: Option<BackendType>,
     #[arg(long = "backend-config", env = "BACKEND_CONFIG")]
@@ -288,6 +303,11 @@ pub struct CopyArgs {
     pub source_insecure: bool,
     #[arg(long = "target-insecure", env = "TARGET_INSECURE")]
     pub target_insecure: bool,
+    /// Extra PEM CA certificate file(s) trusted in addition to the system
+    /// store, for registries signed by a private CA (applies to both source
+    /// and target). Repeatable; ignored when `--*-insecure` is set.
+    #[arg(long = "ca-cert", env = "CA_CERT", value_delimiter = ',')]
+    pub ca_cert: Vec<PathBuf>,
     #[arg(long = "source-backend-type", value_enum, env = "SOURCE_BACKEND_TYPE")]
     pub source_backend_type: Option<BackendType>,
     #[arg(long = "source-backend-config", env = "SOURCE_BACKEND_CONFIG")]

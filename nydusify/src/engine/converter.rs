@@ -91,7 +91,11 @@ pub async fn run_conversion(request: &ConvertRequest, workspace: &Path) -> Resul
 
     let source_client = RegistryClient::new(
         &source_ref.api_host,
-        client_options(request.source_insecure, request.plain_http),
+        client_options(
+            request.source_insecure,
+            request.plain_http,
+            &request.ca_cert_files,
+        ),
     )
     .context("build source registry client")?;
 
@@ -110,7 +114,11 @@ pub async fn run_conversion(request: &ConvertRequest, workspace: &Path) -> Resul
     // ---- push ----
     let target_client = RegistryClient::new(
         &target_ref.api_host,
-        client_options(request.target_insecure, request.plain_http),
+        client_options(
+            request.target_insecure,
+            request.plain_http,
+            &request.ca_cert_files,
+        ),
     )
     .context("build target registry client")?;
     let same_registry = source_ref.api_host == target_ref.api_host;

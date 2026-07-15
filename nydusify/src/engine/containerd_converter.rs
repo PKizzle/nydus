@@ -61,6 +61,7 @@ pub struct ConvertRequest {
     pub mode: ConversionMode,
     pub source_insecure: bool,
     pub target_insecure: bool,
+    pub ca_cert_files: Vec<PathBuf>,
     pub source_backend_type: Option<String>,
     pub source_backend_config: Option<String>,
     pub all_platforms: bool,
@@ -98,6 +99,7 @@ impl ConvertRequest {
             mode: plan.mode,
             source_insecure: args.source_insecure,
             target_insecure: args.target_insecure,
+            ca_cert_files: args.ca_cert.clone(),
             source_backend_type: args
                 .source_backend_type
                 .map(BackendType::as_str)
