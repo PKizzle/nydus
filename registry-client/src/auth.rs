@@ -28,7 +28,7 @@ use http::header::{ACCEPT, AUTHORIZATION, HeaderValue};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Explicit registry credentials (HTTP basic auth / token-service login).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -78,31 +78,91 @@ pub fn mount_scope(repo: &str, from_repo: &str) -> String {
     format!("repository:{repo}:pull,push repository:{from_repo}:pull")
 }
 
+/// Default token lifetime when the token service omits `expires_in`
+/// (the OCI distribution token spec defines 60 seconds as the minimum).
+const DEFAULT_TOKEN_TTL_SECS: u64 = 60;
+/// Re-mint this long before nominal expiry so an in-flight request never
+/// carries a token that expires mid-transfer (mirrors the storage backend's
+/// `REGISTRY_TOKEN_REFRESH_MARGIN`).
+const TOKEN_REFRESH_MARGIN_SECS: u64 = 20;
+/// Upper bound for the per-cache random offset added to the margin, so a
+/// fleet of clients minted at the same moment does not refresh in lockstep.
+const TOKEN_REFRESH_JITTER_MAX_SECS: u64 = 10;
+
 /// Small per-client bearer token cache, keyed by scope.
 ///
 /// A [`RegistryClient`](crate::RegistryClient) is bound to a single registry
 /// and a scope embeds the repository and the actions, so a scope key is
 /// exactly the "registry + repo + actions" granularity tokens are issued at.
-#[derive(Debug, Default)]
+///
+/// Entries expire: a token is served only until `expires_in` minus a
+/// refresh-ahead margin (plus a per-cache jitter), after which `get` returns
+/// `None` and the normal 401-challenge path re-mints. No singleflight is
+/// needed — each cache lives behind a `RefCell` on a single-threaded compio
+/// client, so lookups and refreshes are sequential.
+#[derive(Debug)]
 pub struct TokenCache {
-    map: HashMap<String, String>,
+    map: HashMap<String, CachedToken>,
+    jitter: Duration,
+}
+
+#[derive(Debug)]
+struct CachedToken {
+    token: String,
+    refresh_at: Instant,
+}
+
+impl Default for TokenCache {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl TokenCache {
-    /// Create an empty cache.
+    /// Create an empty cache with a randomized refresh jitter.
     pub fn new() -> Self {
-        Self::default()
+        // A hash of a fresh RandomState keeps this dependency-free while
+        // still de-synchronizing caches created across processes/nodes.
+        use std::hash::{BuildHasher, Hasher};
+        let seed = std::collections::hash_map::RandomState::new()
+            .build_hasher()
+            .finish();
+        Self {
+            map: HashMap::new(),
+            jitter: Duration::from_secs(seed % (TOKEN_REFRESH_JITTER_MAX_SECS + 1)),
+        }
     }
 
-    /// Look up a cached token for `scope`.
+    /// Look up a still-fresh cached token for `scope`.
     pub fn get(&self, scope: &str) -> Option<&str> {
-        self.map.get(scope).map(String::as_str)
+        self.map
+            .get(scope)
+            .filter(|entry| Instant::now() < entry.refresh_at)
+            .map(|entry| entry.token.as_str())
     }
 
     /// Cache `token` under `scope`, replacing any previous token.
-    pub fn insert(&mut self, scope: &str, token: &str) {
-        self.map.insert(scope.to_string(), token.to_string());
+    /// `expires_in` is the token service's advertised lifetime in seconds.
+    pub fn insert(&mut self, scope: &str, token: &str, expires_in: Option<u64>) {
+        let refresh_at = compute_refresh_at(Instant::now(), expires_in, self.jitter);
+        self.map.insert(
+            scope.to_string(),
+            CachedToken {
+                token: token.to_string(),
+                refresh_at,
+            },
+        );
     }
+}
+
+/// When a token inserted at `now` should stop being served: nominal expiry
+/// minus the refresh-ahead margin and jitter, floored at half the lifetime so
+/// short-lived tokens are still cached at all.
+fn compute_refresh_at(now: Instant, expires_in: Option<u64>, jitter: Duration) -> Instant {
+    let ttl = Duration::from_secs(expires_in.unwrap_or(DEFAULT_TOKEN_TTL_SECS));
+    let lead = Duration::from_secs(TOKEN_REFRESH_MARGIN_SECS) + jitter;
+    let usable = std::cmp::max(ttl.saturating_sub(lead), ttl / 2);
+    now + usable
 }
 
 /// Normalize a raw auth string into an `Authorization` header value: an
@@ -179,11 +239,25 @@ pub(crate) fn percent_encode_query(value: &str) -> String {
 struct RegistryTokenResponse {
     token: Option<String>,
     access_token: Option<String>,
+    #[serde(default)]
+    expires_in: Option<u64>,
+}
+
+/// A minted bearer token plus the lifetime the token service advertised.
+#[derive(Debug)]
+pub struct BearerToken {
+    /// The opaque bearer token value.
+    pub token: String,
+    /// Advertised lifetime in seconds, when the service reported one.
+    pub expires_in: Option<u64>,
 }
 
 impl RegistryTokenResponse {
-    fn into_token(self) -> Option<String> {
-        self.token.or(self.access_token)
+    fn into_bearer(self) -> Option<BearerToken> {
+        let expires_in = self.expires_in;
+        self.token
+            .or(self.access_token)
+            .map(|token| BearerToken { token, expires_in })
     }
 }
 
@@ -201,7 +275,7 @@ pub async fn fetch_bearer_token(
     scope: &str,
     basic_auth: Option<&str>,
     timeout: Option<Duration>,
-) -> Result<String> {
+) -> Result<BearerToken> {
     let mut url = challenge.realm.clone();
     let sep = if url.contains('?') { '&' } else { '?' };
     url.push(sep);
@@ -241,7 +315,7 @@ pub async fn fetch_bearer_token(
         .json::<RegistryTokenResponse>()
         .await
         .context("failed to decode registry token response")?
-        .into_token()
+        .into_bearer()
         .context("registry token response did not include a token")
 }
 
@@ -409,12 +483,52 @@ mod tests {
     fn token_cache_round_trip() {
         let mut cache = TokenCache::new();
         assert!(cache.get("repository:a:pull").is_none());
-        cache.insert("repository:a:pull", "tok1");
-        cache.insert("repository:a:pull,push", "tok2");
+        cache.insert("repository:a:pull", "tok1", Some(300));
+        cache.insert("repository:a:pull,push", "tok2", None);
         assert_eq!(cache.get("repository:a:pull"), Some("tok1"));
         assert_eq!(cache.get("repository:a:pull,push"), Some("tok2"));
-        cache.insert("repository:a:pull", "tok3");
+        cache.insert("repository:a:pull", "tok3", Some(300));
         assert_eq!(cache.get("repository:a:pull"), Some("tok3"));
+    }
+
+    #[test]
+    fn token_cache_expires_entries() {
+        let mut cache = TokenCache::new();
+        // A zero-lifetime token is floored at ttl/2 = 0, so it is immediately
+        // past its refresh point and must never be served.
+        cache.insert("repository:a:pull", "tok", Some(0));
+        assert!(cache.get("repository:a:pull").is_none());
+    }
+
+    #[test]
+    fn refresh_at_applies_margin_and_floors_short_lifetimes() {
+        let now = Instant::now();
+        let jitter = Duration::from_secs(5);
+
+        // 300s lifetime: refresh 20s margin + 5s jitter ahead of expiry.
+        assert_eq!(
+            compute_refresh_at(now, Some(300), jitter),
+            now + Duration::from_secs(275)
+        );
+        // Absent lifetime: spec default of 60s applies.
+        assert_eq!(
+            compute_refresh_at(now, None, jitter),
+            now + Duration::from_secs(35)
+        );
+        // Lifetime shorter than margin+jitter: floored at half the lifetime
+        // instead of collapsing to "never cache".
+        assert_eq!(
+            compute_refresh_at(now, Some(10), jitter),
+            now + Duration::from_secs(5)
+        );
+    }
+
+    #[test]
+    fn token_cache_jitter_is_bounded() {
+        for _ in 0..32 {
+            let cache = TokenCache::new();
+            assert!(cache.jitter <= Duration::from_secs(TOKEN_REFRESH_JITTER_MAX_SECS));
+        }
     }
 
     #[test]

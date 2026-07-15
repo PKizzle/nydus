@@ -599,7 +599,7 @@ impl RegistryClient {
             .scope
             .clone()
             .unwrap_or_else(|| requested_scope.to_string());
-        let token = fetch_bearer_token(
+        let bearer = fetch_bearer_token(
             &self.client,
             challenge,
             &token_scope,
@@ -609,12 +609,12 @@ impl RegistryClient {
         .await?;
         {
             let mut cache = self.tokens.borrow_mut();
-            cache.insert(requested_scope, &token);
+            cache.insert(requested_scope, &bearer.token, bearer.expires_in);
             if token_scope != requested_scope {
-                cache.insert(&token_scope, &token);
+                cache.insert(&token_scope, &bearer.token, bearer.expires_in);
             }
         }
-        HeaderValue::from_str(&format!("Bearer {token}"))
+        HeaderValue::from_str(&format!("Bearer {}", bearer.token))
             .context("registry bearer token contained invalid header characters")
     }
 
@@ -864,7 +864,7 @@ mod tests {
         client
             .tokens
             .borrow_mut()
-            .insert("repository:a:pull", "tok");
+            .insert("repository:a:pull", "tok", Some(300));
         assert_eq!(
             client
                 .initial_auth_header("repository:a:pull")

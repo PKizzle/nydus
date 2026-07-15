@@ -35,6 +35,7 @@ const REGISTRY_CONFIG_POLL_INTERVAL: u64 = 5; // in seconds
 
 // Refresh tokens this many seconds before they expire to avoid using an expired token.
 const REGISTRY_TOKEN_REFRESH_MARGIN: u64 = 20; // in seconds
+const REGISTRY_TOKEN_REFRESH_JITTER_MAX: u64 = 10; // in seconds
 
 /// Error codes related to registry storage backend operations.
 #[derive(Debug)]
@@ -1195,6 +1196,16 @@ impl Registry {
         let request = self.request.clone();
         let state = self.state.clone();
         thread::spawn(move || {
+            // Randomize the refresh lead per process so a fleet of nodes that
+            // pulled the same image at the same moment does not stampede the
+            // token service in lockstep when the tokens age out together.
+            let refresh_lead = {
+                use std::hash::{BuildHasher, Hasher};
+                let seed = std::collections::hash_map::RandomState::new()
+                    .build_hasher()
+                    .finish();
+                REGISTRY_TOKEN_REFRESH_MARGIN + seed % (REGISTRY_TOKEN_REFRESH_JITTER_MAX + 1)
+            };
             loop {
                 // Check for config auth changes every tick.
                 state.refresh_cached_auth_from_config(&request);
@@ -1203,7 +1214,7 @@ impl Registry {
                     && let Some(token_expired_at) = state.token_expired_at.load().as_deref()
                 {
                     // Refresh the token if it will expire within the margin.
-                    if now_timestamp.as_secs() + REGISTRY_TOKEN_REFRESH_MARGIN >= *token_expired_at
+                    if now_timestamp.as_secs() + refresh_lead >= *token_expired_at
                         && let Some(cached_bearer_auth) = state.cached_bearer_auth.load().as_deref()
                     {
                         if let Ok(token) = state.get_token(cached_bearer_auth.to_owned(), &request)
