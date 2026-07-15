@@ -53,9 +53,8 @@ const FILE_HASH_CHUNK: usize = 1024 * 1024;
 /// Per-call disambiguator for [`RegistryClient::get_blob_to_file`]'s temp
 /// file name, on top of the process id. The pid alone only makes the name
 /// unique per *process*: two concurrent `get_blob_to_file` calls in the same
-/// process targeting the same destination path (e.g. a future concurrent
-/// pull/copy that fetches the same digest twice) would otherwise share one
-/// `part.<pid>` temp file and race on `File::create`'s truncation. This
+/// process targeting the same destination path would otherwise share one
+/// `part.<pid>` temp file and race on `File::create`'s truncation. The
 /// counter is bumped on every call, making each call's temp path unique
 /// regardless of in-process concurrency.
 static TEMP_FILE_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -726,8 +725,8 @@ pub fn resolve_location(base: &str, location: &str) -> String {
 }
 
 /// Append `key=value` to a URL's query string, using `?` or `&` depending on
-/// whether the URL already has query parameters (the b4b `sep` dance). The
-/// value is percent-encoded, so digests (`sha256:...`) are safe.
+/// whether the URL already has query parameters. The value is
+/// percent-encoded, so digests (`sha256:...`) are safe.
 pub fn append_query_param(url: &str, key: &str, value: &str) -> String {
     let sep = if url.contains('?') { '&' } else { '?' };
     format!("{url}{sep}{key}={}", percent_encode_query(value))
@@ -738,20 +737,15 @@ pub fn append_query_param(url: &str, key: &str, value: &str) -> String {
 ///
 /// A `Content-Length` pre-check alone cannot stop a registry that omits or
 /// lies about the header, or that uses chunked transfer-encoding (no length
-/// header at all): a naive implementation would call `.bytes()` — which
-/// buffers the entire body — before any check ever ran, so a hostile body of
-/// unbounded size would already be fully collected in memory by the time the
-/// post-hoc length check fires. Instead this reads the body chunk-by-chunk
-/// via [`Response::bytes_stream`] (the same streaming accessor
-/// [`RegistryClient::get_blob_to_file`] uses to write to disk) through
-/// [`collect_bounded`], which tracks the running total and bails the moment
-/// it crosses `max_bytes` — so at most one in-flight chunk over the cap is
-/// ever buffered, regardless of what the registry claims or how it frames
-/// the response.
+/// header at all). So the body is read chunk-by-chunk via
+/// [`Response::bytes_stream`] through [`collect_bounded`], which tracks the
+/// running total and bails the moment it crosses `max_bytes` — at most one
+/// in-flight chunk over the cap is ever buffered, regardless of what the
+/// registry claims or how it frames the response.
 ///
-/// The `Content-Length` check is kept as a cheap fast-path rejection (skip
-/// opening the stream at all when the registry honestly advertises an
-/// oversized body up front); it is not load-bearing for the guarantee above.
+/// The `Content-Length` check is a cheap fast-path rejection (skip opening
+/// the stream at all when the registry honestly advertises an oversized body
+/// up front); it is not load-bearing for the guarantee above.
 async fn read_bounded(response: Response, url: &str, max_bytes: u64) -> Result<Vec<u8>> {
     if let Some(len) = response
         .headers()
@@ -772,11 +766,9 @@ async fn read_bounded(response: Response, url: &str, max_bytes: u64) -> Result<V
 ///
 /// Generic over the chunk type (anything `AsRef<[u8]>`, e.g. `bytes::Bytes`
 /// as yielded by [`Response::bytes_stream`]) and the stream's error type, so
-/// this needs no direct dependency on the `bytes` crate and is exercisable
-/// in tests against a plain `futures::stream::iter` of `Vec<u8>` chunks
-/// without a live server. The stream is boxed internally (mirroring
-/// [`RegistryClient::get_blob_to_file`]'s existing pattern) so callers don't
-/// need to prove `Unpin` themselves.
+/// it needs no direct dependency on the `bytes` crate and tests can drive it
+/// with a plain `futures::stream::iter` of `Vec<u8>` chunks. The stream is
+/// boxed internally so callers don't need to prove `Unpin` themselves.
 async fn collect_bounded<S, B, E>(stream: S, max_bytes: u64, label: &str) -> Result<Vec<u8>>
 where
     S: futures::Stream<Item = std::result::Result<B, E>>,
@@ -904,12 +896,12 @@ mod tests {
 
     #[test]
     fn append_query_param_uses_question_mark_or_ampersand() {
-        // No existing query: `?` (the b4b sep='?' case).
+        // No existing query: `?`.
         assert_eq!(
             append_query_param("https://r/v2/x/blobs/uploads/u", "digest", "sha256:abc"),
             "https://r/v2/x/blobs/uploads/u?digest=sha256%3Aabc"
         );
-        // Existing query (registry:2's `?_state=`): `&` (the sep='&' case).
+        // Existing query (registry:2's `?_state=`): `&`.
         assert_eq!(
             append_query_param(
                 "https://r/v2/x/blobs/uploads/u?_state=s1",
@@ -976,12 +968,10 @@ mod tests {
 
     #[compio::test]
     async fn collect_bounded_never_had_content_length_to_lean_on() {
-        // Regression guard for the bug this fixes: with no Content-Length
-        // header available at all (chunked transfer-encoding), the cap must
-        // still be enforced purely from the running total of streamed
-        // chunks. Simulate a body that is one byte over the cap and confirm
-        // it is rejected even though nothing here ever consulted a length
-        // header.
+        // With no Content-Length header at all (chunked transfer-encoding),
+        // the cap must be enforced purely from the running total of streamed
+        // chunks. A body one byte over the cap is rejected even though no
+        // length header was ever consulted.
         let cap = 1024u64;
         let chunks: Vec<std::result::Result<Vec<u8>, std::io::Error>> =
             vec![Ok(vec![0u8; 1024]), Ok(vec![0u8; 1])];

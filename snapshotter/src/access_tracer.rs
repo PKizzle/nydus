@@ -27,11 +27,11 @@
 //!
 //! Concurrency note (CLAUDE.md gotcha #1): the event loop runs on its own OS
 //! thread (`std::thread::Builder`), not on the gRPC compio runtime. Each
-//! fanotify event is processed synchronously; we never block the snapshotter's
-//! main runtime.
+//! fanotify event is processed synchronously; the snapshotter's main runtime
+//! is never blocked.
 //!
 //! The tracer is a no-op if `auto_zran.capture.enable = false`, if
-//! `Fanotify::init(FAN_CLASS_NOTIF)` fails (e.g. kernel too old, missing
+//! `Fanotify::init(FAN_CLASS_NOTIF)` fails (fanotify unavailable, or missing
 //! `CAP_SYS_ADMIN`), or if marking the mount returns `ENOTSUP` (e.g. work_dir
 //! on tmpfs — same constraint as the pre-content path).
 
@@ -72,8 +72,8 @@ struct ImageCapture {
     /// lives on. `FAN_MARK_MOUNT` marks are per-vfsmount, not per-directory:
     /// every capture whose root sits on the same host filesystem shares one
     /// kernel mark, so mark add/remove must be refcounted per device (see
-    /// `Inner::mount_marks`) — removing it when *one* image finishes used to
-    /// silently end event delivery for every other in-flight capture.
+    /// `Inner::mount_marks`) — removing the mark when one image finishes
+    /// would silently end event delivery for every other in-flight capture.
     mark_dev: u64,
     first_seen: Instant,
     last_event: Instant,
@@ -134,8 +134,8 @@ struct Inner {
     /// lock on the hot event-loop path.
     auto_zran: std::sync::OnceLock<Arc<AutoZranManager>>,
     /// Set the first time `flush_profile` observes `auto_zran` still empty at
-    /// settle time, so the "wiring never happened" warning below fires once
-    /// per process instead of once per settled image.
+    /// settle time, so the "wiring never happened" warning fires once per
+    /// process instead of once per settled image.
     warned_auto_zran_unset: std::sync::atomic::AtomicBool,
     /// Keyed by mount_root canonical path.
     mounts: Mutex<HashMap<PathBuf, ImageCapture>>,
@@ -162,10 +162,9 @@ struct Metrics {
 
 impl AccessTracer {
     /// Start the tracer. Returns a disabled tracer (all methods become
-    /// no-ops) when the config disables it, when `Fanotify::init` fails, or
-    /// when the host kernel is older than 6.14 (probed elsewhere; this just
-    /// checks for the init success). Errors during start are logged at
-    /// `warn!` and the returned tracer is disabled.
+    /// no-ops) when the config disables it or when `Fanotify::init` fails
+    /// (fanotify unavailable, or missing `CAP_SYS_ADMIN`). Errors during
+    /// start are logged at `warn!` and the returned tracer is disabled.
     pub fn start(
         config: AccessCaptureConfig,
         profile_store: PrefetchProfileStore,
@@ -233,8 +232,8 @@ impl AccessTracer {
                 .name("nydus-access-tracer".to_string())
                 .spawn(move || run_event_loop(inner_for_thread))
                 .map(|h| {
-                    // Detach: we don't join. The loop is bounded by drop of the
-                    // last `Arc<Inner>` (sentinel check on each iter).
+                    // Detached (never joined): the loop exits once this
+                    // `Arc<Inner>` is the last reference (checked each iteration).
                     drop(h);
                 })
                 .unwrap_or_else(|err| {
@@ -259,8 +258,8 @@ impl AccessTracer {
     /// Callers should attach **every** lowerdir of the image's chain (see the
     /// gRPC prepare path): events are attributed to a capture by mount-root
     /// prefix, so a mark that only covers lowerdir[0] silently drops opens of
-    /// files that physically live in the other layers — multi-layer images
-    /// ended up with systematically truncated prefetch profiles.
+    /// files that physically live in the other layers, yielding systematically
+    /// truncated prefetch profiles for multi-layer images.
     ///
     /// `holder` is the snapshot key attaching; its removal drops the reference
     /// via [`detach_holder`](Self::detach_holder).
@@ -348,7 +347,7 @@ impl AccessTracer {
                     format!("FAN_MARK_ADD | FAN_MARK_MOUNT on {}", canonical.display())
                 })
             {
-                // Roll back the refcount we just took.
+                // Roll back the refcount taken above.
                 if let Ok(mut marks) = self.inner.mount_marks.lock()
                     && let Some(count) = marks.get_mut(&mark_dev)
                 {

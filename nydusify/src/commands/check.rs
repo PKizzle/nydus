@@ -71,8 +71,8 @@ pub async fn run(args: CheckArgs) -> Result<()> {
         .with_context(|| format!("download bootstrap {}", bootstrap.digest))?;
     run_nydus_image_check(&args.nydus_image, &bootstrap_path)?;
 
-    // NOTE (v1): no mount-diff check (comparing the mounted nydus rootfs against
-    // the source rootfs). That needs a nydusd mount + source extraction; deferred.
+    // NOTE: no mount-diff check (comparing the mounted nydus rootfs against
+    // the source rootfs). That needs a nydusd mount + source extraction.
     info!(target = %target_ref, "check passed: valid nydus image, bootstrap verified");
     Ok(())
 }
@@ -91,8 +91,8 @@ fn source_client_for(source: &str, insecure: bool) -> Result<(RegistryClient, Im
 /// registry-client has no referrers-API (`GET /v2/<repo>/referrers/<digest>`)
 /// method, so this checks only the `sha256-<subject-hex>` fallback tag in the
 /// source repo (which nydusify itself publishes). A registry that exposes the
-/// artifact *only* via the native referrers API (no fallback tag) would not be
-/// detected here — see the reported registry-client gap.
+/// artifact *only* via the native referrers API (no fallback tag) is not
+/// detected here.
 async fn check_referrer_linkage(
     ctx: &(RegistryClient, ImageReference),
     source: &str,

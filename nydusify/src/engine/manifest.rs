@@ -28,7 +28,7 @@ use registry_client::types::{
 };
 
 /// Annotation set on nydus data-blob layers so containerd's snapshotter
-/// classifies them as [`LayerKind::NydusData`]. Mirrors the snapshotter's
+/// classifies them as `LayerKind::NydusData`. Mirrors the snapshotter's
 /// `NYDUS_DATA_LAYER` label.
 pub const ANNOTATION_NYDUS_DATA: &str = "containerd.io/snapshot/nydus-blob";
 /// Annotation set on the nydus bootstrap layer. Mirrors the snapshotter's

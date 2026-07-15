@@ -4,11 +4,11 @@
 
 //! Containerd-converter compatible request layer for nydusify-rs.
 //!
-//! The legacy Go implementation routes conversion through Harbor's
-//! acceleration-service wrapper and a snapshotter-converter driver. This module
-//! deliberately models the same provider + `nydus` driver contract without
-//! depending on the acceleration-service package, so the Rust converter backend
-//! can be added behind [`ImageConverter`] in follow-up patches.
+//! The Go implementation routes conversion through Harbor's
+//! acceleration-service wrapper and a snapshotter-converter driver. This
+//! module models the same provider + `nydus` driver contract without
+//! depending on the acceleration-service package; [`ImageConverter`]
+//! dispatches to the conversion pipeline in [`crate::engine::converter`].
 
 use std::collections::BTreeMap;
 use std::fs;

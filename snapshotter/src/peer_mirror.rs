@@ -16,18 +16,15 @@
 //! `peer_discovery = kubernetes` bypasses the mirror's own libp2p routing:
 //! it discovers the cluster's node IPs from the Kubernetes API — using the
 //! same mTLS identity the mirror endpoint already requires — and walks each
-//! peer's mirror endpoint directly. This routes around provider-record rot
-//! observed on THIS cluster with the k3s-bundled **Spegel v0.4.0-k3s3** DHT
-//! ("could not find peer" / "empty list of address ports" for content that
-//! peers demonstrably hold).
+//! peer's mirror endpoint directly. It is a resilience fallback for DHT
+//! provider-record rot ("could not find peer" / "empty list of address
+//! ports" for content that peers demonstrably hold), a failure mode seen in
+//! older Spegel releases (v0.4.0).
 //!
-//! Native DHT routing is now **verified working** on the cluster's current
-//! **Spegel v0.7.1-k3s1**, so `peer_discovery` defaults to `off` for EVERY
-//! preset (including `k3s-spegel`): the local mirror plus Spegel's own libp2p
-//! routing is the primary path. The `kubernetes` node fan-out remains an
-//! explicit operator opt-in — a resilience fallback for per-node Spegel
-//! failure — and is scheduled for removal after a production soak of
-//! default-off (the code is kept until then). When it is enabled, the
+//! `peer_discovery` defaults to `off` for every preset (including
+//! `k3s-spegel`): the local mirror plus the mirror's own libp2p routing is
+//! the primary path. The `kubernetes` node fan-out is an explicit operator
+//! opt-in, deprecated and slated for removal; when it is enabled, the
 //! snapshotter logs a one-time deprecation warning at startup.
 //!
 //! ## Local-mirror self-check
@@ -67,7 +64,7 @@ use tracing::{debug, info, warn};
 use crate::config::{PeerDiscoveryMode, PeerMirrorConfig};
 
 /// How long a peer that failed at the transport layer (refused, TLS
-/// error, timeout) is skipped before we try it again. Keeps a dead node
+/// error, timeout) is skipped before being retried. Keeps a dead node
 /// from adding its full request timeout to every sidecar pull.
 const PEER_COOLDOWN: Duration = Duration::from_secs(60);
 
@@ -91,8 +88,7 @@ pub enum PullOutcome {
     RegistryError { status: u16, body: String },
     /// Mirror is disabled by config, or the TLS material doesn't exist
     /// on disk. Quiet fallback — the locator falls through to its
-    /// label-filter scan and the node behaves exactly as it did before
-    /// the Spegel-pull path landed.
+    /// label-filter scan and the node runs without the mirror-pull path.
     Disabled,
 }
 
@@ -141,8 +137,8 @@ thread_local! {
     /// `cyper::Client` builds a rustls TLS config *and* a connection
     /// pool; a multi-blob sidecar pull calls [`PeerMirror::fetch`]
     /// (and `NodeDiscovery::fetch_nodes`) dozens of times in a row on
-    /// the same blocking thread, so rebuilding per call was dozens of
-    /// redundant TLS handshakes and pool setups. `cached_client`
+    /// the same blocking thread, so rebuilding per call would redo the
+    /// TLS handshake and pool setup every time. `cached_client`
     /// rebuilds only when the key changes (i.e. never in practice,
     /// since `PeerMirror` builds its `Arc<rustls::ClientConfig>` once
     /// in [`build_peer_mirror`] and holds it for its lifetime).
@@ -550,8 +546,9 @@ impl PeerMirror {
 
 /// Kubernetes node discovery: `GET /api/v1/nodes` on the local API
 /// server using the same mTLS identity the mirror requires, cached with
-/// a TTL. Each Ready node's first InternalIP becomes a peer mirror
-/// endpoint `https://<ip>:<port>`; the local node is skipped.
+/// a TTL. Each Ready node's preferred InternalIP (IPv4 first, see
+/// [`peer_endpoints_from_nodes`]) becomes a peer mirror endpoint
+/// `https://<ip>:<port>`; the local node is skipped.
 struct NodeDiscovery {
     /// Always the local API server — node lists are identical
     /// cluster-wide and the local server answers without a network hop.
@@ -737,7 +734,7 @@ struct NodeCondition {
 /// `Ok(None)` is returned when the mirror is disabled by config, or
 /// when the endpoint is HTTPS but the TLS material doesn't exist on
 /// disk — both map to "skip the Spegel-pull path" so a host without an
-/// embedded mirror runs exactly as before.
+/// embedded mirror falls back to the ordinary pull path.
 pub fn build_peer_mirror(cfg: &PeerMirrorConfig) -> Result<Option<Arc<PeerMirror>>> {
     if !cfg.is_enabled() {
         return Ok(None);
@@ -747,9 +744,9 @@ pub fn build_peer_mirror(cfg: &PeerMirrorConfig) -> Result<Option<Arc<PeerMirror
 
     // A plain-HTTP endpoint needs no client auth. An HTTPS endpoint uses mTLS
     // only when all three cert paths are configured AND present on disk;
-    // otherwise the mirror is silently disabled (the pre-existing "certs
-    // missing ⇒ silent fallback" contract). This lets a no-client-auth
-    // plain-HTTP mirror be expressed without any k3s cert files existing.
+    // otherwise the mirror is silently disabled (certs missing ⇒ silent
+    // fallback). This lets a no-client-auth plain-HTTP mirror be expressed
+    // without any k3s cert files existing.
     let tls = if plain_http {
         None
     } else {

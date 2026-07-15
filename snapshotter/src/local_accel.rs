@@ -51,7 +51,7 @@ impl GzipLayer {
 }
 
 /// Low-priority scheduling class for background conversion work, resolved per OS so the same
-/// request maps to the right primitive (this addresses the previously Linux-only `ionice` path).
+/// request maps to the right primitive (`ionice` + `nice` on Linux, `taskpolicy` on macOS).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SchedClass {
     /// Run at normal priority.
@@ -260,9 +260,9 @@ fn expect_single_output(dir: &Path, exclude: Option<&Path>) -> Result<PathBuf> {
 /// layers are referenced in place.
 ///
 /// `prefetch_files` is an optional ordered list of in-image paths captured by
-/// the access tracer during pod startup; when non-empty, after the merge step
-/// we invoke `nydus-image optimize --prefetch-files` to bake the hints into a
-/// new bootstrap (replacing the merged one) and to write a packed prefetch
+/// the access tracer during pod startup; when non-empty, the merge step is
+/// followed by `nydus-image optimize --prefetch-files`, which bakes the hints
+/// into a new bootstrap (replacing the merged one) and writes a packed prefetch
 /// blob into `backend_dir`. The fanotify daemon uses the prefetch blob to
 /// warm-cache the listed chunks on first access. When `prefetch_files` is
 /// empty the optimize step is skipped and `prefetch_blob_id` is `None`.
@@ -594,8 +594,8 @@ mod tests {
         let target = tmp.path().join("l0-abc123");
         std::fs::create_dir_all(&target).unwrap();
         // Simulate debris from a crashed earlier attempt: an old bootstrap AND an
-        // extra stray file that would have made the old "exactly one non-bootstrap
-        // file" scan bail out with "found multiple".
+        // extra stray file that would trip `expect_single_output` if it were not
+        // wiped before the next invocation.
         std::fs::write(target.join("bootstrap"), b"old").unwrap();
         std::fs::write(target.join("stray-leftover"), b"old").unwrap();
 

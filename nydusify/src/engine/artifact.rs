@@ -2,14 +2,14 @@
 //
 // SPDX-License-Identifier: (Apache-2.0 AND BSD-3-Clause)
 
-//! Referrer-artifact push (Phase 4c).
+//! Referrer-artifact push.
 //!
 //! Transparent node-local acceleration never pushes a referrer, but the
 //! registry-publish flow (`nydusify convert --with-referrer`) attaches the
 //! pushed nydus artifact to the *source* image as an OCI 1.1 referrer:
 //!
 //! * `artifactType` = `application/vnd.oci.image.layer.nydus.blob.v1`.
-//! * `config`       = the empty artifact config (`{}`), matching the B4b fixture.
+//! * `config`       = the empty artifact config (`{}`).
 //! * `layers`       = the nydus data blobs (`...layer.nydus.blob.v1`) followed by
 //!   the bootstrap layer (`...bootstrap.nydus.v1`, annotated
 //!   `containerd.io/snapshot/nydus-bootstrap = "true"`).
@@ -48,10 +48,11 @@ use crate::engine::retry::RetryPolicy;
 pub const REFERRER_ARTIFACT_TYPE: &str = MEDIA_TYPE_NYDUS_BLOB;
 
 /// The empty artifact config body (`{}`), pushed as the referrer manifest's
-/// `config` blob. Matches the B4b fixture's config.
+/// `config` blob.
 pub const REFERRER_CONFIG_BYTES: &[u8] = b"{}";
 
-/// Referrer-push seam. Called after the nydus image manifest has been pushed.
+/// Push the nydus artifact as an OCI referrer of the source image. Called
+/// after the nydus image manifest has been pushed.
 ///
 /// * `with_referrer` — the `--with-referrer` flag; when unset this is a no-op
 ///   and returns `Ok(None)`.
@@ -159,7 +160,7 @@ pub fn fallback_referrers_tag(subject_digest: &str) -> String {
 }
 
 /// A referrer data-blob layer descriptor (`...layer.nydus.blob.v1`, no
-/// annotation — matching the B4b fixture's data-blob layer).
+/// annotations).
 pub fn referrer_data_blob_descriptor(digest: String, size: u64) -> Descriptor {
     Descriptor {
         media_type: MEDIA_TYPE_NYDUS_BLOB.to_string(),
@@ -294,7 +295,7 @@ mod tests {
 
     #[test]
     fn no_op_when_flag_unset() {
-        // With the flag unset the seam must not touch the network; a client
+        // With the flag unset the call must not touch the network; a client
         // pointed at an unroutable host proves nothing is sent.
         //
         // `RegistryClient::new` must run INSIDE the compio runtime: when the

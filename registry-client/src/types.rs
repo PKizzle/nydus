@@ -41,8 +41,8 @@ pub const MEDIA_TYPE_OCTET_STREAM: &str = "application/octet-stream";
 /// Nydus RAFS data-blob layer media type. For zran/targz-ref images a data
 /// blob's id equals the original OCI gzip layer digest.
 pub const MEDIA_TYPE_NYDUS_BLOB: &str = "application/vnd.oci.image.layer.nydus.blob.v1";
-/// Nydus bootstrap media type as used by the B4b referrer artifact
-/// (`misc/fanotify/b4b-referrer-serving-test.sh`).
+/// Nydus bootstrap media type as used by nydus referrer artifacts
+/// (exercised by `misc/fanotify/b4b-referrer-serving-test.sh`).
 pub const MEDIA_TYPE_NYDUS_BOOTSTRAP: &str = "application/vnd.oci.image.bootstrap.nydus.v1";
 /// Nydus bootstrap *layer* media type as published by the Go nydusify
 /// (`...layer.nydus.bootstrap.v1`); kept alongside [`MEDIA_TYPE_NYDUS_BOOTSTRAP`]
@@ -248,10 +248,10 @@ pub fn verify_digest(bytes: &[u8], expected: &str) -> Result<()> {
 mod tests {
     use super::*;
 
-    /// The referrer artifact manifest pushed by
-    /// `misc/fanotify/b4b-referrer-serving-test.sh` (its exact shape: data
-    /// blob listed BEFORE the annotated bootstrap layer), extended with the
-    /// `subject` field used when publishing via the OCI 1.1 referrers API.
+    /// The referrer artifact manifest shape pushed by
+    /// `misc/fanotify/b4b-referrer-serving-test.sh` (data blob listed BEFORE
+    /// the annotated bootstrap layer), extended with the `subject` field used
+    /// when publishing via the OCI 1.1 referrers API.
     const B4B_ARTIFACT_JSON: &str = r#"{
         "schemaVersion": 2,
         "mediaType": "application/vnd.oci.image.manifest.v1+json",
@@ -296,7 +296,7 @@ mod tests {
         assert_eq!(manifest.config.media_type, MEDIA_TYPE_OCI_CONFIG);
         assert_eq!(manifest.config.size, 2);
 
-        // b4b's selection-stressing ordering: data blob first, bootstrap second.
+        // Layer ordering stresses bootstrap selection: data blob first, bootstrap second.
         assert_eq!(manifest.layers.len(), 2);
         assert_eq!(manifest.layers[0].media_type, MEDIA_TYPE_NYDUS_BLOB);
         let bootstrap = &manifest.layers[1];
@@ -378,7 +378,7 @@ mod tests {
     fn descriptor_for_bytes_computes_digest_and_size() {
         let desc = Descriptor::for_bytes(MEDIA_TYPE_OCTET_STREAM, b"{}");
         assert_eq!(desc.size, 2);
-        // sha256("{}") — the same value b4b computes for its empty config.
+        // sha256("{}") — the digest of the empty JSON config.
         assert_eq!(
             desc.digest,
             "sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a"

@@ -5,9 +5,7 @@
 //! OCI Distribution client with both **pull** and **push** support.
 //!
 //! This crate is a self-contained OCI Distribution Spec client for the Nydus
-//! tooling (primarily the `nydusify` CLI). It ports the proven registry auth +
-//! GET machinery from the snapshotter's referrer client and adds the first
-//! push implementation in this workspace.
+//! tooling (primarily the `nydusify` CLI).
 //!
 //! # Runtime model
 //!

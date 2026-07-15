@@ -102,7 +102,7 @@ impl From<SnapshotterError> for snapshots::tonic::Status {
     }
 }
 
-/// Convert our `SnapshotInfo` to the containerd `Info` type.
+/// Convert a store `SnapshotInfo` to the containerd `Info` type.
 fn info_to_snapshots(si: SnapshotInfo) -> Info {
     Info {
         kind: match si.kind.as_str() {
@@ -123,8 +123,8 @@ fn info_to_snapshots(si: SnapshotInfo) -> Info {
 /// from containerd's protobuf `update_mask`.
 ///
 /// containerd sends a field-mask whose paths select which mutable properties of
-/// a snapshot to write. For snapshots only labels are mutable, so we recognise
-/// exactly two shapes (mirroring containerd's own `metadata` snapshotter):
+/// a snapshot to write. For snapshots only labels are mutable, so exactly two
+/// shapes are recognised (mirroring containerd's own `metadata` snapshotter):
 ///   * a bare `labels` path — replace the entire label set;
 ///   * `labels.<key>` paths — merge only those keys, preserving every other
 ///     existing label (crucially containerd's `containerd.io/gc.ref.*` GC roots).
@@ -290,9 +290,6 @@ fn snapshot_status_label<T>(result: &Result<T, SnapshotterError>) -> &'static st
     }
 }
 
-/// The main snapshotter implementation.
-///
-/// Bridges containerd's gRPC proxy-plugin protocol to the overlay engine
 /// Parse `lowerdir=…` out of the first overlay mount in `mounts`, returning
 /// **every** layer directory in the list. Used by the access tracer, which
 /// must register each lowerdir as an attribution root: while a single
@@ -348,6 +345,9 @@ fn parent_chain_digest(parent: &str) -> Option<&str> {
     (hex.len() == 64 && hex.chars().all(|c| c.is_ascii_hexdigit())).then_some(suffix)
 }
 
+/// The main snapshotter implementation.
+///
+/// Bridges containerd's gRPC proxy-plugin protocol to the overlay engine
 /// and daemon supervisor.
 pub struct NydusSnapshotter {
     /// Snapshotter runtime config. Held so `prepare()` can read feature flags
@@ -388,7 +388,7 @@ impl NydusSnapshotter {
     ///
     /// `holder` is the snapshot key on whose behalf the daemon is resolved; the
     /// supervisor registers it idempotently, so repeated `Mounts` RPCs for a
-    /// key no longer inflate the daemon refcount.
+    /// key cannot inflate the daemon refcount.
     async fn resolve_nydus_mount(
         &self,
         parent: &str,
@@ -420,8 +420,8 @@ impl NydusSnapshotter {
 
     /// Stamp `image_ref` into the [`labels::NYDUS_DAEMON_IMAGE_REF`] label of
     /// snapshot `key`, so `remove(key)` can release the daemon reference the
-    /// key acquired. Best-effort: on failure the daemon simply stays referenced
-    /// (the pre-existing behaviour for these mount types), which is logged.
+    /// key acquired. Best-effort: on failure the daemon stays referenced and a
+    /// warning is logged.
     fn stamp_daemon_ref_label(&self, key: &str, image_ref: &str) {
         use crate::source::labels::NYDUS_DAEMON_IMAGE_REF;
         let store = self.store.as_ref();
@@ -495,11 +495,11 @@ impl NydusSnapshotter {
             }
         };
         // Daemon start failure is NON-FATAL: the sidecar mount is an
-        // optimization, never a requirement. Failing the prepare here
-        // wedged pods in CreateContainerError loops on hosts where the
-        // fanotify daemon couldn't come up; falling back to overlay keeps
-        // the pod scheduling while the warn (with the full error chain)
-        // tells the operator why acceleration is off.
+        // optimization, never a requirement. Failing the prepare would wedge
+        // pods in CreateContainerError loops on hosts where the fanotify
+        // daemon cannot come up; falling back to overlay keeps the pod
+        // scheduling while the warn (with the full error chain) tells the
+        // operator why acceleration is off.
         let handle = match self
             .supervisor
             .ensure_instance_local(image_ref, &staged.bootstrap, &staged.backend_dir, holder)
@@ -721,9 +721,9 @@ impl snapshots::Snapshotter for NydusSnapshotter {
                                 // JSON parse error, etc.) is loudly logged
                                 // rather than silently collapsed into a miss
                                 // — a missing image-ref disables auto-accel
-                                // routing AND capture, and we'd otherwise
-                                // have no signal that the lookup pipeline
-                                // itself is broken.
+                                // routing AND capture, and without the log
+                                // there is no signal that the lookup
+                                // pipeline itself is broken.
                                 warn!(chain, parent, error = %e, "containerd-lookup refresh failed; auto-accel disabled for this prepare");
                                 None
                             }
@@ -759,11 +759,11 @@ impl snapshots::Snapshotter for NydusSnapshotter {
                     // daemon mount for the overlay. nydusd's registry backend
                     // (built from `image_ref`) serves every data blob on demand
                     // from `/v2/<repo>/blobs/sha256:<blob_id>`, so the bootstrap
-                    // is the only thing we materialize here.
+                    // is the only artifact materialized here.
                     //
                     // Like the auto-accel branch above, this is best-effort and
                     // NON-FATAL: every detection / auth / network / materialize
-                    // / daemon-start error is swallowed here and we fall through
+                    // / daemon-start error is swallowed and control falls through
                     // to the overlay / access-tracer path, so a pod is NEVER
                     // blocked on referrer serving. Runs off the gRPC runtime
                     // (cyper is `!Send`) via the `*_blocking` helpers; the
@@ -1149,7 +1149,7 @@ pub async fn serve(mut config: SnapshotterConfig) -> Result<()> {
     .await
 }
 
-/// Build the snapshot store at the path the config implies. Pulled out of
+/// Build the snapshot store at the path the config implies. Separate from
 /// `serve_with_supervisor` so the binary entry point can open the store before
 /// the runtime spawns the server task — that way it can `persist_now()` on a
 /// SIGTERM path without reaching into the server task to fish out its handle,
@@ -1164,11 +1164,11 @@ pub fn open_store_for_config(config: &SnapshotterConfig) -> Result<Arc<SnapshotS
     // `nydus-migrate store` by hand. Logs and degrades on failure; when no
     // legacy db exists this is a single existence check.
     //
-    // Stamp imported records with the node's actual resolved driver —
+    // Stamp imported records with the node's actual resolved driver:
     // `config.snapshotter.fs_drivers.first()`, already reordered to the
     // probed/promoted driver by `probe_and_promote_driver`, which both
     // `serve()` (above) and `containerd-nydus.rs` run before calling this
-    // function — instead of a hardcoded guess. The label is
+    // function. The label is
     // non-authoritative (the live mount driver always comes from the node's
     // probed driver, never from a snapshot record; see
     // `migrate::auto_migrate_if_needed`), but a wrong label is still
@@ -1208,10 +1208,10 @@ pub async fn serve_with_supervisor(
     let metrics = Arc::new(SnapshotterMetrics::new());
 
     // Deprecation notice for the Kubernetes node fan-out. Native Spegel libp2p
-    // routing (v0.7.1+) is verified working and is now the default
-    // (`peer_discovery = "off"` for every preset); the fan-out is an opt-in
-    // resilience fallback scheduled for removal after a production soak of
-    // default-off. The code is retained until then — this only warns.
+    // routing (v0.7.1+) is the default (`peer_discovery = "off"` for every
+    // preset); the fan-out is an opt-in resilience fallback scheduled for
+    // removal after a production soak of default-off. The code is retained
+    // until then — this only warns.
     if config.snapshotter.peer_mirror.peer_discovery()
         == crate::config::PeerDiscoveryMode::Kubernetes
     {
@@ -1224,10 +1224,10 @@ pub async fn serve_with_supervisor(
     }
 
     // Optional TCP Prometheus endpoint (opt-in via `[snapshotter.metrics]`).
-    // Additive: when `listen` is unset this block is skipped and metrics stay
-    // UDS-only, exactly as before. When set, a one-route cyper-axum server
-    // exposes `GET /metrics` reusing the same `SnapshotterMetrics` renderer as
-    // the sysctl UDS endpoint (no metric text is duplicated).
+    // When `listen` is unset this block is skipped and metrics stay UDS-only.
+    // When set, a one-route cyper-axum server exposes `GET /metrics` reusing
+    // the same `SnapshotterMetrics` renderer as the sysctl UDS endpoint (no
+    // metric text is duplicated).
     if let Some(listen) = config.snapshotter.metrics.listen.clone() {
         let metrics = metrics.clone();
         let cache = cache_manager.clone();
@@ -1258,9 +1258,9 @@ pub async fn serve_with_supervisor(
                 crate::content_store::ContentStoreClient::new(&config.snapshotter.containerd)
                     .context("connect to containerd content store")?;
             // gRPC-backed lookup: image walks go over Images.List +
-            // Content.Read instead of spawning crictl/ctr per image —
-            // the CLI walk took ~80 s per refresh on a loaded node and
-            // head-of-line-blocked every other snapshotter call.
+            // Content.Read, never by spawning crictl/ctr per image — a
+            // CLI walk takes ~80 s per refresh on a loaded node and
+            // head-of-line-blocks every other snapshotter call.
             let containerd_lookup = Arc::new(crate::containerd_lookup::ContainerdLookup::new(
                 content_store.clone(),
             ));
@@ -1280,8 +1280,8 @@ pub async fn serve_with_supervisor(
                 access_tracer.set_auto_zran(manager.clone());
             }
             // Peer-mirror local self-check: turns the silent "local mirror not
-            // advertising local content" failure (the canary-node
-            // registries.yaml incident) into a loud, diagnosable warning + the
+            // advertising local content" misconfiguration (e.g. a broken
+            // registries.yaml) into a loud, diagnosable warning + the
             // `snapshotter_peer_mirror_selfcheck_ok` gauge. It probes a
             // node-local auto-accel sidecar digest against ONLY the local mirror
             // endpoint, so it can only run on the auto_zran path (where a
@@ -1344,14 +1344,9 @@ pub async fn serve_with_supervisor(
         parse_duration(&config.snapshotter.cache.gc_period)?,
     )
     .with_cache_gc(cache_manager, cache_gc_policy);
-    // Job dirs are retained on purpose after a successful BASE stage (the
-    // optimize stage reuses the create+merge output) and removed only when the
-    // OPTIMIZE stage completes; this sweep is the fallback for images whose
-    // settle never arrives. Sweeping is safe — a late optimize degrades to the
-    // full pipeline via the `auto_zran::load_reusable_base_artifact` None seam.
-    // The threshold is generous because conversions run at (possibly) idle
-    // scheduling priority and large multi-layer images can legitimately take a
-    // long time.
+    // Sweep abandoned auto-zran job dirs. Retention semantics and why sweeping
+    // a retained base dir is safe are documented on
+    // `AUTO_ZRAN_STALE_JOB_MAX_AGE`.
     if let Some(manager) = auto_zran.clone() {
         reconciler = reconciler.with_auto_zran_sweep(
             config.snapshotter.auto_zran.work_dir.clone(),
@@ -1505,7 +1500,7 @@ mod tests {
     /// a plain OCI prepare (even with an image-ref label) returns the overlay
     /// mounts untouched and performs zero referrer interaction. If the referrer
     /// branch were not gated on the flag, this prepare would instead attempt a
-    /// live registry round-trip for the bogus ref. (The flag now defaults ON, so
+    /// live registry round-trip for the bogus ref. (The flag defaults ON, so
     /// this test disables it explicitly to exercise the fall-through path.)
     #[compio::test]
     async fn prepare_with_referrer_detect_off_returns_overlay_mounts() {
@@ -1668,9 +1663,9 @@ mod tests {
 
     #[compio::test]
     async fn update_missing_snapshot_is_not_found() {
-        // Both mask paths must agree: updating a snapshot that does not exist is
-        // NotFound, not Internal. This covers the common absent-mask replace-all
-        // path (which previously skipped the stat and surfaced Internal).
+        // Both mask paths must agree: updating a snapshot that does not exist
+        // is NotFound, not Internal — including the common absent-mask
+        // replace-all path, which must not skip the existence check.
         let dir = tempdir().unwrap();
         let snapshotter = test_snapshotter(dir.path());
         let info = Info {

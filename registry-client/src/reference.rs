@@ -6,7 +6,7 @@
 //!
 //! Splits a reference like `docker.io/library/nginx:latest@sha256:abc...` into
 //! `(host, repo, tag, digest)` and applies the well-known `docker.io` ->
-//! `registry-1.docker.io` API-host rewrite. Self-contained port of the
+//! `registry-1.docker.io` API-host rewrite. Matches the behavior of the
 //! snapshotter's `daemon/image_ref.rs` parser.
 
 use anyhow::{Result, bail};

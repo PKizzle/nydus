@@ -667,12 +667,11 @@ mod tests {
 
     // Regression: NbdService::new builds its shutdown broadcast with
     // `broadcast(4)` + `set_overflow(true)` + `receiver.deactivate()`. If that
-    // `deactivate()` were a `drop()` (as it was before the async-broadcast
-    // migration fix), the channel would close and `NbdWorker::run`'s lazily
-    // subscribed `new_receiver().recv()` would return `Closed` immediately,
-    // exiting every worker at startup (daemon up, serves nothing) — the exact
-    // bug fixed in `block_uffd.rs`. Assert the channel stays open and still
-    // delivers the stop signal.
+    // `deactivate()` were a `drop()`, the channel would close and
+    // `NbdWorker::run`'s lazily subscribed `new_receiver().recv()` would return
+    // `Closed` immediately, exiting every worker at startup (daemon up, serves
+    // nothing) — the same failure mode guarded against in `block_uffd.rs`.
+    // Assert the channel stays open and still delivers the stop signal.
     #[test]
     fn test_nbd_shutdown_channel_stays_open() {
         let (mut sender, receiver) = broadcast::<u32>(4);

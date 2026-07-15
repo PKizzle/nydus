@@ -4,8 +4,7 @@
 
 //! Handler to serve on-demand blob data through fanotify pre-content hooks.
 //!
-//! [`FanotifyHandler`] replaces the deprecated fscache-based on-demand path.
-//! It works by:
+//! [`FanotifyHandler`] works by:
 //! 1. Creating a fanotify group with `FAN_CLASS_PRE_CONTENT`.
 //! 2. Placing marks (`FAN_PRE_ACCESS` **only** — never `FAN_OPEN_PERM`, which would
 //!    block every open including the daemon's own) on the sparse data-blob device
@@ -79,9 +78,9 @@ fn fd_identity(fd: RawFd) -> Result<(u64, u64)> {
 /// anything else that clones the compio fd) on a [`BlobBacking`] from `run_loop` workers —
 /// range fills go through `blob().get_blob_object()` instead.
 ///
-/// This deliberately replaces the previous blanket `unsafe impl Send/Sync for FanotifyHandler`,
-/// which vouched for every present and future field; scoping the assertion to the one field
-/// that needs it keeps the compiler checking the rest.
+/// The assertion is scoped to this one field rather than a blanket
+/// `unsafe impl Send/Sync for FanotifyHandler` (which would vouch for every present and future
+/// field), so the compiler keeps checking the rest of the struct.
 struct AssertBlobThreadSafe(DataBlob);
 
 // SAFETY: see the type-level comment — raw-fd-only access from worker threads; the inner
@@ -235,10 +234,10 @@ impl FanotifyHandler {
         blob_cache_mgr: Arc<BlobCacheMgr>,
         threads: usize,
     ) -> Result<Self> {
-        // Create the fanotify notification group.
-        // These raw libc calls are used because nix 0.24 does not expose fanotify.
+        // Create the fanotify notification group with raw libc calls; the `nix` crate's
+        // fanotify module does not expose the 6.14 pre-content API (see `fanotify_sys`).
         //
-        // We deliberately do NOT set `FAN_REPORT_FID`: pre-content fill needs a real file
+        // `FAN_REPORT_FID` is deliberately NOT set: pre-content fill needs a real file
         // descriptor on each event (to identify the target via `fstat` and to respond), whereas
         // `FAN_REPORT_FID` reports an opaque file handle and sets `metadata.fd` to `FAN_NOFD`.
         let init_flags = FAN_CLASS_PRE_CONTENT | libc::FAN_CLOEXEC | libc::FAN_NONBLOCK;
@@ -816,8 +815,8 @@ impl FanotifyHandler {
     /// Invalidate the on-demand cache for a blob by punching out its sparse backing file.
     ///
     /// `FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE` deallocates the cached extents while keeping
-    /// the file size, so subsequent accesses raise fresh `FAN_PRE_ACCESS` events and are re-fetched
-    /// — mirroring the eviction semantics of the old fscache handler.
+    /// the file size, so subsequent accesses raise fresh `FAN_PRE_ACCESS` events and are
+    /// re-fetched.
     pub fn cull_cache(&self, blob_id: String) -> Result<()> {
         let backing = self
             .blob_backings

@@ -25,7 +25,7 @@
 //!
 //! The snapshotter prefers the **fanotify** pre-content backend (Linux ≥ 6.14) and
 //! falls back to **fusedev** when the kernel lacks `FAN_CLASS_PRE_CONTENT` support.
-//! The deprecated **fscache** backend has been removed entirely.
+//! There is deliberately no **fscache** backend; do not add one.
 //!
 //! See [`ARCHITECTURE.md`] in the repository root for the full design document.
 

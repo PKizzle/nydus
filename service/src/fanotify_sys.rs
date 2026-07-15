@@ -123,9 +123,9 @@ mod tests {
     use super::*;
 
     // Golden values from <linux/fanotify.h> (kernel 6.14). The pre-content path
-    // fails silently or at mount if any of these drift from the kernel UAPI
-    // (CLAUDE.md gotcha #4); this guards against accidental edits. When bumping
-    // the minimum kernel, re-verify against /usr/include/linux/fanotify.h.
+    // fails silently or at mount if any of these drift from the kernel UAPI;
+    // this guards against accidental edits. When bumping the minimum kernel,
+    // re-verify against /usr/include/linux/fanotify.h.
     #[test]
     fn test_abi_constants_match_kernel_uapi() {
         assert_eq!(FAN_CLASS_PRE_CONTENT, 0x0000_0008);

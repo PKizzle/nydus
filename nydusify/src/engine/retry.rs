@@ -7,9 +7,9 @@
 //! Blob and manifest uploads are digest-addressed and therefore idempotent (a
 //! `PUT ...?digest=sha256:...` either lands the exact bytes or is a no-op), so
 //! a transient `5xx`/network error can be retried by simply re-running the push
-//! from scratch — restart-not-resume is safe. This honors the CLI's
-//! `--push-retry-count` / `--push-retry-delay` flags so one flaky response no
-//! longer aborts a long conversion.
+//! from scratch — restart-not-resume is safe. Honors the CLI's
+//! `--push-retry-count` / `--push-retry-delay` flags so one flaky response
+//! does not abort a long conversion.
 
 use std::future::Future;
 use std::time::Duration;

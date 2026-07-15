@@ -593,13 +593,13 @@ impl UffdCore {
 /// Bundles an owned Unix socket with a compio [`PollFd`] for readiness.
 ///
 /// The block-uffd protocol passes file descriptors over the socket via
-/// `SCM_RIGHTS`, which we perform with the `sendfd` crate's raw `recvmsg`/
-/// `sendmsg` on the owned [`StdUnixStream`]. compio's completion reactor only
-/// needs to wait for readiness, so a `PollFd` built from a duplicated fd drives
-/// the readiness waits through io_uring while the original stream keeps doing
-/// the safe, audited ancillary-data I/O. This replaces tokio's `AsyncFd`
-/// without reintroducing hand-rolled `cmsg` handling (variable-count
-/// `SCM_RIGHTS` does not map onto compio's fixed-size ancillary API).
+/// `SCM_RIGHTS`, performed with the `sendfd` crate's raw `recvmsg`/`sendmsg`
+/// on the owned [`StdUnixStream`]. compio's completion reactor only needs to
+/// wait for readiness, so a `PollFd` built from a duplicated fd drives the
+/// readiness waits through io_uring while the original stream keeps doing the
+/// safe, audited ancillary-data I/O (variable-count `SCM_RIGHTS` does not map
+/// onto compio's fixed-size ancillary API, so `sendfd` handles the `cmsg`
+/// encoding).
 struct AsyncSock {
     stream: StdUnixStream,
     poll: PollFd<OwnedFd>,
@@ -979,7 +979,7 @@ impl UffdWorker {
     /// Handle uffd page fault events.
     ///
     /// A single `PollFd` readiness notification can cover several queued uffd
-    /// events, so we must drain the fd until it returns `WouldBlock`
+    /// events, so the fd must be drained until it returns `WouldBlock`
     /// (`read_uffd_msg` -> `Ok(None)`); otherwise a second simultaneously-queued
     /// page fault stays unread and its faulting thread stalls until an unrelated
     /// fault happens to re-trigger the fd.
@@ -1800,12 +1800,12 @@ mod tests {
     // Workers subscribe lazily via `sender.new_receiver()`, then `select!` on
     // `recv()` to wait for the stop signal. An `async-broadcast` channel closes the
     // instant its last receiver is dropped, after which a freshly-subscribed
-    // receiver's `recv()` returns `Closed` immediately. The constructor used to
-    // `drop(receiver)`, which closed the channel, so every worker exited its accept
-    // loop at startup: the daemon reached RUNNING but served no connections (clients
-    // saw "connection reset by peer"). The fix deactivates the receiver instead,
-    // pinning the channel open. Here we assert the observable invariant the workers
-    // rely on: a new receiver is *Empty* (pending), not *Closed*, and a stop signal
+    // receiver's `recv()` returns `Closed` immediately. If the constructor dropped
+    // its initial receiver, every worker would exit its accept loop at startup: the
+    // daemon reached RUNNING but served no connections (clients saw "connection
+    // reset by peer"). The constructor therefore deactivates the receiver instead,
+    // pinning the channel open. Assert the observable invariant the workers rely
+    // on: a new receiver is *Empty* (pending), not *Closed*, and a stop signal
     // still reaches it.
     #[test]
     fn test_uffd_service_shutdown_channel_stays_open() {
@@ -2721,12 +2721,12 @@ mod tests {
         // A FORK event carries a brand-new child uffd fd in the first u64 of the union; the handler
         // must close it (returning Noop) instead of leaking it.
         //
-        // We can't check this by dup'ing fd 0 and asserting `fcntl(child_fd, F_GETFD) == -1`
-        // afterwards: cargo test runs tests on multiple threads (Makefile passes
+        // Closure cannot be checked by dup'ing an fd and asserting `fcntl(child_fd, F_GETFD)
+        // == -1` afterwards: cargo test runs tests on multiple threads (Makefile passes
         // `--test-threads=8`) so an unrelated test thread can race and `open()` a file into the
-        // just-freed fd number — `F_GETFD` then returns 0 and this test fails spuriously. (nextest
-        // runs each test in its own process so it never hit the race; the coverage job uses
-        // `cargo test` and did.) Use a socketpair instead: kernel pipe/socket peer-state is
+        // just-freed fd number — `F_GETFD` then returns 0 and the test fails spuriously (nextest
+        // isolates each test in its own process and never hits the race; plain `cargo test`
+        // does). Use a socketpair instead: kernel pipe/socket peer-state is
         // tracked by the file-table entry, not the fd number, so `send(peer, MSG_NOSIGNAL)`
         // returns EPIPE iff the OTHER end was genuinely closed — independent of whether some
         // unrelated open() later reused that fd number on a different thread.

@@ -4,10 +4,9 @@
 
 //! System-controller backend operations.
 //!
-//! The Go snapshotter exposed these capabilities through an HTTP API.  The
-//! Rust implementation keeps the transport separate from the control plane so
-//! a Unix-socket REST server, tests, or future gRPC admin service can all call
-//! the same operations.
+//! Endpoint-compatible with the Go snapshotter's system HTTP API. Transport is
+//! kept separate from the control plane so the Unix-socket REST server, tests,
+//! or a future gRPC admin service can all call the same operations.
 
 use crate::access_tracer::AccessTracer;
 use crate::auto_zran::AutoZranManager;
@@ -129,11 +128,9 @@ impl ControllerMetrics {
     }
 }
 
-/// Builder for `SystemController`. Replaces the previous four-step
-/// `new`/`new_with_metrics`/`new_with_metrics_and_auto_zran`/
-/// `new_with_metrics_auto_zran_and_tracer` chain that doubled in length
-/// every time an optional dep was added. Each `.with_*` accessor takes
-/// the dep; `.build()` constructs the controller.
+/// Builder for [`SystemController`]. Required dependencies go through
+/// [`new`](Self::new); optional ones (metrics, auto-zran, access tracer)
+/// through the `with_*` methods; `build()` constructs the controller.
 pub struct SystemControllerBuilder {
     supervisor: Arc<DaemonSupervisor>,
     store: Arc<SnapshotStore>,
@@ -199,8 +196,8 @@ impl SystemControllerBuilder {
 }
 
 impl SystemController {
-    /// Backwards-compatible shortcut for tests that need the minimal-deps
-    /// controller. Production code uses `SystemControllerBuilder` directly.
+    /// Shortcut for tests that need a controller with no optional
+    /// dependencies. Production code uses [`SystemControllerBuilder`].
     pub fn new(
         supervisor: Arc<DaemonSupervisor>,
         store: Arc<SnapshotStore>,
@@ -231,8 +228,8 @@ impl SystemController {
         result
     }
 
-    /// Checkpoint live daemon records. This is the first safe sysctl upgrade
-    /// hook; real FD handoff can build on the persisted record format.
+    /// Checkpoint live daemon records to the persisted record format
+    /// (the basis a future FD-handoff upgrade would build on).
     pub async fn checkpoint_daemons(&self) -> Result<Vec<DaemonStatusRecord>> {
         self.supervisor.checkpoint_records().await
     }
@@ -282,9 +279,9 @@ impl SystemController {
         Ok(report)
     }
 
-    /// Trigger cache GC with a one-shot policy override. Useful for a future
-    /// `/api/v1/daemons/{id}/cache/gc` request body without mutating global
-    /// config.
+    /// Trigger cache GC with a one-shot policy override (the request-body
+    /// policy of `POST /api/v1/cache/gc`) without mutating the configured
+    /// policy.
     pub fn cache_gc_with_policy(&self, policy: &CacheGcPolicy) -> Result<CacheGcReport> {
         let report = self.cache.garbage_collect(policy)?;
         self.metrics.record_cache_gc(&report, policy.dry_run);
@@ -337,9 +334,9 @@ impl SystemController {
     /// (e.g. `/etc/nginx/nginx.conf`) the auto-zran pipeline wants.
     ///
     /// The Prepare-time attach (on the snapshotter's lower snapshot dir)
-    /// still runs but doesn't capture container reads — overlay resolves
-    /// container paths in the container's namespace, not against the lower.
-    /// This rootfs-time attach is what actually captures.
+    /// doesn't capture container reads — overlay resolves container paths in
+    /// the container's namespace, not against the lower. This rootfs-time
+    /// attach is what actually captures.
     ///
     /// Called by the NRI optimizer plugin's `StartContainer` hook with the
     /// container PID from the NRI Container message.
@@ -430,11 +427,7 @@ pub async fn serve_unix(path: PathBuf, controller: SystemController) -> Result<(
     Ok(())
 }
 
-/// Bridge an axum request to the existing `route_request` dispatcher.
-///
-/// Serving over cyper-axum (the same hyper-on-compio path the gRPC server uses)
-/// avoids the raw `compio` `UnixListener::accept()` loop, which triggers a
-/// multishot-accept panic in compio-driver and aborts the whole process.
+/// Bridge an axum request to the `route_request` dispatcher.
 async fn handle_request(
     axum::extract::State(controller): axum::extract::State<SystemController>,
     request: axum::extract::Request,
@@ -522,11 +515,10 @@ async fn route_request(controller: &SystemController, request: HttpRequest) -> H
 /// Resolve a container PID to the host-side overlay rootfs mount path.
 ///
 /// Canonicalizing `/proc/<pid>/root` directly returns `"/"` because the proc
-/// magic symlink reads as the process's view of its root. We cross the
-/// mount-namespace boundary via `mountinfo` strings — see
-/// `find_rootfs_in_mountinfo` for the pure logic that this wrapper
-/// I/O-binds. Splitting these two so the parser can be unit-tested from
-/// fixtures rather than against a live `/proc`.
+/// magic symlink reads as the process's view of its root, so the
+/// mount-namespace boundary is crossed via `mountinfo` strings instead. The
+/// pure parsing logic lives in `find_rootfs_in_mountinfo` so it can be
+/// unit-tested from fixtures rather than against a live `/proc`.
 fn host_rootfs_for_pid(pid: u32) -> Result<PathBuf> {
     let container_info = std::fs::read_to_string(format!("/proc/{pid}/mountinfo"))
         .with_context(|| format!("read /proc/{pid}/mountinfo"))?;

@@ -12,8 +12,7 @@
 //! * **`--oci-ref`** (zran): `nydus-image create --type targz-ref` per layer,
 //!   then `merge --original-blob-ids <gzip-digests>`. The data blobs are the
 //!   *original gzip layers* (mounted from the source repo on a same-registry
-//!   target, else re-pushed) plus tiny per-layer zran index blobs — the
-//!   B4b-served shape.
+//!   target, else re-pushed) plus tiny per-layer zran index blobs.
 //! * **standard**: `nydus-image create --type targz-rafs` per layer (new nydus
 //!   data blobs), then `merge`.
 //!
@@ -56,12 +55,12 @@ struct PulledLayer {
 
 /// The pulled source image (single platform).
 struct PulledSource {
-    /// Descriptor of the **top-level** source reference (captured for the P4c
-    /// referrer seam: it becomes the referrer artifact `subject` and drives the
-    /// `sha256-<hex>` fallback tag). For a multi-arch source this is the image
-    /// INDEX descriptor, not the platform-resolved manifest — `nydusify check`
-    /// and the snapshotter both resolve the top-level digest, so the referrer
-    /// must be published under it.
+    /// Descriptor of the **top-level** source reference: it becomes the
+    /// referrer artifact `subject` and drives the `sha256-<hex>` fallback
+    /// tag. For a multi-arch source this is the image INDEX descriptor, not
+    /// the platform-resolved manifest — `nydusify check` and the snapshotter
+    /// both resolve the top-level digest, so the referrer must be published
+    /// under it.
     manifest_desc: Descriptor,
     /// Raw image-config JSON, reused verbatim as the nydus image config.
     config_bytes: Vec<u8>,
@@ -131,7 +130,7 @@ pub async fn run_conversion(request: &ConvertRequest, workspace: &Path) -> Resul
     )
     .await?;
 
-    // ---- P4c: attach a referrer artifact to the source image ----
+    // ---- attach a referrer artifact to the source image (--with-referrer) ----
     // Data blobs in image-layer order: reused gzip layers (oci-ref) then the
     // newly-built nydus blobs. Pushed to the source repo so the referrer
     // resolves alongside its subject.
@@ -165,7 +164,7 @@ pub async fn run_conversion(request: &ConvertRequest, workspace: &Path) -> Resul
     Ok(())
 }
 
-/// Reject the v1-out-of-scope knobs with honest errors instead of silently
+/// Reject unsupported options with explicit errors instead of silently
 /// mis-converting.
 fn reject_unsupported(request: &ConvertRequest) -> Result<()> {
     if request.mode == ConversionMode::Reverse {
@@ -193,9 +192,9 @@ fn reject_unsupported(request: &ConvertRequest) -> Result<()> {
         );
     }
 
-    // Flags parsed by the CLI but not yet honored by the converter. Reject them
-    // loudly rather than silently dropping them and producing an image that
-    // does not reflect what the user asked for.
+    // Flags parsed by the CLI but not yet honored by the converter. Reject
+    // them rather than silently dropping them and producing an image that
+    // does not match the requested flags.
     let d = &request.driver;
     if !d.chunk_dict_ref.is_empty() {
         bail!("--chunk-dict is not yet supported by nydusify-rs (follow-up)");

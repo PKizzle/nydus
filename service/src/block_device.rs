@@ -974,7 +974,7 @@ mod tests {
         let tmp_dir = TempDir::new().unwrap();
         let data_dir = Some(String::from(tmp_dir.as_path().to_str().unwrap()));
 
-        // verity = true must now return the dm-verity parameters.
+        // verity = true must return the dm-verity parameters.
         let verity = BlockDevice::export(entry, None, data_dir, thread, true)?;
         let verity = verity.expect("verity export must return BlockDeviceVerityInfo");
         assert_eq!(verity.data_block_size, 4096);

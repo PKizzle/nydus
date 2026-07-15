@@ -154,15 +154,15 @@ struct DaemonInstance {
     daemon: Arc<dyn NydusDaemon>,
     refcount: AtomicUsize,
     /// Snapshot keys currently holding a reference on this daemon. Acquisition
-    /// is idempotent per key (`acquire_holder`), so repeated `Mounts` RPCs for
-    /// the same snapshot no longer inflate `refcount` — the drift that used to
-    /// make daemons immortal. `refcount` can exceed `holders.len()` after a
-    /// restore: the persisted record carries only a count, not the keys, so the
-    /// difference is "ballast" that `release_holder` drains on releases for
-    /// unknown keys (pre-restart holders being removed).
+    /// is idempotent per key (`acquire_holder`): repeated `Mounts` RPCs for the
+    /// same snapshot must not inflate `refcount`, or the daemon becomes
+    /// immortal. `refcount` can exceed `holders.len()` after a restore: the
+    /// persisted record carries only a count, not the keys, so the difference
+    /// is "ballast" that `release_holder` drains on releases for unknown keys
+    /// (pre-restart holders being removed).
     holders: StdMutex<HashSet<String>>,
     /// Mio poller kept alive for the entire lifetime of the daemon - the
-    /// `Waker` we pass into `create_fuse_daemon` borrows its registry.
+    /// `Waker` passed into `create_fuse_daemon` borrows its registry.
     _poll: Arc<Mutex<Poll>>,
     /// Whether this daemon's `/dev/fuse` fd was parked in systemd's store, i.e.
     /// a successor can take its mount over. When false, the mount must be
@@ -415,7 +415,7 @@ pub struct DaemonSupervisor {
     instances: RwLock<HashMap<String, Arc<DaemonInstance>>>,
     /// Per-image startup serialization. Daemon startup (mount syscalls plus a
     /// wait-for-RUNNING loop of up to `startup_timeout`) must never run while
-    /// holding the global `instances` write lock — that stalled every other
+    /// holding the global `instances` write lock — that would stall every other
     /// gRPC RPC behind one slow daemon. Instead, concurrent ensures of the
     /// *same* image take turns on its entry here while ensures of other images
     /// proceed untouched. Entries are never evicted; the map is bounded by the
@@ -977,8 +977,9 @@ impl DaemonSupervisor {
             .find(|record| record.slug == id || record.image_ref == id)
     }
 
-    /// Persist records for every live daemon. This is the safe checkpoint used
-    /// by the first sysctl upgrade hook before real FD handoff is added.
+    /// Persist records for every live daemon. Backs the system-controller
+    /// checkpoint API; failover restore pairs these records with fds preserved
+    /// in systemd's store.
     pub async fn checkpoint_records(&self) -> Result<Vec<DaemonStatusRecord>> {
         let instances = self.instances.read().await;
         let mut records = Vec::with_capacity(instances.len());
@@ -1229,8 +1230,8 @@ impl DaemonSupervisor {
         let mountpoint_str = mountpoint.display().to_string();
 
         // Give the daemon a supervisor socket so its upgrade manager records
-        // mount state and holds the `/dev/fuse` fd. We drive `save()` into that
-        // socket right after start to snapshot the fd + state for failover.
+        // mount state and holds the `/dev/fuse` fd. `save()` is driven into
+        // that socket right after start to snapshot the fd + state for failover.
         let supervisor_sock = supervisor_sock_path(&slug);
         let daemon = create_fuse_daemon(
             &mountpoint_str,
@@ -1347,7 +1348,7 @@ impl DaemonSupervisor {
                 false
             }
         }
-        // `fuse_fd` (our copy) is dropped here; systemd holds its own dup.
+        // `fuse_fd` (the local copy) is dropped here; systemd holds its own dup.
     }
 
     /// Resume daemons whose `/dev/fuse` fds systemd preserved across our restart
@@ -1950,9 +1951,9 @@ fn setup_and_mount_tarfs(
         )
     })?;
     if is_mounted_at(mountpoint) {
-        // Already mounted (e.g. a crash-recovery re-entry). We can't recover the
-        // loop/dm identities here; teardown will still umount, and the leftover
-        // loop/dm are cleaned by the reconciler / next boot.
+        // Already mounted (e.g. a crash-recovery re-entry). The loop/dm
+        // identities can't be recovered here; teardown still umounts, and the
+        // leftover loop/dm are cleaned by the reconciler / next boot.
         return Ok(TarfsMount::default());
     }
 
@@ -2160,7 +2161,7 @@ fn stop_instance(inst: &DaemonInstance) -> Result<()> {
 /// This can spin for up to `timeout` (30 s) and the ensure paths run on the
 /// shared compio gRPC runtime, so callers MUST go through
 /// [`wait_for_running_off_reactor`] — a `thread::sleep` inline on the reactor
-/// stalled every in-flight RPC behind one slow daemon start.
+/// would stall every in-flight RPC behind one slow daemon start.
 fn wait_for_running(daemon: &dyn NydusDaemon, timeout: Duration) -> Result<()> {
     let deadline = Instant::now() + timeout;
     loop {
@@ -2268,8 +2269,8 @@ mod tests {
 
     #[test]
     fn holder_acquisition_is_idempotent_per_key() {
-        // Regression: refcount used to bump on every ensure call, so repeated
-        // Mounts RPCs for the same snapshot made daemons immortal.
+        // Regression guard: repeated Mounts RPCs for the same snapshot must
+        // not inflate the refcount — that drift makes daemons immortal.
         let inst = test_instance();
         inst.acquire_holder("snap-a");
         inst.acquire_holder("snap-a");
@@ -2288,8 +2289,8 @@ mod tests {
     #[test]
     fn release_drains_restore_ballast_for_unknown_keys() {
         // A restored record carries only a count; releases for pre-restart
-        // keys (which we can't identify) must still drain it to zero so
-        // restored daemons can tear down.
+        // keys (which are not individually known) must still drain it to zero
+        // so restored daemons can tear down.
         let inst = test_instance();
         inst.refcount.store(2, Ordering::SeqCst);
         assert_eq!(inst.release_holder("old-snap-1"), 1);

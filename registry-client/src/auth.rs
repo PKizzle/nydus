@@ -19,8 +19,7 @@
 //! `access_token`), and retries the original request with
 //! `Authorization: Bearer <token>`. Tokens are scoped, so pull-only tokens
 //! cannot authorize uploads — push operations request
-//! `repository:<repo>:pull,push` (see [`push_scope`]). This module ports the
-//! proven implementation from the snapshotter's referrer client.
+//! `repository:<repo>:pull,push` (see [`push_scope`]).
 
 use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine as _;

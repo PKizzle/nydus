@@ -25,9 +25,8 @@ use crate::config::{
 };
 use crate::daemon::image_ref::ImageRef;
 
-/// Retry count applied to every daemon storage backend, matching the historical
-/// registry-backend value so the object-store / http-proxy backends inherit the
-/// same resilience.
+/// Retry count applied to every daemon storage backend (registry, object-store
+/// and http-proxy alike).
 const BACKEND_RETRY_LIMIT: u8 = 3;
 /// Per-request / connect timeout (seconds) for the object-store and http-proxy
 /// backends when no per-backend timeout is expressed in the TOML. Mirrors the
@@ -96,7 +95,7 @@ pub fn build_daemon_config(
 /// Selection precedence: at most one of `s3` / `oss` / `http-proxy` / `registry`
 /// may be configured (enforced loudly at startup by
 /// [`crate::config::BackendsConfig::validate`]). When none is set the image's
-/// own registry is used — the historical default. `[backends.localfs]` is NOT
+/// own registry is used. `[backends.localfs]` is NOT
 /// handled here: the `localfs` backend is reserved for the auto-accel sidecar
 /// path (see [`build_auto_accel_config`]).
 ///
@@ -137,10 +136,9 @@ pub fn build_backend_config(
     }
 }
 
-/// Build the registry `BackendConfigV2`. Preserves the historical behaviour:
-/// host/repo come from the image reference, `request_timeout` / `plain_http` /
-/// `skip_verify` from the optional `[backends.registry]` section (defaults used
-/// when absent).
+/// Build the registry `BackendConfigV2`. Host/repo come from the image
+/// reference; `request_timeout` / `plain_http` / `skip_verify` from the
+/// optional `[backends.registry]` section (defaults used when absent).
 fn build_registry_backend(
     registry_cfg: Option<&RegistryBackendConfig>,
     image_ref: &ImageRef,
@@ -447,7 +445,7 @@ fn parse_timeout_seconds(value: &str) -> u32 {
     let parsed = if let Some(num) = trimmed.strip_suffix("ms") {
         // Round sub-second values UP to 1s: the storage backend treats a
         // timeout of 0 as "no timeout at all" (connection.rs maps 0 -> None),
-        // so the old truncation turned an operator's fail-fast "500ms" into
+        // so truncating to 0 would turn an operator's fail-fast "500ms" into
         // an UNBOUNDED request timeout.
         num.parse::<u32>().ok().map(|n| n.div_ceil(1000).max(1))
     } else if let Some(num) = trimmed.strip_suffix('s') {
@@ -541,7 +539,7 @@ mod tests {
         assert_eq!(parse_timeout_seconds("2000ms"), 2);
     }
 
-    // ── B3: backend selection + s3/oss/http-proxy mapping ──────────────
+    // ── backend selection + s3/oss/http-proxy mapping ──────────────────
 
     use crate::config::{
         HttpProxyBackendConfig, OssBackendConfig, RegistryBackendConfig, S3BackendConfig,
@@ -673,9 +671,9 @@ mod tests {
 
     #[test]
     fn s3_scheme_prefixed_endpoint_is_stripped_not_malformed() {
-        // REGRESSION: a scheme-prefixed endpoint used to produce a malformed
-        // `https://https://…`. The prefix must be stripped and win over the
-        // `insecure` flag; the stored endpoint is a bare host.
+        // Regression guard: a scheme-prefixed endpoint must not produce a
+        // malformed `https://https://…` URL. The prefix must be stripped and
+        // win over the `insecure` flag; the stored endpoint is a bare host.
         for (endpoint, insecure, want_scheme) in [
             ("https://s3.us-east-1.amazonaws.com", false, "https"),
             ("http://minio.local:9000", false, "http"), // prefix wins over insecure=false

@@ -137,7 +137,7 @@ impl ServiceController {
 
         // Start worker threads BEFORE mounting. The EROFS mount opens and reads the marked blob
         // (and bootstrap) device files, which raises FAN_OPEN_PERM / FAN_PRE_ACCESS events that
-        // must be answered by a draining worker. If we mounted first, `mount(2)` would block in
+        // must be answered by a draining worker. Mounting first would block `mount(2)` in
         // the kernel waiting for a response that no running thread could provide -> deadlock
         // (the daemon hangs in uninterruptible `D` state and the mount never appears).
         self.spawn_fanotify_workers(image_id, &fanotify);

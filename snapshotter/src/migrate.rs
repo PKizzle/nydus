@@ -228,10 +228,9 @@ pub fn auto_migrate_if_needed(
         .context("failed to check whether the fjall store is empty")?
     {
         // Per-record imports fsync individually, so a crash mid-migration
-        // leaves the store non-empty with records still stranded in bbolt —
-        // and this branch used to skip them with only a debug!. The completion
-        // marker distinguishes "migration finished cleanly" (quiet) from
-        // "interrupted / errored" (loud, actionable).
+        // leaves the store non-empty with records still stranded in bbolt.
+        // The completion marker distinguishes "migration finished cleanly"
+        // (quiet) from "interrupted / errored" (loud, actionable).
         if root.join(MIGRATION_COMPLETE_MARKER).is_file() {
             debug!(
                 legacy_db = %bbolt_db.display(),
@@ -414,8 +413,8 @@ fn ensure_snapshot_dir(
     commit: bool,
     report: &mut StoreMigrationReport,
 ) -> Result<bool> {
-    // An existing target dir is trustworthy because commits below copy into a
-    // temp name and rename atomically — a crash mid-copy can no longer leave a
+    // An existing target dir is trustworthy: commits below copy into a temp
+    // name and rename atomically, so a crash mid-copy cannot leave a
     // half-populated dir under the final name.
     if target_dir.is_dir() {
         report.reused_dirs += 1;
@@ -713,9 +712,8 @@ mod tests {
         default_fixture(root);
         let store = SnapshotStore::open(&root.join(FJALL_DB_DIR)).unwrap();
 
-        // Use a driver other than the old hardcoded default ("fusedev") to
-        // prove the resolved node driver is actually threaded through and
-        // stamped, not a hardcoded guess.
+        // Use a non-"fusedev" driver to prove the caller's resolved node
+        // driver is threaded through and stamped, not a hardcoded guess.
         let report = auto_migrate_if_needed(root, &store, "fanotify")
             .unwrap()
             .unwrap();

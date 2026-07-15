@@ -233,7 +233,7 @@ fn spawn_nydusd(
         .arg("--log-level")
         .arg("info");
     // Also surface the credential via the env var nydusd reads for registry
-    // auth, belt-and-suspenders with the config `auth` field.
+    // auth, redundant with the config `auth` field.
     if let Some(auth) = auth {
         command.env("IMAGE_PULL_AUTH", auth);
     }
