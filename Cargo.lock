@@ -4501,7 +4501,6 @@ dependencies = [
  "prost",
  "prost-types",
  "rustls",
- "rustls-pemfile",
  "sendfd",
  "serde",
  "serde_json",

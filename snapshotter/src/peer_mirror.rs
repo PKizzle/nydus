@@ -55,8 +55,6 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::fs::File;
-use std::io::BufReader;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -842,16 +840,21 @@ fn build_tls_config(
     client_cert_path: &std::path::Path,
     client_key_path: &std::path::Path,
 ) -> Result<rustls::ClientConfig> {
+    // PEM loading uses rustls-pki-types' own `pem` module (re-exported as
+    // `rustls::pki_types::pem`) — the same parser the archived rustls-pemfile
+    // crate wrapped (RUSTSEC-2025-0134). Like its predecessor it skips PEM
+    // sections of a foreign kind, hence the explicit zero-item guards below.
+    use rustls::pki_types::pem::PemObject;
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem};
+
     // 1. Custom root CA (for k3s-spegel: the k3s server CA — system trust
     //    store is not used; the only things we authenticate are the embedded
     //    Spegel mirrors and the API server, all signed by this CA).
     let mut roots = rustls::RootCertStore::empty();
-    let mut ca_reader = BufReader::new(
-        File::open(ca_path)
-            .with_context(|| format!("open peer mirror CA cert {}", ca_path.display()))?,
-    );
+    let ca_certs = CertificateDer::pem_file_iter(ca_path)
+        .with_context(|| format!("open peer mirror CA cert {}", ca_path.display()))?;
     let mut ca_added = 0usize;
-    for cert in rustls_pemfile::certs(&mut ca_reader) {
+    for cert in ca_certs {
         let cert =
             cert.with_context(|| format!("parse peer mirror CA cert {}", ca_path.display()))?;
         roots
@@ -865,14 +868,14 @@ fn build_tls_config(
 
     // 2. Client identity for mTLS (for k3s-spegel: the k3s controller cert +
     //    key — same identity k3s' own internal components use).
-    let mut cert_reader = BufReader::new(File::open(client_cert_path).with_context(|| {
-        format!(
-            "open peer mirror client cert {}",
-            client_cert_path.display()
-        )
-    })?);
-    let client_certs: Vec<rustls::pki_types::CertificateDer<'static>> =
-        rustls_pemfile::certs(&mut cert_reader)
+    let client_certs: Vec<CertificateDer<'static>> =
+        CertificateDer::pem_file_iter(client_cert_path)
+            .with_context(|| {
+                format!(
+                    "open peer mirror client cert {}",
+                    client_cert_path.display()
+                )
+            })?
             .collect::<std::result::Result<_, _>>()
             .with_context(|| {
                 format!(
@@ -887,13 +890,26 @@ fn build_tls_config(
         ));
     }
 
-    let mut key_reader =
-        BufReader::new(File::open(client_key_path).with_context(|| {
-            format!("open peer mirror client key {}", client_key_path.display())
-        })?);
-    let client_key = rustls_pemfile::private_key(&mut key_reader)
-        .with_context(|| format!("parse peer mirror client key {}", client_key_path.display()))?
-        .ok_or_else(|| anyhow!("no private key found in {}", client_key_path.display()))?;
+    // Accepts the first PKCS#8 / SEC1 / PKCS#1 key section, skipping others.
+    let client_key = match PrivateKeyDer::from_pem_file(client_key_path) {
+        Ok(key) => key,
+        Err(pem::Error::NoItemsFound) => {
+            return Err(anyhow!(
+                "no private key found in {}",
+                client_key_path.display()
+            ));
+        }
+        Err(pem::Error::Io(e)) => {
+            return Err(e).with_context(|| {
+                format!("open peer mirror client key {}", client_key_path.display())
+            });
+        }
+        Err(e) => {
+            return Err(e).with_context(|| {
+                format!("parse peer mirror client key {}", client_key_path.display())
+            });
+        }
+    };
 
     rustls::ClientConfig::builder()
         .with_root_certificates(roots)
@@ -1152,5 +1168,173 @@ mod tests {
                 "distinct TLS identities must each build exactly one client"
             );
         });
+    }
+
+    // ---- build_tls_config: PEM identity loading ----
+    //
+    // Throwaway test-only identity (EC P-256, CN=nydus-peer-mirror-test,
+    // self-signed, valid to 2046). The certificate and the two key
+    // encodings below are the SAME key pair — `with_client_auth_cert`
+    // parses the key through the ring provider, so the material must be
+    // genuine. Never use this key outside this test module.
+    const TEST_CERT_PEM: &str = r"-----BEGIN CERTIFICATE-----
+MIIBljCCAT2gAwIBAgIUH2CY6EpcCSul24kgqnvRpR867GAwCgYIKoZIzj0EAwIw
+ITEfMB0GA1UEAwwWbnlkdXMtcGVlci1taXJyb3ItdGVzdDAeFw0yNjA3MTUwMDQ1
+NDFaFw00NjA3MTAwMDQ1NDFaMCExHzAdBgNVBAMMFm55ZHVzLXBlZXItbWlycm9y
+LXRlc3QwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAAR6ofTJvnpenmDK8aFi8wcE
+GvWJ03vGhxeVcetw/dA4TnmDJDPwl26sgyeAe4VzdC7cuFJZ6wKt3mmp3Ic4V0oZ
+o1MwUTAdBgNVHQ4EFgQU0PD3NalGUUvozo7afVumnT+IWNwwHwYDVR0jBBgwFoAU
+0PD3NalGUUvozo7afVumnT+IWNwwDwYDVR0TAQH/BAUwAwEB/zAKBggqhkjOPQQD
+AgNHADBEAiA3gE3QTKdoVKS3mxs9cuZIWjc8o1fZDOzU1bYmKlJtygIgUmvFA6jX
+TPkOLsyiOpBJ239612rqvYAon3DdwuFIUmU=
+-----END CERTIFICATE-----
+";
+
+    const TEST_KEY_PKCS8_PEM: &str = r"-----BEGIN PRIVATE KEY-----
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgJSaYyR0ouMeKF3wM
+x8xv+rg7G61cn2v6UynFoLQqhQ2hRANCAAR6ofTJvnpenmDK8aFi8wcEGvWJ03vG
+hxeVcetw/dA4TnmDJDPwl26sgyeAe4VzdC7cuFJZ6wKt3mmp3Ic4V0oZ
+-----END PRIVATE KEY-----
+";
+
+    const TEST_KEY_SEC1_PEM: &str = r"-----BEGIN EC PRIVATE KEY-----
+MHcCAQEEICUmmMkdKLjHihd8DMfMb/q4OxutXJ9r+lMpxaC0KoUNoAoGCCqGSM49
+AwEHoUQDQgAEeqH0yb56Xp5gyvGhYvMHBBr1idN7xocXlXHrcP3QOE55gyQz8Jdu
+rIMngHuFc3Qu3LhSWesCrd5pqdyHOFdKGQ==
+-----END EC PRIVATE KEY-----
+";
+
+    fn write_pem(dir: &tempfile::TempDir, name: &str, contents: &str) -> std::path::PathBuf {
+        let path = dir.path().join(name);
+        std::fs::write(&path, contents).expect("write test PEM");
+        path
+    }
+
+    /// Happy path: CA + client cert + PKCS#8 key yield an mTLS
+    /// `ClientConfig`. Pins the loader's accepted-input contract so the
+    /// PEM-parsing internals can be swapped under green tests.
+    #[test]
+    fn tls_config_loads_valid_ca_cert_and_pkcs8_key() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ca = write_pem(&dir, "ca.pem", TEST_CERT_PEM);
+        let cert = write_pem(&dir, "client.pem", TEST_CERT_PEM);
+        let key = write_pem(&dir, "client.key", TEST_KEY_PKCS8_PEM);
+        build_tls_config(&ca, &cert, &key).expect("valid PEM identity must load");
+    }
+
+    /// k3s writes its client keys in SEC1 (`EC PRIVATE KEY`) form as
+    /// well — the loader must accept all standard plaintext key
+    /// encodings (PKCS#8 above, SEC1 here), not just one.
+    #[test]
+    fn tls_config_accepts_sec1_ec_client_key() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ca = write_pem(&dir, "ca.pem", TEST_CERT_PEM);
+        let cert = write_pem(&dir, "client.pem", TEST_CERT_PEM);
+        let key = write_pem(&dir, "client.key", TEST_KEY_SEC1_PEM);
+        build_tls_config(&ca, &cert, &key).expect("SEC1 EC key must load");
+    }
+
+    /// Foreign PEM sections (a stray key in a CA bundle) are skipped,
+    /// not fatal — the cert after them must still be found.
+    #[test]
+    fn tls_config_skips_foreign_pem_sections_in_ca_bundle() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let bundle = format!("{TEST_KEY_PKCS8_PEM}{TEST_CERT_PEM}");
+        let ca = write_pem(&dir, "ca.pem", &bundle);
+        let cert = write_pem(&dir, "client.pem", TEST_CERT_PEM);
+        let key = write_pem(&dir, "client.key", TEST_KEY_PKCS8_PEM);
+        build_tls_config(&ca, &cert, &key).expect("cert after foreign sections must load");
+    }
+
+    /// An empty CA file must hard-error: silently trusting nothing would
+    /// disable peer authentication instead of failing loudly.
+    #[test]
+    fn tls_config_rejects_empty_ca_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ca = write_pem(&dir, "ca.pem", "");
+        let cert = write_pem(&dir, "client.pem", TEST_CERT_PEM);
+        let key = write_pem(&dir, "client.key", TEST_KEY_PKCS8_PEM);
+        let err = build_tls_config(&ca, &cert, &key).expect_err("empty CA file must be rejected");
+        assert!(
+            err.to_string().contains("no CA certificates found"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    /// A CA file whose only PEM section is a private key holds zero
+    /// certificates — the skip-foreign-sections behavior must not let it
+    /// silently satisfy the CA load.
+    #[test]
+    fn tls_config_rejects_ca_file_without_certificates() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ca = write_pem(&dir, "ca.pem", TEST_KEY_PKCS8_PEM);
+        let cert = write_pem(&dir, "client.pem", TEST_CERT_PEM);
+        let key = write_pem(&dir, "client.key", TEST_KEY_PKCS8_PEM);
+        let err = build_tls_config(&ca, &cert, &key).expect_err("cert-free CA file rejected");
+        assert!(
+            err.to_string().contains("no CA certificates found"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    /// Same guard for the client certificate chain.
+    #[test]
+    fn tls_config_rejects_client_cert_file_without_certificates() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ca = write_pem(&dir, "ca.pem", TEST_CERT_PEM);
+        let cert = write_pem(&dir, "client.pem", TEST_KEY_PKCS8_PEM);
+        let key = write_pem(&dir, "client.key", TEST_KEY_PKCS8_PEM);
+        let err = build_tls_config(&ca, &cert, &key).expect_err("cert-free client file rejected");
+        assert!(
+            err.to_string().contains("no client certificates found"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    /// A key file whose only PEM section is a certificate contains no
+    /// usable private key and must be rejected with the dedicated
+    /// missing-key message.
+    #[test]
+    fn tls_config_rejects_key_file_without_private_key() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ca = write_pem(&dir, "ca.pem", TEST_CERT_PEM);
+        let cert = write_pem(&dir, "client.pem", TEST_CERT_PEM);
+        let key = write_pem(&dir, "client.key", TEST_CERT_PEM);
+        let err = build_tls_config(&ca, &cert, &key).expect_err("key-free key file rejected");
+        assert!(
+            err.to_string().contains("no private key found"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    /// Malformed PEM (a section that never ends) is a parse error, never
+    /// a silent success.
+    #[test]
+    fn tls_config_rejects_malformed_ca_pem() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ca = write_pem(&dir, "ca.pem", "-----BEGIN CERTIFICATE-----\nzzzz\n");
+        let cert = write_pem(&dir, "client.pem", TEST_CERT_PEM);
+        let key = write_pem(&dir, "client.key", TEST_KEY_PKCS8_PEM);
+        let err = build_tls_config(&ca, &cert, &key).expect_err("malformed CA PEM rejected");
+        assert!(
+            err.to_string().contains("CA cert"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    /// A missing CA file surfaces as an open error naming the path, so
+    /// the operator sees which of the three PEM paths is wrong.
+    #[test]
+    fn tls_config_reports_missing_ca_file_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ca = dir.path().join("does-not-exist.pem");
+        let cert = write_pem(&dir, "client.pem", TEST_CERT_PEM);
+        let key = write_pem(&dir, "client.key", TEST_KEY_PKCS8_PEM);
+        let err = build_tls_config(&ca, &cert, &key).expect_err("missing CA file rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("open peer mirror CA cert") && msg.contains("does-not-exist.pem"),
+            "unexpected error: {err:#}"
+        );
     }
 }
