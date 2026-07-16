@@ -52,7 +52,8 @@ fn parse_profile(s: &str) -> Result<Profile, String> {
 #[derive(Parser, Debug)]
 #[command(
     name = "containerd-nydus",
-    about = "Nydus containerd remote snapshotter"
+    about = "Nydus containerd remote snapshotter",
+    version = nydus_snapshotter::VERSION
 )]
 struct Args {
     /// Path to the unified TOML configuration file.
