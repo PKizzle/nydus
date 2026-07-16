@@ -47,6 +47,9 @@ pub struct SystemController {
     auto_zran: Option<Arc<AutoZranManager>>,
     access_tracer: Option<Arc<AccessTracer>>,
     metrics: Arc<ControllerMetrics>,
+    /// Path of the containerd proxy-plugin gRPC socket, probed by `/readyz`.
+    /// `None` (tests, unusual embeddings) makes `/readyz` report not-ready.
+    grpc_socket: Option<PathBuf>,
 }
 
 #[derive(Default)]
@@ -139,6 +142,7 @@ pub struct SystemControllerBuilder {
     snapshotter_metrics: Option<Arc<SnapshotterMetrics>>,
     auto_zran: Option<Arc<AutoZranManager>>,
     access_tracer: Option<Arc<AccessTracer>>,
+    grpc_socket: Option<PathBuf>,
 }
 
 impl SystemControllerBuilder {
@@ -156,6 +160,7 @@ impl SystemControllerBuilder {
             snapshotter_metrics: None,
             auto_zran: None,
             access_tracer: None,
+            grpc_socket: None,
         }
     }
 
@@ -171,6 +176,15 @@ impl SystemControllerBuilder {
 
     pub fn with_access_tracer(mut self, tracer: Option<Arc<AccessTracer>>) -> Self {
         self.access_tracer = tracer;
+        self
+    }
+
+    /// Path of the containerd proxy-plugin gRPC socket. `/readyz` reports
+    /// ready once this socket accepts connections — the gRPC listener binds
+    /// *after* the sysctl server starts, so readiness correctly lags
+    /// liveness during startup.
+    pub fn with_grpc_socket(mut self, socket: PathBuf) -> Self {
+        self.grpc_socket = Some(socket);
         self
     }
 
@@ -191,6 +205,7 @@ impl SystemControllerBuilder {
             auto_zran: self.auto_zran,
             access_tracer: self.access_tracer,
             metrics: Arc::new(ControllerMetrics::default()),
+            grpc_socket: self.grpc_socket,
         }
     }
 }
@@ -507,6 +522,10 @@ async fn route_request(controller: &SystemController, request: HttpRequest) -> H
         },
         ("PUT", "/api/v1/auth") => handle_auth_put(&request.body),
         ("GET", "/metrics") => metrics_response(controller).await,
+        // Liveness: the sysctl server shares the compio event loop with the
+        // gRPC server, so any reply at all proves the loop is responsive.
+        ("GET", "/healthz") => json_response(200, serde_json::json!({ "status": "ok" })),
+        ("GET", "/readyz") => handle_readyz(controller),
         ("GET", "/debug/allocator") => json_response(200, AllocatorStatsResponse::collect()),
         _ => route_dynamic_request(controller, &request.method, path, &request.body).await,
     }
@@ -800,6 +819,25 @@ fn handle_cache_gc(controller: &SystemController, body: &[u8]) -> HttpResponse {
     match result {
         Ok(report) => json_response(200, CacheGcReportResponse::from(report)),
         Err(e) => error_response(500, e.to_string()),
+    }
+}
+
+/// Readiness: the snapshotter is ready once the containerd proxy-plugin gRPC
+/// socket accepts connections. A UDS connect is cheap and hits no store or
+/// daemon state, so kubelet-frequency probing cannot amplify I/O.
+fn handle_readyz(controller: &SystemController) -> HttpResponse {
+    let Some(socket) = controller.grpc_socket.as_ref() else {
+        return error_response(503, "not ready: gRPC socket path not configured");
+    };
+    match std::os::unix::net::UnixStream::connect(socket) {
+        Ok(_) => json_response(200, serde_json::json!({ "status": "ready" })),
+        Err(e) => error_response(
+            503,
+            format!(
+                "not ready: gRPC socket {} not accepting connections: {e}",
+                socket.display()
+            ),
+        ),
     }
 }
 
@@ -1548,6 +1586,68 @@ mod tests {
         let dir = tempdir().unwrap();
         let controller = test_controller(dir.path().to_path_buf());
         assert!(controller.list_daemons().await.is_empty());
+    }
+
+    #[compio::test]
+    async fn healthz_always_reports_ok() {
+        let dir = tempdir().unwrap();
+        let controller = test_controller(dir.path().to_path_buf());
+        let response = route_request(
+            &controller,
+            HttpRequest {
+                method: "GET".to_string(),
+                path: "/healthz".to_string(),
+                body: Vec::new(),
+            },
+        )
+        .await;
+        assert_eq!(response.status, 200);
+        let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(body["status"], "ok");
+    }
+
+    #[compio::test]
+    async fn readyz_tracks_grpc_socket_liveness() {
+        let dir = tempdir().unwrap();
+        let socket = dir.path().join("grpc.sock");
+        let mut config = SnapshotterConfig::default();
+        config.snapshotter.root = dir.path().to_path_buf();
+        config.snapshotter.cache.work_dir = dir.path().join("cache");
+        let store = Arc::new(SnapshotStore::open(&dir.path().join("metadata.fjall")).unwrap());
+        let controller = SystemControllerBuilder::new(
+            Arc::new(DaemonSupervisor::new(config.clone())),
+            store,
+            CacheManager::from_config(&config),
+            CacheGcPolicy::default(),
+        )
+        .with_grpc_socket(socket.clone())
+        .build();
+
+        let readyz = |controller: &SystemController| {
+            let controller = controller.clone();
+            async move {
+                route_request(
+                    &controller,
+                    HttpRequest {
+                        method: "GET".to_string(),
+                        path: "/readyz".to_string(),
+                        body: Vec::new(),
+                    },
+                )
+                .await
+            }
+        };
+
+        // Before the gRPC listener binds: not ready.
+        assert_eq!(readyz(&controller).await.status, 503);
+
+        // Once something accepts on the socket: ready.
+        let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        assert_eq!(readyz(&controller).await.status, 200);
+
+        // A controller without a configured socket never reports ready.
+        let bare = test_controller(dir.path().join("bare"));
+        assert_eq!(readyz(&bare).await.status, 503);
     }
 
     #[test]

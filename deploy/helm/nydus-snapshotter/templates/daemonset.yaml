@@ -83,6 +83,33 @@ spec:
             # REQUIRED. Bidirectional mount propagation + mount(2) + fanotify FAN_CLASS_PRE_CONTENT
             # all need a privileged container on stable k8s/k3s; userns does not lift this today.
             privileged: {{ .Values.daemonset.privileged }}
+          {{- if .Values.daemonset.probes.enabled }}
+          # Exec probes over the sysctl UDS (the image ships no curl/grpc_health_probe;
+          # the healthcheck subcommand is built into the binary). Requires
+          # [snapshotter.sysctl] enable = true (the default). A liveness restart hands
+          # the mounts to the successor via the failover records + fd store.
+          livenessProbe:
+            exec:
+              command:
+                - /usr/local/bin/containerd-nydus
+                - healthcheck
+                - --socket={{ .Values.hostPaths.run }}/containerd-nydus-api.sock
+            initialDelaySeconds: 10
+            periodSeconds: {{ .Values.daemonset.probes.livenessPeriodSeconds }}
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            exec:
+              command:
+                - /usr/local/bin/containerd-nydus
+                - healthcheck
+                - --ready
+                - --socket={{ .Values.hostPaths.run }}/containerd-nydus-api.sock
+            initialDelaySeconds: 5
+            periodSeconds: {{ .Values.daemonset.probes.readinessPeriodSeconds }}
+            timeoutSeconds: 5
+            failureThreshold: 3
+          {{- end }}
           {{- with .Values.daemonset.env }}
           env:
             {{- toYaml . | nindent 12 }}

@@ -81,11 +81,76 @@ struct Args {
     /// profile resolution.
     #[arg(long, env = "NYDUS_SNAPSHOTTER_PROFILE", value_parser = parse_profile)]
     profile: Option<Profile>,
+
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(clap::Subcommand, Debug)]
+enum Command {
+    /// Probe a running snapshotter over the sysctl API socket and exit 0 iff
+    /// healthy. Intended for Kubernetes exec probes (the container image
+    /// ships no curl or grpc_health_probe).
+    Healthcheck {
+        /// Path of the sysctl API socket ([snapshotter.sysctl] address).
+        #[arg(
+            long,
+            env = "NYDUS_SNAPSHOTTER_API_SOCKET",
+            default_value = "/run/containerd-nydus/containerd-nydus-api.sock"
+        )]
+        socket: std::path::PathBuf,
+        /// Probe readiness (/readyz: gRPC socket accepting) instead of
+        /// liveness (/healthz: event loop responsive).
+        #[arg(long)]
+        ready: bool,
+        /// Per-probe timeout in seconds (connect + read).
+        #[arg(long, default_value_t = 2)]
+        timeout_secs: u64,
+    },
+}
+
+/// One-shot HTTP GET over the sysctl UDS with blocking std I/O — no async
+/// runtime, so a wedged event loop in the *probed* process cannot be
+/// mirrored by a wedged probe. Exit code carries the verdict.
+fn run_healthcheck(socket: &std::path::Path, ready: bool, timeout_secs: u64) -> Result<()> {
+    use std::io::{Read, Write};
+
+    let path = if ready { "/readyz" } else { "/healthz" };
+    let timeout = Some(std::time::Duration::from_secs(timeout_secs));
+    let mut stream = std::os::unix::net::UnixStream::connect(socket)
+        .map_err(|e| anyhow::anyhow!("connect {}: {e}", socket.display()))?;
+    stream.set_read_timeout(timeout)?;
+    stream.set_write_timeout(timeout)?;
+    stream.write_all(
+        format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n").as_bytes(),
+    )?;
+
+    let mut response = String::new();
+    // Read until EOF (Connection: close) or timeout; the status line suffices.
+    let _ = stream.take(4096).read_to_string(&mut response);
+    let status_line = response.lines().next().unwrap_or_default();
+    if status_line.split_whitespace().nth(1) == Some("200") {
+        println!("{}", if ready { "ready" } else { "ok" });
+        Ok(())
+    } else {
+        anyhow::bail!("{path} returned {status_line:?}: {response}")
+    }
 }
 
 #[compio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
+
+    // Probe subcommand: dispatch before config load / tracing setup so it
+    // works with no config file and prints nothing but the verdict.
+    if let Some(Command::Healthcheck {
+        socket,
+        ready,
+        timeout_secs,
+    }) = args.command
+    {
+        return run_healthcheck(&socket, ready, timeout_secs);
+    }
 
     // Initialize tracing.
     tracing_subscriber::fmt()

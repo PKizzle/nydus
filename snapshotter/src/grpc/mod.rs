@@ -1329,6 +1329,7 @@ pub async fn serve_with_supervisor(
         .with_metrics(metrics.clone())
         .with_auto_zran(auto_zran.clone())
         .with_access_tracer(Some(access_tracer.clone()))
+        .with_grpc_socket(socket_path.clone())
         .build();
         compio::runtime::spawn(async move {
             if let Err(e) = serve_sysctl_unix(sysctl_path, controller).await {

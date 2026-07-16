@@ -38,6 +38,17 @@ daemonset:
       memory: 1Gi
   # Extra env for the container (e.g. RUST_LOG).
   env: []
+  # Exec probes via `containerd-nydus healthcheck` over the sysctl UDS.
+  # Requires [snapshotter.sysctl] enable = true (the default); if extraToml
+  # overrides sysctl.address, the probe socket path no longer matches and
+  # probes must be disabled here. Liveness proves the compio event loop is
+  # responsive; readiness additionally proves the containerd proxy-plugin
+  # gRPC socket accepts connections. A liveness restart is safe: failover
+  # records + the systemd/fd-store takeover re-attach live mounts.
+  probes:
+    enabled: true
+    livenessPeriodSeconds: 30
+    readinessPeriodSeconds: 10
 
 # Host paths. These are the contract with the host kernel/containerd and the persistence store.
 hostPaths:
