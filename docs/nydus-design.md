@@ -1,5 +1,12 @@
 # Nydus
 
+> **NOTE (2026-07):** this document predates the v3 single-binary snapshotter
+> (`containerd-nydus`), which links nydus-service in-process and never spawns a
+> standalone `nydusd`. It remains accurate for standalone `nydusd` usage and as
+> historical design context. For the snapshotter, see [ARCHITECTURE.md](../ARCHITECTURE.md)
+> and [quickstart-containerd.md](quickstart-containerd.md).
+
+
 # I. High Level Design
 ##    0. Overview
 Nydus is a container image acceleration service, [GitHub repo](https://github.com/dragonflyoss/nydus)

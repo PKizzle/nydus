@@ -44,17 +44,10 @@ endif
 endif
 RUST_TARGET_STATIC ?= $(STATIC_TARGET)
 
-# The snapshotter's legacy-migration tool (`nydus-migrate`) pulls in bbolt-rs ->
-# aligners, whose default `simd` feature only compiles on x86_64/aarch64 and
-# `compile_error!`s elsewhere. That tool is gated behind the snapshotter's
-# (optional, non-default) `migrate` feature, so the core snapshotter now builds on
-# every arch. Enable `migrate` only where its deps compile; on ppc64le/riscv64 the
-# snapshotter is built without it (and `nydus-migrate` is simply not produced).
-ifeq (,$(findstring powerpc64le,$(RUST_TARGET_STATIC)))
-ifeq (,$(findstring riscv64,$(RUST_TARGET_STATIC)))
-	CARGO_COMMON += --features=nydus-snapshotter/migrate
-endif
-endif
+# `migrate` (the bbolt->fjall legacy migration + the nydus-migrate tool) is a
+# DEFAULT snapshotter feature on every architecture: third_party/bbolt-rs pins
+# `aligners = { default-features = false }`, so the old SIMD-only-on-x86 build
+# break on ppc64le/riscv64 is gone and no per-arch feature gating is needed.
 
 # Extra opt-in cargo features to fold into the build. Used by the Dragonfly e2e
 # job to enable backend-dragonfly-proxy, which is excluded from the default build
@@ -172,14 +165,9 @@ ut-nextest:
 
 # install miri first from https://github.com/rust-lang/miri/
 # nydus-snapshotter is excluded from Miri: it links compio (io_uring) + mimalloc
-# and is FFI/syscall-heavy, which Miri cannot execute. (Its bbolt-rs/aligners dep,
-# the former blocker, is now gated behind the optional `migrate` feature.)
-# Strip --features=nydus-snapshotter/migrate from CARGO_COMMON: cargo errors with
-# "none of the selected packages contains this feature" when the owning package
-# is also excluded from the build set.
-MIRI_CARGO_COMMON := $(filter-out --features=nydus-snapshotter/migrate,$(CARGO_COMMON))
+# and is FFI/syscall-heavy, which Miri cannot execute.
 miri-ut-nextest:
-	$(CARGO_COV_FLAGS) MIRIFLAGS=-Zmiri-disable-isolation TEST_WORKDIR_PREFIX=$(TEST_WORKDIR_PREFIX) RUST_BACKTRACE=1 ${RUSTUP} run nightly cargo miri nextest run --no-fail-fast --filter-expr 'test(test) - test(integration) - test(deduplicate::tests) - test(inode_bitmap::tests::test_inode_bitmap)' --workspace $(EXCLUDE_PACKAGES) --exclude nydus-snapshotter $(MIRI_CARGO_COMMON) $(CARGO_BUILD_FLAGS)
+	$(CARGO_COV_FLAGS) MIRIFLAGS=-Zmiri-disable-isolation TEST_WORKDIR_PREFIX=$(TEST_WORKDIR_PREFIX) RUST_BACKTRACE=1 ${RUSTUP} run nightly cargo miri nextest run --no-fail-fast --filter-expr 'test(test) - test(integration) - test(deduplicate::tests) - test(inode_bitmap::tests::test_inode_bitmap)' --workspace $(EXCLUDE_PACKAGES) --exclude nydus-snapshotter $(CARGO_COMMON) $(CARGO_BUILD_FLAGS)
 
 smoke-only:
 	CARGO_COV_FLAGS="$(CARGO_COV_FLAGS)" make -C smoke test

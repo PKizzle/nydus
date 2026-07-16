@@ -1352,6 +1352,18 @@ fn default_fs_drivers() -> Vec<FsDriverEntry> {
 mod tests {
     use super::*;
 
+    /// The example config shipped in the release tarball must always parse
+    /// and validate against the current schema.
+    #[test]
+    fn shipped_example_config_parses_and_validates() {
+        let example = include_str!("../../../misc/configs/containerd-nydus-config.toml");
+        let config: SnapshotterConfig = toml::from_str(example).expect("example config parses");
+        config.validate().expect("example config validates");
+        assert_eq!(config.snapshotter.profile, Profile::Containerd);
+        assert!(config.snapshotter.sysctl.enable);
+        assert!(!config.snapshotter.auto_zran.enable);
+    }
+
     #[test]
     fn fs_driver_type_hint_roundtrip_and_tarfs() {
         for d in [

@@ -272,7 +272,9 @@ ctr -n k8s.io snapshot --snapshotter nydus ls
 # CRI sees the snapshotter (upstream Kubernetes):
 crictl info | grep -i snapshotter
 
-# DaemonSet healthy:
+# DaemonSet healthy (liveness/readiness exec probes run `containerd-nydus healthcheck`
+# against the sysctl socket; see values `daemonset.probes`):
+kubectl -n nydus-system get pods -o wide
 kubectl -n nydus-system logs ds/nydus-nydus-snapshotter
 
 # A pod using runtimeClassName: nydus starts and its rootfs is a nydus mount on the node:
@@ -281,6 +283,11 @@ mount | grep -E 'erofs|fuse.*nydus'
 
 ## Configuration reference
 
+The chart surfaces the most common knobs; anything else goes through `config.extraToml`,
+appended verbatim to the generated TOML. A fully annotated standalone example of the
+underlying config lives at
+[misc/configs/containerd-nydus-config.toml](../../../misc/configs/containerd-nydus-config.toml).
+
 | Key | Default | Description |
 | --- | --- | --- |
 | `image.repository` / `image.tag` | `…/nydus-snapshotter` / chart appVersion | Image bundling `containerd-nydus` + `nydus-image`. |
@@ -288,6 +295,7 @@ mount | grep -E 'erofs|fuse.*nydus'
 | `config.profile` | `k3s` | Deployment profile stamped into the config TOML: `auto`, `k3s`, or `containerd`. Overridable at runtime via `NYDUS_SNAPSHOTTER_PROFILE` / `--profile`. |
 | `config.peerMirror.preset` | `k3s-spegel` | Peer-mirror preset: `k3s-spegel`, `spegel`, or `none`. Canonical key `peer_mirror` (old `spegel_mirror` is a serde alias). |
 | `daemonset.privileged` | `true` | Required; see [Overview](#overview). |
+| `daemonset.probes.enabled` | `true` | Liveness/readiness exec probes via `containerd-nydus healthcheck` over the sysctl socket. |
 | `hostPaths.containerdSock` | `/run/k3s/containerd/containerd.sock` | Host containerd socket. |
 | `config.fsDrivers` | fanotify, blockdev(loop), fusedev | Ordered driver fallback chain. |
 | `runtimeClass.name` / `runtimeClass.handler` | `nydus` / `nydus` | RuntimeClass and the containerd handler it maps to. |

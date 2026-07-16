@@ -1,5 +1,12 @@
 # Nydusd
 
+> **NOTE (2026-07):** this document predates the v3 single-binary snapshotter
+> (`containerd-nydus`), which links nydus-service in-process and never spawns a
+> standalone `nydusd`. It remains accurate for standalone `nydusd` usage and as
+> historical design context. For the snapshotter, see [ARCHITECTURE.md](../ARCHITECTURE.md)
+> and [quickstart-containerd.md](quickstart-containerd.md).
+
+
 `nydusd` running as daemon to expose a [FUSE](https://www.kernel.org/doc/html/latest/filesystems/fuse.html) mountpoint or a [Virtio-FS](https://virtio-fs.gitlab.io/) mountpoint inside guest for containers to access.
 
 ### Get binary from release page

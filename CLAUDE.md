@@ -60,7 +60,7 @@ nydus/
 │   ├── src/source/      # Image source detection (referrer, encryption)
 │   ├── src/store/       # fjall (LSM) snapshot metadata store (metadata.fjall)
 │   ├── src/migrate.rs   # Legacy bbolt→fjall auto-migration (library core; feature "migrate")
-│   └── src/bin/         # containerd-nydus, nydus-migrate
+│   └── src/bin/         # containerd-nydus, nydus-migrate, nydus-credential-bridge, NRI plugins
 ├── nydusify/         # Rust nydusify: convert/check/copy/mount CLI (registry-publish flow)
 ├── registry-client/  # OCI distribution client (pull+push, bearer auth) used by nydusify
 ├── storage/          # Core storage subsystem (backends, caching)
@@ -113,11 +113,17 @@ tag, no pushed artifact, `original:tag` is served faster than the original. Mech
 3. The artifact is served on demand through the fanotify path (gzip ranges decompressed lazily into
    the cache), so the container starts before the image is fully materialised.
 
-Status: the conversion + serving pipeline is verified end-to-end (single + multi-layer) via
-`misc/fanotify/`. **Remaining**: the snapshotter `Prepare`/commit lifecycle wiring (detect a
-complete standard-OCI image → gather content-store layers → `local_accel::convert` → build a
-fanotify `BlobCacheList` → `DaemonSupervisor::ensure_instance` → return the daemon mount). That step
-needs the containerd/k3s loop to implement and verify.
+Status: **fully wired end-to-end.** The conversion + serving pipeline is verified (single +
+multi-layer) via `misc/fanotify/`, and the snapshotter `Prepare` lifecycle integration exists: the
+prepare path (`snapshotter/src/grpc/mod.rs`) resolves an existing accel sidecar
+(`resolve_auto_accel_mount`), enqueues stage-1 base conversion for new images
+(`AutoZranManager::try_enqueue_base`), and attaches the access tracer whose settle drives the
+stage-2 optimize/prefetch upload — worker logic in `snapshotter/src/auto_zran.rs`, artifact
+build in `local_accel.rs`, serving via `DaemonSupervisor::ensure_instance`. Still unverified in
+automation: a live containerd-GC race against a slow peer fetch mid-promotion, a multi-node
+spegel sidecar-fetch soak, and the fanotify path in CI (GitHub runners are kernel < 6.14;
+`misc/fanotify/*.sh` covers it on a modern host — CI covers the fusedev loop via
+`misc/snapshotter-e2e.sh`).
 
 Do NOT reintroduce the tag-suffix / referrer-push approach for transparent accel — it was
 explicitly rejected because it changes the tag and the snapshotter never consults referrers. Use

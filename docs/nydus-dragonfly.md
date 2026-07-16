@@ -1,5 +1,11 @@
 # Dragonfly P2P Proxy Integration
 
+> **NOTE (2026-07):** this integration rides the storage crate's optional,
+> non-default `backend-dragonfly-proxy` feature (the only tokio-gated path in
+> the workspace) and is not part of the default v3 snapshotter build. For the
+> current architecture see [ARCHITECTURE.md](../ARCHITECTURE.md).
+
+
 This document describes the design and implementation of nydus's integration
 with [Dragonfly](https://d7y.io/) for P2P-accelerated container image
 distribution.

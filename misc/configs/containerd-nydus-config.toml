@@ -1,0 +1,109 @@
+# Example unified configuration for the Rust nydus snapshotter (containerd-nydus).
+#
+# One TOML file drives everything: the containerd proxy-plugin server, the
+# in-process nydusd daemons (backend/cache config is generated per image —
+# see snapshotter/src/config/), the cache, and the optional acceleration
+# features. There is no separate nydusd JSON.
+#
+# This example targets STOCK containerd; the commented alternatives show the
+# k3s values. See docs/quickstart-containerd.md for the containerd side
+# (proxy_plugins registration) and docs/nydus-failover-upgrade.md for the
+# systemd unit failover needs.
+
+[snapshotter]
+# Deployment profile: fills the containerd socket/content-store/peer-mirror
+# defaults for anything left unset below. "auto" probes the well-known
+# sockets at startup; pin "containerd" or "k3s" to avoid ambiguity when both
+# exist. Also overridable via --profile / NYDUS_SNAPSHOTTER_PROFILE.
+profile = "containerd"
+root = "/var/lib/containerd-nydus"
+# k3s: root = "/var/lib/rancher/k3s/agent/containerd/nydus/snapshotter"
+# gRPC proxy-plugin socket — must match the `address` in containerd's
+# [proxy_plugins."nydus"] table.
+address = "/run/containerd-nydus/containerd-nydus-grpc.sock"
+cleanup_on_close = true
+
+[snapshotter.daemon]
+# "none", "restart", or "failover" (default). failover parks each mount's
+# /dev/fuse fd in systemd's fd store so containers survive a snapshotter
+# restart/crash — requires a Type=notify unit with FileDescriptorStoreMax.
+recover_policy = "failover"
+threads = 4
+log_level = "info"
+
+# Filesystem driver candidates. Omitted on purpose: the built-in auto-ranking
+# probes fanotify (kernel >= 6.14 + EROFS, the on-demand fast path) ->
+# blockdev (loop/EROFS) -> fusedev (works everywhere with /dev/fuse) and
+# picks the first viable one. Uncomment to pin a driver for testing:
+# [[snapshotter.fs_drivers]]
+# type = "fusedev"
+
+[snapshotter.cache]
+work_dir = "/var/lib/containerd-nydus/cache"
+# NOTE: the fanotify driver needs work_dir on a filesystem that supports
+# pre-content marks — ext4 works, tmpfs does not.
+gc_period = "6h"
+
+[snapshotter.features]
+# Detect nydus artifacts published as OCI referrers of the original image.
+referrer_detect = true
+prefetch = true
+metrics = true
+
+# System-controller HTTP API over a unix socket: daemon records/upgrade,
+# cache GC, prefetch profiles, runtime auth, GET /metrics, and the
+# /healthz + /readyz endpoints `containerd-nydus healthcheck` probes.
+[snapshotter.sysctl]
+enable = true
+address = "/run/containerd-nydus/containerd-nydus-api.sock"
+
+# Optional TCP Prometheus listener (the sysctl UDS always serves /metrics):
+# [snapshotter.metrics]
+# listen = "0.0.0.0:9110"
+
+[backends.registry]
+# Registry credentials come from the runtime auth store (PUT /api/v1/auth,
+# nydus-credential-bridge) or this env var; see docs/credentials.md.
+auth_env = "IMAGE_PULL_AUTH"
+skip_verify = false
+# For a private-CA registry, trust extra PEM roots instead of skip_verify.
+# Reaches the blob backend AND referrer detection.
+# ca_cert_files = ["/etc/ssl/certs/my-private-ca.pem"]
+request_timeout = "30s"
+
+# Node-local transparent acceleration (auto-zran): pods using standard OCI
+# images get a lazily-served RAFS v6 + zran mount built on this node — no tag
+# change, no registry push. Requires the containerd socket below and (for the
+# serving fast path) the fanotify driver. Disabled in this example; enable
+# once the basics work.
+[snapshotter.auto_zran]
+enable = false
+nydus_image = "/usr/local/bin/nydus-image"
+queue_depth = 4
+# Background conversion runs at idle priority (SchedClass, OS-portable).
+sched_class = "idle"
+work_dir = "/var/lib/containerd-nydus/auto-zran"
+
+# Access-order capture driving the stage-2 prefetch optimization.
+[snapshotter.auto_zran.capture]
+enable = true
+settle_idle = "5s"
+settle_max = "60s"
+exclude_globs = ["/proc/**", "/sys/**", "/dev/**", "/tmp/**", "/run/**", "/var/run/**"]
+
+[snapshotter.containerd]
+# Stock containerd (profile = "containerd" fills these if omitted):
+address = "/run/containerd/containerd.sock"
+namespace = "k8s.io"
+content_root = "/var/lib/containerd/io.containerd.content.v1.content"
+# k3s equivalents:
+# address = "/run/k3s/containerd/containerd.sock"
+# content_root = "/var/lib/rancher/k3s/agent/containerd/io.containerd.content.v1.content"
+
+# Peer registry mirror (e.g. Spegel) for cross-node sidecar pulls. On k3s the
+# "k3s-spegel" preset (profile-derived) fills endpoint + mTLS cert paths;
+# stock containerd clusters set an explicit endpoint or leave this disabled.
+[snapshotter.peer_mirror]
+enable = false
+# preset = "spegel"
+# endpoint = "https://127.0.0.1:5001"

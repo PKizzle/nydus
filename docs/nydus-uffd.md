@@ -1,5 +1,12 @@
 # Nydus UFFD Block Device
 
+> **NOTE (2026-07):** this document predates the v3 single-binary snapshotter
+> (`containerd-nydus`), which links nydus-service in-process and never spawns a
+> standalone `nydusd`. It remains accurate for standalone `nydusd` usage and as
+> historical design context. For the snapshotter, see [ARCHITECTURE.md](../ARCHITECTURE.md)
+> and [quickstart-containerd.md](quickstart-containerd.md).
+
+
 Export a RAFS v6 image as a block device through [userfaultfd](https://www.kernel.org/doc/html/latest/admin-guide/mm/userfaultfd.html), enabling on-demand paging via `mmap`.
 
 ## Overview

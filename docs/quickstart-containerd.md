@@ -23,7 +23,9 @@ supervise.
 Write `/etc/nydus/config.toml`. On a stock host the containerd socket
 (`/run/containerd/containerd.sock`) and content-store root
 (`/var/lib/containerd/io.containerd.content.v1.content`) come from the **profile** — you do not
-repeat them here.
+repeat them here. A fully annotated example covering every common section ships as
+[misc/configs/containerd-nydus-config.toml](../misc/configs/containerd-nydus-config.toml)
+(also included in the release tarball's `configs/`).
 
 ```toml
 [snapshotter]
