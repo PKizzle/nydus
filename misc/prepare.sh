@@ -29,12 +29,12 @@ sudo mkdir -p /opt/cni/bin
 sudo wget https://github.com/containernetworking/plugins/releases/download/$CNI_PLUGINS_VERSION/cni-plugins-linux-amd64-$CNI_PLUGINS_VERSION.tgz
 sudo tar -xzvf cni-plugins-linux-amd64-$CNI_PLUGINS_VERSION.tgz -C /opt/cni/bin
 
-# Upgrade containerd to a release containing the Transfer-API unpacker fix (containerd#11236).
-# containerd v2.0 enabled the Transfer API by default, and unpatched v2.0.x releases fail to pull
-# images with a snapshotter set: "unable to initialize unpacker: no unpack platforms defined"
-# (containerd issues #11228 / #11606). The runner ships an affected v2.0.x, so nerdctl run of nydus
-# images breaks; pin the latest v2.0 patch which unpacks the default platform without --local.
-readonly CONTAINERD_VERSION=2.0.8
+# Upgrade containerd past the runner's stock v2.0.x, which lacks the Transfer-API unpacker fix
+# (containerd#11236) and fails to pull with a snapshotter set: "unable to initialize unpacker: no
+# unpack platforms defined" (containerd issues #11228 / #11606). Track the current stable line,
+# which is what production clusters (k3s) actually run; the nerdctl 1.7.x pin above is the only
+# version constraint that is load-bearing for the proxy-snapshotter annotation.
+readonly CONTAINERD_VERSION=2.3.3
 wget -q https://github.com/containerd/containerd/releases/download/v${CONTAINERD_VERSION}/containerd-static-${CONTAINERD_VERSION}-linux-amd64.tar.gz
 sudo tar -C /usr -xzf containerd-static-${CONTAINERD_VERSION}-linux-amd64.tar.gz
 
