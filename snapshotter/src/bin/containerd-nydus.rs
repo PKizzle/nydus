@@ -292,6 +292,15 @@ async fn main() -> Result<()> {
         );
     }
 
+    // Rebuild any remaining live instances from their persisted records:
+    // fanotify/blockdev daemons hold no preservable fd, so their surviving
+    // kernel mounts must be re-armed by a fresh instance (see
+    // `rebuild_from_records`).
+    let rebuilt = supervisor.rebuild_from_records().await;
+    if rebuilt > 0 {
+        info!(rebuilt, "rebuilt nydus daemons from persisted records");
+    }
+
     // Open the fjall snapshot store HERE — not inside the server task — so the
     // shutdown path below can fsync the journal with a known-good handle even
     // when systemd is about to `kill -9` us on the failover path. If the store

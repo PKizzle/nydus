@@ -1367,12 +1367,34 @@ impl DaemonSupervisor {
             .map(|r| (r.slug.as_str(), r))
             .collect();
 
+        // Fd adoption rebuilds a fusedev daemon around the preserved
+        // `/dev/fuse` fd; under any other driver the parked fd is useless to a
+        // successor. Evict it from the store (systemd's dup would otherwise
+        // pin a connection nobody serves) but leave the mount alone —
+        // `rebuild_from_records` heals kernel mounts in place and detaches
+        // dead FUSE mounts before remounting.
+        let adoptable = self.active_fs_driver() == FsDriverType::Fusedev;
+
         let mut restored = 0;
         for (slug, fds) in &stored {
             let Some(record) = by_slug.get(slug.as_str()) else {
-                warn!(slug, "preserved fd has no live daemon record; dropping it");
+                warn!(
+                    slug,
+                    "preserved fd has no live daemon record; reclaiming the orphaned mount"
+                );
+                self.reclaim_unadoptable_fd(slug);
                 continue;
             };
+            if !adoptable {
+                debug!(
+                    slug,
+                    "evicting preserved fd (fd adoption is fusedev-only); the record-driven rebuild takes over"
+                );
+                if let Err(e) = crate::fdstore::remove_fd(slug) {
+                    warn!(slug, error = %e, "failed to evict preserved fd from the systemd fd store");
+                }
+                continue;
+            }
             let Some(fd) = fds.first() else { continue };
             match self.restore_instance(record, fd.as_raw_fd()).await {
                 Ok(()) => {
@@ -1380,11 +1402,119 @@ impl DaemonSupervisor {
                     info!(slug, image_ref = %record.image_ref, "took over nydus mount from preserved fuse fd");
                 }
                 Err(e) => {
-                    warn!(slug, image_ref = %record.image_ref, error = %e, "failed to take over mount; it may be stale");
+                    warn!(slug, image_ref = %record.image_ref, error = %e, "failed to take over mount; reclaiming it");
+                    self.reclaim_unadoptable_fd(slug);
                 }
             }
         }
         restored
+    }
+
+    /// Rebuild live daemon instances from their persisted records at startup.
+    ///
+    /// The fd-store path (`restore_from_store`) only covers fusedev daemons
+    /// whose `/dev/fuse` fds systemd preserved. Fanotify and blockdev
+    /// instances hold no such fd: their kernel mounts survive the restart, but
+    /// the pre-content marks and daemon state die with the old process —
+    /// without a rebuild, reads through the surviving mount hit unmaterialized
+    /// cache ranges. Re-creating the instance re-stages and re-arms marks on
+    /// the same cache inodes, healing the existing mount in place
+    /// (`start_instance` reuses a live mountpoint). A fusedev record that
+    /// reaches here un-adopted has lost its connection for good; its dead
+    /// mount is detached first so the rebuild mounts fresh.
+    ///
+    /// Call after `restore_from_store`, before serving gRPC. Returns the
+    /// number of instances rebuilt.
+    pub async fn rebuild_from_records(&self) -> usize {
+        let records = self.read_persisted_records();
+        let mut rebuilt = 0;
+        for record in records.into_iter().filter(|r| r.live) {
+            if self.instances.read().await.contains_key(&record.image_ref) {
+                continue; // adopted from the fd store already
+            }
+            if !is_mounted_at(&record.mountpoint) {
+                // Nothing is mounted, so nothing needs healing: the next
+                // Prepare rebuilds lazily. The record is stale — drop it.
+                info!(image_ref = %record.image_ref, "dropping stale daemon record (mountpoint no longer mounted)");
+                let _ = fs::remove_file(self.record_path(&record.slug));
+                continue;
+            }
+            // A FUSE mount without its daemon is dead; evict it so
+            // start_instance gets a clean mountpoint. Kernel (erofs) mounts
+            // are healed in place instead.
+            if mount_fstype_at(&record.mountpoint).is_some_and(|t| t.contains("fuse"))
+                && let Err(e) = detach_mount_lazy(&record.mountpoint)
+            {
+                warn!(slug = %record.slug, error = %e, "failed to detach dead fuse mount before rebuild");
+            }
+            // Auto-accel sidecars are served from the node-local content
+            // store, not a registry: their bootstrap lives in
+            // `auto-accel/<id>/stage/` with the localfs backend dir beside it.
+            // Rebuilding one through the registry path would point chunk
+            // fetches at an upstream that may not even have the blobs (k3s
+            // preloads images like pause from its airgap bundle).
+            let accel_backend = record
+                .bootstrap
+                .parent()
+                .filter(|p| p.file_name().is_some_and(|n| n == "stage"))
+                .and_then(|p| p.parent())
+                .map(|p| p.join("backend"))
+                .filter(|b| b.is_dir());
+            let started = match &accel_backend {
+                Some(backend_dir) => {
+                    self.start_local_instance(&record.image_ref, &record.bootstrap, backend_dir)
+                        .await
+                }
+                None => {
+                    self.start_instance(&record.image_ref, &record.bootstrap, None)
+                        .await
+                }
+            };
+            match started {
+                Ok(instance) => {
+                    instance.refcount.store(record.refcount, Ordering::SeqCst);
+                    if let Err(e) = self.persist_instance_record(&instance, true) {
+                        warn!(image_ref = %record.image_ref, error = %e, "failed to persist rebuilt daemon record");
+                    }
+                    self.instances
+                        .write()
+                        .await
+                        .insert(record.image_ref.clone(), instance);
+                    rebuilt += 1;
+                    info!(image_ref = %record.image_ref, refcount = record.refcount, "rebuilt daemon instance from persisted record");
+                }
+                Err(e) => {
+                    // The image may be gone entirely (removed while we were
+                    // down); drop the record so startup doesn't retry forever.
+                    warn!(image_ref = %record.image_ref, error = %e, "failed to rebuild daemon from record; dropping the record");
+                    let _ = fs::remove_file(self.record_path(&record.slug));
+                }
+            }
+        }
+        rebuilt
+    }
+
+    /// A preserved fd we cannot adopt (no matching record, or takeover failed)
+    /// must not linger: systemd keeps its own dup of every parked fd until told
+    /// otherwise, which holds the dead FUSE connection half-open — readers then
+    /// hang forever instead of failing fast, and kubelet's container restarts
+    /// cannot self-heal because the dead mount still occupies the mountpoint
+    /// and would be reused. Evict the fd from the store and lazily detach the
+    /// mountpoint so consumers get a prompt error, pods restart, and the next
+    /// `Prepare` mounts fresh.
+    fn reclaim_unadoptable_fd(&self, slug: &str) {
+        if let Err(e) = crate::fdstore::remove_fd(slug) {
+            warn!(slug, error = %e, "failed to evict preserved fd from the systemd fd store");
+        }
+        let mountpoint = self.daemons_root().join(slug).join("mnt");
+        if is_mounted_at(&mountpoint) {
+            match detach_mount_lazy(&mountpoint) {
+                Ok(()) => info!(slug, "detached orphaned nydus mount"),
+                Err(e) => {
+                    warn!(slug, error = %e, "failed to detach orphaned nydus mount")
+                }
+            }
+        }
     }
 
     /// Recreate a fusedev daemon in upgrade mode and drive it through the
@@ -2155,6 +2285,53 @@ fn teardown_tarfs_mount(
     _mountpoint: &Path,
 ) -> io::Result<()> {
     Ok(())
+}
+
+/// `umount2(MNT_DETACH)`: detaches the mountpoint immediately (new lookups no
+/// longer see it) while existing holders keep their references until released.
+/// The right tool for evicting a dead FUSE mount that hung consumers may still
+/// reference.
+#[cfg(target_os = "linux")]
+fn detach_mount_lazy(mountpoint: &Path) -> io::Result<()> {
+    nix::mount::umount2(mountpoint, nix::mount::MntFlags::MNT_DETACH).map_err(|errno| {
+        io::Error::other(format!(
+            "umount2(MNT_DETACH) {} failed with {errno}",
+            mountpoint.display()
+        ))
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn detach_mount_lazy(_mountpoint: &Path) -> io::Result<()> {
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn is_mounted_at(_mountpoint: &Path) -> bool {
+    false
+}
+
+/// Filesystem type of the mount at `mountpoint` (`/proc/self/mounts` field 3),
+/// or `None` when nothing is mounted there.
+#[cfg(target_os = "linux")]
+fn mount_fstype_at(mountpoint: &Path) -> Option<String> {
+    let target = mountpoint.display().to_string();
+    let escaped = target.replace(' ', "\\040");
+    fs::read_to_string("/proc/self/mounts")
+        .ok()?
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let path = fields.nth(1)?;
+            let fstype = fields.next()?;
+            (path == target || path == escaped).then(|| fstype.to_string())
+        })
+        .next_back() // last entry wins: the top of any mount stack
+}
+
+#[cfg(not(target_os = "linux"))]
+fn mount_fstype_at(_mountpoint: &Path) -> Option<String> {
+    None
 }
 
 #[cfg(target_os = "linux")]
