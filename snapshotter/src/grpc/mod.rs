@@ -1330,6 +1330,9 @@ pub async fn serve_with_supervisor(
         .with_auto_zran(auto_zran.clone())
         .with_access_tracer(Some(access_tracer.clone()))
         .with_grpc_socket(socket_path.clone())
+        .with_mount_probe_timeout(parse_duration(
+            &config.snapshotter.recon.mount_probe_timeout,
+        )?)
         .build();
         compio::runtime::spawn(async move {
             if let Err(e) = serve_sysctl_unix(sysctl_path, controller).await {
@@ -1339,12 +1342,21 @@ pub async fn serve_with_supervisor(
         .detach();
     }
 
+    // Cheap self-healing passes tick at [snapshotter.recon] period; the
+    // expensive passes (cache GC, auto-zran sweep, sidecar GC) stay on the
+    // cache gc_period cadence.
     let mut reconciler = Reconciler::new(
         supervisor.clone(),
         store.clone(),
-        parse_duration(&config.snapshotter.cache.gc_period)?,
+        parse_duration(&config.snapshotter.recon.period)?,
     )
+    .with_slow_interval(parse_duration(&config.snapshotter.cache.gc_period)?)
     .with_cache_gc(cache_manager, cache_gc_policy);
+    if config.snapshotter.recon.mount_probe {
+        reconciler = reconciler.with_mount_probe(parse_duration(
+            &config.snapshotter.recon.mount_probe_timeout,
+        )?);
+    }
     // Sweep abandoned auto-zran job dirs. Retention semantics and why sweeping
     // a retained base dir is safe are documented on
     // `AUTO_ZRAN_STALE_JOB_MAX_AGE`.

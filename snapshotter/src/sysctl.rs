@@ -30,7 +30,7 @@ use std::sync::{
     Arc,
     atomic::{AtomicU64, Ordering},
 };
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::{debug, info, warn};
 
 const MAX_BODY_BYTES: usize = 1024 * 1024;
@@ -50,6 +50,8 @@ pub struct SystemController {
     /// Path of the containerd proxy-plugin gRPC socket, probed by `/readyz`.
     /// `None` (tests, unusual embeddings) makes `/readyz` report not-ready.
     grpc_socket: Option<PathBuf>,
+    /// Timeout for on-demand mount probes (`POST /api/v1/mounts/health`).
+    mount_probe_timeout: Duration,
 }
 
 #[derive(Default)]
@@ -143,6 +145,7 @@ pub struct SystemControllerBuilder {
     auto_zran: Option<Arc<AutoZranManager>>,
     access_tracer: Option<Arc<AccessTracer>>,
     grpc_socket: Option<PathBuf>,
+    mount_probe_timeout: Duration,
 }
 
 impl SystemControllerBuilder {
@@ -161,7 +164,14 @@ impl SystemControllerBuilder {
             auto_zran: None,
             access_tracer: None,
             grpc_socket: None,
+            mount_probe_timeout: Duration::from_secs(2),
         }
+    }
+
+    /// Timeout for on-demand mount probes (`POST /api/v1/mounts/health`).
+    pub fn with_mount_probe_timeout(mut self, timeout: Duration) -> Self {
+        self.mount_probe_timeout = timeout;
+        self
     }
 
     pub fn with_metrics(mut self, metrics: Arc<SnapshotterMetrics>) -> Self {
@@ -206,6 +216,7 @@ impl SystemControllerBuilder {
             access_tracer: self.access_tracer,
             metrics: Arc::new(ControllerMetrics::default()),
             grpc_socket: self.grpc_socket,
+            mount_probe_timeout: self.mount_probe_timeout,
         }
     }
 }
@@ -504,6 +515,17 @@ async fn route_request(controller: &SystemController, request: HttpRequest) -> H
             Err(e) => error_response(500, e.to_string()),
         },
         ("POST", "/api/v1/cache/gc") => handle_cache_gc(controller, &request.body).await,
+        ("GET", "/api/v1/mounts/health") => match controller.supervisor.last_mount_health() {
+            Some(report) => json_response(200, report),
+            None => json_response(200, crate::daemon::MountHealthReport::default()),
+        },
+        ("POST", "/api/v1/mounts/health") => {
+            let report = controller
+                .supervisor
+                .probe_mount_health(controller.mount_probe_timeout)
+                .await;
+            json_response(200, report)
+        }
         ("GET", "/api/v1/prefetch") => match controller.prefetch_entries() {
             Ok(entries) => json_response(200, entries),
             Err(e) => error_response(500, e.to_string()),
@@ -942,6 +964,36 @@ async fn metrics_response(controller: &SystemController) -> HttpResponse {
         &mut body,
         "nydus_snapshotter_parked_fds",
         controller.supervisor.parked_fd_count(),
+    );
+
+    if let Some(health) = controller.supervisor.last_mount_health() {
+        body.push_str(
+            "# HELP nydus_snapshotter_dead_mounts Live daemon mounts that failed the last health probe.\n",
+        );
+        body.push_str("# TYPE nydus_snapshotter_dead_mounts gauge\n");
+        push_metric(&mut body, "nydus_snapshotter_dead_mounts", health.dead);
+
+        body.push_str(
+            "# HELP nydus_snapshotter_mount_healthy Per-mount health from the last probe pass (1 healthy, 0 dead).\n",
+        );
+        body.push_str("# TYPE nydus_snapshotter_mount_healthy gauge\n");
+        for result in &health.results {
+            push_labeled_metric(
+                &mut body,
+                "nydus_snapshotter_mount_healthy",
+                &[("slug", &result.slug), ("image", &result.image_ref)],
+                u64::from(result.healthy),
+            );
+        }
+    }
+    body.push_str(
+        "# HELP nydus_snapshotter_mount_probe_timeouts_total Mount health probes that timed out.\n",
+    );
+    body.push_str("# TYPE nydus_snapshotter_mount_probe_timeouts_total counter\n");
+    push_metric(
+        &mut body,
+        "nydus_snapshotter_mount_probe_timeouts_total",
+        controller.supervisor.mount_probe_timeouts_total(),
     );
 
     body.push_str("# HELP nydusd_counts The counts of nydus daemon.\n");

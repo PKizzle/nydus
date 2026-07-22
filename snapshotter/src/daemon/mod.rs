@@ -19,7 +19,7 @@ use std::fs;
 use std::io;
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
@@ -48,6 +48,32 @@ use crate::prefetch_profile::runtime_prefetch_for_image;
 
 #[cfg(target_os = "linux")]
 use nydus_service::block_device::BlockDevice;
+
+/// Health verdict for one live daemon's mountpoint (see
+/// `DaemonSupervisor::probe_mount_health`).
+#[derive(Clone, Debug, Serialize)]
+pub struct MountProbeResult {
+    pub slug: String,
+    pub image_ref: String,
+    pub mountpoint: PathBuf,
+    /// Filesystem type observed at the mountpoint (`None` = nothing mounted).
+    pub fstype: Option<String>,
+    pub healthy: bool,
+    pub error: Option<String>,
+    pub latency_ms: u64,
+    /// Overlay mounts whose `lowerdir=` chain references this mountpoint —
+    /// i.e. container rootfs instances that break if this mount is dead.
+    pub affected_overlays: usize,
+    pub probed_at: i64,
+}
+
+/// One reconciler mount-health pass over every live daemon instance.
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct MountHealthReport {
+    pub probed: usize,
+    pub dead: usize,
+    pub results: Vec<MountProbeResult>,
+}
 
 /// Persisted and live daemon status exposed through the system controller.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -428,6 +454,15 @@ pub struct DaemonSupervisor {
     /// approaches `FileDescriptorStoreMax` — past the cap, systemd silently
     /// drops FDSTORE messages and failover quietly stops arming.
     parked_slugs: StdMutex<HashSet<String>>,
+    /// Most recent mount-health pass (see `probe_mount_health`), served by
+    /// `GET /api/v1/mounts/health` and the metrics renderer.
+    last_mount_health: StdMutex<Option<MountHealthReport>>,
+    /// Per-slug hung-probe backoff: a probe thread stuck in uninterruptible
+    /// I/O cannot be cancelled, so a slug is not re-probed while its last
+    /// probe is still (presumed) in flight. Bounds thread leakage to one per
+    /// dead mount per backoff window.
+    probes_in_flight: StdMutex<HashMap<String, Instant>>,
+    probe_timeouts_total: AtomicU64,
 }
 
 impl DaemonSupervisor {
@@ -449,6 +484,9 @@ impl DaemonSupervisor {
             start_locks: Mutex::new(HashMap::new()),
             startup_timeout: Duration::from_secs(30),
             parked_slugs: StdMutex::new(HashSet::new()),
+            last_mount_health: StdMutex::new(None),
+            probes_in_flight: StdMutex::new(HashMap::new()),
+            probe_timeouts_total: AtomicU64::new(0),
         }
     }
 
@@ -890,6 +928,123 @@ impl DaemonSupervisor {
             }
         }
         protected
+    }
+
+    /// Probe every live daemon instance's mountpoint and report which mounts
+    /// are dead from a consumer's point of view.
+    ///
+    /// FUSE mounts round-trip the daemon with a readdir on a dedicated thread
+    /// bounded by `timeout` — a daemonless fuse mount either errors
+    /// (`ENOTCONN`) or hangs, both reported dead. Kernel (EROFS) mounts serve
+    /// reads regardless of daemon state, so their health is the handler's
+    /// state (a dead handler means unmaterialized ranges stop filling). An
+    /// instance whose mountpoint has nothing mounted at all is dead outright.
+    ///
+    /// The blocking waits run through `blocking::unblock`, never on the compio
+    /// reactor. A probe that times out leaves its thread behind (a D-state
+    /// read cannot be cancelled); `probes_in_flight` prevents re-probing that
+    /// slug until a full backoff window (`5 * timeout`) has passed.
+    pub async fn probe_mount_health(&self, timeout: Duration) -> MountHealthReport {
+        let instances: Vec<(String, String, PathBuf, DaemonState)> = {
+            let map = self.instances.read().await;
+            map.iter()
+                .map(|(image_ref, inst)| {
+                    (
+                        slug_for(image_ref),
+                        image_ref.clone(),
+                        inst.mountpoint.clone(),
+                        inst.daemon.get_state(),
+                    )
+                })
+                .collect()
+        };
+
+        let mut report = MountHealthReport {
+            probed: instances.len(),
+            ..MountHealthReport::default()
+        };
+        for (slug, image_ref, mountpoint, state) in instances {
+            let fstype = mount_fstype_at(&mountpoint);
+            let started = Instant::now();
+            let (healthy, error) = match fstype.as_deref() {
+                None => (false, Some("nothing mounted at the mountpoint".to_string())),
+                Some(t) if t.contains("fuse") => {
+                    if self.probe_backoff_active(&slug, timeout) {
+                        (false, Some("previous probe still hung".to_string()))
+                    } else {
+                        self.probes_in_flight
+                            .lock()
+                            .unwrap()
+                            .insert(slug.clone(), Instant::now());
+                        let outcome = probe_readdir_with_timeout(mountpoint.clone(), timeout).await;
+                        match outcome {
+                            ProbeOutcome::Ok => {
+                                self.probes_in_flight.lock().unwrap().remove(&slug);
+                                (true, None)
+                            }
+                            ProbeOutcome::Error(e) => {
+                                self.probes_in_flight.lock().unwrap().remove(&slug);
+                                (false, Some(e))
+                            }
+                            ProbeOutcome::TimedOut => {
+                                // Leave the in-flight marker: the thread is
+                                // still blocked and must not be duplicated.
+                                self.probe_timeouts_total.fetch_add(1, Ordering::Relaxed);
+                                (false, Some(format!("probe timed out after {timeout:?}")))
+                            }
+                        }
+                    }
+                }
+                Some(_) => {
+                    // Kernel mount: reads are served by the kernel; the daemon
+                    // must be healthy for on-demand fills to keep working.
+                    let state_str = format!("{state:?}");
+                    if is_healthy_state(state) {
+                        (true, None)
+                    } else {
+                        (false, Some(format!("daemon state {state_str}")))
+                    }
+                }
+            };
+            if !healthy {
+                report.dead += 1;
+            }
+            report.results.push(MountProbeResult {
+                affected_overlays: overlay_refs_of(&mountpoint),
+                slug,
+                image_ref,
+                mountpoint,
+                fstype,
+                healthy,
+                error,
+                latency_ms: started.elapsed().as_millis() as u64,
+                probed_at: unix_now(),
+            });
+        }
+        *self.last_mount_health.lock().unwrap() = Some(report.clone());
+        report
+    }
+
+    fn probe_backoff_active(&self, slug: &str, timeout: Duration) -> bool {
+        let mut in_flight = self.probes_in_flight.lock().unwrap();
+        match in_flight.get(slug) {
+            Some(since) if since.elapsed() < timeout.saturating_mul(5) => true,
+            Some(_) => {
+                in_flight.remove(slug);
+                false
+            }
+            None => false,
+        }
+    }
+
+    /// Most recent mount-health report, if a probe pass has run.
+    pub fn last_mount_health(&self) -> Option<MountHealthReport> {
+        self.last_mount_health.lock().unwrap().clone()
+    }
+
+    /// Total probes that timed out since startup.
+    pub fn mount_probe_timeouts_total(&self) -> u64 {
+        self.probe_timeouts_total.load(Ordering::Relaxed)
     }
 
     /// Evict the parked fd and delete the on-disk failover state for `slug` —
@@ -2633,6 +2788,83 @@ fn adoption_route(mounted_fstype: Option<&str>) -> AdoptionRoute {
     }
 }
 
+/// Outcome of a bounded filesystem probe.
+#[derive(Debug)]
+enum ProbeOutcome {
+    Ok,
+    Error(String),
+    TimedOut,
+}
+
+/// Run one readdir against `mountpoint` on a dedicated thread, waiting at most
+/// `timeout`. The wait happens on the blocking pool, never the compio reactor.
+/// On timeout the probe thread is abandoned (it may be stuck in
+/// uninterruptible I/O and cannot be cancelled); callers bound re-probing.
+async fn probe_readdir_with_timeout(mountpoint: PathBuf, timeout: Duration) -> ProbeOutcome {
+    blocking::unblock(move || {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let spawned = std::thread::Builder::new()
+            .name("nydus-mount-probe".into())
+            .spawn(move || {
+                let result = fs::read_dir(&mountpoint)
+                    .and_then(|mut entries| entries.next().transpose())
+                    .map(|_| ());
+                let _ = tx.send(result);
+            });
+        if let Err(e) = spawned {
+            return ProbeOutcome::Error(format!("failed to spawn probe thread: {e}"));
+        }
+        match rx.recv_timeout(timeout) {
+            Ok(Ok(())) => ProbeOutcome::Ok,
+            Ok(Err(e)) => ProbeOutcome::Error(e.to_string()),
+            Err(_) => ProbeOutcome::TimedOut,
+        }
+    })
+    .await
+}
+
+/// Number of overlay mounts whose `lowerdir=` chain references `mountpoint` —
+/// the container rootfs instances that break when that mount dies.
+#[cfg(target_os = "linux")]
+fn overlay_refs_of(mountpoint: &Path) -> usize {
+    let Ok(mounts) = fs::read_to_string("/proc/self/mounts") else {
+        return 0;
+    };
+    let needle = mountpoint.display().to_string();
+    mounts
+        .lines()
+        .filter(|line| {
+            let mut fields = line.split_whitespace();
+            let fstype = fields.nth(2);
+            let options = fields.next();
+            matches!(fstype, Some("overlay"))
+                && options.is_some_and(|opts| overlay_references(opts, &needle))
+        })
+        .count()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn overlay_refs_of(_mountpoint: &Path) -> usize {
+    0
+}
+
+/// Does an overlay mount-options string reference `daemon_mnt` as a lowerdir
+/// component? Handles the comma-separated option list and the colon-separated
+/// `lowerdir=` value, matching whole path components only.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn overlay_references(options: &str, daemon_mnt: &str) -> bool {
+    options
+        .split(',')
+        .filter_map(|opt| opt.strip_prefix("lowerdir="))
+        .flat_map(|dirs| dirs.split(':'))
+        .any(|dir| {
+            dir == daemon_mnt
+                || dir
+                    .strip_prefix(daemon_mnt)
+                    .is_some_and(|rest| rest.starts_with('/'))
+        })
+}
+
 /// Filesystem type of the mount at `mountpoint` (`/proc/self/mounts` field 3),
 /// or `None` when nothing is mounted there.
 #[cfg(target_os = "linux")]
@@ -2950,6 +3182,56 @@ mod tests {
         assert_eq!(adoption_route(Some("fuseblk")), AdoptionRoute::Fusedev);
         assert_eq!(adoption_route(Some("overlay")), AdoptionRoute::Evict);
         assert_eq!(adoption_route(None), AdoptionRoute::Evict);
+    }
+
+    #[test]
+    fn overlay_references_matches_whole_lowerdir_components() {
+        let mnt = "/var/lib/nydus/daemons/slug/mnt";
+        assert!(overlay_references(
+            "rw,lowerdir=/var/lib/nydus/daemons/slug/mnt:/other/dir,upperdir=/u,workdir=/w",
+            mnt
+        ));
+        // Subpath of the mountpoint also counts (EROFS content used directly).
+        assert!(overlay_references(
+            "ro,lowerdir=/var/lib/nydus/daemons/slug/mnt/sub",
+            mnt
+        ));
+        // Prefix-similar but distinct path must NOT match.
+        assert!(!overlay_references(
+            "rw,lowerdir=/var/lib/nydus/daemons/slug/mnt-other",
+            mnt
+        ));
+        assert!(!overlay_references("rw,upperdir=/u,workdir=/w", mnt));
+    }
+
+    #[test]
+    fn probe_readdir_with_timeout_reports_all_outcomes() {
+        let runtime = compio::runtime::Runtime::new().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        // Healthy: readable directory.
+        let outcome = runtime.block_on(probe_readdir_with_timeout(
+            dir.path().to_path_buf(),
+            Duration::from_secs(2),
+        ));
+        assert!(matches!(outcome, ProbeOutcome::Ok), "got {outcome:?}");
+        // Error: nonexistent path.
+        let outcome = runtime.block_on(probe_readdir_with_timeout(
+            dir.path().join("missing"),
+            Duration::from_secs(2),
+        ));
+        assert!(matches!(outcome, ProbeOutcome::Error(_)), "got {outcome:?}");
+    }
+
+    #[test]
+    fn probe_mount_health_with_no_instances_is_empty_and_cached() {
+        let supervisor = DaemonSupervisor::new(SnapshotterConfig::default());
+        assert!(supervisor.last_mount_health().is_none());
+        let report = compio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(supervisor.probe_mount_health(Duration::from_millis(100)));
+        assert_eq!(report.probed, 0);
+        assert_eq!(report.dead, 0);
+        assert!(supervisor.last_mount_health().is_some());
     }
 
     #[test]

@@ -66,6 +66,9 @@ pub struct SnapshotterSection {
     pub cache: CacheConfig,
 
     #[serde(default)]
+    pub recon: ReconConfig,
+
+    #[serde(default)]
     pub sysctl: SysctlConfig,
 
     /// Optional Prometheus metrics listener. By default (no `[snapshotter.metrics]`
@@ -119,6 +122,7 @@ impl Default for SnapshotterSection {
             fs_driver_policy: FsDriverSelectionPolicy::default(),
             fs_drivers: default_fs_drivers(),
             cache: CacheConfig::default(),
+            recon: ReconConfig::default(),
             sysctl: SysctlConfig::default(),
             metrics: MetricsConfig::default(),
             features: FeaturesConfig::default(),
@@ -433,6 +437,38 @@ pub struct DaemonConfig {
     /// the documented `FileDescriptorStoreMax=128`). 0 disables the warning.
     #[serde(default = "default_fdstore_warn_threshold")]
     pub fdstore_warn_threshold: usize,
+}
+
+/// Reconciler cadence and mount-health probing (`[snapshotter.recon]`).
+///
+/// The reconciler's cheap self-healing passes (daemon recovery, orphan-mount
+/// scan, stale-dir sweeps, mount-health probing) tick at `period`; the
+/// expensive passes (cache GC, auto-zran sweep, sidecar GC — each enumerates
+/// images or walks the cache tree) stay on the `[snapshotter.cache]`
+/// `gc_period` cadence.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ReconConfig {
+    /// Tick interval for the cheap reconciliation passes (default "5m").
+    #[serde(default = "default_recon_period")]
+    pub period: String,
+    /// Probe each live daemon mountpoint for health every tick and export the
+    /// result as metrics + `GET /api/v1/mounts/health` (default true).
+    #[serde(default = "default_true")]
+    pub mount_probe: bool,
+    /// Per-mount probe timeout: a FUSE mount that cannot answer a readdir
+    /// within this window is reported dead (default "2s").
+    #[serde(default = "default_mount_probe_timeout")]
+    pub mount_probe_timeout: String,
+}
+
+impl Default for ReconConfig {
+    fn default() -> Self {
+        Self {
+            period: default_recon_period(),
+            mount_probe: true,
+            mount_probe_timeout: default_mount_probe_timeout(),
+        }
+    }
 }
 
 /// A single entry in the `[[snapshotter.fs_drivers]]` ordered list.
@@ -1268,6 +1304,12 @@ fn default_recover_policy() -> String {
 }
 fn default_fdstore_warn_threshold() -> usize {
     96
+}
+fn default_recon_period() -> String {
+    "5m".to_string()
+}
+fn default_mount_probe_timeout() -> String {
+    "2s".to_string()
 }
 fn default_threads() -> usize {
     4

@@ -65,6 +65,13 @@ pub struct Reconciler {
     auto_zran_sweep: Option<(PathBuf, Duration, Arc<crate::auto_zran::AutoZranManager>)>,
     sidecar_gc: Option<SidecarGcDeps>,
     interval: Duration,
+    /// Cadence for the expensive passes (cache GC, auto-zran sweep, sidecar
+    /// GC): they run only when at least this much time has passed since their
+    /// last run, while the cheap passes run every `interval` tick.
+    slow_interval: Duration,
+    last_slow_pass: std::sync::Mutex<Option<std::time::Instant>>,
+    /// Per-mount health probe timeout; `None` disables the probe pass.
+    mount_probe_timeout: Option<Duration>,
 }
 
 impl Reconciler {
@@ -80,8 +87,25 @@ impl Reconciler {
             cache_gc: None,
             auto_zran_sweep: None,
             sidecar_gc: None,
+            slow_interval: interval,
             interval,
+            last_slow_pass: std::sync::Mutex::new(None),
+            mount_probe_timeout: None,
         }
+    }
+
+    /// Put the expensive passes (cache GC, auto-zran sweep, sidecar GC) on
+    /// their own, slower cadence than the tick interval.
+    pub fn with_slow_interval(mut self, slow_interval: Duration) -> Self {
+        self.slow_interval = slow_interval;
+        self
+    }
+
+    /// Probe live daemon mountpoints for health every tick, bounding each
+    /// probe by `timeout`.
+    pub fn with_mount_probe(mut self, timeout: Duration) -> Self {
+        self.mount_probe_timeout = Some(timeout);
+        self
     }
 
     /// Enable the auto-accel sidecar GC sweep. Deletes sidecar Image records
@@ -143,7 +167,10 @@ impl Reconciler {
         self.reconcile().await
     }
 
-    /// Perform a single reconciliation pass.
+    /// Perform a single reconciliation pass. Cheap passes run every tick; the
+    /// expensive ones (cache GC, auto-zran sweep, sidecar GC — image
+    /// enumeration and cache-tree walks) only when `slow_interval` has passed
+    /// since their last run.
     async fn reconcile(&self) -> Result<()> {
         debug!("starting reconciliation pass");
 
@@ -156,17 +183,51 @@ impl Reconciler {
         // 3. Check for stale per-daemon state directories.
         self.check_stale_daemon_dirs().await?;
 
-        // 4. Account for and optionally garbage-collect blob-cache artifacts.
-        self.check_cache_gc().await?;
+        // 4. Probe live daemon mountpoints for consumer-visible health.
+        self.check_mount_health().await;
 
-        // 5. Sweep orphaned auto-zran per-job scratch dirs left by a crash.
-        self.check_stale_autozran_dirs().await?;
+        let run_slow = {
+            let mut last = self.last_slow_pass.lock().unwrap();
+            let due = last.is_none_or(|at| at.elapsed() >= self.slow_interval);
+            if due {
+                *last = Some(std::time::Instant::now());
+            }
+            due
+        };
+        if run_slow {
+            // 5. Account for and optionally garbage-collect blob-cache artifacts.
+            self.check_cache_gc().await?;
 
-        // 6. Sweep sidecar Image records whose subject image is gone.
-        self.check_orphan_sidecars().await?;
+            // 6. Sweep orphaned auto-zran per-job scratch dirs left by a crash.
+            self.check_stale_autozran_dirs().await?;
+
+            // 7. Sweep sidecar Image records whose subject image is gone.
+            self.check_orphan_sidecars().await?;
+        }
 
         debug!("reconciliation pass complete");
         Ok(())
+    }
+
+    /// Run the mount-health probe pass and warn once per dead mount. Purely
+    /// observational — remediation is deliberately left to operators/alerts
+    /// consuming the metrics and `GET /api/v1/mounts/health`.
+    async fn check_mount_health(&self) {
+        let Some(timeout) = self.mount_probe_timeout else {
+            return;
+        };
+        let report = self.supervisor.probe_mount_health(timeout).await;
+        for result in report.results.iter().filter(|r| !r.healthy) {
+            warn!(
+                slug = %result.slug,
+                image_ref = %result.image_ref,
+                mountpoint = %result.mountpoint.display(),
+                fstype = result.fstype.as_deref().unwrap_or("none"),
+                affected_overlays = result.affected_overlays,
+                error = result.error.as_deref().unwrap_or("unknown"),
+                "dead nydus mount detected"
+            );
+        }
     }
 
     /// Delete auto-accel sidecar Image records whose subject image no longer
