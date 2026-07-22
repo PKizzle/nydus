@@ -1004,18 +1004,28 @@ impl snapshots::Snapshotter for NydusSnapshotter {
         let result = async {
             debug!(key, "remove snapshot");
             let store = self.store.as_ref();
-            let stat = store.stat(&key).ok();
+            let stat = match store.stat(&key) {
+                Ok(info) => Some(info),
+                Err(e) => {
+                    warn!(key, error = %e, "snapshot stat failed during remove; a daemon release may be missed");
+                    self.metrics.record_daemon_release_missing();
+                    None
+                }
+            };
             let parent = stat.as_ref().and_then(|info| info.parent.clone());
             let labels = stat
                 .as_ref()
                 .map(|info| info.labels.clone())
                 .unwrap_or_default();
             let release_target = if let Some(parent) = parent.as_deref() {
-                self.overlay
-                    .nydus_meta_info(store, parent, &labels)
-                    .ok()
-                    .flatten()
-                    .map(|meta| meta.image_ref)
+                match self.overlay.nydus_meta_info(store, parent, &labels) {
+                    Ok(meta) => meta.map(|meta| meta.image_ref),
+                    Err(e) => {
+                        warn!(key, error = %e, "daemon resolution failed during remove; a daemon release may be missed");
+                        self.metrics.record_daemon_release_missing();
+                        None
+                    }
+                }
             } else {
                 None
             };
@@ -1351,7 +1361,8 @@ pub async fn serve_with_supervisor(
         parse_duration(&config.snapshotter.recon.period)?,
     )
     .with_slow_interval(parse_duration(&config.snapshotter.cache.gc_period)?)
-    .with_cache_gc(cache_manager, cache_gc_policy);
+    .with_cache_gc(cache_manager, cache_gc_policy)
+    .with_refcount_recon(Arc::new(overlay.clone()));
     if config.snapshotter.recon.mount_probe {
         reconciler = reconciler.with_mount_probe(parse_duration(
             &config.snapshotter.recon.mount_probe_timeout,

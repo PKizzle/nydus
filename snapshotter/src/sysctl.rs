@@ -986,6 +986,29 @@ async fn metrics_response(controller: &SystemController) -> HttpResponse {
             );
         }
     }
+    body.push_str("# HELP nydus_snapshotter_daemon_refcount Current refcount per live daemon.\n");
+    body.push_str("# TYPE nydus_snapshotter_daemon_refcount gauge\n");
+    for d in daemons.iter().filter(|d| d.live) {
+        push_labeled_metric(
+            &mut body,
+            "nydus_snapshotter_daemon_refcount",
+            &[("slug", &d.slug), ("image", &d.image_ref)],
+            d.refcount as u64,
+        );
+    }
+    body.push_str(
+        "# HELP nydus_snapshotter_daemon_holders Tracked holder keys per live daemon (refcount minus holders = restart ballast).\n",
+    );
+    body.push_str("# TYPE nydus_snapshotter_daemon_holders gauge\n");
+    for d in daemons.iter().filter(|d| d.live) {
+        push_labeled_metric(
+            &mut body,
+            "nydus_snapshotter_daemon_holders",
+            &[("slug", &d.slug), ("image", &d.image_ref)],
+            d.holders as u64,
+        );
+    }
+
     body.push_str(
         "# HELP nydus_snapshotter_mount_probe_timeouts_total Mount health probes that timed out.\n",
     );
@@ -1795,6 +1818,7 @@ mod tests {
             mountpoint: dir.path().join("daemons/abc-app/mnt"),
             bootstrap: dir.path().join("snapshots/base/fs/image/image.boot"),
             refcount: 0,
+            holders: 0,
             state: "STOPPED".to_string(),
             live: false,
             updated_at: 1,

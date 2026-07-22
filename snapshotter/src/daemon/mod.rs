@@ -75,6 +75,25 @@ pub struct MountHealthReport {
     pub results: Vec<MountProbeResult>,
 }
 
+/// One refcount clamp performed by `DaemonSupervisor::reconcile_refcounts`.
+#[derive(Clone, Debug, Serialize)]
+pub struct RefcountCorrection {
+    pub image_ref: String,
+    pub slug: String,
+    pub before: usize,
+    pub after: usize,
+    pub tracked_holders: usize,
+    pub observed_holders: usize,
+}
+
+/// Outcome of one refcount reconciliation pass.
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct RefcountReconReport {
+    pub checked: usize,
+    pub clamped: usize,
+    pub corrections: Vec<RefcountCorrection>,
+}
+
 /// Persisted and live daemon status exposed through the system controller.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct DaemonStatusRecord {
@@ -83,6 +102,11 @@ pub struct DaemonStatusRecord {
     pub mountpoint: PathBuf,
     pub bootstrap: PathBuf,
     pub refcount: usize,
+    /// Snapshot keys currently registered as holders (in-memory only; ballast
+    /// from restored refcounts is NOT included). `#[serde(default)]` keeps
+    /// records written by older builds loadable.
+    #[serde(default)]
+    pub holders: usize,
     pub state: String,
     pub live: bool,
     pub updated_at: i64,
@@ -889,6 +913,59 @@ impl DaemonSupervisor {
             warn!(image_ref, error = %e, "failed to persist daemon record");
         }
         Ok(())
+    }
+
+    /// Clamp daemon refcounts down to the holders that actually exist.
+    ///
+    /// `observed` maps image refs to the snapshot keys that would release them
+    /// on `remove()` — built by the reconciler from the snapshot store with
+    /// the exact resolution `remove()` uses. Restart ballast (refcounts
+    /// restored from records for holders that disappeared while the
+    /// snapshotter was down) otherwise inflates monotonically and pins
+    /// daemons forever. Shrink-only by design: the target floors at the
+    /// live in-memory holder count, unhealthy daemons are skipped, holders
+    /// are never mutated, and a clamp to zero does NOT stop the daemon —
+    /// teardown stays release-driven.
+    pub async fn reconcile_refcounts(
+        &self,
+        observed: &HashMap<String, HashSet<String>>,
+    ) -> RefcountReconReport {
+        let mut report = RefcountReconReport::default();
+        let instances = self.instances.write().await;
+        for (image_ref, inst) in instances.iter() {
+            report.checked += 1;
+            if !is_healthy_state(inst.daemon.get_state()) {
+                continue;
+            }
+            let tracked = inst.holders.lock().unwrap().len();
+            let observed_holders = observed.get(image_ref).map_or(0, |keys| keys.len());
+            let target = tracked.max(observed_holders);
+            let before = inst.refcount.load(Ordering::SeqCst);
+            if before > target {
+                inst.refcount.store(target, Ordering::SeqCst);
+                if let Err(e) = self.persist_instance_record(inst, true) {
+                    warn!(image_ref, error = %e, "failed to persist reconciled daemon record");
+                }
+                warn!(
+                    image_ref,
+                    before,
+                    after = target,
+                    tracked_holders = tracked,
+                    observed_holders,
+                    "clamped leaked daemon refcount to the observed holder set"
+                );
+                report.clamped += 1;
+                report.corrections.push(RefcountCorrection {
+                    image_ref: image_ref.clone(),
+                    slug: slug_for(image_ref),
+                    before,
+                    after: target,
+                    tracked_holders: tracked,
+                    observed_holders,
+                });
+            }
+        }
+        report
     }
 
     /// Record that `slug` has a fd parked in systemd's store and warn when our
@@ -2293,6 +2370,11 @@ impl DaemonSupervisor {
             } else {
                 0
             },
+            holders: if live {
+                inst.holders.lock().unwrap().len()
+            } else {
+                0
+            },
             state: if live {
                 format!("{:?}", inst.daemon.get_state())
             } else {
@@ -3234,6 +3316,7 @@ mod tests {
             mountpoint: PathBuf::from("/tmp/nydus-x/mnt"),
             bootstrap,
             refcount: 1,
+            holders: 0,
             state: "RUNNING".to_string(),
             live: true,
             updated_at: 0,
@@ -3366,6 +3449,46 @@ mod tests {
         let lonely = lonely_stage.join("bootstrap");
         std::fs::write(&lonely, b"x").unwrap();
         assert_eq!(DaemonSupervisor::accel_backend_for(&lonely), None);
+    }
+
+    #[test]
+    fn reconcile_refcounts_shrinks_only_and_floors_at_holders() {
+        let supervisor = DaemonSupervisor::new(SnapshotterConfig::default());
+        let runtime = compio::runtime::Runtime::new().unwrap();
+        let inst = test_instance();
+        inst.refcount.store(240, Ordering::SeqCst);
+        inst.holders.lock().unwrap().insert("k1".to_string());
+        runtime.block_on(async {
+            supervisor
+                .instances
+                .write()
+                .await
+                .insert("img".to_string(), Arc::new(inst));
+        });
+
+        // Observed {k1, k2} -> clamp 240 -> 2.
+        let observed = HashMap::from([(
+            "img".to_string(),
+            HashSet::from(["k1".to_string(), "k2".to_string()]),
+        )]);
+        let report = runtime.block_on(supervisor.reconcile_refcounts(&observed));
+        assert_eq!(report.checked, 1);
+        assert_eq!(report.clamped, 1);
+        assert_eq!(report.corrections[0].before, 240);
+        assert_eq!(report.corrections[0].after, 2);
+
+        // Observed empty -> floors at tracked holders (1), never below.
+        let report = runtime.block_on(supervisor.reconcile_refcounts(&HashMap::new()));
+        assert_eq!(report.clamped, 1);
+        assert_eq!(report.corrections[0].after, 1);
+
+        // Never grows: refcount 1 with observed 5 stays 1.
+        let observed = HashMap::from([(
+            "img".to_string(),
+            (1..=5).map(|i| format!("k{i}")).collect::<HashSet<_>>(),
+        )]);
+        let report = runtime.block_on(supervisor.reconcile_refcounts(&observed));
+        assert_eq!(report.clamped, 0);
     }
 
     #[test]

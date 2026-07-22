@@ -10,6 +10,7 @@
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -33,6 +34,11 @@ pub struct SnapshotterMetrics {
     /// only once it holds a value, so a "never probed" node is distinguishable
     /// from a failing one by the metric's absence.
     peer_mirror_selfcheck_ok: Mutex<Option<bool>>,
+    /// Snapshot removals where the owning daemon could not be resolved due to
+    /// an error (store stat / meta-chain walk failed): each one is a refcount
+    /// release that never happened. The reconciler's clamp pass repairs the
+    /// count; this counter says how often that repair is being relied on.
+    daemon_release_missing_total: AtomicU64,
 }
 
 #[derive(Clone, Debug)]
@@ -81,6 +87,7 @@ impl SnapshotterMetrics {
             started_at: Instant::now(),
             snapshot_operations: Mutex::new(BTreeMap::new()),
             peer_mirror_selfcheck_ok: Mutex::new(None),
+            daemon_release_missing_total: AtomicU64::new(0),
         }
     }
 
@@ -88,6 +95,11 @@ impl SnapshotterMetrics {
     /// means the local mirror served a known-local digest (advertising works);
     /// `false` means it did not (404 = not advertising, or unreachable). Feeds
     /// the `snapshotter_peer_mirror_selfcheck_ok` gauge (see [`crate::peer_mirror_selfcheck`]).
+    pub fn record_daemon_release_missing(&self) {
+        self.daemon_release_missing_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     pub fn set_peer_mirror_selfcheck(&self, ok: bool) {
         if let Ok(mut slot) = self.peer_mirror_selfcheck_ok.lock() {
             *slot = Some(ok);
@@ -176,7 +188,18 @@ impl SnapshotterMetrics {
         self.render_process_metrics(&mut out);
         self.render_cache_metrics(&mut out, cache);
         self.render_peer_mirror_selfcheck(&mut out);
+        self.render_release_missing(&mut out);
         out
+    }
+
+    fn render_release_missing(&self, out: &mut String) {
+        out.push_str("# HELP snapshotter_daemon_release_missing_total Snapshot removals whose daemon release was skipped due to a resolution error.\n");
+        out.push_str("# TYPE snapshotter_daemon_release_missing_total counter\n");
+        push_metric(
+            out,
+            "snapshotter_daemon_release_missing_total",
+            self.daemon_release_missing_total.load(Ordering::Relaxed),
+        );
     }
 
     /// Render the peer-mirror self-check gauge. Emitted only once a probe has

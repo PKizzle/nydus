@@ -14,7 +14,7 @@ use crate::daemon::DaemonSupervisor;
 use crate::store::SnapshotStore;
 use anyhow::{Context, Result};
 use compio::time;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -72,6 +72,9 @@ pub struct Reconciler {
     last_slow_pass: std::sync::Mutex<Option<std::time::Instant>>,
     /// Per-mount health probe timeout; `None` disables the probe pass.
     mount_probe_timeout: Option<Duration>,
+    /// Overlay engine for resolving which daemon a snapshot would release on
+    /// `remove()`; `None` disables refcount reconciliation.
+    refcount_recon: Option<Arc<crate::overlay::OverlayEngine>>,
 }
 
 impl Reconciler {
@@ -91,7 +94,15 @@ impl Reconciler {
             interval,
             last_slow_pass: std::sync::Mutex::new(None),
             mount_probe_timeout: None,
+            refcount_recon: None,
         }
+    }
+
+    /// Reconcile daemon refcounts against the snapshot store on the slow
+    /// cadence, resolving holders with the same logic `remove()` uses.
+    pub fn with_refcount_recon(mut self, overlay: Arc<crate::overlay::OverlayEngine>) -> Self {
+        self.refcount_recon = Some(overlay);
+        self
     }
 
     /// Put the expensive passes (cache GC, auto-zran sweep, sidecar GC) on
@@ -203,6 +214,9 @@ impl Reconciler {
 
             // 7. Sweep sidecar Image records whose subject image is gone.
             self.check_orphan_sidecars().await?;
+
+            // 8. Clamp leaked daemon refcounts to the observed holder set.
+            self.check_refcounts().await;
         }
 
         debug!("reconciliation pass complete");
@@ -226,6 +240,60 @@ impl Reconciler {
                 affected_overlays = result.affected_overlays,
                 error = result.error.as_deref().unwrap_or("unknown"),
                 "dead nydus mount detected"
+            );
+        }
+    }
+
+    /// Build the observed holder map (image_ref -> snapshot keys that would
+    /// release it on `remove()`) and clamp daemon refcounts to it. Aborts
+    /// without touching anything if the store cannot be enumerated or any
+    /// snapshot's daemon resolution *errors* — a holder we fail to resolve
+    /// must never be clamped away. (A snapshot that legitimately resolves to
+    /// no daemon — a plain overlay image — is simply not a holder.)
+    async fn check_refcounts(&self) {
+        let Some(overlay) = &self.refcount_recon else {
+            return;
+        };
+        let overlay = overlay.clone();
+        let store = self.store.clone();
+        // Sync fjall reads + parent-chain walks — off the reactor.
+        let observed = blocking::unblock(move || -> Result<HashMap<String, HashSet<String>>> {
+            let mut observed: HashMap<String, HashSet<String>> = HashMap::new();
+            for snap in store.list().context("list snapshots for refcount recon")? {
+                let stamped = snap
+                    .labels
+                    .get(crate::source::labels::NYDUS_DAEMON_IMAGE_REF)
+                    .cloned();
+                let resolved = match stamped {
+                    Some(image_ref) => Some(image_ref),
+                    None => match snap.parent.as_deref() {
+                        Some(parent) => overlay
+                            .nydus_meta_info(&store, parent, &snap.labels)
+                            .with_context(|| format!("resolve daemon for snapshot {}", snap.key))?
+                            .map(|meta| meta.image_ref),
+                        None => None,
+                    },
+                };
+                if let Some(image_ref) = resolved {
+                    observed.entry(image_ref).or_default().insert(snap.key);
+                }
+            }
+            Ok(observed)
+        })
+        .await;
+        let observed = match observed {
+            Ok(observed) => observed,
+            Err(e) => {
+                warn!(error = %e, "skipping refcount reconciliation; holder resolution incomplete");
+                return;
+            }
+        };
+        let report = self.supervisor.reconcile_refcounts(&observed).await;
+        if report.clamped > 0 {
+            info!(
+                checked = report.checked,
+                clamped = report.clamped,
+                "refcount reconciliation clamped leaked references"
             );
         }
     }
