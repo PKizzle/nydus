@@ -1804,7 +1804,7 @@ impl DaemonSupervisor {
                             // (systemd's dup would pin a group nobody drains)
                             // and leave the mount for the record rebuild,
                             // which re-arms fresh marks in place.
-                            warn!(slug, image_ref = %record.image_ref, error = %e, "fanotify takeover failed; falling back to the record rebuild");
+                            warn!(slug, image_ref = %record.image_ref, error = format!("{e:#}"), "fanotify takeover failed; falling back to the record rebuild");
                             if let Err(e) = crate::fdstore::remove_fd(slug) {
                                 warn!(slug, error = %e, "failed to evict preserved fd from the systemd fd store");
                             }
@@ -1818,7 +1818,7 @@ impl DaemonSupervisor {
                             info!(slug, image_ref = %record.image_ref, "took over nydus mount from preserved fuse fd");
                         }
                         Err(e) => {
-                            warn!(slug, image_ref = %record.image_ref, error = %e, "failed to take over mount; reclaiming it");
+                            warn!(slug, image_ref = %record.image_ref, error = format!("{e:#}"), "failed to take over mount; reclaiming it");
                             self.reclaim_unadoptable_fd(slug);
                         }
                     }
@@ -1864,11 +1864,12 @@ impl DaemonSupervisor {
                 continue; // adopted from the fd store already
             }
             if !is_mounted_at(&record.mountpoint) {
-                // Nothing is mounted, so nothing needs healing: the next
-                // Prepare rebuilds lazily. The record is stale — drop it.
-                info!(image_ref = %record.image_ref, "dropping stale daemon record (mountpoint no longer mounted)");
-                let _ = fs::remove_file(self.record_path(&record.slug));
-                continue;
+                // A live record with nothing mounted is abnormal — a crash
+                // before the mount landed, or a failed takeover whose reclaim
+                // detached the corpse moments ago. Remount fresh: consumers
+                // may exist, and a genuinely-dead identity fails the start
+                // below and drops the record on the terminal path anyway.
+                info!(image_ref = %record.image_ref, "live record has no mount; restarting its daemon fresh");
             }
             // A FUSE mount without its daemon is dead; evict it (the whole
             // stack — older generations stacked mounts across recoveries) so
@@ -2056,7 +2057,11 @@ impl DaemonSupervisor {
         };
 
         let mountpoint_str = mountpoint.display().to_string();
-        let supervisor_sock = daemon_root.join("supervisor.sock");
+        // Short /run path, NOT under daemon_root: AF_UNIX caps sun_path at
+        // ~108 bytes and the per-image daemon dir blows past it (the park
+        // side already binds the short form — the two must match in length
+        // constraints, not in exact path, since each bind is one-shot).
+        let supervisor_sock = supervisor_sock_path(slug);
         // `upgrade=true` together with a `Some(api_sock)` makes create_fuse_daemon
         // skip the fresh mount and leave the daemon in INIT, ready for takeover.
         let api_sock = daemon_root.join("api.sock");
