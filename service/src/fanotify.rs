@@ -106,6 +106,19 @@ struct BlobBacking {
     blob: AssertBlobThreadSafe,
 }
 
+/// Map a serve error to the errno carried in a `FAN_DENY_ERRNO` response.
+///
+/// Only errnos the kernel's fanotify UAPI documents as valid response
+/// payloads are passed through; everything else collapses to `EIO`. The
+/// distinction matters most for disk pressure: a full cache filesystem must
+/// surface as `ENOSPC` to the reading process, not a generic I/O error.
+fn deny_errno_for(e: &std::io::Error) -> libc::c_int {
+    match e.raw_os_error() {
+        Some(errno @ (libc::ENOSPC | libc::EDQUOT | libc::EIO)) => errno,
+        _ => libc::EIO,
+    }
+}
+
 /// Handler that serves RAFS v6 blob data through fanotify pre-content hooks.
 ///
 /// The lifetime mirrors the existing service handler pattern:
@@ -652,8 +665,11 @@ impl FanotifyHandler {
                 Ok(()) => FAN_ALLOW,
                 Err(e) => {
                     warn!("fanotify: failed to serve pre-content event: {}", e);
-                    // Deny with EIO so the consumer sees an I/O error instead of zero-filled data.
-                    fan_deny_errno(libc::EIO)
+                    // Deny with the real errno where the kernel accepts it
+                    // (disk-full must surface as ENOSPC, not a generic EIO)
+                    // so the consumer sees an honest error instead of
+                    // zero-filled data.
+                    fan_deny_errno(deny_errno_for(&e))
                 }
             };
 
@@ -701,6 +717,17 @@ impl FanotifyHandler {
             let err = std::io::Error::last_os_error();
             if err.raw_os_error() == Some(libc::EINTR) {
                 continue;
+            }
+            // A kernel that rejects this specific errno payload (EINVAL) must
+            // still get *a* response, or the reader stalls in D-state forever.
+            // Retry once with the always-valid EIO form.
+            if err.raw_os_error() == Some(libc::EINVAL) && response != fan_deny_errno(libc::EIO) {
+                warn!(
+                    "fanotify: kernel rejected deny response {:#x} for fd {}; retrying with EIO",
+                    response, event_fd
+                );
+                self.write_response(event_fd, fan_deny_errno(libc::EIO));
+                return;
             }
             error!(
                 "fanotify: failed to write permission response for fd {}: {}; \
@@ -867,6 +894,22 @@ fn fd_file_size(fd: RawFd) -> Result<u64> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn deny_errno_passthrough_table() {
+        use super::deny_errno_for;
+        let e = |errno| std::io::Error::from_raw_os_error(errno);
+        assert_eq!(deny_errno_for(&e(libc::ENOSPC)), libc::ENOSPC);
+        assert_eq!(deny_errno_for(&e(libc::EDQUOT)), libc::EDQUOT);
+        assert_eq!(deny_errno_for(&e(libc::EIO)), libc::EIO);
+        // Everything else collapses to EIO — including errnos the kernel
+        // would reject as deny payloads.
+        assert_eq!(deny_errno_for(&e(libc::ENOENT)), libc::EIO);
+        assert_eq!(
+            deny_errno_for(&std::io::Error::other("no raw errno")),
+            libc::EIO
+        );
+    }
+
     use super::*;
 
     /// Serialize a `fanotify_event_info_range` record to raw bytes.

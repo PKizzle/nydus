@@ -139,6 +139,8 @@ mod tests {
     #[test]
     fn test_fan_deny_errno_masks_to_eight_bits() {
         assert_eq!(fan_deny_errno(libc::EIO), 0x0500_0002); // EIO == 5
+        assert_eq!(fan_deny_errno(libc::ENOSPC) >> 24, 28); // ENOSPC == 28
+        assert_eq!(fan_deny_errno(libc::EDQUOT) >> 24, 122); // EDQUOT == 122
         // Only the low 8 bits of the errno survive; FAN_DENY stays set.
         let encoded = fan_deny_errno(0x1FF);
         assert_eq!(encoded & 0x0000_00FF, 0x02, "FAN_DENY bit preserved");

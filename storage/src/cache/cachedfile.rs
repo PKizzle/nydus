@@ -314,7 +314,12 @@ impl FileCacheEntry {
         .detach();
     }
 
-    fn persist_chunk_data(&self, chunk: &dyn BlobChunkInfo, buf: &[u8]) {
+    /// Persist one chunk's uncompressed bytes into the cache file, returning
+    /// the write result so callers on a terminal path can propagate it: a
+    /// swallowed ENOSPC here turns into FAN_ALLOW over an unfilled sparse
+    /// hole — the consumer silently reads zeros. Chunk pending-state is
+    /// updated on both paths exactly as before.
+    fn persist_chunk_data(&self, chunk: &dyn BlobChunkInfo, buf: &[u8]) -> Result<()> {
         let offset = chunk.uncompressed_offset();
         let res = Self::persist_cached_data(&self.file, offset, buf);
         self.update_chunk_pending_status(chunk, res.is_ok());
@@ -327,11 +332,16 @@ impl FileCacheEntry {
                 e
             );
         }
+        res
     }
 
     fn persist_cached_data(file: &Arc<File>, offset: u64, buffer: &[u8]) -> Result<()> {
         let n = loop {
-            let ret = uio::pwrite(file.as_ref(), buffer, offset as i64).map_err(|_| last_error!());
+            // Deliberately NOT `last_error!()`: that wraps into a Custom error
+            // whose `raw_os_error()` is `None`, and the fanotify deny path
+            // needs the real errno (ENOSPC vs EIO) to reach the reader.
+            let ret =
+                uio::pwrite(file.as_ref(), buffer, offset as i64).map_err(std::io::Error::from);
             match ret {
                 Ok(nr_write) => {
                     trace!("write {}(offset={}) bytes to cache file", nr_write, offset);
@@ -753,7 +763,7 @@ impl BlobCache for FileCacheEntry {
                                 }
                                 Some(Ok(v)) => v,
                             };
-                            self.persist_chunk_data(pending[idx].as_ref(), &buf);
+                            let _ = self.persist_chunk_data(pending[idx].as_ref(), &buf);
                         }
                     }
                 }
@@ -1047,7 +1057,7 @@ impl FileCacheEntry {
                                 if self.dio_enabled {
                                     self.adjust_buffer_for_dio(&mut buf)
                                 }
-                                self.persist_chunk_data(chunks[idx].as_ref(), buf.as_ref());
+                                let _ = self.persist_chunk_data(chunks[idx].as_ref(), buf.as_ref());
                             }
                         }
                     }
@@ -1087,7 +1097,12 @@ impl FileCacheEntry {
                         if self.dio_enabled {
                             self.adjust_buffer_for_dio(&mut buf)
                         }
-                        self.persist_chunk_data(chunk.as_ref(), &buf);
+                        // Terminal path: this chunk already timed out once and
+                        // was re-read from the backend. If the cache write
+                        // fails again (ENOSPC, EDQUOT, I/O error), the range
+                        // cannot be materialized — propagate so the fanotify
+                        // handler denies the read instead of allowing zeros.
+                        self.persist_chunk_data(chunk.as_ref(), &buf)?;
                     }
                 }
             }
@@ -1850,6 +1865,21 @@ impl FileIoMergeState {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn persist_cached_data_preserves_write_errno() {
+        use std::sync::Arc;
+        use vmm_sys_util::tempdir::TempDir;
+        // A read-only file makes pwrite fail deterministically; the raw OS
+        // errno must survive so fanotify can deny with it (EBADF/EACCES here,
+        // ENOSPC in the disk-full case this guards).
+        let dir = TempDir::new().unwrap();
+        let path = dir.as_path().join("cache.blob.data");
+        std::fs::write(&path, b"seed").unwrap();
+        let ro = Arc::new(std::fs::File::open(&path).unwrap());
+        let err = super::FileCacheEntry::persist_cached_data(&ro, 0, b"data").unwrap_err();
+        assert!(err.raw_os_error().is_some(), "raw errno lost: {err:?}");
+    }
+
     use super::*;
     use crate::device::{BlobChunkFlags, BlobFeatures};
     use crate::meta::*;
