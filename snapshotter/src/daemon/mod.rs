@@ -1565,7 +1565,22 @@ impl DaemonSupervisor {
                 Err(e) => {
                     // The image may be gone entirely (removed while we were
                     // down); drop the record so startup doesn't retry forever.
-                    warn!(image_ref = %record.image_ref, error = %e, "failed to rebuild daemon from record; dropping the record");
+                    // Detach whatever is still mounted there first: a
+                    // daemonless erofs mount whose marks are gone would serve
+                    // sparse zeros silently — consumers must fail loudly so
+                    // kubelet restarts them onto a fresh Prepare instead.
+                    warn!(image_ref = %record.image_ref, error = %e, "failed to rebuild daemon from record; detaching its mount and dropping the record");
+                    if is_mounted_at(&record.mountpoint) {
+                        match detach_mount_stack(&record.mountpoint) {
+                            Ok(layers) => {
+                                info!(slug = %record.slug, layers, "detached mount after terminal rebuild failure")
+                            }
+                            Err(e) => {
+                                warn!(slug = %record.slug, error = %e, "failed to detach mount after terminal rebuild failure")
+                            }
+                        }
+                    }
+                    self.clear_failover_state(&record.slug);
                     let _ = fs::remove_file(self.record_path(&record.slug));
                 }
             }
