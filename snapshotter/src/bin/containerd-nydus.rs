@@ -301,6 +301,14 @@ async fn main() -> Result<()> {
         info!(rebuilt, "rebuilt nydus daemons from persisted records");
     }
 
+    // Finally, detach any dead FUSE mount stacks left by daemons that no
+    // longer have a record or preserved fd (e.g. mounts stranded by a
+    // predecessor that predates record persistence).
+    let swept = supervisor.sweep_orphaned_fuse_mounts().await;
+    if swept > 0 {
+        info!(swept, "swept orphaned fuse mounts under the daemons root");
+    }
+
     // Open the fjall snapshot store HERE — not inside the server task — so the
     // shutdown path below can fsync the journal with a known-good handle even
     // when systemd is about to `kill -9` us on the failover path. If the store

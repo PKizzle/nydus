@@ -1367,14 +1367,6 @@ impl DaemonSupervisor {
             .map(|r| (r.slug.as_str(), r))
             .collect();
 
-        // Fd adoption rebuilds a fusedev daemon around the preserved
-        // `/dev/fuse` fd; under any other driver the parked fd is useless to a
-        // successor. Evict it from the store (systemd's dup would otherwise
-        // pin a connection nobody serves) but leave the mount alone —
-        // `rebuild_from_records` heals kernel mounts in place and detaches
-        // dead FUSE mounts before remounting.
-        let adoptable = self.active_fs_driver() == FsDriverType::Fusedev;
-
         let mut restored = 0;
         for (slug, fds) in &stored {
             let Some(record) = by_slug.get(slug.as_str()) else {
@@ -1385,25 +1377,60 @@ impl DaemonSupervisor {
                 self.reclaim_unadoptable_fd(slug);
                 continue;
             };
-            if !adoptable {
-                debug!(
-                    slug,
-                    "evicting preserved fd (fd adoption is fusedev-only); the record-driven rebuild takes over"
-                );
-                if let Err(e) = crate::fdstore::remove_fd(slug) {
-                    warn!(slug, error = %e, "failed to evict preserved fd from the systemd fd store");
-                }
-                continue;
-            }
             let Some(fd) = fds.first() else { continue };
-            match self.restore_instance(record, fd.as_raw_fd()).await {
-                Ok(()) => {
-                    restored += 1;
-                    info!(slug, image_ref = %record.image_ref, "took over nydus mount from preserved fuse fd");
+            // Route by what is actually mounted at the record's mountpoint:
+            // an EROFS mount means a fanotify daemon parked its armed group
+            // fd (adopting it keeps the pre-content marks alive with zero
+            // unprotected window); a FUSE mount means a fusedev daemon
+            // parked its `/dev/fuse` fd.
+            match mount_fstype_at(&record.mountpoint).as_deref() {
+                Some("erofs") => {
+                    match self.restore_fanotify_instance(record, fd.as_raw_fd()).await {
+                        Ok(()) => {
+                            restored += 1;
+                            info!(slug, image_ref = %record.image_ref, "took over fanotify mount from preserved group fd");
+                        }
+                        Err(e) => {
+                            // The kernel mount itself is fine — evict the fd
+                            // (systemd's dup would pin a group nobody drains)
+                            // and leave the mount for the record rebuild,
+                            // which re-arms fresh marks in place.
+                            warn!(slug, image_ref = %record.image_ref, error = %e, "fanotify takeover failed; falling back to the record rebuild");
+                            if let Err(e) = crate::fdstore::remove_fd(slug) {
+                                warn!(slug, error = %e, "failed to evict preserved fd from the systemd fd store");
+                            }
+                        }
+                    }
                 }
-                Err(e) => {
-                    warn!(slug, image_ref = %record.image_ref, error = %e, "failed to take over mount; reclaiming it");
-                    self.reclaim_unadoptable_fd(slug);
+                Some(t)
+                    if t.contains("fuse") && self.active_fs_driver() == FsDriverType::Fusedev =>
+                {
+                    match self.restore_instance(record, fd.as_raw_fd()).await {
+                        Ok(()) => {
+                            restored += 1;
+                            info!(slug, image_ref = %record.image_ref, "took over nydus mount from preserved fuse fd");
+                        }
+                        Err(e) => {
+                            warn!(slug, image_ref = %record.image_ref, error = %e, "failed to take over mount; reclaiming it");
+                            self.reclaim_unadoptable_fd(slug);
+                        }
+                    }
+                }
+                _ => {
+                    // A FUSE record under a non-fusedev driver, or nothing
+                    // mounted at all: the fd cannot be adopted. Evict it from
+                    // the store, but do NOT touch the mount here — the record
+                    // rebuild detaches a dead FUSE stack itself before
+                    // remounting, and detaching first would make the rebuild
+                    // mistake the now-bare mountpoint for a stale record and
+                    // drop it instead of restarting the daemon.
+                    debug!(
+                        slug,
+                        "preserved fd is not adoptable here; evicting it and deferring to the record rebuild"
+                    );
+                    if let Err(e) = crate::fdstore::remove_fd(slug) {
+                        warn!(slug, error = %e, "failed to evict preserved fd from the systemd fd store");
+                    }
                 }
             }
         }
@@ -1439,13 +1466,15 @@ impl DaemonSupervisor {
                 let _ = fs::remove_file(self.record_path(&record.slug));
                 continue;
             }
-            // A FUSE mount without its daemon is dead; evict it so
+            // A FUSE mount without its daemon is dead; evict it (the whole
+            // stack — older generations stacked mounts across recoveries) so
             // start_instance gets a clean mountpoint. Kernel (erofs) mounts
             // are healed in place instead.
-            if mount_fstype_at(&record.mountpoint).is_some_and(|t| t.contains("fuse"))
-                && let Err(e) = detach_mount_lazy(&record.mountpoint)
-            {
-                warn!(slug = %record.slug, error = %e, "failed to detach dead fuse mount before rebuild");
+            while mount_fstype_at(&record.mountpoint).is_some_and(|t| t.contains("fuse")) {
+                if let Err(e) = detach_mount_lazy(&record.mountpoint) {
+                    warn!(slug = %record.slug, error = %e, "failed to detach dead fuse mount before rebuild");
+                    break;
+                }
             }
             // Auto-accel sidecars are served from the node-local content
             // store, not a registry: their bootstrap lives in
@@ -1494,6 +1523,56 @@ impl DaemonSupervisor {
         rebuilt
     }
 
+    /// Sweep `daemons/<slug>/mnt` mountpoints that are FUSE-mounted but have
+    /// no live instance, and detach their whole mount stack.
+    ///
+    /// These are corpses no other startup path reaches: their fds were
+    /// consumed or never parked and their records are gone, yet the dead
+    /// mounts (possibly stacked many deep by earlier daemon generations —
+    /// observed 9 deep in production) still occupy the mountpoint, so any
+    /// consumer fails and a fresh `Prepare` would stack yet another layer.
+    /// Idle EROFS kernel mounts are deliberately left alone: they serve
+    /// cached reads fine and the next `Prepare` re-adopts them in place.
+    ///
+    /// Call at startup after `restore_from_store` + `rebuild_from_records`
+    /// (so every adoptable mount already has its instance). Returns the
+    /// number of mountpoints cleaned.
+    pub async fn sweep_orphaned_fuse_mounts(&self) -> usize {
+        let live_slugs: std::collections::HashSet<String> = {
+            let instances = self.instances.read().await;
+            instances.keys().map(|r| slug_for(r)).collect()
+        };
+        let entries = match fs::read_dir(self.daemons_root()) {
+            Ok(entries) => entries,
+            Err(_) => return 0,
+        };
+        let mut cleaned = 0;
+        for entry in entries.flatten() {
+            let slug = entry.file_name().to_string_lossy().into_owned();
+            if slug == Self::RECORDS_DIRNAME || live_slugs.contains(&slug) {
+                continue;
+            }
+            let mountpoint = entry.path().join("mnt");
+            let mut popped = 0usize;
+            while mount_fstype_at(&mountpoint).is_some_and(|t| t.contains("fuse")) {
+                if popped >= 64 {
+                    warn!(slug, "orphaned fuse mount stack deeper than 64; giving up");
+                    break;
+                }
+                if let Err(e) = detach_mount_lazy(&mountpoint) {
+                    warn!(slug, error = %e, "failed to detach orphaned fuse mount");
+                    break;
+                }
+                popped += 1;
+            }
+            if popped > 0 {
+                info!(slug, layers = popped, "swept orphaned fuse mount stack");
+                cleaned += 1;
+            }
+        }
+        cleaned
+    }
+
     /// A preserved fd we cannot adopt (no matching record, or takeover failed)
     /// must not linger: systemd keeps its own dup of every parked fd until told
     /// otherwise, which holds the dead FUSE connection half-open — readers then
@@ -1508,8 +1587,8 @@ impl DaemonSupervisor {
         }
         let mountpoint = self.daemons_root().join(slug).join("mnt");
         if is_mounted_at(&mountpoint) {
-            match detach_mount_lazy(&mountpoint) {
-                Ok(()) => info!(slug, "detached orphaned nydus mount"),
+            match detach_mount_stack(&mountpoint) {
+                Ok(layers) => info!(slug, layers, "detached orphaned nydus mount"),
                 Err(e) => {
                     warn!(slug, error = %e, "failed to detach orphaned nydus mount")
                 }
@@ -1624,6 +1703,114 @@ impl DaemonSupervisor {
             _poll: poll,
             // The fd stays in systemd's store across restarts, so this daemon is
             // still recoverable by the next successor.
+            failover_armed: AtomicBool::new(true),
+        });
+        self.instances
+            .write()
+            .await
+            .insert(image_ref_str.to_string(), instance);
+        Ok(())
+    }
+
+    /// Recreate a fanotify daemon in upgrade mode and drive it through
+    /// `Takeover -> Restore -> Start`, adopting the preserved fanotify group
+    /// fd and the on-disk state blob.
+    ///
+    /// The parked fd kept the group — and therefore its `FAN_PRE_ACCESS`
+    /// marks — alive across our restart, so the surviving EROFS mount was
+    /// never unprotected: reads that hit unmaterialized cache ranges during
+    /// the daemon gap *block* on the queued pre-content events rather than
+    /// seeing sparse holes, and are answered the moment the restored
+    /// handler's workers start draining. This is why adoption is strictly
+    /// better than the record rebuild for fanotify: the rebuild re-arms
+    /// fresh marks, leaving a brief window where a cold read could slip
+    /// through unmarked.
+    ///
+    /// The daemon-side counterpart is `fanotify_upgrade::restore`
+    /// (`service/src/upgrade.rs`): blob-cache entries are re-added from the
+    /// state blob (no backend config has to be reconstructed here) and the
+    /// handler is rebuilt around the inherited fd without re-arming marks or
+    /// re-mounting.
+    async fn restore_fanotify_instance(
+        &self,
+        record: &DaemonStatusRecord,
+        fan_fd: std::os::fd::RawFd,
+    ) -> Result<()> {
+        let image_ref_str = record.image_ref.as_str();
+        let slug = record.slug.as_str();
+        let daemon_root = self.daemons_root().join(slug);
+        let mountpoint = daemon_root.join("mnt");
+        if !is_mounted_at(&mountpoint) {
+            bail!(
+                "no live EROFS mount at {} to take over",
+                mountpoint.display()
+            );
+        }
+        let state_path = self.failover_state_path(slug);
+        let state = fs::read(&state_path)
+            .with_context(|| format!("read failover state {}", state_path.display()))?;
+
+        let bti = self.build_info.clone();
+        let poll = Poll::new().context("failed to create mio Poll for daemon waker")?;
+        let waker =
+            Arc::new(Waker::new(poll.registry(), Token(1)).context("failed to create mio Waker")?);
+        let poll = Arc::new(Mutex::new(poll));
+
+        let supervisor_sock = supervisor_sock_path(slug);
+        // `upgrade=true` + `Some(api_sock)` skips handler registration and the
+        // Mount/Start events, leaving the daemon in INIT ready for takeover.
+        // No fanotify blob_dir/mountpoint and no blob config are passed: the
+        // handler geometry and the blob-cache entries all come from the state
+        // blob captured at save time.
+        let api_sock = daemon_root.join("api.sock");
+        let daemon = create_daemon(
+            Some(slug.to_string()),
+            Some(supervisor_sock.display().to_string()),
+            None,
+            None,
+            None,
+            None,
+            bti,
+            waker,
+            Some(api_sock.as_path()),
+            true,
+        )
+        .map_err(|e| anyhow::anyhow!("create upgrade fanotify daemon for {image_ref_str}: {e}"))?;
+
+        // Replay (fd, state) into the daemon's restore() over the supervisor
+        // socket, then start it serving on the existing kernel mount.
+        let daemon_for_takeover = daemon.clone();
+        let state_owned = state;
+        let sock_for_restore = supervisor_sock.clone();
+        blocking::unblock(move || {
+            crate::failover::serve_on_restore(&sock_for_restore, fan_fd, state_owned, || {
+                daemon_for_takeover
+                    .trigger_takeover()
+                    .map_err(|e| anyhow::anyhow!("trigger_takeover: {e}"))
+            })
+        })
+        .await
+        .context("replay preserved fanotify fd into daemon")?;
+
+        daemon
+            .trigger_start()
+            .map_err(|e| anyhow::anyhow!("trigger_start: {e}"))?;
+        wait_for_running_off_reactor(daemon.clone(), self.startup_timeout)
+            .await
+            .with_context(|| {
+                format!("restored fanotify daemon for {image_ref_str} never reached RUNNING")
+            })?;
+
+        let instance = Arc::new(DaemonInstance {
+            image_ref: image_ref_str.to_string(),
+            mountpoint,
+            bootstrap: record.bootstrap.clone(),
+            daemon,
+            refcount: AtomicUsize::new(record.refcount.max(1)),
+            holders: StdMutex::new(HashSet::new()),
+            _poll: poll,
+            // The fd stays in systemd's store (it holds its own dup), so this
+            // daemon remains recoverable by the next successor too.
             failover_armed: AtomicBool::new(true),
         });
         self.instances
@@ -2304,6 +2491,28 @@ fn detach_mount_lazy(mountpoint: &Path) -> io::Result<()> {
 #[cfg(not(target_os = "linux"))]
 fn detach_mount_lazy(_mountpoint: &Path) -> io::Result<()> {
     Ok(())
+}
+
+/// Pop **every** layer of the mount stack at `mountpoint`, not just the top.
+///
+/// Earlier daemon generations stacked a fresh mount over the dead one on each
+/// recovery (observed 9 deep in production), so a single `MNT_DETACH` merely
+/// exposes the next corpse. Bounded to keep a pathological `/proc` parse from
+/// looping forever. Returns the number of layers popped.
+fn detach_mount_stack(mountpoint: &Path) -> io::Result<usize> {
+    const MAX_STACK: usize = 64;
+    let mut popped = 0;
+    while is_mounted_at(mountpoint) {
+        if popped >= MAX_STACK {
+            return Err(io::Error::other(format!(
+                "mount stack at {} deeper than {MAX_STACK}; giving up",
+                mountpoint.display()
+            )));
+        }
+        detach_mount_lazy(mountpoint)?;
+        popped += 1;
+    }
+    Ok(popped)
 }
 
 #[cfg(not(target_os = "linux"))]
