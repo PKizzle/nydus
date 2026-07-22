@@ -426,6 +426,13 @@ pub struct DaemonConfig {
     /// Also log to stdout.
     #[serde(default)]
     pub log_to_stdout: bool,
+    /// Warn when this many fds are parked in systemd's fd store. The unit's
+    /// `FileDescriptorStoreMax` bounds the store, and past it systemd silently
+    /// drops FDSTORE messages — failover then quietly stops arming for new
+    /// daemons. Keep this a little below the unit's limit (default 96 against
+    /// the documented `FileDescriptorStoreMax=128`). 0 disables the warning.
+    #[serde(default = "default_fdstore_warn_threshold")]
+    pub fdstore_warn_threshold: usize,
 }
 
 /// A single entry in the `[[snapshotter.fs_drivers]]` ordered list.
@@ -1258,6 +1265,9 @@ fn default_sysctl_address() -> PathBuf {
 }
 fn default_recover_policy() -> String {
     "failover".to_string()
+}
+fn default_fdstore_warn_threshold() -> usize {
+    96
 }
 fn default_threads() -> usize {
     4

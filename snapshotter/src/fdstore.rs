@@ -65,6 +65,33 @@ pub fn remove_fd(name: &str) -> Result<bool> {
     Ok(true)
 }
 
+/// Replace whatever is stored under `name` with `fd`: `FDSTOREREMOVE` first,
+/// then `FDSTORE`. Parking without removing accumulates dups under the same
+/// `FDNAME` across mount/unmount cycles — systemd keeps them all, the store
+/// creeps toward `FileDescriptorStoreMax`, and a successor adopting the wrong
+/// (stale) generation gets a dead connection. Any fd being replaced belongs to
+/// a prior daemon generation for the slug: parking only happens at fresh
+/// instance starts, never after adoption. No-op without a notify socket.
+pub fn replace_fd(name: &str, fd: RawFd) -> Result<bool> {
+    let Some(sock) = notify_socket()? else {
+        return Ok(false);
+    };
+    send_replace(&sock, name, fd)?;
+    Ok(true)
+}
+
+/// The wire half of [`replace_fd`], separated so tests can drive it against a
+/// plain datagram socket without touching the process environment.
+fn send_replace(sock: &UnixDatagram, name: &str, fd: RawFd) -> Result<()> {
+    let remove = format!("FDSTOREREMOVE=1\nFDNAME={name}\n");
+    sock.send(remove.as_bytes())
+        .with_context(|| format!("sd_notify FDSTOREREMOVE for {name}"))?;
+    let store = format!("FDSTORE=1\nFDNAME={name}\n");
+    sock.send_with_fd(store.as_bytes(), &[fd])
+        .with_context(|| format!("sd_notify FDSTORE for {name}"))?;
+    Ok(())
+}
+
 /// Tell systemd the service finished starting (`READY=1`). Required for a
 /// `Type=notify` unit so the manager does not consider startup hung. No-op
 /// without a notify socket.
@@ -247,6 +274,26 @@ mod tests {
         let mut buf = [0u8; 128];
         let n = receiver.recv(&mut buf).unwrap();
         assert_eq!(&buf[..n], payload);
+    }
+
+    #[test]
+    fn replace_fd_sends_remove_then_store() {
+        // Drive the wire half directly against a temp datagram socket — no
+        // process-environment mutation, so this cannot race the env-guarded
+        // tests under cargo's threaded test runner.
+        let dir = tempfile::tempdir().unwrap();
+        let sock_path = dir.path().join("notify.sock");
+        let receiver = UnixDatagram::bind(&sock_path).unwrap();
+        let sender = connect_dgram(sock_path.as_os_str().as_bytes()).unwrap();
+
+        let file = tempfile::tempfile().unwrap();
+        send_replace(&sender, "slug", file.as_raw_fd()).unwrap();
+
+        let mut buf = [0u8; 128];
+        let n = receiver.recv(&mut buf).unwrap();
+        assert_eq!(&buf[..n], b"FDSTOREREMOVE=1\nFDNAME=slug\n");
+        let n = receiver.recv(&mut buf).unwrap();
+        assert_eq!(&buf[..n], b"FDSTORE=1\nFDNAME=slug\n");
     }
 
     #[test]

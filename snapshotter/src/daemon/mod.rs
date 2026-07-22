@@ -422,6 +422,12 @@ pub struct DaemonSupervisor {
     /// number of distinct images the node has served.
     start_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     startup_timeout: Duration,
+    /// Slugs with a fd currently parked in systemd's store (parked at start or
+    /// kept across an adoption). Purely accounting: systemd cannot tell us how
+    /// full the store is, so we track our own contribution and warn as it
+    /// approaches `FileDescriptorStoreMax` — past the cap, systemd silently
+    /// drops FDSTORE messages and failover quietly stops arming.
+    parked_slugs: StdMutex<HashSet<String>>,
 }
 
 impl DaemonSupervisor {
@@ -442,6 +448,7 @@ impl DaemonSupervisor {
             instances: RwLock::new(HashMap::new()),
             start_locks: Mutex::new(HashMap::new()),
             startup_timeout: Duration::from_secs(30),
+            parked_slugs: StdMutex::new(HashSet::new()),
         }
     }
 
@@ -507,6 +514,7 @@ impl DaemonSupervisor {
                 if let Err(e) = self.persist_instance_record(&old, false) {
                     warn!(image_ref, error = %e, "failed to persist stopped daemon record");
                 }
+                self.clear_failover_state(&slug_for(image_ref));
             }
         }
         Ok(())
@@ -792,6 +800,7 @@ impl DaemonSupervisor {
             if let Err(e) = self.persist_instance_record(&old, false) {
                 warn!(image_ref, error = %e, "failed to persist stopped daemon record");
             }
+            self.clear_failover_state(&slug_for(image_ref));
         }
 
         let instance = self
@@ -828,6 +837,9 @@ impl DaemonSupervisor {
                 if let Err(e) = self.persist_instance_record(&inst, false) {
                     warn!(image_ref, error = %e, "failed to persist stopped daemon record");
                 }
+                // Fully torn down: a preserved fd or state blob left behind
+                // would revive a daemon nobody references on the next start.
+                self.clear_failover_state(&slug_for(image_ref));
             }
         } else if let Some(inst) = instances.get(image_ref)
             && let Err(e) = self.persist_instance_record(inst, true)
@@ -835,6 +847,46 @@ impl DaemonSupervisor {
             warn!(image_ref, error = %e, "failed to persist daemon record");
         }
         Ok(())
+    }
+
+    /// Record that `slug` has a fd parked in systemd's store and warn when our
+    /// contribution approaches the unit's `FileDescriptorStoreMax` — beyond the
+    /// cap systemd silently drops FDSTORE messages and failover quietly stops
+    /// arming for new daemons.
+    fn note_parked_slug(&self, slug: &str) {
+        let mut parked = self.parked_slugs.lock().unwrap();
+        parked.insert(slug.to_string());
+        let threshold = self.config.snapshotter.daemon.fdstore_warn_threshold;
+        if threshold > 0 && parked.len() >= threshold {
+            warn!(
+                parked = parked.len(),
+                threshold,
+                "parked fd count is approaching the systemd FileDescriptorStoreMax; \
+                 raise the unit's limit or failover will silently stop arming"
+            );
+        }
+    }
+
+    /// Number of fds currently parked in systemd's store (our accounting).
+    pub fn parked_fd_count(&self) -> usize {
+        self.parked_slugs.lock().unwrap().len()
+    }
+
+    /// Evict the parked fd and delete the on-disk failover state for `slug` —
+    /// call whenever an instance is torn down for good (released to zero,
+    /// replaced, or terminally failed) so a successor cannot adopt a stale
+    /// generation. Log-only on failure; both halves are idempotent.
+    fn clear_failover_state(&self, slug: &str) {
+        if let Err(e) = crate::fdstore::remove_fd(slug) {
+            warn!(slug, error = %e, "failed to evict preserved fd from the systemd fd store");
+        }
+        self.parked_slugs.lock().unwrap().remove(slug);
+        let state_path = self.failover_state_path(slug);
+        if let Err(e) = fs::remove_file(&state_path)
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            warn!(slug, error = %e, "failed to remove failover state blob");
+        }
     }
 
     /// Reconciler hook: re-check daemon health and restart failed instances.
@@ -1330,9 +1382,10 @@ impl DaemonSupervisor {
             warn!(slug, error = %e, "failed to persist failover state blob; failover disabled for this image");
             return false;
         }
-        match crate::fdstore::store_fd(slug, fuse_fd.as_raw_fd()) {
+        match crate::fdstore::replace_fd(slug, fuse_fd.as_raw_fd()) {
             Ok(true) => {
                 info!(slug, "parked fuse fd in systemd fd store for failover");
+                self.note_parked_slug(slug);
                 true
             }
             Ok(false) => {
@@ -1377,7 +1430,9 @@ impl DaemonSupervisor {
                 self.reclaim_unadoptable_fd(slug);
                 continue;
             };
-            let Some(fd) = fds.first() else { continue };
+            // Newest parked generation wins: stores written by builds that
+            // predate replace-on-park can hold [dead, ..., live] under one name.
+            let Some(fd) = fds.last() else { continue };
             // Route by what is actually mounted at the record's mountpoint —
             // never by the configured driver. Registry-backed images mount
             // fusedev even on a fanotify-configured node, and their parked
@@ -1701,6 +1756,7 @@ impl DaemonSupervisor {
             // still recoverable by the next successor.
             failover_armed: AtomicBool::new(true),
         });
+        self.note_parked_slug(slug);
         self.instances
             .write()
             .await
@@ -1809,6 +1865,7 @@ impl DaemonSupervisor {
             // daemon remains recoverable by the next successor too.
             failover_armed: AtomicBool::new(true),
         });
+        self.note_parked_slug(slug);
         self.instances
             .write()
             .await
@@ -1895,6 +1952,7 @@ impl DaemonSupervisor {
             if let Err(e) = self.persist_instance_record(&old, false) {
                 warn!(image_ref, error = %e, "failed to persist stopped daemon record");
             }
+            self.clear_failover_state(&slug);
 
             match self.start_instance(&image_ref, &bootstrap, None).await {
                 Ok(instance) => {

@@ -932,6 +932,16 @@ async fn metrics_response(controller: &SystemController) -> HttpResponse {
     let live_daemon_count = daemons.iter().filter(|d| d.live).count();
     push_metric(&mut body, "nydus_snapshotter_daemons", live_daemon_count);
 
+    body.push_str(
+        "# HELP nydus_snapshotter_parked_fds Fds parked in the systemd fd store for failover.\n",
+    );
+    body.push_str("# TYPE nydus_snapshotter_parked_fds gauge\n");
+    push_metric(
+        &mut body,
+        "nydus_snapshotter_parked_fds",
+        controller.supervisor.parked_fd_count(),
+    );
+
     body.push_str("# HELP nydusd_counts The counts of nydus daemon.\n");
     body.push_str("# TYPE nydusd_counts gauge\n");
     push_labeled_metric(
