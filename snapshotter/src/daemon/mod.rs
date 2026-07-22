@@ -1378,13 +1378,13 @@ impl DaemonSupervisor {
                 continue;
             };
             let Some(fd) = fds.first() else { continue };
-            // Route by what is actually mounted at the record's mountpoint:
-            // an EROFS mount means a fanotify daemon parked its armed group
-            // fd (adopting it keeps the pre-content marks alive with zero
-            // unprotected window); a FUSE mount means a fusedev daemon
-            // parked its `/dev/fuse` fd.
-            match mount_fstype_at(&record.mountpoint).as_deref() {
-                Some("erofs") => {
+            // Route by what is actually mounted at the record's mountpoint —
+            // never by the configured driver. Registry-backed images mount
+            // fusedev even on a fanotify-configured node, and their parked
+            // `/dev/fuse` fds are just as adoptable: what matters is the
+            // observed mount, not the node-level default.
+            match adoption_route(mount_fstype_at(&record.mountpoint).as_deref()) {
+                AdoptionRoute::Fanotify => {
                     match self.restore_fanotify_instance(record, fd.as_raw_fd()).await {
                         Ok(()) => {
                             restored += 1;
@@ -1402,9 +1402,7 @@ impl DaemonSupervisor {
                         }
                     }
                 }
-                Some(t)
-                    if t.contains("fuse") && self.active_fs_driver() == FsDriverType::Fusedev =>
-                {
+                AdoptionRoute::Fusedev => {
                     match self.restore_instance(record, fd.as_raw_fd()).await {
                         Ok(()) => {
                             restored += 1;
@@ -1416,14 +1414,12 @@ impl DaemonSupervisor {
                         }
                     }
                 }
-                _ => {
-                    // A FUSE record under a non-fusedev driver, or nothing
-                    // mounted at all: the fd cannot be adopted. Evict it from
-                    // the store, but do NOT touch the mount here — the record
-                    // rebuild detaches a dead FUSE stack itself before
-                    // remounting, and detaching first would make the rebuild
-                    // mistake the now-bare mountpoint for a stale record and
-                    // drop it instead of restarting the daemon.
+                AdoptionRoute::Evict => {
+                    // Nothing (or something unrecognizable) is mounted there:
+                    // the fd cannot be adopted. Evict it from the store, but
+                    // do NOT touch the mountpoint — the record rebuild owns
+                    // any cleanup, and detaching here would make it mistake a
+                    // bare mountpoint for a stale record and drop it.
                     debug!(
                         slug,
                         "preserved fd is not adoptable here; evicting it and deferring to the record rebuild"
@@ -1439,16 +1435,15 @@ impl DaemonSupervisor {
 
     /// Rebuild live daemon instances from their persisted records at startup.
     ///
-    /// The fd-store path (`restore_from_store`) only covers fusedev daemons
-    /// whose `/dev/fuse` fds systemd preserved. Fanotify and blockdev
-    /// instances hold no such fd: their kernel mounts survive the restart, but
-    /// the pre-content marks and daemon state die with the old process —
-    /// without a rebuild, reads through the surviving mount hit unmaterialized
-    /// cache ranges. Re-creating the instance re-stages and re-arms marks on
-    /// the same cache inodes, healing the existing mount in place
-    /// (`start_instance` reuses a live mountpoint). A fusedev record that
-    /// reaches here un-adopted has lost its connection for good; its dead
-    /// mount is detached first so the rebuild mounts fresh.
+    /// This is the fallback tier behind fd adoption (`restore_from_store`,
+    /// which takes over both fanotify group fds and `/dev/fuse` fds by
+    /// observed mount type). A record reaches here when its fd was never
+    /// parked, was evicted, or its takeover failed. Kernel (EROFS) mounts are
+    /// healed in place — re-creating the instance re-stages and re-arms marks
+    /// on the same cache inodes (`start_instance` reuses a live mountpoint) —
+    /// while a fuse mount that reaches here un-adopted has lost its
+    /// connection for good; its dead mount stack is detached first so the
+    /// rebuild mounts fresh.
     ///
     /// Call after `restore_from_store`, before serving gRPC. Returns the
     /// number of instances rebuilt.
@@ -1599,14 +1594,15 @@ impl DaemonSupervisor {
     /// Recreate a fusedev daemon in upgrade mode and drive it through the
     /// `Takeover -> Restore -> Start` path, adopting the preserved `fuse_fd` and
     /// the on-disk state blob, so it resumes serving the still-mounted image.
+    ///
+    /// Runs regardless of the configured driver: the daemon stack built here is
+    /// self-contained fusedev, derived entirely from the record — a per-image
+    /// fusedev mount on a fanotify-configured node adopts exactly the same way.
     async fn restore_instance(
         &self,
         record: &DaemonStatusRecord,
         fuse_fd: std::os::fd::RawFd,
     ) -> Result<()> {
-        if self.active_fs_driver() != FsDriverType::Fusedev {
-            bail!("failover restore is only supported for the fusedev driver");
-        }
         let image_ref_str = record.image_ref.as_str();
         let slug = record.slug.as_str();
         let bootstrap = record.bootstrap.clone();
@@ -2520,6 +2516,30 @@ fn is_mounted_at(_mountpoint: &Path) -> bool {
     false
 }
 
+/// How a preserved fd should be re-attached at startup, decided purely from
+/// the filesystem type observed at the record's mountpoint. Deliberately
+/// independent of the configured driver: a fanotify-configured node still
+/// mounts registry-backed images via fusedev, and those parked `/dev/fuse`
+/// fds are just as adoptable as the group fds of fanotify daemons.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AdoptionRoute {
+    /// EROFS mount: adopt the armed fanotify group fd (marks stay live).
+    Fanotify,
+    /// FUSE mount: adopt the `/dev/fuse` connection fd.
+    Fusedev,
+    /// Nothing (or something foreign) mounted: evict the fd, let the record
+    /// rebuild decide.
+    Evict,
+}
+
+fn adoption_route(mounted_fstype: Option<&str>) -> AdoptionRoute {
+    match mounted_fstype {
+        Some("erofs") => AdoptionRoute::Fanotify,
+        Some(t) if t.contains("fuse") => AdoptionRoute::Fusedev,
+        _ => AdoptionRoute::Evict,
+    }
+}
+
 /// Filesystem type of the mount at `mountpoint` (`/proc/self/mounts` field 3),
 /// or `None` when nothing is mounted there.
 #[cfg(target_os = "linux")]
@@ -2828,6 +2848,18 @@ mod tests {
     }
 
     #[test]
+    fn adoption_route_depends_only_on_mounted_fstype() {
+        // The regression this pins down: routing must never consult the
+        // configured driver — a fusedev mount on a fanotify node adopts too.
+        assert_eq!(adoption_route(Some("erofs")), AdoptionRoute::Fanotify);
+        assert_eq!(adoption_route(Some("fuse")), AdoptionRoute::Fusedev);
+        assert_eq!(adoption_route(Some("fuse.nydus")), AdoptionRoute::Fusedev);
+        assert_eq!(adoption_route(Some("fuseblk")), AdoptionRoute::Fusedev);
+        assert_eq!(adoption_route(Some("overlay")), AdoptionRoute::Evict);
+        assert_eq!(adoption_route(None), AdoptionRoute::Evict);
+    }
+
+    #[test]
     fn restore_from_store_returns_zero_without_preserved_fds() {
         // No systemd socket-activation env => nothing to take over. Guard on the
         // env being genuinely absent so we never clobber a real activation
@@ -2843,9 +2875,11 @@ mod tests {
     }
 
     #[test]
-    fn restore_instance_rejects_non_fusedev_driver() {
-        // Default driver chain is [Fanotify, Blockdev, Fusedev] -> active=Fanotify,
-        // so failover restore (fusedev-only) must bail before touching the fd.
+    fn restore_instance_runs_under_any_configured_driver() {
+        // Default driver chain is [Fanotify, Blockdev, Fusedev] -> active=Fanotify.
+        // Fusedev takeover must NOT be gated on the configured driver (a
+        // fanotify node still mounts registry images via fusedev); the first
+        // error must be a *real* validation failure, not a driver guard.
         let supervisor = DaemonSupervisor::new(SnapshotterConfig::default());
         assert_ne!(supervisor.active_fs_driver(), FsDriverType::Fusedev);
         let record = sample_record(PathBuf::from("/nonexistent/bootstrap.boot"));
@@ -2854,8 +2888,8 @@ mod tests {
             .block_on(supervisor.restore_instance(&record, -1))
             .unwrap_err();
         assert!(
-            err.to_string().contains("fusedev"),
-            "expected fusedev-driver guard, got: {err}"
+            err.to_string().contains("is gone"),
+            "expected missing-bootstrap validation error, got: {err}"
         );
     }
 
