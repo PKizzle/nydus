@@ -11,6 +11,7 @@
 
 use crate::config::SnapshotterConfig;
 use std::cmp::Reverse;
+use std::collections::HashSet;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -131,6 +132,10 @@ pub struct CacheGcReport {
     pub scanned_bytes: u64,
     pub removed_files: usize,
     pub removed_bytes: u64,
+    /// Files the policy selected but GC spared because their slug belongs to a
+    /// live daemon (in-memory instance or live persisted record).
+    pub spared_files: usize,
+    pub spared_bytes: u64,
     pub removals: Vec<CacheGcRemoval>,
     pub failures: Vec<CacheGcFailure>,
 }
@@ -178,7 +183,17 @@ impl CacheManager {
     }
 
     /// Run one GC pass using the supplied policy.
-    pub fn garbage_collect(&self, policy: &CacheGcPolicy) -> CacheResult<CacheGcReport> {
+    ///
+    /// `protected_slugs` names the per-image cache directories that must never
+    /// be collected: a live fanotify daemon's `.blob.data` file *is* the EROFS
+    /// device the kernel reads, and a live persisted record's blobs are needed
+    /// to rebuild after a restart. The signature makes exclusion mandatory —
+    /// pass an empty set only when provably nothing is being served.
+    pub fn garbage_collect(
+        &self,
+        policy: &CacheGcPolicy,
+        protected_slugs: &HashSet<String>,
+    ) -> CacheResult<CacheGcReport> {
         let usage = self.scan()?;
         let mut report = CacheGcReport {
             scanned_files: usage.total_files,
@@ -186,8 +201,18 @@ impl CacheManager {
             ..CacheGcReport::default()
         };
 
-        let mut candidates = self.select_age_candidates(&usage.entries, policy.max_age);
-        self.select_size_candidates(&usage.entries, policy.max_bytes, &mut candidates);
+        let is_protected =
+            |entry: &CacheEntry| entry_slug(entry).is_some_and(|s| protected_slugs.contains(s));
+
+        let mut candidates =
+            self.select_age_candidates(&usage.entries, policy.max_age, &is_protected, &mut report);
+        self.select_size_candidates(
+            &usage.entries,
+            policy.max_bytes,
+            &is_protected,
+            &mut candidates,
+            &mut report,
+        );
         candidates.sort_by_key(|entry| (entry.eviction_time(), entry.relative_path.clone()));
         candidates.dedup_by(|a, b| a.path == b.path);
 
@@ -205,6 +230,8 @@ impl CacheManager {
             scanned_bytes = report.scanned_bytes,
             removed_files = report.removed_files,
             removed_bytes = report.removed_bytes,
+            spared_files = report.spared_files,
+            spared_bytes = report.spared_bytes,
             failures = report.failures.len(),
             dry_run = policy.dry_run,
             "cache GC pass complete"
@@ -253,22 +280,35 @@ impl CacheManager {
         &self,
         entries: &'a [CacheEntry],
         max_age: Option<Duration>,
+        is_protected: &impl Fn(&CacheEntry) -> bool,
+        report: &mut CacheGcReport,
     ) -> Vec<&'a CacheEntry> {
         let Some(max_age) = max_age else {
             return Vec::new();
         };
         let now = SystemTime::now();
-        entries
-            .iter()
-            .filter(|entry| entry.age_at(now) >= max_age)
-            .collect()
+        let mut out = Vec::new();
+        for entry in entries {
+            if entry.age_at(now) < max_age {
+                continue;
+            }
+            if is_protected(entry) {
+                report.spared_files += 1;
+                report.spared_bytes += entry.size;
+                continue;
+            }
+            out.push(entry);
+        }
+        out
     }
 
     fn select_size_candidates<'a>(
         &self,
         entries: &'a [CacheEntry],
         max_bytes: Option<u64>,
+        is_protected: &impl Fn(&CacheEntry) -> bool,
         out: &mut Vec<&'a CacheEntry>,
+        report: &mut CacheGcReport,
     ) {
         let Some(max_bytes) = max_bytes else {
             return;
@@ -280,12 +320,30 @@ impl CacheManager {
 
         let mut by_lru: Vec<&CacheEntry> = entries.iter().collect();
         by_lru.sort_by_key(|entry| (entry.eviction_time(), entry.relative_path.clone()));
+        let mut pinned: u64 = 0;
         for entry in by_lru {
             if total <= max_bytes {
                 break;
             }
+            if is_protected(entry) {
+                // Live bytes stay in `total`: they genuinely occupy the
+                // budget; evicting more unprotected files to compensate is
+                // exactly the right pressure response.
+                pinned = pinned.saturating_add(entry.size);
+                report.spared_files += 1;
+                report.spared_bytes += entry.size;
+                continue;
+            }
             total = total.saturating_sub(entry.size);
             out.push(entry);
+        }
+        if total > max_bytes {
+            warn!(
+                root = %self.root.display(),
+                over_budget_bytes = total - max_bytes,
+                pinned_bytes = pinned,
+                "cache remains over its byte budget; the remainder is pinned by live daemons"
+            );
         }
     }
 
@@ -342,6 +400,19 @@ fn collect_dirs(dir: &Path, out: &mut Vec<PathBuf>) {
         if path.is_dir() {
             collect_dirs(&path, out);
         }
+    }
+}
+
+/// The per-image cache slug an entry belongs to: the first component of its
+/// path relative to the cache root (layout: `<work_dir>/<slug>/<file>`).
+/// Root-level files carry no slug and stay policy-eligible.
+fn entry_slug(entry: &CacheEntry) -> Option<&str> {
+    let mut components = entry.relative_path.components();
+    let first = components.next()?;
+    components.next()?;
+    match first {
+        std::path::Component::Normal(name) => name.to_str(),
+        _ => None,
     }
 }
 
@@ -452,17 +523,93 @@ mod tests {
 
         let manager = CacheManager::new(dir.path().join("cache"));
         let report = manager
-            .garbage_collect(&CacheGcPolicy {
-                max_age: Some(Duration::from_secs(0)),
-                dry_run: true,
-                ..CacheGcPolicy::default()
-            })
+            .garbage_collect(
+                &CacheGcPolicy {
+                    max_age: Some(Duration::from_secs(0)),
+                    dry_run: true,
+                    ..CacheGcPolicy::default()
+                },
+                &HashSet::new(),
+            )
             .unwrap();
 
         assert_eq!(report.removed_files, 1);
         assert_eq!(report.removed_bytes, 4);
         assert!(report.removals[0].dry_run);
         assert!(file.exists());
+    }
+
+    #[test]
+    fn age_gc_spares_protected_slugs() {
+        let dir = tempdir().unwrap();
+        let cache = dir.path().join("cache");
+        fs::create_dir_all(cache.join("live-slug")).unwrap();
+        fs::create_dir_all(cache.join("idle-slug")).unwrap();
+        fs::write(cache.join("live-slug/a.blob.data"), b"live").unwrap();
+        fs::write(cache.join("idle-slug/b.blob.data"), b"idle").unwrap();
+
+        let protected = HashSet::from(["live-slug".to_string()]);
+        let manager = CacheManager::new(&cache);
+        let report = manager
+            .garbage_collect(
+                &CacheGcPolicy {
+                    max_age: Some(Duration::from_secs(0)),
+                    ..CacheGcPolicy::default()
+                },
+                &protected,
+            )
+            .unwrap();
+
+        assert_eq!(report.removed_files, 1);
+        assert_eq!(report.spared_files, 1);
+        assert_eq!(report.spared_bytes, 4);
+        assert!(cache.join("live-slug/a.blob.data").exists());
+        assert!(!cache.join("idle-slug/b.blob.data").exists());
+    }
+
+    #[test]
+    fn size_gc_spares_protected_slugs_and_reports_pinned_overage() {
+        let dir = tempdir().unwrap();
+        let cache = dir.path().join("cache");
+        fs::create_dir_all(cache.join("live-slug")).unwrap();
+        fs::create_dir_all(cache.join("idle-slug")).unwrap();
+        fs::write(cache.join("live-slug/a.blob.data"), vec![0u8; 64]).unwrap();
+        fs::write(cache.join("idle-slug/b.blob.data"), vec![0u8; 64]).unwrap();
+
+        let protected = HashSet::from(["live-slug".to_string()]);
+        let manager = CacheManager::new(&cache);
+        // Budget 0: everything unprotected must go; the protected file stays
+        // even though the budget remains unreachable.
+        let report = manager
+            .garbage_collect(
+                &CacheGcPolicy {
+                    max_bytes: Some(0),
+                    ..CacheGcPolicy::default()
+                },
+                &protected,
+            )
+            .unwrap();
+
+        assert_eq!(report.removed_files, 1);
+        assert_eq!(report.spared_files, 1);
+        assert!(cache.join("live-slug/a.blob.data").exists());
+        assert!(!cache.join("idle-slug/b.blob.data").exists());
+    }
+
+    #[test]
+    fn entry_slug_requires_a_directory_component() {
+        let entry = |rel: &str| CacheEntry {
+            kind: CacheArtifactKind::BlobData,
+            path: PathBuf::from("/cache").join(rel),
+            relative_path: PathBuf::from(rel),
+            size: 0,
+            modified: None,
+            accessed: None,
+        };
+        assert_eq!(entry_slug(&entry("slug/a.blob.data")), Some("slug"));
+        assert_eq!(entry_slug(&entry("slug/nested/a.blob.data")), Some("slug"));
+        // Root-level files carry no slug and stay policy-eligible.
+        assert_eq!(entry_slug(&entry("root.blob.data")), None);
     }
 
     #[test]
@@ -475,10 +622,13 @@ mod tests {
 
         let manager = CacheManager::new(&cache);
         let report = manager
-            .garbage_collect(&CacheGcPolicy {
-                max_bytes: Some(0),
-                ..CacheGcPolicy::default()
-            })
+            .garbage_collect(
+                &CacheGcPolicy {
+                    max_bytes: Some(0),
+                    ..CacheGcPolicy::default()
+                },
+                &HashSet::new(),
+            )
             .unwrap();
 
         assert_eq!(report.scanned_files, 2);

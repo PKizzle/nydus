@@ -287,8 +287,9 @@ impl SystemController {
     }
 
     /// Trigger cache GC using the controller's configured policy.
-    pub fn cache_gc(&self) -> Result<CacheGcReport> {
-        let report = self.cache.garbage_collect(&self.cache_policy)?;
+    pub async fn cache_gc(&self) -> Result<CacheGcReport> {
+        let protected = self.supervisor.protected_cache_slugs().await;
+        let report = self.cache.garbage_collect(&self.cache_policy, &protected)?;
         self.metrics
             .record_cache_gc(&report, self.cache_policy.dry_run);
         Ok(report)
@@ -297,8 +298,9 @@ impl SystemController {
     /// Trigger cache GC with a one-shot policy override (the request-body
     /// policy of `POST /api/v1/cache/gc`) without mutating the configured
     /// policy.
-    pub fn cache_gc_with_policy(&self, policy: &CacheGcPolicy) -> Result<CacheGcReport> {
-        let report = self.cache.garbage_collect(policy)?;
+    pub async fn cache_gc_with_policy(&self, policy: &CacheGcPolicy) -> Result<CacheGcReport> {
+        let protected = self.supervisor.protected_cache_slugs().await;
+        let report = self.cache.garbage_collect(policy, &protected)?;
         self.metrics.record_cache_gc(&report, policy.dry_run);
         Ok(report)
     }
@@ -501,7 +503,7 @@ async fn route_request(controller: &SystemController, request: HttpRequest) -> H
             Ok(usage) => json_response(200, CacheUsageResponse::from(usage)),
             Err(e) => error_response(500, e.to_string()),
         },
-        ("POST", "/api/v1/cache/gc") => handle_cache_gc(controller, &request.body),
+        ("POST", "/api/v1/cache/gc") => handle_cache_gc(controller, &request.body).await,
         ("GET", "/api/v1/prefetch") => match controller.prefetch_entries() {
             Ok(entries) => json_response(200, entries),
             Err(e) => error_response(500, e.to_string()),
@@ -801,9 +803,9 @@ async fn route_dynamic_request(
     error_response(404, format!("unknown endpoint {method} {path}"))
 }
 
-fn handle_cache_gc(controller: &SystemController, body: &[u8]) -> HttpResponse {
+async fn handle_cache_gc(controller: &SystemController, body: &[u8]) -> HttpResponse {
     let result = if body.is_empty() {
-        controller.cache_gc()
+        controller.cache_gc().await
     } else {
         let req = match serde_json::from_slice::<CacheGcRequest>(body) {
             Ok(req) => req,
@@ -813,7 +815,7 @@ fn handle_cache_gc(controller: &SystemController, body: &[u8]) -> HttpResponse {
             Ok(policy) => policy,
             Err(e) => return error_response(400, e.to_string()),
         };
-        controller.cache_gc_with_policy(&policy)
+        controller.cache_gc_with_policy(&policy).await
     };
 
     match result {
@@ -1104,10 +1106,22 @@ async fn metrics_response(controller: &SystemController) -> HttpResponse {
         metrics.cache_gc_failures_total,
     );
 
-    let blob_data_files = cache_artifacts
-        .get("blob_data")
-        .map(|(files, _bytes)| *files)
-        .unwrap_or_default();
+    // "In use" means backing a live daemon (instance or live record), not
+    // merely present on disk — the same protection set cache GC honors.
+    let protected = controller.supervisor.protected_cache_slugs().await;
+    let blobs_in_use = cache
+        .entries
+        .iter()
+        .filter(|entry| {
+            entry.kind == crate::cache::CacheArtifactKind::BlobData
+                && entry
+                    .relative_path
+                    .components()
+                    .next()
+                    .and_then(|c| c.as_os_str().to_str())
+                    .is_some_and(|slug| protected.contains(slug))
+        })
+        .count() as u64;
     body.push_str(
         &controller
             .snapshotter_metrics
@@ -1116,7 +1130,7 @@ async fn metrics_response(controller: &SystemController) -> HttpResponse {
                 gc: Some(crate::metrics::CacheGcCounters {
                     deleted_blobs: metrics.cache_gc_removed_files_total,
                     deletion_errors: metrics.cache_gc_failures_total,
-                    blobs_in_use: blob_data_files,
+                    blobs_in_use,
                 }),
             }),
     );
@@ -1681,8 +1695,8 @@ mod tests {
         assert_eq!(records[0].key, "active");
     }
 
-    #[test]
-    fn cache_usage_and_gc_use_configured_cache_root() {
+    #[compio::test]
+    async fn cache_usage_and_gc_use_configured_cache_root() {
         let dir = tempdir().unwrap();
         let controller = test_controller(dir.path().to_path_buf());
         std::fs::create_dir_all(controller.cache.root()).unwrap();
@@ -1694,6 +1708,7 @@ mod tests {
                 max_age: Some(Duration::from_secs(0)),
                 ..CacheGcPolicy::default()
             })
+            .await
             .unwrap();
         assert_eq!(report.removed_files, 1);
         assert_eq!(controller.cache_usage().unwrap().total_files, 0);
@@ -2012,6 +2027,7 @@ mod tests {
                 dry_run: true,
                 ..CacheGcPolicy::default()
             })
+            .await
             .unwrap();
 
         let response = route_request(

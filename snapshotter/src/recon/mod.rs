@@ -385,8 +385,9 @@ impl Reconciler {
         let Some((manager, policy)) = &self.cache_gc else {
             return Ok(());
         };
+        let protected = self.supervisor.protected_cache_slugs().await;
         manager
-            .garbage_collect(policy)
+            .garbage_collect(policy, &protected)
             .with_context(|| format!("cache GC failed for {}", manager.root().display()))?;
         Ok(())
     }

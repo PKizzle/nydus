@@ -872,6 +872,26 @@ impl DaemonSupervisor {
         self.parked_slugs.lock().unwrap().len()
     }
 
+    /// Cache slugs that must never be garbage-collected: every in-memory
+    /// instance plus every live persisted record. Records count because a
+    /// crash-restart gap must not expose a rebuildable daemon's blobs to a
+    /// concurrently-ticking GC.
+    pub async fn protected_cache_slugs(&self) -> HashSet<String> {
+        let mut protected: HashSet<String> = {
+            let instances = self.instances.read().await;
+            instances
+                .keys()
+                .map(|image_ref| slug_for(image_ref))
+                .collect()
+        };
+        for record in self.read_persisted_records() {
+            if record.live {
+                protected.insert(record.slug);
+            }
+        }
+        protected
+    }
+
     /// Evict the parked fd and delete the on-disk failover state for `slug` —
     /// call whenever an instance is torn down for good (released to zero,
     /// replaced, or terminally failed) so a successor cannot adopt a stale
