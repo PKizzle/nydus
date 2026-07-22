@@ -463,6 +463,9 @@ pub struct DaemonSupervisor {
     /// dead mount per backoff window.
     probes_in_flight: StdMutex<HashMap<String, Instant>>,
     probe_timeouts_total: AtomicU64,
+    /// Flap guard for `recover()`: a daemon recovered within this window is
+    /// skipped on the next pass instead of being restarted again and again.
+    recent_recoveries: StdMutex<HashMap<String, Instant>>,
 }
 
 impl DaemonSupervisor {
@@ -487,6 +490,7 @@ impl DaemonSupervisor {
             last_mount_health: StdMutex::new(None),
             probes_in_flight: StdMutex::new(HashMap::new()),
             probe_timeouts_total: AtomicU64::new(0),
+            recent_recoveries: StdMutex::new(HashMap::new()),
         }
     }
 
@@ -1064,6 +1068,38 @@ impl DaemonSupervisor {
         }
     }
 
+    /// The auto-accel backend dir for `bootstrap`, when the bootstrap is an
+    /// auto-accel stage bootstrap (`auto-accel/<id>/stage/bootstrap` with the
+    /// localfs backend dir beside it). `None` means a registry-shaped
+    /// bootstrap.
+    fn accel_backend_for(bootstrap: &Path) -> Option<PathBuf> {
+        bootstrap
+            .parent()
+            .filter(|p| p.file_name().is_some_and(|n| n == "stage"))
+            .and_then(|p| p.parent())
+            .map(|p| p.join("backend"))
+            .filter(|b| b.is_dir())
+    }
+
+    /// Start (or restart) the daemon for a persisted record's identity,
+    /// routing auto-accel bootstraps through the node-local content-store
+    /// path and everything else through the registry path. Chunk fetches for
+    /// k3s airgap-preloaded images have no upstream to fall back to, so the
+    /// routing must survive restarts and recoveries alike.
+    async fn start_instance_for_record(
+        &self,
+        image_ref: &str,
+        bootstrap: &Path,
+    ) -> Result<Arc<DaemonInstance>> {
+        match Self::accel_backend_for(bootstrap) {
+            Some(backend_dir) => {
+                self.start_local_instance(image_ref, bootstrap, &backend_dir)
+                    .await
+            }
+            None => self.start_instance(image_ref, bootstrap, None).await,
+        }
+    }
+
     /// Reconciler hook: re-check daemon health and restart failed instances.
     pub async fn recover(&self) -> Result<DaemonRecoveryReport> {
         let candidates = {
@@ -1087,6 +1123,24 @@ impl DaemonSupervisor {
 
         let mut instances = self.instances.write().await;
         for image_ref in candidates {
+            // Flap guard: a daemon we just recovered gets a full window to
+            // settle before another restart is considered.
+            {
+                let mut recent = self.recent_recoveries.lock().unwrap();
+                recent.retain(|_, at| at.elapsed() < RECOVERY_FLAP_WINDOW);
+                if recent.contains_key(&image_ref) {
+                    debug!(image_ref, "skipping recovery; recovered too recently");
+                    continue;
+                }
+            }
+            let Some(old) = instances.get(&image_ref) else {
+                continue;
+            };
+            // Re-check under the write lock: the daemon may have healed
+            // between candidate selection and now.
+            if is_healthy_state(old.daemon.get_state()) {
+                continue;
+            }
             let Some(old) = instances.remove(&image_ref) else {
                 continue;
             };
@@ -1094,23 +1148,53 @@ impl DaemonSupervisor {
             let before_state = format!("{:?}", old.daemon.get_state());
             let bootstrap = old.bootstrap.clone();
             let refcount = old.refcount.load(Ordering::SeqCst);
+            let holders: HashSet<String> = old.holders.lock().unwrap().clone();
             warn!(image_ref, state = %before_state, "recovering unhealthy nydus daemon");
 
-            if let Err(e) = stop_instance(&old) {
-                warn!(image_ref, error = %e, "failed to stop unhealthy daemon during recovery");
+            // Consumer preservation depends on what is mounted:
+            // - EROFS: the kernel mount is fine — only the handler died. Stop
+            //   the service threads WITHOUT unmounting; the restart reuses the
+            //   live mountpoint and re-arms marks on the same inodes, so
+            //   existing container overlays never notice.
+            // - FUSE: an unhealthy daemon means the connection is already
+            //   dead for consumers. Tear down fully (pop any stacked corpse
+            //   layers) so the restart mounts fresh.
+            let fstype = mount_fstype_at(&old.mountpoint);
+            let is_erofs = fstype.as_deref() == Some("erofs");
+            if is_erofs {
+                stop_daemon_keep_mount(&old);
+            } else {
+                if let Err(e) = stop_instance(&old) {
+                    warn!(image_ref, error = %e, "failed to stop unhealthy daemon during recovery");
+                }
+                while mount_fstype_at(&old.mountpoint).is_some_and(|t| t.contains("fuse")) {
+                    if let Err(e) = detach_mount_lazy(&old.mountpoint) {
+                        warn!(image_ref, error = %e, "failed to detach dead fuse mount during recovery");
+                        break;
+                    }
+                }
+                self.clear_failover_state(&slug);
             }
             if let Err(e) = self.persist_instance_record(&old, false) {
                 warn!(image_ref, error = %e, "failed to persist stopped daemon record");
             }
 
-            match self.start_instance(&image_ref, &bootstrap, None).await {
+            match self.start_instance_for_record(&image_ref, &bootstrap).await {
                 Ok(instance) => {
                     instance.refcount.store(refcount, Ordering::SeqCst);
+                    // Carry the holder set over: dropping it would turn every
+                    // real holder into keyless ballast that release() can
+                    // never drain.
+                    *instance.holders.lock().unwrap() = holders;
                     let after_state = format!("{:?}", instance.daemon.get_state());
                     if let Err(e) = self.persist_instance_record(&instance, true) {
                         warn!(image_ref, error = %e, "failed to persist recovered daemon record");
                     }
                     instances.insert(image_ref.clone(), instance);
+                    self.recent_recoveries
+                        .lock()
+                        .unwrap()
+                        .insert(image_ref.clone(), Instant::now());
                     report.restarted += 1;
                     report.outcomes.push(DaemonRecoveryOutcome {
                         image_ref,
@@ -1122,6 +1206,24 @@ impl DaemonSupervisor {
                     });
                 }
                 Err(e) => {
+                    // Terminal for this pass: never leave a daemonless kernel
+                    // mount serving unmarked sparse data — detach so consumers
+                    // fail loudly and kubelet remounts via a fresh Prepare.
+                    if is_erofs && is_mounted_at(&old.mountpoint) {
+                        match detach_mount_stack(&old.mountpoint) {
+                            Ok(layers) => {
+                                info!(image_ref, layers, "detached mount after failed recovery")
+                            }
+                            Err(detach_err) => {
+                                warn!(image_ref, error = %detach_err, "failed to detach mount after failed recovery")
+                            }
+                        }
+                        self.clear_failover_state(&slug);
+                    }
+                    self.recent_recoveries
+                        .lock()
+                        .unwrap()
+                        .insert(image_ref.clone(), Instant::now());
                     report.failed += 1;
                     report.outcomes.push(DaemonRecoveryOutcome {
                         image_ref,
@@ -1707,23 +1809,9 @@ impl DaemonSupervisor {
             // Rebuilding one through the registry path would point chunk
             // fetches at an upstream that may not even have the blobs (k3s
             // preloads images like pause from its airgap bundle).
-            let accel_backend = record
-                .bootstrap
-                .parent()
-                .filter(|p| p.file_name().is_some_and(|n| n == "stage"))
-                .and_then(|p| p.parent())
-                .map(|p| p.join("backend"))
-                .filter(|b| b.is_dir());
-            let started = match &accel_backend {
-                Some(backend_dir) => {
-                    self.start_local_instance(&record.image_ref, &record.bootstrap, backend_dir)
-                        .await
-                }
-                None => {
-                    self.start_instance(&record.image_ref, &record.bootstrap, None)
-                        .await
-                }
-            };
+            let started = self
+                .start_instance_for_record(&record.image_ref, &record.bootstrap)
+                .await;
             match started {
                 Ok(instance) => {
                     instance.refcount.store(record.refcount, Ordering::SeqCst);
@@ -2904,6 +2992,20 @@ fn is_mounted_at(mountpoint: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// Stop a daemon's service threads WITHOUT unmounting its mountpoint or
+/// removing the directory. Used when the kernel mount must survive (an EROFS
+/// mount healed in place by an immediate restart) — `stop_instance`'s
+/// `umount()` would tear the mount away under live container overlays.
+fn stop_daemon_keep_mount(inst: &DaemonInstance) {
+    debug!(image_ref = %inst.image_ref, "stopping nydus daemon (keeping its mount)");
+    if let Err(e) = inst.daemon.trigger_stop() {
+        warn!(image_ref = %inst.image_ref, error = %e, "trigger_stop failed");
+    }
+    if let Err(e) = inst.daemon.wait() {
+        warn!(image_ref = %inst.image_ref, error = %e, "wait failed");
+    }
+}
+
 fn stop_instance(inst: &DaemonInstance) -> Result<()> {
     debug!(image_ref = %inst.image_ref, "stopping nydus daemon");
     if let Err(e) = inst.daemon.trigger_stop() {
@@ -2955,6 +3057,11 @@ async fn wait_for_running_off_reactor(
 ) -> Result<()> {
     blocking::unblock(move || wait_for_running(&*daemon, timeout)).await
 }
+
+/// A daemon recovered more recently than this is skipped by the next
+/// `recover()` pass — restart loops on a deterministically-failing daemon
+/// help nobody and churn consumer mounts.
+const RECOVERY_FLAP_WINDOW: Duration = Duration::from_secs(600);
 
 /// Runtime directory for failover supervisor sockets. Kept short and on a
 /// tmpfs (`/run`) because AF_UNIX paths are capped at ~108 bytes — the per-image
@@ -3232,6 +3339,33 @@ mod tests {
         assert_eq!(report.probed, 0);
         assert_eq!(report.dead, 0);
         assert!(supervisor.last_mount_health().is_some());
+    }
+
+    #[test]
+    fn accel_backend_for_detects_stage_layout() {
+        let dir = tempfile::tempdir().unwrap();
+        let stage = dir.path().join("auto-accel/abc123/stage");
+        let backend = dir.path().join("auto-accel/abc123/backend");
+        std::fs::create_dir_all(&stage).unwrap();
+        std::fs::create_dir_all(&backend).unwrap();
+        let bootstrap = stage.join("bootstrap");
+        std::fs::write(&bootstrap, b"x").unwrap();
+
+        assert_eq!(
+            DaemonSupervisor::accel_backend_for(&bootstrap),
+            Some(backend)
+        );
+        // Registry-shaped bootstrap (no stage/backend layout) -> None.
+        let plain = dir.path().join("meta/image.boot");
+        std::fs::create_dir_all(plain.parent().unwrap()).unwrap();
+        std::fs::write(&plain, b"x").unwrap();
+        assert_eq!(DaemonSupervisor::accel_backend_for(&plain), None);
+        // stage dir without a backend sibling -> None.
+        let lonely_stage = dir.path().join("auto-accel/def456/stage");
+        std::fs::create_dir_all(&lonely_stage).unwrap();
+        let lonely = lonely_stage.join("bootstrap");
+        std::fs::write(&lonely, b"x").unwrap();
+        assert_eq!(DaemonSupervisor::accel_backend_for(&lonely), None);
     }
 
     #[test]
