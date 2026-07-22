@@ -985,6 +985,9 @@ async fn upload_artifact(
 
     let mut zran_descriptors = Vec::with_capacity(artifact.zran_index_blob_ids.len());
     for (i, blob_id) in artifact.zran_index_blob_ids.iter().enumerate() {
+        // Data-less layers (directory/whiteout-only tars) have no zran index; the
+        // sidecar manifest simply carries no descriptor for them.
+        let Some(blob_id) = blob_id else { continue };
         let layer_digest = artifact
             .layer_blob_ids
             .get(i)
@@ -1598,7 +1601,7 @@ mod tests {
             backend_dir: backend.clone(),
             work_dir: work_dir.to_path_buf(),
             layer_blob_ids: vec!["deadbeef".to_string()],
-            zran_index_blob_ids: vec!["cafef00d".to_string()],
+            zran_index_blob_ids: vec![Some("cafef00d".to_string())],
             prefetch_blob_id: None,
         };
 
@@ -1638,7 +1641,7 @@ mod tests {
             backend_dir: backend.clone(),
             work_dir: work_dir.to_path_buf(),
             layer_blob_ids: vec!["deadbeef".to_string()],
-            zran_index_blob_ids: vec!["cafef00d".to_string()],
+            zran_index_blob_ids: vec![Some("cafef00d".to_string())],
             prefetch_blob_id: Some("prefetch01".to_string()),
         };
         write_base_artifact(work_dir, &artifact).unwrap();

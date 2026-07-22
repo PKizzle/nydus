@@ -122,9 +122,13 @@ pub struct NodeLocalArtifact {
     pub work_dir: PathBuf,
     /// Original gzip-layer blob ids, lower→upper, in device-table order.
     pub layer_blob_ids: Vec<String>,
-    /// Per-layer zran index blob ids (one per gzip layer, same order as
-    /// `layer_blob_ids`). Each blob lives at `backend_dir.join(id)`.
-    pub zran_index_blob_ids: Vec<String>,
+    /// Per-layer zran index blob ids (one entry per gzip layer, same order as
+    /// `layer_blob_ids`). Each blob lives at `backend_dir.join(id)`. `None`
+    /// marks a layer with no data chunks (directory/whiteout/metadata-only
+    /// tars): `nydus-image create` emits no zran blob for those, the merged
+    /// blob table never references them, and only their namespace entries
+    /// survive into the merged bootstrap.
+    pub zran_index_blob_ids: Vec<Option<String>>,
     /// Optional prefetch blob id (only present when `convert` was called with
     /// non-empty `prefetch_files`). The blob holds the chunks listed by the
     /// prefetch hint, packed for one-shot warm-up; it lives at
@@ -228,12 +232,13 @@ fn fresh_dir(dir: &Path) -> Result<()> {
     std::fs::create_dir_all(dir).with_context(|| format!("creating dir {}", dir.display()))
 }
 
-/// Return the single file in `dir` other than `exclude` (if given). The caller must
-/// have just wiped-and-recreated `dir` exclusively for one `nydus-image` invocation
-/// (see `fresh_dir`), so finding more than one candidate here means `nydus-image`
-/// itself produced unexpected output -- a real bug to surface, not a discovery race
-/// to paper over.
-fn expect_single_output(dir: &Path, exclude: Option<&Path>) -> Result<PathBuf> {
+/// Return the at-most-one file in `dir` other than `exclude` (if given). The caller
+/// must have just wiped-and-recreated `dir` exclusively for one `nydus-image`
+/// invocation (see `fresh_dir`), so finding more than one candidate here means
+/// `nydus-image` itself produced unexpected output -- a real bug to surface, not a
+/// discovery race to paper over. Zero candidates is a legal outcome for steps where
+/// the tool may legitimately emit nothing (a data-less layer produces no zran blob).
+fn expect_at_most_one_output(dir: &Path, exclude: Option<&Path>) -> Result<Option<PathBuf>> {
     let exclude_name = exclude.and_then(Path::file_name);
     let mut found = None;
     for entry in
@@ -252,7 +257,13 @@ fn expect_single_output(dir: &Path, exclude: Option<&Path>) -> Result<PathBuf> {
         }
         found = Some(entry.path());
     }
-    found.ok_or_else(|| anyhow::anyhow!("nydus-image produced no output file in {}", dir.display()))
+    Ok(found)
+}
+
+/// Like [`expect_at_most_one_output`], for steps where an output file is mandatory.
+fn expect_single_output(dir: &Path, exclude: Option<&Path>) -> Result<PathBuf> {
+    expect_at_most_one_output(dir, exclude)?
+        .ok_or_else(|| anyhow::anyhow!("nydus-image produced no output file in {}", dir.display()))
 }
 
 /// Convert the gzip layers (lower→upper) of a standard OCI image into a
@@ -304,23 +315,40 @@ pub fn convert(
             config.nice,
             "targz-ref convert",
         )?;
-        let index =
-            expect_single_output(&out_dir, Some(&bootstrap)).context("locating zran index blob")?;
+        let index = expect_at_most_one_output(&out_dir, Some(&bootstrap))
+            .context("locating zran index blob")?;
 
-        // Stage the backend: symlink the gzip layer in place (no copy), and move the small zran
-        // index blob in, both keyed by their nydus blob ids.
         let blob_id = layer.blob_id().to_string();
-        symlink_force(&layer.path, &backend.join(&blob_id))?;
-        let index_name = index
-            .file_name()
-            .context("zran index blob has no file name")?
-            .to_string_lossy()
-            .into_owned();
-        stage_blob(&index, &backend.join(&index_name), "zran index blob")?;
+        match index {
+            Some(index) => {
+                // Stage the backend: symlink the gzip layer in place (no copy), and move the
+                // small zran index blob in, both keyed by their nydus blob ids.
+                symlink_force(&layer.path, &backend.join(&blob_id))?;
+                let index_name = index
+                    .file_name()
+                    .context("zran index blob has no file name")?
+                    .to_string_lossy()
+                    .into_owned();
+                stage_blob(&index, &backend.join(&index_name), "zran index blob")?;
+                zran_index_blob_ids.push(Some(index_name));
+            }
+            None => {
+                // A tar with no regular-file data (directories, whiteouts, metadata-only
+                // layers) yields a bootstrap that references no blob, so there is no zran
+                // index to stage and the merged blob table will never ask for this layer.
+                // The blob id still occupies its position in `blob_ids`: `nydus-image merge
+                // --original-blob-ids` requires one id per bootstrap source and ignores the
+                // ids of blob-less sources.
+                tracing::info!(
+                    layer = %layer.digest,
+                    "layer has no data chunks; merging namespace only (no zran index blob)"
+                );
+                zran_index_blob_ids.push(None);
+            }
+        }
 
         layer_bootstraps.push(bootstrap);
         blob_ids.push(blob_id);
-        zran_index_blob_ids.push(index_name);
     }
 
     let bootstrap = stage.join("bootstrap");
@@ -630,6 +658,17 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let err = expect_single_output(tmp.path(), None).unwrap_err();
         assert!(err.to_string().contains("no output file"));
+    }
+
+    #[test]
+    fn expect_at_most_one_output_returns_none_for_an_empty_dir() {
+        // A data-less layer (directory/whiteout-only tar) legitimately produces a
+        // bootstrap and nothing else; the convert loop maps that to a None index.
+        let tmp = tempfile::tempdir().unwrap();
+        let bootstrap = tmp.path().join("bootstrap");
+        std::fs::write(&bootstrap, b"boot").unwrap();
+        let found = expect_at_most_one_output(tmp.path(), Some(&bootstrap)).unwrap();
+        assert_eq!(found, None);
     }
 
     #[test]
