@@ -87,6 +87,14 @@ pub struct RegistryClientOptions {
     /// (unbounded) because a fixed value would break large pushes on slow
     /// links.
     pub upload_timeout: Option<Duration>,
+    /// Wall-clock deadline for reading a whole in-memory response body
+    /// (manifests, [`RegistryClient::get_blob`]). The byte cap bounds size,
+    /// not time — without this, a slow-drip response trickling in just fast
+    /// enough to keep reads alive can hold the caller indefinitely. Generous
+    /// default (5 minutes) so slow-but-honest links are unaffected; file
+    /// downloads ([`RegistryClient::get_blob_to_file`]) are not covered (they
+    /// scale with blob size and make observable progress on disk).
+    pub body_timeout: Option<Duration>,
     /// Explicit credentials. Take precedence over docker `config.json`.
     pub credentials: Option<Credentials>,
     /// Explicit docker `config.json` path for credential loading. When
@@ -106,6 +114,7 @@ impl Default for RegistryClientOptions {
             ca_cert_files: Vec::new(),
             timeout: Some(Duration::from_secs(30)),
             upload_timeout: None,
+            body_timeout: Some(Duration::from_secs(300)),
             credentials: None,
             docker_config: None,
             use_docker_config: true,
@@ -150,6 +159,7 @@ pub struct RegistryClient {
     base: String,
     timeout: Option<Duration>,
     upload_timeout: Option<Duration>,
+    body_timeout: Option<Duration>,
     /// base64 `user:password` payload (or full `Basic `/`Bearer ` value).
     basic_auth: Option<String>,
     tokens: RefCell<TokenCache>,
@@ -191,6 +201,7 @@ impl RegistryClient {
             base: format!("{scheme}://{registry}"),
             timeout: opts.timeout,
             upload_timeout: opts.upload_timeout,
+            body_timeout: opts.body_timeout,
             basic_auth,
             tokens: RefCell::new(TokenCache::new()),
         })
@@ -228,7 +239,8 @@ impl RegistryClient {
             .get("docker-content-digest")
             .and_then(|value| value.to_str().ok())
             .map(str::to_string);
-        let bytes = read_bounded(response, &url, MAX_REGISTRY_BODY_BYTES).await?;
+        let bytes =
+            read_bounded(response, &url, MAX_REGISTRY_BODY_BYTES, self.body_timeout).await?;
         if reference.starts_with("sha256:") {
             verify_digest(&bytes, reference)
                 .with_context(|| format!("manifest {reference} failed digest verification"))?;
@@ -252,7 +264,8 @@ impl RegistryClient {
     pub async fn get_blob(&self, repo: &str, digest: &str) -> Result<Vec<u8>> {
         let url = self.blob_url(repo, digest);
         let response = self.get_blob_response(repo, digest).await?;
-        let bytes = read_bounded(response, &url, MAX_REGISTRY_BODY_BYTES).await?;
+        let bytes =
+            read_bounded(response, &url, MAX_REGISTRY_BODY_BYTES, self.body_timeout).await?;
         verify_digest(&bytes, digest)
             .with_context(|| format!("blob {digest} failed digest verification"))?;
         Ok(bytes)
@@ -797,7 +810,12 @@ pub fn append_query_param(url: &str, key: &str, value: &str) -> String {
 /// The `Content-Length` check is a cheap fast-path rejection (skip opening
 /// the stream at all when the registry honestly advertises an oversized body
 /// up front); it is not load-bearing for the guarantee above.
-async fn read_bounded(response: Response, url: &str, max_bytes: u64) -> Result<Vec<u8>> {
+async fn read_bounded(
+    response: Response,
+    url: &str,
+    max_bytes: u64,
+    deadline: Option<Duration>,
+) -> Result<Vec<u8>> {
     if let Some(len) = response
         .headers()
         .get(CONTENT_LENGTH)
@@ -807,7 +825,17 @@ async fn read_bounded(response: Response, url: &str, max_bytes: u64) -> Result<V
     {
         bail!("registry body at {url} of {len} bytes exceeds cap of {max_bytes} bytes");
     }
-    collect_bounded(response.bytes_stream(), max_bytes, url).await
+    // The byte cap alone does not bound TIME: a slow-drip body trickling in
+    // just fast enough to keep individual reads alive could hold the caller
+    // indefinitely while staying under the cap. The deadline bounds the whole
+    // body read wall-clock.
+    let collect = collect_bounded(response.bytes_stream(), max_bytes, url);
+    match deadline {
+        Some(limit) => compio::time::timeout(limit, collect)
+            .await
+            .map_err(|_| anyhow!("reading registry body at {url} exceeded {limit:?} deadline"))?,
+        None => collect.await,
+    }
 }
 
 /// Collect a byte stream into memory, bailing the moment the running total
@@ -1012,6 +1040,16 @@ mod tests {
             client.file_digest(&path).await.unwrap(),
             sha256_digest(&data)
         );
+    }
+
+    #[compio::test]
+    async fn read_deadline_bounds_a_stalled_body() {
+        // A stream that never yields models a slow-drip/stalled body; the
+        // wall-clock deadline must fire instead of waiting forever.
+        let stream = futures::stream::pending::<std::result::Result<Vec<u8>, std::io::Error>>();
+        let collect = collect_bounded(stream, 1024, "https://registry.local/v2/x");
+        let res = compio::time::timeout(Duration::from_millis(20), collect).await;
+        assert!(res.is_err(), "deadline should fire on a stalled stream");
     }
 
     #[compio::test]
