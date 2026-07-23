@@ -69,12 +69,21 @@ Useful flags (see `--help` for the full list; `nydusify/src/cli.rs` is the sourc
 - `--source-insecure` / `--target-insecure`, `--plain-http` — plain-HTTP / skip-TLS-verify toggles.
 - `--work-dir` (default `./tmp`), `--nydus-image` (default `nydus-image` on `$PATH`).
 - `--push-retry-count` (default `3`) / `--push-retry-delay` (default `5s`).
+- `--platform <os/arch[/variant]>` — a single selector, or a comma-separated list to convert
+  several architectures of a multi-arch source. `--all-platforms` converts every
+  platform-tagged manifest in the source index. Converting more than one platform requires
+  `--merge-platform`, which publishes the per-platform manifests (by digest) under one pushed
+  OCI image index / docker manifest list at the target tag; a single platform pushes the manifest
+  directly at the tag with no index wrapper.
+- `--output-json <path>` — write a conversion summary. Fields: `target`, `manifest_digest`,
+  `manifest_size`, `data_blobs` (the primary/first platform), plus the Go-parity metrics
+  `SourceImageSize` / `TargetImageSize` (byte totals across converted platforms),
+  `ConversionElapsed` (formatted seconds, e.g. `"12.480s"`), and a `platforms[]` breakdown.
 
 **Not yet implemented** (the CLI parses these flags but `convert` rejects them with an explicit
 error rather than mis-converting):
 
 - `--reverse` (nydus → OCI conversion).
-- `--all-platforms` (convert one platform at a time with `--platform` instead).
 - `--source-archive` / `--target-archive` (local OCI-layout tar I/O).
 - `--source-backend-type` / non-`registry` `--backend-type`.
 

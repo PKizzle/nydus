@@ -260,6 +260,10 @@ jobs:
                  --platform linux/amd64 \
                  --output-json convert-native-v6/${I}.json
 
+            # Assert the Go-parity metric fields are present and non-zero.
+            jq -e '.SourceImageSize > 0 and .TargetImageSize > 0 and (.ConversionElapsed | test("^[0-9]"))' \
+                convert-native-v6/${I}.json
+
             sudo rm -rf ./tmp
             sudo DOCKER_CONFIG=$HOME/.docker nydusify check --source $I:latest \
                 --target localhost:5000/$I:nydus-nightly-v6
@@ -272,3 +276,59 @@ jobs:
         with:
           name: convert-native-v6-metric
           path: convert-native-v6
+
+  convert-multiarch:
+    runs-on: ${{ vars.RUNNER_OS || 'ubuntu-latest' }}
+    needs: [nydusify-build, nydus-build]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+      - name: Download Nydus
+        uses: actions/download-artifact@v7
+        with:
+          name: nydus-artifact
+          path: /usr/local/bin
+      - name: Download Nydusify
+        uses: actions/download-artifact@v7
+        with:
+          name: nydusify-artifact
+          path: /usr/local/bin
+      - name: Convert a multi-arch source and verify the pushed index
+        run: |
+          sudo chmod +x /usr/local/bin/nydus*
+          sudo docker run -d --restart=always -p 5000:5000 registry
+          sudo mkdir convert-multiarch
+          # busybox is a small, stable multi-arch source. --all-platforms +
+          # --merge-platform must publish one OCI image index whose manifests
+          # carry per-platform fields.
+          SRC=docker.io/library/busybox:1.36
+          TGT=localhost:5000/busybox:nydus-multiarch
+          sudo DOCKER_CONFIG=$HOME/.docker nydusify convert \
+               --source $SRC \
+               --target $TGT \
+               --fs-version 6 \
+               --all-platforms \
+               --merge-platform \
+               --output-json convert-multiarch/busybox.json
+
+          # Two-platform comma list against the same source must also succeed.
+          sudo DOCKER_CONFIG=$HOME/.docker nydusify convert \
+               --source $SRC \
+               --target localhost:5000/busybox:nydus-multiarch-list \
+               --fs-version 6 \
+               --platform linux/amd64,linux/arm64 \
+               --merge-platform
+
+          # The target must be an image index / manifest list with >1 manifest.
+          MT=$(curl -s -H 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json' \
+               localhost:5000/v2/busybox/manifests/nydus-multiarch | jq -r '.mediaType // .manifests[0].mediaType')
+          COUNT=$(curl -s -H 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json' \
+               localhost:5000/v2/busybox/manifests/nydus-multiarch | jq '.manifests | length')
+          echo "pushed target mediaType=$MT manifests=$COUNT"
+          test "$COUNT" -gt 1
+          jq -e '.platforms | length > 1' convert-multiarch/busybox.json
+      - name: Save Nydusify Metric
+        uses: actions/upload-artifact@v6
+        with:
+          name: convert-multiarch-metric
+          path: convert-multiarch

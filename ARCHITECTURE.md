@@ -405,7 +405,11 @@ working implementations, not stubs:
   targz-rafs` + `merge`, producing new nydus data blobs. `--with-referrer` additionally pushes an
   OCI 1.1 referrer artifact (`subject` = the source manifest descriptor) to the source repo, by
   digest and under the `sha256-<hex>` fallback tag for registries without native referrers-API
-  support.
+  support. Multi-platform sources are handled by `--platform <comma-list>` / `--all-platforms`;
+  converting more than one platform requires `--merge-platform`, which publishes the per-platform
+  nydus manifests by digest under one OCI image index / docker manifest list at the target tag
+  (one referrer per platform). `--output-json` reports Go-parity metrics
+  (`SourceImageSize`/`TargetImageSize`/`ConversionElapsed`) plus a per-platform breakdown.
 - **`check`** — validates manifest/media-type/annotations, referrer linkage (native OCI 1.1
   referrers API first, `sha256-<hex>` fallback tag second), downloads the bootstrap, and runs
   `nydus-image check` on it.
