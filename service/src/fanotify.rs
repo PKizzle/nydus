@@ -119,6 +119,56 @@ fn deny_errno_for(e: &std::io::Error) -> libc::c_int {
     }
 }
 
+/// Exactly-once owner of a permission event's fd between parse and answer.
+///
+/// A pre-content permission event MUST be answered: an event that is dropped
+/// unanswered leaves the accessing task blocked in `D` state until the whole
+/// group closes. The happy path calls [`finish`](Self::finish) with the
+/// computed response; if event handling panics and unwinds past the guard,
+/// `Drop` answers with `FAN_DENY_ERRNO(EIO)` and closes the fd so the reader
+/// gets an honest error instead of a hang (pattern mined from upstream v3's
+/// `PendingPermission`).
+struct EventFdGuard<'a> {
+    handler: &'a FanotifyHandler,
+    fd: RawFd,
+    answered: bool,
+}
+
+impl<'a> EventFdGuard<'a> {
+    fn new(handler: &'a FanotifyHandler, fd: RawFd) -> Self {
+        // Overflow/queue records carry fd == FAN_NOFD; nothing to answer.
+        Self {
+            handler,
+            fd,
+            answered: fd < 0,
+        }
+    }
+
+    /// Answer the event with `response` and close its fd, consuming the guard.
+    fn finish(mut self, response: u32) {
+        if !self.answered {
+            self.handler.write_response(self.fd, response);
+            unsafe {
+                libc::close(self.fd);
+            }
+            self.answered = true;
+        }
+    }
+}
+
+impl Drop for EventFdGuard<'_> {
+    fn drop(&mut self) {
+        if !self.answered {
+            self.handler
+                .write_response(self.fd, fan_deny_errno(libc::EIO));
+            unsafe {
+                libc::close(self.fd);
+            }
+            self.answered = true;
+        }
+    }
+}
+
 /// Handler that serves RAFS v6 blob data through fanotify pre-content hooks.
 ///
 /// The lifetime mirrors the existing service handler pattern:
@@ -491,11 +541,69 @@ impl FanotifyHandler {
         self.threads
     }
 
-    /// Signal all workers to stop and wait until they have exited.
+    /// Signal all workers to stop and wait until they have exited, then deny
+    /// any permission events still queued on the group.
+    ///
+    /// Between worker quiesce and the eventual close of the group fd, readers
+    /// that raise new pre-content events would block in `D` state with nobody
+    /// draining the queue. Answering the residue with `FAN_DENY_ERRNO(EIO)`
+    /// converts that hang into an honest read error; whatever races in after
+    /// the drain fails open when the fd finally closes, which is the kernel's
+    /// own fallback semantic.
     pub fn stop(&self) {
         self.active.store(false, Ordering::Release);
         let _ = self.waker.wake();
         self.barrier.wait();
+        self.drain_deny_pending();
+    }
+
+    /// Answer every event still readable on the (non-blocking) group fd with
+    /// `FAN_DENY_ERRNO(EIO)` and close its fd. Best-effort: stops at `EAGAIN`
+    /// or any read error.
+    fn drain_deny_pending(&self) {
+        let mut buf = vec![0u8; EVENT_BUF_SIZE];
+        let mut denied = 0usize;
+        loop {
+            let n = unsafe {
+                libc::read(
+                    self.fan_fd.as_raw_fd(),
+                    buf.as_mut_ptr() as *mut libc::c_void,
+                    buf.len(),
+                )
+            };
+            if n <= 0 {
+                break;
+            }
+            let buf = &buf[..n as usize];
+            let mut offset = 0usize;
+            while offset + std::mem::size_of::<libc::fanotify_event_metadata>() <= buf.len() {
+                // SAFETY: we verified the buffer has enough bytes.
+                let meta =
+                    unsafe { &*(buf.as_ptr().add(offset) as *const libc::fanotify_event_metadata) };
+                let meta_len = meta.event_len as usize;
+                if meta.vers != libc::FANOTIFY_METADATA_VERSION
+                    || meta_len < std::mem::size_of::<libc::fanotify_event_metadata>()
+                    || offset + meta_len > buf.len()
+                {
+                    break;
+                }
+                let event_fd = meta.fd as RawFd;
+                if event_fd >= 0 {
+                    self.write_response(event_fd, fan_deny_errno(libc::EIO));
+                    unsafe {
+                        libc::close(event_fd);
+                    }
+                    denied += 1;
+                }
+                offset += meta_len;
+            }
+        }
+        if denied > 0 {
+            warn!(
+                "fanotify: denied {} pending pre-content event(s) during shutdown",
+                denied
+            );
+        }
     }
 
     /// Get a clone of the underlying fanotify fd for upgrade/restore paths.
@@ -537,7 +645,18 @@ impl FanotifyHandler {
     /// worker therefore logs, wakes a sibling, and parks on the barrier until
     /// `stop()` supplies the final waiter.
     pub fn run_loop(&self) -> Result<()> {
-        let result = self.run_loop_inner();
+        // A panic anywhere in event handling must not skip the barrier: an
+        // unwinding worker thread would otherwise die silently and wedge
+        // `stop()` (and with it the singleton) forever. The per-event
+        // `EventFdGuard` has already denied the in-flight event during the
+        // unwind by the time we land here.
+        let result =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.run_loop_inner()))
+                .unwrap_or_else(|_| {
+                    Err(std::io::Error::other(
+                        "fanotify worker panicked while handling events",
+                    ))
+                });
         if let Err(ref e) = result {
             error!(
                 "fanotify: worker exiting on error ({}); remaining workers keep serving, \
@@ -660,7 +779,11 @@ impl FanotifyHandler {
             }
 
             // Serve the event; the response reflects whether the content is now available.
-            let event_fd = meta.fd as RawFd;
+            // The guard owns the event fd for exactly-once answering: if
+            // `handle_event` panics and unwinds through here, its Drop denies
+            // with EIO and closes the fd, so the blocked reader errors instead
+            // of hanging in D-state behind an unanswerable event.
+            let guard = EventFdGuard::new(self, meta.fd as RawFd);
             let response = match self.handle_event(meta, &buf[offset..offset + meta_len]) {
                 Ok(()) => FAN_ALLOW,
                 Err(e) => {
@@ -672,15 +795,7 @@ impl FanotifyHandler {
                     fan_deny_errno(deny_errno_for(&e))
                 }
             };
-
-            // Permission events deliver an open fd that must be answered and then closed,
-            // otherwise the daemon leaks a descriptor per access.
-            if event_fd >= 0 {
-                self.write_response(event_fd, response);
-                unsafe {
-                    libc::close(event_fd);
-                }
-            }
+            guard.finish(response);
 
             offset += meta_len;
         }
@@ -718,10 +833,15 @@ impl FanotifyHandler {
             if err.raw_os_error() == Some(libc::EINTR) {
                 continue;
             }
-            // A kernel that rejects this specific errno payload (EINVAL) must
-            // still get *a* response, or the reader stalls in D-state forever.
-            // Retry once with the always-valid EIO form.
-            if err.raw_os_error() == Some(libc::EINVAL) && response != fan_deny_errno(libc::EIO) {
+            // A kernel that rejects a specific DENY errno payload (EINVAL)
+            // must still get *a* response, or the reader stalls in D-state
+            // forever. Retry once with the always-valid EIO form. The guard
+            // excludes FAN_ALLOW: a rejected allow must not be flipped into a
+            // spurious read error.
+            if err.raw_os_error() == Some(libc::EINVAL)
+                && response != FAN_ALLOW
+                && response != fan_deny_errno(libc::EIO)
+            {
                 warn!(
                     "fanotify: kernel rejected deny response {:#x} for fd {}; retrying with EIO",
                     response, event_fd
@@ -784,8 +904,16 @@ impl FanotifyHandler {
         }
         let range = match Self::parse_range(raw_buf) {
             Some(r) => r,
-            // A pre-access event with no range record carries nothing to fill.
-            None => return Ok(()),
+            // Every 6.14+ pre-access read carries a RANGE record. An event
+            // without one cannot be filled, and allowing it blind would let
+            // the reader see unfilled sparse holes as zeros — the silent
+            // corruption class this whole path exists to prevent. Deny loudly
+            // instead (upstream v3 made the same call).
+            None => {
+                return Err(std::io::Error::other(
+                    "pre-access event carries no range record; denying un-fillable access",
+                ));
+            }
         };
         let event_fd = meta.fd as RawFd;
         if event_fd < 0 {
@@ -826,6 +954,12 @@ impl FanotifyHandler {
             return Ok(());
         }
         let count = range.count.min(blob_size - range.offset);
+        if count == 0 {
+            // A zero-length range (the kernel can deliver count == 0) has
+            // nothing to fill; don't push an empty request into the chunk
+            // resolver, whose behavior for empty ranges is not a contract.
+            return Ok(());
+        }
 
         // Download and decompress the requested range into the sparse backing file.
         let obj = backing.blob.blob().get_blob_object().ok_or_else(|| {
