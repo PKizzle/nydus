@@ -933,7 +933,7 @@ pub struct PeerMirrorConfig {
     /// Statically-pinned peer mirror endpoints, tried after discovered
     /// peers (or alone with `peer_discovery = "static"`). Useful for
     /// clusters where the snapshotter may not list nodes, or to pin an
-    /// order in tests. Example: `["https://node-b:6443"]`.
+    /// order in tests. Example: `["https://node-b.internal:6443"]`.
     #[serde(default)]
     pub peer_endpoints: Vec<String>,
     /// PEM-encoded CA bundle for verifying the mirror endpoint's serving

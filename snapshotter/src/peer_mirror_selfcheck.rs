@@ -4,8 +4,8 @@
 
 //! Local peer-mirror self-diagnostic.
 //!
-//! This converts a *silent* failure class into a diagnosable one. On the
-//! 2026-07 `canary-node` incident a single mistyped character in
+//! This converts a *silent* failure class into a diagnosable one. In a
+//! 2026-07 production incident a single mistyped character in
 //! `/etc/rancher/k3s/registries.yaml` (`mirrors: "+"` instead of `"*"`) left
 //! the node's embedded Spegel mirror advertising nothing, so cross-node
 //! acceleration invisibly fell back to full image extraction for months. The
@@ -248,7 +248,7 @@ impl PeerMirrorSelfCheck {
                      silently fall back to full image extraction on peers. Likely causes: \
                      (1) /etc/rancher/k3s/registries.yaml `mirrors:` uses the wrong key — it \
                      MUST be `\"*\":` (a wrong key such as `\"+\":` silently disables local \
-                     content advertisement, the canary-node incident); \
+                     content advertisement — seen in production); \
                      (2) node CPU / etcd health is degraded so the embedded mirror cannot \
                      advertise. Verify registries.yaml and node/etcd load."
                 );
