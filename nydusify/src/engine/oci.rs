@@ -119,7 +119,7 @@ pub async fn fetch_platform_manifest(
     let index: Index = serde_json::from_slice(&fetched.bytes)
         .map_err(|e| anyhow!("parse image index for {repo}:{reference}: {e}"))?;
     let selected = select_platform(&index, platform)?;
-    client.get_manifest(repo, &selected.digest).await
+    Ok(client.get_manifest(repo, &selected.digest).await?)
 }
 
 #[cfg(test)]

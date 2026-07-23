@@ -11,10 +11,10 @@
 //! `--push-retry-count` / `--push-retry-delay` flags so one flaky response
 //! does not abort a long conversion.
 
+use std::fmt::Display;
 use std::future::Future;
 use std::time::Duration;
 
-use anyhow::Result;
 use tracing::warn;
 
 /// Default delay applied when `--push-retry-delay` cannot be parsed.
@@ -54,10 +54,15 @@ impl RetryPolicy {
     /// Run `op` up to [`attempts`](Self::attempts) times, sleeping
     /// [`delay`](Self::delay) between failures. `what` labels the operation in
     /// the retry warning. The last error is returned when all attempts fail.
-    pub async fn run<T, F, Fut>(&self, what: &str, mut op: F) -> Result<T>
+    ///
+    /// Generic over the error type (anything `Display`), so it wraps both
+    /// `anyhow::Result` closures and `registry-client` calls returning the
+    /// typed `RegistryError` without erasing the error the caller gets back.
+    pub async fn run<T, E, F, Fut>(&self, what: &str, mut op: F) -> Result<T, E>
     where
+        E: Display,
         F: FnMut() -> Fut,
-        Fut: Future<Output = Result<T>>,
+        Fut: Future<Output = Result<T, E>>,
     {
         let mut attempt = 1u32;
         loop {
@@ -110,6 +115,7 @@ fn parse_delay(s: &str) -> Option<Duration> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anyhow::Result;
     use std::cell::Cell;
 
     #[test]

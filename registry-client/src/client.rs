@@ -16,15 +16,20 @@
 //! query parameters — see [`resolve_location`] / [`append_query_param`]).
 //! Blob pushes are deduplicated with a `HEAD` probe first. Chunked `PATCH`
 //! uploads are out of scope for now.
+//!
+//! Public operations return the typed [`RegistryError`] (see [`crate::error`])
+//! so callers can branch on `NotFound` / `ReferrersUnsupported` / auth /
+//! digest / timeout failures; internal helpers stay on `anyhow` and flow
+//! through the transparent `Other` catch-all.
 
 use crate::auth::{
     BearerChallenge, Credentials, TokenCache, auth_header_value, docker_config_auth,
     fetch_bearer_token, mount_scope, parse_bearer_challenge, percent_encode_query, pull_scope,
     push_scope,
 };
+use crate::error::RegistryError;
 use crate::types::{
     Index, MANIFEST_ACCEPT, MEDIA_TYPE_OCI_INDEX, MEDIA_TYPE_OCTET_STREAM, sha256_digest,
-    verify_digest,
 };
 use anyhow::{Context, Result, anyhow, bail};
 use compio::BufResult;
@@ -52,6 +57,11 @@ const MAX_REGISTRY_BODY_BYTES: u64 = 512 * 1024 * 1024;
 
 /// Chunk size for hashing local files before upload.
 const FILE_HASH_CHUNK: usize = 1024 * 1024;
+
+/// Upper bound on the response-body snippet captured into
+/// [`RegistryError::Http`] for diagnosis. Registries put small structured
+/// error JSON there; anything larger is truncated noise.
+const MAX_ERROR_BODY_BYTES: u64 = 4 * 1024;
 
 /// Per-call disambiguator for [`RegistryClient::get_blob_to_file`]'s temp
 /// file name, on top of the process id. The pid alone only makes the name
@@ -176,7 +186,7 @@ impl RegistryClient {
     /// Credential resolution: `opts.credentials` wins; otherwise docker
     /// `config.json` is consulted (unless disabled); otherwise requests start
     /// anonymous and rely on the bearer-token flow.
-    pub fn new(registry: &str, opts: RegistryClientOptions) -> Result<Self> {
+    pub fn new(registry: &str, opts: RegistryClientOptions) -> Result<Self, RegistryError> {
         let scheme = if opts.plain_http { "http" } else { "https" };
         let builder = if opts.insecure_tls {
             Client::builder()
@@ -214,7 +224,11 @@ impl RegistryClient {
     /// with the full OCI/docker Accept list. When `reference` is a digest the
     /// body is verified against it; the returned digest is always computed
     /// locally from the bytes.
-    pub async fn get_manifest(&self, repo: &str, reference: &str) -> Result<FetchedManifest> {
+    pub async fn get_manifest(
+        &self,
+        repo: &str,
+        reference: &str,
+    ) -> Result<FetchedManifest, RegistryError> {
         let url = self.manifest_url(repo, reference);
         let response = self
             .request_with_auth(
@@ -227,10 +241,9 @@ impl RegistryClient {
             )
             .await?;
         if !response.status().is_success() {
-            bail!(
-                "manifest fetch for {repo}:{reference} failed with HTTP {}",
-                response.status()
-            );
+            return Err(self
+                .error_for_status(response, &format!("manifest {repo}:{reference}"), &url)
+                .await);
         }
         let content_type = response
             .headers()
@@ -244,11 +257,13 @@ impl RegistryClient {
             .map(str::to_string);
         let bytes =
             read_bounded(response, &url, MAX_REGISTRY_BODY_BYTES, self.body_timeout).await?;
-        if reference.starts_with("sha256:") {
-            verify_digest(&bytes, reference)
-                .with_context(|| format!("manifest {reference} failed digest verification"))?;
-        }
         let digest = sha256_digest(&bytes);
+        if reference.starts_with("sha256:") && !digest.eq_ignore_ascii_case(reference) {
+            return Err(RegistryError::DigestMismatch {
+                expected: reference.to_string(),
+                actual: digest,
+            });
+        }
         if let Some(claimed) = header_digest
             && !claimed.eq_ignore_ascii_case(&digest)
         {
@@ -264,20 +279,30 @@ impl RegistryClient {
     /// GET a blob (`/v2/<repo>/blobs/<digest>`) into memory. Bounded to
     /// [`MAX_REGISTRY_BODY_BYTES`] and digest-verified. For large blobs use
     /// [`get_blob_to_file`](Self::get_blob_to_file).
-    pub async fn get_blob(&self, repo: &str, digest: &str) -> Result<Vec<u8>> {
+    pub async fn get_blob(&self, repo: &str, digest: &str) -> Result<Vec<u8>, RegistryError> {
         let url = self.blob_url(repo, digest);
         let response = self.get_blob_response(repo, digest).await?;
         let bytes =
             read_bounded(response, &url, MAX_REGISTRY_BODY_BYTES, self.body_timeout).await?;
-        verify_digest(&bytes, digest)
-            .with_context(|| format!("blob {digest} failed digest verification"))?;
+        let computed = sha256_digest(&bytes);
+        if !computed.eq_ignore_ascii_case(digest) {
+            return Err(RegistryError::DigestMismatch {
+                expected: digest.to_string(),
+                actual: computed,
+            });
+        }
         Ok(bytes)
     }
 
     /// GET a blob and stream it to `path` (via an adjacent temp file renamed
     /// into place), verifying the sha256 digest as chunks arrive. Returns the
     /// number of bytes written. Not size-capped: the destination is disk.
-    pub async fn get_blob_to_file(&self, repo: &str, digest: &str, path: &Path) -> Result<u64> {
+    pub async fn get_blob_to_file(
+        &self,
+        repo: &str,
+        digest: &str,
+        path: &Path,
+    ) -> Result<u64, RegistryError> {
         let response = self.get_blob_response(repo, digest).await?;
         if let Some(parent) = path.parent()
             && !parent.as_os_str().is_empty()
@@ -294,13 +319,15 @@ impl RegistryClient {
         let mut hasher = Sha256::new();
         let mut written = 0u64;
         let mut stream = Box::pin(response.bytes_stream());
-        let result: Result<()> = async {
+        let result: Result<(), RegistryError> = async {
             loop {
                 let next = stream.next();
                 let item = match self.timeout {
-                    Some(duration) => compio::time::timeout(duration, next)
-                        .await
-                        .map_err(|_| anyhow!("blob download for {digest} stalled"))?,
+                    Some(duration) => {
+                        compio::time::timeout(duration, next).await.map_err(|_| {
+                            RegistryError::Timeout(format!("blob download for {digest} stalled"))
+                        })?
+                    }
                     None => next.await,
                 };
                 let Some(chunk) = item else { break };
@@ -313,7 +340,10 @@ impl RegistryClient {
             }
             let computed = format!("sha256:{}", hex::encode(hasher.finalize()));
             if !computed.eq_ignore_ascii_case(digest) {
-                bail!("blob digest mismatch: expected {digest}, computed {computed}");
+                return Err(RegistryError::DigestMismatch {
+                    expected: digest.to_string(),
+                    actual: computed,
+                });
             }
             Ok(())
         }
@@ -326,14 +356,17 @@ impl RegistryClient {
         if let Err(e) = std::fs::rename(&tmp, path) {
             // Don't leave the `.part` temp file behind on a failed rename.
             let _ = std::fs::remove_file(&tmp);
-            return Err(e).with_context(|| format!("rename blob into place at {}", path.display()));
+            return Err(RegistryError::Other(
+                anyhow::Error::new(e)
+                    .context(format!("rename blob into place at {}", path.display())),
+            ));
         }
         Ok(written)
     }
 
     /// HEAD a blob (`/v2/<repo>/blobs/<digest>`): `true` when it exists,
     /// `false` on 404, error on anything else.
-    pub async fn head_blob(&self, repo: &str, digest: &str) -> Result<bool> {
+    pub async fn head_blob(&self, repo: &str, digest: &str) -> Result<bool, RegistryError> {
         let url = self.blob_url(repo, digest);
         let response = self
             .request_with_auth(
@@ -348,7 +381,9 @@ impl RegistryClient {
         match response.status() {
             status if status.is_success() => Ok(true),
             StatusCode::NOT_FOUND => Ok(false),
-            status => bail!("blob HEAD for {digest} failed with HTTP {status}"),
+            _ => Err(self
+                .error_for_status(response, &format!("blob HEAD {digest}"), &url)
+                .await),
         }
     }
 
@@ -358,7 +393,12 @@ impl RegistryClient {
     /// registry declined the mount and opened a regular upload session
     /// instead; that session is cancelled best-effort and `false` is returned
     /// so the caller falls back to a normal push.
-    pub async fn mount_blob(&self, repo: &str, digest: &str, from_repo: &str) -> Result<bool> {
+    pub async fn mount_blob(
+        &self,
+        repo: &str,
+        digest: &str,
+        from_repo: &str,
+    ) -> Result<bool, RegistryError> {
         let url = append_query_param(
             &append_query_param(&self.upload_url(repo), "mount", digest),
             "from",
@@ -382,13 +422,19 @@ impl RegistryClient {
                 }
                 Ok(false)
             }
-            status => bail!("blob mount of {digest} from {from_repo} failed with HTTP {status}"),
+            _ => Err(self
+                .error_for_status(
+                    response,
+                    &format!("blob mount of {digest} from {from_repo}"),
+                    &url,
+                )
+                .await),
         }
     }
 
     /// Push in-memory bytes as a blob (HEAD-dedup, then monolithic upload).
     /// Returns the blob's `sha256:<hex>` digest.
-    pub async fn push_blob_bytes(&self, repo: &str, bytes: &[u8]) -> Result<String> {
+    pub async fn push_blob_bytes(&self, repo: &str, bytes: &[u8]) -> Result<String, RegistryError> {
         let digest = sha256_digest(bytes);
         if self.blob_already_present(repo, &digest).await {
             return Ok(digest);
@@ -402,7 +448,7 @@ impl RegistryClient {
     /// once, existing blobs are deduplicated via HEAD, and the upload streams
     /// the file with an explicit `Content-Length` (never buffering it whole).
     /// Returns the blob's `sha256:<hex>` digest.
-    pub async fn push_blob_file(&self, repo: &str, path: &Path) -> Result<String> {
+    pub async fn push_blob_file(&self, repo: &str, path: &Path) -> Result<String, RegistryError> {
         let digest = self.file_digest(path).await?;
         if self.blob_already_present(repo, &digest).await {
             return Ok(digest);
@@ -421,7 +467,7 @@ impl RegistryClient {
         reference: &str,
         media_type: &str,
         bytes: &[u8],
-    ) -> Result<String> {
+    ) -> Result<String, RegistryError> {
         let url = self.manifest_url(repo, reference);
         let content_type =
             HeaderValue::from_str(media_type).context("invalid manifest media type")?;
@@ -436,10 +482,9 @@ impl RegistryClient {
             )
             .await?;
         if !response.status().is_success() {
-            bail!(
-                "manifest push to {repo}:{reference} failed with HTTP {}",
-                response.status()
-            );
+            return Err(self
+                .error_for_status(response, &format!("manifest push {repo}:{reference}"), &url)
+                .await);
         }
         Ok(sha256_digest(bytes))
     }
@@ -455,17 +500,18 @@ impl RegistryClient {
     /// the spec allows servers to ignore the query filter, so the local
     /// filter is authoritative.
     ///
-    /// Returns `Ok(None)` when the registry does not support the referrers
-    /// API (a `404` on the endpoint — also tolerating the `405`/`400`/`501`
-    /// shapes seen from older registries), so callers can fall back to the
-    /// `sha256-<subject-hex>` fallback tag. A registry that *does* support
-    /// the API but has no referrers returns an empty index, per spec.
+    /// Returns [`RegistryError::ReferrersUnsupported`] when the registry does
+    /// not support the referrers API (a `404` on the endpoint — also
+    /// tolerating the `405`/`400`/`501` shapes seen from older registries),
+    /// so callers can fall back to the `sha256-<subject-hex>` fallback tag.
+    /// A registry that *does* support the API but has no referrers returns an
+    /// empty index, per spec.
     pub async fn get_referrers(
         &self,
         repo: &str,
         subject_digest: &str,
         artifact_type: Option<&str>,
-    ) -> Result<Option<Index>> {
+    ) -> Result<Index, RegistryError> {
         let mut url = self.referrers_url(repo, subject_digest);
         if let Some(filter) = artifact_type {
             url = append_query_param(&url, "artifactType", filter);
@@ -489,9 +535,13 @@ impl RegistryClient {
             | StatusCode::BAD_REQUEST
             | StatusCode::NOT_IMPLEMENTED => {
                 debug!(%repo, subject = %subject_digest, status = %response.status(), "registry does not support the OCI referrers API");
-                return Ok(None);
+                return Err(RegistryError::ReferrersUnsupported);
             }
-            status => bail!("referrers query for {subject_digest} failed with HTTP {status}"),
+            _ => {
+                return Err(self
+                    .error_for_status(response, &format!("referrers of {subject_digest}"), &url)
+                    .await);
+            }
         }
         let bytes =
             read_bounded(response, &url, MAX_REGISTRY_BODY_BYTES, self.body_timeout).await?;
@@ -500,12 +550,12 @@ impl RegistryClient {
         if let Some(filter) = artifact_type {
             filter_referrers(&mut index, filter);
         }
-        Ok(Some(index))
+        Ok(index)
     }
 
     /// GET the blob endpoint and ensure a success status (shared by the
     /// in-memory and to-file downloads).
-    async fn get_blob_response(&self, repo: &str, digest: &str) -> Result<Response> {
+    async fn get_blob_response(&self, repo: &str, digest: &str) -> Result<Response, RegistryError> {
         let url = self.blob_url(repo, digest);
         let response = self
             .request_with_auth(
@@ -518,12 +568,42 @@ impl RegistryClient {
             )
             .await?;
         if !response.status().is_success() {
-            bail!(
-                "blob fetch for {digest} failed with HTTP {}",
-                response.status()
-            );
+            return Err(self
+                .error_for_status(response, &format!("blob {digest}"), &url)
+                .await);
         }
         Ok(response)
+    }
+
+    /// Map a non-success response to the typed error: `404` →
+    /// [`RegistryError::NotFound`], `401`/`403` → [`RegistryError::Auth`]
+    /// (the auth retry already ran inside [`Self::request_with_auth`]),
+    /// anything else → [`RegistryError::Http`] with a bounded body snippet
+    /// (registries put their structured error JSON there).
+    async fn error_for_status(
+        &self,
+        response: Response,
+        resource: &str,
+        url: &str,
+    ) -> RegistryError {
+        let status = response.status();
+        if status == StatusCode::NOT_FOUND {
+            return RegistryError::NotFound {
+                resource: resource.to_string(),
+            };
+        }
+        let body = read_bounded(response, url, MAX_ERROR_BODY_BYTES, self.body_timeout)
+            .await
+            .map(|bytes| String::from_utf8_lossy(&bytes).trim().to_string())
+            .unwrap_or_default();
+        if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
+            return RegistryError::Auth(format!("HTTP {status} for {resource}: {body}"));
+        }
+        RegistryError::Http {
+            status: status.as_u16(),
+            body,
+            resource: resource.to_string(),
+        }
     }
 
     /// HEAD-dedup probe for pushes. Probe failures are logged and treated as
@@ -549,12 +629,13 @@ impl RegistryClient {
         repo: &str,
         digest: &str,
         body: BodySource<'_>,
-    ) -> Result<()> {
+    ) -> Result<(), RegistryError> {
         let scope = push_scope(repo);
+        let session_url = self.upload_url(repo);
         let response = self
             .request_with_auth(
                 Method::POST,
-                &self.upload_url(repo),
+                &session_url,
                 &scope,
                 &[],
                 BodySource::Empty,
@@ -562,10 +643,13 @@ impl RegistryClient {
             )
             .await?;
         if !response.status().is_success() {
-            bail!(
-                "blob upload session for {repo} failed with HTTP {}",
-                response.status()
-            );
+            return Err(self
+                .error_for_status(
+                    response,
+                    &format!("blob upload session for {repo}"),
+                    &session_url,
+                )
+                .await);
         }
         let location = header_str(&response, &LOCATION)
             .ok_or_else(|| anyhow!("registry returned no Location for blob upload session"))?;
@@ -585,10 +669,13 @@ impl RegistryClient {
             )
             .await?;
         if !response.status().is_success() {
-            bail!(
-                "blob upload of {digest} to {repo} failed with HTTP {}",
-                response.status()
-            );
+            return Err(self
+                .error_for_status(
+                    response,
+                    &format!("blob upload of {digest} to {repo}"),
+                    &put_url,
+                )
+                .await);
         }
         Ok(())
     }
@@ -655,7 +742,7 @@ impl RegistryClient {
         headers: &[(HeaderName, HeaderValue)],
         body: BodySource<'_>,
         timeout: Option<Duration>,
-    ) -> Result<Response> {
+    ) -> Result<Response, RegistryError> {
         let initial_auth = self.initial_auth_header(scope)?;
         let response = self
             .send_once(method.clone(), url, headers, &body, initial_auth, timeout)
@@ -679,12 +766,14 @@ impl RegistryClient {
     }
 
     /// Fetch and cache a bearer token for `challenge`, preferring the
-    /// challenge's scope over the caller-requested one.
+    /// challenge's scope over the caller-requested one. Failures map to
+    /// [`RegistryError::Auth`] — a broken token dance is an auth failure,
+    /// whatever its underlying transport shape.
     async fn acquire_bearer(
         &self,
         challenge: &BearerChallenge,
         requested_scope: &str,
-    ) -> Result<HeaderValue> {
+    ) -> Result<HeaderValue, RegistryError> {
         let token_scope = challenge
             .scope
             .clone()
@@ -696,7 +785,8 @@ impl RegistryClient {
             self.basic_auth.as_deref(),
             self.timeout,
         )
-        .await?;
+        .await
+        .map_err(|e| RegistryError::Auth(format!("bearer token fetch failed: {e:#}")))?;
         {
             let mut cache = self.tokens.borrow_mut();
             cache.insert(requested_scope, &bearer.token, bearer.expires_in);
@@ -704,8 +794,9 @@ impl RegistryClient {
                 cache.insert(&token_scope, &bearer.token, bearer.expires_in);
             }
         }
-        HeaderValue::from_str(&format!("Bearer {}", bearer.token))
-            .context("registry bearer token contained invalid header characters")
+        HeaderValue::from_str(&format!("Bearer {}", bearer.token)).map_err(|_| {
+            RegistryError::Auth("registry bearer token contained invalid header characters".into())
+        })
     }
 
     /// One attempt: build the request (headers, optional auth, body) and send
@@ -718,7 +809,7 @@ impl RegistryClient {
         body: &BodySource<'_>,
         auth: Option<HeaderValue>,
         timeout: Option<Duration>,
-    ) -> Result<Response> {
+    ) -> Result<Response, RegistryError> {
         let mut request = self
             .client
             .request(method, url)
@@ -769,10 +860,11 @@ impl RegistryClient {
         match timeout {
             Some(duration) => compio::time::timeout(duration, send)
                 .await
-                .map_err(|_| anyhow!("registry request to {url} timed out"))?,
+                .map_err(|_| RegistryError::Timeout(format!("registry request to {url}")))?,
             None => send.await,
         }
         .with_context(|| format!("registry request failed for {url}"))
+        .map_err(RegistryError::from)
     }
 
     /// Best available `Authorization` header for the first attempt: cached
@@ -892,7 +984,7 @@ async fn read_bounded(
     url: &str,
     max_bytes: u64,
     deadline: Option<Duration>,
-) -> Result<Vec<u8>> {
+) -> Result<Vec<u8>, RegistryError> {
     if let Some(len) = response
         .headers()
         .get(CONTENT_LENGTH)
@@ -900,19 +992,24 @@ async fn read_bounded(
         .and_then(|value| value.parse::<u64>().ok())
         && len > max_bytes
     {
-        bail!("registry body at {url} of {len} bytes exceeds cap of {max_bytes} bytes");
+        return Err(RegistryError::Other(anyhow!(
+            "registry body at {url} of {len} bytes exceeds cap of {max_bytes} bytes"
+        )));
     }
     // The byte cap alone does not bound TIME: a slow-drip body trickling in
     // just fast enough to keep individual reads alive could hold the caller
     // indefinitely while staying under the cap. The deadline bounds the whole
     // body read wall-clock.
     let collect = collect_bounded(response.bytes_stream(), max_bytes, url);
-    match deadline {
-        Some(limit) => compio::time::timeout(limit, collect)
-            .await
-            .map_err(|_| anyhow!("reading registry body at {url} exceeded {limit:?} deadline"))?,
+    let bytes = match deadline {
+        Some(limit) => compio::time::timeout(limit, collect).await.map_err(|_| {
+            RegistryError::Timeout(format!(
+                "reading registry body at {url} exceeded {limit:?} deadline"
+            ))
+        })?,
         None => collect.await,
-    }
+    }?;
+    Ok(bytes)
 }
 
 /// Collect a byte stream into memory, bailing the moment the running total

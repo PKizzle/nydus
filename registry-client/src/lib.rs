@@ -46,16 +46,27 @@
 //! image index of artifact descriptors. An optional `artifactType` filter is
 //! sent as the spec's query parameter and **always re-applied client-side**
 //! (servers may ignore the query filter). A registry without referrers-API
-//! support is surfaced distinctly so callers can fall back to the
-//! `sha256-<subject-hex>` fallback tag.
+//! support is surfaced distinctly
+//! ([`RegistryError::ReferrersUnsupported`](error::RegistryError)) so callers
+//! can fall back to the `sha256-<subject-hex>` fallback tag.
+//!
+//! # Errors
+//!
+//! Public [`RegistryClient`](client::RegistryClient) operations return the
+//! typed [`RegistryError`](error::RegistryError) so callers can branch on
+//! `NotFound`, `ReferrersUnsupported`, auth, digest-mismatch, and timeout
+//! failures; it implements `std::error::Error`, so `?` into `anyhow::Result`
+//! keeps working for application callers.
 
 pub mod auth;
 pub mod client;
+pub mod error;
 pub mod reference;
 pub mod tls;
 pub mod types;
 
 pub use client::{FetchedManifest, RegistryClient, RegistryClientOptions, filter_referrers};
+pub use error::RegistryError;
 pub use reference::ImageReference;
 pub use types::{
     Descriptor, History, ImageConfig, Index, Manifest, Platform, RootFs, sha256_digest,
