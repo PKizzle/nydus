@@ -63,6 +63,7 @@ pub struct Reconciler {
     store: Arc<SnapshotStore>,
     cache_gc: Option<(CacheManager, CacheGcPolicy)>,
     auto_zran_sweep: Option<(PathBuf, Duration, Arc<crate::auto_zran::AutoZranManager>)>,
+    reoptimize_profiles: Option<crate::prefetch_profile::PrefetchProfileStore>,
     sidecar_gc: Option<SidecarGcDeps>,
     interval: Duration,
     /// Cadence for the expensive passes (cache GC, auto-zran sweep, sidecar
@@ -89,6 +90,7 @@ impl Reconciler {
             store,
             cache_gc: None,
             auto_zran_sweep: None,
+            reoptimize_profiles: None,
             sidecar_gc: None,
             slow_interval: interval,
             interval,
@@ -150,6 +152,20 @@ impl Reconciler {
         manager: Arc<crate::auto_zran::AutoZranManager>,
     ) -> Self {
         self.auto_zran_sweep = Some((work_dir, max_age, manager));
+        self
+    }
+
+    /// Enable the slow-cadence re-optimize trigger: persisted prefetch
+    /// profiles are re-enqueued to the auto-zran OPTIMIZE stage (guarded by
+    /// the manager's failure cache, dedupe, and the worker's already-optimized
+    /// early-exit) so an image is not wedged at Base forever when its first
+    /// settle-driven optimize was lost. Requires
+    /// [`with_auto_zran_sweep`](Self::with_auto_zran_sweep) for the manager.
+    pub fn with_reoptimize_profiles(
+        mut self,
+        store: crate::prefetch_profile::PrefetchProfileStore,
+    ) -> Self {
+        self.reoptimize_profiles = Some(store);
         self
     }
 
@@ -217,10 +233,34 @@ impl Reconciler {
 
             // 8. Clamp leaked daemon refcounts to the observed holder set.
             self.check_refcounts().await;
+
+            // 9. Re-enqueue the optimize stage for images stuck at Base.
+            self.check_stuck_optimizes().await;
         }
 
         debug!("reconciliation pass complete");
         Ok(())
+    }
+
+    /// Re-enqueue the auto-zran OPTIMIZE stage for persisted prefetch
+    /// profiles (the wedge-at-Base recovery). Profile listing is filesystem
+    /// I/O and enqueueing is synchronous, so the whole pass runs on the
+    /// blocking pool.
+    async fn check_stuck_optimizes(&self) {
+        let (Some((_, _, manager)), Some(store)) =
+            (&self.auto_zran_sweep, &self.reoptimize_profiles)
+        else {
+            return;
+        };
+        let manager = Arc::clone(manager);
+        let store = store.clone();
+        let submitted = blocking::unblock(move || manager.retry_stuck_optimizes(&store)).await;
+        if submitted > 0 {
+            debug!(
+                profiles = submitted,
+                "recon: re-submitted persisted prefetch profiles to the optimize stage"
+            );
+        }
     }
 
     /// Run the mount-health probe pass and warn once per dead mount. Purely

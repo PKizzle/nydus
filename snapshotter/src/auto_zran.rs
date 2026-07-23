@@ -21,7 +21,7 @@ use crate::content_store::ContentStoreClient;
 use crate::local_accel::{
     self, LocalAccelConfig, NodeLocalArtifact, SchedClass as AccelSchedClass,
 };
-use crate::prefetch_profile::PrefetchProfile;
+use crate::prefetch_profile::{PrefetchProfile, PrefetchProfileStore};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -480,6 +480,32 @@ impl AutoZranManager {
         self.enqueue(job);
     }
 
+    /// Recon slow-pass driver for the wedge-at-Base limitation: re-enqueue
+    /// the OPTIMIZE stage for every persisted prefetch profile. Cheap by
+    /// construction — the existing guards do all the filtering: the per-image
+    /// failure negative cache, the `(image, stage)` dedupe (once per process
+    /// lifetime unless a run fails), the bounded queue, and the worker's own
+    /// `SidecarState::Optimized` early-exit for images whose sidecar already
+    /// carries a prefetch blob. Returns the number of profiles submitted to
+    /// the enqueue path (not necessarily accepted).
+    pub fn retry_stuck_optimizes(&self, store: &PrefetchProfileStore) -> usize {
+        let profiles = match store.list() {
+            Ok(profiles) => profiles,
+            Err(e) => {
+                warn!(
+                    error = format!("{e:#}"),
+                    "auto-zran re-optimize: listing prefetch profiles failed"
+                );
+                return 0;
+            }
+        };
+        let submitted = profiles.len();
+        for profile in &profiles {
+            self.try_enqueue_profile(profile);
+        }
+        submitted
+    }
+
     /// Shared, non-blocking enqueue path for both stages. Consults the
     /// per-image failure negative cache first (see
     /// [`MAX_CONVERSION_FAILURES`]), then dedupes on `(image, stage)` via
@@ -695,14 +721,11 @@ async fn run_base_stage(
 /// optimized one. Reuses stage 1's on-disk work dir when present (optimize
 /// only); otherwise runs the full pipeline once WITH prefetch.
 ///
-/// Known limitation (wedge-at-Base): this stage has exactly two drivers — the
-/// access tracer's settle and the NRI `StopContainer` force-settle. If the
-/// first pod dies before either fires, or the (single) settle-driven optimize
-/// upload fails past the failure backoff, the image keeps serving the BASE
-/// sidecar until the snapshotter restarts. Accepted: Base already beats plain
-/// overlay, and a future recon-driven re-optimize trigger is tracked in
-/// BACKLOG.md ("Two-stage auto-accel: re-optimize trigger for images stuck at
-/// Base").
+/// Drivers: the access tracer's settle, the NRI `StopContainer`
+/// force-settle, and the reconciler's slow-cadence
+/// [`AutoZranManager::retry_stuck_optimizes`], which re-enqueues persisted
+/// profiles so an image is not wedged at Base when the first pod dies before
+/// settle or the settle-driven upload fails past the in-memory backoff.
 #[allow(clippy::too_many_arguments)]
 async fn run_optimize_stage(
     config: &AutoZranConfig,
@@ -1653,6 +1676,42 @@ mod tests {
         let reused = load_reusable_base_artifact(work_dir).expect("optimized artifact reusable");
         assert_eq!(reused, artifact);
         assert!(reused.prefetch_blob_id.is_some());
+    }
+
+    /// The recon-driven re-optimize trigger flows persisted profiles through
+    /// the exact same guards as any other enqueue: the failure negative cache
+    /// still suppresses, everything else queues.
+    #[test]
+    fn retry_stuck_optimizes_submits_persisted_profiles_through_the_guards() {
+        let (sender, receiver) = async_channel::bounded(8);
+        let state = Arc::new(AutoZranState::new(8));
+        let manager = AutoZranManager {
+            sender,
+            state: state.clone(),
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let store = PrefetchProfileStore::new(tmp.path());
+        store.put(&profile("registry.local/stuck:1")).unwrap();
+        store.put(&profile("registry.local/broken:1")).unwrap();
+
+        // Suppress one image via the real failure path.
+        let bad = AutoZranJob::from_profile(&profile("registry.local/broken:1")).unwrap();
+        for _ in 0..MAX_CONVERSION_FAILURES {
+            state.mark_started(&bad);
+            state.mark_finished(&bad, false);
+        }
+
+        let submitted = manager.retry_stuck_optimizes(&store);
+        assert_eq!(submitted, 2, "both persisted profiles are submitted");
+        assert_eq!(
+            receiver.try_recv().unwrap().image,
+            "registry.local/stuck:1",
+            "non-suppressed image queues"
+        );
+        assert!(
+            receiver.try_recv().is_err(),
+            "suppressed image must not pass the negative cache"
+        );
     }
 
     /// Fix 1 (negative cache): after `MAX_CONVERSION_FAILURES` consecutive

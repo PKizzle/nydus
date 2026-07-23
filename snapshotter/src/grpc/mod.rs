@@ -1372,11 +1372,17 @@ pub async fn serve_with_supervisor(
     // a retained base dir is safe are documented on
     // `AUTO_ZRAN_STALE_JOB_MAX_AGE`.
     if let Some(manager) = auto_zran.clone() {
-        reconciler = reconciler.with_auto_zran_sweep(
-            config.snapshotter.auto_zran.work_dir.clone(),
-            AUTO_ZRAN_STALE_JOB_MAX_AGE,
-            manager,
-        );
+        reconciler = reconciler
+            .with_auto_zran_sweep(
+                config.snapshotter.auto_zran.work_dir.clone(),
+                AUTO_ZRAN_STALE_JOB_MAX_AGE,
+                manager,
+            )
+            .with_reoptimize_profiles(
+                crate::prefetch_profile::PrefetchProfileStore::from_cache_root(
+                    &config.snapshotter.cache.work_dir,
+                ),
+            );
     }
     // Sidecar GC: without this sweep a deleted (or repointed) image's sidecar
     // record lives forever — and it transitively pins the original gzip layer
