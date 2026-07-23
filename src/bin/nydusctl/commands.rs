@@ -562,9 +562,10 @@ mod tests {
     #[test]
     fn test_load_mount_config_missing_file() {
         let err = load_mount_config("/definitely/missing/nydus-config.toml").unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("failed to read mount config /definitely/missing/nydus-config.toml"));
+        assert!(
+            err.to_string()
+                .contains("failed to read mount config /definitely/missing/nydus-config.toml")
+        );
     }
 
     #[test]
