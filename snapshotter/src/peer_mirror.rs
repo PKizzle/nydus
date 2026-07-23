@@ -94,12 +94,12 @@ pub enum PullOutcome {
 
 /// Intermediate result for one Spegel GET (manifest or blob).
 pub enum FetchResult {
+    /// 2xx: the response body, digest-unverified (callers verify).
     Ok(Vec<u8>),
+    /// Every endpoint returned 404 — no peer has the content.
     NotFound,
-    Error {
-        status: u16,
-        body: String,
-    },
+    /// A non-success, non-404 HTTP status with its (truncated) body.
+    Error { status: u16, body: String },
     /// Catastrophic client-side failure that maps directly to a
     /// `PullOutcome` other than NotFound/Error.
     Outcome(PullOutcome),

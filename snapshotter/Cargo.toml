@@ -85,7 +85,7 @@ cyper = { git = "https://github.com/compio-rs/cyper", rev = "d1c8aff18dd81c4b1f8
 # material is `Arc<rustls::ClientConfig>` + the endpoint list (both
 # Send + Sync) and the actual `cyper::Client` is built per call on a
 # blocking thread driving its own thread-local compio runtime (see
-# `auto_accel_sidecar.rs::block_on_http`). This matches the pattern
+# `peer_mirror.rs::block_on_http`). This matches the pattern
 # `storage/src/backend/connection.rs` already uses for the registry
 # backend, keeps reqwest+tokio out of the snapshotter, and avoids
 # pulling OpenSSL. PEM cert/key loading goes through the re-exported
