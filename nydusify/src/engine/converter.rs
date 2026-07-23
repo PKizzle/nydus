@@ -38,10 +38,13 @@ use crate::commands::convert::ConversionMode;
 use crate::engine::artifact::maybe_push_referrer;
 use crate::engine::containerd_converter::ConvertRequest;
 use crate::engine::manifest::{
-    assemble_manifest, bootstrap_descriptor, config_media_type, data_blob_descriptor,
-    manifest_media_type, rebuild_image_config,
+    assemble_index, assemble_manifest, bootstrap_descriptor, config_media_type,
+    data_blob_descriptor, index_media_type, manifest_media_type, rebuild_image_config,
 };
-use crate::engine::oci::{blob_hex, client_options, is_index, select_platform};
+use crate::engine::oci::{
+    all_platform_selectors, blob_hex, client_options, is_index, parse_platform_list,
+    select_platform,
+};
 use crate::engine::retry::RetryPolicy;
 
 /// A source rootfs layer pulled to disk.
@@ -55,13 +58,16 @@ struct PulledLayer {
 
 /// The pulled source image (single platform).
 struct PulledSource {
-    /// Descriptor of the **top-level** source reference: it becomes the
-    /// referrer artifact `subject` and drives the `sha256-<hex>` fallback
-    /// tag. For a multi-arch source this is the image INDEX descriptor, not
-    /// the platform-resolved manifest — `nydusify check` and the snapshotter
-    /// both resolve the top-level digest, so the referrer must be published
-    /// under it.
-    manifest_desc: Descriptor,
+    /// Descriptor the referrer artifact is published against. For a
+    /// single-platform convert of a single-arch source this is the source
+    /// manifest; for one platform of a multi-arch source it is that
+    /// platform's manifest (so a merged conversion attaches one referrer per
+    /// platform, each resolvable from its own subject).
+    referrer_subject: Descriptor,
+    /// The platform this manifest targets (index entry + reporting).
+    platform: registry_client::types::Platform,
+    /// Sum of the source layer (compressed) sizes, for `--output-json`.
+    source_size: u64,
     /// Raw image-config JSON, reused verbatim as the nydus image config.
     config_bytes: Vec<u8>,
     layers: Vec<PulledLayer>,
@@ -83,6 +89,7 @@ struct ConversionOutput {
 /// Run the full convert pipeline. `workspace` is a temp dir under `--work-dir`.
 pub async fn run_conversion(request: &ConvertRequest, workspace: &Path) -> Result<()> {
     reject_unsupported(request)?;
+    let started = std::time::Instant::now();
 
     let source_ref = ImageReference::parse(&request.source)
         .with_context(|| format!("parse --source {}", request.source))?;
@@ -98,20 +105,6 @@ pub async fn run_conversion(request: &ConvertRequest, workspace: &Path) -> Resul
         ),
     )
     .context("build source registry client")?;
-
-    // ---- pull ----
-    let source = pull_source(request, &source_client, &source_ref, workspace).await?;
-    info!(
-        source = %source_ref,
-        layers = source.layers.len(),
-        oci_ref = request.driver.oci_ref,
-        "pulled source image; building nydus artifact"
-    );
-
-    // ---- build (nydus-image subprocess) ----
-    let output = build_artifact(request, &source.layers, workspace)?;
-
-    // ---- push ----
     let target_client = RegistryClient::new(
         &target_ref.api_host,
         client_options(
@@ -122,26 +115,248 @@ pub async fn run_conversion(request: &ConvertRequest, workspace: &Path) -> Resul
     )
     .context("build target registry client")?;
     let same_registry = source_ref.api_host == target_ref.api_host;
-
-    // Retries for idempotent (digest-addressed) pushes, honoring the CLI flags.
     let retry = RetryPolicy::from_flags(request.push_retry_count, &request.push_retry_delay);
 
+    // Resolve which platforms to convert from the top-level source reference.
+    let plan = resolve_platform_plan(request, &source_client, &source_ref).await?;
+
+    if plan.selectors.len() == 1 {
+        // Single platform: push the manifest directly at the target tag —
+        // byte-for-byte the pre-multi-platform behavior (no index wrapper).
+        let outcome = convert_one_platform(
+            request,
+            &source_client,
+            &target_client,
+            &source_ref,
+            &target_ref,
+            same_registry,
+            &plan.selectors[0],
+            PushTarget::Tag,
+            &workspace.join("p0"),
+            &retry,
+        )
+        .await?;
+        if let Some(path) = &request.output_json {
+            write_output_json(
+                path,
+                &target_ref,
+                std::slice::from_ref(&outcome),
+                started.elapsed().as_secs_f64(),
+            )?;
+        }
+        info!(
+            target = %target_ref,
+            manifest = %outcome.manifest.digest,
+            data_blobs = outcome.data_blob_count,
+            "convert complete: pushed nydus image"
+        );
+        return Ok(());
+    }
+
+    // Multi-platform: --merge-platform is required (mirrors the Go tool — we do
+    // not silently pick one, nor push N tag-less manifests with no index to
+    // find them by).
+    if !request.driver.merge_manifest {
+        bail!(
+            "source resolves to {} platforms ({}); pass --merge-platform to publish them as one \
+             multi-arch image, or --platform to pick one",
+            plan.selectors.len(),
+            plan.selectors.join(", ")
+        );
+    }
+
+    let mut outcomes = Vec::with_capacity(plan.selectors.len());
+    for (i, selector) in plan.selectors.iter().enumerate() {
+        info!(platform = %selector, "converting platform {}/{}", i + 1, plan.selectors.len());
+        // Per-platform manifests are pushed BY DIGEST (only the index carries
+        // the tag), each in its own workspace subdir so builds don't collide.
+        let outcome = convert_one_platform(
+            request,
+            &source_client,
+            &target_client,
+            &source_ref,
+            &target_ref,
+            same_registry,
+            selector,
+            PushTarget::ByDigest,
+            &workspace.join(format!("p{i}")),
+            &retry,
+        )
+        .await?;
+        outcomes.push(outcome);
+    }
+
+    // Assemble and push the OCI image index at the target tag.
+    let index_manifests: Vec<Descriptor> = outcomes
+        .iter()
+        .map(|o| {
+            let mut d = o.manifest.clone();
+            d.platform = Some(o.platform.clone());
+            d
+        })
+        .collect();
+    let index = assemble_index(request.driver.docker2oci, index_manifests);
+    let index_bytes = serde_json::to_vec(&index).context("serialize multi-platform index")?;
+    let index_media = index_media_type(request.driver.docker2oci);
+    let index_digest = retry
+        .run("push multi-platform index", || {
+            target_client.push_manifest(
+                &target_ref.repo,
+                target_ref.manifest_reference(),
+                index_media,
+                &index_bytes,
+            )
+        })
+        .await
+        .with_context(|| format!("push multi-platform index to {target_ref}"))?;
+
+    if let Some(path) = &request.output_json {
+        write_output_json(
+            path,
+            &target_ref,
+            &outcomes,
+            started.elapsed().as_secs_f64(),
+        )?;
+    }
+    info!(
+        target = %target_ref,
+        index = %index_digest,
+        platforms = outcomes.len(),
+        "convert complete: pushed multi-platform nydus image"
+    );
+    Ok(())
+}
+
+/// Where a converted per-platform manifest is published.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PushTarget {
+    /// Push at the target reference's tag (single-platform convert).
+    Tag,
+    /// Push by the manifest's own digest (each leaf of a multi-arch index).
+    ByDigest,
+}
+
+/// One converted platform: the pushed manifest descriptor plus the accounting
+/// the Go-schema `--output-json` reports.
+struct PlatformOutcome {
+    /// Descriptor of the pushed per-platform nydus manifest.
+    manifest: Descriptor,
+    /// The platform this manifest targets (for index entries + reporting).
+    platform: registry_client::types::Platform,
+    /// Sum of source layer (compressed) sizes.
+    source_size: u64,
+    /// Sum of pushed nydus content (data blobs + bootstrap + config + manifest).
+    target_size: u64,
+    /// Number of data blobs in the pushed manifest.
+    data_blob_count: usize,
+}
+
+/// The set of platform selectors a convert request expands to.
+struct PlatformPlan {
+    selectors: Vec<String>,
+}
+
+/// Resolve `--platform` / `--all-platforms` against the source's top-level
+/// reference into a concrete selector list.
+async fn resolve_platform_plan(
+    request: &ConvertRequest,
+    client: &RegistryClient,
+    source_ref: &ImageReference,
+) -> Result<PlatformPlan> {
+    let fetched = client
+        .get_manifest(&source_ref.repo, source_ref.manifest_reference())
+        .await
+        .with_context(|| format!("fetch source manifest {source_ref}"))?;
+
+    if !is_index(fetched.content_type.as_deref(), &fetched.bytes) {
+        // A single-arch source has exactly one platform to convert. Multiple
+        // requested platforms cannot be satisfied by a non-index source.
+        if request.all_platforms {
+            bail!(
+                "--all-platforms requires a multi-arch source; {source_ref} is a single manifest"
+            );
+        }
+        let requested = parse_platform_list(&request.platforms)?;
+        if requested.len() > 1 {
+            bail!(
+                "--platform names {} platforms but {source_ref} is a single manifest",
+                requested.len()
+            );
+        }
+        return Ok(PlatformPlan {
+            selectors: vec![requested.into_iter().next().unwrap()],
+        });
+    }
+
+    let index: Index =
+        serde_json::from_slice(&fetched.bytes).context("parse source image index")?;
+    let selectors = if request.all_platforms {
+        let all = all_platform_selectors(&index);
+        if all.is_empty() {
+            bail!("--all-platforms: source index {source_ref} lists no platform-tagged manifests");
+        }
+        all
+    } else {
+        // Validate every requested selector resolves in the index up front.
+        let requested = parse_platform_list(&request.platforms)?;
+        for sel in &requested {
+            select_platform(&index, sel)?;
+        }
+        requested
+    };
+    Ok(PlatformPlan { selectors })
+}
+
+/// Convert exactly one platform end-to-end (pull → build → push, plus an
+/// optional referrer) and report its accounting. Shared by the single- and
+/// multi-platform paths.
+#[allow(clippy::too_many_arguments)]
+async fn convert_one_platform(
+    request: &ConvertRequest,
+    source_client: &RegistryClient,
+    target_client: &RegistryClient,
+    source_ref: &ImageReference,
+    target_ref: &ImageReference,
+    same_registry: bool,
+    platform: &str,
+    push_target: PushTarget,
+    workspace: &Path,
+    retry: &RetryPolicy,
+) -> Result<PlatformOutcome> {
+    std::fs::create_dir_all(workspace)
+        .with_context(|| format!("create platform workspace {}", workspace.display()))?;
+
+    // ---- pull ----
+    let source = pull_source(request, source_client, source_ref, platform, workspace).await?;
+    info!(
+        source = %source_ref,
+        platform = %platform,
+        layers = source.layers.len(),
+        oci_ref = request.driver.oci_ref,
+        "pulled source image; building nydus artifact"
+    );
+
+    // ---- build (nydus-image subprocess) ----
+    let output = build_artifact(request, &source.layers, workspace)?;
+
+    // ---- push ----
     let pushed = push_artifact(
         request,
-        &target_client,
-        &target_ref,
-        &source_ref,
+        target_client,
+        target_ref,
+        source_ref,
         same_registry,
         &source,
         &output,
-        &retry,
+        push_target,
+        retry,
     )
     .await?;
 
-    // ---- attach a referrer artifact to the source image (--with-referrer) ----
+    // ---- referrer (--with-referrer) ----
     // Data blobs in image-layer order: reused gzip layers (oci-ref) then the
-    // newly-built nydus blobs. Pushed to the source repo so the referrer
-    // resolves alongside its subject.
+    // newly-built nydus blobs. The subject is the per-platform source manifest
+    // so a multi-arch conversion attaches one referrer per platform.
     let mut data_blob_files: Vec<PathBuf> = output
         .reused_layers
         .iter()
@@ -150,26 +365,22 @@ pub async fn run_conversion(request: &ConvertRequest, workspace: &Path) -> Resul
     data_blob_files.extend(output.new_blobs.iter().cloned());
     maybe_push_referrer(
         request.driver.with_referrer,
-        &source_client,
+        source_client,
         &source_ref.repo,
         &data_blob_files,
         &output.bootstrap,
-        &source.manifest_desc,
-        &retry,
+        &source.referrer_subject,
+        retry,
     )
     .await?;
 
-    if let Some(path) = &request.output_json {
-        write_output_json(path, &target_ref, &pushed, &output)?;
-    }
-
-    info!(
-        target = %target_ref,
-        manifest = %pushed.digest,
-        data_blobs = output.reused_layers.len() + output.new_blobs.len(),
-        "convert complete: pushed nydus image"
-    );
-    Ok(())
+    Ok(PlatformOutcome {
+        target_size: pushed.target_size,
+        manifest: pushed.manifest,
+        platform: source.platform,
+        source_size: source.source_size,
+        data_blob_count: output.reused_layers.len() + output.new_blobs.len(),
+    })
 }
 
 /// Reject unsupported options with explicit errors instead of silently
@@ -177,11 +388,6 @@ pub async fn run_conversion(request: &ConvertRequest, workspace: &Path) -> Resul
 fn reject_unsupported(request: &ConvertRequest) -> Result<()> {
     if request.mode == ConversionMode::Reverse {
         bail!("--reverse (nydus->OCI) conversion is not yet supported by nydusify-rs (follow-up)");
-    }
-    if request.all_platforms {
-        bail!(
-            "--all-platforms is not yet supported by nydusify-rs; convert one platform at a time with --platform (follow-up)"
-        );
     }
     if request.source_archive.is_some() || request.target_archive.is_some() {
         bail!(
@@ -209,11 +415,6 @@ fn reject_unsupported(request: &ConvertRequest) -> Result<()> {
     }
     if !d.cache_ref.is_empty() {
         bail!("--build-cache is not yet supported by nydusify-rs (follow-up)");
-    }
-    if d.merge_manifest {
-        bail!(
-            "--merge-platform/--multi-platform is not yet supported by nydusify-rs; convert one platform at a time (follow-up)"
-        );
     }
     if d.backend_force_push {
         bail!("--backend-force-push is not yet supported by nydusify-rs (follow-up)");
@@ -244,26 +445,14 @@ fn reject_unsupported(request: &ConvertRequest) -> Result<()> {
 // Pull
 // ---------------------------------------------------------------------------
 
-/// Build the referrer `subject` descriptor from the top-level fetched
-/// reference. For a multi-arch source this describes the image INDEX (the
-/// digest `nydusify check` and the snapshotter resolve), not the
-/// platform-resolved manifest.
-fn top_level_subject_descriptor(fetched: &registry_client::FetchedManifest) -> Descriptor {
-    // When the registry omits Content-Type, sniff index-vs-manifest from the
-    // body instead of defaulting blindly: labeling an index subject with the
-    // manifest media type is cosmetically wrong even though referrers resolve
-    // by digest.
-    let media_type = fetched.content_type.clone().unwrap_or_else(|| {
-        if is_index(None, &fetched.bytes) {
-            registry_client::types::MEDIA_TYPE_OCI_INDEX.to_string()
-        } else {
-            manifest_media_type(true).to_string()
-        }
-    });
+/// Build a referrer `subject` descriptor for a resolved per-platform (or
+/// single-arch) manifest — the digest `nydusify check` and the snapshotter
+/// resolve the referrer against.
+fn subject_descriptor(digest: String, size: u64, docker2oci: bool) -> Descriptor {
     Descriptor {
-        media_type,
-        digest: fetched.digest.clone(),
-        size: fetched.bytes.len() as u64,
+        media_type: manifest_media_type(docker2oci).to_string(),
+        digest,
+        size,
         ..Descriptor::default()
     }
 }
@@ -272,6 +461,7 @@ async fn pull_source(
     request: &ConvertRequest,
     client: &RegistryClient,
     source_ref: &ImageReference,
+    platform: &str,
     workspace: &Path,
 ) -> Result<PulledSource> {
     let repo = &source_ref.repo;
@@ -280,24 +470,39 @@ async fn pull_source(
         .await
         .with_context(|| format!("fetch source manifest {source_ref}"))?;
 
-    // The referrer subject / fallback tag is derived from the TOP-LEVEL fetched
-    // reference (the index digest for a multi-arch source), captured before any
-    // index->platform resolution so convert and `nydusify check` agree.
-    let manifest_desc = top_level_subject_descriptor(&fetched);
+    // Resolve an index/manifest-list down to this platform's manifest, and
+    // capture the platform descriptor for the index entry.
+    let (image_bytes, image_digest, plat) =
+        if is_index(fetched.content_type.as_deref(), &fetched.bytes) {
+            let index: Index =
+                serde_json::from_slice(&fetched.bytes).context("parse source image index")?;
+            let selected = select_platform(&index, platform)?;
+            let plat = selected.platform.clone().unwrap_or_default();
+            let img = client
+                .get_manifest(repo, &selected.digest)
+                .await
+                .with_context(|| format!("fetch platform manifest {}", selected.digest))?;
+            (img.bytes, img.digest, plat)
+        } else {
+            // Single-arch source: honor the requested platform selector for the
+            // index entry's platform field (a single-arch image carries no
+            // platform of its own in the manifest).
+            let (os, arch, variant) = crate::engine::oci::parse_platform(platform)?;
+            let plat = registry_client::types::Platform {
+                architecture: arch,
+                os,
+                variant,
+                ..Default::default()
+            };
+            (fetched.bytes, fetched.digest, plat)
+        };
 
-    // Resolve an index/manifest-list down to a single platform manifest.
-    let (image_bytes, image_digest) = if is_index(fetched.content_type.as_deref(), &fetched.bytes) {
-        let index: Index =
-            serde_json::from_slice(&fetched.bytes).context("parse source image index")?;
-        let selected = select_platform(&index, &request.platforms)?;
-        let img = client
-            .get_manifest(repo, &selected.digest)
-            .await
-            .with_context(|| format!("fetch platform manifest {}", selected.digest))?;
-        (img.bytes, img.digest)
-    } else {
-        (fetched.bytes, fetched.digest)
-    };
+    // The referrer subject and fallback tag resolve against THIS manifest.
+    let referrer_subject = subject_descriptor(
+        image_digest.clone(),
+        image_bytes.len() as u64,
+        request.driver.docker2oci,
+    );
 
     let manifest: Manifest =
         serde_json::from_slice(&image_bytes).context("parse source image manifest")?;
@@ -305,6 +510,7 @@ async fn pull_source(
         bail!("source image manifest {image_digest} has no layers");
     }
     validate_layer_media_types(&manifest)?;
+    let source_size: u64 = manifest.layers.iter().map(|l| l.size).sum();
 
     let config_bytes = client
         .get_blob(repo, &manifest.config.digest)
@@ -328,7 +534,9 @@ async fn pull_source(
     }
 
     Ok(PulledSource {
-        manifest_desc,
+        referrer_subject,
+        platform: plat,
+        source_size,
         config_bytes,
         layers,
     })
@@ -594,6 +802,14 @@ fn parse_prefetch_files(patterns: &str) -> Vec<String> {
 // ---------------------------------------------------------------------------
 
 #[allow(clippy::too_many_arguments)]
+/// A pushed per-platform nydus manifest plus the total bytes of nydus content
+/// it published (data blobs + bootstrap + config + manifest), for reporting.
+struct PushedArtifact {
+    manifest: Descriptor,
+    target_size: u64,
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn push_artifact(
     request: &ConvertRequest,
     client: &RegistryClient,
@@ -602,8 +818,9 @@ async fn push_artifact(
     same_registry: bool,
     source: &PulledSource,
     output: &ConversionOutput,
+    push_target: PushTarget,
     retry: &RetryPolicy,
-) -> Result<Descriptor> {
+) -> Result<PushedArtifact> {
     let repo = &target_ref.repo;
     let docker2oci = request.driver.docker2oci;
 
@@ -676,37 +893,87 @@ async fn push_artifact(
         ..Descriptor::default()
     };
 
+    // Accumulate published nydus content size before consuming data_blobs.
+    let content_size: u64 =
+        data_blobs.iter().map(|d| d.size).sum::<u64>() + bootstrap.size + config.size;
+
     // Manifest.
     let manifest = assemble_manifest(docker2oci, config, data_blobs, bootstrap);
     let manifest_bytes = serde_json::to_vec(&manifest).context("serialize nydus manifest")?;
     let media_type = manifest_media_type(docker2oci);
-    let reference = target_ref.manifest_reference();
-    let manifest_digest = retry
+    // Single-platform: publish at the target tag. A leaf of a multi-arch index:
+    // publish by its own digest (the index references it by digest; only the
+    // index carries the tag).
+    let manifest_digest = registry_client::types::sha256_digest(&manifest_bytes);
+    let reference: &str = match push_target {
+        PushTarget::Tag => target_ref.manifest_reference(),
+        PushTarget::ByDigest => &manifest_digest,
+    };
+    let pushed_digest = retry
         .run("push nydus manifest", || {
             client.push_manifest(repo, reference, media_type, &manifest_bytes)
         })
         .await
         .with_context(|| format!("push nydus manifest to {target_ref}"))?;
 
-    Ok(Descriptor {
-        media_type: media_type.to_string(),
-        digest: manifest_digest,
-        size: manifest_bytes.len() as u64,
-        ..Descriptor::default()
+    Ok(PushedArtifact {
+        manifest: Descriptor {
+            media_type: media_type.to_string(),
+            digest: pushed_digest,
+            size: manifest_bytes.len() as u64,
+            ..Descriptor::default()
+        },
+        target_size: content_size + manifest_bytes.len() as u64,
     })
+}
+
+/// Serialize the convert summary to `--output-json`. The original fields
+/// (`target`, `manifest_digest`, `manifest_size`, `data_blobs`) describe the
+/// primary manifest (the sole platform, or the first of a merged set) and are
+/// kept for compatibility; the Go-parity metric fields are a superset:
+/// `SourceImageSize` / `TargetImageSize` (byte totals across converted
+/// platforms) and `ConversionElapsed` (seconds, filled by the caller). A
+/// `platforms` array carries the per-platform breakdown.
+fn platform_string(p: &registry_client::types::Platform) -> String {
+    match &p.variant {
+        Some(v) => format!("{}/{}/{}", p.os, p.architecture, v),
+        None => format!("{}/{}", p.os, p.architecture),
+    }
 }
 
 fn write_output_json(
     path: &Path,
     target_ref: &ImageReference,
-    pushed: &Descriptor,
-    output: &ConversionOutput,
+    outcomes: &[PlatformOutcome],
+    elapsed_secs: f64,
 ) -> Result<()> {
+    let primary = outcomes
+        .first()
+        .expect("write_output_json requires at least one converted platform");
+    let source_total: u64 = outcomes.iter().map(|o| o.source_size).sum();
+    let target_total: u64 = outcomes.iter().map(|o| o.target_size).sum();
+    let per_platform: Vec<serde_json::Value> = outcomes
+        .iter()
+        .map(|o| {
+            serde_json::json!({
+                "platform": platform_string(&o.platform),
+                "manifest_digest": o.manifest.digest,
+                "manifest_size": o.manifest.size,
+                "data_blobs": o.data_blob_count,
+                "SourceImageSize": o.source_size,
+                "TargetImageSize": o.target_size,
+            })
+        })
+        .collect();
     let summary = serde_json::json!({
         "target": target_ref.to_string(),
-        "manifest_digest": pushed.digest,
-        "manifest_size": pushed.size,
-        "data_blobs": output.reused_layers.len() + output.new_blobs.len(),
+        "manifest_digest": primary.manifest.digest,
+        "manifest_size": primary.manifest.size,
+        "data_blobs": primary.data_blob_count,
+        "SourceImageSize": source_total,
+        "TargetImageSize": target_total,
+        "ConversionElapsed": format!("{elapsed_secs:.3}s"),
+        "platforms": per_platform,
     });
     std::fs::write(path, serde_json::to_vec_pretty(&summary)?)
         .with_context(|| format!("write --output-json {}", path.display()))
@@ -856,44 +1123,52 @@ mod tests {
     }
 
     #[test]
-    fn subject_descriptor_uses_top_level_index_digest_for_multi_arch() {
-        use registry_client::FetchedManifest;
-        use registry_client::types::{MEDIA_TYPE_OCI_INDEX, sha256_digest};
-
-        // Simulate the top-level fetch of a multi-arch image: an index whose own
-        // digest is what `nydusify check` / the snapshotter resolve. The
-        // referrer subject MUST be this index digest, not a platform manifest's.
-        let index_bytes = br#"{"schemaVersion":2,"manifests":[]}"#.to_vec();
-        let index_digest = sha256_digest(&index_bytes);
-        let fetched = FetchedManifest {
-            bytes: index_bytes.clone(),
-            digest: index_digest.clone(),
-            content_type: Some(MEDIA_TYPE_OCI_INDEX.to_string()),
-        };
-
-        let subject = top_level_subject_descriptor(&fetched);
-        assert_eq!(subject.digest, index_digest);
-        assert_eq!(subject.media_type, MEDIA_TYPE_OCI_INDEX);
-        assert_eq!(subject.size, index_bytes.len() as u64);
-
-        // The fallback tag convert publishes under equals the one `check` looks
-        // up (both from this top-level digest).
+    fn subject_descriptor_resolves_against_the_per_platform_manifest() {
+        // The referrer subject is now the resolved per-platform (or single-arch)
+        // manifest digest — so a merged multi-arch conversion attaches one
+        // referrer per platform, each resolvable from its own subject, and the
+        // fallback tag `check` looks up matches.
+        let subject = subject_descriptor("sha256:deadbeef".to_string(), 512, true);
+        assert_eq!(subject.digest, "sha256:deadbeef");
+        assert_eq!(subject.size, 512);
+        assert_eq!(subject.media_type, manifest_media_type(true));
         assert_eq!(
             crate::engine::artifact::fallback_referrers_tag(&subject.digest),
-            index_digest.replace(':', "-")
+            "sha256-deadbeef"
         );
     }
 
     #[test]
-    fn subject_descriptor_defaults_media_type_when_absent() {
-        use registry_client::FetchedManifest;
-        let fetched = FetchedManifest {
-            bytes: b"{}".to_vec(),
-            digest: "sha256:abc".to_string(),
-            content_type: None,
+    fn output_json_reports_go_parity_totals_across_platforms() {
+        use registry_client::types::Platform;
+        let outcome = |os: &str, arch: &str, src: u64, tgt: u64| PlatformOutcome {
+            manifest: Descriptor::for_bytes(manifest_media_type(true), b"{}"),
+            platform: Platform {
+                architecture: arch.to_string(),
+                os: os.to_string(),
+                ..Default::default()
+            },
+            source_size: src,
+            target_size: tgt,
+            data_blob_count: 2,
         };
-        let subject = top_level_subject_descriptor(&fetched);
-        assert_eq!(subject.media_type, manifest_media_type(true));
+        let outcomes = vec![
+            outcome("linux", "amd64", 100, 40),
+            outcome("linux", "arm64", 120, 50),
+        ];
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("out.json");
+        let target = ImageReference::parse("registry.local/app:nydus").unwrap();
+        write_output_json(&path, &target, &outcomes, 1.5).unwrap();
+
+        let v: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(v["SourceImageSize"], 220);
+        assert_eq!(v["TargetImageSize"], 90);
+        assert_eq!(v["ConversionElapsed"], "1.500s");
+        assert_eq!(v["platforms"].as_array().unwrap().len(), 2);
+        assert_eq!(v["platforms"][1]["platform"], "linux/arm64");
+        // Legacy fields still describe the primary (first) platform.
+        assert_eq!(v["data_blobs"], 2);
     }
 
     fn manifest_with_layer_media_type(mt: &str) -> Manifest {

@@ -72,6 +72,41 @@ pub fn parse_platform(selector: &str) -> Result<(String, String, Option<String>)
     Ok((os.to_string(), arch.to_string(), variant))
 }
 
+/// Split a comma-separated `--platform` value into individual `os/arch[/variant]`
+/// selectors, dropping empty entries. A single selector yields a one-element
+/// vec, so callers can treat single- and multi-platform requests uniformly.
+pub fn parse_platform_list(value: &str) -> Result<Vec<String>> {
+    let selectors: Vec<String> = value
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect();
+    if selectors.is_empty() {
+        bail!("empty --platform value");
+    }
+    // Validate each up front so a typo fails before any network work.
+    for sel in &selectors {
+        parse_platform(sel)?;
+    }
+    Ok(selectors)
+}
+
+/// Every index entry that carries a platform field, formatted as
+/// `os/arch[/variant]` selectors. Used to expand `--all-platforms`.
+pub fn all_platform_selectors(index: &Index) -> Vec<String> {
+    index
+        .manifests
+        .iter()
+        .filter_map(|d| d.platform.as_ref())
+        .filter(|p| !p.os.is_empty() && !p.architecture.is_empty())
+        .map(|p| match &p.variant {
+            Some(v) => format!("{}/{}/{}", p.os, p.architecture, v),
+            None => format!("{}/{}", p.os, p.architecture),
+        })
+        .collect()
+}
+
 /// Select the manifest descriptor matching `platform_selector` from an index.
 pub fn select_platform<'a>(index: &'a Index, platform_selector: &str) -> Result<&'a Descriptor> {
     let (os, arch, variant) = parse_platform(platform_selector)?;
@@ -208,5 +243,39 @@ mod tests {
         let (os, arch, variant) = parse_platform("linux/arm/v7").unwrap();
         assert_eq!((os.as_str(), arch.as_str()), ("linux", "arm"));
         assert_eq!(variant.as_deref(), Some("v7"));
+    }
+
+    #[test]
+    fn parse_platform_list_splits_and_validates() {
+        assert_eq!(
+            parse_platform_list("linux/amd64, linux/arm64/v8 ,").unwrap(),
+            vec!["linux/amd64".to_string(), "linux/arm64/v8".to_string()]
+        );
+        assert_eq!(
+            parse_platform_list("linux/amd64").unwrap(),
+            vec!["linux/amd64".to_string()]
+        );
+        // A malformed member fails the whole list up front.
+        assert!(parse_platform_list("linux/amd64,linux").is_err());
+        assert!(parse_platform_list("  ,  ").is_err());
+    }
+
+    #[test]
+    fn all_platform_selectors_lists_platform_tagged_entries_only() {
+        let index = index_of(vec![
+            platform_desc("linux", "amd64", None, "sha256:amd"),
+            platform_desc("linux", "arm64", Some("v8"), "sha256:arm"),
+            // A bare descriptor (e.g. an attestation manifest) with no platform
+            // is skipped.
+            Descriptor {
+                media_type: "application/vnd.oci.image.manifest.v1+json".to_string(),
+                digest: "sha256:att".to_string(),
+                ..Descriptor::default()
+            },
+        ]);
+        assert_eq!(
+            all_platform_selectors(&index),
+            vec!["linux/amd64".to_string(), "linux/arm64/v8".to_string()]
+        );
     }
 }

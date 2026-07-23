@@ -22,9 +22,9 @@ use std::collections::BTreeMap;
 use anyhow::{Context, Result, anyhow, bail};
 use registry_client::Descriptor;
 use registry_client::types::{
-    History, ImageConfig, MEDIA_TYPE_DOCKER_CONFIG, MEDIA_TYPE_DOCKER_MANIFEST,
-    MEDIA_TYPE_NYDUS_BLOB, MEDIA_TYPE_NYDUS_BOOTSTRAP_LAYER, MEDIA_TYPE_OCI_CONFIG,
-    MEDIA_TYPE_OCI_MANIFEST, Manifest,
+    History, ImageConfig, Index, MEDIA_TYPE_DOCKER_CONFIG, MEDIA_TYPE_DOCKER_MANIFEST,
+    MEDIA_TYPE_DOCKER_MANIFEST_LIST, MEDIA_TYPE_NYDUS_BLOB, MEDIA_TYPE_NYDUS_BOOTSTRAP_LAYER,
+    MEDIA_TYPE_OCI_CONFIG, MEDIA_TYPE_OCI_INDEX, MEDIA_TYPE_OCI_MANIFEST, Manifest,
 };
 
 /// Annotation set on nydus data-blob layers so containerd's snapshotter
@@ -143,6 +143,29 @@ pub fn assemble_manifest(
     }
 }
 
+/// Assemble a multi-platform OCI image **index** from the per-platform nydus
+/// manifest descriptors (each must carry its `platform`). The index media type
+/// follows `docker2oci` so a docker-schema conversion still produces a docker
+/// manifest list. Callers push the per-platform manifests by digest first,
+/// then push this index at the target tag.
+pub fn assemble_index(docker2oci: bool, manifests: Vec<Descriptor>) -> Index {
+    Index {
+        schema_version: 2,
+        media_type: Some(index_media_type(docker2oci).to_string()),
+        manifests,
+        annotations: None,
+    }
+}
+
+/// The image-index / manifest-list media type to publish under, per `docker2oci`.
+pub fn index_media_type(docker2oci: bool) -> &'static str {
+    if docker2oci {
+        MEDIA_TYPE_OCI_INDEX
+    } else {
+        MEDIA_TYPE_DOCKER_MANIFEST_LIST
+    }
+}
+
 /// Locate the nydus bootstrap layer in a (pulled) nydus image manifest.
 ///
 /// Prefers a layer annotated `containerd.io/snapshot/nydus-bootstrap = "true"`
@@ -216,6 +239,40 @@ mod tests {
         assert_eq!(config_media_type(false), MEDIA_TYPE_DOCKER_CONFIG);
         // Manifest media type is never a manifest-list/index type.
         assert_ne!(manifest_media_type(false), MEDIA_TYPE_DOCKER_MANIFEST_LIST);
+    }
+
+    #[test]
+    fn assemble_index_carries_platforms_and_switches_media_type() {
+        use registry_client::types::{MEDIA_TYPE_OCI_INDEX, Platform};
+        let leaf = |arch: &str| Descriptor {
+            media_type: MEDIA_TYPE_OCI_MANIFEST.to_string(),
+            digest: format!("sha256:{arch}"),
+            size: 10,
+            platform: Some(Platform {
+                architecture: arch.to_string(),
+                os: "linux".to_string(),
+                ..Default::default()
+            }),
+            ..Descriptor::default()
+        };
+        let oci = assemble_index(true, vec![leaf("amd64"), leaf("arm64")]);
+        assert_eq!(oci.media_type.as_deref(), Some(MEDIA_TYPE_OCI_INDEX));
+        assert_eq!(oci.manifests.len(), 2);
+        assert_eq!(
+            oci.manifests[1].platform.as_ref().unwrap().architecture,
+            "arm64"
+        );
+        // A round-trip serialization keeps the index parseable.
+        let bytes = serde_json::to_vec(&oci).unwrap();
+        let back: registry_client::types::Index = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(back.manifests.len(), 2);
+
+        // docker2oci=false publishes a docker manifest list.
+        let docker = assemble_index(false, vec![leaf("amd64")]);
+        assert_eq!(
+            docker.media_type.as_deref(),
+            Some(MEDIA_TYPE_DOCKER_MANIFEST_LIST)
+        );
     }
 
     #[test]
