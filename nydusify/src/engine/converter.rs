@@ -555,9 +555,16 @@ fn run_optimize(
     ];
     run_nydus_image(nydus_image, &args, "optimize")?;
 
+    // Validate the prefetch blob BEFORE swapping bootstraps: if the rename
+    // happened first, a validation failure would leave the optimized
+    // bootstrap (which references the un-pushed prefetch blob) in place while
+    // the caller logs "pushing un-optimized bootstrap" — publishing a
+    // bootstrap whose prefetch blob never reaches the registry.
+    let prefetch_blob =
+        expect_single_output(&out_blob_dir, None).context("locating optimize prefetch blob")?;
     std::fs::rename(&optimized, bootstrap)
         .context("replace merged bootstrap with optimized one")?;
-    expect_single_output(&out_blob_dir, None).context("locating optimize prefetch blob")
+    Ok(prefetch_blob)
 }
 
 /// Parse `prefetch_patterns` into concrete in-image file paths. The root
