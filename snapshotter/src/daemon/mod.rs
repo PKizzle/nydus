@@ -545,7 +545,7 @@ impl DaemonSupervisor {
             return None;
         }
         inst.acquire_holder(holder);
-        if let Err(e) = self.persist_instance_record(inst, true) {
+        if let Err(e) = self.persist_instance_record(inst, true).await {
             warn!(image_ref, error = %e, "failed to persist daemon record");
         }
         Some(Arc::new(MountHandle {
@@ -577,7 +577,7 @@ impl DaemonSupervisor {
                 if let Err(e) = stop_instance(&old) {
                     warn!(image_ref, error = %e, "failed to stop unhealthy daemon before replacement");
                 }
-                if let Err(e) = self.persist_instance_record(&old, false) {
+                if let Err(e) = self.persist_instance_record(&old, false).await {
                     warn!(image_ref, error = %e, "failed to persist stopped daemon record");
                 }
                 self.clear_failover_state(&slug_for(image_ref));
@@ -640,7 +640,7 @@ impl DaemonSupervisor {
         let mut instances = self.instances.write().await;
         instances.insert(image_ref.to_string(), instance);
         if let Some(inst) = instances.get(image_ref)
-            && let Err(e) = self.persist_instance_record(inst, true)
+            && let Err(e) = self.persist_instance_record(inst, true).await
         {
             warn!(image_ref, error = %e, "failed to persist daemon record");
         }
@@ -710,7 +710,7 @@ impl DaemonSupervisor {
         let mut instances = self.instances.write().await;
         instances.insert(image_ref.to_string(), instance);
         if let Some(inst) = instances.get(image_ref)
-            && let Err(e) = self.persist_instance_record(inst, true)
+            && let Err(e) = self.persist_instance_record(inst, true).await
         {
             warn!(image_ref, error = %e, "failed to persist daemon record");
         }
@@ -848,7 +848,7 @@ impl DaemonSupervisor {
                 );
             }
             if is_healthy_state(inst.daemon.get_state()) {
-                if let Err(e) = self.persist_instance_record(inst, true) {
+                if let Err(e) = self.persist_instance_record(inst, true).await {
                     warn!(image_ref, error = %e, "failed to persist daemon record");
                 }
                 return Ok(self.record_for_instance(inst, true));
@@ -863,7 +863,7 @@ impl DaemonSupervisor {
             if let Err(e) = stop_instance(&old) {
                 warn!(image_ref, error = %e, "failed to stop unhealthy daemon before respawn");
             }
-            if let Err(e) = self.persist_instance_record(&old, false) {
+            if let Err(e) = self.persist_instance_record(&old, false).await {
                 warn!(image_ref, error = %e, "failed to persist stopped daemon record");
             }
             self.clear_failover_state(&slug_for(image_ref));
@@ -876,7 +876,7 @@ impl DaemonSupervisor {
         let record = self.record_for_instance(&instance, true);
         instances.insert(image_ref.to_string(), instance);
         if let Some(inst) = instances.get(image_ref)
-            && let Err(e) = self.persist_instance_record(inst, true)
+            && let Err(e) = self.persist_instance_record(inst, true).await
         {
             warn!(image_ref, error = %e, "failed to persist daemon record");
         }
@@ -900,7 +900,7 @@ impl DaemonSupervisor {
                 if let Err(e) = stop_instance(&inst) {
                     warn!(image_ref, error = %e, "failed to stop nydus daemon cleanly");
                 }
-                if let Err(e) = self.persist_instance_record(&inst, false) {
+                if let Err(e) = self.persist_instance_record(&inst, false).await {
                     warn!(image_ref, error = %e, "failed to persist stopped daemon record");
                 }
                 // Fully torn down: a preserved fd or state blob left behind
@@ -908,7 +908,7 @@ impl DaemonSupervisor {
                 self.clear_failover_state(&slug_for(image_ref));
             }
         } else if let Some(inst) = instances.get(image_ref)
-            && let Err(e) = self.persist_instance_record(inst, true)
+            && let Err(e) = self.persist_instance_record(inst, true).await
         {
             warn!(image_ref, error = %e, "failed to persist daemon record");
         }
@@ -943,7 +943,7 @@ impl DaemonSupervisor {
             let before = inst.refcount.load(Ordering::SeqCst);
             if before > target {
                 inst.refcount.store(target, Ordering::SeqCst);
-                if let Err(e) = self.persist_instance_record(inst, true) {
+                if let Err(e) = self.persist_instance_record(inst, true).await {
                     warn!(image_ref, error = %e, "failed to persist reconciled daemon record");
                 }
                 warn!(
@@ -1252,7 +1252,7 @@ impl DaemonSupervisor {
                 }
                 self.clear_failover_state(&slug);
             }
-            if let Err(e) = self.persist_instance_record(&old, false) {
+            if let Err(e) = self.persist_instance_record(&old, false).await {
                 warn!(image_ref, error = %e, "failed to persist stopped daemon record");
             }
 
@@ -1264,7 +1264,7 @@ impl DaemonSupervisor {
                     // never drain.
                     *instance.holders.lock().unwrap() = holders;
                     let after_state = format!("{:?}", instance.daemon.get_state());
-                    if let Err(e) = self.persist_instance_record(&instance, true) {
+                    if let Err(e) = self.persist_instance_record(&instance, true).await {
                         warn!(image_ref, error = %e, "failed to persist recovered daemon record");
                     }
                     instances.insert(image_ref.clone(), instance);
@@ -1390,7 +1390,7 @@ impl DaemonSupervisor {
         let instances = self.instances.read().await;
         let mut records = Vec::with_capacity(instances.len());
         for inst in instances.values() {
-            self.persist_instance_record(inst, true)?;
+            self.persist_instance_record(inst, true).await?;
             records.push(self.record_for_instance(inst, true));
         }
         Ok(records)
@@ -1423,7 +1423,7 @@ impl DaemonSupervisor {
             if let Err(e) = stop_instance(&inst) {
                 warn!(image_ref, error = %e, "shutdown_all: failed to stop daemon");
             }
-            if let Err(e) = self.persist_instance_record(&inst, false) {
+            if let Err(e) = self.persist_instance_record(&inst, false).await {
                 warn!(image_ref, error = %e, "failed to persist stopped daemon record");
             }
         }
@@ -1893,7 +1893,7 @@ impl DaemonSupervisor {
             match started {
                 Ok(instance) => {
                     instance.refcount.store(record.refcount, Ordering::SeqCst);
-                    if let Err(e) = self.persist_instance_record(&instance, true) {
+                    if let Err(e) = self.persist_instance_record(&instance, true).await {
                         warn!(image_ref = %record.image_ref, error = %e, "failed to persist rebuilt daemon record");
                     }
                     self.instances
@@ -2309,7 +2309,7 @@ impl DaemonSupervisor {
             if let Err(e) = stop_instance(&old) {
                 warn!(image_ref, error = %e, "failed to stop daemon during upgrade");
             }
-            if let Err(e) = self.persist_instance_record(&old, false) {
+            if let Err(e) = self.persist_instance_record(&old, false).await {
                 warn!(image_ref, error = %e, "failed to persist stopped daemon record");
             }
             self.clear_failover_state(&slug);
@@ -2318,7 +2318,7 @@ impl DaemonSupervisor {
                 Ok(instance) => {
                     instance.refcount.store(refcount, Ordering::SeqCst);
                     let after_state = format!("{:?}", instance.daemon.get_state());
-                    if let Err(e) = self.persist_instance_record(&instance, true) {
+                    if let Err(e) = self.persist_instance_record(&instance, true).await {
                         warn!(image_ref, error = %e, "failed to persist upgraded daemon record");
                     }
                     instances.insert(image_ref.clone(), instance);
@@ -2393,22 +2393,26 @@ impl DaemonSupervisor {
         }
     }
 
-    fn persist_instance_record(&self, inst: &DaemonInstance, live: bool) -> Result<()> {
+    async fn persist_instance_record(&self, inst: &DaemonInstance, live: bool) -> Result<()> {
+        // Snapshot the record on the caller's thread (so it reflects state at
+        // the call point), but run the fsync-heavy atomic write on the
+        // blocking pool: two fsyncs per call would otherwise stall the compio
+        // reactor on every Prepare-reuse and release under pod churn. Callers
+        // await the result, so durability ordering with follow-up work (the
+        // fd-store push on the park path) is unchanged.
         let record = self.record_for_instance(inst, live);
-        fs::create_dir_all(self.record_dir()).with_context(|| {
-            format!(
-                "failed to create daemon record directory {}",
-                self.record_dir().display()
-            )
-        })?;
-        let encoded =
-            serde_json::to_vec_pretty(&record).context("failed to encode daemon record")?;
-        atomic_write(&self.record_path(&record.slug), &encoded).with_context(|| {
-            format!(
-                "failed to persist daemon record {}",
-                self.record_path(&record.slug).display()
-            )
+        let dir = self.record_dir();
+        let path = self.record_path(&record.slug);
+        blocking::unblock(move || {
+            fs::create_dir_all(&dir).with_context(|| {
+                format!("failed to create daemon record directory {}", dir.display())
+            })?;
+            let encoded =
+                serde_json::to_vec_pretty(&record).context("failed to encode daemon record")?;
+            atomic_write(&path, &encoded)
+                .with_context(|| format!("failed to persist daemon record {}", path.display()))
         })
+        .await
     }
 
     fn read_persisted_records(&self) -> Vec<DaemonStatusRecord> {
