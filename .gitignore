@@ -25,3 +25,4 @@ pkg/
 # Docker-based Linux build caches (cargo home + target dir mounted into rust containers)
 /.docker-cargo/
 /target-linux/
+BACKLOG.md
