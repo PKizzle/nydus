@@ -10,7 +10,16 @@ rm -rf "$R"; mkdir -p "$R"/{l1,l2,o1,o2,backend,stage,mnt}
 
 mkdir -p "$R/l1/bin"; echo "APP_FROM_LAYER1" > "$R/l1/bin/app"; echo base > "$R/l1/base.txt"
 mkdir -p "$R/l2/data"; head -c 90000 /dev/urandom > "$R/l2/data/payload.bin"; echo top > "$R/l2/top.txt"
-tar -C "$R/l1" -czf "$R/L1.tar.gz" .; tar -C "$R/l2" -czf "$R/L2.tar.gz" .
+tar -C "$R/l1" -czf "$R/L1.tar.gz" .
+# Layer 2 is a MULTI-MEMBER gzip (SOCI-observed pattern): the tar is split at
+# an arbitrary byte boundary, each half gzipped as its own member, and the
+# members concatenated. Decompressed concatenation == the original tar, but
+# the zran indexer must index across the member boundary (the 50000-byte cut
+# lands inside payload.bin's data).
+tar -C "$R/l2" -cf "$R/L2.tar" .
+head -c 50000 "$R/L2.tar" | gzip -c > "$R/L2.tar.gz"
+tail -c +50001 "$R/L2.tar" | gzip -c >> "$R/L2.tar.gz"
+echo "layer2 gzip members: 2 (multi-member; tar size $(stat -c%s "$R/L2.tar") split at 50000)"
 D1=$(sha256sum "$R/L1.tar.gz"|awk '{print $1}'); D2=$(sha256sum "$R/L2.tar.gz"|awk '{print $1}')
 
 B1=$("$NI" create --type targz-ref --fs-version 6 -D "$R/o1" "$R/L1.tar.gz" 2>&1 | sed -n 's/^meta blob path: //p')
