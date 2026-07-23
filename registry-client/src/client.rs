@@ -22,7 +22,10 @@ use crate::auth::{
     fetch_bearer_token, mount_scope, parse_bearer_challenge, percent_encode_query, pull_scope,
     push_scope,
 };
-use crate::types::{MANIFEST_ACCEPT, MEDIA_TYPE_OCTET_STREAM, sha256_digest, verify_digest};
+use crate::types::{
+    Index, MANIFEST_ACCEPT, MEDIA_TYPE_OCI_INDEX, MEDIA_TYPE_OCTET_STREAM, sha256_digest,
+    verify_digest,
+};
 use anyhow::{Context, Result, anyhow, bail};
 use compio::BufResult;
 use compio::io::{AsyncReadAt, AsyncWriteAtExt};
@@ -441,6 +444,65 @@ impl RegistryClient {
         Ok(sha256_digest(bytes))
     }
 
+    /// GET the OCI 1.1 referrers list for `subject_digest`
+    /// (`/v2/<repo>/referrers/<digest>`, OCI distribution spec 1.1). The
+    /// response is an OCI image index whose `manifests[]` are the descriptors
+    /// of the artifact manifests referring to the subject (each carrying the
+    /// artifact's `artifactType` and `annotations`).
+    ///
+    /// `artifact_type`, when given, is sent as the spec's `artifactType`
+    /// query filter AND re-applied client-side (via [`filter_referrers`]):
+    /// the spec allows servers to ignore the query filter, so the local
+    /// filter is authoritative.
+    ///
+    /// Returns `Ok(None)` when the registry does not support the referrers
+    /// API (a `404` on the endpoint — also tolerating the `405`/`400`/`501`
+    /// shapes seen from older registries), so callers can fall back to the
+    /// `sha256-<subject-hex>` fallback tag. A registry that *does* support
+    /// the API but has no referrers returns an empty index, per spec.
+    pub async fn get_referrers(
+        &self,
+        repo: &str,
+        subject_digest: &str,
+        artifact_type: Option<&str>,
+    ) -> Result<Option<Index>> {
+        let mut url = self.referrers_url(repo, subject_digest);
+        if let Some(filter) = artifact_type {
+            url = append_query_param(&url, "artifactType", filter);
+        }
+        let response = self
+            .request_with_auth(
+                Method::GET,
+                &url,
+                &pull_scope(repo),
+                &[(ACCEPT, HeaderValue::from_static(MEDIA_TYPE_OCI_INDEX))],
+                BodySource::Empty,
+                self.timeout,
+            )
+            .await?;
+        match response.status() {
+            status if status.is_success() => {}
+            // 404 is the spec's "referrers API not supported" signal; 405/400/
+            // 501 are equivalent shapes observed from pre-1.1 registries.
+            StatusCode::NOT_FOUND
+            | StatusCode::METHOD_NOT_ALLOWED
+            | StatusCode::BAD_REQUEST
+            | StatusCode::NOT_IMPLEMENTED => {
+                debug!(%repo, subject = %subject_digest, status = %response.status(), "registry does not support the OCI referrers API");
+                return Ok(None);
+            }
+            status => bail!("referrers query for {subject_digest} failed with HTTP {status}"),
+        }
+        let bytes =
+            read_bounded(response, &url, MAX_REGISTRY_BODY_BYTES, self.body_timeout).await?;
+        let mut index: Index = serde_json::from_slice(&bytes)
+            .with_context(|| format!("parse referrers index for {subject_digest}"))?;
+        if let Some(filter) = artifact_type {
+            filter_referrers(&mut index, filter);
+        }
+        Ok(Some(index))
+    }
+
     /// GET the blob endpoint and ensure a success status (shared by the
     /// in-memory and to-file downloads).
     async fn get_blob_response(&self, repo: &str, digest: &str) -> Result<Response> {
@@ -739,6 +801,21 @@ impl RegistryClient {
     fn upload_url(&self, repo: &str) -> String {
         format!("{}/v2/{repo}/blobs/uploads/", self.base)
     }
+
+    fn referrers_url(&self, repo: &str, digest: &str) -> String {
+        format!("{}/v2/{repo}/referrers/{digest}", self.base)
+    }
+}
+
+/// Client-side `artifactType` filter for a referrers index. The OCI 1.1 spec
+/// permits servers to ignore the `artifactType` query parameter (a compliant
+/// server that applied it sets `OCI-Filters-Applied`, but that header is
+/// advisory), so the requested filter must always be re-applied locally.
+/// Descriptors without an `artifactType` are dropped when filtering.
+pub fn filter_referrers(index: &mut Index, artifact_type: &str) {
+    index
+        .manifests
+        .retain(|desc| desc.artifact_type.as_deref() == Some(artifact_type));
 }
 
 /// Read a response header as an owned string.
@@ -899,6 +976,95 @@ mod tests {
             client.upload_url("team/app"),
             "https://registry.local:5000/v2/team/app/blobs/uploads/"
         );
+        assert_eq!(
+            client.referrers_url("team/app", "sha256:abc"),
+            "https://registry.local:5000/v2/team/app/referrers/sha256:abc"
+        );
+        // The artifactType query filter is percent-encoded like any other
+        // query value.
+        assert_eq!(
+            append_query_param(
+                &client.referrers_url("team/app", "sha256:abc"),
+                "artifactType",
+                "application/vnd.oci.image.layer.nydus.blob.v1"
+            ),
+            "https://registry.local:5000/v2/team/app/referrers/sha256:abc?artifactType=application%2Fvnd.oci.image.layer.nydus.blob.v1"
+        );
+    }
+
+    /// The referrers response shape from the OCI distribution spec 1.1: an
+    /// image index whose manifests[] are artifact descriptors carrying
+    /// `artifactType` and `annotations`.
+    const REFERRERS_INDEX_JSON: &str = r#"{
+        "schemaVersion": 2,
+        "mediaType": "application/vnd.oci.image.index.v1+json",
+        "manifests": [
+            {
+                "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                "digest": "sha256:nydusartifact000000000000000000000000000000000000000000000000000",
+                "size": 1234,
+                "artifactType": "application/vnd.oci.image.layer.nydus.blob.v1",
+                "annotations": {"containerd.io/snapshot/nydus-fs-driver": "fanotify"}
+            },
+            {
+                "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                "digest": "sha256:sbomartifact0000000000000000000000000000000000000000000000000000",
+                "size": 5678,
+                "artifactType": "application/spdx+json"
+            },
+            {
+                "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                "digest": "sha256:untyped000000000000000000000000000000000000000000000000000000000",
+                "size": 9
+            }
+        ]
+    }"#;
+
+    #[test]
+    fn referrers_index_parses_artifact_descriptors() {
+        let index: Index = serde_json::from_str(REFERRERS_INDEX_JSON).unwrap();
+        assert_eq!(index.schema_version, 2);
+        assert_eq!(
+            index.media_type.as_deref(),
+            Some("application/vnd.oci.image.index.v1+json")
+        );
+        assert_eq!(index.manifests.len(), 3);
+        let nydus = &index.manifests[0];
+        assert_eq!(
+            nydus.artifact_type.as_deref(),
+            Some("application/vnd.oci.image.layer.nydus.blob.v1")
+        );
+        assert_eq!(
+            nydus
+                .annotations
+                .as_ref()
+                .unwrap()
+                .get("containerd.io/snapshot/nydus-fs-driver")
+                .map(String::as_str),
+            Some("fanotify")
+        );
+        // Absent artifactType parses as None, not an error.
+        assert!(index.manifests[2].artifact_type.is_none());
+    }
+
+    #[test]
+    fn filter_referrers_is_applied_client_side() {
+        // The server may ignore the artifactType query filter entirely, so the
+        // client-side filter must reduce a mixed index to exact matches only.
+        let mut index: Index = serde_json::from_str(REFERRERS_INDEX_JSON).unwrap();
+        filter_referrers(&mut index, "application/vnd.oci.image.layer.nydus.blob.v1");
+        assert_eq!(index.manifests.len(), 1);
+        assert!(
+            index.manifests[0]
+                .digest
+                .starts_with("sha256:nydusartifact")
+        );
+
+        // No matches (including descriptors without any artifactType) leaves
+        // an empty, still-valid index.
+        let mut index: Index = serde_json::from_str(REFERRERS_INDEX_JSON).unwrap();
+        filter_referrers(&mut index, "application/vnd.example.other");
+        assert!(index.manifests.is_empty());
     }
 
     #[compio::test]

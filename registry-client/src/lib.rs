@@ -38,6 +38,16 @@
 //! blobs are deduplicated without an upload, and cross-repo mounting
 //! (`POST ...?mount=<digest>&from=<repo>`) is available separately. Chunked
 //! `PATCH` uploads are deliberately **out of scope** for now.
+//!
+//! # Referrers (OCI 1.1)
+//!
+//! [`RegistryClient::get_referrers`](client::RegistryClient::get_referrers)
+//! implements `GET /v2/<repo>/referrers/<digest>`: the response is an OCI
+//! image index of artifact descriptors. An optional `artifactType` filter is
+//! sent as the spec's query parameter and **always re-applied client-side**
+//! (servers may ignore the query filter). A registry without referrers-API
+//! support is surfaced distinctly so callers can fall back to the
+//! `sha256-<subject-hex>` fallback tag.
 
 pub mod auth;
 pub mod client;
@@ -45,7 +55,7 @@ pub mod reference;
 pub mod tls;
 pub mod types;
 
-pub use client::{FetchedManifest, RegistryClient, RegistryClientOptions};
+pub use client::{FetchedManifest, RegistryClient, RegistryClientOptions, filter_referrers};
 pub use reference::ImageReference;
 pub use types::{
     Descriptor, History, ImageConfig, Index, Manifest, Platform, RootFs, sha256_digest,
