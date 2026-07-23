@@ -200,9 +200,17 @@ impl ContentStoreClient {
     /// and drain the response stream.
     #[instrument(level = "debug", skip(self, labels), fields(path = %path.display()), err)]
     pub async fn write_blob(&self, path: &Path, labels: HashMap<String, String>) -> Result<String> {
-        let bytes = std::fs::read(path)
-            .with_context(|| format!("failed to read {} for upload", path.display()))?;
-        let digest = sha256_of_bytes(&bytes);
+        // Read + hash off the compio reactor: merged bootstraps scale with the
+        // image's file count, and a multi-MiB synchronous read would stall the
+        // event loop for its duration.
+        let path_buf = path.to_path_buf();
+        let (bytes, digest) = blocking::unblock(move || {
+            let bytes = std::fs::read(&path_buf)
+                .with_context(|| format!("failed to read {} for upload", path_buf.display()))?;
+            let digest = sha256_of_bytes(&bytes);
+            Ok::<_, anyhow::Error>((bytes, digest))
+        })
+        .await?;
         let digest_with_prefix = format!("sha256:{digest}");
 
         if self.info(&digest_with_prefix).await?.is_some() {
@@ -298,6 +306,10 @@ impl ContentStoreClient {
                 let stream = futures::stream::once(async move { req });
                 let mut request = tonic::Request::new(stream);
                 attach_namespace(&mut request, &inner.namespace)?;
+                // Peers route bootstrap-sized blobs through this path too, so
+                // mirror write_blob's raised frame cap instead of relying on
+                // the payload staying small.
+                client = client.max_encoding_message_size(64 * 1024 * 1024);
                 let mut response_stream = client
                     .write(request)
                     .await

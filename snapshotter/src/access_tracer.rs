@@ -538,9 +538,6 @@ impl AccessTracer {
         Ok(false)
     }
 
-    /// Called by `AutoZranManager::run_conversion` after a successful sidecar
-    /// upload. Future `attach` calls for this image become no-ops; any
-    /// in-flight state is dropped.
     /// Back-fill the auto_zran link after AccessTracer and AutoZranManager
     /// finish construction. AutoZranManager's `ConversionDeps` need
     /// AccessTracer, so AccessTracer is built first with no auto_zran ref;
@@ -574,6 +571,9 @@ impl AccessTracer {
         }
     }
 
+    /// Called by `AutoZranManager::run_conversion` after a successful sidecar
+    /// upload. Future `attach` calls for this image become no-ops; any
+    /// in-flight state is dropped.
     pub fn mark_image_accelerated(&self, image_ref: &str) {
         // Mutex poisoning means a previous holder panicked. We can still
         // safely manipulate the inner state: the worst case is a stale
@@ -890,6 +890,23 @@ fn check_settle(inner: &Inner, settle_idle: Duration, settle_max: Duration) {
         // Apply settled=true to mounts we just flushed, and prepare flushes.
         for (image_ref, files) in to_settle.into_iter() {
             if files.len() < inner.config.min_files {
+                // Below-threshold captures may still grow until settle_max;
+                // after that they will never produce a flushable profile, so
+                // stop rescanning them every tick (mirrors the empty-capture
+                // branch above).
+                for state in mounts.values_mut() {
+                    if state.image_ref == image_ref
+                        && now.duration_since(state.first_seen) >= settle_max
+                    {
+                        state.settled = true;
+                        debug!(
+                            image = %state.image_ref,
+                            captured = files.len(),
+                            min_files = inner.config.min_files,
+                            "access_tracer: below-threshold capture settled without a profile"
+                        );
+                    }
+                }
                 continue;
             }
             for state in mounts.values_mut() {
