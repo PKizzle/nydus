@@ -64,12 +64,14 @@ cuts a release that lets us switch to a version requirement.
   `snapshotter/Cargo.toml` past it and delete `third_party/bbolt-rs/` + the
   `[patch.crates-io]` entry.
 
-### cyper-core (patches compio-rs/cyper @ `d1c8aff18dd81c4b1f817d0e8e0e05408c15a04c`)
+### cyper-core (patches the 0.9.0 crates.io release)
 
 - **Upstream**: https://github.com/compio-rs/cyper
 - **Local copy**: `third_party/cyper-core/`
-- **Patch target**: `[patch."https://github.com/compio-rs/cyper"]` in
-  `Cargo.toml` (root)
+- **Patch target**: `[patch.crates-io]` in `Cargo.toml` (root). Retargeted
+  2026-07-23 when the whole cyper stack moved from the `d1c8aff` git pin to
+  the crates.io 0.9.0 releases; the vendored `version` must track whatever
+  cyper 0.9.x resolves (same [[patch.unused]] trap as compio-executor).
 - **Bug fixed**: a large-body read throughput regression in cyper-core's
   compio<->hyper stream adapter. compio drains the socket in 8 KiB chunks
   while hyper grows its read cursor toward ~400 KiB for large bodies; the
@@ -102,25 +104,16 @@ cuts a release that lets us switch to a version requirement.
   containerd/rust-extensions release; once it ships tonic >= 0.14, switch
   `containerd-snapshots` to a normal `version = "..."` requirement.
 
-### cyper / cyper-axum
+### cyper / cyper-axum — RESOLVED (moved to crates.io 0.9, 2026-07-23)
 
-- **Pinned in**: `snapshotter/Cargo.toml` (`cyper`, `cyper-axum`),
-  `storage/Cargo.toml` (`cyper`, `cyper-core`)
-- **Upstream**: https://github.com/compio-rs/cyper
-- **Pinned rev**: `d1c8aff18dd81c4b1f817d0e8e0e05408c15a04c` (a `master`
-  commit, not a tag), identical across all four dependency entries
-- **Why pinned**: cyper 0.9 (the version implied by `master`) tracks compio
-  0.19, but the last crates.io release still targets compio 0.18. The
-  workspace's compio usage (`compio = "0.19"` in `snapshotter/Cargo.toml` and
-  `storage/Cargo.toml`) requires the newer cyper.
-- **Trigger to move to crates.io**: cyper publishes a crates.io release built
-  against compio 0.19+; switch all four entries (`cyper`, `cyper-axum` in
-  `snapshotter/Cargo.toml`; `cyper`, `cyper-core` in `storage/Cargo.toml`) to a
-  normal `version = "..."` requirement in the same change (they must stay on
-  the same cyper version). Note `cyper-core` additionally carries the local
-  zero-fill patch above — that patch has its own, independent drop trigger and
-  may still be needed even after the git pin itself is dropped, until the
-  patch's fix lands upstream too.
+- The former `d1c8aff` git pin is gone: cyper/cyper-axum/cyper-core 0.9.0
+  (released 2026-06-01) target compio 0.19, and `d1c8aff` is itself contained
+  in the v0.9.0 tag (2 release-chore commits behind it). All four dependency
+  entries are plain `version = "0.9"` requirements now.
+- `cyper-core` still carries the local zero-fill patch (see above) with its
+  own independent drop trigger, and the HTTP/3 pool wedge remains unfixed
+  upstream (checked 2026-07-23: no `http3.rs` changes since the pin) — h3
+  stays opt-in via `backend-http3`.
 
 ## How to upstream
 

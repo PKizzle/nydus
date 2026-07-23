@@ -49,12 +49,10 @@ lazy_static = "1.4.0"
 libc = "0.2"
 log = "0.4.8"
 nix = { version = "0.31.3", features = ["fs", "uio", "zerocopy"] }
-# Compio-native HTTP client replacing reqwest (cyper 0.9 tracks compio 0.19; the
-# crates.io release still targets 0.18, so pin the master commit). default
-# features drop native-tls so only rustls is pulled (musl-static goal).
-# Drop trigger: cyper publishes a crates.io release built against compio
-# 0.19+, then move to a version req; see docs/dependencies.md.
-cyper = { git = "https://github.com/compio-rs/cyper", rev = "d1c8aff18dd81c4b1f817d0e8e0e05408c15a04c", default-features = false, features = [
+# Compio-native HTTP client replacing reqwest (crates.io 0.9.0 targets compio
+# 0.19). default features drop native-tls so only rustls is pulled
+# (musl-static goal).
+cyper = { version = "0.9", default-features = false, features = [
     "rustls",
     "http2",
     # HTTP/3 over QUIC is deliberately NOT enabled by default. With
@@ -67,7 +65,7 @@ cyper = { git = "https://github.com/compio-rs/cyper", rev = "d1c8aff18dd81c4b1f8
     # concurrent requests during a legitimate connect error instead of
     # waiting. On the fanotify data path that turned every chunk read into
     # EIO (the 0.2.9-nydus mirrors incident). Opt back in via the
-    # `backend-http3` feature once upstream is fixed — see BACKLOG.md
+    # `backend-http3` feature once upstream is fixed
     # "cyper HTTP/3 pool wedge".
     "hickory-dns",
     "stream",
@@ -78,7 +76,8 @@ cyper = { git = "https://github.com/compio-rs/cyper", rev = "d1c8aff18dd81c4b1f8
 # workspace `[patch]`). Same drop trigger as cyper above, plus the vendored
 # zero-fill fix landing upstream (see the `[patch]` comment in the workspace
 # root Cargo.toml).
-cyper-core = { git = "https://github.com/compio-rs/cyper", rev = "d1c8aff18dd81c4b1f817d0e8e0e05408c15a04c", default-features = false, optional = true }
+# The workspace-root [patch.crates-io] swaps in the locally patched copy.
+cyper-core = { version = "0.9", default-features = false, optional = true }
 rusqlite = { version = "0.40.1", features = ["bundled"], optional = true }
 r2d2 = { version = "0.8", optional = true }
 r2d2_sqlite = { version = "0.35.0", optional = true }
@@ -164,7 +163,7 @@ backend-registry = [
 # Opt-in HTTP/3 (QUIC) for the cyper-based backends. OFF by default: cyper's
 # h3 pool wedges an origin after a failed/hung QUIC connect and Alt-Svc makes
 # the upgrade automatic — see the cyper dependency comment above and
-# BACKLOG.md "cyper HTTP/3 pool wedge". Enable only against registries whose
+# the "cyper HTTP/3 pool wedge" note above. Enable only against registries whose
 # h3 endpoint you trust once the upstream pool fix lands.
 backend-http3 = ["cyper/http3", "cyper/http3-altsvc"]
 backend-s3 = [
