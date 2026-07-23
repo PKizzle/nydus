@@ -91,15 +91,18 @@ impl SnapshotterMetrics {
         }
     }
 
-    /// Record the outcome of the latest peer-mirror local self-check. `true`
-    /// means the local mirror served a known-local digest (advertising works);
-    /// `false` means it did not (404 = not advertising, or unreachable). Feeds
-    /// the `snapshotter_peer_mirror_selfcheck_ok` gauge (see [`crate::peer_mirror_selfcheck`]).
+    /// Count a snapshot removal whose daemon release was skipped because the
+    /// snapshot's image could not be resolved (store error or missing
+    /// metadata). Feeds the `snapshotter_daemon_release_missing_total` counter.
     pub fn record_daemon_release_missing(&self) {
         self.daemon_release_missing_total
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Record the outcome of the latest peer-mirror local self-check. `true`
+    /// means the local mirror served a known-local digest (advertising works);
+    /// `false` means it did not (404 = not advertising, or unreachable). Feeds
+    /// the `snapshotter_peer_mirror_selfcheck_ok` gauge (see [`crate::peer_mirror_selfcheck`]).
     pub fn set_peer_mirror_selfcheck(&self, ok: bool) {
         if let Ok(mut slot) = self.peer_mirror_selfcheck_ok.lock() {
             *slot = Some(ok);
