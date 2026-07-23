@@ -8,12 +8,12 @@ use std::process::Command;
 
 use anyhow::{Context, Result, bail};
 use registry_client::types::Manifest;
-use registry_client::{ImageReference, RegistryClient};
+use registry_client::{FetchedManifest, ImageReference, RegistryClient, RegistryError};
 use serde::Serialize;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::cli::CheckArgs;
-use crate::engine::artifact::fallback_referrers_tag;
+use crate::engine::artifact::{REFERRER_ARTIFACT_TYPE, fallback_referrers_tag};
 use crate::engine::manifest::validate_nydus_manifest;
 use crate::engine::oci::{client_options, fetch_platform_manifest};
 
@@ -99,51 +99,94 @@ fn source_client_for(
 
 /// Verify a referrer artifact linking the source image to a nydus artifact.
 ///
-/// registry-client has no referrers-API (`GET /v2/<repo>/referrers/<digest>`)
-/// method, so this checks only the `sha256-<subject-hex>` fallback tag in the
-/// source repo (which nydusify itself publishes). A registry that exposes the
-/// artifact *only* via the native referrers API (no fallback tag) is not
-/// detected here.
+/// The **native OCI 1.1 referrers API** is consulted first
+/// (`GET /v2/<repo>/referrers/<digest>`, filtered — server-side and
+/// client-side — for the artifactType `nydusify convert --with-referrer`
+/// publishes); when the registry lacks the API, or has nothing indexed for
+/// the subject, the `sha256-<subject-hex>` fallback tag (which nydusify also
+/// publishes under) is checked instead.
 async fn check_referrer_linkage(
     ctx: &(RegistryClient, ImageReference),
     source: &str,
 ) -> Result<()> {
     let (client, source_ref) = ctx;
+    let repo = &source_ref.repo;
     let subject = client
-        .get_manifest(&source_ref.repo, source_ref.manifest_reference())
+        .get_manifest(repo, source_ref.manifest_reference())
         .await
         .with_context(|| format!("fetch source manifest {source}"))?;
 
+    // (1) Native referrers API, filtered for the nydus artifactType.
+    match client
+        .get_referrers(repo, &subject.digest, Some(REFERRER_ARTIFACT_TYPE))
+        .await
+    {
+        Ok(index) if !index.manifests.is_empty() => {
+            // Any indexed nydus artifact whose manifest validates and whose
+            // subject matches proves the linkage.
+            let mut last_err: Option<anyhow::Error> = None;
+            for desc in &index.manifests {
+                let artifact = client
+                    .get_manifest(repo, &desc.digest)
+                    .await
+                    .with_context(|| format!("fetch referrer artifact {}", desc.digest))?;
+                match validate_referrer_artifact(&artifact, &subject.digest) {
+                    Ok(()) => {
+                        info!(
+                            subject = %subject.digest,
+                            artifact = %desc.digest,
+                            "referrer linkage verified via the OCI 1.1 referrers API"
+                        );
+                        return Ok(());
+                    }
+                    Err(e) => last_err = Some(e),
+                }
+            }
+            return Err(last_err
+                .expect("non-empty referrers index yields at least one validation error")
+                .context("no referrers-API artifact validated as a nydus referrer"));
+        }
+        Ok(_) => debug!(
+            subject = %subject.digest,
+            "referrers API returned no nydus artifacts; checking fallback tag"
+        ),
+        Err(RegistryError::ReferrersUnsupported) => debug!(
+            subject = %subject.digest,
+            "registry lacks the OCI 1.1 referrers API; checking fallback tag"
+        ),
+        Err(e) => return Err(e).context("query the OCI 1.1 referrers API"),
+    }
+
+    // (2) Fallback tag.
     let fallback_tag = fallback_referrers_tag(&subject.digest);
     let artifact = client
-        .get_manifest(&source_ref.repo, &fallback_tag)
+        .get_manifest(repo, &fallback_tag)
         .await
         .with_context(|| {
-            format!(
-                "no referrer artifact found at fallback tag {fallback_tag} in {} \
-                 (referrers-API-only registries are not checked; see registry-client gap)",
-                source_ref.repo
-            )
+            format!("no referrer artifact found at fallback tag {fallback_tag} in {repo}")
         })?;
+    validate_referrer_artifact(&artifact, &subject.digest)
+        .with_context(|| format!("referrer artifact at fallback tag {fallback_tag}"))?;
+    info!(subject = %subject.digest, fallback_tag = %fallback_tag, "referrer linkage verified via fallback tag");
+    Ok(())
+}
+
+/// Validate one fetched referrer artifact manifest: it must classify as a
+/// nydus artifact (bootstrap layer present) and its `subject` must be the
+/// source image digest.
+fn validate_referrer_artifact(artifact: &FetchedManifest, subject_digest: &str) -> Result<()> {
     let artifact_manifest: Manifest =
         serde_json::from_slice(&artifact.bytes).context("parse referrer artifact manifest")?;
-
-    // It must classify as a nydus artifact (bootstrap layer present)...
     validate_nydus_manifest(&artifact_manifest)
         .context("referrer artifact is not a valid nydus artifact")?;
-    // ...and its subject must be the source image.
     match artifact_manifest.subject.as_ref() {
-        Some(s) if s.digest == subject.digest => {
-            info!(subject = %subject.digest, fallback_tag = %fallback_tag, "referrer linkage verified");
-            Ok(())
-        }
+        Some(s) if s.digest == subject_digest => Ok(()),
         Some(s) => bail!(
-            "referrer artifact subject {} does not match source image {}",
-            s.digest,
-            subject.digest
+            "referrer artifact subject {} does not match source image {subject_digest}",
+            s.digest
         ),
         None => {
-            warn!(fallback_tag = %fallback_tag, "referrer artifact has no subject field; accepting on nydus-classification alone");
+            warn!(artifact = %artifact.digest, "referrer artifact has no subject field; accepting on nydus-classification alone");
             Ok(())
         }
     }

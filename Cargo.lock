@@ -4543,6 +4543,7 @@ dependencies = [
  "nydus-utils",
  "prost",
  "prost-types",
+ "registry-client",
  "rustls",
  "rustls-platform-verifier",
  "sendfd",

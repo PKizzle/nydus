@@ -6,15 +6,28 @@
 //!
 //! Inspects OCI image manifests or OCI referrer/index descriptors to determine
 //! whether an image is a Nydus-optimized image and how to serve it.
+//!
+//! Registry access rides the shared [`registry_client::RegistryClient`] (the
+//! same bearer-auth OCI distribution client nydusify uses): resolution asks
+//! the **native OCI 1.1 referrers API first**
+//! (`GET /v2/<repo>/referrers/<digest>`) and falls back to the
+//! `sha256-<subject-hex>` **fallback tag** when the registry lacks the API
+//! ([`RegistryError::ReferrersUnsupported`]) or has nothing indexed there.
+//! Classification stays entirely client-side and keeps the hard bootstrap
+//! selection rules (annotation first, bootstrap media type second — never a
+//! loose "contains nydus" match, which once selected data blobs).
+//!
+//! `RegistryClient` is `!Send` (cyper/compio, Rc-based), so it is constructed
+//! and used entirely inside the `blocking::unblock` + thread-local compio
+//! runtime hops (`detect_referrer_blocking` /
+//! `materialize_bootstrap_blocking`), mirroring `peer_mirror.rs`.
 
 use crate::cache::parse_duration;
 use crate::config::SnapshotterConfig;
 use crate::daemon::auth::resolve_auth;
 use crate::daemon::image_ref::{ImageRef, parse_image_ref};
 use anyhow::{Context, Result, anyhow, bail};
-use cyper::{Client, Response};
-use http::header::{ACCEPT, AUTHORIZATION, CONTENT_LENGTH, HeaderValue, WWW_AUTHENTICATE};
-use http::{Method, StatusCode};
+use registry_client::{RegistryClient, RegistryClientOptions, RegistryError};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, VecDeque};
@@ -26,20 +39,6 @@ use tracing::{debug, info, warn};
 const DEFAULT_CACHE_CAPACITY: usize = 500;
 const NYDUS_BOOTSTRAP_ANNOTATION: &str = "containerd.io/snapshot/nydus-bootstrap";
 const NYDUS_FS_DRIVER_HINT: &str = "containerd.io/snapshot/nydus-fs-driver";
-/// Accept header for a raw blob (bootstrap) GET.
-const BLOB_ACCEPT: &str = "application/octet-stream";
-/// Upper bound on a registry body we will buffer into memory (manifest or
-/// bootstrap blob). A published nydus bootstrap is the merged RAFS metadata for
-/// the whole image, which stays comfortably under this even for large images;
-/// the cap only exists so a hostile or misbehaving registry cannot OOM the
-/// snapshotter. 512 MiB is deliberately generous.
-const MAX_REGISTRY_BODY_BYTES: u64 = 512 * 1024 * 1024;
-const OCI_INDEX_ACCEPT: &str = concat!(
-    "application/vnd.oci.image.index.v1+json, ",
-    "application/vnd.docker.distribution.manifest.list.v2+json, ",
-    "application/vnd.oci.image.manifest.v1+json, ",
-    "application/vnd.docker.distribution.manifest.v2+json"
-);
 
 /// Detected image type from referrer inspection.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -58,14 +57,6 @@ pub struct ReferrerInfo {
     pub image_type: ImageType,
     pub bootstrap_digest: Option<String>,
     pub fs_driver_hint: Option<String>,
-}
-
-/// Small OCI Distribution client for referrer discovery.
-#[derive(Clone)]
-pub struct RegistryReferrerClient {
-    client: Client,
-    scheme: &'static str,
-    timeout: Duration,
 }
 
 /// Small bounded LRU cache for referrer detection results.
@@ -195,10 +186,7 @@ pub async fn detect_referrer_with_config(
     // image until the process restarted. On error we return the StandardOci
     // fallback (so the pod still schedules via overlay) but leave the cache
     // empty so the next prepare retries.
-    match RegistryReferrerClient::from_config(config)?
-        .detect(image_ref, config)
-        .await
-    {
+    match detect(image_ref, config).await {
         Ok(info) => {
             let info = info.unwrap_or_else(standard_oci);
             if let Ok(mut cache) = global_cache().lock() {
@@ -213,393 +201,143 @@ pub async fn detect_referrer_with_config(
     }
 }
 
-impl RegistryReferrerClient {
-    pub fn from_config(config: &SnapshotterConfig) -> Result<Self> {
-        let registry = config.backends.registry.as_ref();
-        let timeout = registry
-            .and_then(|cfg| parse_duration(&cfg.request_timeout).ok())
-            .unwrap_or_else(|| Duration::from_secs(30));
-        let skip_verify = registry.map(|cfg| cfg.skip_verify).unwrap_or(false);
-        // Transport scheme. HTTPS by default (secure). `[backends.registry]
-        // plain_http = true` opts the registry into cleartext HTTP, mirroring
-        // the same opt-in the storage backend already honors.
-        //
-        // SECURITY: plain HTTP disables transport encryption AND server
-        // authentication, so an on-path attacker can read and *tamper with*
-        // referrer manifests and bootstrap blobs. Because the artifact manifest
-        // — which declares the bootstrap's expected digest — is fetched over the
-        // same cleartext channel, B4b's bootstrap digest verification does NOT
-        // protect against a MITM here: they control both the declared digest and
-        // the served bytes, so a forged bootstrap verifies fine. This is the same
-        // exposure as any plain-HTTP image pull; only enable it for registries on
-        // a trusted network (loopback, air-gapped, private LAN).
-        let plain_http = registry.map(|cfg| cfg.plain_http).unwrap_or(false);
-        let scheme = if plain_http { "http" } else { "https" };
-        // TLS trust mirrors the storage blob backend: `skip_verify` wins,
-        // then `ca_cert_files` extends the platform store, then the cyper
-        // default. Without the middle branch a private-CA registry could
-        // serve blobs but silently fail referrer detection.
-        let ca_cert_files = registry
-            .map(|cfg| cfg.ca_cert_files.as_slice())
-            .unwrap_or_default();
-        // cyper has no client-level timeout; it is applied per request via
-        // `compio::time::timeout` in `send_once` / `fetch_bearer_token`.
-        let builder = if skip_verify {
-            Client::builder()
-                .use_rustls_default()
-                .danger_accept_invalid_certs(true)
-        } else if !ca_cert_files.is_empty() {
-            Client::builder().use_rustls(client_config_with_extra_roots(ca_cert_files)?)
-        } else {
-            Client::builder().use_rustls_default()
-        };
-        let client = builder
-            .build()
-            .context("failed to build registry referrer HTTP client")?;
-        Ok(Self {
-            client,
-            scheme,
-            timeout,
-        })
-    }
-
-    async fn detect(
-        &self,
-        image_ref: &str,
-        config: &SnapshotterConfig,
-    ) -> Result<Option<ReferrerInfo>> {
-        let parsed = parse_image_ref(image_ref).context("invalid image reference")?;
-        let auth = resolve_auth(config, &parsed);
-        let Some(digest) = self.resolve_digest(&parsed, auth.as_deref()).await? else {
-            return Ok(None);
-        };
-
-        if let Some(payload) = self
-            .fetch_referrers(&parsed, &digest, auth.as_deref())
-            .await?
-        {
-            let info = detect_from_oci_json(&payload)?;
-            if info.image_type != ImageType::StandardOci {
-                return Ok(Some(info));
-            }
-        }
-
-        if let Some(payload) = self
-            .fetch_referrers_fallback_tag(&parsed, &digest, auth.as_deref())
-            .await?
-        {
-            let info = detect_from_oci_json(&payload)?;
-            if info.image_type != ImageType::StandardOci {
-                return Ok(Some(info));
-            }
-        }
-
-        Ok(None)
-    }
-
-    async fn resolve_digest(&self, image: &ImageRef, auth: Option<&str>) -> Result<Option<String>> {
-        if let Some(digest) = image.digest.as_ref() {
-            return Ok(Some(digest.clone()));
-        }
-        let Some(reference) = image.tag.as_deref() else {
-            return Ok(None);
-        };
-
-        let url = self.manifest_url(image, reference);
-        let mut used_get = false;
-        let mut response = self
-            .registry_request(Method::HEAD, &url, OCI_INDEX_ACCEPT, image, auth)
-            .await?;
-        if response.status() == StatusCode::METHOD_NOT_ALLOWED {
-            used_get = true;
-            response = self
-                .registry_request(Method::GET, &url, OCI_INDEX_ACCEPT, image, auth)
-                .await?;
-        }
-        if response.status() == StatusCode::NOT_FOUND {
-            return Ok(None);
-        }
-        if !response.status().is_success() {
-            bail!(
-                "registry manifest digest resolution failed with HTTP {}",
-                response.status()
-            );
-        }
-        if let Some(digest) = response
-            .headers()
-            .get("docker-content-digest")
-            .and_then(|value| value.to_str().ok())
-            .map(str::to_string)
-        {
-            return Ok(Some(digest));
-        }
-        // Registries are not required to send Docker-Content-Digest (the OCI
-        // distribution spec makes it optional). Fall back to fetching the
-        // manifest body and hashing it — a HEAD gave us no body, so re-issue as
-        // a GET. Without this, such a registry classified every image as
-        // StandardOci (and, before the negative-cache fix, cached that
-        // permanently).
-        if !used_get {
-            response = self
-                .registry_request(Method::GET, &url, OCI_INDEX_ACCEPT, image, auth)
-                .await?;
-            if response.status() == StatusCode::NOT_FOUND {
-                return Ok(None);
-            }
-            if !response.status().is_success() {
-                bail!(
-                    "registry manifest GET (digest fallback) failed with HTTP {}",
-                    response.status()
-                );
-            }
-        }
-        let body = read_bounded(response).await?;
-        Ok(Some(format!(
-            "sha256:{}",
-            hex::encode(Sha256::digest(&body))
-        )))
-    }
-
-    async fn fetch_referrers(
-        &self,
-        image: &ImageRef,
-        digest: &str,
-        auth: Option<&str>,
-    ) -> Result<Option<Vec<u8>>> {
-        let url = self.referrers_url(image, digest);
-        let response = self
-            .registry_request(Method::GET, &url, OCI_INDEX_ACCEPT, image, auth)
-            .await?;
-        match response.status() {
-            StatusCode::OK => Ok(Some(read_bounded(response).await?)),
-            StatusCode::NOT_FOUND | StatusCode::METHOD_NOT_ALLOWED | StatusCode::BAD_REQUEST => {
-                Ok(None)
-            }
-            status if status.is_success() => Ok(Some(read_bounded(response).await?)),
-            status => {
-                warn!(%status, "registry referrers query returned non-success status");
-                Ok(None)
-            }
-        }
-    }
-
-    async fn fetch_referrers_fallback_tag(
-        &self,
-        image: &ImageRef,
-        digest: &str,
-        auth: Option<&str>,
-    ) -> Result<Option<Vec<u8>>> {
-        let reference = fallback_referrers_tag(digest);
-        let url = self.manifest_url(image, &reference);
-        let response = self
-            .registry_request(Method::GET, &url, OCI_INDEX_ACCEPT, image, auth)
-            .await?;
-        match response.status() {
-            StatusCode::OK => Ok(Some(read_bounded(response).await?)),
-            StatusCode::NOT_FOUND | StatusCode::METHOD_NOT_ALLOWED | StatusCode::BAD_REQUEST => {
-                Ok(None)
-            }
-            status if status.is_success() => Ok(Some(read_bounded(response).await?)),
-            _ => Ok(None),
-        }
-    }
-
-    async fn registry_request(
-        &self,
-        method: Method,
-        url: &str,
-        accept: &str,
-        image: &ImageRef,
-        auth: Option<&str>,
-    ) -> Result<Response> {
-        let response = self
-            .send_once(
-                method.clone(),
-                url,
-                accept,
-                auth.map(auth_header_value).transpose()?,
-            )
-            .await?;
-        if response.status() != StatusCode::UNAUTHORIZED {
-            return Ok(response);
-        }
-        let Some(challenge) = response
-            .headers()
-            .get(WWW_AUTHENTICATE)
-            .and_then(|value| value.to_str().ok())
-            .and_then(parse_bearer_challenge)
-        else {
-            return Ok(response);
-        };
-        let token = self.fetch_bearer_token(&challenge, image, auth).await?;
-        let header = HeaderValue::from_str(&format!("Bearer {token}"))
-            .context("registry bearer token contained invalid header characters")?;
-        self.send_once(method, url, accept, Some(header)).await
-    }
-
-    async fn send_once(
-        &self,
-        method: Method,
-        url: &str,
-        accept: &str,
-        auth: Option<HeaderValue>,
-    ) -> Result<Response> {
-        let mut request = self
-            .client
-            .request(method, url)
-            .with_context(|| format!("invalid registry request URL {url}"))?
-            .header(ACCEPT, accept)
-            .context("invalid Accept header")?;
-        if let Some(auth) = auth {
-            request = request
-                .header(AUTHORIZATION, auth)
-                .context("invalid Authorization header")?;
-        }
-        compio::time::timeout(self.timeout, request.send())
-            .await
-            .map_err(|_| anyhow!("registry request to {url} timed out"))?
-            .with_context(|| format!("registry request failed for {url}"))
-    }
-
-    async fn fetch_bearer_token(
-        &self,
-        challenge: &BearerChallenge,
-        image: &ImageRef,
-        auth: Option<&str>,
-    ) -> Result<String> {
-        let scope = challenge
-            .scope
-            .clone()
-            .unwrap_or_else(|| format!("repository:{}:pull", image.repo));
-        let mut url = challenge.realm.clone();
-        let sep = if url.contains('?') { '&' } else { '?' };
-        url.push(sep);
-        if let Some(service) = challenge.service.as_deref() {
-            url.push_str("service=");
-            url.push_str(&percent_encode_query(service));
-            url.push('&');
-        }
-        url.push_str("scope=");
-        url.push_str(&percent_encode_query(&scope));
-
-        let mut request = self
-            .client
-            .get(url)
-            .context("invalid registry token URL")?
-            .header(ACCEPT, "application/json")
-            .context("invalid Accept header")?;
-        if let Some(auth) = auth.map(auth_header_value).transpose()? {
-            request = request
-                .header(AUTHORIZATION, auth)
-                .context("invalid Authorization header")?;
-        }
-        let response = compio::time::timeout(self.timeout, request.send())
-            .await
-            .map_err(|_| anyhow!("registry token request timed out"))?
-            .context("registry token request failed")?;
-        if !response.status().is_success() {
-            bail!(
-                "registry token request failed with HTTP {}",
-                response.status()
-            );
-        }
-        let token = response
-            .json::<RegistryTokenResponse>()
-            .await
-            .context("failed to decode registry token response")?
-            .into_token()
-            .context("registry token response did not include a token")?;
-        Ok(token)
-    }
-
-    fn manifest_url(&self, image: &ImageRef, reference: &str) -> String {
-        format!(
-            "{}://{}/v2/{}/manifests/{}",
-            self.scheme, image.api_host, image.repo, reference
-        )
-    }
-
-    fn referrers_url(&self, image: &ImageRef, digest: &str) -> String {
-        format!(
-            "{}://{}/v2/{}/referrers/{}",
-            self.scheme, image.api_host, image.repo, digest
-        )
-    }
-
-    fn blob_url(&self, image: &ImageRef, digest: &str) -> String {
-        format!(
-            "{}://{}/v2/{}/blobs/{}",
-            self.scheme, image.api_host, image.repo, digest
-        )
-    }
-
-    /// GET an OCI manifest by digest (`/v2/<repo>/manifests/<digest>`). Reuses
-    /// the same bearer/WWW-Authenticate dance as every other registry request.
-    /// Errors on any non-success status so the caller can fall back to treating
-    /// the digest as a bootstrap blob (a bare blob digest 404s here).
-    async fn fetch_manifest_by_digest(
-        &self,
-        image: &ImageRef,
-        digest: &str,
-        auth: Option<&str>,
-    ) -> Result<Vec<u8>> {
-        let url = self.manifest_url(image, digest);
-        let response = self
-            .registry_request(Method::GET, &url, OCI_INDEX_ACCEPT, image, auth)
-            .await?;
-        if !response.status().is_success() {
-            bail!(
-                "registry manifest fetch for {digest} failed with HTTP {}",
-                response.status()
-            );
-        }
-        read_bounded(response).await
-    }
-
-    /// GET a blob by digest (`/v2/<repo>/blobs/<digest>`). Same bearer dance,
-    /// blob Accept header, bounded read.
-    async fn fetch_blob(
-        &self,
-        image: &ImageRef,
-        digest: &str,
-        auth: Option<&str>,
-    ) -> Result<Vec<u8>> {
-        let url = self.blob_url(image, digest);
-        let response = self
-            .registry_request(Method::GET, &url, BLOB_ACCEPT, image, auth)
-            .await?;
-        if !response.status().is_success() {
-            bail!(
-                "registry blob fetch for {digest} failed with HTTP {}",
-                response.status()
-            );
-        }
-        read_bounded(response).await
+/// Build [`RegistryClientOptions`] from `[backends.registry]` plus a resolved
+/// runtime-auth payload.
+///
+/// * `plain_http` — HTTPS by default (secure); `[backends.registry]
+///   plain_http = true` opts the registry into cleartext HTTP, mirroring the
+///   same opt-in the storage backend honors. SECURITY: plain HTTP disables
+///   transport encryption AND server authentication, so an on-path attacker
+///   can read and *tamper with* referrer manifests and bootstrap blobs.
+///   Because the artifact manifest — which declares the bootstrap's expected
+///   digest — is fetched over the same cleartext channel, B4b's bootstrap
+///   digest verification does NOT protect against a MITM here: they control
+///   both the declared digest and the served bytes, so a forged bootstrap
+///   verifies fine. Same exposure as any plain-HTTP image pull; only enable
+///   it for registries on a trusted network (loopback, air-gapped, LAN).
+/// * TLS trust mirrors the storage blob backend: `skip_verify` wins, then
+///   `ca_cert_files` extends the platform store, then the default verifier.
+///   Without the middle branch a private-CA registry could serve blobs but
+///   silently fail referrer detection.
+/// * `use_docker_config` is force-disabled: the snapshotter's auth policy
+///   (`daemon/auth.rs`) is runtime-injected credentials only — it never reads
+///   docker `config.json` or Kubernetes Secret files from disk. `raw_auth`
+///   carries the runtime store's docker-style base64 payload instead.
+fn client_options_from_config(
+    config: &SnapshotterConfig,
+    raw_auth: Option<String>,
+) -> RegistryClientOptions {
+    let registry = config.backends.registry.as_ref();
+    let timeout = registry
+        .and_then(|cfg| parse_duration(&cfg.request_timeout).ok())
+        .unwrap_or_else(|| Duration::from_secs(30));
+    RegistryClientOptions {
+        plain_http: registry.map(|cfg| cfg.plain_http).unwrap_or(false),
+        insecure_tls: registry.map(|cfg| cfg.skip_verify).unwrap_or(false),
+        ca_cert_files: registry
+            .map(|cfg| cfg.ca_cert_files.iter().map(PathBuf::from).collect())
+            .unwrap_or_default(),
+        timeout: Some(timeout),
+        raw_auth,
+        use_docker_config: false,
+        ..RegistryClientOptions::default()
     }
 }
 
-/// Read a registry response body into memory, rejecting anything larger than
-/// [`MAX_REGISTRY_BODY_BYTES`] (checked against the advertised Content-Length up
-/// front and against the actual body length after buffering, so a lying header
-/// cannot slip a huge body past the cap).
-async fn read_bounded(response: Response) -> Result<Vec<u8>> {
-    if let Some(len) = response
-        .headers()
-        .get(CONTENT_LENGTH)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.parse::<u64>().ok())
-        && len > MAX_REGISTRY_BODY_BYTES
+/// Construct the shared OCI distribution client for `image`'s registry host.
+///
+/// The returned [`RegistryClient`] is `!Send` (cyper/compio) and its TLS
+/// plumbing needs `Runtime::current()` at build time, so this must run on a
+/// thread that owns a compio runtime — in production, inside the
+/// `REFERRER_HTTP_RUNTIME.block_on` of the `*_blocking` wrappers.
+fn build_registry_client(image: &ImageRef, config: &SnapshotterConfig) -> Result<RegistryClient> {
+    let auth = resolve_auth(config, image);
+    RegistryClient::new(&image.api_host, client_options_from_config(config, auth))
+        .context("build referrer registry client")
+}
+
+/// Referrer resolution proper: resolve the subject digest, then consult the
+/// **native OCI 1.1 referrers API first** and the `sha256-<subject-hex>`
+/// fallback tag second.
+async fn detect(image_ref: &str, config: &SnapshotterConfig) -> Result<Option<ReferrerInfo>> {
+    let parsed = parse_image_ref(image_ref).context("invalid image reference")?;
+    let client = build_registry_client(&parsed, config)?;
+    let repo = parsed.repo.as_str();
+
+    // Subject digest: an explicit `@sha256:...` wins; else resolve the tag by
+    // fetching the top-level (index or image) manifest. `get_manifest`
+    // computes the digest locally from the body bytes, so registries that
+    // omit the optional Docker-Content-Digest header resolve correctly too
+    // (they once classified every image as StandardOci).
+    let digest = if let Some(digest) = parsed.digest.clone() {
+        digest
+    } else if let Some(tag) = parsed.tag.as_deref() {
+        match client.get_manifest(repo, tag).await {
+            Ok(fetched) => fetched.digest,
+            Err(RegistryError::NotFound { .. }) => return Ok(None),
+            Err(e) => return Err(e).context("resolve subject manifest digest"),
+        }
+    } else {
+        return Ok(None);
+    };
+
+    // (1) Native referrers API. Deliberately NO server-side artifactType
+    // filter: the snapshotter recognizes both nydus artifacts (nydusify's
+    // `application/vnd.oci.image.layer.nydus.blob.v1` artifactType) and
+    // erofs/blockdev artifacts, and a server-side filter would hide the
+    // latter. Classification is client-side regardless — the spec lets
+    // servers ignore the filter, so a local pass is mandatory anyway.
+    match client.get_referrers(repo, &digest, None).await {
+        Ok(index) => {
+            let info = classify_referrers_index(&index)?;
+            if info.image_type != ImageType::StandardOci {
+                return Ok(Some(info));
+            }
+        }
+        Err(RegistryError::ReferrersUnsupported) => {
+            debug!(image = %image_ref, "registry lacks the OCI 1.1 referrers API; trying fallback tag");
+        }
+        Err(e) => {
+            // A broken referrers endpoint must not kill detection while the
+            // fallback tag can still answer (same stance as the pre-
+            // convergence bespoke client).
+            warn!(image = %image_ref, error = format!("{e:#}"), "referrers API query failed; trying fallback tag");
+        }
+    }
+
+    // (2) Fallback tag (`sha256-<subject-hex>`), the pre-1.1 convention that
+    // nydusify publishes alongside the digest push.
+    match client
+        .get_manifest(repo, &fallback_referrers_tag(&digest))
+        .await
     {
-        bail!("registry body of {len} bytes exceeds cap of {MAX_REGISTRY_BODY_BYTES} bytes");
+        Ok(fetched) => {
+            let info = detect_from_oci_json(&fetched.bytes)?;
+            if info.image_type != ImageType::StandardOci {
+                return Ok(Some(info));
+            }
+        }
+        // Absent tag or any other HTTP status: no fallback artifact
+        // (matching the old client's "any non-success means absent" stance).
+        Err(RegistryError::NotFound { .. }) => {}
+        Err(RegistryError::Http { status, .. }) => {
+            debug!(image = %image_ref, status, "fallback-tag lookup returned non-success; treating as absent");
+        }
+        // Transport-level failures propagate so the caller's don't-cache-
+        // transient-errors contract holds and the next Prepare retries.
+        Err(e) => return Err(e).context("fetch referrers fallback tag"),
     }
-    let bytes = response.bytes().await?;
-    if bytes.len() as u64 > MAX_REGISTRY_BODY_BYTES {
-        bail!(
-            "registry body of {} bytes exceeds cap of {MAX_REGISTRY_BODY_BYTES} bytes",
-            bytes.len()
-        );
-    }
-    Ok(bytes.to_vec())
+
+    Ok(None)
+}
+
+/// Classify a typed referrers index by funneling it through
+/// [`detect_from_oci_json`] — the single classification code path (bootstrap
+/// annotation first, media types second), so the referrers-API and
+/// fallback-tag branches can never drift apart.
+fn classify_referrers_index(index: &registry_client::Index) -> Result<ReferrerInfo> {
+    let payload = serde_json::to_vec(index).context("serialize referrers index for detection")?;
+    detect_from_oci_json(&payload)
 }
 
 /// Classify an OCI referrer response or index/manifest JSON payload. This is
@@ -812,8 +550,8 @@ pub async fn materialize_bootstrap(
     cache_dir: &Path,
 ) -> Result<PathBuf> {
     let parsed = parse_image_ref(image_ref).context("invalid image reference")?;
-    let auth = resolve_auth(config, &parsed);
-    let client = RegistryReferrerClient::from_config(config)?;
+    let client = build_registry_client(&parsed, config)?;
+    let repo = parsed.repo.as_str();
     let dir = cache_dir.join("referrer-bootstraps");
 
     // Fast path: the referrer digest may itself be the (already-materialized)
@@ -824,12 +562,10 @@ pub async fn materialize_bootstrap(
     }
 
     // Probe the manifest endpoint. A bootstrap-blob digest 404s here, so an
-    // error just routes us to the direct-blob branch below.
-    let layer_digest = match client
-        .fetch_manifest_by_digest(&parsed, bootstrap_digest, auth.as_deref())
-        .await
-    {
-        Ok(manifest) => select_nydus_bootstrap_layer(&manifest),
+    // error just routes us to the direct-blob branch below. (`get_manifest`
+    // by digest also verifies the returned bytes against it.)
+    let layer_digest = match client.get_manifest(repo, bootstrap_digest).await {
+        Ok(fetched) => select_nydus_bootstrap_layer(&fetched.bytes),
         Err(e) => {
             debug!(image = %image_ref, bootstrap = bootstrap_digest, error = %e, "manifest probe failed; treating referrer digest as a bootstrap blob");
             None
@@ -844,7 +580,7 @@ pub async fn materialize_bootstrap(
                 return Ok(path);
             }
             let bytes = client
-                .fetch_blob(&parsed, &layer_digest, auth.as_deref())
+                .get_blob(repo, &layer_digest)
                 .await
                 .with_context(|| format!("fetch nydus bootstrap layer {layer_digest}"))?;
             (layer_digest, bytes)
@@ -852,7 +588,7 @@ pub async fn materialize_bootstrap(
         None => {
             // Direct-blob path: bootstrap_digest is the bootstrap blob.
             let bytes = client
-                .fetch_blob(&parsed, bootstrap_digest, auth.as_deref())
+                .get_blob(repo, bootstrap_digest)
                 .await
                 .with_context(|| format!("fetch referrer bootstrap blob {bootstrap_digest}"))?;
             (bootstrap_digest.to_string(), bytes)
@@ -894,135 +630,15 @@ pub fn materialize_bootstrap_blocking(
     })
 }
 
-#[derive(Debug, Deserialize)]
-struct RegistryTokenResponse {
-    token: Option<String>,
-    access_token: Option<String>,
-}
-
-impl RegistryTokenResponse {
-    fn into_token(self) -> Option<String> {
-        self.token.or(self.access_token)
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct BearerChallenge {
-    realm: String,
-    service: Option<String>,
-    scope: Option<String>,
-}
-
-fn auth_header_value(auth: &str) -> Result<HeaderValue> {
-    let value = if auth.starts_with("Basic ") || auth.starts_with("Bearer ") {
-        auth.to_string()
-    } else {
-        format!("Basic {auth}")
-    };
-    HeaderValue::from_str(&value).context("registry auth contained invalid header characters")
-}
-
-fn parse_bearer_challenge(value: &str) -> Option<BearerChallenge> {
-    let value = value.trim();
-    let params = value.strip_prefix("Bearer ")?;
-    let mut realm = None;
-    let mut service = None;
-    let mut scope = None;
-    for part in split_header_params(params) {
-        let (key, raw_value) = part.split_once('=')?;
-        let decoded = raw_value.trim().trim_matches('"').to_string();
-        match key.trim() {
-            "realm" => realm = Some(decoded),
-            "service" => service = Some(decoded),
-            "scope" => scope = Some(decoded),
-            _ => {}
-        }
-    }
-    Some(BearerChallenge {
-        realm: realm?,
-        service,
-        scope,
-    })
-}
-
-fn split_header_params(value: &str) -> Vec<&str> {
-    let mut out = Vec::new();
-    let mut start = 0usize;
-    let mut quoted = false;
-    for (idx, ch) in value.char_indices() {
-        match ch {
-            '"' => quoted = !quoted,
-            ',' if !quoted => {
-                out.push(value[start..idx].trim());
-                start = idx + 1;
-            }
-            _ => {}
-        }
-    }
-    out.push(value[start..].trim());
-    out.into_iter().filter(|part| !part.is_empty()).collect()
-}
-
-fn percent_encode_query(value: &str) -> String {
-    let mut out = String::with_capacity(value.len());
-    for byte in value.bytes() {
-        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
-            out.push(byte as char);
-        } else {
-            out.push_str(&format!("%{byte:02X}"));
-        }
-    }
-    out
-}
-
+/// The referrers-API fallback tag for a subject digest: `sha256:<hex>`
+/// becomes `sha256-<hex>`. Must match nydusify's `fallback_referrers_tag`
+/// (`nydusify/src/engine/artifact.rs`), which publishes under it.
 fn fallback_referrers_tag(digest: &str) -> String {
     digest.replace(':', "-")
 }
 
 fn global_cache() -> &'static Mutex<ReferrerCache> {
     REFERRER_CACHE.get_or_init(|| Mutex::new(ReferrerCache::new(DEFAULT_CACHE_CAPACITY)))
-}
-
-/// rustls `ClientConfig` trusting the platform verifier's roots plus the PEM
-/// roots in `ca_cert_files` (for registries signed by a private CA). Mirrors
-/// what cyper builds for `use_rustls_default()` — platform verifier, ring
-/// provider, ALPN `h2` + `http/1.1` — so behaviour differs only by the extra
-/// roots. ALPN must be set here: cyper passes a custom config through
-/// untouched, and omitting it silently downgrades HTTP/2 negotiation.
-/// (Same helper as `registry_client::tls` and the storage backend's copy; the
-/// snapshotter depends on neither, hence the duplication.)
-fn client_config_with_extra_roots(
-    ca_cert_files: &[String],
-) -> Result<std::sync::Arc<rustls::ClientConfig>> {
-    use rustls::pki_types::CertificateDer;
-    use rustls::pki_types::pem::PemObject;
-
-    let mut extra_roots: Vec<CertificateDer<'static>> = Vec::new();
-    for path in ca_cert_files {
-        let before = extra_roots.len();
-        let certs = CertificateDer::pem_file_iter(path)
-            .with_context(|| format!("open CA cert file {path}"))?;
-        for cert in certs {
-            extra_roots.push(cert.with_context(|| format!("parse CA cert file {path}"))?);
-        }
-        if extra_roots.len() == before {
-            bail!("no CA certificates found in {path}");
-        }
-    }
-
-    let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
-    let verifier =
-        rustls_platform_verifier::Verifier::new_with_extra_roots(extra_roots, provider.clone())
-            .context("build platform certificate verifier with extra CA roots")?;
-
-    let mut config = rustls::ClientConfig::builder_with_provider(provider)
-        .with_safe_default_protocol_versions()
-        .context("select rustls protocol versions")?
-        .dangerous()
-        .with_custom_certificate_verifier(std::sync::Arc::new(verifier))
-        .with_no_client_auth();
-    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
-    Ok(std::sync::Arc::new(config))
 }
 
 #[cfg(test)]
@@ -1126,81 +742,106 @@ mod tests {
         assert_eq!(info.fs_driver_hint.as_deref(), Some("blockdev"));
     }
 
-    #[compio::test]
-    async fn registry_urls_use_oci_distribution_referrers_endpoint() {
-        let client = RegistryReferrerClient {
-            client: Client::new().unwrap(),
-            scheme: "https",
-            timeout: Duration::from_secs(30),
-        };
-        let image = parse_image_ref("registry.local:5000/team/app:1").unwrap();
-        assert_eq!(
-            client.manifest_url(&image, "1"),
-            "https://registry.local:5000/v2/team/app/manifests/1"
-        );
-        assert_eq!(
-            client.referrers_url(&image, "sha256:abc"),
-            "https://registry.local:5000/v2/team/app/referrers/sha256:abc"
-        );
-    }
-
-    #[compio::test]
-    async fn from_config_scheme_defaults_https_and_honors_plain_http() {
-        let image = parse_image_ref("registry.local:5000/team/app:1").unwrap();
-
-        // Default (no [backends.registry]) => secure HTTPS.
-        let config = SnapshotterConfig::default();
-        let client = RegistryReferrerClient::from_config(&config).unwrap();
+    /// `[backends.registry]` plumbing lands on the shared client's options:
+    /// plain_http, skip_verify → insecure_tls, ca_cert_files, request_timeout
+    /// — and docker `config.json` is never consulted (the snapshotter's auth
+    /// policy is runtime-injected credentials only, carried via `raw_auth`).
+    #[test]
+    fn client_options_map_backend_registry_config() {
+        // Default (no [backends.registry]) => secure, docker-config-free.
+        let opts = client_options_from_config(&SnapshotterConfig::default(), None);
+        assert!(!opts.plain_http, "default scheme must be https");
+        assert!(!opts.insecure_tls);
+        assert!(opts.ca_cert_files.is_empty());
         assert!(
-            client.manifest_url(&image, "1").starts_with("https://"),
-            "default referrer scheme must be https"
+            !opts.use_docker_config,
+            "must never read docker config.json"
         );
+        assert_eq!(opts.timeout, Some(Duration::from_secs(30)));
+        assert!(opts.raw_auth.is_none());
 
-        // plain_http = true => cleartext HTTP for both manifest and blob fetches.
         let mut config = SnapshotterConfig::default();
         config.backends.registry = Some(crate::config::RegistryBackendConfig {
             mirrors: Vec::new(),
-            skip_verify: false,
-            ca_cert_files: Vec::new(),
+            skip_verify: true,
+            ca_cert_files: vec!["/etc/ssl/private-ca.pem".to_string()],
             plain_http: true,
-            request_timeout: "30s".to_string(),
+            request_timeout: "5s".to_string(),
         });
-        let client = RegistryReferrerClient::from_config(&config).unwrap();
+        let opts = client_options_from_config(&config, Some("dXNlcjpwYXNz".to_string()));
+        assert!(opts.plain_http);
+        assert!(opts.insecure_tls, "skip_verify must map to insecure_tls");
         assert_eq!(
-            client.manifest_url(&image, "1"),
-            "http://registry.local:5000/v2/team/app/manifests/1"
+            opts.ca_cert_files,
+            vec![PathBuf::from("/etc/ssl/private-ca.pem")]
         );
-        assert!(
-            client.blob_url(&image, "sha256:abc").starts_with("http://"),
-            "plain_http must apply to blob fetches too"
-        );
-    }
-
-    #[test]
-    fn bearer_challenge_parser_handles_quoted_params() {
-        let parsed = parse_bearer_challenge(
-            r#"Bearer realm="https://auth.local/token",service="registry.local",scope="repository:team/app:pull""#,
-        )
-        .unwrap();
-        assert_eq!(parsed.realm, "https://auth.local/token");
-        assert_eq!(parsed.service.as_deref(), Some("registry.local"));
-        assert_eq!(parsed.scope.as_deref(), Some("repository:team/app:pull"));
-    }
-
-    #[test]
-    fn auth_header_preserves_explicit_scheme_or_adds_basic() {
-        assert_eq!(auth_header_value("abc").unwrap(), "Basic abc");
-        assert_eq!(auth_header_value("Bearer token").unwrap(), "Bearer token");
-        assert_eq!(auth_header_value("Basic abc").unwrap(), "Basic abc");
+        assert_eq!(opts.timeout, Some(Duration::from_secs(5)));
+        assert_eq!(opts.raw_auth.as_deref(), Some("dXNlcjpwYXNz"));
+        assert!(!opts.use_docker_config);
     }
 
     #[test]
     fn fallback_tag_matches_referrers_tag_schema() {
         assert_eq!(fallback_referrers_tag("sha256:deadbeef"), "sha256-deadbeef");
+    }
+
+    /// A typed referrers-API index (what `RegistryClient::get_referrers`
+    /// returns) classifies through the same single code path as the raw
+    /// payloads: a nydus artifact descriptor — nydusify publishes
+    /// `artifactType = application/vnd.oci.image.layer.nydus.blob.v1` — wins
+    /// over unrelated referrers, and erofs artifacts classify as blockdev.
+    #[test]
+    fn classify_referrers_index_selects_nydus_artifact() {
+        use registry_client::{Descriptor, Index};
+
+        let sbom = Descriptor {
+            media_type: "application/vnd.oci.image.manifest.v1+json".to_string(),
+            digest: "sha256:sbom".to_string(),
+            artifact_type: Some("application/spdx+json".to_string()),
+            ..Descriptor::default()
+        };
+        let nydus = Descriptor {
+            media_type: "application/vnd.oci.image.manifest.v1+json".to_string(),
+            digest: "sha256:nydusartifact".to_string(),
+            artifact_type: Some(registry_client::types::MEDIA_TYPE_NYDUS_BLOB.to_string()),
+            ..Descriptor::default()
+        };
+        let index = Index {
+            schema_version: 2,
+            manifests: vec![sbom.clone(), nydus],
+            ..Index::default()
+        };
+        let info = classify_referrers_index(&index).unwrap();
+        assert_eq!(info.image_type, ImageType::NydusRafs);
+        // The referrers-index entry digest is the artifact MANIFEST digest;
+        // materialize_bootstrap later resolves the bootstrap layer out of it.
         assert_eq!(
-            percent_encode_query("repository:team/app:pull"),
-            "repository%3Ateam%2Fapp%3Apull"
+            info.bootstrap_digest.as_deref(),
+            Some("sha256:nydusartifact")
         );
+
+        let erofs = Descriptor {
+            media_type: "application/vnd.oci.image.manifest.v1+json".to_string(),
+            digest: "sha256:erofs".to_string(),
+            artifact_type: Some("application/vnd.oci.image.layer.erofs.v1".to_string()),
+            ..Descriptor::default()
+        };
+        let index = Index {
+            schema_version: 2,
+            manifests: vec![erofs],
+            ..Index::default()
+        };
+        let info = classify_referrers_index(&index).unwrap();
+        assert_eq!(info.image_type, ImageType::OciBlockDevice);
+
+        // Unrelated referrers only => StandardOci (no nydus serving).
+        let index = Index {
+            schema_version: 2,
+            manifests: vec![sbom],
+            ..Index::default()
+        };
+        let info = classify_referrers_index(&index).unwrap();
+        assert_eq!(info.image_type, ImageType::StandardOci);
     }
 
     /// A cached NydusRafs result short-circuits `detect_referrer_with_config`

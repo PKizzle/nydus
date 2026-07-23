@@ -178,6 +178,11 @@ tempfile = "3"
 
 nydus-api = { version = "0.4.1", path = "../api" }
 nydus-rafs = { version = "0.4.1", path = "../rafs" }
+# OCI distribution client (bearer auth, referrers API) shared with nydusify.
+# Drives the referrer-detection/materialization path in `source/referrer.rs`;
+# its `RegistryClient` is `!Send` (cyper/compio), so it is constructed and used
+# entirely inside the `blocking::unblock` + thread-local-runtime hops there.
+registry-client = { path = "../registry-client" }
 nydus-service = { version = "0.4.0", path = "../service", features = [
     "block-device",
 ] }

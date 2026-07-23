@@ -177,6 +177,10 @@ never consults referrers.
 The snapshotter detects and **serves** *published* nydus images (the OCI-referrer distribution
 model nydusify / the Go snapshotter produce) via the OCI referrers API, gated behind
 `[snapshotter.features].referrer_detect` (**default on**, `snapshotter/src/source/referrer.rs`).
+Resolution rides the shared `registry-client` crate: the **native OCI 1.1 referrers API**
+(`GET /v2/<repo>/referrers/<digest>`) is asked first, and the `sha256-<subject-hex>` fallback tag
+second (for registries without referrers-API support) — the same two shapes `nydusify convert
+--with-referrer` publishes.
 Serving (backlog item **B4b**) is implemented and e2e-verified: on detecting a published nydus
 image during `Prepare`, the snapshotter fetches the referrer artifact manifest, resolves the
 bootstrap blob digest (detection and materialization share one priority selector — the
@@ -402,8 +406,9 @@ working implementations, not stubs:
   OCI 1.1 referrer artifact (`subject` = the source manifest descriptor) to the source repo, by
   digest and under the `sha256-<hex>` fallback tag for registries without native referrers-API
   support.
-- **`check`** — validates manifest/media-type/annotations, referrer linkage (fallback-tag lookup
-  only today), downloads the bootstrap, and runs `nydus-image check` on it.
+- **`check`** — validates manifest/media-type/annotations, referrer linkage (native OCI 1.1
+  referrers API first, `sha256-<hex>` fallback tag second), downloads the bootstrap, and runs
+  `nydus-image check` on it.
 - **`copy`** — pulls and re-pushes an image between repositories with `HEAD`-based blob dedup and
   same-registry `mount_blob`.
 - **`mount`** — pulls the bootstrap via `registry-client` and spawns a foreground `nydusd` fusedev

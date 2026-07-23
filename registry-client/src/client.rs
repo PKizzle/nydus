@@ -108,8 +108,16 @@ pub struct RegistryClientOptions {
     /// downloads ([`RegistryClient::get_blob_to_file`]) are not covered (they
     /// scale with blob size and make observable progress on disk).
     pub body_timeout: Option<Duration>,
-    /// Explicit credentials. Take precedence over docker `config.json`.
+    /// Explicit credentials. Take precedence over [`raw_auth`](Self::raw_auth)
+    /// and docker `config.json`.
     pub credentials: Option<Credentials>,
+    /// Pre-encoded auth payload: a docker-style base64 `user:password` value,
+    /// or a full `Basic ...` / `Bearer ...` header value. For callers that
+    /// hold an already-encoded credential (e.g. the snapshotter's runtime
+    /// auth store, populated by a CRI credential bridge) and never see the
+    /// user/password pair. Loses to [`credentials`](Self::credentials), wins
+    /// over docker `config.json`.
+    pub raw_auth: Option<String>,
     /// Explicit docker `config.json` path for credential loading. When
     /// `None`, the default location is used (`$DOCKER_CONFIG/config.json`,
     /// else `~/.docker/config.json`).
@@ -129,6 +137,7 @@ impl Default for RegistryClientOptions {
             upload_timeout: None,
             body_timeout: Some(Duration::from_secs(300)),
             credentials: None,
+            raw_auth: None,
             docker_config: None,
             use_docker_config: true,
         }
@@ -183,9 +192,10 @@ impl RegistryClient {
     /// or `registry.local:5000` — use [`crate::ImageReference::api_host`] so
     /// `docker.io` is normalized).
     ///
-    /// Credential resolution: `opts.credentials` wins; otherwise docker
-    /// `config.json` is consulted (unless disabled); otherwise requests start
-    /// anonymous and rely on the bearer-token flow.
+    /// Credential resolution: `opts.credentials` wins; then `opts.raw_auth`
+    /// (a pre-encoded payload); otherwise docker `config.json` is consulted
+    /// (unless disabled); otherwise requests start anonymous and rely on the
+    /// bearer-token flow.
     pub fn new(registry: &str, opts: RegistryClientOptions) -> Result<Self, RegistryError> {
         let scheme = if opts.plain_http { "http" } else { "https" };
         let builder = if opts.insecure_tls {
@@ -202,12 +212,13 @@ impl RegistryClient {
         let client = builder
             .build()
             .context("failed to build registry HTTP client")?;
-        let basic_auth = match opts.credentials.as_ref() {
-            Some(creds) => Some(creds.to_base64()),
-            None if opts.use_docker_config => {
+        let basic_auth = match (opts.credentials.as_ref(), opts.raw_auth.as_ref()) {
+            (Some(creds), _) => Some(creds.to_base64()),
+            (None, Some(raw)) => Some(raw.clone()),
+            (None, None) if opts.use_docker_config => {
                 docker_config_auth(opts.docker_config.as_deref(), registry)
             }
-            None => None,
+            (None, None) => None,
         };
         Ok(Self {
             client,
@@ -1192,6 +1203,67 @@ mod tests {
                 base64::engine::general_purpose::STANDARD.encode("user:pass")
             })
         );
+    }
+
+    #[compio::test]
+    async fn raw_auth_payload_is_used_and_loses_to_explicit_credentials() {
+        // A pre-encoded base64 payload (the snapshotter's runtime-auth shape)
+        // becomes the Basic header as-is.
+        let client = RegistryClient::new(
+            "registry.local:5000",
+            RegistryClientOptions {
+                raw_auth: Some("cHJlOmVuY29kZWQ=".into()),
+                use_docker_config: false,
+                ..RegistryClientOptions::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            client
+                .initial_auth_header("repository:a:pull")
+                .unwrap()
+                .unwrap(),
+            "Basic cHJlOmVuY29kZWQ="
+        );
+
+        // A full Bearer value passes through unchanged.
+        let client = RegistryClient::new(
+            "registry.local:5000",
+            RegistryClientOptions {
+                raw_auth: Some("Bearer tok".into()),
+                use_docker_config: false,
+                ..RegistryClientOptions::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            client
+                .initial_auth_header("repository:a:pull")
+                .unwrap()
+                .unwrap(),
+            "Bearer tok"
+        );
+
+        // Explicit credentials take precedence over raw_auth.
+        let client = RegistryClient::new(
+            "registry.local:5000",
+            RegistryClientOptions {
+                credentials: Some(Credentials {
+                    username: "user".into(),
+                    password: "pass".into(),
+                }),
+                raw_auth: Some("ignored".into()),
+                use_docker_config: false,
+                ..RegistryClientOptions::default()
+            },
+        )
+        .unwrap();
+        let header = client
+            .initial_auth_header("repository:a:pull")
+            .unwrap()
+            .unwrap();
+        assert!(header.to_str().unwrap().starts_with("Basic "));
+        assert_ne!(header, "Basic ignored");
     }
 
     #[compio::test]

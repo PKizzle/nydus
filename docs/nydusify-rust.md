@@ -87,10 +87,10 @@ nydusify check --target myregistry/repo:tag-nydus
 Validates the target image manifest/media-types/annotations, downloads the bootstrap, and runs
 `nydus-image check --bootstrap <path>` on it (subprocess, `--nydus-image` to override the binary).
 If the target was pushed with `--with-referrer`, `check` also verifies the referrer linkage back to
-the source image — **today this only looks up the `sha256-<hex>` fallback tag**; registries that
-expose an artifact *purely* through the native referrers API (`GET
-/v2/<repo>/referrers/<digest>`) are not checked, since `registry-client` has no referrers-API
-client yet (a native referrers-API client is deferred work). Pass `--source` to also request linkage verification:
+the source image: it queries the **native OCI 1.1 referrers API first** (`GET
+/v2/<repo>/referrers/<digest>` via `registry-client`, filtered — server-side and client-side — for
+the nydus artifactType) and falls back to the `sha256-<hex>` fallback tag when the registry lacks
+the API or has nothing indexed for the subject. Pass `--source` to also request linkage verification:
 
 ```shell
 nydusify check --source myregistry/repo:tag --target myregistry/repo:tag-nydus
