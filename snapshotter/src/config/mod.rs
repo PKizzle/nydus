@@ -738,6 +738,18 @@ pub struct AutoZranConfig {
     /// dirs are removed after the artifacts are committed to the content store.
     #[serde(default = "default_auto_zran_work_dir")]
     pub work_dir: PathBuf,
+    /// Re-drive the OPTIMIZE stage from persisted prefetch profiles on the
+    /// reconciler's slow pass, to recover images stuck at the Base sidecar
+    /// (first pod died before settle, or the settle-driven upload failed).
+    ///
+    /// Default **off**: the current implementation re-enqueues every persisted
+    /// profile, so images that were profiled but are not node-local-accel
+    /// candidates (e.g. published `*-nydus` images the tracer happened to see)
+    /// generate a bounded run of failed conversions until the 3-strike backoff
+    /// suppresses them. Enable only once the sweep is gated on the sidecar
+    /// actually existing in Base state (tracked as a follow-up).
+    #[serde(default)]
+    pub reoptimize_stuck_base: bool,
     /// File-access capture (tracing) configuration. Tied to `enable`.
     #[serde(default)]
     pub capture: AccessCaptureConfig,
@@ -752,6 +764,7 @@ impl Default for AutoZranConfig {
             nice: default_auto_zran_nice(),
             sched_class: SchedClass::default(),
             work_dir: default_auto_zran_work_dir(),
+            reoptimize_stuck_base: false,
             capture: AccessCaptureConfig::default(),
         }
     }
