@@ -316,9 +316,16 @@ impl FileCacheEntry {
 
     /// Persist one chunk's uncompressed bytes into the cache file, returning
     /// the write result so callers on a terminal path can propagate it: a
-    /// swallowed ENOSPC here turns into FAN_ALLOW over an unfilled sparse
-    /// hole — the consumer silently reads zeros. Chunk pending-state is
-    /// updated on both paths exactly as before.
+    /// swallowed ENOSPC there would turn into FAN_ALLOW over an unfilled
+    /// sparse hole — the consumer silently reads zeros. Chunk pending-state
+    /// is updated on both paths exactly as before.
+    ///
+    /// The remaining `let _ =` call sites are deliberate, not swallows: on
+    /// failure `update_chunk_pending_status(false)` clears pending WITHOUT
+    /// marking the chunk ready, so `wait_for_range_ready` times out into
+    /// `do_fetch_chunks`' terminal retry, which re-fetches and propagates the
+    /// real errno via `?`. Only that terminal retry must (and does) return
+    /// this result.
     fn persist_chunk_data(&self, chunk: &dyn BlobChunkInfo, buf: &[u8]) -> Result<()> {
         let offset = chunk.uncompressed_offset();
         let res = Self::persist_cached_data(&self.file, offset, buf);
