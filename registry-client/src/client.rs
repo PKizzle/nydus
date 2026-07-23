@@ -654,9 +654,21 @@ impl RegistryClient {
                 .with_context(|| format!("invalid {name} header"))?;
         }
         if let Some(auth) = auth {
-            request = request
-                .header(AUTHORIZATION, auth)
-                .context("invalid Authorization header")?;
+            // Registries may redirect uploads/blobs to a third-party host
+            // (S3, CDN) via an absolute `Location`. The registry credential's
+            // audience is the registry origin only — forwarding it
+            // cross-origin would leak it to whatever host the registry names
+            // (presigned URLs carry their own authorization in the query).
+            if same_origin(&self.base, url) {
+                request = request
+                    .header(AUTHORIZATION, auth)
+                    .context("invalid Authorization header")?;
+            } else {
+                debug!(
+                    url,
+                    "cross-origin registry redirect: not forwarding Authorization"
+                );
+            }
         }
         request = match body {
             BodySource::Empty => request,
@@ -729,6 +741,30 @@ fn header_str(response: &Response, name: &HeaderName) -> Option<String> {
 /// (`scheme://host[:port]`, no trailing slash). Absolute locations pass
 /// through untouched; relative ones (with or without a leading `/`) are
 /// joined onto the base, preserving any query string they carry.
+/// Whether `url` targets the same origin (`scheme://host[:port]`) as `base`.
+///
+/// `base` is already a bare origin with no trailing slash (see
+/// [`RegistryClient`] construction), so this reduces to extracting `url`'s
+/// origin — everything up to the first `/` after the scheme separator — and
+/// comparing case-insensitively. Ports are compared literally: a registry
+/// that names its own origin differently than `base` was configured (implicit
+/// vs explicit default port) fails closed, which only means credentials are
+/// withheld from a URL we cannot prove is the registry itself.
+fn same_origin(base: &str, url: &str) -> bool {
+    fn origin_of(u: &str) -> Option<&str> {
+        let scheme_end = u.find("://")? + 3;
+        let path_start = u[scheme_end..]
+            .find('/')
+            .map(|i| scheme_end + i)
+            .unwrap_or(u.len());
+        Some(&u[..path_start])
+    }
+    match (origin_of(base), origin_of(url)) {
+        (Some(a), Some(b)) => a.eq_ignore_ascii_case(b),
+        _ => false,
+    }
+}
+
 pub fn resolve_location(base: &str, location: &str) -> String {
     if location.starts_with("http://") || location.starts_with("https://") {
         location.to_string()
@@ -887,6 +923,33 @@ mod tests {
                 .unwrap(),
             "Bearer tok"
         );
+    }
+
+    #[test]
+    fn same_origin_matches_scheme_host_port_only() {
+        assert!(same_origin(
+            "https://registry.local:5000",
+            "https://registry.local:5000/v2/foo/blobs/uploads/x?digest=y"
+        ));
+        assert!(same_origin(
+            "https://Registry.Local",
+            "https://registry.local/v2/"
+        ));
+        // Host-prefix confusion must not pass.
+        assert!(!same_origin(
+            "https://registry.local",
+            "https://registry.local.evil.example/v2/"
+        ));
+        // Redirects to object storage lose the credential.
+        assert!(!same_origin(
+            "https://registry.local:5000",
+            "https://bucket.s3.amazonaws.com/presigned"
+        ));
+        // Scheme downgrades are a different origin too.
+        assert!(!same_origin(
+            "https://registry.local",
+            "http://registry.local/v2/"
+        ));
     }
 
     #[test]
