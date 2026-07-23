@@ -578,7 +578,18 @@ impl First {
     where
         F: FnOnce(),
     {
-        self.inner.load().call_once(f)
+        // A panic inside `call_once` poisons the `Once`, and every later
+        // `call_once` on it panics too — one panicking request would
+        // permanently wedge the token singleflight for the daemon's
+        // lifetime. Catch both cases (the panicking leader and waiters that
+        // trip over the poison), renew the cell, and continue without a
+        // recorded result: `handle_force` then falls back to a direct call,
+        // so the request proceeds merely without the de-stampede.
+        let cell = self.inner.load();
+        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cell.call_once(f))).is_err() {
+            warn!("registry token singleflight panicked; renewing and continuing un-deduplicated");
+            self.renew();
+        }
     }
 
     fn renew(&self) {
@@ -1206,26 +1217,45 @@ impl Registry {
                     .finish();
                 REGISTRY_TOKEN_REFRESH_MARGIN + seed % (REGISTRY_TOKEN_REFRESH_JITTER_MAX + 1)
             };
+            // Exponential backoff on refresh failure: without it, a registry
+            // or token-service outage has every node re-attempting (and
+            // error-logging) once per poll tick, and the whole fleet hammers
+            // the recovering service in lockstep. Doubling the wait per
+            // consecutive failure (capped at 16 ticks) spreads the retries;
+            // in-band requests still refresh tokens on 401 regardless.
+            let mut failure_streak: u32 = 0;
+            let mut backoff_ticks_left: u64 = 0;
             loop {
                 // Check for config auth changes every tick.
                 state.refresh_cached_auth_from_config(&request);
 
-                if let Ok(now_timestamp) = SystemTime::now().duration_since(UNIX_EPOCH)
+                if backoff_ticks_left > 0 {
+                    backoff_ticks_left -= 1;
+                } else if let Ok(now_timestamp) = SystemTime::now().duration_since(UNIX_EPOCH)
                     && let Some(token_expired_at) = state.token_expired_at.load().as_deref()
                 {
                     // Refresh the token if it will expire within the margin.
                     if now_timestamp.as_secs() + refresh_lead >= *token_expired_at
                         && let Some(cached_bearer_auth) = state.cached_bearer_auth.load().as_deref()
                     {
-                        if let Ok(token) = state.get_token(cached_bearer_auth.to_owned(), &request)
-                        {
-                            let new_cached_auth = format!("Bearer {}", token.token);
-                            debug!("[refresh_token_thread] registry token has been refreshed");
-                            state
-                                .cached_auth
-                                .set(&state.cached_auth.get(), new_cached_auth);
-                        } else {
-                            error!("[refresh_token_thread] failed to refresh registry token");
+                        match state.get_token(cached_bearer_auth.to_owned(), &request) {
+                            Ok(token) => {
+                                let new_cached_auth = format!("Bearer {}", token.token);
+                                debug!("[refresh_token_thread] registry token has been refreshed");
+                                state
+                                    .cached_auth
+                                    .set(&state.cached_auth.get(), new_cached_auth);
+                                failure_streak = 0;
+                            }
+                            Err(e) => {
+                                failure_streak = failure_streak.saturating_add(1);
+                                backoff_ticks_left = 1u64 << failure_streak.min(4);
+                                error!(
+                                    "[refresh_token_thread] failed to refresh registry token \
+                                     (attempt {}): {}; backing off for {} poll tick(s)",
+                                    failure_streak, e, backoff_ticks_left
+                                );
+                            }
                         }
                     }
                 }
