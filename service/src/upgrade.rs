@@ -615,9 +615,13 @@ pub mod fusedev_upgrade {
             let fuse_svc = svc.as_any().downcast_ref::<FusedevFsService>().unwrap();
             fuse_svc.session.lock().unwrap().set_fuse_file(f);
 
-            // drain fuse requests
+            // Drain fuse requests. Best-effort: the drain only pre-answers
+            // requests already queued on the old connection; on kernels
+            // without the fusectl abort node it fails with ENOENT, and the
+            // takeover replays those requests anyway. Not worth a warning
+            // (this fires on every takeover on 6.14+/7.x fleets).
             if let Err(e) = fuse_svc.drain_fuse_requests() {
-                warn!("Failed to drain fuse requests: {}", e);
+                debug!("fuse request drain skipped (best-effort): {}", e);
             }
         }
 
