@@ -499,9 +499,29 @@ impl AutoZranManager {
                 return 0;
             }
         };
-        let submitted = profiles.len();
+        // Respect the bounded queue. This sweep runs every recon slow pass, so
+        // on a node with more persisted profiles than the queue depth, blindly
+        // enqueuing every one would flood the channel and log a drop warning
+        // per rejected job on each pass. Stop once the queue is full; the
+        // remainder are picked up next pass (the dedupe set and failure cache
+        // make repeated passes idempotent). Dedup/suppressed profiles skip
+        // without consuming a slot, so they never trip the capacity guard.
+        let capacity = self.sender.capacity().unwrap_or(usize::MAX);
+        let mut submitted = 0;
+        let mut deferred = 0;
         for profile in &profiles {
+            if self.sender.len() >= capacity {
+                deferred = profiles.len() - submitted;
+                break;
+            }
             self.try_enqueue_profile(profile);
+            submitted += 1;
+        }
+        if deferred > 0 {
+            debug!(
+                deferred,
+                "auto-zran re-optimize: queue at capacity; deferring remaining profiles to the next pass"
+            );
         }
         submitted
     }
