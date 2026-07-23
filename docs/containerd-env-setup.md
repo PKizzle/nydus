@@ -4,16 +4,14 @@ This document will walk through how to setup a nydus image service to work with 
 
 ## Install All Nydus Binaries
 
-1. Get `nydus-image`, `nydusd`, `nydusify`, `nydusctl` and `nydus-overlayfs` binaries from [release](https://github.com/dragonflyoss/nydus/releases/latest) page.
+Get `nydus-image`, `nydusd`, `nydusify`, `nydusctl` and the snapshotter binaries
+(`containerd-nydus`, `nydus-migrate`, `nydus-credential-bridge`) from the
+[release](https://github.com/dragonflyoss/nydus/releases/latest) page — they all
+ship in one tarball now.
 
 ```bash
-sudo install -D -m 755 nydusd nydus-image nydusify nydusctl nydus-overlayfs /usr/bin
-```
-
-2. Get `containerd-nydus-grpc` (nydus snapshotter) binary from nydus-snapshotter [release](https://github.com/containerd/nydus-snapshotter/releases/latest) page.
-
-```bash
-sudo install -D -m 755 containerd-nydus-grpc /usr/bin
+sudo install -D -m 755 nydusd nydus-image nydusify nydusctl /usr/bin
+sudo install -D -m 755 containerd-nydus nydus-migrate nydus-credential-bridge /usr/local/bin
 ```
 
 ## Start a Local Registry Container
@@ -38,69 +36,46 @@ For more details about how to build nydus image, please refer to [Nydusify](http
 
 ## Start Nydus Snapshotter
 
-Nydus provides a containerd remote snapshotter `containerd-nydus-grpc` (nydus snapshotter) to prepare container rootfs with nydus formatted images.
+Nydus provides a containerd remote snapshotter, the single `containerd-nydus`
+binary, to prepare container rootfs with nydus formatted images. It runs the
+nydus daemon in-process (no separate `nydusd` child) and is configured by one
+unified TOML file that replaces both the legacy Go-snapshotter TOML and the
+`nydusd` JSON.
 
-1. Prepare a `nydusd` configuration to `/etc/nydus/nydusd-config.fusedev.json`:
+1. Install a configuration to `/etc/nydus/config.toml`. Start from the
+   annotated example at
+   [misc/configs/containerd-nydus-config.toml](../misc/configs/containerd-nydus-config.toml);
+   the built-in defaults (kernel-capability probe picks fanotify → blockdev →
+   fusedev automatically) are sensible, so a minimal file is enough:
 
 ```bash
-$ sudo tee /etc/nydus/nydusd-config.fusedev.json > /dev/null << EOF
-{
-  "device": {
-    "backend": {
-      "type": "registry",
-      "config": {
-        "scheme": "",
-        "skip_verify": true,
-        "timeout": 5,
-        "connect_timeout": 5,
-        "retry_limit": 4,
-        "auth": ""
-      }
-    },
-    "cache": {
-      "type": "blobcache",
-      "config": {
-        "work_dir": "cache"
-      }
-    }
-  },
-  "mode": "direct",
-  "digest_validate": false,
-  "iostats_files": false,
-  "enable_xattr": true,
-  "fs_prefetch": {
-    "enable": true,
-    "threads_count": 4
-  }
-}
+sudo mkdir -p /etc/nydus
+sudo tee /etc/nydus/config.toml > /dev/null << EOF
+[snapshotter]
+root = "/var/lib/containerd/io.containerd.snapshotter.v1.nydus"
+address = "/run/containerd-nydus/containerd-nydus-grpc.sock"
+log_level = "info"
+log_to_stdout = true
 EOF
 ```
 
-Please refer to the nydusd [doc](./nydusd.md) to learn more options.
+Registry credentials are resolved at runtime through the sysctl auth API and
+the `nydus-credential-bridge` helper — see [credentials.md](./credentials.md).
 
-⚠️ Note:
-
-- The `device.backend.config.scheme` is the URL scheme for the registry. Leave it empty for automatic detection, or specify `https` or `http` depending on your registry server configuration.
-- The `device.backend.config.auth` is the base64 encoded `username:password` authentication string required by nydusd to lazily pull image data from an authenticated registry. The nydus snapshotter will automatically read it from the `$HOME/.docker/config.json` configuration file, or you can also fill it with your own.
-- The `device.backend.config.skip_verify` allows you to skip the insecure https certificate checks for the registry and enables automatic HTTPS-to-HTTP fallback on TLS errors. Only set it to `true` when necessary. Note that enabling this option is a security risk for the connection to registry, so you should only use this when you are sure it is safe.
-- The `fs_prefetch.enable` option enables nydusd to prefetch image data in background, which can make container startup faster when it needs to read a large amount of image data. Set this to `false` if you don't need this functionality when it brings disk and network pressure.
-
-2. [Optional] Cleanup snapshotter environment:
-
-Make sure the default nydus snapshotter root directory is clear.
+2. [Optional] Make sure the snapshotter root directory is clear:
 
 ```
 sudo rm -rf /var/lib/containerd/io.containerd.snapshotter.v1.nydus
 ```
 
-3. Start `containerd-nydus-grpc` (nydus snapshotter):
-Optionally, a TOML based nydus-snapshotter configuration file can be provided by appending `--config <CONFIG>` when starting nydus-snapshotter if you want fine-grained control items. An example configuration file can be found [here](https://github.com/containerd/nydus-snapshotter/blob/main/misc/snapshotter/config.toml)
+3. Start the snapshotter:
 
 ```bash
-sudo /usr/bin/containerd-nydus-grpc \
-    --nydusd-config /etc/nydus/nydusd-config.fusedev.json \
-    --log-to-stdout
+sudo /usr/local/bin/containerd-nydus --config /etc/nydus/config.toml
 ```
+
+For a full walkthrough (systemd unit, health checks, Kubernetes/Helm
+deployment) see [quickstart-containerd.md](./quickstart-containerd.md).
 
 ## [Option 1] Configure as Containerd Global Snapshotter
 

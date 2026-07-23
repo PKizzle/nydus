@@ -11,7 +11,7 @@ built on the new `registry-client/` crate (a compio-native OCI distribution clie
 manifest/blob GET, blob push, `HEAD`-based dedup, mount-blob). They drive `nydus-image` (and, for
 `mount`, `nydusd`) as subprocesses, the same convention `snapshotter/src/local_accel.rs` uses for
 node-local conversion. Live end-to-end verification against a real registry is still pending
-(tracked in BACKLOG.md); everything below is validated by unit/plan tests and code inspection.
+(tracked as deferred work); everything below is validated by unit/plan tests and code inspection.
 
 > **Platform:** `nydusify convert`/`check`/`copy` are pure networking + subprocess orchestration
 > and build/run anywhere `nydus-image` runs (including macOS for `check`/`convert` tooling). `mount`
@@ -90,7 +90,7 @@ If the target was pushed with `--with-referrer`, `check` also verifies the refer
 the source image — **today this only looks up the `sha256-<hex>` fallback tag**; registries that
 expose an artifact *purely* through the native referrers API (`GET
 /v2/<repo>/referrers/<digest>`) are not checked, since `registry-client` has no referrers-API
-client yet (tracked in BACKLOG.md). Pass `--source` to also request linkage verification:
+client yet (a native referrers-API client is deferred work). Pass `--source` to also request linkage verification:
 
 ```shell
 nydusify check --source myregistry/repo:tag --target myregistry/repo:tag-nydus

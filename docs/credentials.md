@@ -140,4 +140,6 @@ plugin or a static secret), you have two options today:
    whatever process already holds them (e.g. a sidecar or init step that resolves secrets from a
    vault).
 
-See [`BACKLOG.md`](../BACKLOG.md) for the criteria to revisit CRI keychain support.
+The trigger to revisit CRI keychain support is real demand from a cluster whose only
+credential source is CRI-proxied auth (not reachable via a kubelet credential-provider
+plugin or a static secret).

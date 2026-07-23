@@ -144,7 +144,7 @@ fan-out as an explicit, **deprecated** opt-in resilience fallback (a startup `wa
 it's set) — kept only because a misconfigured or unhealthy Spegel instance (e.g. a
 `registries.yaml` typo, or a Cilium XDP path degrading etcd) can silently stop advertising a node's
 content, and the fan-out routed around that class of failure during the same testing. It is
-scheduled for removal after a production soak of default-off (tracked in BACKLOG.md).
+scheduled for removal after a production soak of default-off.
 
 **Peer-mirror self-check.** When peer_mirror is enabled, `PeerMirrorSelfCheck`
 (`snapshotter/src/peer_mirror_selfcheck.rs`) periodically probes the *local* mirror endpoint for a
@@ -403,7 +403,7 @@ working implementations, not stubs:
   digest and under the `sha256-<hex>` fallback tag for registries without native referrers-API
   support.
 - **`check`** — validates manifest/media-type/annotations, referrer linkage (fallback-tag lookup
-  only today — see BACKLOG.md), downloads the bootstrap, and runs `nydus-image check` on it.
+  only today), downloads the bootstrap, and runs `nydus-image check` on it.
 - **`copy`** — pulls and re-pushes an image between repositories with `HEAD`-based blob dedup and
   same-registry `mount_blob`.
 - **`mount`** — pulls the bootstrap via `registry-client` and spawns a foreground `nydusd` fusedev

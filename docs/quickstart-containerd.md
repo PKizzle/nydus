@@ -180,4 +180,3 @@ echo '[{"registry":"registry.example.com","auth":"dXNlcjpwYXNz","expires_in_seco
 - [ARCHITECTURE.md](../ARCHITECTURE.md) — design, runtime (compio), profiles, backends, storage
 - [credentials.md](./credentials.md) — registry auth flow and the credential bridge
 - [operations.md](./operations.md) — metrics, allocator stats, CPU profiling
-- [../BACKLOG.md](../BACKLOG.md) — deferred work (referrer serving, CRI keychain, …)
