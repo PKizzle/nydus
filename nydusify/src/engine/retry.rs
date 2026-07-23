@@ -99,7 +99,7 @@ fn parse_delay(s: &str) -> Option<Duration> {
     }
     let seconds = match unit {
         "ms" => value / 1000.0,
-        "s" | "" => value,
+        "s" => value,
         "m" => value * 60.0,
         "h" => value * 3600.0,
         _ => return None,

@@ -249,11 +249,19 @@ fn reject_unsupported(request: &ConvertRequest) -> Result<()> {
 /// digest `nydusify check` and the snapshotter resolve), not the
 /// platform-resolved manifest.
 fn top_level_subject_descriptor(fetched: &registry_client::FetchedManifest) -> Descriptor {
+    // When the registry omits Content-Type, sniff index-vs-manifest from the
+    // body instead of defaulting blindly: labeling an index subject with the
+    // manifest media type is cosmetically wrong even though referrers resolve
+    // by digest.
+    let media_type = fetched.content_type.clone().unwrap_or_else(|| {
+        if is_index(None, &fetched.bytes) {
+            registry_client::types::MEDIA_TYPE_OCI_INDEX.to_string()
+        } else {
+            manifest_media_type(true).to_string()
+        }
+    });
     Descriptor {
-        media_type: fetched
-            .content_type
-            .clone()
-            .unwrap_or_else(|| manifest_media_type(true).to_string()),
+        media_type,
         digest: fetched.digest.clone(),
         size: fetched.bytes.len() as u64,
         ..Descriptor::default()
