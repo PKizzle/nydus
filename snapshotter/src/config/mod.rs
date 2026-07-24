@@ -742,13 +742,14 @@ pub struct AutoZranConfig {
     /// reconciler's slow pass, to recover images stuck at the Base sidecar
     /// (first pod died before settle, or the settle-driven upload failed).
     ///
-    /// Default **off**: the current implementation re-enqueues every persisted
-    /// profile, so images that were profiled but are not node-local-accel
-    /// candidates (e.g. published `*-nydus` images the tracer happened to see)
-    /// generate a bounded run of failed conversions until the 3-strike backoff
-    /// suppresses them. Enable only once the sweep is gated on the sidecar
-    /// actually existing in Base state (tracked as a follow-up).
-    #[serde(default)]
+    /// Default **on**, and safe: the sweep tags its jobs
+    /// [`crate::auto_zran::JobOrigin::ReconSweep`], and the worker's re-optimize
+    /// gate defers any such job whose base sidecar does not exist yet — a
+    /// profiled-but-non-candidate image (e.g. a published `*-nydus` image the
+    /// tracer happened to see) is skipped WITHOUT a conversion attempt or a
+    /// failure strike, so a deferred profile costs only a cheap local manifest
+    /// probe per pass. Set to `false` to opt out of the recovery sweep entirely.
+    #[serde(default = "default_true")]
     pub reoptimize_stuck_base: bool,
     /// File-access capture (tracing) configuration. Tied to `enable`.
     #[serde(default)]
@@ -764,7 +765,7 @@ impl Default for AutoZranConfig {
             nice: default_auto_zran_nice(),
             sched_class: SchedClass::default(),
             work_dir: default_auto_zran_work_dir(),
-            reoptimize_stuck_base: false,
+            reoptimize_stuck_base: true,
             capture: AccessCaptureConfig::default(),
         }
     }
@@ -1621,6 +1622,9 @@ skip_verify = true
         assert_eq!(config.snapshotter.auto_zran.sched_class, SchedClass::Idle);
         assert_eq!(config.snapshotter.auto_zran.nice, 19);
         assert!(config.snapshotter.auto_zran.capture.enable);
+        // The Base-recovery sweep is on by default (the worker's re-optimize
+        // gate makes it safe for non-candidate profiles).
+        assert!(config.snapshotter.auto_zran.reoptimize_stuck_base);
         assert_eq!(config.snapshotter.containerd.namespace, "k8s.io");
         // The TCP metrics endpoint is opt-in: with no `[snapshotter.metrics]`
         // section the listener is unset, so behavior is UDS-only as before.
@@ -1682,6 +1686,17 @@ min_files = 5
         assert_eq!(config.snapshotter.auto_zran.capture.settle_idle, "10s");
         assert_eq!(config.snapshotter.auto_zran.capture.settle_max, "120s");
         assert_eq!(config.snapshotter.auto_zran.capture.min_files, 5);
+        // Absent from the TOML above → the default-on Base-recovery sweep.
+        assert!(config.snapshotter.auto_zran.reoptimize_stuck_base);
+    }
+
+    #[test]
+    fn reoptimize_stuck_base_can_be_disabled() {
+        let config: SnapshotterConfig = toml::from_str(
+            "[snapshotter.auto_zran]\nenable = true\nreoptimize_stuck_base = false\n",
+        )
+        .expect("parse config");
+        assert!(!config.snapshotter.auto_zran.reoptimize_stuck_base);
     }
 
     #[test]

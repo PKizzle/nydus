@@ -1377,9 +1377,11 @@ pub async fn serve_with_supervisor(
             AUTO_ZRAN_STALE_JOB_MAX_AGE,
             manager,
         );
-        // Opt-in: the re-optimize sweep re-enqueues every persisted profile,
-        // which re-drives non-candidate images (see the config field doc), so
-        // it stays off until sidecar-Base gating lands.
+        // Default-on opt-out: the re-optimize sweep replays persisted profiles
+        // to recover images wedged at Base. The worker's re-optimize gate
+        // defers sweep jobs whose base sidecar is absent (no strike, no failing
+        // conversion — see the config field doc), so non-candidate profiles are
+        // harmless. Set `reoptimize_stuck_base = false` to disable the sweep.
         if config.snapshotter.auto_zran.reoptimize_stuck_base {
             reconciler = reconciler.with_reoptimize_profiles(
                 crate::prefetch_profile::PrefetchProfileStore::from_cache_root(

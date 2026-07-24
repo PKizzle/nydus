@@ -162,6 +162,27 @@ impl AutoZranStage {
     }
 }
 
+/// What triggered a conversion job. Drives the worker's re-optimize gate: an
+/// [`JobOrigin::ReconSweep`] optimize job for an image whose base sidecar does
+/// not exist yet is *deferred* rather than run as a full-pipeline conversion —
+/// a profiled-but-non-candidate image (e.g. a published `*-nydus` image the
+/// tracer happened to see) would otherwise fail conversion and burn the failure
+/// backoff on every slow pass. Settle-driven jobs keep the full-pipeline
+/// fallback for the legitimate settle-before-base race.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub enum JobOrigin {
+    /// Tracer settle or sysctl force-settle: this node just captured the
+    /// profile and wants it optimized now. When no base sidecar exists yet the
+    /// optimize stage runs the full pipeline once WITH prefetch (the profile is
+    /// never lost — see the ordering note on [`run_conversion`]).
+    #[default]
+    Settle,
+    /// Reconciler slow-pass re-optimize sweep replaying a persisted profile to
+    /// recover an image wedged at Base. Proceeds only when a base sidecar
+    /// already exists; otherwise the job is deferred to a later pass.
+    ReconSweep,
+}
+
 /// Conversion job persisted in memory while waiting for the worker.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct AutoZranJob {
@@ -170,6 +191,10 @@ pub struct AutoZranJob {
     /// Empty for [`AutoZranStage::Base`]; the captured access profile (in
     /// first-seen order) for [`AutoZranStage::Optimize`].
     pub prefetch_files: Vec<String>,
+    /// What triggered this job. Defaults to [`JobOrigin::Settle`] so older
+    /// serialized jobs (no `origin` key) keep the full-pipeline fallback.
+    #[serde(default)]
+    pub origin: JobOrigin,
 }
 
 impl AutoZranJob {
@@ -179,17 +204,20 @@ impl AutoZranJob {
             image,
             stage: AutoZranStage::Base,
             prefetch_files: Vec::new(),
+            origin: JobOrigin::Settle,
         }
     }
 
     /// A stage-2 optimize job from a settled prefetch profile. `None` when the
-    /// profile captured no files (nothing to optimize for).
-    pub fn from_profile(profile: &PrefetchProfile) -> Option<Self> {
+    /// profile captured no files (nothing to optimize for). `origin` records
+    /// whether the profile came from a live settle or the recon sweep.
+    pub fn from_profile(profile: &PrefetchProfile, origin: JobOrigin) -> Option<Self> {
         let prefetch_files = profile.prefetch_files();
         (!prefetch_files.is_empty()).then(|| Self {
             image: profile.image.clone(),
             stage: AutoZranStage::Optimize,
             prefetch_files,
+            origin,
         })
     }
 }
@@ -300,6 +328,24 @@ impl AutoZranState {
                 seen.remove(&dedupe_key(&job.image, job.stage));
             }
             self.record_failure(&job.image);
+        }
+        if let Ok(mut active) = self.active_image.lock()
+            && active.as_deref() == Some(job.image.as_str())
+        {
+            *active = None;
+        }
+    }
+
+    /// A job the worker chose not to run (the re-optimize gate deferred it: no
+    /// base sidecar yet). Unlike a failure, this records NO strike — the image
+    /// is not non-convertible, it simply has no base to optimize against — and
+    /// releases the `(image, stage)` dedupe key so a later sweep (or a real
+    /// settle-driven optimize once the base exists) can enqueue again.
+    fn mark_skipped(&self, job: &AutoZranJob) {
+        self.metrics.running_jobs.fetch_sub(1, Ordering::Relaxed);
+        self.metrics.skipped_total.fetch_add(1, Ordering::Relaxed);
+        if let Ok(mut seen) = self.queued_or_done.lock() {
+            seen.remove(&dedupe_key(&job.image, job.stage));
         }
         if let Ok(mut active) = self.active_image.lock()
             && active.as_deref() == Some(job.image.as_str())
@@ -467,9 +513,17 @@ impl AutoZranManager {
     /// Enqueue the stage-2 OPTIMIZE conversion from a settled prefetch profile
     /// without blocking the sysctl request path. Deduped independently of the
     /// base stage, so this queues even when a base job for the same image is
-    /// already queued/done.
+    /// already queued/done. Origin [`JobOrigin::Settle`]: when no base sidecar
+    /// exists the worker runs the full pipeline (settle-before-base race).
     pub fn try_enqueue_profile(&self, profile: &PrefetchProfile) {
-        let Some(job) = AutoZranJob::from_profile(profile) else {
+        self.enqueue_profile(profile, JobOrigin::Settle);
+    }
+
+    /// Shared body of [`Self::try_enqueue_profile`] and the recon sweep,
+    /// parameterized by origin so the worker's re-optimize gate can tell a live
+    /// settle apart from a replayed profile.
+    fn enqueue_profile(&self, profile: &PrefetchProfile, origin: JobOrigin) {
+        let Some(job) = AutoZranJob::from_profile(profile, origin) else {
             self.state
                 .metrics
                 .skipped_total
@@ -484,10 +538,14 @@ impl AutoZranManager {
     /// the OPTIMIZE stage for every persisted prefetch profile. Cheap by
     /// construction — the existing guards do all the filtering: the per-image
     /// failure negative cache, the `(image, stage)` dedupe (once per process
-    /// lifetime unless a run fails), the bounded queue, and the worker's own
-    /// `SidecarState::Optimized` early-exit for images whose sidecar already
-    /// carries a prefetch blob. Returns the number of profiles submitted to
-    /// the enqueue path (not necessarily accepted).
+    /// lifetime unless a run fails), the bounded queue, the worker's own
+    /// `SidecarState::Optimized` early-exit for already-optimized sidecars, and
+    /// — because these jobs carry [`JobOrigin::ReconSweep`] — the worker's
+    /// re-optimize gate, which defers (no strike, dedupe key released) any
+    /// profile whose base sidecar does not exist yet, so a profiled
+    /// non-candidate image never triggers a failing conversion. Returns the
+    /// number of profiles submitted to the enqueue path (not necessarily
+    /// accepted).
     pub fn retry_stuck_optimizes(&self, store: &PrefetchProfileStore) -> usize {
         let profiles = match store.list() {
             Ok(profiles) => profiles,
@@ -514,7 +572,7 @@ impl AutoZranManager {
                 deferred = profiles.len() - submitted;
                 break;
             }
-            self.try_enqueue_profile(profile);
+            self.enqueue_profile(profile, JobOrigin::ReconSweep);
             submitted += 1;
         }
         if deferred > 0 {
@@ -594,13 +652,40 @@ async fn worker_loop(
 ) {
     while let Ok(job) = receiver.recv().await {
         state.mark_started(&job);
-        let result = run_conversion(&config, &deps, &job).await;
-        let success = result.is_ok();
-        state.mark_finished(&job, success);
-        if let Err(e) = result {
-            warn!(image = %job.image, error = ?e, "auto-zran conversion failed");
+        match run_conversion(&config, &deps, &job).await {
+            Ok(ConversionOutcome::Completed) => state.mark_finished(&job, true),
+            Ok(ConversionOutcome::Deferred) => state.mark_skipped(&job),
+            Err(e) => {
+                state.mark_finished(&job, false);
+                warn!(image = %job.image, error = ?e, "auto-zran conversion failed");
+            }
         }
     }
+}
+
+/// Terminal disposition of a worker job, distinguishing a real conversion from
+/// a gated no-op (see [`AutoZranState::mark_skipped`]).
+enum ConversionOutcome {
+    /// The stage ran (or was a legitimate already-present skip): count success.
+    Completed,
+    /// The re-optimize gate declined the job (no base sidecar yet): no strike,
+    /// dedupe key released, revisited on a later slow pass.
+    Deferred,
+}
+
+/// Whether the worker must defer a job instead of converting: a
+/// [`JobOrigin::ReconSweep`] optimize job whose subject has no base sidecar
+/// yet. Base jobs and settle-driven optimize jobs are never deferred — the
+/// latter keep the settle-before-base full-pipeline fallback.
+fn sweep_job_deferred(stage: AutoZranStage, origin: JobOrigin, existing: SidecarState) -> bool {
+    matches!(
+        (stage, origin, existing),
+        (
+            AutoZranStage::Optimize,
+            JobOrigin::ReconSweep,
+            SidecarState::Absent,
+        )
+    )
 }
 
 /// Map our config-side scheduling enum to the local_accel-side one.
@@ -633,11 +718,19 @@ enum SidecarState {
 ///   disk, so the optimize stage runs ONLY `nydus-image optimize`.
 /// * settle BEFORE base done — no base output on disk, so the optimize stage
 ///   runs the full pipeline once WITH prefetch (the profile is never lost).
+///
+/// Re-optimize gate: a [`JobOrigin::ReconSweep`] optimize job whose base
+/// sidecar is [`SidecarState::Absent`] is deferred here, BEFORE any conversion
+/// work — the sweep replays every persisted profile, and a profiled
+/// non-candidate image (no base sidecar will ever exist for it) would otherwise
+/// run a full-pipeline conversion that fails and burns the failure backoff on
+/// every slow pass. The gate costs one manifest resolve + sidecar probe per
+/// deferred profile per pass, which is cheap and local.
 async fn run_conversion(
     config: &AutoZranConfig,
     deps: &ConversionDeps,
     job: &AutoZranJob,
-) -> Result<()> {
+) -> Result<ConversionOutcome> {
     // (1) Resolve manifest + layers.
     let info = deps
         .containerd_lookup
@@ -646,6 +739,23 @@ async fn run_conversion(
         .with_context(|| format!("resolve manifest for {}", job.image))?;
     let manifest_digest = info.manifest_digest.clone();
     let image_name = auto_accel_image_name(&manifest_digest);
+
+    // Probe whether a sidecar already exists (and, if so, whether it is
+    // already optimized). Half-uploaded sidecars (snapshotter killed
+    // mid-write, GC raced) read back as `Absent` so we re-convert rather
+    // than mark-accelerated-then-fail-to-mount. Probed BEFORE the start log so
+    // a gated sweep job produces no info-level noise.
+    let (existing, existing_manifest) = existing_sidecar_state(deps, &image_name).await;
+
+    if sweep_job_deferred(job.stage, job.origin, existing) {
+        debug!(
+            image = %job.image,
+            manifest = %manifest_digest,
+            "auto-zran re-optimize deferred: no base sidecar yet (revisited next slow pass)"
+        );
+        return Ok(ConversionOutcome::Deferred);
+    }
+
     info!(
         image = %job.image,
         stage = job.stage.tag(),
@@ -654,12 +764,6 @@ async fn run_conversion(
         prefetch_files = job.prefetch_files.len(),
         "auto-zran starting conversion"
     );
-
-    // Probe whether a sidecar already exists (and, if so, whether it is
-    // already optimized). Half-uploaded sidecars (snapshotter killed
-    // mid-write, GC raced) read back as `Absent` so we re-convert rather
-    // than mark-accelerated-then-fail-to-mount.
-    let (existing, existing_manifest) = existing_sidecar_state(deps, &image_name).await;
 
     match job.stage {
         AutoZranStage::Base => {
@@ -688,6 +792,7 @@ async fn run_conversion(
             .await
         }
     }
+    .map(|()| ConversionOutcome::Completed)
 }
 
 /// Stage 1: create + merge with an EMPTY prefetch list → a fully servable base
@@ -745,7 +850,10 @@ async fn run_base_stage(
 /// force-settle, and the reconciler's slow-cadence
 /// [`AutoZranManager::retry_stuck_optimizes`], which re-enqueues persisted
 /// profiles so an image is not wedged at Base when the first pod dies before
-/// settle or the settle-driven upload fails past the in-memory backoff.
+/// settle or the settle-driven upload fails past the in-memory backoff. Sweep
+/// jobs only reach this stage once a base sidecar exists — the re-optimize gate
+/// in [`run_conversion`] defers them otherwise — so a `SidecarState::Absent`
+/// here means a live settle raced ahead of its own base (full-pipeline path).
 #[allow(clippy::too_many_arguments)]
 async fn run_optimize_stage(
     config: &AutoZranConfig,
@@ -1361,10 +1469,11 @@ mod tests {
     #[test]
     fn job_from_profile_keeps_prefetch_order() {
         let profile = profile("registry.local/app:1");
-        let job = AutoZranJob::from_profile(&profile).unwrap();
+        let job = AutoZranJob::from_profile(&profile, JobOrigin::Settle).unwrap();
         assert_eq!(job.image, "registry.local/app:1");
         assert_eq!(job.stage, AutoZranStage::Optimize);
         assert_eq!(job.prefetch_files, vec!["/bin/app"]);
+        assert_eq!(job.origin, JobOrigin::Settle);
     }
 
     #[test]
@@ -1449,6 +1558,7 @@ mod tests {
             image: "registry.local/success:1".to_string(),
             stage: AutoZranStage::Optimize,
             prefetch_files: vec!["/bin/app".to_string()],
+            origin: JobOrigin::Settle,
         };
         state
             .queued_or_done
@@ -1477,6 +1587,7 @@ mod tests {
             image: "registry.local/fail:1".to_string(),
             stage: AutoZranStage::Optimize,
             prefetch_files: vec!["/bin/app".to_string()],
+            origin: JobOrigin::Settle,
         };
         state
             .queued_or_done
@@ -1508,6 +1619,7 @@ mod tests {
             image: "registry.local/app:1".to_string(),
             stage: AutoZranStage::Optimize,
             prefetch_files: vec!["/bin/app".to_string()],
+            origin: JobOrigin::Settle,
         };
         state.mark_started(&job);
         // active_job_key is the stage-AGNOSTIC work-dir key (both stages share
@@ -1715,7 +1827,8 @@ mod tests {
         store.put(&profile("registry.local/broken:1")).unwrap();
 
         // Suppress one image via the real failure path.
-        let bad = AutoZranJob::from_profile(&profile("registry.local/broken:1")).unwrap();
+        let bad = AutoZranJob::from_profile(&profile("registry.local/broken:1"), JobOrigin::Settle)
+            .unwrap();
         for _ in 0..MAX_CONVERSION_FAILURES {
             state.mark_started(&bad);
             state.mark_finished(&bad, false);
@@ -1731,6 +1844,90 @@ mod tests {
         assert!(
             receiver.try_recv().is_err(),
             "suppressed image must not pass the negative cache"
+        );
+    }
+
+    /// The re-optimize gate: only a `ReconSweep` optimize job whose base sidecar
+    /// is `Absent` is deferred. Base jobs and settle-driven optimize jobs (the
+    /// legitimate settle-before-base race) always proceed.
+    #[test]
+    fn sweep_gate_defers_only_reconsweep_optimize_without_base() {
+        // The one deferred combination.
+        assert!(sweep_job_deferred(
+            AutoZranStage::Optimize,
+            JobOrigin::ReconSweep,
+            SidecarState::Absent
+        ));
+
+        // Settle-driven optimize keeps the full-pipeline fallback.
+        assert!(!sweep_job_deferred(
+            AutoZranStage::Optimize,
+            JobOrigin::Settle,
+            SidecarState::Absent
+        ));
+        // A sweep job with a base present proceeds (it has something to optimize).
+        assert!(!sweep_job_deferred(
+            AutoZranStage::Optimize,
+            JobOrigin::ReconSweep,
+            SidecarState::Base
+        ));
+        assert!(!sweep_job_deferred(
+            AutoZranStage::Optimize,
+            JobOrigin::ReconSweep,
+            SidecarState::Optimized
+        ));
+        // Base jobs are never gated by this rule, regardless of origin/state.
+        for origin in [JobOrigin::Settle, JobOrigin::ReconSweep] {
+            for existing in [
+                SidecarState::Absent,
+                SidecarState::Base,
+                SidecarState::Optimized,
+            ] {
+                assert!(!sweep_job_deferred(AutoZranStage::Base, origin, existing));
+            }
+        }
+    }
+
+    /// A deferred sweep job (`mark_skipped`) records NO failure strike and
+    /// releases the `(image, stage)` dedupe key, so the image can be re-swept
+    /// (or optimized for real once its base lands) instead of being wedged.
+    #[test]
+    fn mark_skipped_releases_dedupe_without_a_failure_strike() {
+        let state = AutoZranState::new(8);
+        let job = AutoZranJob {
+            image: "registry.local/no-base:1".to_string(),
+            stage: AutoZranStage::Optimize,
+            prefetch_files: vec!["/bin/app".to_string()],
+            origin: JobOrigin::ReconSweep,
+        };
+        state
+            .queued_or_done
+            .lock()
+            .unwrap()
+            .insert(dedupe_key(&job.image, job.stage));
+
+        state.mark_started(&job);
+        state.mark_skipped(&job);
+        let status = state.status();
+
+        assert_eq!(status.running_jobs, 0, "running gauge is released");
+        assert_eq!(status.skipped_total, 1, "deferral counts as a skip");
+        assert_eq!(status.failed_total, 0, "a deferral is not a failure");
+        assert!(status.active_image.is_none(), "active image cleared");
+        // Dedupe key released → a fresh enqueue for the same image/stage is not
+        // suppressed as a duplicate.
+        assert!(
+            !state
+                .queued_or_done
+                .lock()
+                .unwrap()
+                .contains(&dedupe_key(&job.image, job.stage)),
+            "dedupe key released so the image can be re-swept"
+        );
+        // No failure recorded → the enqueue path is not backing off the image.
+        assert!(
+            !state.enqueue_suppressed(&job.image, Instant::now()),
+            "a deferral must not trip the failure backoff"
         );
     }
 
