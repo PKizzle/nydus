@@ -542,10 +542,10 @@ impl AutoZranManager {
     /// `SidecarState::Optimized` early-exit for already-optimized sidecars, and
     /// — because these jobs carry [`JobOrigin::ReconSweep`] — the worker's
     /// re-optimize gate, which defers (no strike, dedupe key released) any
-    /// profile whose base sidecar does not exist yet, so a profiled
-    /// non-candidate image never triggers a failing conversion. Returns the
-    /// number of profiles submitted to the enqueue path (not necessarily
-    /// accepted).
+    /// profile whose image no longer resolves or whose base sidecar does not
+    /// exist yet, so a profiled non-candidate image never triggers a failing
+    /// conversion. Returns the number of profiles submitted to the enqueue path
+    /// (not necessarily accepted).
     pub fn retry_stuck_optimizes(&self, store: &PrefetchProfileStore) -> usize {
         let profiles = match store.list() {
             Ok(profiles) => profiles,
@@ -719,24 +719,44 @@ enum SidecarState {
 /// * settle BEFORE base done — no base output on disk, so the optimize stage
 ///   runs the full pipeline once WITH prefetch (the profile is never lost).
 ///
-/// Re-optimize gate: a [`JobOrigin::ReconSweep`] optimize job whose base
-/// sidecar is [`SidecarState::Absent`] is deferred here, BEFORE any conversion
-/// work — the sweep replays every persisted profile, and a profiled
-/// non-candidate image (no base sidecar will ever exist for it) would otherwise
-/// run a full-pipeline conversion that fails and burns the failure backoff on
-/// every slow pass. The gate costs one manifest resolve + sidecar probe per
-/// deferred profile per pass, which is cheap and local.
+/// Re-optimize gate (two stages, both BEFORE any conversion work): a
+/// [`JobOrigin::ReconSweep`] optimize job is deferred — no failure strike, no
+/// WARN — when it is not a live acceleration candidate. The sweep replays every
+/// persisted profile on the recon slow pass, and a stale/non-candidate profile
+/// would otherwise run (and fail) a full-pipeline conversion every pass. Two
+/// non-candidate signals are caught here:
+/// * its image manifest no longer resolves (moving tag gone, image evicted from
+///   the content store) — nothing to recover; and
+/// * its base sidecar is [`SidecarState::Absent`] (no base will exist for a
+///   non-node-local-accel image).
+///
+/// A settle-driven job (the tracer just saw the image) keeps the hard error /
+/// full-pipeline fallback for both cases. The gate costs one manifest resolve +
+/// sidecar probe per deferred profile per pass, which is cheap and local.
 async fn run_conversion(
     config: &AutoZranConfig,
     deps: &ConversionDeps,
     job: &AutoZranJob,
 ) -> Result<ConversionOutcome> {
-    // (1) Resolve manifest + layers.
-    let info = deps
+    // (1) Resolve manifest + layers. A sweep-replayed profile whose image no
+    // longer resolves is not a live candidate — defer quietly instead of
+    // burning a failure strike (a live settle keeps the hard error).
+    let info = match deps
         .containerd_lookup
         .manifest_info(&job.image, &deps.containerd.content_root())
         .await
-        .with_context(|| format!("resolve manifest for {}", job.image))?;
+    {
+        Ok(info) => info,
+        Err(e) if job.origin == JobOrigin::ReconSweep => {
+            debug!(
+                image = %job.image,
+                error = %format!("{e:#}"),
+                "auto-zran re-optimize deferred: image manifest no longer resolves"
+            );
+            return Ok(ConversionOutcome::Deferred);
+        }
+        Err(e) => return Err(e).with_context(|| format!("resolve manifest for {}", job.image)),
+    };
     let manifest_digest = info.manifest_digest.clone();
     let image_name = auto_accel_image_name(&manifest_digest);
 
