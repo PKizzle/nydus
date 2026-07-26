@@ -158,10 +158,12 @@ jobs:
                 --target localhost:5000/$I:nydus-nightly-oci-ref \
                 --plain-http
 
-            # The Rust nydusify writes the fetched bootstrap to <work-dir>/bootstrap
-            # (work-dir defaults to ./tmp); the ./output/target/nydus_bootstrap/...
-            # tree was the Go implementation's layout and is never created here.
-            sudo fsck.erofs -d1 ./tmp/bootstrap
+            # `check` writes the fetched bootstrap to <work-dir>/bootstrap, and its
+            # work-dir defaults to ./output. The old
+            # ./output/target/nydus_bootstrap/image/image.boot was the Go
+            # implementation's nested layout and is never created here.
+            sudo fsck.erofs -d1 ./output/bootstrap
+            sudo rm -rf ./output
           done
       - name: Save Nydusify Metric
         uses: actions/upload-artifact@v6
@@ -229,10 +231,12 @@ jobs:
                 --target localhost:5000/$I:nydus-nightly-v6 \
                 --target-plain-http
 
-            # The Rust nydusify writes the fetched bootstrap to <work-dir>/bootstrap
-            # (work-dir defaults to ./tmp); the ./output/target/nydus_bootstrap/...
-            # tree was the Go implementation's layout and is never created here.
-            sudo fsck.erofs -d1 ./tmp/bootstrap
+            # `check` writes the fetched bootstrap to <work-dir>/bootstrap, and its
+            # work-dir defaults to ./output. The old
+            # ./output/target/nydus_bootstrap/image/image.boot was the Go
+            # implementation's nested layout and is never created here.
+            sudo fsck.erofs -d1 ./output/bootstrap
+            sudo rm -rf ./output
           done
       - name: Save Nydusify Metric
         uses: actions/upload-artifact@v6
