@@ -209,6 +209,7 @@ How it works, and where each piece lives:
 |---|---|---|
 | inspect | `ctr container info` + `ctr snapshot mounts` yield the image ref and the overlay `upperdir` | `engine/containerd_inspect.rs` |
 | diff | the upperdir is walked into an OCI layer tar, translating overlayfs' markers | `engine/overlay_diff.rs` |
+| volumes | each `--with-path` is tarred out of the container's mount namespace (`nsenter`) | `commands/commit.rs` |
 | build | `nydus-image create --type tar-rafs` (base's fs-version + compressor) | `commands/commit.rs` |
 | merge | `nydus-image merge --parent-bootstrap <base>` | `commands/commit.rs` |
 | push | reused base blobs + the new blob + bootstrap + rewritten config + manifest | `commands/commit.rs` |
@@ -225,6 +226,14 @@ layer. containerd's overlay snapshotter enables neither.
 
 Useful flags:
 
+- `--with-path <PATH>` (repeatable) — also commit an absolute path from *inside* the running
+  container, as its own layer. Bind-mounted volumes are separate mounts over the merged view, so
+  nothing written into them ever reaches the overlay upperdir an ordinary commit walks; this reads
+  them out of the container's mount namespace with `nsenter` (override the binary with `--nsenter`).
+  It needs a task in `RUNNING` state — a container whose process has exited still has a writable
+  layer worth committing, so the pid is only looked up when this flag is used. The resulting layers
+  are merged *after* the writable layer, so a bind-mounted path shadows whatever the rootfs had at
+  the same location, as it did in the container.
 - `--container` takes a containerd id, an unambiguous id prefix, or a nerdctl `--name`.
 - `--containerd-namespace` (default `default`; Kubernetes uses `k8s.io`),
   `--containerd-address`, `--containerd-cli` (default `ctr`).
@@ -237,10 +246,6 @@ Useful flags:
   never engages.
 - `--plain-http` / `--source-plain-http` / `--target-plain-http`, `--platform`, `--work-dir`,
   `--nydus-image`, `--push-retry-count` / `--push-retry-delay` behave as they do elsewhere.
-
-Not implemented: `--with-path`, the Go tool's option for committing extra bind-mounted paths by
-entering the container's mount namespace with `nsenter`. `commit` covers the container's own
-writable layer.
 
 > Needs root (the upperdir lives under containerd's state directory) and a container on an overlay
 > snapshot with a writable layer — a read-only view has nothing to commit and is rejected as such.

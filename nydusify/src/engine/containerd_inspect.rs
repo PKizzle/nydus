@@ -198,6 +198,18 @@ impl ContainerdCli {
         }
     }
 
+    /// The pid of the container's running task, for entering its mount
+    /// namespace (`commit --with-path`).
+    ///
+    /// Only needed for `--with-path`, so it is a separate call rather than part
+    /// of [`inspect`](Self::inspect): a container whose task has exited still
+    /// has a writable layer worth committing, and failing the whole commit for
+    /// want of a pid nobody asked about would be wrong.
+    pub fn task_pid(&self, container_id: &str) -> Result<u32> {
+        let listed = self.run(&["task", "ls"], "list tasks")?;
+        parse_task_pid(&listed, container_id)
+    }
+
     /// `ctr snapshot --snapshotter <s> mounts <target> <key>`. The target path is
     /// only echoed back into the printed mount command — nothing is mounted.
     fn snapshot_mounts(&self, snapshotter: &str, key: &str) -> Result<String> {
@@ -311,6 +323,50 @@ fn mount_options(line: &str) -> Option<&str> {
     // that carries an overlay directory.
     line.split_whitespace()
         .find(|t| t.contains("upperdir=") || t.contains("lowerdir="))
+}
+
+/// Pull the pid of `container_id`'s task out of `ctr task ls`.
+///
+/// The output is a header plus one `TASK PID STATUS` row per task:
+///
+/// ```text
+/// TASK                PID      STATUS
+/// 0d1c9f1a...         31337    RUNNING
+/// ```
+///
+/// A task in any state other than `RUNNING` has no process to enter, so it is
+/// rejected here rather than surfacing as an opaque `nsenter` failure.
+pub fn parse_task_pid(stdout: &str, container_id: &str) -> Result<u32> {
+    let mut seen = 0usize;
+    for line in stdout.lines() {
+        let mut fields = line.split_whitespace();
+        let (Some(task), Some(pid), status) = (fields.next(), fields.next(), fields.next()) else {
+            continue;
+        };
+        if task == "TASK" {
+            continue;
+        }
+        seen += 1;
+        if task != container_id {
+            continue;
+        }
+        let pid: u32 = pid
+            .parse()
+            .with_context(|| format!("`ctr task ls` reported a non-numeric pid {pid:?}"))?;
+        match status {
+            Some("RUNNING") => return Ok(pid),
+            Some(other) => bail!(
+                "container {container_id} is {other}, not RUNNING; --with-path has to enter \
+                 the container's mount namespace, which needs a live process"
+            ),
+            None => bail!("`ctr task ls` row for {container_id} has no status column"),
+        }
+    }
+    bail!(
+        "container {container_id} has no task ({seen} task(s) in this namespace). --with-path \
+         commits paths from inside the running container, so it needs one; drop --with-path to \
+         commit only the writable layer."
+    )
 }
 
 /// Whether `path` looks like a directory we can read — used to turn a stale
@@ -434,6 +490,42 @@ mod tests {
         assert_eq!(info.id, "abc");
         assert_eq!(info.snapshot_key, "k");
         assert!(info.snapshotter.is_empty());
+    }
+
+    const CTR_TASKS: &str = "TASK                                                                PID       STATUS\n\
+        0d1c9f1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e    31337     RUNNING\n\
+        aa11bb22cc33dd44ee55ff66aa77bb88cc99dd00ee11ff22aa33bb44cc55dd66    404       STOPPED\n";
+
+    #[test]
+    fn finds_the_pid_of_a_running_task() {
+        let pid = parse_task_pid(
+            CTR_TASKS,
+            "0d1c9f1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e",
+        )
+        .unwrap();
+
+        assert_eq!(pid, 31337);
+    }
+
+    #[test]
+    fn refuses_a_task_that_is_not_running() {
+        let err = parse_task_pid(
+            CTR_TASKS,
+            "aa11bb22cc33dd44ee55ff66aa77bb88cc99dd00ee11ff22aa33bb44cc55dd66",
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("STOPPED"), "unexpected: {err}");
+        assert!(err.to_string().contains("--with-path"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn reports_a_container_with_no_task_at_all() {
+        let err = parse_task_pid(CTR_TASKS, "deadbeef").unwrap_err();
+
+        assert!(err.to_string().contains("has no task"), "unexpected: {err}");
+        // The count excludes the header row.
+        assert!(err.to_string().contains("2 task(s)"), "unexpected: {err}");
     }
 
     #[test]

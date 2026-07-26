@@ -25,7 +25,11 @@ func (c *CommitTestSuite) TestCommitContainer() test.Generator {
 	scenarios := tool.DescartesIterator{}
 	scenarios.
 		Dimension(paramImage, []interface{}{"ubuntu:latest"}).
-		Dimension(paramFSVersion, []interface{}{"6"})
+		Dimension(paramFSVersion, []interface{}{"6"}).
+		// zran=true converts the base with --oci-ref, whose bootstrap references
+		// the original gzip layers as its data blobs instead of new RAFS ones.
+		// commit has to merge onto that blob table too, not just a standard one.
+		Dimension(paramZran, []interface{}{false, true})
 
 	return func() (name string, testCase test.Case) {
 		if !scenarios.HasNext() {
@@ -34,6 +38,7 @@ func (c *CommitTestSuite) TestCommitContainer() test.Generator {
 		scenario := scenarios.Next()
 		ctx := tool.DefaultContext(c.t)
 		ctx.Build.FSVersion = scenario.GetString(paramFSVersion)
+		ctx.Build.OCIRef = scenario.GetBool(paramZran)
 
 		image, committedImage := c.prepareImage(c.t, ctx, scenario.GetString(paramImage))
 		return scenario.Str(), func(_ *testing.T) {
@@ -43,9 +48,17 @@ func (c *CommitTestSuite) TestCommitContainer() test.Generator {
 }
 
 func (c *CommitTestSuite) TestCommitAndCheck(ctx tool.Context, image, commitedImage string) {
+	// A bind-mounted volume is a separate mount over the merged view, so nothing
+	// written into it ever reaches the overlay upperdir an ordinary commit walks.
+	// --with-path is the only way to capture it, and it reads the path out of the
+	// container's mount namespace with nsenter.
+	volumeDir := path.Join(ctx.Env.WorkDir, "volume")
+	require.NoError(c.t, os.MkdirAll(volumeDir, 0755))
+	require.NoError(c.t, os.WriteFile(path.Join(volumeDir, "volume-file"), []byte("This is a Nydus volume\n"), 0644))
+
 	// run nydus container
 	containerName := uuid.NewString()
-	runContainerCmd := fmt.Sprintf("sudo nerdctl --snapshotter nydus run -d -t --insecure-registry --name=%s %s sh", containerName, image)
+	runContainerCmd := fmt.Sprintf("sudo nerdctl --snapshotter nydus run -d -t --insecure-registry -v %s:/nydus-volume --name=%s %s sh", volumeDir, containerName, image)
 	containerID := strings.Trim(tool.RunWithOutput(runContainerCmd), "\n")
 	defer tool.ClearContainer(c.t, image, "nydus", containerName)
 
@@ -62,7 +75,7 @@ func (c *CommitTestSuite) TestCommitAndCheck(ctx tool.Context, image, commitedIm
 	committedContainerName := fmt.Sprintf("%s-committed", containerName)
 	// -E so the harness-wide PLAIN_HTTP reaches nydusify: the smoke registry
 	// speaks plain HTTP and the Rust nydusify never downgrades silently.
-	commitCmd := fmt.Sprintf("sudo -E %s commit --container %s --target %s", ctx.Binary.Nydusify, containerID, commitedImage)
+	commitCmd := fmt.Sprintf("sudo -E %s commit --container %s --target %s --with-path /nydus-volume", ctx.Binary.Nydusify, containerID, commitedImage)
 	tool.RunWithoutOutput(c.t, commitCmd)
 
 	// run committed container
@@ -72,6 +85,10 @@ func (c *CommitTestSuite) TestCommitAndCheck(ctx tool.Context, image, commitedIm
 
 	// check committed file content
 	checkFileContent(c.t, committedContainerName, "/root/commit", "This is Nydus commit")
+	// The committed image must carry the volume's contents as a plain layer --
+	// the committed container is run without any -v, so anything at
+	// /nydus-volume can only have come from --with-path.
+	checkFileContent(c.t, committedContainerName, "/nydus-volume/volume-file", "This is a Nydus volume")
 }
 
 func (c *CommitTestSuite) prepareImage(t *testing.T, ctx *tool.Context, image string) (string, string) {

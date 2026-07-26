@@ -58,10 +58,20 @@ pub struct CommitArgs {
     /// containerd recorded for the container, which is almost always right.
     #[arg(long, env = "SOURCE")]
     pub source: Option<String>,
+    /// Also commit this absolute path from *inside* the running container,
+    /// as its own layer. Repeatable. Use it for bind-mounted volumes, whose
+    /// contents live outside the container's writable layer and are therefore
+    /// invisible to an ordinary commit. Requires a running task.
+    #[arg(long = "with-path", value_name = "PATH")]
+    pub with_path: Vec<PathBuf>,
     /// Refuse to commit an image that already carries this many committed
     /// layers, so a commit loop cannot grow a manifest without bound.
     #[arg(long = "maximum-times", default_value_t = 400)]
     pub maximum_times: usize,
+    /// `nsenter` binary used to enter the container's mount namespace for
+    /// `--with-path`.
+    #[arg(long = "nsenter", env = "NSENTER", default_value = "nsenter")]
+    pub nsenter: PathBuf,
     /// containerd CLI used to inspect the container.
     #[arg(long = "containerd-cli", env = "CONTAINERD_CLI", default_value = "ctr")]
     pub containerd_cli: PathBuf,

@@ -29,15 +29,17 @@
 //!   push blobs + bootstrap + config + manifest  registry-client
 //! ```
 //!
-//! ## Scope
+//! ## Bind mounts
 //!
-//! `--with-path` (committing extra bind-mounted paths by entering the
-//! container's mount namespace, which the Go nydusify does via `nsenter`) is
-//! **not** implemented. Everything below covers the container's own writable
-//! layer, which is what a commit means for an unmodified `run`.
+//! A bind-mounted volume is a separate mount over the merged view, so nothing
+//! written into it ever reaches the overlay upperdir the diff walks -- an
+//! ordinary commit cannot see it at all. `--with-path` covers those: each named
+//! path is tarred out of the *running* container's mount namespace with
+//! `nsenter` and merged as its own layer, after the writable one, so it shadows
+//! whatever the rootfs had at that location just as the mount did.
 
 use std::ffi::OsString;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context, Result, bail};
@@ -80,6 +82,8 @@ pub struct CommitPlan {
     pub source_override: Option<String>,
     /// Platform of the base image to commit.
     pub platform: String,
+    /// Absolute paths to additionally commit from inside the running container.
+    pub with_path: Vec<PathBuf>,
     /// Committed-layer ceiling.
     pub maximum_times: usize,
 }
@@ -233,63 +237,52 @@ pub async fn run(args: CommitArgs) -> Result<()> {
 
     let blob_dir = work_dir.join("commit-blobs");
     fresh_dir(&blob_dir)?;
-    let staged_bootstrap = work_dir.join("bootstrap-upper");
-    let create_json = work_dir.join("create-upper.json");
-    run_nydus_image(
+    let upper = build_rafs_layer(
         &args.nydus_image,
-        &create_args(
-            &upper_tar,
-            &staged_bootstrap,
-            &blob_dir,
-            &base_info.fs_version,
-            &base_info.compressor,
-            &create_json,
-        ),
-        "build the upper RAFS layer",
+        &upper_tar,
+        "upper",
+        &base_info,
+        &blob_dir,
+        work_dir,
     )?;
-    // A commit that only deleted files or created empty ones has no chunks, so
-    // `create` writes no data blob at all. That is a valid layer.
-    let upper_blob_id = read_output_json(&create_json)?.blobs.pop();
-    let (upper_blob, upper_bootstrap) = match &upper_blob_id {
-        Some(id) => {
-            let path = blob_dir.join(id);
-            if !path.exists() {
-                bail!(
-                    "nydus-image reported blob {id} but wrote no file at {}",
-                    path.display()
-                );
-            }
-            info!(blob = %id, size = file_len(&path)?, "built the upper data blob");
-            // `merge` recovers a source layer's blob id from its *bootstrap file
-            // name* whenever the blob is not otherwise addressable
-            // (`BlobInfo::get_blob_id_from_meta_path`), so the bootstrap has to
-            // be named after the blob or the merged image references a blob
-            // called "bootstrap-upper" that no registry can serve. Same
-            // convention as converter::layer_bootstrap_path.
-            let named = blob_dir.join(format!("{id}.boot"));
-            std::fs::rename(&staged_bootstrap, &named).with_context(|| {
-                format!(
-                    "name the upper bootstrap after its blob ({} -> {})",
-                    staged_bootstrap.display(),
-                    named.display()
-                )
-            })?;
-            (Some(path), named)
-        }
-        None => {
-            info!("the committed layer holds no file data; no new blob to push");
-            (None, staged_bootstrap)
-        }
-    };
 
-    // (5) Stack it on the base bootstrap.
+    // (5) `--with-path`: bind-mounted volumes live outside the writable layer,
+    // so they are invisible to the upperdir walk. Read them out of the running
+    // container's mount namespace instead, one layer each.
+    let mut extra_layers: Vec<RafsLayer> = Vec::new();
+    if !plan.with_path.is_empty() {
+        let pid = containerd.task_pid(&inspected.id)?;
+        info!(
+            pid,
+            paths = plan.with_path.len(),
+            "committing extra paths from the container"
+        );
+        for (idx, path) in plan.with_path.iter().enumerate() {
+            let tar = work_dir.join(format!("blob-mount-{idx}.tar"));
+            copy_from_container(&args.nsenter, pid, path, &tar)?;
+            extra_layers.push(build_rafs_layer(
+                &args.nydus_image,
+                &tar,
+                &format!("mount-{idx}"),
+                &base_info,
+                &blob_dir,
+                work_dir,
+            )?);
+        }
+    }
+
+    // (6) Stack them on the base bootstrap. The upper layer goes first and the
+    // `--with-path` layers over it, so a bind-mounted path shadows whatever the
+    // rootfs had at the same location -- which is what it did in the container.
+    let mut sources: Vec<PathBuf> = vec![upper.bootstrap.clone()];
+    sources.extend(extra_layers.iter().map(|l| l.bootstrap.clone()));
     let merged_bootstrap = work_dir.join("bootstrap-merged");
     let merge_json = work_dir.join("merge.json");
     run_nydus_image(
         &args.nydus_image,
         &merge_args(
             &base_bootstrap,
-            &upper_bootstrap,
+            &sources,
             &merged_bootstrap,
             &blob_dir,
             &merge_json,
@@ -299,10 +292,16 @@ pub async fn run(args: CommitArgs) -> Result<()> {
     let merged_blob_ids = read_output_json(&merge_json)?.blobs;
     debug!(?merged_blob_ids, "merged bootstrap blob table");
 
-    // (6) Publish. Keep the base's manifest flavour: a docker-schema base stays
+    // (7) Publish. Keep the base's manifest flavour: a docker-schema base stays
     // docker, an OCI base stays OCI. Some registries omit `mediaType` from the
     // manifest body, so fall back to the Content-Type it was served with.
     let docker2oci = is_oci_manifest(base.media_type.as_deref(), fetched.content_type.as_deref());
+    let new_blobs: Vec<&Path> = upper
+        .blob
+        .iter()
+        .chain(extra_layers.iter().filter_map(|l| l.blob.as_ref()))
+        .map(PathBuf::as_path)
+        .collect();
     let pushed = push_committed_image(
         docker2oci,
         &target_client,
@@ -311,7 +310,7 @@ pub async fn run(args: CommitArgs) -> Result<()> {
         &source_ref,
         &base,
         &config_bytes,
-        upper_blob.as_deref(),
+        &new_blobs,
         &merged_bootstrap,
         &merged_blob_ids,
         &already_committed,
@@ -340,7 +339,7 @@ async fn push_committed_image(
     source_ref: &ImageReference,
     base: &Manifest,
     config_bytes: &[u8],
-    upper_blob: Option<&Path>,
+    new_blobs: &[&Path],
     merged_bootstrap: &Path,
     merged_blob_ids: &[String],
     already_committed: &[String],
@@ -371,7 +370,7 @@ async fn push_committed_image(
     }
 
     let mut commit_blobs: Vec<String> = already_committed.to_vec();
-    if let Some(blob) = upper_blob {
+    for blob in new_blobs {
         let digest = retry
             .run("push committed blob", || {
                 target_client.push_blob_file(repo, blob)
@@ -525,6 +524,151 @@ async fn copy_blob_to_target(
     Ok(())
 }
 
+/// One RAFS layer built for this commit: its data blob (absent when the layer
+/// holds no file content) and the bootstrap describing it.
+struct RafsLayer {
+    blob: Option<PathBuf>,
+    bootstrap: PathBuf,
+}
+
+/// Build one RAFS layer from a tar, at the base image's fs version and
+/// compressor so `merge` accepts it.
+///
+/// The bootstrap is named after the blob it describes. That is not cosmetic:
+/// `merge` recovers a source layer's blob id from its *bootstrap file name*
+/// whenever the blob is not otherwise addressable
+/// (`BlobInfo::get_blob_id_from_meta_path`), so a bootstrap called
+/// `bootstrap-upper` yields a merged image referencing a blob by that name,
+/// which no registry can serve. Same convention as
+/// `converter::layer_bootstrap_path`.
+fn build_rafs_layer(
+    nydus_image: &Path,
+    tar: &Path,
+    label: &str,
+    base: &NydusImageOutput,
+    blob_dir: &Path,
+    work_dir: &Path,
+) -> Result<RafsLayer> {
+    let staged = work_dir.join(format!("bootstrap-{label}"));
+    let create_json = work_dir.join(format!("create-{label}.json"));
+    run_nydus_image(
+        nydus_image,
+        &create_args(
+            tar,
+            &staged,
+            blob_dir,
+            &base.fs_version,
+            &base.compressor,
+            &create_json,
+        ),
+        &format!("build the {label} RAFS layer"),
+    )?;
+
+    // A layer that only deletes files, or only creates empty ones, has no
+    // chunks, so `create` writes no data blob at all. That is a valid layer.
+    let Some(id) = read_output_json(&create_json)?.blobs.pop() else {
+        info!(
+            layer = label,
+            "layer holds no file data; no new blob to push"
+        );
+        return Ok(RafsLayer {
+            blob: None,
+            bootstrap: staged,
+        });
+    };
+    let blob = blob_dir.join(&id);
+    if !blob.exists() {
+        bail!(
+            "nydus-image reported blob {id} but wrote no file at {}",
+            blob.display()
+        );
+    }
+    info!(layer = label, blob = %id, size = file_len(&blob)?, "built a data blob");
+
+    let bootstrap = blob_dir.join(format!("{id}.boot"));
+    std::fs::rename(&staged, &bootstrap).with_context(|| {
+        format!(
+            "name the {label} bootstrap after its blob ({} -> {})",
+            staged.display(),
+            bootstrap.display()
+        )
+    })?;
+    Ok(RafsLayer {
+        blob: Some(blob),
+        bootstrap,
+    })
+}
+
+/// Tar an absolute path out of the running container's mount namespace.
+///
+/// `--with-path` exists for bind-mounted volumes: they are separate mounts over
+/// the merged view, so nothing they contain ever reaches the overlay upperdir
+/// an ordinary commit walks. Reading them means entering the container's mount
+/// namespace, which is what `nsenter` is for.
+fn copy_from_container(nsenter: &Path, pid: u32, path: &Path, out: &Path) -> Result<()> {
+    if !path.is_absolute() {
+        bail!(
+            "--with-path {} must be absolute: it is resolved inside the container, \
+             where the working directory is not ours",
+            path.display()
+        );
+    }
+    let tar = std::fs::File::create(out)
+        .with_context(|| format!("create mount tar {}", out.display()))?;
+    let args = nsenter_tar_args(pid, path);
+    debug!(binary = %nsenter.display(), ?args, "reading a path out of the container");
+
+    let output = Command::new(nsenter)
+        .args(&args)
+        .stdout(tar)
+        .output()
+        .with_context(|| {
+            format!(
+                "spawn `{}` to read {} out of the container (install util-linux, or point \
+                 --nsenter at it)",
+                nsenter.display(),
+                path.display()
+            )
+        })?;
+    if !output.status.success() {
+        bail!(
+            "reading {} out of container pid {pid} failed ({}): {}",
+            path.display(),
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim(),
+        );
+    }
+    // `tar` warns on unreadable files rather than failing; surface that instead
+    // of silently committing a partial volume.
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if !stderr.trim().is_empty() {
+        warn!(path = %path.display(), "tar reported: {}", stderr.trim());
+    }
+    info!(path = %path.display(), bytes = file_len(out)?, "read a path out of the container");
+    Ok(())
+}
+
+/// `nsenter --target <pid> --mount -- tar ... -cf - <path>` args, matching what
+/// the Go nydusify runs.
+fn nsenter_tar_args(pid: u32, path: &Path) -> Vec<OsString> {
+    vec![
+        "--target".into(),
+        pid.to_string().into(),
+        "--mount".into(),
+        "--".into(),
+        "tar".into(),
+        // Keep xattrs (capabilities, SELinux labels); do not abort the whole
+        // commit because one file in a volume is unreadable; keep the leading
+        // `/` so the entry lands at the same absolute path in the layer.
+        "--xattrs".into(),
+        "--ignore-failed-read".into(),
+        "--absolute-names".into(),
+        "-cf".into(),
+        "-".into(),
+        path.into(),
+    ]
+}
+
 /// Read fs version, compressor and blob table out of a bootstrap, via
 /// `nydus-image check -J`. The upper layer must be built with the same fs
 /// version and compressor or `merge` refuses it.
@@ -591,15 +735,16 @@ fn create_args(
     ]
 }
 
-/// `nydus-image merge --parent-bootstrap <base> <upper>` args.
+/// `nydus-image merge --parent-bootstrap <base> <source>...` args. Sources are
+/// listed lower-first: later ones overlay earlier ones.
 fn merge_args(
     base_bootstrap: &Path,
-    upper_bootstrap: &Path,
+    sources: &[PathBuf],
     bootstrap_out: &Path,
     blob_dir: &Path,
     output_json: &Path,
 ) -> Vec<OsString> {
-    vec![
+    let mut args: Vec<OsString> = vec![
         "merge".into(),
         "--parent-bootstrap".into(),
         base_bootstrap.into(),
@@ -609,8 +754,9 @@ fn merge_args(
         blob_dir.into(),
         "--output-json".into(),
         output_json.into(),
-        upper_bootstrap.into(),
-    ]
+    ];
+    args.extend(sources.iter().map(OsString::from));
+    args
 }
 
 /// The blobs previous commits contributed, read off the base bootstrap layer.
@@ -695,6 +841,15 @@ pub fn plan(args: &CommitArgs) -> Result<CommitPlan> {
     if args.maximum_times == 0 {
         bail!("--maximum-times must be at least 1");
     }
+    for path in &args.with_path {
+        if !path.is_absolute() {
+            bail!(
+                "--with-path {} must be absolute: it is resolved inside the container, \
+                 where the working directory is not ours",
+                path.display()
+            );
+        }
+    }
     // Committing onto the tag the container is running from would replace the
     // base image out from under it while its blobs are still being read.
     if let Some(source) = &args.source
@@ -707,6 +862,7 @@ pub fn plan(args: &CommitArgs) -> Result<CommitPlan> {
         target: args.target.trim().to_string(),
         source_override: args.source.clone(),
         platform: args.platform.clone(),
+        with_path: args.with_path.clone(),
         maximum_times: args.maximum_times,
     })
 }
@@ -725,7 +881,9 @@ mod tests {
             container: "0d1c9f1a".to_string(),
             target: "registry.example.com/app:latest-nydus-committed".to_string(),
             source: None,
+            with_path: Vec::new(),
             maximum_times: 400,
+            nsenter: PathBuf::from("nsenter"),
             containerd_cli: PathBuf::from("ctr"),
             containerd_namespace: "default".to_string(),
             containerd_address: None,
@@ -887,10 +1045,86 @@ mod tests {
     }
 
     #[test]
+    fn rejects_a_relative_with_path() {
+        let mut args = base_args();
+        args.with_path = vec![PathBuf::from("var/lib/data")];
+
+        let err = plan(&args).unwrap_err();
+
+        assert!(
+            err.to_string().contains("must be absolute"),
+            "unexpected: {err}"
+        );
+    }
+
+    #[test]
+    fn carries_absolute_with_paths_into_the_plan() {
+        let mut args = base_args();
+        args.with_path = vec![PathBuf::from("/data"), PathBuf::from("/srv/cache")];
+
+        let plan = plan(&args).unwrap();
+
+        assert_eq!(
+            plan.with_path,
+            vec![PathBuf::from("/data"), PathBuf::from("/srv/cache")]
+        );
+    }
+
+    #[test]
+    fn nsenter_args_enter_the_mount_namespace_and_keep_absolute_names() {
+        let args: Vec<String> = nsenter_tar_args(31337, Path::new("/data"))
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+
+        assert!(args.windows(2).any(|w| w == ["--target", "31337"]));
+        assert!(args.contains(&"--mount".to_string()));
+        // Everything after `--` is the command run inside the namespace.
+        let sep = args.iter().position(|a| a == "--").unwrap();
+        assert_eq!(args[sep + 1], "tar");
+        // Without --absolute-names tar strips the leading `/` and the entry
+        // lands at the wrong place in the layer.
+        assert!(args.contains(&"--absolute-names".to_string()));
+        assert!(args.contains(&"--xattrs".to_string()));
+        assert!(args.contains(&"--ignore-failed-read".to_string()));
+        // Streamed to stdout, with the path last.
+        assert!(args.windows(2).any(|w| w == ["-cf", "-"]));
+        assert_eq!(args.last().unwrap(), "/data");
+    }
+
+    #[test]
+    fn merge_lists_with_path_layers_after_the_upper_one() {
+        // Later sources overlay earlier ones, so a bind-mounted path has to come
+        // after the writable layer -- it shadowed the rootfs in the container.
+        let sources = vec![
+            PathBuf::from("/w/blobs/aa.boot"),
+            PathBuf::from("/w/blobs/bb.boot"),
+        ];
+        let args: Vec<String> = merge_args(
+            Path::new("/w/bootstrap-base"),
+            &sources,
+            Path::new("/w/bootstrap-merged"),
+            Path::new("/w/blobs"),
+            Path::new("/w/merge.json"),
+        )
+        .iter()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
+
+        assert_eq!(
+            &args[args.len() - 2..],
+            &[
+                "/w/blobs/aa.boot".to_string(),
+                "/w/blobs/bb.boot".to_string()
+            ]
+        );
+    }
+
+    #[test]
     fn merge_args_stack_the_upper_layer_on_the_base_bootstrap() {
         let args = merge_args(
             Path::new("/w/bootstrap-base"),
-            Path::new("/w/bootstrap-upper"),
+            &[PathBuf::from("/w/bootstrap-upper")],
             Path::new("/w/bootstrap-merged"),
             Path::new("/w/blobs"),
             Path::new("/w/merge.json"),
