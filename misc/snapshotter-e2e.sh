@@ -45,10 +45,27 @@ timeout 10 /usr/local/bin/containerd-nydus healthcheck --ready --socket "$SYSCTL
 # --- fixture registry + image ----------------------------------------------
 # docker treats localhost registries as insecure out of the box, so it stages
 # the fixture; everything after this line exercises the nydus stack instead.
-docker ps --format '{{.Names}}' | grep -q '^e2e-registry$' || \
+# Docker Hub times out often enough on CI runners to be the single largest source
+# of false failures here (exit 125 before any nydus code runs), so every pull is
+# retried rather than failing the whole gate.
+docker_pull_retry() {
+    for attempt in 1 2 3 4 5; do
+        if docker pull "$1"; then
+            return 0
+        fi
+        echo "docker pull $1 failed (attempt $attempt/5); retrying in $((attempt * 5))s" >&2
+        sleep $((attempt * 5))
+    done
+    echo "docker pull $1 failed after 5 attempts" >&2
+    return 1
+}
+
+docker ps --format '{{.Names}}' | grep -q '^e2e-registry$' || {
+    docker_pull_retry registry:2
     docker run -d --name e2e-registry -p ${REGISTRY_PORT}:5000 registry:2
+}
 timeout 60 sh -c "until curl -sf http://localhost:${REGISTRY_PORT}/v2/; do sleep 1; done"
-docker pull "$FIXTURE_SRC"
+docker_pull_retry "$FIXTURE_SRC"
 docker tag "$FIXTURE_SRC" "$FIXTURE"
 docker push "$FIXTURE"
 
