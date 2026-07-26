@@ -151,15 +151,6 @@ dedup = ["nydus-storage/dedup"]
 # at the workspace root so Cargo doesn't warn about ignoring members' resolvers.
 resolver = "3"
 
-[workspace.package]
-# Tracks the toolchain pinned in rust-toolchain.toml, which is what every build
-# of this repo actually uses. It was "1.85" (edition 2024's floor) until
-# 2026-07, but that had long since stopped being true -- `time` and `darling`
-# require 1.88 and fjall requires 1.90, so a 1.85 rustc failed anyway, pointing
-# at a dependency instead of at us. Declaring it here rather than on the root
-# package alone is what makes clippy's MSRV-aware lints work for every member;
-# without it they run unconstrained and have to be silenced in the Makefile.
-rust-version = "1.96"
 members = [
     "api",
     "builder",
@@ -173,6 +164,16 @@ members = [
     "upgrade",
     "utils",
 ]
+
+[workspace.package]
+# Tracks the toolchain pinned in rust-toolchain.toml, which is what every build
+# of this repo actually uses. It was "1.85" (edition 2024's floor) until
+# 2026-07, but that had long since stopped being true -- `time` and `darling`
+# require 1.88 and fjall requires 1.90, so a 1.85 rustc failed anyway, pointing
+# at a dependency instead of at us. Declaring it here rather than on the root
+# package alone is what makes clippy's MSRV-aware lints work for every member;
+# without it they run unconstrained and have to be silenced in the Makefile.
+rust-version = "1.96"
 
 [workspace.dependencies]
 # rust-vmm crates
