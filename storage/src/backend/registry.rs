@@ -35,7 +35,50 @@ const REGISTRY_CONFIG_POLL_INTERVAL: u64 = 5; // in seconds
 
 // Refresh tokens this many seconds before they expire to avoid using an expired token.
 const REGISTRY_TOKEN_REFRESH_MARGIN: u64 = 20; // in seconds
-const REGISTRY_TOKEN_REFRESH_JITTER_MAX: u64 = 10; // in seconds
+// Hard cap on the proactive-refresh jitter window, however long-lived the token is.
+const REGISTRY_TOKEN_REFRESH_JITTER_MAX: u64 = 5 * 60; // in seconds
+// The jitter window is this fraction of the token's lifetime.
+const REGISTRY_TOKEN_REFRESH_JITTER_DIVISOR: u64 = 10;
+// Ceiling on the exponential backoff between failed proactive refresh attempts.
+const REGISTRY_TOKEN_REFRESH_BACKOFF_MAX: u64 = 10 * 60; // in seconds
+
+/// A per-call random `u64`.
+///
+/// `RandomState` is seeded from the OS per instance, which is all the entropy the
+/// refresh jitter needs — cheaper than pulling `rand` into `nydus-storage` for it.
+fn random_u64() -> u64 {
+    use std::hash::{BuildHasher, Hasher};
+    std::collections::hash_map::RandomState::new()
+        .build_hasher()
+        .finish()
+}
+
+/// Width of the proactive-refresh jitter window for a token living `ttl_secs`.
+///
+/// Proportional rather than flat. Nodes that pulled the same image at the same moment
+/// hold tokens that expire at the same moment, so the window has to be wide enough to
+/// actually decorrelate a fleet — a fixed handful of seconds is not. One tenth of the
+/// lifetime spreads them while staying small next to the TTL, and the cap keeps a
+/// long-lived token from being thrown away absurdly early.
+fn token_refresh_jitter_max(ttl_secs: u64) -> u64 {
+    (ttl_secs / REGISTRY_TOKEN_REFRESH_JITTER_DIVISOR).min(REGISTRY_TOKEN_REFRESH_JITTER_MAX)
+}
+
+/// Epoch second at which a token issued at `now` with `ttl_secs` of life should be refreshed.
+///
+/// Never later than the expiry and never earlier than `now`: for a very short-lived token
+/// the margin plus jitter can exceed the whole lifetime, in which case the honest answer is
+/// "refresh immediately" rather than a time in the past.
+fn token_refresh_at(now: u64, ttl_secs: u64) -> u64 {
+    let jitter_max = token_refresh_jitter_max(ttl_secs);
+    let jitter = if jitter_max == 0 {
+        0
+    } else {
+        random_u64() % (jitter_max + 1)
+    };
+    let lead = REGISTRY_TOKEN_REFRESH_MARGIN.saturating_add(jitter);
+    now.saturating_add(ttl_secs).saturating_sub(lead).max(now)
+}
 
 /// Error codes related to registry storage backend operations.
 #[derive(Debug)]
@@ -268,6 +311,11 @@ struct RegistryState {
     cached_redirect: HashCache<String>,
     // The epoch timestamp of token expiration, which is obtained from the registry server.
     token_expired_at: ArcSwapOption<u64>,
+    // The epoch timestamp at which the background thread should proactively refresh the
+    // token: the expiry less a safety margin and a per-process jitter proportional to the
+    // token's lifetime (see `token_refresh_at`). Derived from `token_expired_at`, so the
+    // two are always set and cleared together.
+    token_refresh_at: ArcSwapOption<u64>,
     // Cache bearer auth for refreshing token.
     cached_bearer_auth: ArcSwapOption<BearerAuth>,
 }
@@ -333,6 +381,7 @@ impl RegistryState {
         let last_cached_auth = self.cached_auth.get();
         self.cached_auth.set(&last_cached_auth, String::new());
         self.token_expired_at.store(None);
+        self.token_refresh_at.store(None);
     }
 
     fn detect_config_auth_update(&self) -> Option<ConfigAuthUpdate> {
@@ -371,6 +420,7 @@ impl RegistryState {
                 self.cached_auth
                     .set(&last_cached_auth, format!("Basic {}", config_auth));
                 self.token_expired_at.store(None);
+                self.token_refresh_at.store(None);
                 debug!("refreshed basic registry auth after registry_auth config update");
             }
             Some(ConfigAuthUpdate::RefreshBearer(auth)) => match self.get_token(auth, request) {
@@ -416,11 +466,16 @@ impl RegistryState {
             .map_err(|e| einval!(format!("failed to get auth token from registry: {:?}", e)))?;
 
         if let Ok(now_timestamp) = SystemTime::now().duration_since(UNIX_EPOCH) {
-            self.token_expired_at
-                .store(Some(Arc::new(now_timestamp.as_secs() + ret.expires_in)));
+            // The jitter is proportional to the lifetime, so it can only be computed here,
+            // where the server-reported TTL is in hand.
+            let now = now_timestamp.as_secs();
+            let expires_at = now.saturating_add(ret.expires_in);
+            let refresh_at = token_refresh_at(now, ret.expires_in);
+            self.token_expired_at.store(Some(Arc::new(expires_at)));
+            self.token_refresh_at.store(Some(Arc::new(refresh_at)));
             debug!(
-                "cached bearer auth, next time: {}",
-                now_timestamp.as_secs() + ret.expires_in
+                "cached bearer auth, expires at {}, proactive refresh at {}",
+                expires_at, refresh_at
             );
         }
 
@@ -1162,6 +1217,7 @@ impl Registry {
             cached_auth_using_http_get: HashCache::new(),
             cached_redirect: HashCache::new(),
             token_expired_at: ArcSwapOption::new(None),
+            token_refresh_at: ArcSwapOption::new(None),
             cached_bearer_auth: ArcSwapOption::new(None),
         });
         state.set_config_auth(auth);
@@ -1207,22 +1263,14 @@ impl Registry {
         let request = self.request.clone();
         let state = self.state.clone();
         thread::spawn(move || {
-            // Randomize the refresh lead per process so a fleet of nodes that
-            // pulled the same image at the same moment does not stampede the
-            // token service in lockstep when the tokens age out together.
-            let refresh_lead = {
-                use std::hash::{BuildHasher, Hasher};
-                let seed = std::collections::hash_map::RandomState::new()
-                    .build_hasher()
-                    .finish();
-                REGISTRY_TOKEN_REFRESH_MARGIN + seed % (REGISTRY_TOKEN_REFRESH_JITTER_MAX + 1)
-            };
             // Exponential backoff on refresh failure: without it, a registry
             // or token-service outage has every node re-attempting (and
             // error-logging) once per poll tick, and the whole fleet hammers
             // the recovering service in lockstep. Doubling the wait per
-            // consecutive failure (capped at 16 ticks) spreads the retries;
-            // in-band requests still refresh tokens on 401 regardless.
+            // consecutive failure spreads the retries; in-band requests still
+            // refresh tokens on 401 regardless.
+            const MAX_BACKOFF_TICKS: u64 =
+                REGISTRY_TOKEN_REFRESH_BACKOFF_MAX / REGISTRY_CONFIG_POLL_INTERVAL;
             let mut failure_streak: u32 = 0;
             let mut backoff_ticks_left: u64 = 0;
             loop {
@@ -1232,10 +1280,11 @@ impl Registry {
                 if backoff_ticks_left > 0 {
                     backoff_ticks_left -= 1;
                 } else if let Ok(now_timestamp) = SystemTime::now().duration_since(UNIX_EPOCH)
-                    && let Some(token_expired_at) = state.token_expired_at.load().as_deref()
+                    && let Some(token_refresh_at) = state.token_refresh_at.load().as_deref()
                 {
-                    // Refresh the token if it will expire within the margin.
-                    if now_timestamp.as_secs() + refresh_lead >= *token_expired_at
+                    // The jittered instant was computed when the token was issued, from
+                    // its actual lifetime — see `token_refresh_at`.
+                    if now_timestamp.as_secs() >= *token_refresh_at
                         && let Some(cached_bearer_auth) = state.cached_bearer_auth.load().as_deref()
                     {
                         match state.get_token(cached_bearer_auth.to_owned(), &request) {
@@ -1249,7 +1298,8 @@ impl Registry {
                             }
                             Err(e) => {
                                 failure_streak = failure_streak.saturating_add(1);
-                                backoff_ticks_left = 1u64 << failure_streak.min(4);
+                                backoff_ticks_left =
+                                    (1u64 << failure_streak.min(7)).min(MAX_BACKOFF_TICKS);
                                 error!(
                                     "[refresh_token_thread] failed to refresh registry token \
                                      (attempt {}): {}; backing off for {} poll tick(s)",
@@ -1362,6 +1412,7 @@ mod tests {
             cached_config_auth: Default::default(),
             cached_redirect: Default::default(),
             token_expired_at: ArcSwapOption::new(None),
+            token_refresh_at: ArcSwapOption::new(None),
             cached_bearer_auth: ArcSwapOption::new(None),
         }
     }
@@ -1459,6 +1510,7 @@ mod tests {
             cached_config_auth: Default::default(),
             cached_redirect: Default::default(),
             token_expired_at: ArcSwapOption::new(None),
+            token_refresh_at: ArcSwapOption::new(None),
             cached_bearer_auth: ArcSwapOption::new(None),
         };
 
@@ -1494,6 +1546,7 @@ mod tests {
             cached_config_auth: Cache::new("old-auth".to_string()),
             cached_redirect: Default::default(),
             token_expired_at: ArcSwapOption::new(None),
+            token_refresh_at: ArcSwapOption::new(None),
             cached_bearer_auth: ArcSwapOption::new(Some(Arc::new(BearerAuth {
                 realm: "https://auth.example.com/token".to_string(),
                 service: "example.com".to_string(),
@@ -1540,6 +1593,7 @@ mod tests {
             cached_config_auth: Default::default(),
             cached_redirect: Default::default(),
             token_expired_at: ArcSwapOption::new(None),
+            token_refresh_at: ArcSwapOption::new(None),
             cached_bearer_auth: ArcSwapOption::new(None),
         };
 
@@ -1996,6 +2050,7 @@ mod tests {
             cached_config_auth: Default::default(),
             cached_redirect: Default::default(),
             token_expired_at: ArcSwapOption::new(None),
+            token_refresh_at: ArcSwapOption::new(None),
             cached_bearer_auth: ArcSwapOption::new(None),
         };
 
@@ -2217,9 +2272,13 @@ mod tests {
         state
             .token_expired_at
             .store(Some(Arc::new(9_999_999_999u64)));
+        state
+            .token_refresh_at
+            .store(Some(Arc::new(9_999_999_000u64)));
 
         assert_eq!(state.cached_auth.get(), "Bearer eyJhbGciOiJSUzI1NiJ9");
         assert!(state.token_expired_at.load().is_some());
+        assert!(state.token_refresh_at.load().is_some());
 
         state.clear_cached_auth();
 
@@ -2232,6 +2291,78 @@ mod tests {
             state.token_expired_at.load().is_none(),
             "token_expired_at should be None after clear"
         );
+        // The two must clear together: a stale refresh instant with no expiry would
+        // have the background thread refresh against auth that is already gone.
+        assert!(
+            state.token_refresh_at.load().is_none(),
+            "token_refresh_at should be None after clear"
+        );
+    }
+
+    #[test]
+    fn test_token_refresh_jitter_is_proportional_and_capped() {
+        // Proportional branch: one tenth of the lifetime. At the default 10-minute
+        // token expiration that is a 60s spread, versus the 10s flat window this
+        // replaced.
+        assert_eq!(
+            token_refresh_jitter_max(REGISTRY_DEFAULT_TOKEN_EXPIRATION),
+            60
+        );
+        assert_eq!(token_refresh_jitter_max(1800), 180);
+
+        // Capped branch: the cap binds from a 50-minute lifetime upwards, so a
+        // long-lived token is not thrown away absurdly early.
+        assert_eq!(
+            token_refresh_jitter_max(REGISTRY_TOKEN_REFRESH_JITTER_MAX * 10),
+            REGISTRY_TOKEN_REFRESH_JITTER_MAX
+        );
+        assert_eq!(
+            token_refresh_jitter_max(3600),
+            REGISTRY_TOKEN_REFRESH_JITTER_MAX
+        );
+        assert_eq!(
+            token_refresh_jitter_max(24 * 3600),
+            REGISTRY_TOKEN_REFRESH_JITTER_MAX
+        );
+
+        // A very short TTL yields no jitter room at all — `token_refresh_at` relies
+        // on this to avoid a modulo by zero.
+        assert_eq!(token_refresh_jitter_max(5), 0);
+    }
+
+    #[test]
+    fn test_token_refresh_at_lands_inside_the_expected_window() {
+        const NOW: u64 = 1_000_000;
+        const TTL: u64 = 3600;
+        let expires_at = NOW + TTL;
+        // margin + jitter, where jitter ∈ [0, ttl/10].
+        let earliest = expires_at - REGISTRY_TOKEN_REFRESH_MARGIN - token_refresh_jitter_max(TTL);
+        let latest = expires_at - REGISTRY_TOKEN_REFRESH_MARGIN;
+
+        // Sample repeatedly: the jitter is random per call, so assert the invariant
+        // rather than a value, and check the window is actually being used.
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..200 {
+            let at = token_refresh_at(NOW, TTL);
+            assert!(
+                (earliest..=latest).contains(&at),
+                "refresh instant {at} outside [{earliest}, {latest}]"
+            );
+            seen.insert(at);
+        }
+        assert!(
+            seen.len() > 1,
+            "jitter should spread refreshes across the window, got {:?}",
+            seen
+        );
+    }
+
+    #[test]
+    fn test_token_refresh_at_never_precedes_now() {
+        // The margin alone exceeds this lifetime; the answer must be "refresh now",
+        // not an instant in the past (which would underflow or refresh forever).
+        assert_eq!(token_refresh_at(1_000_000, 1), 1_000_000);
+        assert_eq!(token_refresh_at(0, 0), 0);
     }
 
     #[test]
