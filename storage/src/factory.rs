@@ -371,10 +371,7 @@ mod tests {
         fn get_blob_cache(&self, _blob_info: &Arc<BlobInfo>) -> IOResult<Arc<dyn BlobCache>> {
             self.entered.wait();
             self.release.wait();
-            Err(std::io::Error::new(
-                ErrorKind::Other,
-                "blocking test manager always errors",
-            ))
+            Err(std::io::Error::other("blocking test manager always errors"))
         }
 
         fn check_stat(&self) {}
