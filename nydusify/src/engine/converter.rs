@@ -619,6 +619,29 @@ fn build_artifact(
         let blob = single_output(&out_dir, Some(&bootstrap_i))
             .context("locating per-layer nydus data blob")?;
 
+        // Without --original-blob-ids, `merge` takes each source's blob id from its
+        // bootstrap FILE NAME (BlobInfo::get_blob_id_from_meta_path) and dedupes the
+        // blob table by that id. Naming every layer's bootstrap "bootstrap" therefore
+        // collapses all of them onto ONE blob-table entry with the literal id
+        // "bootstrap", and every layer's chunks get remapped onto it -- a merged image
+        // referencing chunks its single blob does not contain, which `nydus-image
+        // check` rejects. Name each bootstrap after its own blob instead. (The
+        // --oci-ref path supplies the ids explicitly and is unaffected, but there is
+        // no reason for the two to disagree.)
+        let bootstrap_i = match layer_bootstrap_path(&out_dir, blob.as_deref())? {
+            Some(named) => {
+                std::fs::rename(&bootstrap_i, &named).with_context(|| {
+                    format!(
+                        "rename layer bootstrap {} -> {}",
+                        bootstrap_i.display(),
+                        named.display()
+                    )
+                })?;
+                named
+            }
+            None => bootstrap_i,
+        };
+
         layer_bootstraps.push(bootstrap_i);
         if let Some(blob) = blob {
             new_blobs.push(blob);
@@ -989,6 +1012,14 @@ fn write_output_json(
         "ConversionElapsed": format!("{elapsed_secs:.3}s"),
         "platforms": per_platform,
     });
+    // Callers routinely derive this path from an image name, and a namespaced name
+    // (`hashicorp/vault`) puts a directory component in it that nobody created.
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("create --output-json directory {}", parent.display()))?;
+    }
     std::fs::write(path, serde_json::to_vec_pretty(&summary)?)
         .with_context(|| format!("write --output-json {}", path.display()))
 }
@@ -1028,6 +1059,31 @@ fn fresh_dir(dir: &Path) -> Result<()> {
         Err(e) => return Err(e).with_context(|| format!("clearing stale dir {}", dir.display())),
     }
     std::fs::create_dir_all(dir).with_context(|| format!("creating dir {}", dir.display()))
+}
+
+/// Where a layer's bootstrap must live so that `merge` derives the right blob id
+/// for it, or `None` when the current name is already fine.
+///
+/// Without `--original-blob-ids`, `merge` takes each source's blob id from its
+/// bootstrap file name (`BlobInfo::get_blob_id_from_meta_path`, which strips every
+/// extension) and dedupes the blob table by that id. So the bootstrap has to be
+/// named after its own blob; leaving every layer's called "bootstrap" collapses the
+/// whole table onto one entry with the literal id "bootstrap".
+///
+/// A blob-less layer contributes no blob-table entry, so merge never derives an id
+/// from its name and it can stay where it is.
+fn layer_bootstrap_path(out_dir: &Path, blob: Option<&Path>) -> Result<Option<PathBuf>> {
+    let Some(blob) = blob else {
+        return Ok(None);
+    };
+    let blob_id = blob
+        .file_name()
+        .context("per-layer nydus data blob has no file name")?
+        .to_str()
+        .context("per-layer nydus data blob has a non-UTF-8 file name")?;
+    // The blob itself already owns `<out_dir>/<blob_id>`; the suffix keeps the
+    // bootstrap a distinct file, and get_blob_id_from_meta_path strips it back off.
+    Ok(Some(out_dir.join(format!("{blob_id}.boot"))))
 }
 
 /// Return the single file in `dir` other than `exclude`, or `None` when the dir
@@ -1185,6 +1241,34 @@ mod tests {
         assert_eq!(v["data_blobs"], 2);
     }
 
+    #[test]
+    fn output_json_creates_missing_parent_directories() {
+        use registry_client::types::Platform;
+        let outcomes = vec![PlatformOutcome {
+            manifest: Descriptor::for_bytes(manifest_media_type(true), b"{}"),
+            platform: Platform {
+                architecture: "amd64".to_string(),
+                os: "linux".to_string(),
+                ..Default::default()
+            },
+            source_size: 1,
+            target_size: 1,
+            data_blob_count: 1,
+        }];
+        let tmp = tempfile::tempdir().unwrap();
+        // A namespaced image name (hashicorp/vault) yields a nested path whose
+        // parent the caller never created.
+        let path = tmp
+            .path()
+            .join("metrics")
+            .join("hashicorp")
+            .join("vault.json");
+        let target = ImageReference::parse("registry.local/app:nydus").unwrap();
+
+        write_output_json(&path, &target, &outcomes, 0.5).unwrap();
+        assert!(path.is_file());
+    }
+
     fn manifest_with_layer_media_type(mt: &str) -> Manifest {
         use registry_client::types::MEDIA_TYPE_OCI_CONFIG;
         let mut layer = Descriptor::for_bytes(mt, b"x");
@@ -1262,6 +1346,34 @@ mod tests {
         assert_eq!(
             single_output(dir.path(), Some(&bootstrap)).unwrap(),
             Some(blob)
+        );
+    }
+
+    #[test]
+    fn layer_bootstrap_is_named_after_its_own_blob() {
+        // merge derives the blob id from this file name, so two layers must never
+        // end up with the same one -- that collapses the whole blob table onto a
+        // single entry and produces an image referencing chunks it does not have.
+        let dir = PathBuf::from("/w/l0");
+        let blob_a = PathBuf::from("/w/l0/aaaa1111");
+        let blob_b = PathBuf::from("/w/l1/bbbb2222");
+
+        let a = layer_bootstrap_path(&dir, Some(&blob_a)).unwrap().unwrap();
+        let b = layer_bootstrap_path(&dir, Some(&blob_b)).unwrap().unwrap();
+
+        assert_eq!(a, PathBuf::from("/w/l0/aaaa1111.boot"));
+        assert_ne!(a, b, "distinct blobs must yield distinct bootstrap names");
+        // The name must not collide with the blob file itself, which sits in the
+        // same directory under the bare blob id.
+        assert_ne!(a, blob_a);
+    }
+
+    #[test]
+    fn layer_bootstrap_keeps_its_name_when_there_is_no_blob() {
+        // No blob means no blob-table entry, so merge never reads this name.
+        assert_eq!(
+            layer_bootstrap_path(&PathBuf::from("/w/l0"), None).unwrap(),
+            None
         );
     }
 
