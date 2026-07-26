@@ -108,6 +108,11 @@ the API or has nothing indexed for the subject. Pass `--source` to also request 
 nydusify check --source myregistry/repo:tag --target myregistry/repo:tag-nydus
 ```
 
+A referrer only exists when the image was converted with `--with-referrer`, so **finding none is
+not a failure** — the linkage check is skipped with an informational log. An artifact that *is*
+present is validated strictly: it must classify as a nydus artifact and its `subject` must be the
+source manifest digest, or `check` fails.
+
 There is no mount-diff / rootfs-comparison in this version (that needs a live `nydusd` mount of
 both images) — `check` validates manifest, bootstrap, and (when applicable) referrer linkage only.
 

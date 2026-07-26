@@ -16,7 +16,9 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   REGISTRY: ghcr.io
-  ORGANIZATION: ${{ github.repository }}
+  # ghcr rejects uppercase repository names, and a fork's owner need not be
+  # lowercase (this one is not). Expression syntax has no lowercase function, so
+  # each job that pushes derives it with ${GITHUB_REPOSITORY,,} instead.
   IMAGE_LIST_PATH: misc/top_images/image_list.txt
   FSCK_PATCH_PATH: misc/top_images/fsck.patch
 
@@ -124,7 +126,7 @@ jobs:
               continue
             fi
             echo "converting $I:latest to $I:nydus-nightly-oci-ref"
-            ghcr_repo=${{ env.REGISTRY }}/${{ env.ORGANIZATION }}
+            ghcr_repo=${{ env.REGISTRY }}/${GITHUB_REPOSITORY,,}
 
             # push oci image to ghcr/local for zran reference
             sudo docker pull $I:latest
@@ -203,7 +205,7 @@ jobs:
             # for pre-built images
             sudo DOCKER_CONFIG=$HOME/.docker nydusify convert \
                  --source $I:latest \
-                 --target ${{ env.REGISTRY }}/${{ env.ORGANIZATION }}/$I:nydus-nightly-v6 \
+                 --target ${{ env.REGISTRY }}/${GITHUB_REPOSITORY,,}/$I:nydus-nightly-v6 \
                  --fs-version 6 \
                  --platform linux/amd64
 

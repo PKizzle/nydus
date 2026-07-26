@@ -167,14 +167,28 @@ async fn check_referrer_linkage(
         Err(e) => return Err(e).context("query the OCI 1.1 referrers API"),
     }
 
-    // (2) Fallback tag.
+    // (2) Fallback tag. A referrer only exists when the image was converted with
+    // `--with-referrer`, so its absence means "nothing to link", not "broken link"
+    // — plain conversions must not fail here. An artifact that *is* present is
+    // still validated strictly below.
     let fallback_tag = fallback_referrers_tag(&subject.digest);
-    let artifact = client
-        .get_manifest(repo, &fallback_tag)
-        .await
-        .with_context(|| {
-            format!("no referrer artifact found at fallback tag {fallback_tag} in {repo}")
-        })?;
+    let artifact = match client.get_manifest(repo, &fallback_tag).await {
+        Ok(artifact) => artifact,
+        Err(RegistryError::NotFound { .. }) => {
+            info!(
+                subject = %subject.digest,
+                fallback_tag = %fallback_tag,
+                "no referrer artifact for this image; skipping linkage check \
+                 (expected unless it was converted with --with-referrer)"
+            );
+            return Ok(());
+        }
+        Err(e) => {
+            return Err(e).with_context(|| {
+                format!("fetch referrer artifact at fallback tag {fallback_tag} in {repo}")
+            });
+        }
+    };
     validate_referrer_artifact(&artifact, &subject.digest)
         .with_context(|| format!("referrer artifact at fallback tag {fallback_tag}"))?;
     info!(subject = %subject.digest, fallback_tag = %fallback_tag, "referrer linkage verified via fallback tag");

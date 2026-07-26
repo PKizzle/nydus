@@ -92,14 +92,20 @@ pub fn parse_platform_list(value: &str) -> Result<Vec<String>> {
     Ok(selectors)
 }
 
-/// Every index entry that carries a platform field, formatted as
+/// Every index entry that carries a real platform, formatted as
 /// `os/arch[/variant]` selectors. Used to expand `--all-platforms`.
+///
+/// buildkit attaches SBOM/provenance attestations as extra index entries tagged
+/// `unknown/unknown` (their layers are `application/vnd.in-toto+json`, not tars).
+/// They are not images and must not be converted — `docker.io/library/busybox`
+/// carries them, so `--all-platforms` hits this on a very ordinary source.
 pub fn all_platform_selectors(index: &Index) -> Vec<String> {
     index
         .manifests
         .iter()
         .filter_map(|d| d.platform.as_ref())
         .filter(|p| !p.os.is_empty() && !p.architecture.is_empty())
+        .filter(|p| !(p.os == "unknown" && p.architecture == "unknown"))
         .map(|p| match &p.variant {
             Some(v) => format!("{}/{}/{}", p.os, p.architecture, v),
             None => format!("{}/{}", p.os, p.architecture),
@@ -272,6 +278,23 @@ mod tests {
                 digest: "sha256:att".to_string(),
                 ..Descriptor::default()
             },
+        ]);
+        assert_eq!(
+            all_platform_selectors(&index),
+            vec!["linux/amd64".to_string(), "linux/arm64/v8".to_string()]
+        );
+    }
+
+    #[test]
+    fn all_platform_selectors_skips_buildkit_attestations() {
+        // buildkit tags SBOM/provenance attestations `unknown/unknown` rather than
+        // omitting the platform, so the "has a platform" filter alone lets them
+        // through and the converter then chokes on their in-toto layers.
+        let index = index_of(vec![
+            platform_desc("linux", "amd64", None, "sha256:amd"),
+            platform_desc("unknown", "unknown", None, "sha256:sbom"),
+            platform_desc("linux", "arm64", Some("v8"), "sha256:arm"),
+            platform_desc("unknown", "unknown", None, "sha256:provenance"),
         ]);
         assert_eq!(
             all_platform_selectors(&index),
