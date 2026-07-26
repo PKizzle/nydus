@@ -23,7 +23,7 @@ Two proxy modes are supported:
   P2P peers when available, falling back to the source registry otherwise.
 
 - **SDK proxy mode** -- Requests are made directly through the Dragonfly client
-  SDK (`dragonfly-client-util`), which communicates with a Dragonfly scheduler
+  SDK (`dragonfly-client-request`), which communicates with a Dragonfly scheduler
   for P2P task coordination. This provides tighter integration with Dragonfly's
   scheduling and priority system.
 
@@ -228,7 +228,7 @@ Response with X-Dragonfly-Error-Type: proxy
 use HTTP semantics. `proxy.rs` maps these to the same `ProxyError` variants:
 
 ```
-dragonfly_client_util::Error
+dragonfly_client_request::errors::Error
   +-- ProxyError { status_code: 429 } --> ProxyError::TooManyRequests
   +-- ProxyError { status_code: 403 } --> ProxyError::Forbidden
   +-- DfdaemonError                   --> ProxyError::Common
@@ -402,10 +402,10 @@ and trigger fallback to the HTTP proxy path.
 
 | Feature | Deps | Purpose |
 |---------|------|---------|
-| `backend-dragonfly-proxy` | `dragonfly-client-util`, `cyper`, `http`, `url` | Dragonfly P2P proxy integration: the SDK path **and** the HTTP-proxy `X-Dragonfly-Error-Type` typed-error handling. |
+| `backend-dragonfly-proxy` | `dragonfly-client-request`, `cyper`, `http`, `url` | Dragonfly P2P proxy integration: the SDK path **and** the HTTP-proxy `X-Dragonfly-Error-Type` typed-error handling. |
 
 `backend-dragonfly-proxy` is **opt-in — it is NOT in `default`**. It pulls the
-third-party `dragonfly-client-util`, which hardcodes `native-tls` (OpenSSL on
+third-party `dragonfly-client-request`, which hardcodes `native-tls` (OpenSSL on
 Linux) and spins up its own tokio runtime; that is the sole remaining consumer of
 both OpenSSL and tokio in the default build and would block the fully-static musl
 build. Enable it explicitly on a **glibc** target when Dragonfly P2P is required:
