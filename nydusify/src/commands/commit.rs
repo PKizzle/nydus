@@ -70,6 +70,27 @@ use crate::engine::retry::RetryPolicy;
 /// means anything.
 pub const ANNOTATION_NYDUS_COMMIT_BLOBS: &str = "containerd.io/snapshot/nydus-commit-blobs";
 
+/// The compressors `nydus-image create` can actually produce
+/// (`src/bin/nydus-image/main.rs`, `--compressor`). A base converted with
+/// `--oci-ref` reports `gzip`, because its data blobs *are* the original gzip
+/// layers -- but that describes referencing an external stream, not something a
+/// newly built RAFS blob can be encoded with, and `create` rejects it outright.
+///
+/// Falling back is safe: `RafsSuperMeta::check_compatibility`
+/// (`rafs/src/metadata/mod.rs`) requires layers to agree on chunk size, RAFS
+/// version and -- for v5 -- the digester, and says nothing about the
+/// compressor, which RAFS records per blob.
+const CREATE_COMPRESSORS: [&str; 3] = ["none", "lz4_block", "zstd"];
+
+/// What a new layer is compressed with, given what the base reports.
+fn compressor_for_new_layer(base_compressor: &str) -> &str {
+    if CREATE_COMPRESSORS.contains(&base_compressor) {
+        base_compressor
+    } else {
+        "zstd"
+    }
+}
+
 /// What a commit is going to do, resolved from the flags before anything is
 /// pulled, built or pushed.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -701,6 +722,17 @@ fn inspect_bootstrap(
         warn!("nydus-image reported no compressor for the base bootstrap; assuming zstd");
         info.compressor = "zstd".to_string();
     }
+    let usable = compressor_for_new_layer(&info.compressor);
+    if usable != info.compressor {
+        info!(
+            base_compressor = %info.compressor,
+            layer_compressor = usable,
+            "the base's compressor cannot be produced by nydus-image create \
+             (a zran base reports the gzip of its referenced layers); compressing the \
+             committed layer with {usable} instead",
+        );
+        info.compressor = usable.to_string();
+    }
     Ok(info)
 }
 
@@ -1018,6 +1050,20 @@ mod tests {
             media_type: "application/vnd.oci.image.bootstrap.nydus.v1".to_string(),
             ..Descriptor::default()
         }));
+    }
+
+    #[test]
+    fn a_zran_base_falls_back_to_a_compressor_create_can_produce() {
+        // An --oci-ref base reports gzip, because its data blobs are the
+        // original gzip layers. `nydus-image create` only accepts
+        // none/lz4_block/zstd and fails the build on anything else.
+        assert_eq!(compressor_for_new_layer("gzip"), "zstd");
+        // Anything create understands is passed through untouched.
+        assert_eq!(compressor_for_new_layer("zstd"), "zstd");
+        assert_eq!(compressor_for_new_layer("lz4_block"), "lz4_block");
+        assert_eq!(compressor_for_new_layer("none"), "none");
+        // An unrecognised value is a fallback too, not a build failure.
+        assert_eq!(compressor_for_new_layer("brotli"), "zstd");
     }
 
     #[test]
