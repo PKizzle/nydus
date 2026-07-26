@@ -178,6 +178,15 @@ func (i *ImageTestSuite) TestGenerateChunkdicts() test.Generator {
 }
 
 func (i *ImageTestSuite) TestChundict(t *testing.T, ctx tool.Context, images []string) {
+	// `nydusify chunkdict generate` trains a shared chunk dictionary across
+	// images. That subcommand exists only in the Go nydusify, which this
+	// repository removed; the Rust one ships convert/check/mount/copy. Without
+	// the skip the case fails as an opaque "exit status 1" from an unknown
+	// subcommand. (`nydus-image chunkdict` itself is still built and is covered
+	// by the builder's own unit tests -- it is the nydusify wrapper that is
+	// absent.) Drop this when the subcommand is implemented.
+	t.Skip("nydusify chunkdict is not implemented by the Rust nydusify")
+
 	trainImage := images[:len(images)-1]
 	testImage := images[len(images)-1]
 
