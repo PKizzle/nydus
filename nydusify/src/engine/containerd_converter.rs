@@ -68,7 +68,11 @@ pub struct ConvertRequest {
     pub platforms: String,
     pub push_retry_count: u32,
     pub push_retry_delay: String,
-    pub plain_http: bool,
+    /// Plain HTTP is per-side: the two ends can legitimately disagree (an HTTPS
+    /// upstream converted into a local HTTP test registry, say). `--plain-http`
+    /// is folded into both here.
+    pub source_plain_http: bool,
+    pub target_plain_http: bool,
     pub work_dir: PathBuf,
     pub output_json: Option<PathBuf>,
     pub driver: NydusDriverConfig,
@@ -114,7 +118,8 @@ impl ConvertRequest {
             platforms: crate::commands::common::resolve_platform(args.platform.as_deref()),
             push_retry_count: args.push_retry_count,
             push_retry_delay: args.push_retry_delay.clone(),
-            plain_http: args.plain_http,
+            source_plain_http: args.plain_http || args.source_plain_http,
+            target_plain_http: args.plain_http || args.target_plain_http,
             work_dir: args.work_dir.clone(),
             output_json: args.output_json.clone(),
             driver: NydusDriverConfig {
@@ -309,5 +314,55 @@ mod tests {
         assert!(work_dir.is_dir());
         assert!(workspace.path().starts_with(&work_dir));
         assert!(workspace.path().is_dir());
+    }
+
+    /// Build a ConvertRequest from bare `nydusify convert` args plus `extra`.
+    fn request_with(extra: &[&str]) -> ConvertRequest {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let work_dir = temp_dir.path().join("work");
+        let mut argv = vec![
+            "nydusify",
+            "convert",
+            "--source",
+            "registry.local/app:latest",
+            "--target",
+            "localhost:5000/app:nydus",
+            "--work-dir",
+            work_dir.to_str().unwrap(),
+        ];
+        argv.extend_from_slice(extra);
+        let cli = Cli::parse_from(argv);
+        let Commands::Convert(args) = cli.command else {
+            panic!("expected convert command");
+        };
+        let plan = plan(&args).unwrap();
+        ConvertRequest::from_convert_args(&args, &plan, "/".to_string()).unwrap()
+    }
+
+    #[test]
+    fn plain_http_defaults_to_https_on_both_sides() {
+        let request = request_with(&[]);
+        assert!(!request.source_plain_http);
+        assert!(!request.target_plain_http);
+    }
+
+    #[test]
+    fn plain_http_shorthand_covers_both_sides() {
+        let request = request_with(&["--plain-http"]);
+        assert!(request.source_plain_http);
+        assert!(request.target_plain_http);
+    }
+
+    #[test]
+    fn plain_http_can_differ_per_side() {
+        // The case the single --plain-http switch cannot express: pull an
+        // upstream image over HTTPS, push it into a local HTTP registry.
+        let request = request_with(&["--target-plain-http"]);
+        assert!(!request.source_plain_http);
+        assert!(request.target_plain_http);
+
+        let request = request_with(&["--source-plain-http"]);
+        assert!(request.source_plain_http);
+        assert!(!request.target_plain_http);
     }
 }

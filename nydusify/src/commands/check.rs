@@ -34,7 +34,11 @@ pub async fn run(args: CheckArgs) -> Result<()> {
         .with_context(|| format!("parse --target {}", plan.target))?;
     let target_client = RegistryClient::new(
         &target_ref.api_host,
-        client_options(args.target_insecure, false, &args.ca_cert),
+        client_options(
+            args.target_insecure,
+            args.plain_http || args.target_plain_http,
+            &args.ca_cert,
+        ),
     )
     .context("build target registry client")?;
 
@@ -60,7 +64,12 @@ pub async fn run(args: CheckArgs) -> Result<()> {
     // its subject matches the source manifest digest.
     if let Some(source) = &plan.source {
         check_referrer_linkage(
-            &source_client_for(source, args.source_insecure, &args.ca_cert)?,
+            &source_client_for(
+                source,
+                args.source_insecure,
+                args.plain_http || args.source_plain_http,
+                &args.ca_cert,
+            )?,
             source,
         )
         .await?;
@@ -85,13 +94,14 @@ pub async fn run(args: CheckArgs) -> Result<()> {
 fn source_client_for(
     source: &str,
     insecure: bool,
+    plain_http: bool,
     ca_cert_files: &[std::path::PathBuf],
 ) -> Result<(RegistryClient, ImageReference)> {
     let source_ref =
         ImageReference::parse(source).with_context(|| format!("parse --source {source}"))?;
     let client = RegistryClient::new(
         &source_ref.api_host,
-        client_options(insecure, false, ca_cert_files),
+        client_options(insecure, plain_http, ca_cert_files),
     )
     .context("build source registry client")?;
     Ok((client, source_ref))
@@ -250,6 +260,9 @@ mod tests {
             target: "registry.example.com/base:latest-nydus".to_string(),
             source_insecure: false,
             target_insecure: false,
+            plain_http: false,
+            source_plain_http: false,
+            target_plain_http: false,
             ca_cert: Vec::new(),
             source_backend_type: None,
             source_backend_config: None,

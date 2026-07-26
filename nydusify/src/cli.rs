@@ -199,8 +199,20 @@ pub struct ConvertArgs {
     pub nydus_image: PathBuf,
     #[arg(long = "output-json", env = "OUTPUT_JSON")]
     pub output_json: Option<PathBuf>,
+    /// Speak plain HTTP to both registries. Shorthand for setting both
+    /// `--source-plain-http` and `--target-plain-http`.
     #[arg(long = "plain-http", env = "PLAIN_HTTP")]
     pub plain_http: bool,
+    /// Speak plain HTTP to the source registry only.
+    #[arg(long = "source-plain-http", env = "SOURCE_PLAIN_HTTP")]
+    pub source_plain_http: bool,
+    /// Speak plain HTTP to the target registry only.
+    ///
+    /// Needed whenever the two ends disagree — e.g. converting an upstream
+    /// image over HTTPS into a local test registry served over HTTP, which the
+    /// single `--plain-http` switch cannot express.
+    #[arg(long = "target-plain-http", env = "TARGET_PLAIN_HTTP")]
+    pub target_plain_http: bool,
     #[arg(
         long = "push-retry-count",
         env = "PUSH_RETRY_COUNT",
@@ -225,6 +237,15 @@ pub struct CheckArgs {
     pub source_insecure: bool,
     #[arg(long = "target-insecure", env = "TARGET_INSECURE")]
     pub target_insecure: bool,
+    /// Speak plain HTTP to both registries. Shorthand for both flags below.
+    #[arg(long = "plain-http", env = "PLAIN_HTTP")]
+    pub plain_http: bool,
+    /// Speak plain HTTP to the source registry only.
+    #[arg(long = "source-plain-http", env = "SOURCE_PLAIN_HTTP")]
+    pub source_plain_http: bool,
+    /// Speak plain HTTP to the target registry only.
+    #[arg(long = "target-plain-http", env = "TARGET_PLAIN_HTTP")]
+    pub target_plain_http: bool,
     /// Extra PEM CA certificate file(s) trusted in addition to the system
     /// store, for registries signed by a private CA (applies to both source
     /// and target). Repeatable; ignored when `--*-insecure` is set.

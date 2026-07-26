@@ -66,7 +66,10 @@ Useful flags (see `--help` for the full list; `nydusify/src/cli.rs` is the sourc
 - `--backend-type {registry,oss,s3,localfs}` + `--backend-config`/`--backend-config-file` — **only
   `registry` (the default) is implemented today**; other backend types are validated but rejected
   with an honest "not yet supported" error, not silently ignored.
-- `--source-insecure` / `--target-insecure`, `--plain-http` — plain-HTTP / skip-TLS-verify toggles.
+- `--source-insecure` / `--target-insecure` — skip TLS verification (still HTTPS).
+- `--plain-http` — speak plain HTTP to **both** registries; `--source-plain-http` /
+  `--target-plain-http` set one side only, for when the two ends disagree (pulling an upstream
+  image over HTTPS into a local HTTP test registry, say). Available on `convert` and `check`.
 - `--work-dir` (default `./tmp`), `--nydus-image` (default `nydus-image` on `$PATH`).
 - `--push-retry-count` (default `3`) / `--push-retry-delay` (default `5s`).
 - `--platform <os/arch[/variant]>` — a single selector, or a comma-separated list to convert

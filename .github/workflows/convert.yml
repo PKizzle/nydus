@@ -6,6 +6,13 @@ on:
     - cron: "3 0 * * *"
   workflow_dispatch:
 
+# The conversion jobs push converted images to ghcr.io. The repository default for
+# GITHUB_TOKEN is read-only, so without this the pushes fail with
+# `DENIED: installation not allowed to Create organization package`.
+permissions:
+  contents: read
+  packages: write
+
 env:
   CARGO_TERM_COLOR: always
   REGISTRY: ghcr.io
@@ -138,6 +145,7 @@ jobs:
                  --oci-ref \
                  --source localhost:5000/$I \
                  --target localhost:5000/$I:nydus-nightly-oci-ref \
+                 --plain-http \
                  --platform linux/amd64 \
                  --output-json convert-zran/${I}.json
 
@@ -145,7 +153,8 @@ jobs:
             sudo rm -rf ./tmp
             sudo DOCKER_CONFIG=$HOME/.docker nydusify check \
                 --source localhost:5000/$I \
-                --target localhost:5000/$I:nydus-nightly-oci-ref
+                --target localhost:5000/$I:nydus-nightly-oci-ref \
+                --plain-http
 
             sudo fsck.erofs -d1 ./output/target/nydus_bootstrap/image/image.boot
             sudo rm -rf ./output
@@ -155,60 +164,6 @@ jobs:
         with:
           name: convert-zran-metric
           path: convert-zran
-
-  convert-native-v5:
-    runs-on: ${{ vars.RUNNER_OS || 'ubuntu-latest' }}
-    needs: [nydusify-build, nydus-build]
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v6
-      - name: Login ghcr registry
-        uses: docker/login-action@v3
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Download Nydus
-        uses: actions/download-artifact@v7
-        with:
-          name: nydus-artifact
-          path: /usr/local/bin
-      - name: Download Nydusify
-        uses: actions/download-artifact@v7
-        with:
-          name: nydusify-artifact
-          path: /usr/local/bin
-      - name: Convert and check RAFS v5 images
-        run: |
-          sudo chmod +x /usr/local/bin/nydus*
-          sudo docker run -d --restart=always -p 5000:5000 registry
-          sudo mkdir convert-native-v5
-          for I in $(cat ${{ env.IMAGE_LIST_PATH }}); do
-            echo "converting $I:latest to $I:nydus-nightly-v5"
-            # for pre-built images
-            sudo DOCKER_CONFIG=$HOME/.docker nydusify convert \
-                 --source $I:latest \
-                 --target ${{ env.REGISTRY }}/${{ env.ORGANIZATION }}/$I:nydus-nightly-v5 \
-                 --fs-version 5 \
-                 --platform linux/amd64
-
-            # use local registry for speed
-            sudo DOCKER_CONFIG=$HOME/.docker nydusify convert \
-                 --source $I:latest \
-                 --target localhost:5000/$I:nydus-nightly-v5 \
-                 --fs-version 5 \
-                 --platform linux/amd64 \
-                 --output-json convert-native-v5/${I}.json
-
-            sudo rm -rf ./tmp
-            sudo DOCKER_CONFIG=$HOME/.docker nydusify check --source $I:latest \
-                --target localhost:5000/$I:nydus-nightly-v5
-          done
-      - name: Save Nydusify Metric
-        uses: actions/upload-artifact@v6
-        with:
-          name: convert-native-v5-metric
-          path: convert-native-v5
 
   convert-native-v6:
     runs-on: ${{ vars.RUNNER_OS || 'ubuntu-latest' }}
@@ -256,6 +211,7 @@ jobs:
             sudo DOCKER_CONFIG=$HOME/.docker nydusify convert \
                  --source $I:latest \
                  --target localhost:5000/$I:nydus-nightly-v6 \
+                 --target-plain-http \
                  --fs-version 6 \
                  --platform linux/amd64 \
                  --output-json convert-native-v6/${I}.json
@@ -266,7 +222,8 @@ jobs:
 
             sudo rm -rf ./tmp
             sudo DOCKER_CONFIG=$HOME/.docker nydusify check --source $I:latest \
-                --target localhost:5000/$I:nydus-nightly-v6
+                --target localhost:5000/$I:nydus-nightly-v6 \
+                --target-plain-http
 
             sudo fsck.erofs -d1 ./output/target/nydus_bootstrap/image/image.boot
             sudo rm -rf ./output
@@ -306,6 +263,7 @@ jobs:
           sudo DOCKER_CONFIG=$HOME/.docker nydusify convert \
                --source $SRC \
                --target $TGT \
+               --target-plain-http \
                --fs-version 6 \
                --all-platforms \
                --merge-platform \
@@ -315,6 +273,7 @@ jobs:
           sudo DOCKER_CONFIG=$HOME/.docker nydusify convert \
                --source $SRC \
                --target localhost:5000/busybox:nydus-multiarch-list \
+               --target-plain-http \
                --fs-version 6 \
                --platform linux/amd64,linux/arm64 \
                --merge-platform

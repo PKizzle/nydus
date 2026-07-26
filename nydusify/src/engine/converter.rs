@@ -100,7 +100,7 @@ pub async fn run_conversion(request: &ConvertRequest, workspace: &Path) -> Resul
         &source_ref.api_host,
         client_options(
             request.source_insecure,
-            request.plain_http,
+            request.source_plain_http,
             &request.ca_cert_files,
         ),
     )
@@ -109,7 +109,7 @@ pub async fn run_conversion(request: &ConvertRequest, workspace: &Path) -> Resul
         &target_ref.api_host,
         client_options(
             request.target_insecure,
-            request.plain_http,
+            request.target_plain_http,
             &request.ca_cert_files,
         ),
     )
