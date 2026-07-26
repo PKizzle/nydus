@@ -37,6 +37,64 @@ pub enum Commands {
     Mount(Box<MountArgs>),
     /// Copy an image from source to target.
     Copy(Box<CopyArgs>),
+    /// Deduplicate chunks across Nydus images (experimental).
+    #[command(subcommand)]
+    Chunkdict(ChunkdictCommands),
+}
+
+#[derive(Clone, Debug, Subcommand)]
+pub enum ChunkdictCommands {
+    /// Train a shared chunk dictionary from several Nydus images.
+    Generate(Box<ChunkdictArgs>),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Args)]
+pub struct ChunkdictArgs {
+    /// Nydus image references to train from. Repeatable, and each value may be
+    /// a comma-separated list. At least two are required.
+    #[arg(long = "sources", env = "SOURCES", required = true)]
+    pub sources: Vec<String>,
+    /// Target reference to publish the dictionary image under.
+    #[arg(long, env = "TARGET")]
+    pub target: String,
+    #[arg(long = "source-insecure", env = "SOURCE_INSECURE")]
+    pub source_insecure: bool,
+    #[arg(long = "target-insecure", env = "TARGET_INSECURE")]
+    pub target_insecure: bool,
+    /// Speak plain HTTP to both registries. Shorthand for both flags below.
+    #[arg(long = "plain-http", env = "PLAIN_HTTP")]
+    pub plain_http: bool,
+    /// Speak plain HTTP to the source registries only.
+    #[arg(long = "source-plain-http", env = "SOURCE_PLAIN_HTTP")]
+    pub source_plain_http: bool,
+    /// Speak plain HTTP to the target registry only.
+    #[arg(long = "target-plain-http", env = "TARGET_PLAIN_HTTP")]
+    pub target_plain_http: bool,
+    #[arg(long = "ca-cert", env = "CA_CERT", value_delimiter = ',')]
+    pub ca_cert: Vec<PathBuf>,
+    /// Target platform of the source images.
+    #[arg(long, default_value_t = default_platform())]
+    pub platform: String,
+    #[arg(long = "work-dir", env = "WORK_DIR", default_value = "./tmp")]
+    pub work_dir: PathBuf,
+    #[arg(
+        long = "nydus-image",
+        env = "NYDUS_IMAGE",
+        default_value = "nydus-image"
+    )]
+    pub nydus_image: PathBuf,
+    #[arg(
+        long = "push-retry-count",
+        env = "PUSH_RETRY_COUNT",
+        default_value_t = 3
+    )]
+    pub push_retry_count: u32,
+    #[arg(
+        long = "push-retry-delay",
+        env = "PUSH_RETRY_DELAY",
+        default_value = "5s"
+    )]
+    pub push_retry_delay: String,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]

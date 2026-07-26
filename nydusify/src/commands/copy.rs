@@ -12,6 +12,7 @@ use tracing::{debug, info, warn};
 
 use crate::cli::CopyArgs;
 use crate::engine::oci::{blob_hex, client_options, is_index, select_platform};
+use crate::engine::oci_archive::{self, ArchiveBlob};
 use crate::engine::retry::RetryPolicy;
 
 use super::common::{resolve_backend_config, resolve_platform, validate_platform_selection};
@@ -43,10 +44,32 @@ pub async fn run(args: CopyArgs) -> Result<()> {
         .clone()
         .ok_or_else(|| anyhow!("copy requires --target"))?;
 
+    // `file://<path>` on either side means a local OCI layout tarball rather
+    // than a registry, so those are resolved before parsing anything as a
+    // reference (ImageReference rejects a scheme outright).
+    let source_archive = oci_archive::local_path(&plan.source).context("parse --source")?;
+    let target_archive = oci_archive::local_path(&target).context("parse --target")?;
+
+    ensure_dir(&args.work_dir)?;
+    let staging = tempfile::Builder::new()
+        .prefix("nydusify-copy-")
+        .tempdir_in(&args.work_dir)
+        .with_context(|| format!("create staging dir in {}", args.work_dir.display()))?;
+
+    if let Some(archive) = source_archive {
+        return copy_from_archive(
+            &args,
+            &plan,
+            &archive,
+            target_archive.as_deref(),
+            &target,
+            staging.path(),
+        )
+        .await;
+    }
+
     let source_ref = ImageReference::parse(&plan.source)
         .with_context(|| format!("parse --source {}", plan.source))?;
-    let target_ref =
-        ImageReference::parse(&target).with_context(|| format!("parse --target {target}"))?;
 
     let source_client = RegistryClient::new(
         &source_ref.api_host,
@@ -57,18 +80,7 @@ pub async fn run(args: CopyArgs) -> Result<()> {
         ),
     )
     .context("build source registry client")?;
-    let target_client = RegistryClient::new(
-        &target_ref.api_host,
-        client_options(
-            args.target_insecure,
-            args.plain_http || args.target_plain_http,
-            &args.ca_cert,
-        ),
-    )
-    .context("build target registry client")?;
-    let same_registry = source_ref.api_host == target_ref.api_host;
-
-    info!(source = %source_ref, target = %target_ref, platform = %plan.platform, "copying image");
+    info!(source = %source_ref, target = %target, platform = %plan.platform, "copying image");
 
     let retry = RetryPolicy::default();
 
@@ -99,12 +111,31 @@ pub async fn run(args: CopyArgs) -> Result<()> {
     let manifest: Manifest =
         serde_json::from_slice(&fetched.bytes).context("parse source image manifest")?;
 
-    // Staging dir for blobs that must be downloaded then re-pushed.
-    ensure_dir(&args.work_dir)?;
-    let staging = tempfile::Builder::new()
-        .prefix("nydusify-copy-")
-        .tempdir_in(&args.work_dir)
-        .with_context(|| format!("create staging dir in {}", args.work_dir.display()))?;
+    // Registry -> local archive: stage every blob, then write the layout tar.
+    if let Some(archive) = &target_archive {
+        return export_from_registry(
+            &source_client,
+            &source_ref,
+            &manifest,
+            &fetched,
+            archive,
+            staging.path(),
+        )
+        .await;
+    }
+
+    let target_ref =
+        ImageReference::parse(&target).with_context(|| format!("parse --target {target}"))?;
+    let target_client = RegistryClient::new(
+        &target_ref.api_host,
+        client_options(
+            args.target_insecure,
+            args.plain_http || args.target_plain_http,
+            &args.ca_cert,
+        ),
+    )
+    .context("build target registry client")?;
+    let same_registry = source_ref.api_host == target_ref.api_host;
 
     // Copy the config blob and every layer.
     copy_blob(
@@ -156,6 +187,138 @@ pub async fn run(args: CopyArgs) -> Result<()> {
         .with_context(|| format!("push manifest to {target_ref}"))?;
 
     info!(target = %target_ref, manifest = %pushed, layers = manifest.layers.len(), "copy complete");
+    Ok(())
+}
+
+/// Registry -> `file://` archive: download the manifest's blobs and write an
+/// OCI layout tarball.
+async fn export_from_registry(
+    source_client: &RegistryClient,
+    source_ref: &ImageReference,
+    manifest: &Manifest,
+    fetched: &registry_client::FetchedManifest,
+    archive: &Path,
+    staging: &Path,
+) -> Result<()> {
+    let mut blobs = Vec::with_capacity(manifest.layers.len() + 1);
+    for desc in std::iter::once(&manifest.config).chain(manifest.layers.iter()) {
+        let path = staging.join(blob_hex(&desc.digest));
+        source_client
+            .get_blob_to_file(&source_ref.repo, &desc.digest, &path)
+            .await
+            .with_context(|| format!("download blob {}", desc.digest))?;
+        blobs.push(ArchiveBlob {
+            digest: desc.digest.clone(),
+            size: desc.size,
+            path,
+        });
+    }
+
+    let media_type = manifest
+        .media_type
+        .as_deref()
+        .or(fetched.content_type.as_deref())
+        .unwrap_or(MEDIA_TYPE_OCI_MANIFEST);
+    oci_archive::export(
+        archive,
+        &fetched.bytes,
+        media_type,
+        &source_ref.to_string(),
+        &blobs,
+    )
+    .with_context(|| format!("write archive {}", archive.display()))?;
+
+    info!(
+        archive = %archive.display(),
+        layers = manifest.layers.len(),
+        "exported image to OCI archive"
+    );
+    Ok(())
+}
+
+/// `file://` archive -> registry (or another archive): unpack the layout and
+/// push, or copy the file when both ends are archives.
+async fn copy_from_archive(
+    args: &CopyArgs,
+    plan: &CopyPlan,
+    archive: &Path,
+    target_archive: Option<&Path>,
+    target: &str,
+    staging: &Path,
+) -> Result<()> {
+    let unpacked = staging.join("layout");
+    let imported = oci_archive::import(archive, &unpacked)
+        .with_context(|| format!("import archive {}", archive.display()))?;
+    info!(
+        archive = %archive.display(),
+        ref_name = imported.ref_name.as_deref().unwrap_or("<none>"),
+        "imported image from OCI archive"
+    );
+
+    // Archive -> archive is a straight copy; re-serialising would only risk
+    // changing bytes that are already exactly what we would write.
+    if let Some(out) = target_archive {
+        std::fs::copy(archive, out)
+            .with_context(|| format!("copy archive {} -> {}", archive.display(), out.display()))?;
+        info!(archive = %out.display(), "wrote OCI archive");
+        return Ok(());
+    }
+
+    let target_ref =
+        ImageReference::parse(target).with_context(|| format!("parse --target {target}"))?;
+    let client = RegistryClient::new(
+        &target_ref.api_host,
+        client_options(
+            args.target_insecure,
+            args.plain_http || args.target_plain_http,
+            &args.ca_cert,
+        ),
+    )
+    .context("build target registry client")?;
+    let retry = RetryPolicy::default();
+
+    let manifest = &imported.manifest;
+    for desc in std::iter::once(&manifest.config).chain(manifest.layers.iter()) {
+        if client
+            .head_blob(&target_ref.repo, &desc.digest)
+            .await
+            .unwrap_or(false)
+        {
+            debug!(digest = %desc.digest, "blob already present in target; skipping");
+            continue;
+        }
+        let path = imported.blob_path(&desc.digest)?;
+        retry
+            .run("push archived blob", || {
+                client.push_blob_file(&target_ref.repo, &path)
+            })
+            .await
+            .with_context(|| format!("push blob {}", desc.digest))?;
+    }
+
+    let media_type = manifest
+        .media_type
+        .as_deref()
+        .unwrap_or(&imported.descriptor.media_type);
+    let pushed = retry
+        .run("push manifest", || {
+            client.push_manifest(
+                &target_ref.repo,
+                target_ref.manifest_reference(),
+                media_type,
+                &imported.manifest_bytes,
+            )
+        })
+        .await
+        .with_context(|| format!("push manifest to {target_ref}"))?;
+
+    info!(
+        target = %target_ref,
+        manifest = %pushed,
+        layers = manifest.layers.len(),
+        platform = %plan.platform,
+        "copy complete"
+    );
     Ok(())
 }
 

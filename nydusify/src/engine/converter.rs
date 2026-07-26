@@ -46,6 +46,7 @@ use crate::engine::oci::{
     all_platform_selectors, blob_hex, client_options, is_index, parse_platform_list,
     select_platform,
 };
+use crate::engine::oci_archive::{self, ArchiveBlob};
 use crate::engine::retry::RetryPolicy;
 
 /// A source rootfs layer pulled to disk.
@@ -328,7 +329,10 @@ async fn convert_one_platform(
         .with_context(|| format!("create platform workspace {}", workspace.display()))?;
 
     // ---- pull ----
-    let source = pull_source(request, source_client, source_ref, platform, workspace).await?;
+    let source = match &request.source_archive {
+        Some(archive) => pull_source_from_archive(request, archive, platform, workspace)?,
+        None => pull_source(request, source_client, source_ref, platform, workspace).await?,
+    };
     info!(
         source = %source_ref,
         platform = %platform,
@@ -340,19 +344,31 @@ async fn convert_one_platform(
     // ---- build (nydus-image subprocess) ----
     let output = build_artifact(request, &source.layers, workspace)?;
 
-    // ---- push ----
-    let pushed = push_artifact(
-        request,
-        target_client,
-        target_ref,
-        source_ref,
-        same_registry,
-        &source,
-        &output,
-        push_target,
-        retry,
-    )
-    .await?;
+    // ---- push (or write a local archive) ----
+    let pushed = match &request.target_archive {
+        Some(archive) => export_artifact(
+            request,
+            archive,
+            &source,
+            &output,
+            &request.target,
+            workspace,
+        )?,
+        None => {
+            push_artifact(
+                request,
+                target_client,
+                target_ref,
+                source_ref,
+                same_registry,
+                &source,
+                &output,
+                push_target,
+                retry,
+            )
+            .await?
+        }
+    };
 
     // ---- referrer (--with-referrer) ----
     // Data blobs in image-layer order: reused gzip layers (oci-ref) then the
@@ -390,9 +406,15 @@ fn reject_unsupported(request: &ConvertRequest) -> Result<()> {
     if request.mode == ConversionMode::Reverse {
         bail!("--reverse (nydus->OCI) conversion is not yet supported by nydusify-rs (follow-up)");
     }
-    if request.source_archive.is_some() || request.target_archive.is_some() {
+    // --source-archive/--target-archive read and write OCI layout tarballs; see
+    // engine::oci_archive. Multi-platform is registry-only: an archive holds one
+    // image, so there is no index to assemble into.
+    if request.target_archive.is_some()
+        && (request.all_platforms || request.platforms.contains(','))
+    {
         bail!(
-            "--source-archive/--target-archive (OCI archive I/O) is not yet supported by nydusify-rs (follow-up)"
+            "--target-archive writes a single image, so it cannot be combined with \
+             --all-platforms or a multi-platform --platform list"
         );
     }
     if let Some(kind) = request.source_backend_type.as_deref()
@@ -456,6 +478,60 @@ fn subject_descriptor(digest: String, size: u64, docker2oci: bool) -> Descriptor
         size,
         ..Descriptor::default()
     }
+}
+
+/// Build a [`PulledSource`] from a local OCI layout tarball.
+///
+/// The archive already holds every layer, so nothing is downloaded; the layers
+/// are used from the unpacked layout in place.
+fn pull_source_from_archive(
+    request: &ConvertRequest,
+    archive: &Path,
+    platform: &str,
+    workspace: &Path,
+) -> Result<PulledSource> {
+    let unpacked = workspace.join("source-layout");
+    let imported = oci_archive::import(archive, &unpacked)
+        .with_context(|| format!("import --source-archive {}", archive.display()))?;
+    let manifest = &imported.manifest;
+    if manifest.layers.is_empty() {
+        bail!(
+            "--source-archive {} holds an image with no layers",
+            archive.display()
+        );
+    }
+    validate_layer_media_types(manifest)?;
+
+    let (os, arch, variant) = crate::engine::oci::parse_platform(platform)?;
+    let plat = registry_client::types::Platform {
+        architecture: arch,
+        os,
+        variant,
+        ..Default::default()
+    };
+    let referrer_subject = subject_descriptor(
+        imported.descriptor.digest.clone(),
+        imported.manifest_bytes.len() as u64,
+        request.driver.docker2oci,
+    );
+    let config_bytes = std::fs::read(imported.blob_path(&manifest.config.digest)?)
+        .context("read image config from the source archive")?;
+
+    let mut layers = Vec::with_capacity(manifest.layers.len());
+    for layer in &manifest.layers {
+        layers.push(PulledLayer {
+            digest: layer.digest.clone(),
+            path: imported.blob_path(&layer.digest)?,
+        });
+    }
+
+    Ok(PulledSource {
+        referrer_subject,
+        platform: plat,
+        source_size: manifest.layers.iter().map(|l| l.size).sum(),
+        config_bytes,
+        layers,
+    })
 }
 
 async fn pull_source(
@@ -968,6 +1044,114 @@ async fn push_artifact(
         manifest: Descriptor {
             media_type: media_type.to_string(),
             digest: pushed_digest,
+            size: manifest_bytes.len() as u64,
+            ..Descriptor::default()
+        },
+        target_size: content_size + manifest_bytes.len() as u64,
+    })
+}
+
+/// Write the converted image to a local OCI layout tarball instead of pushing.
+///
+/// Everything the archive needs is already on disk or in memory after the build
+/// -- reused gzip layers, new nydus blobs, the packed bootstrap and the rewritten
+/// config -- so no registry is contacted at all.
+fn export_artifact(
+    request: &ConvertRequest,
+    archive: &Path,
+    source: &PulledSource,
+    output: &ConversionOutput,
+    target_ref: &str,
+    workspace: &Path,
+) -> Result<PushedArtifact> {
+    let docker2oci = request.driver.docker2oci;
+    let staging = workspace.join("archive-blobs");
+    std::fs::create_dir_all(&staging)
+        .with_context(|| format!("create archive staging {}", staging.display()))?;
+
+    let mut data_blobs = Vec::new();
+    let mut archive_blobs = Vec::new();
+    for path in output
+        .reused_layers
+        .iter()
+        .map(|l| &l.path)
+        .chain(output.new_blobs.iter())
+    {
+        let size = file_len(path)?;
+        let digest = registry_client::types::sha256_digest(
+            &std::fs::read(path).with_context(|| format!("read blob {}", path.display()))?,
+        );
+        data_blobs.push(data_blob_descriptor(digest.clone(), size));
+        archive_blobs.push(ArchiveBlob {
+            digest,
+            size,
+            path: path.clone(),
+        });
+    }
+
+    let boot_layer = bootstrap_layer::pack(&output.bootstrap)?;
+    let boot_path = staging.join("bootstrap.tar.gz");
+    std::fs::write(&boot_path, &boot_layer.gzip_bytes)
+        .with_context(|| format!("stage bootstrap layer {}", boot_path.display()))?;
+    let bootstrap = bootstrap_descriptor(
+        boot_layer.digest.clone(),
+        boot_layer.diff_id.clone(),
+        boot_layer.gzip_bytes.len() as u64,
+    );
+    archive_blobs.push(ArchiveBlob {
+        digest: boot_layer.digest.clone(),
+        size: boot_layer.gzip_bytes.len() as u64,
+        path: boot_path,
+    });
+
+    let layer_diff_ids: Vec<String> = data_blobs
+        .iter()
+        .map(|d| d.digest.clone())
+        .chain(std::iter::once(boot_layer.diff_id))
+        .collect();
+    let config_bytes = rebuild_image_config(&source.config_bytes, &layer_diff_ids)
+        .context("rewrite image config for the archived nydus image")?;
+    let config_digest = registry_client::types::sha256_digest(&config_bytes);
+    let config_path = staging.join("config.json");
+    std::fs::write(&config_path, &config_bytes)
+        .with_context(|| format!("stage image config {}", config_path.display()))?;
+    let config = Descriptor {
+        media_type: config_media_type(docker2oci).to_string(),
+        digest: config_digest.clone(),
+        size: config_bytes.len() as u64,
+        ..Descriptor::default()
+    };
+    archive_blobs.push(ArchiveBlob {
+        digest: config_digest,
+        size: config_bytes.len() as u64,
+        path: config_path,
+    });
+
+    let content_size: u64 =
+        data_blobs.iter().map(|d| d.size).sum::<u64>() + bootstrap.size + config.size;
+    let manifest = assemble_manifest(docker2oci, config, data_blobs, bootstrap);
+    let manifest_bytes = serde_json::to_vec(&manifest).context("serialize nydus manifest")?;
+    let media_type = manifest_media_type(docker2oci);
+
+    oci_archive::export(
+        archive,
+        &manifest_bytes,
+        media_type,
+        target_ref,
+        &archive_blobs,
+    )
+    .with_context(|| format!("write --target-archive {}", archive.display()))?;
+
+    info!(
+        archive = %archive.display(),
+        layers = manifest.layers.len(),
+        "wrote nydus image to OCI archive"
+    );
+
+    Ok(PushedArtifact {
+        manifest: Descriptor {
+            media_type: media_type.to_string(),
+            digest: registry_client::types::sha256_digest(&manifest_bytes),
             size: manifest_bytes.len() as u64,
             ..Descriptor::default()
         },
