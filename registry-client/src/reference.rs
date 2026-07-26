@@ -41,6 +41,16 @@ impl ImageReference {
         if trimmed.is_empty() {
             bail!("empty image reference");
         }
+        // `file://…` / `oci://…` name a local OCI archive or layout, not a
+        // registry. Nothing here speaks those, and the `:` in the scheme makes
+        // the host heuristic below read `file:` as a registry host and silently
+        // aim requests at `https://file/…`. Reject it with the real reason.
+        if let Some((scheme, _)) = trimmed.split_once("://") {
+            bail!(
+                "image reference {trimmed:?} uses the {scheme:?} scheme: local archive/layout \
+                 references are not supported, pass a registry reference"
+            );
+        }
 
         let (rest, digest) = match trimmed.split_once('@') {
             Some((head, d)) if !d.is_empty() => (head, Some(d.to_string())),
@@ -212,5 +222,30 @@ mod tests {
             assert_eq!(parsed.to_string(), want);
             assert_eq!(ImageReference::parse(want).unwrap(), parsed);
         }
+    }
+
+    #[test]
+    fn rejects_archive_scheme_references() {
+        // `file://` targets are how the Go nydusify saves an image to a local
+        // OCI archive. Without this guard the `:` in the scheme makes `file:`
+        // look like a registry host and requests silently go to `https://file/`.
+        for r in [
+            "file:///tmp/saved.tar",
+            "oci:///var/lib/layout",
+            "docker-archive:///tmp/x.tar",
+        ] {
+            let err = ImageReference::parse(r).unwrap_err().to_string();
+            assert!(
+                err.contains("not supported"),
+                "{r} should be rejected with a clear reason, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn still_accepts_ordinary_references_with_ports() {
+        // The guard keys on "://", so a host:port reference is unaffected.
+        let r = ImageReference::parse("localhost:5077/redis:7.0.3").unwrap();
+        assert_eq!(r.repo, "redis");
     }
 }
