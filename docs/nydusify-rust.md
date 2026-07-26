@@ -260,6 +260,12 @@ recovers the name and tag from the parent directory), `nydus-image chunkdict gen
 the set, and the resulting image is pushed with its source blobs cross-repo-mounted rather than
 re-uploaded.
 
+**An empty dictionary is a normal outcome, not an error.** `nydus-image` clusters candidate images
+with DBSCAN at `min_points = 10` (`src/bin/nydus-image/deduplicate.rs`), so a handful of sources can
+never form a cluster — every one comes back a noise point and the dictionary comes out empty. The
+image is still published (with no data layers) and the run warns; train from more images, or from
+more versions of the same image, to get a dictionary worth using.
+
 ## The ecosystem loop
 
 ```

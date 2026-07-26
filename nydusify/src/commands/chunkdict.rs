@@ -32,7 +32,7 @@ use anyhow::{Context, Result, bail};
 use registry_client::types::Manifest;
 use registry_client::{Descriptor, ImageReference, RegistryClient};
 use serde::Deserialize;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::cli::ChunkdictArgs;
 use crate::engine::bootstrap_layer;
@@ -102,21 +102,26 @@ pub async fn run(args: ChunkdictArgs) -> Result<()> {
 
     let blob_ids = dedup_blob_ids(&output.blobs);
     if blob_ids.is_empty() {
-        // The dictionary is only worth publishing when the sources actually
-        // share chunks; nydus-image already says so on stderr, but an empty
-        // dictionary would also produce a manifest with no data layers, which
-        // is not a valid nydus image.
-        bail!(
-            "the sources share no chunks, so there is no dictionary to publish \
-             (nydus-image produced an empty blob list); pass images that have \
-             layers in common"
+        // An empty dictionary is a legitimate answer, not a failure: the
+        // selection in `nydus-image` clusters images with DBSCAN at
+        // `min_points = 10` (src/bin/nydus-image/deduplicate.rs), so a handful
+        // of sources can never form a cluster and every one of them comes back
+        // a noise point. Say so and publish the bootstrap anyway — the caller
+        // asked for an artifact at `--target`, and exiting 0 while quietly
+        // pushing nothing is the worse failure.
+        warn!(
+            sources = sources.len(),
+            "the trained dictionary is empty, so the published image carries no data layers. \
+             nydus-image clusters sources with DBSCAN (min_points = 10); train from more \
+             images, or from more versions of the same image, to get a dictionary worth using"
+        );
+    } else {
+        info!(
+            blobs = blob_ids.len(),
+            sources = sources.len(),
+            "trained chunk dictionary"
         );
     }
-    info!(
-        blobs = blob_ids.len(),
-        sources = sources.len(),
-        "trained chunk dictionary"
-    );
 
     // (3) Publish it as a nydus image.
     push_chunkdict_image(
