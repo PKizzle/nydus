@@ -44,9 +44,20 @@ pub const MEDIA_TYPE_NYDUS_BLOB: &str = "application/vnd.oci.image.layer.nydus.b
 /// Nydus bootstrap media type as used by nydus referrer artifacts
 /// (exercised by `misc/fanotify/b4b-referrer-serving-test.sh`).
 pub const MEDIA_TYPE_NYDUS_BOOTSTRAP: &str = "application/vnd.oci.image.bootstrap.nydus.v1";
-/// Nydus bootstrap *layer* media type as published by the Go nydusify
-/// (`...layer.nydus.bootstrap.v1`); kept alongside [`MEDIA_TYPE_NYDUS_BOOTSTRAP`]
-/// because both shapes exist in the wild.
+/// Standard OCI gzip'd-tar layer media type. The nydus **bootstrap layer** is
+/// published under this — it is an ordinary tar holding `image/image.boot`,
+/// distinguished only by [`ANNOTATION_NYDUS_BOOTSTRAP`], exactly as the Go
+/// nydusify and upstream's v3 converter publish it. containerd therefore
+/// unpacks it with no stream processor registered.
+pub const MEDIA_TYPE_OCI_LAYER_GZIP: &str = "application/vnd.oci.image.layer.v1.tar+gzip";
+
+/// A bespoke bootstrap-*layer* media type that this crate used to publish.
+///
+/// NOTE: no nydus implementation actually emits this — the Go nydusify uses
+/// [`MEDIA_TYPE_OCI_LAYER_GZIP`] for the bootstrap layer, and a bare
+/// `git grep` of it across the Go tree finds nothing. It is retained only so
+/// existing images written by older builds of this crate can still be
+/// recognised on the read path; never emit it.
 pub const MEDIA_TYPE_NYDUS_BOOTSTRAP_LAYER: &str =
     "application/vnd.oci.image.layer.nydus.bootstrap.v1";
 

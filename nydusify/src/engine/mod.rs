@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: (Apache-2.0 AND BSD-3-Clause)
 
 pub mod artifact;
+pub mod bootstrap_layer;
 pub mod containerd_converter;
 pub mod converter;
 pub mod manifest;

@@ -55,6 +55,32 @@ without native support). A node running the snapshotter with `referrer_detect` e
 default) will detect and serve it transparently the next time that source tag is pulled — no
 change to the tag itself, no separate mount.
 
+## Layer shapes in the produced image
+
+The manifest carries the nydus data blobs first and the bootstrap last:
+
+| layer | media type | annotation |
+|---|---|---|
+| data blob | `application/vnd.oci.image.layer.nydus.blob.v1` | `containerd.io/snapshot/nydus-blob` |
+| bootstrap | `application/vnd.oci.image.layer.v1.tar+gzip` | `containerd.io/snapshot/nydus-bootstrap` |
+
+The **bootstrap is an ordinary gzip'd tar** whose single entry is `image/image.boot` — the same
+shape the Go nydusify and upstream's v3 converter publish. That matters in both directions:
+containerd unpacks it through its normal tar path with **no stream processor registered**, and the
+snapshotter then finds the bootstrap at `<snapshot>/fs/image/image.boot`, which is exactly where
+`snapshotter/src/overlay` looks for it. Publishing the raw bootstrap under a bespoke
+`…layer.nydus.bootstrap.v1` media type instead — as this tool did before 2026-07 — yields an image
+no standard nydus deployment can pull (`no processor for media-type: unknown`).
+
+Every layer also carries `containerd.io/uncompressed`, its **diff id**, and the image config's
+`rootfs.diff_ids` is built from those. For a data blob the diff id is the blob digest (blobs are
+uncompressed at the layer level); for the bootstrap it is the digest of the *uncompressed* tar,
+which containerd recomputes while unpacking and rejects the image if it disagrees.
+
+Referrer artifacts are the exception: there the bootstrap travels **raw** under
+`application/vnd.oci.image.bootstrap.nydus.v1`, because the snapshotter fetches that blob itself
+rather than having containerd unpack it.
+
 Useful flags (see `--help` for the full list; `nydusify/src/cli.rs` is the source of truth):
 
 - `--target-suffix <suffix>` — derive `--target` from `--source` by appending a suffix, instead of

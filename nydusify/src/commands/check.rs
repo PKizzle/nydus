@@ -14,6 +14,7 @@ use tracing::{debug, info, warn};
 
 use crate::cli::CheckArgs;
 use crate::engine::artifact::{REFERRER_ARTIFACT_TYPE, fallback_referrers_tag};
+use crate::engine::bootstrap_layer;
 use crate::engine::manifest::validate_nydus_manifest;
 use crate::engine::oci::{client_options, fetch_platform_manifest};
 
@@ -76,12 +77,14 @@ pub async fn run(args: CheckArgs) -> Result<()> {
     }
 
     // (3) Download the bootstrap and run `nydus-image check` on it.
+    //
+    // The bootstrap ships as a gzip'd tar holding `image/image.boot`, so the
+    // downloaded blob is the *layer*, not the bootstrap. Unpack it before handing
+    // it to nydus-image. (Images published by older builds carried the raw
+    // bootstrap under a bespoke media type; those are used as-is.)
     ensure_dir(&args.work_dir)?;
-    let bootstrap_path = args.work_dir.join("bootstrap");
-    target_client
-        .get_blob_to_file(&target_ref.repo, &bootstrap.digest, &bootstrap_path)
-        .await
-        .with_context(|| format!("download bootstrap {}", bootstrap.digest))?;
+    let bootstrap_path =
+        bootstrap_layer::fetch(&target_client, &target_ref.repo, bootstrap, &args.work_dir).await?;
     run_nydus_image_check(&args.nydus_image, &bootstrap_path)?;
 
     // NOTE: no mount-diff check (comparing the mounted nydus rootfs against

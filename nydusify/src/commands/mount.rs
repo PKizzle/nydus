@@ -67,11 +67,11 @@ pub async fn run(args: MountArgs) -> Result<()> {
     ensure_dir(&args.work_dir)?;
     let cache_dir = args.work_dir.join("cache");
     ensure_dir(&cache_dir)?;
-    let bootstrap_path = args.work_dir.join("bootstrap");
-    client
-        .get_blob_to_file(&target_ref.repo, &bootstrap.digest, &bootstrap_path)
-        .await
-        .with_context(|| format!("download bootstrap {}", bootstrap.digest))?;
+    // The bootstrap ships as a gzip'd tar holding `image/image.boot`; nydusd needs
+    // the bootstrap itself, so unpack before staging it.
+    let bootstrap_path =
+        crate::engine::bootstrap_layer::fetch(&client, &target_ref.repo, bootstrap, &args.work_dir)
+            .await?;
 
     // Resolve the target registry's docker-config credentials so nydusd's
     // registry backend can authenticate its on-demand blob fetches; without

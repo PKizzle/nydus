@@ -36,6 +36,7 @@ use tracing::{debug, info, warn};
 
 use crate::commands::convert::ConversionMode;
 use crate::engine::artifact::maybe_push_referrer;
+use crate::engine::bootstrap_layer;
 use crate::engine::containerd_converter::ConvertRequest;
 use crate::engine::manifest::{
     assemble_index, assemble_manifest, bootstrap_descriptor, config_media_type,
@@ -897,25 +898,35 @@ async fn push_artifact(
         data_blobs.push(data_blob_descriptor(digest, file_len(blob)?));
     }
 
-    // Bootstrap.
+    // Bootstrap. Published as an ordinary gzip'd tar holding `image/image.boot`,
+    // not as a raw blob under a bespoke media type: containerd has to be able to
+    // unpack it with its normal tar+gzip path (no stream processor), and the
+    // snapshotter reads the bootstrap out of the expanded snapshot.
+    let boot_layer = bootstrap_layer::pack(&output.bootstrap)?;
     let boot_digest = retry
         .run("push nydus bootstrap", || {
-            client.push_blob_file(repo, &output.bootstrap)
+            client.push_blob_bytes(repo, &boot_layer.gzip_bytes)
         })
         .await
         .context("push nydus bootstrap")?;
-    let bootstrap = bootstrap_descriptor(boot_digest, file_len(&output.bootstrap)?);
+    let bootstrap = bootstrap_descriptor(
+        boot_digest,
+        boot_layer.diff_id.clone(),
+        boot_layer.gzip_bytes.len() as u64,
+    );
 
     // Rebuild the image config so `rootfs.diff_ids` has exactly one entry per
     // pushed manifest layer (data blobs first, bootstrap last) — otherwise
     // containerd rejects the image with "mismatched image rootfs and manifest
-    // layers". Push the NEW config blob and reference it in the manifest.
-    let layer_digests: Vec<String> = data_blobs
+    // layers". These are DIFF ids, i.e. the digest of each layer *uncompressed*:
+    // for a nydus data blob that is the blob digest, but for the gzip'd bootstrap
+    // it is the tar digest, and containerd recomputes it while unpacking.
+    let layer_diff_ids: Vec<String> = data_blobs
         .iter()
         .map(|d| d.digest.clone())
-        .chain(std::iter::once(bootstrap.digest.clone()))
+        .chain(std::iter::once(boot_layer.diff_id))
         .collect();
-    let config_bytes = rebuild_image_config(&source.config_bytes, &layer_digests)
+    let config_bytes = rebuild_image_config(&source.config_bytes, &layer_diff_ids)
         .context("rewrite image config diff_ids/history for nydus layer set")?;
     let config_digest = retry
         .run("push image config", || {

@@ -23,8 +23,8 @@ use anyhow::{Context, Result, anyhow, bail};
 use registry_client::Descriptor;
 use registry_client::types::{
     History, ImageConfig, Index, MEDIA_TYPE_DOCKER_CONFIG, MEDIA_TYPE_DOCKER_MANIFEST,
-    MEDIA_TYPE_DOCKER_MANIFEST_LIST, MEDIA_TYPE_NYDUS_BLOB, MEDIA_TYPE_NYDUS_BOOTSTRAP_LAYER,
-    MEDIA_TYPE_OCI_CONFIG, MEDIA_TYPE_OCI_INDEX, MEDIA_TYPE_OCI_MANIFEST, Manifest,
+    MEDIA_TYPE_DOCKER_MANIFEST_LIST, MEDIA_TYPE_NYDUS_BLOB, MEDIA_TYPE_OCI_CONFIG,
+    MEDIA_TYPE_OCI_INDEX, MEDIA_TYPE_OCI_LAYER_GZIP, MEDIA_TYPE_OCI_MANIFEST, Manifest,
 };
 
 /// Annotation set on nydus data-blob layers so containerd's snapshotter
@@ -34,6 +34,10 @@ pub const ANNOTATION_NYDUS_DATA: &str = "containerd.io/snapshot/nydus-blob";
 /// Annotation set on the nydus bootstrap layer. Mirrors the snapshotter's
 /// `NYDUS_META_LAYER` label (`registry_client::types::ANNOTATION_NYDUS_BOOTSTRAP`).
 pub const ANNOTATION_NYDUS_BOOTSTRAP: &str = "containerd.io/snapshot/nydus-bootstrap";
+/// Per-layer diff id (digest of the *uncompressed* layer), the containerd
+/// convention every nydus converter follows. The image config's
+/// `rootfs.diff_ids` is assembled from these.
+pub const ANNOTATION_UNCOMPRESSED: &str = "containerd.io/uncompressed";
 
 /// The manifest media type to publish under, per `docker2oci`.
 pub fn manifest_media_type(docker2oci: bool) -> &'static str {
@@ -54,29 +58,38 @@ pub fn config_media_type(docker2oci: bool) -> &'static str {
 }
 
 /// Build a nydus **data-blob** layer descriptor (annotated `nydus-blob`).
+///
+/// A nydus data blob is uncompressed at the layer level, so its diff id is the
+/// blob digest itself.
 pub fn data_blob_descriptor(digest: String, size: u64) -> Descriptor {
     Descriptor {
         media_type: MEDIA_TYPE_NYDUS_BLOB.to_string(),
+        annotations: Some(BTreeMap::from([
+            (ANNOTATION_NYDUS_DATA.to_string(), "true".to_string()),
+            (ANNOTATION_UNCOMPRESSED.to_string(), digest.clone()),
+        ])),
         digest,
         size,
-        annotations: Some(BTreeMap::from([(
-            ANNOTATION_NYDUS_DATA.to_string(),
-            "true".to_string(),
-        )])),
         ..Descriptor::default()
     }
 }
 
 /// Build the nydus **bootstrap** layer descriptor (annotated `nydus-bootstrap`).
-pub fn bootstrap_descriptor(digest: String, size: u64) -> Descriptor {
+///
+/// The bootstrap ships as an ordinary gzip'd tar holding `image/image.boot`
+/// (see [`crate::engine::bootstrap_layer`]), so this is a plain
+/// `…layer.v1.tar+gzip` descriptor: containerd unpacks it with no stream
+/// processor, and the snapshotter finds the bootstrap in the expanded snapshot.
+/// `diff_id` is the digest of the *uncompressed* tar.
+pub fn bootstrap_descriptor(digest: String, diff_id: String, size: u64) -> Descriptor {
     Descriptor {
-        media_type: MEDIA_TYPE_NYDUS_BOOTSTRAP_LAYER.to_string(),
+        media_type: MEDIA_TYPE_OCI_LAYER_GZIP.to_string(),
         digest,
         size,
-        annotations: Some(BTreeMap::from([(
-            ANNOTATION_NYDUS_BOOTSTRAP.to_string(),
-            "true".to_string(),
-        )])),
+        annotations: Some(BTreeMap::from([
+            (ANNOTATION_NYDUS_BOOTSTRAP.to_string(), "true".to_string()),
+            (ANNOTATION_UNCOMPRESSED.to_string(), diff_id),
+        ])),
         ..Descriptor::default()
     }
 }
@@ -286,14 +299,26 @@ mod tests {
                 .unwrap(),
             "true"
         );
-        let boot = bootstrap_descriptor("sha256:b".into(), 20);
-        assert_eq!(boot.media_type, MEDIA_TYPE_NYDUS_BOOTSTRAP_LAYER);
+        let boot = bootstrap_descriptor("sha256:b".into(), "sha256:bdiff".into(), 20);
+        // A plain gzip'd-tar layer: containerd must be able to unpack it with no
+        // stream processor registered for a bespoke media type.
+        assert_eq!(boot.media_type, MEDIA_TYPE_OCI_LAYER_GZIP);
+        let ann = boot.annotations.unwrap();
+        assert_eq!(ann.get(ANNOTATION_NYDUS_BOOTSTRAP).unwrap(), "true");
+        // The diff id is the UNCOMPRESSED digest, never the layer digest.
+        assert_eq!(ann.get(ANNOTATION_UNCOMPRESSED).unwrap(), "sha256:bdiff");
+    }
+
+    #[test]
+    fn data_blob_diff_id_is_its_own_digest() {
+        // A nydus data blob is uncompressed at the layer level.
+        let data = data_blob_descriptor("sha256:d".into(), 7);
         assert_eq!(
-            boot.annotations
+            data.annotations
                 .unwrap()
-                .get(ANNOTATION_NYDUS_BOOTSTRAP)
+                .get(ANNOTATION_UNCOMPRESSED)
                 .unwrap(),
-            "true"
+            "sha256:d"
         );
     }
 
@@ -302,7 +327,7 @@ mod tests {
         let config = Descriptor::for_bytes(MEDIA_TYPE_OCI_CONFIG, b"{}");
         let d0 = data_blob_descriptor("sha256:0".into(), 1);
         let d1 = data_blob_descriptor("sha256:1".into(), 2);
-        let boot = bootstrap_descriptor("sha256:boot".into(), 3);
+        let boot = bootstrap_descriptor("sha256:boot".into(), "sha256:bootdiff".into(), 3);
         let manifest = assemble_manifest(true, config, vec![d0, d1], boot);
 
         assert_eq!(manifest.schema_version, 2);
@@ -315,7 +340,7 @@ mod tests {
         assert_eq!(manifest.layers[1].digest, "sha256:1");
         // Bootstrap is last and carries the meta annotation.
         let last = manifest.layers.last().unwrap();
-        assert_eq!(last.media_type, MEDIA_TYPE_NYDUS_BOOTSTRAP_LAYER);
+        assert_eq!(last.media_type, MEDIA_TYPE_OCI_LAYER_GZIP);
         assert!(
             last.annotations
                 .as_ref()
@@ -333,7 +358,7 @@ mod tests {
     fn nydus_manifest() -> Manifest {
         let config = Descriptor::for_bytes(MEDIA_TYPE_OCI_CONFIG, b"{}");
         let data = data_blob_descriptor("sha256:data".into(), 100);
-        let boot = bootstrap_descriptor("sha256:boot".into(), 50);
+        let boot = bootstrap_descriptor("sha256:boot".into(), "sha256:bootdiff".into(), 50);
         assemble_manifest(true, config, vec![data], boot)
     }
 
@@ -405,7 +430,7 @@ mod tests {
         for i in 0..n {
             data_blobs.push(data_blob_descriptor(format!("sha256:nydus{i}"), 100));
         }
-        let bootstrap = bootstrap_descriptor("sha256:boot".into(), 50);
+        let bootstrap = bootstrap_descriptor("sha256:boot".into(), "sha256:bootdiff".into(), 50);
 
         let layer_digests: Vec<String> = data_blobs
             .iter()
@@ -454,7 +479,7 @@ mod tests {
             // Tiny per-layer zran index blob.
             data_blobs.push(data_blob_descriptor(format!("sha256:zran{i}"), 20));
         }
-        let bootstrap = bootstrap_descriptor("sha256:boot".into(), 50);
+        let bootstrap = bootstrap_descriptor("sha256:boot".into(), "sha256:bootdiff".into(), 50);
 
         let layer_digests: Vec<String> = data_blobs
             .iter()
@@ -493,7 +518,7 @@ mod tests {
     #[test]
     fn validate_rejects_bootstrap_without_data_blob() {
         let config = Descriptor::for_bytes(MEDIA_TYPE_OCI_CONFIG, b"{}");
-        let boot = bootstrap_descriptor("sha256:boot".into(), 50);
+        let boot = bootstrap_descriptor("sha256:boot".into(), "sha256:bootdiff".into(), 50);
         // Only a bootstrap layer, no data blob.
         let manifest = Manifest {
             schema_version: 2,
