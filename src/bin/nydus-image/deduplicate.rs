@@ -269,9 +269,11 @@ impl Deduplicate<SqliteDatabase> {
             self.db
                 .insert_blob(&ChunkdictBlobInfo {
                     blob_id: blob.blob_id().to_string(),
+                    blob_chunk_count: blob.chunk_count(),
                     blob_compressed_size: blob.compressed_size(),
                     blob_uncompressed_size: blob.uncompressed_size(),
                     blob_compressor: blob.compressor().to_string(),
+                    blob_meta_ci_compressor: blob.meta_ci_compressor().to_string(),
                     blob_meta_ci_compressed_size: blob.meta_ci_compressed_size(),
                     blob_meta_ci_uncompressed_size: blob.meta_ci_uncompressed_size(),
                     blob_meta_ci_offset: blob.meta_ci_offset(),
@@ -304,6 +306,7 @@ impl Deduplicate<SqliteDatabase> {
                         chunk_uncompressed_size: chunk.inner.uncompressed_size(),
                         chunk_compressed_offset: chunk.inner.compressed_offset(),
                         chunk_uncompressed_offset: chunk.inner.uncompressed_offset(),
+                        chunk_index: chunk.inner.index(),
                     })
                     .context("Failed to insert chunk")?;
             }
@@ -460,6 +463,7 @@ impl Algorithm<SqliteDatabase> {
                 chunk_uncompressed_offset: all_chunks[i].chunk_uncompressed_offset,
                 chunk_compressed_size: all_chunks[i].chunk_compressed_size,
                 chunk_uncompressed_size: all_chunks[i].chunk_uncompressed_size,
+                chunk_index: all_chunks[i].chunk_index,
             };
             if smoothed_data[i] > threshold {
                 chunkdict.push(chunk);
@@ -989,7 +993,7 @@ impl ChunkTable {
         let mut stmt: rusqlite::Statement<'_> = conn_guard
             .prepare(
                 "SELECT id, image_reference, version, chunk_blob_id, chunk_digest,chunk_crc32, chunk_compressed_size,
-                chunk_uncompressed_size, chunk_compressed_offset, chunk_uncompressed_offset from chunk
+                chunk_uncompressed_size, chunk_compressed_offset, chunk_uncompressed_offset, chunk_index from chunk
                 WHERE chunk_blob_id = ?1
                 ORDER BY id LIMIT ?2 OFFSET ?3",
             )?;
@@ -1004,6 +1008,7 @@ impl ChunkTable {
                 chunk_uncompressed_size: row.get(7)?,
                 chunk_compressed_offset: row_u64(row, 8)?,
                 chunk_uncompressed_offset: row_u64(row, 9)?,
+                chunk_index: row.get(10)?,
             })
         })?;
         let mut chunks = Vec::new();
@@ -1102,7 +1107,8 @@ impl Table<ChunkdictChunkInfo, DatabaseError> for ChunkTable {
                     chunk_compressed_size  INT,
                     chunk_uncompressed_size  INT,
                     chunk_compressed_offset  INT,
-                    chunk_uncompressed_offset  INT
+                    chunk_uncompressed_offset  INT,
+                    chunk_index               INT
                 )",
                 [],
             )
@@ -1127,9 +1133,10 @@ impl Table<ChunkdictChunkInfo, DatabaseError> for ChunkTable {
                     chunk_compressed_size,
                     chunk_uncompressed_size,
                     chunk_compressed_offset,
-                    chunk_uncompressed_offset
+                    chunk_uncompressed_offset,
+                    chunk_index
                 )
-                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9);
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10);
                 ",
                 rusqlite::params![
                     chunk.image_reference,
@@ -1141,6 +1148,7 @@ impl Table<ChunkdictChunkInfo, DatabaseError> for ChunkTable {
                     chunk.chunk_uncompressed_size,
                     chunk_compressed_offset,
                     chunk_uncompressed_offset,
+                    chunk.chunk_index,
                 ],
             )
             .map_err(DatabaseError::SqliteError)?;
@@ -1177,7 +1185,7 @@ impl Table<ChunkdictChunkInfo, DatabaseError> for ChunkTable {
         let mut stmt: rusqlite::Statement<'_> = conn_guard
             .prepare(
                 "SELECT id, image_reference, version, chunk_blob_id, chunk_digest,chunk_crc32, chunk_compressed_size,
-                chunk_uncompressed_size, chunk_compressed_offset, chunk_uncompressed_offset from chunk
+                chunk_uncompressed_size, chunk_compressed_offset, chunk_uncompressed_offset, chunk_index from chunk
                 ORDER BY id LIMIT ?1 OFFSET ?2",
             )?;
         let chunk_iterator = stmt.query_map(params![limit, offset], |row| {
@@ -1191,6 +1199,7 @@ impl Table<ChunkdictChunkInfo, DatabaseError> for ChunkTable {
                 chunk_uncompressed_size: row.get(7)?,
                 chunk_compressed_offset: row_u64(row, 8)?,
                 chunk_uncompressed_offset: row_u64(row, 9)?,
+                chunk_index: row.get(10)?,
             })
         })?;
         let mut chunks = Vec::new();
@@ -1227,7 +1236,7 @@ impl BlobTable {
             .lock()
             .map_err(|e| DatabaseError::PoisonError(e.to_string()))?;
         let mut stmt = conn_guard.prepare(
-            "SELECT blob_id, blob_compressed_size, blob_uncompressed_size, blob_compressor, blob_meta_ci_compressed_size, blob_meta_ci_uncompressed_size, blob_meta_ci_offset FROM blob WHERE blob_id = ?1",
+            "SELECT blob_id, blob_compressed_size, blob_uncompressed_size, blob_compressor, blob_meta_ci_compressor, blob_meta_ci_compressed_size, blob_meta_ci_uncompressed_size, blob_meta_ci_offset, blob_chunk_count FROM blob WHERE blob_id = ?1",
         )?;
         let mut blob_iterator = stmt.query_map([blob_id], |row| {
             Ok(ChunkdictBlobInfo {
@@ -1235,9 +1244,11 @@ impl BlobTable {
                 blob_compressed_size: row_u64(row, 1)?,
                 blob_uncompressed_size: row_u64(row, 2)?,
                 blob_compressor: row.get(3)?,
-                blob_meta_ci_compressed_size: row_u64(row, 4)?,
-                blob_meta_ci_uncompressed_size: row_u64(row, 5)?,
-                blob_meta_ci_offset: row_u64(row, 6)?,
+                blob_meta_ci_compressor: row.get(4)?,
+                blob_meta_ci_compressed_size: row_u64(row, 5)?,
+                blob_meta_ci_uncompressed_size: row_u64(row, 6)?,
+                blob_meta_ci_offset: row_u64(row, 7)?,
+                blob_chunk_count: row.get(8)?,
             })
         })?;
 
@@ -1272,9 +1283,11 @@ impl Table<ChunkdictBlobInfo, DatabaseError> for BlobTable {
                     blob_compressed_size                INT,
                     blob_uncompressed_size              INT,
                     blob_compressor                     TEXT,
+                    blob_meta_ci_compressor             TEXT,
                     blob_meta_ci_compressed_size        INT,
                     blob_meta_ci_uncompressed_size      INT,
-                    blob_meta_ci_offset                 INT
+                    blob_meta_ci_offset                 INT,
+                    blob_chunk_count                    INT
                 )",
                 [],
             )
@@ -1298,20 +1311,24 @@ impl Table<ChunkdictBlobInfo, DatabaseError> for BlobTable {
                     blob_compressed_size,
                     blob_uncompressed_size,
                     blob_compressor,
+                    blob_meta_ci_compressor,
                     blob_meta_ci_compressed_size,
                     blob_meta_ci_uncompressed_size,
-                    blob_meta_ci_offset
+                    blob_meta_ci_offset,
+                    blob_chunk_count
                 )
-                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7);
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9);
                 ",
                 rusqlite::params![
                     blob.blob_id,
                     blob_compressed_size,
                     blob_uncompressed_size,
                     blob.blob_compressor,
+                    blob.blob_meta_ci_compressor,
                     blob_meta_ci_compressed_size,
                     blob_meta_ci_uncompressed_size,
                     blob_meta_ci_offset,
+                    blob.blob_chunk_count,
                 ],
             )
             .map_err(DatabaseError::SqliteError)?;
@@ -1342,7 +1359,7 @@ impl Table<ChunkdictBlobInfo, DatabaseError> for BlobTable {
             .lock()
             .map_err(|e| DatabaseError::PoisonError(e.to_string()))?;
         let mut stmt: rusqlite::Statement<'_> = conn_guard.prepare(
-            "SELECT blob_id, blob_compressed_size, blob_uncompressed_size, blob_compressor, blob_meta_ci_compressed_size, blob_meta_ci_uncompressed_size, blob_meta_ci_offset from blob
+            "SELECT blob_id, blob_compressed_size, blob_uncompressed_size, blob_compressor, blob_meta_ci_compressor, blob_meta_ci_compressed_size, blob_meta_ci_uncompressed_size, blob_meta_ci_offset, blob_chunk_count from blob
                 ORDER BY id LIMIT ?1 OFFSET ?2",
         )?;
         let blob_iterator = stmt.query_map(params![limit, offset], |row| {
@@ -1351,9 +1368,11 @@ impl Table<ChunkdictBlobInfo, DatabaseError> for BlobTable {
                 blob_compressed_size: row_u64(row, 1)?,
                 blob_uncompressed_size: row_u64(row, 2)?,
                 blob_compressor: row.get(3)?,
-                blob_meta_ci_compressed_size: row_u64(row, 4)?,
-                blob_meta_ci_uncompressed_size: row_u64(row, 5)?,
-                blob_meta_ci_offset: row_u64(row, 6)?,
+                blob_meta_ci_compressor: row.get(4)?,
+                blob_meta_ci_compressed_size: row_u64(row, 5)?,
+                blob_meta_ci_uncompressed_size: row_u64(row, 6)?,
+                blob_meta_ci_offset: row_u64(row, 7)?,
+                blob_chunk_count: row.get(8)?,
             })
         })?;
         let mut blobs = Vec::new();
@@ -1402,9 +1421,11 @@ mod tests {
         blob_table.create()?;
         let blob = ChunkdictBlobInfo {
             blob_id: "BLOB123".to_string(),
+            blob_chunk_count: 16,
             blob_compressed_size: 1024,
             blob_uncompressed_size: 2048,
             blob_compressor: "zstd".to_string(),
+            blob_meta_ci_compressor: "none".to_string(),
             blob_meta_ci_compressed_size: 1024,
             blob_meta_ci_uncompressed_size: 2048,
             blob_meta_ci_offset: 0,
@@ -1416,6 +1437,11 @@ mod tests {
         assert_eq!(blobs[0].blob_compressed_size, blob.blob_compressed_size);
         assert_eq!(blobs[0].blob_uncompressed_size, blob.blob_uncompressed_size);
         assert_eq!(blobs[0].blob_compressor, blob.blob_compressor);
+        assert_eq!(blobs[0].blob_chunk_count, blob.blob_chunk_count);
+        assert_eq!(
+            blobs[0].blob_meta_ci_compressor,
+            blob.blob_meta_ci_compressor
+        );
         assert_eq!(
             blobs[0].blob_meta_ci_compressed_size,
             blob.blob_meta_ci_compressed_size
@@ -1442,6 +1468,7 @@ mod tests {
             chunk_uncompressed_size: 1024,
             chunk_compressed_offset: 0,
             chunk_uncompressed_offset: 0,
+            chunk_index: 7,
         };
         chunk_table.insert(&chunk)?;
         let chunk2 = ChunkdictChunkInfo {
@@ -1454,6 +1481,7 @@ mod tests {
             chunk_uncompressed_size: 1024,
             chunk_compressed_offset: 0,
             chunk_uncompressed_offset: 0,
+            chunk_index: 8,
         };
         chunk_table.insert(&chunk2)?;
         let chunks = chunk_table.list_all()?;
@@ -1475,6 +1503,7 @@ mod tests {
             chunks[0].chunk_uncompressed_offset,
             chunk.chunk_uncompressed_offset
         );
+        assert_eq!(chunks[0].chunk_index, chunk.chunk_index);
 
         let chunks = chunk_table.list_all_by_blob_id(&chunk.chunk_blob_id)?;
         assert_eq!(chunks[0].chunk_blob_id, chunk.chunk_blob_id);
@@ -1490,9 +1519,11 @@ mod tests {
         for i in 0..200 {
             let blob = ChunkdictBlobInfo {
                 blob_id: format!("BLOB{}", i),
+                blob_chunk_count: i as u32,
                 blob_compressed_size: i,
                 blob_uncompressed_size: i * 2,
                 blob_compressor: "zstd".to_string(),
+                blob_meta_ci_compressor: "none".to_string(),
                 blob_meta_ci_compressed_size: i,
                 blob_meta_ci_uncompressed_size: i * 2,
                 blob_meta_ci_offset: i * 3,
@@ -1505,6 +1536,8 @@ mod tests {
         assert_eq!(blobs[0].blob_compressed_size, 100);
         assert_eq!(blobs[0].blob_uncompressed_size, 200);
         assert_eq!(blobs[0].blob_compressor, "zstd");
+        assert_eq!(blobs[0].blob_chunk_count, 100);
+        assert_eq!(blobs[0].blob_meta_ci_compressor, "none");
         assert_eq!(blobs[0].blob_meta_ci_compressed_size, 100);
         assert_eq!(blobs[0].blob_meta_ci_uncompressed_size, 200);
         assert_eq!(blobs[0].blob_meta_ci_offset, 300);
@@ -1527,6 +1560,7 @@ mod tests {
                 chunk_uncompressed_size: i * 2,
                 chunk_compressed_offset: i64 * 3,
                 chunk_uncompressed_offset: i64 * 4,
+                chunk_index: i,
             };
             chunk_table.insert(&chunk)?;
         }
@@ -1540,6 +1574,7 @@ mod tests {
         assert_eq!(chunks[0].chunk_uncompressed_size, 200);
         assert_eq!(chunks[0].chunk_compressed_offset, 300);
         assert_eq!(chunks[0].chunk_uncompressed_offset, 400);
+        assert_eq!(chunks[0].chunk_index, 100);
         Ok(())
     }
 
@@ -1559,6 +1594,7 @@ mod tests {
                 chunk_uncompressed_size: i * 2,
                 chunk_compressed_offset: i64 * 3,
                 chunk_uncompressed_offset: i64 * 4,
+                chunk_index: i,
             };
             all_chunk.push(chunk);
         }
@@ -1572,6 +1608,7 @@ mod tests {
         assert_eq!(chunkdict[0].chunk_uncompressed_size, 198);
         assert_eq!(chunkdict[0].chunk_compressed_offset, 297);
         assert_eq!(chunkdict[0].chunk_uncompressed_offset, 396);
+        assert_eq!(chunkdict[0].chunk_index, 99);
         Ok(())
     }
 
@@ -1592,6 +1629,7 @@ mod tests {
                 chunk_uncompressed_size: i * 2,
                 chunk_compressed_offset: i64 * 3,
                 chunk_uncompressed_offset: i64 * 4,
+                chunk_index: i,
             };
             chunk_table.insert(&chunk)?;
         }
@@ -1622,6 +1660,7 @@ mod tests {
                 chunk_uncompressed_size: 1,
                 chunk_compressed_offset: i64 * 3,
                 chunk_uncompressed_offset: i64 * 4,
+                chunk_index: i,
             };
             all_chunks1.push(chunk);
         }
@@ -1638,6 +1677,7 @@ mod tests {
                 chunk_uncompressed_size: 1,
                 chunk_compressed_offset: i64 * 3,
                 chunk_uncompressed_offset: i64 * 4,
+                chunk_index: i,
             };
             all_chunks2.push(chunk);
         }
@@ -1667,6 +1707,7 @@ mod tests {
                     chunk_uncompressed_size: 1,
                     chunk_compressed_offset: 1,
                     chunk_uncompressed_offset: 1,
+                    chunk_index: j,
                 };
                 all_chunks.push(chunk);
             }
@@ -1698,6 +1739,7 @@ mod tests {
                     chunk_uncompressed_size: 1,
                     chunk_compressed_offset: 1,
                     chunk_uncompressed_offset: 1,
+                    chunk_index: j,
                 };
                 all_chunks.push(chunk);
             }
@@ -1734,6 +1776,7 @@ mod tests {
                     chunk_uncompressed_size: 1,
                     chunk_compressed_offset: 1,
                     chunk_uncompressed_offset: 1,
+                    chunk_index: j,
                 };
                 all_chunks.push(chunk);
             }
@@ -1761,6 +1804,7 @@ mod tests {
                     chunk_uncompressed_size: 1,
                     chunk_compressed_offset: 1,
                     chunk_uncompressed_offset: 1,
+                    chunk_index: j,
                 };
                 all_chunks.push(chunk);
             }
@@ -1798,6 +1842,7 @@ mod tests {
                 chunk_uncompressed_size: i * 2,
                 chunk_compressed_offset: i64 * 3,
                 chunk_uncompressed_offset: i64 * 4,
+                chunk_index: i,
             };
             all_chunks.push(chunk);
         }

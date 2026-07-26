@@ -23,11 +23,9 @@ use anyhow::{Ok, Result};
 use nydus_rafs::metadata::chunk::ChunkWrapper;
 use nydus_rafs::metadata::inode::InodeWrapper;
 use nydus_rafs::metadata::layout::RafsXAttrs;
-use nydus_storage::meta::BlobChunkInfoV1Ondisk;
 use nydus_utils::compress::Algorithm;
 use nydus_utils::digest::{DigestHasher, RafsDigest};
 
-use std::mem::size_of;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -43,13 +41,16 @@ pub struct ChunkdictChunkInfo {
     pub chunk_uncompressed_size: u32,
     pub chunk_compressed_offset: u64,
     pub chunk_uncompressed_offset: u64,
+    pub chunk_index: u32,
 }
 
 pub struct ChunkdictBlobInfo {
     pub blob_id: String,
+    pub blob_chunk_count: u32,
     pub blob_compressed_size: u64,
     pub blob_uncompressed_size: u64,
     pub blob_compressor: String,
+    pub blob_meta_ci_compressor: String,
     pub blob_meta_ci_compressed_size: u64,
     pub blob_meta_ci_uncompressed_size: u64,
     pub blob_meta_ci_offset: u64,
@@ -138,11 +139,11 @@ impl Generator {
 
     /// Put the chunk list into a deterministic, blob-major order.
     ///
-    /// `insert_chunks` allocates chunk indexes with `alloc_chunk_index()` in iteration order,
-    /// so without this the on-disk index assignment — and the file offsets derived alongside it
-    /// — depend on whatever order the caller happened to collect chunks in. Sorting by blob id
-    /// first keeps each blob's chunks contiguous; the offsets and digest break ties so the
-    /// output is stable across runs.
+    /// Chunk indexes now come from the source blob (see `insert_chunks`), so this no longer
+    /// decides index assignment -- but `insert_chunks` still walks the list in order to lay out
+    /// file offsets, so without a total order the generated dictionary image depends on whatever
+    /// order the caller happened to collect chunks in. Sorting by blob id keeps each blob's
+    /// chunks contiguous; the offsets and digest break ties so the output is stable across runs.
     fn sort_chunks(chunkdict: &mut [ChunkdictChunkInfo]) {
         chunkdict.sort_by(|a, b| {
             a.chunk_blob_id
@@ -263,26 +264,14 @@ impl Generator {
             file_offset += chunk_info.chunk_uncompressed_size as u64;
             let mut chunk = ChunkWrapper::new(ctx.fs_version);
 
-            // Update blob context.
-            let (blob_index, blob_ctx) =
-                blob_mgr.get_or_cerate_blob_for_chunkdict(ctx, &chunk_info.chunk_blob_id)?;
-            let chunk_uncompressed_size = chunk_info.chunk_uncompressed_size;
-            let pre_d_offset = blob_ctx.current_uncompressed_offset;
-            blob_ctx.uncompressed_blob_size = pre_d_offset + chunk_uncompressed_size as u64;
-            blob_ctx.current_uncompressed_offset += chunk_uncompressed_size as u64;
-
-            blob_ctx.blob_meta_header.set_ci_uncompressed_size(
-                blob_ctx.blob_meta_header.ci_uncompressed_size()
-                    + size_of::<BlobChunkInfoV1Ondisk>() as u64,
-            );
-            blob_ctx.blob_meta_header.set_ci_compressed_size(
-                blob_ctx.blob_meta_header.ci_uncompressed_size()
-                    + size_of::<BlobChunkInfoV1Ondisk>() as u64,
-            );
             let chunkdict_blob_info = chunkdict_blobs
                 .iter()
                 .find(|blob| blob.blob_id == chunk_info.chunk_blob_id)
                 .unwrap();
+            let (blob_index, blob_ctx) =
+                blob_mgr.get_or_cerate_blob_for_chunkdict(ctx, &chunk_info.chunk_blob_id)?;
+            blob_ctx.compressed_blob_size = chunkdict_blob_info.blob_compressed_size;
+            blob_ctx.uncompressed_blob_size = chunkdict_blob_info.blob_uncompressed_size;
             blob_ctx.blob_compressor =
                 Algorithm::from_str(chunkdict_blob_info.blob_compressor.as_str())?;
             blob_ctx
@@ -294,10 +283,14 @@ impl Generator {
             blob_ctx
                 .blob_meta_header
                 .set_ci_compressed_offset(chunkdict_blob_info.blob_meta_ci_offset);
-            blob_ctx.blob_meta_header.set_ci_compressor(Algorithm::Zstd);
+            blob_ctx
+                .blob_meta_header
+                .set_ci_compressor(Algorithm::from_str(
+                    chunkdict_blob_info.blob_meta_ci_compressor.as_str(),
+                )?);
 
-            // Update chunk context.
-            let chunk_index = blob_ctx.alloc_chunk_index()?;
+            blob_ctx.chunk_count = chunkdict_blob_info.blob_chunk_count;
+            let chunk_index = chunk_info.chunk_index;
             chunk.set_blob_index(blob_index);
             chunk.set_index(chunk_index);
             chunk.set_file_offset(cur_file_offset);
@@ -342,6 +335,7 @@ mod tests {
             chunk_uncompressed_size: size,
             chunk_compressed_offset: 0,
             chunk_uncompressed_offset: 0,
+            chunk_index: 0,
         }
     }
 
@@ -398,6 +392,7 @@ mod tests {
             chunk_crc32: 0,
             chunk_compressed_size: compressed,
             chunk_uncompressed_size: uncompressed,
+            chunk_index: 0,
             chunk_compressed_offset: compressed_offset,
             chunk_uncompressed_offset: 0,
         }
@@ -470,6 +465,8 @@ mod tests {
             blob_compressed_size: 0,
             blob_uncompressed_size: 0,
             blob_compressor: compressor.to_string(),
+            blob_chunk_count: 0,
+            blob_meta_ci_compressor: "none".to_string(),
             blob_meta_ci_compressed_size: 0,
             blob_meta_ci_uncompressed_size: 0,
             blob_meta_ci_offset: 0,
