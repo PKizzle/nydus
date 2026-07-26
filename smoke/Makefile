@@ -1,4 +1,14 @@
 PACKAGES ?= $(shell go list ./... | grep -v /vendor/)
+
+# Every smoke case pushes to the throwaway registry on localhost:5077, which
+# serves plain HTTP. The Go nydusify used to paper over this by silently
+# retrying an HTTPS failure over HTTP; the Rust one deliberately does not
+# (an automatic downgrade to plaintext is exactly the MITM opening the
+# plain-http docs warn about), so the harness asks for HTTP explicitly.
+# nydusify reads this per-flag env var, so it covers convert/check/copy/mount
+# without threading a flag through every call site.
+export PLAIN_HTTP = true
+
 GOPROXY ?=
 TESTS ?= .*
 GO_TEST_BUILD_FLAGS ?=

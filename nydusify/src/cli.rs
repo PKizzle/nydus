@@ -324,6 +324,15 @@ pub struct CopyArgs {
     pub source_insecure: bool,
     #[arg(long = "target-insecure", env = "TARGET_INSECURE")]
     pub target_insecure: bool,
+    /// Speak plain HTTP to both registries. Shorthand for both flags below.
+    #[arg(long = "plain-http", env = "PLAIN_HTTP")]
+    pub plain_http: bool,
+    /// Speak plain HTTP to the source registry only.
+    #[arg(long = "source-plain-http", env = "SOURCE_PLAIN_HTTP")]
+    pub source_plain_http: bool,
+    /// Speak plain HTTP to the target registry only.
+    #[arg(long = "target-plain-http", env = "TARGET_PLAIN_HTTP")]
+    pub target_plain_http: bool,
     /// Extra PEM CA certificate file(s) trusted in addition to the system
     /// store, for registries signed by a private CA (applies to both source
     /// and target). Repeatable; ignored when `--*-insecure` is set.

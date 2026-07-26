@@ -95,7 +95,15 @@ Useful flags (see `--help` for the full list; `nydusify/src/cli.rs` is the sourc
 - `--source-insecure` / `--target-insecure` — skip TLS verification (still HTTPS).
 - `--plain-http` — speak plain HTTP to **both** registries; `--source-plain-http` /
   `--target-plain-http` set one side only, for when the two ends disagree (pulling an upstream
-  image over HTTPS into a local HTTP test registry, say). Available on `convert` and `check`.
+  image over HTTPS into a local HTTP test registry, say). Available on `convert`, `check` and
+  `copy`, and settable via the `PLAIN_HTTP` / `SOURCE_PLAIN_HTTP` / `TARGET_PLAIN_HTTP`
+  environment variables.
+
+  > Unlike the Go nydusify, this tool **never silently falls back** from HTTPS to HTTP when the
+  > TLS handshake fails. That fallback is an automatic downgrade to plaintext, which is precisely
+  > the exposure the plain-http notes elsewhere in this repo warn about, so HTTP has to be asked
+  > for. Scripts carried over from the Go tool against a plain-HTTP registry need one of these
+  > flags added.
 - `--work-dir` (default `./tmp`), `--nydus-image` (default `nydus-image` on `$PATH`).
 - `--push-retry-count` (default `3`) / `--push-retry-delay` (default `5s`).
 - `--platform <os/arch[/variant]>` — a single selector, or a comma-separated list to convert

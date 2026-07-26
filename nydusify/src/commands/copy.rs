@@ -50,12 +50,20 @@ pub async fn run(args: CopyArgs) -> Result<()> {
 
     let source_client = RegistryClient::new(
         &source_ref.api_host,
-        client_options(args.source_insecure, false, &args.ca_cert),
+        client_options(
+            args.source_insecure,
+            args.plain_http || args.source_plain_http,
+            &args.ca_cert,
+        ),
     )
     .context("build source registry client")?;
     let target_client = RegistryClient::new(
         &target_ref.api_host,
-        client_options(args.target_insecure, false, &args.ca_cert),
+        client_options(
+            args.target_insecure,
+            args.plain_http || args.target_plain_http,
+            &args.ca_cert,
+        ),
     )
     .context("build target registry client")?;
     let same_registry = source_ref.api_host == target_ref.api_host;
@@ -230,6 +238,9 @@ mod tests {
             target: Some("registry.example.com/base:copy".to_string()),
             source_insecure: false,
             target_insecure: false,
+            plain_http: false,
+            source_plain_http: false,
+            target_plain_http: false,
             ca_cert: Vec::new(),
             source_backend_type: None,
             source_backend_config: None,
