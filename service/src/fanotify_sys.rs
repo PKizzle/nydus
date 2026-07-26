@@ -39,6 +39,20 @@ pub const FAN_REPORT_TARGET_FID: u32 = 0x0000_1000;
 /// (or `FAN_DENY` / `FAN_DENY_ERRNO(e)` on failure).
 pub const FAN_PRE_ACCESS: u64 = 0x0010_0000;
 
+/// The kernel's event queue overflowed and events were **dropped**.
+///
+/// Delivered as a synthetic record with `fd == FAN_NOFD` and no information
+/// records. For a permission class such as `FAN_CLASS_PRE_CONTENT` the dropped
+/// events were fail-opened by the kernel, so this is a data-integrity signal,
+/// not a throughput hint — see `FanotifyHandler::process_event_buffer`.
+pub const FAN_Q_OVERFLOW: u64 = 0x0000_4000;
+
+/// `fanotify_event_metadata.fd` value meaning "no descriptor for this event".
+///
+/// Carried by the `FAN_Q_OVERFLOW` record, and by every event when a group is
+/// created with `FAN_REPORT_FID` (which this path deliberately does not set).
+pub const FAN_NOFD: i32 = -1;
+
 // ---------------------------------------------------------------------------
 // fanotify response helpers
 // ---------------------------------------------------------------------------
@@ -132,6 +146,8 @@ mod tests {
         assert_eq!(FAN_REPORT_FID, 0x0000_0200);
         assert_eq!(FAN_REPORT_TARGET_FID, 0x0000_1000);
         assert_eq!(FAN_PRE_ACCESS, 0x0010_0000);
+        assert_eq!(FAN_Q_OVERFLOW, 0x0000_4000);
+        assert_eq!(FAN_NOFD, -1);
         assert_eq!(FAN_EVENT_INFO_TYPE_RANGE, 6u8);
     }
 

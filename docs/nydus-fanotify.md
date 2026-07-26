@@ -10,18 +10,29 @@ EROFS + `fscache` (`cachefiles`) on-demand path, which has been removed.
 
 ## How it works
 
-1. The daemon opens a fanotify group with `FAN_CLASS_PRE_CONTENT` and places a
-   `FAN_PRE_ACCESS | FAN_OPEN_PERM` mark on every sparse blob file in the staging directory.
-2. It mounts the image with the in-kernel EROFS driver, referencing the bootstrap and blobs as
-   multiple devices:
-   `mount("none", <mountpoint>, "erofs", 0, "device=<bootstrap>,device=<blob0>,device=<blob1>,…")`.
+1. The daemon opens a fanotify group with `FAN_CLASS_PRE_CONTENT` and places a `FAN_PRE_ACCESS`
+   mark — **only** that; never `FAN_OPEN_PERM`, which would block every open including the
+   daemon's own — on every sparse data blob in the staging directory.
+2. It mounts the image with the in-kernel EROFS driver. The **bootstrap is the mount source**; the
+   data blobs are `device=` options in device-table order:
+   `mount("<bootstrap>", <mountpoint>, "erofs", MS_RDONLY|MS_NODEV|MS_NOSUID,
+   "device=<blob0>,device=<blob1>,…")`. A `NULL`/`"none"` source fails with `EINVAL`, and the
+   bootstrap is not itself a `device=` entry. The option string is capped at one page, so a deep
+   cache directory with many blobs is rejected up front rather than silently truncated.
 3. When a process reads a region of the rootfs that is not yet present, the kernel raises a
    `FAN_PRE_ACCESS` event carrying the **byte range** (`offset`, `count`) and an fd to the backing
    blob file.
 4. The handler resolves the fd to the owning blob, downloads + decompresses exactly that range via
    the blob cache (`fetch_range_uncompressed`) into the sparse file, then answers `FAN_ALLOW`.
-   On a fetch/write failure it answers `FAN_DENY_ERRNO(EIO)` so the consumer sees a real I/O error
-   instead of silently reading zeros.
+   On a fetch/write failure it answers `FAN_DENY_ERRNO(e)` — passing through `ENOSPC`/`EDQUOT`/`EIO`
+   so a full cache filesystem is distinguishable from an I/O error — and the consumer sees a real
+   error instead of silently reading zeros.
+
+Every permission event must be answered, and the daemon is written so that no path can leave one
+outstanding: a panic during handling denies via `EventFdGuard::drop`, a structurally corrupt event
+buffer denies everything still parsable before failing, and shutdown drains and denies whatever is
+queued before the group fd closes. A `FAN_Q_OVERFLOW` record is treated as fatal — the kernel
+fail-opens the events it dropped, so continuing would mean knowingly serving unfetched zeros.
 
 Implementation: [`service/src/fanotify.rs`](../service/src/fanotify.rs) (`FanotifyHandler`) and the
 local FFI shim [`service/src/fanotify_sys.rs`](../service/src/fanotify_sys.rs) (the `nix` crate does
@@ -89,6 +100,18 @@ It needs root (for `mount(2)`), kernel ≥ 6.14, and a non-tmpfs work dir:
 ```bash
 sudo NYDUS_IMAGE=./target/release/nydus-image NYDUSD=./target/release/nydusd \
   ROOT=/var/tmp/fan-rt misc/fanotify/runtime-test.sh
+```
+
+[`misc/fanotify/precontent-cases.sh`](../misc/fanotify/precontent-cases.sh) covers the two
+behaviours a byte-comparison cannot: that a cold read **fails closed** when the backend is
+unreachable (rather than hanging or leaking the sparse file's zeros), and — under `strace` — that
+the daemon is mechanically on the read path (`fanotify_init`/`fanotify_mark` succeeded, events were
+read off the group fd, responses were written back, and fetched bytes were `pwrite(2)`'d into the
+blob cache file). Same requirements, plus `strace(1)`:
+
+```bash
+sudo NYDUS_IMAGE=./target/release/nydus-image NYDUSD=./target/release/nydusd \
+  ROOT=/var/tmp/fan-precontent misc/fanotify/precontent-cases.sh
 ```
 
 > **Layout invariant:** the kernel-visible EROFS device file *must be the same inode* as the blob

@@ -11,8 +11,8 @@
 //!    files (hardlinks of each blob's `.blob.data` cache file — same inode).
 //! 3. Issuing a file-backed EROFS mount with the **bootstrap as the mount source**
 //!    and the data blobs as `device=` options:
-//!    `mount("<bootstrap>", mountpoint, "erofs", 0, "device=blob_0,device=blob_1,...")`
-//!    (a NULL/`none` source fails with `EINVAL`).
+//!    `mount("<bootstrap>", mountpoint, "erofs", MS_RDONLY|MS_NODEV|MS_NOSUID,
+//!    "device=blob_0,device=blob_1,...")` (a NULL/`none` source fails with `EINVAL`).
 //! 4. Polling the fanotify fd; when a `FAN_PRE_ACCESS` event arrives, the handler
 //!    fetches the missing chunk data from the [`BlobCacheMgr`], writes it into the
 //!    sparse blob via `pwrite(2)`, and responds `FAN_ALLOW`.
@@ -31,8 +31,8 @@ use mio::{Events, Interest, Poll, Token, Waker};
 
 use crate::blob_cache::{BlobCacheMgr, DataBlob};
 use crate::fanotify_sys::{
-    FAN_CLASS_PRE_CONTENT, FAN_EVENT_INFO_TYPE_RANGE, FAN_PRE_ACCESS, fan_deny_errno,
-    fanotify_event_info_header, fanotify_event_info_range,
+    FAN_CLASS_PRE_CONTENT, FAN_EVENT_INFO_TYPE_RANGE, FAN_NOFD, FAN_PRE_ACCESS, FAN_Q_OVERFLOW,
+    fan_deny_errno, fanotify_event_info_header, fanotify_event_info_range,
 };
 
 const TOKEN_EVENT_WAKER: usize = 1;
@@ -240,6 +240,64 @@ fn discover_blobs(blob_dir: &Path) -> Result<(PathBuf, Vec<PathBuf>)> {
     Ok((bootstrap, blobs))
 }
 
+/// Maximum size of the `mount(2)` data argument.
+///
+/// The kernel copies the options string with `copy_mount_options()`, which is bounded by one
+/// page and NUL-terminates at the end — anything longer is **silently truncated**, so a deep
+/// cache directory multiplied by a large device table turns into a baffling EROFS mount error
+/// rather than an obvious "options too long". 4095 leaves room for the terminator on the
+/// smallest supported page size.
+const MOUNT_DATA_MAX: usize = 4095;
+
+/// Build the `device=<path>,device=<path>,…` option string for a file-backed EROFS mount.
+///
+/// Split out from [`mount_erofs`] so the validation is unit-testable without root or a
+/// 6.14 kernel. The option list is comma-separated and NUL-terminated by the kernel, so a
+/// path containing either byte would silently change the meaning of the mount rather than
+/// fail — both are rejected up front.
+fn build_erofs_device_options(blobs: &[PathBuf]) -> Result<String> {
+    for blob in blobs {
+        let bytes = blob.as_os_str().as_encoded_bytes();
+        if bytes.contains(&b',') {
+            return Err(std::io::Error::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "device path {:?} contains a comma, which would split the EROFS mount \
+                     option list",
+                    blob
+                ),
+            ));
+        }
+        if bytes.contains(&0) {
+            return Err(std::io::Error::new(
+                ErrorKind::InvalidInput,
+                format!("device path {:?} contains an interior NUL byte", blob),
+            ));
+        }
+    }
+
+    let options = blobs
+        .iter()
+        .map(|blob| format!("device={}", blob.display()))
+        .collect::<Vec<_>>()
+        .join(",");
+
+    if options.len() > MOUNT_DATA_MAX {
+        return Err(std::io::Error::new(
+            ErrorKind::InvalidInput,
+            format!(
+                "EROFS mount options are {} bytes for {} device(s), over the {}-byte kernel \
+                 limit; use a shorter blob cache directory path",
+                options.len(),
+                blobs.len(),
+                MOUNT_DATA_MAX
+            ),
+        ));
+    }
+
+    Ok(options)
+}
+
 // Issue a file-backed EROFS mount via `mount(2)` (kernel ≥ 6.12).
 //
 // The **bootstrap** is the mount source: it holds the EROFS superblock, inode metadata and the
@@ -248,11 +306,7 @@ fn discover_blobs(blob_dir: &Path) -> Result<(PathBuf, Vec<PathBuf>)> {
 // `device=` entry, and the source must be the bootstrap path — passing a NULL/`none` source fails
 // with `EINVAL` ("special device none does not exist").
 fn mount_erofs(bootstrap: &Path, blobs: &[PathBuf], mountpoint: &Path) -> Result<()> {
-    let options = blobs
-        .iter()
-        .map(|blob| format!("device={}", blob.display()))
-        .collect::<Vec<_>>()
-        .join(",");
+    let options = build_erofs_device_options(blobs)?;
 
     let source_c = std::ffi::CString::new(bootstrap.as_os_str().as_encoded_bytes())
         .map_err(|e| std::io::Error::new(ErrorKind::InvalidInput, e))?;
@@ -268,12 +322,18 @@ fn mount_erofs(bootstrap: &Path, blobs: &[PathBuf], mountpoint: &Path) -> Result
         opts.as_ptr() as *const libc::c_void
     };
 
+    // The mounted tree is an untrusted container image. EROFS is read-only anyway, but
+    // `MS_RDONLY` states it rather than relying on the driver, and `MS_NODEV`/`MS_NOSUID`
+    // stop a device node or setuid bit baked into the image from being honoured through
+    // this mount.
+    let flags = libc::MS_RDONLY | libc::MS_NODEV | libc::MS_NOSUID;
+
     let ret = unsafe {
         libc::mount(
             source_c.as_ptr(),
             mountpoint_c.as_ptr(),
             fstype.as_ptr(),
-            0,
+            flags,
             opts_ptr,
         )
     };
@@ -560,7 +620,10 @@ impl FanotifyHandler {
     /// Answer every event still readable on the (non-blocking) group fd with
     /// `FAN_DENY_ERRNO(EIO)` and close its fd. Best-effort: stops at `EAGAIN`
     /// or any read error.
-    fn drain_deny_pending(&self) {
+    ///
+    /// Public because teardown needs to keep the queue drained between unmount
+    /// attempts — see `ServiceController::unregister_fanotify_handler`.
+    pub fn drain_deny_pending(&self) {
         let mut buf = vec![0u8; EVENT_BUF_SIZE];
         let mut denied = 0usize;
         loop {
@@ -574,29 +637,7 @@ impl FanotifyHandler {
             if n <= 0 {
                 break;
             }
-            let buf = &buf[..n as usize];
-            let mut offset = 0usize;
-            while offset + std::mem::size_of::<libc::fanotify_event_metadata>() <= buf.len() {
-                // SAFETY: we verified the buffer has enough bytes.
-                let meta =
-                    unsafe { &*(buf.as_ptr().add(offset) as *const libc::fanotify_event_metadata) };
-                let meta_len = meta.event_len as usize;
-                if meta.vers != libc::FANOTIFY_METADATA_VERSION
-                    || meta_len < std::mem::size_of::<libc::fanotify_event_metadata>()
-                    || offset + meta_len > buf.len()
-                {
-                    break;
-                }
-                let event_fd = meta.fd as RawFd;
-                if event_fd >= 0 {
-                    self.write_response(event_fd, fan_deny_errno(libc::EIO));
-                    unsafe {
-                        libc::close(event_fd);
-                    }
-                    denied += 1;
-                }
-                offset += meta_len;
-            }
+            denied += self.deny_events_in_buffer(&buf[..n as usize]);
         }
         if denied > 0 {
             warn!(
@@ -604,6 +645,33 @@ impl FanotifyHandler {
                 denied
             );
         }
+    }
+
+    /// Answer `event_fd` with `FAN_DENY_ERRNO(EIO)` and close it; no-op for `FAN_NOFD`.
+    fn deny_event_fd(&self, event_fd: RawFd) {
+        if event_fd < 0 {
+            return;
+        }
+        self.write_response(event_fd, fan_deny_errno(libc::EIO));
+        unsafe {
+            libc::close(event_fd);
+        }
+    }
+
+    /// Deny and close every parsable event in `buf`, returning how many were answered.
+    ///
+    /// Shared by the shutdown drain and by [`process_event_buffer`](Self::process_event_buffer)'s
+    /// structural-failure path.
+    fn deny_events_in_buffer(&self, buf: &[u8]) -> usize {
+        let mut denied = 0usize;
+        for_each_parsable_event(buf, |meta| {
+            let event_fd = meta.fd as RawFd;
+            if event_fd >= 0 {
+                self.deny_event_fd(event_fd);
+                denied += 1;
+            }
+        });
+        denied
     }
 
     /// Get a clone of the underlying fanotify fd for upgrade/restore paths.
@@ -752,6 +820,16 @@ impl FanotifyHandler {
     }
 
     /// Walk the raw event buffer, dispatch each metadata record, and answer the permission event.
+    ///
+    /// Parse failures fall into two classes, and conflating them is a hang:
+    ///
+    /// * **Semantic** — the record is well-formed but unusable (no `FAN_EVENT_INFO_TYPE_RANGE`
+    ///   record, unresolvable backing file). [`handle_event`](Self::handle_event) returns `Err`,
+    ///   that one event is denied, and the walk continues with the rest of the batch.
+    /// * **Structural** — the record boundary itself is untrustworthy (bad `vers`, bogus
+    ///   `event_len`). The remainder of the buffer cannot be walked, so the batch is abandoned —
+    ///   but every fd we can still account for is denied first. An event fd that is neither
+    ///   answered nor closed leaves its reader blocked in `D` state until the whole group closes.
     fn process_event_buffer(&self, buf: &[u8]) -> Result<()> {
         let mut offset = 0usize;
         while offset + std::mem::size_of::<libc::fanotify_event_metadata>() <= buf.len() {
@@ -761,6 +839,12 @@ impl FanotifyHandler {
 
             // fanotify(7) mandates checking the metadata version before consuming an
             // event; a mismatched kernel ABI must fail loudly, not be misparsed.
+            //
+            // The fd field is deliberately NOT touched on mismatch: with an unknown
+            // layout the value at that offset may be garbage, and answering on (or
+            // closing) an arbitrary descriptor — possibly one of our own — is worse
+            // than leaving the event unanswered. A version mismatch is a wrong-kernel
+            // condition that shows up on the very first event, not a mid-flight hazard.
             if meta.vers != libc::FANOTIFY_METADATA_VERSION {
                 return Err(std::io::Error::other(format!(
                     "fanotify: metadata version {} != expected {}; kernel ABI mismatch",
@@ -769,13 +853,45 @@ impl FanotifyHandler {
                 )));
             }
 
-            let meta_len = meta.event_len as usize;
-            if meta_len == 0 || meta_len < std::mem::size_of::<libc::fanotify_event_metadata>() {
-                warn!("fanotify: bogus event_len {}", meta_len);
-                break;
+            // A `FAN_Q_OVERFLOW` record (fd == FAN_NOFD) means the kernel's event queue
+            // filled and it DROPPED permission events. The kernel fail-opens what it
+            // drops, so the readers behind those events have already been served
+            // unfilled sparse holes as zeros — silent data corruption that we cannot
+            // retroactively repair. There is nothing to answer here and no way to
+            // recover the lost events, so surface it loudly and fail closed rather than
+            // keep serving a stream we know has holes in it. `FAN_UNLIMITED_QUEUE` is
+            // deliberately not set in `new()` so this safety valve stays reachable.
+            if meta.fd == FAN_NOFD {
+                let denied = self.deny_events_in_buffer(&buf[offset..]);
+                error!(
+                    "fanotify: kernel event queue overflowed (mask {:#x}) for mount {:?}; \
+                     dropped pre-content events were fail-opened by the kernel and may have \
+                     served zeros. Denied {} further event(s) in this batch and failing closed.",
+                    meta.mask & FAN_Q_OVERFLOW,
+                    self.mountpoint,
+                    denied
+                );
+                return Err(std::io::Error::other(
+                    "fanotify: event queue overflow; dropped permission events cannot be answered",
+                ));
             }
-            if offset + meta_len > buf.len() {
-                break;
+
+            let meta_len = meta.event_len as usize;
+            if meta_len < std::mem::size_of::<libc::fanotify_event_metadata>()
+                || offset + meta_len > buf.len()
+            {
+                // The next record boundary is unknowable, so the rest of the buffer is
+                // lost. This record's own fd is still trustworthy (the metadata version
+                // checked out above), so answer it instead of stranding its reader, then
+                // fail closed — a corrupt event stream must not be chewed on silently.
+                self.deny_event_fd(meta.fd as RawFd);
+                return Err(std::io::Error::other(format!(
+                    "fanotify: bogus event_len {} at buffer offset {} (buffer {} bytes); \
+                     denied the current event and abandoned the batch",
+                    meta_len,
+                    offset,
+                    buf.len()
+                )));
             }
 
             // Serve the event; the response reflects whether the content is now available.
@@ -915,6 +1031,9 @@ impl FanotifyHandler {
                 ));
             }
         };
+        // Defensive: `process_event_buffer` rejects `FAN_NOFD` before dispatching here, so
+        // this should be unreachable. Kept because everything below dereferences the fd,
+        // and a future second call site must not silently `fstat(-1)`.
         let event_fd = meta.fd as RawFd;
         if event_fd < 0 {
             return Ok(());
@@ -1008,6 +1127,32 @@ impl FanotifyHandler {
         }
         info!("fanotify: culled cache for blob {}", blob_id);
         Ok(())
+    }
+}
+
+/// Walk a raw fanotify event buffer, invoking `f` for every record that can be trusted.
+///
+/// Stops at the first unparsable record — an unknown metadata version or an `event_len` that
+/// is too small or runs past the buffer means the *next* record boundary is guesswork, and a
+/// misread `fd` field would have the caller answer on (or close) an arbitrary descriptor.
+///
+/// Only used off the hot path (shutdown drain, structural-failure recovery); the serving loop
+/// in [`FanotifyHandler::process_event_buffer`] needs per-record error handling and does its
+/// own walk.
+fn for_each_parsable_event(buf: &[u8], mut f: impl FnMut(&libc::fanotify_event_metadata)) {
+    let mut offset = 0usize;
+    while offset + std::mem::size_of::<libc::fanotify_event_metadata>() <= buf.len() {
+        // SAFETY: we verified the buffer has enough bytes.
+        let meta = unsafe { &*(buf.as_ptr().add(offset) as *const libc::fanotify_event_metadata) };
+        let meta_len = meta.event_len as usize;
+        if meta.vers != libc::FANOTIFY_METADATA_VERSION
+            || meta_len < std::mem::size_of::<libc::fanotify_event_metadata>()
+            || offset + meta_len > buf.len()
+        {
+            break;
+        }
+        f(meta);
+        offset += meta_len;
     }
 }
 
@@ -1108,5 +1253,171 @@ mod tests {
         assert_eq!((resp >> 24) & 0xff, libc::EIO as u32);
         // Exact kernel-computed value for EIO (5): 0x02 | (5 << 24) = 0x0500_0002.
         assert_eq!(resp, 0x0500_0002);
+    }
+
+    // ---- mount option construction (Part 2d) ------------------------------
+
+    #[test]
+    fn test_device_options_join_in_order() {
+        let blobs = vec![
+            PathBuf::from("/cache/blob_0"),
+            PathBuf::from("/cache/blob_1"),
+        ];
+        let opts = build_erofs_device_options(&blobs).expect("plain paths are accepted");
+        // Device-table order is load-bearing: the Nth `device=` entry backs the Nth
+        // slot in the EROFS device table.
+        assert_eq!(opts, "device=/cache/blob_0,device=/cache/blob_1");
+    }
+
+    #[test]
+    fn test_device_options_empty_is_empty_string() {
+        // A bootstrap-only image has no data blobs; `mount_erofs` maps this to a NULL
+        // data pointer rather than an empty C string.
+        assert_eq!(
+            build_erofs_device_options(&[]).expect("no devices is valid"),
+            ""
+        );
+    }
+
+    #[test]
+    fn test_device_options_reject_comma_in_path() {
+        // A comma would silently split one path into two bogus mount options.
+        let blobs = vec![PathBuf::from("/cache/we,ird/blob_0")];
+        let err = build_erofs_device_options(&blobs).expect_err("comma must be rejected");
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(
+            err.to_string().contains("comma"),
+            "error should name the problem: {err}"
+        );
+    }
+
+    #[test]
+    fn test_device_options_reject_length_over_kernel_limit() {
+        // The kernel truncates the mount data at one page instead of erroring, so a
+        // deep cache dir + a large device table must be caught here.
+        let deep = PathBuf::from(format!("/{}", "d".repeat(400)));
+        let blobs = vec![deep; 12];
+        let err =
+            build_erofs_device_options(&blobs).expect_err("over-long options must be rejected");
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        let msg = err.to_string();
+        assert!(
+            msg.contains("shorter blob cache directory"),
+            "error should say how to fix it: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_device_options_accept_up_to_the_limit() {
+        // Exactly at the boundary must still mount: "device=" (7) + path length.
+        let path = PathBuf::from(format!("/{}", "d".repeat(MOUNT_DATA_MAX - 8)));
+        let opts = build_erofs_device_options(std::slice::from_ref(&path))
+            .expect("a single device at exactly the limit is valid");
+        assert_eq!(opts.len(), MOUNT_DATA_MAX);
+    }
+
+    // ---- event buffer walking (Parts 2a / 2b) ----------------------------
+
+    /// Serialize a `fanotify_event_metadata` header with the given fd and mask.
+    ///
+    /// `event_len` covers the header plus `extra_len` trailing bytes.
+    fn event_header(fd: i32, mask: u64, extra_len: usize) -> Vec<u8> {
+        let meta = libc::fanotify_event_metadata {
+            event_len: (std::mem::size_of::<libc::fanotify_event_metadata>() + extra_len) as u32,
+            vers: libc::FANOTIFY_METADATA_VERSION,
+            reserved: 0,
+            metadata_len: std::mem::size_of::<libc::fanotify_event_metadata>() as u16,
+            mask,
+            fd,
+            pid: 0,
+        };
+        // SAFETY: `fanotify_event_metadata` is a `#[repr(C)]` POD struct.
+        unsafe {
+            std::slice::from_raw_parts(
+                &meta as *const _ as *const u8,
+                std::mem::size_of::<libc::fanotify_event_metadata>(),
+            )
+        }
+        .to_vec()
+    }
+
+    /// Offset of the `vers` field within `fanotify_event_metadata`.
+    const VERS_OFFSET: usize = std::mem::offset_of!(libc::fanotify_event_metadata, vers);
+
+    #[test]
+    fn test_overflow_record_is_recognisable_by_nofd() {
+        // The FAN_Q_OVERFLOW record is what `process_event_buffer` keys on to fail
+        // closed. Guard the two properties that make it detectable.
+        let buf = event_header(FAN_NOFD, FAN_Q_OVERFLOW, 0);
+        let meta = unsafe { &*(buf.as_ptr() as *const libc::fanotify_event_metadata) };
+        assert_eq!(meta.fd, FAN_NOFD);
+        assert_ne!(meta.mask & FAN_Q_OVERFLOW, 0);
+        assert_eq!(meta.vers, libc::FANOTIFY_METADATA_VERSION);
+    }
+
+    #[test]
+    fn test_deny_walk_stops_at_bad_version() {
+        // A record whose metadata version is unknown has an untrusted layout: the
+        // walk must stop there rather than read an `fd` field that may be garbage.
+        let hdr_len = std::mem::size_of::<libc::fanotify_event_metadata>();
+        let mut buf = event_header(7, FAN_PRE_ACCESS, 0);
+        buf.extend_from_slice(&event_header(8, FAN_PRE_ACCESS, 0));
+        buf[hdr_len + VERS_OFFSET] = libc::FANOTIFY_METADATA_VERSION.wrapping_add(1);
+
+        assert_eq!(
+            walk_deniable_events(&buf),
+            vec![7],
+            "the second record's fd must not be touched once the version is unknown"
+        );
+    }
+
+    #[test]
+    fn test_deny_walk_stops_at_bogus_event_len() {
+        // event_len smaller than the fixed header makes the next boundary unknowable.
+        let hdr_len = std::mem::size_of::<libc::fanotify_event_metadata>();
+        let mut buf = event_header(7, FAN_PRE_ACCESS, 0);
+        buf.extend_from_slice(&event_header(8, FAN_PRE_ACCESS, 0));
+        buf[hdr_len..hdr_len + 4].copy_from_slice(&4u32.to_ne_bytes());
+
+        assert_eq!(walk_deniable_events(&buf), vec![7]);
+    }
+
+    #[test]
+    fn test_deny_walk_stops_when_record_runs_past_buffer() {
+        // A truncated read: the last record claims more bytes than were delivered.
+        let hdr_len = std::mem::size_of::<libc::fanotify_event_metadata>();
+        let mut buf = event_header(7, FAN_PRE_ACCESS, 0);
+        buf.extend_from_slice(&event_header(8, FAN_PRE_ACCESS, 64));
+        assert!(buf.len() < 2 * hdr_len + 64);
+
+        assert_eq!(walk_deniable_events(&buf), vec![7]);
+    }
+
+    #[test]
+    fn test_deny_walk_covers_whole_batch_and_skips_nofd() {
+        // The happy path for the structural-failure and shutdown drains: every fd in
+        // the batch is accounted for, and the fd-less overflow record is skipped
+        // rather than treated as a descriptor to close.
+        let mut buf = event_header(7, FAN_PRE_ACCESS, 0);
+        buf.extend_from_slice(&event_header(FAN_NOFD, FAN_Q_OVERFLOW, 0));
+        buf.extend_from_slice(&event_header(9, FAN_PRE_ACCESS, 0));
+
+        assert_eq!(walk_deniable_events(&buf), vec![7, 9]);
+    }
+
+    /// Collect the fds that [`FanotifyHandler::deny_events_in_buffer`] would answer.
+    ///
+    /// Drives the production walk ([`for_each_parsable_event`]) — the part whose
+    /// termination rules strand readers in `D` state when they are wrong — without
+    /// needing a live fanotify group (root + kernel ≥ 6.14). The `write`/`close` pair
+    /// itself is covered by `misc/fanotify/*.sh`.
+    fn walk_deniable_events(buf: &[u8]) -> Vec<RawFd> {
+        let mut fds = Vec::new();
+        for_each_parsable_event(buf, |meta| {
+            if meta.fd >= 0 {
+                fds.push(meta.fd as RawFd);
+            }
+        });
+        fds
     }
 }

@@ -238,31 +238,84 @@ impl ServiceController {
     /// Unregister a fanotify handler for an image.
     ///
     /// This stops the worker threads and unmounts the EROFS filesystem.
+    ///
+    /// The unmount **must** complete before the handler (and with it the fanotify group fd)
+    /// is dropped: `fanotify_release()` fail-opens every permission event still queued on the
+    /// group, and an `ALLOW` landing on a still-live mount reads unfilled sparse holes as
+    /// zeros. So a busy mount is retried rather than warned about once, and the queue is
+    /// drained between attempts so whoever is holding the mount can make progress and let go.
+    ///
+    /// A failed unmount is reported to the caller instead of being swallowed, but the handler is
+    /// still removed: its workers have already been stopped and cannot be restarted, so keeping a
+    /// dead entry in the map would be worse than reporting the leaked mount.
     pub fn unregister_fanotify_handler(&self, image_id: &str) -> std::io::Result<()> {
         info!("Unregister fanotify handler for image {}", image_id);
         let mut handlers = self.fanotify.lock().unwrap();
         let mut is_empty = handlers.is_empty();
+        let mut result = Ok(());
         if let Some(fanotify) = handlers.remove(image_id) {
             is_empty = handlers.is_empty();
             fanotify.stop();
             // Unmount the EROFS filesystem
             let mountpoint = fanotify.mountpoint().to_path_buf();
             drop(handlers); // Release lock before unmounting
-            let mnt_cstr = std::ffi::CString::new(mountpoint.as_os_str().as_encoded_bytes())
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
-            let ret = unsafe { libc::umount(mnt_cstr.as_ptr()) };
-            if ret != 0 {
-                let err = std::io::Error::last_os_error();
-                warn!(
-                    "Failed to unmount fanotify EROFS at {:?}: {}",
-                    mountpoint, err
-                );
-            }
+            result = Self::umount_fanotify_erofs(&fanotify, &mountpoint);
+            // Only now may the handler — and the group fd it owns — drop.
+            drop(fanotify);
         }
         if is_empty {
             self.fanotify_enabled.store(false, Ordering::Release);
         }
-        Ok(())
+        result
+    }
+
+    /// Unmount a fanotify-backed EROFS mount, retrying while it is busy.
+    ///
+    /// Bounded at `UMOUNT_MAX_ATTEMPTS` × `UMOUNT_RETRY_INTERVAL` (≈10s). Each retry is
+    /// preceded by a deny-drain so a reader blocked on a pre-content event gets an error and
+    /// releases its reference instead of pinning the mount for the whole window.
+    fn umount_fanotify_erofs(
+        fanotify: &crate::fanotify::FanotifyHandler,
+        mountpoint: &std::path::Path,
+    ) -> std::io::Result<()> {
+        /// Attempts before giving up on a busy mount (≈10s at the interval below).
+        const UMOUNT_MAX_ATTEMPTS: u32 = 40;
+        /// Delay between unmount attempts.
+        const UMOUNT_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
+
+        let mnt_cstr = std::ffi::CString::new(mountpoint.as_os_str().as_encoded_bytes())
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+
+        for attempt in 1..=UMOUNT_MAX_ATTEMPTS {
+            let ret = unsafe { libc::umount(mnt_cstr.as_ptr()) };
+            if ret == 0 {
+                if attempt > 1 {
+                    info!(
+                        "Unmounted fanotify EROFS at {:?} after {} attempts",
+                        mountpoint, attempt
+                    );
+                }
+                return Ok(());
+            }
+            let err = std::io::Error::last_os_error();
+            // EINVAL means it is not a mountpoint any more — someone else already
+            // unmounted it, which is the outcome we wanted.
+            if err.raw_os_error() == Some(libc::EINVAL) {
+                return Ok(());
+            }
+            if err.raw_os_error() != Some(libc::EBUSY) || attempt == UMOUNT_MAX_ATTEMPTS {
+                error!(
+                    "Failed to unmount fanotify EROFS at {:?} after {} attempt(s): {}",
+                    mountpoint, attempt, err
+                );
+                return Err(err);
+            }
+            // Busy: answer whatever is queued so a blocked reader can error out and
+            // drop its reference, then try again.
+            fanotify.drain_deny_pending();
+            std::thread::sleep(UMOUNT_RETRY_INTERVAL);
+        }
+        unreachable!("loop returns on the final attempt")
     }
 }
 
