@@ -183,7 +183,7 @@ fn validate_vma_region(region: &VmaRegion, block_size: u64) -> Result<()> {
     if !region.page_size.is_power_of_two() {
         return Err(eother!("uffd: VMA page_size must be a power of two"));
     }
-    if page_size < block_size || page_size % block_size != 0 {
+    if page_size < block_size || !page_size.is_multiple_of(block_size) {
         return Err(eother!(format!(
             "uffd: VMA page_size {} must be a multiple of block size {}",
             page_size, block_size

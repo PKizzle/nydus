@@ -9,10 +9,9 @@ homepage = "https://nydus.dev/"
 repository = "https://github.com/dragonflyoss/nydus"
 exclude = ["contrib/", "smoke/", "tests/"]
 edition = "2024"
-# Edition 2024 requires rustc >= 1.85; the toolchain is pinned in
-# rust-toolchain.toml (1.96). Declared so a too-old rustc fails with a clear
-# MSRV error instead of a confusing edition/feature parse error.
-rust-version = "1.85"
+# Inherited from [workspace.package] so every member declares the same MSRV --
+# see the note there for why it tracks the pinned toolchain.
+rust-version.workspace = true
 build = "build.rs"
 
 [profile.release]
@@ -151,6 +150,16 @@ dedup = ["nydus-storage/dedup"]
 # All members are edition 2024 (which implies the v3 resolver); set it explicitly
 # at the workspace root so Cargo doesn't warn about ignoring members' resolvers.
 resolver = "3"
+
+[workspace.package]
+# Tracks the toolchain pinned in rust-toolchain.toml, which is what every build
+# of this repo actually uses. It was "1.85" (edition 2024's floor) until
+# 2026-07, but that had long since stopped being true -- `time` and `darling`
+# require 1.88 and fjall requires 1.90, so a 1.85 rustc failed anyway, pointing
+# at a dependency instead of at us. Declaring it here rather than on the root
+# package alone is what makes clippy's MSRV-aware lints work for every member;
+# without it they run unconstrained and have to be silenced in the Makefile.
+rust-version = "1.96"
 members = [
     "api",
     "builder",
