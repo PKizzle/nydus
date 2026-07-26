@@ -610,11 +610,19 @@ fn build_artifact(
             )
         };
         run_nydus_image(nydus_image, &args, "create")?;
-        let blob = expect_single_output(&out_dir, Some(&bootstrap_i))
+        // A layer with no file content -- only directories, or only whiteouts --
+        // yields a bootstrap but no data blob, and that is perfectly ordinary
+        // (postgres:latest has a 116-byte layer holding one empty directory).
+        // Only the blob is optional: `merge` indexes --original-blob-ids by layer
+        // and requires exactly one entry per source bootstrap, so those two stay
+        // one-per-layer regardless.
+        let blob = single_output(&out_dir, Some(&bootstrap_i))
             .context("locating per-layer nydus data blob")?;
 
         layer_bootstraps.push(bootstrap_i);
-        new_blobs.push(blob);
+        if let Some(blob) = blob {
+            new_blobs.push(blob);
+        }
         original_blob_ids.push(blob_hex(&layer.digest).to_string());
     }
 
@@ -776,8 +784,14 @@ fn run_optimize(
     // bootstrap (which references the un-pushed prefetch blob) in place while
     // the caller logs "pushing un-optimized bootstrap" — publishing a
     // bootstrap whose prefetch blob never reaches the registry.
-    let prefetch_blob =
-        expect_single_output(&out_blob_dir, None).context("locating optimize prefetch blob")?;
+    let prefetch_blob = single_output(&out_blob_dir, None)
+        .context("locating optimize prefetch blob")?
+        .ok_or_else(|| {
+            anyhow!(
+                "nydus-image optimize produced no prefetch blob in {}",
+                out_blob_dir.display()
+            )
+        })?;
     std::fs::rename(&optimized, bootstrap)
         .context("replace merged bootstrap with optimized one")?;
     Ok(prefetch_blob)
@@ -1016,10 +1030,10 @@ fn fresh_dir(dir: &Path) -> Result<()> {
     std::fs::create_dir_all(dir).with_context(|| format!("creating dir {}", dir.display()))
 }
 
-/// Return the single file in `dir` other than `exclude`. More than one
-/// candidate in a freshly-wiped private dir means `nydus-image` produced
-/// unexpected output — a real bug, surfaced.
-fn expect_single_output(dir: &Path, exclude: Option<&Path>) -> Result<PathBuf> {
+/// Return the single file in `dir` other than `exclude`, or `None` when the dir
+/// holds nothing else. More than one candidate in a freshly-wiped private dir
+/// means `nydus-image` produced unexpected output — a real bug, surfaced.
+fn single_output(dir: &Path, exclude: Option<&Path>) -> Result<Option<PathBuf>> {
     let exclude_name = exclude.and_then(Path::file_name);
     let mut found = None;
     for entry in
@@ -1037,7 +1051,7 @@ fn expect_single_output(dir: &Path, exclude: Option<&Path>) -> Result<PathBuf> {
         }
         found = Some(entry.path());
     }
-    found.ok_or_else(|| anyhow!("nydus-image produced no output file in {}", dir.display()))
+    Ok(found)
 }
 
 /// Symlink `target` into `link` (unix), falling back to a copy elsewhere.
@@ -1233,5 +1247,42 @@ mod tests {
             parse_prefetch_files("/a, /b ,/"),
             vec!["/a".to_string(), "/b".to_string()]
         );
+    }
+
+    // ---- single_output -------------------------------------------------
+
+    #[test]
+    fn single_output_finds_the_one_blob_beside_the_bootstrap() {
+        let dir = tempfile::tempdir().unwrap();
+        let bootstrap = dir.path().join("bootstrap");
+        std::fs::write(&bootstrap, b"boot").unwrap();
+        let blob = dir.path().join("deadbeef");
+        std::fs::write(&blob, b"data").unwrap();
+
+        assert_eq!(
+            single_output(dir.path(), Some(&bootstrap)).unwrap(),
+            Some(blob)
+        );
+    }
+
+    #[test]
+    fn single_output_is_none_for_a_layer_with_no_data() {
+        // A layer holding only directories or only whiteouts produces a
+        // bootstrap and nothing else. postgres:latest ships exactly such a
+        // layer (116 bytes, one empty dir), so this is not a corner case.
+        let dir = tempfile::tempdir().unwrap();
+        let bootstrap = dir.path().join("bootstrap");
+        std::fs::write(&bootstrap, b"boot").unwrap();
+
+        assert_eq!(single_output(dir.path(), Some(&bootstrap)).unwrap(), None);
+    }
+
+    #[test]
+    fn single_output_rejects_more_than_one_candidate() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a"), b"a").unwrap();
+        std::fs::write(dir.path().join("b"), b"b").unwrap();
+
+        assert!(single_output(dir.path(), None).is_err());
     }
 }
