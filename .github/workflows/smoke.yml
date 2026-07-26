@@ -4,8 +4,13 @@ on:
   # Only run the `push` trigger on long-lived branches. For feature branches the
   # open pull request already runs the full suite via the `pull_request` trigger;
   # leaving `push: ["**"]` made every PR push run the whole workflow twice.
+  #
+  # `production` carries the work and is the default branch; `master` is the
+  # upstream mirror. Omitting `production` here (as this did until 2026-07)
+  # silently skipped the smoke suite on every push to the branch that actually
+  # changes, leaving only the nightly schedule to catch regressions.
   push:
-    branches: [master, "stable/**"]
+    branches: [master, production, "stable/**"]
     paths-ignore: [ '**.md', '**.png', '**.jpg', '**.svg', '**/docs/**' ]
   pull_request:
     branches: ["**", "stable/**"]
