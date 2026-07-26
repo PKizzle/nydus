@@ -2321,6 +2321,18 @@ mod tests {
 
     #[test]
     fn test_dispatch_message_closes_unexpected_fds() {
+        // A message that carries fds the handler does not expect must have them
+        // closed rather than leaked.
+        //
+        // Closure is checked through a socketpair peer, not with
+        // `fcntl(fd, F_GETFD) == -1`: the Makefile runs `cargo test
+        // --test-threads=8`, so between the close and the check an unrelated
+        // test thread can `open()` something into the just-freed fd number,
+        // `F_GETFD` then returns 0, and the assertion fails spuriously. Peer
+        // state lives in the file-table entry rather than the fd number, so
+        // `send(peer, MSG_NOSIGNAL)` returns EPIPE iff the other end was
+        // genuinely closed — see test_handle_page_fault_fork_closes_child_fd,
+        // which hit the same race.
         compio::runtime::Runtime::new().unwrap().block_on(async {
             let (sock1, _sock2) = std::os::unix::net::UnixStream::pair().unwrap();
             sock1.set_nonblocking(true).unwrap();
@@ -2331,17 +2343,24 @@ mod tests {
             let core = UffdCore::new(device);
             let mut conn_state: Option<ConnState> = None;
 
-            let mut pipe_fds: [libc::c_int; 2] = [-1, -1];
-            let ret = unsafe { libc::pipe(pipe_fds.as_mut_ptr()) };
-            assert_eq!(ret, 0);
-            let read_fd = pipe_fds[0];
-            let write_fd = pipe_fds[1];
+            let mut sock_fds = [-1_i32; 2];
+            let rc = unsafe {
+                libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, sock_fds.as_mut_ptr())
+            };
+            assert_eq!(
+                rc,
+                0,
+                "socketpair failed: {}",
+                std::io::Error::last_os_error()
+            );
+            let passed_fd = sock_fds[0];
+            let peer_fd = sock_fds[1];
 
             let json_val = serde_json::json!({"type": 99});
             let res = UffdWorker::dispatch_message(
                 MessageType::PageFault,
                 json_val,
-                vec![read_fd],
+                vec![passed_fd],
                 &sock_async,
                 &core,
                 &mut conn_state,
@@ -2351,10 +2370,13 @@ mod tests {
             .await;
             assert!(res.is_ok());
 
-            let flags = unsafe { libc::fcntl(read_fd, libc::F_GETFD) };
-            assert_eq!(flags, -1);
+            let n =
+                unsafe { libc::send(peer_fd, b"x".as_ptr() as *const _, 1, libc::MSG_NOSIGNAL) };
+            let errno = std::io::Error::last_os_error().raw_os_error();
+            unsafe { libc::close(peer_fd) };
 
-            unsafe { libc::close(write_fd) };
+            assert_eq!(n, -1, "unexpected fd was leaked: send to peer succeeded");
+            assert_eq!(errno, Some(libc::EPIPE), "expected EPIPE after peer closed");
         });
     }
 
