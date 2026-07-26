@@ -276,9 +276,9 @@ impl FileCacheEntry {
                 return Err(einval!(msg));
             }
             let load_chunk_digest = need_validation || cas_mgr.is_some();
-            let meta = if blob_info.meta_ci_is_valid()
-                || blob_info.has_feature(BlobFeatures::IS_CHUNKDICT_GENERATED)
-            {
+            // A chunkdict-generated blob carries no valid chunk info, so building a
+            // `FileCacheMeta` over it reads garbage; only `meta_ci_is_valid()` gates this.
+            let meta = if blob_info.meta_ci_is_valid() {
                 let meta = FileCacheMeta::new(
                     blob_file_path,
                     blob_info.clone(),

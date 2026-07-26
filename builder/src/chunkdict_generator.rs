@@ -25,7 +25,7 @@ use nydus_rafs::metadata::inode::InodeWrapper;
 use nydus_rafs::metadata::layout::RafsXAttrs;
 use nydus_storage::meta::BlobChunkInfoV1Ondisk;
 use nydus_utils::compress::Algorithm;
-use nydus_utils::digest::RafsDigest;
+use nydus_utils::digest::{DigestHasher, RafsDigest};
 
 use std::mem::size_of;
 use std::path::PathBuf;
@@ -69,6 +69,7 @@ impl Generator {
     ) -> Result<BuildOutput> {
         // Validate and remove chunks whose belonged blob sizes are smaller than a block.
         let mut chunkdict_chunks = chunkdict_chunks_origin.to_vec();
+        Self::sort_chunks(&mut chunkdict_chunks);
         Self::validate_and_remove_chunks(ctx, &mut chunkdict_chunks);
         // Build root tree.
         let mut tree = Self::build_root_tree(ctx)?;
@@ -133,6 +134,26 @@ impl Generator {
 
         // Retain only chunks with chunk_blob_id that has a total uncompressed size > v6_block_size.
         chunkdict.retain(|chunk| !small_chunks.contains(&chunk.chunk_blob_id));
+    }
+
+    /// Put the chunk list into a deterministic, blob-major order.
+    ///
+    /// `insert_chunks` allocates chunk indexes with `alloc_chunk_index()` in iteration order,
+    /// so without this the on-disk index assignment — and the file offsets derived alongside it
+    /// — depend on whatever order the caller happened to collect chunks in. Sorting by blob id
+    /// first keeps each blob's chunks contiguous; the offsets and digest break ties so the
+    /// output is stable across runs.
+    fn sort_chunks(chunkdict: &mut [ChunkdictChunkInfo]) {
+        chunkdict.sort_by(|a, b| {
+            a.chunk_blob_id
+                .cmp(&b.chunk_blob_id)
+                .then_with(|| a.chunk_compressed_offset.cmp(&b.chunk_compressed_offset))
+                .then_with(|| {
+                    a.chunk_uncompressed_offset
+                        .cmp(&b.chunk_uncompressed_offset)
+                })
+                .then_with(|| a.chunk_digest.cmp(&b.chunk_digest))
+        });
     }
 
     /// Build the root tree.
@@ -208,6 +229,15 @@ impl Generator {
 
         // Update child count.
         node.inode.set_child_count(node.chunks.len() as u32);
+
+        // For RAFS v5, a regular inode's digest is the hash of all its chunk digests.
+        // Leaving it at the default makes v5 metadata validation reject the chunkdict.
+        let mut inode_hasher = RafsDigest::hasher(ctx.digester);
+        for chunk in node.chunks.iter() {
+            inode_hasher.digest_update(chunk.inner.id().as_ref());
+        }
+        node.inode.set_digest(inode_hasher.digest_finalize());
+
         let child = Tree::new(node);
         child
             .borrow_mut_node()
@@ -223,9 +253,14 @@ impl Generator {
         chunkdict_chunks: &[ChunkdictChunkInfo],
         chunkdict_blobs: &[ChunkdictBlobInfo],
     ) -> Result<()> {
-        for (index, chunk_info) in chunkdict_chunks.iter().enumerate() {
-            let chunk_size: u32 = chunk_info.chunk_compressed_size;
-            let file_offset = index as u64 * chunk_size as u64;
+        // `file_offset` addresses the *uncompressed* stream, so it must accumulate
+        // uncompressed sizes. Deriving it from a compressed stride (the old
+        // `index * chunk_compressed_size`) only happens to line up when every chunk
+        // compresses identically, and silently mis-maps the chunk otherwise.
+        let mut file_offset = 0u64;
+        for chunk_info in chunkdict_chunks.iter() {
+            let cur_file_offset = file_offset;
+            file_offset += chunk_info.chunk_uncompressed_size as u64;
             let mut chunk = ChunkWrapper::new(ctx.fs_version);
 
             // Update blob context.
@@ -265,11 +300,17 @@ impl Generator {
             let chunk_index = blob_ctx.alloc_chunk_index()?;
             chunk.set_blob_index(blob_index);
             chunk.set_index(chunk_index);
-            chunk.set_file_offset(file_offset);
+            chunk.set_file_offset(cur_file_offset);
             chunk.set_compressed_size(chunk_info.chunk_compressed_size);
             chunk.set_compressed_offset(chunk_info.chunk_compressed_offset);
             chunk.set_uncompressed_size(chunk_info.chunk_uncompressed_size);
             chunk.set_uncompressed_offset(chunk_info.chunk_uncompressed_offset);
+            // Without this the flag keeps its default and the runtime mis-handles a chunk
+            // that was stored uncompressed inside an otherwise-compressed blob.
+            chunk.set_compressed(
+                blob_ctx.blob_compressor != Algorithm::None
+                    && chunk_info.chunk_compressed_size != chunk_info.chunk_uncompressed_size,
+            );
             chunk.set_id(RafsDigest::from_string(&chunk_info.chunk_digest));
             chunk.set_crc32(chunk_info.chunk_crc32);
 
@@ -284,7 +325,11 @@ impl Generator {
 
 #[cfg(test)]
 mod tests {
-    use super::{BuildContext, ChunkdictChunkInfo, Generator};
+    use super::{
+        BlobManager, BuildContext, ChunkdictBlobInfo, ChunkdictChunkInfo, DigestHasher, Generator,
+        RafsDigest,
+    };
+    use nydus_rafs::metadata::RafsVersion;
 
     fn chunk(blob_id: &str, size: u32) -> ChunkdictChunkInfo {
         ChunkdictChunkInfo {
@@ -335,5 +380,202 @@ mod tests {
 
         assert_eq!(tree.name(), b"/");
         assert!(tree.borrow_mut_node().is_dir());
+    }
+
+    /// A chunk whose compressed and uncompressed sizes differ, at explicit offsets.
+    fn sized_chunk(
+        blob_id: &str,
+        digest: &str,
+        compressed: u32,
+        uncompressed: u32,
+        compressed_offset: u64,
+    ) -> ChunkdictChunkInfo {
+        ChunkdictChunkInfo {
+            image_reference: "test/image:latest".to_string(),
+            version: "v1".to_string(),
+            chunk_blob_id: blob_id.to_string(),
+            chunk_digest: digest.to_string(),
+            chunk_crc32: 0,
+            chunk_compressed_size: compressed,
+            chunk_uncompressed_size: uncompressed,
+            chunk_compressed_offset: compressed_offset,
+            chunk_uncompressed_offset: 0,
+        }
+    }
+
+    #[test]
+    fn sort_chunks_groups_by_blob_then_compressed_offset() {
+        let mut chunks = vec![
+            sized_chunk("blob-b", "d3", 10, 10, 200),
+            sized_chunk("blob-a", "d2", 10, 10, 100),
+            sized_chunk("blob-b", "d4", 10, 10, 100),
+            sized_chunk("blob-a", "d1", 10, 10, 0),
+        ];
+
+        Generator::sort_chunks(&mut chunks);
+
+        // Blob-major, then ascending compressed offset within each blob. This is the
+        // order `insert_chunks` allocates chunk indexes in, so it must not depend on
+        // how the caller happened to collect the chunks.
+        let order: Vec<_> = chunks
+            .iter()
+            .map(|c| (c.chunk_blob_id.as_str(), c.chunk_compressed_offset))
+            .collect();
+        assert_eq!(
+            order,
+            vec![
+                ("blob-a", 0),
+                ("blob-a", 100),
+                ("blob-b", 100),
+                ("blob-b", 200)
+            ]
+        );
+    }
+
+    #[test]
+    fn sort_chunks_is_deterministic_across_input_orders() {
+        let base = vec![
+            sized_chunk("blob-a", "d1", 10, 10, 0),
+            sized_chunk("blob-a", "d2", 10, 10, 100),
+            sized_chunk("blob-b", "d3", 10, 10, 0),
+        ];
+        let mut forward = base.clone();
+        let mut reversed: Vec<_> = base.into_iter().rev().collect();
+
+        Generator::sort_chunks(&mut forward);
+        Generator::sort_chunks(&mut reversed);
+
+        assert_eq!(forward, reversed);
+    }
+
+    #[test]
+    fn sort_chunks_breaks_offset_ties_by_digest() {
+        // Two chunks of the same blob at the same offsets: without the digest tiebreak
+        // the ordering would depend on the sort's stability and the input order.
+        let mut chunks = vec![
+            sized_chunk("blob-a", "zzz", 10, 10, 0),
+            sized_chunk("blob-a", "aaa", 10, 10, 0),
+        ];
+
+        Generator::sort_chunks(&mut chunks);
+
+        let digests: Vec<_> = chunks.iter().map(|c| c.chunk_digest.as_str()).collect();
+        assert_eq!(digests, vec!["aaa", "zzz"]);
+    }
+
+    /// A `ChunkdictBlobInfo` for `blob_id` using the given compressor name.
+    fn blob_info(blob_id: &str, compressor: &str) -> ChunkdictBlobInfo {
+        ChunkdictBlobInfo {
+            blob_id: blob_id.to_string(),
+            blob_compressed_size: 0,
+            blob_uncompressed_size: 0,
+            blob_compressor: compressor.to_string(),
+            blob_meta_ci_compressed_size: 0,
+            blob_meta_ci_uncompressed_size: 0,
+            blob_meta_ci_offset: 0,
+        }
+    }
+
+    /// Build the chunkdict child node and hand back its chunks.
+    fn build_chunks(
+        chunks: &[ChunkdictChunkInfo],
+        blobs: &[ChunkdictBlobInfo],
+    ) -> Vec<crate::NodeChunk> {
+        let mut ctx = BuildContext::default();
+        let mut blob_mgr = BlobManager::new(ctx.digester, false);
+        let tree = Generator::build_child_tree(&mut ctx, &mut blob_mgr, chunks, blobs).unwrap();
+        let node = tree.borrow_mut_node();
+        node.chunks.clone()
+    }
+
+    #[test]
+    fn file_offsets_accumulate_uncompressed_sizes() {
+        // The regression this guards: `file_offset` used to be `index * compressed_size`.
+        // These chunks compress unevenly, so a compressed stride produces offsets that
+        // do not describe the uncompressed stream at all.
+        let chunks = vec![
+            sized_chunk("blob-a", "d1", 10, 4096, 0),
+            sized_chunk("blob-a", "d2", 4096, 4096, 10),
+            sized_chunk("blob-a", "d3", 100, 1024, 4106),
+        ];
+        let blobs = vec![blob_info("blob-a", "zstd")];
+
+        let built = build_chunks(&chunks, &blobs);
+
+        let offsets: Vec<u64> = built.iter().map(|c| c.inner.file_offset()).collect();
+        assert_eq!(
+            offsets,
+            vec![0, 4096, 8192],
+            "file offsets must walk the uncompressed stream"
+        );
+        // Offsets must also be exactly contiguous with the uncompressed sizes.
+        for pair in built.windows(2) {
+            assert_eq!(
+                pair[1].inner.file_offset(),
+                pair[0].inner.file_offset() + pair[0].inner.uncompressed_size() as u64
+            );
+        }
+    }
+
+    #[test]
+    fn compressed_flag_tracks_actual_size_difference() {
+        // Within a zstd blob, a chunk that did not shrink is stored uncompressed; the
+        // runtime needs the flag to tell the two apart.
+        let chunks = vec![
+            sized_chunk("blob-a", "d1", 100, 4096, 0),
+            sized_chunk("blob-a", "d2", 4096, 4096, 100),
+        ];
+        let blobs = vec![blob_info("blob-a", "zstd")];
+
+        let built = build_chunks(&chunks, &blobs);
+
+        assert!(built[0].inner.is_compressed(), "100 != 4096 => compressed");
+        assert!(
+            !built[1].inner.is_compressed(),
+            "4096 == 4096 => stored uncompressed"
+        );
+    }
+
+    #[test]
+    fn compressed_flag_is_clear_for_uncompressed_blobs() {
+        // Compressor "none": no chunk is compressed, whatever the sizes say.
+        let chunks = vec![sized_chunk("blob-a", "d1", 100, 4096, 0)];
+        let blobs = vec![blob_info("blob-a", "none")];
+
+        let built = build_chunks(&chunks, &blobs);
+
+        assert!(!built[0].inner.is_compressed());
+    }
+
+    #[test]
+    fn child_inode_digest_covers_all_chunk_digests() {
+        // RAFS v5 validates a regular inode against the hash of its chunk digests; a
+        // default (all-zero) digest makes the generated chunkdict unreadable. The field
+        // only exists on v5 (`InodeWrapper::digest()` is unimplemented elsewhere), so
+        // this has to be built against a v5 context.
+        let chunks = vec![
+            sized_chunk("blob-a", "d1", 10, 4096, 0),
+            sized_chunk("blob-a", "d2", 20, 4096, 10),
+        ];
+        let blobs = vec![blob_info("blob-a", "zstd")];
+
+        let mut ctx = BuildContext {
+            fs_version: RafsVersion::V5,
+            ..Default::default()
+        };
+        let mut blob_mgr = BlobManager::new(ctx.digester, false);
+        let tree = Generator::build_child_tree(&mut ctx, &mut blob_mgr, &chunks, &blobs).unwrap();
+        let node = tree.borrow_mut_node();
+
+        let mut expected = RafsDigest::hasher(ctx.digester);
+        for chunk in node.chunks.iter() {
+            expected.digest_update(chunk.inner.id().as_ref());
+        }
+        assert_eq!(node.inode.digest(), &expected.digest_finalize());
+        assert_ne!(
+            node.inode.digest(),
+            &RafsDigest::default(),
+            "digest must actually be populated"
+        );
     }
 }
