@@ -33,7 +33,7 @@ use crate::backend::proxy;
 use crate::backend::proxy::ProxySDKClients;
 
 #[cfg(feature = "backend-dragonfly-proxy")]
-use dragonfly_client_util::request::GetResponse;
+use dragonfly_client_request::GetResponse;
 
 const HEADER_ENV_PREFIX: &str = "NYDUS_HEADER_";
 const HEADER_USER_AGENT: &str = "User-Agent";

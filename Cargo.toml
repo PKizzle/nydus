@@ -44,9 +44,23 @@ clap = { version = "4.6.1", features = ["derive", "cargo"] }
 flexi_logger = { version = "0.31.9", features = ["compress"] }
 fuse-backend-rs = { workspace = true }
 hex = "0.4.3"
-hyper = { version = "1.10.1", features = ["client"] }
-hyperlocal = "0.9.1"
-hyper-util = "0.1.20"
+# `nydusctl` speaks HTTP/1 to the daemon's unix socket over compio, using hyper's
+# low-level client — the same tokio-free pattern as nydus-storage's http-proxy
+# backend. Deliberately NOT hyper-util/hyperlocal: both are tokio-bound, and the
+# workspace runs on compio (see CLAUDE.md).
+# The driver features are named explicitly rather than inherited from nydus-storage:
+# a `--bin nydusctl` build must stand on its own, since relying on feature unification
+# is what let the tokio dependency hide here in the first place.
+compio = { version = "0.19", default-features = false, features = [
+    "runtime",
+    "time",
+    "io-uring",
+    "polling",
+    "net",
+    "macros",
+] }
+cyper-core = { version = "0.9", default-features = false }
+hyper = { version = "1.10.1", features = ["client", "http1"] }
 http-body-util = "0.1.4"
 lazy_static = "1.5.0"
 libc = "0.2.186"
@@ -63,7 +77,6 @@ rusqlite = { version = "0.40.1", features = ["bundled"] }
 serde = { version = "1.0.228", features = ["serde_derive", "rc"] }
 serde_json = "1.0.150"
 tar = "0.4.46"
-tokio = { version = "1.52.3", features = ["macros"] }
 
 nydus-api = { version = "0.4.1", path = "api", features = [
     "error-backtrace",
@@ -126,7 +139,7 @@ backend-localdisk = [
 backend-oss = ["nydus-storage/backend-oss"]
 backend-registry = ["nydus-storage/backend-registry"]
 backend-s3 = ["nydus-storage/backend-s3"]
-# Opt-in only — NOT in `default`. Pulls the third-party dragonfly-client-util,
+# Opt-in only — NOT in `default`. Pulls the third-party dragonfly-client-request,
 # which hardcodes native-tls (OpenSSL on Linux, which blocks the musl-static
 # build) and spins up its own tokio runtime (the default build runs solely on
 # compio). Enable explicitly on a glibc target when Dragonfly P2P is required.
@@ -154,12 +167,12 @@ members = [
 
 [workspace.dependencies]
 # rust-vmm crates
-vhost = "0.17.0"
+vhost = "0.16.0"
 virtio-bindings = "0.2.7"
-virtio-queue = "0.18.0"
+virtio-queue = "0.17.0"
 vm-memory = "=0.17.1"
 vmm-sys-util = "0.15.0"
-vhost-user-backend = "0.23.0"
+vhost-user-backend = "0.22.0"
 
 # fuse-backend-rs which depends on rust-vmm
 fuse-backend-rs = "0.14.0"

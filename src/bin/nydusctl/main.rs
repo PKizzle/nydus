@@ -31,7 +31,7 @@ lazy_static! {
     static ref BTI_STRING: String = get_build_time_info().0;
 }
 
-#[tokio::main]
+#[compio::main]
 async fn main() -> Result<()> {
     let app = Command::new("A client to query and configure the nydusd daemon\n")
         .version(BTI_STRING.as_str())

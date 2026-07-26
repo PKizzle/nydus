@@ -108,7 +108,10 @@ nydus-utils = { version = "0.5.1", path = "../utils", features = [
     "zran",
 ] }
 once_cell = { version = "1" }
-dragonfly-client-util = { version = "1.3.3", optional = true }
+# The `request` module moved out of `dragonfly-client-util` into its own crate at 1.4.0.
+# Pinned exactly because the split showed that this API is not covered by semver in
+# practice, and a silent minor bump breaks the build (upstream v3 pins it the same way).
+dragonfly-client-request = { version = "=1.4.2", optional = true }
 rand = { version = "0.10" }
 
 [dev-dependencies]
@@ -192,7 +195,7 @@ dedup = ["rusqlite", "r2d2", "r2d2_sqlite"]
 backend-dragonfly-proxy = [
     "cyper",
     "dep:tokio",
-    "dragonfly-client-util",
+    "dragonfly-client-request",
     "http",
     "url",
 ]

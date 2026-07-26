@@ -15,9 +15,9 @@ use std::{
 use tokio::io::AsyncRead;
 use tokio::runtime::Runtime;
 
-use dragonfly_client_util::request::Request;
-use dragonfly_client_util::request::errors::Error;
-use dragonfly_client_util::request::{Body, GetRequest, GetResponse, Proxy};
+use dragonfly_client_request::Request;
+use dragonfly_client_request::errors::Error;
+use dragonfly_client_request::{Body, GetRequest, GetResponse, Proxy};
 use http::StatusCode;
 use http::header::HeaderMap;
 use lazy_static::lazy_static;

@@ -51,7 +51,7 @@ RUST_TARGET_STATIC ?= $(STATIC_TARGET)
 
 # Extra opt-in cargo features to fold into the build. Used by the Dragonfly e2e
 # job to enable backend-dragonfly-proxy, which is excluded from the default build
-# (it pulls dragonfly-client-util -> OpenSSL/tokio and blocks the musl-static
+# (it pulls dragonfly-client-request -> OpenSSL/tokio and blocks the musl-static
 # build) but is required to exercise the Dragonfly proxy error-handling path.
 # Build on a glibc target, e.g. `make release EXTRA_FEATURES=backend-dragonfly-proxy`.
 ifneq ($(EXTRA_FEATURES),)
