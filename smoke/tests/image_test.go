@@ -7,6 +7,7 @@ package tests
 import (
 	"fmt"
 	"log"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -14,6 +15,7 @@ import (
 	"github.com/dragonflyoss/nydus/smoke/tests/tool"
 	"github.com/dragonflyoss/nydus/smoke/tests/tool/test"
 	"github.com/google/uuid"
+	"github.com/stretchr/testify/require"
 )
 
 const (
@@ -145,13 +147,33 @@ func testNydusifyCopy(t *testing.T, ctx tool.Context, source, target, logLevel, 
 	)
 	tool.RunWithoutOutput(t, checkCmd)
 
-	// The Go nydusify could save an image to a local OCI archive and load it
-	// back (`--target file://…`). The Rust nydusify implements registry-to-
-	// registry copy only; archive/layout I/O is a known gap (the same one that
-	// makes `convert --source-archive/--target-archive` reject their inputs),
-	// and `ImageReference::parse` now refuses a `file://` reference outright
-	// rather than aiming HTTPS at a host called "file". Restore these steps if
-	// archive I/O is ever implemented.
+	// Save the image to a local OCI layout tarball. `file://<path>` selects
+	// archive I/O on either side of a copy (engine::oci_archive).
+	targetSaved := fmt.Sprintf("file://%s", filepath.Join(ctx.Env.WorkDir, "saved.tar"))
+	saveCmd := fmt.Sprintf(
+		"%s %s copy --source %s --target %s --nydus-image %s --work-dir %s",
+		ctx.Binary.Nydusify, logLevel, target, targetSaved, ctx.Binary.Builder, filepath.Join(ctx.Env.WorkDir, "save"),
+	)
+	tool.RunWithoutOutput(t, saveCmd)
+
+	// Check saved image
+	_, err := os.Stat(filepath.Join(ctx.Env.WorkDir, "saved.tar"))
+	require.NoError(t, err)
+
+	// Load it back out of the archive and push it under a third tag.
+	targetLoaded := fmt.Sprintf("%s_loaded", target)
+	loadCmd := fmt.Sprintf(
+		"%s %s copy --source %s --target %s --nydus-image %s --work-dir %s",
+		ctx.Binary.Nydusify, logLevel, targetSaved, targetLoaded, ctx.Binary.Builder, filepath.Join(ctx.Env.WorkDir, "load"),
+	)
+	tool.RunWithoutOutput(t, loadCmd)
+
+	// Check loaded image
+	checkCmd = fmt.Sprintf(
+		"%s %s check --source %s --target %s --nydus-image %s --nydusd %s --work-dir %s",
+		nydusifyPath, logLevel, source, targetLoaded, ctx.Binary.Builder, ctx.Binary.Nydusd, filepath.Join(ctx.Env.WorkDir, "check"),
+	)
+	tool.RunWithoutOutput(t, checkCmd)
 }
 
 func (i *ImageTestSuite) TestGenerateChunkdicts() test.Generator {
@@ -178,15 +200,6 @@ func (i *ImageTestSuite) TestGenerateChunkdicts() test.Generator {
 }
 
 func (i *ImageTestSuite) TestChundict(t *testing.T, ctx tool.Context, images []string) {
-	// `nydusify chunkdict generate` trains a shared chunk dictionary across
-	// images. That subcommand exists only in the Go nydusify, which this
-	// repository removed; the Rust one ships convert/check/mount/copy. Without
-	// the skip the case fails as an opaque "exit status 1" from an unknown
-	// subcommand. (`nydus-image chunkdict` itself is still built and is covered
-	// by the builder's own unit tests -- it is the nydusify wrapper that is
-	// absent.) Drop this when the subcommand is implemented.
-	t.Skip("nydusify chunkdict is not implemented by the Rust nydusify")
-
 	trainImage := images[:len(images)-1]
 	testImage := images[len(images)-1]
 

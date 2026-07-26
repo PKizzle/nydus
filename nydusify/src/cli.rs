@@ -37,9 +37,75 @@ pub enum Commands {
     Mount(Box<MountArgs>),
     /// Copy an image from source to target.
     Copy(Box<CopyArgs>),
+    /// Commit a running container's writable layer into a new Nydus image.
+    Commit(Box<CommitArgs>),
     /// Deduplicate chunks across Nydus images (experimental).
     #[command(subcommand)]
     Chunkdict(ChunkdictCommands),
+}
+
+/// `nydusify commit` — snapshot a running container back into a nydus image.
+#[derive(Clone, Debug, Eq, PartialEq, Args)]
+pub struct CommitArgs {
+    /// Container to commit: a containerd id, an unambiguous id prefix, or a
+    /// nerdctl `--name`.
+    #[arg(long, env = "CONTAINER")]
+    pub container: String,
+    /// Reference to publish the committed image under.
+    #[arg(long, env = "TARGET")]
+    pub target: String,
+    /// The nydus image the container was started from. Defaults to the image
+    /// containerd recorded for the container, which is almost always right.
+    #[arg(long, env = "SOURCE")]
+    pub source: Option<String>,
+    /// Refuse to commit an image that already carries this many committed
+    /// layers, so a commit loop cannot grow a manifest without bound.
+    #[arg(long = "maximum-times", default_value_t = 400)]
+    pub maximum_times: usize,
+    /// containerd CLI used to inspect the container.
+    #[arg(long = "containerd-cli", env = "CONTAINERD_CLI", default_value = "ctr")]
+    pub containerd_cli: PathBuf,
+    /// containerd namespace holding the container (`k8s.io` under Kubernetes).
+    #[arg(
+        long = "containerd-namespace",
+        env = "CONTAINERD_NAMESPACE",
+        default_value = "default"
+    )]
+    pub containerd_namespace: String,
+    /// containerd gRPC socket, when it is not at the default path.
+    #[arg(long = "containerd-address", env = "CONTAINERD_ADDRESS")]
+    pub containerd_address: Option<PathBuf>,
+    #[arg(long = "source-insecure", env = "SOURCE_INSECURE")]
+    pub source_insecure: bool,
+    #[arg(long = "target-insecure", env = "TARGET_INSECURE")]
+    pub target_insecure: bool,
+    /// Speak plain HTTP to both registries. Shorthand for both flags below.
+    #[arg(long = "plain-http", env = "PLAIN_HTTP")]
+    pub plain_http: bool,
+    /// Speak plain HTTP to the source registry only.
+    #[arg(long = "source-plain-http", env = "SOURCE_PLAIN_HTTP")]
+    pub source_plain_http: bool,
+    /// Speak plain HTTP to the target registry only.
+    #[arg(long = "target-plain-http", env = "TARGET_PLAIN_HTTP")]
+    pub target_plain_http: bool,
+    /// Extra PEM CA certificate file(s) trusted in addition to the system store.
+    #[arg(long = "ca-cert", env = "CA_CERT", value_delimiter = ',')]
+    pub ca_cert: Vec<PathBuf>,
+    /// Platform of the source image to commit (defaults to the host platform).
+    #[arg(long, default_value_t = default_platform())]
+    pub platform: String,
+    #[arg(long = "work-dir", env = "WORK_DIR", default_value = "./tmp")]
+    pub work_dir: PathBuf,
+    #[arg(
+        long = "nydus-image",
+        env = "NYDUS_IMAGE",
+        default_value = "nydus-image"
+    )]
+    pub nydus_image: PathBuf,
+    #[arg(long = "push-retry-count", default_value_t = 3)]
+    pub push_retry_count: u32,
+    #[arg(long = "push-retry-delay", default_value = "5s")]
+    pub push_retry_delay: String,
 }
 
 #[derive(Clone, Debug, Subcommand)]

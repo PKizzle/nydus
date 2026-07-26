@@ -6,12 +6,12 @@ removed from this repository. `nydusify` is unrelated to *transparent* node-loca
 (`snapshotter/src/local_accel.rs`, see [ARCHITECTURE.md](../ARCHITECTURE.md) Decision 7), which
 never pushes anything to a registry.
 
-All four subcommands — `convert`, `check`, `copy`, `mount` — are real, working implementations
-built on the new `registry-client/` crate (a compio-native OCI distribution client: bearer auth,
-manifest/blob GET, blob push, `HEAD`-based dedup, mount-blob). They drive `nydus-image` (and, for
-`mount`, `nydusd`) as subprocesses, the same convention `snapshotter/src/local_accel.rs` uses for
-node-local conversion. Live end-to-end verification against a real registry is still pending
-(tracked as deferred work); everything below is validated by unit/plan tests and code inspection.
+Every subcommand — `convert`, `check`, `copy`, `mount`, `commit`, `chunkdict generate` — is a real,
+working implementation built on the new `registry-client/` crate (a compio-native OCI distribution
+client: bearer auth, manifest/blob GET, blob push, `HEAD`-based dedup, mount-blob). They drive
+`nydus-image` (and, for `mount`, `nydusd`) as subprocesses, the same convention
+`snapshotter/src/local_accel.rs` uses for node-local conversion; `commit` additionally shells out to
+containerd's `ctr` to inspect the container it is snapshotting.
 
 > **Platform:** `nydusify convert`/`check`/`copy` are pure networking + subprocess orchestration
 > and build/run anywhere `nydus-image` runs (including macOS for `check`/`convert` tooling). `mount`
@@ -117,11 +117,14 @@ Useful flags (see `--help` for the full list; `nydusify/src/cli.rs` is the sourc
   `SourceImageSize` / `TargetImageSize` (byte totals across converted platforms),
   `ConversionElapsed` (formatted seconds, e.g. `"12.480s"`), and a `platforms[]` breakdown.
 
+- `--source-archive` / `--target-archive` — read the source from, or write the result to, a local
+  OCI image-layout tarball instead of a registry (`engine::oci_archive`). Imported archives are
+  digest-verified and unpacked with a path-traversal guard.
+
 **Not yet implemented** (the CLI parses these flags but `convert` rejects them with an explicit
 error rather than mis-converting):
 
 - `--reverse` (nydus → OCI conversion).
-- `--source-archive` / `--target-archive` (local OCI-layout tar I/O).
 - `--source-backend-type` / non-`registry` `--backend-type`.
 
 ## `nydusify check`
@@ -163,6 +166,18 @@ already exist there and using registry-native `mount_blob` when source and targe
 registry. `--all-platforms` is parsed but rejected today ("copy one platform at a time with
 `--platform`" — same v1 scope cut as `convert`).
 
+Either side may be a **local OCI image-layout tarball** instead of a registry, written as
+`file://<path>.tar` — that is how an image is saved and loaded without a second registry:
+
+```shell
+nydusify copy --source myregistry/repo:tag-nydus --target file://./saved.tar   # save
+nydusify copy --source file://./saved.tar --target otherregistry/repo:tag      # load
+```
+
+Note that `file://` is understood only where a local archive is a documented input (`copy`, and
+`convert`'s `--source-archive`/`--target-archive`); `ImageReference::parse` rejects a scheme
+outright everywhere else rather than reading `file` as a registry host.
+
 ## `nydusify mount`
 
 ```shell
@@ -174,6 +189,76 @@ backend for the target image, and spawns `nydusd` (override with `--nydusd`) in 
 until SIGINT/SIGTERM, then unmounts and stops it. Only `--backend-type registry` (the default) is
 implemented; `oss`/`s3`/`localfs` are validated but rejected as follow-up work. This subcommand
 requires a working `nydusd` FUSE mount, i.e. a Linux host.
+
+## `nydusify commit`
+
+```shell
+sudo nydusify commit \
+  --container 0d1c9f1a \
+  --target myregistry/repo:tag-nydus-committed
+```
+
+Snapshots a **running container** back into a nydus image: the container's read-write layer becomes
+one more RAFS layer stacked on the image it was started from, and the result is published under a
+new reference. Only the bytes the container actually wrote are uploaded — the base image's data
+blobs are reused (mounted cross-repo, or copied when the registries differ).
+
+How it works, and where each piece lives:
+
+| step | what happens | code |
+|---|---|---|
+| inspect | `ctr container info` + `ctr snapshot mounts` yield the image ref and the overlay `upperdir` | `engine/containerd_inspect.rs` |
+| diff | the upperdir is walked into an OCI layer tar, translating overlayfs' markers | `engine/overlay_diff.rs` |
+| build | `nydus-image create --type tar-rafs` (base's fs-version + compressor) | `commands/commit.rs` |
+| merge | `nydus-image merge --parent-bootstrap <base>` | `commands/commit.rs` |
+| push | reused base blobs + the new blob + bootstrap + rewritten config + manifest | `commands/commit.rs` |
+
+The overlayfs→OCI translation is the part worth knowing about: a character device with device
+number 0/0 becomes `.wh.<name>`, a directory carrying `overlay.opaque=y` gets a `.wh..wh..opq`
+inside it, `overlay.*` bookkeeping xattrs are stripped, and every other xattr travels as a
+`SCHILY.xattr.*` PAX record — but only in the namespaces RAFS can store (`user.`, `security.`,
+`trusted.`, `system.posix_acl_*`), because `nydus-image` rejects anything else with a bare
+"invalid xattr key" and fails the whole build. Two overlayfs features cannot be reconstructed from
+the upperdir alone — `overlay.redirect` (a renamed directory) and `overlay.metacopy` (contents
+still in a lower layer) — so hitting either fails the commit loudly instead of publishing a wrong
+layer. containerd's overlay snapshotter enables neither.
+
+Useful flags:
+
+- `--container` takes a containerd id, an unambiguous id prefix, or a nerdctl `--name`.
+- `--containerd-namespace` (default `default`; Kubernetes uses `k8s.io`),
+  `--containerd-address`, `--containerd-cli` (default `ctr`).
+- `--source <ref>` overrides the base image, which otherwise comes from what containerd recorded
+  for the container.
+- `--maximum-times` (default 400) refuses to commit onto an image that already carries that many
+  committed layers. The count comes from the bootstrap layer's
+  `containerd.io/snapshot/nydus-commit-blobs` annotation, which this tool **accumulates** across
+  commits — the Go nydusify overwrites it with only the current commit's blobs, so its own limit
+  never engages.
+- `--plain-http` / `--source-plain-http` / `--target-plain-http`, `--platform`, `--work-dir`,
+  `--nydus-image`, `--push-retry-count` / `--push-retry-delay` behave as they do elsewhere.
+
+Not implemented: `--with-path`, the Go tool's option for committing extra bind-mounted paths by
+entering the container's mount namespace with `nsenter`. `commit` covers the container's own
+writable layer.
+
+> Needs root (the upperdir lives under containerd's state directory) and a container on an overlay
+> snapshot with a writable layer — a read-only view has nothing to commit and is rejected as such.
+
+## `nydusify chunkdict generate`
+
+```shell
+nydusify chunkdict generate \
+  --sources myregistry/repo:v1,myregistry/repo:v2,myregistry/repo:v3 \
+  --target myregistry/repo:chunkdict
+```
+
+Trains a shared chunk dictionary across several nydus images and publishes it as its own image, so
+later conversions can dedup against it via `nydus-image --chunk-dict`. Each source bootstrap is
+staged under a directory named after its reference (with `/` rewritten to `:` so `nydus-image`
+recovers the name and tag from the parent directory), `nydus-image chunkdict generate` is run over
+the set, and the resulting image is pushed with its source blobs cross-repo-mounted rather than
+re-uploaded.
 
 ## The ecosystem loop
 

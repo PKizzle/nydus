@@ -4484,6 +4484,7 @@ dependencies = [
  "tempfile",
  "tracing",
  "tracing-subscriber",
+ "xattr",
 ]
 
 [[package]]

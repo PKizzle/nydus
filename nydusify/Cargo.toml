@@ -40,5 +40,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # which supervises a nydusd child and unmounts on exit.
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+# `commit` reads the container's overlay upperdir: overlayfs marks opaque
+# directories with an xattr, and non-overlay xattrs are carried into the
+# published layer as SCHILY.xattr.* PAX records (see engine::overlay_diff).
+xattr = "1.6.1"
 
 [dev-dependencies]

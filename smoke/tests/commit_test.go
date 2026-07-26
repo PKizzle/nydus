@@ -60,7 +60,9 @@ func (c *CommitTestSuite) TestCommitAndCheck(ctx tool.Context, image, commitedIm
 
 	// commit container
 	committedContainerName := fmt.Sprintf("%s-committed", containerName)
-	commitCmd := fmt.Sprintf("sudo %s commit --container %s --target %s", ctx.Binary.Nydusify, containerID, commitedImage)
+	// -E so the harness-wide PLAIN_HTTP reaches nydusify: the smoke registry
+	// speaks plain HTTP and the Rust nydusify never downgrades silently.
+	commitCmd := fmt.Sprintf("sudo -E %s commit --container %s --target %s", ctx.Binary.Nydusify, containerID, commitedImage)
 	tool.RunWithoutOutput(c.t, commitCmd)
 
 	// run committed container
@@ -106,16 +108,5 @@ func nerdctlExec(t *testing.T, containerName, cmd string) {
 }
 
 func TestCommit(t *testing.T) {
-	// `nydusify commit` (snapshot a running container's rootfs back into a nydus
-	// image) exists only in the Go nydusify, which this repository removed in
-	// favour of the Rust one. The Rust nydusify implements convert/check/copy/
-	// mount and deliberately not commit, so the case cannot pass here; without
-	// this skip it fails as an opaque "exit status 1" from an unknown subcommand
-	// followed by a "not found" on the image that was never produced.
-	//
-	// Drop the skip if and when commit is implemented (tracked as a nydusify
-	// feature gap alongside --reverse and the archive I/O flags).
-	t.Skip("nydusify commit is not implemented by the Rust nydusify")
-
 	test.Run(t, &CommitTestSuite{t: t})
 }
