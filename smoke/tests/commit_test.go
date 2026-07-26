@@ -125,5 +125,10 @@ func nerdctlExec(t *testing.T, containerName, cmd string) {
 }
 
 func TestCommit(t *testing.T) {
-	test.Run(t, &CommitTestSuite{t: t})
+	// test.Sync: the scenarios must not run concurrently. Each starts a
+	// container, and nerdctl creates its default CNI bridge lazily on the first
+	// `run`; two of those racing fail with "subnet 10.4.0.0/24 overlaps with
+	// other one on this address space". The suite was single-scenario until the
+	// zran dimension was added, which is why this only started mattering then.
+	test.Run(t, &CommitTestSuite{t: t}, test.Sync)
 }
