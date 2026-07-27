@@ -5,6 +5,17 @@
 use std::fmt::Debug;
 
 /// Display error messages with line number, file path and optional backtrace.
+///
+/// **The context is logged, not attached.** `err` is returned unchanged, so the `_raw` detail
+/// reaches the log only when the non-default `error-backtrace` feature is on and is otherwise
+/// dropped. That means `einval!("cannot open {}", path)` produces an error whose `Display` is
+/// just "Invalid argument (os error 22)" in a normal build.
+///
+/// This is deliberate for now rather than an oversight: attaching the message would mean
+/// returning `io::Error::new(err.kind(), msg)`, which yields a `Custom` error with
+/// `raw_os_error() == None`, and several call sites across the workspace branch on
+/// `raw_os_error()` (e.g. `deny_errno_for` in `service/src/fanotify.rs`). Changing it is a
+/// workspace-wide behavioural change that needs its own audit.
 pub fn make_error(
     err: std::io::Error,
     _raw: impl Debug,
@@ -28,17 +39,35 @@ pub fn make_error(
     err
 }
 
-/// Define error macro like `x!()` or `x!(err)`.
+/// Define error macro like `x!()`, `x!(err)` or `x!("fmt {}", arg)`.
+///
 /// Note: The `x!()` macro will convert any origin error (Os, Simple, Custom) to Custom error.
+///
+/// `$d` must always be passed the literal token `$`. This macro *generates* a `macro_rules!`,
+/// and a repetition inside the generated macro needs a `$` that belongs to the inner macro
+/// rather than this one; there is no stable `$$` escape, so the token is threaded in as an
+/// argument instead. See `define_libc_error_macro!` and the call sites below.
 macro_rules! define_error_macro {
-    ($fn:ident, $err:expr_2021) => {
+    ($d:tt, $fn:ident, $err:expr_2021) => {
         #[macro_export]
         macro_rules! $fn {
             () => {
                 std::io::Error::new($err.kind(), format!("{}: {}:{}", $err, file!(), line!()))
             };
-            ($raw:expr_2021) => {
-                $crate::error::make_error($err, &$raw, file!(), line!())
+            ($d raw:expr_2021) => {
+                $crate::error::make_error($err, &$d raw, file!(), line!())
+            };
+            // Format-string form, so call sites can write `einval!("bad size {}", n)` instead
+            // of the `einval!(format!(...))` dance. Requires at least one argument after the
+            // literal, which keeps `einval!("plain message")` on the single-expression arm
+            // above and preserves its behaviour.
+            ($d fmt:literal, $d($d arg:tt)+) => {
+                $crate::error::make_error(
+                    $err,
+                    &format!($d fmt, $d($d arg)+),
+                    file!(),
+                    line!(),
+                )
             };
         }
     };
@@ -46,23 +75,22 @@ macro_rules! define_error_macro {
 
 /// Define error macro for libc error codes
 macro_rules! define_libc_error_macro {
-    ($fn:ident, $code:ident) => {
-        define_error_macro!($fn, std::io::Error::from_raw_os_error(libc::$code));
+    ($d:tt, $fn:ident, $code:ident) => {
+        define_error_macro!($d, $fn, std::io::Error::from_raw_os_error(libc::$code));
     };
 }
 
-// TODO: Add format string support
 // Add more libc error macro here if necessary
-define_libc_error_macro!(einval, EINVAL);
-define_libc_error_macro!(enoent, ENOENT);
-define_libc_error_macro!(ebadf, EBADF);
-define_libc_error_macro!(eacces, EACCES);
-define_libc_error_macro!(enotdir, ENOTDIR);
-define_libc_error_macro!(eisdir, EISDIR);
-define_libc_error_macro!(ealready, EALREADY);
-define_libc_error_macro!(enosys, ENOSYS);
-define_libc_error_macro!(epipe, EPIPE);
-define_libc_error_macro!(eio, EIO);
+define_libc_error_macro!($, einval, EINVAL);
+define_libc_error_macro!($, enoent, ENOENT);
+define_libc_error_macro!($, ebadf, EBADF);
+define_libc_error_macro!($, eacces, EACCES);
+define_libc_error_macro!($, enotdir, ENOTDIR);
+define_libc_error_macro!($, eisdir, EISDIR);
+define_libc_error_macro!($, ealready, EALREADY);
+define_libc_error_macro!($, enosys, ENOSYS);
+define_libc_error_macro!($, epipe, EPIPE);
+define_libc_error_macro!($, eio, EIO);
 
 /// Return EINVAL error with formatted error message.
 #[macro_export]
@@ -81,8 +109,8 @@ macro_rules! bail_eio {
 }
 
 // Add more custom error macro here if necessary
-define_error_macro!(last_error, std::io::Error::last_os_error());
-define_error_macro!(eother, std::io::Error::new(std::io::ErrorKind::Other, ""));
+define_error_macro!($, last_error, std::io::Error::last_os_error());
+define_error_macro!($, eother, std::io::Error::new(std::io::ErrorKind::Other, ""));
 
 #[cfg(test)]
 mod tests {
@@ -102,6 +130,26 @@ mod tests {
             check_size(0x2000).unwrap_err().kind(),
             std::io::Error::from_raw_os_error(libc::EINVAL).kind()
         );
+    }
+
+    #[test]
+    fn error_macros_accept_a_format_string() {
+        // The point of the arm is that this *compiles* — before it existed the only way to
+        // interpolate was `einval!(format!(...))`.
+        let err = einval!("bad size {} for {}", 0x2000, "blob");
+        assert_eq!(err.kind(), Error::from_raw_os_error(libc::EINVAL).kind());
+        assert_eq!(err.raw_os_error(), Some(libc::EINVAL));
+
+        // Note what is NOT asserted: that the message survives. `make_error` returns the
+        // original error and only logs the context under the non-default `error-backtrace`
+        // feature — see its doc comment. Asserting the message here would fail.
+        assert!(!err.to_string().is_empty());
+
+        // Adding the variadic arm must not steal `einval!("...")` from the single-expression
+        // arm above; a lone literal still has to take the old path.
+        let plain = enoent!("just a message");
+        assert_eq!(plain.kind(), Error::from_raw_os_error(libc::ENOENT).kind());
+        assert_eq!(plain.raw_os_error(), Some(libc::ENOENT));
     }
 
     #[test]

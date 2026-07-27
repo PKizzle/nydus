@@ -114,7 +114,9 @@ impl ClientConnection {
         let mut msg = GetBlobRequest::default();
         msg.as_mut_slice().copy_from_slice(&data);
 
-        // TODO
+        // Not implemented: the server has no blob registry to resolve the request against,
+        // so it answers every GetBlob with ENOSYS rather than pretending to serve one. The
+        // token/generation pair is still minted so the client can correlate the reply.
         let token = self.token.fetch_add(1, Ordering::AcqRel) as u64;
         let gen = (msg.generation as u64) << 32;
         let reply = GetBlobReply::new(gen | token, 0, libc::ENOSYS as u32);
@@ -140,7 +142,10 @@ impl ClientConnection {
         }
         drop(guard);
 
-        // TODO
+        // Not implemented: no range is actually fetched. The reply reports the requested
+        // count with a zero error code purely to keep the wire protocol well-formed; a real
+        // implementation has to resolve the blob (see `handle_get_blob`, equally a stub)
+        // before this can mean anything.
         let mut msg = FetchRangeRequest::default();
         msg.as_mut_slice().copy_from_slice(&data);
 

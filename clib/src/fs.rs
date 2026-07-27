@@ -100,7 +100,17 @@ fn do_nydus_open_rafs(bootstrap: &str, config: &str) -> NydusFsHandle {
         return fs_error_einval();
     }
 
-    let root_ino = rafs.metadata().root_inode;
+    // `RafsSuperMeta::root_inode` is a plain field that is left at its `0` default by every
+    // superblock loader, so reading it here handed out a handle rooted at inode 0 and every
+    // subsequent `lookup` failed with ENOENT. The superblock knows the real root (1 for both
+    // v5 and v6); `FileSystem::root_inode` is the public way to ask it.
+    let root_ino = match rafs.get_root_inode() {
+        Ok(inode) => inode.ino(),
+        Err(e) => {
+            warn!("failed to resolve the RAFS root inode, {}", e);
+            return fs_error_einval();
+        }
+    };
     let fs = Box::new(FileSystemState {
         magic: NYDUS_FS_HANDLE_MAGIC,
         root_ino,
@@ -190,7 +200,7 @@ pub unsafe extern "C" fn nydus_close_rafs(handle: NydusFsHandle) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::ffi::CString;
     use std::io::Error;
