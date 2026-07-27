@@ -85,9 +85,55 @@ const DEFAULT_TOKEN_TTL_SECS: u64 = 60;
 /// carries a token that expires mid-transfer (mirrors the storage backend's
 /// `REGISTRY_TOKEN_REFRESH_MARGIN`).
 const TOKEN_REFRESH_MARGIN_SECS: u64 = 20;
-/// Upper bound for the per-cache random offset added to the margin, so a
-/// fleet of clients minted at the same moment does not refresh in lockstep.
-const TOKEN_REFRESH_JITTER_MAX_SECS: u64 = 10;
+/// Hard cap on the refresh jitter window, however long-lived the token is.
+const TOKEN_REFRESH_JITTER_MAX_SECS: u64 = 5 * 60;
+/// The jitter window is this fraction of the token's lifetime.
+const TOKEN_REFRESH_JITTER_DIVISOR: u64 = 10;
+
+/// A per-call random `u64`.
+///
+/// `RandomState` is seeded from the OS per instance, which is all the entropy the
+/// refresh jitter needs — cheaper than pulling `rand` into this crate for it.
+/// Mirrors `random_u64` in `storage/src/backend/registry.rs`.
+fn random_u64() -> u64 {
+    use std::hash::{BuildHasher, Hasher};
+    std::collections::hash_map::RandomState::new()
+        .build_hasher()
+        .finish()
+}
+
+/// Lifetime to assume for a token the service described as `expires_in`.
+fn ttl_from(expires_in: Option<u64>) -> Duration {
+    Duration::from_secs(expires_in.unwrap_or(DEFAULT_TOKEN_TTL_SECS))
+}
+
+/// Width of the refresh jitter window for a token living `ttl`.
+///
+/// Proportional rather than flat, and kept in step with
+/// `token_refresh_jitter_max` in `storage/src/backend/registry.rs`: nodes that
+/// pulled the same image at the same moment hold tokens that expire at the same
+/// moment, so the window has to be wide enough to actually decorrelate a fleet.
+/// A fixed handful of seconds is not — this crate backs the snapshotter's
+/// referrer lookups, so "a fleet" is the normal case, not the exotic one.
+fn token_refresh_jitter_max(ttl: Duration) -> Duration {
+    Duration::from_secs(
+        (ttl.as_secs() / TOKEN_REFRESH_JITTER_DIVISOR).min(TOKEN_REFRESH_JITTER_MAX_SECS),
+    )
+}
+
+/// Draw a refresh jitter for a token living `ttl`.
+///
+/// Drawn per token rather than once per cache: a single offset shared by every
+/// token a client holds re-correlates all of them, which is most of what the
+/// jitter exists to prevent.
+fn random_jitter(ttl: Duration) -> Duration {
+    let max = token_refresh_jitter_max(ttl).as_secs();
+    if max == 0 {
+        Duration::ZERO
+    } else {
+        Duration::from_secs(random_u64() % (max + 1))
+    }
+}
 
 /// Small per-client bearer token cache, keyed by scope.
 ///
@@ -96,14 +142,13 @@ const TOKEN_REFRESH_JITTER_MAX_SECS: u64 = 10;
 /// exactly the "registry + repo + actions" granularity tokens are issued at.
 ///
 /// Entries expire: a token is served only until `expires_in` minus a
-/// refresh-ahead margin (plus a per-cache jitter), after which `get` returns
+/// refresh-ahead margin (plus a per-token jitter), after which `get` returns
 /// `None` and the normal 401-challenge path re-mints. No singleflight is
 /// needed — each cache lives behind a `RefCell` on a single-threaded compio
 /// client, so lookups and refreshes are sequential.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct TokenCache {
     map: HashMap<String, CachedToken>,
-    jitter: Duration,
 }
 
 #[derive(Debug)]
@@ -112,25 +157,10 @@ struct CachedToken {
     refresh_at: Instant,
 }
 
-impl Default for TokenCache {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl TokenCache {
-    /// Create an empty cache with a randomized refresh jitter.
+    /// Create an empty cache.
     pub fn new() -> Self {
-        // A hash of a fresh RandomState keeps this dependency-free while
-        // still de-synchronizing caches created across processes/nodes.
-        use std::hash::{BuildHasher, Hasher};
-        let seed = std::collections::hash_map::RandomState::new()
-            .build_hasher()
-            .finish();
-        Self {
-            map: HashMap::new(),
-            jitter: Duration::from_secs(seed % (TOKEN_REFRESH_JITTER_MAX_SECS + 1)),
-        }
+        Self::default()
     }
 
     /// Look up a still-fresh cached token for `scope`.
@@ -144,7 +174,8 @@ impl TokenCache {
     /// Cache `token` under `scope`, replacing any previous token.
     /// `expires_in` is the token service's advertised lifetime in seconds.
     pub fn insert(&mut self, scope: &str, token: &str, expires_in: Option<u64>) {
-        let refresh_at = compute_refresh_at(Instant::now(), expires_in, self.jitter);
+        let jitter = random_jitter(ttl_from(expires_in));
+        let refresh_at = compute_refresh_at(Instant::now(), expires_in, jitter);
         self.map.insert(
             scope.to_string(),
             CachedToken {
@@ -159,7 +190,7 @@ impl TokenCache {
 /// minus the refresh-ahead margin and jitter, floored at half the lifetime so
 /// short-lived tokens are still cached at all.
 fn compute_refresh_at(now: Instant, expires_in: Option<u64>, jitter: Duration) -> Instant {
-    let ttl = Duration::from_secs(expires_in.unwrap_or(DEFAULT_TOKEN_TTL_SECS));
+    let ttl = ttl_from(expires_in);
     let lead = Duration::from_secs(TOKEN_REFRESH_MARGIN_SECS) + jitter;
     let usable = std::cmp::max(ttl.saturating_sub(lead), ttl / 2);
     now + usable
@@ -524,11 +555,45 @@ mod tests {
     }
 
     #[test]
-    fn token_cache_jitter_is_bounded() {
-        for _ in 0..32 {
-            let cache = TokenCache::new();
-            assert!(cache.jitter <= Duration::from_secs(TOKEN_REFRESH_JITTER_MAX_SECS));
-        }
+    fn jitter_window_scales_with_lifetime_and_is_capped() {
+        // A tenth of the lifetime, so a fleet holding identical tokens spreads
+        // out proportionally rather than by a fixed handful of seconds.
+        assert_eq!(
+            token_refresh_jitter_max(Duration::from_secs(300)),
+            Duration::from_secs(30)
+        );
+        // ... but never so early that a long-lived token is thrown away absurdly
+        // soon: 3600/10 = 360 would exceed the 300s cap.
+        assert_eq!(
+            token_refresh_jitter_max(Duration::from_secs(3600)),
+            Duration::from_secs(TOKEN_REFRESH_JITTER_MAX_SECS)
+        );
+        // A lifetime too short to divide gets no jitter rather than a panic on
+        // the `% (max + 1)` below.
+        assert_eq!(
+            token_refresh_jitter_max(Duration::from_secs(5)),
+            Duration::ZERO
+        );
+        assert_eq!(random_jitter(Duration::from_secs(5)), Duration::ZERO);
+    }
+
+    #[test]
+    fn jitter_is_drawn_per_token_not_once_per_cache() {
+        // A single offset shared by every token a client holds would leave them
+        // all correlated, which is most of what the jitter exists to prevent.
+        let ttl = Duration::from_secs(3600);
+        let draws: std::collections::HashSet<_> =
+            (0..64).map(|_| random_jitter(ttl).as_secs()).collect();
+        assert!(
+            draws.len() > 1,
+            "expected varying jitter across draws, got {draws:?}"
+        );
+        assert!(
+            draws
+                .iter()
+                .all(|&d| d <= token_refresh_jitter_max(ttl).as_secs()),
+            "a draw exceeded the window: {draws:?}"
+        );
     }
 
     #[test]
