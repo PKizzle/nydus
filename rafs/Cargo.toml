@@ -22,7 +22,7 @@ vm-memory = { workspace = true }
 fuse-backend-rs = { workspace = true }
 thiserror = "2.0.18"
 
-nydus-api = { version = "0.4.1", path = "../api" }
+nydus-api = { version = "0.5.0", path = "../api" }
 nydus-storage = { version = "0.7.2", path = "../storage", features = [
     "backend-localfs",
 ] }

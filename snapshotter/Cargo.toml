@@ -177,7 +177,7 @@ which = "8"
 # in /tmp while the snapshotter runs as root.
 tempfile = "3"
 
-nydus-api = { version = "0.4.1", path = "../api" }
+nydus-api = { version = "0.5.0", path = "../api" }
 nydus-rafs = { version = "0.4.1", path = "../rafs" }
 # OCI distribution client (bearer auth, referrers API) shared with nydusify.
 # Drives the referrer-detection/materialization path in `source/referrer.rs`;

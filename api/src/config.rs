@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 use std::convert::{TryFrom, TryInto};
 use std::fs;
-use std::io::{Error, ErrorKind, Result};
+use std::io;
 use std::path::Path;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -14,6 +14,123 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde::Deserialize;
 use serde_json::Value;
+
+/// Maximum size accepted for a configuration file.
+pub const MAX_CONFIG_FILE_SIZE: u64 = 0x100000;
+
+/// Errors reported while loading, parsing or querying a nydus configuration.
+///
+/// Configuration handling used to speak `std::io::Error`, which forced every failure into an
+/// `ErrorKind` that described none of them ("invalid input" for a missing section, for an
+/// unsupported backend type and for a malformed document alike) and discarded the detail that
+/// makes a bad config actionable. Each variant below carries the field it is about.
+#[derive(Debug, thiserror::Error)]
+pub enum ConfigError {
+    /// A configuration section the caller needs is not present.
+    #[error("missing configuration section `{0}`")]
+    Missing(&'static str),
+
+    /// A configuration field carries a value that cannot be acted on.
+    #[error("invalid value `{value}` for `{field}`: {reason}")]
+    InvalidValue {
+        /// Dotted path of the offending field, e.g. `cache.type`.
+        field: &'static str,
+        /// The value as configured.
+        value: String,
+        /// What was expected instead.
+        reason: String,
+    },
+
+    /// The document parsed, but does not describe a usable configuration.
+    #[error("`{0}` configuration failed validation")]
+    Invalid(&'static str),
+
+    /// The text is not a valid document in any of the supported formats.
+    #[error("failed to parse `{0}` configuration: not valid JSON, YAML or TOML")]
+    Unparsable(&'static str),
+
+    /// An embedded document could not be deserialized into the expected shape.
+    ///
+    /// The source error is repeated in the message on purpose: it carries the line and column,
+    /// and callers that only print `Display` (rather than walking the chain) would lose it.
+    #[error("failed to deserialize configuration: {0}")]
+    Deserialize(#[from] serde_json::Error),
+
+    /// The configuration names a backend or cache type that is not implemented.
+    #[error("unsupported {kind} type `{name}`")]
+    Unsupported {
+        /// What is unsupported, e.g. `backend` or `cache`.
+        kind: &'static str,
+        /// The type name as configured.
+        name: String,
+    },
+
+    /// A configuration file could not be read.
+    #[error("failed to access configuration path `{path}`: {source}")]
+    Io {
+        /// The path that could not be read.
+        path: String,
+        /// The underlying OS error.
+        #[source]
+        source: io::Error,
+    },
+
+    /// A configuration file exceeds [`MAX_CONFIG_FILE_SIZE`].
+    #[error("configuration file `{path}` is {size} bytes, over the {limit} byte limit")]
+    TooLarge {
+        /// The offending path.
+        path: String,
+        /// Its size in bytes.
+        size: u64,
+        /// The accepted maximum.
+        limit: u64,
+    },
+}
+
+impl ConfigError {
+    /// Build a [`ConfigError::Io`] for `path`.
+    fn io(path: &Path, source: io::Error) -> Self {
+        ConfigError::Io {
+            path: path.display().to_string(),
+            source,
+        }
+    }
+}
+
+/// Compatibility conversion for callers still pinned to `std::io::Error`.
+///
+/// Temporary: it exists so that dependents which have not been migrated yet keep compiling, and
+/// is removed once none are left. The `ErrorKind` of an underlying OS error is preserved so that
+/// callers branching on `NotFound`/`PermissionDenied` from a config-file stat keep working; the
+/// `ConfigError` travels along as the payload, so the message survives the conversion.
+impl From<ConfigError> for io::Error {
+    fn from(e: ConfigError) -> Self {
+        let kind = match &e {
+            ConfigError::Io { source, .. } => source.kind(),
+            _ => io::ErrorKind::InvalidData,
+        };
+        io::Error::new(kind, e)
+    }
+}
+
+/// Result of a configuration operation.
+pub type ConfigResult<T> = std::result::Result<T, ConfigError>;
+
+/// Read a configuration file, rejecting anything over [`MAX_CONFIG_FILE_SIZE`].
+///
+/// The size check exists because the content is parsed three times over (JSON, YAML, TOML) by the
+/// `FromStr` impls below, so an oversized file is expensive well before it is rejected.
+fn read_config_file(path: &Path) -> ConfigResult<String> {
+    let md = fs::metadata(path).map_err(|e| ConfigError::io(path, e))?;
+    if md.len() > MAX_CONFIG_FILE_SIZE {
+        return Err(ConfigError::TooLarge {
+            path: path.display().to_string(),
+            size: md.len(),
+            limit: MAX_CONFIG_FILE_SIZE,
+        });
+    }
+    fs::read_to_string(path).map_err(|e| ConfigError::io(path, e))
+}
 
 /// Configuration file format version 2, supporting JSON, TOML and YAML.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -70,7 +187,7 @@ impl ConfigV2 {
     }
 
     /// Create a new configuration object for `backend-localfs` and `filecache`.
-    pub fn new_localfs(id: &str, dir: &str) -> Result<Self> {
+    pub fn new_localfs(id: &str, dir: &str) -> ConfigResult<Self> {
         let content = format!(
             r#"
         version = 2
@@ -89,12 +206,8 @@ impl ConfigV2 {
     }
 
     /// Read configuration information from a file.
-    pub fn from_file<P: AsRef<Path>>(path: P) -> Result<Self> {
-        let md = fs::metadata(path.as_ref())?;
-        if md.len() > 0x100000 {
-            return Err(Error::other("configuration file size is too big"));
-        }
-        let content = fs::read_to_string(path)?;
+    pub fn from_file<P: AsRef<Path>>(path: P) -> ConfigResult<Self> {
+        let content = read_config_file(path.as_ref())?;
         Self::from_str(&content)
     }
 
@@ -123,27 +236,17 @@ impl ConfigV2 {
     }
 
     /// Get configuration information for storage backend.
-    pub fn get_backend_config(&self) -> Result<&BackendConfigV2> {
-        self.backend.as_ref().ok_or_else(|| {
-            Error::new(
-                ErrorKind::InvalidInput,
-                "no configuration information for backend",
-            )
-        })
+    pub fn get_backend_config(&self) -> ConfigResult<&BackendConfigV2> {
+        self.backend.as_ref().ok_or(ConfigError::Missing("backend"))
     }
 
     /// Get configuration information for cache subsystem.
-    pub fn get_cache_config(&self) -> Result<&CacheConfigV2> {
-        self.cache.as_ref().ok_or_else(|| {
-            Error::new(
-                ErrorKind::InvalidData,
-                "no configuration information for cache",
-            )
-        })
+    pub fn get_cache_config(&self) -> ConfigResult<&CacheConfigV2> {
+        self.cache.as_ref().ok_or(ConfigError::Missing("cache"))
     }
 
     /// Get cache working directory.
-    pub fn get_cache_working_directory(&self) -> Result<String> {
+    pub fn get_cache_working_directory(&self) -> ConfigResult<String> {
         let cache = self.get_cache_config()?;
         if cache.is_filecache() {
             if let Some(c) = cache.file_cache.as_ref() {
@@ -155,20 +258,12 @@ impl ConfigV2 {
             return Ok(c.work_dir.clone());
         }
 
-        Err(Error::new(
-            ErrorKind::NotFound,
-            "no working directory configured",
-        ))
+        Err(ConfigError::Missing("cache work directory"))
     }
 
     /// Get configuration information for RAFS filesystem.
-    pub fn get_rafs_config(&self) -> Result<&RafsConfigV2> {
-        self.rafs.as_ref().ok_or_else(|| {
-            Error::new(
-                ErrorKind::InvalidInput,
-                "no configuration information for rafs",
-            )
-        })
+    pub fn get_rafs_config(&self) -> ConfigResult<&RafsConfigV2> {
+        self.rafs.as_ref().ok_or(ConfigError::Missing("rafs"))
     }
 
     /// Clone the object with all secrets removed.
@@ -239,28 +334,28 @@ impl ConfigV2 {
 }
 
 impl FromStr for ConfigV2 {
-    type Err = std::io::Error;
+    type Err = ConfigError;
 
-    fn from_str(s: &str) -> Result<ConfigV2> {
+    fn from_str(s: &str) -> ConfigResult<ConfigV2> {
         if let Ok(v) = serde_json::from_str::<ConfigV2>(s) {
             return if v.validate() {
                 Ok(v)
             } else {
-                Err(Error::new(ErrorKind::InvalidInput, "invalid configuration"))
+                Err(ConfigError::Invalid("ConfigV2"))
             };
         }
         if let Ok(v) = serde_yaml::from_str::<ConfigV2>(s) {
             return if v.validate() {
                 Ok(v)
             } else {
-                Err(Error::new(ErrorKind::InvalidInput, "invalid configuration"))
+                Err(ConfigError::Invalid("ConfigV2"))
             };
         }
         if let Ok(v) = toml::from_str::<ConfigV2>(s) {
             return if v.validate() {
                 Ok(v)
             } else {
-                Err(Error::new(ErrorKind::InvalidInput, "invalid configuration"))
+                Err(ConfigError::Invalid("ConfigV2"))
             };
         }
         if let Ok(v) = serde_json::from_str::<RafsConfig>(s)
@@ -275,10 +370,7 @@ impl FromStr for ConfigV2 {
         {
             return Ok(v);
         }
-        Err(Error::new(
-            ErrorKind::InvalidInput,
-            "failed to parse configuration information",
-        ))
+        Err(ConfigError::Unparsable("ConfigV2"))
     }
 }
 
@@ -375,105 +467,74 @@ impl BackendConfigV2 {
         true
     }
 
+    /// Report that `backend.type` is not the one the caller asked for.
+    fn wrong_backend_type(&self, expected: &'static str) -> ConfigError {
+        ConfigError::InvalidValue {
+            field: "backend.type",
+            value: self.backend_type.clone(),
+            reason: format!("expected `{}`", expected),
+        }
+    }
+
     /// Get configuration information for localdisk
-    pub fn get_localdisk_config(&self) -> Result<&LocalDiskConfig> {
-        if &self.backend_type != "localdisk" {
-            Err(Error::new(
-                ErrorKind::InvalidInput,
-                "backend type is not 'localdisk'",
-            ))
+    pub fn get_localdisk_config(&self) -> ConfigResult<&LocalDiskConfig> {
+        if self.backend_type != "localdisk" {
+            Err(self.wrong_backend_type("localdisk"))
         } else {
-            self.localdisk.as_ref().ok_or_else(|| {
-                Error::new(
-                    ErrorKind::InvalidData,
-                    "no configuration information for localdisk",
-                )
-            })
+            self.localdisk
+                .as_ref()
+                .ok_or(ConfigError::Missing("backend.localdisk"))
         }
     }
 
     /// Get configuration information for localfs
-    pub fn get_localfs_config(&self) -> Result<&LocalFsConfig> {
-        if &self.backend_type != "localfs" {
-            Err(Error::new(
-                ErrorKind::InvalidInput,
-                "backend type is not 'localfs'",
-            ))
+    pub fn get_localfs_config(&self) -> ConfigResult<&LocalFsConfig> {
+        if self.backend_type != "localfs" {
+            Err(self.wrong_backend_type("localfs"))
         } else {
-            self.localfs.as_ref().ok_or_else(|| {
-                Error::new(
-                    ErrorKind::InvalidData,
-                    "no configuration information for localfs",
-                )
-            })
+            self.localfs
+                .as_ref()
+                .ok_or(ConfigError::Missing("backend.localfs"))
         }
     }
 
     /// Get configuration information for OSS
-    pub fn get_oss_config(&self) -> Result<&OssConfig> {
-        if &self.backend_type != "oss" {
-            Err(Error::new(
-                ErrorKind::InvalidInput,
-                "backend type is not 'oss'",
-            ))
+    pub fn get_oss_config(&self) -> ConfigResult<&OssConfig> {
+        if self.backend_type != "oss" {
+            Err(self.wrong_backend_type("oss"))
         } else {
-            self.oss.as_ref().ok_or_else(|| {
-                Error::new(
-                    ErrorKind::InvalidData,
-                    "no configuration information for OSS",
-                )
-            })
+            self.oss.as_ref().ok_or(ConfigError::Missing("backend.oss"))
         }
     }
 
     /// Get configuration information for S3
-    pub fn get_s3_config(&self) -> Result<&S3Config> {
-        if &self.backend_type != "s3" {
-            Err(Error::new(
-                ErrorKind::InvalidInput,
-                "backend type is not 's3'",
-            ))
+    pub fn get_s3_config(&self) -> ConfigResult<&S3Config> {
+        if self.backend_type != "s3" {
+            Err(self.wrong_backend_type("s3"))
         } else {
-            self.s3.as_ref().ok_or_else(|| {
-                Error::new(
-                    ErrorKind::InvalidData,
-                    "no configuration information for s3",
-                )
-            })
+            self.s3.as_ref().ok_or(ConfigError::Missing("backend.s3"))
         }
     }
 
     /// Get configuration information for Registry
-    pub fn get_registry_config(&self) -> Result<&RegistryConfig> {
-        if &self.backend_type != "registry" {
-            Err(Error::new(
-                ErrorKind::InvalidInput,
-                "backend type is not 'registry'",
-            ))
+    pub fn get_registry_config(&self) -> ConfigResult<&RegistryConfig> {
+        if self.backend_type != "registry" {
+            Err(self.wrong_backend_type("registry"))
         } else {
-            self.registry.as_ref().ok_or_else(|| {
-                Error::new(
-                    ErrorKind::InvalidData,
-                    "no configuration information for registry",
-                )
-            })
+            self.registry
+                .as_ref()
+                .ok_or(ConfigError::Missing("backend.registry"))
         }
     }
 
     /// Get configuration information for http proxy
-    pub fn get_http_proxy_config(&self) -> Result<&HttpProxyConfig> {
-        if &self.backend_type != "http-proxy" {
-            Err(Error::new(
-                ErrorKind::InvalidInput,
-                "backend type is not 'http-proxy'",
-            ))
+    pub fn get_http_proxy_config(&self) -> ConfigResult<&HttpProxyConfig> {
+        if self.backend_type != "http-proxy" {
+            Err(self.wrong_backend_type("http-proxy"))
         } else {
-            self.http_proxy.as_ref().ok_or_else(|| {
-                Error::new(
-                    ErrorKind::InvalidData,
-                    "no configuration information for http-proxy",
-                )
-            })
+            self.http_proxy
+                .as_ref()
+                .ok_or(ConfigError::Missing("backend.http-proxy"))
         }
     }
 }
@@ -732,20 +793,14 @@ impl CacheConfigV2 {
     }
 
     /// Get configuration information for file cache.
-    pub fn get_filecache_config(&self) -> Result<&FileCacheConfig> {
+    pub fn get_filecache_config(&self) -> ConfigResult<&FileCacheConfig> {
         // `fanotify` reuses the file-cache backing store, so it also exposes a `FileCacheConfig`.
         if self.is_filecache() || self.is_fanotify() {
-            self.file_cache.as_ref().ok_or_else(|| {
-                Error::new(
-                    ErrorKind::InvalidInput,
-                    "no configuration information for filecache",
-                )
-            })
+            self.file_cache
+                .as_ref()
+                .ok_or(ConfigError::Missing("cache.filecache"))
         } else {
-            Err(Error::new(
-                ErrorKind::InvalidData,
-                "cache type is not 'filecache'",
-            ))
+            Err(self.wrong_cache_type("`filecache` or `fanotify`"))
         }
     }
 
@@ -755,19 +810,22 @@ impl CacheConfigV2 {
     }
 
     /// Get configuration information for fanotify.
-    pub fn get_fanotify_config(&self) -> Result<&FanotifyConfig> {
+    pub fn get_fanotify_config(&self) -> ConfigResult<&FanotifyConfig> {
         if self.is_fanotify() {
-            self.fanotify.as_ref().ok_or_else(|| {
-                Error::new(
-                    ErrorKind::InvalidData,
-                    "no configuration information for fanotify",
-                )
-            })
+            self.fanotify
+                .as_ref()
+                .ok_or(ConfigError::Missing("cache.fanotify"))
         } else {
-            Err(Error::new(
-                ErrorKind::InvalidInput,
-                "cache type is not 'fanotify'",
-            ))
+            Err(self.wrong_cache_type("`fanotify`"))
+        }
+    }
+
+    /// Report that `cache.type` is not the one the caller asked for.
+    fn wrong_cache_type(&self, expected: &'static str) -> ConfigError {
+        ConfigError::InvalidValue {
+            field: "cache.type",
+            value: self.cache_type.clone(),
+            reason: format!("expected {}", expected),
         }
     }
 }
@@ -794,25 +852,31 @@ pub struct FileCacheConfig {
 
 impl FileCacheConfig {
     /// Get the working directory.
-    pub fn get_work_dir(&self) -> Result<&str> {
-        let path = fs::metadata(&self.work_dir)
-            .or_else(|_| {
-                fs::create_dir_all(&self.work_dir)?;
-                fs::metadata(&self.work_dir)
-            })
-            .map_err(|e| {
-                log::error!("fail to stat filecache work_dir {}: {}", self.work_dir, e);
-                e
-            })?;
+    pub fn get_work_dir(&self) -> ConfigResult<&str> {
+        ensure_work_dir(&self.work_dir, "cache.filecache.work_dir")
+    }
+}
 
-        if path.is_dir() {
-            Ok(&self.work_dir)
-        } else {
-            Err(Error::new(
-                ErrorKind::NotFound,
-                format!("filecache work_dir {} is not a directory", self.work_dir),
-            ))
-        }
+/// Stat `work_dir`, creating it if it does not exist yet, and check it is really a directory.
+///
+/// `field` names the configuration field for the error message, since both the file cache and
+/// the fanotify cache have a `work_dir` and a failure has to say which one.
+fn ensure_work_dir<'a>(work_dir: &'a str, field: &'static str) -> ConfigResult<&'a str> {
+    let md = fs::metadata(work_dir)
+        .or_else(|_| {
+            fs::create_dir_all(work_dir)?;
+            fs::metadata(work_dir)
+        })
+        .map_err(|e| ConfigError::io(Path::new(work_dir), e))?;
+
+    if md.is_dir() {
+        Ok(work_dir)
+    } else {
+        Err(ConfigError::InvalidValue {
+            field,
+            value: work_dir.to_string(),
+            reason: "not a directory".to_string(),
+        })
     }
 }
 
@@ -833,25 +897,8 @@ pub struct FanotifyConfig {
 
 impl FanotifyConfig {
     /// Get the working directory.
-    pub fn get_work_dir(&self) -> Result<&str> {
-        let path = fs::metadata(&self.work_dir)
-            .or_else(|_| {
-                fs::create_dir_all(&self.work_dir)?;
-                fs::metadata(&self.work_dir)
-            })
-            .map_err(|e| {
-                log::error!("fail to stat fanotify work_dir {}: {}", self.work_dir, e);
-                e
-            })?;
-
-        if path.is_dir() {
-            Ok(&self.work_dir)
-        } else {
-            Err(Error::new(
-                ErrorKind::NotFound,
-                format!("fanotify work_dir {} is not a directory", self.work_dir),
-            ))
-        }
+    pub fn get_work_dir(&self) -> ConfigResult<&str> {
+        ensure_work_dir(&self.work_dir, "cache.fanotify.work_dir")
     }
 }
 
@@ -1000,15 +1047,8 @@ pub struct BlobCacheEntryConfigV2 {
 
 impl BlobCacheEntryConfigV2 {
     /// Read configuration information from a file.
-    pub fn from_file<P: AsRef<Path>>(path: P) -> Result<Self> {
-        let md = fs::metadata(path.as_ref())?;
-        if md.len() > 0x100000 {
-            return Err(Error::new(
-                ErrorKind::InvalidInput,
-                "configuration file size is too big",
-            ));
-        }
-        let content = fs::read_to_string(path)?;
+    pub fn from_file<P: AsRef<Path>>(path: P) -> ConfigResult<Self> {
+        let content = read_config_file(path.as_ref())?;
         Self::from_str(&content)
     }
 
@@ -1038,34 +1078,31 @@ impl BlobCacheEntryConfigV2 {
 }
 
 impl FromStr for BlobCacheEntryConfigV2 {
-    type Err = Error;
+    type Err = ConfigError;
 
-    fn from_str(s: &str) -> Result<BlobCacheEntryConfigV2> {
+    fn from_str(s: &str) -> ConfigResult<BlobCacheEntryConfigV2> {
         if let Ok(v) = serde_json::from_str::<BlobCacheEntryConfigV2>(s) {
             return if v.validate() {
                 Ok(v)
             } else {
-                Err(Error::new(ErrorKind::InvalidInput, "invalid configuration"))
+                Err(ConfigError::Invalid("BlobCacheEntryConfigV2"))
             };
         }
         if let Ok(v) = serde_yaml::from_str::<BlobCacheEntryConfigV2>(s) {
             return if v.validate() {
                 Ok(v)
             } else {
-                Err(Error::new(ErrorKind::InvalidInput, "invalid configuration"))
+                Err(ConfigError::Invalid("BlobCacheEntryConfigV2"))
             };
         }
         if let Ok(v) = toml::from_str::<BlobCacheEntryConfigV2>(s) {
             return if v.validate() {
                 Ok(v)
             } else {
-                Err(Error::new(ErrorKind::InvalidInput, "invalid configuration"))
+                Err(ConfigError::Invalid("BlobCacheEntryConfigV2"))
             };
         }
-        Err(Error::new(
-            ErrorKind::InvalidInput,
-            "failed to parse configuration information",
-        ))
+        Err(ConfigError::Unparsable("BlobCacheEntryConfigV2"))
     }
 }
 
@@ -1182,15 +1219,8 @@ impl BlobCacheEntry {
 
 impl BlobCacheEntry {
     /// Read configuration information from a file.
-    pub fn from_file<P: AsRef<Path>>(path: P) -> Result<Self> {
-        let md = fs::metadata(path.as_ref())?;
-        if md.len() > 0x100000 {
-            return Err(Error::new(
-                ErrorKind::InvalidInput,
-                "configuration file size is too big",
-            ));
-        }
-        let content = fs::read_to_string(path)?;
+    pub fn from_file<P: AsRef<Path>>(path: P) -> ConfigResult<Self> {
+        let content = read_config_file(path.as_ref())?;
         Self::from_str(&content)
     }
 
@@ -1212,34 +1242,31 @@ impl BlobCacheEntry {
 }
 
 impl FromStr for BlobCacheEntry {
-    type Err = Error;
+    type Err = ConfigError;
 
-    fn from_str(s: &str) -> Result<BlobCacheEntry> {
+    fn from_str(s: &str) -> ConfigResult<BlobCacheEntry> {
         if let Ok(v) = serde_json::from_str::<BlobCacheEntry>(s) {
             return if v.validate() {
                 Ok(v)
             } else {
-                Err(Error::new(ErrorKind::InvalidInput, "invalid configuration"))
+                Err(ConfigError::Invalid("BlobCacheEntry"))
             };
         }
         if let Ok(v) = serde_yaml::from_str::<BlobCacheEntry>(s) {
             return if v.validate() {
                 Ok(v)
             } else {
-                Err(Error::new(ErrorKind::InvalidInput, "invalid configuration"))
+                Err(ConfigError::Invalid("BlobCacheEntry"))
             };
         }
         if let Ok(v) = toml::from_str::<BlobCacheEntry>(s) {
             return if v.validate() {
                 Ok(v)
             } else {
-                Err(Error::new(ErrorKind::InvalidInput, "invalid configuration"))
+                Err(ConfigError::Invalid("BlobCacheEntry"))
             };
         }
-        Err(Error::new(
-            ErrorKind::InvalidInput,
-            "failed to parse configuration information",
-        ))
+        Err(ConfigError::Unparsable("BlobCacheEntry"))
     }
 }
 
@@ -1252,22 +1279,15 @@ pub struct BlobCacheList {
 
 impl BlobCacheList {
     /// Read blob cache list configuration from a file.
-    pub fn from_file<P: AsRef<Path>>(path: P) -> Result<Self> {
-        let md = fs::metadata(path.as_ref())?;
-        if md.len() > 0x100000 {
-            return Err(Error::new(
-                ErrorKind::InvalidInput,
-                "configuration file size is too big",
-            ));
-        }
-        let content = fs::read_to_string(path)?;
+    pub fn from_file<P: AsRef<Path>>(path: P) -> ConfigResult<Self> {
+        let content = read_config_file(path.as_ref())?;
         Self::from_str(&content)
     }
 
-    fn prepare_and_validate(mut self) -> Result<Self> {
+    fn prepare_and_validate(mut self) -> ConfigResult<Self> {
         for blob in self.blobs.iter_mut() {
             if !blob.prepare_configuration_info() || !blob.validate() {
-                return Err(Error::new(ErrorKind::InvalidInput, "invalid configuration"));
+                return Err(ConfigError::Invalid("BlobCacheEntry"));
             }
         }
         Ok(self)
@@ -1275,9 +1295,9 @@ impl BlobCacheList {
 }
 
 impl FromStr for BlobCacheList {
-    type Err = Error;
+    type Err = ConfigError;
 
-    fn from_str(s: &str) -> Result<BlobCacheList> {
+    fn from_str(s: &str) -> ConfigResult<BlobCacheList> {
         if let Ok(v) = serde_json::from_str::<BlobCacheList>(s) {
             return v.prepare_and_validate();
         }
@@ -1287,10 +1307,7 @@ impl FromStr for BlobCacheList {
         if let Ok(v) = toml::from_str::<BlobCacheList>(s) {
             return v.prepare_and_validate();
         }
-        Err(Error::new(
-            ErrorKind::InvalidInput,
-            "failed to parse configuration information",
-        ))
+        Err(ConfigError::Unparsable("BlobCacheList"))
     }
 }
 
@@ -1370,9 +1387,9 @@ struct BackendConfig {
 }
 
 impl TryFrom<&BackendConfig> for BackendConfigV2 {
-    type Error = std::io::Error;
+    type Error = ConfigError;
 
-    fn try_from(value: &BackendConfig) -> std::result::Result<Self, Self::Error> {
+    fn try_from(value: &BackendConfig) -> ConfigResult<Self> {
         let mut config = BackendConfigV2 {
             backend_type: value.backend_type.clone(),
             localdisk: None,
@@ -1400,10 +1417,10 @@ impl TryFrom<&BackendConfig> for BackendConfigV2 {
                 config.registry = Some(serde_json::from_value(value.backend_config.clone())?);
             }
             v => {
-                return Err(Error::new(
-                    ErrorKind::InvalidInput,
-                    format!("unsupported backend type '{}'", v),
-                ));
+                return Err(ConfigError::Unsupported {
+                    kind: "backend",
+                    name: v.to_string(),
+                });
             }
         }
 
@@ -1445,9 +1462,9 @@ pub struct ExternalBackendConfig {
 }
 
 impl TryFrom<&CacheConfig> for CacheConfigV2 {
-    type Error = std::io::Error;
+    type Error = ConfigError;
 
-    fn try_from(v: &CacheConfig) -> std::result::Result<Self, Self::Error> {
+    fn try_from(v: &CacheConfig) -> ConfigResult<Self> {
         let mut config = CacheConfigV2 {
             cache_type: v.cache_type.clone(),
             cache_compressed: v.cache_compressed,
@@ -1471,10 +1488,10 @@ impl TryFrom<&CacheConfig> for CacheConfigV2 {
             }
             "" | "dummycache" => {}
             t => {
-                return Err(Error::new(
-                    ErrorKind::InvalidInput,
-                    format!("unsupported cache type '{}'", t),
-                ));
+                return Err(ConfigError::Unsupported {
+                    kind: "cache",
+                    name: t.to_string(),
+                });
             }
         }
 
@@ -1530,9 +1547,9 @@ struct RafsConfig {
 }
 
 impl TryFrom<RafsConfig> for ConfigV2 {
-    type Error = std::io::Error;
+    type Error = ConfigError;
 
-    fn try_from(v: RafsConfig) -> std::result::Result<Self, Self::Error> {
+    fn try_from(v: RafsConfig) -> ConfigResult<Self> {
         let backend: BackendConfigV2 = (&v.device.backend).try_into()?;
         let mut cache: CacheConfigV2 = (&v.device.cache).try_into()?;
         let rafs = RafsConfigV2 {
@@ -1673,9 +1690,9 @@ pub(crate) struct BlobCacheEntryConfig {
 }
 
 impl TryFrom<&BlobCacheEntryConfig> for BlobCacheEntryConfigV2 {
-    type Error = std::io::Error;
+    type Error = ConfigError;
 
-    fn try_from(v: &BlobCacheEntryConfig) -> std::result::Result<Self, Self::Error> {
+    fn try_from(v: &BlobCacheEntryConfig) -> ConfigResult<Self> {
         let backend_config = BackendConfig {
             backend_type: v.backend_type.clone(),
             backend_config: v.backend_config.clone(),
@@ -1712,6 +1729,7 @@ pub struct OverlayConfig {
 mod tests {
     use super::*;
     use crate::{BLOB_CACHE_TYPE_META_BLOB, BlobCacheEntry};
+    use vmm_sys_util::tempfile::TempFile;
 
     #[test]
     fn test_blob_prefetch_config() {
@@ -3026,48 +3044,102 @@ external_backends:
 
     #[test]
     fn test_backend_get_config_correct_type_missing_sub_config() {
-        // Correct type, but sub-config struct is None → InvalidData error.
-        let cfg = BackendConfigV2 {
-            backend_type: "localdisk".to_string(),
-            ..Default::default()
-        };
-        let err = cfg.get_localdisk_config().unwrap_err();
-        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        // Correct type, but the sub-config struct is None. The two failure modes of these
+        // getters used to be `InvalidInput` and `InvalidData`, which is not a distinction
+        // anyone could act on; now they name the section that is missing.
+        fn cfg(backend_type: &str) -> BackendConfigV2 {
+            BackendConfigV2 {
+                backend_type: backend_type.to_string(),
+                ..Default::default()
+            }
+        }
 
+        assert!(matches!(
+            cfg("localdisk").get_localdisk_config().unwrap_err(),
+            ConfigError::Missing("backend.localdisk")
+        ));
+        assert!(matches!(
+            cfg("localfs").get_localfs_config().unwrap_err(),
+            ConfigError::Missing("backend.localfs")
+        ));
+        assert!(matches!(
+            cfg("oss").get_oss_config().unwrap_err(),
+            ConfigError::Missing("backend.oss")
+        ));
+        assert!(matches!(
+            cfg("s3").get_s3_config().unwrap_err(),
+            ConfigError::Missing("backend.s3")
+        ));
+        assert!(matches!(
+            cfg("registry").get_registry_config().unwrap_err(),
+            ConfigError::Missing("backend.registry")
+        ));
+        assert!(matches!(
+            cfg("http-proxy").get_http_proxy_config().unwrap_err(),
+            ConfigError::Missing("backend.http-proxy")
+        ));
+    }
+
+    #[test]
+    fn test_backend_get_config_wrong_type_names_the_value() {
+        // The whole point of the typed error: the message says what was configured and what
+        // was expected, instead of `ErrorKind::InvalidInput`.
         let cfg = BackendConfigV2 {
             backend_type: "localfs".to_string(),
             ..Default::default()
         };
-        let err = cfg.get_localfs_config().unwrap_err();
-        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
-
-        let cfg = BackendConfigV2 {
-            backend_type: "oss".to_string(),
-            ..Default::default()
-        };
         let err = cfg.get_oss_config().unwrap_err();
-        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(matches!(
+            &err,
+            ConfigError::InvalidValue { field: "backend.type", value, .. } if value == "localfs"
+        ));
+        assert_eq!(
+            err.to_string(),
+            "invalid value `localfs` for `backend.type`: expected `oss`"
+        );
+    }
 
-        let cfg = BackendConfigV2 {
-            backend_type: "s3".to_string(),
-            ..Default::default()
-        };
-        let err = cfg.get_s3_config().unwrap_err();
+    #[test]
+    fn test_config_error_converts_to_io_error() {
+        // The compatibility shim for callers still on `io::Error` must not swallow the
+        // message, and must keep the OS error kind where there is one.
+        let err: std::io::Error = ConfigError::Missing("cache").into();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(err.to_string(), "missing configuration section `cache`");
 
-        let cfg = BackendConfigV2 {
-            backend_type: "registry".to_string(),
-            ..Default::default()
-        };
-        let err = cfg.get_registry_config().unwrap_err();
-        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        let err: std::io::Error = ConfigError::Io {
+            path: "/no/such/path".to_string(),
+            source: std::io::Error::from_raw_os_error(libc::ENOENT),
+        }
+        .into();
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+    }
 
-        let cfg = BackendConfigV2 {
-            backend_type: "http-proxy".to_string(),
-            ..Default::default()
-        };
-        let err = cfg.get_http_proxy_config().unwrap_err();
-        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    #[test]
+    fn test_config_file_size_limit() {
+        let file = TempFile::new().unwrap();
+        std::fs::write(
+            file.as_path(),
+            vec![b' '; MAX_CONFIG_FILE_SIZE as usize + 1],
+        )
+        .unwrap();
+
+        let err = ConfigV2::from_file(file.as_path()).unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::TooLarge {
+                size,
+                limit: MAX_CONFIG_FILE_SIZE,
+                ..
+            } if size == MAX_CONFIG_FILE_SIZE + 1
+        ));
+
+        // A path that does not exist is an I/O failure naming the path, not a parse failure.
+        let absent = file.as_path().with_extension("absent");
+        let err = ConfigV2::from_file(&absent).unwrap_err();
+        assert!(
+            matches!(&err, ConfigError::Io { path, .. } if path == &absent.display().to_string())
+        );
     }
 
     #[test]

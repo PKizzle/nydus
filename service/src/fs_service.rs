@@ -143,7 +143,8 @@ pub trait FsService: Send + Sync {
         let rafs = any_fs
             .downcast_ref::<Rafs>()
             .ok_or_else(|| Error::FsTypeMismatch("RAFS".to_string()))?;
-        let rafs_cfg = ConfigV2::from_str(&cmd.config).map_err(RafsError::LoadConfig)?;
+        let rafs_cfg =
+            ConfigV2::from_str(&cmd.config).map_err(|e| RafsError::LoadConfig(e.into()))?;
         let rafs_cfg = Arc::new(rafs_cfg);
 
         rafs.update(&mut bootstrap, &rafs_cfg, &cmd.mountpoint)
@@ -298,7 +299,8 @@ fn fs_backend_factory(cmd: &FsBackendMountCmd) -> Result<BackFileSystem> {
 
     match cmd.fs_type {
         FsBackendType::Rafs => {
-            let config = ConfigV2::from_str(cmd.config.as_str()).map_err(RafsError::LoadConfig)?;
+            let config = ConfigV2::from_str(cmd.config.as_str())
+                .map_err(|e| RafsError::LoadConfig(e.into()))?;
             let config = Arc::new(config);
             let (mut rafs, reader) = Rafs::new(&config, &cmd.mountpoint, Path::new(&cmd.source))?;
             rafs.import(reader, prefetch_files)?;

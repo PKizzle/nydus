@@ -34,7 +34,7 @@ nix = { version = "0.31.3", features = ["uio"] }
 crc = "3.4.0"
 xxhash-rust = { version = "0.8.16", features = ["xxh3"] }
 
-nydus-api = { version = "0.4.1", path = "../api" }
+nydus-api = { version = "0.5.0", path = "../api" }
 
 # libz-ng-sys doesn't compile on ppc64, and zlib-ng currently breaks test binary
 # linking on linux/aarch64 in this workspace. Fall back to stock zlib-sys there.

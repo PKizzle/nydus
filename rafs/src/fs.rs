@@ -94,8 +94,12 @@ impl Rafs {
         // Assume all meta/data blobs are accessible, otherwise it will always cause IO errors.
         cfg.internal.set_blob_accessible(true);
 
-        let cache_cfg = cfg.get_cache_config().map_err(RafsError::LoadConfig)?;
-        let rafs_cfg = cfg.get_rafs_config().map_err(RafsError::LoadConfig)?;
+        let cache_cfg = cfg
+            .get_cache_config()
+            .map_err(|e| RafsError::LoadConfig(e.into()))?;
+        let rafs_cfg = cfg
+            .get_rafs_config()
+            .map_err(|e| RafsError::LoadConfig(e.into()))?;
         let (sb, reader) = RafsSuper::load_from_file(metadata_path, cfg.clone(), false)
             .map_err(RafsError::FillSuperBlock)?;
         let blob_infos = sb.superblock.get_blob_infos();
