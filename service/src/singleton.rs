@@ -25,6 +25,8 @@ use crate::daemon::{
 use crate::fs_service::FsService;
 use crate::upgrade::UpgradeManager;
 use crate::{BlobCacheMgr, Error, Result};
+#[cfg(target_os = "linux")]
+use nydus_storage::cache::{BLOB_DATA_FILE_SUFFIX, BLOB_RAW_FILE_SUFFIX};
 
 #[allow(dead_code)]
 pub struct ServiceController {
@@ -392,8 +394,91 @@ impl NydusDaemon for ServiceController {
         Some(self.blob_cache_mgr.clone())
     }
 
+    /// Reclaim a blob's on-disk cache.
+    ///
+    /// Scoped deliberately to blobs that are **not** currently served. Under the fanotify
+    /// path's inode invariant the blob's cache file *is* the EROFS device the kernel reads, so
+    /// a live mount pins it: "deleting" it while mounted could not free the data and would
+    /// leave the mount reading a file nothing refills. Such a request gets `EBUSY` and the
+    /// caller is expected to unregister the handler first, which is what the snapshotter's
+    /// teardown path does anyway (snapshot removed → instance stopped → cache reclaimed).
+    ///
+    /// Invalidating the cache of a *live* blob is a different operation with different
+    /// correctness requirements — see [`FanotifyHandler::invalidate`], which must revoke the
+    /// chunk map before discarding bytes. It is deliberately not reachable from here.
+    #[cfg(target_os = "linux")]
+    fn delete_blob(&self, blob_id: String) -> Result<()> {
+        {
+            let handlers = self.fanotify.lock().unwrap();
+            if let Some((image_id, _)) = handlers.iter().find(|(_, h)| h.serves_blob(&blob_id)) {
+                warn!(
+                    "Refusing to delete blob {}: still served by the mount for image {}",
+                    blob_id, image_id
+                );
+                return Err(Error::Busy(format!(
+                    "blob {} is in use by image {}; unregister that image first",
+                    blob_id, image_id
+                )));
+            }
+        }
+
+        let config = self
+            .blob_cache_mgr
+            .get_all_data_blobs()
+            .into_iter()
+            .find(|cfg| cfg.blob_info().blob_id() == blob_id)
+            .ok_or(Error::NotFound)?;
+
+        let work_dir = config
+            .config_v2()
+            .get_cache_config()
+            .and_then(|c| c.get_filecache_config())
+            .and_then(|c| c.get_work_dir())
+            .map_err(|e| {
+                Error::DeleteBlob(format!(
+                    "cannot locate the cache directory for blob {}: {}",
+                    blob_id, e
+                ))
+            })?;
+
+        // Three files, because the cache layout depends on configuration:
+        //   * `<blob>.blob.data` — the cache file in the normal (decompressed) mode, and the
+        //     EROFS device on the fanotify path;
+        //   * `<blob>.blob.raw` — used instead when the manager caches raw backend data
+        //     (`cache_raw_data`); missing otherwise;
+        //   * `<blob>.blob.data.chunk_map` — always named after `.blob.data` regardless of
+        //     which of the two is in use (see `FileCacheEntry::create_chunk_map`).
+        //
+        // The data and its chunk map are one unit: leaving the map behind would have a later
+        // open believe the (now absent) data is cached. Removing a file that was never created
+        // is the desired end state rather than an error, so listing all three is safe.
+        let base = format!("{}/{}", work_dir, blob_id);
+        let data = format!("{}{}", base, BLOB_DATA_FILE_SUFFIX);
+        let mut removed = 0usize;
+        for path in [
+            format!("{}.chunk_map", data),
+            data,
+            format!("{}{}", base, BLOB_RAW_FILE_SUFFIX),
+        ] {
+            match std::fs::remove_file(&path) {
+                Ok(()) => removed += 1,
+                // Already gone is the desired end state, not a failure.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    return Err(Error::DeleteBlob(format!("cannot remove {}: {}", path, e)));
+                }
+            }
+        }
+
+        info!(
+            "Deleted cache for blob {} ({} file(s) removed from {})",
+            blob_id, removed, work_dir
+        );
+        Ok(())
+    }
+
+    #[cfg(not(target_os = "linux"))]
     fn delete_blob(&self, _blob_id: String) -> Result<()> {
-        // TODO: implement blob deletion for fanotify path
         Err(Error::Unsupported)
     }
 }

@@ -35,7 +35,7 @@ Against this fork, v3 is a large capability regression:
 | digesters | blake3, sha256 | `{blake3}` |
 | hot upgrade / takeover | yes | none — start/SIGTERM/exit |
 | multi-image per daemon | yes | one process, one image |
-| cache invalidation | `cull_cache()` | none |
+| cache invalidation | `invalidate()` (revoke chunk map, then punch) | none |
 | chunk dictionary / cross-layer dedup | yes | explicit non-goal |
 
 The zran gap is the decisive one. v3's `nydus build` accepts only a directory
@@ -91,9 +91,21 @@ Ranked. None of these require adopting v3's format.
 1. **Skip arming fully-ready blobs.** A pre-content mark disables kernel readahead on that file, so
    dropping the mark once a blob is fully cached restores it — a larger win than any per-event
    saving. We already own the latch (`storage/src/cache/state/persist_map.rs`, `MAGIC_ALL_READY`)
-   and simply never consult it from `handle_event`. **Blocker:** it interacts with `cull_cache()` —
-   an unmarked blob whose cache is later punched would serve zeros, so any port must re-`fanotify_mark`
-   inside `cull_cache` or gate the skip on culling being disabled.
+   and simply never consult it from `handle_event`.
+
+   This used to be listed as blocked on `cull_cache()`: an unmarked blob whose cache was later
+   punched would serve zeros. That blocker is now **structural rather than incidental**, which makes
+   the port tractable. `cull_cache` has been replaced by `FanotifyHandler::invalidate`, the single
+   function through which cached bytes may be discarded, and it already owns the general invariant:
+   *every promise that data is present must be revoked before the data goes away*. It revokes the
+   chunk map first (`BlobObject::reset_data_ready`), then punches, under a per-blob `io_lock` that
+   also excludes in-flight fetches.
+
+   So a skip-arming port has one requirement: un-arming must be recorded on the `BlobBacking`, and
+   `invalidate` must re-`fanotify_mark` as step 0, before the revoke. Landing it anywhere else
+   reintroduces the hazard; landing it there cannot, because `invalidate` is the only path that
+   discards bytes. See the ordering rationale on `invalidate` and the two `invalidate_in_order`
+   tests, which pin the sequence and the fail-closed behaviour when the revoke fails.
 2. **Request coalescing** on `(blob, aligned_range)`. Container start has many tasks paging the same
    library; today each faulting reader issues its own `fetch_range_uncompressed`.
 3. **Chunk/group decoupling.** v3 separates the dedup unit (`chunk_block_bits`, BLAKE3, 1 MiB) from

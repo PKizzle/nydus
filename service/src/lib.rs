@@ -76,6 +76,12 @@ pub enum Error {
     InvalidPrefetchList,
     #[error("object or filesystem doesn't exist")]
     NotFound,
+    /// The request cannot proceed because the object is still in use.
+    #[error("object is busy, {0}")]
+    Busy(String),
+    /// Failed to reclaim a blob's on-disk cache.
+    #[error("failed to delete blob cache, {0}")]
+    DeleteBlob(String),
     #[error("daemon is not ready yet")]
     NotReady,
     #[error("unsupported request or operation")]
