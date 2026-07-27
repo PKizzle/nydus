@@ -12,6 +12,7 @@ extern crate nydus_api;
 use std::convert::{Into, TryFrom, TryInto};
 use std::time::Duration;
 
+pub use self::error_chain::{source_errno, with_context};
 pub use self::exec::*;
 pub use self::inode_bitmap::InodeBitmap;
 pub use self::reader::*;
@@ -24,6 +25,7 @@ pub mod crc32;
 #[cfg(feature = "encryption")]
 pub mod crypt;
 pub mod digest;
+pub mod error_chain;
 pub mod exec;
 pub mod filemap;
 pub mod inode_bitmap;
