@@ -910,6 +910,22 @@ impl BlobObject for FileCacheEntry {
         }
     }
 
+    fn reset_data_ready(&self) -> Result<()> {
+        // A tarfs blob is the tar itself rather than a populated cache; there is no readiness
+        // bookkeeping to revoke and nothing that could be re-fetched.
+        if self.is_tarfs {
+            return Err(enosys!());
+        }
+        // `as_range_map` only resolves for `BlobStateMap<IndexedChunkMap, _>`. A legacy RAFS v5
+        // blob on the `DigestedChunkMap` fallback yields `None` and so reports "unsupported"
+        // rather than silently doing nothing — which is the direction that keeps callers safe,
+        // since a caller that cannot revoke readiness must not discard the data either.
+        match self.chunk_map.as_range_map() {
+            Some(b) => b.reset_range_ready(),
+            None => Err(enosys!()),
+        }
+    }
+
     fn fetch_range_compressed(&self, offset: u64, size: u64, prefetch: bool) -> Result<()> {
         // Assume data from tar file is always ready.
         if self.is_tarfs {

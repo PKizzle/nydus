@@ -45,7 +45,7 @@ mod worker;
 pub mod state;
 
 pub use dummycache::DummyCacheMgr;
-pub use filecache::FileCacheMgr;
+pub use filecache::{BLOB_DATA_FILE_SUFFIX, BLOB_RAW_FILE_SUFFIX, FileCacheMgr};
 
 /// Timeout in milli-seconds to retrieve blob data from backend storage.
 pub const SINGLE_INFLIGHT_WAIT_TIMEOUT: u64 = 2000;

@@ -261,4 +261,41 @@ impl PersistMap {
     pub fn is_range_all_ready(&self) -> bool {
         self.not_ready_count.load(Ordering::Acquire) == 0
     }
+
+    /// Revoke every chunk's ready state, returning the map to "nothing cached".
+    ///
+    /// The inverse of the incremental [`set_chunk_ready`](Self::set_chunk_ready): clears the
+    /// `all_ready` header marker and zeroes the whole bitmap, so subsequent reads miss and
+    /// re-fetch.
+    ///
+    /// Callers invalidating a cache MUST do this *before* discarding the cached bytes. The
+    /// bitmap is a promise that data is present; dropping the data first leaves a window in
+    /// which the map still claims ready for a hole, and a reader in that window is served
+    /// zeros. Clearing first only risks a redundant re-fetch, which is harmless.
+    pub fn reset(&self) -> Result<()> {
+        let size = self.filemap.size();
+
+        // Clear the header marker first: it short-circuits `is_range_all_ready`, so while the
+        // bitmap is being zeroed a concurrent reader must not still see "all ready".
+        //
+        // Written through an `AtomicU32` rather than `get_mut::<Header>`, which needs `&mut
+        // self` the `Arc<dyn ChunkMap>` this hangs off cannot provide. `offset_of!` keeps the
+        // two views of the header from drifting apart.
+        let all_ready = self
+            .filemap
+            .get_ref::<AtomicU32>(std::mem::offset_of!(Header, all_ready))?;
+        all_ready.store(0, Ordering::Release);
+
+        for idx in HEADER_SIZE..size {
+            let byte = self.filemap.get_ref::<AtomicU8>(idx)?;
+            byte.store(0, Ordering::Release);
+        }
+        self.not_ready_count.store(self.count, Ordering::Release);
+
+        // Persist before returning: if the process dies between the punch and a later flush,
+        // a stale on-disk bitmap would claim the discarded chunks are present.
+        self.filemap.sync_data()?;
+
+        Ok(())
+    }
 }

@@ -173,6 +173,14 @@ impl RangeMap for BlobStateMap<IndexedChunkMap, u32> {
         self.c.is_range_all_ready()
     }
 
+    fn reset_range_ready(&self) -> Result<()> {
+        // Deliberately leaves `inflight_tracer` alone: a slot in there is a fetch another
+        // thread is still running, and dropping it would let a second fetch of the same chunk
+        // start in parallel. The caller is responsible for excluding in-flight fetches (the
+        // fanotify path holds a per-blob write lock across invalidation).
+        self.c.reset_range_ready()
+    }
+
     fn is_range_ready(&self, start: Self::I, count: Self::I) -> Result<bool> {
         self.c.is_range_ready(start, count)
     }

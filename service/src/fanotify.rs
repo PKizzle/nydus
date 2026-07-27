@@ -24,7 +24,7 @@ use std::io::{ErrorKind, Result};
 use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Barrier, Mutex};
+use std::sync::{Arc, Barrier, Mutex, RwLock};
 
 use mio::unix::SourceFd;
 use mio::{Events, Interest, Poll, Token, Waker};
@@ -104,6 +104,16 @@ struct BlobBacking {
     dev: u64,
     ino: u64,
     blob: AssertBlobThreadSafe,
+    /// Excludes cache invalidation from in-flight fetches for *this* blob.
+    ///
+    /// Serving takes it shared (many worker threads fill ranges concurrently, which is the
+    /// whole point of the worker pool); [`FanotifyHandler::invalidate`] takes it exclusively.
+    ///
+    /// Without it, a fetch that started before an invalidation can write its chunk *after* the
+    /// hole punch and then mark that chunk ready — leaving the map claiming ready for bytes
+    /// that were just discarded, which is served to the next reader as zeros. Per-blob rather
+    /// than global so invalidating one blob does not stall reads of the others.
+    io_lock: RwLock<()>,
 }
 
 /// Map a serve error to the errno carried in a `FAN_DENY_ERRNO` response.
@@ -482,6 +492,7 @@ impl FanotifyHandler {
                     dev,
                     ino,
                     blob: AssertBlobThreadSafe(blob),
+                    io_lock: RwLock::new(()),
                 }),
                 Err(e) => warn!(
                     "fanotify: failed to stat backing file for blob {}: {}",
@@ -1002,6 +1013,14 @@ impl FanotifyHandler {
         None
     }
 
+    /// Whether this handler serves `blob_id`, i.e. that blob's cache file is one of the EROFS
+    /// devices behind the live mount.
+    pub fn serves_blob(&self, blob_id: &str) -> bool {
+        self.blob_backings
+            .iter()
+            .any(|b| b.blob.blob_info().blob_id() == blob_id)
+    }
+
     /// Resolve a backing-file identity to the data blob serving it.
     fn find_backing(&self, dev: u64, ino: u64) -> Option<&BlobBacking> {
         self.blob_backings
@@ -1087,17 +1106,44 @@ impl FanotifyHandler {
                 backing.blob.blob_info().blob_id()
             ))
         })?;
+        // Shared for the whole fetch: `fetch_range_uncompressed` both writes the bytes and
+        // marks them ready, and an invalidation interleaved between those two steps would
+        // leave the map promising data that was just punched away. Concurrent fetches of
+        // other ranges (and of other blobs) are unaffected.
+        let _serving = backing
+            .io_lock
+            .read()
+            .map_err(|_| std::io::Error::other("fanotify: blob io lock poisoned"))?;
         obj.fetch_range_uncompressed(range.offset, count)?;
 
         Ok(())
     }
 
-    /// Invalidate the on-demand cache for a blob by punching out its sparse backing file.
+    /// Invalidate the on-demand cache for a blob, so its data is fetched afresh on next access.
     ///
-    /// `FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE` deallocates the cached extents while keeping
-    /// the file size, so subsequent accesses raise fresh `FAN_PRE_ACCESS` events and are
-    /// re-fetched.
-    pub fn cull_cache(&self, blob_id: String) -> Result<()> {
+    /// Two things make the cached data "present", and **both** have to be revoked, in this
+    /// order:
+    ///
+    /// 1. the chunk map, which records which chunks have been fetched. The fetch path consults
+    ///    it first ([`is_range_all_ready`] short-circuits, and every chunk goes through
+    ///    `check_ready_and_mark_pending`), so a stale map means a `FAN_PRE_ACCESS` event is
+    ///    answered without fetching anything;
+    /// 2. the bytes themselves, deallocated with `FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE`
+    ///    so the file keeps its size and reads still raise events.
+    ///
+    /// Clearing the map *before* punching is the whole correctness argument. The bad window in
+    /// this order is "map says not-ready, bytes still there" — a wasted re-fetch, correct data.
+    /// The reverse order's window is "map says ready, bytes gone", which the kernel serves to
+    /// the reader as zeros: silent corruption, and precisely what the pre-content path exists
+    /// to prevent. The `io_lock` closes the matching race against fetches already in flight.
+    ///
+    /// Note the mark itself is deliberately left armed. Should a future change stop arming
+    /// fully-cached blobs (so the kernel can readahead them again), un-arming must be reversed
+    /// *here*, before step 2 — an unmarked blob whose bytes are punched away raises no event
+    /// and reads as zeros.
+    ///
+    /// [`is_range_all_ready`]: nydus_storage::cache::state::RangeMap::is_range_all_ready
+    pub fn invalidate(&self, blob_id: String) -> Result<()> {
         let backing = self
             .blob_backings
             .iter()
@@ -1105,29 +1151,74 @@ impl FanotifyHandler {
             .ok_or_else(|| {
                 std::io::Error::new(
                     ErrorKind::NotFound,
-                    format!("fanotify: cannot cull unknown blob {}", blob_id),
+                    format!("fanotify: cannot invalidate unknown blob {}", blob_id),
                 )
             })?;
 
+        // Exclusive: no fetch may be between "wrote the bytes" and "marked them ready" while
+        // the steps below run.
+        let _invalidating = backing
+            .io_lock
+            .write()
+            .map_err(|_| std::io::Error::other("fanotify: blob io lock poisoned"))?;
+
+        let obj = backing.blob.blob().get_blob_object().ok_or_else(|| {
+            std::io::Error::other(format!("fanotify: blob object unavailable for {}", blob_id))
+        })?;
         let fd = backing.blob.file().as_raw_fd();
-        let len = fd_file_size(fd)?;
-        if len == 0 {
-            return Ok(());
-        }
-        let ret = unsafe {
-            libc::fallocate(
-                fd,
-                libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
-                0,
-                len as libc::off_t,
-            )
-        };
-        if ret != 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        info!("fanotify: culled cache for blob {}", blob_id);
+
+        invalidate_in_order(
+            // Step 1 — revoke the readiness bookkeeping.
+            || {
+                obj.reset_data_ready().map_err(|e| {
+                    std::io::Error::other(format!(
+                        "fanotify: cannot revoke ready state for blob {}: {}; \
+                         refusing to punch its cache (would serve zeros)",
+                        blob_id, e
+                    ))
+                })
+            },
+            // Step 2 — discard the bytes.
+            || {
+                let len = fd_file_size(fd)?;
+                if len == 0 {
+                    return Ok(());
+                }
+                let ret = unsafe {
+                    libc::fallocate(
+                        fd,
+                        libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
+                        0,
+                        len as libc::off_t,
+                    )
+                };
+                if ret != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            },
+        )?;
+
+        info!("fanotify: invalidated cache for blob {}", blob_id);
         Ok(())
     }
+}
+
+/// Run a cache invalidation in the only safe order: revoke the readiness bookkeeping, *then*
+/// discard the bytes.
+///
+/// Factored out of [`FanotifyHandler::invalidate`] so both the ordering and the fail-closed
+/// behaviour are unit-testable without a live blob or a 6.14 kernel.
+///
+/// If readiness cannot be revoked the bytes MUST stay: punching them while the chunk map still
+/// claims they are cached is exactly what makes a later reader see zeros. Leaving a populated
+/// cache in place is merely wasteful, so the failure direction is the safe one.
+fn invalidate_in_order(
+    revoke_ready: impl FnOnce() -> Result<()>,
+    discard_bytes: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    revoke_ready()?;
+    discard_bytes()
 }
 
 /// Walk a raw fanotify event buffer, invoking `f` for every record that can be trusted.
@@ -1419,5 +1510,50 @@ mod tests {
             }
         });
         fds
+    }
+
+    #[test]
+    fn invalidation_revokes_readiness_before_discarding_bytes() {
+        use std::cell::RefCell;
+
+        // The reverse order leaves a window in which the chunk map claims data is cached and
+        // the bytes are already gone — which the kernel serves to the reader as zeros.
+        let log = RefCell::new(Vec::new());
+        invalidate_in_order(
+            || {
+                log.borrow_mut().push("revoke");
+                Ok(())
+            },
+            || {
+                log.borrow_mut().push("discard");
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(*log.borrow(), vec!["revoke", "discard"]);
+    }
+
+    #[test]
+    fn invalidation_keeps_the_bytes_when_readiness_cannot_be_revoked() {
+        use std::cell::Cell;
+
+        // Fail-closed: a cache that could not be marked stale must keep its data. Punching it
+        // anyway would produce precisely the ready-map-over-a-hole state this ordering exists
+        // to prevent.
+        let discarded = Cell::new(false);
+        let err = invalidate_in_order(
+            || Err(std::io::Error::other("chunk map is read-only")),
+            || {
+                discarded.set(true);
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        assert!(
+            !discarded.get(),
+            "bytes were discarded despite a failed revoke"
+        );
+        assert!(err.to_string().contains("read-only"), "unexpected: {err}");
     }
 }

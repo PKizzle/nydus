@@ -72,6 +72,10 @@ impl RangeMap for IndexedChunkMap {
         self.map.is_range_all_ready()
     }
 
+    fn reset_range_ready(&self) -> Result<()> {
+        self.map.reset()
+    }
+
     fn is_range_ready(&self, start_index: u32, count: u32) -> Result<bool> {
         if !self.is_range_all_ready() {
             for idx in 0..count {
@@ -339,5 +343,75 @@ mod tests {
         assert!(!map.is_ready(chunk.as_base()).unwrap());
         map.set_ready_and_clear_pending(chunk.as_base()).unwrap();
         assert!(map.is_ready(chunk.as_base()).unwrap());
+    }
+
+    #[test]
+    fn test_reset_revokes_every_chunk() {
+        let dir = TempDir::new().unwrap();
+        let blob_path = dir.as_path().join("blob-reset");
+        let blob_path = blob_path.as_os_str().to_str().unwrap().to_string();
+
+        let map = IndexedChunkMap::new(&blob_path, 16, true).unwrap();
+        for idx in 0..16u32 {
+            let chunk = MockChunkInfo {
+                index: idx,
+                ..Default::default()
+            };
+            map.set_ready_and_clear_pending(chunk.as_base()).unwrap();
+        }
+        assert!(map.is_range_all_ready());
+        assert_eq!(map.map.not_ready_count.load(Ordering::Acquire), 0);
+
+        map.reset_range_ready().unwrap();
+
+        // Both views of readiness must agree: the `all_ready` short circuit *and* the
+        // per-chunk bits. Clearing only the header would leave `is_ready(i)` answering true
+        // for a chunk whose bytes are gone.
+        assert!(!map.is_range_all_ready());
+        assert_eq!(map.map.not_ready_count.load(Ordering::Acquire), 16);
+        for idx in 0..16u32 {
+            let chunk = MockChunkInfo {
+                index: idx,
+                ..Default::default()
+            };
+            assert!(
+                !map.is_ready(chunk.as_base()).unwrap(),
+                "chunk {idx} still claimed ready after reset"
+            );
+        }
+
+        // And the map is still usable afterwards, not left in a wedged state.
+        let chunk = MockChunkInfo {
+            index: 3,
+            ..Default::default()
+        };
+        map.set_ready_and_clear_pending(chunk.as_base()).unwrap();
+        assert!(map.is_ready(chunk.as_base()).unwrap());
+    }
+
+    #[test]
+    fn test_reset_survives_reopen() {
+        let dir = TempDir::new().unwrap();
+        let blob_path = dir.as_path().join("blob-reset-persist");
+        let blob_path = blob_path.as_os_str().to_str().unwrap().to_string();
+
+        {
+            let map = IndexedChunkMap::new(&blob_path, 8, true).unwrap();
+            for idx in 0..8u32 {
+                let chunk = MockChunkInfo {
+                    index: idx,
+                    ..Default::default()
+                };
+                map.set_ready_and_clear_pending(chunk.as_base()).unwrap();
+            }
+            assert!(map.is_range_all_ready());
+            map.reset_range_ready().unwrap();
+        }
+
+        // A reset that only lived in the mmap would come back "all ready" here, and the
+        // discarded bytes would be served as zeros after a restart.
+        let reopened = IndexedChunkMap::new(&blob_path, 8, true).unwrap();
+        assert!(!reopened.is_range_all_ready());
+        assert_eq!(reopened.map.not_ready_count.load(Ordering::Acquire), 8);
     }
 }

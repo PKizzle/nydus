@@ -1203,6 +1203,17 @@ pub trait BlobObject: AsRawFd {
     ///
     /// Used by asynchronous prefetch worker to implement fs prefetch.
     fn prefetch_chunks(&self, range: &BlobIoRange) -> io::Result<()>;
+
+    /// Revoke the "this data is cached" bookkeeping for the whole blob.
+    ///
+    /// Used when a cache is about to be discarded, so that later reads miss and re-fetch
+    /// instead of being told the data is already present. Must be called *before* the cached
+    /// bytes go away — see [`RangeMap::reset_range_ready`].
+    ///
+    /// [`RangeMap::reset_range_ready`]: crate::cache::state::RangeMap::reset_range_ready
+    fn reset_data_ready(&self) -> io::Result<()> {
+        Err(enosys!())
+    }
 }
 
 /// A wrapping object over an underlying [BlobCache] object.

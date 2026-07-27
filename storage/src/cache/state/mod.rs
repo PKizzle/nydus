@@ -150,6 +150,16 @@ pub trait RangeMap: Send + Sync {
     fn wait_for_range_ready(&self, _start: Self::I, _count: Self::I) -> Result<bool> {
         Err(enosys!())
     }
+
+    /// Revoke the ready state of everything the map tracks.
+    ///
+    /// Only implemented by persistent maps, since only a persistent cache can be invalidated
+    /// meaningfully. Callers discarding cached data MUST call this **first**: the map is a
+    /// promise that the data is present, and a promise outliving the data is served to a
+    /// reader as zeros.
+    fn reset_range_ready(&self) -> Result<()> {
+        Err(enosys!())
+    }
 }
 
 /// Trait to convert a [BlobChunkInfo](../../device/trait.BlobChunkInfo.html) object to an index
