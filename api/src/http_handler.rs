@@ -137,75 +137,73 @@ macro_rules! endpoint_v2 {
 
 /// HTTP_ROUTES contain all the nydusd HTTP routes.
 pub static HTTP_ROUTES: LazyLock<HttpRoutes> = LazyLock::new(|| {
-    {
-        let mut r = HttpRoutes {
-            routes: HashMap::new(),
-        };
+    let mut r = HttpRoutes {
+        routes: HashMap::new(),
+    };
 
-        // Common
-        r.routes
-            .insert(endpoint_v1!("/daemon/events"), Box::new(EventsHandler {}));
-        r.routes
-            .insert(endpoint_v1!("/daemon/exit"), Box::new(ExitHandler {}));
-        r.routes
-            .insert(endpoint_v1!("/daemon/start"), Box::new(StartHandler {}));
-        r.routes.insert(
-            endpoint_v1!("/daemon/fuse/sendfd"),
-            Box::new(SendFuseFdHandler {}),
-        );
-        r.routes.insert(
-            endpoint_v1!("/daemon/fuse/takeover"),
-            Box::new(TakeoverFuseFdHandler {}),
-        );
-        r.routes
-            .insert(endpoint_v1!("/mount"), Box::new(MountHandler {}));
-        r.routes.insert(
-            endpoint_v1!("/metrics/backend"),
-            Box::new(MetricsBackendHandler {}),
-        );
-        r.routes.insert(
-            endpoint_v1!("/metrics/blobcache"),
-            Box::new(MetricsBlobcacheHandler {}),
-        );
+    // Common
+    r.routes
+        .insert(endpoint_v1!("/daemon/events"), Box::new(EventsHandler {}));
+    r.routes
+        .insert(endpoint_v1!("/daemon/exit"), Box::new(ExitHandler {}));
+    r.routes
+        .insert(endpoint_v1!("/daemon/start"), Box::new(StartHandler {}));
+    r.routes.insert(
+        endpoint_v1!("/daemon/fuse/sendfd"),
+        Box::new(SendFuseFdHandler {}),
+    );
+    r.routes.insert(
+        endpoint_v1!("/daemon/fuse/takeover"),
+        Box::new(TakeoverFuseFdHandler {}),
+    );
+    r.routes
+        .insert(endpoint_v1!("/mount"), Box::new(MountHandler {}));
+    r.routes.insert(
+        endpoint_v1!("/metrics/backend"),
+        Box::new(MetricsBackendHandler {}),
+    );
+    r.routes.insert(
+        endpoint_v1!("/metrics/blobcache"),
+        Box::new(MetricsBlobcacheHandler {}),
+    );
 
-        // Nydus API, v1
-        r.routes
-            .insert(endpoint_v1!("/daemon"), Box::new(InfoHandler {}));
-        r.routes
-            .insert(endpoint_v1!("/daemon/backend"), Box::new(FsBackendInfo {}));
-        r.routes.insert(
-            endpoint_v1!("/metrics"),
-            Box::new(MetricsFsGlobalHandler {}),
-        );
-        r.routes.insert(
-            endpoint_v1!("/metrics/files"),
-            Box::new(MetricsFsFilesHandler {}),
-        );
-        r.routes.insert(
-            endpoint_v1!("/metrics/inflight"),
-            Box::new(MetricsFsInflightHandler {}),
-        );
-        r.routes.insert(
-            endpoint_v1!("/metrics/pattern"),
-            Box::new(MetricsFsAccessPatternHandler {}),
-        );
-        r.routes
-            .insert(endpoint_v1!("/config"), Box::new(ConfigHandler {}));
-        r.routes.insert(
-            PROMETHEUS_METRICS_PATH.to_string(),
-            Box::new(PrometheusMetricsHandler {}),
-        );
+    // Nydus API, v1
+    r.routes
+        .insert(endpoint_v1!("/daemon"), Box::new(InfoHandler {}));
+    r.routes
+        .insert(endpoint_v1!("/daemon/backend"), Box::new(FsBackendInfo {}));
+    r.routes.insert(
+        endpoint_v1!("/metrics"),
+        Box::new(MetricsFsGlobalHandler {}),
+    );
+    r.routes.insert(
+        endpoint_v1!("/metrics/files"),
+        Box::new(MetricsFsFilesHandler {}),
+    );
+    r.routes.insert(
+        endpoint_v1!("/metrics/inflight"),
+        Box::new(MetricsFsInflightHandler {}),
+    );
+    r.routes.insert(
+        endpoint_v1!("/metrics/pattern"),
+        Box::new(MetricsFsAccessPatternHandler {}),
+    );
+    r.routes
+        .insert(endpoint_v1!("/config"), Box::new(ConfigHandler {}));
+    r.routes.insert(
+        PROMETHEUS_METRICS_PATH.to_string(),
+        Box::new(PrometheusMetricsHandler {}),
+    );
 
-        // Nydus API, v2
-        r.routes
-            .insert(endpoint_v2!("/daemon"), Box::new(InfoV2Handler {}));
-        r.routes
-            .insert(endpoint_v2!("/config"), Box::new(ConfigV2Handler {}));
-        r.routes
-            .insert(endpoint_v2!("/blobs"), Box::new(BlobObjectListHandlerV2 {}));
+    // Nydus API, v2
+    r.routes
+        .insert(endpoint_v2!("/daemon"), Box::new(InfoV2Handler {}));
+    r.routes
+        .insert(endpoint_v2!("/config"), Box::new(ConfigV2Handler {}));
+    r.routes
+        .insert(endpoint_v2!("/blobs"), Box::new(BlobObjectListHandlerV2 {}));
 
-        r
-    }
+    r
 });
 
 fn kick_api_server(
