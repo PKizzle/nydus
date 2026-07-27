@@ -548,24 +548,22 @@ impl ServerConnection {
     }
 
     fn send_msg<T: Sized>(&self, hdr: &MsgHeader, msg: &T) -> Result<()> {
-        if let Ok(mut guard) = self.get_connection() {
-            if let Some(conn) = guard.as_mut() {
-                if conn.send_message(hdr, msg, None).is_ok() {
-                    return Ok(());
-                }
-            }
+        if let Ok(mut guard) = self.get_connection()
+            && let Some(conn) = guard.as_mut()
+            && conn.send_message(hdr, msg, None).is_ok()
+        {
+            return Ok(());
         }
 
         let start = Instant::now();
         self.disconnect();
         loop {
             self.reconnect();
-            if let Ok(mut guard) = self.get_connection() {
-                if let Some(conn) = guard.as_mut() {
-                    if conn.send_message(hdr, msg, None).is_ok() {
-                        return Ok(());
-                    }
-                }
+            if let Ok(mut guard) = self.get_connection()
+                && let Some(conn) = guard.as_mut()
+                && conn.send_message(hdr, msg, None).is_ok()
+            {
+                return Ok(());
             }
 
             self.disconnect();

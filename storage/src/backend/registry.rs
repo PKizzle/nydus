@@ -245,7 +245,6 @@ struct BasicAuth {
 }
 
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 struct BearerAuth {
     realm: String,
     service: String,
@@ -253,8 +252,8 @@ struct BearerAuth {
 }
 
 #[derive(Debug)]
-#[allow(dead_code)]
 enum Auth {
+    #[allow(dead_code)]
     Basic(BasicAuth),
     Bearer(BearerAuth),
 }
@@ -1177,7 +1176,6 @@ pub struct Registry {
 }
 
 impl Registry {
-    #[allow(clippy::useless_let_if_seq)]
     pub fn new(config: &RegistryConfig, id: Option<&str>) -> Result<Registry> {
         let id = id.ok_or_else(|| einval!("Registry backend requires id"))?;
         let con_config: ConnectionConfig = config.clone().into();
@@ -1705,7 +1703,6 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::redundant_clone)]
     fn test_first_concurrently() {
         let val = Arc::new(ArcSwap::new(Arc::new(0)));
         let first = First::new();

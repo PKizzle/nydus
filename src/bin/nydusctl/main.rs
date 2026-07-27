@@ -9,12 +9,11 @@ extern crate clap;
 #[macro_use]
 extern crate anyhow;
 #[macro_use]
-extern crate lazy_static;
-#[macro_use]
 extern crate serde_json;
 extern crate nydus_rafs as rafs;
 
 use std::collections::HashMap;
+use std::sync::LazyLock;
 
 use anyhow::Result;
 use clap::{Arg, ArgAction, Command};
@@ -27,9 +26,7 @@ use commands::{
 };
 use nydus::get_build_time_info;
 
-lazy_static! {
-    static ref BTI_STRING: String = get_build_time_info().0;
-}
+static BTI_STRING: LazyLock<String> = LazyLock::new(|| get_build_time_info().0);
 
 #[compio::main]
 async fn main() -> Result<()> {

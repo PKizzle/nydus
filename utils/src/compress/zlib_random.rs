@@ -227,7 +227,6 @@ impl<R: Read> ZranGenerator<R> {
     ///
     /// # Arguments
     /// - `chunk_size`: size of data to be read from the zlib stream.
-    #[allow(clippy::if_same_then_else)]
     pub fn begin_read(&mut self, chunk_size: u64) -> Result<u32> {
         let info = self.reader.get_current_ctx_info();
         let ci_idx = if let Some(idx) = self.curr_ci_idx {
@@ -713,7 +712,6 @@ fn align_up(size: usize, align: usize) -> usize {
     (size + align - 1) & !(align - 1)
 }
 
-#[allow(unused)]
 extern "C" fn zalloc(_ptr: *mut c_void, items: uInt, item_size: uInt) -> *mut c_void {
     // We need to multiply `items` and `item_size` to get the actual desired
     // allocation size. Since `zfree` doesn't receive a size argument we
@@ -747,7 +745,6 @@ extern "C" fn zalloc(_ptr: *mut c_void, items: uInt, item_size: uInt) -> *mut c_
     }
 }
 
-#[allow(unused)]
 extern "C" fn zfree(_ptr: *mut c_void, address: *mut c_void) {
     unsafe {
         // Move our address being freed back one pointer, read the size we

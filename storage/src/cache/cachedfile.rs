@@ -1193,7 +1193,6 @@ impl FileCacheEntry {
         trace!("dispatch single io range {:?}", req);
         let mut blob_cci = BlobCCI::new();
         for (i, chunk) in req.chunks.iter().enumerate() {
-            #[allow(unused_mut)]
             let mut is_ready = match self.chunk_map.check_ready_and_mark_pending(chunk.as_ref()) {
                 Ok(true) => true,
                 Ok(false) => false,
@@ -1625,8 +1624,8 @@ impl Drop for FileCacheEntry {
 }
 
 /// An enum to reuse existing buffers for IO operations, and CoW on demand.
-#[allow(dead_code)]
 enum DataBuffer {
+    #[allow(dead_code)]
     Reuse(ManuallyDrop<Vec<u8>>),
     Allocated(Vec<u8>),
 }

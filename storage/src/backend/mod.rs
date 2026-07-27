@@ -106,12 +106,12 @@ pub struct BackendContext {
     pub error: Option<String>,
 }
 
-lazy_static::lazy_static! {
-    /// Global QPS limiter for source backend fallback, limited to 1 QPS.
-    pub static ref BACKEND_QPS_LIMITER: self::qps::QpsLimiter = self::qps::QpsLimiter::new(1.0);
-    /// Global pauser for backend requests, allows pausing all requests.
-    pub static ref BACKEND_PAUSER: self::pauser::Pauser = self::pauser::Pauser::new();
-}
+/// Global QPS limiter for source backend fallback, limited to 1 QPS.
+pub static BACKEND_QPS_LIMITER: std::sync::LazyLock<self::qps::QpsLimiter> =
+    std::sync::LazyLock::new(|| self::qps::QpsLimiter::new(1.0));
+/// Global pauser for backend requests, allows pausing all requests.
+pub static BACKEND_PAUSER: std::sync::LazyLock<self::pauser::Pauser> =
+    std::sync::LazyLock::new(self::pauser::Pauser::new);
 
 /// Error codes related to storage backend operations.
 #[derive(Debug)]

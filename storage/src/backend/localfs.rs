@@ -159,7 +159,6 @@ impl LocalFs {
         })
     }
 
-    #[allow(clippy::mutex_atomic)]
     fn get_blob(&self, blob_id: &str) -> LocalFsResult<Arc<dyn BlobReader>> {
         // Don't expect poisoned lock here.
         if let Some(entry) = self.entries.read().unwrap().get(blob_id) {

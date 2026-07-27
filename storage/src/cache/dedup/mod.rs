@@ -18,9 +18,8 @@ use crate::utils::copy_file_range;
 
 mod db;
 
-lazy_static::lazy_static!(
-    static ref CAS_MGR: Mutex<Option<Arc<CasMgr>>> = Mutex::new(None);
-);
+static CAS_MGR: std::sync::LazyLock<Mutex<Option<Arc<CasMgr>>>> =
+    std::sync::LazyLock::new(|| Mutex::new(None));
 
 /// Error codes related to local cas.
 #[derive(Debug)]

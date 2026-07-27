@@ -517,7 +517,6 @@ impl Connection {
         self.health_checker_stop.stop();
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub fn call<R: Read + Clone + Send + 'static>(
         &self,
         method: Method,

@@ -8,8 +8,6 @@
 #[macro_use]
 extern crate log;
 #[macro_use]
-extern crate lazy_static;
-#[macro_use]
 extern crate nydus_api;
 
 // compio's completion I/O is owned-buffer-per-op, so the hot read/write path
@@ -23,6 +21,7 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use std::convert::TryInto;
 use std::io::{Error, ErrorKind, Result};
+use std::sync::LazyLock;
 
 use clap::{Arg, ArgAction, ArgMatches, Command};
 use nix::sys::signal;
@@ -49,11 +48,9 @@ const RLIMIT_NOFILE_RESERVED: u64 = 16384;
 /// Default number of file descriptors.
 const RLIMIT_NOFILE_MAX: u64 = 1_000_000;
 
-lazy_static! {
-    static ref DAEMON_CONTROLLER: DaemonController = DaemonController::new();
-    static ref BTI_STRING: String = get_build_time_info().0;
-    static ref BTI: BuildTimeInfo = get_build_time_info().1;
-}
+static DAEMON_CONTROLLER: LazyLock<DaemonController> = LazyLock::new(DaemonController::new);
+static BTI_STRING: LazyLock<String> = LazyLock::new(|| get_build_time_info().0);
+static BTI: LazyLock<BuildTimeInfo> = LazyLock::new(|| get_build_time_info().1);
 
 fn thread_validator(v: &str) -> std::result::Result<String, String> {
     validate_threads_configuration(v).map(|s| s.to_string())

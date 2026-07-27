@@ -11,8 +11,6 @@ extern crate anyhow;
 extern crate log;
 #[macro_use]
 extern crate serde_json;
-#[macro_use]
-extern crate lazy_static;
 
 // mimalloc global allocator: image conversion churns many small buffers
 // (chunking, compression, zran); thread-local pools cut allocator overhead.
@@ -31,7 +29,7 @@ use std::fs::{self, DirEntry, OpenOptions, metadata};
 use std::os::unix::fs::FileTypeExt;
 use std::path::{Path, PathBuf};
 use std::result::Result::Ok;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 
 use anyhow::{Context, Result, bail};
 use clap::parser::ValueSource;
@@ -949,10 +947,8 @@ fn init_log(matches: &ArgMatches) -> Result<()> {
     setup_logging(log_file, level, 0).context("failed to setup logging")
 }
 
-lazy_static! {
-    static ref BTI_STRING: String = get_build_time_info().0;
-    static ref BTI: BuildTimeInfo = get_build_time_info().1;
-}
+static BTI_STRING: LazyLock<String> = LazyLock::new(|| get_build_time_info().0);
+static BTI: LazyLock<BuildTimeInfo> = LazyLock::new(|| get_build_time_info().1);
 
 fn main() -> Result<()> {
     let build_info = BTI.to_owned();

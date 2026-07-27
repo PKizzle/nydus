@@ -13,7 +13,7 @@
 use std::collections::{HashMap, HashSet};
 use std::ops::{Deref, Drop};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, LazyLock, Mutex, RwLock};
 use std::time::{Duration, SystemTime};
 
 use nydus_api::http::MetricsError;
@@ -93,23 +93,17 @@ fn latency_micros_range_index(elapsed: u64) -> usize {
 // Defining below global static metrics set so that a specific metrics counter can
 // be found as per the rafs backend mountpoint/id. Remind that nydusd can have
 // multiple backends mounted.
-lazy_static! {
-    static ref FS_METRICS: RwLock<HashMap<String, Arc<FsIoStats>>> = Default::default();
-}
+static FS_METRICS: LazyLock<RwLock<HashMap<String, Arc<FsIoStats>>>> =
+    LazyLock::new(Default::default);
 
-lazy_static! {
-    static ref BACKEND_METRICS: RwLock<HashMap<String, Arc<BackendMetrics>>> = Default::default();
-}
+static BACKEND_METRICS: LazyLock<RwLock<HashMap<String, Arc<BackendMetrics>>>> =
+    LazyLock::new(Default::default);
 
-lazy_static! {
-    static ref BLOBCACHE_METRICS: RwLock<HashMap<String, Arc<BlobcacheMetrics>>> =
-        Default::default();
-}
+static BLOBCACHE_METRICS: LazyLock<RwLock<HashMap<String, Arc<BlobcacheMetrics>>>> =
+    LazyLock::new(Default::default);
 
-lazy_static! {
-    pub static ref ERROR_HOLDER: Arc<Mutex<ErrorHolder>> =
-        Arc::new(Mutex::new(ErrorHolder::new(500, 50 * 1024)));
-}
+pub static ERROR_HOLDER: LazyLock<Arc<Mutex<ErrorHolder>>> =
+    LazyLock::new(|| Arc::new(Mutex::new(ErrorHolder::new(500, 50 * 1024))));
 
 /// Trait to manipulate per inode statistics metrics.
 pub trait InodeStatsCounter {

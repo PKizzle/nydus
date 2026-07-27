@@ -139,7 +139,13 @@ prepare-codecov:
 build: .format
 	$(CARGO_COV_FLAGS) ${CARGO} build --workspace $(EXCLUDE_PACKAGES) $(CARGO_COMMON) $(CARGO_BUILD_FLAGS)
 	# Cargo will skip checking if it is already checked
-	${CARGO} clippy --workspace $(EXCLUDE_PACKAGES) $(CARGO_COMMON) $(CARGO_BUILD_FLAGS) --bins --tests -- -Dwarnings --allow clippy::unnecessary_cast --allow clippy::needless_borrow --allow clippy::result_large_err --allow clippy::io_other_error
+	# No blanket --allow flags. They suppress a lint across the whole workspace, including
+	# code written later, so a stale entry silently hides real findings. Of the four dropped
+	# in 2026-07, `needless_borrow`, `result_large_err` and `io_other_error` had gone
+	# completely dead, and `unnecessary_cast` was hiding five redundant `addr as u64` casts
+	# in `block_uffd.rs` -- fixed rather than re-suppressed. Suppress at the item with
+	# #[allow]/#[expect] and a reason instead.
+	${CARGO} clippy --workspace $(EXCLUDE_PACKAGES) $(CARGO_COMMON) $(CARGO_BUILD_FLAGS) --bins --tests -- -Dwarnings
 
 release: .format build
 

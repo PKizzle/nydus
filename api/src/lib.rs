@@ -11,10 +11,6 @@
 extern crate log;
 #[macro_use]
 extern crate serde;
-#[cfg(feature = "handler")]
-#[macro_use]
-extern crate lazy_static;
-
 pub mod config;
 pub use config::*;
 #[macro_use]

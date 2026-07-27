@@ -51,7 +51,6 @@ struct BlobCacheMgrKey {
     config: Arc<ConfigV2>,
 }
 
-#[allow(clippy::derived_hash_with_manual_eq)]
 impl Hash for BlobCacheMgrKey {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.config.id.hash(state);
@@ -65,10 +64,9 @@ impl Hash for BlobCacheMgrKey {
     }
 }
 
-lazy_static::lazy_static! {
-    /// Default blob factory.
-    pub static ref BLOB_FACTORY: BlobFactory = BlobFactory::new();
-}
+/// Default blob factory.
+pub static BLOB_FACTORY: std::sync::LazyLock<BlobFactory> =
+    std::sync::LazyLock::new(BlobFactory::new);
 
 struct BlobCacheMgrEntry {
     mgr: Arc<dyn BlobCacheMgr>,
@@ -240,7 +238,6 @@ impl BlobFactory {
     }
 
     /// Create a storage backend for the blob with id `blob_id`.
-    #[allow(unused_variables)]
     pub fn new_backend(
         config: &BackendConfigV2,
         id: &str,

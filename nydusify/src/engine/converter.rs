@@ -915,7 +915,6 @@ fn parse_prefetch_files(patterns: &str) -> Vec<String> {
 // Push
 // ---------------------------------------------------------------------------
 
-#[allow(clippy::too_many_arguments)]
 /// A pushed per-platform nydus manifest plus the total bytes of nydus content
 /// it published (data blobs + bootstrap + config + manifest), for reporting.
 struct PushedArtifact {

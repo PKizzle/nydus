@@ -8,7 +8,7 @@ use std::any::Any;
 use std::cmp::{Eq, PartialEq};
 use std::collections::HashMap;
 use std::fmt::{Display, Formatter, Result as FmtResult};
-use std::sync::{Arc, Mutex, RwLock, atomic::AtomicU64};
+use std::sync::{Arc, LazyLock, Mutex, RwLock, atomic::AtomicU64};
 use std::time::SystemTime;
 
 use serde::Serialize;
@@ -138,7 +138,6 @@ impl BuildRootTracer {
 
 #[derive(Serialize)]
 #[serde(untagged)]
-#[allow(dead_code)]
 pub enum TraceEvent {
     Counter(AtomicU64),
     Fixed(u64),
@@ -160,16 +159,16 @@ impl TracerClass for EventTracerClass {
     }
 }
 
-lazy_static! {
-    pub static ref BUILDING_RECORDER: BuildRootTracer = BuildRootTracer {
-        tracers: RwLock::new(HashMap::default())
-    };
-}
+pub static BUILDING_RECORDER: LazyLock<BuildRootTracer> = LazyLock::new(|| BuildRootTracer {
+    tracers: RwLock::new(HashMap::default()),
+});
 
 #[macro_export]
 macro_rules! root_tracer {
+    // The deref is load-bearing: `BUILDING_RECORDER` is a `LazyLock<BuildRootTracer>`, so
+    // `&BUILDING_RECORDER` is a `&LazyLock<_>` and would not coerce to the target type.
     () => {
-        &$crate::trace::BUILDING_RECORDER as &$crate::trace::BuildRootTracer
+        &*$crate::trace::BUILDING_RECORDER as &$crate::trace::BuildRootTracer
     };
 }
 
@@ -232,6 +231,8 @@ macro_rules! event_tracer {
             if new {
                 // Double check to close the race that another thread has already inserted.
                 // Cast integer to u64 should be reliable for most cases.
+                // Not a let-chain: the `else` arm needs `guard`, which a failed chain would
+                // leave unbound.
                 if let Ok(ref mut guard) = t.events.write() {
                     if let Some($crate::trace::TraceEvent::Counter(e)) = guard.get($event) {
                         e.fetch_add($value as u64, std::sync::atomic::Ordering::Relaxed);
@@ -248,13 +249,13 @@ macro_rules! event_tracer {
         }
     };
     ($event:expr_2021, $format:expr_2021, $value:expr_2021) => {
-        if let Some(t) = event_tracer!() {
-            if let Ok(ref mut guard) = t.events.write() {
-                guard.insert(
-                    $event.to_string(),
-                    $crate::trace::TraceEvent::Desc(format!($format, $value)),
-                );
-            }
+        if let Some(t) = event_tracer!()
+            && let Ok(ref mut guard) = t.events.write()
+        {
+            guard.insert(
+                $event.to_string(),
+                $crate::trace::TraceEvent::Desc(format!($format, $value)),
+            );
         }
     };
 }

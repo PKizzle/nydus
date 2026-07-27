@@ -44,7 +44,6 @@ pub(crate) struct AsyncPrefetchConfig {
     /// The amplify batch size to prefetch data from backend.
     pub batch_size: usize,
     /// Network bandwidth for prefetch, in unit of Bytes and Zero means no rate limit is set.
-    #[allow(unused)]
     pub bandwidth_limit: u32,
 }
 
@@ -68,7 +67,7 @@ pub(crate) enum AsyncPrefetchMessage {
     #[cfg_attr(not(test), allow(unused))]
     /// Ping for test.
     Ping,
-    #[allow(unused)]
+    #[allow(dead_code)]
     RateLimiter(u64),
 }
 
@@ -98,7 +97,6 @@ pub(crate) struct AsyncWorkerMgr {
     prefetch_sema: Arc<Semaphore>,
     prefetch_channel: Arc<Channel<AsyncPrefetchMessage>>,
     prefetch_config: Arc<AsyncPrefetchConfig>,
-    #[allow(unused)]
     prefetch_delayed: AtomicU64,
     prefetch_inflight: AtomicU32,
     prefetch_consumed: AtomicUsize,

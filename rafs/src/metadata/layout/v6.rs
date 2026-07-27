@@ -11,9 +11,8 @@ use std::io::{Read, Result};
 use std::mem::size_of;
 use std::os::unix::ffi::OsStrExt;
 use std::str::FromStr;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
-use lazy_static::lazy_static;
 use nydus_storage::device::{BlobFeatures, BlobInfo};
 use nydus_storage::meta::{
     BlobChunkInfoV1Ondisk, BlobChunkInfoV2Ondisk, BlobCompressionContextHeader,
@@ -927,7 +926,10 @@ impl_bootstrap_converter!(RafsV6InodeCompact);
 
 impl RafsStore for RafsV6InodeCompact {
     fn store(&self, w: &mut dyn RafsIoWrite) -> Result<usize> {
-        // TODO: need to write xattr as well.
+        // Fixed-size inode only, by design. EROFS stores inline xattrs in the bytes that
+        // follow the inode, and the caller owns that: `Node::dump_bootstrap_v6` sizes the
+        // record with `v6_size_with_xattr()` and appends them via `v6_store_xattrs()`
+        // (builder/src/core/v6.rs). Writing them here too would double them.
         w.write_all(self.as_ref())?;
         Ok(self.as_ref().len())
     }
@@ -1088,7 +1090,10 @@ impl_bootstrap_converter!(RafsV6InodeExtended);
 
 impl RafsStore for RafsV6InodeExtended {
     fn store(&self, w: &mut dyn RafsIoWrite) -> Result<usize> {
-        // TODO: need to write xattr as well.
+        // Fixed-size inode only, by design. EROFS stores inline xattrs in the bytes that
+        // follow the inode, and the caller owns that: `Node::dump_bootstrap_v6` sizes the
+        // record with `v6_size_with_xattr()` and appends them via `v6_store_xattrs()`
+        // (builder/src/core/v6.rs). Writing them here too would double them.
         w.write_all(self.as_ref())?;
         Ok(self.as_ref().len())
     }
@@ -2010,35 +2015,35 @@ impl RafsV6XattrPrefix {
     }
 }
 
-lazy_static! {
-    static ref RAFSV6_XATTR_TYPES: Vec<RafsV6XattrPrefix> = vec![
+static RAFSV6_XATTR_TYPES: LazyLock<Vec<RafsV6XattrPrefix>> = LazyLock::new(|| {
+    vec![
         RafsV6XattrPrefix::new(
             XATTR_USER_PREFIX,
             EROFS_XATTR_INDEX_USER,
-            XATTR_USER_PREFIX.len()
+            XATTR_USER_PREFIX.len(),
         ),
         RafsV6XattrPrefix::new(
             XATTR_NAME_POSIX_ACL_ACCESS,
             EROFS_XATTR_INDEX_POSIX_ACL_ACCESS,
-            XATTR_NAME_POSIX_ACL_ACCESS.len()
+            XATTR_NAME_POSIX_ACL_ACCESS.len(),
         ),
         RafsV6XattrPrefix::new(
             XATTR_NAME_POSIX_ACL_DEFAULT,
             EROFS_XATTR_INDEX_POSIX_ACL_DEFAULT,
-            XATTR_NAME_POSIX_ACL_DEFAULT.len()
+            XATTR_NAME_POSIX_ACL_DEFAULT.len(),
         ),
         RafsV6XattrPrefix::new(
             XATTR_TRUSTED_PREFIX,
             EROFS_XATTR_INDEX_TRUSTED,
-            XATTR_TRUSTED_PREFIX.len()
+            XATTR_TRUSTED_PREFIX.len(),
         ),
         RafsV6XattrPrefix::new(
             XATTR_SECURITY_PREFIX,
             EROFS_XATTR_INDEX_SECURITY,
-            XATTR_SECURITY_PREFIX.len()
+            XATTR_SECURITY_PREFIX.len(),
         ),
-    ];
-}
+    ]
+});
 
 // inline xattrs (n == i_xattr_icount):
 // erofs_xattr_ibody_header(1) + (n - 1) * 4 bytes

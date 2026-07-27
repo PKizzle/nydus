@@ -4,18 +4,15 @@
 
 use arc_swap::ArcSwap;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
-lazy_static! {
-    static ref CONFIG_MAP: ArcSwap<HashMap<String, String>> = ArcSwap::from_pointee(HashMap::new());
-}
+static CONFIG_MAP: LazyLock<ArcSwap<HashMap<String, String>>> =
+    LazyLock::new(|| ArcSwap::from_pointee(HashMap::new()));
 
 #[cfg(test)]
 mod test_sync {
-    use std::sync::Mutex;
-    lazy_static! {
-        pub static ref TEST_LOCK: Mutex<()> = Mutex::new(());
-    }
+    use std::sync::{LazyLock, Mutex};
+    pub static TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 }
 
 /// Configuration keys for the system

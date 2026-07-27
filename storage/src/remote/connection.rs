@@ -419,10 +419,10 @@ impl Endpoint {
         if len > MAX_MSG_SIZE - mem::size_of::<T>() {
             return Err(Error::OversizedMsg);
         }
-        if let Some(fd_arr) = fds {
-            if fd_arr.len() > MAX_ATTACHED_FD_ENTRIES {
-                return Err(Error::IncorrectFds);
-            }
+        if let Some(fd_arr) = fds
+            && fd_arr.len() > MAX_ATTACHED_FD_ENTRIES
+        {
+            return Err(Error::IncorrectFds);
         }
 
         // Safe because there can't be other mutable reference to hdr, body and payload.

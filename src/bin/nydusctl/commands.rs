@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::collections::HashMap;
+use std::sync::LazyLock;
 use std::thread::sleep;
 use std::time::Duration;
 
@@ -46,10 +47,8 @@ macro_rules! items_map(
      };
 );
 
-lazy_static! {
-    pub static ref CONFIGURE_ITEMS_MAP: HashMap<String, String> =
-        items_map!("log-level" => "log_level");
-}
+pub static CONFIGURE_ITEMS_MAP: LazyLock<HashMap<String, String>> =
+    LazyLock::new(|| items_map!("log-level" => "log_level"));
 
 impl CommandCache {
     pub async fn execute(

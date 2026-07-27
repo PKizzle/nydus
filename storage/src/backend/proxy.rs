@@ -20,8 +20,8 @@ use dragonfly_client_request::errors::Error;
 use dragonfly_client_request::{Body, GetRequest, GetResponse, Proxy};
 use http::StatusCode;
 use http::header::HeaderMap;
-use lazy_static::lazy_static;
 use log::info;
+use std::sync::LazyLock;
 
 // --- Dragonfly header constants ---
 pub const HEADER_DRAGONFLY_PRIORITY: &str = "X-Dragonfly-Priority";
@@ -47,16 +47,21 @@ pub enum ProxyError {
     Forbidden(String),
 }
 
-lazy_static! {
-    static ref PROXY_SDK_CLIENT: Arc<RwLock<HashMap<String, Arc<ProxySDKClient>>>> =
-        Arc::new(RwLock::new(HashMap::new()));
-    static ref PROXY_RUNTIME: Result<Runtime, String> = tokio::runtime::Builder::new_multi_thread()
+/// Per-endpoint proxy SDK clients, created on first use and shared thereafter.
+///
+/// No outer `Arc`: the map is reached only through `.read()`/`.write()` and the `LazyLock`
+/// already gives it `'static` lifetime, so refcounting it bought nothing. (The inner `Arc`
+/// *is* cloned out to callers and stays.)
+static PROXY_SDK_CLIENT: LazyLock<RwLock<HashMap<String, Arc<ProxySDKClient>>>> =
+    LazyLock::new(|| RwLock::new(HashMap::new()));
+static PROXY_RUNTIME: LazyLock<Result<Runtime, String>> = LazyLock::new(|| {
+    tokio::runtime::Builder::new_multi_thread()
         .thread_name("nydus-backend-proxy-runtime")
         .worker_threads(10)
         .enable_all()
         .build()
-        .map_err(|e| format!("failed to create proxy tokio runtime: {}", e));
-}
+        .map_err(|e| format!("failed to create proxy tokio runtime: {}", e))
+});
 
 pub(crate) fn runtime() -> &'static Runtime {
     PROXY_RUNTIME

@@ -2512,7 +2512,7 @@ mod tests {
             // so we must NOT close it via cleanup_uffd_region afterward.
             let handshake = HandshakeRequest {
                 r#type: MessageType::Handshake,
-                regions: vec![VmaRegion::new(addr as u64, 4096, 0, 4096)],
+                regions: vec![VmaRegion::new(addr, 4096, 0, 4096)],
                 policy: FaultPolicy::Zerocopy,
                 enable_prefault: false,
             };
@@ -2577,7 +2577,7 @@ mod tests {
 
             // Setup uffd region - OwnedFd takes ownership of uffd_fd
             let (uffd_fd, addr, mmap_size) = setup_uffd_region(4096).unwrap();
-            let vma_regions = vec![VmaRegion::new(addr as u64, 4096, 0, 4096)];
+            let vma_regions = vec![VmaRegion::new(addr, 4096, 0, 4096)];
             let state = ConnState {
                 vma_regions,
                 policy: FaultPolicy::Zerocopy,
@@ -3046,21 +3046,21 @@ mod tests {
         compio::runtime::Runtime::new().unwrap().block_on(async {
             let (uffd_fd, addr, mmap_size) = setup_uffd_region(4096).unwrap();
 
-            let result = uffdio_wake(uffd_fd, addr as u64, 4096).await;
+            let result = uffdio_wake(uffd_fd, addr, 4096).await;
             assert!(
                 result.is_ok(),
                 "uffdio_wake on registered region failed: {:?}",
                 result.err()
             );
 
-            let zeropage_result = uffdio_zeropage(uffd_fd, addr as u64, 4096).await;
+            let zeropage_result = uffdio_zeropage(uffd_fd, addr, 4096).await;
             assert!(
                 zeropage_result.is_ok(),
                 "uffdio_zeropage failed: {:?}",
                 zeropage_result.err()
             );
 
-            let result = uffdio_wake(uffd_fd, addr as u64, 4096).await;
+            let result = uffdio_wake(uffd_fd, addr, 4096).await;
             assert!(
                 result.is_ok(),
                 "uffdio_wake after zeropage should return Ok (EEXIST): {:?}",
