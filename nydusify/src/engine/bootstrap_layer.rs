@@ -36,6 +36,15 @@ use registry_client::{Descriptor, RegistryClient};
 /// this path under the unpacked snapshot.
 pub const BOOTSTRAP_FILE_NAME_IN_LAYER: &str = "image/image.boot";
 
+/// Ceiling on the *decompressed* size of a bootstrap layer.
+///
+/// Generous next to any real bootstrap — those scale with inode count and run to
+/// tens of megabytes even for very large images — while still refusing a
+/// decompression bomb. `registry_client` bounds every HTTP body it buffers;
+/// without this the defense would stop at the crate boundary and a hostile image
+/// could OOM `nydusify check` / `nydusify mount` with a few kilobytes of gzip.
+const MAX_BOOTSTRAP_BYTES: u64 = 1024 * 1024 * 1024;
+
 /// A bootstrap packaged as a gzip'd tar layer.
 pub struct BootstrapLayer {
     /// The gzip'd tar bytes — this is what gets pushed as the layer blob.
@@ -104,6 +113,12 @@ pub fn is_tar_layer(media_type: &str) -> bool {
 /// Handles both gzip'd and plain tars, so it works whichever compression the
 /// publisher chose.
 pub fn extract(layer: &Path, out: &Path) -> Result<()> {
+    extract_bounded(layer, out, MAX_BOOTSTRAP_BYTES)
+}
+
+/// [`extract`] with an explicit decompression ceiling, so the bound itself is
+/// testable without materializing a gigabyte.
+fn extract_bounded(layer: &Path, out: &Path, max_bytes: u64) -> Result<()> {
     let bytes = std::fs::read(layer)
         .with_context(|| format!("read bootstrap layer {}", layer.display()))?;
 
@@ -111,9 +126,23 @@ pub fn extract(layer: &Path, out: &Path) -> Result<()> {
     let tar_bytes = if bytes.starts_with(&[0x1f, 0x8b]) {
         use std::io::Read as _;
         let mut buf = Vec::new();
+        // Bounded on purpose. The layer is registry-supplied, and verifying its
+        // digest only proves it is the blob the manifest named — the manifest is
+        // written by whoever published the image, so a small blob that inflates
+        // to tens of gigabytes is theirs to choose. Read one byte past the
+        // ceiling so overshoot is detectable rather than silently truncated.
         flate2::read::GzDecoder::new(bytes.as_slice())
+            .take(max_bytes.saturating_add(1))
             .read_to_end(&mut buf)
             .context("gunzip bootstrap layer")?;
+        if buf.len() as u64 > max_bytes {
+            anyhow::bail!(
+                "bootstrap layer {} decompresses to more than {} bytes; \
+                 refusing to buffer it (a RAFS bootstrap is far smaller)",
+                layer.display(),
+                max_bytes
+            );
+        }
         buf
     } else {
         bytes
@@ -258,6 +287,47 @@ mod tests {
 
         let err = extract(&layer_path, &dir.path().join("out")).unwrap_err();
         assert!(err.to_string().contains(BOOTSTRAP_FILE_NAME_IN_LAYER));
+    }
+
+    #[test]
+    fn extract_refuses_a_decompression_bomb() {
+        use std::io::Write as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        // 8 MiB of zeros gzips to a few kilobytes: the shape of the attack, at a
+        // size a test can afford. The ceiling is passed explicitly so this does
+        // not have to reach the real 1 GiB one.
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
+        enc.write_all(&vec![0u8; 8 * 1024 * 1024]).unwrap();
+        let bomb = enc.finish().unwrap();
+        assert!(
+            bomb.len() < 64 * 1024,
+            "fixture should be small on the wire, was {}",
+            bomb.len()
+        );
+
+        let layer_path = dir.path().join("bomb.tar.gz");
+        std::fs::write(&layer_path, &bomb).unwrap();
+
+        let err = extract_bounded(&layer_path, &dir.path().join("out"), 1024 * 1024).unwrap_err();
+        assert!(
+            err.to_string().contains("decompresses to more than"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn extract_accepts_a_layer_that_fits_the_ceiling() {
+        // The bound must not be so eager that it rejects a legitimate layer
+        // sitting just under it.
+        let (dir, path) = write_temp(b"SMALL-BOOTSTRAP");
+        let layer = pack(&path).unwrap();
+        let layer_path = dir.path().join("layer.tar.gz");
+        std::fs::write(&layer_path, &layer.gzip_bytes).unwrap();
+
+        let out = dir.path().join("extracted");
+        extract_bounded(&layer_path, &out, 64 * 1024).unwrap();
+        assert_eq!(std::fs::read(&out).unwrap(), b"SMALL-BOOTSTRAP");
     }
 
     #[test]
