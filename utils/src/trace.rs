@@ -54,11 +54,17 @@ pub enum TraceClass {
 
 #[derive(Error, Debug)]
 pub enum TraceError {
+    /// A tracer's records could not be rendered as JSON.
     #[error("serialize error: {0}")]
-    Serde(Error),
+    Serde(#[from] Error),
 }
 
-type Result<T> = std::result::Result<T, TraceError>;
+/// `Result` specialized for the tracing subsystem.
+///
+/// Deliberately not named `Result`: a module-level alias of that name shadows
+/// `std::result::Result` for every item in the file, so a signature reading `Result<T>` says
+/// nothing about which error it carries and `Result<T, E>` stops compiling.
+type TraceResult<T> = std::result::Result<T, TraceError>;
 
 /// Used to measure time consuming and gather all tracing points when building image.
 #[derive(Serialize, Default)]
@@ -70,13 +76,13 @@ pub struct TimingTracerClass {
 }
 
 pub trait TracerClass: Send + Sync + 'static {
-    fn release(&self) -> Result<Value>;
+    fn release(&self) -> TraceResult<Value>;
     fn as_any(&self) -> &dyn Any;
 }
 
 impl TracerClass for TimingTracerClass {
-    fn release(&self) -> Result<Value> {
-        serde_json::to_value(self).map_err(TraceError::Serde)
+    fn release(&self) -> TraceResult<Value> {
+        Ok(serde_json::to_value(self)?)
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -127,7 +133,7 @@ impl BuildRootTracer {
         g.get(&class).cloned()
     }
 
-    pub fn dump_summary_map(&self) -> Result<serde_json::Map<String, serde_json::Value>> {
+    pub fn dump_summary_map(&self) -> TraceResult<serde_json::Map<String, serde_json::Value>> {
         let mut map = serde_json::Map::new();
         for c in self.tracers.write().unwrap().iter() {
             map.insert(c.0.name(), c.1.release()?);
@@ -151,8 +157,8 @@ pub struct EventTracerClass {
 }
 
 impl TracerClass for EventTracerClass {
-    fn release(&self) -> Result<Value> {
-        serde_json::to_value(self).map_err(TraceError::Serde)
+    fn release(&self) -> TraceResult<Value> {
+        Ok(serde_json::to_value(self)?)
     }
     fn as_any(&self) -> &dyn Any {
         self

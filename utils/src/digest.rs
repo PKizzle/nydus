@@ -40,7 +40,10 @@ impl FromStr for Algorithm {
         match s {
             "blake3" => Ok(Self::Blake3),
             "sha256" => Ok(Self::Sha256),
-            _ => Err(einval!("digest algorithm should be blake3 or sha256")),
+            _ => Err(Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "digest algorithm should be blake3 or sha256",
+            )),
         }
     }
 }

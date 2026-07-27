@@ -2,10 +2,10 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-use std::io::{Result, Write};
+use std::io::{self, Write};
 use std::process::{Command, Stdio};
 
-pub fn exec(cmd: &str, output: bool, input: &[u8]) -> Result<String> {
+pub fn exec(cmd: &str, output: bool, input: &[u8]) -> io::Result<String> {
     debug!("exec `{}`", cmd);
     let has_input = !input.is_empty();
     let mut basic_cmd = Command::new("sh");
@@ -33,15 +33,16 @@ pub fn exec(cmd: &str, output: bool, input: &[u8]) -> Result<String> {
     if output {
         let output = child.wait_with_output()?;
         if !output.status.success() {
-            return Err(eother!("exit with non-zero status"));
+            return Err(io::Error::other("exit with non-zero status"));
         }
-        let stdout = std::str::from_utf8(&output.stdout).map_err(|e| einval!(e))?;
+        let stdout = std::str::from_utf8(&output.stdout)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         return Ok(stdout.to_string());
     }
 
     let status = child.wait()?;
     if !status.success() {
-        return Err(eother!("exit with non-zero status"));
+        return Err(io::Error::other("exit with non-zero status"));
     }
 
     Ok(String::from(""))

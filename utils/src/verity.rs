@@ -5,7 +5,7 @@
 //! Utilities to generate Merkle trees for data integrity verification.
 
 use std::fs::File;
-use std::io::Result;
+use std::io;
 use std::mem::size_of;
 use std::sync::Mutex;
 
@@ -138,15 +138,18 @@ pub struct VerityGenerator {
 
 impl VerityGenerator {
     /// Create a new instance [VerityGenerator].
-    pub fn new(file: File, offset: u64, data_pages: u32) -> Result<Self> {
+    pub fn new(file: File, offset: u64, data_pages: u32) -> io::Result<Self> {
         let mkl_tree = MerkleTree::new(4096, data_pages, Algorithm::Sha256);
         let total_size = mkl_tree.total_pages() as usize * 4096;
         let file_map = if data_pages > 1 {
             if offset.checked_add(total_size as u64).is_none() {
-                return Err(einval!(format!(
-                    "verity data offset 0x{:x} and size 0x{:x} is too big",
-                    offset, total_size
-                )));
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "verity data offset 0x{:x} and size 0x{:x} is too big",
+                        offset, total_size
+                    ),
+                ));
             }
 
             let md = file.metadata()?;
@@ -166,7 +169,7 @@ impl VerityGenerator {
     }
 
     /// Initialize all digest values.
-    pub fn initialize(&mut self) -> Result<()> {
+    pub fn initialize(&mut self) -> io::Result<()> {
         let total_size = self.mkl_tree.total_pages() as usize * 4096;
         let mut offset = 0;
         let mut map = self.file_map.lock().unwrap();
@@ -184,13 +187,13 @@ impl VerityGenerator {
     ///
     /// Digests for data pages must be set by calling this method. It can also be used to set
     /// digest values for intermediate digest pages.
-    pub fn set_digest(&mut self, level: u32, index: u32, digest: &[u8]) -> Result<()> {
+    pub fn set_digest(&mut self, level: u32, index: u32, digest: &[u8]) -> io::Result<()> {
         let digest_size = self.mkl_tree.digest_size;
         if digest.len() != digest_size {
-            return Err(einval!(format!(
-                "size of digest data is not {}",
-                digest_size
-            )));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("size of digest data is not {}", digest_size),
+            ));
         }
 
         // Handle special case of zero-level Merkle tree.
@@ -200,17 +203,23 @@ impl VerityGenerator {
         }
 
         if level > self.mkl_tree.max_levels() || level == 0 {
-            return Err(einval!(format!(
-                "level {} is out of range, max {}",
-                level,
-                self.mkl_tree.max_levels()
-            )));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "level {} is out of range, max {}",
+                    level,
+                    self.mkl_tree.max_levels()
+                ),
+            ));
         } else if index >= self.mkl_tree.level_entries(level) {
-            return Err(einval!(format!(
-                "index {} is out of range, max {}",
-                index,
-                self.mkl_tree.level_entries(level) - 1
-            )));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "index {} is out of range, max {}",
+                    index,
+                    self.mkl_tree.level_entries(level) - 1
+                ),
+            ));
         }
 
         let base = self.mkl_tree.level_base(level) as usize;
@@ -223,7 +232,7 @@ impl VerityGenerator {
     }
 
     /// Generate digest values from lower level digest pages.
-    pub fn generate_level_digests(&mut self, level: u32) -> Result<()> {
+    pub fn generate_level_digests(&mut self, level: u32) -> io::Result<()> {
         assert!(level > 1 && level <= self.mkl_tree.max_levels);
         let page_size = self.mkl_tree.page_size as usize;
         let count = self.mkl_tree.level_entries(level) as usize;
@@ -249,7 +258,7 @@ impl VerityGenerator {
     /// - `NON_EXIST_ENTRY_DIGEST` if there's no data page
     /// - digest of the data page if there's only one data page
     /// - digest of the intermediate digest page if there's more than one data pages
-    pub fn generate_root_digest(&mut self) -> Result<RafsDigest> {
+    pub fn generate_root_digest(&mut self) -> io::Result<RafsDigest> {
         if self.mkl_tree.max_levels == 0 {
             Ok(self.root_digest)
         } else {
@@ -263,7 +272,7 @@ impl VerityGenerator {
     ///
     /// Digests for data pages at level 1 must be set up by calling [set_digest()] before this
     /// function to generate intermediate and root digests.
-    pub fn generate_all_digests(&mut self) -> Result<RafsDigest> {
+    pub fn generate_all_digests(&mut self) -> io::Result<RafsDigest> {
         for level in 2..=self.mkl_tree.max_levels {
             self.generate_level_digests(level)?;
         }

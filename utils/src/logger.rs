@@ -7,17 +7,24 @@ use std::sync::Mutex;
 use std::time::SystemTime;
 
 use serde::Serialize;
-use serde_json::Error as SerdeError;
 
 /// Error codes for `ErrorHolder`.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum ErrorHolderError {
+    /// The message does not fit even in an empty buffer.
+    #[error("error message of {0} bytes exceeds the holder's capacity")]
     TooLarge(usize),
-    Serde(SerdeError),
+    /// The buffer could not be rendered as JSON.
+    #[error("failed to serialize the error holder")]
+    Serde(#[from] serde_json::Error),
 }
 
-/// `Result` specialized for `ErrorHolder`.
-pub type Result<T> = std::result::Result<T, ErrorHolderError>;
+/// `Result` specialized for [`ErrorHolder`].
+///
+/// Deliberately not named `Result`: a module-level alias of that name shadows
+/// `std::result::Result` for every item in the file, so a signature reading `Result<T>` says
+/// nothing about which error it carries and `Result<T, E>` stops compiling.
+pub type ErrorHolderResult<T> = std::result::Result<T, ErrorHolderError>;
 
 /// Struct to record important or critical events or errors in circular buffer mode.
 #[derive(Serialize, Default, Debug)]
@@ -42,7 +49,7 @@ impl ErrorHolder {
     }
 
     /// Push an error into the circular buffer.
-    pub fn push(&mut self, error: &str) -> Result<()> {
+    pub fn push(&mut self, error: &str) -> ErrorHolderResult<()> {
         let mut guard = self.errors.lock().unwrap();
         let formatted_error = format!("{} - {}", httpdate::fmt_http_date(SystemTime::now()), error);
 
@@ -70,9 +77,9 @@ impl ErrorHolder {
     }
 
     /// Export all errors in the circular buffer as an `JSON` string.
-    pub fn export(&self) -> Result<String> {
+    pub fn export(&self) -> ErrorHolderResult<String> {
         let _guard = self.errors.lock().unwrap();
-        serde_json::to_string(self).map_err(ErrorHolderError::Serde)
+        Ok(serde_json::to_string(self)?)
     }
 }
 

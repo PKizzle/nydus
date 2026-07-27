@@ -40,7 +40,7 @@ impl Read for FileRangeReader<'_> {
         // used only for the duration of this synchronous read call.
         let fd = unsafe { BorrowedFd::borrow_raw(self.fd) };
         let nr_read = nix::sys::uio::pread(fd, &mut buf[0..size], self.offset as i64)
-            .map_err(|_| last_error!())?;
+            .map_err(std::io::Error::from)?;
         self.offset += nr_read as u64;
         self.size -= nr_read as u64;
         Ok(nr_read)

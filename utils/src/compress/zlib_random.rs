@@ -6,7 +6,7 @@
 
 use std::alloc::{self, Layout};
 use std::convert::TryFrom;
-use std::io::{Read, Result};
+use std::io::{self, Read};
 use std::ops::DerefMut;
 use std::os::raw::{c_int, c_void};
 use std::sync::{Arc, Mutex};
@@ -84,7 +84,7 @@ pub struct ZranDecoder {
 
 impl ZranDecoder {
     /// Create a new instance of `ZranDecoder`.
-    pub fn new() -> Result<Self> {
+    pub fn new() -> io::Result<Self> {
         let stream = ZranStream::new(true)?;
         Ok(Self { stream })
     }
@@ -102,11 +102,17 @@ impl ZranDecoder {
         dict: Option<&[u8]>,
         input: &[u8],
         output: &mut [u8],
-    ) -> Result<usize> {
+    ) -> io::Result<usize> {
         if input.len() != ctx.in_len as usize {
-            return Err(einval!("size of input buffer doesn't match"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "size of input buffer doesn't match",
+            ));
         } else if ctx.out_len as usize > output.len() {
-            return Err(einval!("buffer to receive decompressed data is too small"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "buffer to receive decompressed data is too small",
+            ));
         }
 
         self.stream.reset()?;
@@ -133,7 +139,9 @@ impl ZranDecoder {
                 Z_OK => {
                     let count = self.stream.next_out() as usize - output.as_ptr() as usize;
                     if count != ctx.out_len as usize {
-                        return Err(eio!("failed to decode data from stream, size mismatch"));
+                        return Err(io::Error::other(
+                            "failed to decode data from stream, size mismatch",
+                        ));
                     } else {
                         return Ok(count);
                     }
@@ -147,7 +155,9 @@ impl ZranDecoder {
                         self.stream.set_next_in(&input[used..]);
                     } else {
                         // The input does not have a complete trailer.
-                        return Err(eio!("the input does not have a complete gzip trailer"));
+                        return Err(io::Error::other(
+                            "the input does not have a complete gzip trailer",
+                        ));
                     }
                     // Use inflate to skip the gzip header and resume the raw inflate there.
                     self.stream.reset2(true)?;
@@ -161,7 +171,7 @@ impl ZranDecoder {
                         }
 
                         if ret != Z_OK {
-                            return Err(eio!(format!(
+                            return Err(io::Error::other(format!(
                                 "failed to handle gzip multi member, ret: {:?}",
                                 ret
                             )));
@@ -171,7 +181,7 @@ impl ZranDecoder {
                     }
                 }
                 e => {
-                    return Err(eio!(format!(
+                    return Err(io::Error::other(format!(
                         "failed to decode data from compressed data stream, ret: {}",
                         e
                     )));
@@ -227,7 +237,7 @@ impl<R: Read> ZranGenerator<R> {
     ///
     /// # Arguments
     /// - `chunk_size`: size of data to be read from the zlib stream.
-    pub fn begin_read(&mut self, chunk_size: u64) -> Result<u32> {
+    pub fn begin_read(&mut self, chunk_size: u64) -> io::Result<u32> {
         let info = self.reader.get_current_ctx_info();
         let ci_idx = if let Some(idx) = self.curr_ci_idx {
             let ctx = &self.ci_array[idx];
@@ -254,7 +264,10 @@ impl<R: Read> ZranGenerator<R> {
         };
 
         if ci_idx > ZRAN_MAX_CI_ENTRIES {
-            Err(einval!("too many compression information entries"))
+            Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "too many compression information entries",
+            ))
         } else {
             self.curr_ci_idx = Some(ci_idx);
             self.curr_ci_offset = info.out_pos;
@@ -265,7 +278,7 @@ impl<R: Read> ZranGenerator<R> {
 
     /// Mark end of a data read operation and returns information to decode data from the random
     /// access slice.
-    pub fn end_read(&mut self) -> Result<ZranChunkInfo> {
+    pub fn end_read(&mut self) -> io::Result<ZranChunkInfo> {
         let info = self.reader.get_current_ctx_info();
         if let Some(idx) = self.curr_ci_idx {
             let ctx = &mut self.ci_array[idx];
@@ -282,7 +295,10 @@ impl<R: Read> ZranGenerator<R> {
             ctx.in_len = comp_size as u32;
             Ok(ci)
         } else {
-            Err(einval!("invalid compression state"))
+            Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid compression state",
+            ))
         }
     }
 
@@ -312,7 +328,7 @@ impl<R: Read> ZranGenerator<R> {
         self.max_uncomp_size = sz;
     }
 
-    fn new_ci_entry(&mut self) -> Result<usize> {
+    fn new_ci_entry(&mut self) -> io::Result<usize> {
         let info = self.reader.get_block_ctx_info();
         let dict = self.reader.get_block_ctx_dict();
         self.ci_array.push(ZranContext::new(&info, dict));
@@ -327,7 +343,7 @@ impl<R: Read> ZranGenerator<R> {
 }
 
 impl<R: Read> Read for ZranGenerator<R> {
-    fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         self.reader.read(buf)
     }
 }
@@ -341,7 +357,7 @@ pub struct ZranReader<R> {
 
 impl<R> ZranReader<R> {
     /// Create a `ZranReader` from a reader.
-    pub fn new(reader: R) -> Result<Self> {
+    pub fn new(reader: R) -> io::Result<Self> {
         let inner = ZranReaderState::new(reader)?;
         Ok(Self {
             inner: Arc::new(Mutex::new(inner)),
@@ -390,7 +406,7 @@ impl<R> ZranReader<R> {
 }
 
 impl<R: Read> Read for ZranReader<R> {
-    fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         self.inner.lock().unwrap().read(buf)
     }
 }
@@ -426,7 +442,7 @@ struct ZranReaderState<R> {
 }
 
 impl<R> ZranReaderState<R> {
-    fn new(reader: R) -> Result<Self> {
+    fn new(reader: R) -> io::Result<Self> {
         let mut stream = ZranStream::new(false)?;
         let input = vec![0u8; ZRAN_READER_BUF_SIZE];
         stream.set_next_in(&input[0..0]);
@@ -452,14 +468,14 @@ impl<R> ZranReaderState<R> {
             .get_compression_info(&self.input, stream_switched)
     }
 
-    fn get_compression_dict(&mut self) -> Result<()> {
+    fn get_compression_dict(&mut self) -> io::Result<()> {
         self.block_ctx_dict_size = self.stream.get_compression_dict(&mut self.block_ctx_dict)?;
         Ok(())
     }
 }
 
 impl<R: Read> Read for ZranReaderState<R> {
-    fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         self.stream.set_next_out(buf);
         self.stream.set_avail_out(buf.len() as u32);
 
@@ -503,11 +519,13 @@ impl<R: Read> Read for ZranReaderState<R> {
                         // Need more input data, continue to feed data into the input buffer.
                         continue;
                     } else {
-                        return Err(eio!("failed to decode data from compressed data stream"));
+                        return Err(io::Error::other(
+                            "failed to decode data from compressed data stream",
+                        ));
                     }
                 }
                 e => {
-                    return Err(eio!(format!(
+                    return Err(io::Error::other(format!(
                         "failed to decode data from compressed data stream, error code {}",
                         e
                     )));
@@ -525,7 +543,7 @@ struct ZranStream {
 }
 
 impl ZranStream {
-    fn new(decode: bool) -> Result<Self> {
+    fn new(decode: bool) -> io::Result<Self> {
         let mut stream = Box::new(z_stream {
             next_in: ptr::null_mut(),
             avail_in: 0,
@@ -556,7 +574,10 @@ impl ZranStream {
             )
         };
         if ret != Z_OK {
-            return Err(einval!("failed to initialize zlib inflate context"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "failed to initialize zlib inflate context",
+            ));
         }
 
         Ok(Self {
@@ -586,19 +607,25 @@ impl ZranStream {
         unsafe { inflate(self.stream.deref_mut() as *mut z_stream, mode) }
     }
 
-    fn reset(&mut self) -> Result<()> {
+    fn reset(&mut self) -> io::Result<()> {
         let ret = unsafe { inflateReset(self.stream.deref_mut() as *mut z_stream) };
         if ret != Z_OK {
-            return Err(einval!("failed to reset zlib inflate context"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "failed to reset zlib inflate context",
+            ));
         }
         Ok(())
     }
 
-    fn reset2(&mut self, is_gzip: bool) -> Result<()> {
+    fn reset2(&mut self, is_gzip: bool) -> io::Result<()> {
         let winodw_bits = if is_gzip { 31 } else { -15 };
         let ret = unsafe { inflateReset2(self.stream.deref_mut() as *mut z_stream, winodw_bits) };
         if ret != Z_OK {
-            return Err(einval!("failed to reset zlib inflate context"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "failed to reset zlib inflate context",
+            ));
         }
         Ok(())
     }
@@ -624,7 +651,7 @@ impl ZranStream {
         }
     }
 
-    fn get_compression_dict(&mut self, buf: &mut [u8]) -> Result<usize> {
+    fn get_compression_dict(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         let mut len: uInt = 0;
         assert_eq!(buf.len(), ZRAN_DICT_WIN_SIZE);
 
@@ -637,23 +664,29 @@ impl ZranStream {
         };
 
         if ret != Z_OK {
-            Err(einval!("failed to get inflate dictionary"))
+            Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "failed to get inflate dictionary",
+            ))
         } else {
             Ok(len as usize)
         }
     }
 
-    fn set_dict(&mut self, dict: &[u8]) -> Result<()> {
+    fn set_dict(&mut self, dict: &[u8]) -> io::Result<()> {
         let ret = unsafe {
             inflateSetDictionary(self.stream.deref_mut(), dict.as_ptr(), dict.len() as uInt)
         };
         if ret != Z_OK {
-            return Err(einval!("failed to reset zlib inflate context"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "failed to reset zlib inflate context",
+            ));
         }
         Ok(())
     }
 
-    fn set_prime(&mut self, bits: u8, prime: u8) -> Result<()> {
+    fn set_prime(&mut self, bits: u8, prime: u8) -> io::Result<()> {
         let ret = unsafe {
             inflatePrime(
                 self.stream.deref_mut(),
@@ -662,7 +695,10 @@ impl ZranStream {
             )
         };
         if ret != Z_OK {
-            return Err(einval!("failed to reset zlib inflate context"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "failed to reset zlib inflate context",
+            ));
         }
         Ok(())
     }

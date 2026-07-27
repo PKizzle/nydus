@@ -5,7 +5,7 @@
 use std::borrow::Cow;
 use std::convert::TryFrom;
 use std::fmt;
-use std::io::{BufReader, Error, Read, Result, Write};
+use std::io::{BufReader, Error, ErrorKind, Read, Result, Write};
 use std::str::FromStr;
 
 mod lz4_standard;
@@ -48,7 +48,10 @@ impl FromStr for Algorithm {
             "lz4_block" => Ok(Self::Lz4Block),
             "gzip" => Ok(Self::GZip),
             "zstd" => Ok(Self::Zstd),
-            _ => Err(einval!("compression algorithm should be none or lz4_block")),
+            _ => Err(Error::new(
+                ErrorKind::InvalidInput,
+                "compression algorithm should be none or lz4_block",
+            )),
         }
     }
 }

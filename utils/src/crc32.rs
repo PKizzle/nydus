@@ -107,7 +107,7 @@ impl Crc32 {
             }
             let bytes_to_read = std::cmp::min((size - total_read) as usize, buf.len());
             let ret = uio::pread(fd, &mut buf[..bytes_to_read], (offset + total_read) as i64)
-                .map_err(|_| last_error!());
+                .map_err(std::io::Error::from);
             match ret {
                 Ok(read_size) => {
                     if read_size == 0 {

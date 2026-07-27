@@ -3,10 +3,12 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::fs::File;
-use std::io::Result;
+use std::io;
 use std::mem::size_of;
 use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd, RawFd};
 use std::ptr::NonNull;
+
+use crate::with_context;
 
 /// Struct to manage memory range mapped from file objects.
 ///
@@ -53,7 +55,7 @@ impl FileMapState {
     /// Memory map a region of the file object into current process.
     ///
     /// It takes ownership of the file object and will close it when the returned object is dropped.
-    pub fn new(file: File, offset: libc::off_t, size: usize, writable: bool) -> Result<Self> {
+    pub fn new(file: File, offset: libc::off_t, size: usize, writable: bool) -> io::Result<Self> {
         let prot = if writable {
             libc::PROT_READ | libc::PROT_WRITE
         } else {
@@ -69,13 +71,14 @@ impl FileMapState {
                 offset,
             )
         } as *const u8;
-        if base as *mut core::ffi::c_void == libc::MAP_FAILED {
-            return Err(last_error!(
-                "failed to memory map file region into current process"
-            ));
-        } else if base.is_null() {
-            return Err(last_error!(
-                "failed to memory map file region into current process"
+        // `MAP_FAILED` is the documented failure value; the null check is belt-and-braces for a
+        // libc that returns NULL instead. Both mean the same thing to the caller, and both leave
+        // `errno` set. (These were two arms with identical bodies until the error macros went
+        // away -- the macro embedded `line!()`, so the bodies only looked different.)
+        if base as *mut core::ffi::c_void == libc::MAP_FAILED || base.is_null() {
+            return Err(with_context(
+                io::Error::last_os_error(),
+                "failed to memory map file region into current process",
             ));
         }
         // Safe because the mmap area should covered the range [start, end)
@@ -95,47 +98,62 @@ impl FileMapState {
     }
 
     /// Cast a subregion of the mapped area to an object reference.
-    pub fn get_ref<T>(&self, offset: usize) -> Result<&T> {
+    pub fn get_ref<T>(&self, offset: usize) -> io::Result<&T> {
         let start = self.base.wrapping_add(offset);
         let end = start.wrapping_add(size_of::<T>());
 
         if start > end || start < self.base || end < self.base || end > self.end {
-            return Err(einval!("invalid mmap offset"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid mmap offset",
+            ));
         }
 
         Ok(unsafe { &*(start as *const T) })
     }
 
     /// Cast a subregion of the mapped area to an mutable object reference.
-    pub fn get_mut<T>(&mut self, offset: usize) -> Result<&mut T> {
+    pub fn get_mut<T>(&mut self, offset: usize) -> io::Result<&mut T> {
         let start = self.base.wrapping_add(offset);
         let end = start.wrapping_add(size_of::<T>());
 
         if start > end || start < self.base || end < self.base || end > self.end {
-            return Err(einval!("invalid mmap offset"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid mmap offset",
+            ));
         }
 
         Ok(unsafe { &mut *(start as *const T as *mut T) })
     }
 
     /// Get an immutable slice of 'T' at 'offset' with 'count' entries.
-    pub fn get_slice<T>(&self, offset: usize, count: usize) -> Result<&[T]> {
+    pub fn get_slice<T>(&self, offset: usize, count: usize) -> io::Result<&[T]> {
         let start = self.base.wrapping_add(offset);
         if count.checked_mul(size_of::<T>()).is_none() {
-            bail_einval!("count 0x{count:x} to validate_slice() is too big");
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("count 0x{count:x} to validate_slice() is too big"),
+            ));
         }
         let size = count * size_of::<T>();
         if size.checked_add(start as usize).is_none() {
-            bail_einval!(
-                "invalid parameter to validate_slice(), offset 0x{offset:x}, count 0x{count:x}"
-            );
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "invalid parameter to validate_slice(), offset 0x{offset:x}, count 0x{count:x}"
+                ),
+            ));
         }
         let end = start.wrapping_add(size);
         if start > end || start < self.base || end < self.base || end > self.end {
-            bail_einval!(
-                "invalid range in validate_slice, base 0x{:p}, start 0x{start:p}, end 0x{end:p}",
-                self.base
-            );
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "invalid range in validate_slice, base 0x{:p}, start 0x{start:p}, end 0x{end:p}",
+                    self.base
+                ),
+            ));
         }
         let ptr = if size == 0 {
             NonNull::<T>::dangling().as_ptr()
@@ -146,23 +164,32 @@ impl FileMapState {
     }
 
     /// Get a mutable slice of 'T' at 'offset' with 'count' entries.
-    pub fn get_slice_mut<T>(&mut self, offset: usize, count: usize) -> Result<&mut [T]> {
+    pub fn get_slice_mut<T>(&mut self, offset: usize, count: usize) -> io::Result<&mut [T]> {
         let start = self.base.wrapping_add(offset);
         if count.checked_mul(size_of::<T>()).is_none() {
-            bail_einval!("count 0x{count:x} to validate_slice() is too big");
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("count 0x{count:x} to validate_slice() is too big"),
+            ));
         }
         let size = count * size_of::<T>();
         if size.checked_add(start as usize).is_none() {
-            bail_einval!(
-                "invalid parameter to validate_slice(), offset 0x{offset:x}, count 0x{count:x}"
-            );
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "invalid parameter to validate_slice(), offset 0x{offset:x}, count 0x{count:x}"
+                ),
+            ));
         }
         let end = start.wrapping_add(size);
         if start > end || start < self.base || end < self.base || end > self.end {
-            bail_einval!(
-                "invalid range in validate_slice, base 0x{:p}, start 0x{start:p}, end 0x{end:p}",
-                self.base
-            );
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "invalid range in validate_slice, base 0x{:p}, start 0x{start:p}, end 0x{end:p}",
+                    self.base
+                ),
+            ));
         }
         let ptr = if size == 0 {
             NonNull::<T>::dangling().as_ptr()
@@ -173,12 +200,12 @@ impl FileMapState {
     }
 
     /// Check whether the range [offset, offset + size) is valid and return the start address.
-    pub fn validate_range(&self, offset: usize, size: usize) -> Result<*const u8> {
+    pub fn validate_range(&self, offset: usize, size: usize) -> io::Result<*const u8> {
         let start = self.base.wrapping_add(offset);
         let end = start.wrapping_add(size);
 
         if start > end || start < self.base || end < self.base || end > self.end {
-            return Err(einval!("invalid range"));
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid range"));
         }
 
         Ok(start)
@@ -193,7 +220,7 @@ impl FileMapState {
     }
 
     /// Sync mapped file data into disk.
-    pub fn sync_data(&self) -> Result<()> {
+    pub fn sync_data(&self) -> io::Result<()> {
         let file = unsafe { File::from_raw_fd(self.fd) };
         let result = file.sync_data();
         std::mem::forget(file);
@@ -202,11 +229,14 @@ impl FileMapState {
 }
 
 /// Duplicate a file object by `libc::dup()`.
-pub fn clone_file(fd: RawFd) -> Result<File> {
+pub fn clone_file(fd: RawFd) -> io::Result<File> {
     unsafe {
         let fd = libc::dup(fd);
         if fd < 0 {
-            return Err(last_error!("failed to dup bootstrap file fd"));
+            return Err(with_context(
+                io::Error::last_os_error(),
+                "failed to dup bootstrap file fd",
+            ));
         }
         Ok(File::from_raw_fd(fd))
     }

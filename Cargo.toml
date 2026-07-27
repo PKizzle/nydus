@@ -86,7 +86,7 @@ nydus-service = { version = "0.4.0", path = "service", features = [
     "block-device",
 ] }
 nydus-storage = { version = "0.7.2", path = "storage" }
-nydus-utils = { version = "0.5.1", path = "utils" }
+nydus-utils = { version = "0.6.0", path = "utils" }
 
 vhost = { workspace = true, features = ["vhost-user"], optional = true }
 vhost-user-backend = { workspace = true, optional = true }

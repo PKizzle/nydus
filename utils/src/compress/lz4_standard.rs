@@ -1,17 +1,20 @@
 // Copyright (C) 2020 Alibaba Cloud. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::io::Result;
+use std::io;
 
 use libc::c_char;
 use lz4_sys::{LZ4_compress_default, LZ4_compressBound, LZ4_decompress_safe};
 
-pub(super) fn lz4_compress(src: &[u8]) -> Result<Vec<u8>> {
+pub(super) fn lz4_compress(src: &[u8]) -> io::Result<Vec<u8>> {
     // 0 iff src too large
     let compress_bound: i32 = unsafe { LZ4_compressBound(src.len() as i32) };
 
     if src.len() > (i32::MAX as usize) || compress_bound <= 0 {
-        return Err(einval!("compression input data is too big"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "compression input data is too big",
+        ));
     }
 
     let mut dst_buf = Vec::with_capacity(compress_bound as usize);
@@ -24,7 +27,7 @@ pub(super) fn lz4_compress(src: &[u8]) -> Result<Vec<u8>> {
         )
     };
     if cmp_size <= 0 {
-        return Err(eio!("compression failed"));
+        return Err(io::Error::other("compression failed"));
     }
 
     assert!(cmp_size as usize <= dst_buf.capacity());
@@ -33,14 +36,20 @@ pub(super) fn lz4_compress(src: &[u8]) -> Result<Vec<u8>> {
     Ok(dst_buf)
 }
 
-pub(super) fn lz4_decompress(src: &[u8], dst: &mut [u8]) -> Result<usize> {
+pub(super) fn lz4_decompress(src: &[u8], dst: &mut [u8]) -> io::Result<usize> {
     if dst.len() >= i32::MAX as usize {
-        return Err(einval!("the destination buffer is big than i32::MAX"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "the destination buffer is big than i32::MAX",
+        ));
     }
     let size = dst.len() as i32;
 
     if unsafe { LZ4_compressBound(size) } <= 0 {
-        return Err(einval!("given size parameter is too big"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "given size parameter is too big",
+        ));
     }
 
     let dec_bytes = unsafe {
@@ -53,7 +62,7 @@ pub(super) fn lz4_decompress(src: &[u8], dst: &mut [u8]) -> Result<usize> {
     };
 
     if dec_bytes < 0 {
-        return Err(eio!("decompression failed"));
+        return Err(io::Error::other("decompression failed"));
     }
 
     Ok(dec_bytes as usize)

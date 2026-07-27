@@ -5,7 +5,7 @@
 use std::borrow::Cow;
 use std::convert::TryFrom;
 use std::fmt::{self, Debug, Formatter};
-use std::io::Error;
+use std::io::{Error, ErrorKind};
 use std::str::FromStr;
 use std::sync::Arc;
 
@@ -122,7 +122,10 @@ impl FromStr for Algorithm {
             "aes128xts" => Ok(Self::Aes128Xts),
             "aes256xts" => Ok(Self::Aes256Xts),
             "aes256gcm" => Ok(Self::Aes256Gcm),
-            _ => Err(einval!("cypher algorithm should be none or aes_gcm")),
+            _ => Err(Error::new(
+                ErrorKind::InvalidInput,
+                "cypher algorithm should be none or aes_gcm",
+            )),
         }
     }
 }
@@ -228,7 +231,10 @@ impl Cipher {
                 };
                 Self::xts_crypt::<Aes256>(key, iv, data, true).map(Cow::from)
             }
-            Cipher::Aes256Gcm => Err(einval!("Cipher::encrypt() doesn't support Aes256Gcm")),
+            Cipher::Aes256Gcm => Err(Error::new(
+                ErrorKind::InvalidInput,
+                "Cipher::encrypt() doesn't support Aes256Gcm",
+            )),
         }
     }
 
@@ -238,7 +244,10 @@ impl Cipher {
             Cipher::None => Ok(data.to_vec()),
             Cipher::Aes128Xts => Self::xts_crypt::<Aes128>(key, iv, data, false),
             Cipher::Aes256Xts => Self::xts_crypt::<Aes256>(key, iv, data, false),
-            Cipher::Aes256Gcm => Err(einval!("Cipher::decrypt() doesn't support Aes256Gcm")),
+            Cipher::Aes256Gcm => Err(Error::new(
+                ErrorKind::InvalidInput,
+                "Cipher::decrypt() doesn't support Aes256Gcm",
+            )),
         }?;
 
         // Trim possible padding.
@@ -249,10 +258,10 @@ impl Cipher {
             if val < DATA_UNIT_LENGTH {
                 data.truncate(DATA_UNIT_LENGTH - val);
             } else {
-                return Err(einval!(format!(
-                    "Cipher::decrypt: invalid padding data, value {}",
-                    val,
-                )));
+                return Err(Error::new(
+                    ErrorKind::InvalidInput,
+                    format!("Cipher::decrypt: invalid padding data, value {}", val,),
+                ));
             }
         };
 
@@ -269,7 +278,10 @@ impl Cipher {
     ) -> Result<Vec<u8>, Error> {
         match self {
             Cipher::Aes256Gcm => Self::gcm_encrypt(key, iv, data, tag),
-            _ => Err(einval!("invalid algorithm for encrypt_aead()")),
+            _ => Err(Error::new(
+                ErrorKind::InvalidInput,
+                "invalid algorithm for encrypt_aead()",
+            )),
         }
     }
 
@@ -283,7 +295,10 @@ impl Cipher {
     ) -> Result<Vec<u8>, Error> {
         match self {
             Cipher::Aes256Gcm => Self::gcm_decrypt(key, iv, data, tag),
-            _ => Err(einval!("invalid algorithm for decrypt_aead()")),
+            _ => Err(Error::new(
+                ErrorKind::InvalidInput,
+                "invalid algorithm for decrypt_aead()",
+            )),
         }
     }
 
@@ -345,15 +360,19 @@ impl Cipher {
     where
         C: KeyInit + BlockSizeUser<BlockSize = U16> + BlockCipherEncrypt + BlockCipherDecrypt,
     {
-        let iv = iv.ok_or_else(|| einval!("XTS mode requires an IV"))?;
-        let tweak: [u8; AES_XTS_IV_LENGTH] = iv
-            .try_into()
-            .map_err(|_| einval!(format!("XTS IV must be {} bytes", AES_XTS_IV_LENGTH)))?;
+        let iv =
+            iv.ok_or_else(|| Error::new(ErrorKind::InvalidInput, "XTS mode requires an IV"))?;
+        let tweak: [u8; AES_XTS_IV_LENGTH] = iv.try_into().map_err(|_| {
+            Error::new(
+                ErrorKind::InvalidInput,
+                format!("XTS IV must be {} bytes", AES_XTS_IV_LENGTH),
+            )
+        })?;
         let half = key.len() / 2;
-        let cipher_1 =
-            C::new_from_slice(&key[..half]).map_err(|_| einval!("invalid XTS key length"))?;
-        let cipher_2 =
-            C::new_from_slice(&key[half..]).map_err(|_| einval!("invalid XTS key length"))?;
+        let cipher_1 = C::new_from_slice(&key[..half])
+            .map_err(|_| Error::new(ErrorKind::InvalidInput, "invalid XTS key length"))?;
+        let cipher_2 = C::new_from_slice(&key[half..])
+            .map_err(|_| Error::new(ErrorKind::InvalidInput, "invalid XTS key length"))?;
         let xts = Xts128::new(cipher_1, cipher_2);
         let mut buf = data.to_vec();
         if encrypt {
@@ -370,21 +389,25 @@ impl Cipher {
         data: &[u8],
         tag: &mut [u8],
     ) -> Result<Vec<u8>, Error> {
-        let iv = iv.ok_or_else(|| einval!("GCM mode requires an IV"))?;
-        let nonce: &Array<u8, U16> = iv
-            .try_into()
-            .map_err(|_| einval!(format!("GCM IV must be {} bytes", AES_XTS_IV_LENGTH)))?;
-        let cipher =
-            Aes256GcmCipher::new_from_slice(key).map_err(|_| einval!("invalid GCM key length"))?;
+        let iv =
+            iv.ok_or_else(|| Error::new(ErrorKind::InvalidInput, "GCM mode requires an IV"))?;
+        let nonce: &Array<u8, U16> = iv.try_into().map_err(|_| {
+            Error::new(
+                ErrorKind::InvalidInput,
+                format!("GCM IV must be {} bytes", AES_XTS_IV_LENGTH),
+            )
+        })?;
+        let cipher = Aes256GcmCipher::new_from_slice(key)
+            .map_err(|_| Error::new(ErrorKind::InvalidInput, "invalid GCM key length"))?;
         let mut buf = data.to_vec();
         let out_tag = cipher
             .encrypt_inout_detached(nonce, &[], InOutBuf::from(&mut buf[..]))
-            .map_err(|e| eother!(format!("failed to encrypt data, {}", e)))?;
+            .map_err(|e| Error::other(format!("failed to encrypt data, {}", e)))?;
         if tag.len() != out_tag.len() {
-            return Err(einval!(format!(
-                "GCM tag buffer must be {} bytes",
-                out_tag.len()
-            )));
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                format!("GCM tag buffer must be {} bytes", out_tag.len()),
+            ));
         }
         tag.copy_from_slice(out_tag.as_slice());
         Ok(buf)
@@ -396,33 +419,39 @@ impl Cipher {
         data: &[u8],
         tag: &[u8],
     ) -> Result<Vec<u8>, Error> {
-        let iv = iv.ok_or_else(|| einval!("GCM mode requires an IV"))?;
-        let nonce: &Array<u8, U16> = iv
-            .try_into()
-            .map_err(|_| einval!(format!("GCM IV must be {} bytes", AES_XTS_IV_LENGTH)))?;
+        let iv =
+            iv.ok_or_else(|| Error::new(ErrorKind::InvalidInput, "GCM mode requires an IV"))?;
+        let nonce: &Array<u8, U16> = iv.try_into().map_err(|_| {
+            Error::new(
+                ErrorKind::InvalidInput,
+                format!("GCM IV must be {} bytes", AES_XTS_IV_LENGTH),
+            )
+        })?;
         let tag: &Array<u8, U12> = tag
             .try_into()
-            .map_err(|_| einval!("GCM tag must be 12 bytes"))?;
-        let cipher =
-            Aes256GcmCipher::new_from_slice(key).map_err(|_| einval!("invalid GCM key length"))?;
+            .map_err(|_| Error::new(ErrorKind::InvalidInput, "GCM tag must be 12 bytes"))?;
+        let cipher = Aes256GcmCipher::new_from_slice(key)
+            .map_err(|_| Error::new(ErrorKind::InvalidInput, "invalid GCM key length"))?;
         let mut buf = data.to_vec();
         cipher
             .decrypt_inout_detached(nonce, &[], InOutBuf::from(&mut buf[..]), tag)
-            .map_err(|e| eother!(format!("failed to decrypt data, {}", e)))?;
+            .map_err(|e| Error::other(format!("failed to decrypt data, {}", e)))?;
         Ok(buf)
     }
 
     pub fn generate_random_key(cipher_algo: Algorithm) -> Result<Vec<u8>, Error> {
         let length = cipher_algo.key_length();
         let mut buf = vec![0u8; length];
-        getrandom::fill(&mut buf)
-            .map_err(|e| eother!(format!("failed to generate key for {}, {}", cipher_algo, e)))?;
+        getrandom::fill(&mut buf).map_err(|e| {
+            Error::other(format!("failed to generate key for {}, {}", cipher_algo, e))
+        })?;
         Ok(Self::tweak_key_for_xts(&buf).to_vec())
     }
 
     pub fn generate_random_iv() -> Result<Vec<u8>, Error> {
         let mut buf = vec![0u8; AES_XTS_IV_LENGTH];
-        getrandom::fill(&mut buf).map_err(|e| eother!(format!("failed to generate iv, {}", e)))?;
+        getrandom::fill(&mut buf)
+            .map_err(|e| Error::other(format!("failed to generate iv, {}", e)))?;
         Ok(buf)
     }
 }
@@ -446,12 +475,18 @@ impl CipherContext {
     ) -> Result<Self, Error> {
         let key_length = key.len();
         if key_length != cipher_algo.key_length() {
-            return Err(einval!(format!(
-                "invalid key length {} for {} encryption",
-                key_length, cipher_algo
-            )));
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "invalid key length {} for {} encryption",
+                    key_length, cipher_algo
+                ),
+            ));
         } else if key[0..key_length >> 1] == key[key_length >> 1..key_length] {
-            return Err(einval!("invalid symmetry key for encryption"));
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "invalid symmetry key for encryption",
+            ));
         }
 
         Ok(CipherContext {
@@ -501,7 +536,10 @@ pub fn encrypt_with_context<'a>(
             let (key, iv) = cipher_ctx.get_cipher_meta();
             Ok(cipher_obj.encrypt(key, Some(iv), data)?)
         } else {
-            Err(einval!("the encrypt context can not be none"))
+            Err(Error::new(
+                ErrorKind::InvalidInput,
+                "the encrypt context can not be none",
+            ))
         }
     } else {
         Ok(Cow::Borrowed(data))
@@ -520,7 +558,10 @@ pub fn decrypt_with_context<'a>(
             let (key, iv) = cipher_ctx.get_cipher_meta();
             Ok(Cow::from(cipher_obj.decrypt(key, Some(iv), data)?))
         } else {
-            Err(einval!("the decrypt context can not be none"))
+            Err(Error::new(
+                ErrorKind::InvalidInput,
+                "the decrypt context can not be none",
+            ))
         }
     } else {
         Ok(Cow::Borrowed(data))
