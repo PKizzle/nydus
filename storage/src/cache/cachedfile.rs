@@ -1193,6 +1193,9 @@ impl FileCacheEntry {
         trace!("dispatch single io range {:?}", req);
         let mut blob_cci = BlobCCI::new();
         for (i, chunk) in req.chunks.iter().enumerate() {
+            // The reassignment lives behind `dedup` (a default feature, but disableable —
+            // e.g. clib's feature set), so the `mut` is unused in some builds only.
+            #[cfg_attr(not(feature = "dedup"), allow(unused_mut))]
             let mut is_ready = match self.chunk_map.check_ready_and_mark_pending(chunk.as_ref()) {
                 Ok(true) => true,
                 Ok(false) => false,

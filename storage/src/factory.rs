@@ -240,32 +240,37 @@ impl BlobFactory {
     /// Create a storage backend for the blob with id `blob_id`.
     pub fn new_backend(
         config: &BackendConfigV2,
-        id: &str,
+        // Underscore-prefixed like `new_backend_from_json`'s params: every use sits in a
+        // feature-gated match arm, so with no backend features enabled it is unused.
+        _id: &str,
     ) -> IOResult<Arc<dyn BlobBackend + Send + Sync>> {
         match config.backend_type.as_str() {
             #[cfg(feature = "backend-oss")]
-            "oss" => Ok(Arc::new(oss::Oss::new(config.get_oss_config()?, Some(id))?)),
+            "oss" => Ok(Arc::new(oss::Oss::new(
+                config.get_oss_config()?,
+                Some(_id),
+            )?)),
             #[cfg(feature = "backend-s3")]
-            "s3" => Ok(Arc::new(s3::S3::new(config.get_s3_config()?, Some(id))?)),
+            "s3" => Ok(Arc::new(s3::S3::new(config.get_s3_config()?, Some(_id))?)),
             #[cfg(feature = "backend-registry")]
             "registry" => Ok(Arc::new(registry::Registry::new(
                 config.get_registry_config()?,
-                Some(id),
+                Some(_id),
             )?)),
             #[cfg(feature = "backend-localfs")]
             "localfs" => Ok(Arc::new(localfs::LocalFs::new(
                 config.get_localfs_config()?,
-                Some(id),
+                Some(_id),
             )?)),
             #[cfg(feature = "backend-localdisk")]
             "localdisk" => Ok(Arc::new(localdisk::LocalDisk::new(
                 config.get_localdisk_config()?,
-                Some(id),
+                Some(_id),
             )?)),
             #[cfg(feature = "backend-http-proxy")]
             "http-proxy" => Ok(Arc::new(http_proxy::HttpProxy::new(
                 config.get_http_proxy_config()?,
-                Some(id),
+                Some(_id),
             )?)),
             _ => Err(einval!(format!(
                 "unsupported backend type '{}'",
