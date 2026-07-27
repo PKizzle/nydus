@@ -98,6 +98,12 @@ pub unsafe extern "C" fn nydus_fopen(
 /// released again before returning — otherwise every open would leak a reference on each
 /// directory along the way. The final inode keeps its reference, which `nydus_fclose` drops.
 fn lookup_path(fs: &FileSystemState, path: &str) -> Result<Inode, i32> {
+    // POSIX resolves an empty path to ENOENT; without this check it would silently
+    // resolve to the root directory below.
+    if path.is_empty() {
+        return Err(libc::ENOENT);
+    }
+
     let ctx = Context::default();
     let mut ino = fs.root_ino;
     let mut pending_forget: Vec<Inode> = Vec::new();
@@ -108,6 +114,20 @@ fn lookup_path(fs: &FileSystemState, path: &str) -> Result<Inode, i32> {
         }
         let name = CString::new(component).map_err(|_| libc::EINVAL)?;
         match fs.rafs.lookup(&ctx, ino, &name) {
+            // A missing name is NOT an error at the FUSE layer: `Rafs::lookup` answers it
+            // with a *negative entry* (`Ok` with inode 0) so the kernel can cache the
+            // absence. Treating that as success would hand out a file handle pinned to
+            // inode 0. A negative entry holds no reference, so there is nothing extra to
+            // forget — but the references already taken along the path still are.
+            Ok(entry) if entry.inode == 0 => {
+                if ino != fs.root_ino {
+                    pending_forget.push(ino);
+                }
+                for stale in pending_forget {
+                    fs.rafs.forget(&ctx, stale, 1);
+                }
+                return Err(libc::ENOENT);
+            }
             Ok(entry) => {
                 if ino != fs.root_ino {
                     pending_forget.push(ino);
@@ -115,6 +135,13 @@ fn lookup_path(fs: &FileSystemState, path: &str) -> Result<Inode, i32> {
                 ino = entry.inode;
             }
             Err(e) => {
+                // The current `ino` is the last component that DID resolve, and its
+                // reference is not yet in `pending_forget` (an inode only moves there
+                // once the lookup *under* it succeeds). Forgetting only the list would
+                // leak that reference on every failed open of a partially valid path.
+                if ino != fs.root_ino {
+                    pending_forget.push(ino);
+                }
                 for stale in pending_forget {
                     fs.rafs.forget(&ctx, stale, 1);
                 }
@@ -227,6 +254,17 @@ mod tests {
         let fs = open_file_system();
         let handle = fopen(fs, "/no/such/file");
         assert_eq!(handle, NYDUS_INVALID_FILE_HANDLE as NydusFileHandle);
+
+        // A partially valid path exercises the error path's reference cleanup: the
+        // prefix resolves (taking references), the tail does not. The leak itself is
+        // not observable through the C API, but the walk must still fail cleanly.
+        let handle = fopen(fs, "/hardlink-test/does-not-exist");
+        assert_eq!(handle, NYDUS_INVALID_FILE_HANDLE as NydusFileHandle);
+
+        // POSIX: an empty path is ENOENT, not the root directory.
+        let handle = fopen(fs, "");
+        assert_eq!(handle, NYDUS_INVALID_FILE_HANDLE as NydusFileHandle);
+
         unsafe { nydus_close_rafs(fs) };
     }
 
