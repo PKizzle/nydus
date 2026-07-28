@@ -187,11 +187,22 @@ pub unsafe extern "C" fn nydus_open_rafs_default(
 /// All `NydusFileHandle` objects created from the `NydusFsHandle` should be freed before calling
 /// `nydus_close_rafs()`, otherwise it may cause panic.
 ///
+/// Passing `NYDUS_INVALID_FS_HANDLE` is a no-op, so the natural C idiom of closing whatever
+/// `nydus_open_rafs()` returned without checking it first does not fault.
+///
 /// # Safety
 /// Caller needs to ensure `handle` is valid, otherwise it may cause memory access violation.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn nydus_close_rafs(handle: NydusFsHandle) {
     unsafe {
+        // An open that failed returns `NYDUS_INVALID_FS_HANDLE`, and every caller which does not
+        // check before closing used to reach `Box::from_raw(null)` and read `magic` through it --
+        // a null dereference, reported as a bare SIGSEGV with nothing pointing back at the failed
+        // open. Rejecting it here turns that into an ordinary error.
+        if handle == NYDUS_INVALID_FS_HANDLE {
+            set_errno(libc::EINVAL);
+            return;
+        }
         let mut fs = Box::from_raw(handle as *mut FileSystemState);
         assert_eq!(fs.magic, NYDUS_FS_HANDLE_MAGIC);
         fs.magic -= 0x4fdf_03cd_ae34_9d9a;
@@ -266,6 +277,21 @@ pub(crate) mod tests {
         let fs = unsafe {
             nydus_open_rafs_default(bootstrap.as_ptr(), blob_dir.as_ptr() as *const c_char)
         };
+        // Assert before closing. Without this, an open that failed for any reason handed a
+        // null handle straight to `nydus_close_rafs`, and the test died with a bare SIGSEGV
+        // that said nothing about which step had actually gone wrong.
+        assert_ne!(fs, NYDUS_INVALID_FS_HANDLE);
         unsafe { nydus_close_rafs(fs) };
+    }
+
+    #[test]
+    fn closing_an_invalid_handle_is_rejected_not_fatal() {
+        // The C idiom is to close whatever open returned. When open failed that handle is
+        // `NYDUS_INVALID_FS_HANDLE`, and dereferencing it used to fault inside the library.
+        unsafe { nydus_close_rafs(NYDUS_INVALID_FS_HANDLE) };
+        assert_eq!(
+            Error::raw_os_error(&Error::last_os_error()),
+            Some(libc::EINVAL)
+        );
     }
 }

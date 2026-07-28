@@ -168,11 +168,18 @@ fn lookup_path(fs: &FileSystemState, path: &str) -> Result<Inode, i32> {
 
 /// Close the file handle returned by `nydus_fopen()`.
 ///
+/// Passing `NYDUS_INVALID_FILE_HANDLE` is a no-op, so closing whatever `nydus_fopen()` returned
+/// without checking it first does not fault -- see `nydus_close_rafs()`.
+///
 /// # Safety
 /// Caller needs to ensure `fs_handle` is valid, otherwise it may cause memory access violation.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn nydus_fclose(handle: NydusFileHandle) {
     unsafe {
+        if handle == NYDUS_INVALID_FILE_HANDLE as NydusFileHandle {
+            set_errno(libc::EINVAL);
+            return;
+        }
         let mut file = Box::from_raw(handle as *mut FileState);
         assert_eq!(file.magic, NYDUS_FILE_HANDLE_MAGIC);
 
@@ -266,6 +273,17 @@ mod tests {
         assert_eq!(handle, NYDUS_INVALID_FILE_HANDLE as NydusFileHandle);
 
         unsafe { nydus_close_rafs(fs) };
+    }
+
+    #[test]
+    fn closing_an_invalid_file_handle_is_rejected_not_fatal() {
+        // Mirrors `nydus_close_rafs`: `nydus_fopen` returns NYDUS_INVALID_FILE_HANDLE on
+        // failure, and closing it must not fault.
+        unsafe { nydus_fclose(NYDUS_INVALID_FILE_HANDLE as NydusFileHandle) };
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::EINVAL)
+        );
     }
 
     #[test]
