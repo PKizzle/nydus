@@ -35,7 +35,7 @@ impl ClientConnection {
         let uds = sock.try_clone()?;
 
         if id > u32::MAX as u64 {
-            return Err(einval!("ran out of connection id"));
+            return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
         }
 
         Ok(Self {
@@ -75,14 +75,14 @@ impl ClientConnection {
         }
 
         let mut guard = self.lock_conn();
-        let (mut hdr, _files) = guard.recv_header().map_err(|e| eio!(format!("{}", e)))?;
+        let (mut hdr, _files) = guard.recv_header().map_err(|e| std::io::Error::from_raw_os_error(libc::EIO))?;
         match hdr.get_code() {
             RequestCode::Noop => self.handle_noop(&mut hdr, guard)?,
             RequestCode::GetBlob => self.handle_get_blob(&mut hdr, guard)?,
             RequestCode::FetchRange => self.handle_fetch_range(&mut hdr, guard)?,
             cmd => {
                 let msg = format!("unknown request command {}", u32::from(cmd));
-                return Err(einval!(msg));
+                return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
             }
         }
 
@@ -92,22 +92,22 @@ impl ClientConnection {
     fn handle_noop(&self, hdr: &mut MsgHeader, mut guard: MutexGuard<Endpoint>) -> Result<()> {
         let size = hdr.get_size() as usize;
         if !hdr.is_valid() || size != 0 {
-            return Err(eio!("invalid noop request message"));
+            return Err(std::io::Error::from_raw_os_error(libc::EIO));
         }
 
         hdr.set_reply(true);
-        guard.send_header(hdr, None).map_err(|_e| eio!())
+        guard.send_header(hdr, None).map_err(|_e| std::io::Error::from_raw_os_error(libc::EIO))
     }
 
     fn handle_get_blob(&self, hdr: &mut MsgHeader, mut guard: MutexGuard<Endpoint>) -> Result<()> {
         let size = hdr.get_size() as usize;
         if !hdr.is_valid() || size != mem::size_of::<GetBlobRequest>() {
-            return Err(eio!("invalid get blob request message"));
+            return Err(std::io::Error::from_raw_os_error(libc::EIO));
         }
 
-        let (sz, data) = guard.recv_data(size).map_err(|e| eio!(format!("{}", e)))?;
+        let (sz, data) = guard.recv_data(size).map_err(|e| std::io::Error::from_raw_os_error(libc::EIO))?;
         if sz != size || data.len() != size {
-            return Err(einval!("invalid get blob request message"));
+            return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
         }
         drop(guard);
 
@@ -123,7 +123,7 @@ impl ClientConnection {
 
         let mut guard = self.lock_conn();
         hdr.set_reply(true);
-        guard.send_message(hdr, &reply, None).map_err(|_e| eio!())
+        guard.send_message(hdr, &reply, None).map_err(|_e| std::io::Error::from_raw_os_error(libc::EIO))
     }
 
     fn handle_fetch_range(
@@ -133,12 +133,12 @@ impl ClientConnection {
     ) -> Result<()> {
         let size = hdr.get_size() as usize;
         if !hdr.is_valid() || size != mem::size_of::<FetchRangeRequest>() {
-            return Err(eio!("invalid fetch range request message"));
+            return Err(std::io::Error::from_raw_os_error(libc::EIO));
         }
 
-        let (sz, data) = guard.recv_data(size).map_err(|e| eio!(format!("{}", e)))?;
+        let (sz, data) = guard.recv_data(size).map_err(|e| std::io::Error::from_raw_os_error(libc::EIO))?;
         if sz != size || data.len() != size {
-            return Err(einval!("invalid fetch range request message"));
+            return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
         }
         drop(guard);
 
@@ -153,7 +153,7 @@ impl ClientConnection {
 
         let mut guard = self.lock_conn();
         hdr.set_reply(true);
-        guard.send_message(hdr, &reply, None).map_err(|_e| eio!())
+        guard.send_message(hdr, &reply, None).map_err(|_e| std::io::Error::from_raw_os_error(libc::EIO))
     }
 
     fn lock_conn(&self) -> MutexGuard<Endpoint> {
@@ -210,7 +210,7 @@ pub struct Server {
 impl Server {
     /// Create a new instance of `Server` to accept connections from clients.
     pub fn new(sock: &str) -> Result<Self> {
-        let listener = Listener::new(sock, true).map_err(|_e| eio!())?;
+        let listener = Listener::new(sock, true).map_err(|_e| std::io::Error::from_raw_os_error(libc::EIO))?;
 
         Ok(Server {
             sock: sock.to_owned(),
@@ -226,7 +226,7 @@ impl Server {
         server
             .listener
             .set_nonblocking(false)
-            .map_err(|_e| eio!())?;
+            .map_err(|_e| std::io::Error::from_raw_os_error(libc::EIO))?;
 
         std::thread::spawn(move || {
             server.state.active_workers.fetch_add(1, Ordering::Acquire);
@@ -310,22 +310,22 @@ impl Server {
         if let Some(c) = conn {
             match c.handle_message() {
                 Ok(true) => Ok(()),
-                Ok(false) => Err(eother!("client connection is shutting down")),
+                Ok(false) => Err(std::io::Error::other("")),
                 Err(e) => Err(e),
             }
         } else {
-            Err(enoent!("client connect doesn't exist"))
+            Err(std::io::Error::from_raw_os_error(libc::ENOENT))
         }
     }
 
     /// Accept one incoming connection from client.
     pub fn handle_incoming_connection(&self) -> Result<Option<Arc<ClientConnection>>> {
         if self.exiting.load(Ordering::Acquire) {
-            return Err(eio!("server shutdown"));
+            return Err(std::io::Error::from_raw_os_error(libc::EIO));
         }
 
         match self.listener.accept() {
-            Err(e) => Err(eio!(format!("failed to accept incoming connection, {}", e))),
+            Err(e) => Err(std::io::Error::from_raw_os_error(libc::EIO)),
             Ok(None) => Ok(None),
             Ok(Some(sock)) => {
                 let id = self.next_id.fetch_add(1, Ordering::AcqRel);

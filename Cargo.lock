@@ -4156,7 +4156,6 @@ dependencies = [
 name = "nydus-api"
 version = "0.5.0"
 dependencies = [
- "backtrace",
  "dbs-uhttp",
  "http",
  "libc",

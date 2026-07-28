@@ -793,7 +793,7 @@ impl Node {
             // Skip xattrs whose namespace prefix is not recognized by RAFS
             // (e.g. macOS `com.apple.*` xattrs).  Check the prefix before
             // calling `RafsXAttrs::add()` so we avoid triggering the ERROR
-            // log inside the `einval!()` error-construction path.
+            // log inside the error-construction path.
             let key_bytes = key.as_bytes();
             let recognized = RAFS_XATTR_PREFIXES
                 .iter()

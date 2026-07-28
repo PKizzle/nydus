@@ -66,7 +66,7 @@ struct Contextual {
 ///
 /// The result keeps `err`'s [`ErrorKind`](std::io::ErrorKind), reports `context` from `Display`,
 /// and stores `err` as the payload's source — so [`source_errno`] still recovers the errno.
-/// This is what the old `last_error!("...")` macro only pretended to do: it passed the message
+/// This is what the old thread-local errno macro only pretended to do: it passed the message
 /// to `make_error`, which logged it under a non-default feature and returned the error unchanged.
 pub fn with_context(err: std::io::Error, context: impl Into<String>) -> std::io::Error {
     std::io::Error::new(
@@ -149,7 +149,7 @@ mod tests {
         assert_eq!(source_errno(&Bare), None);
 
         // A `Custom` io::Error whose payload is a plain message carries no errno either --
-        // this is exactly what the old `einval!("...")` macro produced.
+        // this is exactly what the old EINVAL error macro produced.
         let msg = Error::new(ErrorKind::InvalidInput, "bad argument");
         assert_eq!(source_errno(&msg), None);
 

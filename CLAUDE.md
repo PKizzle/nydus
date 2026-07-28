@@ -81,7 +81,31 @@ nydus/
 ## Coding Conventions
 
 - **Language**: Rust, **edition 2024** (workspace `resolver = "3"`), MSRV rustc ≥ 1.96, declared once in `[workspace.package]` and inherited by every member (`rust-version.workspace = true`) so clippy's MSRV-aware lints actually apply; it tracks the `rust-toolchain.toml` pin. `#![deny(warnings)]` in all binary crates — including each `snapshotter/src/bin/*.rs` target (bin targets are separate compilation units, so the lib-level attribute does not cover them).
-- **Error handling**: Use `anyhow::Result` in applications; `thiserror` for library error types.
+- **Error handling**: `thiserror` enums in library crates, `anyhow` in binaries. `std::io::Error`
+  survives only at external boundaries — traits we do not own (`FileSystem`, `FileReadWriteVolatile`,
+  `Read`/`Write`/`Seek`, vhost, tonic) and the C ABI. Four rules, all of them load-bearing:
+  - **One `Result` alias per library crate, and files never `use std::io::Result`.** A module-level
+    alias named `Result` shadows `std::result::Result` for every item in the file, so a signature
+    reading `Result<T>` tells you nothing about what it carries. Spell `io::Result<T>` where pinned.
+  - **Capture an errno once, at the syscall, and never re-wrap it.** An `io::Error` is *either* `Os`
+    (has an errno, no message) *or* `Custom` (has a message, `raw_os_error() == None`) — it cannot be
+    both. So an OS error goes into the nearest variant as a raw `#[source] std::io::Error` and stays
+    raw. Wrapping it into a `Custom` error to attach context destroys the errno, and the fanotify
+    pre-content path answers permission events with that errno: a full disk re-wrapped as `Custom`
+    is reported to the reading process as a generic `EIO`, or — worse, if the event is allowed —
+    as an unfilled sparse hole full of zeros.
+  - **Recover errnos with `nydus_utils::source_errno`, not `raw_os_error()`.** It walks the whole
+    chain, including *through* a `Custom` `io::Error` (which `source()` alone skips — it returns the
+    payload's source, not the payload). Boundaries convert with it: see
+    `From<StorageError> for io::Error`, `RafsError::errno()` and `From<service::Error> for io::Error`.
+  - **Protocol errnos are variants, not stringly errors.** `ENOENT` from a lookup is how the kernel
+    is told to cache a negative dentry; `ENOTDIR`, `EBADF`, `EACCES`, `EOPNOTSUPP` are similar. They
+    get dedicated variants and an explicit variant→errno table at the boundary (`RafsError::errno`),
+    pinned by a test, so adding a variant without a row cannot silently start answering `EIO`.
+
+  The old `einval!`/`eio!`/`eother!` macro family is **deleted** — it returned a bare errno and threw
+  the message away in every non-`error-backtrace` build. `make .no-error-macros` fails the build if
+  it comes back.
 - **Async runtime**: split by crate, and none of it is tokio-driven — with **one sanctioned exception** (below). The **snapshotter** (`containerd-nydus`) runs on **compio** (io_uring, `#[compio::main]`); its gRPC/health server and sysctl HTTP API are cyper-axum (hyper-on-compio). The **`service/` crate** (in-process nydus-service: FUSE + fanotify I/O) has **zero tokio**: the fanotify loop is `mio`-poll + blocking libc reads, FUSE runs sync `svc_loop` std threads, and blob io_uring reads plus block-device (uffd/nbd) event loops run on **compio** (`async-broadcast` + `futures-util` standing in for tokio's `select!`/broadcast) — see gotcha #1. `nydus-storage`'s default build is also tokio-free; `tokio` is `optional = true`, gated behind the `backend-dragonfly-proxy` feature (non-default). **`nydusctl`** runs on `#[compio::main]` and speaks HTTP/1 to the daemon's unix socket with `compio::net::UnixStream` + `cyper_core::HyperStream` + `hyper::client::conn::http1` — copy that pattern (also used by `storage/src/backend/http_proxy.rs`) for any new unix-socket HTTP client. Do **not** reach for `hyper-util`'s legacy `Client` or `hyperlocal`: both are tokio-bound, and pulling them in reintroduces a tokio runtime by the back door (this is exactly how `nydusctl` silently acquired `#[tokio::main]` and broke musl-static, where building the bins alone removed the feature unification that had been hiding it). **The one place a tokio runtime is deliberately spawned** is `snapshotter/src/content_store.rs`: an isolated 2-worker runtime that drives the tonic *client* to containerd's Content/Images gRPC (tonic's transport pins its futures to a tokio reactor). It is fully quarantined behind `blocking::unblock` + `handle.block_on` and torn down in `Drop`, so no tokio task ever runs on a nydusd session thread and compio still drives the snapshotter's own event loop. Apart from that, the tokio crate in `cargo tree` is only a type-compat dependency of `h2`/`hyper`/`tonic`/`cyper-axum` — nothing spawns a runtime. Do not hand any nydusd session thread a tokio runtime handle of any kind, and do not add a second tokio runtime elsewhere without the same quarantine.
 - **Logging**: Use `tracing` macros (`info!`, `warn!`, `error!`, `debug!`, `trace!`). Never use `println!` in library code.
 - **Naming**: Follow standard Rust conventions (snake_case, PascalCase).
@@ -148,7 +172,10 @@ hard-coding `ionice` (Linux-only; macOS uses `taskpolicy`).
 - [ ] New config fields have `#[serde(default)]` where appropriate
 - [ ] No fscache references added
 - [ ] If the fanotify path changed: ABI constants still match the kernel UAPI, and `misc/fanotify/*.sh` still pass on a 6.14+ host
-- [ ] Error types use `thiserror` for library code, `anyhow` for application code
+- [ ] Error types use `thiserror` for library code, `anyhow` for application code, and
+      `make .no-error-macros` passes (the deleted `einval!` family has not come back)
+- [ ] Any new OS error is captured raw at the syscall site and never re-wrapped, so
+      `nydus_utils::source_errno` can still recover its errno at the fanotify/FUSE boundary
 - [ ] `tracing` used instead of `log` in new code
 - [ ] Documentation updated if public API changed
 

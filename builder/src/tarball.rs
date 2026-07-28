@@ -92,7 +92,7 @@ impl Seek for TarReader {
             TarReader::File(f) => f.seek(pos),
             TarReader::BufReaderInfoSeekable(b) => b.seek(pos),
             // `Seek` is pinned to `io::Error` by std, but the message survives here --
-            // the old `enosys!` dropped it and answered a bare ENOSYS.
+            // the old error macro dropped it and answered a bare ENOSYS.
             _ => Err(std::io::Error::new(
                 std::io::ErrorKind::Unsupported,
                 "TarReader: seek() is not supported for this reader",

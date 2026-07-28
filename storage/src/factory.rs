@@ -464,7 +464,7 @@ mod tests {
             matches!(&err, StorageError::InvalidArgument(msg) if msg.contains("unsupported backend type 'unknown'")),
             "unexpected error: {err}"
         );
-        // The C API and the FUSE boundary still see EINVAL, as they did when this was `einval!`.
+        // The C API and the FUSE boundary still see EINVAL, as they did before the migration.
         assert_eq!(std::io::Error::from(err).kind(), ErrorKind::InvalidInput);
     }
 

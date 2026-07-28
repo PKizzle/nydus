@@ -117,11 +117,25 @@ define build_golang
 	fi
 endef
 
-.PHONY: .format .musl_target .clean_libz_sys \
+.PHONY: .format .no-error-macros .musl_target .clean_libz_sys \
 	all all-build all-release all-static-release build release static-release
 
 .format:
 	${CARGO} fmt -- --check
+
+# The api error-macro family was deleted in favour of per-crate `thiserror` enums: those macros
+# returned a bare errno and discarded the message the call site wrote, so a failure that had a
+# perfectly good explanation surfaced as "Invalid argument (os error 22)". Nothing should
+# reintroduce them. (The names are only spelled in the pattern below, so this check does not
+# match its own comment.)
+#
+# `grep -P`, not `-E`: `\b` is undefined in POSIX ERE and git grep matches *nothing* for the
+# whole pattern, which makes the check silently pass. `storage/src/remote/` is excluded
+# because that module is disabled (see its header) and takes no part in the migration.
+.no-error-macros:
+	@! git grep -nP '\b(einval|eio|eother|enoent|enosys|eacces|ebadf|enotdir|eisdir|ealready|epipe|last_error|bail_einval|bail_eio|make_error)!' \
+		-- ':(exclude)third_party' ':(exclude)tests/texture' ':(exclude)storage/src/remote' \
+		|| { echo 'error: the deleted error macros are back; use a thiserror variant or anyhow instead'; exit 1; }
 
 .musl_target:
 	$(eval CARGO_BUILD_FLAGS += --target ${RUST_TARGET_STATIC})
@@ -136,7 +150,7 @@ prepare-codecov:
 	${RUSTUP} component add llvm-tools-preview
 
 # Targets that are exposed to developers and users.
-build: .format
+build: .format .no-error-macros
 	$(CARGO_COV_FLAGS) ${CARGO} build --workspace $(EXCLUDE_PACKAGES) $(CARGO_COMMON) $(CARGO_BUILD_FLAGS)
 	# Cargo will skip checking if it is already checked
 	# No blanket --allow flags. They suppress a lint across the whole workspace, including

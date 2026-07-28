@@ -2020,7 +2020,7 @@ mod tests {
         assert_eq!(as_io.raw_os_error(), Some(libc::ENOSPC));
 
         // A failure with no syscall behind it must not invent one; the deny path defaults it
-        // to EIO, which is what the old `eio!("failed to write data to file cache")` produced.
+        // to EIO, which is what the old EIO error macro produced.
         let short = StorageError::ShortWrite {
             expected: 4096,
             written: 10,

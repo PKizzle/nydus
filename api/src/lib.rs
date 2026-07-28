@@ -14,7 +14,6 @@ extern crate serde;
 pub mod config;
 pub use config::*;
 #[macro_use]
-pub mod error;
 pub mod http;
 pub use self::http::*;
 

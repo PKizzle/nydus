@@ -123,7 +123,7 @@ pub enum StorageError {
     /// A cache write completed with fewer bytes than asked for.
     ///
     /// Carries no errno, so the fanotify deny path falls back to `EIO` -- which is what the
-    /// old `eio!("failed to write data to file cache")` produced.
+    /// old EIO error macro produced.
     #[error("short write to the blob cache: wrote {written} of {expected} bytes")]
     ShortWrite {
         /// Bytes the caller asked to write.

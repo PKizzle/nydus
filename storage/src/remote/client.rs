@@ -211,7 +211,7 @@ impl BlobObject for RemoteBlob {
     }
 
     fn fetch_range_compressed(&self, _offset: u64, _size: u64) -> Result<usize> {
-        Err(enosys!())
+        Err(std::io::Error::from_raw_os_error(libc::ENOSYS))
     }
 
     fn fetch_range_uncompressed(&self, offset: u64, size: u64) -> Result<usize> {
@@ -222,7 +222,7 @@ impl BlobObject for RemoteBlob {
     }
 
     fn prefetch_chunks(&self, _range: &BlobIoRange) -> Result<usize> {
-        Err(enosys!())
+        Err(std::io::Error::from_raw_os_error(libc::ENOSYS))
     }
 }
 
@@ -330,7 +330,7 @@ impl ServerConnection {
             }
             Err(e) => {
                 error!("cannot connect to remote blob manager, {}", e);
-                Err(eio!())
+                Err(std::io::Error::from_raw_os_error(libc::EIO))
             }
         }
     }
@@ -372,7 +372,7 @@ impl ServerConnection {
                 rfd.clear();
                 efd.clear();
                 match self.get_connection()?.as_ref() {
-                    None => return Err(eio!()),
+                    None => return Err(std::io::Error::from_raw_os_error(libc::EIO)),
                     Some(conn) => {
                         rfd.insert(conn.as_raw_fd());
                         efd.insert(conn.as_raw_fd());
@@ -381,20 +381,20 @@ impl ServerConnection {
                 }
             }
             let _ = select(nr, Some(&mut rfd), None, Some(&mut efd), None)
-                .map_err(|e| eother!(format!("{}", e)))?;
+                .map_err(|e| std::io::Error::other(""))?;
 
             let mut guard = self.get_connection()?;
             let (hdr, files) = match guard.as_mut() {
-                None => return Err(eio!()),
-                Some(conn) => conn.recv_header().map_err(|_e| eio!())?,
+                None => return Err(std::io::Error::from_raw_os_error(libc::EIO)),
+                Some(conn) => conn.recv_header().map_err(|_e| std::io::Error::from_raw_os_error(libc::EIO))?,
             };
             if !hdr.is_valid() {
-                return Err(einval!());
+                return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
             }
             let body_size = hdr.get_size() as usize;
 
             match hdr.get_code() {
-                RequestCode::MaxCommand => return Err(eother!()),
+                RequestCode::MaxCommand => return Err(std::io::Error::other("")),
                 RequestCode::Noop => self.handle_result(hdr.get_tag(), RequestResult::Noop),
                 RequestCode::GetBlob => {
                     self.handle_get_blob_reply(guard, &hdr, body_size, files)?;
@@ -421,14 +421,14 @@ impl ServerConnection {
             match self.wait_for_result(&req)? {
                 RequestResult::Noop => return Ok(()),
                 RequestResult::Reconnect => continue 'next_iter,
-                _ => return Err(eother!()),
+                _ => return Err(std::io::Error::other("")),
             }
         }
     }
 
     fn call_get_blob(&self, blob_info: &Arc<BlobInfo>) -> Result<(File, u64, u64)> {
         if blob_info.blob_id().len() >= 256 {
-            return Err(einval!("blob id is too large"));
+            return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
         }
 
         'next_iter: loop {
@@ -452,11 +452,11 @@ impl ServerConnection {
                     } else if let Some(file) = file {
                         return Ok((file, base, token));
                     } else {
-                        return Err(einval!());
+                        return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
                     }
                 }
                 RequestResult::Reconnect => continue 'next_iter,
-                _ => return Err(eother!()),
+                _ => return Err(std::io::Error::other("")),
             }
         }
     }
@@ -489,7 +489,7 @@ impl ServerConnection {
                     }
                 }
                 RequestResult::Reconnect => continue 'next_iter,
-                _ => return Err(eother!()),
+                _ => return Err(std::io::Error::other("")),
             }
         }
     }
@@ -517,11 +517,11 @@ impl ServerConnection {
                         blob.token.store(token, Ordering::Release);
                         return Ok(());
                     } else {
-                        return Err(einval!());
+                        return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
                     }
                 }
                 RequestResult::Reconnect => continue 'next_iter,
-                _ => return Err(eother!()),
+                _ => return Err(std::io::Error::other("")),
             }
         }
     }
@@ -541,7 +541,7 @@ impl ServerConnection {
 
     fn get_connection(&self) -> Result<MutexGuard<Option<Endpoint>>> {
         if self.exiting.load(Ordering::Relaxed) {
-            Err(eio!())
+            Err(std::io::Error::from_raw_os_error(libc::EIO))
         } else {
             Ok(self.conn.lock().unwrap())
         }
@@ -570,10 +570,10 @@ impl ServerConnection {
             if let Some(end) = start.checked_add(Duration::from_secs(REQUEST_TIMEOUT_SEC)) {
                 let now = Instant::now();
                 if end < now {
-                    return Err(eio!());
+                    return Err(std::io::Error::from_raw_os_error(libc::EIO));
                 }
             } else {
-                return Err(eio!());
+                return Err(std::io::Error::from_raw_os_error(libc::EIO));
             }
             std::thread::sleep(Duration::from_millis(10));
         }
@@ -607,12 +607,12 @@ impl ServerConnection {
 
         let mut guard = self.requests.lock().unwrap();
         match guard.remove(&request.tag) {
-            None => Err(enoent!()),
+            None => Err(std::io::Error::from_raw_os_error(libc::ENOENT)),
             Some(entry) => {
                 let mut guard2 = entry.state.lock().unwrap();
                 match guard2.0 {
                     RequestStatus::Waiting => panic!("should not happen"),
-                    RequestStatus::Timeout => Err(eio!()),
+                    RequestStatus::Timeout => Err(std::io::Error::from_raw_os_error(libc::EIO)),
                     RequestStatus::Reconnect => Ok(RequestResult::Reconnect),
                     RequestStatus::Finished => {
                         let mut val = RequestResult::None;
@@ -641,21 +641,21 @@ impl ServerConnection {
         files: Option<Vec<File>>,
     ) -> Result<()> {
         if body_size != mem::size_of::<GetBlobReply>() {
-            return Err(einval!());
+            return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
         }
         let (size, data) = match guard.as_mut() {
-            None => return Err(einval!()),
-            Some(conn) => conn.recv_data(body_size).map_err(|_e| eio!())?,
+            None => return Err(std::io::Error::from_raw_os_error(libc::EINVAL)),
+            Some(conn) => conn.recv_data(body_size).map_err(|_e| std::io::Error::from_raw_os_error(libc::EIO))?,
         };
         if size != body_size {
-            return Err(eio!());
+            return Err(std::io::Error::from_raw_os_error(libc::EIO));
         }
         drop(guard);
 
         let mut msg = GetBlobReply::new(0, 0, 0);
         msg.as_mut_slice().copy_from_slice(&data);
         if !msg.is_valid() {
-            return Err(einval!());
+            return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
         } else if msg.result != 0 {
             self.handle_result(
                 hdr.get_tag(),
@@ -663,12 +663,12 @@ impl ServerConnection {
             );
         } else {
             if files.is_none() {
-                return Err(einval!());
+                return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
             }
             // Safe because we have just validated files is not none.
             let mut files = files.unwrap();
             if files.len() != 1 {
-                return Err(einval!());
+                return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
             }
             // Safe because we have just validated files[0] is valid.
             let file = files.pop().unwrap();
@@ -689,21 +689,21 @@ impl ServerConnection {
         files: Option<Vec<File>>,
     ) -> Result<()> {
         if body_size != mem::size_of::<FetchRangeReply>() || files.is_some() {
-            return Err(einval!());
+            return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
         }
         let (size, data) = match guard.as_mut() {
-            None => return Err(einval!()),
-            Some(conn) => conn.recv_data(body_size).map_err(|_e| eio!())?,
+            None => return Err(std::io::Error::from_raw_os_error(libc::EINVAL)),
+            Some(conn) => conn.recv_data(body_size).map_err(|_e| std::io::Error::from_raw_os_error(libc::EIO))?,
         };
         if size != body_size {
-            return Err(eio!());
+            return Err(std::io::Error::from_raw_os_error(libc::EIO));
         }
         drop(guard);
 
         let mut msg = FetchRangeReply::new(0, 0, 0);
         msg.as_mut_slice().copy_from_slice(&data);
         if !msg.is_valid() {
-            return Err(einval!());
+            return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
         } else {
             self.handle_result(
                 hdr.get_tag(),
