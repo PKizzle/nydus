@@ -34,6 +34,7 @@ use nydus_service::{
     Error as NydusError, FsBackendMountCmd, FsBackendType, ServiceArgs, create_daemon,
     create_fuse_daemon, create_vfs_backend, validate_threads_configuration,
 };
+#[cfg(feature = "dedup")]
 use nydus_storage::cache::CasMgr;
 
 use crate::api_server_glue::ApiServerController;
@@ -57,6 +58,8 @@ fn thread_validator(v: &str) -> std::result::Result<String, String> {
 }
 
 fn append_fs_options(app: Command) -> Command {
+    // `mut` only matters under `dedup`, which is the sole conditional `app = app.arg(...)` below.
+    #[cfg_attr(not(feature = "dedup"), allow(unused_mut))]
     let mut app = app.arg(
         Arg::new("bootstrap")
             .long("bootstrap")
