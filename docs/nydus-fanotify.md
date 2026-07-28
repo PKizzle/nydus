@@ -25,8 +25,15 @@ EROFS + `fscache` (`cachefiles`) on-demand path, which has been removed.
 4. The handler resolves the fd to the owning blob, downloads + decompresses exactly that range via
    the blob cache (`fetch_range_uncompressed`) into the sparse file, then answers `FAN_ALLOW`.
    On a fetch/write failure it answers `FAN_DENY_ERRNO(e)` — passing through `ENOSPC`/`EDQUOT`/`EIO`
-   so a full cache filesystem is distinguishable from an I/O error — and the consumer sees a real
+   so a full cache filesystem is distinguishable from an I/O error — and the consumer gets a real
    error instead of silently reading zeros.
+
+   The **denial** is what the consumer depends on; the **errno** mostly does not reach it. Measured
+   on Linux 7.0.11 (`misc/fanotify/precontent-cases.sh` C13): a process reading the marked blob file
+   directly receives the exact errno, but a process reading through the EROFS mount always receives
+   `EIO`, because EROFS pulls the backing file through the page cache and the outer read only sees
+   that the folio is not uptodate. The specific errno is therefore an observability property today
+   (daemon logs, direct readers) rather than something containers can branch on.
 
 Every permission event must be answered, and the daemon is written so that no path can leave one
 outstanding: a panic during handling denies via `EventFdGuard::drop`, a structurally corrupt event

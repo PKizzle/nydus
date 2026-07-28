@@ -495,9 +495,14 @@ mod tests {
     /// The disk-full path, end to end through rafs.
     ///
     /// A cache `pwrite` that fails with `ENOSPC` becomes `StorageError::CacheIo`, travels up as
-    /// `RafsError::Storage`, and must still be `ENOSPC` when it reaches the kernel -- answering
-    /// `EIO` there would tell a reader "I/O error" for a full disk, and answering `FAN_ALLOW`
-    /// would hand it zeros. Nothing in the chain may re-wrap the raw `Os` error.
+    /// `RafsError::Storage`, and must still be `ENOSPC` when it reaches the boundary that answers
+    /// the kernel -- answering `EIO` there would report a full disk as a generic I/O error, and
+    /// answering `FAN_ALLOW` would hand the reader zeros. Nothing in the chain may re-wrap the raw
+    /// `Os` error.
+    ///
+    /// This pins the chain up to that boundary. Past it the errno reaches a direct reader of the
+    /// blob file but is flattened to `EIO` by EROFS for readers coming through the mount; see
+    /// `service::fanotify::deny_errno_for` and `misc/fanotify/precontent-cases.sh` C13.
     #[test]
     fn enospc_survives_the_trip_through_rafs() {
         let cache_err = StorageError::cache_io("pwrite", Error::from_raw_os_error(libc::ENOSPC));

@@ -364,8 +364,11 @@ impl FileCacheEntry {
                         // The raw `Os` error goes in as the source and is never re-wrapped:
                         // the fanotify deny path recovers its errno with `source_errno` and
                         // answers the kernel's permission event with ENOSPC/EDQUOT/EIO as
-                        // appropriate. A `Custom` error here would report `None` and the
-                        // reader would be told EIO for a full disk.
+                        // appropriate. A `Custom` error here would report `None` and a full
+                        // disk would be answered with a generic EIO -- losing the distinction
+                        // at the last point that still holds it. (A container reading through
+                        // the EROFS mount sees EIO either way; EROFS flattens the denial
+                        // errno. What is lost is the daemon's own diagnosis of a full disk.)
                         return Err(StorageError::cache_io("pwrite", err));
                     }
                 }

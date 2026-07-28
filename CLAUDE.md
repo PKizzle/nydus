@@ -28,8 +28,14 @@ cargo run -p nydus-snapshotter --bin containerd-nydus -- --config /etc/nydus/con
 sudo NYDUS_IMAGE=./target/release/nydus-image NYDUSD=./target/release/nydusd \
   misc/fanotify/runtime-test.sh         # plain blob fetch path
 sudo misc/fanotify/zran-multilayer-test.sh   # node-local zran convert + merge + serve
-sudo misc/fanotify/precontent-cases.sh       # fail-closed + strace ground truth (needs strace)
+sudo misc/fanotify/precontent-cases.sh       # fail-closed + strace ground truth + ENOSPC (needs strace)
 ```
+
+> **The fanotify suite runs in a privileged container**, so a dedicated Linux VM is not required as
+> long as the host VM's kernel is ≥ 6.14 — Docker Desktop and OrbStack qualify (`docker run --rm
+> alpine uname -r` to check). Needs `--privileged` (mount(2), fanotify, loop devices) and a real ext4
+> for `ROOT`: the repo bind mount is virtiofs and the container root is overlayfs, and neither
+> supports pre-content marks, so `mkfs.ext4` a loopback inside the container and point `ROOT` at it.
 
 > **Linting is Linux-only in practice.** `service/src/fanotify*.rs` and the fanotify half of
 > `singleton.rs` are entirely `cfg(target_os = "linux")`, so a macOS `cargo clippy` compiles none of
@@ -92,8 +98,12 @@ nydus/
     both. So an OS error goes into the nearest variant as a raw `#[source] std::io::Error` and stays
     raw. Wrapping it into a `Custom` error to attach context destroys the errno, and the fanotify
     pre-content path answers permission events with that errno: a full disk re-wrapped as `Custom`
-    is reported to the reading process as a generic `EIO`, or — worse, if the event is allowed —
-    as an unfilled sparse hole full of zeros.
+    is answered with a generic `EIO`, or — worse, if the event is allowed — with an unfilled sparse
+    hole full of zeros. Scope, verified on Linux 7.0.11 by `misc/fanotify/precontent-cases.sh` C13:
+    the errno is intact in the `FAN_DENY_ERRNO` response and reaches a process reading the blob file
+    directly, but **EROFS flattens it to `EIO`** for readers coming through the mount, so today it is
+    an observability property (logs, direct readers), not something containers branch on. Keep the
+    discipline anyway — it is the only point at which the errno still exists to be preserved.
   - **Recover errnos with `nydus_utils::source_errno`, not `raw_os_error()`.** It walks the whole
     chain, including *through* a `Custom` `io::Error` (which `source()` alone skips — it returns the
     payload's source, not the payload). Boundaries convert with it: see

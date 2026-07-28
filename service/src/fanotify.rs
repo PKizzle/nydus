@@ -120,8 +120,25 @@ struct BlobBacking {
 ///
 /// Only errnos the kernel's fanotify UAPI documents as valid response
 /// payloads are passed through; everything else collapses to `EIO`. The
-/// distinction matters most for disk pressure: a full cache filesystem must
-/// surface as `ENOSPC` to the reading process, not a generic I/O error.
+/// distinction matters most for disk pressure: a full cache filesystem is
+/// answered `ENOSPC`, not a generic I/O error.
+///
+/// How far that errno travels depends on how the data is being read, and the
+/// answer is not the intuitive one (measured on Linux 7.0.11 by
+/// `misc/fanotify/precontent-cases.sh` case C13):
+///
+/// - A process reading the **marked file directly** gets this exact errno from
+///   its `read(2)`. The kernel honours `FAN_DENY_ERRNO` faithfully.
+/// - A process reading through the **EROFS mount** — which is every container —
+///   gets `EIO` regardless. EROFS pulls the marked backing file through the page
+///   cache, and the outer read only learns that the folio is not uptodate.
+///
+/// So the payoff is not that a container can tell a full disk from an I/O error
+/// -- today it cannot. It is still worth getting right: this is the errno the
+/// daemon logs and reports, the one a direct reader of the cache file observes,
+/// and the one containers would get for free if EROFS ever propagated it.
+/// Answering `EIO` for a full disk throws it away at the only point where we
+/// still hold it.
 fn deny_errno_for(e: &std::io::Error) -> libc::c_int {
     // `source_errno`, not `raw_os_error`: the failure originates several layers down (a cache
     // `pwrite` in nydus-storage) and reaches here through typed errors. If any of them wraps
@@ -919,10 +936,11 @@ impl FanotifyHandler {
                 Ok(()) => FAN_ALLOW,
                 Err(e) => {
                     warn!("fanotify: failed to serve pre-content event: {}", e);
-                    // Deny with the real errno where the kernel accepts it
-                    // (disk-full must surface as ENOSPC, not a generic EIO)
-                    // so the consumer sees an honest error instead of
-                    // zero-filled data.
+                    // Deny — never allow — so the reader gets an error instead of
+                    // the unfetched hole's zeros. The errno is the most specific
+                    // one we still hold (see `deny_errno_for`); EROFS flattens it
+                    // to EIO for readers coming through the mount, but denying is
+                    // what makes the read fail at all.
                     fan_deny_errno(deny_errno_for(&e))
                 }
             };

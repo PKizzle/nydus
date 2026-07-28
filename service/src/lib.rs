@@ -487,8 +487,11 @@ mod tests {
     ///
     /// This is the disk-full path: a cache `pwrite` fails with `ENOSPC`, the error travels up
     /// through storage and rafs, and the fanotify handler answers the permission event with
-    /// whatever `raw_os_error()` reports. Anything else there means a reader is told "I/O
-    /// error" for a full disk -- or, if the event is allowed instead, silently reads zeros.
+    /// whatever `raw_os_error()` reports. Anything else there means a full disk is answered as
+    /// a generic "I/O error" -- or, if the event is allowed instead, the reader silently gets
+    /// zeros. (EROFS flattens the answered errno to `EIO` on its way to a container's `read(2)`;
+    /// what this protects is the daemon's own diagnosis and a direct reader of the blob file.
+    /// See `crate::fanotify::deny_errno_for`.)
     #[test]
     fn io_error_conversion_preserves_a_real_errno() {
         let storage = nydus_storage::StorageError::cache_io(
