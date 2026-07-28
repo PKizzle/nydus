@@ -4368,7 +4368,7 @@ dependencies = [
 
 [[package]]
 name = "nydus-storage"
-version = "0.7.2"
+version = "0.8.0"
 dependencies = [
  "arc-swap",
  "async-lock",
@@ -4412,6 +4412,7 @@ dependencies = [
  "sha1 0.11.0",
  "sha2 0.11.0",
  "tar",
+ "thiserror 2.0.18",
  "time",
  "tokio",
  "toml",

@@ -81,53 +81,60 @@ fn token_refresh_at(now: u64, ttl_secs: u64) -> u64 {
 }
 
 /// Error codes related to registry storage backend operations.
-#[derive(Debug)]
-pub enum RegistryError {
+///
+/// Named `RegistryBackendError` rather than `RegistryError` so it does not read as the same
+/// type as `registry_client::RegistryError`, which is a different thing in the same workspace
+/// (the OCI distribution client used by nydusify). The two never meet in one file today, so
+/// this is about a reader not being misled rather than a name clash.
+#[derive(Debug, thiserror::Error)]
+pub enum RegistryBackendError {
+    /// A registry failure described only by a message.
+    #[error("failed to access blob from registry, {0}")]
     Common(String),
-    Url(String, ParseError),
-    Request(ConnectionError),
+    /// The blob URL is malformed.
+    #[error("failed to parse URL {0}, {1}")]
+    Url(String, #[source] ParseError),
+    /// The HTTP request could not be issued.
+    #[error("failed to issue request, {0}")]
+    Request(#[source] ConnectionError),
+    /// The registry URL scheme is not supported.
+    #[error("invalid scheme, {0}")]
     Scheme(String),
-    Transport(std::io::Error),
+    /// The request did not reach the registry.
+    #[error("network transport error, {0}")]
+    Transport(#[source] std::io::Error),
     #[cfg(feature = "backend-dragonfly-proxy")]
-    Proxy(request::RequestError),
+    /// The Dragonfly proxy rejected the request.
+    ///
+    /// Rendered with `Debug`, as it always has been -- see `BackendError`.
+    #[error("proxy error: {0:?}")]
+    Proxy(#[source] request::RequestError),
 }
 
-impl fmt::Display for RegistryError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            RegistryError::Common(s) => write!(f, "failed to access blob from registry, {}", s),
-            RegistryError::Url(u, e) => write!(f, "failed to parse URL {}, {}", u, e),
-            RegistryError::Request(e) => write!(f, "failed to issue request, {}", e),
-            RegistryError::Scheme(s) => write!(f, "invalid scheme, {}", s),
-            RegistryError::Transport(e) => write!(f, "network transport error, {}", e),
-            #[cfg(feature = "backend-dragonfly-proxy")]
-            RegistryError::Proxy(e) => write!(f, "proxy error: {:?}", e),
-        }
-    }
-}
-
-impl From<RegistryError> for BackendError {
-    fn from(error: RegistryError) -> Self {
+impl From<RegistryBackendError> for BackendError {
+    fn from(error: RegistryBackendError) -> Self {
         // Proxy errors must surface as BackendError::Request so that
         // retry_op's is_proxy_forbidden/is_proxy_limited checks match.
         #[cfg(feature = "backend-dragonfly-proxy")]
-        if let RegistryError::Proxy(e) = error {
+        if let RegistryBackendError::Proxy(e) = error {
             return BackendError::Request(e);
         }
         BackendError::Registry(error)
     }
 }
 
-type RegistryResult<T> = std::result::Result<T, RegistryError>;
+type RegistryResult<T> = std::result::Result<T, RegistryBackendError>;
 
-/// Convert a `RequestError` into a `RegistryError`, preserving proxy error types
+/// Convert a `RequestError` into a `RegistryBackendError`, preserving proxy error types
 /// so that retry_op's is_proxy_forbidden/is_proxy_limited checks work correctly.
-fn request_err_to_registry(e: request::RequestError) -> RegistryError {
+fn request_err_to_registry(e: request::RequestError) -> RegistryBackendError {
     match e {
-        request::RequestError::Connection(ce) => RegistryError::Request(ce),
+        request::RequestError::Connection(ce) => RegistryBackendError::Request(ce),
         #[cfg(feature = "backend-dragonfly-proxy")]
-        e @ request::RequestError::Proxy(_) => RegistryError::Proxy(e),
-        other => RegistryError::Request(ConnectionError::ErrorWithMsg(format!("{:?}", other))),
+        e @ request::RequestError::Proxy(_) => RegistryBackendError::Proxy(e),
+        other => {
+            RegistryBackendError::Request(ConnectionError::ErrorWithMsg(format!("{:?}", other)))
+        }
     }
 }
 
@@ -139,7 +146,9 @@ fn respond(resp: request::Response, catch_status: bool) -> RegistryResult<reques
         let msg = resp
             .text()
             .unwrap_or_else(|e| format!("failed to read response body: {}", e));
-        Err(RegistryError::Request(ConnectionError::ErrorWithMsg(msg)))
+        Err(RegistryBackendError::Request(
+            ConnectionError::ErrorWithMsg(msg),
+        ))
     }
 }
 
@@ -808,7 +817,7 @@ impl RegistryReader {
                     let auth_header = self
                         .state
                         .get_auth_header(auth, &self.request)
-                        .map_err(|e| RegistryError::Common(e.to_string()))?;
+                        .map_err(|e| RegistryBackendError::Common(e.to_string()))?;
 
                     headers.insert(
                         HEADER_AUTHORIZATION,
@@ -865,7 +874,7 @@ impl RegistryReader {
         let url = self
             .state
             .url(url.as_str(), &[])
-            .map_err(|e| RegistryError::Url(url, e))?;
+            .map_err(|e| RegistryBackendError::Url(url, e))?;
         let mut headers = HeaderMap::new();
         let end_at = offset + buf.len() as u64 - 1;
         let range = format!("bytes={}-{}", offset, end_at);
@@ -900,12 +909,12 @@ impl RegistryReader {
                 return self._try_read(buf, offset, false, context);
             }
             if !is_success_status(status) {
-                return Err(RegistryError::Request(ConnectionError::ErrorWithMsg(
-                    format!(
+                return Err(RegistryBackendError::Request(
+                    ConnectionError::ErrorWithMsg(format!(
                         "unexpected status {} reading blob from cached redirect",
                         status
-                    ),
-                )));
+                    )),
+                ));
             }
             return Ok(written);
         }
@@ -922,7 +931,7 @@ impl RegistryReader {
             context,
         ) {
             Ok(res) => res,
-            Err(RegistryError::Request(ConnectionError::Common(e)))
+            Err(RegistryBackendError::Request(ConnectionError::Common(e)))
                 if self.state.needs_fallback_http(&e) =>
             {
                 self.state.fallback_http();
@@ -930,7 +939,7 @@ impl RegistryReader {
                 let url = self
                     .state
                     .url(url.as_str(), &[])
-                    .map_err(|e| RegistryError::Url(url, e))?;
+                    .map_err(|e| RegistryBackendError::Url(url, e))?;
                 self.request::<&[u8]>(
                     Method::GET,
                     url.as_str(),
@@ -940,11 +949,11 @@ impl RegistryReader {
                     context,
                 )?
             }
-            Err(RegistryError::Request(ConnectionError::Common(e))) => {
+            Err(RegistryBackendError::Request(ConnectionError::Common(e))) => {
                 if e.to_string().contains("self signed certificate") {
                     warn!("try to enable \"skip_verify: true\" option");
                 }
-                return Err(RegistryError::Request(ConnectionError::Common(e)));
+                return Err(RegistryBackendError::Request(ConnectionError::Common(e)));
             }
             Err(e) => {
                 return Err(e);
@@ -959,13 +968,15 @@ impl RegistryReader {
             if let Some(location) = resp.headers().get("location") {
                 let location = location.to_str().unwrap();
                 let mut location = Url::parse(location)
-                    .map_err(|e| RegistryError::Url(location.to_string(), e))?;
+                    .map_err(|e| RegistryBackendError::Url(location.to_string(), e))?;
                 // Note: Some P2P proxy server supports only scheme specified origin blob server,
                 // so we need change scheme to `blob_url_scheme` here
                 if !self.state.blob_url_scheme.is_empty() {
                     location
                         .set_scheme(&self.state.blob_url_scheme)
-                        .map_err(|_| RegistryError::Scheme(self.state.blob_url_scheme.clone()))?;
+                        .map_err(|_| {
+                            RegistryBackendError::Scheme(self.state.blob_url_scheme.clone())
+                        })?;
                 }
                 if !self.state.blob_redirected_host.is_empty() {
                     location
@@ -976,7 +987,7 @@ impl RegistryReader {
                                 self.state.blob_redirected_host.as_str(),
                                 e
                             );
-                            RegistryError::Url(location.to_string(), e)
+                            RegistryBackendError::Url(location.to_string(), e)
                         })?;
                     debug!("New redirected location {:?}", location.host_str());
                 }
@@ -996,13 +1007,13 @@ impl RegistryReader {
                     )
                     .map_err(request_err_to_registry)?;
                 if !is_success_status(rstatus) {
-                    return Err(RegistryError::Request(ConnectionError::ErrorWithMsg(
-                        format!(
+                    return Err(RegistryBackendError::Request(
+                        ConnectionError::ErrorWithMsg(format!(
                             "unexpected status {} reading blob from redirect {}",
                             rstatus,
                             location.as_str()
-                        ),
-                    )));
+                        )),
+                    ));
                 }
                 trace!(
                     "redirect cache for blob={}, status={}",
@@ -1020,7 +1031,7 @@ impl RegistryReader {
         }
 
         resp.copy_to(buf)
-            .map_err(|e| RegistryError::Transport(std::io::Error::other(e)))
+            .map_err(|e| RegistryBackendError::Transport(std::io::Error::other(e)))
             .map(|size| size as usize)
     }
 
@@ -1039,7 +1050,7 @@ impl RegistryReader {
         let url = self
             .state
             .url(url.as_str(), &[])
-            .map_err(|e| RegistryError::Url(url, e))?;
+            .map_err(|e| RegistryBackendError::Url(url, e))?;
         let mut headers = HeaderMap::new();
 
         // Only add Range header if offset > 0 (open-ended range to stream from offset).
@@ -1060,7 +1071,7 @@ impl RegistryReader {
 
         let status = resp.status();
         if !is_success_status(status) {
-            return Err(RegistryError::Common(format!(
+            return Err(RegistryBackendError::Common(format!(
                 "stream_read failed, status: {}",
                 status,
             )));
@@ -1077,7 +1088,7 @@ impl BlobReader for RegistryReader {
             let url = self
                 .state
                 .url(&url, &[])
-                .map_err(|e| RegistryError::Url(url, e))?;
+                .map_err(|e| RegistryBackendError::Url(url, e))?;
 
             let mut ctx = BackendContext::default();
             let resp = match self.request::<&[u8]>(
@@ -1089,7 +1100,7 @@ impl BlobReader for RegistryReader {
                 &mut ctx,
             ) {
                 Ok(res) => res,
-                Err(RegistryError::Request(ConnectionError::Common(e)))
+                Err(RegistryBackendError::Request(ConnectionError::Common(e)))
                     if self.state.needs_fallback_http(&e) =>
                 {
                     self.state.fallback_http();
@@ -1097,7 +1108,7 @@ impl BlobReader for RegistryReader {
                     let url = self
                         .state
                         .url(&url, &[])
-                        .map_err(|e| RegistryError::Url(url, e))?;
+                        .map_err(|e| RegistryBackendError::Url(url, e))?;
                     self.request::<&[u8]>(
                         Method::HEAD,
                         url.as_str(),
@@ -1111,17 +1122,18 @@ impl BlobReader for RegistryReader {
                     return Err(BackendError::from(e));
                 }
             };
-            let content_length = resp
-                .headers()
-                .get(CONTENT_LENGTH)
-                .ok_or_else(|| RegistryError::Common("invalid content length".to_string()))?;
+            let content_length = resp.headers().get(CONTENT_LENGTH).ok_or_else(|| {
+                RegistryBackendError::Common("invalid content length".to_string())
+            })?;
 
             Ok(content_length
                 .to_str()
-                .map_err(|err| RegistryError::Common(format!("invalid content length: {:?}", err)))?
+                .map_err(|err| {
+                    RegistryBackendError::Common(format!("invalid content length: {:?}", err))
+                })?
                 .parse::<u64>()
                 .map_err(|err| {
-                    RegistryError::Common(format!("invalid content length: {:?}", err))
+                    RegistryBackendError::Common(format!("invalid content length: {:?}", err))
                 })?)
         })
     }
@@ -1716,9 +1728,9 @@ mod tests {
                     let val = val_cloned.load();
                     let ret = if *val.as_ref() == 0 {
                         std::thread::sleep(std::time::Duration::from_secs(2));
-                        Err(BackendError::Registry(RegistryError::Common(String::from(
-                            "network error",
-                        ))))
+                        Err(BackendError::Registry(RegistryBackendError::Common(
+                            String::from("network error"),
+                        )))
                     } else {
                         Ok(())
                     };
@@ -1804,7 +1816,7 @@ mod tests {
 
     #[test]
     fn test_registry_error_display() {
-        let err = RegistryError::Common("something went wrong".to_string());
+        let err = RegistryBackendError::Common("something went wrong".to_string());
         assert!(
             err.to_string()
                 .contains("failed to access blob from registry")
@@ -1812,22 +1824,22 @@ mod tests {
         assert!(err.to_string().contains("something went wrong"));
 
         let pe = url::Url::parse("::not-a-url").unwrap_err();
-        let err = RegistryError::Url("::not-a-url".to_string(), pe);
+        let err = RegistryBackendError::Url("::not-a-url".to_string(), pe);
         assert!(err.to_string().contains("failed to parse URL"));
         assert!(err.to_string().contains("::not-a-url"));
 
-        let err = RegistryError::Request(ConnectionError::ErrorWithMsg(
+        let err = RegistryBackendError::Request(ConnectionError::ErrorWithMsg(
             "connection refused".to_string(),
         ));
         assert!(err.to_string().contains("failed to issue request"));
         assert!(err.to_string().contains("connection refused"));
 
-        let err = RegistryError::Scheme("ftp".to_string());
+        let err = RegistryBackendError::Scheme("ftp".to_string());
         assert!(err.to_string().contains("invalid scheme"));
         assert!(err.to_string().contains("ftp"));
 
         let io_err = std::io::Error::other("transport failure");
-        let err = RegistryError::Transport(io_err);
+        let err = RegistryBackendError::Transport(io_err);
         assert!(err.to_string().contains("network transport error"));
         assert!(err.to_string().contains("transport failure"));
     }
@@ -1836,26 +1848,29 @@ mod tests {
     #[test]
     fn test_registry_error_proxy_display() {
         let proxy_err = request::RequestError::Common("proxy unreachable".to_string());
-        let err = RegistryError::Proxy(proxy_err);
+        let err = RegistryBackendError::Proxy(proxy_err);
         let s = err.to_string();
         assert!(s.contains("proxy"), "expected 'proxy' in '{}' ", s);
     }
 
     #[test]
     fn test_registry_error_into_backend_error() {
-        // RegistryError::Common → BackendError::Registry
-        let err: BackendError = RegistryError::Common("test".to_string()).into();
+        // RegistryBackendError::Common → BackendError::Registry
+        let err: BackendError = RegistryBackendError::Common("test".to_string()).into();
         assert!(
-            matches!(err, BackendError::Registry(RegistryError::Common(_))),
+            matches!(err, BackendError::Registry(RegistryBackendError::Common(_))),
             "expected BackendError::Registry, got: {:?}",
             err
         );
 
-        // RegistryError::Request → BackendError::Registry
+        // RegistryBackendError::Request → BackendError::Registry
         let err: BackendError =
-            RegistryError::Request(ConnectionError::ErrorWithMsg("msg".to_string())).into();
+            RegistryBackendError::Request(ConnectionError::ErrorWithMsg("msg".to_string())).into();
         assert!(
-            matches!(err, BackendError::Registry(RegistryError::Request(_))),
+            matches!(
+                err,
+                BackendError::Registry(RegistryBackendError::Request(_))
+            ),
             "expected BackendError::Registry(Request), got: {:?}",
             err
         );
@@ -1864,9 +1879,9 @@ mod tests {
     #[cfg(feature = "backend-dragonfly-proxy")]
     #[test]
     fn test_registry_error_proxy_into_backend_error() {
-        // RegistryError::Proxy → BackendError::Request (so retry_op checks work)
+        // RegistryBackendError::Proxy → BackendError::Request (so retry_op checks work)
         let proxy_req_err = request::RequestError::Common("proxy error".to_string());
-        let err: BackendError = RegistryError::Proxy(proxy_req_err).into();
+        let err: BackendError = RegistryBackendError::Proxy(proxy_req_err).into();
         assert!(
             matches!(err, BackendError::Request(_)),
             "expected BackendError::Request for proxy error, got: {:?}",
@@ -1876,15 +1891,15 @@ mod tests {
 
     #[test]
     fn test_request_err_to_registry_connection() {
-        // RequestError::Connection → RegistryError::Request preserving inner ConnectionError
+        // RequestError::Connection → RegistryBackendError::Request preserving inner ConnectionError
         let ce = ConnectionError::ErrorWithMsg("conn failed".to_string());
         let result = request_err_to_registry(request::RequestError::Connection(ce));
         match result {
-            RegistryError::Request(ConnectionError::ErrorWithMsg(msg)) => {
+            RegistryBackendError::Request(ConnectionError::ErrorWithMsg(msg)) => {
                 assert_eq!(msg, "conn failed");
             }
             other => panic!(
-                "expected RegistryError::Request(ErrorWithMsg), got {:?}",
+                "expected RegistryBackendError::Request(ErrorWithMsg), got {:?}",
                 other
             ),
         }
@@ -1892,11 +1907,11 @@ mod tests {
 
     #[test]
     fn test_request_err_to_registry_common() {
-        // RequestError::Common → RegistryError::Request(ErrorWithMsg) containing Debug repr
+        // RequestError::Common → RegistryBackendError::Request(ErrorWithMsg) containing Debug repr
         let result =
             request_err_to_registry(request::RequestError::Common("unknown error".to_string()));
         match result {
-            RegistryError::Request(ConnectionError::ErrorWithMsg(msg)) => {
+            RegistryBackendError::Request(ConnectionError::ErrorWithMsg(msg)) => {
                 // The Debug repr of RequestError::Common("unknown error") is embedded
                 assert!(
                     msg.contains("unknown error"),
@@ -1905,7 +1920,7 @@ mod tests {
                 );
             }
             other => panic!(
-                "expected RegistryError::Request(ErrorWithMsg), got {:?}",
+                "expected RegistryBackendError::Request(ErrorWithMsg), got {:?}",
                 other
             ),
         }
@@ -1952,7 +1967,7 @@ mod tests {
 
         assert!(matches!(
             result,
-            Err(RegistryError::Request(ConnectionError::ErrorWithMsg(msg)))
+            Err(RegistryBackendError::Request(ConnectionError::ErrorWithMsg(msg)))
                 if msg == "rate limited"
         ));
     }
@@ -1961,12 +1976,12 @@ mod tests {
     #[test]
     fn test_request_err_to_registry_proxy() {
         use crate::backend::proxy::ProxyError;
-        // RequestError::Proxy → RegistryError::Proxy preserving the original error
+        // RequestError::Proxy → RegistryBackendError::Proxy preserving the original error
         let proxy_err = request::RequestError::Proxy(ProxyError::Common("proxy down".to_string()));
         let result = request_err_to_registry(proxy_err);
         assert!(
-            matches!(result, RegistryError::Proxy(_)),
-            "expected RegistryError::Proxy, got {:?}",
+            matches!(result, RegistryBackendError::Proxy(_)),
+            "expected RegistryBackendError::Proxy, got {:?}",
             result
         );
     }
@@ -1989,7 +2004,7 @@ mod tests {
         let mut call_count = 0u32;
         let result: BackendResult<u32> = first.handle_force(&mut || {
             call_count += 1;
-            Err(BackendError::Registry(RegistryError::Common(
+            Err(BackendError::Registry(RegistryBackendError::Common(
                 "forced fail".to_string(),
             )))
         });
@@ -2139,7 +2154,7 @@ mod tests {
         let result = request_err_to_registry(other_err);
         assert!(matches!(
             result,
-            RegistryError::Request(ConnectionError::ErrorWithMsg(msg))
+            RegistryBackendError::Request(ConnectionError::ErrorWithMsg(msg))
                 if msg.contains("some other error")
         ));
     }
@@ -2240,7 +2255,7 @@ mod tests {
         // First handle() call fails — error triggers renew() inside once()
         let result: Option<BackendResult<u32>> = first.handle(&mut || {
             attempts += 1;
-            Err(BackendError::Registry(RegistryError::Common(
+            Err(BackendError::Registry(RegistryBackendError::Common(
                 "fail".to_string(),
             )))
         });

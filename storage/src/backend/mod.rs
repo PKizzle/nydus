@@ -114,27 +114,39 @@ pub static BACKEND_PAUSER: std::sync::LazyLock<self::pauser::Pauser> =
     std::sync::LazyLock::new(self::pauser::Pauser::new);
 
 /// Error codes related to storage backend operations.
-#[derive(Debug)]
+///
+/// Note the `{:?}` in three of the messages below: `Registry`, `LocalDisk` and `Request` have
+/// always rendered their cause with `Debug` rather than `Display`, and callers' log output is
+/// matched against that in smoke tests, so the formatting is reproduced exactly rather than
+/// tidied up.
+#[derive(Debug, thiserror::Error)]
 pub enum BackendError {
     /// Unsupported operation.
+    #[error("{0}")]
     Unsupported(String),
     /// Failed to copy data from/into blob.
-    CopyData(StorageError),
+    #[error("failed to copy data, {0}")]
+    CopyData(#[source] StorageError),
     #[cfg(feature = "backend-localdisk")]
     /// Error from LocalDisk storage backend.
-    LocalDisk(self::localdisk::LocalDiskError),
+    #[error("{0:?}")]
+    LocalDisk(#[source] self::localdisk::LocalDiskError),
     #[cfg(feature = "backend-registry")]
     /// Error from Registry storage backend.
-    Registry(self::registry::RegistryError),
+    #[error("{0:?}")]
+    Registry(#[source] self::registry::RegistryBackendError),
     #[cfg(feature = "backend-localfs")]
     /// Error from LocalFs storage backend.
-    LocalFs(self::localfs::LocalFsError),
+    #[error("{0}")]
+    LocalFs(#[source] self::localfs::LocalFsError),
     #[cfg(any(feature = "backend-oss", feature = "backend-s3"))]
     /// Error from object storage backend.
-    ObjectStorage(self::object_storage::ObjectStorageError),
+    #[error("{0}")]
+    ObjectStorage(#[source] self::object_storage::ObjectStorageError),
     #[cfg(feature = "backend-http-proxy")]
     /// Error from local http proxy backend.
-    HttpProxy(self::http_proxy::HttpProxyError),
+    #[error("{0}")]
+    HttpProxy(#[source] self::http_proxy::HttpProxyError),
     #[cfg(any(
         feature = "backend-oss",
         feature = "backend-registry",
@@ -142,33 +154,8 @@ pub enum BackendError {
         feature = "backend-http-proxy",
     ))]
     /// Error from the request routing layer.
-    Request(self::request::RequestError),
-}
-
-impl fmt::Display for BackendError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            BackendError::Unsupported(s) => write!(f, "{}", s),
-            BackendError::CopyData(e) => write!(f, "failed to copy data, {}", e),
-            #[cfg(feature = "backend-registry")]
-            BackendError::Registry(e) => write!(f, "{:?}", e),
-            #[cfg(feature = "backend-localfs")]
-            BackendError::LocalFs(e) => write!(f, "{}", e),
-            #[cfg(any(feature = "backend-oss", feature = "backend-s3"))]
-            BackendError::ObjectStorage(e) => write!(f, "{}", e),
-            #[cfg(feature = "backend-localdisk")]
-            BackendError::LocalDisk(e) => write!(f, "{:?}", e),
-            #[cfg(feature = "backend-http-proxy")]
-            BackendError::HttpProxy(e) => write!(f, "{}", e),
-            #[cfg(any(
-                feature = "backend-oss",
-                feature = "backend-registry",
-                feature = "backend-s3",
-                feature = "backend-http-proxy",
-            ))]
-            BackendError::Request(e) => write!(f, "request error: {:?}", e),
-        }
-    }
+    #[error("request error: {0:?}")]
+    Request(#[source] self::request::RequestError),
 }
 
 /// Specialized `Result` for storage backends.
@@ -683,6 +670,21 @@ mod tests {
         assert_eq!(format!("{}", err), "test operation");
 
         let err = BackendError::CopyData(StorageError::Unsupported);
+        assert!(format!("{}", err).contains("failed to copy data"));
+    }
+
+    #[test]
+    fn backend_errors_expose_their_cause() {
+        // Before these enums were thiserror types they implemented `Display` by hand and no
+        // `std::error::Error` at all, so nothing could walk into them: an errno captured at a
+        // syscall was unreachable once wrapped. The whole errno channel depends on this.
+        let err = BackendError::CopyData(StorageError::CacheIndex(
+            std::io::Error::from_raw_os_error(libc::ENOSPC),
+        ));
+
+        assert_eq!(nydus_utils::source_errno(&err), Some(libc::ENOSPC));
+
+        // ...and the message is still the one the smoke tests match on.
         assert!(format!("{}", err).contains("failed to copy data"));
     }
 

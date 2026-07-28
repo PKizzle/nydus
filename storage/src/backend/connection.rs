@@ -9,8 +9,8 @@ use std::io::{Read, Result};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicI16, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
+use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use std::{fmt, thread};
 
 use log::{Level, max_level};
 
@@ -59,25 +59,23 @@ thread_local! {
 }
 
 /// Error codes related to network communication.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum ConnectionError {
+    /// The connection was closed by the peer.
+    #[error("network connection disconnected")]
     Disconnected,
+    /// A network failure described only by a message.
+    #[error("network error, {0}")]
     ErrorWithMsg(String),
-    Common(cyper::Error),
-    Url(String, ParseError),
+    /// A failure reported by the HTTP client.
+    #[error("network error, {0}")]
+    Common(#[source] cyper::Error),
+    /// The configured URL is malformed.
+    #[error("failed to parse URL {0}, {1}")]
+    Url(String, #[source] ParseError),
+    /// The URL scheme is not one this backend speaks.
+    #[error("invalid scheme {0}")]
     Scheme(String),
-}
-
-impl fmt::Display for ConnectionError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            ConnectionError::Disconnected => write!(f, "network connection disconnected"),
-            ConnectionError::ErrorWithMsg(s) => write!(f, "network error, {}", s),
-            ConnectionError::Common(e) => write!(f, "network error, {}", e),
-            ConnectionError::Url(s, e) => write!(f, "failed to parse URL {}, {}", s, e),
-            ConnectionError::Scheme(s) => write!(f, "invalid scheme {}", s),
-        }
-    }
 }
 
 /// Specialized `Result` for network communication.

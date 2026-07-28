@@ -44,8 +44,6 @@ extern crate bitflags;
 #[macro_use]
 extern crate nydus_api;
 
-use std::fmt::{Display, Formatter};
-
 pub mod backend;
 pub mod cache;
 pub mod device;
@@ -77,31 +75,32 @@ pub const RAFS_MAX_CHUNKS_PER_BLOB: u32 = 1u32 << 24;
 pub const RAFS_BATCH_SIZE_TO_GAP_SHIFT: u64 = 7;
 
 /// Error codes related to storage subsystem.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum StorageError {
+    /// The operation is not supported by this storage configuration.
+    #[error("unsupported storage operation")]
     Unsupported,
+    /// A backend read did not complete in time.
+    #[error("timeout when reading data from storage backend")]
     Timeout,
-    VolatileSlice(vm_memory::VolatileMemoryError),
+    /// A guest-memory slice could not be addressed.
+    #[error("{0}")]
+    VolatileSlice(#[source] vm_memory::VolatileMemoryError),
+    /// An offset or length calculation overflowed.
+    #[error("memory overflow when doing storage backend IO")]
     MemOverflow,
+    /// The supplied address ranges are not contiguous.
+    #[error("address ranges are not continuous")]
     NotContinuous,
-    CacheIndex(std::io::Error),
+    /// The chunk index is out of range for the blob.
+    #[error("Wrong cache index {0}")]
+    CacheIndex(#[source] std::io::Error),
+    /// The proxy refused the request.
+    #[error("proxy forbidden: {0}")]
     ProxyForbidden(String),
+    /// The proxy rate-limited the request.
+    #[error("proxy rate limited: {0}")]
     ProxyLimited(String),
-}
-
-impl Display for StorageError {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        match self {
-            StorageError::Unsupported => write!(f, "unsupported storage operation"),
-            StorageError::Timeout => write!(f, "timeout when reading data from storage backend"),
-            StorageError::MemOverflow => write!(f, "memory overflow when doing storage backend IO"),
-            StorageError::NotContinuous => write!(f, "address ranges are not continuous"),
-            StorageError::VolatileSlice(e) => write!(f, "{}", e),
-            StorageError::CacheIndex(e) => write!(f, "Wrong cache index {}", e),
-            StorageError::ProxyForbidden(s) => write!(f, "proxy forbidden: {}", s),
-            StorageError::ProxyLimited(s) => write!(f, "proxy rate limited: {}", s),
-        }
-    }
 }
 
 /// Specialized std::result::Result for storage subsystem.

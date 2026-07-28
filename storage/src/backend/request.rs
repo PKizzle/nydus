@@ -39,12 +39,23 @@ const HEADER_ENV_PREFIX: &str = "NYDUS_HEADER_";
 const HEADER_USER_AGENT: &str = "User-Agent";
 const HEADER_VALUE_USER_AGENT: &str = "nydusd/1.0.0";
 
-#[derive(Debug)]
+/// Error codes from the request routing layer.
+///
+/// Like [`ProxyError`](proxy::ProxyError) this had no `Display` impl and so was not a
+/// `std::error::Error`; it is rendered with `{:?}` by `BackendError::Request`, which is
+/// unchanged.
+#[derive(Debug, thiserror::Error)]
 pub enum RequestError {
+    /// A request failure described only by a message.
+    #[error("request error, {0}")]
     Common(String),
-    Connection(ConnectionError),
+    /// The underlying connection failed.
+    #[error("request error, {0}")]
+    Connection(#[source] ConnectionError),
     #[cfg(feature = "backend-dragonfly-proxy")]
-    Proxy(proxy::ProxyError),
+    /// The Dragonfly proxy rejected the request.
+    #[error("request error, {0}")]
+    Proxy(#[source] proxy::ProxyError),
 }
 
 pub type RequestResult<T> = std::result::Result<T, RequestError>;

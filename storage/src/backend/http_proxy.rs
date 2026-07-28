@@ -17,73 +17,50 @@ use super::{BackendContext, BackendError, BackendResult, BlobBackend, BlobReader
 use crate::backend::request;
 use std::path::Path;
 use std::{
-    fmt,
     io::{Error, Result},
     num::ParseIntError,
     str::{self},
     sync::Arc,
 };
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum HttpProxyError {
     /// Failed to parse string to integer.
-    ParseStringToInteger(ParseIntError),
-    ParseContentLengthFromHeader(http::header::ToStrError),
+    #[error("failed to parse string to integer, {0}")]
+    ParseStringToInteger(#[source] ParseIntError),
+    /// The `Content-Length` header was not valid UTF-8.
+    #[error("failed to parse content length from header, {0}")]
+    ParseContentLengthFromHeader(#[source] http::header::ToStrError),
     /// Failed to connect to the local http proxy unix socket.
-    LocalConnect(Error),
+    #[error("failed to connect to local http proxy socket, {0}")]
+    LocalConnect(#[source] Error),
     /// Failed to perform the HTTP/1 handshake with the local http server.
-    LocalHandshake(hyper::Error),
+    #[error("failed to handshake with local http proxy, {0}")]
+    LocalHandshake(#[source] hyper::Error),
     /// Failed to get response from the local http server.
-    LocalRequest(hyper::Error),
+    #[error("failed to get response, {0}")]
+    LocalRequest(#[source] hyper::Error),
     /// Failed to get response from the remote http server.
-    RemoteRequest(ConnectionError),
+    #[error("failed to get response, {0}")]
+    RemoteRequest(#[source] ConnectionError),
     /// Failed to build local http request.
-    BuildHttpRequest(http::Error),
+    #[error("failed to build http request, {0}")]
+    BuildHttpRequest(#[source] http::Error),
     /// Failed to read the response body.
-    ReadResponseBody(hyper::Error),
+    #[error("failed to read response body, {0}")]
+    ReadResponseBody(#[source] hyper::Error),
     /// Failed to transport the remote response body.
-    Transport(Error),
+    #[error("failed to transport remote response body, {0}")]
+    Transport(#[source] Error),
     /// Failed to copy the buffer.
-    CopyBuffer(Error),
+    #[error("failed to copy buffer, {0}")]
+    CopyBuffer(#[source] Error),
     /// Invalid path.
+    #[error("invalid path")]
     InvalidPath,
     /// Failed to build request header.
+    #[error("failed to construct request header, {0}")]
     ConstructHeader(String),
-}
-
-impl fmt::Display for HttpProxyError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            HttpProxyError::ParseStringToInteger(e) => {
-                write!(f, "failed to parse string to integer, {}", e)
-            }
-            HttpProxyError::ParseContentLengthFromHeader(e) => {
-                write!(f, "failed to parse content length from header, {}", e)
-            }
-            HttpProxyError::LocalConnect(e) => {
-                write!(f, "failed to connect to local http proxy socket, {}", e)
-            }
-            HttpProxyError::LocalHandshake(e) => {
-                write!(f, "failed to handshake with local http proxy, {}", e)
-            }
-            HttpProxyError::LocalRequest(e) => write!(f, "failed to get response, {}", e),
-            HttpProxyError::RemoteRequest(e) => write!(f, "failed to get response, {}", e),
-            HttpProxyError::BuildHttpRequest(e) => {
-                write!(f, "failed to build http request, {}", e)
-            }
-            HttpProxyError::Transport(e) => {
-                write!(f, "failed to transport remote response body, {}", e)
-            }
-            HttpProxyError::ReadResponseBody(e) => {
-                write!(f, "failed to read response body, {}", e)
-            }
-            HttpProxyError::CopyBuffer(e) => write!(f, "failed to copy buffer, {}", e),
-            HttpProxyError::InvalidPath => write!(f, "invalid path"),
-            HttpProxyError::ConstructHeader(e) => {
-                write!(f, "failed to construct request header, {}", e)
-            }
-        }
-    }
 }
 
 impl From<HttpProxyError> for BackendError {

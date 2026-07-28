@@ -5,7 +5,6 @@
 //! Storage backend driver to access blobs on local disks.
 
 use std::collections::HashMap;
-use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::io::Result;
 use std::os::unix::io::AsRawFd;
@@ -23,19 +22,14 @@ use crate::utils::{MemSliceCursor, readv};
 type LocalDiskResult<T> = std::result::Result<T, LocalDiskError>;
 
 /// Error codes related to localdisk storage backend.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum LocalDiskError {
+    /// The blob file could not be opened or is not usable.
+    #[error("{0}")]
     BlobFile(String),
+    /// Reading blob data from the disk failed.
+    #[error("{0}")]
     ReadBlob(String),
-}
-
-impl fmt::Display for LocalDiskError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            LocalDiskError::BlobFile(s) => write!(f, "{}", s),
-            LocalDiskError::ReadBlob(s) => write!(f, "{}", s),
-        }
-    }
 }
 
 impl From<LocalDiskError> for BackendError {

@@ -5,7 +5,6 @@
 
 //! Base module used to implement object storage backend drivers (such as oss, s3, etc.).
 
-use std::fmt;
 use std::fmt::Debug;
 use std::io::{Error, Read, Result};
 use std::marker::Send;
@@ -20,25 +19,20 @@ use super::request::{self, is_success_status};
 use super::{BackendContext, BackendError, BackendResult, BlobBackend, BlobReader};
 
 /// Error codes related to object storage backend.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum ObjectStorageError {
-    Auth(Error),
+    /// The request could not be signed.
+    #[error("failed to generate auth info, {0}")]
+    Auth(#[source] Error),
+    /// A required HTTP header could not be built.
+    #[error("failed to generate HTTP header, {0}")]
     ConstructHeader(String),
-    Transport(std::io::Error),
+    /// The request did not reach the object store.
+    #[error("network communication error, {0}")]
+    Transport(#[source] std::io::Error),
+    /// The object store answered with an error.
+    #[error("network communication error, {0}")]
     Response(String),
-}
-
-impl fmt::Display for ObjectStorageError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            ObjectStorageError::Auth(e) => write!(f, "failed to generate auth info, {}", e),
-            ObjectStorageError::ConstructHeader(e) => {
-                write!(f, "failed to generate HTTP header, {}", e)
-            }
-            ObjectStorageError::Transport(e) => write!(f, "network communication error, {}", e),
-            ObjectStorageError::Response(s) => write!(f, "network communication error, {}", s),
-        }
-    }
 }
 
 impl From<ObjectStorageError> for BackendError {

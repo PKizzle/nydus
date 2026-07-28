@@ -39,11 +39,24 @@ pub const HEADER_VALUE_DRAGONFLY_PRIORITY_6: i32 = 6;
 pub const HEADER_VALUE_DRAGONFLY_USE_P2P_TRUE: &str = "true";
 pub const HEADER_VALUE_DRAGONFLY_ERROR_TYPE_PROXY: &str = "proxy";
 
-#[derive(Debug)]
+/// Error codes reported by the Dragonfly proxy SDK.
+///
+/// This had no `Display` impl, and so did not implement `std::error::Error` either -- callers
+/// only ever rendered it with `{:?}`. Those `Debug` renderings are unchanged; the messages
+/// below are new, and make the variants usable as a source in an error chain.
+#[derive(Debug, thiserror::Error)]
 pub enum ProxyError {
+    /// A proxy failure described only by a message.
+    #[error("proxy error, {0}")]
     Common(String),
+    /// The proxy reported an internal failure.
+    #[error("proxy internal error, {0}")]
     Internal(String),
+    /// The proxy rate-limited this client.
+    #[error("proxy rate limited, {0}")]
     TooManyRequests(String),
+    /// The proxy refused the request.
+    #[error("proxy forbidden, {0}")]
     Forbidden(String),
 }
 

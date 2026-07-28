@@ -187,7 +187,7 @@ registry-client = { path = "../registry-client" }
 nydus-service = { version = "0.4.0", path = "../service", features = [
     "block-device",
 ] }
-nydus-storage = { version = "0.7.2", path = "../storage" }
+nydus-storage = { version = "0.8.0", path = "../storage" }
 nydus-utils = { version = "0.6.0", path = "../utils" }
 
 [dev-dependencies]
