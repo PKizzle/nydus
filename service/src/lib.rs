@@ -14,8 +14,6 @@
 
 #[macro_use]
 extern crate log;
-#[macro_use]
-extern crate nydus_api;
 
 use std::fmt::{self, Display};
 use std::io;
@@ -98,6 +96,30 @@ pub enum Error {
     UpgradeManager(upgrade::UpgradeMgrError),
     #[error("failed to start service, {0}")]
     StartService(String),
+    /// The storage layer failed to serve blob data or metadata.
+    ///
+    /// Boxed to keep `Error` small -- `StorageError` is several words wide and this is the
+    /// error half of most signatures in the crate.
+    #[error("{0}")]
+    Storage(#[source] Box<nydus_storage::StorageError>),
+    /// The blob cache manager could not serve a request.
+    #[error("{0}")]
+    BlobCache(String),
+    /// The block device could not serve a request.
+    #[error("{0}")]
+    BlockDevice(String),
+    /// The userfaultfd page-fault handler failed.
+    ///
+    /// The uffd loop branches on `EEXIST` and `WouldBlock` at the syscall site, before the
+    /// error is wrapped, so nothing downstream needs the errno back.
+    #[error("{0}")]
+    Uffd(String),
+    /// The NBD server failed.
+    #[error("{0}")]
+    Nbd(String),
+    /// The fanotify pre-content handler failed.
+    #[error("{0}")]
+    Fanotify(String),
     /// Input event to stat-machine is not expected.
     #[error("unexpected state machine transition event `{0:?}`")]
     UnexpectedEvent(crate::daemon::DaemonStateMachineInput),
@@ -145,7 +167,7 @@ pub enum Error {
 
 /// Boundary conversion for the FUSE and vhost pins.
 ///
-/// This used to be `einval!(e)`, which threw `e` away and answered `EINVAL` for everything --
+/// This used to be an EINVAL error macro, which threw `e` away and answered `EINVAL` for everything --
 /// a full disk, a missing blob and a bad mount option were indistinguishable at the FUSE
 /// boundary, and all three arrived as "Invalid argument".
 ///
@@ -195,6 +217,12 @@ impl From<Error> for DaemonErrorKind {
             InvalidConfig(msg) => DaemonErrorKind::InvalidArguments(msg),
             o => DaemonErrorKind::Other(o.to_string()),
         }
+    }
+}
+
+impl From<nydus_storage::StorageError> for Error {
+    fn from(e: nydus_storage::StorageError) -> Self {
+        Error::Storage(Box::new(e))
     }
 }
 

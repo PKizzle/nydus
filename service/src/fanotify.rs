@@ -123,7 +123,11 @@ struct BlobBacking {
 /// distinction matters most for disk pressure: a full cache filesystem must
 /// surface as `ENOSPC` to the reading process, not a generic I/O error.
 fn deny_errno_for(e: &std::io::Error) -> libc::c_int {
-    match e.raw_os_error() {
+    // `source_errno`, not `raw_os_error`: the failure originates several layers down (a cache
+    // `pwrite` in nydus-storage) and reaches here through typed errors. If any of them wraps
+    // it in a `Custom` `io::Error` on the way, `raw_os_error()` reports `None` and a full disk
+    // would be answered as a generic `EIO`. Walking the chain sees through that.
+    match nydus_utils::source_errno(e) {
         Some(errno @ (libc::ENOSPC | libc::EDQUOT | libc::EIO)) => errno,
         _ => libc::EIO,
     }
@@ -1278,6 +1282,30 @@ mod tests {
             deny_errno_for(&std::io::Error::other("no raw errno")),
             libc::EIO
         );
+
+        // The shape the on-demand path actually produces: a cache `pwrite` that hit ENOSPC,
+        // as a `StorageError`, converted at the storage boundary. The errno has to survive
+        // -- answering EIO here tells a reader "I/O error" for a full disk, and answering
+        // FAN_ALLOW would hand it an unfilled sparse hole full of zeros.
+        let storage = nydus_storage::StorageError::cache_io(
+            "pwrite",
+            std::io::Error::from_raw_os_error(libc::ENOSPC),
+        );
+        assert_eq!(deny_errno_for(&std::io::Error::from(storage)), libc::ENOSPC);
+
+        // ... and the same through a `Custom` wrapper, which `raw_os_error()` alone cannot see
+        // through. This is the regression the switch to `source_errno` exists for.
+        let storage = nydus_storage::StorageError::cache_io(
+            "pwrite",
+            std::io::Error::from_raw_os_error(libc::EDQUOT),
+        );
+        let wrapped = std::io::Error::other(crate::Error::from(storage));
+        assert_eq!(
+            wrapped.raw_os_error(),
+            None,
+            "precondition: wrapper hides the errno"
+        );
+        assert_eq!(deny_errno_for(&wrapped), libc::EDQUOT);
     }
 
     use super::*;

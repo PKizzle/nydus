@@ -77,7 +77,7 @@ impl ServiceController {
         }
     }
 
-    fn initialize_blob_cache(&self, config: &Option<serde_json::Value>) -> std::io::Result<()> {
+    fn initialize_blob_cache(&self, config: &Option<serde_json::Value>) -> Result<()> {
         // Create blob cache objects configured by the configuration file.
         if let Some(config) = config
             && let Some(config1) = config.as_object()
@@ -565,7 +565,8 @@ pub fn create_daemon(
         #[cfg(target_os = "linux")]
         if let (Some(blob_dir), Some(mountpoint)) = (fanotify_blob_dir, fanotify_mountpoint) {
             let threads = if let Some(threads_value) = fanotify_threads {
-                crate::validate_threads_configuration(threads_value).map_err(|err| einval!(err))?
+                crate::validate_threads_configuration(threads_value)
+                    .map_err(|err| Error::InvalidArguments(err.to_string()))?
             } else {
                 1usize
             };
@@ -574,10 +575,10 @@ pub fn create_daemon(
 
         daemon
             .on_event(DaemonStateMachineInput::Mount)
-            .map_err(|e| eother!(e))?;
+            .map_err(|e| Error::StartService(e.to_string()))?;
         daemon
             .on_event(DaemonStateMachineInput::Start)
-            .map_err(|e| eother!(e))?;
+            .map_err(|e| Error::StartService(e.to_string()))?;
     }
 
     Ok(daemon)

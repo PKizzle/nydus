@@ -10,7 +10,7 @@ use nydus_rafs::metadata::{RafsInode, RafsInodeWalkAction};
 use std::any::Any;
 use std::ffi::{CStr, CString, OsStr, OsString};
 use std::fs::metadata;
-use std::io::{Error, Result, Write};
+use std::io::Write;
 use std::ops::Deref;
 #[cfg(target_os = "linux")]
 use std::os::linux::fs::MetadataExt;
@@ -44,7 +44,7 @@ use crate::daemon::{
 };
 use crate::fs_service::{FsBackendCollection, FsBackendMountCmd, FsService};
 use crate::upgrade::{self, FailoverPolicy, UpgradeManager};
-use crate::{Error as NydusError, FsBackendType, FuseNotifyError, Result as NydusResult};
+use crate::{Error as NydusError, FsBackendType, FuseNotifyError, Result as NydusResult, Result};
 
 const FS_IDX_SHIFT: u64 = 56;
 
@@ -110,17 +110,22 @@ struct FuseServer {
 
 impl FuseServer {
     fn new(server: Arc<Server<Arc<Vfs>>>, se: &FuseSession) -> Result<FuseServer> {
-        let ch = se.new_channel().map_err(|e| eother!(e))?;
+        let ch = se
+            .new_channel()
+            .map_err(|e| NydusError::StartService(e.to_string()))?;
         Ok(FuseServer { server, ch })
     }
 
     fn svc_loop(&mut self, metrics_hook: &dyn MetricsHook) -> Result<()> {
         // Given error EBADF, it means kernel has shut down this session.
-        let _ebadf = Error::from_raw_os_error(libc::EBADF);
+        let _ebadf = std::io::Error::from_raw_os_error(libc::EBADF);
 
         loop {
             if let Some((reader, writer)) = self.ch.get_request().map_err(|e| {
-                Error::other(format!("failed to get fuse request from /dev/fuse, {}", e))
+                NydusError::StartService(format!(
+                    "failed to get fuse request from /dev/fuse, {}",
+                    e
+                ))
             })? {
                 if let Err(e) =
                     self.server
@@ -128,7 +133,9 @@ impl FuseServer {
                 {
                     match e {
                         fuse_backend_rs::Error::EncodeMessage(_ebadf) => {
-                            return Err(eio!("fuse session has been shut down"));
+                            return Err(NydusError::StartService(
+                                "fuse session has been shut down".to_string(),
+                            ));
                         }
                         _ => {
                             error!("Handling fuse message, {}", NydusError::ProcessQueue(e));
@@ -249,7 +256,8 @@ impl FusedevFsService {
         failover_policy: FailoverPolicy,
         readonly: bool,
     ) -> Result<Self> {
-        let session = FuseSession::new(mnt, "rafs", "", readonly).map_err(|e| eother!(e))?;
+        let session = FuseSession::new(mnt, "rafs", "", readonly)
+            .map_err(|e| NydusError::StartService(e.to_string()))?;
         let upgrade_mgr = supervisor
             .as_ref()
             .map(|s| Mutex::new(UpgradeManager::new(s.to_string().into())));
@@ -370,7 +378,8 @@ impl FsService for FusedevFsService {
         }
 
         // === Post-order: invalidate cache of the current node ===
-        let cstr_name = CString::new(cur_name).map_err(|_| eother!("invalid file name"))?;
+        let cstr_name = CString::new(cur_name)
+            .map_err(|_| NydusError::StartService("invalid file name".to_string()))?;
         // Invalidate inode cache
         self.session.lock().unwrap().with_writer(|writer| {
             if let Err(e) = self.server.notify_inval_inode(writer, cur_kernel_ino, 0, 0) {
@@ -457,7 +466,7 @@ impl FusedevDaemon {
         let mut s = self
             .service
             .create_fuse_server()
-            .map_err(NydusError::CreateFuseServer)?;
+            .map_err(|e| NydusError::CreateFuseServer(e.into()))?;
         let inflight_op = self.service.create_inflight_op();
         let thread = thread::Builder::new()
             .name("fuse_server".to_string())
@@ -556,12 +565,14 @@ impl NydusDaemon for FusedevDaemon {
                 handle
                     .join()
                     .map_err(|e| {
-                        let e = *e
-                            .downcast::<Error>()
-                            .unwrap_or_else(|e| Box::new(eother!(e)));
+                        // A panicking service thread carries an arbitrary payload; only an
+                        // `io::Error` can be recovered, anything else keeps its `Debug` text.
+                        let e = *e.downcast::<std::io::Error>().unwrap_or_else(|e| {
+                            Box::new(std::io::Error::other(format!("{:?}", e)))
+                        });
                         NydusError::WaitDaemon(e)
                     })?
-                    .map_err(NydusError::WaitDaemon)?;
+                    .map_err(|e| NydusError::WaitDaemon(e.into()))?;
             } else {
                 // No more handles to wait
                 break;
@@ -576,11 +587,11 @@ impl NydusDaemon for FusedevDaemon {
         if let Some(handler) = guard.take() {
             let result = handler.join().map_err(|e| {
                 let e = *e
-                    .downcast::<Error>()
-                    .unwrap_or_else(|e| Box::new(eother!(e)));
+                    .downcast::<std::io::Error>()
+                    .unwrap_or_else(|e| Box::new(std::io::Error::other(format!("{:?}", e))));
                 NydusError::WaitDaemon(e)
             })?;
-            result.map_err(NydusError::WaitDaemon)
+            result.map_err(|e| NydusError::WaitDaemon(e.into()))
         } else {
             Ok(())
         }
@@ -608,8 +619,9 @@ fn is_mounted(mp: impl AsRef<Path>) -> Result<bool> {
     let mp = mp
         .as_ref()
         .to_str()
-        .ok_or_else(|| Error::from_raw_os_error(libc::EINVAL))?;
-    let mp = CString::new(String::from(mp)).map_err(|_| Error::from_raw_os_error(libc::EINVAL))?;
+        .ok_or_else(|| NydusError::InvalidArguments("non-UTF-8 mountpoint".to_string()))?;
+    let mp = CString::new(String::from(mp))
+        .map_err(|_| NydusError::InvalidArguments("mountpoint contains a NUL byte".to_string()))?;
     let mut mpb: Vec<libc::statfs> = Vec::new();
     let mut mpb_ptr = mpb.as_mut_ptr();
     let mpb_ptr = &mut mpb_ptr;
@@ -617,7 +629,10 @@ fn is_mounted(mp: impl AsRef<Path>) -> Result<bool> {
     let mpb: Vec<libc::statfs> = unsafe {
         let res = libc::getmntinfo(mpb_ptr, libc::MNT_NOWAIT);
         if res < 0 {
-            return Err(Error::from_raw_os_error(res));
+            return Err(NydusError::StartService(format!(
+                "getmntinfo failed: {}",
+                std::io::Error::from_raw_os_error(res)
+            )));
         }
         let size = res as usize;
         Vec::from_raw_parts(*mpb_ptr, size, size)
@@ -652,7 +667,11 @@ fn is_mounted(mp: impl AsRef<Path>) -> Result<bool> {
 
         // Mount point path
         if unsafe { CStr::from_ptr((*mnt).mnt_dir) }
-            == CString::new(mp.as_ref().as_os_str().as_bytes())?.as_c_str()
+            == CString::new(mp.as_ref().as_os_str().as_bytes())
+                .map_err(|_| {
+                    NydusError::InvalidArguments("mountpoint contains a NUL byte".to_string())
+                })?
+                .as_c_str()
         {
             unsafe { libc::endmntent(mounts_stream) };
             return Ok(true);
@@ -749,7 +768,7 @@ pub fn create_fuse_daemon(
         if let Some(cmd) = mount_cmd {
             daemon.service.mount(cmd).map_err(|e| {
                 error!("service mount error: {}", &e);
-                eother!(e)
+                NydusError::StartService(e.to_string())
             })?;
         }
         daemon
@@ -760,15 +779,15 @@ pub fn create_fuse_daemon(
             .mount()
             .map_err(|e| {
                 error!("service session mount error: {}", &e);
-                eother!(e)
+                NydusError::StartService(e.to_string())
             })?;
 
         daemon
             .on_event(DaemonStateMachineInput::Mount)
-            .map_err(|e| eother!(e))?;
+            .map_err(|e| NydusError::StartService(e.to_string()))?;
         daemon
             .on_event(DaemonStateMachineInput::Start)
-            .map_err(|e| eother!(e))?;
+            .map_err(|e| NydusError::StartService(e.to_string()))?;
         daemon
             .service
             .conn
@@ -779,7 +798,7 @@ pub fn create_fuse_daemon(
         {
             m.hold_file(f).map_err(|e| {
                 error!("Failed to hold fusedev fd, {:?}", e);
-                eother!(e)
+                NydusError::StartService(e.to_string())
             })?;
             m.save_fuse_cid(daemon.service.conn.load(Ordering::Acquire));
         }

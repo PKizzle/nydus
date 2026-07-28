@@ -29,7 +29,7 @@
 //! - [Stat Response] JSON StatResponse
 
 use std::any::Any;
-use std::io::{Error, Result};
+
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixListener;
 use std::os::unix::net::UnixStream as StdUnixStream;
@@ -56,6 +56,8 @@ use crate::daemon::{
 use crate::{Error as NydusError, Result as NydusResult};
 
 use super::uffd_proto::*;
+
+use crate::{Error, Result};
 
 // ---------------------------------------------------------------------------
 // UFFD kernel ABI constants
@@ -151,40 +153,46 @@ fn checked_vma_end(region: &VmaRegion) -> Result<u64> {
     region
         .base_host_virt_addr
         .checked_add(region.size as u64)
-        .ok_or_else(|| eother!("uffd: VMA host address range overflows u64"))
+        .ok_or_else(|| Error::Uffd("uffd: VMA host address range overflows u64".to_string()))
 }
 
 fn checked_vma_device_end(region: &VmaRegion) -> Result<u64> {
     region
         .offset
         .checked_add(region.size as u64)
-        .ok_or_else(|| eother!("uffd: VMA block-device range overflows u64"))
+        .ok_or_else(|| Error::Uffd("uffd: VMA block-device range overflows u64".to_string()))
 }
 
 fn checked_vma_addr(region: &VmaRegion, block_offset: u64) -> Result<u64> {
     let relative = block_offset
         .checked_sub(region.offset)
-        .ok_or_else(|| eother!("uffd: block offset is before VMA region offset"))?;
+        .ok_or_else(|| Error::Uffd("uffd: block offset is before VMA region offset".to_string()))?;
     region
         .base_host_virt_addr
         .checked_add(relative)
-        .ok_or_else(|| eother!("uffd: translated VMA address overflows u64"))
+        .ok_or_else(|| Error::Uffd("uffd: translated VMA address overflows u64".to_string()))
 }
 
 fn validate_vma_region(region: &VmaRegion, block_size: u64) -> Result<()> {
     if region.size == 0 {
-        return Err(eother!("uffd: VMA region size must be non-zero"));
+        return Err(Error::Uffd(
+            "uffd: VMA region size must be non-zero".to_string(),
+        ));
     }
     if region.page_size == 0 {
-        return Err(eother!("uffd: VMA page_size must be non-zero"));
+        return Err(Error::Uffd(
+            "uffd: VMA page_size must be non-zero".to_string(),
+        ));
     }
 
     let page_size = region.page_size as u64;
     if !region.page_size.is_power_of_two() {
-        return Err(eother!("uffd: VMA page_size must be a power of two"));
+        return Err(Error::Uffd(
+            "uffd: VMA page_size must be a power of two".to_string(),
+        ));
     }
     if page_size < block_size || !page_size.is_multiple_of(block_size) {
-        return Err(eother!(format!(
+        return Err(Error::Uffd(format!(
             "uffd: VMA page_size {} must be a multiple of block size {}",
             page_size, block_size
         )));
@@ -197,8 +205,8 @@ fn validate_vma_region(region: &VmaRegion, block_size: u64) -> Result<()> {
 
 fn validate_vma_regions(regions: &[VmaRegion], block_size: u64) -> Result<()> {
     if regions.is_empty() {
-        return Err(eother!(
-            "uffd: handshake must contain at least one VMA region"
+        return Err(Error::Uffd(
+            "uffd: handshake must contain at least one VMA region".to_string(),
         ));
     }
 
@@ -230,10 +238,10 @@ pub fn read_uffd_msg(uffd_fd: RawFd) -> Result<Option<UffdMsg>> {
         if err.kind() == std::io::ErrorKind::WouldBlock {
             return Ok(None);
         }
-        return Err(eother!(format!("uffd read failed: {}", err)));
+        return Err(Error::Uffd(format!("uffd read failed: {}", err)));
     }
     if (n as usize) < std::mem::size_of::<UffdMsg>() {
-        return Err(eother!(format!("uffd short read: {n} bytes")));
+        return Err(Error::Uffd(format!("uffd short read: {n} bytes")));
     }
 
     Ok(Some(unsafe { msg.assume_init() }))
@@ -254,13 +262,13 @@ pub async fn uffdio_zeropage(uffd_fd: RawFd, start_addr: u64, len: u64) -> Resul
             if err.raw_os_error() == Some(libc::EEXIST) {
                 return Ok(());
             }
-            return Err(eother!(format!("UFFDIO_ZEROPAGE failed: {}", err)));
+            return Err(Error::Uffd(format!("UFFDIO_ZEROPAGE failed: {}", err)));
         }
         Ok(())
     })
     .await
     .resume_unwind()
-    .unwrap_or_else(|| Err(eother!("uffd ioctl task was cancelled")))
+    .unwrap_or_else(|| Err(Error::Uffd("uffd ioctl task was cancelled".to_string())))
 }
 
 /// Perform UFFDIO_COPY ioctl asynchronously.
@@ -278,7 +286,7 @@ pub async fn uffdio_copy(uffd_fd: RawFd, dst: u64, buf: Vec<u8>, len: u64) -> Re
         };
         let ret = unsafe { libc::ioctl(uffd_fd, UFFDIO_COPY, &mut ioctl_arg) };
         if ret < 0 {
-            return Err(eother!(format!(
+            return Err(Error::Uffd(format!(
                 "UFFDIO_COPY failed: {}",
                 std::io::Error::last_os_error()
             )));
@@ -287,7 +295,7 @@ pub async fn uffdio_copy(uffd_fd: RawFd, dst: u64, buf: Vec<u8>, len: u64) -> Re
     })
     .await
     .resume_unwind()
-    .unwrap_or_else(|| Err(eother!("uffd ioctl task was cancelled")))
+    .unwrap_or_else(|| Err(Error::Uffd("uffd ioctl task was cancelled".to_string())))
 }
 
 /// Perform UFFDIO_WAKE ioctl asynchronously.
@@ -309,13 +317,13 @@ pub async fn uffdio_wake(uffd_fd: RawFd, start_addr: u64, len: u64) -> Result<()
             if err.raw_os_error() == Some(libc::EEXIST) {
                 return Ok(());
             }
-            return Err(eother!(format!("UFFDIO_WAKE failed: {}", err)));
+            return Err(Error::Uffd(format!("UFFDIO_WAKE failed: {}", err)));
         }
         Ok(())
     })
     .await
     .resume_unwind()
-    .unwrap_or_else(|| Err(eother!("uffd ioctl task was cancelled")))
+    .unwrap_or_else(|| Err(Error::Uffd("uffd ioctl task was cancelled".to_string())))
 }
 
 // ---------------------------------------------------------------------------
@@ -377,7 +385,7 @@ impl UffdCore {
                     // These events invalidate the VMA layout captured at handshake;
                     // continuing would resolve faults against stale addresses, so
                     // surface an error and let the caller tear the connection down.
-                    return Err(eother!(format!(
+                    return Err(Error::Uffd(format!(
                         "uffd_core: VMA-invalidating event 0x{:x} not supported",
                         msg.event
                     )));
@@ -412,14 +420,16 @@ impl UffdCore {
         let fault_block_offset = vma_region
             .offset
             .checked_add(fault_addr - vma_region.base_host_virt_addr)
-            .ok_or_else(|| eother!("uffd_core: fault block offset overflows u64"))?;
+            .ok_or_else(|| {
+                Error::Uffd("uffd_core: fault block offset overflows u64".to_string())
+            })?;
         let region_offset_end = checked_vma_device_end(vma_region)?;
         let aligned_start = (fault_block_offset / fetch_size) * fetch_size;
         let fetch_start = std::cmp::max(aligned_start, vma_region.offset);
         let fetch_end = std::cmp::min(
             fetch_start
                 .checked_add(fetch_size)
-                .ok_or_else(|| eother!("uffd_core: fetch range overflows u64"))?,
+                .ok_or_else(|| Error::Uffd("uffd_core: fetch range overflows u64".to_string()))?,
             region_offset_end,
         );
 
@@ -486,7 +496,7 @@ impl UffdCore {
         let mut current_offset = block_offset;
         let end_offset = block_offset
             .checked_add(len)
-            .ok_or_else(|| eother!("uffd_core: zerocopy range overflows u64"))?;
+            .ok_or_else(|| Error::Uffd("uffd_core: zerocopy range overflows u64".to_string()))?;
         let mut data_ranges: Vec<(RawFd, u64, usize, u64)> = Vec::new();
 
         for (blob_fd, blob_offset, blob_len, range_offset) in ranges {
@@ -497,14 +507,14 @@ impl UffdCore {
             }
 
             if blob_len > 0 && range_offset < end_offset {
-                let range_end = range_offset
-                    .checked_add(blob_len as u64)
-                    .ok_or_else(|| eother!("uffd_core: blob range overflows u64"))?;
+                let range_end = range_offset.checked_add(blob_len as u64).ok_or_else(|| {
+                    Error::Uffd("uffd_core: blob range overflows u64".to_string())
+                })?;
                 let actual_len = std::cmp::min(range_end, end_offset) - range_offset;
                 data_ranges.push((blob_fd, blob_offset, actual_len as usize, range_offset));
-                current_offset = range_offset
-                    .checked_add(actual_len)
-                    .ok_or_else(|| eother!("uffd_core: current offset overflows u64"))?;
+                current_offset = range_offset.checked_add(actual_len).ok_or_else(|| {
+                    Error::Uffd("uffd_core: current offset overflows u64".to_string())
+                })?;
             }
         }
 
@@ -533,9 +543,9 @@ impl UffdCore {
         let read_len = num_blocks as usize * self.block_size as usize;
         let buf = alloc_buf(read_len);
         let (res, buf) = self.device.async_read(start_block, num_blocks, buf).await;
-        let bytes_read = res.map_err(|e| eother!(format!("async_read failed: {}", e)))?;
+        let bytes_read = res.map_err(|e| Error::Uffd(format!("async_read failed: {}", e)))?;
         if bytes_read != read_len {
-            return Err(eother!(format!(
+            return Err(Error::Uffd(format!(
                 "read {} bytes, expected {}",
                 bytes_read, read_len
             )));
@@ -610,9 +620,9 @@ impl AsyncSock {
         let dup = stream
             .as_fd()
             .try_clone_to_owned()
-            .map_err(|e| eother!(format!("Failed to dup sock fd for PollFd: {}", e)))?;
+            .map_err(|e| Error::Uffd(format!("Failed to dup sock fd for PollFd: {}", e)))?;
         let poll = PollFd::new(dup)
-            .map_err(|e| eother!(format!("Failed to create PollFd for sock: {}", e)))?;
+            .map_err(|e| Error::Uffd(format!("Failed to create PollFd for sock: {}", e)))?;
         Ok(Self { stream, poll })
     }
 
@@ -626,7 +636,7 @@ impl AsyncSock {
         self.poll
             .read_ready()
             .await
-            .map_err(|e| eother!(format!("sock readable: {e}")))
+            .map_err(|e| Error::Uffd(format!("sock readable: {e}")))
     }
 
     /// Wait until the socket is writable.
@@ -634,7 +644,7 @@ impl AsyncSock {
         self.poll
             .write_ready()
             .await
-            .map_err(|e| eother!(format!("sock writable: {e}")))
+            .map_err(|e| Error::Uffd(format!("sock writable: {e}")))
     }
 }
 
@@ -762,7 +772,7 @@ impl UffdWorker {
                     if let Some(ref state) = conn_state {
                         state.uffd_poll.read_ready().await
                     } else {
-                        std::future::pending::<Result<()>>().await
+                        std::future::pending::<std::io::Result<()>>().await
                     }
                 }
                 .fuse();
@@ -774,7 +784,7 @@ impl UffdWorker {
                         Wakeup::Sock
                     }
                     res = uffd_fut => {
-                        res.map_err(|e| eother!(format!("uffd readable: {e}")))?;
+                        res.map_err(|e| Error::Uffd(format!("uffd readable: {e}")))?;
                         Wakeup::Uffd
                     }
                     _ = shutdown_fut => Wakeup::Shutdown,
@@ -883,10 +893,10 @@ impl UffdWorker {
                     policy: FaultPolicy::default(),
                     enable_prefault: false,
                 })
-                .map_err(|e| eother!(format!("Invalid region array: {}", e)))
+                .map_err(|e| Error::Uffd(format!("Invalid region array: {}", e)))
         } else {
             serde_json::from_value(json_val)
-                .map_err(|e| eother!(format!("Invalid HandshakeRequest: {}", e)))
+                .map_err(|e| Error::Uffd(format!("Invalid HandshakeRequest: {}", e)))
         } {
             Ok(request) => request,
             Err(e) => {
@@ -910,7 +920,9 @@ impl UffdWorker {
 
         let mut fds = fds;
         let fd = if fds.is_empty() {
-            return Err(eother!("No uffd fd received during handshake"));
+            return Err(Error::Uffd(
+                "No uffd fd received during handshake".to_string(),
+            ));
         } else {
             fds.remove(0)
         };
@@ -922,17 +934,17 @@ impl UffdWorker {
         let flags = unsafe { libc::fcntl(fd, libc::F_GETFL, 0) };
         if flags < 0 {
             unsafe { libc::close(fd) };
-            return Err(std::io::Error::last_os_error());
+            return Err(std::io::Error::last_os_error().into());
         }
         if unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
             let err = std::io::Error::last_os_error();
             unsafe { libc::close(fd) };
-            return Err(err);
+            return Err(err.into());
         }
 
         let owned_fd = unsafe { OwnedFd::from_raw_fd(fd) };
         let uffd_poll = PollFd::new(owned_fd)
-            .map_err(|e| eother!(format!("Failed to create PollFd for uffd: {}", e)))?;
+            .map_err(|e| Error::Uffd(format!("Failed to create PollFd for uffd: {}", e)))?;
         let state = ConnState {
             vma_regions: request.regions.clone(),
             policy: request.policy,
@@ -944,7 +956,7 @@ impl UffdWorker {
             let stream_prefault = sock_async
                 .get_ref()
                 .try_clone()
-                .map_err(|e| eother!(format!("Failed to clone stream for prefault: {}", e)))?;
+                .map_err(|e| Error::Uffd(format!("Failed to clone stream for prefault: {}", e)))?;
             stream_prefault
                 .set_nonblocking(true)
                 .expect("failed to set nonblocking");
@@ -972,7 +984,7 @@ impl UffdWorker {
     ) -> Result<()> {
         let response = StatResponse::new(device_size, block_size as u32, 0, UFFD_PROTOCOL_VERSION);
         let json_data = serde_json::to_vec(&response)
-            .map_err(|e| eother!(format!("Failed to serialize StatResponse: {}", e)))?;
+            .map_err(|e| Error::Uffd(format!("Failed to serialize StatResponse: {}", e)))?;
         Self::async_send_with_fd(sock_async, &json_data, &[]).await
     }
 
@@ -1031,7 +1043,8 @@ impl UffdWorker {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::UnexpectedEof,
                         "client disconnected",
-                    ));
+                    )
+                    .into());
                 }
 
                 let received_fds = &fds[..fd_count];
@@ -1039,14 +1052,14 @@ impl UffdWorker {
                     Ok(s) => s,
                     Err(e) => {
                         Self::close_fds(received_fds);
-                        return Err(eother!(format!("Invalid UTF-8: {}", e)));
+                        return Err(Error::Uffd(format!("Invalid UTF-8: {}", e)));
                     }
                 };
                 let json_val: serde_json::Value = match serde_json::from_str(json_str) {
                     Ok(v) => v,
                     Err(e) => {
                         Self::close_fds(received_fds);
-                        return Err(eother!(format!("Invalid JSON: {}", e)));
+                        return Err(Error::Uffd(format!("Invalid JSON: {}", e)));
                     }
                 };
                 let msg_type = json_val
@@ -1061,7 +1074,7 @@ impl UffdWorker {
                 if e.kind() == std::io::ErrorKind::WouldBlock {
                     return Ok(None);
                 }
-                Err(eother!(format!("recv_with_fd failed: {}", e)))
+                Err(Error::Uffd(format!("recv_with_fd failed: {}", e)))
             }
         }
     }
@@ -1079,7 +1092,7 @@ impl UffdWorker {
                     // to clear: the next `writable()` re-arms the poll.
                     sock.writable().await?;
                 }
-                Err(e) => return Err(eother!(format!("send_with_fd failed: {}", e))),
+                Err(e) => return Err(Error::Uffd(format!("send_with_fd failed: {}", e))),
             }
         }
     }
@@ -1101,7 +1114,7 @@ impl UffdWorker {
                 .collect(),
         };
         let json_data = serde_json::to_vec(&response)
-            .map_err(|e| eother!(format!("Failed to serialize PageFaultResponse: {}", e)))?;
+            .map_err(|e| Error::Uffd(format!("Failed to serialize PageFaultResponse: {}", e)))?;
 
         let fds: Vec<RawFd> = batch.iter().map(|(fd, _, _, _)| *fd).collect();
         Self::async_send_with_fd(stream, &json_data, &fds).await
@@ -1216,8 +1229,8 @@ impl UffdService {
 
         let worker_num = self.worker_threads.lock().unwrap().len();
         if worker_num == 0 {
-            return Err(einval!(
-                "block_uffd: at least one worker thread is required"
+            return Err(Error::InvalidArguments(
+                "block_uffd: at least one worker thread is required".to_string(),
             ));
         }
 
@@ -1256,12 +1269,14 @@ impl UffdService {
                 handle
                     .join()
                     .map_err(|e| {
-                        let e = *e
-                            .downcast::<Error>()
-                            .unwrap_or_else(|e| Box::new(eother!(e)));
+                        // A panicking worker carries an arbitrary payload; only an `io::Error`
+                        // can be recovered, anything else keeps its `Debug` text.
+                        let e = *e.downcast::<std::io::Error>().unwrap_or_else(|e| {
+                            Box::new(std::io::Error::other(format!("{:?}", e)))
+                        });
                         crate::Error::WaitDaemon(e)
                     })?
-                    .map_err(crate::Error::WaitDaemon)?;
+                    .map_err(|e| crate::Error::WaitDaemon(e.into()))?;
             } else {
                 // No more handles to wait
                 break;
@@ -1433,12 +1448,14 @@ impl NydusDaemon for UffdDaemon {
                 handle
                     .join()
                     .map_err(|e| {
-                        let e = *e
-                            .downcast::<Error>()
-                            .unwrap_or_else(|e| Box::new(eother!(e)));
+                        // A panicking worker carries an arbitrary payload; only an `io::Error`
+                        // can be recovered, anything else keeps its `Debug` text.
+                        let e = *e.downcast::<std::io::Error>().unwrap_or_else(|e| {
+                            Box::new(std::io::Error::other(format!("{:?}", e)))
+                        });
                         NydusError::WaitDaemon(e)
                     })?
-                    .map_err(NydusError::WaitDaemon)?;
+                    .map_err(|e| NydusError::WaitDaemon(e.into()))?;
             } else {
                 // No more handles to wait
                 break;
@@ -1453,11 +1470,11 @@ impl NydusDaemon for UffdDaemon {
         if let Some(handler) = guard.take() {
             let result = handler.join().map_err(|e| {
                 let e = *e
-                    .downcast::<Error>()
-                    .unwrap_or_else(|e| Box::new(eother!(e)));
+                    .downcast::<std::io::Error>()
+                    .unwrap_or_else(|e| Box::new(std::io::Error::other(format!("{:?}", e))));
                 NydusError::WaitDaemon(e)
             })?;
-            result.map_err(NydusError::WaitDaemon)
+            result.map_err(|e| NydusError::WaitDaemon(e.into()))
         } else {
             Ok(())
         }
@@ -1492,8 +1509,8 @@ pub fn create_uffd_daemon(
     waker: Arc<Waker>,
 ) -> Result<Arc<dyn NydusDaemon>> {
     if threads == 0 {
-        return Err(einval!(
-            "block_uffd: at least one worker thread is required"
+        return Err(Error::InvalidArguments(
+            "block_uffd: at least one worker thread is required".to_string(),
         ));
     }
 
@@ -1527,10 +1544,10 @@ pub fn create_uffd_daemon(
     *daemon.state_machine_thread.lock().unwrap() = Some(machine_thread);
     daemon
         .on_event(DaemonStateMachineInput::Mount)
-        .map_err(|e| eother!(e))?;
+        .map_err(|e| Error::Uffd(e.to_string()))?;
     daemon
         .on_event(DaemonStateMachineInput::Start)
-        .map_err(|e| eother!(e))?;
+        .map_err(|e| Error::Uffd(e.to_string()))?;
 
     Ok(daemon)
 }
@@ -1564,7 +1581,7 @@ mod tests {
         };
         if addr == libc::MAP_FAILED {
             unsafe { libc::close(uffd_fd) };
-            return Err(std::io::Error::last_os_error());
+            return Err(std::io::Error::last_os_error().into());
         }
         if let Err(e) = uffd_register_for_test(uffd_fd, addr as u64, mmap_size as u64) {
             unsafe {
@@ -1587,7 +1604,7 @@ mod tests {
         let fd = unsafe { libc::syscall(libc::SYS_userfaultfd, libc::O_CLOEXEC | libc::O_NONBLOCK) }
             as i32;
         if fd < 0 {
-            return Err(std::io::Error::last_os_error());
+            return Err(std::io::Error::last_os_error().into());
         }
         #[repr(C)]
         struct UffdioApi {
@@ -1604,7 +1621,7 @@ mod tests {
         let ret = unsafe { libc::ioctl(fd, UFFDIO_API_IOCTL, &mut api) };
         if ret < 0 {
             unsafe { libc::close(fd) };
-            return Err(std::io::Error::last_os_error());
+            return Err(std::io::Error::last_os_error().into());
         }
         Ok(fd)
     }
@@ -1627,7 +1644,7 @@ mod tests {
         };
         let ret = unsafe { libc::ioctl(fd, UFFDIO_REGISTER_IOCTL, &mut reg) };
         if ret < 0 {
-            return Err(std::io::Error::last_os_error());
+            return Err(std::io::Error::last_os_error().into());
         }
         Ok(())
     }
@@ -1878,7 +1895,11 @@ mod tests {
         let result = UffdWorker::try_recv_from_sock(&sock1);
         assert!(result.is_err());
         let err = result.unwrap_err();
-        assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
+        // The peer closing is still `UnexpectedEof`; it just travels wrapped now.
+        assert_eq!(
+            std::io::Error::from(err).kind(),
+            std::io::ErrorKind::UnexpectedEof
+        );
     }
 
     #[test]

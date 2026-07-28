@@ -5,7 +5,7 @@
 //! Blob cache manager to cache RAFS meta/data blob objects.
 
 use std::collections::HashMap;
-use std::io::{Error, ErrorKind, Result};
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -24,6 +24,8 @@ use nydus_storage::cache::BlobCache;
 use nydus_storage::device::BlobInfo;
 use nydus_storage::factory::BLOB_FACTORY;
 use serde::Serialize;
+
+use crate::{Error, Result};
 
 const ID_SPLITTER: &str = "/";
 
@@ -223,10 +225,7 @@ impl BlobCacheState {
             match entry {
                 BlobConfig::MetaBlob(_o) => {
                     // Meta blob must be unique.
-                    return Err(Error::new(
-                        ErrorKind::AlreadyExists,
-                        "blob_cache: bootstrap blob already exists",
-                    ));
+                    return Err(Error::AlreadyExists);
                 }
                 BlobConfig::DataBlob(o) => {
                     // Data blob is reference counted.
@@ -254,7 +253,11 @@ impl BlobCacheState {
             let scoped_blob_prefix = generate_blob_key(&param.domain_id, &param.blob_id);
 
             match self.id_to_config_map.get(&scoped_blob_prefix) {
-                None => return Err(enoent!("blob_cache: cache entry not found")),
+                None => {
+                    return Err(Error::BlobCache(
+                        "blob_cache: cache entry not found".to_string(),
+                    ));
+                }
                 Some(BlobConfig::MetaBlob(o)) => {
                     is_meta = true;
                     data_blobs = o.blobs.lock().unwrap().clone();
@@ -284,7 +287,9 @@ impl BlobCacheState {
 
     fn list(&self, param: &BlobCacheObjectId) -> Result<BlobCacheObjectList> {
         if param.domain_id.is_empty() {
-            return Err(einval!("blob_cache: missing domain id"));
+            return Err(Error::InvalidArguments(
+                "blob_cache: missing domain id".to_string(),
+            ));
         }
 
         if !param.blob_id.is_empty() {
@@ -292,7 +297,7 @@ impl BlobCacheState {
             let entry = self
                 .id_to_config_map
                 .get(&scoped_blob_id)
-                .ok_or_else(|| enoent!("blob_cache: cache entry not found"))?;
+                .ok_or_else(|| Error::BlobCache("blob_cache: cache entry not found".to_string()))?;
             return Ok(BlobCacheObjectList {
                 blobs: vec![entry.to_object_info(&param.domain_id)],
             });
@@ -356,11 +361,11 @@ impl BlobCacheMgr {
                         );
                     })
             }
-            BLOB_CACHE_TYPE_DATA_BLOB => Err(einval!(format!(
+            BLOB_CACHE_TYPE_DATA_BLOB => Err(Error::InvalidArguments(format!(
                 "blob_cache: invalid data blob cache entry: {:?}",
                 entry
             ))),
-            _ => Err(einval!(format!(
+            _ => Err(Error::InvalidArguments(format!(
                 "blob_cache: invalid blob cache entry, {:?}",
                 entry
             ))),
@@ -414,62 +419,79 @@ impl BlobCacheMgr {
     }
 
     fn get_meta_info(&self, entry: &BlobCacheEntry) -> Result<(PathBuf, Arc<ConfigV2>)> {
-        let config = entry
-            .blob_config
-            .as_ref()
-            .ok_or_else(|| einval!("blob_cache: missing blob cache configuration information"))?;
+        let config = entry.blob_config.as_ref().ok_or_else(|| {
+            Error::InvalidArguments(
+                "blob_cache: missing blob cache configuration information".to_string(),
+            )
+        })?;
 
         if entry.blob_id.contains(ID_SPLITTER) {
-            return Err(einval!("blob_cache: `blob_id` for meta blob is invalid"));
+            return Err(Error::InvalidArguments(
+                "blob_cache: `blob_id` for meta blob is invalid".to_string(),
+            ));
         } else if entry.domain_id.contains(ID_SPLITTER) {
-            return Err(einval!("blob_cache: `domain_id` for meta blob is invalid"));
+            return Err(Error::InvalidArguments(
+                "blob_cache: `domain_id` for meta blob is invalid".to_string(),
+            ));
         }
 
         let path = config.metadata_path.clone().unwrap_or_default();
         if path.is_empty() {
-            return Err(einval!(
-                "blob_cache: `config.metadata_path` for meta blob is empty"
+            return Err(Error::InvalidArguments(
+                "blob_cache: `config.metadata_path` for meta blob is empty".to_string(),
             ));
         }
         let path = Path::new(&path).canonicalize().map_err(|_e| {
-            einval!(format!(
+            Error::InvalidArguments(format!(
                 "blob_cache: `config.metadata_path={}` for meta blob is invalid",
                 path
             ))
         })?;
         if !path.is_file() {
-            return Err(einval!(
-                "blob_cache: `config.metadata_path` for meta blob is not a file"
+            return Err(Error::InvalidArguments(
+                "blob_cache: `config.metadata_path` for meta blob is not a file".to_string(),
             ));
         }
 
         // Validate type of backend and cache.
         if config.cache.is_filecache() {
             // Validate the working directory for filecache
-            let cache_config = config.cache.get_filecache_config()?;
+            let cache_config = config
+                .cache
+                .get_filecache_config()
+                .map_err(|e| Error::InvalidConfig(e.to_string()))?;
             let path2 = Path::new(&cache_config.work_dir);
-            let path2 = path2
-                .canonicalize()
-                .map_err(|_e| eio!("blob_cache: `config.cache_config.work_dir` is invalid"))?;
+            let path2 = path2.canonicalize().map_err(|_e| {
+                Error::BlobCache(
+                    "blob_cache: `config.cache_config.work_dir` is invalid".to_string(),
+                )
+            })?;
             if !path2.is_dir() {
-                return Err(einval!(
-                    "blob_cache: `config.cache_config.work_dir` is not a directory"
+                return Err(Error::InvalidArguments(
+                    "blob_cache: `config.cache_config.work_dir` is not a directory".to_string(),
                 ));
             }
         } else if config.cache.is_fanotify() {
             // Validate the working directory for fanotify
-            let cache_config = config.cache.get_fanotify_config()?;
+            let cache_config = config
+                .cache
+                .get_fanotify_config()
+                .map_err(|e| Error::InvalidConfig(e.to_string()))?;
             let path2 = Path::new(&cache_config.work_dir);
-            let path2 = path2
-                .canonicalize()
-                .map_err(|_e| eio!("blob_cache: `config.cache_config.work_dir` is invalid"))?;
+            let path2 = path2.canonicalize().map_err(|_e| {
+                Error::BlobCache(
+                    "blob_cache: `config.cache_config.work_dir` is invalid".to_string(),
+                )
+            })?;
             if !path2.is_dir() {
-                return Err(einval!(
-                    "blob_cache: `config.cache_config.work_dir` is not a directory"
+                return Err(Error::InvalidArguments(
+                    "blob_cache: `config.cache_config.work_dir` is not a directory".to_string(),
                 ));
             }
         } else {
-            return Err(einval!("blob_cache: unknown cache type"));
+            return Err(Error::InvalidArguments(
+                "blob_cache: unknown cache type".to_string(),
+            ));
         }
 
         let config: Arc<ConfigV2> = Arc::new(config.into());
@@ -487,7 +509,9 @@ impl BlobCacheMgr {
     ) -> Result<()> {
         let (rs, _) = RafsSuper::load_from_file(&path, config.clone(), false)?;
         if rs.meta.is_v5() {
-            return Err(einval!("blob_cache: RAFSv5 image is not supported"));
+            return Err(Error::InvalidArguments(
+                "blob_cache: RAFSv5 image is not supported".to_string(),
+            ));
         }
 
         let blob_extra_infos = rs.superblock.get_blob_extra_infos()?;
@@ -561,7 +585,7 @@ impl MetaBlob {
         })?;
         let size = md.len();
         if size % EROFS_BLOCK_SIZE_4096 != 0 || (size >> EROFS_BLOCK_BITS_12) > u32::MAX as u64 {
-            return Err(einval!(format!(
+            return Err(Error::InvalidArguments(format!(
                 "blob_cache: metadata blob size (0x{:x}) is invalid",
                 size
             )));
@@ -578,7 +602,7 @@ impl MetaBlob {
     /// Read data from the cached metadata blob in asynchronous mode.
     pub async fn async_read<T: IoBufMut>(&self, pos: u64, buf: T) -> (Result<usize>, T) {
         let BufResult(res, buf) = self.file.read_at(buf, pos).await;
-        (res, buf)
+        (res.map_err(Error::from), buf)
     }
 
     pub fn file(&self) -> &File {
@@ -616,13 +640,13 @@ impl DataBlob {
                 // transparently handles hardlinked cache files.
                 let path = std::fs::read_link(format!("/proc/self/fd/{}", obj.as_raw_fd()))
                     .map_err(|e| {
-                        eio!(format!(
+                        Error::BlobCache(format!(
                             "blob_cache: failed to resolve cache path for blob {}: {}",
                             blob_id, e
                         ))
                     })?;
                 let file = File::open(&path).await.map_err(|e| {
-                    eio!(format!(
+                    Error::BlobCache(format!(
                         "blob_cache: failed to open data blob {} at {}: {}",
                         blob_id,
                         path.display(),
@@ -636,7 +660,7 @@ impl DataBlob {
                     file,
                 })
             }
-            None => Err(eio!(format!(
+            None => Err(Error::BlobCache(format!(
                 "blob_cache: failed to get BlobObject for blob {}",
                 blob_id
             ))),
@@ -657,7 +681,7 @@ impl DataBlob {
         // re-raises a panic in the blocking closure and otherwise yields its `Result`.
         compio::runtime::spawn_blocking(move || -> Result<()> {
             let obj = blob.get_blob_object().ok_or_else(|| {
-                eio!(format!(
+                Error::BlobCache(format!(
                     "blob_cache: failed to get BlobObject for blob {}",
                     blob_id
                 ))
@@ -666,7 +690,11 @@ impl DataBlob {
         })
         .await
         .resume_unwind()
-        .unwrap_or_else(|| Err(eother!("blob_cache: blob fetch task was cancelled")))
+        .unwrap_or_else(|| {
+            Err(Error::BlobCache(
+                "blob_cache: blob fetch task was cancelled".to_string(),
+            ))
+        })
     }
 
     /// Read data from the cached data blob in asynchronous mode.
@@ -675,7 +703,7 @@ impl DataBlob {
         match self.async_fetch(pos, len).await {
             Ok(()) => {
                 let BufResult(res, buf) = self.file.read_at(buf, pos).await;
-                (res, buf)
+                (res.map_err(Error::from), buf)
             }
             Err(e) => (Err(e), buf),
         }

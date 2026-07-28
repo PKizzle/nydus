@@ -13,7 +13,6 @@
 
 use std::cmp::{max, min};
 use std::fs::OpenOptions;
-use std::io::Result;
 use std::os::fd::{AsRawFd, RawFd};
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -34,6 +33,8 @@ use nydus_utils::round_up;
 use nydus_utils::verity::VerityGenerator;
 
 use crate::blob_cache::{BlobCacheMgr, BlobConfig, DataBlob, MetaBlob, generate_blob_key};
+
+use crate::{Error, Result};
 
 const BLOCK_DEVICE_EXPORT_BATCH_SIZE: usize = 0x80000;
 
@@ -87,7 +88,7 @@ impl BlockDevice {
     pub async fn new(blob_entry: BlobCacheEntry) -> Result<Self> {
         let cache_mgr = Arc::new(BlobCacheMgr::new());
         cache_mgr.add_blob_entry(&blob_entry).map_err(|e| {
-            eother!(format!(
+            Error::BlockDevice(format!(
                 "block_device: failed to add blob into CacheMgr, {}",
                 e
             ))
@@ -109,13 +110,13 @@ impl BlockDevice {
 
         let meta_blob_config = match cache_mgr.get_config(&blob_id) {
             None => {
-                return Err(enoent!(format!(
+                return Err(Error::BlockDevice(format!(
                     "block_device: can not find blob {} in blob cache manager",
                     blob_id
                 )));
             }
             Some(BlobConfig::DataBlob(_v)) => {
-                return Err(einval!(format!(
+                return Err(Error::InvalidArguments(format!(
                     "block_device: blob {} is not a metadata blob",
                     blob_id
                 )));
@@ -132,7 +133,7 @@ impl BlockDevice {
         };
         let constraint = Constraint::new(blocks).min(0u32).max(blocks - 1);
         let range = ranges.allocate(&constraint).ok_or_else(|| {
-            enoent!(format!(
+            Error::BlockDevice(format!(
                 "block_device: failed to allocate address range for meta blob {}",
                 meta_blob_config.blob_id()
             ))
@@ -151,21 +152,21 @@ impl BlockDevice {
                         "block_device: can not get extra information for blob {}",
                         blob_id
                     );
-                    enoent!(msg)
+                    Error::BlockDevice(msg.to_string())
                 })?;
             if extra_info.mapped_blkaddr == 0 {
                 let msg = format!(
                     "block_device: mapped block address for blob {} is zero",
                     blob_id
                 );
-                return Err(einval!(msg));
+                return Err(Error::InvalidArguments(msg.to_string()));
             }
             if is_tarfs_mode != blob_info.features().is_tarfs() {
                 let msg = format!(
                     "block_device: inconsistent `TARFS` mode from meta and data blob {}",
                     blob_id
                 );
-                return Err(einval!(msg));
+                return Err(Error::InvalidArguments(msg.to_string()));
             }
 
             if pos < extra_info.mapped_blkaddr {
@@ -173,7 +174,10 @@ impl BlockDevice {
                     .min(pos)
                     .max(extra_info.mapped_blkaddr - 1);
                 let range = ranges.allocate(&constraint).ok_or_else(|| {
-                    enoent!("block_device: failed to allocate address range for hole between blobs")
+                    Error::BlockDevice(
+                        "block_device: failed to allocate address range for hole between blobs"
+                            .to_string(),
+                    )
                 })?;
                 ranges.update(&range, BlockRange::Hole);
             }
@@ -186,7 +190,7 @@ impl BlockDevice {
             if blocks > u32::MAX as u64
                 || blocks + extra_info.mapped_blkaddr as u64 > u32::MAX as u64
             {
-                return Err(einval!(format!(
+                return Err(Error::InvalidArguments(format!(
                     "block_device: uncompressed size 0x{:x} of blob {} is invalid",
                     blob_info.uncompressed_size(),
                     blob_info.blob_id()
@@ -197,7 +201,7 @@ impl BlockDevice {
                 .min(extra_info.mapped_blkaddr)
                 .max(extra_info.mapped_blkaddr + blocks as u32 - 1);
             let range = ranges.allocate(&constraint).ok_or_else(|| {
-                enoent!(format!(
+                Error::BlockDevice(format!(
                     "block_device: can not allocate address range for blob {}",
                     blob_info.blob_id()
                 ))
@@ -267,7 +271,9 @@ impl BlockDevice {
         let sz = self.blocks_to_size(blocks);
         if start.checked_add(blocks).is_none() || sz > buf.buf_capacity() as u64 {
             return (
-                Err(einval!("block_device: invalid parameters to read()")),
+                Err(Error::InvalidArguments(
+                    "block_device: invalid parameters to read()".to_string(),
+                )),
                 buf,
             );
         }
@@ -279,7 +285,7 @@ impl BlockDevice {
                 Some(v) => v,
                 None => {
                     return (
-                        Err(eio!(format!(
+                        Err(Error::BlockDevice(format!(
                             "block_device: can not locate block 0x{:x} for meta blob {}",
                             start, self.blob_id
                         ))),
@@ -317,7 +323,7 @@ impl BlockDevice {
                 pos += sz;
             } else {
                 return (
-                    Err(eio!(format!(
+                    Err(Error::BlockDevice(format!(
                         "block_device: block range 0x{:x}/0x{:x} of meta blob {} is unhandled",
                         start, blocks, self.blob_id,
                     ))),
@@ -340,8 +346,8 @@ impl BlockDevice {
         probe_only: bool,
     ) -> Result<Vec<(RawFd, u64, usize, u64)>> {
         if start.checked_add(blocks).is_none() {
-            return Err(einval!(
-                "block_device: invalid parameters to fetch_ranges()"
+            return Err(Error::InvalidArguments(
+                "block_device: invalid parameters to fetch_ranges()".to_string(),
             ));
         }
 
@@ -350,7 +356,7 @@ impl BlockDevice {
             let (range, node) = match self.ranges.get_superset(&Range::new_point(start)) {
                 Some(v) => v,
                 None => {
-                    return Err(eio!(format!(
+                    return Err(Error::BlockDevice(format!(
                         "block_device: can not locate block 0x{:x} for meta blob {}",
                         start, self.blob_id
                     )));
@@ -393,7 +399,7 @@ impl BlockDevice {
                 start += count;
                 blocks -= count;
             } else {
-                return Err(eio!(format!(
+                return Err(Error::BlockDevice(format!(
                     "block_device: block range 0x{:x}/0x{:x} of meta blob {} is unhandled",
                     start, blocks, self.blob_id,
                 )));
@@ -490,10 +496,14 @@ impl BlockDevice {
             None => {
                 let path = match block_device.cache_mgr.get_config(blob_id) {
                     Some(BlobConfig::MetaBlob(meta)) => meta.path().to_path_buf(),
-                    _ => return Err(enoent!("block_device: failed to get meta blob")),
+                    _ => {
+                        return Err(Error::BlockDevice(
+                            "block_device: failed to get meta blob".to_string(),
+                        ));
+                    }
                 };
                 if !path.is_file() {
-                    return Err(eother!(format!(
+                    return Err(Error::BlockDevice(format!(
                         "block_device: meta blob {} is not a file",
                         path.display()
                     )));
@@ -501,20 +511,23 @@ impl BlockDevice {
                 let name = path
                     .file_name()
                     .ok_or_else(|| {
-                        eother!(format!(
+                        Error::BlockDevice(format!(
                             "block_device: failed to get file name from {}",
                             path.display()
                         ))
                     })?
                     .to_str()
                     .ok_or_else(|| {
-                        eother!(format!(
+                        Error::BlockDevice(format!(
                             "block_device: failed to get file name from {}",
                             path.display()
                         ))
                     })?;
-                let dir = data_dir
-                    .ok_or_else(|| einval!("block_device: parameter `data_dir` is missing"))?;
+                let dir = data_dir.ok_or_else(|| {
+                    Error::InvalidArguments(
+                        "block_device: parameter `data_dir` is missing".to_string(),
+                    )
+                })?;
                 let path = PathBuf::from(dir);
                 path.join(name.to_string() + ".disk")
             }
@@ -530,7 +543,7 @@ impl BlockDevice {
             .write(true)
             .open(&path)
             .map_err(|e| {
-                eother!(format!(
+                Error::BlockDevice(format!(
                     "block_device: failed to create output file {}, {}",
                     path.display(),
                     e
@@ -544,7 +557,7 @@ impl BlockDevice {
                 .write(true)
                 .open(&path)
                 .map_err(|e| {
-                    eother!(format!(
+                    Error::BlockDevice(format!(
                         "block_device: failed to create output file {}, {}",
                         path.display(),
                         e
@@ -580,7 +593,7 @@ impl BlockDevice {
                             .open(&path)
                             .await
                             .map_err(|e| {
-                                eother!(format!(
+                                Error::BlockDevice(format!(
                                     "block_device: failed to open output file {}, {}",
                                     path.display(),
                                     e
@@ -613,7 +626,7 @@ impl BlockDevice {
                                     .open(&path)
                                     .await
                                     .map_err(|e| {
-                                        eother!(format!(
+                                        Error::BlockDevice(format!(
                                             "block_device: failed to open output file {}, {}",
                                             path.display(),
                                             e
@@ -623,7 +636,7 @@ impl BlockDevice {
                             let block_device = BlockDevice::new_with_cache_manager(id, mgr)
                                 .await
                                 .map_err(|e| {
-                                eother!(format!(
+                                Error::BlockDevice(format!(
                                     "block_device: failed to create block device object, {}",
                                     e
                                 ))
@@ -643,13 +656,16 @@ impl BlockDevice {
                 handler
                     .join()
                     .map_err(|e| {
-                        eother!(format!(
+                        Error::BlockDevice(format!(
                             "block_device: failed to wait for worker thread, {:?}",
                             e
                         ))
                     })?
                     .map_err(|e| {
-                        eother!(format!("block_device: failed to export disk image, {}", e))
+                        Error::BlockDevice(format!(
+                            "block_device: failed to export disk image, {}",
+                            e
+                        ))
                     })?;
             }
         }
@@ -689,8 +705,8 @@ impl BlockDevice {
             let (res, buf1) = block_device.async_read(pos, count, buf).await;
             let sz = res?;
             if sz != count as usize * block_size {
-                return Err(eio!(
-                    "block_device: failed to read data, got less data than requested"
+                return Err(Error::BlockDevice(
+                    "block_device: failed to read data, got less data than requested".to_string(),
                 ));
             }
             buf = buf1;
@@ -704,9 +720,7 @@ impl BlockDevice {
             let BufResult(res, buf2) = out.write_at(buf, block_device.blocks_to_size(pos)).await;
             let sz1 = res?;
             if sz1 != sz {
-                return Err(eio!(
-                    "block_device: failed to write data to disk image file, written less data than requested"
-                ));
+                return Err(Error::BlockDevice("block_device: failed to write data to disk image file, written less data than requested".to_string()));
             }
             buf = buf2;
 
@@ -968,7 +982,7 @@ mod tests {
     }
 
     fn test_export_arg_thread(thread: u32) -> Result<()> {
-        let entry_tmp_dir = TempDir::new()?;
+        let entry_tmp_dir = TempDir::new().map_err(|e| Error::BlockDevice(e.to_string()))?;
         let entry = create_bootstrap_entry(&entry_tmp_dir);
 
         let tmp_dir = TempDir::new().unwrap();

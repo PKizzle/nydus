@@ -60,20 +60,23 @@ pub enum FailoverPolicy {
 }
 
 impl TryFrom<&str> for FailoverPolicy {
-    type Error = std::io::Error;
+    type Error = crate::Error;
 
     fn try_from(p: &str) -> std::result::Result<Self, Self::Error> {
         match p {
             "none" => Ok(FailoverPolicy::None),
             "flush" => Ok(FailoverPolicy::Flush),
             "resend" => Ok(FailoverPolicy::Resend),
-            x => Err(einval!(format!("invalid FUSE fail-over mode {}", x))),
+            x => Err(Error::InvalidArguments(format!(
+                "invalid FUSE fail-over mode {}",
+                x
+            ))),
         }
     }
 }
 
 impl TryFrom<&String> for FailoverPolicy {
-    type Error = std::io::Error;
+    type Error = crate::Error;
 
     fn try_from(p: &String) -> std::result::Result<Self, Self::Error> {
         p.as_str().try_into()
@@ -446,7 +449,7 @@ pub mod fanotify_upgrade {
             mgr.fanotify_deamon_stat.handlers = handlers;
 
             let backend_stat = FanotifyBackendState::try_from(&mgr.fanotify_deamon_stat)
-                .map_err(UpgradeMgrError::Serialize)?;
+                .map_err(|e| UpgradeMgrError::Serialize(PersistError::Save(e.to_string())))?;
             let stat = backend_stat.save().map_err(UpgradeMgrError::Serialize)?;
             mgr.save_fanotify(files, &stat)?;
         }
@@ -468,16 +471,16 @@ pub mod fanotify_upgrade {
             let backend_stat = FanotifyBackendState::restore(&mut state_data)
                 .map_err(UpgradeMgrError::Deserialize)?;
 
-            let stat =
-                FanotifyState::try_from(&backend_stat).map_err(UpgradeMgrError::Deserialize)?;
+            let stat = FanotifyState::try_from(&backend_stat)
+                .map_err(|e| UpgradeMgrError::Deserialize(PersistError::Restore(e.to_string())))?;
 
             // Re-add blob entries first so handler reconstruction sees a populated cache.
             stat.blob_entry_map
                 .iter()
                 .try_for_each(|(_, entry)| -> Result<()> {
-                    blob_mgr
-                        .add_blob_entry(entry)
-                        .map_err(UpgradeMgrError::Deserialize)?;
+                    blob_mgr.add_blob_entry(entry).map_err(|e| {
+                        UpgradeMgrError::Deserialize(PersistError::Restore(e.to_string()))
+                    })?;
                     Ok(())
                 })?;
 

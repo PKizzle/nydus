@@ -12,7 +12,7 @@
 
 use std::any::Any;
 use std::fs::{self, OpenOptions};
-use std::io::{Error, Result};
+
 use std::os::fd::{AsRawFd, RawFd};
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::{Arc, Mutex};
@@ -36,6 +36,8 @@ use crate::daemon::{
 };
 use crate::{Error as NydusError, Result as NydusResult};
 
+use crate::{Error, Result};
+
 const NBD_SET_SOCK: u32 = 0;
 const NBD_SET_BLOCK_SIZE: u32 = 1;
 const NBD_DO_IT: u32 = 3;
@@ -56,7 +58,7 @@ const NBD_OK: u32 = 0;
 const NBD_EIO: u32 = 5;
 const NBD_EINVAL: u32 = 22;
 
-fn nbd_ioctl(fd: RawFd, cmd: u32, arg: u64) -> nix::Result<libc::c_int> {
+fn nbd_ioctl(fd: RawFd, cmd: u32, arg: u64) -> Result<libc::c_int> {
     // `_IO(0xab, cmd)`: direction NONE and size 0, so the request code reduces
     // to `(type << _IOC_NRBITS) | nr` == `(0xab << 8) | cmd`. nix 0.31 dropped
     // the `request_code_none!`/`convert_ioctl_res!` macros, so compute the code
@@ -66,6 +68,7 @@ fn nbd_ioctl(fd: RawFd, cmd: u32, arg: u64) -> nix::Result<libc::c_int> {
     // width per target so the musl static-release builds stop tripping E0308.
     let code = (0xab_u32 << 8) | cmd;
     nix::errno::Errno::result(unsafe { libc::ioctl(fd, code as _, arg) })
+        .map_err(|e| Error::Nbd(format!("block_nbd: ioctl 0x{:x} failed, {}", cmd, e)))
 }
 
 /// Network Block Device server to expose RAFSv6 images as block devices.
@@ -483,12 +486,14 @@ impl NydusDaemon for NbdDaemon {
                 handle
                     .join()
                     .map_err(|e| {
-                        let e = *e
-                            .downcast::<Error>()
-                            .unwrap_or_else(|e| Box::new(eother!(e)));
+                        // A panicking worker carries an arbitrary payload; only an `io::Error`
+                        // can be recovered, anything else keeps its `Debug` text.
+                        let e = *e.downcast::<std::io::Error>().unwrap_or_else(|e| {
+                            Box::new(std::io::Error::other(format!("{:?}", e)))
+                        });
                         NydusError::WaitDaemon(e)
                     })?
-                    .map_err(NydusError::WaitDaemon)?;
+                    .map_err(|e| NydusError::WaitDaemon(e.into()))?;
             } else {
                 // No more handles to wait
                 break;
@@ -503,11 +508,11 @@ impl NydusDaemon for NbdDaemon {
         if let Some(handler) = guard.take() {
             let result = handler.join().map_err(|e| {
                 let e = *e
-                    .downcast::<Error>()
-                    .unwrap_or_else(|e| Box::new(eother!(e)));
+                    .downcast::<std::io::Error>()
+                    .unwrap_or_else(|e| Box::new(std::io::Error::other(format!("{:?}", e))));
                 NydusError::WaitDaemon(e)
             })?;
-            result.map_err(NydusError::WaitDaemon)
+            result.map_err(|e| NydusError::WaitDaemon(e.into()))
         } else {
             Ok(())
         }
@@ -560,10 +565,10 @@ pub fn create_nbd_daemon(
     *daemon.state_machine_thread.lock().unwrap() = Some(machine_thread);
     daemon
         .on_event(DaemonStateMachineInput::Mount)
-        .map_err(|e| eother!(e))?;
+        .map_err(|e| Error::Nbd(e.to_string()))?;
     daemon
         .on_event(DaemonStateMachineInput::Start)
-        .map_err(|e| eother!(e))?;
+        .map_err(|e| Error::Nbd(e.to_string()))?;
 
     /*
     // TODO: support crash recover and hot-upgrade.
@@ -581,13 +586,13 @@ pub fn create_nbd_daemon(
             .lock()
             .unwrap()
             .mount()
-            .map_err(|e| eother!(e))?;
+            .map_err(|e| Error::Nbd(e.to_string()))?;
         daemon
             .on_event(DaemonStateMachineInput::Mount)
-            .map_err(|e| eother!(e))?;
+            .map_err(|e| Error::Nbd(e.to_string()))?;
         daemon
             .on_event(DaemonStateMachineInput::Start)
-            .map_err(|e| eother!(e))?;
+            .map_err(|e| Error::Nbd(e.to_string()))?;
         daemon
             .service
             .conn

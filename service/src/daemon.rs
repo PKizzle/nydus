@@ -251,14 +251,14 @@ impl DaemonStateMachineContext {
     }
 
     /// Create a worker thread to run event loop for the state machine.
-    pub fn kick_state_machine(self) -> Result<JoinHandle<std::io::Result<()>>> {
+    pub fn kick_state_machine(self) -> Result<JoinHandle<Result<()>>> {
         Builder::new()
             .name("state_machine".to_string())
             .spawn(move || self.run_state_machine_event_loop())
             .map_err(Error::ThreadSpawn)
     }
 
-    fn run_state_machine_event_loop(mut self) -> std::io::Result<()> {
+    fn run_state_machine_event_loop(mut self) -> Result<()> {
         loop {
             use DaemonStateMachineOutput::*;
             let event = self
