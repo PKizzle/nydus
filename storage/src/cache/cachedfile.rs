@@ -286,6 +286,7 @@ impl FileCacheEntry {
                                 chunk.as_ref(),
                                 false,
                                 &metrics,
+                                None,
                             );
                             return;
                         }
@@ -307,6 +308,7 @@ impl FileCacheEntry {
                 chunk.as_ref(),
                 res.is_ok(),
                 &metrics,
+                res.as_ref().err(),
             );
             #[cfg(feature = "dedup")]
             if let Some(mgr) = _cas_mgr
@@ -336,7 +338,7 @@ impl FileCacheEntry {
     fn persist_chunk_data(&self, chunk: &dyn BlobChunkInfo, buf: &[u8]) -> StorageResult<()> {
         let offset = chunk.uncompressed_offset();
         let res = Self::persist_cached_data(&self.file, offset, buf);
-        self.update_chunk_pending_status(chunk, res.is_ok());
+        self.update_chunk_persist_status(chunk, &res);
         #[cfg(feature = "dedup")]
         if let Some(mgr) = &self.cas_mgr
             && let Err(e) = mgr.record_chunk(&self.blob_info, chunk, self.file_path.as_ref())
@@ -386,7 +388,25 @@ impl FileCacheEntry {
     }
 
     fn update_chunk_pending_status(&self, chunk: &dyn BlobChunkInfo, success: bool) {
-        Self::_update_chunk_pending_status(&self.chunk_map, chunk, success, &self.metrics)
+        Self::_update_chunk_pending_status(&self.chunk_map, chunk, success, &self.metrics, None)
+    }
+
+    /// Update pending state after a *cache write*, naming the failure.
+    ///
+    /// [`Self::update_chunk_pending_status`] takes a `bool`, so it throws the error away
+    /// and the errno with it: a full disk and a read-only cache directory both log as a
+    /// bare "Failed to persist data". On the fusedev path that log line is the only
+    /// signal there is -- the read itself succeeds from the in-memory buffer
+    /// (`delay_persist_chunk_data` writes the cache from a detached task), so nothing
+    /// else tells an operator that the cache has silently stopped absorbing writes.
+    fn update_chunk_persist_status(&self, chunk: &dyn BlobChunkInfo, res: &StorageResult<()>) {
+        Self::_update_chunk_pending_status(
+            &self.chunk_map,
+            chunk,
+            res.is_ok(),
+            &self.metrics,
+            res.as_ref().err(),
+        )
     }
 
     fn _update_chunk_pending_status(
@@ -394,6 +414,11 @@ impl FileCacheEntry {
         chunk: &dyn BlobChunkInfo,
         success: bool,
         metrics: &Arc<BlobcacheMetrics>,
+        // Why the chunk is not ready, where the caller knows. `None` at the sites that
+        // clear pending after a failure already reported elsewhere (a backend read, a
+        // decompress); `Some` wherever a cache *write* failed, because that error is the
+        // one carrying an errno worth reporting.
+        cause: Option<&StorageError>,
     ) {
         if success {
             if let Err(e) = chunk_map.set_ready_and_clear_pending(chunk) {
@@ -407,10 +432,17 @@ impl FileCacheEntry {
                 metrics.entries_count.inc();
             }
         } else {
-            error!(
-                "Failed to persist data for chunk at offset {}",
-                chunk.compressed_offset()
-            );
+            match cause {
+                Some(e) => error!(
+                    "Failed to persist data for chunk at offset {}: {}",
+                    chunk.compressed_offset(),
+                    e
+                ),
+                None => error!(
+                    "Failed to persist data for chunk at offset {}",
+                    chunk.compressed_offset()
+                ),
+            }
             chunk_map.clear_pending(chunk);
         }
     }
@@ -774,7 +806,7 @@ impl BlobCache for FileCacheEntry {
                             bufs.compressed_buf(),
                         );
                         for c in pending.iter().take(end + 1).skip(start) {
-                            self.update_chunk_pending_status(c.as_ref(), res.is_ok());
+                            self.update_chunk_persist_status(c.as_ref(), &res);
                         }
                     } else {
                         for idx in start..=end {
@@ -927,7 +959,7 @@ impl BlobCache for FileCacheEntry {
             }
         })();
 
-        self.update_chunk_pending_status(chunk, result.is_ok());
+        self.update_chunk_persist_status(chunk, &result);
         result.map(|_| true)
     }
 }
@@ -1109,7 +1141,7 @@ impl FileCacheEntry {
                         );
                         for idx in start_idx..=end_idx {
                             if status[idx] {
-                                self.update_chunk_pending_status(chunks[idx].as_ref(), res.is_ok());
+                                self.update_chunk_persist_status(chunks[idx].as_ref(), &res);
                             }
                         }
                     } else {
@@ -1490,7 +1522,7 @@ impl FileCacheEntry {
             let res =
                 Self::persist_cached_data(&self.file, region.blob_address, bufs.compressed_buf());
             for chunk in region.chunks.iter() {
-                self.update_chunk_pending_status(chunk.as_ref(), res.is_ok());
+                self.update_chunk_persist_status(chunk.as_ref(), &res);
             }
             res?;
         }
@@ -2427,7 +2459,7 @@ mod tests {
         };
 
         // Test successful update increments the metric
-        FileCacheEntry::_update_chunk_pending_status(&chunk_map, &chunk, true, &metrics);
+        FileCacheEntry::_update_chunk_pending_status(&chunk_map, &chunk, true, &metrics, None);
         assert_eq!(
             metrics.entries_count.count(),
             1,
@@ -2439,7 +2471,7 @@ mod tests {
             index: 1,
             ..Default::default()
         };
-        FileCacheEntry::_update_chunk_pending_status(&chunk_map, &chunk2, true, &metrics);
+        FileCacheEntry::_update_chunk_pending_status(&chunk_map, &chunk2, true, &metrics, None);
         assert_eq!(
             metrics.entries_count.count(),
             2,
@@ -2451,7 +2483,7 @@ mod tests {
             index: 2,
             ..Default::default()
         };
-        FileCacheEntry::_update_chunk_pending_status(&chunk_map, &chunk3, false, &metrics);
+        FileCacheEntry::_update_chunk_pending_status(&chunk_map, &chunk3, false, &metrics, None);
         assert_eq!(
             metrics.entries_count.count(),
             2,
@@ -2464,7 +2496,7 @@ mod tests {
                 index: idx,
                 ..Default::default()
             };
-            FileCacheEntry::_update_chunk_pending_status(&chunk_map, &chunk, true, &metrics);
+            FileCacheEntry::_update_chunk_pending_status(&chunk_map, &chunk, true, &metrics, None);
         }
         assert_eq!(
             metrics.entries_count.count(),
