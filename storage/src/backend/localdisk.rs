@@ -6,7 +6,6 @@
 
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
-use std::io::Result;
 use std::os::unix::io::AsRawFd;
 use std::path::Path;
 use std::sync::{Arc, RwLock};
@@ -30,6 +29,9 @@ pub enum LocalDiskError {
     /// Reading blob data from the disk failed.
     #[error("{0}")]
     ReadBlob(String),
+    /// The backend could not be set up from its configuration.
+    #[error("{0}")]
+    Config(String),
 }
 
 impl From<LocalDiskError> for BackendError {
@@ -145,23 +147,25 @@ pub struct LocalDisk {
 }
 
 impl LocalDisk {
-    pub fn new(config: &LocalDiskConfig, id: Option<&str>) -> Result<LocalDisk> {
-        let id = id.ok_or_else(|| einval!("localdisk: argument `id` is empty"))?;
+    pub fn new(config: &LocalDiskConfig, id: Option<&str>) -> BackendResult<LocalDisk> {
+        let id = id.ok_or_else(|| {
+            LocalDiskError::Config("localdisk: argument `id` is empty".to_string())
+        })?;
         let path = &config.device_path;
         let path_buf = Path::new(path).to_path_buf().canonicalize().map_err(|e| {
-            einval!(format!(
+            LocalDiskError::Config(format!(
                 "localdisk: invalid disk device path {}, {}",
                 path, e
             ))
         })?;
         let device_file = OpenOptions::new().read(true).open(path_buf).map_err(|e| {
-            einval!(format!(
+            LocalDiskError::Config(format!(
                 "localdisk: can not open disk device at {}, {}",
                 path, e
             ))
         })?;
         let md = device_file.metadata().map_err(|e| {
-            eio!(format!(
+            LocalDiskError::BlobFile(format!(
                 "localdisk: can not get file meta data about disk device {}, {}",
                 path, e
             ))
@@ -256,11 +260,11 @@ impl LocalDisk {
         Err(LocalDiskError::ReadBlob(msg))
     }
 
-    fn scan_blobs_by_gpt(&mut self) -> Result<()> {
+    fn scan_blobs_by_gpt(&mut self) -> LocalDiskResult<()> {
         // Open disk image.
         let cfg = gpt::GptConfig::new().writable(false);
         let disk = cfg.open(&self.device_path).map_err(|e| {
-            eio!(format!(
+            LocalDiskError::BlobFile(format!(
                 "localdisk: failed to open GPT on {}, {}",
                 self.device_path, e
             ))
@@ -276,8 +280,18 @@ impl LocalDisk {
 
         let mut table_guard = self.entries.write().unwrap();
         for (k, v) in partitions {
-            let length = v.bytes_len(sector_size)?;
-            let base_offset = v.bytes_start(sector_size)?;
+            let length = v.bytes_len(sector_size).map_err(|e| {
+                LocalDiskError::BlobFile(format!(
+                    "localdisk: invalid length for partition {}, {}",
+                    v.part_guid, e
+                ))
+            })?;
+            let base_offset = v.bytes_start(sector_size).map_err(|e| {
+                LocalDiskError::BlobFile(format!(
+                    "localdisk: invalid start offset for partition {}, {}",
+                    v.part_guid, e
+                ))
+            })?;
             if base_offset.checked_add(length).is_none()
                 || base_offset + length > self.device_capacity
             {
@@ -285,7 +299,7 @@ impl LocalDisk {
                     "localdisk: partition {} with invalid offset and length",
                     v.part_guid
                 );
-                return Err(einval!(msg));
+                return Err(LocalDiskError::BlobFile(msg));
             };
             let guid = v.part_guid;
             let mut is_gpt_mode = false;
@@ -300,14 +314,19 @@ impl LocalDisk {
 
             if name.is_empty() {
                 let msg = format!("localdisk: partition {} has empty blob id", v.part_guid);
-                return Err(einval!(msg));
+                return Err(LocalDiskError::BlobFile(msg));
             }
             if table_guard.contains_key(&name) {
                 let msg = format!("localdisk: blob {} already exists", name);
-                return Err(einval!(msg));
+                return Err(LocalDiskError::BlobFile(msg));
             }
 
-            let device_file = self.device_file.try_clone()?;
+            let device_file = self.device_file.try_clone().map_err(|e| {
+                LocalDiskError::BlobFile(format!(
+                    "localdisk: failed to clone the device file handle, {}",
+                    e
+                ))
+            })?;
             let partition = Arc::new(LocalDiskBlob {
                 blob_id: name.clone(),
                 device_file,

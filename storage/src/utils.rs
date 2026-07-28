@@ -16,7 +16,7 @@ use nydus_utils::{
 };
 use std::alloc::{Layout, alloc, handle_alloc_error};
 use std::cmp::{self, min};
-use std::io::{ErrorKind, IoSliceMut, Result};
+use std::io::{self, ErrorKind, IoSliceMut};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
 use std::os::unix::io::RawFd;
 #[cfg(target_os = "linux")]
@@ -29,7 +29,7 @@ use vm_memory::bytes::Bytes;
 use crate::{StorageError, StorageResult};
 
 /// Just a simple wrapper for posix `preadv`. Provide a slice of `IoVec` as input.
-pub fn readv(fd: RawFd, iovec: &mut [IoSliceMut], offset: u64) -> Result<usize> {
+pub fn readv(fd: RawFd, iovec: &mut [IoSliceMut], offset: u64) -> io::Result<usize> {
     if iovec.is_empty() {
         return Ok(0);
     }
@@ -122,7 +122,7 @@ pub fn copy_file_range(
     dst: impl AsFd,
     dst_off: u64,
     mut len: usize,
-) -> Result<()> {
+) -> io::Result<()> {
     let mut src_off = src_off as i64;
     let mut dst_off = dst_off as i64;
 
@@ -135,7 +135,7 @@ pub fn copy_file_range(
             len,
         )?;
         if ret == 0 {
-            return Err(eio!("reach end of file when copy file range"));
+            return Err(io::Error::other("reach end of file when copy file range"));
         }
         len -= ret;
     }
@@ -150,7 +150,7 @@ pub fn copy_file_range(
     dst: impl AsFd,
     mut dst_off: u64,
     mut len: usize,
-) -> Result<()> {
+) -> io::Result<()> {
     let buf_size = 4096;
     let mut buf = vec![0u8; buf_size];
 
@@ -163,13 +163,17 @@ pub fn copy_file_range(
         )?;
 
         if read_bytes == 0 {
-            return Err(eio!("reach end of file when read in copy_file_range"));
+            return Err(io::Error::other(
+                "reach end of file when read in copy_file_range",
+            ));
         }
 
         let write_bytes =
             nix::sys::uio::pwrite(dst.as_fd(), &buf[..read_bytes], dst_off as libc::off_t)?;
         if write_bytes == 0 {
-            return Err(eio!("reach end of file when write in copy_file_range"));
+            return Err(io::Error::other(
+                "reach end of file when write in copy_file_range",
+            ));
         }
 
         src_off += read_bytes as u64;

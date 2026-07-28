@@ -5,7 +5,7 @@
 //! Help library to manage network connections.
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::io::{Read, Result};
+use std::io::Read;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicI16, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -76,10 +76,13 @@ pub enum ConnectionError {
     /// The URL scheme is not one this backend speaks.
     #[error("invalid scheme {0}")]
     Scheme(String),
+    /// The TLS trust store or client configuration could not be built.
+    #[error("TLS configuration error, {0}")]
+    Tls(String),
 }
 
 /// Specialized `Result` for network communication.
-type ConnectionResult<T> = std::result::Result<T, ConnectionError>;
+pub type ConnectionResult<T> = std::result::Result<T, ConnectionError>;
 
 /// Generic configuration for storage backends.
 #[derive(Debug, Clone)]
@@ -180,7 +183,7 @@ impl<R> Progress<R> {
 }
 
 impl<R: Read + Send + 'static> Read for Progress<R> {
-    fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         self.inner.read(buf).inspect(|&count| {
             self.current += count;
             (self.callback)((self.current, self.total));
@@ -334,7 +337,7 @@ impl Response {
 }
 
 impl Read for Response {
-    fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         self.body.read(buf)
     }
 }
@@ -384,14 +387,17 @@ pub(crate) struct Connection {
 
 impl Connection {
     /// Create a new connection according to the configuration.
-    pub fn new(config: &ConnectionConfig) -> Result<Arc<Connection>> {
+    pub fn new(config: &ConnectionConfig) -> ConnectionResult<Arc<Connection>> {
         info!("backend config: {:?}", config);
         // Per-thread cyper clients are built lazily inside the compio runtime
         // (cyper's hickory resolver needs `Runtime::current()` at build time).
 
         let proxy = if !config.proxy.url.is_empty() {
             let ping_url = if !config.proxy.ping_url.is_empty() {
-                Some(Url::from_str(&config.proxy.ping_url).map_err(|e| einval!(e))?)
+                Some(
+                    Url::from_str(&config.proxy.ping_url)
+                        .map_err(|e| ConnectionError::Url(config.proxy.ping_url.clone(), e))?,
+                )
             } else {
                 None
             };
@@ -637,7 +643,7 @@ impl Connection {
         )
     }
 
-    fn build_connection(proxy: &str, config: &ConnectionConfig) -> Result<Client> {
+    fn build_connection(proxy: &str, config: &ConnectionConfig) -> ConnectionResult<Client> {
         // Note: cyper has no client-level request/connect timeout; the request
         // timeout is applied per-call via `compio::time::timeout` in `call_inner`.
         let mut cb = Client::builder()
@@ -660,7 +666,7 @@ impl Connection {
         };
 
         if !proxy.is_empty() {
-            cb = cb.proxy(cyper::proxy::Proxy::all(proxy).map_err(|e| einval!(e))?)
+            cb = cb.proxy(cyper::proxy::Proxy::all(proxy).map_err(ConnectionError::Common)?)
         } else {
             // Explicitly disable system proxy (HTTP_PROXY/HTTPS_PROXY env vars)
             // so that the direct client truly bypasses any proxy, especially when
@@ -668,7 +674,7 @@ impl Connection {
             cb = cb.no_proxy()
         }
 
-        cb.build().map_err(|e| einval!(e))
+        cb.build().map_err(ConnectionError::Common)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -968,7 +974,7 @@ impl Connection {
 /// below the OCI client in the crate graph.)
 fn client_config_with_extra_roots(
     ca_cert_files: &[String],
-) -> Result<std::sync::Arc<rustls::ClientConfig>> {
+) -> ConnectionResult<std::sync::Arc<rustls::ClientConfig>> {
     use rustls::pki_types::CertificateDer;
     use rustls::pki_types::pem::PemObject;
 
@@ -976,23 +982,29 @@ fn client_config_with_extra_roots(
     for path in ca_cert_files {
         let before = extra_roots.len();
         let certs = CertificateDer::pem_file_iter(path)
-            .map_err(|e| einval!(format!("open CA cert file {path}: {e}")))?;
+            .map_err(|e| ConnectionError::Tls(format!("open CA cert file {path}: {e}")))?;
         for cert in certs {
-            extra_roots.push(cert.map_err(|e| einval!(format!("parse CA cert file {path}: {e}")))?);
+            extra_roots.push(
+                cert.map_err(|e| ConnectionError::Tls(format!("parse CA cert file {path}: {e}")))?,
+            );
         }
         if extra_roots.len() == before {
-            return Err(einval!(format!("no CA certificates found in {path}")));
+            return Err(ConnectionError::Tls(format!(
+                "no CA certificates found in {path}"
+            )));
         }
     }
 
     let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
     let verifier =
         rustls_platform_verifier::Verifier::new_with_extra_roots(extra_roots, provider.clone())
-            .map_err(|e| einval!(format!("build certificate verifier with extra roots: {e}")))?;
+            .map_err(|e| {
+                ConnectionError::Tls(format!("build certificate verifier with extra roots: {e}"))
+            })?;
 
     let mut config = rustls::ClientConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()
-        .map_err(|e| einval!(format!("select rustls protocol versions: {e}")))?
+        .map_err(|e| ConnectionError::Tls(format!("select rustls protocol versions: {e}")))?
         .dangerous()
         .with_custom_certificate_verifier(std::sync::Arc::new(verifier))
         .with_no_client_auth();

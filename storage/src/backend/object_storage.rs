@@ -6,7 +6,7 @@
 //! Base module used to implement object storage backend drivers (such as oss, s3, etc.).
 
 use std::fmt::Debug;
-use std::io::{Error, Read, Result};
+use std::io::Read;
 use std::marker::Send;
 use std::sync::Arc;
 
@@ -23,7 +23,7 @@ use super::{BackendContext, BackendError, BackendResult, BlobBackend, BlobReader
 pub enum ObjectStorageError {
     /// The request could not be signed.
     #[error("failed to generate auth info, {0}")]
-    Auth(#[source] Error),
+    Auth(String),
     /// A required HTTP header could not be built.
     #[error("failed to generate HTTP header, {0}")]
     ConstructHeader(String),
@@ -33,7 +33,13 @@ pub enum ObjectStorageError {
     /// The object store answered with an error.
     #[error("network communication error, {0}")]
     Response(String),
+    /// The HTTP client could not be built.
+    #[error("failed to set up the connection, {0}")]
+    Connection(#[source] super::connection::ConnectionError),
 }
+
+/// Specialized `Result` for object storage backends.
+pub type ObjectStorageResult<T> = std::result::Result<T, ObjectStorageError>;
 
 impl From<ObjectStorageError> for BackendError {
     fn from(err: ObjectStorageError) -> Self {
@@ -52,7 +58,7 @@ pub trait ObjectStorageState: Send + Sync + Debug {
         headers: &mut HeaderMap,
         canonicalized_resource: &str,
         full_resource_url: &str,
-    ) -> Result<()>;
+    ) -> ObjectStorageResult<()>;
 
     fn retry_limit(&self) -> u8;
 }
@@ -76,8 +82,7 @@ where
         let mut headers = HeaderMap::new();
 
         self.state
-            .sign(Method::HEAD, &mut headers, resource.as_str(), url.as_str())
-            .map_err(ObjectStorageError::Auth)?;
+            .sign(Method::HEAD, &mut headers, resource.as_str(), url.as_str())?;
 
         let mut ctx = BackendContext::default();
         let resp = self
@@ -136,8 +141,7 @@ where
                 .map_err(|e| ObjectStorageError::ConstructHeader(format!("{}", e)))?,
         );
         self.state
-            .sign(Method::GET, &mut headers, resource.as_str(), url.as_str())
-            .map_err(ObjectStorageError::Auth)?;
+            .sign(Method::GET, &mut headers, resource.as_str(), url.as_str())?;
 
         let written = self
             .request
@@ -186,8 +190,7 @@ where
         }
 
         self.state
-            .sign(Method::GET, &mut headers, resource.as_str(), url.as_str())
-            .map_err(ObjectStorageError::Auth)?;
+            .sign(Method::GET, &mut headers, resource.as_str(), url.as_str())?;
 
         let resp = self
             .request
@@ -361,10 +364,10 @@ mod tests {
             _headers: &mut HeaderMap,
             _canonicalized_resource: &str,
             _full_resource_url: &str,
-        ) -> std::io::Result<()> {
+        ) -> ObjectStorageResult<()> {
             self.signed_methods.lock().unwrap().push(verb);
             if let Some(msg) = self.sign_error.as_ref() {
-                return Err(IoError::other(msg.clone()));
+                return Err(ObjectStorageError::Auth(msg.clone()));
             }
             Ok(())
         }
@@ -502,7 +505,7 @@ mod tests {
 
     #[test]
     fn test_object_storage_error_auth_display() {
-        let err = ObjectStorageError::Auth(make_io_error("auth failed"));
+        let err = ObjectStorageError::Auth("auth failed".to_string());
         let msg = format!("{}", err);
         assert!(msg.contains("failed to generate auth info"));
         assert!(msg.contains("auth failed"));
@@ -534,7 +537,7 @@ mod tests {
 
     #[test]
     fn test_object_storage_error_auth_debug() {
-        let err = ObjectStorageError::Auth(make_io_error("test"));
+        let err = ObjectStorageError::Auth("test".to_string());
         let dbg = format!("{:?}", err);
         assert!(dbg.contains("Auth"));
     }

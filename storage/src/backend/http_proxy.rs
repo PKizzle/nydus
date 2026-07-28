@@ -17,7 +17,7 @@ use super::{BackendContext, BackendError, BackendResult, BlobBackend, BlobReader
 use crate::backend::request;
 use std::path::Path;
 use std::{
-    io::{Error, Result},
+    io::Error,
     num::ParseIntError,
     str::{self},
     sync::Arc,
@@ -276,11 +276,11 @@ impl BlobReader for HttpProxyReader {
 }
 
 impl HttpProxy {
-    pub fn new(config: &HttpProxyConfig, id: Option<&str>) -> Result<HttpProxy> {
+    pub fn new(config: &HttpProxyConfig, id: Option<&str>) -> BackendResult<HttpProxy> {
         let client = if config.addr.starts_with("http://") || config.addr.starts_with("https://") {
             let conn_cfg: ConnectionConfig = config.clone().into();
             let proxy_config = conn_cfg.proxy.clone();
-            let conn = Connection::new(&conn_cfg)?;
+            let conn = Connection::new(&conn_cfg).map_err(BackendError::Connection)?;
             let request = request::Request::new(conn, proxy_config, false, id.unwrap_or(""));
             Client::Remote(request)
         } else {

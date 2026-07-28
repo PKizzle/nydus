@@ -18,7 +18,6 @@
 //! - Read uncompressed data from local disk and no need to double cache the data.
 //!   The [is_chunk_cached()](../trait.BlobCache.html#tymethod.is_chunk_cached) method always
 //!   return true to enable data prefetching.
-use std::io::Result;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -189,7 +188,7 @@ impl DummyCacheMgr {
         config: &CacheConfigV2,
         backend: Arc<dyn BlobBackend>,
         cached: bool,
-    ) -> Result<DummyCacheMgr> {
+    ) -> StorageResult<DummyCacheMgr> {
         Ok(DummyCacheMgr {
             backend,
             cached,

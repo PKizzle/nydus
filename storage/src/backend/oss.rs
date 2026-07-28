@@ -4,7 +4,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Storage backend driver to access blobs on Oss(Object Storage System).
-use std::io::Result;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -18,8 +17,11 @@ use nydus_api::OssConfig;
 use nydus_utils::metrics::BackendMetrics;
 
 use crate::backend::connection::{Connection, ConnectionConfig};
-use crate::backend::object_storage::{ObjectStorage, ObjectStorageState};
+use crate::backend::object_storage::{
+    ObjectStorage, ObjectStorageError, ObjectStorageResult, ObjectStorageState,
+};
 use crate::backend::request;
+use crate::backend::{BackendError, BackendResult};
 
 const HEADER_DATE: &str = "Date";
 const HEADER_AUTHORIZATION: &str = "Authorization";
@@ -45,15 +47,17 @@ impl OssState {
 
     /// Generate a pre-signed URL query string for OSS access.
     #[allow(dead_code)]
-    fn sign_by_url(&self, method: Method, resource: &str) -> Result<String> {
+    fn sign_by_url(&self, method: Method, resource: &str) -> ObjectStorageResult<String> {
         let expiry = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .map_err(|e| einval!(e))?
+            .map_err(|e| {
+                ObjectStorageError::Auth(format!("system clock is before the epoch, {e}"))
+            })?
             .as_secs()
             + 3600;
         let string_to_sign = format!("{}\n\n\n{}\n{}", method.as_str(), expiry, resource);
         let hmac = HmacSha1::new_from_slice(self.access_key_secret.as_bytes())
-            .map_err(|e| einval!(e))?
+            .map_err(|e| ObjectStorageError::Auth(format!("invalid OSS access key secret, {e}")))?
             .chain_update(string_to_sign.as_bytes())
             .finalize()
             .into_bytes();
@@ -92,7 +96,7 @@ impl ObjectStorageState for OssState {
         headers: &mut HeaderMap,
         canonicalized_resource: &str,
         _: &str,
-    ) -> Result<()> {
+    ) -> ObjectStorageResult<()> {
         let content_md5 = "";
         let content_type = "";
         let mut canonicalized_oss_headers = vec![];
@@ -108,7 +112,11 @@ impl ObjectStorageState for OssState {
 
         for (name, value) in headers.iter() {
             let name = name.as_str();
-            let value = value.to_str().map_err(|e| einval!(e))?;
+            let value = value.to_str().map_err(|e| {
+                ObjectStorageError::ConstructHeader(format!(
+                    "header {name} is not valid UTF-8, {e}"
+                ))
+            })?;
             if name.starts_with("x-oss-") {
                 let header = format!("{}:{}", name.to_lowercase(), value);
                 canonicalized_oss_headers.push(header);
@@ -120,7 +128,7 @@ impl ObjectStorageState for OssState {
         }
         let data = data.join("\n");
         let hmac = HmacSha1::new_from_slice(self.access_key_secret.as_bytes())
-            .map_err(|e| einval!(e))?
+            .map_err(|e| ObjectStorageError::Auth(format!("invalid OSS access key secret, {e}")))?
             .chain_update(data.as_bytes())
             .finalize()
             .into_bytes();
@@ -128,10 +136,17 @@ impl ObjectStorageState for OssState {
 
         let authorization = format!("OSS {}:{}", self.access_key_id, signature);
 
-        headers.insert(HEADER_DATE, date.as_str().parse().map_err(|e| einval!(e))?);
+        headers.insert(
+            HEADER_DATE,
+            date.as_str().parse().map_err(|e| {
+                ObjectStorageError::ConstructHeader(format!("invalid Date header, {e}"))
+            })?,
+        );
         headers.insert(
             HEADER_AUTHORIZATION,
-            authorization.as_str().parse().map_err(|e| einval!(e))?,
+            authorization.as_str().parse().map_err(|e| {
+                ObjectStorageError::ConstructHeader(format!("invalid Authorization header, {e}"))
+            })?,
         );
 
         Ok(())
@@ -147,11 +162,11 @@ pub type Oss = ObjectStorage<OssState>;
 
 impl Oss {
     /// Create a new OSS storage backend.
-    pub fn new(oss_config: &OssConfig, id: Option<&str>) -> Result<Oss> {
+    pub fn new(oss_config: &OssConfig, id: Option<&str>) -> BackendResult<Oss> {
         let con_config: ConnectionConfig = oss_config.clone().into();
         let retry_limit = con_config.retry_limit;
         let proxy_config = con_config.proxy.clone();
-        let connection = Connection::new(&con_config)?;
+        let connection = Connection::new(&con_config).map_err(BackendError::Connection)?;
         let request = request::Request::new(connection, proxy_config, false, id.unwrap_or(""));
         let state = Arc::new(OssState {
             scheme: oss_config.scheme.clone(),

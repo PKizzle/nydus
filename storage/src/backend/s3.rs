@@ -7,7 +7,6 @@
 
 use std::collections::BTreeMap;
 use std::fmt::Debug;
-use std::io::Result;
 use std::sync::Arc;
 
 use hmac::{Hmac, KeyInit, Mac};
@@ -20,8 +19,11 @@ use sha2::{Digest, Sha256};
 use time::{OffsetDateTime, format_description};
 
 use crate::backend::connection::{Connection, ConnectionConfig};
-use crate::backend::object_storage::{ObjectStorage, ObjectStorageState};
+use crate::backend::object_storage::{
+    ObjectStorage, ObjectStorageError, ObjectStorageResult, ObjectStorageState,
+};
 use crate::backend::request;
+use crate::backend::{BackendError, BackendResult};
 
 const EMPTY_SHA256: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 const HEADER_HOST: &str = "Host";
@@ -46,11 +48,11 @@ pub type S3 = ObjectStorage<S3State>;
 
 impl S3 {
     /// Create a new S3 storage backend.
-    pub fn new(s3_config: &S3Config, id: Option<&str>) -> Result<S3> {
+    pub fn new(s3_config: &S3Config, id: Option<&str>) -> BackendResult<S3> {
         let con_config: ConnectionConfig = s3_config.clone().into();
         let retry_limit = con_config.retry_limit;
         let proxy_config = con_config.proxy.clone();
-        let connection = Connection::new(&con_config)?;
+        let connection = Connection::new(&con_config).map_err(BackendError::Connection)?;
         let final_endpoint = if s3_config.endpoint.is_empty() {
             S3_DEFAULT_ENDPOINT.to_string()
         } else {
@@ -170,25 +172,39 @@ impl ObjectStorageState for S3State {
         headers: &mut HeaderMap,
         _: &str,
         full_resource_url: &str,
-    ) -> Result<()> {
+    ) -> ObjectStorageResult<()> {
         let date = OffsetDateTime::now_utc();
         let content_sha256 = EMPTY_SHA256;
-        let parsed_uri = full_resource_url
-            .to_string()
-            .parse::<Uri>()
-            .map_err(|e| einval!(e))?;
+        let parsed_uri = full_resource_url.to_string().parse::<Uri>().map_err(|e| {
+            ObjectStorageError::ConstructHeader(format!(
+                "invalid resource URL {full_resource_url}, {e}"
+            ))
+        })?;
         let uri_path = parsed_uri.path();
         let query = parsed_uri.query().unwrap_or("");
         let host = parsed_uri.host().unwrap_or(self.endpoint.as_str());
 
-        headers.insert(HEADER_HOST, host.parse().map_err(|e| einval!(e))?);
+        headers.insert(
+            HEADER_HOST,
+            host.parse().map_err(|e| {
+                ObjectStorageError::ConstructHeader(format!("invalid Host header {host}, {e}"))
+            })?,
+        );
         headers.insert(
             HEADER_AWZ_DATE,
-            to_awz_date(&date).parse().map_err(|e| einval!(e))?,
+            to_awz_date(&date).parse().map_err(|e| {
+                ObjectStorageError::ConstructHeader(format!(
+                    "invalid {HEADER_AWZ_DATE} header, {e}"
+                ))
+            })?,
         );
         headers.insert(
             HEADER_AWZ_CONTENT_SHA256,
-            EMPTY_SHA256.parse().map_err(|e| einval!(e))?,
+            EMPTY_SHA256.parse().map_err(|e| {
+                ObjectStorageError::ConstructHeader(format!(
+                    "invalid {HEADER_AWZ_CONTENT_SHA256} header, {e}"
+                ))
+            })?,
         );
         let scope = format!(
             "{}/{}/{}/aws4_request",
@@ -219,7 +235,9 @@ impl ObjectStorageState for S3State {
         );
         headers.insert(
             "Authorization",
-            authorization.parse().map_err(|e| einval!(e))?,
+            authorization.parse().map_err(|e| {
+                ObjectStorageError::ConstructHeader(format!("invalid Authorization header, {e}"))
+            })?,
         );
 
         Ok(())

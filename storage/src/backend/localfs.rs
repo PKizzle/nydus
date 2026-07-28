@@ -6,7 +6,6 @@
 
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
-use std::io::Result;
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
@@ -31,6 +30,9 @@ pub enum LocalFsError {
     /// Reading blob data from the file failed.
     #[error("{0}")]
     ReadBlob(String),
+    /// The backend could not be set up from its configuration.
+    #[error("{0}")]
+    Config(String),
 }
 
 impl From<LocalFsError> for BackendError {
@@ -101,11 +103,15 @@ pub struct LocalFs {
 }
 
 impl LocalFs {
-    pub fn new(config: &LocalFsConfig, id: Option<&str>) -> Result<LocalFs> {
-        let id = id.ok_or_else(|| einval!("LocalFs requires blob_id"))?;
+    pub fn new(config: &LocalFsConfig, id: Option<&str>) -> BackendResult<LocalFs> {
+        let id = id.ok_or_else(|| {
+            BackendError::LocalFs(LocalFsError::Config("LocalFs requires blob_id".to_string()))
+        })?;
 
         if config.blob_file.is_empty() && config.dir.is_empty() {
-            return Err(einval!("blob file or dir is required"));
+            return Err(BackendError::LocalFs(LocalFsError::Config(
+                "blob file or dir is required".to_string(),
+            )));
         }
 
         Ok(LocalFs {

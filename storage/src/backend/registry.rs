@@ -5,7 +5,7 @@
 //! Storage backend driver to access blobs on container image registry.
 use std::collections::HashMap;
 use std::error::Error;
-use std::io::{Read, Result};
+use std::io::Read;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Once, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -100,6 +100,12 @@ pub enum RegistryBackendError {
     /// The registry URL scheme is not supported.
     #[error("invalid scheme, {0}")]
     Scheme(String),
+    /// The registry refused, or did not supply, an authentication token.
+    #[error("registry authentication failed, {0}")]
+    Auth(String),
+    /// The backend could not be set up from its configuration.
+    #[error("{0}")]
+    Config(String),
     /// The request did not reach the registry.
     #[error("network transport error, {0}")]
     Transport(#[source] std::io::Error),
@@ -228,10 +234,15 @@ fn default_expires_in() -> u64 {
 
 impl TokenResponse {
     // Extract the bearer token from the registry auth server response
-    fn from_resp(resp: request::Response) -> Result<Self> {
-        let body = resp.text().map_err(|e| einval!(e))?;
+    fn from_resp(resp: request::Response) -> RegistryResult<Self> {
+        let body = resp.text().map_err(|e| {
+            RegistryBackendError::Auth(format!(
+                "failed to read the registry auth server response: {:?}",
+                e
+            ))
+        })?;
         let mut token: TokenResponse = serde_json::from_str(&body).map_err(|e| {
-            einval!(format!(
+            RegistryBackendError::Auth(format!(
                 "failed to decode registry auth server response: {:?}",
                 e
             ))
@@ -239,7 +250,9 @@ impl TokenResponse {
 
         if token.token.is_empty() {
             if token.access_token.is_empty() {
-                return Err(einval!("failed to get auth token from registry"));
+                return Err(RegistryBackendError::Auth(
+                    "failed to get auth token from registry".to_string(),
+                ));
             }
             token.token = token.access_token.clone();
         }
@@ -450,7 +463,11 @@ impl RegistryState {
     }
 
     // Request registry authentication server to get bearer token
-    fn get_token(&self, auth: BearerAuth, request: &request::Request) -> Result<TokenResponse> {
+    fn get_token(
+        &self,
+        auth: BearerAuth,
+        request: &request::Request,
+    ) -> RegistryResult<TokenResponse> {
         let http_get = self
             .cached_auth_using_http_get
             .get(&self.host)
@@ -470,8 +487,9 @@ impl RegistryState {
             }
         };
 
-        let ret = TokenResponse::from_resp(resp)
-            .map_err(|e| einval!(format!("failed to get auth token from registry: {:?}", e)))?;
+        let ret = TokenResponse::from_resp(resp).map_err(|e| {
+            RegistryBackendError::Auth(format!("failed to get auth token from registry: {:?}", e))
+        })?;
 
         if let Ok(now_timestamp) = SystemTime::now().duration_since(UNIX_EPOCH) {
             // The jitter is proportional to the lifetime, so it can only be computed here,
@@ -499,7 +517,7 @@ impl RegistryState {
         auth: &BearerAuth,
         request: &request::Request,
         method: Method,
-    ) -> Result<request::Response> {
+    ) -> RegistryResult<request::Response> {
         let mut headers = HeaderMap::new();
 
         let config_auth = self.get_config_auth();
@@ -531,7 +549,12 @@ impl RegistryState {
                 form.insert("client_id".to_string(), REGISTRY_CLIENT_ID.to_string());
                 body = Some(ReqBody::Form(form));
             }
-            _ => return Err(einval!()),
+            _ => {
+                return Err(RegistryBackendError::Auth(format!(
+                    "unsupported registry auth request method {:?}",
+                    method
+                )));
+            }
         }
 
         let mut ctx = BackendContext::default();
@@ -547,17 +570,16 @@ impl RegistryState {
                 true, // temp_disable_proxy: auth always goes direct
             )
             .map_err(move |e| {
-                warn!(
+                RegistryBackendError::Auth(format!(
                     "failed to request registry auth server by {:?} method: {:?}",
                     method, e
-                );
-                einval!()
+                ))
             })?;
 
         Ok(token_resp)
     }
 
-    fn get_auth_header(&self, auth: Auth, request: &request::Request) -> Result<String> {
+    fn get_auth_header(&self, auth: Auth, request: &request::Request) -> RegistryResult<String> {
         match auth {
             Auth::Basic(_) => Ok(format!("Basic {}", self.get_config_auth())),
             Auth::Bearer(auth) => {
@@ -814,10 +836,7 @@ impl RegistryReader {
             if let Some(resp_auth_header) = resp.headers().get(HEADER_WWW_AUTHENTICATE) {
                 // Get token from registry authorization server
                 if let Some(auth) = RegistryState::parse_auth(resp_auth_header) {
-                    let auth_header = self
-                        .state
-                        .get_auth_header(auth, &self.request)
-                        .map_err(|e| RegistryBackendError::Common(e.to_string()))?;
+                    let auth_header = self.state.get_auth_header(auth, &self.request)?;
 
                     headers.insert(
                         HEADER_AUTHORIZATION,
@@ -1188,13 +1207,15 @@ pub struct Registry {
 }
 
 impl Registry {
-    pub fn new(config: &RegistryConfig, id: Option<&str>) -> Result<Registry> {
-        let id = id.ok_or_else(|| einval!("Registry backend requires id"))?;
+    pub fn new(config: &RegistryConfig, id: Option<&str>) -> BackendResult<Registry> {
+        let id = id.ok_or_else(|| {
+            RegistryBackendError::Config("Registry backend requires id".to_string())
+        })?;
         let con_config: ConnectionConfig = config.clone().into();
 
         let retry_limit = con_config.retry_limit;
         let proxy_config = con_config.proxy.clone();
-        let connection = Connection::new(&con_config)?;
+        let connection = Connection::new(&con_config).map_err(BackendError::Connection)?;
         let request = request::Request::new(connection, proxy_config, false, id);
         let auth = trim(config.auth.clone());
         let registry_token = trim(config.registry_token.clone());
@@ -1245,25 +1266,27 @@ impl Registry {
         Ok(registry)
     }
 
-    fn validate_authorization_info(auth: &Option<String>) -> Result<()> {
+    fn validate_authorization_info(auth: &Option<String>) -> RegistryResult<()> {
         if let Some(auth) = &auth {
             let auth: Vec<u8> = base64::engine::general_purpose::STANDARD
                 .decode(auth.as_bytes())
                 .map_err(|e| {
-                    einval!(format!(
+                    RegistryBackendError::Config(format!(
                         "Invalid base64 encoded registry auth config: {:?}",
                         e
                     ))
                 })?;
             let auth = std::str::from_utf8(&auth).map_err(|e| {
-                einval!(format!(
+                RegistryBackendError::Config(format!(
                     "Invalid utf-8 encoded registry auth config: {:?}",
                     e
                 ))
             })?;
             let auth: Vec<&str> = auth.splitn(2, ':').collect();
             if auth.len() < 2 {
-                return Err(einval!("Invalid registry auth config"));
+                return Err(RegistryBackendError::Config(
+                    "Invalid registry auth config".to_string(),
+                ));
             }
         }
         Ok(())

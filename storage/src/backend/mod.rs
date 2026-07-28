@@ -127,6 +127,18 @@ pub enum BackendError {
     /// Failed to copy data from/into blob.
     #[error("failed to copy data, {0}")]
     CopyData(#[source] StorageError),
+    #[cfg(any(
+        feature = "backend-oss",
+        feature = "backend-registry",
+        feature = "backend-s3",
+        feature = "backend-http-proxy",
+    ))]
+    /// The HTTP client backing a network backend could not be built.
+    ///
+    /// Construction-time failure, distinct from [`BackendError::Request`], which is a request
+    /// that was issued and failed.
+    #[error("failed to set up the backend connection, {0}")]
+    Connection(#[source] self::connection::ConnectionError),
     #[cfg(feature = "backend-localdisk")]
     /// Error from LocalDisk storage backend.
     #[error("{0:?}")]
@@ -600,7 +612,9 @@ impl Read for BlobBufReader {
             let ret = self
                 .reader
                 .read(&mut self.buf[..cnt], self.start)
-                .map_err(|e| eio!(format!("failed to read data from backend, {:?}", e)))?;
+                .map_err(|e| {
+                    std::io::Error::other(format!("failed to read data from backend, {:?}", e))
+                })?;
             self.start += ret as u64;
             self.size -= ret as u64;
             self.pos = 0;
@@ -608,7 +622,9 @@ impl Read for BlobBufReader {
             sz = ret;
         }
         if self.size != 0 && sz == 0 {
-            return Err(eio!("unexpected EOF when reading data from backend"));
+            return Err(std::io::Error::other(
+                "unexpected EOF when reading data from backend",
+            ));
         }
 
         let sz = std::cmp::min(sz, buf.len());
