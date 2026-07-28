@@ -29,6 +29,11 @@ sudo NYDUS_IMAGE=./target/release/nydus-image NYDUSD=./target/release/nydusd \
   misc/fanotify/runtime-test.sh         # plain blob fetch path
 sudo misc/fanotify/zran-multilayer-test.sh   # node-local zran convert + merge + serve
 sudo misc/fanotify/precontent-cases.sh       # fail-closed + strace ground truth + ENOSPC (needs strace)
+
+# Blob cache under disk pressure on the fusedev path (root + loopback ext4 + FUSE;
+# needs NO kernel >= 6.14, so this one runs anywhere FUSE does)
+sudo NYDUS_IMAGE=./target/release/nydus-image NYDUSD=./target/release/nydusd \
+  misc/fusedev/disk-pressure.sh
 ```
 
 > **The fanotify suite runs in a privileged container**, so a dedicated Linux VM is not required as

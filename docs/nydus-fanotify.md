@@ -35,6 +35,14 @@ EROFS + `fscache` (`cachefiles`) on-demand path, which has been removed.
    that the folio is not uptodate. The specific errno is therefore an observability property today
    (daemon logs, direct readers) rather than something containers can branch on.
 
+   **The fusedev path answers disk pressure the other way round**, because there the cache is only
+   an accelerator rather than the device being read: `delay_persist_chunk_data` writes it from a
+   detached task while the read is served out of the in-memory buffer, so a failed cache write never
+   reaches the reader at all. The chunk is left not-ready instead of being marked ready, so a later
+   read re-fetches rather than being served the sparse hole, and the only operator-visible signal is
+   the daemon's log line — which is why that line names the errno. Covered by
+   `misc/fusedev/disk-pressure.sh`.
+
 Every permission event must be answered, and the daemon is written so that no path can leave one
 outstanding: a panic during handling denies via `EventFdGuard::drop`, a structurally corrupt event
 buffer denies everything still parsable before failing, and shutdown drains and denies whatever is
