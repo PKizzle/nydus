@@ -24,7 +24,7 @@ use std::collections::HashMap;
 use std::collections::hash_map::Drain;
 use std::convert::TryFrom;
 use std::fmt::{Debug, Formatter};
-use std::io::{self, Error};
+use std::io::Error;
 use std::ops::Deref;
 use std::os::unix::io::AsRawFd;
 use std::path::Path;
@@ -101,13 +101,16 @@ impl BlobFeatures {
 }
 
 impl TryFrom<u32> for BlobFeatures {
-    type Error = Error;
+    type Error = StorageError;
 
-    fn try_from(value: u32) -> Result<Self, Self::Error> {
+    fn try_from(value: u32) -> StorageResult<Self> {
         if value & BLOB_FEATURE_INCOMPAT_MASK & !BLOB_FEATURE_INCOMPAT_VALUE != 0
             || value & BlobFeatures::_V5_NO_EXT_BLOB_TABLE.bits() != 0
         {
-            Err(einval!(format!("invalid blob features: 0x{:x}", value)))
+            Err(StorageError::InvalidArgument(format!(
+                "invalid blob features: 0x{:x}",
+                value
+            )))
         } else {
             Ok(BlobFeatures::from_bits_retain(value))
         }
@@ -556,54 +559,45 @@ impl BlobInfo {
     }
 
     /// Set path for meta blob file, which will be used by `get_blob_id()` and `get_blob_meta_id()`.
-    pub fn set_blob_id_from_meta_path(&self, path: &Path) -> Result<(), Error> {
+    pub fn set_blob_id_from_meta_path(&self, path: &Path) -> StorageResult<()> {
         *self.meta_path.lock().unwrap() = Self::get_blob_id_from_meta_path(path)?;
         Ok(())
     }
 
-    pub fn get_blob_id_from_meta_path(path: &Path) -> Result<String, Error> {
-        // Manual implementation of Path::file_prefix().
-        let mut id = path.file_name().ok_or_else(|| {
-            einval!(format!(
+    pub fn get_blob_id_from_meta_path(path: &Path) -> StorageResult<String> {
+        let bad_path = || {
+            StorageError::InvalidArgument(format!(
                 "failed to get blob id from meta file path {}",
                 path.display()
             ))
-        })?;
+        };
+
+        // Manual implementation of Path::file_prefix().
+        let mut id = path.file_name().ok_or_else(bad_path)?;
         loop {
-            let id1 = Path::new(id).file_stem().ok_or_else(|| {
-                einval!(format!(
-                    "failed to get blob id from meta file path {}",
-                    path.display()
-                ))
-            })?;
+            let id1 = Path::new(id).file_stem().ok_or_else(bad_path)?;
             if id1.is_empty() {
-                return Err(einval!(format!(
-                    "failed to get blob id from meta file path {}",
-                    path.display()
-                )));
+                return Err(bad_path());
             } else if id == id1 {
                 break;
             } else {
                 id = id1;
             }
         }
-        let id = id.to_str().ok_or_else(|| {
-            einval!(format!(
-                "failed to get blob id from meta file path {}",
-                path.display()
-            ))
-        })?;
+        let id = id.to_str().ok_or_else(bad_path)?;
 
         Ok(id.to_string())
     }
 
     /// Get RAFS blob id for ZRan.
-    pub fn get_blob_meta_id(&self) -> Result<String, Error> {
+    pub fn get_blob_meta_id(&self) -> StorageResult<String> {
         assert!(self.has_feature(BlobFeatures::SEPARATE));
         let id = if self.has_feature(BlobFeatures::INLINED_FS_META) {
             let guard = self.meta_path.lock().unwrap();
             if guard.is_empty() {
-                return Err(einval!("failed to get blob id from meta file name"));
+                return Err(StorageError::InvalidState(
+                    "failed to get blob id from meta file name".to_string(),
+                ));
             }
             guard.deref().clone()
         } else {
@@ -1233,7 +1227,7 @@ impl BlobDevice {
         config: &Arc<ConfigV2>,
         blob_infos: &[Arc<BlobInfo>],
         mountpoint: &str,
-    ) -> io::Result<BlobDevice> {
+    ) -> StorageResult<BlobDevice> {
         let mut blobs = Vec::with_capacity(blob_infos.len());
         for blob_info in blob_infos.iter() {
             let blob = BLOB_FACTORY.new_blob_cache(config, blob_info, mountpoint)?;
@@ -1256,10 +1250,10 @@ impl BlobDevice {
         blob_infos: &[Arc<BlobInfo>],
         fs_prefetch: bool,
         mountpoint: &str,
-    ) -> io::Result<()> {
+    ) -> StorageResult<()> {
         if self.blobs.load().len() != blob_infos.len() {
-            return Err(einval!(
-                "number of blobs doesn't match when update 'BlobDevice' object"
+            return Err(StorageError::InvalidArgument(
+                "number of blobs doesn't match when update 'BlobDevice' object".to_string(),
             ));
         }
 
@@ -1284,7 +1278,7 @@ impl BlobDevice {
     }
 
     /// Close the blob device.
-    pub fn close(&self) -> io::Result<()> {
+    pub fn close(&self) -> StorageResult<()> {
         Ok(())
     }
 
@@ -1294,7 +1288,11 @@ impl BlobDevice {
     }
 
     /// Read a range of data from a data blob into the provided writer
-    pub fn read_to(&self, w: &mut dyn ZeroCopyWriter, desc: &mut BlobIoVec) -> io::Result<usize> {
+    pub fn read_to(
+        &self,
+        w: &mut dyn ZeroCopyWriter,
+        desc: &mut BlobIoVec,
+    ) -> StorageResult<usize> {
         // Validate that:
         // - bi_vec[0] is valid
         // - bi_vec[0].blob.blob_index() is valid
@@ -1303,16 +1301,26 @@ impl BlobDevice {
             if desc.bi_size == 0 {
                 Ok(0)
             } else {
-                Err(einval!("BlobIoVec size doesn't match."))
+                Err(StorageError::InvalidArgument(
+                    "BlobIoVec size doesn't match.".to_string(),
+                ))
             }
         } else if desc.blob_index() as usize >= self.blob_count {
-            Err(einval!("BlobIoVec has out of range blob_index."))
+            Err(StorageError::InvalidArgument(
+                "BlobIoVec has out of range blob_index.".to_string(),
+            ))
         } else {
             let size = desc.bi_size;
             let mut f = BlobDeviceIoVec::new(self, desc);
             // The `off` parameter to w.write_from() is actually ignored by
             // BlobV5IoVec::read_vectored_at_volatile()
+            //
+            // `write_from` is `ZeroCopyWriter`, pinned to `io::Error`, and the error it hands
+            // back is usually one this crate produced a moment earlier inside
+            // `read_vectored_at_volatile`. Wrapping rather than re-interpreting keeps the
+            // original chain -- and its errno -- intact.
             w.write_from(&mut f, size as usize, 0)
+                .map_err(|source| StorageError::DeviceIo { op: "read", source })
         }
     }
 
@@ -1321,7 +1329,7 @@ impl BlobDevice {
         &self,
         io_vecs: &[&BlobIoVec],
         prefetches: &[BlobPrefetchRequest],
-    ) -> io::Result<()> {
+    ) -> StorageResult<()> {
         for idx in 0..prefetches.len() {
             if let Some(blob) = self.get_blob_by_id(&prefetches[idx].blob_id) {
                 let _ = blob.prefetch(blob.clone(), &prefetches[idx..idx + 1], &[]);
@@ -1362,7 +1370,7 @@ impl BlobDevice {
     }
 
     /// fetch specified blob data in a synchronous way.
-    pub fn fetch_range_synchronous(&self, prefetches: &[BlobPrefetchRequest]) -> io::Result<()> {
+    pub fn fetch_range_synchronous(&self, prefetches: &[BlobPrefetchRequest]) -> StorageResult<()> {
         for req in prefetches {
             if req.len == 0 {
                 continue;
@@ -1386,7 +1394,9 @@ impl BlobDevice {
                         })?;
                 } else {
                     error!("No support for fetching uncompressed blob data");
-                    return Err(einval!("No support for fetching uncompressed blob data"));
+                    return Err(StorageError::InvalidState(
+                        "No support for fetching uncompressed blob data".to_string(),
+                    ));
                 }
             }
         }
@@ -1400,7 +1410,10 @@ impl BlobDevice {
     /// await blob-stream prefetch work without blocking the reactor while
     /// individual cache backends are converted to native async I/O incrementally.
     /// Uses the runtime-agnostic `blocking` pool so it works on any executor.
-    pub async fn fetch_range_async(&self, prefetches: Vec<BlobPrefetchRequest>) -> io::Result<()> {
+    pub async fn fetch_range_async(
+        &self,
+        prefetches: Vec<BlobPrefetchRequest>,
+    ) -> StorageResult<()> {
         let device = self.clone();
         blocking::unblock(move || device.fetch_range_synchronous(&prefetches)).await
     }
@@ -1510,17 +1523,20 @@ impl FileReadWriteVolatile for BlobDeviceIoVec<'_> {
         let index = self.iovec.blob_index();
         let blobs = &self.dev.blobs.load();
 
+        // `FileReadWriteVolatile` is an external trait pinned to `io::Error`, so this is one
+        // of the boundaries `From<StorageError> for io::Error` exists for: an errno anywhere on
+        // the chain is preserved, anything else keeps the `StorageError` as the payload.
         if (index as usize) < blobs.len() {
             blobs[index as usize]
                 .read(self.iovec, buffers)
-                .map_err(std::io::Error::from)
+                .map_err(Error::from)
         } else {
             let msg = format!(
                 "failed to get blob object for BlobIoVec, index {}, blob array len: {}",
                 index,
                 blobs.len()
             );
-            Err(einval!(msg))
+            Err(StorageError::InvalidArgument(msg).into())
         }
     }
 

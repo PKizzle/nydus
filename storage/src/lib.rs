@@ -104,6 +104,15 @@ pub enum StorageError {
     /// A blob's compression context table could not be read or trusted.
     #[error("{0}")]
     Meta(#[from] crate::meta::MetaError),
+    /// A storage backend refused, or failed to serve, a request.
+    ///
+    /// Boxed because [`crate::backend::BackendError::CopyData`] carries a `StorageError` back
+    /// the other way; storing either inline would make both enums infinitely sized.
+    #[error("{0}")]
+    Backend(#[source] Box<crate::backend::BackendError>),
+    /// The configuration the storage layer was handed does not describe a usable blob.
+    #[error("{0}")]
+    Config(#[from] nydus_api::ConfigError),
     /// A caller passed an argument the storage layer cannot act on.
     #[error("{0}")]
     InvalidArgument(String),
@@ -123,6 +132,21 @@ pub enum StorageError {
         expected: usize,
         /// Bytes actually written.
         written: usize,
+    },
+    /// An I/O operation against the blob device failed.
+    ///
+    /// The blob device sits under `FileReadWriteVolatile` and the FUSE `ZeroCopyWriter`, both of
+    /// which are pinned to `io::Error` by external traits. `source` is whatever came back across
+    /// that pin -- either a raw `Os` error or a `Custom` one still carrying a `StorageError`
+    /// payload -- and `source_errno` sees through both, so an errno raised deeper down (a cache
+    /// `pwrite` hitting `ENOSPC`, say) survives the round trip.
+    #[error("failed to {op} the blob device: {source}")]
+    DeviceIo {
+        /// The operation attempted, e.g. `read`.
+        op: &'static str,
+        /// The error as it came back across the `io::Error` pin.
+        #[source]
+        source: std::io::Error,
     },
     /// A read or write against the local cache failed.
     ///
@@ -144,6 +168,17 @@ impl StorageError {
     /// Build a [`StorageError::CacheIo`] for `op`.
     pub fn cache_io(op: &'static str, source: std::io::Error) -> Self {
         StorageError::CacheIo { op, source }
+    }
+
+    /// Build a [`StorageError::Backend`], boxing the backend error.
+    pub fn backend(source: crate::backend::BackendError) -> Self {
+        StorageError::Backend(Box::new(source))
+    }
+}
+
+impl From<crate::backend::BackendError> for StorageError {
+    fn from(e: crate::backend::BackendError) -> Self {
+        StorageError::backend(e)
     }
 }
 

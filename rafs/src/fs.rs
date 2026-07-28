@@ -17,7 +17,7 @@
 use std::any::Any;
 use std::cmp;
 use std::ffi::{CStr, OsStr, OsString};
-use std::io::Result;
+use std::io::{Error, Result};
 use std::ops::Deref;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
@@ -103,8 +103,8 @@ impl Rafs {
         let (sb, reader) = RafsSuper::load_from_file(metadata_path, cfg.clone(), false)
             .map_err(RafsError::FillSuperBlock)?;
         let blob_infos = sb.superblock.get_blob_infos();
-        let device =
-            BlobDevice::new(cfg, &blob_infos, mountpoint).map_err(RafsError::CreateDevice)?;
+        let device = BlobDevice::new(cfg, &blob_infos, mountpoint)
+            .map_err(|e| RafsError::CreateDevice(e.into()))?;
 
         if cfg.is_chunk_validation_enabled() && sb.meta.has_inlined_chunk_digest() {
             sb.superblock.set_blob_device(device.clone());
@@ -191,7 +191,7 @@ impl Rafs {
                 self.fs_prefetch && !self.stream_prefetch,
                 mountpoint,
             )
-            .map_err(RafsError::SwapBackend)?;
+            .map_err(|e| RafsError::SwapBackend(e.into()))?;
         info!("update device is successful");
 
         Ok(())
@@ -260,7 +260,7 @@ impl Rafs {
             if self.fs_prefetch && !self.stream_prefetch {
                 self.device.stop_prefetch();
             }
-            self.device.close()?;
+            self.device.close().map_err(Error::from)?;
             self.initialized = false;
         }
 
@@ -416,7 +416,9 @@ impl Rafs {
 
     /// for blobfs
     pub fn fetch_range_synchronous(&self, prefetches: &[BlobPrefetchRequest]) -> Result<()> {
-        self.device.fetch_range_synchronous(prefetches)
+        self.device
+            .fetch_range_synchronous(prefetches)
+            .map_err(Error::from)
     }
 
     fn root_ino(&self) -> u64 {
@@ -744,7 +746,7 @@ impl FileSystem for Rafs {
             assert_ne!(io_vec.size(), 0);
 
             // Avoid copying `desc`
-            let r = self.device.read_to(w, io_vec)?;
+            let r = self.device.read_to(w, io_vec).map_err(Error::from)?;
             result += r;
             recorder.mark_success(r);
             if r as u64 != io_vec.size() {

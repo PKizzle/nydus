@@ -11,7 +11,6 @@
 //! garbage-collected! by [BlobFactory::gc()](struct.BlobFactory.html#method.gc) if not used anymore.
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
-use std::io::Result as IOResult;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -45,6 +44,7 @@ use crate::backend::registry;
 use crate::backend::s3;
 use crate::cache::{BlobCache, BlobCacheMgr, DummyCacheMgr, FileCacheMgr};
 use crate::device::BlobInfo;
+use crate::{StorageError, StorageResult};
 
 #[derive(Eq, PartialEq)]
 struct BlobCacheMgrKey {
@@ -148,7 +148,7 @@ impl BlobFactory {
         config: &Arc<ConfigV2>,
         blob_info: &Arc<BlobInfo>,
         id: &str,
-    ) -> IOResult<Arc<dyn BlobCache>> {
+    ) -> StorageResult<Arc<dyn BlobCache>> {
         let backend_cfg = config.get_backend_config()?;
         let cache_cfg = config.get_cache_config()?;
         let user_io_batch_size = config
@@ -163,10 +163,7 @@ impl BlobFactory {
         if let Some(entry) = guard.get(&key).cloned() {
             let _active_guard = entry.pin();
             drop(guard);
-            return entry
-                .mgr
-                .get_blob_cache(blob_info)
-                .map_err(std::io::Error::from);
+            return entry.mgr.get_blob_cache(blob_info);
         }
         let backend = Self::new_backend(backend_cfg, id)?;
         let mgr = match cache_cfg.cache_type.as_str() {
@@ -191,7 +188,7 @@ impl BlobFactory {
         guard.insert(key, entry);
         drop(guard);
 
-        mgr.get_blob_cache(blob_info).map_err(std::io::Error::from)
+        mgr.get_blob_cache(blob_info)
     }
 
     /// Garbage-collect unused blob cache managers and blob caches.
@@ -246,7 +243,7 @@ impl BlobFactory {
         // Underscore-prefixed like `new_backend_from_json`'s params: every use sits in a
         // feature-gated match arm, so with no backend features enabled it is unused.
         _id: &str,
-    ) -> IOResult<Arc<dyn BlobBackend + Send + Sync>> {
+    ) -> StorageResult<Arc<dyn BlobBackend + Send + Sync>> {
         match config.backend_type.as_str() {
             #[cfg(feature = "backend-oss")]
             "oss" => Ok(Arc::new(oss::Oss::new(
@@ -275,7 +272,7 @@ impl BlobFactory {
                 config.get_http_proxy_config()?,
                 Some(_id),
             )?)),
-            _ => Err(einval!(format!(
+            _ => Err(StorageError::InvalidArgument(format!(
                 "unsupported backend type '{}'",
                 config.backend_type
             ))),
@@ -286,39 +283,39 @@ impl BlobFactory {
         backend_type: &str,
         _content: &str,
         _id: &str,
-    ) -> IOResult<Arc<dyn BlobBackend + Send + Sync>> {
+    ) -> StorageResult<Arc<dyn BlobBackend + Send + Sync>> {
         match backend_type {
             #[cfg(feature = "backend-oss")]
             "oss" => {
-                let cfg = serde_json::from_str::<OssConfig>(_content)?;
+                let cfg = parse_backend_json::<OssConfig>(_content)?;
                 Ok(Arc::new(oss::Oss::new(&cfg, Some(_id))?))
             }
             #[cfg(feature = "backend-s3")]
             "s3" => {
-                let cfg = serde_json::from_str::<S3Config>(_content)?;
+                let cfg = parse_backend_json::<S3Config>(_content)?;
                 Ok(Arc::new(s3::S3::new(&cfg, Some(_id))?))
             }
             #[cfg(feature = "backend-registry")]
             "registry" => {
-                let cfg = serde_json::from_str::<RegistryConfig>(_content)?;
+                let cfg = parse_backend_json::<RegistryConfig>(_content)?;
                 Ok(Arc::new(registry::Registry::new(&cfg, Some(_id))?))
             }
             #[cfg(feature = "backend-localfs")]
             "localfs" => {
-                let cfg = serde_json::from_str::<LocalFsConfig>(_content)?;
+                let cfg = parse_backend_json::<LocalFsConfig>(_content)?;
                 Ok(Arc::new(localfs::LocalFs::new(&cfg, Some(_id))?))
             }
             #[cfg(feature = "backend-localdisk")]
             "localdisk" => {
-                let cfg = serde_json::from_str::<LocalDiskConfig>(_content)?;
+                let cfg = parse_backend_json::<LocalDiskConfig>(_content)?;
                 Ok(Arc::new(localdisk::LocalDisk::new(&cfg, Some(_id))?))
             }
             #[cfg(feature = "backend-http-proxy")]
             "http-proxy" => {
-                let cfg = serde_json::from_str::<HttpProxyConfig>(_content)?;
+                let cfg = parse_backend_json::<HttpProxyConfig>(_content)?;
                 Ok(Arc::new(http_proxy::HttpProxy::new(&cfg, Some(_id))?))
             }
-            _ => Err(einval!(format!(
+            _ => Err(StorageError::InvalidArgument(format!(
                 "unsupported backend type '{}'",
                 backend_type
             ))),
@@ -331,6 +328,18 @@ impl BlobFactory {
             entry.mgr.check_stat();
         }
     }
+}
+
+/// Deserialize a backend configuration blob handed to [`BlobFactory::new_backend_from_json`].
+///
+/// The JSON comes from a caller (nydus-image's `--backend-config` and friends), so a parse
+/// failure is a bad argument rather than a storage failure; naming the backend type in the
+/// message is what makes it actionable.
+#[allow(dead_code)]
+fn parse_backend_json<T: serde::de::DeserializeOwned>(content: &str) -> StorageResult<T> {
+    serde_json::from_str(content).map_err(|e| {
+        StorageError::InvalidArgument(format!("failed to parse the backend configuration, {}", e))
+    })
 }
 
 impl Default for BlobFactory {
@@ -451,7 +460,12 @@ mod tests {
             Ok(_) => panic!("unexpected backend creation success"),
         };
 
-        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(
+            matches!(&err, StorageError::InvalidArgument(msg) if msg.contains("unsupported backend type 'unknown'")),
+            "unexpected error: {err}"
+        );
+        // The C API and the FUSE boundary still see EINVAL, as they did when this was `einval!`.
+        assert_eq!(std::io::Error::from(err).kind(), ErrorKind::InvalidInput);
     }
 
     #[test]
@@ -461,7 +475,11 @@ mod tests {
             Ok(_) => panic!("unexpected backend creation success"),
         };
 
-        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(
+            matches!(&err, StorageError::InvalidArgument(msg) if msg.contains("unsupported backend type 'unknown'")),
+            "unexpected error: {err}"
+        );
+        assert_eq!(std::io::Error::from(err).kind(), ErrorKind::InvalidInput);
     }
 
     #[test]

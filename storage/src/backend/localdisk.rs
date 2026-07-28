@@ -358,7 +358,7 @@ impl LocalDisk {
         )))
     }
 
-    fn scan_blobs_by_gpt(&mut self) -> Result<()> {
+    fn scan_blobs_by_gpt(&mut self) -> LocalDiskResult<()> {
         Ok(())
     }
 }

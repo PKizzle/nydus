@@ -662,7 +662,7 @@ impl DataBlob {
                     blob_id
                 ))
             })?;
-            obj.fetch_range_uncompressed(pos, len as u64)
+            Ok(obj.fetch_range_uncompressed(pos, len as u64)?)
         })
         .await
         .resume_unwind()
