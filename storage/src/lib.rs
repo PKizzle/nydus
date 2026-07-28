@@ -41,8 +41,6 @@
 extern crate log;
 #[macro_use]
 extern crate bitflags;
-#[macro_use]
-extern crate nydus_api;
 
 pub mod backend;
 pub mod cache;

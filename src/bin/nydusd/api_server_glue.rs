@@ -16,7 +16,7 @@ use nix::sys::signal::{SIGTERM, kill};
 use nix::unistd::Pid;
 
 use nydus::daemon::NydusDaemon;
-use nydus::{FsBackendMountCmd, FsBackendType, FsBackendUmountCmd, FsService};
+use nydus::{Error, FsBackendMountCmd, FsBackendType, FsBackendUmountCmd, FsService};
 use nydus_api::{
     ApiError, ApiMountCmd, ApiRequest, ApiResponse, ApiResponsePayload, ApiResult, BlobCacheEntry,
     BlobCacheObjectId, Config, ConfigV2, DaemonConf, DaemonErrorKind, MetricsErrorKind,
@@ -556,7 +556,11 @@ impl ApiServerController {
                 let _ = daemon_waker.wake();
                 Ok(())
             })
-            .map_err(|_e| einval!("Failed to start work thread for HTTP handler"))?;
+            .map_err(|e| {
+                Error::StartService(format!(
+                    "failed to start the work thread for the HTTP handler, {e}"
+                ))
+            })?;
 
         self.waker = Some(waker);
         self.http_handler_thread = Some(handler_thread);

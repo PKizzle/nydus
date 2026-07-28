@@ -145,7 +145,11 @@ fn lookup_path(fs: &FileSystemState, path: &str) -> Result<Inode, i32> {
                 for stale in pending_forget {
                     fs.rafs.forget(&ctx, stale, 1);
                 }
-                return Err(e.raw_os_error().unwrap_or(libc::ENOENT));
+                // The RAFS FUSE boundary answers with a raw `Os` error, so `raw_os_error()`
+                // is the real errno. The fallback is `EIO`, not `ENOENT`: an error we cannot
+                // decode is a failure, and reporting it as "no such file" would tell the
+                // caller the path is absent when it may well exist.
+                return Err(e.raw_os_error().unwrap_or(libc::EIO));
             }
         }
     }
@@ -160,7 +164,7 @@ fn lookup_path(fs: &FileSystemState, path: &str) -> Result<Inode, i32> {
         let dot = CString::new(".").map_err(|_| libc::EINVAL)?;
         fs.rafs
             .lookup(&ctx, fs.root_ino, &dot)
-            .map_err(|e| e.raw_os_error().unwrap_or(libc::ENOENT))?;
+            .map_err(|e| e.raw_os_error().unwrap_or(libc::EIO))?;
     }
 
     Ok(ino)
@@ -261,6 +265,13 @@ mod tests {
         let fs = open_file_system();
         let handle = fopen(fs, "/no/such/file");
         assert_eq!(handle, NYDUS_INVALID_FILE_HANDLE as NydusFileHandle);
+        // Not just "some error": the C ABI must report ENOENT specifically. This is what
+        // pins the errno all the way from the RAFS lookup -- if the chain ever loses it, the
+        // `unwrap_or(EIO)` fallback fires and this fails rather than passing silently.
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ENOENT)
+        );
 
         // A partially valid path exercises the error path's reference cleanup: the
         // prefix resolves (taking references), the tail does not. The leak itself is

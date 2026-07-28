@@ -25,7 +25,6 @@ use std::sync::Mutex;
 use anyhow::{Context, Result, anyhow, bail};
 use tar::{Archive, Entry, EntryType, Header};
 
-use nydus_api::enosys;
 use nydus_rafs::metadata::RafsVersion;
 use nydus_rafs::metadata::inode::{InodeWrapper, RafsInodeFlags, RafsV6Inode};
 use nydus_rafs::metadata::layout::RafsXAttrs;
@@ -92,7 +91,12 @@ impl Seek for TarReader {
         match self {
             TarReader::File(f) => f.seek(pos),
             TarReader::BufReaderInfoSeekable(b) => b.seek(pos),
-            _ => Err(enosys!("seek() not supported!")),
+            // `Seek` is pinned to `io::Error` by std, but the message survives here --
+            // the old `enosys!` dropped it and answered a bare ENOSYS.
+            _ => Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "TarReader: seek() is not supported for this reader",
+            )),
         }
     }
 }

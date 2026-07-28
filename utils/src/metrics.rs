@@ -1068,8 +1068,19 @@ mod tests {
         assert!(export_events().is_ok());
     }
 
+    /// Serializes the two tests that share the process-wide `BACKEND_METRICS` map.
+    ///
+    /// `test_backend_metric` asserts on the map's exact contents -- `export_backend_metrics(None)`
+    /// only succeeds when there is exactly one registered backend -- so any other test that
+    /// registers one concurrently makes it fail. It passed standalone and failed roughly one
+    /// workspace run in three, which is the worst way for a test to be wrong.
+    static BACKEND_METRICS_TEST_LOCK: Mutex<()> = Mutex::new(());
+
     #[test]
     fn test_backend_metric() {
+        let _guard = BACKEND_METRICS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let id0: Option<String> = Some("id-0".to_string());
         let id1: Option<String> = Some("id-1".to_string());
         let none: Option<String> = None;
@@ -1149,6 +1160,9 @@ mod tests {
 
     #[test]
     fn test_backend_metrics_error_flag() {
+        let _guard = BACKEND_METRICS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let backend = BackendMetrics::new("test-error-flag-backend", "test");
         let begin = backend.begin();
         backend.end(&begin, 4096, false);

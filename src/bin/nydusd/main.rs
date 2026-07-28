@@ -7,8 +7,6 @@
 
 #[macro_use]
 extern crate log;
-#[macro_use]
-extern crate nydus_api;
 
 // compio's completion I/O is owned-buffer-per-op, so the hot read/write path
 // churns many small heap buffers; mimalloc's thread-local pools cut that
@@ -19,8 +17,8 @@ extern crate nydus_api;
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+use anyhow::{Context, Result, bail};
 use std::convert::TryInto;
-use std::io::{Error, ErrorKind, Result};
 use std::sync::LazyLock;
 
 use clap::{Arg, ArgAction, ArgMatches, Command};
@@ -336,7 +334,7 @@ fn get_max_rlimit_nofile() -> Result<u64> {
     file_max
         .trim()
         .parse::<u64>()
-        .map_err(|_| eother!("invalid content from fs.file-max"))
+        .with_context(|| format!("invalid content from fs.file-max: {:?}", file_max.trim()))
 }
 
 /// Handle command line option to tune rlimit for maximum file descriptor number.
@@ -346,20 +344,13 @@ fn handle_rlimit_nofile_option(args: &ArgMatches, option_name: &str) -> Result<(
         .get_one::<String>(option_name)
         .unwrap()
         .parse()
-        .map_err(|_e| {
-            Error::new(
-                ErrorKind::InvalidInput,
-                "invalid value for option `rlimit-nofile`",
-            )
-        })?;
+        .context("invalid value for option `rlimit-nofile`")?;
 
     if rlimit_nofile != 0 {
         // Ensures there are fds available for other processes so we don't cause resource exhaustion.
         let rlimit_nofile_max = get_max_rlimit_nofile()?;
         if rlimit_nofile_max < 2 * RLIMIT_NOFILE_RESERVED {
-            return Err(eother!(
-                "The fs.file-max sysctl is too low to allow a reasonable number of open files."
-            ));
+            bail!("The fs.file-max sysctl is too low to allow a reasonable number of open files.");
         }
 
         // Reduce max_fds below the system-wide maximum, if necessary.
@@ -573,12 +564,8 @@ fn process_singleton_arguments(
         None => None,
         Some(path) => {
             let config = BlobCacheList::from_file(path)?;
-            let config = serde_json::to_value(config).map_err(|e| {
-                Error::new(
-                    ErrorKind::InvalidInput,
-                    format!("invalid blob cache configuration file: {e}"),
-                )
-            })?;
+            let config =
+                serde_json::to_value(config).context("invalid blob cache configuration file")?;
             Some(config)
         }
     };
@@ -663,7 +650,7 @@ mod nbd {
     ) -> Result<()> {
         let mut entry = if let Some(bootstrap) = args.value_of("bootstrap") {
             let dir = args.value_of("localfs-dir").ok_or_else(|| {
-                einval!("option `-D/--localfs-dir` is required by `--boootstrap`")
+                anyhow!("option `-D/--localfs-dir` is required by `--boootstrap`")
             })?;
             let config = r#"
             {
@@ -695,19 +682,13 @@ mod nbd {
         } else if let Some(v) = args.value_of("config") {
             BlobCacheEntry::from_file(v)?
         } else {
-            return Err(einval!(
-                "both option `-C/--config` and `-B/--bootstrap` are missing"
-            ));
+            bail!("both option `-C/--config` and `-B/--bootstrap` are missing");
         };
         if !entry.prepare_configuration_info() {
-            return Err(einval!(
-                "invalid blob cache entry configuration information"
-            ));
+            bail!("invalid blob cache entry configuration information");
         }
         if !entry.validate() {
-            return Err(einval!(
-                "invalid blob cache entry configuration information"
-            ));
+            bail!("invalid blob cache entry configuration information");
         }
 
         // Safe to unwrap because `DEVICE` is mandatory option.
@@ -806,22 +787,18 @@ mod uffd {
                 cfg.update_registry_auth_info(&Some(auth));
             }
 
-            let backend = cfg.backend.clone().ok_or_else(|| {
-                Error::new(ErrorKind::InvalidInput, "missing backend in ConfigV2")
-            })?;
+            let backend = cfg
+                .backend
+                .clone()
+                .ok_or_else(|| anyhow!("missing backend in ConfigV2"))?;
             let cache = cfg
                 .cache
                 .clone()
-                .ok_or_else(|| Error::new(ErrorKind::InvalidInput, "missing cache in ConfigV2"))?;
+                .ok_or_else(|| anyhow!("missing cache in ConfigV2"))?;
             let bootstrap = args
                 .value_of("bootstrap")
                 .map(|s| s.to_string())
-                .ok_or_else(|| {
-                    Error::new(
-                        ErrorKind::InvalidInput,
-                        "option `-B/--bootstrap` is required with `--config`",
-                    )
-                })?;
+                .ok_or_else(|| anyhow!("option `-B/--bootstrap` is required with `--config`"))?;
             let entry_json = serde_json::json!({
                 "type": "bootstrap",
                 "id": "disk-default",
@@ -839,7 +816,7 @@ mod uffd {
         } else if let Some(bootstrap) = args.value_of("bootstrap") {
             let dir = args
                 .value_of("localfs-dir")
-                .ok_or_else(|| einval!("option `-D/--localfs-dir` is required by `--bootstrap`"))?;
+                .ok_or_else(|| anyhow!("option `-D/--localfs-dir` is required by `--bootstrap`"))?;
             let config = r#"
             {
                 "type": "bootstrap",
@@ -868,19 +845,13 @@ mod uffd {
                 .replace("META_FILE_PATH", bootstrap);
             BlobCacheEntry::from_str(&config)?
         } else {
-            return Err(einval!(
-                "both option `-C/--config` and `-B/--bootstrap` are missing"
-            ));
+            bail!("both option `-C/--config` and `-B/--bootstrap` are missing");
         };
         if !entry.prepare_configuration_info() {
-            return Err(einval!(
-                "invalid blob cache entry configuration information"
-            ));
+            bail!("invalid blob cache entry configuration information");
         }
         if !entry.validate() {
-            return Err(einval!(
-                "invalid blob cache entry configuration information"
-            ));
+            bail!("invalid blob cache entry configuration information");
         }
 
         // Safe to unwrap because `sock` is mandatory option.
@@ -939,7 +910,7 @@ fn main() -> Result<()> {
         .get_one::<String>("log-rotation-size")
         .unwrap()
         .parse::<u64>()
-        .map_err(|e| einval!(format!("Invalid log rotation size: {}", e)))?;
+        .context("Invalid log rotation size")?;
 
     setup_logging(logging_file, level, rotation_size)?;
 
@@ -952,7 +923,8 @@ fn main() -> Result<()> {
 
     #[cfg(feature = "dedup")]
     if let Some(db) = args.get_one::<String>("dedup-db") {
-        let mgr = CasMgr::new(db).map_err(|e| eother!(format!("{}", e)))?;
+        let mgr =
+            CasMgr::new(db).with_context(|| format!("failed to open the dedup database {db}"))?;
         info!("Enable chunk deduplication by using database at {}", db);
         CasMgr::set_singleton(mgr);
     }

@@ -37,7 +37,10 @@ pub fn readv(fd: RawFd, iovec: &mut [IoSliceMut], offset: u64) -> io::Result<usi
     // SAFETY: callers pass a live fd and this borrowed fd is used only during each preadv call.
     let fd = unsafe { BorrowedFd::borrow_raw(fd) };
     loop {
-        match preadv(fd, iovec, offset as off64_t).map_err(|_| last_error!()) {
+        // `map_err(std::io::Error::from)`, not the old `last_error!()`: nix hands back the
+        // `Errno` it observed, while `last_error!()` threw it away and re-read the
+        // thread-local `errno`, which any intervening libc call may already have clobbered.
+        match preadv(fd, iovec, offset as off64_t).map_err(std::io::Error::from) {
             Ok(ret) => return Ok(ret),
             // Retry if the IO is interrupted by signal.
             Err(err) if err.kind() != ErrorKind::Interrupted => return Err(err),

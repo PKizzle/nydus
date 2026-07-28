@@ -73,6 +73,12 @@ impl SnapshotterError {
         )))
     }
 
+    fn unavailable(message: impl Into<String>) -> Self {
+        Self(Box::new(snapshots::tonic::Status::unavailable(
+            message.into(),
+        )))
+    }
+
     fn status_label(&self) -> &'static str {
         match self.0.code() {
             snapshots::tonic::Code::Ok => "ok",
@@ -100,6 +106,38 @@ impl From<SnapshotterError> for snapshots::tonic::Status {
     fn from(error: SnapshotterError) -> Self {
         *error.0
     }
+}
+
+/// Map an internal failure onto a gRPC status, keeping the class of error where we know it.
+///
+/// Every one of these used to be `grpc_error(&e)`, which told
+/// containerd two untruths at once: that a missing snapshot was an internal server fault, and
+/// -- because `to_string()` on an `anyhow::Error` renders only the outermost context -- that
+/// the cause was whatever the last `.context()` said. containerd retries `Unavailable` and
+/// gives up on `Internal`, so the distinction changes its behaviour, not just its logs.
+///
+/// The daemon's own errors reach here inside an `anyhow` chain, so the root is recovered by
+/// downcast; anything we cannot classify still becomes `internal`, now with the full chain.
+fn grpc_error(e: &anyhow::Error) -> SnapshotterError {
+    let message = format!("{:#}", e);
+    for cause in e.chain() {
+        if let Some(svc) = cause.downcast_ref::<nydus_service::Error>() {
+            return match svc {
+                nydus_service::Error::NotFound => SnapshotterError::not_found(message),
+                nydus_service::Error::AlreadyExists => SnapshotterError::already_exists(message),
+                nydus_service::Error::InvalidArguments(_)
+                | nydus_service::Error::InvalidConfig(_)
+                | nydus_service::Error::InvalidPrefetchList => {
+                    SnapshotterError::invalid_argument(message)
+                }
+                nydus_service::Error::Busy(_) | nydus_service::Error::NotReady => {
+                    SnapshotterError::unavailable(message)
+                }
+                _ => SnapshotterError::internal(message),
+            };
+        }
+    }
+    SnapshotterError::internal(message)
 }
 
 /// Convert a store `SnapshotInfo` to the containerd `Info` type.
@@ -399,7 +437,7 @@ impl NydusSnapshotter {
         let meta = self
             .overlay
             .nydus_meta_info(store, parent, call_labels)
-            .map_err(|e| SnapshotterError::internal(e.to_string()))?;
+            .map_err(|e| grpc_error(&e))?;
         let Some(meta) = meta else {
             return Ok(None);
         };
@@ -412,7 +450,7 @@ impl NydusSnapshotter {
             .await
             .map_err(|e| {
                 warn!(image_ref = %meta.image_ref, error = %e, "failed to start nydus daemon");
-                SnapshotterError::internal(e.to_string())
+                grpc_error(&e)
             })?;
         let mountpoint = handle.mountpoint().to_path_buf();
         Ok(Some((meta, mountpoint)))
@@ -602,12 +640,12 @@ impl snapshots::Snapshotter for NydusSnapshotter {
             let labels: Vec<(String, String)> = new_labels.into_iter().collect();
             store.update(&info.name, &labels).map_err(|e| {
                 warn!(name = %info.name, error = %e, "update snapshot failed");
-                SnapshotterError::internal(e.to_string())
+                grpc_error(&e)
             })?;
             // Re-fetch the updated info (with the bumped updated_at the store sets).
             store.stat(&info.name).map(info_to_snapshots).map_err(|e| {
                 warn!(name = %info.name, error = %e, "stat updated snapshot failed");
-                SnapshotterError::internal(e.to_string())
+                grpc_error(&e)
             })
         }
         .await;
@@ -628,7 +666,7 @@ impl snapshots::Snapshotter for NydusSnapshotter {
                 .await
                 .map_err(|e| {
                     warn!(key, error = %e, "usage snapshot failed");
-                    SnapshotterError::internal(e.to_string())
+                    grpc_error(&e)
                 })?;
             Ok(Usage { inodes, size })
         }
@@ -655,7 +693,7 @@ impl snapshots::Snapshotter for NydusSnapshotter {
 
             self.overlay.mounts(store, &key).map_err(|e| {
                 warn!(key, error = %e, "mounts snapshot failed");
-                SnapshotterError::internal(e.to_string())
+                grpc_error(&e)
             })
         }
         .await;
@@ -683,7 +721,7 @@ impl snapshots::Snapshotter for NydusSnapshotter {
                 .prepare(store, &key, &parent, &labels)
                 .map_err(|e| {
                     warn!(key, parent, error = %e, "prepare snapshot failed");
-                    SnapshotterError::internal(e.to_string())
+                    grpc_error(&e)
                 })?;
 
             match outcome {
@@ -963,7 +1001,7 @@ impl snapshots::Snapshotter for NydusSnapshotter {
                 })
                 .map_err(|e| {
                     warn!(key, parent, error = %e, "view snapshot failed");
-                    SnapshotterError::internal(e.to_string())
+                    grpc_error(&e)
                 })?;
 
             if let Some((_, daemon_mnt)) = self.resolve_nydus_mount(&parent, &labels, &key).await? {
@@ -991,7 +1029,7 @@ impl snapshots::Snapshotter for NydusSnapshotter {
                 .inspect(|_| debug!(name, key, "committed snapshot"))
                 .map_err(|e| {
                     warn!(name, key, error = %e, "commit snapshot failed");
-                    SnapshotterError::internal(e.to_string())
+                    grpc_error(&e)
                 })
         }
         .await;
@@ -1045,7 +1083,7 @@ impl snapshots::Snapshotter for NydusSnapshotter {
                     .inspect(|_| debug!(key, "removed snapshot"))
                     .map_err(|e| {
                         warn!(key, error = %e, "remove snapshot failed");
-                        SnapshotterError::internal(e.to_string())
+                        grpc_error(&e)
                     })?;
             }
             for image_ref in release_target.iter().chain(
@@ -1098,7 +1136,7 @@ impl snapshots::Snapshotter for NydusSnapshotter {
 
             let snapshots = store
                 .list()
-                .map_err(|e| SnapshotterError::internal(e.to_string()))?
+                .map_err(|e| grpc_error(&e))?
                 .into_iter()
                 .filter(move |info| match &exprs {
                     Some(exprs) => snapshot_matches(info, exprs),
@@ -1121,7 +1159,7 @@ impl snapshots::Snapshotter for NydusSnapshotter {
             info!("cleanup RPC: running one-shot reconciler pass");
             self.reconciler.run_once().await.map_err(|e| {
                 warn!(error = %e, "cleanup reconciler pass failed");
-                SnapshotterError::internal(e.to_string())
+                grpc_error(&e)
             })
         }
         .await;

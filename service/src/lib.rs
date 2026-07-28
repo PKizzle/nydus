@@ -346,7 +346,7 @@ mod blob_cache {
             BlobCacheMgr {}
         }
 
-        pub fn add_blob_list(&self, _blobs: &nydus_api::BlobCacheList) -> io::Result<()> {
+        pub fn add_blob_list(&self, _blobs: &nydus_api::BlobCacheList) -> Result<()> {
             unimplemented!()
         }
 

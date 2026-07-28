@@ -4,8 +4,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::env::current_dir;
-use std::io::Result;
 use std::path::PathBuf;
+
+use anyhow::{Context, Result, anyhow};
 
 use flexi_logger::{
     self, Cleanup, Criterion, DeferredNow, FileSpec, Logger, Naming,
@@ -106,23 +107,16 @@ pub fn setup_logging(
         // https://github.com/emabee/flexi_logger/issues/74
         let basename = path
             .file_stem()
-            .ok_or_else(|| {
-                eprintln!("invalid file name input {:?}", path);
-                einval!()
-            })?
+            .ok_or_else(|| anyhow!("log file path {:?} has no file name", path))?
             .to_str()
-            .ok_or_else(|| {
-                eprintln!("invalid file name input {:?}", path);
-                einval!()
-            })?;
+            .ok_or_else(|| anyhow!("log file name {:?} is not valid UTF-8", path))?;
         spec = spec.basename(basename);
 
         // `flexi_logger` automatically add `.log` suffix if the file name has no extension.
         if let Some(suffix) = path.extension() {
-            let suffix = suffix.to_str().ok_or_else(|| {
-                eprintln!("invalid file extension {:?}", suffix);
-                einval!()
-            })?;
+            let suffix = suffix
+                .to_str()
+                .ok_or_else(|| anyhow!("log file extension {:?} is not valid UTF-8", suffix))?;
             spec = spec.suffix(suffix);
         }
 
@@ -142,7 +136,7 @@ pub fn setup_logging(
         // So we set `flexi_logger` log level to "trace" which is High enough. Otherwise, we
         // can't change log level to a higher level than what is passed to `flexi_logger`.
         let mut logger = Logger::try_with_env_or_str("trace")
-            .map_err(|_e| enosys!())?
+            .context("failed to build the file logger")?
             .log_to_file(spec)
             .append()
             .panic_if_error_channel_is_broken(false)
@@ -158,20 +152,17 @@ pub fn setup_logging(
             );
         }
 
-        logger.start().map_err(|e| {
-            eprintln!("{:?}", e);
-            eother!(e)
-        })?;
+        logger.start().context("failed to start the file logger")?;
     } else {
         // We rely on rust `log` macro to limit current log level rather than `flexi_logger`
         // So we set `flexi_logger` log level to "trace" which is High enough. Otherwise, we
         // can't change log level to a higher level than what is passed to `flexi_logger`.
         Logger::try_with_env_or_str("trace")
-            .map_err(|_e| enosys!())?
+            .context("failed to build the console logger")?
             .panic_if_error_channel_is_broken(false)
             .format(colored_opt_format)
             .start()
-            .map_err(|e| eother!(e))?;
+            .context("failed to start the console logger")?;
     }
 
     log::set_max_level(level);

@@ -346,7 +346,7 @@ where
             .lock()
             .unwrap()
             .wait()
-            .map_err(|e| Error::WaitDaemon(eother!(e)))
+            .map_err(|e| Error::WaitDaemon(e.into()))
     }
 
     fn supervisor(&self) -> Option<String> {
@@ -417,12 +417,8 @@ pub fn create_virtiofs_daemon(
     if let Some(cmd) = mount_cmd {
         daemon.service.mount(cmd)?;
     }
-    daemon
-        .on_event(DaemonStateMachineInput::Mount)
-        .map_err(|e| eother!(e))?;
-    daemon
-        .on_event(DaemonStateMachineInput::Start)
-        .map_err(|e| eother!(e))?;
+    daemon.on_event(DaemonStateMachineInput::Mount)?;
+    daemon.on_event(DaemonStateMachineInput::Start)?;
 
     Ok(daemon)
 }
