@@ -16,6 +16,7 @@ use std::str::FromStr;
 use nydus_api::{BlobCacheEntry, ConfigV2};
 use nydus_upgrade::backend::unix_domain_socket::UdsStorageBackend;
 use nydus_upgrade::backend::{StorageBackend, StorageBackendErr};
+use nydus_upgrade::persist::PersistError;
 
 use crate::fs_service::{FsBackendMountCmd, FsBackendUmountCmd};
 use crate::{Error, Result};
@@ -30,15 +31,15 @@ pub enum UpgradeMgrError {
     MissingSupervisorPath,
 
     #[error("failed to save/restore data via the backend, {0}")]
-    StorageBackendError(StorageBackendErr),
+    StorageBackendError(#[source] StorageBackendErr),
     #[error("failed to serialize, {0}")]
-    Serialize(io::Error),
+    Serialize(#[source] PersistError),
     #[error("failed to deserialize, {0}")]
-    Deserialize(io::Error),
+    Deserialize(#[source] PersistError),
     #[error("failed to clone file, {0}")]
-    CloneFile(io::Error),
+    CloneFile(#[source] io::Error),
     #[error("failed to initialize fanotify driver, {0}")]
-    InitializeFanotify(io::Error),
+    InitializeFanotify(#[source] io::Error),
 }
 
 impl From<UpgradeMgrError> for Error {
@@ -226,8 +227,7 @@ impl UpgradeManager {
 
     pub fn save_vfs_stat(&mut self, vfs: &Vfs) -> Result<()> {
         let vfs_state_data = vfs.save_to_bytes().map_err(|e| {
-            let io_err = io::Error::other(format!("Failed to save vfs state: {:?}", e));
-            UpgradeMgrError::Serialize(io_err)
+            UpgradeMgrError::Serialize(PersistError::Save(format!("vfs state: {:?}", e)))
         })?;
         self.fuse_deamon_stat.vfs_state_data = vfs_state_data;
         Ok(())

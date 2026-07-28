@@ -10,7 +10,7 @@ use std::{
 
 use sendfd::{RecvWithFd, SendWithFd};
 
-use super::{Result, StorageBackend, StorageBackendErr};
+use super::{StorageBackend, StorageBackendErr, StorageBackendResult};
 
 pub struct UdsStorageBackend {
     socket_path: PathBuf,
@@ -38,7 +38,7 @@ fn read_remaining<R: Read>(reader: &mut R, data: &mut Vec<u8>) -> std::io::Resul
 }
 
 impl StorageBackend for UdsStorageBackend {
-    fn save(&mut self, fds: &[RawFd], data: &[u8]) -> Result<usize> {
+    fn save(&mut self, fds: &[RawFd], data: &[u8]) -> StorageBackendResult<usize> {
         if fds.is_empty() {
             return Err(StorageBackendErr::NoEnoughFds);
         }
@@ -53,7 +53,7 @@ impl StorageBackend for UdsStorageBackend {
         Ok(data.len())
     }
 
-    fn restore(&mut self) -> Result<(Vec<RawFd>, Vec<u8>)> {
+    fn restore(&mut self) -> StorageBackendResult<(Vec<RawFd>, Vec<u8>)> {
         let mut data = vec![0u8; MAX_STATE_DATA_LENGTH];
         let mut fds = vec![0i32; 16];
         let mut socket =

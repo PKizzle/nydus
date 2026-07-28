@@ -9,26 +9,31 @@ pub mod unix_domain_socket;
 #[derive(thiserror::Error, Debug)]
 pub enum StorageBackendErr {
     #[error("failed to create UnixStream, {0}")]
-    CreateUnixStream(io::Error),
+    CreateUnixStream(#[source] io::Error),
     #[error("failed to send fd over UnixStream, {0}")]
-    SendFd(io::Error),
+    SendFd(#[source] io::Error),
     #[error("failed to receive fd over UnixStream, {0}")]
-    RecvFd(io::Error),
+    RecvFd(#[source] io::Error),
     #[error("no enough fds")]
     NoEnoughFds,
 }
 
-pub type Result<T> = std::result::Result<T, StorageBackendErr>;
+/// Specialized `Result` for the hot-upgrade state backends.
+///
+/// Deliberately not named `Result`: a module-level alias of that name shadows
+/// `std::result::Result` for every item in the file, so a signature reading `Result<T>` says
+/// nothing about which error it carries.
+pub type StorageBackendResult<T> = std::result::Result<T, StorageBackendErr>;
 
 /// StorageBackend trait is used to save and restore the dev fds and daemon state data for online upgrade.
 pub trait StorageBackend: Send + Sync {
     /// Save the dev fds and daemon state data for online upgrade.
     /// Returns the length of bytes of state data.
-    fn save(&mut self, fds: &[RawFd], data: &[u8]) -> Result<usize>;
+    fn save(&mut self, fds: &[RawFd], data: &[u8]) -> StorageBackendResult<usize>;
 
     /// Restore the dev fds and daemon state data for online upgrade.
     /// Returns the fds and state data
-    fn restore(&mut self) -> Result<(Vec<RawFd>, Vec<u8>)>;
+    fn restore(&mut self) -> StorageBackendResult<(Vec<RawFd>, Vec<u8>)>;
 }
 
 #[cfg(test)]
@@ -38,7 +43,7 @@ mod test {
     fn test_storage_backend() {
         use std::os::fd::RawFd;
 
-        use crate::backend::{Result, StorageBackend};
+        use crate::backend::{StorageBackend, StorageBackendResult};
 
         #[derive(Default)]
         struct TestStorageBackend {
@@ -47,7 +52,7 @@ mod test {
         }
 
         impl StorageBackend for TestStorageBackend {
-            fn save(&mut self, fds: &[RawFd], data: &[u8]) -> Result<usize> {
+            fn save(&mut self, fds: &[RawFd], data: &[u8]) -> StorageBackendResult<usize> {
                 self.fds = Vec::new();
                 fds.iter().for_each(|fd| self.fds.push(*fd));
 
@@ -57,7 +62,7 @@ mod test {
                 Ok(self.data.len())
             }
 
-            fn restore(&mut self) -> Result<(Vec<RawFd>, Vec<u8>)> {
+            fn restore(&mut self) -> StorageBackendResult<(Vec<RawFd>, Vec<u8>)> {
                 Ok((self.fds.clone(), self.data.clone()))
             }
         }

@@ -3,7 +3,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::fmt::Debug;
-use std::io::{Error as IoError, Result};
 use std::{any::TypeId, collections::HashMap};
 
 use dbs_snapshot::Snapshot;
@@ -11,6 +10,24 @@ use versionize::{VersionMap, Versionize};
 
 /// A list of versions.
 type Versions = Vec<HashMap<TypeId, u16>>;
+
+/// Error codes for snapshotting daemon state across a hot upgrade.
+///
+/// `dbs_snapshot`'s error type does not implement `std::error::Error`, so it cannot be a
+/// `#[source]`; its `Debug` rendering is carried in the message instead -- which is what the
+/// previous `io::Error::other(format!("...{:?}", e))` did, minus the `io::Error` in the middle.
+#[derive(Debug, thiserror::Error)]
+pub enum PersistError {
+    /// The state could not be serialized into a snapshot.
+    #[error("Failed to save snapshot: {0}")]
+    Save(String),
+    /// The snapshot could not be deserialized back into state.
+    #[error("Failed to load snapshot: {0}")]
+    Restore(String),
+}
+
+/// Specialized `Result` for state snapshotting.
+pub type PersistResult<T> = std::result::Result<T, PersistError>;
 
 /// A trait for snapshotting.
 /// This trait is used to save and restore a struct
@@ -41,21 +58,21 @@ pub trait Snapshotter: Versionize + Sized + Debug {
     }
 
     /// Saves the struct to a `Vec<u8>`.
-    fn save(&self) -> Result<Vec<u8>> {
+    fn save(&self) -> PersistResult<Vec<u8>> {
         let mut buf = Vec::new();
         let mut snapshot = Self::new_snapshot();
         snapshot
             .save(&mut buf, self)
-            .map_err(|e| IoError::other(format!("Failed to save snapshot: {:?}", e)))?;
+            .map_err(|e| PersistError::Save(format!("{:?}", e)))?;
 
         Ok(buf)
     }
 
     /// Restores the struct from a `Vec<u8>`.
-    fn restore(buf: &mut Vec<u8>) -> Result<Self> {
+    fn restore(buf: &mut Vec<u8>) -> PersistResult<Self> {
         match Snapshot::load(&mut buf.as_slice(), buf.len(), Self::new_version_map()) {
             Ok((o, _)) => Ok(o),
-            Err(e) => Err(IoError::other(format!("Failed to load snapshot: {:?}", e))),
+            Err(e) => Err(PersistError::Restore(format!("{:?}", e))),
         }
     }
 }
