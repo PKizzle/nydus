@@ -11,8 +11,12 @@
 #                         the group fd, wrote responses back, and pwrite(2)'d into the blob
 #                         cache file. Byte-comparison alone cannot distinguish "the daemon
 #                         served this" from "the data happened to already be there".
+#   C13 ENOSPC end-to-end — with a healthy backend but a full cache filesystem, a cold read
+#                         must fail with ENOSPC, not EIO. Unit tests pin the errno's whole
+#                         journey up our own call stack; only a real disk can show whether
+#                         the kernel delivers it to read(2) through FAN_DENY_ERRNO.
 #
-# Both cases are adapted from upstream v3's tests/integration/fanotify_test.go (caseFailClosed,
+# C11 and C12 are adapted from upstream v3's tests/integration/fanotify_test.go (caseFailClosed,
 # caseStraceGroundTruth); see docs/upstream-v3-evaluation.md.
 set -u
 
@@ -211,6 +215,171 @@ else
     grep -qE "pwrite64\([0-9]+<[^>]*${BLOB}\.blob\.data>.*\)[[:space:]]*=[[:space:]]*[1-9]" "$STRACE_LOG" \
       && case_pass "C12: fetched bytes pwrite(2)'d into the blob cache file" \
       || case_fail "C12: no successful pwrite64() into ${BLOB}.blob.data"
+  fi
+fi
+
+# ===========================================================================
+# C13 — a full cache filesystem is answered with FAN_DENY_ERRNO(ENOSPC)
+# ===========================================================================
+# Unit tests pin the errno's whole journey up our own call stack: a cache `pwrite` failing
+# with ENOSPC becomes StorageError::CacheIo, travels up through the typed errors, and
+# `deny_errno_for` recovers ENOSPC from the chain (storage/src/cache/cachedfile.rs,
+# service/src/fanotify.rs, rafs/src/lib.rs). What they cannot reach is a real full disk, so
+# this case starves one and checks two separate things:
+#
+#   1. the read fails CLOSED — no hang, no zero-filled holes. This is the property callers
+#      actually depend on, and it holds whatever errno comes out.
+#   2. the daemon answered the permission event with FAN_DENY_ERRNO(ENOSPC) on the wire.
+#      That is the boundary we own, and the last point at which the errno is ours to get
+#      right; asserting the response bytes rather than a log line proves what reached the
+#      kernel, not what we meant to send.
+#
+# What the READER sees is reported, not asserted, and it is worth knowing why. Measured on
+# Linux 7.0.11 (2026-07-28): responding FAN_DENY_ERRNO(ENOSPC) to a process reading the
+# marked file DIRECTLY delivers ENOSPC to its read(2) — likewise EDQUOT — so the kernel
+# mechanism works exactly as this code assumes. Through the EROFS mount it arrives as EIO:
+# EROFS pulls the marked backing file through the page cache and the outer read only learns
+# that the folio is not uptodate, which is EIO. The errno is lost in EROFS, above anything
+# nydus controls. Assert the half we own; report the half we do not.
+#
+# Unlike C11 the backend here is HEALTHY: the fetch succeeds and the only operation that
+# can fail is the cache write, so the failure is unambiguously the disk-full path.
+step "C13: disk-full answered with FAN_DENY_ERRNO(ENOSPC)"
+
+teardown
+
+LOOP_IMG="$ROOT/c13.ext4"
+LOOP_MNT="$ROOT/loop-c13"
+STAGE_C13="$LOOP_MNT/stage"
+# `struct fanotify_response { __s32 fd; __u32 response; }`. FAN_DENY_ERRNO(ENOSPC) is
+# FAN_DENY | (28 << 24) == 0x1c000002, which strace renders little-endian as these four
+# bytes after the (variable) event fd. Matched as a fixed string — every byte is
+# non-printable, so strace's escaping of it is stable.
+DENY_ENOSPC_BYTES='\2\0\0\34", 8)'
+
+c13_cleanup() {
+  sudo umount "$LOOP_MNT" 2>/dev/null
+  rm -f "$LOOP_IMG"
+}
+
+if ! command -v mkfs.ext4 >/dev/null; then
+  note "SKIP: mkfs.ext4 not installed"
+else
+  # A small, private ext4 so exhausting it cannot touch anything outside this case.
+  # It must be a real ext4 for two independent reasons: tmpfs has no pre-content marks,
+  # and only a filesystem we own can be filled to genuine exhaustion.
+  rm -rf "$LOOP_MNT"; mkdir -p "$LOOP_MNT"
+  dd if=/dev/zero of="$LOOP_IMG" bs=1M count=32 status=none
+  mkfs.ext4 -q -F "$LOOP_IMG"
+
+  if ! sudo mount -o loop "$LOOP_IMG" "$LOOP_MNT" 2>"$ROOT/c13.mount.err"; then
+    note "SKIP: cannot mount a loopback ext4: $(head -1 "$ROOT/c13.mount.err")"
+    c13_cleanup
+  else
+    sudo mkdir -p "$STAGE_C13"
+    sudo cp "$ROOT/out/bootstrap" "$STAGE_C13/bootstrap"
+    cp "$ROOT/out/$BLOB" "$ROOT/backend/$BLOB"
+
+    write_config "$STAGE_C13" \
+      "\"backend_type\": \"localfs\",
+      \"backend_config\": { \"dir\": \"$ROOT/backend\" }"
+
+    # -y so the fanotify group fd is identifiable; without strace the case still runs and
+    # checks fail-closed, it just cannot see the response bytes.
+    if command -v strace >/dev/null; then
+      C13_STRACE="$ROOT/strace-c13.log"
+      sudo strace -f -y -o "$C13_STRACE" -e trace=write \
+        "$ND" singleton --config "$ROOT/config.json" \
+        --fanotify "$STAGE_C13" --fanotify-mountpoint "$ROOT/mnt" --fanotify-threads 2 \
+        --log-level info > "$ROOT/nydusd-c13.log" 2>&1 &
+    else
+      C13_STRACE=""
+      sudo "$ND" singleton --config "$ROOT/config.json" \
+        --fanotify "$STAGE_C13" --fanotify-mountpoint "$ROOT/mnt" --fanotify-threads 2 \
+        --log-level info > "$ROOT/nydusd-c13.log" 2>&1 &
+    fi
+    sleep 6
+
+    if ! mount | grep -qi "on $ROOT/mnt .*erofs"; then
+      echo "--- nydusd-c13.log ---"; tail -40 "$ROOT/nydusd-c13.log"
+      case_fail "C13: EROFS not mounted"
+      c13_cleanup
+    else
+      # Exhaust the filesystem only NOW, after the device files are staged and the mount
+      # is armed, so setup succeeds and the one remaining operation that needs a fresh
+      # block is the cache pwrite. The blob cache file is sized with ftruncate
+      # (storage/src/cache/filecache/mod.rs), so it is sparse — every fetched chunk
+      # allocates. conv=fsync forces ext4's delayed allocation to settle before we read,
+      # otherwise the balloon's blocks are still only reserved and the disk is not
+      # actually full yet.
+      sudo dd if=/dev/zero of="$LOOP_MNT/balloon" bs=1M conv=fsync status=none 2>/dev/null
+      sudo dd if=/dev/zero of="$LOOP_MNT/balloon.tail" bs=4096 conv=fsync status=none 2>/dev/null
+      avail=$(df --output=avail -k "$LOOP_MNT" | tail -1 | tr -d ' ')
+      note "cache fs free after balloon: ${avail} KiB"
+      [ "${avail:-1}" -le 8 ] || note "WARNING: ${avail} KiB still free — the cache write may not fail at all"
+
+      # A cold read of a range that has never been fetched, against a working backend
+      # and a full cache disk. dd renders the failing read's errno via strerror, which is
+      # what lets us tell ENOSPC from EIO without a helper binary.
+      timeout 30 dd if="$ROOT/mnt/hello.txt" of="$ROOT/c13.out" bs=4096 count=16 \
+        2>"$ROOT/c13.err"
+      rc=$?
+      errmsg=$(sed -n 's/^dd: error reading [^:]*: //p' "$ROOT/c13.err" | head -1)
+      note "read exit status = $rc, error = ${errmsg:-<none>}"
+
+      # --- (1) fail closed: asserted, and independent of which errno comes out ---------
+      if [ "$rc" = 124 ]; then
+        case_fail "C13: read HUNG on a full cache disk (must fail closed, not block forever)"
+      elif [ "$rc" = 0 ]; then
+        nonzero=$(LC_ALL=C tr -d '\0' < "$ROOT/c13.out" | wc -c | tr -d ' ')
+        if [ "$nonzero" = 0 ]; then
+          case_fail "C13: read returned ZEROS — unfetched sparse holes leaked to the caller"
+        else
+          # Not a pass: the range was served from cache, so the disk-full path was never
+          # taken and the case proved nothing.
+          case_fail "C13: read SUCCEEDED — the range was already cached before the balloon; case inconclusive"
+        fi
+      else
+        case_pass "C13: read failed closed on a full cache disk (exit $rc, ${errmsg:-<none>})"
+      fi
+
+      # --- (2) the boundary we own: what the daemon actually put on the wire -----------
+      sleep 1
+      teardown   # flush strace output
+      if [ -z "$C13_STRACE" ]; then
+        note "SKIP the on-wire check: strace not installed"
+      elif grep -qF "$DENY_ENOSPC_BYTES" "$C13_STRACE"; then
+        case_pass "C13: daemon answered FAN_DENY_ERRNO(ENOSPC) — errno intact to the kernel"
+      else
+        case_fail "C13: daemon did NOT answer FAN_DENY_ERRNO(ENOSPC); the errno was lost inside nydus"
+        note "responses actually written to the fanotify group fd:"
+        grep -E 'write\([0-9]+<anon_inode:\[fanotify\]>' "$C13_STRACE" \
+          | sed 's/.*write(/write(/' | sort | uniq -c | head -5
+        note "and the daemon's own view of the failure:"
+        grep -i 'no space\|enospc\|failed to serve' "$ROOT/nydusd-c13.log" | tail -3
+      fi
+
+      # --- (3) what the reader saw: reported, because it is not ours to control --------
+      case "$errmsg" in
+        "No space left on device")
+          note "reader saw ENOSPC — EROFS now propagates the fanotify errno on this kernel" ;;
+        "Input/output error")
+          note "reader saw EIO — expected: EROFS flattens the denial errno of its backing file" ;;
+        *)
+          note "reader saw an unexpected error: ${errmsg:-<none>}" ;;
+      esac
+
+      # Whatever the errno, no unfetched byte may ever be observable.
+      if [ -s "$ROOT/c13.out" ]; then
+        zeros=$(LC_ALL=C tr -d '\0' < "$ROOT/c13.out" | wc -c | tr -d ' ')
+        [ "$zeros" -gt 0 ] \
+          && case_pass "C13: the bytes dd did get before the error were real, not holes" \
+          || case_fail "C13: dd received $(stat -c%s "$ROOT/c13.out") bytes of ZEROS before the error"
+      fi
+
+      echo "--- nydusd-c13.log (tail) ---"; tail -15 "$ROOT/nydusd-c13.log"
+      c13_cleanup   # the daemon is already down: teardown ran to flush strace
+    fi
   fi
 fi
 
