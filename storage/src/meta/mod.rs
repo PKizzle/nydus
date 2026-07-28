@@ -86,6 +86,10 @@ pub enum MetaError {
     #[error("{0}")]
     Backend(String),
 
+    /// The configuration needed to reach the metadata is missing or unusable.
+    #[error("{0}")]
+    Config(#[from] nydus_api::ConfigError),
+
     /// A filesystem operation on the metadata file failed.
     ///
     /// The OS error is kept as the source rather than folded into the message, so
@@ -123,6 +127,8 @@ impl From<MetaError> for io::Error {
             | MetaError::InvalidRange(_)
             | MetaError::IndexOutOfRange { .. } => io::ErrorKind::InvalidInput,
             MetaError::Corrupted(_) | MetaError::Backend(_) => io::ErrorKind::Other,
+            // Defer to the config layer's own mapping rather than second-guessing it.
+            MetaError::Config(_) => io::ErrorKind::InvalidData,
         };
         io::Error::new(kind, e)
     }
@@ -653,11 +659,8 @@ impl BlobCompressionContextInfo {
                     TocLocation::default()
                 };
                 let toc_list =
-                    TocEntryList::read_from_cache_file(toc_path, reader.as_ref(), &location)
-                        .map_err(|e| MetaError::io("failed to read the blob TOC", e))?;
-                toc_list
-                    .extract_from_blob(reader.clone(), None, Some(&digest_path))
-                    .map_err(|e| MetaError::io("failed to extract the chunk digest file", e))?;
+                    TocEntryList::read_from_cache_file(toc_path, reader.as_ref(), &location)?;
+                toc_list.extract_from_blob(reader.clone(), None, Some(&digest_path))?;
             }
             if !digest_path.exists() {
                 return Err(MetaError::Backend(

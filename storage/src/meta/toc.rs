@@ -6,7 +6,9 @@
 
 use std::convert::{TryFrom, TryInto};
 use std::fs::{self, File, OpenOptions};
-use std::io::{Error, ErrorKind, Read, Result, Write};
+use std::io::{Read, Write};
+
+use crate::meta::{MetaError, MetaResult};
 use std::mem::size_of;
 use std::path::{Path, PathBuf};
 use std::slice;
@@ -51,14 +53,17 @@ bitflags! {
 }
 
 impl TryFrom<compress::Algorithm> for TocEntryFlags {
-    type Error = Error;
+    type Error = MetaError;
 
     fn try_from(c: compress::Algorithm) -> std::result::Result<Self, Self::Error> {
         match c {
             compress::Algorithm::None => Ok(Self::COMPRESSION_NONE),
             compress::Algorithm::Zstd => Ok(Self::COMPRESSION_ZSTD),
             compress::Algorithm::Lz4Block => Ok(Self::COMPRESSION_LZ4_BLOCK),
-            _ => Err(eother!(format!("unsupported compressor {}", c,))),
+            _ => Err(MetaError::InvalidMetadata(format!(
+                "unsupported compressor {}",
+                c
+            ))),
         }
     }
 }
@@ -102,10 +107,10 @@ impl Default for TocEntry {
 
 impl TocEntry {
     /// Get ToC entry name.
-    pub fn name(&self) -> Result<String> {
+    pub fn name(&self) -> MetaResult<String> {
         String::from_utf8(self.name.to_vec())
             .map(|v| v.trim_end_matches('\0').to_string())
-            .map_err(|_e| eother!(format!("failed to get ToC entry name")))
+            .map_err(|_e| MetaError::Corrupted("failed to get ToC entry name".to_string()))
     }
 
     /// Get digest of uncompressed content.
@@ -131,20 +136,25 @@ impl TocEntry {
     }
 
     /// Get compression algorithm to process entry  data.
-    pub fn compressor(&self) -> Result<compress::Algorithm> {
-        let flags = TocEntryFlags::from_bits(self.flags)
-            .ok_or_else(|| einval!("unknown compression algorithm for TOC entry"))?;
+    pub fn compressor(&self) -> MetaResult<compress::Algorithm> {
+        let flags = TocEntryFlags::from_bits(self.flags).ok_or_else(|| {
+            MetaError::InvalidMetadata("unknown compression algorithm for TOC entry".to_string())
+        })?;
         let algo = match flags & TocEntryFlags::COMPRESSION_MASK {
             TocEntryFlags::COMPRESSION_ZSTD => compress::Algorithm::Zstd,
             TocEntryFlags::COMPRESSION_LZ4_BLOCK => compress::Algorithm::Lz4Block,
             TocEntryFlags::COMPRESSION_NONE => compress::Algorithm::None,
-            _ => return Err(einval!("unknown compression algorithm for TOC entry")),
+            _ => {
+                return Err(MetaError::InvalidMetadata(
+                    "unknown compression algorithm for TOC entry".to_string(),
+                ));
+            }
         };
         Ok(algo)
     }
 
     /// Set compression algorithm to process entry data.
-    pub fn set_compressor(&mut self, compressor: compress::Algorithm) -> Result<()> {
+    pub fn set_compressor(&mut self, compressor: compress::Algorithm) -> MetaResult<()> {
         let c: TocEntryFlags = compressor.try_into()?;
 
         self.flags &= !TocEntryFlags::COMPRESSION_MASK.bits();
@@ -158,7 +168,7 @@ impl TocEntry {
         &self,
         reader: Arc<dyn BlobReader>,
         writer: &mut W,
-    ) -> Result<()> {
+    ) -> MetaResult<()> {
         let mut hasher = digest::RafsDigest::hasher(digest::Algorithm::Sha256);
         let mut count = 0;
         let buf_size = std::cmp::min(0x1000000u64, self.compressed_size) as usize;
@@ -171,44 +181,48 @@ impl TocEntry {
 
         if self.flags & TocEntryFlags::COMPRESSION_ZSTD.bits() != 0 {
             let mut decoder = Decoder::new(buf_reader, compress::Algorithm::Zstd)
-                .map_err(|_| eother!("failed to create decoder"))?;
+                .map_err(|_| MetaError::Corrupted("failed to create decoder".to_string()))?;
             let mut buf = alloc_buf(0x40000);
             loop {
-                let sz = decoder
-                    .read(&mut buf)
-                    .map_err(|e| eother!(format!("failed to decompress data, {}", e)))?;
+                let sz = decoder.read(&mut buf).map_err(|e| {
+                    MetaError::Corrupted(format!("failed to decompress data, {}", e))
+                })?;
                 if sz == 0 {
                     break;
                 }
                 hasher.digest_update(&buf[..sz]);
-                writer
-                    .write_all(&buf[..sz])
-                    .map_err(|e| eother!(format!("failed to write decompressed data, {}", e)))?;
+                writer.write_all(&buf[..sz]).map_err(|e| {
+                    MetaError::Corrupted(format!("failed to write decompressed data, {}", e))
+                })?;
                 count += sz as u64;
             }
         } else if self.flags & TocEntryFlags::COMPRESSION_LZ4_BLOCK.bits() != 0 {
-            return Err(eother!("unsupported compression algorithm lz4_block."));
+            return Err(MetaError::Corrupted(
+                "unsupported compression algorithm lz4_block.".to_string(),
+            ));
         } else if self.flags & TocEntryFlags::COMPRESSION_NONE.bits() != 0 {
             let mut buf = alloc_buf(0x40000);
             loop {
-                let sz = buf_reader
-                    .read(&mut buf)
-                    .map_err(|e| eother!(format!("failed to decompress data, {}", e)))?;
+                let sz = buf_reader.read(&mut buf).map_err(|e| {
+                    MetaError::Corrupted(format!("failed to decompress data, {}", e))
+                })?;
                 if sz == 0 {
                     break;
                 }
                 hasher.digest_update(&buf[..sz]);
-                writer
-                    .write_all(&buf[..sz])
-                    .map_err(|e| eother!(format!("failed to write decompressed data, {}", e)))?;
+                writer.write_all(&buf[..sz]).map_err(|e| {
+                    MetaError::Corrupted(format!("failed to write decompressed data, {}", e))
+                })?;
                 count += sz as u64;
             }
         } else {
-            return Err(eother!("unsupported compression algorithm."));
+            return Err(MetaError::Corrupted(
+                "unsupported compression algorithm.".to_string(),
+            ));
         }
 
         if count != self.uncompressed_size {
-            return Err(eother!(format!(
+            return Err(MetaError::Corrupted(format!(
                 "size of decompressed content doesn't match, expect {}, got {}",
                 self.uncompressed_size, count,
             )));
@@ -217,55 +231,63 @@ impl TocEntry {
         if digest.data != self.uncompressed_digest
             && self.uncompressed_digest != RafsDigest::default().data
         {
-            return Err(eother!("digest of decompressed content doesn't match"));
+            return Err(MetaError::Corrupted(
+                "digest of decompressed content doesn't match".to_string(),
+            ));
         }
 
         Ok(())
     }
 
     /// Extract entry data from a data buffer into a writer.
-    pub fn extract_from_buf<W: Write>(&self, buf: &[u8], writer: &mut W) -> Result<()> {
+    pub fn extract_from_buf<W: Write>(&self, buf: &[u8], writer: &mut W) -> MetaResult<()> {
         let mut hasher = digest::RafsDigest::hasher(digest::Algorithm::Sha256);
         let mut count = 0;
 
         if self.flags & TocEntryFlags::COMPRESSION_ZSTD.bits() != 0 {
             let mut decoder = Decoder::new(buf, compress::Algorithm::Zstd)
-                .map_err(|_| eother!("failed to create decoder"))?;
+                .map_err(|_| MetaError::Corrupted("failed to create decoder".to_string()))?;
             let mut buf = alloc_buf(0x40000);
             loop {
-                let sz = decoder
-                    .read(&mut buf)
-                    .map_err(|e| eother!(format!("failed to decompress data, {}", e)))?;
+                let sz = decoder.read(&mut buf).map_err(|e| {
+                    MetaError::Corrupted(format!("failed to decompress data, {}", e))
+                })?;
                 if sz == 0 {
                     break;
                 }
                 hasher.digest_update(&buf[..sz]);
-                writer
-                    .write_all(&buf[..sz])
-                    .map_err(|e| eother!(format!("failed to write decompressed data, {}", e)))?;
+                writer.write_all(&buf[..sz]).map_err(|e| {
+                    MetaError::Corrupted(format!("failed to write decompressed data, {}", e))
+                })?;
                 count += sz as u64;
             }
         } else if self.flags & TocEntryFlags::COMPRESSION_LZ4_BLOCK.bits() != 0 {
-            return Err(eother!("unsupported compression algorithm lz4_block."));
+            return Err(MetaError::Corrupted(
+                "unsupported compression algorithm lz4_block.".to_string(),
+            ));
         } else if self.flags & TocEntryFlags::COMPRESSION_NONE.bits() != 0 {
             hasher.digest_update(buf);
-            writer
-                .write_all(buf)
-                .map_err(|e| eother!(format!("failed to write decompressed data, {}", e)))?;
+            writer.write_all(buf).map_err(|e| {
+                MetaError::Corrupted(format!("failed to write decompressed data, {}", e))
+            })?;
             count = buf.len() as u64;
         } else {
-            return Err(eother!("unsupported compression algorithm."));
+            return Err(MetaError::Corrupted(
+                "unsupported compression algorithm.".to_string(),
+            ));
         }
 
         if count != self.uncompressed_size {
-            return Err(eother!(format!(
+            return Err(MetaError::Corrupted(format!(
                 "size of decompressed content doesn't match, expect {}, got {}",
                 self.uncompressed_size, count,
             )));
         }
         let digest = hasher.digest_finalize();
         if digest.data != self.uncompressed_digest {
-            return Err(eother!("digest of decompressed content doesn't match"));
+            return Err(MetaError::Corrupted(
+                "digest of decompressed content doesn't match".to_string(),
+            ));
         }
 
         Ok(())
@@ -305,10 +327,13 @@ impl TocEntryList {
         compressed_offset: u64,
         compressed_size: u64,
         uncompressed_size: u64,
-    ) -> Result<&mut TocEntry> {
+    ) -> MetaResult<&mut TocEntry> {
         let name_size = name.len();
         if name_size > 16 {
-            return Err(eother!(format!("invalid entry name length {}", name_size)));
+            return Err(MetaError::Corrupted(format!(
+                "invalid entry name length {}",
+                name_size
+            )));
         }
 
         let last = self.entries.len();
@@ -364,10 +389,12 @@ impl TocEntryList {
         reader: &dyn BlobReader,
         cache_file: Option<&mut W>,
         location: &TocLocation,
-    ) -> Result<Self> {
+    ) -> MetaResult<Self> {
         let (buf, _) = Self::read_toc_header(reader, location)?;
         if let Some(writer) = cache_file {
-            writer.write_all(&buf)?;
+            writer
+                .write_all(&buf)
+                .map_err(|e| MetaError::io("failed to write the decompressed ToC entry", e))?;
         }
         Self::parse_toc_header(&buf, location)
     }
@@ -377,16 +404,19 @@ impl TocEntryList {
         path: P,
         reader: &dyn BlobReader,
         location: &TocLocation,
-    ) -> Result<Self> {
+    ) -> MetaResult<Self> {
         location.validate()?;
 
         if let Ok(mut file) = OpenOptions::new().read(true).open(path.as_ref()) {
-            let md = file.metadata()?;
+            let md = file
+                .metadata()
+                .map_err(|e| MetaError::io("failed to stat the cached ToC file", e))?;
             let size = md.len();
             if size > 512 && size % 128 == 0 && md.len() <= 0x1000 {
                 let mut buf = alloc_buf(size as usize);
-                file.read_exact(&mut buf)
-                    .map_err(|e| eother!(format!("failed to read ToC from cache, {}", e)))?;
+                file.read_exact(&mut buf).map_err(|e| {
+                    MetaError::Backend(format!("failed to read ToC from cache, {}", e))
+                })?;
                 if let Ok(toc) = Self::parse_toc_header(&buf, location) {
                     return Ok(toc);
                 }
@@ -418,12 +448,15 @@ impl TocEntryList {
         }
     }
 
-    fn read_toc_header(reader: &dyn BlobReader, location: &TocLocation) -> Result<(Vec<u8>, u64)> {
+    fn read_toc_header(
+        reader: &dyn BlobReader,
+        location: &TocLocation,
+    ) -> MetaResult<(Vec<u8>, u64)> {
         location.validate()?;
         let (offset, size) = if location.auto_detect {
             let blob_size = reader
                 .blob_size()
-                .map_err(|e| eio!(format!("failed to get blob size, {}", e)))?;
+                .map_err(|e| MetaError::Backend(format!("failed to get blob size, {}", e)))?;
             let size = if blob_size > 0x1000 {
                 0x1000
             } else {
@@ -438,9 +471,9 @@ impl TocEntryList {
         let mut buf = alloc_buf(size);
         let sz = reader
             .read(&mut buf, offset)
-            .map_err(|e| eother!(format!("failed to read ToC from backend, {}", e)))?;
+            .map_err(|e| MetaError::Backend(format!("failed to read ToC from backend, {}", e)))?;
         if sz != size {
-            return Err(eother!(format!(
+            return Err(MetaError::Corrupted(format!(
                 "failed to read ToC from backend, expect {}, got {} bytes",
                 size, sz
             )));
@@ -449,47 +482,49 @@ impl TocEntryList {
         Ok((buf, offset + 0x1000))
     }
 
-    fn parse_toc_header(buf: &[u8], location: &TocLocation) -> Result<Self> {
+    fn parse_toc_header(buf: &[u8], location: &TocLocation) -> MetaResult<Self> {
         if buf.len() < 512 {
-            return Err(Error::new(
-                ErrorKind::InvalidData,
-                format!("blob ToC size {} is too small", buf.len()),
-            ));
+            return Err(MetaError::InvalidMetadata(format!(
+                "blob ToC size {} is too small",
+                buf.len()
+            )));
         }
         let size = buf.len() - 512;
         let header = Header::from_byte_slice(&buf[size..]);
         let entry_type = header.entry_type();
         if entry_type != EntryType::Regular {
-            return Err(Error::other("Tar entry type for ToC is not a regular file"));
+            return Err(MetaError::Corrupted(
+                "Tar entry type for ToC is not a regular file".to_string(),
+            ));
         }
-        let entry_size = header
-            .entry_size()
-            .map_err(|_| Error::other("failed to get entry size from tar header"))?;
+        let entry_size = header.entry_size().map_err(|_| {
+            MetaError::Corrupted("failed to get entry size from tar header".to_string())
+        })?;
         if entry_size > size as u64 {
-            return Err(Error::other(format!(
+            return Err(MetaError::Corrupted(format!(
                 "invalid toc entry size in tar header, expect {}, got {}",
                 size, entry_size
             )));
         }
-        let name = header
-            .path()
-            .map_err(|_| Error::other("failed to get ToC file name from tar header"))?;
+        let name = header.path().map_err(|_| {
+            MetaError::Corrupted("failed to get ToC file name from tar header".to_string())
+        })?;
         if name != Path::new(TOC_ENTRY_BLOB_TOC) {
-            return Err(Error::other(format!(
+            return Err(MetaError::Corrupted(format!(
                 "ToC file name from tar header doesn't match, {}",
                 name.display()
             )));
         }
         let _header = header
             .as_gnu()
-            .ok_or_else(|| Error::other("invalid GNU tar header for ToC"))?;
+            .ok_or_else(|| MetaError::Corrupted("invalid GNU tar header for ToC".to_string()))?;
 
         let mut pos = size - entry_size as usize;
         let mut list = TocEntryList::new();
         list.toc_digest = digest::RafsDigest::from_buf(&buf[pos..], digest::Algorithm::Sha256);
         list.toc_size = (entry_size + 512) as u32;
         if location.validate_digest && list.toc_digest != location.digest {
-            return Err(eother!(format!(
+            return Err(MetaError::Corrupted(format!(
                 "toc content digest value doesn't match, expect {:?}, got {:?}",
                 location.digest.data, list.toc_digest.data
             )));
@@ -514,22 +549,28 @@ impl TocEntryList {
         reader: Arc<dyn BlobReader>,
         bootstrap: Option<P>,
         digest: Option<P>,
-    ) -> Result<()> {
+    ) -> MetaResult<()> {
         if let Some(path) = bootstrap {
-            let bootstrap = self
-                .get_entry(TOC_ENTRY_BOOTSTRAP)
-                .ok_or_else(|| enoent!("`image.boot` doesn't exist in the ToC list"))?;
+            let bootstrap = self.get_entry(TOC_ENTRY_BOOTSTRAP).ok_or_else(|| {
+                MetaError::NotFound("`image.boot` doesn't exist in the ToC list".to_string())
+            })?;
             let compressor = bootstrap.compressor()?;
             if compressor == compress::Algorithm::None
                 && bootstrap.compressed_size() != bootstrap.uncompressed_size()
             {
-                return Err(einval!("invalid ToC entry for `image.boot`"));
+                return Err(MetaError::InvalidMetadata(
+                    "invalid ToC entry for `image.boot`".to_string(),
+                ));
             }
 
             let mut ready = false;
             if path.as_ref().exists() {
-                let mut file = OpenOptions::new().read(true).open(path.as_ref())?;
-                let digest = RafsDigest::from_reader(&mut file, digest::Algorithm::Sha256)?;
+                let mut file = OpenOptions::new()
+                    .read(true)
+                    .open(path.as_ref())
+                    .map_err(|e| MetaError::io("failed to open the cached bootstrap", e))?;
+                let digest = RafsDigest::from_reader(&mut file, digest::Algorithm::Sha256)
+                    .map_err(|e| MetaError::io("failed to digest the cached bootstrap", e))?;
                 if digest.data == bootstrap.uncompressed_digest {
                     ready = true;
                 }
@@ -543,33 +584,42 @@ impl TocEntryList {
                     .create(true)
                     .write(true)
                     .truncate(true)
-                    .open(p.as_path())?;
+                    .open(p.as_path())
+                    .map_err(|e| MetaError::io("failed to create the bootstrap temp file", e))?;
                 bootstrap
                     .extract_from_reader(reader.clone(), &mut file)
                     .inspect_err(|_e| {
                         let _ = fs::remove_file(&p);
                     })?;
-                fs::rename(&p, path).inspect_err(|_e| {
-                    let _ = fs::remove_file(&p);
-                })?;
+                fs::rename(&p, path)
+                    .inspect_err(|_e| {
+                        let _ = fs::remove_file(&p);
+                    })
+                    .map_err(|e| MetaError::io("failed to publish the bootstrap file", e))?;
             }
         }
 
         if let Some(path) = digest {
-            let cda = self
-                .get_entry(TOC_ENTRY_BLOB_DIGEST)
-                .ok_or_else(|| enoent!("`blob.digest` doesn't exist in the ToC list"))?;
+            let cda = self.get_entry(TOC_ENTRY_BLOB_DIGEST).ok_or_else(|| {
+                MetaError::NotFound("`blob.digest` doesn't exist in the ToC list".to_string())
+            })?;
             let compressor = cda.compressor()?;
             if compressor == compress::Algorithm::None
                 && cda.compressed_size() != cda.uncompressed_size()
             {
-                return Err(einval!("invalid ToC entry for `blob.digest`"));
+                return Err(MetaError::InvalidMetadata(
+                    "invalid ToC entry for `blob.digest`".to_string(),
+                ));
             }
 
             let mut ready = false;
             if path.as_ref().exists() {
-                let mut file = OpenOptions::new().read(true).open(path.as_ref())?;
-                let digest = RafsDigest::from_reader(&mut file, digest::Algorithm::Sha256)?;
+                let mut file = OpenOptions::new()
+                    .read(true)
+                    .open(path.as_ref())
+                    .map_err(|e| MetaError::io("failed to open the cached chunk digest file", e))?;
+                let digest = RafsDigest::from_reader(&mut file, digest::Algorithm::Sha256)
+                    .map_err(|e| MetaError::io("failed to digest the chunk digest file", e))?;
                 if digest.data == cda.uncompressed_digest {
                     ready = true;
                 }
@@ -583,14 +633,17 @@ impl TocEntryList {
                     .create(true)
                     .write(true)
                     .truncate(true)
-                    .open(p.as_path())?;
+                    .open(p.as_path())
+                    .map_err(|e| MetaError::io("failed to create the chunk digest temp file", e))?;
                 cda.extract_from_reader(reader.clone(), &mut file)
                     .inspect_err(|_e| {
                         let _ = fs::remove_file(&p);
                     })?;
-                fs::rename(&p, path).inspect_err(|_e| {
-                    let _ = fs::remove_file(&p);
-                })?;
+                fs::rename(&p, path)
+                    .inspect_err(|_e| {
+                        let _ = fs::remove_file(&p);
+                    })
+                    .map_err(|e| MetaError::io("failed to publish the chunk digest file", e))?;
             }
         }
 
@@ -598,22 +651,22 @@ impl TocEntryList {
     }
 
     /// Extract inlined RAFS metadata from data blobs.
-    pub fn extract_rafs_meta(id: &str, config: Arc<ConfigV2>) -> Result<PathBuf> {
+    pub fn extract_rafs_meta(id: &str, config: Arc<ConfigV2>) -> MetaResult<PathBuf> {
         let backend_config = config.get_backend_config()?;
         let workdir = config.get_cache_working_directory()?;
         let path = PathBuf::from(workdir);
         if !path.is_dir() {
-            return Err(Error::new(
-                ErrorKind::NotFound,
-                "invalid cache working directory",
+            return Err(MetaError::NotFound(
+                "invalid cache working directory".to_string(),
             ));
         }
         let path = path.join(id).with_extension(TOC_ENTRY_BOOTSTRAP);
 
-        let blob_mgr = BlobFactory::new_backend(backend_config, "extract_rafs_meta")?;
-        let reader = blob_mgr
-            .get_reader(id)
-            .map_err(|e| eother!(format!("failed to get reader for blob {}, {}", id, e)))?;
+        let blob_mgr = BlobFactory::new_backend(backend_config, "extract_rafs_meta")
+            .map_err(|e| MetaError::Backend(format!("failed to create the backend, {}", e)))?;
+        let reader = blob_mgr.get_reader(id).map_err(|e| {
+            MetaError::Backend(format!("failed to get reader for blob {}, {}", id, e))
+        })?;
         let location = TocLocation::default();
         let (buf, blob_size) = Self::read_toc_header(reader.as_ref(), &location)?;
 
@@ -621,32 +674,37 @@ impl TocEntryList {
             toc.extract_from_blob(reader, Some(path.clone()), None)?;
         } else {
             if buf.len() < 512 {
-                return Err(einval!(format!("blob ToC size {} is too small", buf.len())));
+                return Err(MetaError::InvalidMetadata(format!(
+                    "blob ToC size {} is too small",
+                    buf.len()
+                )));
             }
             let header = Header::from_byte_slice(&buf[buf.len() - 512..]);
             let entry_type = header.entry_type();
             if entry_type != EntryType::Regular {
-                return Err(eother!(
-                    "Tar entry type for `image.boot` is not a regular file"
+                return Err(MetaError::Corrupted(
+                    "Tar entry type for `image.boot` is not a regular file".to_string(),
                 ));
             }
-            let name = header
-                .path()
-                .map_err(|_| eother!("failed to get `image.boot` file name from tar header"))?;
+            let name = header.path().map_err(|_| {
+                MetaError::Corrupted(
+                    "failed to get `image.boot` file name from tar header".to_string(),
+                )
+            })?;
             if name != Path::new(TOC_ENTRY_BOOTSTRAP) {
-                return Err(eother!(format!(
+                return Err(MetaError::Corrupted(format!(
                     "file name from tar header doesn't match `image.boot`, {}",
                     name.display()
                 )));
             }
-            let _header = header
-                .as_gnu()
-                .ok_or_else(|| eother!("invalid GNU tar header for ToC"))?;
-            let entry_size = header
-                .entry_size()
-                .map_err(|_| eother!("failed to get entry size from tar header"))?;
+            let _header = header.as_gnu().ok_or_else(|| {
+                MetaError::Corrupted("invalid GNU tar header for ToC".to_string())
+            })?;
+            let entry_size = header.entry_size().map_err(|_| {
+                MetaError::Corrupted("failed to get entry size from tar header".to_string())
+            })?;
             if entry_size > blob_size - 512 {
-                return Err(eother!(format!(
+                return Err(MetaError::Corrupted(format!(
                     "invalid `image.boot` entry size in tar header, max {}, got {}",
                     blob_size - 512,
                     entry_size
@@ -720,11 +778,14 @@ impl TocLocation {
         }
     }
 
-    fn validate(&self) -> Result<()> {
+    fn validate(&self) -> MetaResult<()> {
         if !self.auto_detect
             && (!(512..=0x10000).contains(&self.size) || !self.size.is_multiple_of(128))
         {
-            return Err(eother!(format!("invalid size {} of blob ToC", self.size)));
+            return Err(MetaError::Corrupted(format!(
+                "invalid size {} of blob ToC",
+                self.size
+            )));
         }
 
         Ok(())
@@ -897,7 +958,7 @@ mod tests {
         let _e = TocEntryFlags::try_from(compress::Algorithm::GZip).unwrap_err();
     }
 
-    fn extract_from_buf_with_different_flags(entry: &TocEntry, buf: &[u8]) -> Result<String> {
+    fn extract_from_buf_with_different_flags(entry: &TocEntry, buf: &[u8]) -> MetaResult<String> {
         let tmp_file = TempFile::new();
         let mut file = OpenOptions::new()
             .write(true)
@@ -910,7 +971,9 @@ mod tests {
         let mut hasher = RafsDigest::hasher(digest::Algorithm::Sha256);
         let mut buffer = [0; 1024];
         loop {
-            let count = file.read(&mut buffer)?;
+            let count = file
+                .read(&mut buffer)
+                .map_err(|e| MetaError::io("failed to read back the extracted entry", e))?;
             if count == 0 {
                 break;
             }
