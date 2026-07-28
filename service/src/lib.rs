@@ -189,7 +189,11 @@ impl From<Error> for io::Error {
             | Error::InvalidConfig(_)
             | Error::InvalidPrefetchList
             | Error::FsTypeMismatch(_) => io::ErrorKind::InvalidInput,
-            _ => io::ErrorKind::Other,
+            // Anything else that wraps an `io::Error` keeps that error's kind. Not every
+            // meaningful `ErrorKind` has an errno behind it -- `UnexpectedEof` from a peer
+            // closing a socket is the one the uffd receive loop branches on -- so answering
+            // `Other` here would lose a distinction the caller acts on.
+            _ => io_error_kind(&e).unwrap_or(io::ErrorKind::Other),
         };
         io::Error::new(kind, e)
     }
@@ -224,6 +228,22 @@ impl From<nydus_storage::StorageError> for Error {
     fn from(e: nydus_storage::StorageError) -> Self {
         Error::Storage(Box::new(e))
     }
+}
+
+/// The `ErrorKind` of the first `io::Error` on `err`'s chain, if any.
+///
+/// Companion to [`nydus_utils::source_errno`], for the kinds that carry no errno at all:
+/// `UnexpectedEof`, `WouldBlock` and `BrokenPipe` are all produced by std rather than by a
+/// syscall's `errno`, so a chain walk looking only for `raw_os_error` cannot see them.
+fn io_error_kind(err: &(dyn std::error::Error + 'static)) -> Option<io::ErrorKind> {
+    let mut cur = Some(err);
+    while let Some(e) = cur {
+        if let Some(ioe) = e.downcast_ref::<io::Error>() {
+            return Some(ioe.kind());
+        }
+        cur = e.source();
+    }
+    None
 }
 
 /// Specialized `Result` for Nydus library.
@@ -433,6 +453,26 @@ mod tests {
 
         let io_err: std::io::Error = Error::AlreadyExists.into();
         assert_eq!(io_err.kind(), std::io::ErrorKind::AlreadyExists);
+    }
+
+    /// A kind that has no errno behind it still has to survive the boundary.
+    ///
+    /// `UnexpectedEof` is what a closed uffd socket reports, and the receive loop branches on
+    /// it. It is produced by std, not by a syscall, so `source_errno` finds nothing and the
+    /// variant table has no row for it -- the kind has to come from the wrapped error itself.
+    /// Answering `Other` here is how `block_uffd::tests::test_try_recv_from_sock_eof` failed.
+    #[test]
+    fn io_error_conversion_preserves_a_wrapped_error_kind() {
+        for kind in [
+            std::io::ErrorKind::UnexpectedEof,
+            std::io::ErrorKind::WouldBlock,
+            std::io::ErrorKind::BrokenPipe,
+        ] {
+            let e = Error::from(std::io::Error::new(kind, "peer went away"));
+            assert_eq!(nydus_utils::source_errno(&e), None, "no errno to recover");
+            let io_err: std::io::Error = e.into();
+            assert_eq!(io_err.kind(), kind);
+        }
     }
 
     /// An errno raised by a real syscall deeper down has to reach the kernel unchanged.
