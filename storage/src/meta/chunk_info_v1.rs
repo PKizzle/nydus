@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::meta::{BLOB_CCT_CHUNK_SIZE_MASK, BlobCompressionContext, BlobMetaChunkInfo};
-use std::io::Result;
+use crate::meta::{MetaError, MetaResult};
 
 const BLOB_CC_V1_CHUNK_COMP_OFFSET_MASK: u64 = 0xff_ffff_ffff;
 const BLOB_CC_V1_CHUNK_UNCOMP_OFFSET_MASK: u64 = 0xfff_ffff_f000;
@@ -104,19 +104,19 @@ impl BlobMetaChunkInfo for BlobChunkInfoV1Ondisk {
         false
     }
 
-    fn get_zran_index(&self) -> Result<u32> {
+    fn get_zran_index(&self) -> MetaResult<u32> {
         unimplemented!()
     }
 
-    fn get_zran_offset(&self) -> Result<u32> {
+    fn get_zran_offset(&self) -> MetaResult<u32> {
         unimplemented!()
     }
 
-    fn get_batch_index(&self) -> Result<u32> {
+    fn get_batch_index(&self) -> MetaResult<u32> {
         unimplemented!()
     }
 
-    fn get_uncompressed_offset_in_batch_buf(&self) -> Result<u32> {
+    fn get_uncompressed_offset_in_batch_buf(&self) -> MetaResult<u32> {
         unimplemented!()
     }
 
@@ -128,13 +128,13 @@ impl BlobMetaChunkInfo for BlobChunkInfoV1Ondisk {
         0
     }
 
-    fn validate(&self, state: &BlobCompressionContext) -> Result<()> {
+    fn validate(&self, state: &BlobCompressionContext) -> MetaResult<()> {
         if self.compressed_end() > state.compressed_size
             || self.uncompressed_end() > state.uncompressed_size
             || self.uncompressed_size() == 0
             || (!self.is_compressed() && self.uncompressed_size() != self.compressed_size())
         {
-            return Err(einval!(format!(
+            return Err(MetaError::InvalidMetadata(format!(
                 "invalid chunk, blob: index {}/c_end 0x{:}/d_end 0x{:x}, chunk: c_end 0x{:x}/d_end 0x{:x}/compressed {}",
                 state.blob_index,
                 state.compressed_size,

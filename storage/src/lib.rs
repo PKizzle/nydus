@@ -101,6 +101,9 @@ pub enum StorageError {
     /// The proxy rate-limited the request.
     #[error("proxy rate limited: {0}")]
     ProxyLimited(String),
+    /// A blob's compression context table could not be read or trusted.
+    #[error("{0}")]
+    Meta(#[from] crate::meta::MetaError),
 }
 
 /// Specialized std::result::Result for storage subsystem.

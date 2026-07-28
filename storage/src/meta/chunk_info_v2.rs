@@ -2,8 +2,8 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
+use crate::meta::{MetaError, MetaResult};
 use std::fmt::{Display, Formatter};
-use std::io::{Error, Result};
 use std::sync::atomic::{AtomicU8, Ordering};
 
 use crate::device::BlobFeatures;
@@ -198,31 +198,37 @@ impl BlobMetaChunkInfo for BlobChunkInfoV2Ondisk {
         u64::from_le(self.uncomp_info) & CHUNK_V2_FLAG_BATCH != 0
     }
 
-    fn get_zran_index(&self) -> Result<u32> {
+    fn get_zran_index(&self) -> MetaResult<u32> {
         if !self.is_zran() {
-            return Err(einval!("Failed to get zran_index: not a ZRan chunk"));
+            return Err(MetaError::InvalidMetadata(
+                "Failed to get zran_index: not a ZRan chunk".to_string(),
+            ));
         }
         Ok((u64::from_le(self.data) >> 32) as u32)
     }
 
-    fn get_zran_offset(&self) -> Result<u32> {
+    fn get_zran_offset(&self) -> MetaResult<u32> {
         if !self.is_zran() {
-            return Err(einval!("Failed to get zran_offset: not a ZRan chunk"));
+            return Err(MetaError::InvalidMetadata(
+                "Failed to get zran_offset: not a ZRan chunk".to_string(),
+            ));
         }
         Ok(u64::from_le(self.data) as u32)
     }
 
-    fn get_batch_index(&self) -> Result<u32> {
+    fn get_batch_index(&self) -> MetaResult<u32> {
         if !self.is_batch() {
-            return Err(einval!("Failed to get batch_index: not a batch chunk"));
+            return Err(MetaError::InvalidMetadata(
+                "Failed to get batch_index: not a batch chunk".to_string(),
+            ));
         }
         Ok((u64::from_le(self.data) >> 32) as u32)
     }
 
-    fn get_uncompressed_offset_in_batch_buf(&self) -> Result<u32> {
+    fn get_uncompressed_offset_in_batch_buf(&self) -> MetaResult<u32> {
         if !self.is_batch() {
-            return Err(einval!(
-                "Failed to get uncompressed_offset_in_batch_buf: not a batch chunk"
+            return Err(MetaError::InvalidMetadata(
+                "Failed to get uncompressed_offset_in_batch_buf: not a batch chunk".to_string(),
             ));
         }
         Ok(u64::from_le(self.data) as u32)
@@ -240,7 +246,7 @@ impl BlobMetaChunkInfo for BlobChunkInfoV2Ondisk {
         u64::from_le(self.data)
     }
 
-    fn validate(&self, state: &BlobCompressionContext) -> Result<()> {
+    fn validate(&self, state: &BlobCompressionContext) -> MetaResult<()> {
         if self.compressed_end() > state.compressed_size
             || self.uncompressed_end() > state.uncompressed_size
             || self.uncompressed_size() == 0
@@ -250,7 +256,7 @@ impl BlobMetaChunkInfo for BlobChunkInfoV2Ondisk {
                 && self.uncompressed_size() != self.compressed_size())
             || (self.has_crc32() && self.crc32() == 0)
         {
-            return Err(Error::other(format!(
+            return Err(MetaError::Corrupted(format!(
                 "invalid chunk, blob: index {}/c_size 0x{:x}/d_size 0x{:x}, chunk: c_end 0x{:x}/d_end 0x{:x}/compressed {} batch {} zran {} encrypted {} has_crc {}, crc32 {}",
                 state.blob_index,
                 state.compressed_size,
@@ -267,8 +273,9 @@ impl BlobMetaChunkInfo for BlobChunkInfoV2Ondisk {
         }
 
         if self.has_xxh3() && (self.has_crc32() || self.is_batch() || self.is_zran()) {
-            return Err(Error::other(
-                "invalid chunk flags: XXH3 shares the v2 data field with CRC32, batch and ZRan",
+            return Err(MetaError::Corrupted(
+                "invalid chunk flags: XXH3 shares the v2 data field with CRC32, batch and ZRan"
+                    .to_string(),
             ));
         }
 
@@ -285,11 +292,13 @@ impl BlobMetaChunkInfo for BlobChunkInfoV2Ondisk {
         }
 
         if state.blob_features & BlobFeatures::ZRAN.bits() == 0 && self.is_zran() {
-            return Err(Error::other("invalid chunk flag ZRan for non-ZRan blob"));
+            return Err(MetaError::Corrupted(
+                "invalid chunk flag ZRan for non-ZRan blob".to_string(),
+            ));
         } else if self.is_zran() {
             let index = self.get_zran_index()? as usize;
             if index >= state.zran_info_array.len() {
-                return Err(Error::other(format!(
+                return Err(MetaError::Corrupted(format!(
                     "ZRan index {} is too big, max {}",
                     index,
                     state.zran_info_array.len()
@@ -300,7 +309,7 @@ impl BlobMetaChunkInfo for BlobChunkInfoV2Ondisk {
             if zran_offset >= ctx.out_size()
                 || zran_offset + self.uncompressed_size() > ctx.out_size()
             {
-                return Err(Error::other(format!(
+                return Err(MetaError::Corrupted(format!(
                     "ZRan range 0x{:x}/0x{:x} is invalid, should be with in 0/0x{:x}",
                     zran_offset,
                     self.uncompressed_size(),
@@ -311,11 +320,13 @@ impl BlobMetaChunkInfo for BlobChunkInfoV2Ondisk {
 
         if self.is_batch() {
             if state.blob_features & BlobFeatures::BATCH.bits() == 0 {
-                return Err(Error::other("invalid chunk flag Batch for non-Batch blob"));
+                return Err(MetaError::Corrupted(
+                    "invalid chunk flag Batch for non-Batch blob".to_string(),
+                ));
             } else {
                 let index = self.get_batch_index()? as usize;
                 if index >= state.batch_info_array.len() {
-                    return Err(Error::other(format!(
+                    return Err(MetaError::Corrupted(format!(
                         "Batch index {} is too big, max {}",
                         index,
                         state.batch_info_array.len()
@@ -327,7 +338,7 @@ impl BlobMetaChunkInfo for BlobChunkInfoV2Ondisk {
                         > ctx.uncompressed_batch_size()
                     || u64::MAX - self.compressed_offset() < ctx.compressed_size() as u64
                 {
-                    return Err(Error::other(format!(
+                    return Err(MetaError::Corrupted(format!(
                         "Batch Context is invalid: chunk: uncompressed_size 0x{:x}, uncompressed_offset_in_batch_buf 0x{:x}, uncompressed_batch_size 0x{:x}, batch context: index {}, compressed_size 0x{:x}, uncompressed_batch_size 0x{:x}",
                         self.uncompressed_size(),
                         self.get_uncompressed_offset_in_batch_buf()?,

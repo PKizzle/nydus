@@ -27,7 +27,7 @@
 use std::any::Any;
 use std::borrow::Cow;
 use std::fs::OpenOptions;
-use std::io::Result;
+use std::io;
 use std::mem::{ManuallyDrop, size_of};
 use std::ops::{Add, BitAnd, Not};
 use std::path::PathBuf;
@@ -45,6 +45,91 @@ use crate::device::{BlobChunkFlags, BlobChunkInfo, BlobFeatures, BlobInfo};
 use crate::meta::toc::{TocEntryList, TocLocation};
 use crate::utils::alloc_buf;
 use crate::{RAFS_MAX_CHUNK_SIZE, RAFS_MAX_CHUNKS_PER_BLOB};
+
+/// Errors reported while reading or interpreting a blob's compression context table.
+///
+/// The blob metadata is read from a file the daemon does not control -- it is produced by an
+/// image build and fetched from a registry -- so "the header is wrong" is an expected outcome,
+/// not a bug, and callers need to be able to tell it apart from "the disk is full" or "the
+/// index you asked for does not exist".
+#[derive(Debug, thiserror::Error)]
+pub enum MetaError {
+    /// A field in the blob compression context header is not usable.
+    #[error("invalid blob metadata: {0}")]
+    InvalidMetadata(String),
+
+    /// The caller asked for a byte range the blob does not describe.
+    #[error("invalid range: {0}")]
+    InvalidRange(String),
+
+    /// The caller asked for an index past the end of a table.
+    #[error("{kind} index {index} is out of range, max {max}")]
+    IndexOutOfRange {
+        /// Which table the index is for, e.g. `chunk` or `zran`.
+        kind: &'static str,
+        /// The index requested.
+        index: u64,
+        /// The largest index the table holds.
+        max: u64,
+    },
+
+    /// The metadata the caller needs is not present.
+    #[error("{0}")]
+    NotFound(String),
+
+    /// The metadata is internally inconsistent -- chunks that do not cover the range they claim,
+    /// a digest that does not match, a table that contradicts the header.
+    #[error("{0}")]
+    Corrupted(String),
+
+    /// The metadata could not be fetched from the storage backend.
+    #[error("{0}")]
+    Backend(String),
+
+    /// A filesystem operation on the metadata file failed.
+    ///
+    /// The OS error is kept as the source rather than folded into the message, so
+    /// `nydus_utils::source_errno` can still recover the errno at a boundary.
+    #[error("{context}")]
+    Io {
+        /// What was being attempted.
+        context: String,
+        /// The underlying OS error.
+        #[source]
+        source: io::Error,
+    },
+}
+
+impl MetaError {
+    /// Build a [`MetaError::Io`] describing `context`.
+    pub(crate) fn io(context: impl Into<String>, source: io::Error) -> Self {
+        MetaError::Io {
+            context: context.into(),
+            source,
+        }
+    }
+}
+
+/// Compatibility conversion for callers still pinned to `std::io::Error`.
+///
+/// Temporary: dropped once every caller in `storage` speaks `StorageError`. The errno of an
+/// underlying OS failure is preserved so nothing downstream regresses in the meantime.
+impl From<MetaError> for io::Error {
+    fn from(e: MetaError) -> Self {
+        let kind = match &e {
+            MetaError::Io { source, .. } => source.kind(),
+            MetaError::NotFound(_) => io::ErrorKind::NotFound,
+            MetaError::InvalidMetadata(_)
+            | MetaError::InvalidRange(_)
+            | MetaError::IndexOutOfRange { .. } => io::ErrorKind::InvalidInput,
+            MetaError::Corrupted(_) | MetaError::Backend(_) => io::ErrorKind::Other,
+        };
+        io::Error::new(kind, e)
+    }
+}
+
+/// Result of a blob-metadata operation.
+pub type MetaResult<T> = std::result::Result<T, MetaError>;
 
 mod chunk_info_v1;
 pub use chunk_info_v1::BlobChunkInfoV1Ondisk;
@@ -397,7 +482,7 @@ impl BlobCompressionContextInfo {
         blob_info: &BlobInfo,
         reader: Option<&Arc<dyn BlobReader>>,
         load_chunk_digest: bool,
-    ) -> Result<Self> {
+    ) -> MetaResult<Self> {
         assert_eq!(
             size_of::<BlobCompressionContextHeader>() as u64,
             BLOB_CCT_HEADER_SIZE
@@ -408,7 +493,9 @@ impl BlobCompressionContextInfo {
 
         let chunk_count = blob_info.chunk_count();
         if chunk_count == 0 || chunk_count > RAFS_MAX_CHUNKS_PER_BLOB {
-            return Err(einval!("invalid chunk count in blob meta header"));
+            return Err(MetaError::InvalidMetadata(
+                "invalid chunk count in blob meta header".to_string(),
+            ));
         }
 
         let uncompressed_size = blob_info.meta_ci_uncompressed_size() as usize;
@@ -424,40 +511,55 @@ impl BlobCompressionContextInfo {
             .create(enable_write)
             .open(&meta_path)
             .map_err(|err| {
-                einval!(format!(
-                    "failed to open/create blob meta file {}: {}",
-                    meta_path, err
-                ))
+                MetaError::io(
+                    format!("failed to open/create blob meta file {}", meta_path),
+                    err,
+                )
             })?;
 
         let aligned_uncompressed_size = round_up_4k(uncompressed_size);
         let expected_size = BLOB_CCT_HEADER_SIZE as usize + aligned_uncompressed_size;
-        let mut file_size = file.metadata()?.len();
+        let mut file_size = file
+            .metadata()
+            .map_err(|e| MetaError::io(format!("failed to stat blob meta file {}", meta_path), e))?
+            .len();
         if file_size == 0 && enable_write {
-            file.set_len(expected_size as u64)?;
+            file.set_len(expected_size as u64).map_err(|e| {
+                MetaError::io(format!("failed to size blob meta file {}", meta_path), e)
+            })?;
             file_size = expected_size as u64;
         }
         if file_size != expected_size as u64 {
-            return Err(einval!(format!(
+            return Err(MetaError::InvalidMetadata(format!(
                 "size of blob meta file '{}' doesn't match, expect {:x}, got {:x}",
                 meta_path, expected_size, file_size
             )));
         }
 
-        let mut filemap = FileMapState::new(file, 0, expected_size, enable_write)?;
-        let base = filemap.validate_range(0, expected_size)?;
-        let header = filemap.get_mut::<BlobCompressionContextHeader>(aligned_uncompressed_size)?;
+        let mut filemap = FileMapState::new(file, 0, expected_size, enable_write).map_err(|e| {
+            MetaError::io(format!("failed to mmap blob meta file {}", meta_path), e)
+        })?;
+        let base = filemap
+            .validate_range(0, expected_size)
+            .map_err(|e| MetaError::io("blob meta file is shorter than its header claims", e))?;
+        let header = filemap
+            .get_mut::<BlobCompressionContextHeader>(aligned_uncompressed_size)
+            .map_err(|e| MetaError::io("failed to reach the blob meta header", e))?;
         if !Self::validate_header(blob_info, header)? {
             if let Some(reader) = reader {
                 let buffer =
                     unsafe { std::slice::from_raw_parts_mut(base as *mut u8, expected_size) };
                 Self::read_metadata(blob_info, reader, buffer)?;
                 if !Self::validate_header(blob_info, header)? {
-                    return Err(enoent!(format!("double check blob_info still invalid",)));
+                    return Err(MetaError::NotFound(
+                        "blob meta header is still invalid after re-reading it".to_string(),
+                    ));
                 }
-                filemap.sync_data()?;
+                filemap
+                    .sync_data()
+                    .map_err(|e| MetaError::io("failed to flush the blob meta file", e))?;
             } else {
-                return Err(enoent!(format!(
+                return Err(MetaError::NotFound(format!(
                     "blob meta header from file '{}' is invalid",
                     meta_path
                 )));
@@ -479,13 +581,15 @@ impl BlobCompressionContextInfo {
         if blob_info.has_feature(BlobFeatures::BATCH) {
             let header = state
                 .blob_meta_file_map
-                .get_mut::<BlobCompressionContextHeader>(aligned_uncompressed_size)?;
+                .get_mut::<BlobCompressionContextHeader>(aligned_uncompressed_size)
+                .map_err(|e| MetaError::io("failed to reach the blob meta header", e))?;
             let inflate_offset = header.s_ci_zran_offset as usize;
             let inflate_count = header.s_ci_zran_count as usize;
             let batch_inflate_size = inflate_count * size_of::<BatchInflateContext>();
             let ptr = state
                 .blob_meta_file_map
-                .validate_range(inflate_offset, batch_inflate_size)?;
+                .validate_range(inflate_offset, batch_inflate_size)
+                .map_err(|e| MetaError::io("batch inflate table is outside the meta file", e))?;
             let array = unsafe {
                 Vec::from_raw_parts(
                     ptr as *mut u8 as *mut BatchInflateContext,
@@ -497,14 +601,16 @@ impl BlobCompressionContextInfo {
         } else if blob_info.has_feature(BlobFeatures::ZRAN) {
             let header = state
                 .blob_meta_file_map
-                .get_mut::<BlobCompressionContextHeader>(aligned_uncompressed_size)?;
+                .get_mut::<BlobCompressionContextHeader>(aligned_uncompressed_size)
+                .map_err(|e| MetaError::io("failed to reach the blob meta header", e))?;
             let zran_offset = header.s_ci_zran_offset as usize;
             let zran_count = header.s_ci_zran_count as usize;
             let ci_zran_size = header.s_ci_zran_size as usize;
             let zran_size = zran_count * size_of::<ZranInflateContext>();
             let ptr = state
                 .blob_meta_file_map
-                .validate_range(zran_offset, zran_size)?;
+                .validate_range(zran_offset, zran_size)
+                .map_err(|e| MetaError::io("ZRan context table is outside the meta file", e))?;
             let array = unsafe {
                 Vec::from_raw_parts(
                     ptr as *mut u8 as *mut ZranInflateContext,
@@ -517,7 +623,8 @@ impl BlobCompressionContextInfo {
             let zran_dict_size = ci_zran_size - zran_size;
             let ptr = state
                 .blob_meta_file_map
-                .validate_range(zran_offset + zran_size, zran_dict_size)?;
+                .validate_range(zran_offset + zran_size, zran_dict_size)
+                .map_err(|e| MetaError::io("ZRan dictionary is outside the meta file", e))?;
             let array =
                 unsafe { Vec::from_raw_parts(ptr as *mut u8, zran_dict_size, zran_dict_size) };
             state.zran_dict_table = ManuallyDrop::new(array);
@@ -528,9 +635,9 @@ impl BlobCompressionContextInfo {
             if let Some(reader) = reader {
                 let toc_path = format!("{}.{}", blob_path, BLOB_TOC_FILE_SUFFIX);
                 let location = if blob_info.blob_toc_size() != 0 {
-                    let blob_size = reader
-                        .blob_size()
-                        .map_err(|_e| eio!("failed to get blob size"))?;
+                    let blob_size = reader.blob_size().map_err(|e| {
+                        MetaError::Backend(format!("failed to get blob size: {}", e))
+                    })?;
                     let offset = blob_size - blob_info.blob_toc_size() as u64;
                     let mut location = TocLocation::new(offset, blob_info.blob_toc_size() as u64);
                     let digest = blob_info.blob_toc_digest();
@@ -546,26 +653,44 @@ impl BlobCompressionContextInfo {
                     TocLocation::default()
                 };
                 let toc_list =
-                    TocEntryList::read_from_cache_file(toc_path, reader.as_ref(), &location)?;
-                toc_list.extract_from_blob(reader.clone(), None, Some(&digest_path))?;
+                    TocEntryList::read_from_cache_file(toc_path, reader.as_ref(), &location)
+                        .map_err(|e| MetaError::io("failed to read the blob TOC", e))?;
+                toc_list
+                    .extract_from_blob(reader.clone(), None, Some(&digest_path))
+                    .map_err(|e| MetaError::io("failed to extract the chunk digest file", e))?;
             }
             if !digest_path.exists() {
-                return Err(eother!("failed to download chunk digest file from blob"));
+                return Err(MetaError::Backend(
+                    "failed to download chunk digest file from blob".to_string(),
+                ));
             }
 
-            let file = OpenOptions::new().read(true).open(&digest_path)?;
-            let md = file.metadata()?;
+            let file = OpenOptions::new()
+                .read(true)
+                .open(&digest_path)
+                .map_err(|e| {
+                    MetaError::io(
+                        format!("failed to open chunk digest file {:?}", digest_path),
+                        e,
+                    )
+                })?;
+            let md = file
+                .metadata()
+                .map_err(|e| MetaError::io("failed to stat the chunk digest file", e))?;
             let size = 32 * blob_info.chunk_count() as usize;
             if md.len() != size as u64 {
-                return Err(eother!(format!(
+                return Err(MetaError::Backend(format!(
                     "size of chunk digest file doesn't match, expect {}, got {}",
                     size,
                     md.len()
                 )));
             }
 
-            let file_map = FileMapState::new(file, 0, size, false)?;
-            let ptr = file_map.validate_range(0, size)?;
+            let file_map = FileMapState::new(file, 0, size, false)
+                .map_err(|e| MetaError::io("failed to mmap the chunk digest file", e))?;
+            let ptr = file_map
+                .validate_range(0, size)
+                .map_err(|e| MetaError::io("chunk digest file is shorter than expected", e))?;
             let array = unsafe {
                 Vec::from_raw_parts(
                     ptr as *mut u8 as *mut _,
@@ -596,15 +721,15 @@ impl BlobCompressionContextInfo {
         start: u64,
         size: u64,
         batch_size: u64,
-    ) -> Result<Vec<Arc<dyn BlobChunkInfo>>> {
+    ) -> MetaResult<Vec<Arc<dyn BlobChunkInfo>>> {
         let end = start.checked_add(size).ok_or_else(|| {
-            einval!(format!(
+            MetaError::InvalidRange(format!(
                 "get_chunks_uncompressed: invalid start {}/size {}",
                 start, size
             ))
         })?;
         if end > self.state.uncompressed_size {
-            return Err(einval!(format!(
+            return Err(MetaError::InvalidRange(format!(
                 "get_chunks_uncompressed: invalid end {}/uncompressed_size {}",
                 end, self.state.uncompressed_size
             )));
@@ -636,15 +761,15 @@ impl BlobCompressionContextInfo {
         size: u64,
         batch_size: u64,
         prefetch: bool,
-    ) -> Result<Vec<Arc<dyn BlobChunkInfo>>> {
+    ) -> MetaResult<Vec<Arc<dyn BlobChunkInfo>>> {
         let end = start.checked_add(size).ok_or_else(|| {
-            einval!(einval!(format!(
+            MetaError::InvalidRange(format!(
                 "get_chunks_compressed: invalid start {}/size {}",
                 start, size
-            )))
+            ))
         })?;
         if end > self.state.compressed_size {
-            return Err(einval!(format!(
+            return Err(MetaError::InvalidRange(format!(
                 "get_chunks_compressed: invalid end {}/compressed_size {}",
                 end, self.state.compressed_size
             )));
@@ -667,7 +792,7 @@ impl BlobCompressionContextInfo {
         &self,
         chunks: &[Arc<dyn BlobChunkInfo>],
         max_size: u64,
-    ) -> Result<Vec<Arc<dyn BlobChunkInfo>>> {
+    ) -> MetaResult<Vec<Arc<dyn BlobChunkInfo>>> {
         self.state.add_more_chunks(chunks, max_size)
     }
 
@@ -677,7 +802,7 @@ impl BlobCompressionContextInfo {
     }
 
     /// Get index of chunk covering uncompressed `addr`.
-    pub fn get_chunk_index(&self, addr: u64) -> Result<usize> {
+    pub fn get_chunk_index(&self, addr: u64) -> MetaResult<usize> {
         self.state.get_chunk_index(addr)
     }
 
@@ -704,39 +829,39 @@ impl BlobCompressionContextInfo {
     }
 
     /// Get Batch index associated with the chunk at `chunk_index`.
-    pub fn get_batch_index(&self, chunk_index: u32) -> Result<u32> {
+    pub fn get_batch_index(&self, chunk_index: u32) -> MetaResult<u32> {
         self.state.get_batch_index(chunk_index as usize)
     }
 
     /// Get uncompressed batch offset associated with the chunk at `chunk_index`.
-    pub fn get_uncompressed_offset_in_batch_buf(&self, chunk_index: u32) -> Result<u32> {
+    pub fn get_uncompressed_offset_in_batch_buf(&self, chunk_index: u32) -> MetaResult<u32> {
         self.state
             .get_uncompressed_offset_in_batch_buf(chunk_index as usize)
     }
 
     /// Get Batch context information at `batch_index`.
-    pub fn get_batch_context(&self, batch_index: u32) -> Result<&BatchInflateContext> {
+    pub fn get_batch_context(&self, batch_index: u32) -> MetaResult<&BatchInflateContext> {
         self.state.get_batch_context(batch_index as usize)
     }
 
     /// Get compressed size associated with the chunk at `chunk_index`.
     /// Capable of handling both batch and non-batch chunks.
-    pub fn get_compressed_size(&self, chunk_index: u32) -> Result<u32> {
+    pub fn get_compressed_size(&self, chunk_index: u32) -> MetaResult<u32> {
         self.state.get_compressed_size(chunk_index as usize)
     }
 
     /// Get ZRan index associated with the chunk at `chunk_index`.
-    pub fn get_zran_index(&self, chunk_index: u32) -> Result<u32> {
+    pub fn get_zran_index(&self, chunk_index: u32) -> MetaResult<u32> {
         self.state.get_zran_index(chunk_index as usize)
     }
 
     /// Get ZRan offset associated with the chunk at `chunk_index`.
-    pub fn get_zran_offset(&self, chunk_index: u32) -> Result<u32> {
+    pub fn get_zran_offset(&self, chunk_index: u32) -> MetaResult<u32> {
         self.state.get_zran_offset(chunk_index as usize)
     }
 
     /// Get ZRan context information at `zran_index`.
-    pub fn get_zran_context(&self, zran_index: u32) -> Result<(ZranContext, &[u8])> {
+    pub fn get_zran_context(&self, zran_index: u32) -> MetaResult<(ZranContext, &[u8])> {
         self.state.get_zran_context(zran_index as usize)
     }
 
@@ -744,7 +869,7 @@ impl BlobCompressionContextInfo {
         blob_info: &BlobInfo,
         reader: &Arc<dyn BlobReader>,
         buffer: &mut [u8],
-    ) -> Result<()> {
+    ) -> MetaResult<()> {
         trace!(
             "blob_info compressor {} ci_compressor {} ci_compressed_size {} ci_uncompressed_size {}",
             blob_info.compressor(),
@@ -778,7 +903,7 @@ impl BlobCompressionContextInfo {
                             continue;
                         }
 
-                        return Err(eio!(format!(
+                        return Err(MetaError::Corrupted(format!(
                             "failed to read metadata for blob {} from backend, {}",
                             blob_info.blob_id(),
                             e
@@ -789,7 +914,7 @@ impl BlobCompressionContextInfo {
         })()?;
 
         if read_size != expected_raw_size {
-            return Err(eio!(format!(
+            return Err(MetaError::Corrupted(format!(
                 "failed to read metadata for blob {} from backend, compressor {}, got {} bytes, expect {} bytes",
                 blob_info.blob_id(),
                 blob_info.meta_ci_compressor(),
@@ -806,7 +931,7 @@ impl BlobCompressionContextInfo {
         ) {
             Ok(data) => data,
             Err(e) => {
-                return Err(eio!(format!(
+                return Err(MetaError::Corrupted(format!(
                     "failed to decrypt metadata for blob {} from backend, cipher {}, encrypted data size {}, {}",
                     blob_info.blob_id(),
                     blob_info.cipher(),
@@ -823,7 +948,7 @@ impl BlobCompressionContextInfo {
         ) {
             Ok(data) => data,
             Err(e) => {
-                return Err(eio!(format!(
+                return Err(MetaError::Corrupted(format!(
                     "failed to decrypt meta header for blob {} from backend, cipher {}, encrypted data size {}, {}",
                     blob_info.blob_id(),
                     blob_info.cipher(),
@@ -852,10 +977,7 @@ impl BlobCompressionContextInfo {
                 &mut uncompressed,
                 blob_info.meta_ci_compressor(),
             )
-            .map_err(|e| {
-                error!("failed to decompress blob meta data: {}", e);
-                e
-            })?;
+            .map_err(|e| MetaError::io("failed to decompress the blob meta data", e))?;
             Cow::Owned(uncompressed)
         } else {
             decrypted
@@ -870,7 +992,7 @@ impl BlobCompressionContextInfo {
     fn validate_header(
         blob_info: &BlobInfo,
         header: &BlobCompressionContextHeader,
-    ) -> Result<bool> {
+    ) -> MetaResult<bool> {
         trace!(
             "blob meta header magic {:x}/{:x}, entries {:x}/{:x}, features {:x}/{:x}, compressor {:x}/{:x}, ci_offset {:x}/{:x}, compressed_size {:x}/{:x}, uncompressed_size {:x}/{:x}",
             u32::from_le(header.s_magic),
@@ -903,7 +1025,7 @@ impl BlobCompressionContextInfo {
 
         let chunk_count = blob_info.chunk_count();
         if chunk_count == 0 || chunk_count > RAFS_MAX_CHUNKS_PER_BLOB {
-            return Err(einval!(format!(
+            return Err(MetaError::InvalidMetadata(format!(
                 "chunk count {:x} in blob meta header is invalid!",
                 chunk_count
             )));
@@ -916,23 +1038,31 @@ impl BlobCompressionContextInfo {
                 || blob_info.has_feature(BlobFeatures::BATCH))
         {
             if info_size < (chunk_count as usize) * (size_of::<BlobChunkInfoV2Ondisk>()) {
-                return Err(einval!("uncompressed size in blob meta header is invalid!"));
+                return Err(MetaError::InvalidMetadata(
+                    "uncompressed size in blob meta header is invalid!".to_string(),
+                ));
             }
         } else if blob_info.has_feature(BlobFeatures::CHUNK_INFO_V2) {
             if info_size != (chunk_count as usize) * (size_of::<BlobChunkInfoV2Ondisk>())
                 || (aligned_info_size as u64) > BLOB_CCT_V2_MAX_SIZE
             {
-                return Err(einval!("uncompressed size in blob meta header is invalid!"));
+                return Err(MetaError::InvalidMetadata(
+                    "uncompressed size in blob meta header is invalid!".to_string(),
+                ));
             }
         } else if blob_info.has_feature(BlobFeatures::ZRAN)
             || blob_info.has_feature(BlobFeatures::BATCH)
         {
-            return Err(einval!("invalid feature flags in blob meta header!"));
+            return Err(MetaError::InvalidMetadata(
+                "invalid feature flags in blob meta header!".to_string(),
+            ));
         } else if !blob_info.has_feature(BlobFeatures::IS_CHUNKDICT_GENERATED)
             && (info_size != (chunk_count as usize) * (size_of::<BlobChunkInfoV1Ondisk>())
                 || (aligned_info_size as u64) > BLOB_CCT_V1_MAX_SIZE)
         {
-            return Err(einval!("uncompressed size in blob meta header is invalid!"));
+            return Err(MetaError::InvalidMetadata(
+                "uncompressed size in blob meta header is invalid!".to_string(),
+            ));
         }
 
         if blob_info.has_feature(BlobFeatures::ZRAN) {
@@ -981,7 +1111,7 @@ impl BlobCompressionContext {
         end: u64,
         batch_end: u64,
         batch_size: u64,
-    ) -> Result<Vec<Arc<dyn BlobChunkInfo>>> {
+    ) -> MetaResult<Vec<Arc<dyn BlobChunkInfo>>> {
         self.chunk_info_array
             .get_chunks_uncompressed(self, start, end, batch_end, batch_size)
     }
@@ -993,7 +1123,7 @@ impl BlobCompressionContext {
         batch_end: u64,
         batch_size: u64,
         prefetch: bool,
-    ) -> Result<Vec<Arc<dyn BlobChunkInfo>>> {
+    ) -> MetaResult<Vec<Arc<dyn BlobChunkInfo>>> {
         self.chunk_info_array
             .get_chunks_compressed(self, start, end, batch_end, batch_size, prefetch)
     }
@@ -1002,7 +1132,7 @@ impl BlobCompressionContext {
         self: &Arc<BlobCompressionContext>,
         chunks: &[Arc<dyn BlobChunkInfo>],
         max_size: u64,
-    ) -> Result<Vec<Arc<dyn BlobChunkInfo>>> {
+    ) -> MetaResult<Vec<Arc<dyn BlobChunkInfo>>> {
         self.chunk_info_array
             .add_more_chunks(self, chunks, max_size)
     }
@@ -1019,7 +1149,7 @@ impl BlobCompressionContext {
         }
     }
 
-    fn get_chunk_index(&self, addr: u64) -> Result<usize> {
+    fn get_chunk_index(&self, addr: u64) -> MetaResult<usize> {
         self.chunk_info_array
             .get_chunk_index_nocheck(self, addr, false)
     }
@@ -1031,32 +1161,32 @@ impl BlobCompressionContext {
         self.chunk_info_array.is_batch(chunk_index)
     }
 
-    fn get_batch_index(&self, chunk_index: usize) -> Result<u32> {
+    fn get_batch_index(&self, chunk_index: usize) -> MetaResult<u32> {
         self.chunk_info_array.batch_index(chunk_index)
     }
 
-    fn get_uncompressed_offset_in_batch_buf(&self, chunk_index: usize) -> Result<u32> {
+    fn get_uncompressed_offset_in_batch_buf(&self, chunk_index: usize) -> MetaResult<u32> {
         self.chunk_info_array
             .uncompressed_offset_in_batch_buf(chunk_index)
     }
 
     /// Get Batch context information for decoding.
-    fn get_batch_context(&self, batch_index: usize) -> Result<&BatchInflateContext> {
+    fn get_batch_context(&self, batch_index: usize) -> MetaResult<&BatchInflateContext> {
         if batch_index < self.batch_info_array.len() {
             let ctx = &self.batch_info_array[batch_index];
             Ok(ctx)
         } else {
-            Err(einval!(format!(
-                "Invalid batch index, current: {}, max: {}",
-                batch_index,
-                self.batch_info_array.len()
-            )))
+            Err(MetaError::IndexOutOfRange {
+                kind: "batch",
+                index: batch_index as u64,
+                max: self.batch_info_array.len() as u64,
+            })
         }
     }
 
     /// Get compressed size associated with the chunk at `chunk_index`.
     /// Capable of handling both batch and non-batch chunks.
-    pub fn get_compressed_size(&self, chunk_index: usize) -> Result<u32> {
+    pub fn get_compressed_size(&self, chunk_index: usize) -> MetaResult<u32> {
         if self.is_batch_chunk(chunk_index) {
             let ctx = self
                 .get_batch_context(self.get_batch_index(chunk_index)? as usize)
@@ -1067,16 +1197,16 @@ impl BlobCompressionContext {
         }
     }
 
-    fn get_zran_index(&self, chunk_index: usize) -> Result<u32> {
+    fn get_zran_index(&self, chunk_index: usize) -> MetaResult<u32> {
         self.chunk_info_array.zran_index(chunk_index)
     }
 
-    fn get_zran_offset(&self, chunk_index: usize) -> Result<u32> {
+    fn get_zran_offset(&self, chunk_index: usize) -> MetaResult<u32> {
         self.chunk_info_array.zran_offset(chunk_index)
     }
 
     /// Get ZRan context information for decoding.
-    fn get_zran_context(&self, zran_index: usize) -> Result<(ZranContext, &[u8])> {
+    fn get_zran_context(&self, zran_index: usize) -> MetaResult<(ZranContext, &[u8])> {
         if zran_index < self.zran_info_array.len() {
             let entry = &self.zran_info_array[zran_index];
             let dict_off = entry.dict_offset() as usize;
@@ -1084,7 +1214,7 @@ impl BlobCompressionContext {
             if dict_off.checked_add(dict_size).is_none()
                 || dict_off + dict_size > self.zran_dict_table.len()
             {
-                return Err(einval!(format!(
+                return Err(MetaError::InvalidMetadata(format!(
                     "Invalid ZRan context, dict_off: {}, dict_size: {}, max: {}",
                     dict_off,
                     dict_size,
@@ -1095,11 +1225,11 @@ impl BlobCompressionContext {
             let ctx = ZranContext::from(entry);
             Ok((ctx, dict))
         } else {
-            Err(einval!(format!(
-                "Invalid ZRan index, current: {}, max: {}",
-                zran_index,
-                self.zran_info_array.len()
-            )))
+            Err(MetaError::IndexOutOfRange {
+                kind: "ZRan",
+                index: zran_index as u64,
+                max: self.zran_info_array.len() as u64,
+            })
         }
     }
 
@@ -1238,11 +1368,13 @@ impl BlobMetaChunkArray {
 }
 
 impl BlobMetaChunkArray {
-    fn from_file_map(filemap: &FileMapState, blob_info: &BlobInfo) -> Result<Self> {
+    fn from_file_map(filemap: &FileMapState, blob_info: &BlobInfo) -> MetaResult<Self> {
         let chunk_count = blob_info.chunk_count();
         if blob_info.has_feature(BlobFeatures::CHUNK_INFO_V2) {
             let chunk_size = chunk_count as usize * size_of::<BlobChunkInfoV2Ondisk>();
-            let base = filemap.validate_range(0, chunk_size)?;
+            let base = filemap
+                .validate_range(0, chunk_size)
+                .map_err(|e| MetaError::io("chunk info table is outside the meta file", e))?;
             let v = unsafe {
                 Vec::from_raw_parts(
                     base as *mut u8 as *mut BlobChunkInfoV2Ondisk,
@@ -1253,7 +1385,9 @@ impl BlobMetaChunkArray {
             Ok(BlobMetaChunkArray::V2(v))
         } else {
             let chunk_size = chunk_count as usize * size_of::<BlobChunkInfoV1Ondisk>();
-            let base = filemap.validate_range(0, chunk_size)?;
+            let base = filemap
+                .validate_range(0, chunk_size)
+                .map_err(|e| MetaError::io("chunk info table is outside the meta file", e))?;
             let v = unsafe {
                 Vec::from_raw_parts(
                     base as *mut u8 as *mut BlobChunkInfoV1Ondisk,
@@ -1270,7 +1404,7 @@ impl BlobMetaChunkArray {
         state: &BlobCompressionContext,
         addr: u64,
         compressed: bool,
-    ) -> Result<usize> {
+    ) -> MetaResult<usize> {
         match self {
             BlobMetaChunkArray::V1(v) => {
                 Self::_get_chunk_index_nocheck(state, v, addr, compressed, false)
@@ -1289,7 +1423,7 @@ impl BlobMetaChunkArray {
         batch_end: u64,
         batch_size: u64,
         prefetch: bool,
-    ) -> Result<Vec<Arc<dyn BlobChunkInfo>>> {
+    ) -> MetaResult<Vec<Arc<dyn BlobChunkInfo>>> {
         match self {
             BlobMetaChunkArray::V1(v) => {
                 Self::_get_chunks_compressed(state, v, start, end, batch_end, batch_size, prefetch)
@@ -1307,7 +1441,7 @@ impl BlobMetaChunkArray {
         end: u64,
         batch_end: u64,
         batch_size: u64,
-    ) -> Result<Vec<Arc<dyn BlobChunkInfo>>> {
+    ) -> MetaResult<Vec<Arc<dyn BlobChunkInfo>>> {
         match self {
             BlobMetaChunkArray::V1(v) => {
                 Self::_get_chunks_uncompressed(state, v, start, end, batch_end, batch_size)
@@ -1323,7 +1457,7 @@ impl BlobMetaChunkArray {
         state: &Arc<BlobCompressionContext>,
         chunks: &[Arc<dyn BlobChunkInfo>],
         max_size: u64,
-    ) -> Result<Vec<Arc<dyn BlobChunkInfo>>> {
+    ) -> MetaResult<Vec<Arc<dyn BlobChunkInfo>>> {
         match self {
             BlobMetaChunkArray::V1(v) => Self::_add_more_chunks(state, v, chunks, max_size),
             BlobMetaChunkArray::V2(v) => Self::_add_more_chunks(state, v, chunks, max_size),
@@ -1365,28 +1499,28 @@ impl BlobMetaChunkArray {
         }
     }
 
-    fn batch_index(&self, index: usize) -> Result<u32> {
+    fn batch_index(&self, index: usize) -> MetaResult<u32> {
         match self {
             BlobMetaChunkArray::V1(v) => v[index].get_batch_index(),
             BlobMetaChunkArray::V2(v) => v[index].get_batch_index(),
         }
     }
 
-    fn uncompressed_offset_in_batch_buf(&self, index: usize) -> Result<u32> {
+    fn uncompressed_offset_in_batch_buf(&self, index: usize) -> MetaResult<u32> {
         match self {
             BlobMetaChunkArray::V1(v) => v[index].get_uncompressed_offset_in_batch_buf(),
             BlobMetaChunkArray::V2(v) => v[index].get_uncompressed_offset_in_batch_buf(),
         }
     }
 
-    fn zran_index(&self, index: usize) -> Result<u32> {
+    fn zran_index(&self, index: usize) -> MetaResult<u32> {
         match self {
             BlobMetaChunkArray::V1(v) => v[index].get_zran_index(),
             BlobMetaChunkArray::V2(v) => v[index].get_zran_index(),
         }
     }
 
-    fn zran_offset(&self, index: usize) -> Result<u32> {
+    fn zran_offset(&self, index: usize) -> MetaResult<u32> {
         match self {
             BlobMetaChunkArray::V1(v) => v[index].get_zran_offset(),
             BlobMetaChunkArray::V2(v) => v[index].get_zran_offset(),
@@ -1441,7 +1575,7 @@ impl BlobMetaChunkArray {
         addr: u64,
         compressed: bool,
         prefetch: bool,
-    ) -> Result<usize> {
+    ) -> MetaResult<usize> {
         let mut size = chunks.len();
         let mut left = 0;
         let mut right = size;
@@ -1497,7 +1631,7 @@ impl BlobMetaChunkArray {
         }
 
         // if addr == self.chunks[last].compressed_offset, return einval with error msg.
-        Err(einval!(format!(
+        Err(MetaError::InvalidMetadata(format!(
             "failed to get chunk index, prefetch {}, left {}, right {}, start: {}, end: {}, addr: {}",
             prefetch, left, right, start, end, addr
         )))
@@ -1510,7 +1644,7 @@ impl BlobMetaChunkArray {
         end: u64,
         batch_end: u64,
         batch_size: u64,
-    ) -> Result<Vec<Arc<dyn BlobChunkInfo>>> {
+    ) -> MetaResult<Vec<Arc<dyn BlobChunkInfo>>> {
         let mut vec = Vec::with_capacity(512);
         let mut index =
             Self::_get_chunk_index_nocheck(state, chunk_info_array, start, false, false)?;
@@ -1531,8 +1665,9 @@ impl BlobMetaChunkArray {
             while index > 0 {
                 let entry = Self::get_chunk_entry(state, chunk_info_array, index - 1)?;
                 if !entry.is_zran() {
-                    return Err(einval!(
+                    return Err(MetaError::InvalidMetadata(
                         "inconsistent ZRan and non-ZRan chunk compression information entries"
+                            .to_string(),
                     ));
                 } else if entry.get_zran_index()? != zran_index {
                     // reach the header chunk associated with the same ZRan context.
@@ -1545,8 +1680,9 @@ impl BlobMetaChunkArray {
             for entry in &chunk_info_array[index..] {
                 entry.validate(state)?;
                 if !entry.is_zran() {
-                    return Err(einval!(
+                    return Err(MetaError::InvalidMetadata(
                         "inconsistent ZRan and non-ZRan chunk compression information entries"
+                            .to_string(),
                     ));
                 }
                 if entry.get_zran_index()? != zran_last {
@@ -1567,7 +1703,7 @@ impl BlobMetaChunkArray {
             if zran_end >= end {
                 return Ok(vec);
             }
-            return Err(einval!(format!(
+            return Err(MetaError::InvalidMetadata(format!(
                 "entry not found index {} chunk_info_array.len {}, end 0x{:x}, range [0x{:x}-0x{:x}]",
                 index,
                 chunk_info_array.len(),
@@ -1587,7 +1723,7 @@ impl BlobMetaChunkArray {
 
                 let entry = Self::get_chunk_entry(state, chunk_info_array, index)?;
                 if entry.uncompressed_offset() != last_end {
-                    return Err(einval!(format!(
+                    return Err(MetaError::InvalidMetadata(format!(
                         "mismatch uncompressed {} size {} last_end {}",
                         entry.uncompressed_offset(),
                         entry.uncompressed_size(),
@@ -1608,7 +1744,7 @@ impl BlobMetaChunkArray {
             if last_end >= end {
                 Ok(vec)
             } else {
-                Err(einval!(format!(
+                Err(MetaError::InvalidMetadata(format!(
                     "entry not found index {} chunk_info_array.len {}, last_end 0x{:x}, end 0x{:x}, blob compressed size 0x{:x}",
                     index,
                     chunk_info_array.len(),
@@ -1628,7 +1764,7 @@ impl BlobMetaChunkArray {
         batch_end: u64,
         batch_size: u64,
         prefetch: bool,
-    ) -> Result<Vec<Arc<dyn BlobChunkInfo>>> {
+    ) -> MetaResult<Vec<Arc<dyn BlobChunkInfo>>> {
         let mut vec = Vec::with_capacity(512);
         let mut index =
             Self::_get_chunk_index_nocheck(state, chunk_info_array, start, true, prefetch)?;
@@ -1643,8 +1779,9 @@ impl BlobMetaChunkArray {
             while index > 0 {
                 let entry = Self::get_chunk_entry(state, chunk_info_array, index - 1)?;
                 if !entry.is_zran() {
-                    return Err(einval!(
+                    return Err(MetaError::InvalidMetadata(
                         "inconsistent ZRan and non-ZRan chunk compression information entries"
+                            .to_string(),
                     ));
                 } else if entry.get_zran_index()? != zran_index {
                     // reach the header chunk associated with the same ZRan context.
@@ -1657,8 +1794,9 @@ impl BlobMetaChunkArray {
             for entry in &chunk_info_array[index..] {
                 entry.validate(state)?;
                 if !entry.is_zran() {
-                    return Err(einval!(
+                    return Err(MetaError::InvalidMetadata(
                         "inconsistent ZRan and non-ZRan chunk compression information entries"
+                            .to_string(),
                     ));
                 }
                 if entry.get_zran_index()? != zran_last {
@@ -1683,7 +1821,7 @@ impl BlobMetaChunkArray {
                     return Ok(vec);
                 }
             }
-            return Err(einval!(format!(
+            return Err(MetaError::InvalidMetadata(format!(
                 "entry not found index {} chunk_info_array.len {}",
                 index,
                 chunk_info_array.len(),
@@ -1714,7 +1852,7 @@ impl BlobMetaChunkArray {
             if last_end >= end || (prefetch && !vec.is_empty()) {
                 Ok(vec)
             } else {
-                Err(einval!(format!(
+                Err(MetaError::InvalidMetadata(format!(
                     "entry not found index {} chunk_info_array.len {}, last_end 0x{:x}, end 0x{:x}, blob compressed size 0x{:x}",
                     index,
                     chunk_info_array.len(),
@@ -1731,7 +1869,7 @@ impl BlobMetaChunkArray {
         chunk_info_array: &[T],
         chunks: &[Arc<dyn BlobChunkInfo>],
         max_size: u64,
-    ) -> Result<Vec<Arc<dyn BlobChunkInfo>>> {
+    ) -> MetaResult<Vec<Arc<dyn BlobChunkInfo>>> {
         let first_idx = chunks[0].id() as usize;
         let first_entry = Self::get_chunk_entry(state, chunk_info_array, first_idx)?;
         let last_idx = chunks[chunks.len() - 1].id() as usize;
@@ -1751,8 +1889,8 @@ impl BlobMetaChunkArray {
                 let entry = Self::get_chunk_entry(state, chunk_info_array, index - 1)?;
                 if !entry.is_zran() {
                     // All chunks should be ZRan chunks.
-                    return Err(std::io::Error::other(
-                        "invalid ZRan compression information data",
+                    return Err(MetaError::Corrupted(
+                        "invalid ZRan compression information data".to_string(),
                     ));
                 } else if entry.get_zran_index()? != first_zran_idx {
                     // reach the header chunk associated with the same ZRan context.
@@ -1764,8 +1902,8 @@ impl BlobMetaChunkArray {
 
             for entry in &chunk_info_array[index..] {
                 if entry.validate(state).is_err() || !entry.is_zran() {
-                    return Err(std::io::Error::other(
-                        "invalid ZRan compression information data",
+                    return Err(MetaError::Corrupted(
+                        "invalid ZRan compression information data".to_string(),
                     ));
                 } else if entry.get_zran_index()? > last_zran_idx {
                     if entry.compressed_end() + RAFS_MAX_CHUNK_SIZE <= fetch_end
@@ -1847,7 +1985,7 @@ impl BlobMetaChunkArray {
         state: &Arc<BlobCompressionContext>,
         chunk_info_array: &'a [T],
         index: usize,
-    ) -> Result<&'a T> {
+    ) -> MetaResult<&'a T> {
         assert!(index < chunk_info_array.len());
         let entry = &chunk_info_array[index];
         // If the chunk belongs to a chunkdict, skip the validation check.
@@ -2035,16 +2173,16 @@ pub trait BlobMetaChunkInfo {
     fn is_zran(&self) -> bool;
 
     /// Get index of the ZRan context data associated with the chunk.
-    fn get_zran_index(&self) -> Result<u32>;
+    fn get_zran_index(&self) -> MetaResult<u32>;
 
     /// Get offset to get context data from the associated ZRan context.
-    fn get_zran_offset(&self) -> Result<u32>;
+    fn get_zran_offset(&self) -> MetaResult<u32>;
 
     /// Get index of the Batch context data associated with the chunk.
-    fn get_batch_index(&self) -> Result<u32>;
+    fn get_batch_index(&self) -> MetaResult<u32>;
 
     /// Get offset of uncompressed chunk data inside the batch chunk.
-    fn get_uncompressed_offset_in_batch_buf(&self) -> Result<u32>;
+    fn get_uncompressed_offset_in_batch_buf(&self) -> MetaResult<u32>;
 
     /// Get CRC32 of the chunk.
     fn crc32(&self) -> u32;
@@ -2063,7 +2201,7 @@ pub trait BlobMetaChunkInfo {
     fn get_data(&self) -> u64;
 
     /// Check whether the chunk compression information is valid or not.
-    fn validate(&self, state: &BlobCompressionContext) -> Result<()>;
+    fn validate(&self, state: &BlobCompressionContext) -> MetaResult<()>;
 }
 
 /// Generate description string for blob meta features.

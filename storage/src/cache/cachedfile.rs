@@ -68,7 +68,7 @@ impl FileCacheMeta {
                     has_error: Arc::new(AtomicBool::new(false)),
                     meta: Arc::new(Mutex::new(Some(Arc::new(m)))),
                 }),
-                Err(e) => Err(e),
+                Err(e) => Err(e.into()),
             }
         } else {
             let meta = FileCacheMeta {
