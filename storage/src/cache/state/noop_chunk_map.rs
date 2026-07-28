@@ -2,8 +2,7 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-use std::io::Result;
-
+use crate::StorageResult;
 use crate::cache::state::{ChunkIndexGetter, ChunkMap};
 use crate::device::BlobChunkInfo;
 
@@ -23,7 +22,7 @@ impl NoopChunkMap {
 }
 
 impl ChunkMap for NoopChunkMap {
-    fn is_ready(&self, _chunk: &dyn BlobChunkInfo) -> Result<bool> {
+    fn is_ready(&self, _chunk: &dyn BlobChunkInfo) -> StorageResult<bool> {
         Ok(self.cached)
     }
 }

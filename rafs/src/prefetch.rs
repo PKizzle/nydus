@@ -596,7 +596,7 @@ mod tests {
     }
 
     impl ChunkMap for MockChunkMap {
-        fn is_ready(&self, _chunk: &dyn BlobChunkInfo) -> std::io::Result<bool> {
+        fn is_ready(&self, _chunk: &dyn BlobChunkInfo) -> nydus_storage::StorageResult<bool> {
             Ok(self.ready)
         }
     }

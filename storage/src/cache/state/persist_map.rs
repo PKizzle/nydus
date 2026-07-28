@@ -4,7 +4,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::fs::{File, OpenOptions};
-use std::io::{Result, Write};
+use std::io::Write;
 use std::os::unix::io::AsRawFd;
 use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
 
@@ -12,6 +12,7 @@ use nydus_utils::div_round_up;
 use nydus_utils::filemap::{FileMapState, clone_file};
 
 use crate::utils::readahead;
+use crate::{StorageError, StorageResult};
 
 pub(crate) const MAGIC1: u32 = 0x424D_4150;
 pub(crate) const MAGIC2: u32 = 0x434D_4150;
@@ -48,9 +49,16 @@ pub(crate) struct PersistMap {
 }
 
 impl PersistMap {
-    pub fn open(filename: &str, chunk_count: u32, create: bool, persist: bool) -> Result<Self> {
+    pub fn open(
+        filename: &str,
+        chunk_count: u32,
+        create: bool,
+        persist: bool,
+    ) -> StorageResult<Self> {
         if chunk_count == 0 {
-            return Err(einval!("chunk count should be greater than 0"));
+            return Err(StorageError::InvalidArgument(
+                "chunk count should be greater than 0".to_string(),
+            ));
         }
 
         let mut file = OpenOptions::new()
@@ -59,21 +67,21 @@ impl PersistMap {
             .create(create)
             .truncate(!persist)
             .open(filename)
-            .map_err(|err| {
-                einval!(format!(
-                    "failed to open/create blob chunk_map file {:?}: {:?}",
-                    filename, err
-                ))
-            })?;
+            .map_err(|err| StorageError::cache_io("open the chunk map file", err))?;
 
-        let file_size = file.metadata()?.len();
+        let file_size = file
+            .metadata()
+            .map_err(|e| StorageError::cache_io("stat the chunk map file", e))?
+            .len();
         let bitmap_size = div_round_up(chunk_count as u64, 8u64);
         let expected_size = HEADER_SIZE as u64 + bitmap_size;
         let mut new_content = false;
 
         if file_size == 0 {
             if !create {
-                return Err(enoent!());
+                return Err(StorageError::InvalidState(
+                    "chunk map file does not exist and may not be created".to_string(),
+                ));
             }
 
             new_content = true;
@@ -82,24 +90,35 @@ impl PersistMap {
             // File size doesn't match, it's too risky to accept the chunk state file. Fallback to
             // always mark chunk data as not ready.
             warn!("blob chunk_map file may be corrupted: {:?}", filename);
-            return Err(einval!(format!("chunk_map file {:?} is invalid", filename)));
+            return Err(StorageError::InvalidData(format!(
+                "chunk_map file {:?} is invalid",
+                filename
+            )));
         }
 
-        let file2 = clone_file(file.as_raw_fd())?;
-        let mut filemap = FileMapState::new(file2, 0, expected_size as usize, true)?;
-        let header = filemap.get_mut::<Header>(0)?;
+        let file2 = clone_file(file.as_raw_fd())
+            .map_err(|e| StorageError::cache_io("dup the chunk map fd", e))?;
+        let mut filemap = FileMapState::new(file2, 0, expected_size as usize, true)
+            .map_err(|e| StorageError::cache_io("mmap the chunk map file", e))?;
+        let header = filemap
+            .get_mut::<Header>(0)
+            .map_err(|e| StorageError::cache_io("reach the chunk map contents", e))?;
         if header.magic != MAGIC1 {
             if !create {
-                return Err(enoent!());
+                return Err(StorageError::InvalidState(
+                    "chunk map file does not exist and may not be created".to_string(),
+                ));
             }
 
             // There's race window between "file.set_len()" and "file.write(&header)". If that
             // happens, all file content should be zero. Detect the race window and write out
             // header again to fix it.
-            let content = filemap.get_slice::<u8>(0, expected_size as usize)?;
+            let content = filemap
+                .get_slice::<u8>(0, expected_size as usize)
+                .map_err(|e| StorageError::cache_io("reach the chunk map contents", e))?;
             for c in content {
                 if *c != 0 {
-                    return Err(einval!(format!(
+                    return Err(StorageError::InvalidData(format!(
                         "invalid blob chunk_map file header: {:?}",
                         filename
                     )));
@@ -110,11 +129,13 @@ impl PersistMap {
             Self::write_header(&mut file, expected_size)?;
         }
 
-        let header = filemap.get_mut::<Header>(0)?;
+        let header = filemap
+            .get_mut::<Header>(0)
+            .map_err(|e| StorageError::cache_io("reach the chunk map contents", e))?;
         let mut not_ready_count = chunk_count;
         if header.version >= 1 {
             if header.magic2 != MAGIC2 {
-                return Err(einval!(format!(
+                return Err(StorageError::InvalidData(format!(
                     "invalid blob chunk_map file header: {:?}",
                     filename
                 )));
@@ -126,13 +147,17 @@ impl PersistMap {
             } else {
                 let mut ready_count = 0;
                 for idx in HEADER_SIZE..expected_size as usize {
-                    let current = filemap.get_ref::<AtomicU8>(idx)?;
+                    let current = filemap
+                        .get_ref::<AtomicU8>(idx)
+                        .map_err(|e| StorageError::cache_io("reach the chunk map contents", e))?;
                     let val = current.load(Ordering::Acquire);
                     ready_count += val.count_ones() as u32;
                 }
 
                 if ready_count >= chunk_count {
-                    let header = filemap.get_mut::<Header>(0)?;
+                    let header = filemap
+                        .get_mut::<Header>(0)
+                        .map_err(|e| StorageError::cache_io("reach the chunk map contents", e))?;
                     header.all_ready = MAGIC_ALL_READY;
                     let _ = file.sync_all();
                     not_ready_count = 0;
@@ -154,7 +179,7 @@ impl PersistMap {
         })
     }
 
-    fn write_header(file: &mut File, size: u64) -> Result<()> {
+    fn write_header(file: &mut File, size: u64) -> StorageResult<()> {
         let header = Header {
             magic: MAGIC1,
             version: 1,
@@ -164,11 +189,15 @@ impl PersistMap {
         };
 
         // Set file size to expected value and sync to disk.
-        file.set_len(size)?;
-        file.sync_all()?;
+        file.set_len(size)
+            .map_err(|e| StorageError::cache_io("size the chunk map file", e))?;
+        file.sync_all()
+            .map_err(|e| StorageError::cache_io("flush the chunk map file", e))?;
         // write file header and sync to disk.
-        file.write_all(header.as_slice())?;
-        file.sync_all()?;
+        file.write_all(header.as_slice())
+            .map_err(|e| StorageError::cache_io("write the chunk map header", e))?;
+        file.sync_all()
+            .map_err(|e| StorageError::cache_io("flush the chunk map file", e))?;
 
         Ok(())
     }
@@ -179,11 +208,11 @@ impl PersistMap {
     }
 
     #[inline]
-    pub fn validate_index(&self, idx: u32) -> Result<u32> {
+    pub fn validate_index(&self, idx: u32) -> StorageResult<u32> {
         if idx < self.count {
             Ok(idx)
         } else {
-            Err(einval!(format!(
+            Err(StorageError::InvalidData(format!(
                 "chunk index {} exceeds chunk count {}",
                 idx, self.count
             )))
@@ -225,7 +254,7 @@ impl PersistMap {
         (ready, current)
     }
 
-    pub fn set_chunk_ready(&self, index: u32) -> Result<()> {
+    pub fn set_chunk_ready(&self, index: u32) -> StorageResult<()> {
         let index = self.validate_index(index)?;
 
         // Loop to atomically update the state bit corresponding to the chunk index.
@@ -272,7 +301,7 @@ impl PersistMap {
     /// bitmap is a promise that data is present; dropping the data first leaves a window in
     /// which the map still claims ready for a hole, and a reader in that window is served
     /// zeros. Clearing first only risks a redundant re-fetch, which is harmless.
-    pub fn reset(&self) -> Result<()> {
+    pub fn reset(&self) -> StorageResult<()> {
         let size = self.filemap.size();
 
         // Clear the header marker first: it short-circuits `is_range_all_ready`, so while the
@@ -283,18 +312,24 @@ impl PersistMap {
         // two views of the header from drifting apart.
         let all_ready = self
             .filemap
-            .get_ref::<AtomicU32>(std::mem::offset_of!(Header, all_ready))?;
+            .get_ref::<AtomicU32>(std::mem::offset_of!(Header, all_ready))
+            .map_err(|e| StorageError::cache_io("reach the chunk map contents", e))?;
         all_ready.store(0, Ordering::Release);
 
         for idx in HEADER_SIZE..size {
-            let byte = self.filemap.get_ref::<AtomicU8>(idx)?;
+            let byte = self
+                .filemap
+                .get_ref::<AtomicU8>(idx)
+                .map_err(|e| StorageError::cache_io("reach the chunk map contents", e))?;
             byte.store(0, Ordering::Release);
         }
         self.not_ready_count.store(self.count, Ordering::Release);
 
         // Persist before returning: if the process dies between the punch and a later flush,
         // a stale on-disk bitmap would claim the discarded chunks are present.
-        self.filemap.sync_data()?;
+        self.filemap
+            .sync_data()
+            .map_err(|e| StorageError::cache_io("flush the chunk map", e))?;
 
         Ok(())
     }

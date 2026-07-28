@@ -10,11 +10,11 @@
 //! optimal in case of performance and memory consumption. So it is only used to keep backward
 /// compatibility with the old nydus image format.
 use std::collections::HashSet;
-use std::io::Result;
 use std::sync::RwLock;
 
 use nydus_utils::digest::RafsDigest;
 
+use crate::StorageResult;
 use crate::cache::state::{ChunkIndexGetter, ChunkMap};
 use crate::device::BlobChunkInfo;
 
@@ -41,11 +41,11 @@ impl DigestedChunkMap {
 }
 
 impl ChunkMap for DigestedChunkMap {
-    fn is_ready(&self, chunk: &dyn BlobChunkInfo) -> Result<bool> {
+    fn is_ready(&self, chunk: &dyn BlobChunkInfo) -> StorageResult<bool> {
         Ok(self.cache.read().unwrap().contains(chunk.chunk_id()))
     }
 
-    fn set_ready_and_clear_pending(&self, chunk: &dyn BlobChunkInfo) -> Result<()> {
+    fn set_ready_and_clear_pending(&self, chunk: &dyn BlobChunkInfo) -> StorageResult<()> {
         // Do not expect poisoned lock.
         self.cache.write().unwrap().insert(*chunk.chunk_id());
         Ok(())

@@ -104,6 +104,64 @@ pub enum StorageError {
     /// A blob's compression context table could not be read or trusted.
     #[error("{0}")]
     Meta(#[from] crate::meta::MetaError),
+    /// A caller passed an argument the storage layer cannot act on.
+    #[error("{0}")]
+    InvalidArgument(String),
+    /// The storage object is not in a state where the operation makes sense.
+    #[error("{0}")]
+    InvalidState(String),
+    /// Data read back from the cache or a blob is not what it claimed to be.
+    #[error("{0}")]
+    InvalidData(String),
+    /// A read or write against the local cache failed.
+    ///
+    /// This is the errno carrier the on-demand path depends on. A `pwrite` into a blob's cache
+    /// file can fail with `ENOSPC` or `EDQUOT`, and the fanotify handler has to answer the
+    /// kernel's permission event with that exact errno -- so `source` holds the raw `Os` error
+    /// and is never re-wrapped into a `Custom` one.
+    #[error("failed to {op} the blob cache: {source}")]
+    CacheIo {
+        /// The operation attempted, e.g. `pwrite` or `mmap`.
+        op: &'static str,
+        /// The OS error, kept raw so its errno stays recoverable.
+        #[source]
+        source: std::io::Error,
+    },
+}
+
+impl StorageError {
+    /// Build a [`StorageError::CacheIo`] for `op`.
+    pub fn cache_io(op: &'static str, source: std::io::Error) -> Self {
+        StorageError::CacheIo { op, source }
+    }
+}
+
+/// Boundary conversion for the places pinned to `std::io::Error` by an external trait.
+///
+/// This one is permanent, not a migration shim: `FileReadWriteVolatile`, the FUSE server and
+/// the C API all require an `io::Error`, and the kernel on the other side of them understands
+/// an errno and nothing else.
+///
+/// An errno recovered from anywhere on the chain wins, so a failure that started as a real
+/// syscall failure (`ENOSPC` from a cache write, say) arrives at the fanotify or FUSE boundary
+/// as that errno rather than as a generic one. Only when there is no errno to recover does the
+/// variant decide the kind.
+impl From<StorageError> for std::io::Error {
+    fn from(e: StorageError) -> Self {
+        if let Some(errno) = nydus_utils::source_errno(&e) {
+            return std::io::Error::from_raw_os_error(errno);
+        }
+        let kind = match &e {
+            StorageError::Unsupported => std::io::ErrorKind::Unsupported,
+            StorageError::Timeout => std::io::ErrorKind::TimedOut,
+            StorageError::InvalidArgument(_) | StorageError::InvalidState(_) => {
+                std::io::ErrorKind::InvalidInput
+            }
+            StorageError::InvalidData(_) => std::io::ErrorKind::InvalidData,
+            _ => std::io::ErrorKind::Other,
+        };
+        std::io::Error::new(kind, e)
+    }
 }
 
 /// Specialized std::result::Result for storage subsystem.

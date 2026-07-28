@@ -8,11 +8,11 @@
 //! This module provides a chunk state tracking driver based on a bitmap file. There's a state bit
 //! in the bitmap file for each chunk, and atomic operations are used to manipulate the bitmap.
 //! So it supports concurrent downloading.
-use std::io::Result;
 
 use crate::cache::state::persist_map::PersistMap;
 use crate::cache::state::{ChunkIndexGetter, ChunkMap, RangeMap};
 use crate::device::BlobChunkInfo;
+use crate::{StorageError, StorageResult};
 
 /// The name suffix of blob chunk_map file, named $blob_id.chunk_map.
 const FILE_SUFFIX: &str = "chunk_map";
@@ -34,7 +34,7 @@ pub struct IndexedChunkMap {
 
 impl IndexedChunkMap {
     /// Create a new instance of `IndexedChunkMap`.
-    pub fn new(blob_path: &str, chunk_count: u32, persist: bool) -> Result<Self> {
+    pub fn new(blob_path: &str, chunk_count: u32, persist: bool) -> StorageResult<Self> {
         let filename = format!("{}.{}", blob_path, FILE_SUFFIX);
 
         PersistMap::open(&filename, chunk_count, true, persist).map(|map| IndexedChunkMap { map })
@@ -42,7 +42,7 @@ impl IndexedChunkMap {
 }
 
 impl ChunkMap for IndexedChunkMap {
-    fn is_ready(&self, chunk: &dyn BlobChunkInfo) -> Result<bool> {
+    fn is_ready(&self, chunk: &dyn BlobChunkInfo) -> StorageResult<bool> {
         if self.is_range_all_ready() {
             Ok(true)
         } else {
@@ -51,7 +51,7 @@ impl ChunkMap for IndexedChunkMap {
         }
     }
 
-    fn set_ready_and_clear_pending(&self, chunk: &dyn BlobChunkInfo) -> Result<()> {
+    fn set_ready_and_clear_pending(&self, chunk: &dyn BlobChunkInfo) -> StorageResult<()> {
         self.map.set_chunk_ready(chunk.id())
     }
 
@@ -72,16 +72,18 @@ impl RangeMap for IndexedChunkMap {
         self.map.is_range_all_ready()
     }
 
-    fn reset_range_ready(&self) -> Result<()> {
+    fn reset_range_ready(&self) -> StorageResult<()> {
         self.map.reset()
     }
 
-    fn is_range_ready(&self, start_index: u32, count: u32) -> Result<bool> {
+    fn is_range_ready(&self, start_index: u32, count: u32) -> StorageResult<bool> {
         if !self.is_range_all_ready() {
             for idx in 0..count {
                 let index = self
                     .map
-                    .validate_index(start_index.checked_add(idx).ok_or_else(|| einval!())?)?;
+                    .validate_index(start_index.checked_add(idx).ok_or_else(|| {
+                        StorageError::InvalidArgument("chunk index overflowed".to_string())
+                    })?)?;
                 if !self.map.is_chunk_ready(index).0 {
                     return Ok(false);
                 }
@@ -95,7 +97,7 @@ impl RangeMap for IndexedChunkMap {
         &self,
         start_index: u32,
         count: u32,
-    ) -> Result<Option<Vec<u32>>> {
+    ) -> StorageResult<Option<Vec<u32>>> {
         if self.is_range_all_ready() {
             return Ok(None);
         }
@@ -117,7 +119,7 @@ impl RangeMap for IndexedChunkMap {
         }
     }
 
-    fn set_range_ready_and_clear_pending(&self, start_index: u32, count: u32) -> Result<()> {
+    fn set_range_ready_and_clear_pending(&self, start_index: u32, count: u32) -> StorageResult<()> {
         let count = std::cmp::min(count, u32::MAX - start_index);
         let end = start_index + count;
 
@@ -165,7 +167,7 @@ mod tests {
             .truncate(false)
             .open(&cache_path)
             .map_err(|err| {
-                einval!(format!(
+                StorageError::InvalidArgument(format!(
                     "failed to open/create blob chunk_map file {:?}: {:?}",
                     cache_path, err
                 ))
@@ -195,7 +197,7 @@ mod tests {
             .truncate(false)
             .open(&cache_path)
             .map_err(|err| {
-                einval!(format!(
+                StorageError::InvalidArgument(format!(
                     "failed to open/create blob chunk_map file {:?}: {:?}",
                     cache_path, err
                 ))
@@ -231,7 +233,7 @@ mod tests {
             .truncate(false)
             .open(&cache_path)
             .map_err(|err| {
-                einval!(format!(
+                StorageError::InvalidArgument(format!(
                     "failed to open/create blob chunk_map file {:?}: {:?}",
                     cache_path, err
                 ))
@@ -268,7 +270,7 @@ mod tests {
             .truncate(false)
             .open(&cache_path)
             .map_err(|err| {
-                einval!(format!(
+                StorageError::InvalidArgument(format!(
                     "failed to open/create blob chunk_map file {:?}: {:?}",
                     cache_path, err
                 ))
@@ -314,7 +316,7 @@ mod tests {
             .truncate(false)
             .open(&cache_path)
             .map_err(|err| {
-                einval!(format!(
+                StorageError::InvalidArgument(format!(
                     "failed to open/create blob chunk_map file {:?}: {:?}",
                     cache_path, err
                 ))

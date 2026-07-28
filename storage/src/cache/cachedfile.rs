@@ -11,7 +11,7 @@
 
 use std::collections::HashSet;
 use std::fs::File;
-use std::io::{ErrorKind, Read, Result};
+use std::io::{self, ErrorKind, Read, Result};
 use std::mem::ManuallyDrop;
 #[cfg(feature = "dedup")]
 use std::ops::Deref;
@@ -914,15 +914,15 @@ impl BlobObject for FileCacheEntry {
         // A tarfs blob is the tar itself rather than a populated cache; there is no readiness
         // bookkeeping to revoke and nothing that could be re-fetched.
         if self.is_tarfs {
-            return Err(enosys!());
+            return Err(io::Error::from_raw_os_error(libc::ENOSYS));
         }
         // `as_range_map` only resolves for `BlobStateMap<IndexedChunkMap, _>`. A legacy RAFS v5
         // blob on the `DigestedChunkMap` fallback yields `None` and so reports "unsupported"
         // rather than silently doing nothing — which is the direction that keeps callers safe,
         // since a caller that cannot revoke readiness must not discard the data either.
         match self.chunk_map.as_range_map() {
-            Some(b) => b.reset_range_ready(),
-            None => Err(enosys!()),
+            Some(b) => b.reset_range_ready().map_err(io::Error::from),
+            None => Err(io::Error::from_raw_os_error(libc::ENOSYS)),
         }
     }
 

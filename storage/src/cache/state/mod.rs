@@ -33,10 +33,9 @@
 //!   based backend storage or dummy cache.
 
 use std::any::Any;
-use std::io::Result;
 
-use crate::StorageResult;
 use crate::device::BlobChunkInfo;
+use crate::{StorageError, StorageResult};
 
 pub use blob_state_map::BlobStateMap;
 pub use digested_chunk_map::DigestedChunkMap;
@@ -54,15 +53,15 @@ mod range_map;
 /// Trait to track chunk readiness state.
 pub trait ChunkMap: Any + Send + Sync {
     /// Check whether the chunk is ready for use.
-    fn is_ready(&self, chunk: &dyn BlobChunkInfo) -> Result<bool>;
+    fn is_ready(&self, chunk: &dyn BlobChunkInfo) -> StorageResult<bool>;
 
     /// Check whether the chunk is pending for downloading.
-    fn is_pending(&self, _chunk: &dyn BlobChunkInfo) -> Result<bool> {
+    fn is_pending(&self, _chunk: &dyn BlobChunkInfo) -> StorageResult<bool> {
         Ok(false)
     }
 
     /// Check whether a chunk is ready for use or pending for downloading.
-    fn is_ready_or_pending(&self, chunk: &dyn BlobChunkInfo) -> Result<bool> {
+    fn is_ready_or_pending(&self, chunk: &dyn BlobChunkInfo) -> StorageResult<bool> {
         if matches!(self.is_pending(chunk), Ok(true)) {
             Ok(true)
         } else {
@@ -82,7 +81,7 @@ pub trait ChunkMap: Any + Send + Sync {
     }
 
     /// Set the chunk to ready for use and clear the pending state.
-    fn set_ready_and_clear_pending(&self, _chunk: &dyn BlobChunkInfo) -> Result<()> {
+    fn set_ready_and_clear_pending(&self, _chunk: &dyn BlobChunkInfo) -> StorageResult<()> {
         panic!("no support of check_ready_and_mark_pending()");
     }
 
@@ -116,8 +115,8 @@ pub trait RangeMap: Send + Sync {
     }
 
     /// Check whether all chunks or data in the range are ready for use.
-    fn is_range_ready(&self, _start: Self::I, _count: Self::I) -> Result<bool> {
-        Err(enosys!())
+    fn is_range_ready(&self, _start: Self::I, _count: Self::I) -> StorageResult<bool> {
+        Err(StorageError::Unsupported)
     }
 
     /// Check whether all chunks or data in the range [start, start + count) are ready.
@@ -134,21 +133,25 @@ pub trait RangeMap: Send + Sync {
         &self,
         _start: Self::I,
         _count: Self::I,
-    ) -> Result<Option<Vec<Self::I>>> {
-        Err(enosys!())
+    ) -> StorageResult<Option<Vec<Self::I>>> {
+        Err(StorageError::Unsupported)
     }
 
     /// Mark all chunks or data in the range as ready for use.
-    fn set_range_ready_and_clear_pending(&self, _start: Self::I, _count: Self::I) -> Result<()> {
-        Err(enosys!())
+    fn set_range_ready_and_clear_pending(
+        &self,
+        _start: Self::I,
+        _count: Self::I,
+    ) -> StorageResult<()> {
+        Err(StorageError::Unsupported)
     }
 
     /// Clear the pending state for all chunks or data in the range.
     fn clear_range_pending(&self, _start: Self::I, _count: Self::I) {}
 
     /// Wait for all chunks or data in the range to be ready until timeout.
-    fn wait_for_range_ready(&self, _start: Self::I, _count: Self::I) -> Result<bool> {
-        Err(enosys!())
+    fn wait_for_range_ready(&self, _start: Self::I, _count: Self::I) -> StorageResult<bool> {
+        Err(StorageError::Unsupported)
     }
 
     /// Revoke the ready state of everything the map tracks.
@@ -157,8 +160,8 @@ pub trait RangeMap: Send + Sync {
     /// meaningfully. Callers discarding cached data MUST call this **first**: the map is a
     /// promise that the data is present, and a promise outliving the data is served to a
     /// reader as zeros.
-    fn reset_range_ready(&self) -> Result<()> {
-        Err(enosys!())
+    fn reset_range_ready(&self) -> StorageResult<()> {
+        Err(StorageError::Unsupported)
     }
 }
 

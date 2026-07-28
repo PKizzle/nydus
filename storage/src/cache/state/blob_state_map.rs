@@ -7,7 +7,6 @@ use std::any::Any;
 use std::collections::HashMap;
 use std::fmt::Display;
 use std::hash::Hash;
-use std::io::Result;
 use std::sync::{Arc, Condvar, Mutex, WaitTimeoutResult};
 use std::time::Duration;
 
@@ -93,17 +92,17 @@ where
     C: ChunkMap + ChunkIndexGetter<Index = I>,
     I: Eq + Hash + Display + Send + 'static,
 {
-    fn is_ready(&self, chunk: &dyn BlobChunkInfo) -> Result<bool> {
+    fn is_ready(&self, chunk: &dyn BlobChunkInfo) -> StorageResult<bool> {
         self.c.is_ready(chunk)
     }
 
-    fn is_pending(&self, chunk: &dyn BlobChunkInfo) -> Result<bool> {
+    fn is_pending(&self, chunk: &dyn BlobChunkInfo) -> StorageResult<bool> {
         let index = C::get_index(chunk);
         Ok(self.inflight_tracer.lock().unwrap().get(&index).is_some())
     }
 
     fn check_ready_and_mark_pending(&self, chunk: &dyn BlobChunkInfo) -> StorageResult<bool> {
-        let mut ready = self.c.is_ready(chunk).map_err(StorageError::CacheIndex)?;
+        let mut ready = self.c.is_ready(chunk)?;
 
         if ready {
             return Ok(true);
@@ -131,7 +130,7 @@ where
         } else {
             // Double check to close the window where prior slot was just removed after backend IO
             // returned.
-            if self.c.is_ready(chunk).map_err(StorageError::CacheIndex)? {
+            if self.c.is_ready(chunk)? {
                 ready = true;
             } else {
                 guard.insert(index, Arc::new(Slot::new()));
@@ -140,7 +139,7 @@ where
         }
     }
 
-    fn set_ready_and_clear_pending(&self, chunk: &dyn BlobChunkInfo) -> Result<()> {
+    fn set_ready_and_clear_pending(&self, chunk: &dyn BlobChunkInfo) -> StorageResult<()> {
         let res = self.c.set_ready_and_clear_pending(chunk);
         self.clear_pending(chunk);
         res
@@ -173,7 +172,7 @@ impl RangeMap for BlobStateMap<IndexedChunkMap, u32> {
         self.c.is_range_all_ready()
     }
 
-    fn reset_range_ready(&self) -> Result<()> {
+    fn reset_range_ready(&self) -> StorageResult<()> {
         // Deliberately leaves `inflight_tracer` alone: a slot in there is a fetch another
         // thread is still running, and dropping it would let a second fetch of the same chunk
         // start in parallel. The caller is responsible for excluding in-flight fetches (the
@@ -181,7 +180,7 @@ impl RangeMap for BlobStateMap<IndexedChunkMap, u32> {
         self.c.reset_range_ready()
     }
 
-    fn is_range_ready(&self, start: Self::I, count: Self::I) -> Result<bool> {
+    fn is_range_ready(&self, start: Self::I, count: Self::I) -> StorageResult<bool> {
         self.c.is_range_ready(start, count)
     }
 
@@ -189,7 +188,7 @@ impl RangeMap for BlobStateMap<IndexedChunkMap, u32> {
         &self,
         start: Self::I,
         count: Self::I,
-    ) -> Result<Option<Vec<Self::I>>> {
+    ) -> StorageResult<Option<Vec<Self::I>>> {
         let pending = match self.c.check_range_ready_and_mark_pending(start, count) {
             Err(e) => return Err(e),
             Ok(None) => return Ok(None),
@@ -217,7 +216,11 @@ impl RangeMap for BlobStateMap<IndexedChunkMap, u32> {
         Ok(Some(res))
     }
 
-    fn set_range_ready_and_clear_pending(&self, start: Self::I, count: Self::I) -> Result<()> {
+    fn set_range_ready_and_clear_pending(
+        &self,
+        start: Self::I,
+        count: Self::I,
+    ) -> StorageResult<()> {
         let res = self.c.set_range_ready_and_clear_pending(start, count);
         self.clear_range_pending(start, count);
         res
@@ -235,7 +238,7 @@ impl RangeMap for BlobStateMap<IndexedChunkMap, u32> {
         }
     }
 
-    fn wait_for_range_ready(&self, start: Self::I, count: Self::I) -> Result<bool> {
+    fn wait_for_range_ready(&self, start: Self::I, count: Self::I) -> StorageResult<bool> {
         let count = std::cmp::min(count, u32::MAX - start);
         let end = start + count;
         if self.is_range_ready(start, count)? {
@@ -273,7 +276,7 @@ impl RangeMap for BlobStateMap<BlobRangeMap, u64> {
         self.c.is_range_all_ready()
     }
 
-    fn is_range_ready(&self, start: Self::I, count: Self::I) -> Result<bool> {
+    fn is_range_ready(&self, start: Self::I, count: Self::I) -> StorageResult<bool> {
         self.c.is_range_ready(start, count)
     }
 
@@ -281,7 +284,7 @@ impl RangeMap for BlobStateMap<BlobRangeMap, u64> {
         &self,
         start: Self::I,
         count: Self::I,
-    ) -> Result<Option<Vec<Self::I>>> {
+    ) -> StorageResult<Option<Vec<Self::I>>> {
         let pending = match self.c.check_range_ready_and_mark_pending(start, count) {
             Err(e) => return Err(e),
             Ok(None) => return Ok(None),
@@ -309,7 +312,11 @@ impl RangeMap for BlobStateMap<BlobRangeMap, u64> {
         Ok(Some(res))
     }
 
-    fn set_range_ready_and_clear_pending(&self, start: Self::I, count: Self::I) -> Result<()> {
+    fn set_range_ready_and_clear_pending(
+        &self,
+        start: Self::I,
+        count: Self::I,
+    ) -> StorageResult<()> {
         let res = self.c.set_range_ready_and_clear_pending(start, count);
         self.clear_range_pending(start, count);
         res
@@ -333,7 +340,7 @@ impl RangeMap for BlobStateMap<BlobRangeMap, u64> {
         }
     }
 
-    fn wait_for_range_ready(&self, start: Self::I, count: Self::I) -> Result<bool> {
+    fn wait_for_range_ready(&self, start: Self::I, count: Self::I) -> StorageResult<bool> {
         if self.c.is_range_ready(start, count)? {
             return Ok(true);
         }
