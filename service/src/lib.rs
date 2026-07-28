@@ -143,8 +143,16 @@ pub enum Error {
     SessionShutdown(FuseTransportError),
     #[error("FUSE notify error, {0}")]
     NotifyError(#[from] FuseNotifyError),
-    #[error("failed to walk and notify invalidation: {0}")]
-    WalkNotifyInvalidation(#[from] std::io::Error),
+    /// An I/O operation failed.
+    ///
+    /// This is what `?` on a bare `io::Error` produces anywhere in the crate, so it must not
+    /// claim to describe a particular operation. It was called `WalkNotifyInvalidation` and
+    /// rendered as "failed to walk and notify invalidation" -- a message that was right for the
+    /// one site it was written for and wrong for every other error that reached it, which after
+    /// the typed-error migration is most of them. Kept raw so `source_errno` and the boundary
+    /// `ErrorKind` lookup can both still see through it.
+    #[error("{0}")]
+    Io(#[from] std::io::Error),
 
     // virtio-fs
     #[error("failed to handle event other than input event")]
