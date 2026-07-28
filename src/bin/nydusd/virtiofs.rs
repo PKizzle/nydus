@@ -346,7 +346,9 @@ where
             .lock()
             .unwrap()
             .wait()
-            .map_err(|e| Error::WaitDaemon(e.into()))
+            // vhost's error does not convert to `io::Error`, and the macro this replaces
+            // produced an `Other` error with an *empty* message, dropping `e` entirely.
+            .map_err(|e| Error::WaitDaemon(std::io::Error::other(format!("{:?}", e))))
     }
 
     fn supervisor(&self) -> Option<String> {

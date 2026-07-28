@@ -123,18 +123,19 @@ endef
 .format:
 	${CARGO} fmt -- --check
 
-# The api error-macro family was deleted in favour of per-crate `thiserror` enums: those macros
-# returned a bare errno and discarded the message the call site wrote, so a failure that had a
-# perfectly good explanation surfaced as "Invalid argument (os error 22)". Nothing should
-# reintroduce them. (The names are only spelled in the pattern below, so this check does not
-# match its own comment.)
+# The api error-macro family (einval!, eio!, eother!, ...) was deleted in favour of per-crate
+# `thiserror` enums: those macros returned a bare errno and discarded the message the call site
+# wrote, so a failure that had a perfectly good explanation surfaced as "Invalid argument (os
+# error 22)". Nothing should
+# reintroduce them. Scoped to `*.rs` so prose (CLAUDE.md, this comment) can name what it is
+# telling you not to write.
 #
 # `grep -P`, not `-E`: `\b` is undefined in POSIX ERE and git grep matches *nothing* for the
 # whole pattern, which makes the check silently pass. `storage/src/remote/` is excluded
 # because that module is disabled (see its header) and takes no part in the migration.
 .no-error-macros:
 	@! git grep -nP '\b(einval|eio|eother|enoent|enosys|eacces|ebadf|enotdir|eisdir|ealready|epipe|last_error|bail_einval|bail_eio|make_error)!' \
-		-- ':(exclude)third_party' ':(exclude)tests/texture' ':(exclude)storage/src/remote' \
+		-- '*.rs' ':(exclude)third_party' ':(exclude)storage/src/remote' \
 		|| { echo 'error: the deleted error macros are back; use a thiserror variant or anyhow instead'; exit 1; }
 
 .musl_target:
