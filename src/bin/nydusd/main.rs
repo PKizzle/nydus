@@ -17,6 +17,14 @@ extern crate log;
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+// `anyhow!` is only reached from the `block-nbd` / `block-uffd` singleton paths, which are
+// feature- and Linux-gated -- hence the conditional import rather than an unconditional one
+// that the default macOS build would flag as unused.
+#[cfg(any(
+    feature = "block-nbd",
+    all(target_os = "linux", feature = "block-uffd")
+))]
+use anyhow::anyhow;
 use anyhow::{Context, Result, bail};
 use std::convert::TryInto;
 use std::sync::LazyLock;

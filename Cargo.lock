@@ -4154,7 +4154,7 @@ dependencies = [
 
 [[package]]
 name = "nydus-api"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "dbs-uhttp",
  "http",
@@ -4209,7 +4209,7 @@ dependencies = [
 
 [[package]]
 name = "nydus-rafs"
-version = "0.4.1"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -4271,7 +4271,7 @@ dependencies = [
 
 [[package]]
 name = "nydus-service"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "async-broadcast",
  "bytes",
@@ -4422,7 +4422,7 @@ dependencies = [
 
 [[package]]
 name = "nydus-upgrade"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "dbs-snapshot",
  "sendfd",
