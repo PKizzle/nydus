@@ -150,6 +150,12 @@ pub enum DaemonErrorKind {
     UpgradeManager(String),
     /// Unsupported requests.
     Unsupported,
+    /// The object or filesystem the request names does not exist.
+    NotFound,
+    /// The object the request would create already exists.
+    AlreadyExists,
+    /// The request carried an argument the daemon cannot act on.
+    InvalidArguments(String),
 }
 
 /// Kinds for metrics related error messages.

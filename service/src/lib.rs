@@ -143,12 +143,43 @@ pub enum Error {
     QueueMemoryUnset,
 }
 
+/// Boundary conversion for the FUSE and vhost pins.
+///
+/// This used to be `einval!(e)`, which threw `e` away and answered `EINVAL` for everything --
+/// a full disk, a missing blob and a bad mount option were indistinguishable at the FUSE
+/// boundary, and all three arrived as "Invalid argument".
+///
+/// An errno recovered from anywhere on the chain wins, because it came from a real syscall and
+/// the kernel on the other side can act on it (`ENOSPC` must stay `ENOSPC`). Only when there is
+/// no errno to recover does the variant pick the kind -- and then the message is kept as the
+/// payload, which is what makes the difference visible in a log.
 impl From<Error> for io::Error {
     fn from(e: Error) -> Self {
-        einval!(e)
+        if let Some(errno) = nydus_utils::source_errno(&e) {
+            return io::Error::from_raw_os_error(errno);
+        }
+        let kind = match &e {
+            Error::NotFound => io::ErrorKind::NotFound,
+            Error::AlreadyExists => io::ErrorKind::AlreadyExists,
+            Error::Unsupported => io::ErrorKind::Unsupported,
+            Error::Busy(_) => io::ErrorKind::ResourceBusy,
+            Error::InvalidArguments(_)
+            | Error::InvalidConfig(_)
+            | Error::InvalidPrefetchList
+            | Error::FsTypeMismatch(_) => io::ErrorKind::InvalidInput,
+            _ => io::ErrorKind::Other,
+        };
+        io::Error::new(kind, e)
     }
 }
 
+/// Map a daemon error onto the kind the HTTP API reports.
+///
+/// `DaemonErrorKind`'s `Debug` rendering *is* the wire format (see the note on `HttpError` in
+/// `nydus_api::http`), so this deliberately routes only the cases a client can act on
+/// differently -- not found, already exists, bad argument -- through their own variants. The
+/// rest still collapse into `Other`, which keeps every string a caller might already be
+/// matching on unchanged.
 impl From<Error> for DaemonErrorKind {
     fn from(e: Error) -> Self {
         use Error::*;
@@ -158,6 +189,10 @@ impl From<Error> for DaemonErrorKind {
             Unsupported => DaemonErrorKind::Unsupported,
             Serde(e) => DaemonErrorKind::Serde(e),
             UnexpectedEvent(e) => DaemonErrorKind::UnexpectedEvent(format!("{:?}", e)),
+            NotFound => DaemonErrorKind::NotFound,
+            AlreadyExists => DaemonErrorKind::AlreadyExists,
+            InvalidArguments(msg) => DaemonErrorKind::InvalidArguments(msg),
+            InvalidConfig(msg) => DaemonErrorKind::InvalidArguments(msg),
             o => DaemonErrorKind::Other(o.to_string()),
         }
     }
@@ -355,15 +390,40 @@ mod tests {
         assert!(validate_threads_configuration("test").is_err());
     }
 
+    /// The FUSE/vhost boundary must stop flattening everything to `EINVAL`.
     #[test]
     fn test_error_into_io_error() {
-        let e = Error::NotFound;
-        let io_err: std::io::Error = e.into();
-        assert_eq!(io_err.kind(), std::io::ErrorKind::InvalidInput);
+        let io_err: std::io::Error = Error::NotFound.into();
+        assert_eq!(io_err.kind(), std::io::ErrorKind::NotFound);
 
-        let e = Error::InvalidArguments("bad arg".into());
-        let io_err: std::io::Error = e.into();
+        let io_err: std::io::Error = Error::InvalidArguments("bad arg".into()).into();
         assert_eq!(io_err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(
+            io_err.to_string().contains("bad arg"),
+            "the message must survive the conversion: {io_err}"
+        );
+
+        let io_err: std::io::Error = Error::AlreadyExists.into();
+        assert_eq!(io_err.kind(), std::io::ErrorKind::AlreadyExists);
+    }
+
+    /// An errno raised by a real syscall deeper down has to reach the kernel unchanged.
+    ///
+    /// This is the disk-full path: a cache `pwrite` fails with `ENOSPC`, the error travels up
+    /// through storage and rafs, and the fanotify handler answers the permission event with
+    /// whatever `raw_os_error()` reports. Anything else there means a reader is told "I/O
+    /// error" for a full disk -- or, if the event is allowed instead, silently reads zeros.
+    #[test]
+    fn io_error_conversion_preserves_a_real_errno() {
+        let storage = nydus_storage::StorageError::cache_io(
+            "pwrite",
+            std::io::Error::from_raw_os_error(libc::ENOSPC),
+        );
+        let e = Error::Rafs(RafsError::from(storage));
+
+        assert_eq!(nydus_utils::source_errno(&e), Some(libc::ENOSPC));
+        let io_err: std::io::Error = e.into();
+        assert_eq!(io_err.raw_os_error(), Some(libc::ENOSPC));
     }
 
     #[test]
@@ -394,10 +454,16 @@ mod tests {
         let kind = DaemonErrorKind::from(Error::UnexpectedEvent(DaemonStateMachineInput::Start));
         assert!(matches!(kind, DaemonErrorKind::UnexpectedEvent(_)));
 
-        // Other (catch-all) branch
+        // Cases a client can act on differently now have their own variant.
         let kind = DaemonErrorKind::from(Error::AlreadyExists);
-        assert!(matches!(kind, DaemonErrorKind::Other(_)));
+        assert!(matches!(kind, DaemonErrorKind::AlreadyExists));
         let kind = DaemonErrorKind::from(Error::NotFound);
+        assert!(matches!(kind, DaemonErrorKind::NotFound));
+        let kind = DaemonErrorKind::from(Error::InvalidArguments("bad".into()));
+        assert!(matches!(kind, DaemonErrorKind::InvalidArguments(m) if m == "bad"));
+
+        // Everything else still collapses into `Other`, keeping the wire strings stable.
+        let kind = DaemonErrorKind::from(Error::InvalidPrefetchList);
         assert!(matches!(kind, DaemonErrorKind::Other(_)));
     }
 
