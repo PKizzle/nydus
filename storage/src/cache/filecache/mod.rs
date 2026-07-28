@@ -886,6 +886,63 @@ pub mod blob_cache_tests {
 mod tests {
     use super::*;
 
+    /// A live blob cache must keep its manager from asking to be garbage-collected.
+    ///
+    /// `BlobFactory::gc` drops -- and therefore `destroy()`s -- a manager the moment its `gc`
+    /// answers true, and the caches it handed out are not counted anywhere: the factory's
+    /// `active_users` pin only spans a `new_blob_cache` call, not the lifetime of its result.
+    /// So this invariant is the whole of what stops a running filesystem having its backend
+    /// shut down underneath it, and it lives here rather than in the factory.
+    #[test]
+    fn gc_keeps_the_manager_while_a_blob_cache_is_live() {
+        use crate::device::BlobFeatures;
+        use crate::test::MockBackend;
+        use nydus_api::CacheConfigV2;
+        use nydus_utils::metrics::BackendMetrics;
+        use vmm_sys_util::tempdir::TempDir;
+
+        let tmp_dir = TempDir::new().unwrap();
+        let config = CacheConfigV2 {
+            cache_type: "filecache".to_string(),
+            file_cache: Some(nydus_api::FileCacheConfig {
+                work_dir: tmp_dir.as_path().to_str().unwrap().to_owned(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let backend = Arc::new(MockBackend {
+            metrics: BackendMetrics::new("gc-liveness-test", "mock"),
+        });
+        let mgr = FileCacheMgr::new(&config, backend, "gc-liveness-test", 0).unwrap();
+        mgr.init().unwrap();
+
+        // An empty manager is collectable -- that is the state the factory may reclaim.
+        assert!(mgr.gc(None), "an empty manager should be collectable");
+
+        let blob_info = Arc::new(BlobInfo::new(
+            0,
+            "gc-liveness-blob".to_string(),
+            8192,
+            8192,
+            4096,
+            2,
+            BlobFeatures::empty(),
+        ));
+        let cache = mgr.get_blob_cache(&blob_info).unwrap();
+
+        // ... but not while something still holds a cache it produced, whether the sweep is
+        // targeted at that blob or untargeted.
+        assert!(
+            !mgr.gc(Some("gc-liveness-blob")),
+            "a manager with a live blob cache must not ask to be collected"
+        );
+        assert!(!mgr.gc(None));
+
+        // Once the last reference goes, it becomes collectable again.
+        drop(cache);
+        assert!(mgr.gc(None), "the manager should be collectable once idle");
+    }
+
     #[test]
     fn test_blob_raw_file_suffix() {
         assert_eq!(BLOB_RAW_FILE_SUFFIX, ".blob.raw");

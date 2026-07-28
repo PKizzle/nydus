@@ -5,7 +5,6 @@
 //! Blob cache manager to cache RAFS meta/data blob objects.
 
 use std::collections::HashMap;
-use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};

@@ -748,6 +748,21 @@ pub(crate) trait BlobCacheMgr: Send + Sync {
     /// Garbage-collect unused resources.
     ///
     /// Return true if the blob cache manager itself should be garbage-collected.
+    ///
+    /// **This return value is the only thing keeping a manager alive.** When it is true,
+    /// [`BlobFactory::gc`] removes the manager from its map, which drops the last `Arc` to it
+    /// and runs `Drop` -> [`BlobCacheMgr::destroy`] -> `backend().shutdown()`. Blob caches
+    /// handed out earlier are *not* counted anywhere: `BlobFactory`'s `active_users` only pins
+    /// the entry for the duration of a `new_blob_cache` call, not for the lifetime of what
+    /// that call returned. So an implementation that answers true while any of its blob caches
+    /// is still live tears the backend out from under a running filesystem.
+    ///
+    /// Both implementations are conservative today -- `FileCacheMgr` reports whether its blob
+    /// map is empty, and only removes entries whose `Arc::strong_count` is 1, so a live cache
+    /// keeps it non-empty; `DummyCacheMgr` never asks to be collected at all. A new
+    /// implementation has to be equally careful.
+    ///
+    /// [`BlobFactory::gc`]: crate::factory::BlobFactory::gc
     fn gc(&self, _id: Option<&str>) -> bool;
 
     /// Get the underlying `BlobBackend` object of the blob cache object.
