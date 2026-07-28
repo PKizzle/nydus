@@ -218,6 +218,20 @@ pub(crate) mod tests {
     use std::path::PathBuf;
     use std::ptr::null;
 
+    /// Hands every test its own `id`, and so its own key in the global `BLOB_FACTORY`.
+    ///
+    /// `BlobFactory` caches one `BlobCacheMgr` per whole-`ConfigV2` key. Every test here used
+    /// to build a byte-identical config with `id = "my_id"`, so all of them shared a single
+    /// entry -- and one test's `nydus_close_rafs` -> `Rafs::destroy` -> `BLOB_FACTORY.gc()`
+    /// raced another test's open. At `--test-threads=8` that failed 38 runs out of 60; serially
+    /// it never failed, which is why it only ever showed up in CI.
+    static NEXT_TEST_ID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+    fn unique_test_id() -> String {
+        let n = NEXT_TEST_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        format!("clib_test_{}", n)
+    }
+
     pub(crate) fn open_file_system() -> NydusFsHandle {
         let ret = unsafe { nydus_open_rafs(null(), null()) };
         assert_eq!(ret, NYDUS_INVALID_FS_HANDLE);
@@ -236,7 +250,7 @@ pub(crate) mod tests {
         let config = format!(
             r#"
         version = 2
-        id = "my_id"
+        id = "{}"
         [backend]
         type = "localfs"
         [backend.localfs]
@@ -245,6 +259,7 @@ pub(crate) mod tests {
         type = "dummycache"
         [rafs]
         "#,
+            unique_test_id(),
             blob_dir.display()
         );
         let config = CString::new(config).unwrap();
