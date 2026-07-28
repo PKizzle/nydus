@@ -113,6 +113,17 @@ pub enum StorageError {
     /// Data read back from the cache or a blob is not what it claimed to be.
     #[error("{0}")]
     InvalidData(String),
+    /// A cache write completed with fewer bytes than asked for.
+    ///
+    /// Carries no errno, so the fanotify deny path falls back to `EIO` -- which is what the
+    /// old `eio!("failed to write data to file cache")` produced.
+    #[error("short write to the blob cache: wrote {written} of {expected} bytes")]
+    ShortWrite {
+        /// Bytes the caller asked to write.
+        expected: usize,
+        /// Bytes actually written.
+        written: usize,
+    },
     /// A read or write against the local cache failed.
     ///
     /// This is the errno carrier the on-demand path depends on. A `pwrite` into a blob's cache

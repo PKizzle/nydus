@@ -33,7 +33,7 @@ use crate::device::{
 };
 use crate::meta::BlobCompressionContextInfo;
 use crate::utils::{alloc_buf, check_crc, check_hash, check_xxh3};
-use crate::{RAFS_MAX_CHUNK_SIZE, StorageResult};
+use crate::{RAFS_MAX_CHUNK_SIZE, StorageError, StorageResult};
 
 mod cachedfile;
 #[cfg(feature = "dedup")]
@@ -140,10 +140,10 @@ pub trait BlobCache: Send + Sync {
     fn blob_id(&self) -> &str;
 
     /// Get size of the decompressed blob object.
-    fn blob_uncompressed_size(&self) -> Result<u64>;
+    fn blob_uncompressed_size(&self) -> StorageResult<u64>;
 
     /// Get size of the compressed blob object.
-    fn blob_compressed_size(&self) -> Result<u64>;
+    fn blob_compressed_size(&self) -> StorageResult<u64>;
 
     /// Get data compression algorithm to handle chunks in the blob.
     fn blob_compressor(&self) -> compress::Algorithm;
@@ -164,10 +164,10 @@ pub trait BlobCache: Send + Sync {
     fn is_legacy_stargz(&self) -> bool;
 
     /// Get maximum size of gzip compressed data.
-    fn get_legacy_stargz_size(&self, offset: u64, uncomp_size: usize) -> Result<usize> {
+    fn get_legacy_stargz_size(&self, offset: u64, uncomp_size: usize) -> StorageResult<usize> {
         let blob_size = self.blob_compressed_size()?;
         let max_size = blob_size.checked_sub(offset).ok_or_else(|| {
-            einval!(format!(
+            StorageError::InvalidArgument(format!(
                 "chunk compressed offset {:x} is bigger than blob file size {:x}",
                 offset, blob_size
             ))
@@ -228,12 +228,12 @@ pub trait BlobCache: Send + Sync {
     ) -> StorageResult<usize>;
 
     /// Execute filesystem data prefetch.
-    fn prefetch_range(&self, _range: &BlobIoRange) -> Result<usize> {
-        Err(enosys!("doesn't support prefetch_range()"))
+    fn prefetch_range(&self, _range: &BlobIoRange) -> StorageResult<usize> {
+        Err(StorageError::Unsupported)
     }
 
     /// Read chunk data described by the blob Io descriptors from the blob cache into the buffer.
-    fn read(&self, iovec: &mut BlobIoVec, buffers: &[FileVolatileSlice]) -> Result<usize>;
+    fn read(&self, iovec: &mut BlobIoVec, buffers: &[FileVolatileSlice]) -> StorageResult<usize>;
 
     /// Read multiple chunks from the blob cache in batch mode.
     ///
@@ -250,7 +250,7 @@ pub trait BlobCache: Send + Sync {
         blob_size: usize,
         chunks: &'b [Arc<dyn BlobChunkInfo>],
         prefetch: bool,
-    ) -> Result<ChunkDecompressState<'a, 'b>>
+    ) -> StorageResult<ChunkDecompressState<'a, 'b>>
     where
         Self: Sized,
     {
@@ -265,9 +265,11 @@ pub trait BlobCache: Send + Sync {
         let nr_read = self
             .reader()
             .read_with_source(c_buf.as_mut_slice(), blob_offset, source)
-            .map_err(|e| eio!(e))?;
+            .map_err(|e| {
+                StorageError::InvalidData(format!("failed to read from the backend, {}", e))
+            })?;
         if nr_read != blob_size {
-            return Err(eio!(format!(
+            return Err(StorageError::InvalidData(format!(
                 "request for {} bytes but got {} bytes",
                 blob_size, nr_read
             )));
@@ -301,7 +303,7 @@ pub trait BlobCache: Send + Sync {
         blob_size: usize,
         chunks: &'b [Arc<dyn BlobChunkInfo>],
         prefetch: bool,
-    ) -> Result<ChunkDecompressState<'a, 'b>>
+    ) -> StorageResult<ChunkDecompressState<'a, 'b>>
     where
         Self: Sized,
     {
@@ -316,9 +318,11 @@ pub trait BlobCache: Send + Sync {
             .reader()
             .read_with_source_async(c_buf.as_mut_slice(), blob_offset, source)
             .await
-            .map_err(|e| eio!(e))?;
+            .map_err(|e| {
+                StorageError::InvalidData(format!("failed to read from the backend, {}", e))
+            })?;
         if nr_read != blob_size {
-            return Err(eio!(format!(
+            return Err(StorageError::InvalidData(format!(
                 "request for {} bytes but got {} bytes",
                 blob_size, nr_read
             )));
@@ -345,17 +349,21 @@ pub trait BlobCache: Send + Sync {
         &self,
         chunk: &dyn BlobChunkInfo,
         buffer: &mut [u8],
-    ) -> Result<Option<Vec<u8>>> {
+    ) -> StorageResult<Option<Vec<u8>>> {
         let start = Instant::now();
         let offset = chunk.compressed_offset();
         let mut c_buf = None;
 
         if self.is_zran() || self.is_batch() {
-            return Err(enosys!("read_chunk_from_backend"));
+            return Err(StorageError::Unsupported);
         } else if !chunk.is_compressed() && !chunk.is_encrypted() {
-            let size = self.reader().read(buffer, offset).map_err(|e| eio!(e))?;
+            let size = self.reader().read(buffer, offset).map_err(|e| {
+                StorageError::InvalidData(format!("failed to read from the backend, {}", e))
+            })?;
             if size != buffer.len() {
-                return Err(eio!("storage backend returns less data than requested"));
+                return Err(StorageError::InvalidData(
+                    "storage backend returns less data than requested".to_string(),
+                ));
             }
         } else {
             let c_size = if self.is_legacy_stargz() {
@@ -367,16 +375,21 @@ pub trait BlobCache: Send + Sync {
             let size = self
                 .reader()
                 .read(raw_buffer.as_mut_slice(), offset)
-                .map_err(|e| eio!(e))?;
+                .map_err(|e| {
+                    StorageError::InvalidData(format!("failed to read from the backend, {}", e))
+                })?;
             if size != raw_buffer.len() {
-                return Err(eio!("storage backend returns less data than requested"));
+                return Err(StorageError::InvalidData(
+                    "storage backend returns less data than requested".to_string(),
+                ));
             }
             let decrypted_buffer = crypt::decrypt_with_context(
                 &raw_buffer,
                 &self.blob_cipher_object(),
                 &self.blob_cipher_context(),
                 chunk.is_encrypted(),
-            )?;
+            )
+            .map_err(|e| StorageError::InvalidData(format!("failed to decrypt chunk, {}", e)))?;
             self.decompress_chunk_data(&decrypted_buffer, buffer, chunk.is_compressed())?;
             c_buf = Some(raw_buffer);
         }
@@ -404,15 +417,15 @@ pub trait BlobCache: Send + Sync {
         raw_buffer: &[u8],
         buffer: &mut [u8],
         is_compressed: bool,
-    ) -> Result<()> {
+    ) -> StorageResult<()> {
         if is_compressed {
             let compressor = self.blob_compressor();
             let ret = compress::decompress(raw_buffer, buffer, compressor).map_err(|e| {
                 error!("failed to decompress chunk: {}", e);
-                e
+                StorageError::InvalidData(format!("failed to decompress chunk, {}", e))
             })?;
             if ret != buffer.len() {
-                return Err(einval!(format!(
+                return Err(StorageError::InvalidArgument(format!(
                     "size of decompressed data doesn't match expected, {} vs {}, raw_buffer: {}",
                     ret,
                     buffer.len(),
@@ -432,10 +445,12 @@ pub trait BlobCache: Send + Sync {
         chunk: &dyn BlobChunkInfo,
         buffer: &[u8],
         force_validation: bool,
-    ) -> Result<usize> {
+    ) -> StorageResult<usize> {
         let d_size = chunk.uncompressed_size() as usize;
         if buffer.len() != d_size {
-            Err(eio!("uncompressed size and buffer size doesn't match"))
+            Err(StorageError::InvalidData(
+                "uncompressed size and buffer size doesn't match".to_string(),
+            ))
         } else if (self.need_validation()
             || chunk.has_xxh3()
             || chunk.has_crc32()
@@ -443,9 +458,8 @@ pub trait BlobCache: Send + Sync {
             && !self.is_legacy_stargz()
             && !self.check_digest(chunk, buffer)
         {
-            Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "data digest value doesn't match",
+            Err(StorageError::InvalidData(
+                "data digest value doesn't match".to_string(),
             ))
         } else {
             Ok(d_size)
@@ -474,11 +488,11 @@ pub trait BlobCache: Send + Sync {
         &self,
         _chunk: &dyn BlobChunkInfo,
         _compressed_data: &[u8],
-    ) -> Result<bool> {
-        Err(enosys!("cache_chunk_data not supported"))
+    ) -> StorageResult<bool> {
+        Err(StorageError::Unsupported)
     }
 
-    fn get_blob_meta_info(&self) -> Result<Option<Arc<BlobCompressionContextInfo>>> {
+    fn get_blob_meta_info(&self) -> StorageResult<Option<Arc<BlobCompressionContextInfo>>> {
         Ok(None)
     }
 }
@@ -518,7 +532,7 @@ impl<'a, 'b> ChunkDecompressState<'a, 'b> {
         &mut self,
         meta: &Arc<BlobCompressionContextInfo>,
         c_offset: u64,
-    ) -> Result<()> {
+    ) -> StorageResult<()> {
         let ctx = meta.get_batch_context(self.batch_idx)?;
         let c_size = ctx.compressed_size() as u64;
         let d_size = ctx.uncompressed_batch_size() as u64;
@@ -535,7 +549,7 @@ impl<'a, 'b> ChunkDecompressState<'a, 'b> {
                 c_size,
                 d_size
             );
-            return Err(einval!(msg));
+            return Err(StorageError::InvalidData(msg));
         }
 
         let c_offset = (c_offset - self.blob_offset) as usize;
@@ -545,14 +559,15 @@ impl<'a, 'b> ChunkDecompressState<'a, 'b> {
             &self.cache.blob_cipher_object(),
             &self.cache.blob_cipher_context(),
             meta.state.is_encrypted(),
-        )?;
+        )
+        .map_err(|e| StorageError::InvalidData(format!("failed to decrypt chunk, {}", e)))?;
         let mut output = alloc_buf(d_size as usize);
 
         self.cache
             .decompress_chunk_data(&decrypted_buffer, &mut output, c_size != d_size)?;
 
         if output.len() != d_size as usize {
-            return Err(einval!(format!(
+            return Err(StorageError::InvalidArgument(format!(
                 "decompressed data size doesn't match: {} vs {}",
                 output.len(),
                 d_size
@@ -564,7 +579,7 @@ impl<'a, 'b> ChunkDecompressState<'a, 'b> {
         Ok(())
     }
 
-    fn decompress_zran(&mut self, meta: &Arc<BlobCompressionContextInfo>) -> Result<()> {
+    fn decompress_zran(&mut self, meta: &Arc<BlobCompressionContextInfo>) -> StorageResult<()> {
         let (ctx, dict) = meta.get_zran_context(self.zran_idx)?;
         let c_offset = ctx.in_offset;
         let c_size = ctx.in_len as u64;
@@ -581,29 +596,32 @@ impl<'a, 'b> ChunkDecompressState<'a, 'b> {
                 c_size,
                 ctx.out_len
             );
-            return Err(einval!(msg));
+            return Err(StorageError::InvalidData(msg));
         }
 
         let c_offset = (c_offset - self.blob_offset) as usize;
         let input = &self.c_buf[c_offset..c_offset + c_size as usize];
         let mut output = alloc_buf(ctx.out_len as usize);
-        let mut decoder = ZranDecoder::new()?;
-        decoder.uncompress(&ctx, Some(dict), input, &mut output)?;
+        let mut decoder = ZranDecoder::new().map_err(|e| {
+            StorageError::InvalidData(format!("failed to build zran decoder, {}", e))
+        })?;
+        decoder
+            .uncompress(&ctx, Some(dict), input, &mut output)
+            .map_err(|e| StorageError::InvalidData(format!("failed to zran-decompress, {}", e)))?;
         self.d_buf = output;
 
         Ok(())
     }
 
-    fn next_batch(&mut self, chunk: &dyn BlobChunkInfo) -> Result<Vec<u8>> {
+    fn next_batch(&mut self, chunk: &dyn BlobChunkInfo) -> StorageResult<Vec<u8>> {
         // If the chunk is not a batch chunk, decompress it as normal.
         if !chunk.is_batch() {
             return self.next_buf(chunk);
         }
 
-        let meta = self
-            .cache
-            .get_blob_meta_info()?
-            .ok_or_else(|| einval!("failed to get blob meta object for Batch"))?;
+        let meta = self.cache.get_blob_meta_info()?.ok_or_else(|| {
+            StorageError::InvalidState("failed to get blob meta object for Batch".to_string())
+        })?;
 
         let batch_idx = meta.get_batch_index(chunk.id())?;
         if batch_idx != self.batch_idx {
@@ -613,7 +631,7 @@ impl<'a, 'b> ChunkDecompressState<'a, 'b> {
         let offset = meta.get_uncompressed_offset_in_batch_buf(chunk.id())? as usize;
         let end = offset + chunk.uncompressed_size() as usize;
         if end > self.d_buf.len() {
-            return Err(einval!(format!(
+            return Err(StorageError::InvalidArgument(format!(
                 "invalid Batch decompression status, end: {}, len: {}",
                 end,
                 self.d_buf.len()
@@ -627,11 +645,10 @@ impl<'a, 'b> ChunkDecompressState<'a, 'b> {
         Ok(buffer)
     }
 
-    fn next_zran(&mut self, chunk: &dyn BlobChunkInfo) -> Result<Vec<u8>> {
-        let meta = self
-            .cache
-            .get_blob_meta_info()?
-            .ok_or_else(|| einval!("failed to get blob meta object for ZRan"))?;
+    fn next_zran(&mut self, chunk: &dyn BlobChunkInfo) -> StorageResult<Vec<u8>> {
+        let meta = self.cache.get_blob_meta_info()?.ok_or_else(|| {
+            StorageError::InvalidState("failed to get blob meta object for ZRan".to_string())
+        })?;
         let zran_idx = meta.get_zran_index(chunk.id())?;
         if zran_idx != self.zran_idx {
             self.zran_idx = zran_idx;
@@ -640,7 +657,9 @@ impl<'a, 'b> ChunkDecompressState<'a, 'b> {
         let offset = meta.get_zran_offset(chunk.id())? as usize;
         let end = offset + chunk.uncompressed_size() as usize;
         if end > self.d_buf.len() {
-            return Err(einval!("invalid ZRan decompression status"));
+            return Err(StorageError::InvalidState(
+                "invalid ZRan decompression status".to_string(),
+            ));
         }
         // Use alloc_buf here to ensure 4k alignment for later use
         // in adjust_buffer_for_dio.
@@ -649,7 +668,7 @@ impl<'a, 'b> ChunkDecompressState<'a, 'b> {
         Ok(buffer)
     }
 
-    fn next_buf(&mut self, chunk: &dyn BlobChunkInfo) -> Result<Vec<u8>> {
+    fn next_buf(&mut self, chunk: &dyn BlobChunkInfo) -> StorageResult<Vec<u8>> {
         let c_offset = chunk.compressed_offset();
         let c_size = chunk.compressed_size();
         let d_size = chunk.uncompressed_size() as usize;
@@ -663,7 +682,7 @@ impl<'a, 'b> ChunkDecompressState<'a, 'b> {
                 "invalid chunk info: c_offset 0x{:x}, c_size 0x{:x}, d_size 0x{:x}, blob_offset 0x{:x}",
                 c_offset, c_size, d_size, self.blob_offset
             );
-            return Err(eio!(msg));
+            return Err(StorageError::InvalidData(msg));
         }
 
         let offset_merged = (c_offset - self.blob_offset) as usize;
@@ -673,7 +692,8 @@ impl<'a, 'b> ChunkDecompressState<'a, 'b> {
             &self.cache.blob_cipher_object(),
             &self.cache.blob_cipher_context(),
             chunk.is_encrypted(),
-        )?;
+        )
+        .map_err(|e| StorageError::InvalidData(format!("failed to decrypt chunk, {}", e)))?;
         let mut buffer = alloc_buf(d_size);
         self.cache
             .decompress_chunk_data(&decrypted_buffer, &mut buffer, chunk.is_compressed())?;
@@ -710,7 +730,7 @@ impl Iterator for ChunkDecompressState<'_, '_> {
         } else {
             self.next_buf(chunk)
         };
-        Some(res)
+        Some(res.map_err(std::io::Error::from))
     }
 }
 
@@ -720,7 +740,7 @@ impl Iterator for ChunkDecompressState<'_, '_> {
 /// all IO requests should be issued to the blob cache object directly.
 pub(crate) trait BlobCacheMgr: Send + Sync {
     /// Initialize the blob cache manager.
-    fn init(&self) -> Result<()>;
+    fn init(&self) -> StorageResult<()>;
 
     /// Tear down the blob cache manager.
     fn destroy(&self);
@@ -734,7 +754,7 @@ pub(crate) trait BlobCacheMgr: Send + Sync {
     fn backend(&self) -> &dyn BlobBackend;
 
     /// Get the blob cache to provide access to the `blob` object.
-    fn get_blob_cache(&self, blob_info: &Arc<BlobInfo>) -> Result<Arc<dyn BlobCache>>;
+    fn get_blob_cache(&self, blob_info: &Arc<BlobInfo>) -> StorageResult<Arc<dyn BlobCache>>;
 
     /// Check the blob cache data status, if data all ready stop prefetch workers.
     fn check_stat(&self);

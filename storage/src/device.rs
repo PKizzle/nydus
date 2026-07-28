@@ -42,6 +42,7 @@ use nydus_utils::digest::{self, RafsDigest};
 
 use crate::cache::BlobCache;
 use crate::factory::BLOB_FACTORY;
+use crate::{StorageError, StorageResult};
 
 pub(crate) const BLOB_FEATURE_INCOMPAT_MASK: u32 = 0x0000_ffff;
 pub(crate) const BLOB_FEATURE_INCOMPAT_VALUE: u32 = 0x0000_0fff;
@@ -1191,18 +1192,18 @@ pub trait BlobObject: AsRawFd {
     /// Fetch data from storage backend covering compressed blob range [offset, offset + size).
     ///
     /// Used by asynchronous prefetch worker to implement blob prefetch.
-    fn fetch_range_compressed(&self, offset: u64, size: u64, prefetch: bool) -> io::Result<()>;
+    fn fetch_range_compressed(&self, offset: u64, size: u64, prefetch: bool) -> StorageResult<()>;
 
     /// Fetch data from storage backend and make sure data range [offset, offset + size) is ready
     /// for use.
     ///
     /// Used by rafs to support blobfs.
-    fn fetch_range_uncompressed(&self, offset: u64, size: u64) -> io::Result<()>;
+    fn fetch_range_uncompressed(&self, offset: u64, size: u64) -> StorageResult<()>;
 
     /// Prefetch data for specified chunks from storage backend.
     ///
     /// Used by asynchronous prefetch worker to implement fs prefetch.
-    fn prefetch_chunks(&self, range: &BlobIoRange) -> io::Result<()>;
+    fn prefetch_chunks(&self, range: &BlobIoRange) -> StorageResult<()>;
 
     /// Revoke the "this data is cached" bookkeeping for the whole blob.
     ///
@@ -1211,8 +1212,8 @@ pub trait BlobObject: AsRawFd {
     /// bytes go away — see [`RangeMap::reset_range_ready`].
     ///
     /// [`RangeMap::reset_range_ready`]: crate::cache::state::RangeMap::reset_range_ready
-    fn reset_data_ready(&self) -> io::Result<()> {
-        Err(enosys!())
+    fn reset_data_ready(&self) -> StorageResult<()> {
+        Err(StorageError::Unsupported)
     }
 }
 
@@ -1510,7 +1511,9 @@ impl FileReadWriteVolatile for BlobDeviceIoVec<'_> {
         let blobs = &self.dev.blobs.load();
 
         if (index as usize) < blobs.len() {
-            blobs[index as usize].read(self.iovec, buffers)
+            blobs[index as usize]
+                .read(self.iovec, buffers)
+                .map_err(std::io::Error::from)
         } else {
             let msg = format!(
                 "failed to get blob object for BlobIoVec, index {}, blob array len: {}",

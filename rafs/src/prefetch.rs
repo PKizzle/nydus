@@ -656,10 +656,10 @@ mod tests {
         fn blob_id(&self) -> &str {
             "mock-blob"
         }
-        fn blob_uncompressed_size(&self) -> std::io::Result<u64> {
+        fn blob_uncompressed_size(&self) -> nydus_storage::StorageResult<u64> {
             Ok(0)
         }
-        fn blob_compressed_size(&self) -> std::io::Result<u64> {
+        fn blob_compressed_size(&self) -> nydus_storage::StorageResult<u64> {
             Ok(0)
         }
         fn blob_compressor(&self) -> compress::Algorithm {
@@ -713,19 +713,21 @@ mod tests {
             &self,
             _iovec: &mut BlobIoVec,
             _bufs: &[FileVolatileSlice],
-        ) -> std::io::Result<usize> {
+        ) -> nydus_storage::StorageResult<usize> {
             unimplemented!()
         }
         fn cache_chunk_data(
             &self,
             _chunk: &dyn BlobChunkInfo,
             _data: &[u8],
-        ) -> std::io::Result<bool> {
+        ) -> nydus_storage::StorageResult<bool> {
             self.cache_calls.fetch_add(1, Ordering::Relaxed);
             if self.cache_succeeds {
                 Ok(true)
             } else {
-                Err(std::io::Error::other("mock cache error"))
+                Err(nydus_storage::StorageError::InvalidState(
+                    "mock cache error".to_string(),
+                ))
             }
         }
     }

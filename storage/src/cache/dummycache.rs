@@ -52,12 +52,14 @@ impl BlobCache for DummyCache {
         &self.blob_id
     }
 
-    fn blob_uncompressed_size(&self) -> Result<u64> {
+    fn blob_uncompressed_size(&self) -> StorageResult<u64> {
         Ok(self.blob_info.uncompressed_size())
     }
 
-    fn blob_compressed_size(&self) -> Result<u64> {
-        self.reader.blob_size().map_err(|e| eother!(e))
+    fn blob_compressed_size(&self) -> StorageResult<u64> {
+        self.reader
+            .blob_size()
+            .map_err(|e| StorageError::InvalidState(format!("failed to get blob size, {}", e)))
     }
 
     fn blob_compressor(&self) -> compress::Algorithm {
@@ -121,11 +123,13 @@ impl BlobCache for DummyCache {
         Err(StorageError::Unsupported)
     }
 
-    fn read(&self, iovec: &mut BlobIoVec, bufs: &[FileVolatileSlice]) -> Result<usize> {
+    fn read(&self, iovec: &mut BlobIoVec, bufs: &[FileVolatileSlice]) -> StorageResult<usize> {
         let bios = &iovec.bi_vec;
 
         if iovec.size() == 0 || bios.is_empty() {
-            return Err(einval!("parameter `bios` is empty"));
+            return Err(StorageError::InvalidArgument(
+                "parameter `bios` is empty".to_string(),
+            ));
         }
 
         let bios_len = bios.len();
@@ -162,7 +166,7 @@ impl BlobCache for DummyCache {
             0,
         )
         .map(|(n, _)| n)
-        .map_err(|e| eother!(e))
+        .map_err(|e| StorageError::InvalidState(e.to_string()))
     }
 }
 
@@ -196,7 +200,7 @@ impl DummyCacheMgr {
 }
 
 impl BlobCacheMgr for DummyCacheMgr {
-    fn init(&self) -> Result<()> {
+    fn init(&self) -> StorageResult<()> {
         Ok(())
     }
 
@@ -215,15 +219,18 @@ impl BlobCacheMgr for DummyCacheMgr {
         self.backend.as_ref()
     }
 
-    fn get_blob_cache(&self, blob_info: &Arc<BlobInfo>) -> Result<Arc<dyn BlobCache>> {
+    fn get_blob_cache(&self, blob_info: &Arc<BlobInfo>) -> StorageResult<Arc<dyn BlobCache>> {
         if blob_info.has_feature(BlobFeatures::ZRAN) {
-            return Err(einval!(
-                "BlobCacheMgr doesn't support ZRan based RAFS data blobs"
+            return Err(StorageError::InvalidArgument(
+                "BlobCacheMgr doesn't support ZRan based RAFS data blobs".to_string(),
             ));
         }
 
         let blob_id = blob_info.blob_id();
-        let reader = self.backend.get_reader(&blob_id).map_err(|e| eother!(e))?;
+        let reader = self
+            .backend
+            .get_reader(&blob_id)
+            .map_err(|e| StorageError::InvalidState(e.to_string()))?;
 
         Ok(Arc::new(DummyCache {
             blob_id,

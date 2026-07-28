@@ -11,7 +11,7 @@
 
 use std::collections::HashSet;
 use std::fs::File;
-use std::io::{self, ErrorKind, Read, Result};
+use std::io::{ErrorKind, Read};
 use std::mem::ManuallyDrop;
 #[cfg(feature = "dedup")]
 use std::ops::Deref;
@@ -56,7 +56,7 @@ impl FileCacheMeta {
         reader: Option<Arc<dyn BlobReader>>,
         sync: bool,
         validation: bool,
-    ) -> Result<Self> {
+    ) -> StorageResult<Self> {
         if sync {
             match BlobCompressionContextInfo::new(
                 &blob_file,
@@ -142,19 +142,21 @@ impl BlobCCI {
         self.meta.is_none()
     }
 
-    fn set_meta(&mut self, meta: Option<Arc<BlobCompressionContextInfo>>) -> Result<&Self> {
+    fn set_meta(&mut self, meta: Option<Arc<BlobCompressionContextInfo>>) -> StorageResult<&Self> {
         if meta.is_none() {
-            return Err(einval!("failed to get blob meta info"));
+            return Err(StorageError::InvalidState(
+                "failed to get blob meta info".to_string(),
+            ));
         }
         self.meta = meta;
         Ok(self)
     }
 
-    fn get_compressed_offset(&self, chunk: &Arc<dyn BlobChunkInfo>) -> Result<u64> {
+    fn get_compressed_offset(&self, chunk: &Arc<dyn BlobChunkInfo>) -> StorageResult<u64> {
         Ok(chunk.compressed_offset())
     }
 
-    fn get_compressed_size(&self, chunk: &Arc<dyn BlobChunkInfo>) -> Result<u32> {
+    fn get_compressed_size(&self, chunk: &Arc<dyn BlobChunkInfo>) -> StorageResult<u32> {
         let size = if chunk.is_batch() {
             self.meta
                 .as_ref()
@@ -166,14 +168,14 @@ impl BlobCCI {
         Ok(size)
     }
 
-    fn get_compressed_info(&self, chunk: &Arc<dyn BlobChunkInfo>) -> Result<(u64, u32)> {
+    fn get_compressed_info(&self, chunk: &Arc<dyn BlobChunkInfo>) -> StorageResult<(u64, u32)> {
         Ok((
             self.get_compressed_offset(chunk)?,
             self.get_compressed_size(chunk)?,
         ))
     }
 
-    fn get_compressed_end(&self, chunk: &Arc<dyn BlobChunkInfo>) -> Result<u64> {
+    fn get_compressed_end(&self, chunk: &Arc<dyn BlobChunkInfo>) -> StorageResult<u64> {
         let (offset, size) = self.get_compressed_info(chunk)?;
         Ok(offset + size as u64)
     }
@@ -222,10 +224,15 @@ pub(crate) struct FileCacheEntry {
 }
 
 impl FileCacheEntry {
-    pub(crate) fn get_blob_size(reader: &Arc<dyn BlobReader>, blob_info: &BlobInfo) -> Result<u64> {
+    pub(crate) fn get_blob_size(
+        reader: &Arc<dyn BlobReader>,
+        blob_info: &BlobInfo,
+    ) -> StorageResult<u64> {
         // Stargz needs blob size information, so hacky!
         let size = if blob_info.is_legacy_stargz() {
-            reader.blob_size().map_err(|e| einval!(e))?
+            reader.blob_size().map_err(|e| {
+                StorageError::InvalidState(format!("failed to get blob size, {}", e))
+            })?
         } else {
             blob_info.compressed_size()
         };
@@ -326,7 +333,7 @@ impl FileCacheEntry {
     /// `do_fetch_chunks`' terminal retry, which re-fetches and propagates the
     /// real errno via `?`. Only that terminal retry must (and does) return
     /// this result.
-    fn persist_chunk_data(&self, chunk: &dyn BlobChunkInfo, buf: &[u8]) -> Result<()> {
+    fn persist_chunk_data(&self, chunk: &dyn BlobChunkInfo, buf: &[u8]) -> StorageResult<()> {
         let offset = chunk.uncompressed_offset();
         let res = Self::persist_cached_data(&self.file, offset, buf);
         self.update_chunk_pending_status(chunk, res.is_ok());
@@ -342,11 +349,8 @@ impl FileCacheEntry {
         res
     }
 
-    fn persist_cached_data(file: &Arc<File>, offset: u64, buffer: &[u8]) -> Result<()> {
+    fn persist_cached_data(file: &Arc<File>, offset: u64, buffer: &[u8]) -> StorageResult<()> {
         let n = loop {
-            // Deliberately NOT `last_error!()`: that wraps into a Custom error
-            // whose `raw_os_error()` is `None`, and the fanotify deny path
-            // needs the real errno (ENOSPC vs EIO) to reach the reader.
             let ret =
                 uio::pwrite(file.as_ref(), buffer, offset as i64).map_err(std::io::Error::from);
             match ret {
@@ -357,14 +361,22 @@ impl FileCacheEntry {
                 Err(err) => {
                     // Retry if the IO is interrupted by signal.
                     if err.kind() != ErrorKind::Interrupted {
-                        return Err(err);
+                        // The raw `Os` error goes in as the source and is never re-wrapped:
+                        // the fanotify deny path recovers its errno with `source_errno` and
+                        // answers the kernel's permission event with ENOSPC/EDQUOT/EIO as
+                        // appropriate. A `Custom` error here would report `None` and the
+                        // reader would be told EIO for a full disk.
+                        return Err(StorageError::cache_io("pwrite", err));
                     }
                 }
             }
         };
 
         if n != buffer.len() {
-            Err(eio!("failed to write data to file cache"))
+            Err(StorageError::ShortWrite {
+                expected: buffer.len(),
+                written: n,
+            })
         } else {
             Ok(())
         }
@@ -420,7 +432,7 @@ impl FileCacheEntry {
         &self,
         chunks: &[Arc<dyn BlobChunkInfo>],
         batch_size: u64,
-    ) -> Result<Option<Vec<Arc<dyn BlobChunkInfo>>>> {
+    ) -> StorageResult<Option<Vec<Arc<dyn BlobChunkInfo>>>> {
         assert!(!chunks.is_empty());
         match self.get_blob_meta_info() {
             Err(e) => Err(e),
@@ -515,12 +527,15 @@ impl FileCacheEntry {
         }
     }
 
-    fn get_blob_range(&self, chunks: &[Arc<dyn BlobChunkInfo>]) -> Result<(u64, u64, usize)> {
+    fn get_blob_range(
+        &self,
+        chunks: &[Arc<dyn BlobChunkInfo>],
+    ) -> StorageResult<(u64, u64, usize)> {
         assert!(!chunks.is_empty());
         let (start, end) = if self.is_zran {
-            let meta = self
-                .get_blob_meta_info()?
-                .ok_or_else(|| einval!("failed to get blob meta object"))?;
+            let meta = self.get_blob_meta_info()?.ok_or_else(|| {
+                StorageError::InvalidState("failed to get blob meta object".to_string())
+            })?;
             let zran_index = meta.get_zran_index(chunks[0].id())?;
             let (ctx, _) = meta.get_zran_context(zran_index)?;
             let blob_start = ctx.in_offset;
@@ -550,8 +565,8 @@ impl FileCacheEntry {
 
         let size = end - start;
         if end - start > u32::MAX as u64 {
-            Err(einval!(
-                "requested blob range is too bigger, larger than u32::MAX"
+            Err(StorageError::InvalidArgument(
+                "requested blob range is too bigger, larger than u32::MAX".to_string(),
             ))
         } else {
             Ok((start, end, size as usize))
@@ -570,11 +585,11 @@ impl BlobCache for FileCacheEntry {
         &self.blob_id
     }
 
-    fn blob_uncompressed_size(&self) -> Result<u64> {
+    fn blob_uncompressed_size(&self) -> StorageResult<u64> {
         Ok(self.blob_uncompressed_size)
     }
 
-    fn blob_compressed_size(&self) -> Result<u64> {
+    fn blob_compressed_size(&self) -> StorageResult<u64> {
         Ok(self.blob_compressed_size)
     }
 
@@ -699,7 +714,7 @@ impl BlobCache for FileCacheEntry {
         Ok(0)
     }
 
-    fn prefetch_range(&self, range: &BlobIoRange) -> Result<usize> {
+    fn prefetch_range(&self, range: &BlobIoRange) -> StorageResult<usize> {
         let mut pending = Vec::with_capacity(range.chunks.len());
         if !self.chunk_map.is_persist() {
             let mut d_size = 0;
@@ -761,12 +776,16 @@ impl BlobCache for FileCacheEntry {
                     } else {
                         for idx in start..=end {
                             let buf = match bufs.next() {
-                                None => return Err(einval!("invalid chunk decompressed status")),
+                                None => {
+                                    return Err(StorageError::InvalidData(
+                                        "invalid chunk decompressed status".to_string(),
+                                    ));
+                                }
                                 Some(Err(e)) => {
                                     for chunk in &mut pending[idx..=end] {
                                         self.update_chunk_pending_status(chunk.as_ref(), false);
                                     }
-                                    return Err(e);
+                                    return Err(StorageError::cache_io("decompress a chunk", e));
                                 }
                                 Some(Ok(v)) => v,
                             };
@@ -788,7 +807,7 @@ impl BlobCache for FileCacheEntry {
         Ok(total_size)
     }
 
-    fn read(&self, iovec: &mut BlobIoVec, buffers: &[FileVolatileSlice]) -> Result<usize> {
+    fn read(&self, iovec: &mut BlobIoVec, buffers: &[FileVolatileSlice]) -> StorageResult<usize> {
         self.metrics.total.inc();
         self.workers.consume_prefetch_budget(iovec.size());
 
@@ -804,19 +823,25 @@ impl BlobCache for FileCacheEntry {
         }
     }
 
-    fn get_blob_meta_info(&self) -> Result<Option<Arc<BlobCompressionContextInfo>>> {
+    fn get_blob_meta_info(&self) -> StorageResult<Option<Arc<BlobCompressionContextInfo>>> {
         if let Some(meta) = self.meta.as_ref() {
             if let Some(bm) = meta.get_blob_meta() {
                 Ok(Some(bm))
             } else {
-                Err(einval!("failed to get blob meta object for cache file"))
+                Err(StorageError::InvalidState(
+                    "failed to get blob meta object for cache file".to_string(),
+                ))
             }
         } else {
             Ok(None)
         }
     }
 
-    fn cache_chunk_data(&self, chunk: &dyn BlobChunkInfo, compressed_data: &[u8]) -> Result<bool> {
+    fn cache_chunk_data(
+        &self,
+        chunk: &dyn BlobChunkInfo,
+        compressed_data: &[u8],
+    ) -> StorageResult<bool> {
         // Check if already cached
         if matches!(self.chunk_map.is_ready(chunk), Ok(true)) {
             return Ok(false);
@@ -827,14 +852,17 @@ impl BlobCache for FileCacheEntry {
             Ok(true) => return Ok(false), // Already ready
             Ok(false) => {}               // Marked pending, proceed
             Err(e) => {
-                return Err(eio!(format!("failed to mark chunk pending: {:?}", e)));
+                return Err(StorageError::InvalidState(format!(
+                    "failed to mark chunk pending: {:?}",
+                    e
+                )));
             }
         }
 
         // All fallible operations are inside this closure so that
         // update_chunk_pending_status is always called on any error path,
         // preventing chunks from being permanently stuck in pending state.
-        let result = (|| -> Result<()> {
+        let result = (|| -> StorageResult<()> {
             if self.is_raw_data {
                 // Cache stores compressed data directly
                 Self::persist_cached_data(&self.file, chunk.compressed_offset(), compressed_data)
@@ -846,7 +874,9 @@ impl BlobCache for FileCacheEntry {
                     &self.blob_cipher_context(),
                     chunk.is_encrypted(),
                 )
-                .map_err(|e| eio!(format!("failed to decrypt chunk: {:?}", e)))?;
+                .map_err(|e| {
+                    StorageError::InvalidData(format!("failed to decrypt chunk: {:?}", e))
+                })?;
 
                 // Decompress if needed
                 let data = if chunk.is_compressed() {
@@ -878,7 +908,12 @@ impl BlobCache for FileCacheEntry {
                         let enc = self
                             .cache_cipher_object
                             .encrypt(key, Some(&iv), block)
-                            .map_err(|e| eio!(format!("cache encryption failed: {:?}", e)))?;
+                            .map_err(|e| {
+                                StorageError::InvalidData(format!(
+                                    "cache encryption failed: {:?}",
+                                    e
+                                ))
+                            })?;
                         encrypted[pos..pos + ENCRYPTION_PAGE_SIZE].copy_from_slice(enc.as_ref());
                         pos += ENCRYPTION_PAGE_SIZE;
                     }
@@ -910,30 +945,35 @@ impl BlobObject for FileCacheEntry {
         }
     }
 
-    fn reset_data_ready(&self) -> Result<()> {
+    fn reset_data_ready(&self) -> StorageResult<()> {
         // A tarfs blob is the tar itself rather than a populated cache; there is no readiness
         // bookkeeping to revoke and nothing that could be re-fetched.
         if self.is_tarfs {
-            return Err(io::Error::from_raw_os_error(libc::ENOSYS));
+            return Err(StorageError::Unsupported);
         }
         // `as_range_map` only resolves for `BlobStateMap<IndexedChunkMap, _>`. A legacy RAFS v5
         // blob on the `DigestedChunkMap` fallback yields `None` and so reports "unsupported"
         // rather than silently doing nothing — which is the direction that keeps callers safe,
         // since a caller that cannot revoke readiness must not discard the data either.
         match self.chunk_map.as_range_map() {
-            Some(b) => b.reset_range_ready().map_err(io::Error::from),
-            None => Err(io::Error::from_raw_os_error(libc::ENOSYS)),
+            Some(b) => b.reset_range_ready(),
+            None => Err(StorageError::Unsupported),
         }
     }
 
-    fn fetch_range_compressed(&self, offset: u64, size: u64, prefetch: bool) -> Result<()> {
+    fn fetch_range_compressed(&self, offset: u64, size: u64, prefetch: bool) -> StorageResult<()> {
         // Assume data from tar file is always ready.
         if self.is_tarfs {
             return Ok(());
         }
 
-        let meta = self.meta.as_ref().ok_or_else(|| enoent!())?;
-        let meta = meta.get_blob_meta().ok_or_else(|| einval!())?;
+        let meta = self
+            .meta
+            .as_ref()
+            .ok_or_else(|| StorageError::InvalidState("blob meta is not available".to_string()))?;
+        let meta = meta
+            .get_blob_meta()
+            .ok_or_else(|| StorageError::InvalidState("blob meta is not loaded".to_string()))?;
         let mut chunks =
             meta.get_chunks_compressed(offset, size, self.prefetch_batch_size(), prefetch)?;
         if !chunks.is_empty() {
@@ -941,7 +981,7 @@ impl BlobObject for FileCacheEntry {
                 chunks = self.strip_ready_chunks(meta, None, chunks);
             }
         } else {
-            return Err(einval!(format!(
+            return Err(StorageError::InvalidArgument(format!(
                 "fetch_range_compressed offset 0x{:x}, size 0x{:x}",
                 offset, size
             )));
@@ -953,14 +993,19 @@ impl BlobObject for FileCacheEntry {
         }
     }
 
-    fn fetch_range_uncompressed(&self, offset: u64, size: u64) -> Result<()> {
+    fn fetch_range_uncompressed(&self, offset: u64, size: u64) -> StorageResult<()> {
         // Assume data from tar file is always ready.
         if self.is_tarfs {
             return Ok(());
         }
 
-        let meta = self.meta.as_ref().ok_or_else(|| einval!())?;
-        let meta = meta.get_blob_meta().ok_or_else(|| einval!())?;
+        let meta = self
+            .meta
+            .as_ref()
+            .ok_or_else(|| StorageError::InvalidState("blob meta is not available".to_string()))?;
+        let meta = meta
+            .get_blob_meta()
+            .ok_or_else(|| StorageError::InvalidState("blob meta is not loaded".to_string()))?;
         let mut chunks = meta.get_chunks_uncompressed(offset, size, self.user_io_batch_size())?;
         if let Some(meta) = self.get_blob_meta_info()? {
             chunks = self.strip_ready_chunks(meta, None, chunks);
@@ -972,7 +1017,7 @@ impl BlobObject for FileCacheEntry {
         }
     }
 
-    fn prefetch_chunks(&self, range: &BlobIoRange) -> Result<()> {
+    fn prefetch_chunks(&self, range: &BlobIoRange) -> StorageResult<()> {
         // Assume data from tar file is always ready.
         if self.is_tarfs {
             return Ok(());
@@ -1001,15 +1046,18 @@ impl BlobObject for FileCacheEntry {
 }
 
 impl FileCacheEntry {
-    fn do_fetch_chunks(&self, chunks: &[Arc<dyn BlobChunkInfo>], prefetch: bool) -> Result<()> {
+    fn do_fetch_chunks(
+        &self,
+        chunks: &[Arc<dyn BlobChunkInfo>],
+        prefetch: bool,
+    ) -> StorageResult<()> {
         // Validate input parameters.
         assert!(!chunks.is_empty());
 
         // Get chunks not ready yet, also marking them as in-flight.
-        let bitmap = self
-            .chunk_map
-            .as_range_map()
-            .ok_or_else(|| einval!("invalid chunk_map for do_fetch_chunks()"))?;
+        let bitmap = self.chunk_map.as_range_map().ok_or_else(|| {
+            StorageError::InvalidState("invalid chunk_map for do_fetch_chunks()".to_string())
+        })?;
         let chunk_index = chunks[0].id();
         let count = chunks.len() as u32;
         let pending = match bitmap.check_range_ready_and_mark_pending(chunk_index, count)? {
@@ -1064,14 +1112,18 @@ impl FileCacheEntry {
                     } else {
                         for idx in start_idx..=end_idx {
                             let mut buf = match bufs.next() {
-                                None => return Err(einval!("invalid chunk decompressed status")),
+                                None => {
+                                    return Err(StorageError::InvalidData(
+                                        "invalid chunk decompressed status".to_string(),
+                                    ));
+                                }
                                 Some(Err(e)) => {
                                     for idx in idx..=end_idx {
                                         if status[idx] {
                                             bitmap.clear_range_pending(chunks[idx].id(), 1)
                                         }
                                     }
-                                    return Err(e);
+                                    return Err(StorageError::cache_io("decompress a chunk", e));
                                 }
                                 Some(Ok(v)) => v,
                             };
@@ -1098,7 +1150,7 @@ impl FileCacheEntry {
 
         if !bitmap.wait_for_range_ready(chunk_index, count)? {
             if prefetch {
-                return Err(eio!(format!(
+                return Err(StorageError::InvalidData(format!(
                     "failed to prefetch data from storage backend for chunk {}/{}",
                     chunk_index, count
                 )));
@@ -1107,7 +1159,12 @@ impl FileCacheEntry {
             // if we are in on-demand path, retry for the timeout chunks
             for chunk in chunks {
                 match self.chunk_map.check_ready_and_mark_pending(chunk.as_ref()) {
-                    Err(e) => return Err(eio!(format!("do_fetch_chunks failed, {:?}", e))),
+                    Err(e) => {
+                        return Err(StorageError::InvalidData(format!(
+                            "do_fetch_chunks failed, {:?}",
+                            e
+                        )));
+                    }
                     Ok(true) => {}
                     Ok(false) => {
                         info!("retry for timeout chunk, {}", chunk.id());
@@ -1115,7 +1172,7 @@ impl FileCacheEntry {
                         self.read_chunk_from_backend(chunk.as_ref(), &mut buf)
                             .map_err(|e| {
                                 self.update_chunk_pending_status(chunk.as_ref(), false);
-                                eio!(format!("read_raw_chunk failed, {:?}", e))
+                                StorageError::InvalidData(format!("read_raw_chunk failed, {:?}", e))
                             })?;
                         if self.dio_enabled {
                             self.adjust_buffer_for_dio(&mut buf)
@@ -1152,7 +1209,11 @@ impl FileCacheEntry {
     //   request.
     // - Optionally there may be some prefetch/read amplify requests following the user io request.
     // - The optional prefetch/read amplify requests may be silently dropped.
-    fn read_iter(&self, bios: &mut [BlobIoDesc], buffers: &[FileVolatileSlice]) -> Result<usize> {
+    fn read_iter(
+        &self,
+        bios: &mut [BlobIoDesc],
+        buffers: &[FileVolatileSlice],
+    ) -> StorageResult<usize> {
         // Merge requests with continuous blob addresses.
         let requests = self
             .merge_requests_for_user(bios, self.user_io_batch_size())
@@ -1160,7 +1221,7 @@ impl FileCacheEntry {
                 for bio in bios.iter() {
                     self.update_chunk_pending_status(&bio.chunkinfo, false);
                 }
-                einval!("Empty bios list")
+                StorageError::InvalidArgument("Empty bios list".to_string())
             })?;
 
         let mut state = FileIoMergeState::new();
@@ -1187,7 +1248,7 @@ impl FileCacheEntry {
         req: &BlobIoRange,
         cursor: &mut MemSliceCursor,
         state: &mut FileIoMergeState,
-    ) -> Result<usize> {
+    ) -> StorageResult<usize> {
         let mut total_read: usize = 0;
 
         trace!("dispatch single io range {:?}", req);
@@ -1200,7 +1261,7 @@ impl FileCacheEntry {
                 Ok(true) => true,
                 Ok(false) => false,
                 Err(StorageError::Timeout) => false, // Retry if waiting for inflight IO timeouts
-                Err(e) => return Err(einval!(e)),
+                Err(e) => return Err(StorageError::InvalidArgument(e.to_string())),
             };
 
             #[cfg(feature = "dedup")]
@@ -1292,17 +1353,26 @@ impl FileCacheEntry {
     }
 
     // Directly read data requested by user from the file cache into the user memory buffer.
-    fn dispatch_cache_fast(&self, cursor: &mut MemSliceCursor, region: &Region) -> Result<usize> {
+    fn dispatch_cache_fast(
+        &self,
+        cursor: &mut MemSliceCursor,
+        region: &Region,
+    ) -> StorageResult<usize> {
         let offset = region.blob_address + region.seg.offset as u64;
         let size = region.seg.len as usize;
         let mut iovec = cursor.consume(size);
 
         self.metrics.partial_hits.inc();
         readv(self.file.as_raw_fd(), &mut iovec, offset)
+            .map_err(|e| StorageError::cache_io("readv the cache file", e))
     }
 
     // Try to read data from blob cache and validate it, fallback to storage backend.
-    fn dispatch_cache_slow(&self, cursor: &mut MemSliceCursor, region: &Region) -> Result<usize> {
+    fn dispatch_cache_slow(
+        &self,
+        cursor: &mut MemSliceCursor,
+        region: &Region,
+    ) -> StorageResult<usize> {
         let mut total_read = 0;
 
         for (i, c) in region.chunks.iter().enumerate() {
@@ -1317,7 +1387,11 @@ impl FileCacheEntry {
         Ok(total_read)
     }
 
-    fn dispatch_backend(&self, mem_cursor: &mut MemSliceCursor, r: &Region) -> Result<usize> {
+    fn dispatch_backend(
+        &self,
+        mem_cursor: &mut MemSliceCursor,
+        r: &Region,
+    ) -> StorageResult<usize> {
         let mut region = r;
         debug!(
             "{} try to read {} bytes of {} chunks from backend",
@@ -1421,7 +1495,10 @@ impl FileCacheEntry {
         let mut chunk_buffers = Vec::with_capacity(region.chunks.len());
         let mut buffer_holder = Vec::with_capacity(region.chunks.len());
         for (i, v) in bufs.enumerate() {
-            let d = Arc::new(DataBuffer::Allocated(v?));
+            let d =
+                Arc::new(DataBuffer::Allocated(v.map_err(|e| {
+                    StorageError::cache_io("allocate a chunk buffer", e)
+                })?));
             if region.tags[i] {
                 buffer_holder.push(d.clone());
             }
@@ -1444,7 +1521,7 @@ impl FileCacheEntry {
         .map(|(n, _)| n)
         .map_err(|e| {
             error!("failed to copy from chunk buf to buf: {:?}", e);
-            eio!(e)
+            StorageError::InvalidData(e.to_string())
         })?;
         mem_cursor.move_cursor(total_read);
 
@@ -1458,7 +1535,7 @@ impl FileCacheEntry {
         user_offset: u32,
         size: u32,
         mem_cursor: &mut MemSliceCursor,
-    ) -> Result<usize> {
+    ) -> StorageResult<usize> {
         trace!(
             "read_single_chunk {:x}:{:x}:{:x}/@{}",
             chunk.compressed_offset(),
@@ -1528,14 +1605,14 @@ impl FileCacheEntry {
         .map(|r| r.0)
         .map_err(|e| {
             error!("failed to copy from chunk buf to buf: {:?}", e);
-            eother!(e)
+            StorageError::InvalidData(e.to_string())
         })?;
         mem_cursor.move_cursor(read_size);
 
         Ok(read_size)
     }
 
-    fn read_file_cache(&self, chunk: &dyn BlobChunkInfo, buffer: &mut [u8]) -> Result<()> {
+    fn read_file_cache(&self, chunk: &dyn BlobChunkInfo, buffer: &mut [u8]) -> StorageResult<()> {
         if self.is_raw_data {
             let offset = chunk.compressed_offset();
             let size = if self.is_legacy_stargz() {
@@ -1545,19 +1622,27 @@ impl FileCacheEntry {
             };
             let mut reader = FileRangeReader::new(&self.file, offset, size);
             if !chunk.is_compressed() {
-                reader.read_exact(buffer)?;
+                reader
+                    .read_exact(buffer)
+                    .map_err(|e| StorageError::cache_io("read the cache file", e))?;
             } else if self.blob_compressor() == compress::Algorithm::Lz4Block {
                 let mut buf = alloc_buf(size as usize);
-                reader.read_exact(&mut buf)?;
-                let size = compress::decompress(&buf, buffer, self.blob_compressor())?;
+                reader
+                    .read_exact(&mut buf)
+                    .map_err(|e| StorageError::cache_io("read the cache file", e))?;
+                let size = compress::decompress(&buf, buffer, self.blob_compressor())
+                    .map_err(|e| StorageError::cache_io("decompress the cached chunk", e))?;
                 if size != buffer.len() {
-                    return Err(einval!(
-                        "data size decoded by lz4_block doesn't match expected"
+                    return Err(StorageError::InvalidArgument(
+                        "data size decoded by lz4_block doesn't match expected".to_string(),
                     ));
                 }
             } else {
-                let mut decoder = Decoder::new(reader, self.blob_compressor())?;
-                decoder.read_exact(buffer)?;
+                let mut decoder = Decoder::new(reader, self.blob_compressor())
+                    .map_err(|e| StorageError::cache_io("build the cache decoder", e))?;
+                decoder
+                    .read_exact(buffer)
+                    .map_err(|e| StorageError::cache_io("read the cache file", e))?;
             }
         } else if self.is_cache_encrypted {
             let offset = chunk.uncompressed_offset();
@@ -1568,7 +1653,9 @@ impl FileCacheEntry {
 
             let align_size = round_up_usize(size, ENCRYPTION_PAGE_SIZE);
             let mut buf = alloc_buf(align_size);
-            FileRangeReader::new(&self.file, offset, align_size as u64).read_exact(&mut buf)?;
+            FileRangeReader::new(&self.file, offset, align_size as u64)
+                .read_exact(&mut buf)
+                .map_err(|e| StorageError::cache_io("read the cache file", e))?;
 
             let mut pos = 0;
             while pos < buffer.len() {
@@ -1579,13 +1666,19 @@ impl FileCacheEntry {
                         buffer[pos..pos + len].copy_from_slice(&buf2[..len]);
                         pos += ENCRYPTION_PAGE_SIZE;
                     }
-                    Err(_) => return Err(eother!("failed to decrypt data from cache file")),
+                    Err(_) => {
+                        return Err(StorageError::InvalidData(
+                            "failed to decrypt data from cache file".to_string(),
+                        ));
+                    }
                 }
             }
         } else {
             let offset = chunk.uncompressed_offset();
             let size = chunk.uncompressed_size() as u64;
-            FileRangeReader::new(&self.file, offset, size).read_exact(buffer)?;
+            FileRangeReader::new(&self.file, offset, size)
+                .read_exact(buffer)
+                .map_err(|e| StorageError::cache_io("read the cache file", e))?;
         }
         self.validate_chunk_data(chunk, buffer, false)?;
         Ok(())
@@ -1738,7 +1831,7 @@ impl Region {
         ctx: &FileCacheEntry,
         region: &Region,
         chunks: Vec<Arc<dyn BlobChunkInfo>>,
-    ) -> Result<Self> {
+    ) -> StorageResult<Self> {
         assert!(!chunks.is_empty());
         let len = chunks.len();
         let first_chunk = &chunks[0];
@@ -1842,7 +1935,7 @@ impl FileIoMergeState {
         user_start: u64,
         tag: BlobIoTag,
         chunk: Option<Arc<dyn BlobChunkInfo>>,
-    ) -> Result<()> {
+    ) -> StorageResult<()> {
         // Make sure user io of same region continuous
         if !self.regions.is_empty() && self.joinable(region_type) {
             let region = &self.regions[self.regions.len() - 1];
@@ -1864,7 +1957,7 @@ impl FileIoMergeState {
         let idx = self.regions.len() - 1;
         self.regions[idx]
             .append(start, len, user_start, tag, chunk)
-            .map_err(|e| einval!(e))
+            .map_err(|e| StorageError::InvalidArgument(e.to_string()))
     }
 
     // Committing current region ensures a new region will be created when more
@@ -1894,15 +1987,45 @@ mod tests {
     fn persist_cached_data_preserves_write_errno() {
         use std::sync::Arc;
         use vmm_sys_util::tempdir::TempDir;
-        // A read-only file makes pwrite fail deterministically; the raw OS
-        // errno must survive so fanotify can deny with it (EBADF/EACCES here,
-        // ENOSPC in the disk-full case this guards).
+        // A read-only file makes pwrite fail deterministically; the raw OS errno must survive
+        // so fanotify can deny with it (EBADF/EACCES here, ENOSPC in the disk-full case this
+        // guards). The error is now a `StorageError`, so the errno lives one layer down and is
+        // recovered by walking the source chain rather than read off the top.
         let dir = TempDir::new().unwrap();
         let path = dir.as_path().join("cache.blob.data");
         std::fs::write(&path, b"seed").unwrap();
         let ro = Arc::new(std::fs::File::open(&path).unwrap());
         let err = super::FileCacheEntry::persist_cached_data(&ro, 0, b"data").unwrap_err();
-        assert!(err.raw_os_error().is_some(), "raw errno lost: {err:?}");
+
+        assert!(
+            matches!(err, StorageError::CacheIo { op: "pwrite", .. }),
+            "expected a pwrite CacheIo, got {err:?}"
+        );
+        assert!(
+            nydus_utils::source_errno(&err).is_some(),
+            "raw errno lost: {err:?}"
+        );
+    }
+
+    #[test]
+    fn enospc_reaches_the_fanotify_deny_path() {
+        // The invariant the on-demand path rests on: a full disk must reach the kernel as
+        // ENOSPC, not as a generic EIO. `persist_cached_data` captures the errno once at the
+        // syscall and wraps it; every layer above recovers it by walking `source`.
+        let err = StorageError::cache_io("pwrite", std::io::Error::from_raw_os_error(libc::ENOSPC));
+        assert_eq!(nydus_utils::source_errno(&err), Some(libc::ENOSPC));
+
+        // ...and through the boundary conversion the FUSE/fanotify layers actually use.
+        let as_io: std::io::Error = err.into();
+        assert_eq!(as_io.raw_os_error(), Some(libc::ENOSPC));
+
+        // A failure with no syscall behind it must not invent one; the deny path defaults it
+        // to EIO, which is what the old `eio!("failed to write data to file cache")` produced.
+        let short = StorageError::ShortWrite {
+            expected: 4096,
+            written: 10,
+        };
+        assert_eq!(nydus_utils::source_errno(&short), None);
     }
 
     use super::*;

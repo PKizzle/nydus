@@ -5,7 +5,6 @@
 
 use std::collections::HashMap;
 use std::fs::OpenOptions;
-use std::io::Result;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, RwLock};
 
@@ -24,6 +23,7 @@ use crate::cache::worker::{AsyncPrefetchConfig, AsyncWorkerMgr};
 use crate::cache::{BlobCache, BlobCacheMgr};
 use crate::device::{BlobFeatures, BlobInfo};
 use crate::utils::get_path_from_file;
+use crate::{StorageError, StorageResult};
 
 pub const BLOB_RAW_FILE_SUFFIX: &str = ".blob.raw";
 pub const BLOB_DATA_FILE_SUFFIX: &str = ".blob.data";
@@ -55,12 +55,17 @@ impl FileCacheMgr {
         backend: Arc<dyn BlobBackend>,
         id: &str,
         user_io_batch_size: u32,
-    ) -> Result<FileCacheMgr> {
-        let blob_cfg = config.get_filecache_config()?;
-        let work_dir = blob_cfg.get_work_dir()?;
+    ) -> StorageResult<FileCacheMgr> {
+        let blob_cfg = config
+            .get_filecache_config()
+            .map_err(|e| StorageError::InvalidArgument(e.to_string()))?;
+        let work_dir = blob_cfg
+            .get_work_dir()
+            .map_err(|e| StorageError::InvalidArgument(e.to_string()))?;
         let metrics = BlobcacheMetrics::new(id, work_dir);
         let prefetch_config: Arc<AsyncPrefetchConfig> = Arc::new((&config.prefetch).into());
-        let worker_mgr = AsyncWorkerMgr::new(metrics.clone(), prefetch_config.clone())?;
+        let worker_mgr = AsyncWorkerMgr::new(metrics.clone(), prefetch_config.clone())
+            .map_err(|e| StorageError::cache_io("start the prefetch workers", e))?;
 
         Ok(FileCacheMgr {
             blobs: Arc::new(RwLock::new(HashMap::new())),
@@ -87,7 +92,10 @@ impl FileCacheMgr {
 
     // Create a file cache entry for the specified blob object if not present, otherwise
     // return the existing one.
-    fn get_or_create_cache_entry(&self, blob: &Arc<BlobInfo>) -> Result<Arc<FileCacheEntry>> {
+    fn get_or_create_cache_entry(
+        &self,
+        blob: &Arc<BlobInfo>,
+    ) -> StorageResult<Arc<FileCacheEntry>> {
         if let Some(entry) = self.get(blob) {
             return Ok(entry);
         }
@@ -116,8 +124,9 @@ impl FileCacheMgr {
 }
 
 impl BlobCacheMgr for FileCacheMgr {
-    fn init(&self) -> Result<()> {
+    fn init(&self) -> StorageResult<()> {
         AsyncWorkerMgr::start(self.worker_mgr.clone())
+            .map_err(|e| StorageError::cache_io("start the prefetch workers", e))
     }
 
     fn destroy(&self) {
@@ -159,7 +168,7 @@ impl BlobCacheMgr for FileCacheMgr {
         self.backend.as_ref()
     }
 
-    fn get_blob_cache(&self, blob_info: &Arc<BlobInfo>) -> Result<Arc<dyn BlobCache>> {
+    fn get_blob_cache(&self, blob_info: &Arc<BlobInfo>) -> StorageResult<Arc<dyn BlobCache>> {
         self.get_or_create_cache_entry(blob_info)
             .map(|v| v as Arc<dyn BlobCache>)
     }
@@ -179,24 +188,25 @@ impl FileCacheEntry {
         blob_info: Arc<BlobInfo>,
         prefetch_config: Arc<AsyncPrefetchConfig>,
         workers: Arc<AsyncWorkerMgr>,
-    ) -> Result<Self> {
+    ) -> StorageResult<Self> {
         let is_separate_meta = blob_info.has_feature(BlobFeatures::SEPARATE);
         let is_tarfs = blob_info.features().is_tarfs();
         let is_batch = blob_info.has_feature(BlobFeatures::BATCH);
         let is_zran = blob_info.has_feature(BlobFeatures::ZRAN);
         let blob_id = blob_info.blob_id();
         let blob_meta_id = if is_separate_meta {
-            blob_info.get_blob_meta_id()?
+            blob_info
+                .get_blob_meta_id()
+                .map_err(|e| StorageError::InvalidState(e.to_string()))?
         } else {
             blob_id.clone()
         };
-        let reader = mgr
-            .backend
-            .get_reader(&blob_id)
-            .map_err(|e| eio!(format!("failed to get reader for blob {}, {}", blob_id, e)))?;
+        let reader = mgr.backend.get_reader(&blob_id).map_err(|e| {
+            StorageError::InvalidData(format!("failed to get reader for blob {}, {}", blob_id, e))
+        })?;
         let blob_meta_reader = if is_separate_meta {
             mgr.backend.get_reader(&blob_meta_id).map_err(|e| {
-                eio!(format!(
+                StorageError::InvalidData(format!(
                     "failed to get reader for blob.meta {}, {}",
                     blob_id, e
                 ))
@@ -235,7 +245,8 @@ impl FileCacheEntry {
                 .create(false)
                 .write(false)
                 .read(true)
-                .open(blob_file_path)?;
+                .open(blob_file_path)
+                .map_err(|e| StorageError::cache_io("open the blob cache file", e))?;
             let chunk_map =
                 Arc::new(BlobStateMap::from(NoopChunkMap::new(true))) as Arc<dyn ChunkMap>;
             (file, None, chunk_map, true, true, false)
@@ -259,21 +270,26 @@ impl FileCacheEntry {
                 .truncate(false)
                 .write(true)
                 .read(true)
-                .open(blob_data_file_path)?;
-            let file_size = file.metadata()?.len();
+                .open(blob_data_file_path)
+                .map_err(|e| StorageError::cache_io("open the blob data file", e))?;
+            let file_size = file
+                .metadata()
+                .map_err(|e| StorageError::cache_io("stat the blob cache file", e))?
+                .len();
             let cached_file_size = if mgr.cache_raw_data {
                 blob_info.compressed_data_size()
             } else {
                 blob_info.uncompressed_size()
             };
             if file_size == 0 || file_size < cached_file_size {
-                file.set_len(cached_file_size)?;
+                file.set_len(cached_file_size)
+                    .map_err(|e| StorageError::cache_io("size the blob cache file", e))?;
             } else if cached_file_size != 0 && file_size != cached_file_size {
                 let msg = format!(
                     "blob data file size doesn't match: got 0x{:x}, expect 0x{:x}",
                     file_size, cached_file_size
                 );
-                return Err(einval!(msg));
+                return Err(StorageError::InvalidArgument(msg));
             }
             let load_chunk_digest = need_validation || cas_mgr.is_some();
             // A chunkdict-generated blob carries no valid chunk info, so building a
@@ -302,15 +318,21 @@ impl FileCacheEntry {
         };
 
         let (cache_cipher_object, cache_cipher_context) = if mgr.cache_encrypted {
-            let key = hex::decode(mgr.cache_encryption_key.clone())
-                .map_err(|_e| einval!("invalid cache file encryption key"))?;
-            let cipher = crypt::Algorithm::Aes128Xts.new_cipher()?;
+            let key = hex::decode(mgr.cache_encryption_key.clone()).map_err(|_e| {
+                StorageError::InvalidArgument("invalid cache file encryption key".to_string())
+            })?;
+            let cipher = crypt::Algorithm::Aes128Xts.new_cipher().map_err(|e| {
+                StorageError::InvalidState(format!("failed to create cipher, {}", e))
+            })?;
             let ctx = crypt::CipherContext::new(
                 key,
                 [0u8; 16].to_vec(),
                 mgr.cache_convergent_encryption,
                 crypt::Algorithm::Aes128Xts,
-            )?;
+            )
+            .map_err(|e| {
+                StorageError::InvalidState(format!("failed to create cipher context, {}", e))
+            })?;
             (Arc::new(cipher), Arc::new(ctx))
         } else {
             (Default::default(), Default::default())
@@ -372,7 +394,7 @@ impl FileCacheEntry {
         mgr: &FileCacheMgr,
         blob_info: &BlobInfo,
         blob_file: &str,
-    ) -> Result<(Arc<dyn ChunkMap>, bool)> {
+    ) -> StorageResult<(Arc<dyn ChunkMap>, bool)> {
         // The builder now records the number of chunks in the blob table, so we can
         // use IndexedChunkMap as a chunk map, but for the old Nydus bootstrap, we
         // need downgrade to use DigestedChunkMap as a compatible solution.

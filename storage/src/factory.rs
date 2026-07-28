@@ -163,7 +163,10 @@ impl BlobFactory {
         if let Some(entry) = guard.get(&key).cloned() {
             let _active_guard = entry.pin();
             drop(guard);
-            return entry.mgr.get_blob_cache(blob_info);
+            return entry
+                .mgr
+                .get_blob_cache(blob_info)
+                .map_err(std::io::Error::from);
         }
         let backend = Self::new_backend(backend_cfg, id)?;
         let mgr = match cache_cfg.cache_type.as_str() {
@@ -188,7 +191,7 @@ impl BlobFactory {
         guard.insert(key, entry);
         drop(guard);
 
-        mgr.get_blob_cache(blob_info)
+        mgr.get_blob_cache(blob_info).map_err(std::io::Error::from)
     }
 
     /// Garbage-collect unused blob cache managers and blob caches.
@@ -356,7 +359,7 @@ mod tests {
     }
 
     impl BlobCacheMgr for BlockingMgr {
-        fn init(&self) -> IOResult<()> {
+        fn init(&self) -> crate::StorageResult<()> {
             Ok(())
         }
 
@@ -370,10 +373,15 @@ mod tests {
             self.backend.as_ref()
         }
 
-        fn get_blob_cache(&self, _blob_info: &Arc<BlobInfo>) -> IOResult<Arc<dyn BlobCache>> {
+        fn get_blob_cache(
+            &self,
+            _blob_info: &Arc<BlobInfo>,
+        ) -> crate::StorageResult<Arc<dyn BlobCache>> {
             self.entered.wait();
             self.release.wait();
-            Err(std::io::Error::other("blocking test manager always errors"))
+            Err(crate::StorageError::InvalidState(
+                "blocking test manager always errors".to_string(),
+            ))
         }
 
         fn check_stat(&self) {}
