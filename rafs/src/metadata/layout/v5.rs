@@ -37,7 +37,7 @@ use std::cmp;
 use std::convert::TryFrom;
 use std::ffi::{OsStr, OsString};
 use std::fmt::{Debug, Display, Formatter, Result as FmtResult};
-use std::io::{Read, Result};
+use std::io::Read;
 use std::mem::size_of;
 use std::ops::Deref;
 use std::os::unix::ffi::OsStrExt;
@@ -62,7 +62,8 @@ use crate::metadata::{
     Inode, RAFS_DEFAULT_CHUNK_SIZE, RAFS_MAX_CHUNK_SIZE, RafsInode, RafsStore, RafsSuperFlags,
 };
 use crate::{
-    RafsInodeExt, RafsIoReader, RafsIoWrite, impl_bootstrap_converter, impl_pub_getter_setter,
+    RafsError, RafsInodeExt, RafsIoReader, RafsIoWrite, RafsResult, impl_bootstrap_converter,
+    impl_pub_getter_setter,
 };
 
 pub(crate) const RAFSV5_ALIGNMENT: usize = 8;
@@ -76,7 +77,7 @@ const RAFSV5_EXT_BLOB_RESERVED_SIZE: usize = RAFSV5_EXT_BLOB_ENTRY_SIZE - 24;
 /// Trait to get information about a Rafs v5 inode.
 pub(crate) trait RafsV5InodeOps {
     /// Get the `BlobInfo` object corresponding to the `blob_index`.
-    fn get_blob_by_index(&self, blob_index: u32) -> Result<Arc<BlobInfo>>;
+    fn get_blob_by_index(&self, blob_index: u32) -> RafsResult<Arc<BlobInfo>>;
 
     /// Get chunk size for the inode.
     fn get_chunk_size(&self) -> u32;
@@ -87,7 +88,7 @@ pub(crate) trait RafsV5InodeOps {
 
 pub(crate) trait RafsV5InodeChunkOps {
     /// Get chunk info object for a chunk.
-    fn get_chunk_info_v5(&self, idx: u32) -> Result<Arc<dyn BlobV5ChunkInfo>>;
+    fn get_chunk_info_v5(&self, idx: u32) -> RafsResult<Arc<dyn BlobV5ChunkInfo>>;
 }
 
 /// Rafs v5 superblock on disk metadata, 8192 bytes.
@@ -144,21 +145,27 @@ impl RafsV5SuperBlock {
     }
 
     /// Validate the Rafs v5 super block.
-    pub fn validate(&self, meta_size: u64) -> Result<()> {
+    pub fn validate(&self, meta_size: u64) -> RafsResult<()> {
         if !self.is_rafs_v5() {
-            return Err(einval!("invalid super block version number"));
+            return Err(RafsError::InvalidMetadata(
+                "invalid super block version number".to_string(),
+            ));
         } else if self.sb_size() as usize != RAFSV5_SUPERBLOCK_SIZE
             || meta_size <= RAFSV5_SUPERBLOCK_SIZE as u64
         {
-            return Err(einval!("invalid super block blob size"));
+            return Err(RafsError::InvalidMetadata(
+                "invalid super block blob size".to_string(),
+            ));
         } else if !self.block_size().is_power_of_two()
             || self.block_size() < 0x1000
             || (self.block_size() as u64 > RAFS_MAX_CHUNK_SIZE && self.block_size() != 4 << 20)
         {
             // Stargz has a special chunk size of 4MB.
-            return Err(einval!("invalid block size"));
+            return Err(RafsError::InvalidMetadata("invalid block size".to_string()));
         } else if RafsSuperFlags::from_bits(self.flags()).is_none() {
-            return Err(einval!("invalid super block flags"));
+            return Err(RafsError::InvalidMetadata(
+                "invalid super block flags".to_string(),
+            ));
         }
 
         let meta_range = MetaRange::new(
@@ -173,7 +180,9 @@ impl RafsV5SuperBlock {
         let inode_table_size = inode_table_entries * size_of::<u32>() as u64;
         let inode_table_range = MetaRange::new(inode_table_offset, inode_table_size, false)?;
         if inodes_count > inode_table_entries || !inode_table_range.is_subrange_of(&meta_range) {
-            return Err(einval!("invalid inode table count, offset or entries."));
+            return Err(RafsError::InvalidMetadata(
+                "invalid inode table count, offset or entries.".to_string(),
+            ));
         }
 
         let blob_table_offset = self.blob_table_offset();
@@ -182,7 +191,9 @@ impl RafsV5SuperBlock {
         if !blob_table_range.is_subrange_of(&meta_range)
             || blob_table_range.intersect_with(&inode_table_range)
         {
-            return Err(einval!("invalid blob table offset or size."));
+            return Err(RafsError::InvalidMetadata(
+                "invalid blob table offset or size.".to_string(),
+            ));
         }
 
         let ext_blob_table_offset = self.extended_blob_table_offset();
@@ -195,7 +206,9 @@ impl RafsV5SuperBlock {
                 || ext_blob_table_range.intersect_with(&inode_table_range)
                 || ext_blob_table_range.intersect_with(&blob_table_range))
         {
-            return Err(einval!("invalid extended blob table offset or size."));
+            return Err(RafsError::InvalidMetadata(
+                "invalid extended blob table offset or size.".to_string(),
+            ));
         }
 
         let prefetch_table_offset = self.prefetch_table_offset();
@@ -209,7 +222,9 @@ impl RafsV5SuperBlock {
                 || (ext_blob_table_size != 0
                     && prefetch_table_range.intersect_with(&ext_blob_table_range)))
         {
-            return Err(einval!("invalid prefetch table offset or size."));
+            return Err(RafsError::InvalidMetadata(
+                "invalid prefetch table offset or size.".to_string(),
+            ));
         }
 
         Ok(())
@@ -302,12 +317,12 @@ impl RafsV5SuperBlock {
     );
 
     /// Load a super block from a `RafsIoReader` object.
-    pub fn load(&mut self, r: &mut RafsIoReader) -> Result<()> {
-        r.read_exact(self.as_mut())
+    pub fn load(&mut self, r: &mut RafsIoReader) -> RafsResult<()> {
+        Ok(r.read_exact(self.as_mut())?)
     }
 
     /// Read Rafs v5 super block from a reader.
-    pub fn read(r: &mut RafsIoReader) -> Result<Self> {
+    pub fn read(r: &mut RafsIoReader) -> RafsResult<Self> {
         let mut sb = RafsV5SuperBlock::new();
 
         r.read_exact(sb.as_mut())?;
@@ -317,9 +332,9 @@ impl RafsV5SuperBlock {
 }
 
 impl RafsStore for RafsV5SuperBlock {
-    fn store(&self, w: &mut dyn RafsIoWrite) -> Result<usize> {
+    fn store(&self, w: &mut dyn RafsIoWrite) -> RafsResult<usize> {
         w.write_all(self.as_ref())?;
-        w.validate_alignment(self.as_ref().len(), RAFSV5_ALIGNMENT)
+        Ok(w.validate_alignment(self.as_ref().len(), RAFSV5_ALIGNMENT)?)
     }
 }
 
@@ -397,15 +412,18 @@ impl RafsV5InodeTable {
     }
 
     /// Set inode offset in the metadata blob for an inode.
-    pub fn set(&mut self, ino: Inode, offset: u32) -> Result<()> {
+    pub fn set(&mut self, ino: Inode, offset: u32) -> RafsResult<()> {
         if ino == 0 || ino > self.data.len() as u64 {
-            return Err(einval!(format!(
+            return Err(RafsError::InvalidMetadata(format!(
                 "invalid inode number {}, max {}",
                 ino,
                 self.data.len()
             )));
         } else if offset as usize <= RAFSV5_SUPERBLOCK_SIZE || offset & 0x7 != 0 {
-            return Err(einval!(format!("invalid inode offset 0x{:x}", offset)));
+            return Err(RafsError::InvalidMetadata(format!(
+                "invalid inode offset 0x{:x}",
+                offset
+            )));
         }
 
         // The offset is aligned with 8 bytes to make it easier to validate RafsV5Inode.
@@ -416,14 +434,18 @@ impl RafsV5InodeTable {
     }
 
     /// Get inode offset in the metadata blob of an inode.
-    pub fn get(&self, ino: Inode) -> Result<u32> {
+    pub fn get(&self, ino: Inode) -> RafsResult<u32> {
         if ino == 0 || ino > self.data.len() as u64 {
-            return Err(enoent!());
+            return Err(RafsError::NotFound(format!(
+                "v5: inode number {} is out of range of the inode table ({} entries)",
+                ino,
+                self.data.len()
+            )));
         }
 
         let offset = u32::from_le(self.data[(ino - 1) as usize]) as usize;
         if offset <= (RAFSV5_SUPERBLOCK_SIZE >> 3) || offset >= (1usize << 29) {
-            return Err(einval!(format!(
+            return Err(RafsError::InvalidMetadata(format!(
                 "invalid offset 0x{:x} for inode {}",
                 offset, ino
             )));
@@ -433,7 +455,7 @@ impl RafsV5InodeTable {
     }
 
     /// Load inode offset table for a `RafsIoReader` object.
-    pub fn load(&mut self, r: &mut RafsIoReader) -> Result<()> {
+    pub fn load(&mut self, r: &mut RafsIoReader) -> RafsResult<()> {
         let (_, data, _) = unsafe { self.data.align_to_mut::<u8>() };
         r.read_exact(data)?;
         Ok(())
@@ -441,11 +463,11 @@ impl RafsV5InodeTable {
 }
 
 impl RafsStore for RafsV5InodeTable {
-    fn store(&self, w: &mut dyn RafsIoWrite) -> Result<usize> {
+    fn store(&self, w: &mut dyn RafsIoWrite) -> RafsResult<usize> {
         let (_, data, _) = unsafe { self.data.align_to::<u8>() };
 
         w.write_all(data)?;
-        w.validate_alignment(data.len(), RAFSV5_ALIGNMENT)
+        Ok(w.validate_alignment(data.len(), RAFSV5_ALIGNMENT)?)
     }
 }
 
@@ -493,7 +515,7 @@ impl RafsV5PrefetchTable {
     }
 
     /// Store the inode prefetch table to a writer.
-    pub fn store(&mut self, w: &mut dyn RafsIoWrite) -> Result<usize> {
+    pub fn store(&mut self, w: &mut dyn RafsIoWrite) -> RafsResult<usize> {
         let (_, data, _) = unsafe { self.inodes.align_to::<u8>() };
         w.write_all(data.as_ref())?;
 
@@ -515,7 +537,7 @@ impl RafsV5PrefetchTable {
         r: &mut RafsIoReader,
         offset: u64,
         entries: usize,
-    ) -> Result<usize> {
+    ) -> RafsResult<usize> {
         self.inodes = vec![0u32; entries];
 
         let (_, data, _) = unsafe { self.inodes.align_to_mut::<u8>() };
@@ -604,9 +626,9 @@ impl RafsV5BlobTable {
 
     /// Get base information for a blob.
     #[inline]
-    pub fn get(&self, blob_index: u32) -> Result<Arc<BlobInfo>> {
+    pub fn get(&self, blob_index: u32) -> RafsResult<Arc<BlobInfo>> {
         if blob_index >= self.entries.len() as u32 {
-            return Err(enoent!("blob not found"));
+            return Err(RafsError::NotFound("blob not found".to_string()));
         }
         Ok(self.entries[blob_index as usize].clone())
     }
@@ -618,7 +640,7 @@ impl RafsV5BlobTable {
         blob_table_size: u32,
         chunk_size: u32,
         flags: RafsSuperFlags,
-    ) -> Result<()> {
+    ) -> RafsResult<()> {
         if blob_table_size == 0 {
             return Ok(());
         }
@@ -642,7 +664,7 @@ impl RafsV5BlobTable {
             }
             let blob_id = std::str::from_utf8(&buf[8..pos])
                 .map(|v| v.to_owned())
-                .map_err(|e| einval!(e))?;
+                .map_err(|e| RafsError::InvalidMetadata(e.to_string()))?;
             if pos == buf.len() {
                 buf = &mut buf[pos..];
             } else {
@@ -657,7 +679,11 @@ impl RafsV5BlobTable {
                     let ext_len = self.extended.entries.len();
                     if index >= ext_len {
                         error!( "Extended blob table({}) is shorter than blob table", ext_len);
-                        return Err(einval!());
+                        return Err(RafsError::InvalidMetadata(format!(
+                            "v5: extended blob table has {} entries, shorter than the blob table's {}",
+                            ext_len,
+                            index + 1
+                        )));
                     }
                     let entry = &self.extended.entries[index];
                     let blob_features = match BlobFeatures::try_from(entry.features) {
@@ -702,18 +728,18 @@ impl RafsV5BlobTable {
     }
 
     /// Store the extended blob information array.
-    pub fn store_extended(&self, w: &mut dyn RafsIoWrite) -> Result<usize> {
+    pub fn store_extended(&self, w: &mut dyn RafsIoWrite) -> RafsResult<usize> {
         self.extended.store(w)
     }
 }
 
 impl RafsStore for RafsV5BlobTable {
-    fn store(&self, w: &mut dyn RafsIoWrite) -> Result<usize> {
+    fn store(&self, w: &mut dyn RafsIoWrite) -> RafsResult<usize> {
         let mut size = 0;
         self.entries
             .iter()
             .enumerate()
-            .try_for_each::<_, Result<()>>(|(idx, entry)| {
+            .try_for_each::<_, RafsResult<()>>(|(idx, entry)| {
                 w.write_all(&u32::to_le_bytes(entry.prefetch_offset() as u32))?;
                 w.write_all(&u32::to_le_bytes(entry.prefetch_size() as u32))?;
                 w.write_all(entry.blob_id().as_bytes())?;
@@ -730,7 +756,7 @@ impl RafsStore for RafsV5BlobTable {
         w.write_padding(padding)?;
         size += padding;
 
-        w.validate_alignment(size, RAFSV5_ALIGNMENT)
+        Ok(w.validate_alignment(size, RAFSV5_ALIGNMENT)?)
     }
 }
 
@@ -848,7 +874,7 @@ impl RafsV5ExtBlobTable {
     }
 
     /// Load extended blob information table from a reader.
-    pub fn load(&mut self, r: &mut RafsIoReader, count: usize) -> Result<()> {
+    pub fn load(&mut self, r: &mut RafsIoReader, count: usize) -> RafsResult<()> {
         let mut entries = Vec::<RafsV5ExtBlobEntry>::with_capacity(count);
         // Safe because it is already reserved enough space
         let (_, data, _) = unsafe {
@@ -864,14 +890,14 @@ impl RafsV5ExtBlobTable {
 }
 
 impl RafsStore for RafsV5ExtBlobTable {
-    fn store(&self, w: &mut dyn RafsIoWrite) -> Result<usize> {
+    fn store(&self, w: &mut dyn RafsIoWrite) -> RafsResult<usize> {
         let mut size = 0;
 
         // Store the list of entries
         self.entries
             .iter()
             .enumerate()
-            .try_for_each::<_, Result<()>>(|(_idx, entry)| {
+            .try_for_each::<_, RafsResult<()>>(|(_idx, entry)| {
                 w.write_all(&u32::to_le_bytes(entry.chunk_count))?;
                 w.write_all(&u32::to_le_bytes(entry.features))?;
                 w.write_all(&u64::to_le_bytes(entry.uncompressed_size))?;
@@ -886,7 +912,7 @@ impl RafsStore for RafsV5ExtBlobTable {
         w.write_padding(padding)?;
         size += padding;
 
-        w.validate_alignment(size, RAFSV5_ALIGNMENT)
+        Ok(w.validate_alignment(size, RAFSV5_ALIGNMENT)?)
     }
 }
 
@@ -1030,12 +1056,12 @@ impl RafsV5Inode {
     }
 
     /// Load an inode from a reader.
-    pub fn load(&mut self, r: &mut RafsIoReader) -> Result<()> {
-        r.read_exact(self.as_mut())
+    pub fn load(&mut self, r: &mut RafsIoReader) -> RafsResult<()> {
+        Ok(r.read_exact(self.as_mut())?)
     }
 
     /// Set filename for the inode.
-    pub fn load_file_name(&self, r: &mut RafsIoReader) -> Result<OsString> {
+    pub fn load_file_name(&self, r: &mut RafsIoReader) -> RafsResult<OsString> {
         let mut name_buf = vec![0u8; self.i_name_size as usize];
         r.read_exact(name_buf.as_mut_slice())?;
         r.seek_to_next_aligned(name_buf.len(), RAFSV5_ALIGNMENT)?;
@@ -1081,7 +1107,7 @@ pub struct RafsV5InodeWrapper<'a> {
 }
 
 impl RafsStore for RafsV5InodeWrapper<'_> {
-    fn store(&self, w: &mut dyn RafsIoWrite) -> Result<usize> {
+    fn store(&self, w: &mut dyn RafsIoWrite) -> RafsResult<usize> {
         let mut size: usize = 0;
 
         let inode_data = self.inode.as_ref();
@@ -1104,7 +1130,7 @@ impl RafsStore for RafsV5InodeWrapper<'_> {
             size += padding;
         }
 
-        w.validate_alignment(size, RAFSV5_ALIGNMENT)
+        Ok(w.validate_alignment(size, RAFSV5_ALIGNMENT)?)
     }
 }
 
@@ -1141,15 +1167,15 @@ impl RafsV5ChunkInfo {
     }
 
     /// Load a Rafs v5 indoe from a reader.
-    pub fn load(&mut self, r: &mut RafsIoReader) -> Result<()> {
-        r.read_exact(self.as_mut())
+    pub fn load(&mut self, r: &mut RafsIoReader) -> RafsResult<()> {
+        Ok(r.read_exact(self.as_mut())?)
     }
 }
 
 impl RafsStore for RafsV5ChunkInfo {
-    fn store(&self, w: &mut dyn RafsIoWrite) -> Result<usize> {
+    fn store(&self, w: &mut dyn RafsIoWrite) -> RafsResult<usize> {
         w.write_all(self.as_ref())?;
-        w.validate_alignment(self.as_ref().len(), RAFSV5_ALIGNMENT)
+        Ok(w.validate_alignment(self.as_ref().len(), RAFSV5_ALIGNMENT)?)
     }
 }
 
@@ -1214,7 +1240,7 @@ impl RafsXAttrs {
         rafsv5_align(self.size())
     }
 
-    pub fn store_v5(&self, w: &mut dyn RafsIoWrite) -> Result<usize> {
+    pub fn store_v5(&self, w: &mut dyn RafsIoWrite) -> RafsResult<usize> {
         let mut size = 0;
 
         if !self.pairs.is_empty() {
@@ -1242,7 +1268,7 @@ impl RafsXAttrs {
         w.write_padding(padding)?;
         size += padding;
 
-        w.validate_alignment(size, RAFSV5_ALIGNMENT)
+        Ok(w.validate_alignment(size, RAFSV5_ALIGNMENT)?)
     }
 }
 
@@ -1255,10 +1281,10 @@ pub(crate) fn rafsv5_alloc_bio_vecs<I: RafsInode + RafsV5InodeChunkOps + RafsV5I
     offset: u64,
     size: usize,
     user_io: bool,
-) -> Result<Vec<BlobIoVec>> {
+) -> RafsResult<Vec<BlobIoVec>> {
     let end = offset
         .checked_add(size as u64)
-        .ok_or_else(|| einval!("invalid read size"))?;
+        .ok_or_else(|| RafsError::InvalidMetadata("invalid read size".to_string()))?;
     let (index_start, index_end) = calculate_bio_chunk_index(
         offset,
         end,
@@ -1283,7 +1309,9 @@ pub(crate) fn rafsv5_alloc_bio_vecs<I: RafsInode + RafsV5InodeChunkOps + RafsV5I
     let blob = inode.get_blob_by_index(chunk.blob_index())?;
     let mut desc = BlobIoVec::new(blob.clone());
     if !add_chunk_to_bio_desc(&mut desc, offset, end, chunk, blob, user_io) {
-        return Err(einval!("failed to create blob io vector"));
+        return Err(RafsError::InvalidMetadata(
+            "failed to create blob io vector".to_string(),
+        ));
     }
 
     let mut descs = Vec::with_capacity(4);
@@ -1295,7 +1323,9 @@ pub(crate) fn rafsv5_alloc_bio_vecs<I: RafsInode + RafsV5InodeChunkOps + RafsV5I
             desc = BlobIoVec::new(blob.clone());
         }
         if !add_chunk_to_bio_desc(&mut desc, offset, end, chunk, blob, user_io) {
-            return Err(einval!("failed to create blob io vector"));
+            return Err(RafsError::InvalidMetadata(
+                "failed to create blob io vector".to_string(),
+            ));
         }
     }
     descs.push(desc);
@@ -1413,7 +1443,7 @@ pub(crate) fn rafsv5_validate_inode(
     inode: &dyn RafsInodeExt,
     recursive: bool,
     digester: digest::Algorithm,
-) -> Result<bool> {
+) -> RafsResult<bool> {
     let child_count = inode.get_child_count();
     let expected_digest = inode.get_digest();
     let mut hasher = RafsDigest::hasher(digester);

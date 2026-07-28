@@ -52,6 +52,23 @@ pub const RAFS_DEFAULT_ATTR_TIMEOUT: u64 = 1 << 32;
 /// Rafs default entry timeout value.
 pub const RAFS_DEFAULT_ENTRY_TIMEOUT: u64 = RAFS_DEFAULT_ATTR_TIMEOUT;
 
+/// Convert a `RafsError` into the `io::Error` the FUSE server expects, logging it on the way.
+///
+/// The kernel on the other side of FUSE reads `raw_os_error()` and nothing else, so the rich
+/// message cannot travel with the error -- this is the one place it gets recorded before being
+/// dropped. Protocol answers (`ENOENT` from a lookup, `ENOTDIR` from a readdir on a file) are
+/// logged at debug: they are how the kernel is *told* something, not failures. Everything else
+/// is a warning.
+fn fuse_err(e: RafsError) -> Error {
+    let errno = e.errno();
+    if matches!(errno, libc::ENOENT | libc::ENOTDIR) {
+        debug!("rafs: {} (answering errno {})", e, errno);
+    } else {
+        warn!("rafs: {} (answering errno {})", e, errno);
+    }
+    Error::from_raw_os_error(errno)
+}
+
 /// Struct to glue fuse, storage backend and filesystem metadata together.
 ///
 /// The [Rafs](struct.Rafs.html) structure implements the `fuse_backend_rs::FileSystem` trait,
@@ -101,7 +118,7 @@ impl Rafs {
             .get_rafs_config()
             .map_err(|e| RafsError::LoadConfig(e.into()))?;
         let (sb, reader) = RafsSuper::load_from_file(metadata_path, cfg.clone(), false)
-            .map_err(RafsError::FillSuperBlock)?;
+            .map_err(|e| RafsError::FillSuperBlock(e.into()))?;
         let blob_infos = sb.superblock.get_blob_infos();
         let device = BlobDevice::new(cfg, &blob_infos, mountpoint)
             .map_err(|e| RafsError::CreateDevice(e.into()))?;
@@ -292,12 +309,18 @@ impl Rafs {
             return Ok(());
         }
 
-        let parent = self.sb.get_inode(ino, self.digest_validate)?;
+        let parent = self
+            .sb
+            .get_inode(ino, self.digest_validate)
+            .map_err(fuse_err)?;
         if !parent.is_dir() {
-            return Err(enotdir!());
+            return Err(Error::from_raw_os_error(libc::ENOTDIR));
         }
 
         let mut handler = |_inode, name: OsString, ino, offset| {
+            // `add_entry` is the FUSE writer, pinned to `io::Error`, but the walk handler is
+            // now `RafsResult`. A short write is a real I/O failure, so it travels as
+            // `RafsError::Io` and keeps its errno.
             match add_entry(DirEntry {
                 ino,
                 offset,
@@ -312,11 +335,13 @@ impl Rafs {
                     self.ios.new_file_counter(ino);
                     Ok(RafsInodeWalkAction::Continue)
                 } // TODO: should we check `size` here?
-                Err(e) => Err(e),
+                Err(e) => Err(RafsError::Io(e)),
             }
         };
 
-        parent.walk_children_inodes(offset, &mut handler)?;
+        parent
+            .walk_children_inodes(offset, &mut handler)
+            .map_err(fuse_err)?;
 
         Ok(())
     }
@@ -425,7 +450,7 @@ impl Rafs {
         self.sb.superblock.root_ino()
     }
 
-    pub fn get_root_inode(&self) -> Result<Arc<dyn RafsInode>> {
+    pub fn get_root_inode(&self) -> RafsResult<Arc<dyn RafsInode>> {
         let root_ino = self.root_ino();
         self.sb.get_inode(root_ino, self.digest_validate)
     }
@@ -618,7 +643,7 @@ impl FileSystem for Rafs {
         let target = OsStr::from_bytes(name.to_bytes());
         let parent = self.sb.get_inode(ino, self.digest_validate)?;
         if !parent.is_dir() {
-            return Err(enotdir!());
+            return Err(Error::from_raw_os_error(libc::ENOTDIR));
         }
 
         rec.mark_success(0);
@@ -693,7 +718,8 @@ impl FileSystem for Rafs {
         _flags: u32,
     ) -> Result<usize> {
         if offset.checked_add(size as u64).is_none() {
-            return Err(einval!("offset + size wraps around."));
+            warn!("rafs: read at offset {} size {} wraps around", offset, size);
+            return Err(Error::from_raw_os_error(libc::EINVAL));
         }
 
         let inode = self.sb.get_inode(ino, false)?;
@@ -936,7 +962,7 @@ impl FileSystem for Rafs {
             && (st.gid != ctx.gid || st.mode & 0o040 == 0)
             && st.mode & 0o004 == 0
         {
-            return Err(eacces!("permission denied"));
+            return Err(Error::from_raw_os_error(libc::EACCES));
         }
 
         if (mode & libc::W_OK) != 0
@@ -945,7 +971,7 @@ impl FileSystem for Rafs {
             && (st.gid != ctx.gid || st.mode & 0o020 == 0)
             && st.mode & 0o002 == 0
         {
-            return Err(eacces!("permission denied"));
+            return Err(Error::from_raw_os_error(libc::EACCES));
         }
 
         // root can only execute something if it is executable by one of the owner, the group, or
@@ -956,7 +982,7 @@ impl FileSystem for Rafs {
             && (st.gid != ctx.gid || st.mode & 0o010 == 0)
             && st.mode & 0o001 == 0
         {
-            return Err(eacces!("permission denied"));
+            return Err(Error::from_raw_os_error(libc::EACCES));
         }
 
         rec.mark_success(0);

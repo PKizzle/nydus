@@ -12,7 +12,7 @@ use std::any::Any;
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::{OsStr, OsString};
 use std::io::SeekFrom;
-use std::io::{ErrorKind, Read, Result};
+use std::io::{ErrorKind, Read};
 use std::mem::size_of;
 use std::ops::Deref;
 use std::os::unix::ffi::OsStrExt;
@@ -63,7 +63,7 @@ impl CachedSuperBlockV5 {
     /// Load all inodes into memory.
     ///
     /// Rafs v5 layout is based on BFS, which means parents always are in front of children.
-    fn load_all_inodes(&mut self, r: &mut RafsIoReader) -> Result<()> {
+    fn load_all_inodes(&mut self, r: &mut RafsIoReader) -> RafsResult<()> {
         let mut dir_ino_set = Vec::with_capacity(self.s_meta.inode_table_entries as usize);
 
         for _idx in 0..self.s_meta.inode_table_entries {
@@ -79,7 +79,10 @@ impl CachedSuperBlockV5 {
                         inode.i_child_cnt,
                     );
                 }
-                Err(ref e) if e.kind() == ErrorKind::UnexpectedEof => break,
+                // End of the inode table is how the loop terminates, not a failure. The
+                // underlying `read_exact` still reports `UnexpectedEof`; it now arrives wrapped
+                // in `RafsError::Io`, so ask the chain rather than the outer type.
+                Err(ref e) if e.io_error_kind() == Some(ErrorKind::UnexpectedEof) => break,
                 Err(e) => {
                     error!("error when loading CachedInode {:?}", e);
                     return Err(e);
@@ -107,15 +110,21 @@ impl CachedSuperBlockV5 {
         Ok(())
     }
 
-    fn get_node(&self, ino: Inode) -> Result<Arc<CachedInodeV5>> {
-        Ok(self.s_inodes.get(&ino).ok_or_else(|| enoent!())?.clone())
+    fn get_node(&self, ino: Inode) -> RafsResult<Arc<CachedInodeV5>> {
+        Ok(self
+            .s_inodes
+            .get(&ino)
+            .ok_or_else(|| RafsError::NotFound(format!("v5: no cached inode {}", ino)))?
+            .clone())
     }
 
-    fn get_node_mut(&mut self, ino: Inode) -> Result<&mut Arc<CachedInodeV5>> {
-        self.s_inodes.get_mut(&ino).ok_or_else(|| enoent!())
+    fn get_node_mut(&mut self, ino: Inode) -> RafsResult<&mut Arc<CachedInodeV5>> {
+        self.s_inodes
+            .get_mut(&ino)
+            .ok_or_else(|| RafsError::NotFound(format!("v5: no cached inode {}", ino)))
     }
 
-    fn hash_inode(&mut self, inode: Arc<CachedInodeV5>) -> Result<Arc<CachedInodeV5>> {
+    fn hash_inode(&mut self, inode: Arc<CachedInodeV5>) -> RafsResult<Arc<CachedInodeV5>> {
         if self.max_inode < inode.ino() {
             self.max_inode = inode.ino();
         }
@@ -145,25 +154,27 @@ impl RafsSuperInodes for CachedSuperBlockV5 {
         self.max_inode
     }
 
-    fn get_inode(&self, ino: Inode, _validate_digest: bool) -> Result<Arc<dyn RafsInode>> {
-        self.s_inodes
-            .get(&ino)
-            .map_or(Err(enoent!()), |i| Ok(i.clone()))
+    fn get_inode(&self, ino: Inode, _validate_digest: bool) -> RafsResult<Arc<dyn RafsInode>> {
+        self.s_inodes.get(&ino).map_or_else(
+            || Err(RafsError::NotFound(format!("v5: no cached inode {}", ino))),
+            |i| Ok(i.clone() as Arc<dyn RafsInode>),
+        )
     }
 
     fn get_extended_inode(
         &self,
         ino: Inode,
         _validate_digest: bool,
-    ) -> Result<Arc<dyn RafsInodeExt>> {
-        self.s_inodes
-            .get(&ino)
-            .map_or(Err(enoent!()), |i| Ok(i.clone()))
+    ) -> RafsResult<Arc<dyn RafsInodeExt>> {
+        self.s_inodes.get(&ino).map_or_else(
+            || Err(RafsError::NotFound(format!("v5: no cached inode {}", ino))),
+            |i| Ok(i.clone() as Arc<dyn RafsInodeExt>),
+        )
     }
 }
 
 impl RafsSuperBlock for CachedSuperBlockV5 {
-    fn load(&mut self, r: &mut RafsIoReader) -> Result<()> {
+    fn load(&mut self, r: &mut RafsIoReader) -> RafsResult<()> {
         let meta = &self.s_meta;
 
         // FIXME: add validator for all load operations.
@@ -195,7 +206,9 @@ impl RafsSuperBlock for CachedSuperBlockV5 {
         let digester = self.s_meta.get_digester();
         let inode = self.get_extended_inode(RAFS_V5_ROOT_INODE, false)?;
         if self.validate_inode && !rafsv5_validate_inode(inode.deref(), true, digester)? {
-            return Err(einval!("invalid inode digest"));
+            return Err(RafsError::InvalidMetadata(
+                "invalid inode digest".to_string(),
+            ));
         }
 
         Ok(())
@@ -217,7 +230,7 @@ impl RafsSuperBlock for CachedSuperBlockV5 {
         RAFS_V5_ROOT_INODE
     }
 
-    fn get_chunk_info(&self, _idx: usize) -> Result<Arc<dyn BlobChunkInfo>> {
+    fn get_chunk_info(&self, _idx: usize) -> RafsResult<Arc<dyn BlobChunkInfo>> {
         unimplemented!("used by RAFS v6 only")
     }
 
@@ -266,7 +279,7 @@ impl CachedInodeV5 {
         }
     }
 
-    fn load_name(&mut self, name_size: usize, r: &mut RafsIoReader) -> Result<()> {
+    fn load_name(&mut self, name_size: usize, r: &mut RafsIoReader) -> RafsResult<()> {
         if name_size > 0 {
             let mut name_buf = vec![0u8; name_size];
             r.read_exact(name_buf.as_mut_slice())?;
@@ -277,7 +290,7 @@ impl CachedInodeV5 {
         Ok(())
     }
 
-    fn load_symlink(&mut self, symlink_size: usize, r: &mut RafsIoReader) -> Result<()> {
+    fn load_symlink(&mut self, symlink_size: usize, r: &mut RafsIoReader) -> RafsResult<()> {
         if self.is_symlink() && symlink_size > 0 {
             let mut symbol_buf = vec![0u8; symlink_size];
             r.read_exact(symbol_buf.as_mut_slice())?;
@@ -288,7 +301,7 @@ impl CachedInodeV5 {
         Ok(())
     }
 
-    fn load_xattr(&mut self, r: &mut RafsIoReader) -> Result<()> {
+    fn load_xattr(&mut self, r: &mut RafsIoReader) -> RafsResult<()> {
         if self.has_xattr() {
             let mut xattrs = RafsV5XAttrsTable::new();
             r.read_exact(xattrs.as_mut())?;
@@ -305,7 +318,7 @@ impl CachedInodeV5 {
         Ok(())
     }
 
-    fn load_chunk_info(&mut self, r: &mut RafsIoReader) -> Result<()> {
+    fn load_chunk_info(&mut self, r: &mut RafsIoReader) -> RafsResult<()> {
         if self.is_reg() && self.i_child_cnt > 0 {
             let mut chunk = RafsV5ChunkInfo::new();
             for _ in 0..self.i_child_cnt {
@@ -318,7 +331,7 @@ impl CachedInodeV5 {
     }
 
     /// Load an inode metadata from a reader.
-    pub fn load(&mut self, sb: &RafsSuperMeta, r: &mut RafsIoReader) -> Result<()> {
+    pub fn load(&mut self, sb: &RafsSuperMeta, r: &mut RafsIoReader) -> RafsResult<()> {
         // RafsV5Inode...name...symbol link...xattrs...chunks
         let mut inode = RafsV5Inode::new();
 
@@ -365,7 +378,7 @@ impl CachedInodeV5 {
 
 impl RafsInode for CachedInodeV5 {
     // Somehow we got invalid `inode_count` from superblock.
-    fn validate(&self, _inode_count: u64, chunk_size: u64) -> Result<()> {
+    fn validate(&self, _inode_count: u64, chunk_size: u64) -> RafsResult<()> {
         if self.i_ino == 0
             // || self.i_ino > inode_count
             || self.i_nlink == 0
@@ -373,27 +386,35 @@ impl RafsInode for CachedInodeV5 {
             || self.i_name.len() > RAFS_MAX_NAME
             || self.i_name.is_empty()
         {
-            return Err(einval!("invalid inode"));
+            return Err(RafsError::InvalidMetadata("invalid inode".to_string()));
         }
         if !self.is_hardlink() && self.i_parent >= self.i_ino {
-            return Err(einval!("invalid parent inode"));
+            return Err(RafsError::InvalidMetadata(
+                "invalid parent inode".to_string(),
+            ));
         }
         if self.is_reg() {
             let chunks = self.i_size.div_ceil(chunk_size);
             if !self.has_hole() && chunks != self.i_data.len() as u64 {
-                return Err(einval!("invalid chunk count"));
+                return Err(RafsError::InvalidMetadata(
+                    "invalid chunk count".to_string(),
+                ));
             }
             let blocks = self.i_size.div_ceil(512);
             // Old stargz builder generates inode with 0 blocks
             if blocks != self.i_blocks && self.i_blocks != 0 {
-                return Err(einval!("invalid block count"));
+                return Err(RafsError::InvalidMetadata(
+                    "invalid block count".to_string(),
+                ));
             }
         } else if self.is_dir() {
             if self.i_child_cnt != 0 && (self.i_child_idx as Inode) <= self.i_ino {
-                return Err(einval!("invalid directory"));
+                return Err(RafsError::InvalidMetadata("invalid directory".to_string()));
             }
         } else if self.is_symlink() && self.i_target.is_empty() {
-            return Err(einval!("invalid symlink target"));
+            return Err(RafsError::InvalidMetadata(
+                "invalid symlink target".to_string(),
+            ));
         }
 
         Ok(())
@@ -405,16 +426,19 @@ impl RafsInode for CachedInodeV5 {
         offset: u64,
         size: usize,
         user_io: bool,
-    ) -> Result<Vec<BlobIoVec>> {
+    ) -> RafsResult<Vec<BlobIoVec>> {
         rafsv5_alloc_bio_vecs(self, offset, size, user_io)
     }
 
     fn collect_descendants_inodes(
         &self,
         descendants: &mut Vec<Arc<dyn RafsInode>>,
-    ) -> Result<usize> {
+    ) -> RafsResult<usize> {
         if !self.is_dir() {
-            return Err(enotdir!());
+            return Err(RafsError::NotDirectory(format!(
+                "v5: cached inode {} is not a directory, cannot collect descendants",
+                self.ino()
+            )));
         }
 
         let mut child_dirs: Vec<Arc<dyn RafsInode>> = Vec::new();
@@ -506,11 +530,11 @@ impl RafsInode for CachedInodeV5 {
     }
 
     #[inline]
-    fn get_xattr(&self, name: &OsStr) -> Result<Option<XattrValue>> {
+    fn get_xattr(&self, name: &OsStr) -> RafsResult<Option<XattrValue>> {
         Ok(self.i_xattr.get(name).cloned())
     }
 
-    fn get_xattrs(&self) -> Result<Vec<XattrName>> {
+    fn get_xattrs(&self) -> RafsResult<Vec<XattrName>> {
         Ok(self
             .i_xattr
             .keys()
@@ -519,9 +543,11 @@ impl RafsInode for CachedInodeV5 {
     }
 
     #[inline]
-    fn get_symlink(&self) -> Result<OsString> {
+    fn get_symlink(&self) -> RafsResult<OsString> {
         if !self.is_symlink() {
-            Err(einval!("inode is not a symlink"))
+            Err(RafsError::InvalidMetadata(
+                "inode is not a symlink".to_string(),
+            ))
         } else {
             Ok(self.i_target.clone())
         }
@@ -536,7 +562,11 @@ impl RafsInode for CachedInodeV5 {
         }
     }
 
-    fn walk_children_inodes(&self, entry_offset: u64, handler: RafsInodeWalkHandler) -> Result<()> {
+    fn walk_children_inodes(
+        &self,
+        entry_offset: u64,
+        handler: RafsInodeWalkHandler,
+    ) -> RafsResult<()> {
         // offset 0 and 1 is for "." and ".." respectively.
         let mut cur_offset = entry_offset;
 
@@ -586,20 +616,22 @@ impl RafsInode for CachedInodeV5 {
         Ok(())
     }
 
-    fn get_child_by_name(&self, name: &OsStr) -> Result<Arc<dyn RafsInodeExt>> {
+    fn get_child_by_name(&self, name: &OsStr) -> RafsResult<Arc<dyn RafsInodeExt>> {
         let idx = self
             .i_child
             .binary_search_by(|c| c.i_name.as_os_str().cmp(name))
-            .map_err(|_| enoent!())?;
+            .map_err(|_| RafsError::NotFound(format!("v5: no child named {:?}", name)))?;
         Ok(self.i_child[idx].clone())
     }
 
     #[inline]
-    fn get_child_by_index(&self, index: u32) -> Result<Arc<dyn RafsInodeExt>> {
+    fn get_child_by_index(&self, index: u32) -> RafsResult<Arc<dyn RafsInodeExt>> {
         if (index as usize) < self.i_child.len() {
             Ok(self.i_child[index as usize].clone())
         } else {
-            Err(einval!("invalid child index"))
+            Err(RafsError::InvalidMetadata(
+                "invalid child index".to_string(),
+            ))
         }
     }
 
@@ -609,7 +641,7 @@ impl RafsInode for CachedInodeV5 {
     }
 
     #[inline]
-    fn get_child_index(&self) -> Result<u32> {
+    fn get_child_index(&self) -> RafsResult<u32> {
         Ok(self.i_child_idx)
     }
 
@@ -654,11 +686,13 @@ impl RafsInodeExt for CachedInodeV5 {
     }
 
     #[inline]
-    fn get_chunk_info(&self, idx: u32) -> Result<Arc<dyn BlobChunkInfo>> {
+    fn get_chunk_info(&self, idx: u32) -> RafsResult<Arc<dyn BlobChunkInfo>> {
         if (idx as usize) < self.i_data.len() {
             Ok(self.i_data[idx as usize].clone())
         } else {
-            Err(einval!("invalid chunk index"))
+            Err(RafsError::InvalidMetadata(
+                "invalid chunk index".to_string(),
+            ))
         }
     }
 
@@ -666,17 +700,19 @@ impl RafsInodeExt for CachedInodeV5 {
 }
 
 impl RafsV5InodeChunkOps for CachedInodeV5 {
-    fn get_chunk_info_v5(&self, idx: u32) -> Result<Arc<dyn BlobV5ChunkInfo>> {
+    fn get_chunk_info_v5(&self, idx: u32) -> RafsResult<Arc<dyn BlobV5ChunkInfo>> {
         if (idx as usize) < self.i_data.len() {
             Ok(self.i_data[idx as usize].clone() as Arc<dyn BlobV5ChunkInfo>)
         } else {
-            Err(einval!("invalid chunk index"))
+            Err(RafsError::InvalidMetadata(
+                "invalid chunk index".to_string(),
+            ))
         }
     }
 }
 
 impl RafsV5InodeOps for CachedInodeV5 {
-    fn get_blob_by_index(&self, idx: u32) -> Result<Arc<BlobInfo>> {
+    fn get_blob_by_index(&self, idx: u32) -> RafsResult<Arc<BlobInfo>> {
         self.i_blob_table.get(idx)
     }
 
@@ -719,7 +755,7 @@ impl CachedChunkInfoV5 {
     }
 
     /// Load a chunk metadata from a reader.
-    pub fn load(&mut self, r: &mut RafsIoReader) -> Result<()> {
+    pub fn load(&mut self, r: &mut RafsIoReader) -> RafsResult<()> {
         let mut chunk = RafsV5ChunkInfo::new();
 
         r.read_exact(chunk.as_mut())?;

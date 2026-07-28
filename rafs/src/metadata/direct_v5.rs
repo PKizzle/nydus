@@ -19,7 +19,6 @@
 /// rule is to call validate() after creating any data structure from the on-disk bootstrap.
 use std::any::Any;
 use std::ffi::{OsStr, OsString};
-use std::io::Result;
 use std::io::SeekFrom;
 use std::mem::{ManuallyDrop, size_of};
 use std::ops::Deref;
@@ -146,7 +145,7 @@ impl DirectSuperBlockV5 {
         ino: Inode,
         state: &DirectMappingState,
         validate_inode: bool,
-    ) -> Result<OndiskInodeWrapper> {
+    ) -> RafsResult<OndiskInodeWrapper> {
         let offset = state.inode_table.get(ino)? as usize;
         let _inode = state.file_map.get_ref::<RafsV5Inode>(offset)?;
         let wrapper = OndiskInodeWrapper {
@@ -154,24 +153,28 @@ impl DirectSuperBlockV5 {
             offset,
         };
 
+        // An inode the current build cannot interpret is tolerated (the caller only needs the
+        // fields it does understand); anything else is fatal. This used to compare
+        // `raw_os_error()` against `EOPNOTSUPP`, which is now a variant rather than an errno.
         if let Err(e) = wrapper.validate(state.meta.inodes_count, state.meta.chunk_size as u64)
-            && e.raw_os_error().unwrap_or(0) != libc::EOPNOTSUPP
+            && !matches!(e, RafsError::Unsupported)
         {
             return Err(e);
         }
-        // ignore unsupported err
 
         if validate_inode {
             let digester = state.meta.get_digester();
             if !rafsv5_validate_inode(&wrapper, false, digester)? {
-                return Err(einval!("invalid inode digest"));
+                return Err(RafsError::InvalidMetadata(
+                    "invalid inode digest".to_string(),
+                ));
             }
         }
 
         Ok(wrapper)
     }
 
-    fn update_state(&self, r: &mut RafsIoReader) -> Result<()> {
+    fn update_state(&self, r: &mut RafsIoReader) -> RafsResult<()> {
         let old_state = self.state();
 
         // Validate file size
@@ -183,7 +186,9 @@ impl DirectSuperBlockV5 {
             || len > RAFS_MAX_METADATA_SIZE as u64
             || len & (RAFSV5_ALIGNMENT as u64 - 1) != 0
         {
-            return Err(ebadf!("invalid bootstrap file"));
+            return Err(RafsError::BadDescriptor(
+                "invalid bootstrap file".to_string(),
+            ));
         }
         let md_range = MetaRange::new(
             RAFSV5_SUPERBLOCK_SIZE as u64,
@@ -196,7 +201,7 @@ impl DirectSuperBlockV5 {
         let inode_table_size = old_state.meta.inode_table_entries as u64 * size_of::<u32>() as u64;
         let inode_table_range = MetaRange::new(inode_table_start, inode_table_size, false)?;
         if !inode_table_range.is_subrange_of(&md_range) {
-            return Err(ebadf!("invalid inode table"));
+            return Err(RafsError::BadDescriptor("invalid inode table".to_string()));
         }
 
         // Validate blob table layout
@@ -206,7 +211,7 @@ impl DirectSuperBlockV5 {
         if !blob_table_range.is_subrange_of(&md_range)
             || blob_table_range.intersect_with(&inode_table_range)
         {
-            return Err(ebadf!("invalid blob table"));
+            return Err(RafsError::BadDescriptor("invalid blob table".to_string()));
         }
 
         // Validate extended blob table layout
@@ -221,7 +226,9 @@ impl DirectSuperBlockV5 {
                 || extended_blob_table_range.intersect_with(&inode_table_range)
                 || extended_blob_table_range.intersect_with(&blob_table_range))
         {
-            return Err(ebadf!("invalid extended blob table"));
+            return Err(RafsError::BadDescriptor(
+                "invalid extended blob table".to_string(),
+            ));
         }
 
         // Prefetch the bootstrap file
@@ -287,7 +294,7 @@ impl RafsSuperInodes for DirectSuperBlockV5 {
     }
 
     /// Find inode offset by ino from inode table and mmap to OndiskInode.
-    fn get_inode(&self, ino: Inode, validate_inode: bool) -> Result<Arc<dyn RafsInode>> {
+    fn get_inode(&self, ino: Inode, validate_inode: bool) -> RafsResult<Arc<dyn RafsInode>> {
         let state = self.state();
         let wrapper = self.get_inode_wrapper(ino, state.deref(), validate_inode)?;
         Ok(Arc::new(wrapper))
@@ -297,7 +304,7 @@ impl RafsSuperInodes for DirectSuperBlockV5 {
         &self,
         ino: Inode,
         validate_inode: bool,
-    ) -> Result<Arc<dyn RafsInodeExt>> {
+    ) -> RafsResult<Arc<dyn RafsInodeExt>> {
         let state = self.state();
         let wrapper = self.get_inode_wrapper(ino, state.deref(), validate_inode)?;
         Ok(Arc::new(wrapper))
@@ -305,12 +312,13 @@ impl RafsSuperInodes for DirectSuperBlockV5 {
 }
 
 impl RafsSuperBlock for DirectSuperBlockV5 {
-    fn load(&mut self, r: &mut RafsIoReader) -> Result<()> {
+    fn load(&mut self, r: &mut RafsIoReader) -> RafsResult<()> {
         self.update_state(r)
     }
 
     fn update(&self, r: &mut RafsIoReader) -> RafsResult<()> {
-        self.update_state(r).map_err(RafsError::SwapBackend)
+        self.update_state(r)
+            .map_err(|e| RafsError::SwapBackend(e.into()))
     }
 
     fn destroy(&mut self) {
@@ -327,7 +335,7 @@ impl RafsSuperBlock for DirectSuperBlockV5 {
         RAFS_V5_ROOT_INODE
     }
 
-    fn get_chunk_info(&self, _idx: usize) -> Result<Arc<dyn BlobChunkInfo>> {
+    fn get_chunk_info(&self, _idx: usize) -> RafsResult<Arc<dyn BlobChunkInfo>> {
         unimplemented!("used by RAFS v6 only")
     }
 
@@ -371,7 +379,7 @@ impl OndiskInodeWrapper {
     fn get_xattr_data<'a>(
         &self,
         state: &'a Guard<Arc<DirectMappingState>>,
-    ) -> Result<(&'a [u8], usize)> {
+    ) -> RafsResult<(&'a [u8], usize)> {
         let inode = self.inode(state.deref());
 
         if !inode.has_xattr() {
@@ -388,12 +396,12 @@ impl OndiskInodeWrapper {
         Ok((xattr_data, xattr_size))
     }
 
-    fn _get_chunk_info(&self, idx: u32) -> Result<Arc<DirectChunkInfoV5>> {
+    fn _get_chunk_info(&self, idx: u32) -> RafsResult<Arc<DirectChunkInfoV5>> {
         let state = self.state();
         let inode = self.inode(state.deref());
 
         if !inode.is_reg() || inode.i_child_count == 0 || idx >= inode.i_child_count {
-            return Err(enoent!("invalid chunk info"));
+            return Err(RafsError::NotFound("invalid chunk info".to_string()));
         }
 
         let mut offset = self.offset + inode.size();
@@ -412,7 +420,7 @@ impl OndiskInodeWrapper {
 
 impl RafsInode for OndiskInodeWrapper {
     // Somehow we got invalid `inode_count` from superblock.
-    fn validate(&self, _inode_count: u64, _chunk_size: u64) -> Result<()> {
+    fn validate(&self, _inode_count: u64, _chunk_size: u64) -> RafsResult<()> {
         let state = self.state();
         let inode = state.file_map.get_ref::<RafsV5Inode>(self.offset)?;
         let max_inode = state.inode_table.len() as u64;
@@ -437,24 +445,26 @@ impl RafsInode for OndiskInodeWrapper {
             || inode.i_name_size as usize > (RAFS_MAX_NAME + 1)
             || inode.i_name_size == 0
         {
-            return Err(ebadf!(format!(
+            return Err(RafsError::BadDescriptor(format!(
                 "inode validation failure, inode {:?}",
                 inode
             )));
         }
         if !inode.is_hardlink() && inode.i_parent >= inode.i_ino {
-            return Err(einval!("invalid parent inode"));
+            return Err(RafsError::InvalidMetadata(
+                "invalid parent inode".to_string(),
+            ));
         }
 
         let chunk_count = 0;
         if inode.is_reg() {
             if self.state().meta.is_chunk_dict() {
                 // chunk-dict doesn't support chunk_count check
-                return Err(std::io::Error::from_raw_os_error(libc::EOPNOTSUPP));
+                return Err(RafsError::Unsupported);
             }
             // let chunks = inode.i_size.div_ceil(chunk_size);
             // if !inode.has_hole() && chunks != inode.i_child_count as u64 {
-            //     return Err(einval!(format!(
+            //     return Err(RafsError::InvalidMetadata(format!(
             //         "invalid chunk count, ino {}, expected {}, actual {}",
             //         inode.i_ino, chunks, inode.i_child_count,
             //     )));
@@ -470,15 +480,19 @@ impl RafsInode for OndiskInodeWrapper {
                     || inode.i_child_count as u64 >= max_inode
                     || inode.i_child_count as u64 + inode.i_child_index as u64 - 1 > max_inode)
             {
-                return Err(einval!("invalid directory"));
+                return Err(RafsError::InvalidMetadata("invalid directory".to_string()));
             }
             let size = inode.size() + xattr_size;
             state.file_map.validate_range(self.offset, size)?;
         } else if inode.is_symlink() && inode.i_symlink_size == 0 {
-            return Err(einval!("invalid symlink target"));
+            return Err(RafsError::InvalidMetadata(
+                "invalid symlink target".to_string(),
+            ));
         }
         if !inode.is_hardlink() && inode.i_parent >= inode.i_ino {
-            return Err(einval!("invalid parent inode"));
+            return Err(RafsError::InvalidMetadata(
+                "invalid parent inode".to_string(),
+            ));
         }
 
         let size = inode.size() + xattr_size + chunk_count * size_of::<RafsV5ChunkInfo>();
@@ -493,16 +507,19 @@ impl RafsInode for OndiskInodeWrapper {
         offset: u64,
         size: usize,
         user_io: bool,
-    ) -> Result<Vec<BlobIoVec>> {
+    ) -> RafsResult<Vec<BlobIoVec>> {
         rafsv5_alloc_bio_vecs(self, offset, size, user_io)
     }
 
     fn collect_descendants_inodes(
         &self,
         descendants: &mut Vec<Arc<dyn RafsInode>>,
-    ) -> Result<usize> {
+    ) -> RafsResult<usize> {
         if !self.is_dir() {
-            return Err(enotdir!());
+            return Err(RafsError::NotDirectory(format!(
+                "v5: inode {} is not a directory, cannot collect descendants",
+                self.ino()
+            )));
         }
 
         let state = self.state();
@@ -561,13 +578,13 @@ impl RafsInode for OndiskInodeWrapper {
         }
     }
 
-    fn get_xattr(&self, name: &OsStr) -> Result<Option<XattrValue>> {
+    fn get_xattr(&self, name: &OsStr) -> RafsResult<Option<XattrValue>> {
         let state = self.state();
         let (xattr_data, xattr_size) = self.get_xattr_data(&state)?;
         parse_xattr_value(xattr_data, xattr_size, name)
     }
 
-    fn get_xattrs(&self) -> Result<Vec<XattrName>> {
+    fn get_xattrs(&self) -> RafsResult<Vec<XattrName>> {
         let state = self.state();
         let (xattr_data, xattr_size) = self.get_xattr_data(&state)?;
         parse_xattr_names(xattr_data, xattr_size)
@@ -577,7 +594,7 @@ impl RafsInode for OndiskInodeWrapper {
     ///
     /// # Safety
     /// It depends on Self::validate() to ensure valid memory layout.
-    fn get_symlink(&self) -> Result<OsString> {
+    fn get_symlink(&self) -> RafsResult<OsString> {
         let state = self.state();
         let inode = self.inode(state.deref());
         let offset =
@@ -587,7 +604,11 @@ impl RafsInode for OndiskInodeWrapper {
         Ok(bytes_to_os_str(symlink).to_os_string())
     }
 
-    fn walk_children_inodes(&self, entry_offset: u64, handler: RafsInodeWalkHandler) -> Result<()> {
+    fn walk_children_inodes(
+        &self,
+        entry_offset: u64,
+        handler: RafsInodeWalkHandler,
+    ) -> RafsResult<()> {
         // offset 0 and 1 is for "." and ".." respectively.
         let mut cur_offset = entry_offset;
 
@@ -631,14 +652,19 @@ impl RafsInode for OndiskInodeWrapper {
     ///
     /// # Safety
     /// It depends on Self::validate() to ensure valid memory layout.
-    fn get_child_by_name(&self, name: &OsStr) -> Result<Arc<dyn RafsInodeExt>> {
+    fn get_child_by_name(&self, name: &OsStr) -> RafsResult<Arc<dyn RafsInodeExt>> {
         let state = self.state();
         let inode = self.inode(state.deref());
 
         if !inode.is_dir() {
-            return Err(einval!("inode is not a directory"));
+            return Err(RafsError::InvalidMetadata(
+                "inode is not a directory".to_string(),
+            ));
         } else if inode.i_child_count == 0 {
-            return Err(enoent!());
+            return Err(RafsError::NotFound(format!(
+                "v5: directory inode {} is empty",
+                inode.i_ino
+            )));
         }
 
         let mut first = 0i32;
@@ -664,23 +690,28 @@ impl RafsInode for OndiskInodeWrapper {
             }
         }
 
-        Err(enoent!())
+        Err(RafsError::NotFound(format!(
+            "v5: no child named {:?} under inode {}",
+            name, inode.i_ino
+        )))
     }
 
     /// Get the child with the specified index.
     ///
     /// # Safety
     /// It depends on Self::validate() to ensure valid memory layout.
-    fn get_child_by_index(&self, idx: u32) -> Result<Arc<dyn RafsInodeExt>> {
+    fn get_child_by_index(&self, idx: u32) -> RafsResult<Arc<dyn RafsInodeExt>> {
         let state = self.state();
         let inode = self.inode(state.deref());
         let child_count = inode.i_child_count;
         let child_index = inode.i_child_index;
 
         if !inode.is_dir() {
-            return Err(einval!("inode is not a directory"));
+            return Err(RafsError::InvalidMetadata(
+                "inode is not a directory".to_string(),
+            ));
         } else if idx >= child_count {
-            return Err(enoent!("invalid child index"));
+            return Err(RafsError::NotFound("invalid child index".to_string()));
         }
 
         let wrapper = self.mapping.get_inode_wrapper(
@@ -699,7 +730,7 @@ impl RafsInode for OndiskInodeWrapper {
     }
 
     #[inline]
-    fn get_child_index(&self) -> Result<u32> {
+    fn get_child_index(&self) -> RafsResult<u32> {
         let state = self.state();
         let inode = self.inode(state.deref());
         Ok(inode.i_child_index)
@@ -761,7 +792,7 @@ impl RafsInodeExt for OndiskInodeWrapper {
     ///
     /// # Safety
     /// It depends on Self::validate() to ensure valid memory layout.
-    fn get_chunk_info(&self, idx: u32) -> Result<Arc<dyn BlobChunkInfo>> {
+    fn get_chunk_info(&self, idx: u32) -> RafsResult<Arc<dyn BlobChunkInfo>> {
         self._get_chunk_info(idx)
             .map(|v| v as Arc<dyn BlobChunkInfo>)
     }
@@ -771,14 +802,14 @@ impl RafsInodeExt for OndiskInodeWrapper {
 }
 
 impl RafsV5InodeChunkOps for OndiskInodeWrapper {
-    fn get_chunk_info_v5(&self, idx: u32) -> Result<Arc<dyn BlobV5ChunkInfo>> {
+    fn get_chunk_info_v5(&self, idx: u32) -> RafsResult<Arc<dyn BlobV5ChunkInfo>> {
         self._get_chunk_info(idx)
             .map(|v| v as Arc<dyn BlobV5ChunkInfo>)
     }
 }
 
 impl RafsV5InodeOps for OndiskInodeWrapper {
-    fn get_blob_by_index(&self, idx: u32) -> Result<Arc<BlobInfo>> {
+    fn get_blob_by_index(&self, idx: u32) -> RafsResult<Arc<BlobInfo>> {
         self.state().blob_table.get(idx)
     }
 
@@ -803,7 +834,7 @@ impl DirectChunkInfoV5 {
         chunk: &RafsV5ChunkInfo,
         mapping: DirectSuperBlockV5,
         offset: usize,
-    ) -> Result<Self> {
+    ) -> RafsResult<Self> {
         state.file_map.get_ref::<RafsV5ChunkInfo>(offset)?;
         Ok(Self {
             mapping,

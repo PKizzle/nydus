@@ -12,7 +12,7 @@ use super::layout::v5::{RafsV5PrefetchTable, RafsV5SuperBlock};
 use super::*;
 
 impl RafsSuper {
-    pub(crate) fn try_load_v5(&mut self, r: &mut RafsIoReader) -> Result<bool> {
+    pub(crate) fn try_load_v5(&mut self, r: &mut RafsIoReader) -> RafsResult<bool> {
         let end = r.seek_to_end(0)?;
         r.seek_to_offset(0)?;
         let mut sb = RafsV5SuperBlock::new();
@@ -26,8 +26,9 @@ impl RafsSuper {
         self.meta.version = sb.version();
         self.meta.sb_size = sb.sb_size();
         self.meta.chunk_size = sb.block_size();
-        self.meta.flags = RafsSuperFlags::from_bits(sb.flags())
-            .ok_or_else(|| einval!(format!("invalid super flags 0x{:x}", sb.flags())))?;
+        self.meta.flags = RafsSuperFlags::from_bits(sb.flags()).ok_or_else(|| {
+            RafsError::InvalidMetadata(format!("invalid super flags 0x{:x}", sb.flags()))
+        })?;
         info!("RAFS v5 super block features: {}", self.meta.flags);
 
         self.meta.inodes_count = sb.inodes_count();
@@ -105,7 +106,7 @@ impl RafsSuper {
         Ok(found_root_inode)
     }
 
-    pub(crate) fn skip_v5_superblock(&self, r: &mut RafsIoReader) -> Result<()> {
+    pub(crate) fn skip_v5_superblock(&self, r: &mut RafsIoReader) -> RafsResult<()> {
         let _ = RafsV5SuperBlock::read(r)?;
 
         Ok(())
@@ -136,7 +137,7 @@ impl RafsSuper {
         inode: &Arc<dyn RafsInode>,
         window_base: u64,
         mut window_size: u64,
-    ) -> Result<()> {
+    ) -> RafsResult<()> {
         let inode_size = inode.size();
         let last_desc = match descs.last_mut() {
             Some(d) if !d.is_empty() => d,

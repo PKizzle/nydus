@@ -3,7 +3,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::collections::HashSet;
-use std::io::Result;
 use std::mem::size_of;
 use std::sync::Arc;
 
@@ -17,7 +16,7 @@ use crate::RafsIoReader;
 use crate::{RafsError, RafsResult};
 
 impl RafsSuper {
-    pub(crate) fn try_load_v6(&mut self, r: &mut RafsIoReader) -> Result<bool> {
+    pub(crate) fn try_load_v6(&mut self, r: &mut RafsIoReader) -> RafsResult<bool> {
         let end = r.seek_to_end(0)?;
         r.seek_to_offset(0)?;
 
@@ -47,8 +46,9 @@ impl RafsSuper {
         self.meta.chunk_table_size = ext_sb.chunk_table_size();
         self.meta.inodes_count = sb.inodes_count();
 
-        self.meta.flags = RafsSuperFlags::from_bits(ext_sb.flags())
-            .ok_or_else(|| einval!(format!("invalid RAFS flags 0x{:x}", ext_sb.flags())))?;
+        self.meta.flags = RafsSuperFlags::from_bits(ext_sb.flags()).ok_or_else(|| {
+            RafsError::InvalidMetadata(format!("invalid RAFS flags 0x{:x}", ext_sb.flags()))
+        })?;
         info!("RAFS features: {}", self.meta.flags);
 
         self.meta.prefetch_table_entries = ext_sb.prefetch_table_size() / size_of::<u32>() as u32;
@@ -65,7 +65,7 @@ impl RafsSuper {
                 self.superblock = Arc::new(sb_v6);
                 Ok(true)
             }
-            RafsMode::Cached => Err(enosys!("Rafs v6 does not support cached mode")),
+            RafsMode::Cached => Err(RafsError::Unsupported),
         }
     }
 

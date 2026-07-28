@@ -4,7 +4,6 @@
 
 //! A noop meta data driver for place-holding.
 
-use std::io::Result;
 use std::sync::Arc;
 
 use storage::device::{BlobChunkInfo, BlobDevice, BlobInfo};
@@ -26,7 +25,7 @@ impl RafsSuperInodes for NoopSuperBlock {
         unimplemented!()
     }
 
-    fn get_inode(&self, _ino: Inode, _digest_validate: bool) -> Result<Arc<dyn RafsInode>> {
+    fn get_inode(&self, _ino: Inode, _digest_validate: bool) -> RafsResult<Arc<dyn RafsInode>> {
         unimplemented!()
     }
 
@@ -34,13 +33,13 @@ impl RafsSuperInodes for NoopSuperBlock {
         &self,
         _ino: Inode,
         _validate_digest: bool,
-    ) -> Result<Arc<dyn RafsInodeExt>> {
+    ) -> RafsResult<Arc<dyn RafsInodeExt>> {
         unimplemented!()
     }
 }
 
 impl RafsSuperBlock for NoopSuperBlock {
-    fn load(&mut self, _r: &mut RafsIoReader) -> Result<()> {
+    fn load(&mut self, _r: &mut RafsIoReader) -> RafsResult<()> {
         unimplemented!()
     }
 
@@ -58,7 +57,7 @@ impl RafsSuperBlock for NoopSuperBlock {
         unimplemented!()
     }
 
-    fn get_chunk_info(&self, _idx: usize) -> Result<Arc<dyn BlobChunkInfo>> {
+    fn get_chunk_info(&self, _idx: usize) -> RafsResult<Arc<dyn BlobChunkInfo>> {
         unimplemented!("used by RAFS v6 only")
     }
 

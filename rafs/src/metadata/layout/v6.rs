@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::convert::{TryFrom, TryInto};
 use std::ffi::{OsStr, OsString};
 use std::fmt::Debug;
-use std::io::{Read, Result};
+use std::io::Read;
 use std::mem::size_of;
 use std::os::unix::ffi::OsStrExt;
 use std::str::FromStr;
@@ -25,7 +25,10 @@ use crate::metadata::inode::InodeWrapper;
 use crate::metadata::layout::v5::RafsV5ChunkInfo;
 use crate::metadata::layout::{MetaRange, RafsXAttrs};
 use crate::metadata::{Inode, RafsBlobExtraInfo, RafsStore, RafsSuperFlags, RafsSuperMeta};
-use crate::{RafsIoReader, RafsIoWrite, impl_bootstrap_converter, impl_pub_getter_setter};
+use crate::{
+    RafsError, RafsIoReader, RafsIoWrite, RafsResult, impl_bootstrap_converter,
+    impl_pub_getter_setter,
+};
 
 /// EROFS metadata slot size.
 pub const EROFS_INODE_SLOT_SIZE: usize = 1 << EROFS_INODE_SLOT_BITS;
@@ -185,70 +188,76 @@ impl RafsV6SuperBlock {
     }
 
     /// Load a `RafsV6SuperBlock` from a reader.
-    pub fn load(&mut self, r: &mut RafsIoReader) -> Result<()> {
+    pub fn load(&mut self, r: &mut RafsIoReader) -> RafsResult<()> {
         let mut buf1 = [0u8; EROFS_SUPER_OFFSET as usize];
 
         r.read_exact(&mut buf1)?;
-        r.read_exact(self.as_mut())
+        Ok(r.read_exact(self.as_mut())?)
     }
 
     /// Validate the Rafs v6 super block.
-    pub fn validate(&self, meta_size: u64) -> Result<()> {
+    pub fn validate(&self, meta_size: u64) -> RafsResult<()> {
         let block_size = block_size_from_bits(self.s_blkszbits).ok_or_else(|| {
-            einval!(format!(
+            RafsError::InvalidMetadata(format!(
                 "unsupported block size bits {} in Rafsv6 superblock",
                 self.s_blkszbits
             ))
         })?;
         if meta_size < block_size {
-            return Err(einval!(format!(
+            return Err(RafsError::InvalidMetadata(format!(
                 "invalid Rafs v6 metadata size: {}",
                 meta_size
             )));
         }
         if meta_size & (block_size - 1) != 0 {
-            return Err(einval!(format!(
+            return Err(RafsError::InvalidMetadata(format!(
                 "invalid Rafs v6 metadata size: bootstrap size {} is not aligned",
                 meta_size
             )));
         }
         let meta_addr = u32::from_le(self.s_meta_blkaddr) as u64 * block_size;
         if meta_addr > meta_size {
-            return Err(einval!(format!(
+            return Err(RafsError::InvalidMetadata(format!(
                 "invalid Rafs v6 meta block address 0x{:x}, meta file size 0x{:x}",
                 meta_addr, meta_size
             )));
         }
 
         if u32::from_le(self.s_magic) != EROFS_SUPER_MAGIC_V1 {
-            return Err(einval!(format!(
+            return Err(RafsError::InvalidMetadata(format!(
                 "invalid EROFS magic number 0x{:x} in Rafsv6 superblock",
                 u32::from_le(self.s_magic)
             )));
         }
 
         if self.s_checksum != 0 {
-            return Err(einval!(format!(
+            return Err(RafsError::InvalidMetadata(format!(
                 "invalid checksum {} in Rafsv6 superblock",
                 u32::from_le(self.s_checksum)
             )));
         }
 
         if self.s_extslots != 0 {
-            return Err(einval!("invalid extended slots in Rafsv6 superblock"));
+            return Err(RafsError::InvalidMetadata(
+                "invalid extended slots in Rafsv6 superblock".to_string(),
+            ));
         }
 
         if self.s_inos == 0 {
-            return Err(einval!("invalid inode number in Rafsv6 superblock"));
+            return Err(RafsError::InvalidMetadata(
+                "invalid inode number in Rafsv6 superblock".to_string(),
+            ));
         }
 
         if self.s_u != 0 {
-            return Err(einval!("invalid union field in Rafsv6 superblock"));
+            return Err(RafsError::InvalidMetadata(
+                "invalid union field in Rafsv6 superblock".to_string(),
+            ));
         }
 
         if self.s_xattr_blkaddr != 0 {
-            return Err(einval!(
-                "unsupported shared extended attribute namespace in Rafsv6 superblock"
+            return Err(RafsError::InvalidMetadata(
+                "unsupported shared extended attribute namespace in Rafsv6 superblock".to_string(),
             ));
         }
 
@@ -258,20 +267,22 @@ impl RafsV6SuperBlock {
                 "rafs v6 extra devices {}, blocks {}",
                 self.s_extra_devices, self.s_blocks
             );
-            return Err(einval!("invalid extra device count in Rafsv6 superblock"));
+            return Err(RafsError::InvalidMetadata(
+                "invalid extra device count in Rafsv6 superblock".to_string(),
+            ));
         }
 
         let devtable_off =
             u16::from_le(self.s_devt_slotoff) as u64 * size_of::<RafsV6Device>() as u64;
         if devtable_off != EROFS_DEVTABLE_OFFSET as u64 {
-            return Err(einval!(format!(
+            return Err(RafsError::InvalidMetadata(format!(
                 "invalid device table slot offset {} in Rafsv6 superblock",
                 u16::from_le(self.s_devt_slotoff)
             )));
         }
         let devtable_end = devtable_off + u16::from_le(self.s_extra_devices) as u64;
         if devtable_end > meta_size {
-            return Err(einval!(format!(
+            return Err(RafsError::InvalidMetadata(format!(
                 "invalid device table slot count {} in Rafsv6 superblock",
                 u16::from_le(self.s_extra_devices)
             )));
@@ -279,22 +290,22 @@ impl RafsV6SuperBlock {
 
         // s_build_time may be used as compact_inode's timestamp in the future.
         // if u64::from_le(self.s_build_time) != 0 || u32::from_le(self.s_build_time_nsec) != 0 {
-        //     return Err(einval!("invalid build time in Rafsv6 superblock"));
+        //     return Err(RafsError::InvalidMetadata("invalid build time in Rafsv6 superblock".to_string()));
         // }
 
         if u32::from_le(self.s_feature_incompat)
             != EROFS_FEATURE_INCOMPAT_CHUNKED_FILE | EROFS_FEATURE_INCOMPAT_DEVICE_TABLE
         {
-            return Err(einval!(
-                "invalid incompatible feature bits in Rafsv6 superblock"
+            return Err(RafsError::InvalidMetadata(
+                "invalid incompatible feature bits in Rafsv6 superblock".to_string(),
             ));
         }
 
         if u32::from_le(self.s_feature_compat) & EROFS_FEATURE_COMPAT_RAFS_V6
             != EROFS_FEATURE_COMPAT_RAFS_V6
         {
-            return Err(einval!(
-                "invalid compatible feature bits in Rafsv6 superblock"
+            return Err(RafsError::InvalidMetadata(
+                "invalid compatible feature bits in Rafsv6 superblock".to_string(),
             ));
         }
 
@@ -385,7 +396,7 @@ impl RafsV6SuperBlock {
 impl RafsStore for RafsV6SuperBlock {
     // This method must be called before RafsV6SuperBlockExt::store(), otherwise data written by
     // RafsV6SuperBlockExt::store() will be overwritten.
-    fn store(&self, w: &mut dyn RafsIoWrite) -> Result<usize> {
+    fn store(&self, w: &mut dyn RafsIoWrite) -> RafsResult<usize> {
         debug_assert!(
             ((EROFS_SUPER_OFFSET + EROFS_SUPER_BLOCK_SIZE) as u64) < EROFS_BLOCK_SIZE_4096
         );
@@ -462,7 +473,7 @@ impl RafsV6SuperBlockExt {
     }
 
     /// Load an `RafsV6SuperBlockExt` from a reader.
-    pub fn load(&mut self, r: &mut RafsIoReader) -> Result<()> {
+    pub fn load(&mut self, r: &mut RafsIoReader) -> RafsResult<()> {
         r.seek_to_offset((EROFS_SUPER_OFFSET + EROFS_SUPER_BLOCK_SIZE) as u64)?;
         r.read_exact(self.as_mut())?;
         r.seek_to_offset(EROFS_BLOCK_SIZE_4096)?;
@@ -471,14 +482,14 @@ impl RafsV6SuperBlockExt {
     }
 
     /// Validate the Rafs v6 super block.
-    pub fn validate(&self, meta_size: u64, meta: &RafsSuperMeta) -> Result<()> {
+    pub fn validate(&self, meta_size: u64, meta: &RafsSuperMeta) -> RafsResult<()> {
         let mut flags = self.flags();
         flags &= RafsSuperFlags::COMPRESSION_NONE.bits()
             | RafsSuperFlags::COMPRESSION_LZ4.bits()
             | RafsSuperFlags::COMPRESSION_GZIP.bits()
             | RafsSuperFlags::COMPRESSION_ZSTD.bits();
         if flags.count_ones() != 1 {
-            return Err(einval!(format!(
+            return Err(RafsError::InvalidMetadata(format!(
                 "invalid flags {:#x} related to compression algorithm in Rafs v6 extended superblock",
                 flags
             )));
@@ -487,7 +498,7 @@ impl RafsV6SuperBlockExt {
         let mut flags = self.flags();
         flags &= RafsSuperFlags::HASH_BLAKE3.bits() | RafsSuperFlags::HASH_SHA256.bits();
         if flags.count_ones() != 1 {
-            return Err(einval!(format!(
+            return Err(RafsError::InvalidMetadata(format!(
                 "invalid flags {:#x} related to digest algorithm in Rafs v6 extended superblock",
                 flags
             )));
@@ -502,7 +513,9 @@ impl RafsV6SuperBlockExt {
         if !chunk_size.is_power_of_two()
             || !(block_size..=RAFS_MAX_CHUNK_SIZE).contains(&chunk_size)
         {
-            return Err(einval!("invalid chunk size in Rafs v6 extended superblock"));
+            return Err(RafsError::InvalidMetadata(
+                "invalid chunk size in Rafs v6 extended superblock".to_string(),
+            ));
         }
 
         let devslot_end = meta.blob_device_table_offset + meta.blob_table_size as u64;
@@ -516,7 +529,7 @@ impl RafsV6SuperBlockExt {
             || blob_offset.checked_add(blob_size).is_none()
             || blob_offset + blob_size > meta_size
         {
-            return Err(einval!(format!(
+            return Err(RafsError::InvalidMetadata(format!(
                 "invalid blob table offset 0x{:x}/size 0x{:x} in Rafs v6 extended superblock",
                 blob_offset, blob_size
             )));
@@ -534,16 +547,17 @@ impl RafsV6SuperBlockExt {
                 || chunk_tbl_offset.checked_add(chunk_tbl_size).is_none()
                 || chunk_tbl_offset + chunk_tbl_size > meta_size
             {
-                return Err(einval!(format!(
+                return Err(RafsError::InvalidMetadata(format!(
                     "invalid chunk table offset 0x{:x}/size 0x{:x} in Rafs v6 extended superblock",
                     chunk_tbl_offset, chunk_tbl_size
                 )));
             }
             let chunk_range = MetaRange::new(chunk_tbl_offset, chunk_tbl_size, true)?;
             if blob_range.intersect_with(&chunk_range) {
-                return Err(einval!(format!(
-                    "blob table intersects with chunk table in Rafs v6 extended superblock",
-                )));
+                return Err(RafsError::InvalidMetadata(
+                    "blob table intersects with chunk table in Rafs v6 extended superblock"
+                        .to_string(),
+                ));
             }
             chunk_info_tbl_range = Some(chunk_range);
         }
@@ -559,23 +573,24 @@ impl RafsV6SuperBlockExt {
                 || tbl_offset.checked_add(tbl_size).is_none()
                 || tbl_offset + tbl_size > meta_size
             {
-                return Err(einval!(format!(
+                return Err(RafsError::InvalidMetadata(format!(
                     "invalid prefetch table offset 0x{:x}/size 0x{:x} in Rafs v6 extended superblock",
                     tbl_offset, tbl_size
                 )));
             }
             let prefetch_range = MetaRange::new(tbl_offset, tbl_size, false)?;
             if blob_range.intersect_with(&prefetch_range) {
-                return Err(einval!(format!(
-                    "blob table intersects with prefetch table in Rafs v6 extended superblock",
-                )));
+                return Err(RafsError::InvalidMetadata(
+                    "blob table intersects with prefetch table in Rafs v6 extended superblock"
+                        .to_string(),
+                ));
             }
             if let Some(chunk_range) = chunk_info_tbl_range.as_ref()
                 && chunk_range.intersect_with(&prefetch_range)
             {
-                return Err(einval!(format!(
-                    "chunk information table intersects with prefetch table in Rafs v6 extended superblock",
-                )));
+                return Err(RafsError::InvalidMetadata(
+                    "chunk information table intersects with prefetch table in Rafs v6 extended superblock".to_string(),
+                ));
             }
         }
 
@@ -674,7 +689,7 @@ impl RafsV6SuperBlockExt {
 }
 
 impl RafsStore for RafsV6SuperBlockExt {
-    fn store(&self, w: &mut dyn RafsIoWrite) -> Result<usize> {
+    fn store(&self, w: &mut dyn RafsIoWrite) -> RafsResult<usize> {
         w.write_all(self.as_ref())?;
         w.seek_offset(EROFS_BLOCK_SIZE_4096)?;
 
@@ -769,7 +784,7 @@ pub trait RafsV6OndiskInode: RafsStore {
     fn rdev(&self) -> u32;
     fn xattr_inline_count(&self) -> u16;
 
-    fn load(&mut self, r: &mut RafsIoReader) -> Result<()>;
+    fn load(&mut self, r: &mut RafsIoReader) -> RafsResult<()>;
 }
 
 impl Debug for &dyn RafsV6OndiskInode {
@@ -917,15 +932,15 @@ impl RafsV6OndiskInode for RafsV6InodeCompact {
     }
 
     /// Load a `RafsV6InodeCompact` from a reader.
-    fn load(&mut self, r: &mut RafsIoReader) -> Result<()> {
-        r.read_exact(self.as_mut())
+    fn load(&mut self, r: &mut RafsIoReader) -> RafsResult<()> {
+        Ok(r.read_exact(self.as_mut())?)
     }
 }
 
 impl_bootstrap_converter!(RafsV6InodeCompact);
 
 impl RafsStore for RafsV6InodeCompact {
-    fn store(&self, w: &mut dyn RafsIoWrite) -> Result<usize> {
+    fn store(&self, w: &mut dyn RafsIoWrite) -> RafsResult<usize> {
         // Fixed-size inode only, by design. EROFS stores inline xattrs in the bytes that
         // follow the inode, and the caller owns that: `Node::dump_bootstrap_v6` sizes the
         // record with `v6_size_with_xattr()` and appends them via `v6_store_xattrs()`
@@ -1081,15 +1096,15 @@ impl RafsV6OndiskInode for RafsV6InodeExtended {
     }
 
     /// Load a `RafsV6InodeExtended` from a reader.
-    fn load(&mut self, r: &mut RafsIoReader) -> Result<()> {
-        r.read_exact(self.as_mut())
+    fn load(&mut self, r: &mut RafsIoReader) -> RafsResult<()> {
+        Ok(r.read_exact(self.as_mut())?)
     }
 }
 
 impl_bootstrap_converter!(RafsV6InodeExtended);
 
 impl RafsStore for RafsV6InodeExtended {
-    fn store(&self, w: &mut dyn RafsIoWrite) -> Result<usize> {
+    fn store(&self, w: &mut dyn RafsIoWrite) -> RafsResult<usize> {
         // Fixed-size inode only, by design. EROFS stores inline xattrs in the bytes that
         // follow the inode, and the caller owns that: `Node::dump_bootstrap_v6` sizes the
         // record with `v6_size_with_xattr()` and appends them via `v6_store_xattrs()`
@@ -1181,13 +1196,13 @@ impl RafsV6Dirent {
     }
 
     /// Load a `RafsV6Dirent` from a reader.
-    pub fn load(&mut self, r: &mut RafsIoReader) -> Result<()> {
-        r.read_exact(self.as_mut())
+    pub fn load(&mut self, r: &mut RafsIoReader) -> RafsResult<()> {
+        Ok(r.read_exact(self.as_mut())?)
     }
 }
 
 impl RafsStore for RafsV6Dirent {
-    fn store(&self, w: &mut dyn RafsIoWrite) -> Result<usize> {
+    fn store(&self, w: &mut dyn RafsIoWrite) -> RafsResult<usize> {
         w.write_all(self.as_ref())?;
         Ok(self.as_ref().len())
     }
@@ -1276,10 +1291,12 @@ impl RafsV6InodeChunkAddr {
     /// The index in BlobInfo grows from 0, so when using this method to index the corresponding blob,
     /// the index always needs to be minus 1
     /// Get the blob index of the chunk.
-    pub fn blob_index(&self) -> Result<u32> {
+    pub fn blob_index(&self) -> RafsResult<u32> {
         let idx = (u16::from_le(self.c_blob_addr_hi) & 0x00ff) as u32;
         if idx == 0 {
-            Err(einval!("invalid zero blob index from RafsV6InodeChunkAddr"))
+            Err(RafsError::InvalidMetadata(
+                "invalid zero blob index from RafsV6InodeChunkAddr".to_string(),
+            ))
         } else {
             Ok(idx - 1)
         }
@@ -1325,15 +1342,15 @@ impl RafsV6InodeChunkAddr {
     }
 
     /// Load a `RafsV6InodeChunkAddr` from a reader.
-    pub fn load(&mut self, r: &mut RafsIoReader) -> Result<()> {
-        r.read_exact(self.as_mut())
+    pub fn load(&mut self, r: &mut RafsIoReader) -> RafsResult<()> {
+        Ok(r.read_exact(self.as_mut())?)
     }
 }
 
 impl_bootstrap_converter!(RafsV6InodeChunkAddr);
 
 impl RafsStore for RafsV6InodeChunkAddr {
-    fn store(&self, w: &mut dyn RafsIoWrite) -> Result<usize> {
+    fn store(&self, w: &mut dyn RafsIoWrite) -> RafsResult<usize> {
         w.write_all(self.as_ref())?;
         Ok(self.as_ref().len())
     }
@@ -1380,27 +1397,31 @@ impl RafsV6Device {
     }
 
     /// Load a `RafsV6Device` from a reader.
-    pub fn load(&mut self, r: &mut RafsIoReader) -> Result<()> {
-        r.read_exact(self.as_mut())
+    pub fn load(&mut self, r: &mut RafsIoReader) -> RafsResult<()> {
+        Ok(r.read_exact(self.as_mut())?)
     }
 
     /// Validate the Rafs v6 Device slot.
-    pub fn validate(&self) -> Result<()> {
+    pub fn validate(&self) -> RafsResult<()> {
         match String::from_utf8(self.blob_id.to_vec()) {
             Ok(v) => {
                 if v.len() != BLOB_SHA256_LEN {
-                    return Err(einval!(format!(
+                    return Err(RafsError::InvalidMetadata(format!(
                         "Length of blob_id {} in RAFS v6 device entry is invalid",
                         v.len()
                     )));
                 }
             }
-            Err(_) => return Err(einval!("blob_id in RAFS v6 device entry is invalid")),
+            Err(_) => {
+                return Err(RafsError::InvalidMetadata(
+                    "blob_id in RAFS v6 device entry is invalid".to_string(),
+                ));
+            }
         }
 
         if self.blocks() == 0 {
             let msg = format!("invalid blocks {} in Rafs v6 device entry", self.blocks());
-            return Err(einval!(msg));
+            return Err(RafsError::InvalidMetadata(msg.to_string()));
         }
 
         Ok(())
@@ -1413,7 +1434,7 @@ impl RafsV6Device {
 impl_bootstrap_converter!(RafsV6Device);
 
 impl RafsStore for RafsV6Device {
-    fn store(&self, w: &mut dyn RafsIoWrite) -> Result<usize> {
+    fn store(&self, w: &mut dyn RafsIoWrite) -> RafsResult<usize> {
         w.write_all(self.as_ref())?;
 
         Ok(self.as_ref().len())
@@ -1424,7 +1445,7 @@ impl RafsStore for RafsV6Device {
 pub fn rafsv6_load_blob_extra_info(
     meta: &RafsSuperMeta,
     r: &mut RafsIoReader,
-) -> Result<HashMap<String, RafsBlobExtraInfo>> {
+) -> RafsResult<HashMap<String, RafsBlobExtraInfo>> {
     let mut infos = HashMap::new();
     if meta.blob_device_table_count == 0 {
         return Ok(infos);
@@ -1435,12 +1456,14 @@ pub fn rafsv6_load_blob_extra_info(
         r.read_exact(devslot.as_mut())?;
         devslot.validate()?;
         let id = String::from_utf8(devslot.blob_id.to_vec())
-            .map_err(|e| einval!(format!("invalid blob id, {}", e)))?;
+            .map_err(|e| RafsError::InvalidMetadata(format!("invalid blob id, {}", e)))?;
         let info = RafsBlobExtraInfo {
             mapped_blkaddr: devslot.mapped_blkaddr(),
         };
         if infos.contains_key(&id) {
-            return Err(einval!("duplicated blob id in RAFS v6 device table"));
+            return Err(RafsError::InvalidMetadata(
+                "duplicated blob id in RAFS v6 device table".to_string(),
+            ));
         }
         infos.insert(id, info);
     }
@@ -1549,12 +1572,12 @@ impl_bootstrap_converter!(RafsV6Blob);
 
 impl RafsV6Blob {
     #[allow(clippy::wrong_self_convention)]
-    fn to_blob_info(&self) -> Result<BlobInfo> {
+    fn to_blob_info(&self) -> RafsResult<BlobInfo> {
         // debug_assert!(RAFS_DIGEST_LENGTH == 32);
         debug_assert!(size_of::<RafsV6Blob>() == 256);
 
         let blob_id = String::from_utf8(self.blob_id.to_vec())
-            .map_err(|e| einval!(format!("invalid blob id, {}", e)))?;
+            .map_err(|e| RafsError::InvalidMetadata(format!("invalid blob id, {}", e)))?;
         let blob_features = BlobFeatures::try_from(u32::from_le(self.features))?;
         let mut blob_info = BlobInfo::new(
             u32::from_le(self.blob_index),
@@ -1566,17 +1589,23 @@ impl RafsV6Blob {
             blob_features,
         );
 
-        let comp = compress::Algorithm::try_from(u32::from_le(self.compression_algo))
-            .map_err(|_| einval!("invalid compression algorithm in Rafs v6 blob entry"))?;
+        let comp =
+            compress::Algorithm::try_from(u32::from_le(self.compression_algo)).map_err(|_| {
+                RafsError::InvalidMetadata(
+                    "invalid compression algorithm in Rafs v6 blob entry".to_string(),
+                )
+            })?;
         blob_info.set_compressor(comp);
-        let digest = digest::Algorithm::try_from(u32::from_le(self.digest_algo))
-            .map_err(|_| einval!("invalid digest algorithm in Rafs v6 blob entry"))?;
+        let digest = digest::Algorithm::try_from(u32::from_le(self.digest_algo)).map_err(|_| {
+            RafsError::InvalidMetadata("invalid digest algorithm in Rafs v6 blob entry".to_string())
+        })?;
         blob_info.set_digester(digest);
-        let cipher = crypt::Algorithm::try_from(u32::from_le(self.cipher_algo))
-            .map_err(|_| einval!("invalid cipher algorithm in Rafs v6 blob entry"))?;
-        let cipher_object = cipher
-            .new_cipher()
-            .map_err(|e| einval!(format!("failed to create new cipher object {}", e)))?;
+        let cipher = crypt::Algorithm::try_from(u32::from_le(self.cipher_algo)).map_err(|_| {
+            RafsError::InvalidMetadata("invalid cipher algorithm in Rafs v6 blob entry".to_string())
+        })?;
+        let cipher_object = cipher.new_cipher().map_err(|e| {
+            RafsError::InvalidMetadata(format!("failed to create new cipher object {}", e))
+        })?;
         let cipher_context = match cipher {
             crypt::Algorithm::None => None,
             crypt::Algorithm::Aes128Xts => {
@@ -1591,7 +1620,7 @@ impl RafsV6Blob {
                 )?)
             }
             _ => {
-                return Err(einval!(format!(
+                return Err(RafsError::InvalidMetadata(format!(
                     "invalid cipher algorithm {:?} when creating cipher context",
                     cipher
                 )));
@@ -1612,10 +1641,10 @@ impl RafsV6Blob {
         Ok(blob_info)
     }
 
-    fn from_blob_info(blob_info: &BlobInfo) -> Result<Self> {
+    fn from_blob_info(blob_info: &BlobInfo) -> RafsResult<Self> {
         if blob_info.blob_id().len() > BLOB_SHA256_LEN || blob_info.blob_id().is_empty() {
             let msg = format!("invalid blob id in blob info, {}", blob_info.blob_id());
-            return Err(einval!(msg));
+            return Err(RafsError::InvalidMetadata(msg.to_string()));
         }
 
         let blob_id = blob_info.blob_id();
@@ -1633,8 +1662,9 @@ impl RafsV6Blob {
                 let cipher_ctx = match blob_info.cipher_context() {
                     Some(ctx) => ctx,
                     None => {
-                        return Err(einval!(
+                        return Err(RafsError::InvalidMetadata(
                             "cipher context is unset while using Aes128Xts encryption algorithm"
+                                .to_string(),
                         ));
                     }
                 };
@@ -1648,7 +1678,7 @@ impl RafsV6Blob {
                 )
             }
             _ => {
-                return Err(einval!(format!(
+                return Err(RafsError::InvalidMetadata(format!(
                     "invalid cipher algorithm type {:?} in blob info",
                     blob_info.cipher()
                 )));
@@ -1869,9 +1899,9 @@ impl RafsV6BlobTable {
 
     /// Get base information for a blob.
     #[inline]
-    pub fn get(&self, blob_index: u32) -> Result<Arc<BlobInfo>> {
+    pub fn get(&self, blob_index: u32) -> RafsResult<Arc<BlobInfo>> {
         if blob_index >= self.entries.len() as u32 {
-            Err(enoent!("blob not found"))
+            Err(RafsError::NotFound("blob not found".to_string()))
         } else {
             Ok(self.entries[blob_index as usize].clone())
         }
@@ -1945,20 +1975,22 @@ impl RafsV6BlobTable {
         blob_table_size: u32,
         chunk_size: u32,
         flags: RafsSuperFlags,
-    ) -> Result<()> {
+    ) -> RafsResult<()> {
         if blob_table_size == 0 {
             return Ok(());
         }
         if !(blob_table_size as usize).is_multiple_of(size_of::<RafsV6Blob>()) {
             let msg = format!("invalid Rafs v6 blob table size {}", blob_table_size);
-            return Err(einval!(msg));
+            return Err(RafsError::InvalidMetadata(msg.to_string()));
         }
 
         for idx in 0..(blob_table_size as usize / size_of::<RafsV6Blob>()) {
             let mut blob = RafsV6Blob::default();
             r.read_exact(blob.as_mut())?;
             if !blob.validate(idx as u32, chunk_size, flags) {
-                return Err(einval!("invalid Rafs v6 blob entry"));
+                return Err(RafsError::InvalidMetadata(
+                    "invalid Rafs v6 blob entry".to_string(),
+                ));
             }
             let blob_info = blob.to_blob_info()?;
             self.entries.push(Arc::new(blob_info));
@@ -1969,7 +2001,7 @@ impl RafsV6BlobTable {
 }
 
 impl RafsStore for RafsV6BlobTable {
-    fn store(&self, w: &mut dyn RafsIoWrite) -> Result<usize> {
+    fn store(&self, w: &mut dyn RafsIoWrite) -> RafsResult<usize> {
         for blob_info in self.entries.iter() {
             let blob: RafsV6Blob = RafsV6Blob::from_blob_info(blob_info)?;
             trace!(
@@ -2070,8 +2102,8 @@ impl RafsV6XattrIbodyHeader {
     }
 
     /// Load a `RafsV6XattrIbodyHeader` from a reader.
-    pub fn load(&mut self, r: &mut RafsIoReader) -> Result<()> {
-        r.read_exact(self.as_mut())
+    pub fn load(&mut self, r: &mut RafsIoReader) -> RafsResult<()> {
+        Ok(r.read_exact(self.as_mut())?)
     }
 }
 
@@ -2120,13 +2152,13 @@ impl RafsV6XattrEntry {
     }
 }
 
-pub(crate) fn recover_namespace(index: u8) -> Result<OsString> {
+pub(crate) fn recover_namespace(index: u8) -> RafsResult<OsString> {
     let pos = RAFSV6_XATTR_TYPES
         .iter()
         .position(|x| x.index == index)
-        .ok_or_else(|| einval!(format!("invalid xattr name index {}", index)))?;
+        .ok_or_else(|| RafsError::InvalidMetadata(format!("invalid xattr name index {}", index)))?;
     OsString::from_str(RAFSV6_XATTR_TYPES[pos].prefix)
-        .map_err(|_e| einval!("invalid xattr name prefix"))
+        .map_err(|_e| RafsError::InvalidMetadata("invalid xattr name prefix".to_string()))
 }
 
 impl RafsXAttrs {
@@ -2159,19 +2191,25 @@ impl RafsXAttrs {
     }
 
     /// Write Xattr to rafsv6 ondisk inode.
-    pub fn store_v6(&self, w: &mut dyn RafsIoWrite) -> Result<usize> {
+    pub fn store_v6(&self, w: &mut dyn RafsIoWrite) -> RafsResult<usize> {
         let header = RafsV6XattrIbodyHeader::new();
         w.write_all(header.as_ref())?;
 
         if !self.pairs.is_empty() {
             for (key, value) in self.pairs.iter() {
-                let (index, prefix_len) = Self::match_prefix(key)
-                    .map_err(|_| einval!(format!("invalid xattr key {:?}", key)))?;
+                let (index, prefix_len) = Self::match_prefix(key).map_err(|_| {
+                    RafsError::InvalidMetadata(format!("invalid xattr key {:?}", key))
+                })?;
                 if key.len() < prefix_len {
-                    return Err(einval!(format!("invalid xattr key {:?}", key)));
+                    return Err(RafsError::InvalidMetadata(format!(
+                        "invalid xattr key {:?}",
+                        key
+                    )));
                 }
                 if value.len() > u16::MAX as usize {
-                    return Err(einval!("xattr value size is too big"));
+                    return Err(RafsError::InvalidMetadata(
+                        "xattr value size is too big".to_string(),
+                    ));
                 }
 
                 let mut entry = RafsV6XattrEntry::new();
@@ -2194,12 +2232,14 @@ impl RafsXAttrs {
         Ok(0)
     }
 
-    fn match_prefix(key: &OsStr) -> Result<(u8, usize)> {
+    fn match_prefix(key: &OsStr) -> RafsResult<(u8, usize)> {
         let key_str = key.to_string_lossy();
         let pos = RAFSV6_XATTR_TYPES
             .iter()
             .position(|x| key_str.starts_with(x.prefix))
-            .ok_or_else(|| einval!(format!("xattr prefix {:?} is not valid", key)))?;
+            .ok_or_else(|| {
+                RafsError::InvalidMetadata(format!("xattr prefix {:?} is not valid", key))
+            })?;
         Ok((
             RAFSV6_XATTR_TYPES[pos].index,
             RAFSV6_XATTR_TYPES[pos].prefix_len,
@@ -2241,7 +2281,7 @@ impl RafsV6PrefetchTable {
     }
 
     /// Store the inode prefetch table to a writer.
-    pub fn store(&mut self, w: &mut dyn RafsIoWrite) -> Result<usize> {
+    pub fn store(&mut self, w: &mut dyn RafsIoWrite) -> RafsResult<usize> {
         let (_, data, _) = unsafe { self.inodes.align_to::<u8>() };
         w.write_all(data.as_ref())?;
 
@@ -2261,7 +2301,7 @@ impl RafsV6PrefetchTable {
         r: &mut RafsIoReader,
         offset: u64,
         entries: usize,
-    ) -> Result<usize> {
+    ) -> RafsResult<usize> {
         self.inodes = vec![0u32; entries];
 
         let (_, data, _) = unsafe { self.inodes.align_to_mut::<u8>() };

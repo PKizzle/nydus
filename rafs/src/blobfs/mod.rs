@@ -55,15 +55,26 @@ pub struct BlobOndemandConfig {
     pub blob_cache_dir: String,
 }
 
+/// Answer the guest with `errno`, and put `msg` where a human can find it.
+///
+/// blobfs sits under virtio-fs: the guest kernel reads `raw_os_error()` and nothing else, so an
+/// `io::Error` cannot carry both the errno and the explanation (a `Custom` one reports no
+/// errno at all). The errno goes to the guest and the message goes to the host log -- which is
+/// still strictly more than the old error macros did, since they dropped it entirely.
+pub(crate) fn io_err(errno: i32, msg: impl std::fmt::Display) -> io::Error {
+    debug!("blobfs: {}", msg);
+    io::Error::from_raw_os_error(errno)
+}
+
 impl FromStr for BlobOndemandConfig {
     type Err = io::Error;
 
     fn from_str(s: &str) -> io::Result<BlobOndemandConfig> {
         serde_json::from_str(s).map_err(|e| {
-            einval!(format!(
-                "blobfs: failed to load blobfs configuration, {}",
-                e
-            ))
+            io_err(
+                libc::EINVAL,
+                format!("failed to load blobfs configuration, {}", e),
+            )
         })
     }
 }
@@ -98,23 +109,26 @@ impl BlobfsState {
                 Ok(v) => match v {
                     Ok(rafs) => rafs_handle.rafs = Some(rafs),
                     Err(e) => {
-                        return Err(eio!(format!(
-                            "blobfs: failed to get RAFS filesystem handle, {}",
-                            e
-                        )));
+                        return Err(io_err(
+                            libc::EIO,
+                            format!("blobfs: failed to get RAFS filesystem handle, {}", e),
+                        ));
                     }
                 },
                 Err(e) => {
-                    return Err(eio!(format!(
-                        "blobfs: failed to get RAFS filesystem handle, {:?}",
-                        e
-                    )));
+                    return Err(io_err(
+                        libc::EIO,
+                        format!("blobfs: failed to get RAFS filesystem handle, {:?}", e),
+                    ));
                 }
             }
         }
 
         if rafs_handle.rafs.is_none() {
-            Err(eio!("blobfs: failed to get RAFS filesystem handle"))
+            Err(io_err(
+                libc::EIO,
+                "blobfs: failed to get RAFS filesystem handle",
+            ))
         } else {
             Ok(())
         }
@@ -152,7 +166,7 @@ impl BlobFs {
 
     fn ensure_path_exist(path: &Path) -> io::Result<()> {
         if path.is_empty() {
-            return Err(einval!("blobfs: path is empty"));
+            return Err(io_err(libc::EINVAL, "blobfs: path is empty"));
         }
         if !path.exists() {
             create_dir_all(path).map_err(|e| {
@@ -167,11 +181,17 @@ impl BlobFs {
     fn load_bootstrap(cfg: &Config) -> io::Result<BlobfsState> {
         let blob_ondemand_conf = BlobOndemandConfig::from_str(&cfg.blob_ondemand_cfg)?;
         if !blob_ondemand_conf.rafs_conf.validate() {
-            return Err(einval!("blobfs: invalidate configuration for blobfs"));
+            return Err(io_err(
+                libc::EINVAL,
+                "blobfs: invalidate configuration for blobfs",
+            ));
         }
         let rafs_cfg = blob_ondemand_conf.rafs_conf.get_rafs_config()?;
         if rafs_cfg.mode != "direct" {
-            return Err(einval!("blobfs: only 'direct' mode is supported"));
+            return Err(io_err(
+                libc::EINVAL,
+                "blobfs: only 'direct' mode is supported",
+            ));
         }
 
         // check if blob cache dir exists.
@@ -180,10 +200,10 @@ impl BlobFs {
 
         let path = Path::new(blob_ondemand_conf.bootstrap_path.as_str());
         if blob_ondemand_conf.bootstrap_path.is_empty() || !path.is_file() {
-            return Err(einval!(format!(
-                "blobfs: bootstrap file {} is invalid",
-                path.display()
-            )));
+            return Err(io_err(
+                libc::EINVAL,
+                format!("blobfs: bootstrap file {} is invalid", path.display()),
+            ));
         }
 
         let bootstrap_path = blob_ondemand_conf.bootstrap_path.clone();
@@ -224,26 +244,28 @@ impl BlobFs {
                     libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
                     0,
                 )
-                .map_err(|e| einval!(e))?;
+                .map_err(|e| io_err(libc::EINVAL, e))?;
                 let st = Self::stat(&blob_file).map_err(|e| {
                     error!("get_blob_id_and_size: stat failed {:?}", e);
                     e
                 })?;
                 if st.st_size < 0 {
-                    return Err(einval!(format!(
-                        "load_chunks_on_demand: blob_id {:?}, size: {:?} is less than 0",
-                        blob_id_full_path.display(),
-                        st.st_size
-                    )));
+                    return Err(io_err(
+                        libc::EINVAL,
+                        format!(
+                            "load_chunks_on_demand: blob_id {:?}, size: {:?} is less than 0",
+                            blob_id_full_path.display(),
+                            st.st_size
+                        ),
+                    ));
                 }
 
                 let blob_id = blob_id_full_path
                     .file_name()
-                    .ok_or_else(|| einval!("blobfs: failed to find blob file"))?;
-                let blob_id = blob_id
-                    .to_os_string()
-                    .into_string()
-                    .map_err(|_e| einval!("blobfs: failed to get blob id from file name"))?;
+                    .ok_or_else(|| io_err(libc::EINVAL, "blobfs: failed to find blob file"))?;
+                let blob_id = blob_id.to_os_string().into_string().map_err(|_e| {
+                    io_err(libc::EINVAL, "blobfs: failed to get blob id from file name")
+                })?;
                 trace!("load_chunks_on_demand: blob_id {}", blob_id);
                 entry.insert((st.st_size as u64, blob_id.clone()));
 

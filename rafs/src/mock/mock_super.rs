@@ -4,14 +4,13 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::collections::HashMap;
-use std::io::Result;
 use std::sync::Arc;
 
 use nydus_storage::device::{BlobChunkInfo, BlobDevice, BlobInfo};
 
 use crate::metadata::{Inode, RafsInode, RafsSuperBlock, RafsSuperInodes};
 use crate::mock::MockInode;
-use crate::{RafsInodeExt, RafsIoReader, RafsResult};
+use crate::{RafsError, RafsInodeExt, RafsIoReader, RafsResult};
 
 #[derive(Default)]
 pub struct MockSuperBlock {
@@ -33,25 +32,27 @@ impl RafsSuperInodes for MockSuperBlock {
         unimplemented!()
     }
 
-    fn get_inode(&self, ino: Inode, _validate_inode: bool) -> Result<Arc<dyn RafsInode>> {
-        self.inodes
-            .get(&ino)
-            .map_or(Err(enoent!()), |i| Ok(i.clone()))
+    fn get_inode(&self, ino: Inode, _validate_inode: bool) -> RafsResult<Arc<dyn RafsInode>> {
+        self.inodes.get(&ino).map_or_else(
+            || Err(RafsError::NotFound(format!("mock: no inode {}", ino))),
+            |i| Ok(i.clone() as Arc<dyn RafsInode>),
+        )
     }
 
     fn get_extended_inode(
         &self,
         ino: Inode,
         _validate_inode: bool,
-    ) -> Result<Arc<dyn RafsInodeExt>> {
-        self.inodes
-            .get(&ino)
-            .map_or(Err(enoent!()), |i| Ok(i.clone()))
+    ) -> RafsResult<Arc<dyn RafsInodeExt>> {
+        self.inodes.get(&ino).map_or_else(
+            || Err(RafsError::NotFound(format!("mock: no inode {}", ino))),
+            |i| Ok(i.clone() as Arc<dyn RafsInodeExt>),
+        )
     }
 }
 
 impl RafsSuperBlock for MockSuperBlock {
-    fn load(&mut self, _r: &mut RafsIoReader) -> Result<()> {
+    fn load(&mut self, _r: &mut RafsIoReader) -> RafsResult<()> {
         unimplemented!()
     }
     fn update(&self, _r: &mut RafsIoReader) -> RafsResult<()> {
@@ -66,7 +67,7 @@ impl RafsSuperBlock for MockSuperBlock {
         unimplemented!()
     }
 
-    fn get_chunk_info(&self, _idx: usize) -> Result<Arc<dyn BlobChunkInfo>> {
+    fn get_chunk_info(&self, _idx: usize) -> RafsResult<Arc<dyn BlobChunkInfo>> {
         unimplemented!()
     }
 

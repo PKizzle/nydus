@@ -28,7 +28,10 @@ impl BlobfsState {
         let rafs_handle = self.rafs_handle.read().unwrap();
         match rafs_handle.rafs.as_ref() {
             Some(rafs) => rafs.fetch_range_synchronous(prefetches),
-            None => Err(einval!("blobfs: failed to initialize RAFS filesystem.")),
+            None => Err(io_err(
+                libc::EINVAL,
+                "blobfs: failed to initialize RAFS filesystem.",
+            )),
         }
     }
 }
@@ -39,10 +42,13 @@ impl BlobFs {
     fn load_chunks_on_demand(&self, inode: Inode, offset: u64, len: u64) -> io::Result<()> {
         let (blob_id, size) = self.get_blob_id_and_size(inode)?;
         if size <= offset || offset.checked_add(len).is_none() {
-            return Err(einval!(format!(
-                "blobfs: blob_id {:?}, offset {:?} is larger than size {:?}",
-                blob_id, offset, size
-            )));
+            return Err(io_err(
+                libc::EINVAL,
+                format!(
+                    "blob_id {:?}, offset {:?} is larger than size {:?}",
+                    blob_id, offset, size
+                ),
+            ));
         }
 
         let end = std::cmp::min(offset + len, size);
@@ -102,7 +108,10 @@ impl FileSystem for BlobFs {
         _handle: Option<Handle>,
         _valid: SetattrValid,
     ) -> io::Result<(libc::stat64, Duration)> {
-        Err(eacces!("Setattr request is not allowed in blobfs"))
+        Err(io_err(
+            libc::EACCES,
+            "Setattr request is not allowed in blobfs",
+        ))
     }
 
     fn readlink(&self, _ctx: &Context, inode: Inode) -> io::Result<Vec<u8>> {
@@ -116,7 +125,10 @@ impl FileSystem for BlobFs {
         _parent: Inode,
         _name: &CStr,
     ) -> io::Result<Entry> {
-        Err(eacces!("Symlink request is not allowed in blobfs"))
+        Err(io_err(
+            libc::EACCES,
+            "Symlink request is not allowed in blobfs",
+        ))
     }
 
     fn mknod(
@@ -128,7 +140,10 @@ impl FileSystem for BlobFs {
         _rdev: u32,
         _umask: u32,
     ) -> io::Result<Entry> {
-        Err(eacces!("Mknod request is not allowed in blobfs"))
+        Err(io_err(
+            libc::EACCES,
+            "Mknod request is not allowed in blobfs",
+        ))
     }
 
     fn mkdir(
@@ -139,15 +154,24 @@ impl FileSystem for BlobFs {
         _mode: u32,
         _umask: u32,
     ) -> io::Result<Entry> {
-        Err(eacces!("Mkdir request is not allowed in blobfs"))
+        Err(io_err(
+            libc::EACCES,
+            "Mkdir request is not allowed in blobfs",
+        ))
     }
 
     fn unlink(&self, _ctx: &Context, _parent: Inode, _name: &CStr) -> io::Result<()> {
-        Err(eacces!("Unlink request is not allowed in blobfs"))
+        Err(io_err(
+            libc::EACCES,
+            "Unlink request is not allowed in blobfs",
+        ))
     }
 
     fn rmdir(&self, _ctx: &Context, _parent: Inode, _name: &CStr) -> io::Result<()> {
-        Err(eacces!("Rmdir request is not allowed in blobfs"))
+        Err(io_err(
+            libc::EACCES,
+            "Rmdir request is not allowed in blobfs",
+        ))
     }
 
     fn rename(
@@ -159,7 +183,10 @@ impl FileSystem for BlobFs {
         _newname: &CStr,
         _flags: u32,
     ) -> io::Result<()> {
-        Err(eacces!("Rename request is not allowed in blobfs"))
+        Err(io_err(
+            libc::EACCES,
+            "Rename request is not allowed in blobfs",
+        ))
     }
 
     fn link(
@@ -169,7 +196,10 @@ impl FileSystem for BlobFs {
         _newparent: Inode,
         _newname: &CStr,
     ) -> io::Result<Entry> {
-        Err(eacces!("Link request is not allowed in blobfs"))
+        Err(io_err(
+            libc::EACCES,
+            "Link request is not allowed in blobfs",
+        ))
     }
 
     fn open(
@@ -189,7 +219,10 @@ impl FileSystem for BlobFs {
         _name: &CStr,
         _args: CreateIn,
     ) -> io::Result<(Entry, Option<Handle>, OpenOptions, Option<u32>)> {
-        Err(eacces!("Create request is not allowed in blobfs"))
+        Err(io_err(
+            libc::EACCES,
+            "Create request is not allowed in blobfs",
+        ))
     }
 
     fn read(
@@ -221,7 +254,10 @@ impl FileSystem for BlobFs {
         _flags: u32,
         _fuse_flags: u32,
     ) -> io::Result<usize> {
-        Err(eacces!("Write request is not allowed in blobfs"))
+        Err(io_err(
+            libc::EACCES,
+            "Write request is not allowed in blobfs",
+        ))
     }
 
     fn flush(
@@ -253,7 +289,10 @@ impl FileSystem for BlobFs {
         _offset: u64,
         _length: u64,
     ) -> io::Result<()> {
-        Err(eacces!("Fallocate request is not allowed in blobfs"))
+        Err(io_err(
+            libc::EACCES,
+            "Fallocate request is not allowed in blobfs",
+        ))
     }
 
     fn release(
@@ -289,7 +328,10 @@ impl FileSystem for BlobFs {
         _value: &[u8],
         _flags: u32,
     ) -> io::Result<()> {
-        Err(eacces!("Setxattr request is not allowed in blobfs"))
+        Err(io_err(
+            libc::EACCES,
+            "Setxattr request is not allowed in blobfs",
+        ))
     }
 
     fn getxattr(
@@ -307,7 +349,10 @@ impl FileSystem for BlobFs {
     }
 
     fn removexattr(&self, _ctx: &Context, _inode: Inode, _name: &CStr) -> io::Result<()> {
-        Err(eacces!("Removexattr request is not allowed in blobfs"))
+        Err(io_err(
+            libc::EACCES,
+            "Removexattr request is not allowed in blobfs",
+        ))
     }
 
     fn opendir(
@@ -377,13 +422,13 @@ impl FileSystem for BlobFs {
         vu_req: &mut dyn FsCacheReqHandler,
     ) -> io::Result<()> {
         if (flags & virtio_fs::SetupmappingFlags::WRITE.bits()) != 0 {
-            return Err(eacces!("blob file cannot write in dax"));
+            return Err(io_err(libc::EACCES, "blob file cannot write in dax"));
         }
         if foffset.checked_add(len).is_none() || foffset + len > u64::MAX - MAPPING_UNIT_SIZE {
-            return Err(einval!(format!(
-                "blobfs: invalid offset 0x{:x} and len 0x{:x}",
-                foffset, len
-            )));
+            return Err(io_err(
+                libc::EINVAL,
+                format!("invalid offset 0x{:x} and len 0x{:x}", foffset, len),
+            ));
         }
 
         let end = round_up(foffset + len, MAPPING_UNIT_SIZE);

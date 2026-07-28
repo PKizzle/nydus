@@ -6,7 +6,6 @@
 use std::any::Any;
 use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
-use std::io::Result;
 use std::os::unix::ffi::OsStrExt;
 use std::sync::Arc;
 
@@ -27,6 +26,7 @@ use crate::metadata::{
     Inode, RAFS_ATTR_BLOCK_SIZE, RafsInode, RafsInodeWalkHandler, RafsSuperMeta,
     layout::{XattrName, XattrValue},
 };
+use crate::{RafsError, RafsResult};
 
 #[derive(Default, Clone, Debug)]
 #[allow(unused)]
@@ -75,9 +75,9 @@ impl MockInode {
 }
 
 impl RafsInode for MockInode {
-    fn validate(&self, _max_inode: Inode, _chunk_size: u64) -> Result<()> {
+    fn validate(&self, _max_inode: Inode, _chunk_size: u64) -> RafsResult<()> {
         if self.is_symlink() && self.i_target.is_empty() {
-            return Err(einval!("invalid inode"));
+            return Err(RafsError::InvalidMetadata("invalid inode".to_string()));
         }
         Ok(())
     }
@@ -112,13 +112,15 @@ impl RafsInode for MockInode {
         &self,
         _entry_offset: u64,
         _handler: RafsInodeWalkHandler,
-    ) -> Result<()> {
+    ) -> RafsResult<()> {
         todo!()
     }
 
-    fn get_symlink(&self) -> Result<OsString> {
+    fn get_symlink(&self) -> RafsResult<OsString> {
         if !self.is_symlink() {
-            Err(einval!("inode is not a symlink"))
+            Err(RafsError::InvalidMetadata(
+                "inode is not a symlink".to_string(),
+            ))
         } else {
             Ok(self.i_target.clone())
         }
@@ -132,16 +134,16 @@ impl RafsInode for MockInode {
         }
     }
 
-    fn get_child_by_name(&self, name: &OsStr) -> Result<Arc<dyn RafsInodeExt>> {
+    fn get_child_by_name(&self, name: &OsStr) -> RafsResult<Arc<dyn RafsInodeExt>> {
         let idx = self
             .i_child
             .binary_search_by(|c| c.i_name.as_os_str().cmp(name))
-            .map_err(|_| enoent!())?;
+            .map_err(|_| RafsError::NotFound(format!("mock: no child named {:?}", name)))?;
         Ok(self.i_child[idx].clone())
     }
 
     #[inline]
-    fn get_child_by_index(&self, index: u32) -> Result<Arc<dyn RafsInodeExt>> {
+    fn get_child_by_index(&self, index: u32) -> RafsResult<Arc<dyn RafsInodeExt>> {
         Ok(self.i_child[index as usize].clone())
     }
 
@@ -150,7 +152,7 @@ impl RafsInode for MockInode {
         self.i_child_cnt
     }
 
-    fn get_child_index(&self) -> Result<u32> {
+    fn get_child_index(&self) -> RafsResult<u32> {
         Ok(self.i_child_idx)
     }
 
@@ -163,11 +165,11 @@ impl RafsInode for MockInode {
     }
 
     #[inline]
-    fn get_xattr(&self, name: &OsStr) -> Result<Option<XattrValue>> {
+    fn get_xattr(&self, name: &OsStr) -> RafsResult<Option<XattrValue>> {
         Ok(self.i_xattr.get(name).cloned())
     }
 
-    fn get_xattrs(&self) -> Result<Vec<XattrName>> {
+    fn get_xattrs(&self) -> RafsResult<Vec<XattrName>> {
         Ok(self
             .i_xattr
             .keys()
@@ -214,9 +216,12 @@ impl RafsInode for MockInode {
     fn collect_descendants_inodes(
         &self,
         descendants: &mut Vec<Arc<dyn RafsInode>>,
-    ) -> Result<usize> {
+    ) -> RafsResult<usize> {
         if !self.is_dir() {
-            return Err(enotdir!());
+            return Err(RafsError::NotDirectory(format!(
+                "mock: inode {} is not a directory",
+                self.ino()
+            )));
         }
 
         let mut child_dirs: Vec<Arc<dyn RafsInode>> = Vec::new();
@@ -246,7 +251,7 @@ impl RafsInode for MockInode {
         offset: u64,
         size: usize,
         user_io: bool,
-    ) -> Result<Vec<BlobIoVec>> {
+    ) -> RafsResult<Vec<BlobIoVec>> {
         rafsv5_alloc_bio_vecs(self, offset, size, user_io)
     }
 
@@ -278,7 +283,7 @@ impl RafsInodeExt for MockInode {
     }
 
     #[inline]
-    fn get_chunk_info(&self, idx: u32) -> Result<Arc<dyn BlobChunkInfo>> {
+    fn get_chunk_info(&self, idx: u32) -> RafsResult<Arc<dyn BlobChunkInfo>> {
         Ok(self.i_data[idx as usize].clone())
     }
 
@@ -290,13 +295,13 @@ impl RafsInodeExt for MockInode {
 }
 
 impl RafsV5InodeChunkOps for MockInode {
-    fn get_chunk_info_v5(&self, idx: u32) -> Result<Arc<dyn BlobV5ChunkInfo>> {
+    fn get_chunk_info_v5(&self, idx: u32) -> RafsResult<Arc<dyn BlobV5ChunkInfo>> {
         Ok(self.i_data[idx as usize].clone())
     }
 }
 
 impl RafsV5InodeOps for MockInode {
-    fn get_blob_by_index(&self, _idx: u32) -> Result<Arc<BlobInfo>> {
+    fn get_blob_by_index(&self, _idx: u32) -> RafsResult<Arc<BlobInfo>> {
         Ok(Arc::new(BlobInfo::default()))
     }
 

@@ -11,7 +11,7 @@ use std::convert::{TryFrom, TryInto};
 use std::ffi::{OsStr, OsString};
 use std::fmt::{Debug, Display, Formatter, Result as FmtResult};
 use std::fs::OpenOptions;
-use std::io::{Error, Result};
+use std::io::Error;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Component, Path, PathBuf};
 use std::str::FromStr;
@@ -94,17 +94,20 @@ pub trait RafsSuperInodes {
     fn get_max_ino(&self) -> Inode;
 
     /// Get the `RafsInode` trait object corresponding to the inode number `ino`.
-    fn get_inode(&self, ino: Inode, validate_inode: bool) -> Result<Arc<dyn RafsInode>>;
+    fn get_inode(&self, ino: Inode, validate_inode: bool) -> RafsResult<Arc<dyn RafsInode>>;
 
     /// Get the `RafsInodeExt` trait object corresponding to the 'ino`.
-    fn get_extended_inode(&self, ino: Inode, validate_inode: bool)
-    -> Result<Arc<dyn RafsInodeExt>>;
+    fn get_extended_inode(
+        &self,
+        ino: Inode,
+        validate_inode: bool,
+    ) -> RafsResult<Arc<dyn RafsInodeExt>>;
 }
 
 /// Trait to access RAFS filesystem metadata, including the RAFS super block and inodes.
 pub trait RafsSuperBlock: RafsSuperInodes + Send + Sync {
     /// Load and validate the RAFS filesystem super block from the specified reader.
-    fn load(&mut self, r: &mut RafsIoReader) -> Result<()>;
+    fn load(&mut self, r: &mut RafsIoReader) -> RafsResult<()>;
 
     /// Update/reload the RAFS filesystem super block from the specified reader.
     fn update(&self, r: &mut RafsIoReader) -> RafsResult<()>;
@@ -116,7 +119,7 @@ pub trait RafsSuperBlock: RafsSuperInodes + Send + Sync {
     fn get_blob_infos(&self) -> Vec<Arc<BlobInfo>>;
 
     /// Get extra information associated with blob objects.
-    fn get_blob_extra_infos(&self) -> Result<HashMap<String, RafsBlobExtraInfo>> {
+    fn get_blob_extra_infos(&self) -> RafsResult<HashMap<String, RafsBlobExtraInfo>> {
         Ok(HashMap::new())
     }
 
@@ -124,7 +127,7 @@ pub trait RafsSuperBlock: RafsSuperInodes + Send + Sync {
     fn root_ino(&self) -> u64;
 
     /// Get the `BlobChunkInfo` object by a chunk index, used by RAFS v6.
-    fn get_chunk_info(&self, _idx: usize) -> Result<Arc<dyn BlobChunkInfo>>;
+    fn get_chunk_info(&self, _idx: usize) -> RafsResult<Arc<dyn BlobChunkInfo>>;
 
     /// Associate `BlobDevice` object with the `RafsSuperBlock` object, used by RAFS v6.
     fn set_blob_device(&self, blob_device: BlobDevice);
@@ -144,7 +147,7 @@ pub type RafsInodeWalkHandler<'a> = &'a mut dyn FnMut(
     OsString,
     u64,
     u64,
-) -> Result<RafsInodeWalkAction>;
+) -> RafsResult<RafsInodeWalkAction>;
 
 /// Trait to provide readonly accessors for RAFS filesystem inode.
 ///
@@ -156,7 +159,7 @@ pub trait RafsInode: Any {
     ///
     /// Inodes objects may be transmuted from raw buffers or loaded from untrusted source.
     /// It must be validated for integrity before accessing any of its data fields .
-    fn validate(&self, max_inode: Inode, chunk_size: u64) -> Result<()>;
+    fn validate(&self, max_inode: Inode, chunk_size: u64) -> RafsResult<()>;
 
     /// RAFS: allocate blob io vectors to read file data in range [offset, offset + size).
     fn alloc_bio_vecs(
@@ -165,13 +168,13 @@ pub trait RafsInode: Any {
         offset: u64,
         size: usize,
         user_io: bool,
-    ) -> Result<Vec<BlobIoVec>>;
+    ) -> RafsResult<Vec<BlobIoVec>>;
 
     /// RAFS: collect all descendants of the inode for image building.
     fn collect_descendants_inodes(
         &self,
         descendants: &mut Vec<Arc<dyn RafsInode>>,
-    ) -> Result<usize>;
+    ) -> RafsResult<usize>;
 
     /// Posix: generate a `Entry` object required by libc/fuse from the inode.
     fn get_entry(&self) -> Entry;
@@ -216,31 +219,35 @@ pub trait RafsInode: Any {
     fn has_xattr(&self) -> bool;
 
     /// Xattr: get the value of xattr with key `name`.
-    fn get_xattr(&self, name: &OsStr) -> Result<Option<XattrValue>>;
+    fn get_xattr(&self, name: &OsStr) -> RafsResult<Option<XattrValue>>;
 
     /// Xattr: get all xattr keys.
-    fn get_xattrs(&self) -> Result<Vec<XattrName>>;
+    fn get_xattrs(&self) -> RafsResult<Vec<XattrName>>;
 
     /// Symlink: get the symlink target.
-    fn get_symlink(&self) -> Result<OsString>;
+    fn get_symlink(&self) -> RafsResult<OsString>;
 
     /// Symlink: get size of the symlink target path.
     fn get_symlink_size(&self) -> u16;
 
     /// Directory: walk/enumerate child inodes.
-    fn walk_children_inodes(&self, entry_offset: u64, handler: RafsInodeWalkHandler) -> Result<()>;
+    fn walk_children_inodes(
+        &self,
+        entry_offset: u64,
+        handler: RafsInodeWalkHandler,
+    ) -> RafsResult<()>;
 
     /// Directory: get child inode by name.
-    fn get_child_by_name(&self, name: &OsStr) -> Result<Arc<dyn RafsInodeExt>>;
+    fn get_child_by_name(&self, name: &OsStr) -> RafsResult<Arc<dyn RafsInodeExt>>;
 
     /// Directory: get child inode by child index, child index starts from 0.
-    fn get_child_by_index(&self, idx: u32) -> Result<Arc<dyn RafsInodeExt>>;
+    fn get_child_by_index(&self, idx: u32) -> RafsResult<Arc<dyn RafsInodeExt>>;
 
     /// Directory: get number of child inodes.
     fn get_child_count(&self) -> u32;
 
     /// Directory: get the inode number corresponding to the first child inode.
-    fn get_child_index(&self) -> Result<u32>;
+    fn get_child_index(&self) -> RafsResult<u32>;
 
     /// Regular: get size of file content
     fn size(&self) -> u64;
@@ -277,13 +284,13 @@ pub trait RafsInodeExt: RafsInode {
     fn get_digest(&self) -> RafsDigest;
 
     /// RAFS v5: get chunk info object by chunk index, chunk index starts from 0.
-    fn get_chunk_info(&self, idx: u32) -> Result<Arc<dyn BlobChunkInfo>>;
+    fn get_chunk_info(&self, idx: u32) -> RafsResult<Arc<dyn BlobChunkInfo>>;
 }
 
 /// Trait to write out RAFS filesystem meta objects into the metadata blob.
 pub trait RafsStore {
     /// Write out the Rafs filesystem meta object to the writer.
-    fn store(&self, w: &mut dyn RafsIoWrite) -> Result<usize>;
+    fn store(&self, w: &mut dyn RafsIoWrite) -> RafsResult<usize>;
 }
 
 bitflags! {
@@ -658,7 +665,10 @@ impl TryFrom<u32> for RafsVersion {
         } else if version == RAFS_SUPER_VERSION_V6 {
             return Ok(RafsVersion::V6);
         }
-        Err(einval!(format!("invalid RAFS version number {}", version)))
+        Err(Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("invalid RAFS version number {}", version),
+        ))
     }
 }
 
@@ -709,7 +719,10 @@ impl FromStr for RafsMode {
         match s {
             "direct" => Ok(Self::Direct),
             "cached" => Ok(Self::Cached),
-            _ => Err(einval!("rafs mode should be direct or cached")),
+            _ => Err(Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "rafs mode should be direct or cached",
+            )),
         }
     }
 }
@@ -748,7 +761,7 @@ impl Default for RafsSuper {
 
 impl RafsSuper {
     /// Create a new `RafsSuper` instance from a `RafsConfigV2` object.
-    pub fn new(conf: &RafsConfigV2) -> Result<Self> {
+    pub fn new(conf: &RafsConfigV2) -> RafsResult<Self> {
         Ok(Self {
             mode: RafsMode::from_str(conf.mode.as_str())?,
             validate_digest: conf.validate,
@@ -768,7 +781,7 @@ impl RafsSuper {
         path: P,
         config: Arc<ConfigV2>,
         is_chunk_dict: bool,
-    ) -> Result<(Self, RafsIoReader)> {
+    ) -> RafsResult<(Self, RafsIoReader)> {
         let validate_digest = config
             .rafs
             .as_ref()
@@ -829,7 +842,7 @@ impl RafsSuper {
     }
 
     /// Load RAFS metadata and optionally cache inodes.
-    pub(crate) fn load(&mut self, r: &mut RafsIoReader) -> Result<()> {
+    pub(crate) fn load(&mut self, r: &mut RafsIoReader) -> RafsResult<()> {
         // Try to load the filesystem as Rafs v5
         if self.try_load_v5(r)? {
             return Ok(());
@@ -839,13 +852,15 @@ impl RafsSuper {
             return Ok(());
         }
 
-        Err(Error::other("invalid RAFS superblock"))
+        Err(RafsError::InvalidMetadata(
+            "invalid RAFS superblock: neither a v5 nor a v6 image".to_string(),
+        ))
     }
 
     /// Set meta blob file path from which the `RafsSuper` object is loaded from.
     ///
     /// It's used to support inlined-meta and ZRan blobs.
-    pub fn set_blob_id_from_meta_path(&self, meta_path: &Path) -> Result<()> {
+    pub fn set_blob_id_from_meta_path(&self, meta_path: &Path) -> RafsResult<()> {
         let blobs = self.superblock.get_blob_infos();
         for blob in blobs.iter() {
             if blob.has_feature(BlobFeatures::INLINED_FS_META)
@@ -860,7 +875,7 @@ impl RafsSuper {
     /// Create a `BlobDevice` object and associated it with the `RafsSuper` object.
     ///
     /// The `BlobDevice` object is needed to get meta information from RAFS V6 data blobs.
-    pub fn create_blob_device(&self, config: Arc<ConfigV2>) -> Result<()> {
+    pub fn create_blob_device(&self, config: Arc<ConfigV2>) -> RafsResult<()> {
         let blobs = self.superblock.get_blob_infos();
         let device = BlobDevice::new(&config, &blobs, "/")?;
         self.superblock.set_blob_device(device);
@@ -871,7 +886,7 @@ impl RafsSuper {
     pub fn update(&self, r: &mut RafsIoReader) -> RafsResult<()> {
         if self.meta.is_v5() {
             self.skip_v5_superblock(r)
-                .map_err(RafsError::FillSuperBlock)?;
+                .map_err(|e| RafsError::FillSuperBlock(e.into()))?;
         }
 
         self.superblock.update(r)
@@ -883,7 +898,7 @@ impl RafsSuper {
     }
 
     /// Get the `RafsInode` object corresponding to `ino`.
-    pub fn get_inode(&self, ino: Inode, validate_inode: bool) -> Result<Arc<dyn RafsInode>> {
+    pub fn get_inode(&self, ino: Inode, validate_inode: bool) -> RafsResult<Arc<dyn RafsInode>> {
         self.superblock.get_inode(ino, validate_inode)
     }
 
@@ -892,17 +907,20 @@ impl RafsSuper {
         &self,
         ino: Inode,
         validate_inode: bool,
-    ) -> Result<Arc<dyn RafsInodeExt>> {
+    ) -> RafsResult<Arc<dyn RafsInodeExt>> {
         self.superblock.get_extended_inode(ino, validate_inode)
     }
 
     /// Convert a file path to an inode number.
-    pub fn ino_from_path(&self, f: &Path) -> Result<Inode> {
+    pub fn ino_from_path(&self, f: &Path) -> RafsResult<Inode> {
         let root_ino = self.superblock.root_ino();
         if f == Path::new("/") {
             return Ok(root_ino);
         } else if !f.starts_with("/") {
-            return Err(einval!());
+            return Err(RafsError::InvalidMetadata(format!(
+                "path {} is not absolute",
+                f.display()
+            )));
         }
 
         let entries = f
@@ -917,7 +935,10 @@ impl RafsSuper {
             .collect::<Vec<_>>();
         if entries.is_empty() {
             warn!("Path can't be parsed {:?}", f);
-            return Err(enoent!());
+            return Err(RafsError::NotFound(format!(
+                "path {} has no resolvable components",
+                f.display()
+            )));
         }
 
         let mut parent = self.get_extended_inode(root_ino, self.validate_digest)?;
@@ -925,12 +946,18 @@ impl RafsSuper {
             match p {
                 None => {
                     error!("Illegal specified path {:?}", f);
-                    return Err(einval!());
+                    return Err(RafsError::InvalidMetadata(format!(
+                        "path {} contains a component RAFS cannot resolve",
+                        f.display()
+                    )));
                 }
                 Some(name) => {
                     parent = parent.get_child_by_name(name).map_err(|e| {
                         warn!("File {:?} not in RAFS filesystem, {}", name, e);
-                        enoent!()
+                        RafsError::NotFound(format!(
+                            "{:?} is not present in the RAFS filesystem",
+                            name
+                        ))
                     })?;
                 }
             }
@@ -993,7 +1020,7 @@ impl RafsSuper {
         state: &mut BlobIoMerge,
         hardlinks: &mut HashSet<u64>,
         fetcher: &dyn Fn(&mut BlobIoVec, bool),
-    ) -> Result<()> {
+    ) -> RafsResult<()> {
         // Check for duplicated hardlinks.
         if inode.is_hardlink() {
             if hardlinks.contains(&inode.ino()) {
@@ -1021,11 +1048,11 @@ impl RafsSuper {
         state: &mut BlobIoMerge,
         hardlinks: &mut HashSet<u64>,
         fetcher: &dyn Fn(&mut BlobIoVec, bool),
-    ) -> Result<()> {
+    ) -> RafsResult<()> {
         let inode = self
             .superblock
             .get_inode(ino, self.validate_digest)
-            .map_err(|_e| enoent!("Can't find inode"))?;
+            .map_err(|_e| RafsError::NotFound("Can't find inode".to_string()))?;
 
         if inode.is_dir() {
             let mut descendants = Vec::new();
@@ -1049,7 +1076,7 @@ impl RafsSuper {
 // For nydus-image
 impl RafsSuper {
     /// Convert an inode number to a file path.
-    pub fn path_from_ino(&self, ino: Inode) -> Result<PathBuf> {
+    pub fn path_from_ino(&self, ino: Inode) -> RafsResult<PathBuf> {
         if ino == self.superblock.root_ino() {
             return Ok(self.get_extended_inode(ino, false)?.name().into());
         }
@@ -1074,7 +1101,7 @@ impl RafsSuper {
     }
 
     /// Get prefetched inos
-    pub fn get_prefetched_inos(&self, bootstrap: &mut RafsIoReader) -> Result<Vec<u32>> {
+    pub fn get_prefetched_inos(&self, bootstrap: &mut RafsIoReader) -> RafsResult<Vec<u32>> {
         if self.meta.is_v5() {
             let mut pt = RafsV5PrefetchTable::new();
             pt.load_prefetch_table_from(

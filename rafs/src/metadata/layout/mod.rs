@@ -9,7 +9,6 @@ use std::collections::HashMap;
 use std::convert::TryInto;
 use std::ffi::{OsStr, OsString};
 use std::fmt::{Debug, Formatter};
-use std::io::Result;
 use std::mem::size_of;
 use std::os::unix::ffi::OsStrExt;
 
@@ -17,6 +16,7 @@ use fuse_backend_rs::abi::fuse_abi::ROOT_ID;
 use nydus_utils::ByteSize;
 
 use crate::metadata::layout::v5::RAFSV5_ALIGNMENT;
+use crate::{RafsError, RafsResult};
 
 /// Version number for Rafs v4.
 pub const RAFS_SUPER_VERSION_V4: u32 = 0x400;
@@ -55,7 +55,10 @@ macro_rules! impl_bootstrap_converter {
                 if buf.len() != size_of::<$T>()
                     || ptr as usize & (std::mem::align_of::<$T>() - 1) != 0
                 {
-                    return Err(einval!("convert failed"));
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "convert failed",
+                    ));
                 }
 
                 Ok(unsafe { &*(ptr as *const $T) })
@@ -70,7 +73,10 @@ macro_rules! impl_bootstrap_converter {
                 if buf.len() != size_of::<$T>()
                     || ptr as usize & (std::mem::align_of::<$T>() - 1) != 0
                 {
-                    return Err(einval!("convert failed"));
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "convert failed",
+                    ));
                 }
 
                 Ok(unsafe { &mut *(ptr as *const $T as *mut $T) })
@@ -112,7 +118,7 @@ macro_rules! impl_pub_getter_setter {
 }
 
 /// Parse a utf8 byte slice into two strings.
-pub fn parse_string(buf: &[u8]) -> Result<(&str, &str)> {
+pub fn parse_string(buf: &[u8]) -> RafsResult<(&str, &str)> {
     std::str::from_utf8(buf)
         .map(|origin| {
             if let Some(pos) = origin.find('\0') {
@@ -122,7 +128,7 @@ pub fn parse_string(buf: &[u8]) -> Result<(&str, &str)> {
                 (origin, "")
             }
         })
-        .map_err(|e| einval!(format!("failed in parsing string, {:?}", e)))
+        .map_err(|e| RafsError::InvalidMetadata(format!("failed in parsing string, {:?}", e)))
 }
 
 /// Convert a byte slice into OsStr.
@@ -133,12 +139,14 @@ pub fn bytes_to_os_str(buf: &[u8]) -> &OsStr {
 /// Parse a byte slice into xattr pairs and invoke the callback for each xattr pair.
 ///
 /// The iteration breaks if the callback returns false.
-pub fn parse_xattr<F>(data: &[u8], size: usize, mut cb: F) -> Result<()>
+pub fn parse_xattr<F>(data: &[u8], size: usize, mut cb: F) -> RafsResult<()>
 where
     F: FnMut(&OsStr, XattrValue) -> bool,
 {
     if data.len() < size {
-        return Err(einval!("invalid xattr content size"));
+        return Err(RafsError::InvalidMetadata(
+            "invalid xattr content size".to_string(),
+        ));
     }
 
     let mut rest_data = &data[0..size];
@@ -146,22 +154,20 @@ where
 
     while i < size {
         if rest_data.len() < size_of::<u32>() {
-            return Err(einval!(
-                "invalid xattr content, no enough data for xattr pair size"
+            return Err(RafsError::InvalidMetadata(
+                "invalid xattr content, no enough data for xattr pair size".to_string(),
             ));
         }
 
         let (pair_size, rest) = rest_data.split_at(size_of::<u32>());
-        let pair_size = u32::from_le_bytes(
-            pair_size
-                .try_into()
-                .map_err(|_| einval!("failed to parse xattr pair size"))?,
-        ) as usize;
+        let pair_size = u32::from_le_bytes(pair_size.try_into().map_err(|_| {
+            RafsError::InvalidMetadata("failed to parse xattr pair size".to_string())
+        })?) as usize;
         i += size_of::<u32>();
 
         if rest.len() < pair_size {
-            return Err(einval!(
-                "inconsistent xattr (size, data) pair, size is too big"
+            return Err(RafsError::InvalidMetadata(
+                "inconsistent xattr (size, data) pair, size is too big".to_string(),
             ));
         }
 
@@ -183,7 +189,7 @@ where
 }
 
 /// Parse a byte slice into xattr name list.
-pub fn parse_xattr_names(data: &[u8], size: usize) -> Result<Vec<XattrName>> {
+pub fn parse_xattr_names(data: &[u8], size: usize) -> RafsResult<Vec<XattrName>> {
     let mut result = Vec::new();
 
     parse_xattr(data, size, |name, _| {
@@ -195,7 +201,7 @@ pub fn parse_xattr_names(data: &[u8], size: usize) -> Result<Vec<XattrName>> {
 }
 
 /// Parse a 'buf' to xattr value by xattr name.
-pub fn parse_xattr_value(data: &[u8], size: usize, name: &OsStr) -> Result<Option<XattrValue>> {
+pub fn parse_xattr_value(data: &[u8], size: usize, name: &OsStr) -> RafsResult<Option<XattrValue>> {
     let mut value = None;
 
     parse_xattr(data, size, |_name, _value| {
@@ -261,10 +267,12 @@ impl RafsXAttrs {
     }
 
     /// Add or update an extended attribute.
-    pub fn add(&mut self, name: OsString, value: XattrValue) -> Result<()> {
+    pub fn add(&mut self, name: OsString, value: XattrValue) -> RafsResult<()> {
         let buf = name.as_bytes();
         if buf.len() > 255 || value.len() > 0x10000 {
-            return Err(einval!("xattr key/value is too big"));
+            return Err(RafsError::InvalidMetadata(
+                "xattr key/value is too big".to_string(),
+            ));
         }
         for p in RAFS_XATTR_PREFIXES {
             if buf.len() >= p.len() && &buf[..p.len()] == p.as_bytes() {
@@ -272,7 +280,7 @@ impl RafsXAttrs {
                 return Ok(());
             }
         }
-        Err(einval!("invalid xattr key"))
+        Err(RafsError::InvalidMetadata("invalid xattr key".to_string()))
     }
 
     /// Remove an extended attribute
@@ -300,10 +308,10 @@ impl MetaRange {
         {
             Ok(MetaRange { start, size })
         } else {
-            Err(einval!(format!(
-                "invalid metadata range {}:{}",
-                start, size
-            )))
+            Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("invalid metadata range {}:{}", start, size),
+            ))
         }
     }
 

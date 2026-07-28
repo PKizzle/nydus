@@ -6,7 +6,7 @@ use std::{
     collections::BTreeMap,
     ffi::OsString,
     fs::Permissions,
-    io::{Error, Write},
+    io::Write,
     ops::DerefMut,
     os::unix::prelude::PermissionsExt,
     path::{Path, PathBuf},
@@ -14,8 +14,8 @@ use std::{
 };
 
 use nydus_api::ConfigV2;
-use nydus_rafs::RafsIoReader;
 use nydus_rafs::metadata::{RafsInode, RafsInodeExt, RafsInodeWalkAction, RafsSuper};
+use nydus_rafs::{RafsError, RafsIoReader};
 use nydus_storage::device::BlobChunkInfo;
 use serde_json::Value;
 
@@ -213,7 +213,7 @@ impl RafsInspector {
                 if let Err(e) =
                     self.stat_single_file(Some(dir_inode.as_ref()), child_inode.as_ref())
                 {
-                    return Err(Error::other(e));
+                    return Err(RafsError::InvalidMetadata(e.to_string()));
                 }
 
                 let child_inode = dir_inode.get_child_by_name(&child_name)?;

@@ -33,8 +33,6 @@ extern crate log;
 #[macro_use]
 extern crate bitflags;
 #[macro_use]
-extern crate nydus_api;
-#[macro_use]
 extern crate nydus_storage as storage;
 
 use std::any::Any;
@@ -45,6 +43,8 @@ use std::io::{BufWriter, Error, Read, Result, Seek, SeekFrom, Write};
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+
+use nydus_storage::StorageError;
 
 use crate::metadata::{RafsInodeExt, RafsSuper};
 
@@ -66,17 +66,17 @@ pub enum RafsError {
     #[error("Rafs is already mounted.")]
     AlreadyMounted,
     #[error("Failed to read metadata: {0}`")]
-    ReadMetadata(Error, String),
+    ReadMetadata(#[source] Error, String),
     #[error("Failed to load config: {0}`")]
-    LoadConfig(Error),
+    LoadConfig(#[source] Error),
     #[error("Failed to parse config: {0}`")]
     ParseConfig(#[source] serde_json::Error),
     #[error("Failed to create swap backend: {0}`")]
-    SwapBackend(Error),
+    SwapBackend(#[source] Error),
     #[error("Failed to fill superBlock: {0}`")]
-    FillSuperBlock(Error),
+    FillSuperBlock(#[source] Error),
     #[error("Failed to create device: {0}`")]
-    CreateDevice(Error),
+    CreateDevice(#[source] Error),
     #[error("Failed to prefetch data: {0}`")]
     Prefetch(String),
     #[error("Failed to configure device: {0}`")]
@@ -87,6 +87,104 @@ pub enum RafsError {
     IllegalMetaStruct(MetaType, String),
     #[error("Invalid image data")]
     InvalidImageData,
+    /// The on-disk metadata is malformed, inconsistent or fails validation.
+    ///
+    /// Every one of these used to be an EINVAL error macro, whose message was dropped before it could be
+    /// logged; the string is the description the code already wrote.
+    #[error("{0}")]
+    InvalidMetadata(String),
+    /// A name, inode number or index does not exist in the filesystem.
+    ///
+    /// Maps to `ENOENT`, which is a protocol answer rather than a failure: the kernel caches
+    /// negative lookups on it.
+    #[error("{0}")]
+    NotFound(String),
+    /// The operation requires a directory and the inode is not one.
+    #[error("{0}")]
+    NotDirectory(String),
+    /// A table, index or handle referenced by the metadata is unusable.
+    #[error("{0}")]
+    BadDescriptor(String),
+    /// Access to the object is not permitted.
+    #[error("{0}")]
+    PermissionDenied(String),
+    /// The storage layer failed to serve blob data or metadata.
+    ///
+    /// Boxed to keep `RafsError` small: it is the error half of nearly every signature in this
+    /// crate, and `StorageError` is several words wide.
+    #[error("{0}")]
+    Storage(#[source] Box<StorageError>),
+    /// An I/O operation against the bootstrap or a blob failed.
+    ///
+    /// Kept raw (never re-wrapped) so `source_errno` can recover its errno at the FUSE
+    /// boundary. Context comes from the caller: the outer variants above (`FillSuperBlock`,
+    /// `ReadMetadata`, ...) name which stage of the load or store this happened in.
+    #[error("{0}")]
+    Io(#[from] Error),
+}
+
+impl RafsError {
+    /// The errno to answer the kernel with for this error.
+    ///
+    /// RAFS sits under FUSE, where the only thing the other side understands is an errno, and
+    /// several of them are protocol rather than failure -- `ENOENT` from a lookup is how a
+    /// negative dentry is cached, `ENOTDIR` is how `readdir` on a file is refused. Those have
+    /// dedicated variants above so this table can reproduce them exactly; anything else defers
+    /// to an errno recovered from the chain (a cache write that hit `ENOSPC`, say) and falls
+    /// back to `EIO`.
+    /// The `ErrorKind` of the first `io::Error` on the chain, if any.
+    ///
+    /// `RafsError` wraps rather than flattens its I/O failures, so callers that used to match
+    /// on `e.kind()` -- the inode-table loader ends its loop on `UnexpectedEof` -- have to ask
+    /// the chain instead of the outer type.
+    pub fn io_error_kind(&self) -> Option<std::io::ErrorKind> {
+        let mut cur: Option<&(dyn std::error::Error + 'static)> = Some(self);
+        while let Some(e) = cur {
+            if let Some(ioe) = e.downcast_ref::<Error>() {
+                return Some(ioe.kind());
+            }
+            cur = e.source();
+        }
+        None
+    }
+
+    pub fn errno(&self) -> i32 {
+        match self {
+            RafsError::NotFound(_) => libc::ENOENT,
+            RafsError::NotDirectory(_) => libc::ENOTDIR,
+            RafsError::BadDescriptor(_) => libc::EBADF,
+            RafsError::PermissionDenied(_) => libc::EACCES,
+            RafsError::Unsupported => libc::EOPNOTSUPP,
+            RafsError::InvalidMetadata(_)
+            | RafsError::Uninitialized
+            | RafsError::AlreadyMounted
+            | RafsError::Incompatible(_)
+            | RafsError::IllegalMetaStruct(..)
+            | RafsError::InvalidImageData
+            | RafsError::ParseConfig(_)
+            | RafsError::Configure(_) => libc::EINVAL,
+            _ => nydus_utils::source_errno(self).unwrap_or(libc::EIO),
+        }
+    }
+}
+
+impl From<StorageError> for RafsError {
+    fn from(e: StorageError) -> Self {
+        RafsError::Storage(Box::new(e))
+    }
+}
+
+/// Boundary conversion for the places pinned to `std::io::Error` by an external trait.
+///
+/// Permanent, not a migration shim: `impl FileSystem for Rafs`, blobfs' `sync_io` and the C API
+/// are all pinned, and the kernel behind them reads `raw_os_error()` and nothing else. A
+/// `Custom` error would report `None` there and be answered as `EIO`, so this deliberately
+/// produces a raw `Os` error and drops the message -- callers that want the message must log it
+/// before converting, which is what `fuse_err` in `fs.rs` does.
+impl From<RafsError> for Error {
+    fn from(e: RafsError) -> Self {
+        Error::from_raw_os_error(e.errno())
+    }
 }
 
 #[derive(Debug)]
@@ -119,7 +217,10 @@ pub trait RafsIoWrite: Write + Seek + 'static {
             let cur = self.stream_position()?;
 
             if (size & (alignment - 1) != 0) || (cur & (alignment as u64 - 1) != 0) {
-                return Err(einval!("unaligned data"));
+                return Err(Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "unaligned data",
+                ));
             }
         }
 
@@ -129,7 +230,10 @@ pub trait RafsIoWrite: Write + Seek + 'static {
     /// write padding to align to RAFS_ALIGNMENT.
     fn write_padding(&mut self, size: usize) -> Result<()> {
         if size > WRITE_PADDING_DATA.len() {
-            return Err(einval!("invalid padding size"));
+            return Err(Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "invalid padding size",
+            ));
         }
         self.write_all(&WRITE_PADDING_DATA[0..size])
     }
@@ -355,5 +459,72 @@ mod tests {
             }
         }
         assert!(last);
+    }
+
+    /// Every variant the FUSE boundary can be handed must map to the errno the kernel expects.
+    ///
+    /// Before the migration these were raw `Os` errors built by the error macros, so the
+    /// errno came for free (and the message did not). Now the errno comes from this table, and
+    /// a variant added without a row would silently start answering `EIO`.
+    #[test]
+    fn rafs_error_errno_table() {
+        let cases: Vec<(RafsError, i32)> = vec![
+            (RafsError::NotFound("x".into()), libc::ENOENT),
+            (RafsError::NotDirectory("x".into()), libc::ENOTDIR),
+            (RafsError::BadDescriptor("x".into()), libc::EBADF),
+            (RafsError::PermissionDenied("x".into()), libc::EACCES),
+            (RafsError::Unsupported, libc::EOPNOTSUPP),
+            (RafsError::InvalidMetadata("x".into()), libc::EINVAL),
+            (RafsError::Uninitialized, libc::EINVAL),
+            (RafsError::AlreadyMounted, libc::EINVAL),
+            (RafsError::Incompatible(7), libc::EINVAL),
+            (RafsError::InvalidImageData, libc::EINVAL),
+            (RafsError::Configure("x".into()), libc::EINVAL),
+            (RafsError::Prefetch("x".into()), libc::EIO),
+        ];
+        for (err, want) in cases {
+            assert_eq!(err.errno(), want, "wrong errno for {:?}", err);
+            assert_eq!(
+                Error::from(err).raw_os_error(),
+                Some(want),
+                "the io::Error conversion must keep the errno recoverable"
+            );
+        }
+    }
+
+    /// The disk-full path, end to end through rafs.
+    ///
+    /// A cache `pwrite` that fails with `ENOSPC` becomes `StorageError::CacheIo`, travels up as
+    /// `RafsError::Storage`, and must still be `ENOSPC` when it reaches the kernel -- answering
+    /// `EIO` there would tell a reader "I/O error" for a full disk, and answering `FAN_ALLOW`
+    /// would hand it zeros. Nothing in the chain may re-wrap the raw `Os` error.
+    #[test]
+    fn enospc_survives_the_trip_through_rafs() {
+        let cache_err = StorageError::cache_io("pwrite", Error::from_raw_os_error(libc::ENOSPC));
+        let err = RafsError::from(cache_err);
+
+        assert_eq!(nydus_utils::source_errno(&err), Some(libc::ENOSPC));
+        assert_eq!(err.errno(), libc::ENOSPC);
+        assert_eq!(Error::from(err).raw_os_error(), Some(libc::ENOSPC));
+    }
+
+    /// A storage failure with no errno behind it falls back to `EIO`, not to a guess.
+    #[test]
+    fn storage_error_without_an_errno_is_eio() {
+        let err = RafsError::from(StorageError::ShortWrite {
+            expected: 4096,
+            written: 17,
+        });
+        assert_eq!(nydus_utils::source_errno(&err), None);
+        assert_eq!(err.errno(), libc::EIO);
+    }
+
+    /// `io_error_kind` has to see through the wrapper, because the v5 inode-table loader ends
+    /// its loop on `UnexpectedEof` and would otherwise read past the table.
+    #[test]
+    fn io_error_kind_sees_through_the_wrapper() {
+        let err = RafsError::Io(Error::new(std::io::ErrorKind::UnexpectedEof, "eof"));
+        assert_eq!(err.io_error_kind(), Some(std::io::ErrorKind::UnexpectedEof));
+        assert_eq!(RafsError::Unsupported.io_error_kind(), None);
     }
 }
