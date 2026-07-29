@@ -218,6 +218,39 @@ pub(crate) mod tests {
     use std::path::PathBuf;
     use std::ptr::null;
 
+    /// Send the library's own `warn!` output to stderr for the duration of the tests.
+    ///
+    /// Nothing installs a logger in a test binary, so every `warn!` in this crate is dropped on
+    /// the floor -- and these entry points report failure by returning the caller's error handle
+    /// and setting `errno`, which an `assert_ne!` renders as a bare `left: 0, right: 0`. That
+    /// combination is how a non-NUL-terminated `blob_dir` argument hid here: the only test-visible
+    /// evidence was the handle, and the only explanation was in a message no one could see.
+    /// Deliberately minimal rather than a logging crate -- this exists to make failures legible,
+    /// not to be configurable.
+    struct StderrLogger;
+
+    impl log::Log for StderrLogger {
+        fn enabled(&self, _metadata: &log::Metadata) -> bool {
+            true
+        }
+        fn log(&self, record: &log::Record) {
+            eprintln!("[{}] {}", record.level(), record.args());
+        }
+        fn flush(&self) {}
+    }
+
+    static STDERR_LOGGER: StderrLogger = StderrLogger;
+
+    fn init_logging() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            // Err only if something already set a logger, which is fine -- either way there
+            // is one.
+            let _ = log::set_logger(&STDERR_LOGGER);
+            log::set_max_level(log::LevelFilter::Warn);
+        });
+    }
+
     /// Hands every test its own `id`, and so its own key in the global `BLOB_FACTORY`.
     ///
     /// `BlobFactory` caches one `BlobCacheMgr` per whole-`ConfigV2` key. Every test here used
@@ -233,6 +266,7 @@ pub(crate) mod tests {
     }
 
     pub(crate) fn open_file_system() -> NydusFsHandle {
+        init_logging();
         let ret = unsafe { nydus_open_rafs(null(), null()) };
         assert_eq!(ret, NYDUS_INVALID_FS_HANDLE);
         assert_eq!(
@@ -282,6 +316,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_open_rafs_default() {
+        init_logging();
         let root_dir = &std::env::var("CARGO_MANIFEST_DIR").expect("$CARGO_MANIFEST_DIR");
         let bootstrap = PathBuf::from(root_dir)
             .join("../tests/texture/repeatable/sha256-nocompress-repeatable");
@@ -290,11 +325,12 @@ pub(crate) mod tests {
         let blob_dir = PathBuf::from(root_dir).join("../tests/texture/repeatable/blobs");
         // A `CString`, like `bootstrap` above -- not `str::as_ptr()`. A `&str` is not
         // NUL-terminated, so `CStr::from_ptr` ran off the end of it and kept reading whatever
-        // heap bytes happened to follow. Usually those reached a zero soon and were valid
-        // UTF-8, so nothing was noticed; when they were not, `cstr_to_str!` returned the null
-        // handle -- silently, since it only sets errno -- and this test failed with a bare
-        // "left: 0, right: 0" naming neither the cause nor the step. About 1-3% of
-        // `--test-threads=8` runs, i.e. only ever in CI.
+        // heap bytes happened to follow. Usually it reached a zero immediately and nothing was
+        // noticed; when it did not, the trailing garbage came back as part of the directory
+        // path, got interpolated into `dir = "..."` in the generated config, and
+        // `ConfigV2::from_str` rejected the result -- so the open returned the null handle and
+        // this test failed with a bare "left: 0, right: 0" naming neither the cause nor the
+        // step. About 1-3% of `--test-threads=8` runs, i.e. only ever in CI.
         let blob_dir = CString::new(blob_dir.to_str().unwrap()).unwrap();
         let fs = unsafe { nydus_open_rafs_default(bootstrap.as_ptr(), blob_dir.as_ptr()) };
         // Assert before closing. Without this, an open that failed for any reason handed a

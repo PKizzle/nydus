@@ -42,13 +42,24 @@ fn set_errno(errno: i32) {
 }
 
 /// Macro to convert C `char *` into rust `&str`.
+///
+/// The failure path names the offending argument. Returning the caller's error handle with
+/// nothing but `errno` set makes this indistinguishable from every other way an entry point
+/// can fail, and the most likely way to land here -- handing over a pointer that is not
+/// NUL-terminated, so `CStr::from_ptr` reads past the end of it into whatever follows -- is
+/// intermittent and produces no other evidence at all.
 #[macro_export]
 macro_rules! cstr_to_str {
     ($var: ident, $ret: expr) => {{
         let s = CStr::from_ptr($var);
         match s.to_str() {
             Ok(v) => v,
-            Err(_e) => {
+            Err(e) => {
+                log::warn!(
+                    "invalid UTF-8 in C string argument `{}`: {} (is it NUL-terminated?)",
+                    stringify!($var),
+                    e
+                );
                 set_errno(libc::EINVAL);
                 return $ret;
             }
