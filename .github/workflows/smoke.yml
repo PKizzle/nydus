@@ -761,6 +761,37 @@ jobs:
         echo "=== nydus-snapshotter status ==="
         sudo systemctl status nydus-snapshotter --no-pager --full || true
 
+  # The blob cache under disk pressure, on the fusedev path. Needs root, a loopback ext4 and
+  # FUSE -- but NOT kernel >= 6.14, which is what keeps misc/fanotify/*.sh out of CI. Runs
+  # against a real starved filesystem, so it covers what unit tests cannot: that a failing
+  # cache write leaves the chunk not-ready and a later read re-fetches instead of being served
+  # the sparse hole as zeros.
+  fusedev-disk-pressure:
+    runs-on: ${{ vars.RUNNER_OS || 'ubuntu-latest' }}
+    needs: [nydus-build]
+    timeout-minutes: 15
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v6
+    - name: Download Nydus
+      uses: actions/download-artifact@v7
+      with:
+        name: nydus-artifact
+        path: target/release
+    - name: Prepare
+      run: |
+        sudo apt-get update -qq
+        sudo apt-get install -y -qq fuse3 e2fsprogs
+        chmod +x target/release/nydusd target/release/nydus-image
+    - name: Blob cache under disk pressure
+      run: |
+        sudo NYDUS_IMAGE=$PWD/target/release/nydus-image NYDUSD=$PWD/target/release/nydusd \
+          bash misc/fusedev/disk-pressure.sh
+    - name: Dump nydusd log
+      if: failure()
+      run: |
+        sudo cat /var/tmp/fusedev-disk-pressure/nydusd.log || true
+
   takeover-test:
     runs-on: ${{ vars.RUNNER_OS || 'ubuntu-latest' }}
     needs: [contrib-build, nydus-build]

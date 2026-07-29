@@ -49,9 +49,17 @@ teardown() {
 finish() { teardown; exit "${1:-0}"; }
 trap 'finish 1' INT TERM
 
-# Force the next read to re-enter nydusd instead of being answered from the kernel's
-# page cache -- without this F2 re-reads its own first result and proves nothing.
+# Force the next read to re-enter nydusd instead of being answered from the kernel's page
+# cache. F2 depends on this completely: a warm cache answers the re-read without ever
+# consulting the daemon, so the case would report a pass while testing nothing at all.
 drop_caches() { sync; echo 3 | sudo tee /proc/sys/vm/drop_caches >/dev/null 2>&1; }
+
+# How many cache writes the daemon has failed so far. F2 compares this across its read
+# instead of trusting `drop_caches` to have worked: with the disk still full, a read that
+# genuinely re-enters nydusd MUST fail to persist again and bump this counter. If it does
+# not move, the read was served from the page cache and the case proved nothing -- which is
+# reported as a failure, not a pass, because a check that cannot check must not look green.
+persist_failures() { grep -c 'Failed to persist data' "$ROOT/nydusd.log" 2>/dev/null || echo 0; }
 
 step "reset dirs"
 teardown
@@ -122,14 +130,18 @@ else
 fi
 
 step "F2: read the same range again — the un-persisted chunks must not look ready"
+pf_before=$(persist_failures)
 drop_caches
 timeout 60 dd if="$ROOT/mnt/hello.txt" of="$ROOT/read2.out" bs=4096 status=none 2>"$ROOT/read2.err"
 rc2=$?
+pf_after=$(persist_failures)
 got2=$(sha256sum "$ROOT/read2.out" 2>/dev/null | awk '{print $1}')
 nonzero2=$(LC_ALL=C tr -d '\0' < "$ROOT/read2.out" 2>/dev/null | wc -c | tr -d ' ')
-note "exit=$rc2 non-zero bytes=$nonzero2"
-if [ "$got2" = "$SRC" ]; then
-  case_pass "F2: second read still correct — failed writes did not mark chunks ready"
+note "exit=$rc2 non-zero bytes=$nonzero2, daemon persist failures ${pf_before} -> ${pf_after}"
+if [ "$pf_after" -le "$pf_before" ]; then
+  case_fail "F2: the re-read never reached nydusd (page cache not dropped) — INCONCLUSIVE, so counted as a failure rather than a pass"
+elif [ "$got2" = "$SRC" ]; then
+  case_pass "F2: second read re-entered the daemon and was still correct — failed writes did not mark chunks ready"
 elif [ "$nonzero2" = "0" ]; then
   case_fail "F2: second read returned ZEROS — a sparse hole was served as data"
 else
