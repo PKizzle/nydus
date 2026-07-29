@@ -288,10 +288,15 @@ pub(crate) mod tests {
         let bootstrap = bootstrap.to_str().unwrap();
         let bootstrap = CString::new(bootstrap).unwrap();
         let blob_dir = PathBuf::from(root_dir).join("../tests/texture/repeatable/blobs");
-        let blob_dir = blob_dir.to_str().unwrap();
-        let fs = unsafe {
-            nydus_open_rafs_default(bootstrap.as_ptr(), blob_dir.as_ptr() as *const c_char)
-        };
+        // A `CString`, like `bootstrap` above -- not `str::as_ptr()`. A `&str` is not
+        // NUL-terminated, so `CStr::from_ptr` ran off the end of it and kept reading whatever
+        // heap bytes happened to follow. Usually those reached a zero soon and were valid
+        // UTF-8, so nothing was noticed; when they were not, `cstr_to_str!` returned the null
+        // handle -- silently, since it only sets errno -- and this test failed with a bare
+        // "left: 0, right: 0" naming neither the cause nor the step. About 1-3% of
+        // `--test-threads=8` runs, i.e. only ever in CI.
+        let blob_dir = CString::new(blob_dir.to_str().unwrap()).unwrap();
+        let fs = unsafe { nydus_open_rafs_default(bootstrap.as_ptr(), blob_dir.as_ptr()) };
         // Assert before closing. Without this, an open that failed for any reason handed a
         // null handle straight to `nydus_close_rafs`, and the test died with a bare SIGSEGV
         // that said nothing about which step had actually gone wrong.
