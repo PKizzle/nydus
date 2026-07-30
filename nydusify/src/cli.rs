@@ -312,6 +312,19 @@ pub struct ConvertArgs {
     pub prefetch_dir: Option<String>,
     #[arg(long = "prefetch-patterns", env = "PREFETCH_PATTERNS")]
     pub prefetch_patterns: bool,
+    /// Path to a JSON access-pattern file describing what to prefetch, in the
+    /// format `nydus-image optimize --prefetch-files` consumes:
+    /// `{"version":"v1","files":[{"path":"/usr/bin/app","ranges":null}]}`.
+    ///
+    /// Unlike `--prefetch-dir` and `--prefetch-patterns`, which can only name whole
+    /// files, this carries per-file byte `ranges` — so a recorded trace of what a
+    /// container actually touched at start-up can be replayed verbatim.
+    #[arg(
+        long = "prefetch-pattern-file",
+        env = "PREFETCH_PATTERN_FILE",
+        value_name = "FILE"
+    )]
+    pub prefetch_pattern_file: Option<PathBuf>,
     #[arg(long, env = "COMPRESSOR", default_value = "zstd")]
     pub compressor: String,
     #[arg(

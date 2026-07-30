@@ -138,6 +138,7 @@ impl ConvertRequest {
                 oci_ref: plan.oci_ref,
                 with_referrer: args.with_referrer,
                 prefetch_patterns,
+                prefetch_pattern_file: args.prefetch_pattern_file.clone(),
                 compressor: args.compressor.clone(),
                 fs_version: plan.fs_version.clone(),
                 fs_align_chunk: args.fs_align_chunk || args.backend_aligned_chunk,
@@ -186,6 +187,10 @@ pub struct NydusDriverConfig {
     pub oci_ref: bool,
     pub with_referrer: bool,
     pub prefetch_patterns: String,
+    /// Access-pattern document handed to `nydus-image optimize` verbatim, when
+    /// `--prefetch-pattern-file` was given. Takes precedence over
+    /// `prefetch_patterns`, which cannot express per-file byte ranges.
+    pub prefetch_pattern_file: Option<PathBuf>,
     pub compressor: String,
     pub fs_version: String,
     pub fs_align_chunk: bool,
@@ -218,6 +223,13 @@ impl NydusDriverConfig {
             (
                 "prefetch_patterns".to_string(),
                 self.prefetch_patterns.clone(),
+            ),
+            (
+                "prefetch_pattern_file".to_string(),
+                self.prefetch_pattern_file
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default(),
             ),
             ("compressor".to_string(), self.compressor.clone()),
             ("fs_version".to_string(), self.fs_version.clone()),

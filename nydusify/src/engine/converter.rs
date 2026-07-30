@@ -743,7 +743,8 @@ fn build_artifact(
 
     // Optional prefetch optimization.
     let prefetch_files = parse_prefetch_files(&request.driver.prefetch_patterns);
-    if !prefetch_files.is_empty() {
+    let pattern_file = request.driver.prefetch_pattern_file.as_deref();
+    if !prefetch_files.is_empty() || pattern_file.is_some() {
         match run_optimize(
             nydus_image,
             workspace,
@@ -751,6 +752,7 @@ fn build_artifact(
             &new_blobs,
             &reused_layers,
             &prefetch_files,
+            pattern_file,
         ) {
             Ok(prefetch_blob) => new_blobs.push(prefetch_blob),
             Err(e) => warn!(error = %e, "prefetch optimize failed; pushing un-optimized bootstrap"),
@@ -829,6 +831,11 @@ fn merge_args(
 
 /// Bake prefetch hints into the bootstrap via `nydus-image optimize`. Returns
 /// the path of the new packed prefetch blob (its file name is the blob id).
+///
+/// `pattern_file`, when present, is a caller-supplied access-pattern document that is used
+/// as-is instead of one synthesised from `prefetch_files`. Copying it rather than parsing and
+/// re-emitting it keeps whatever the recorder wrote — per-file byte `ranges` above all, which
+/// the synthesised form has no way to express.
 fn run_optimize(
     nydus_image: &Path,
     workspace: &Path,
@@ -836,6 +843,7 @@ fn run_optimize(
     new_blobs: &[PathBuf],
     reused_layers: &[PulledLayer],
     prefetch_files: &[String],
+    pattern_file: Option<&Path>,
 ) -> Result<PathBuf> {
     // optimize needs every blob the bootstrap references in one --blob-dir.
     let blob_dir = workspace.join("optimize-blobs");
@@ -851,15 +859,28 @@ fn run_optimize(
     }
 
     let prefetch_json = workspace.join("prefetch.json");
-    let json = serde_json::json!({
-        "version": "v1",
-        "files": prefetch_files
-            .iter()
-            .map(|p| serde_json::json!({ "path": p, "ranges": null }))
-            .collect::<Vec<_>>(),
-    });
-    std::fs::write(&prefetch_json, serde_json::to_vec(&json)?)
-        .with_context(|| format!("write {}", prefetch_json.display()))?;
+    match pattern_file {
+        Some(src) => {
+            std::fs::copy(src, &prefetch_json).with_context(|| {
+                format!(
+                    "stage access-pattern file {} as {}",
+                    src.display(),
+                    prefetch_json.display()
+                )
+            })?;
+        }
+        None => {
+            let json = serde_json::json!({
+                "version": "v1",
+                "files": prefetch_files
+                    .iter()
+                    .map(|p| serde_json::json!({ "path": p, "ranges": null }))
+                    .collect::<Vec<_>>(),
+            });
+            std::fs::write(&prefetch_json, serde_json::to_vec(&json)?)
+                .with_context(|| format!("write {}", prefetch_json.display()))?;
+        }
+    }
 
     let out_blob_dir = workspace.join("optimize-out");
     fresh_dir(&out_blob_dir)?;

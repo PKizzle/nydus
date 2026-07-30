@@ -3,9 +3,10 @@
 // SPDX-License-Identifier: (Apache-2.0 AND BSD-3-Clause)
 
 use std::io::{self, Read};
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tracing::info;
 
 use crate::cli::ConvertArgs;
@@ -38,6 +39,67 @@ pub enum PrefetchInput {
     Root,
     Directory(String),
     StdinPatterns,
+    /// A JSON access-pattern document, passed through to `nydus-image optimize`
+    /// verbatim so its per-file byte ranges survive.
+    PatternFile(PathBuf),
+}
+
+/// The access-pattern document `nydus-image optimize --prefetch-files` consumes.
+///
+/// Parsed only to validate it. The file is handed to the builder byte-for-byte rather than
+/// re-serialised from this type, so a field nydusify does not model yet cannot be silently
+/// dropped on the way through.
+#[derive(Deserialize)]
+struct AccessPatternDoc {
+    #[serde(default)]
+    version: Option<String>,
+    files: Vec<AccessPatternFile>,
+}
+
+#[derive(Deserialize)]
+struct AccessPatternFile {
+    path: String,
+}
+
+/// Reject an access-pattern file that would produce a useless or confusing optimize run.
+///
+/// Worth doing here rather than leaving it to `nydus-image`: a prefetch failure is
+/// deliberately non-fatal during conversion (the image is still published, just un-optimised),
+/// so a typo in this file would otherwise cost a full convert-and-push to discover, and only
+/// as a warning buried in the log.
+fn validate_prefetch_pattern_file(path: &Path) -> Result<()> {
+    let raw = std::fs::read(path)
+        .with_context(|| format!("read --prefetch-pattern-file {}", path.display()))?;
+    let doc: AccessPatternDoc = serde_json::from_slice(&raw).with_context(|| {
+        format!(
+            "parse --prefetch-pattern-file {} (expected {{\"version\":\"v1\",\"files\":[…]}})",
+            path.display()
+        )
+    })?;
+    if let Some(version) = doc.version.as_deref()
+        && version != "v1"
+    {
+        bail!(
+            "--prefetch-pattern-file {} declares version {:?}; only \"v1\" is understood",
+            path.display(),
+            version
+        );
+    }
+    if doc.files.is_empty() {
+        bail!(
+            "--prefetch-pattern-file {} lists no files; omit the flag instead of \
+             asking for an empty prefetch",
+            path.display()
+        );
+    }
+    if let Some(bad) = doc.files.iter().find(|f| !f.path.starts_with('/')) {
+        bail!(
+            "--prefetch-pattern-file {} contains {:?}; paths must be absolute inside the image",
+            path.display(),
+            bad.path
+        );
+    }
+    Ok(())
 }
 
 pub async fn run(args: ConvertArgs) -> Result<()> {
@@ -75,6 +137,16 @@ pub fn plan(args: &ConvertArgs) -> Result<ConvertPlan> {
     if args.prefetch_dir.is_some() && args.prefetch_patterns {
         bail!("--prefetch-dir conflicts with --prefetch-patterns");
     }
+    if let Some(path) = &args.prefetch_pattern_file {
+        if args.prefetch_dir.is_some() {
+            bail!("--prefetch-pattern-file conflicts with --prefetch-dir");
+        }
+        if args.prefetch_patterns {
+            bail!("--prefetch-pattern-file conflicts with --prefetch-patterns");
+        }
+        validate_existing_file(path, "--prefetch-pattern-file")?;
+        validate_prefetch_pattern_file(path)?;
+    }
     if let Some(path) = &args.source_archive {
         validate_existing_file(path, "--source-archive")?;
     }
@@ -101,7 +173,9 @@ pub fn plan(args: &ConvertArgs) -> Result<ConvertPlan> {
         let _ = parse_chunk_dict_reference(chunk_dict)?;
     }
 
-    let prefetch = if args.prefetch_patterns {
+    let prefetch = if let Some(path) = &args.prefetch_pattern_file {
+        PrefetchInput::PatternFile(path.clone())
+    } else if args.prefetch_patterns {
         PrefetchInput::StdinPatterns
     } else if let Some(path) = &args.prefetch_dir {
         PrefetchInput::Directory(path.clone())
@@ -135,6 +209,9 @@ fn read_prefetch_patterns(plan: &ConvertPlan) -> Result<String> {
                 .context("read prefetch patterns from stdin")?;
             Ok(patterns)
         }
+        // The document travels as a path, not as patterns: flattening it to a list of
+        // paths here would discard the per-file ranges that are the reason to use it.
+        PrefetchInput::PatternFile(_) => Ok(String::new()),
     }
 }
 
@@ -297,5 +374,100 @@ mod tests {
 
         let err = plan(&args).unwrap_err();
         assert!(err.to_string().contains("--source-archive"));
+    }
+
+    fn pattern_file(body: &str) -> tempfile::NamedTempFile {
+        use std::io::Write as _;
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(body.as_bytes()).unwrap();
+        f.flush().unwrap();
+        f
+    }
+
+    #[test]
+    fn a_pattern_file_is_accepted_and_selected_over_the_other_prefetch_inputs() {
+        let f = pattern_file(
+            r#"{"version":"v1","files":[{"path":"/usr/bin/app","ranges":[[0,4096]]}]}"#,
+        );
+        let cli = Cli::parse_from([
+            "nydusify",
+            "convert",
+            "--source",
+            "localhost:5000/app:v1",
+            "--target",
+            "localhost:5000/app:v1-nydus",
+            "--prefetch-pattern-file",
+            f.path().to_str().unwrap(),
+        ]);
+        let Commands::Convert(args) = cli.command else {
+            panic!("expected convert")
+        };
+        let plan = plan(&args).unwrap();
+        assert_eq!(plan.prefetch, PrefetchInput::PatternFile(f.path().into()));
+        // The document travels by path; flattening it to patterns would drop the ranges.
+        assert_eq!(read_prefetch_patterns(&plan).unwrap(), "");
+    }
+
+    #[test]
+    fn a_pattern_file_conflicts_with_the_other_prefetch_inputs() {
+        let f = pattern_file(r#"{"version":"v1","files":[{"path":"/a"}]}"#);
+        for (flag, value) in [
+            ("--prefetch-dir", Some("/usr")),
+            ("--prefetch-patterns", None),
+        ] {
+            let mut argv = vec![
+                "nydusify",
+                "convert",
+                "--source",
+                "localhost:5000/app:v1",
+                "--target",
+                "localhost:5000/app:v1-nydus",
+                "--prefetch-pattern-file",
+                f.path().to_str().unwrap(),
+                flag,
+            ];
+            if let Some(v) = value {
+                argv.push(v);
+            }
+            let cli = Cli::parse_from(argv);
+            let Commands::Convert(args) = cli.command else {
+                panic!("expected convert")
+            };
+            let err = plan(&args).unwrap_err().to_string();
+            assert!(err.contains(flag), "{flag}: unexpected error {err}");
+        }
+    }
+
+    #[test]
+    fn a_malformed_pattern_file_is_rejected_before_any_conversion_work() {
+        // Each of these is silently useless if it reaches `nydus-image`, because a failed
+        // optimize only warns and publishes an un-optimised image.
+        let cases = [
+            (r#"not json at all"#, "parse"),
+            (r#"{"version":"v2","files":[{"path":"/a"}]}"#, "v1"),
+            (r#"{"version":"v1","files":[]}"#, "no files"),
+            (
+                r#"{"version":"v1","files":[{"path":"usr/bin/app"}]}"#,
+                "absolute",
+            ),
+        ];
+        for (body, expected) in cases {
+            let f = pattern_file(body);
+            let err = validate_prefetch_pattern_file(f.path())
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains(expected),
+                "body {body:?} should have complained about {expected:?}, said: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_pattern_file_without_a_version_field_is_accepted() {
+        // The field is optional in the document `nydus-image` consumes; only a *wrong*
+        // version is an error.
+        let f = pattern_file(r#"{"files":[{"path":"/a"}]}"#);
+        validate_prefetch_pattern_file(f.path()).unwrap();
     }
 }
