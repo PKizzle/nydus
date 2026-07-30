@@ -19,13 +19,45 @@ use super::common::{
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct ConvertPlan {
+    /// The image reference the conversion is anchored to: the uppermost `--source`
+    /// that is an image. It supplies the runtime config, the platform, and the repo
+    /// that reused blobs are mounted from.
     pub source: String,
+    /// Every source in stacking order, lowest first. A single-entry list is the
+    /// ordinary one-image conversion.
+    pub sources: Vec<SourceSpec>,
     pub target: String,
     pub mode: ConversionMode,
     pub oci_ref: bool,
     pub effective_oci: bool,
     pub fs_version: String,
     pub prefetch: PrefetchInput,
+}
+
+/// One `--source` value, classified.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum SourceSpec {
+    /// An image reference, pulled and converted layer by layer.
+    Image(String),
+    /// A local directory, built into a single nydus layer with
+    /// `nydus-image create --type dir-rafs`.
+    Directory(PathBuf),
+}
+
+/// Decide whether a `--source` value names a local directory or an image.
+///
+/// Existence on disk is the test, and it is deliberately one-way: an image reference
+/// that happens to collide with a directory in the working directory would be
+/// misread, but the reverse -- a directory silently treated as a registry reference --
+/// fails much later and far more confusingly, in a pull against a registry that has
+/// never heard of it.
+fn classify_source(value: &str) -> SourceSpec {
+    let path = Path::new(value);
+    if path.is_dir() {
+        SourceSpec::Directory(path.to_path_buf())
+    } else {
+        SourceSpec::Image(value.to_string())
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -118,12 +150,54 @@ pub async fn run(args: ConvertArgs) -> Result<()> {
 }
 
 pub fn plan(args: &ConvertArgs) -> Result<ConvertPlan> {
+    let sources: Vec<SourceSpec> = args.source.iter().map(|s| classify_source(s)).collect();
+    if sources.is_empty() {
+        bail!("--source is required");
+    }
+    // The uppermost image source anchors the conversion. Without one there is no config
+    // to inherit, no platform to resolve against and no repo to mount reused blobs from,
+    // all of which the pipeline below assumes exist.
+    let anchor = sources
+        .iter()
+        .rev()
+        .find_map(|s| match s {
+            SourceSpec::Image(reference) => Some(reference.clone()),
+            SourceSpec::Directory(_) => None,
+        })
+        .with_context(|| {
+            "every --source is a local directory; at least one must be an image reference, \
+             whose config (env, entrypoint, architecture) the converted image inherits"
+        })?;
+
+    if sources.len() > 1 {
+        // Each of these is incompatible with stacking for a concrete reason, and saying
+        // so up front beats a confusing failure several minutes into a conversion.
+        if args.oci_ref {
+            bail!(
+                "--oci-ref cannot be combined with multiple --source values: zran records \
+                 offsets into each layer's original gzip stream, and a directory source has \
+                 no such stream"
+            );
+        }
+        if args.source_archive.is_some() {
+            bail!(
+                "--source-archive reads a single image; it cannot be combined with multiple --source values"
+            );
+        }
+        if args.all_platforms {
+            bail!(
+                "--all-platforms cannot be combined with multiple --source values: the sources \
+                 are stacked into one image, so exactly one platform is converted (use --platform)"
+            );
+        }
+    }
+
     if args.target.is_some() && args.target_suffix.is_some() {
         bail!("--target conflicts with --target-suffix");
     }
     let target = match (&args.target, &args.target_suffix) {
         (Some(target), None) => target.clone(),
-        (None, Some(suffix)) => add_reference_suffix(&args.source, suffix)?,
+        (None, Some(suffix)) => add_reference_suffix(&anchor, suffix)?,
         (None, None) => bail!("--target or --target-suffix is required"),
         (Some(_), Some(_)) => unreachable!(),
     };
@@ -184,7 +258,8 @@ pub fn plan(args: &ConvertArgs) -> Result<ConvertPlan> {
     };
 
     Ok(ConvertPlan {
-        source: args.source.clone(),
+        source: anchor,
+        sources,
         target,
         mode: if args.reverse {
             ConversionMode::Reverse
@@ -461,6 +536,99 @@ mod tests {
                 "body {body:?} should have complained about {expected:?}, said: {err}"
             );
         }
+    }
+
+    /// Build a convert CLI over `sources`, in order.
+    fn convert_args(sources: &[&str], extra: &[&str]) -> ConvertArgs {
+        let mut argv = vec!["nydusify".to_string(), "convert".to_string()];
+        for s in sources {
+            argv.push("--source".to_string());
+            argv.push((*s).to_string());
+        }
+        argv.push("--target".to_string());
+        argv.push("localhost:5000/app:v1-nydus".to_string());
+        argv.extend(extra.iter().map(|s| (*s).to_string()));
+        let cli = Cli::parse_from(argv);
+        let Commands::Convert(args) = cli.command else {
+            panic!("expected convert")
+        };
+        *args
+    }
+
+    #[test]
+    fn a_single_image_source_plans_exactly_as_before() {
+        let plan = plan(&convert_args(&["localhost:5000/app:v1"], &[])).unwrap();
+        assert_eq!(plan.source, "localhost:5000/app:v1");
+        assert_eq!(
+            plan.sources,
+            vec![SourceSpec::Image("localhost:5000/app:v1".into())]
+        );
+    }
+
+    #[test]
+    fn sources_keep_their_order_and_the_uppermost_image_anchors() {
+        let lower = tempfile::tempdir().unwrap();
+        let upper = tempfile::tempdir().unwrap();
+        let plan = plan(&convert_args(
+            &[
+                lower.path().to_str().unwrap(),
+                "localhost:5000/base:v1",
+                "localhost:5000/app:v2",
+                upper.path().to_str().unwrap(),
+            ],
+            &[],
+        ))
+        .unwrap();
+
+        // Stacking order is preserved verbatim: it is the merge order.
+        assert_eq!(
+            plan.sources,
+            vec![
+                SourceSpec::Directory(lower.path().into()),
+                SourceSpec::Image("localhost:5000/base:v1".into()),
+                SourceSpec::Image("localhost:5000/app:v2".into()),
+                SourceSpec::Directory(upper.path().into()),
+            ]
+        );
+        // ...but the anchor is the uppermost *image*, even with a directory above it.
+        assert_eq!(plan.source, "localhost:5000/app:v2");
+    }
+
+    #[test]
+    fn a_directory_only_conversion_is_refused_with_the_reason() {
+        let d = tempfile::tempdir().unwrap();
+        let err = plan(&convert_args(&[d.path().to_str().unwrap()], &[]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("at least one must be an image"), "got: {err}");
+    }
+
+    #[test]
+    fn a_missing_path_is_treated_as_an_image_reference_not_a_directory() {
+        // Classification is by existence, so a typo'd path becomes a registry
+        // reference and fails at pull time rather than being silently skipped.
+        let plan = plan(&convert_args(&["./no/such/dir"], &[])).unwrap();
+        assert_eq!(
+            plan.sources,
+            vec![SourceSpec::Image("./no/such/dir".into())]
+        );
+    }
+
+    #[test]
+    fn stacking_is_refused_for_the_options_it_cannot_honour() {
+        let d = tempfile::tempdir().unwrap();
+        let sources = ["localhost:5000/app:v1", d.path().to_str().unwrap()];
+        for (flag, needle) in [("--oci-ref", "zran"), ("--all-platforms", "one platform")] {
+            let err = plan(&convert_args(&sources, &[flag]))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains(needle),
+                "{flag} should mention {needle}: {err}"
+            );
+        }
+        // ...and none of them is refused for an ordinary single-source convert.
+        plan(&convert_args(&["localhost:5000/app:v1"], &["--oci-ref"])).unwrap();
     }
 
     #[test]

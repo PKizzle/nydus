@@ -34,7 +34,7 @@ use registry_client::types::Manifest;
 use registry_client::{Descriptor, ImageReference, Index, RegistryClient};
 use tracing::{debug, info, warn};
 
-use crate::commands::convert::ConversionMode;
+use crate::commands::convert::{ConversionMode, SourceSpec};
 use crate::engine::artifact::maybe_push_referrer;
 use crate::engine::bootstrap_layer;
 use crate::engine::containerd_converter::ConvertRequest;
@@ -56,6 +56,39 @@ struct PulledLayer {
     digest: String,
     /// On-disk path of the downloaded layer blob.
     path: PathBuf,
+}
+
+/// One unit of the merge, in stacking order (lowest first).
+///
+/// Layers and directories are interchangeable from `merge`'s point of view: each becomes
+/// one bootstrap, and the merge stacks them in the order given. What differs is only how
+/// the bootstrap is produced.
+#[derive(Clone, Debug)]
+enum BuildInput {
+    /// A layer of a pulled image source.
+    Layer(PulledLayer),
+    /// A local directory, built into a nydus layer directly.
+    Directory(PathBuf),
+}
+
+impl BuildInput {
+    /// A short, filesystem-safe tag for this input's scratch directory.
+    ///
+    /// Only has to be unique among the inputs, and the index prefixed by the caller
+    /// already guarantees that; this exists to keep the workspace readable when a
+    /// conversion is being debugged.
+    fn slug(&self) -> String {
+        match self {
+            BuildInput::Layer(layer) => blob_hex(&layer.digest).to_string(),
+            BuildInput::Directory(dir) => dir
+                .file_name()
+                .map(|n| {
+                    n.to_string_lossy()
+                        .replace(|c: char| !c.is_alphanumeric(), "_")
+                })
+                .unwrap_or_else(|| "dir".to_string()),
+        }
+    }
 }
 
 /// The pulled source image (single platform).
@@ -329,20 +362,30 @@ async fn convert_one_platform(
         .with_context(|| format!("create platform workspace {}", workspace.display()))?;
 
     // ---- pull ----
-    let source = match &request.source_archive {
-        Some(archive) => pull_source_from_archive(request, archive, platform, workspace)?,
-        None => pull_source(request, source_client, source_ref, platform, workspace).await?,
+    let (source, inputs) = match &request.source_archive {
+        Some(archive) => {
+            let source = pull_source_from_archive(request, archive, platform, workspace)?;
+            let inputs = source
+                .layers
+                .iter()
+                .cloned()
+                .map(BuildInput::Layer)
+                .collect();
+            (source, inputs)
+        }
+        None => gather_sources(request, source_client, source_ref, platform, workspace).await?,
     };
     info!(
         source = %source_ref,
         platform = %platform,
-        layers = source.layers.len(),
+        sources = request.sources.len(),
+        inputs = inputs.len(),
         oci_ref = request.driver.oci_ref,
-        "pulled source image; building nydus artifact"
+        "gathered sources; building nydus artifact"
     );
 
     // ---- build (nydus-image subprocess) ----
-    let output = build_artifact(request, &source.layers, workspace)?;
+    let output = build_artifact(request, &inputs, workspace)?;
 
     // ---- push (or write a local archive) ----
     let pushed = match &request.target_archive {
@@ -534,6 +577,60 @@ fn pull_source_from_archive(
     })
 }
 
+/// Walk `--source` in stacking order, producing the merge inputs and the image whose
+/// config the result inherits.
+///
+/// The anchor is the *uppermost* image source, matching the intuition that what you stack
+/// last is what the image is: its config (entrypoint, env, architecture) is the one a
+/// runtime sees, and its repo is where reused blobs are mounted from. `plan()` guarantees
+/// at least one image source exists.
+///
+/// Every image source is pulled with the same client, so the source-side flags
+/// (`--source-insecure`, `--source-plain-http`, credentials) apply to all of them; sources
+/// spread across registries with differing settings are not supported.
+async fn gather_sources(
+    request: &ConvertRequest,
+    client: &RegistryClient,
+    anchor_ref: &ImageReference,
+    platform: &str,
+    workspace: &Path,
+) -> Result<(PulledSource, Vec<BuildInput>)> {
+    let mut inputs = Vec::new();
+    let mut anchor: Option<PulledSource> = None;
+
+    for spec in &request.sources {
+        match spec {
+            SourceSpec::Image(reference) => {
+                // The anchor is already parsed and validated by the caller; re-parsing it
+                // would duplicate the error handling for no benefit.
+                let image_ref = if reference == &request.source {
+                    anchor_ref.clone()
+                } else {
+                    ImageReference::parse(reference)
+                        .with_context(|| format!("parse --source {reference}"))?
+                };
+                let pulled = pull_source(request, client, &image_ref, platform, workspace).await?;
+                inputs.extend(pulled.layers.iter().cloned().map(BuildInput::Layer));
+                anchor = Some(pulled);
+            }
+            SourceSpec::Directory(dir) => {
+                if !dir.is_dir() {
+                    bail!(
+                        "--source {} is not a directory (it was one when the conversion was planned)",
+                        dir.display()
+                    );
+                }
+                inputs.push(BuildInput::Directory(dir.clone()));
+            }
+        }
+    }
+
+    let anchor = anchor.context(
+        "no image source was pulled; --source must include at least one image reference",
+    )?;
+    Ok((anchor, inputs))
+}
+
 async fn pull_source(
     request: &ConvertRequest,
     client: &RegistryClient,
@@ -659,7 +756,7 @@ fn validate_layer_media_types(manifest: &Manifest) -> Result<()> {
 
 fn build_artifact(
     request: &ConvertRequest,
-    layers: &[PulledLayer],
+    inputs: &[BuildInput],
     workspace: &Path,
 ) -> Result<ConversionOutput> {
     let nydus_image = request.driver.builder.as_path();
@@ -667,24 +764,35 @@ fn build_artifact(
     let convert_root = workspace.join("convert");
     std::fs::create_dir_all(&convert_root)?;
 
-    let mut layer_bootstraps = Vec::with_capacity(layers.len());
+    let mut layer_bootstraps = Vec::with_capacity(inputs.len());
     let mut new_blobs = Vec::new();
-    let mut original_blob_ids = Vec::with_capacity(layers.len());
+    let mut original_blob_ids = Vec::with_capacity(inputs.len());
 
-    for (i, layer) in layers.iter().enumerate() {
-        let out_dir = convert_root.join(format!("l{i}-{}", blob_hex(&layer.digest)));
+    for (i, input) in inputs.iter().enumerate() {
+        let out_dir = convert_root.join(format!("l{i}-{}", input.slug()));
         fresh_dir(&out_dir)?;
         let bootstrap_i = out_dir.join("bootstrap");
-        let args = if request.driver.oci_ref {
-            targz_ref_args(&layer.path, &bootstrap_i, &out_dir, fs_version)
-        } else {
-            targz_rafs_args(
+        let args = match input {
+            BuildInput::Layer(layer) if request.driver.oci_ref => {
+                targz_ref_args(&layer.path, &bootstrap_i, &out_dir, fs_version)
+            }
+            BuildInput::Layer(layer) => targz_rafs_args(
                 &layer.path,
                 &bootstrap_i,
                 &out_dir,
                 fs_version,
                 &request.driver.compressor,
-            )
+            ),
+            // A directory is built straight into a nydus layer. `--oci-ref` is
+            // rejected for multi-source conversions precisely because there is no
+            // original gzip stream here for zran to index into.
+            BuildInput::Directory(dir) => dir_rafs_args(
+                dir,
+                &bootstrap_i,
+                &out_dir,
+                fs_version,
+                &request.driver.compressor,
+            ),
         };
         run_nydus_image(nydus_image, &args, "create")?;
         // A layer with no file content -- only directories, or only whiteouts --
@@ -723,7 +831,10 @@ fn build_artifact(
         if let Some(blob) = blob {
             new_blobs.push(blob);
         }
-        original_blob_ids.push(blob_hex(&layer.digest).to_string());
+        // Only consumed on the `--oci-ref` path, which never sees a directory input.
+        if let BuildInput::Layer(layer) = input {
+            original_blob_ids.push(blob_hex(&layer.digest).to_string());
+        }
     }
 
     // Merge the per-layer bootstraps (lower->upper) into one.
@@ -736,7 +847,13 @@ fn build_artifact(
     run_nydus_image(nydus_image, &margs, "merge")?;
 
     let reused_layers = if request.driver.oci_ref {
-        layers.to_vec()
+        inputs
+            .iter()
+            .filter_map(|i| match i {
+                BuildInput::Layer(l) => Some(l.clone()),
+                BuildInput::Directory(_) => None,
+            })
+            .collect()
     } else {
         Vec::new()
     };
@@ -788,6 +905,33 @@ fn targz_ref_args(
 }
 
 /// `nydus-image create --type targz-rafs` (standard, new data blob) args.
+/// `nydus-image create --type dir-rafs` args for a local directory source.
+///
+/// `dir-rafs` walks the directory itself rather than a tar stream, so the directory is
+/// the image content as-is: no whiteouts, no layer semantics, just files.
+fn dir_rafs_args(
+    dir: &Path,
+    bootstrap_out: &Path,
+    blob_out_dir: &Path,
+    fs_version: &str,
+    compressor: &str,
+) -> Vec<OsString> {
+    vec![
+        "create".into(),
+        "--type".into(),
+        "dir-rafs".into(),
+        "--fs-version".into(),
+        fs_version.into(),
+        "--compressor".into(),
+        compressor.into(),
+        "-B".into(),
+        bootstrap_out.into(),
+        "-D".into(),
+        blob_out_dir.into(),
+        dir.into(),
+    ]
+}
+
 fn targz_rafs_args(
     layer: &Path,
     bootstrap_out: &Path,
@@ -1304,14 +1448,27 @@ fn layer_bootstrap_path(out_dir: &Path, blob: Option<&Path>) -> Result<Option<Pa
 /// Return the single file in `dir` other than `exclude`, or `None` when the dir
 /// holds nothing else. More than one candidate in a freshly-wiped private dir
 /// means `nydus-image` produced unexpected output — a real bug, surfaced.
+///
+/// Sidecars of `exclude` — a sibling named `<exclude>.<something>` — are excluded too.
+/// `--type dir-rafs` writes a `bootstrap.external` next to the bootstrap where
+/// `targz-rafs` writes nothing of the kind, and without this a directory source would
+/// always fail here with "produced unexpected output" rather than yielding its blob.
 fn single_output(dir: &Path, exclude: Option<&Path>) -> Result<Option<PathBuf>> {
     let exclude_name = exclude.and_then(Path::file_name);
+    let sidecar_prefix = exclude_name
+        .and_then(|n| n.to_str())
+        .map(|n| format!("{n}."));
     let mut found = None;
     for entry in
         std::fs::read_dir(dir).with_context(|| format!("reading output dir {}", dir.display()))?
     {
         let entry = entry?;
         if !entry.path().is_file() || Some(entry.file_name().as_os_str()) == exclude_name {
+            continue;
+        }
+        if let (Some(prefix), Some(name)) = (&sidecar_prefix, entry.file_name().to_str())
+            && name.starts_with(prefix.as_str())
+        {
             continue;
         }
         if found.is_some() {
@@ -1555,6 +1712,24 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let bootstrap = dir.path().join("bootstrap");
         std::fs::write(&bootstrap, b"boot").unwrap();
+        let blob = dir.path().join("deadbeef");
+        std::fs::write(&blob, b"data").unwrap();
+
+        assert_eq!(
+            single_output(dir.path(), Some(&bootstrap)).unwrap(),
+            Some(blob)
+        );
+    }
+
+    #[test]
+    fn single_output_ignores_the_bootstrap_sidecar_a_directory_source_produces() {
+        // `nydus-image create --type dir-rafs` writes `bootstrap.external` beside the
+        // bootstrap; `targz-rafs` does not. Counting it as a second output made every
+        // directory source fail with "produced unexpected output".
+        let dir = tempfile::tempdir().unwrap();
+        let bootstrap = dir.path().join("bootstrap");
+        std::fs::write(&bootstrap, b"boot").unwrap();
+        std::fs::write(dir.path().join("bootstrap.external"), b"ext").unwrap();
         let blob = dir.path().join("deadbeef");
         std::fs::write(&blob, b"data").unwrap();
 

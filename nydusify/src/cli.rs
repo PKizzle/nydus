@@ -221,8 +221,14 @@ impl BackendType {
 
 #[derive(Clone, Debug, Eq, PartialEq, Args)]
 pub struct ConvertArgs {
-    #[arg(long, env = "SOURCE")]
-    pub source: String,
+    /// What to convert. Repeatable, in stacking order (lowest first): each value is
+    /// either an image reference or a path to a local directory, and the result is one
+    /// nydus image whose layers are their concatenation.
+    ///
+    /// At least one image reference is required even when stacking directories on top —
+    /// the uppermost one supplies the runtime config (env, entrypoint, architecture).
+    #[arg(long, env = "SOURCE", required = true, num_args = 1)]
+    pub source: Vec<String>,
     #[arg(long = "source-archive", env = "SOURCE_ARCHIVE")]
     pub source_archive: Option<PathBuf>,
     #[arg(long, env = "TARGET")]

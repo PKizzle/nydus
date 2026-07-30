@@ -21,7 +21,7 @@ use tracing::info;
 
 use crate::cli::{BackendType, ConvertArgs};
 use crate::commands::common::{parse_chunk_dict_reference, resolve_backend_config};
-use crate::commands::convert::{ConversionMode, ConvertPlan};
+use crate::commands::convert::{ConversionMode, ConvertPlan, SourceSpec};
 
 /// Converter backend contract. `convert` is an `async fn` in the trait (AFIT);
 /// the single implementor ([`ContainerdConverter`]) is dispatched statically,
@@ -54,7 +54,11 @@ impl ImageConverter for ContainerdConverter {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct ConvertRequest {
+    /// The image reference the conversion is anchored to (the uppermost image `--source`).
     pub source: String,
+    /// Every `--source` in stacking order, lowest first. One entry is the ordinary
+    /// single-image conversion; more than one stacks directories and images together.
+    pub sources: Vec<SourceSpec>,
     pub source_archive: Option<PathBuf>,
     pub target: String,
     pub target_archive: Option<PathBuf>,
@@ -97,6 +101,7 @@ impl ConvertRequest {
 
         Ok(Self {
             source: plan.source.clone(),
+            sources: plan.sources.clone(),
             source_archive: args.source_archive.clone(),
             target: plan.target.clone(),
             target_archive: args.target_archive.clone(),
