@@ -384,6 +384,96 @@ else
 fi
 
 # ===========================================================================
+# C14 — a fully-cached blob loses its mark, and warm reads stop reaching the daemon
+# ===========================================================================
+# A `FAN_PRE_ACCESS` mark suppresses kernel readahead on the file it guards, so leaving one
+# armed over a blob that is already complete costs every later read both a round trip through
+# the daemon and the readahead it would otherwise have had. `disarm_if_complete` drops the
+# mark once the cache holds every byte.
+#
+# The failure mode this guards against is silence: if `is_all_data_ready()` never actually
+# latches in practice, nothing breaks and no test notices -- the optimisation simply never
+# happens. So this case measures the effect rather than the intent:
+#
+#   1. a FAN_MARK_REMOVE really is issued after the blob fills;
+#   2. a subsequent cold-page read delivers NO further pre-content events. That is the whole
+#      point: warm reads served straight from the device with the daemon uninvolved.
+#
+# Ordering, not sampling, is what makes (2) trustworthy -- strace's output is only reliably
+# flushed at teardown, so the check is "no successful group-fd read appears after the last
+# FAN_MARK_REMOVE line" rather than a count taken mid-run.
+step "C14: a fully-cached blob is unmarked"
+
+teardown
+
+if ! command -v strace >/dev/null; then
+  note "SKIP: strace not installed"
+else
+  rm -rf "$ROOT/stage-c14"; mkdir -p "$ROOT/stage-c14"
+  cp "$ROOT/out/bootstrap" "$ROOT/stage-c14/bootstrap"
+  cp "$ROOT/out/$BLOB" "$ROOT/backend/$BLOB"
+
+  write_config "$ROOT/stage-c14" \
+    "\"backend_type\": \"localfs\",
+    \"backend_config\": { \"dir\": \"$ROOT/backend\" }"
+
+  C14_STRACE="$ROOT/strace-c14.log"
+  sudo strace -f -y -o "$C14_STRACE" -e trace=fanotify_mark,read \
+    "$ND" singleton --config "$ROOT/config.json" \
+    --fanotify "$ROOT/stage-c14" --fanotify-mountpoint "$ROOT/mnt" --fanotify-threads 2 \
+    --log-level info > "$ROOT/nydusd-c14.log" 2>&1 &
+  sleep 6
+
+  if ! mount | grep -qi "on $ROOT/mnt .*erofs"; then
+    echo "--- nydusd-c14.log ---"; tail -40 "$ROOT/nydusd-c14.log"
+    case_fail "C14: EROFS not mounted"
+  else
+    # Cold read of the whole file: every chunk of the blob is fetched, which is what
+    # latches the all-ready flag and triggers the unmark.
+    C14_COLD=$(timeout 60 sha256sum "$ROOT/mnt/hello.txt" 2>/dev/null | awk '{print $1}')
+    [ "$C14_COLD" = "$SRC_HELLO" ] \
+      && case_pass "C14: cold read correct (blob now fully cached)" \
+      || case_fail "C14: cold read mismatch (src=$SRC_HELLO mnt=$C14_COLD)"
+
+    sleep 1
+    # Evict the page cache so the warm read really goes back to the device; without this
+    # it is answered from cache and would raise no events whether or not we unmarked.
+    sync; echo 3 | sudo tee /proc/sys/vm/drop_caches >/dev/null 2>&1 \
+      || note "WARNING: could not drop the page cache; the warm-read check may be vacuous"
+
+    C14_WARM=$(timeout 60 sha256sum "$ROOT/mnt/hello.txt" 2>/dev/null | awk '{print $1}')
+    [ "$C14_WARM" = "$SRC_HELLO" ] \
+      && case_pass "C14: warm read still correct after the mark was dropped" \
+      || case_fail "C14: warm read mismatch (src=$SRC_HELLO mnt=$C14_WARM)"
+
+    sleep 1
+    teardown   # flush strace
+
+    # (1) The unmark happened. FAN_MARK_REMOVE is 0x2; strace renders the flags symbolically.
+    if grep -qE 'fanotify_mark\([0-9]+[^,]*, *FAN_MARK_REMOVE' "$C14_STRACE"; then
+      case_pass "C14: FAN_MARK_REMOVE issued once the blob was complete"
+    else
+      case_fail "C14: no FAN_MARK_REMOVE — the blob never latched all-ready, so the mark was never dropped"
+      note "fanotify_mark calls seen:"
+      grep -oE 'fanotify_mark\([0-9]+[^)]*\)' "$C14_STRACE" | sed 's/,.*AT_FDCWD.*//' | sort -u | head -4
+    fi
+
+    # (2) And nothing reached the daemon afterwards. Successful reads only: the workers poll
+    # the non-blocking group fd continuously and those EAGAIN returns are not events.
+    last_remove=$(grep -nE 'fanotify_mark\([0-9]+[^,]*, *FAN_MARK_REMOVE' "$C14_STRACE" \
+      | tail -1 | cut -d: -f1)
+    if [ -n "$last_remove" ]; then
+      after=$(tail -n "+$((last_remove + 1))" "$C14_STRACE" \
+        | grep -cE 'read\([0-9]+<anon_inode:\[fanotify\]>.*\)[[:space:]]*=[[:space:]]*[1-9]')
+      note "pre-content events delivered after the unmark: $after"
+      [ "$after" = "0" ] \
+        && case_pass "C14: warm reads bypassed the daemon entirely" \
+        || case_fail "C14: $after event(s) still reached the daemon after unmarking"
+    fi
+  fi
+fi
+
+# ===========================================================================
 step "SUMMARY"
 if [ "$FAILURES" = 0 ]; then
   echo "==== FANOTIFY PRE-CONTENT CASES: PASS ===="

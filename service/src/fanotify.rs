@@ -114,6 +114,55 @@ struct BlobBacking {
     /// that were just discarded, which is served to the next reader as zeros. Per-blob rather
     /// than global so invalidating one blob does not stall reads of the others.
     io_lock: RwLock<()>,
+    /// Whether this blob's `FAN_PRE_ACCESS` mark is believed to be armed.
+    ///
+    /// Only ever a syscall-avoidance hint, never a correctness input: [`FanotifyHandler::arm`]
+    /// clears it for blobs that were already complete at startup and
+    /// [`FanotifyHandler::disarm_if_complete`] clears it once a blob finishes filling, but
+    /// [`FanotifyHandler::invalidate`] re-marks *unconditionally* rather than consulting it.
+    /// So a stale value in either direction costs at most one redundant `fanotify_mark`, and
+    /// cannot leave an unmarked blob whose bytes are about to be punched away.
+    armed: AtomicBool,
+}
+
+impl BlobBacking {
+    /// Add or remove this blob's `FAN_PRE_ACCESS` mark.
+    ///
+    /// The mark goes on the cache file's own descriptor (`dirfd` with a `NULL` path) rather
+    /// than on the `blob_<i>` device path. The two are hardlinks to one inode -- the invariant
+    /// the whole path rests on -- so they are the same object to fanotify, and a descriptor we
+    /// already hold cannot be raced by a rename the way a path lookup can.
+    fn set_mark(&self, fan_fd: RawFd, flags: u32) -> Result<()> {
+        let ret = unsafe {
+            libc::fanotify_mark(
+                fan_fd,
+                flags,
+                FAN_PRE_ACCESS,
+                self.blob.file().as_raw_fd(),
+                std::ptr::null(),
+            )
+        };
+        if ret != 0 {
+            let err = std::io::Error::last_os_error();
+            // Removing a mark that is already gone is the outcome we wanted.
+            if flags & libc::FAN_MARK_REMOVE != 0 && err.raw_os_error() == Some(libc::ENOENT) {
+                return Ok(());
+            }
+            return Err(err);
+        }
+        Ok(())
+    }
+
+    /// Whether every byte of this blob is already in its cache file.
+    ///
+    /// `false` whenever the answer is unavailable, which keeps the mark armed -- the direction
+    /// that costs performance rather than correctness.
+    fn is_fully_cached(&self) -> bool {
+        self.blob
+            .blob()
+            .get_blob_object()
+            .is_some_and(|obj| obj.is_all_data_ready())
+    }
 }
 
 /// Map a serve error to the errno carried in a `FAN_DENY_ERRNO` response.
@@ -514,6 +563,7 @@ impl FanotifyHandler {
                     ino,
                     blob: AssertBlobThreadSafe(blob),
                     io_lock: RwLock::new(()),
+                    armed: AtomicBool::new(false),
                 }),
                 Err(e) => warn!(
                     "fanotify: failed to stat backing file for blob {}: {}",
@@ -581,10 +631,18 @@ impl FanotifyHandler {
     /// fully materialised, so marking it would just add allow-only events on every metadata read.
     /// `FAN_OPEN_PERM` is deliberately *not* requested: only content reads need to block; making
     /// every open block would stall the mount and the daemon's own descriptors.
+    ///
+    /// A blob whose cache is *already complete* is not marked at all. Every event it could raise
+    /// would be answered `FAN_ALLOW` after a no-op fetch, and the mark's real cost is not that
+    /// round trip but that a pre-content mark suppresses kernel readahead on the file it guards.
+    /// Leaving one armed over a fully-cached blob therefore slows down exactly the reads that
+    /// need the daemon least. See [`Self::disarm_if_complete`] for the same decision taken later,
+    /// once a blob finishes filling while the mount is live.
     pub fn arm(&self) -> Result<()> {
-        let mask = FAN_PRE_ACCESS;
-        let mark_flags = libc::FAN_MARK_ADD;
-        for blob_path in self.device_blobs.iter() {
+        // `device_blobs[i]` is the hardlink to `blob_backings[i]`'s cache file: the vector is
+        // built from the backings, in order, immediately after they are sorted.
+        debug_assert_eq!(self.device_blobs.len(), self.blob_backings.len());
+        for (backing, blob_path) in self.blob_backings.iter().zip(self.device_blobs.iter()) {
             // A missing device file is always pathological — assemble() just created
             // every entry in `device_blobs`. Skipping it would leave the sparse file
             // unmarked, and EROFS would then silently serve zeros for that blob (the
@@ -599,26 +657,64 @@ impl FanotifyHandler {
                     ),
                 ));
             }
-            let path_c = std::ffi::CString::new(blob_path.as_os_str().as_encoded_bytes())
-                .map_err(|e| std::io::Error::new(ErrorKind::InvalidInput, e))?;
-            let ret = unsafe {
-                libc::fanotify_mark(
-                    self.fan_fd.as_raw_fd(),
-                    mark_flags,
-                    mask,
-                    libc::AT_FDCWD,
-                    path_c.as_ptr(),
-                )
-            };
-            if ret != 0 {
-                return Err(std::io::Error::other(format!(
-                    "fanotify_mark on {:?} failed: {}",
-                    blob_path,
-                    std::io::Error::last_os_error()
-                )));
+            if backing.is_fully_cached() {
+                info!(
+                    "fanotify: blob {} is already fully cached; leaving it unmarked so the \
+                     kernel can read it ahead",
+                    backing.blob.blob_info().blob_id()
+                );
+                continue;
             }
+            backing
+                .set_mark(self.fan_fd.as_raw_fd(), libc::FAN_MARK_ADD)
+                .map_err(|e| {
+                    std::io::Error::other(format!("fanotify_mark on {:?} failed: {}", blob_path, e))
+                })?;
+            backing.armed.store(true, Ordering::Release);
         }
         Ok(())
+    }
+
+    /// Drop a blob's mark once its cache holds every byte.
+    ///
+    /// Called after a fetch has completed, while the caller still holds the blob's `io_lock`
+    /// **shared** -- which is what makes this safe against [`Self::invalidate`], since that takes
+    /// the same lock exclusively and so cannot be punching bytes out from under a blob we are
+    /// in the middle of unmarking.
+    ///
+    /// Failure is logged and swallowed. The mark staying on is the status quo, not a hazard, and
+    /// a read that has just been served correctly must not be turned into a denial because an
+    /// optimisation could not be applied.
+    fn disarm_if_complete(&self, backing: &BlobBacking) {
+        if !backing.armed.load(Ordering::Acquire) || !backing.is_fully_cached() {
+            return;
+        }
+        // Whichever worker wins the swap issues the syscall; the rest return immediately.
+        if backing
+            .armed
+            .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        let blob_id = backing.blob.blob_info().blob_id();
+        match backing.set_mark(self.fan_fd.as_raw_fd(), libc::FAN_MARK_REMOVE) {
+            Ok(()) => info!(
+                "fanotify: blob {} is fully cached; dropped its mark so later reads bypass \
+                 the daemon entirely",
+                blob_id
+            ),
+            Err(e) => {
+                // Restore the hint. Believing a mark is armed when it is not merely costs
+                // `invalidate` a redundant `FAN_MARK_ADD`; it re-marks unconditionally either
+                // way, so neither value can strand a blob unmarked over punched-out bytes.
+                backing.armed.store(true, Ordering::Release);
+                warn!(
+                    "fanotify: could not drop the mark on blob {}: {}",
+                    blob_id, e
+                );
+            }
+        }
     }
 
     /// Mount the EROFS filesystem after all marks are in place.
@@ -1138,14 +1234,24 @@ impl FanotifyHandler {
             .map_err(|_| std::io::Error::other("fanotify: blob io lock poisoned"))?;
         obj.fetch_range_uncompressed(range.offset, count)?;
 
+        // That fetch may have been the one that completed the blob. Still under the shared
+        // `io_lock`, so this cannot interleave with an invalidation.
+        self.disarm_if_complete(backing);
+
         Ok(())
     }
 
     /// Invalidate the on-demand cache for a blob, so its data is fetched afresh on next access.
     ///
-    /// Two things make the cached data "present", and **both** have to be revoked, in this
+    /// Three things make the cached data "present", and **all** have to be revoked, in this
     /// order:
     ///
+    /// 0. the `FAN_PRE_ACCESS` mark, which [`Self::arm`] and [`Self::disarm_if_complete`] drop
+    ///    from blobs whose cache is complete. An unmarked blob raises no event, so punching its
+    ///    bytes without re-marking first hands the next reader a hole full of zeros -- the exact
+    ///    corruption this path exists to prevent. Re-marking is unconditional rather than
+    ///    conditional on [`BlobBacking::armed`]: `FAN_MARK_ADD` on an already-marked inode is a
+    ///    no-op, so doing it always is both cheaper to reason about and immune to a stale hint.
     /// 1. the chunk map, which records which chunks have been fetched. The fetch path consults
     ///    it first ([`is_range_all_ready`] short-circuits, and every chunk goes through
     ///    `check_ready_and_mark_pending`), so a stale map means a `FAN_PRE_ACCESS` event is
@@ -1158,11 +1264,6 @@ impl FanotifyHandler {
     /// The reverse order's window is "map says ready, bytes gone", which the kernel serves to
     /// the reader as zeros: silent corruption, and precisely what the pre-content path exists
     /// to prevent. The `io_lock` closes the matching race against fetches already in flight.
-    ///
-    /// Note the mark itself is deliberately left armed. Should a future change stop arming
-    /// fully-cached blobs (so the kernel can readahead them again), un-arming must be reversed
-    /// *here*, before step 2 — an unmarked blob whose bytes are punched away raises no event
-    /// and reads as zeros.
     ///
     /// [`is_range_all_ready`]: nydus_storage::cache::state::RangeMap::is_range_all_ready
     pub fn invalidate(&self, blob_id: String) -> Result<()> {
@@ -1190,6 +1291,19 @@ impl FanotifyHandler {
         let fd = backing.blob.file().as_raw_fd();
 
         invalidate_in_order(
+            // Step 0 — re-arm, so the punched blob raises events again.
+            || {
+                backing
+                    .set_mark(self.fan_fd.as_raw_fd(), libc::FAN_MARK_ADD)
+                    .map(|()| backing.armed.store(true, Ordering::Release))
+                    .map_err(|e| {
+                        std::io::Error::other(format!(
+                            "fanotify: cannot re-arm the mark on blob {}: {}; \
+                             refusing to punch its cache (would serve zeros)",
+                            blob_id, e
+                        ))
+                    })
+            },
             // Step 1 — revoke the readiness bookkeeping.
             || {
                 obj.reset_data_ready().map_err(|e| {
@@ -1226,19 +1340,23 @@ impl FanotifyHandler {
     }
 }
 
-/// Run a cache invalidation in the only safe order: revoke the readiness bookkeeping, *then*
-/// discard the bytes.
+/// Run a cache invalidation in the only safe order: re-arm the mark, revoke the readiness
+/// bookkeeping, *then* discard the bytes.
 ///
 /// Factored out of [`FanotifyHandler::invalidate`] so both the ordering and the fail-closed
 /// behaviour are unit-testable without a live blob or a 6.14 kernel.
 ///
-/// If readiness cannot be revoked the bytes MUST stay: punching them while the chunk map still
-/// claims they are cached is exactly what makes a later reader see zeros. Leaving a populated
-/// cache in place is merely wasteful, so the failure direction is the safe one.
+/// Every step is a promise that the data is present, and each must be withdrawn before the
+/// bytes go away. If either withdrawal fails the bytes MUST stay: punching them while the mark
+/// is off (no event is raised at all) or while the chunk map still claims they are cached is
+/// exactly what makes a later reader see zeros. Leaving a populated cache in place is merely
+/// wasteful, so the failure direction is the safe one.
 fn invalidate_in_order(
+    rearm_mark: impl FnOnce() -> Result<()>,
     revoke_ready: impl FnOnce() -> Result<()>,
     discard_bytes: impl FnOnce() -> Result<()>,
 ) -> Result<()> {
+    rearm_mark()?;
     revoke_ready()?;
     discard_bytes()
 }
@@ -1559,13 +1677,18 @@ mod tests {
     }
 
     #[test]
-    fn invalidation_revokes_readiness_before_discarding_bytes() {
+    fn invalidation_rearms_and_revokes_readiness_before_discarding_bytes() {
         use std::cell::RefCell;
 
-        // The reverse order leaves a window in which the chunk map claims data is cached and
-        // the bytes are already gone — which the kernel serves to the reader as zeros.
+        // Both promises that the data is present — the mark being off, and the chunk map
+        // saying "ready" — must be withdrawn before the bytes go. Either one left standing
+        // over a punched cache is served to the reader as zeros.
         let log = RefCell::new(Vec::new());
         invalidate_in_order(
+            || {
+                log.borrow_mut().push("rearm");
+                Ok(())
+            },
             || {
                 log.borrow_mut().push("revoke");
                 Ok(())
@@ -1576,7 +1699,40 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(*log.borrow(), vec!["revoke", "discard"]);
+        assert_eq!(*log.borrow(), vec!["rearm", "revoke", "discard"]);
+    }
+
+    #[test]
+    fn invalidation_keeps_the_bytes_when_the_mark_cannot_be_rearmed() {
+        use std::cell::Cell;
+
+        // Fail-closed, and the reason this step is first: an unmarked blob raises no
+        // pre-content event at all, so punching its cache is not a wasted re-fetch but a
+        // silent read of zeros. Nothing after the failed re-arm may run.
+        let revoked = Cell::new(false);
+        let discarded = Cell::new(false);
+        let err = invalidate_in_order(
+            || Err(std::io::Error::other("mark target vanished")),
+            || {
+                revoked.set(true);
+                Ok(())
+            },
+            || {
+                discarded.set(true);
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        assert!(
+            !revoked.get(),
+            "readiness was revoked despite a failed re-arm"
+        );
+        assert!(
+            !discarded.get(),
+            "bytes were discarded despite a failed re-arm"
+        );
+        assert!(err.to_string().contains("vanished"), "unexpected: {err}");
     }
 
     #[test]
@@ -1588,6 +1744,7 @@ mod tests {
         // to prevent.
         let discarded = Cell::new(false);
         let err = invalidate_in_order(
+            || Ok(()),
             || Err(std::io::Error::other("chunk map is read-only")),
             || {
                 discarded.set(true);
