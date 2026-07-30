@@ -438,8 +438,13 @@ else
     sleep 1
     # Evict the page cache so the warm read really goes back to the device; without this
     # it is answered from cache and would raise no events whether or not we unmarked.
-    sync; echo 3 | sudo tee /proc/sys/vm/drop_caches >/dev/null 2>&1 \
-      || note "WARNING: could not drop the page cache; the warm-read check may be vacuous"
+    # A failure here is fatal, not a warning: without the eviction the warm read is answered
+    # from the page cache and raises no events whether or not the unmark worked, so the two
+    # checks below would pass for the wrong reason.
+    sync
+    if ! echo 3 | sudo tee /proc/sys/vm/drop_caches >/dev/null 2>&1; then
+      case_fail "C14: could not drop the page cache; the warm-read checks would be vacuous"
+    fi
 
     C14_WARM=$(timeout 60 sha256sum "$ROOT/mnt/hello.txt" 2>/dev/null | awk '{print $1}')
     [ "$C14_WARM" = "$SRC_HELLO" ] \
@@ -463,8 +468,21 @@ else
     last_remove=$(grep -nE 'fanotify_mark\([0-9]+[^,]*, *FAN_MARK_REMOVE' "$C14_STRACE" \
       | tail -1 | cut -d: -f1)
     if [ -n "$last_remove" ]; then
-      after=$(tail -n "+$((last_remove + 1))" "$C14_STRACE" \
-        | grep -cE 'read\([0-9]+<anon_inode:\[fanotify\]>.*\)[[:space:]]*=[[:space:]]*[1-9]')
+      # With `-f` and two workers a read can be split across two lines --
+      #   PID read(4<anon_inode:[fanotify]>, <unfinished ...>
+      #   PID <... read resumed>0x..., 8192) = 72
+      # -- and the resumed half carries the return value but not the fd annotation. Counting
+      # only the single-line form would silently miss exactly the events this check exists to
+      # catch, so pair the halves by pid instead. Only the group fd is counted: the daemon
+      # reads plenty of other descriptors, and a bare `read resumed` says nothing about which.
+      after=$(tail -n "+$((last_remove + 1))" "$C14_STRACE" | awk '
+        /read\([0-9]+<anon_inode:\[fanotify\]>/ && /<unfinished \.\.\.>/ { pending[$1] = 1; next }
+        /read\([0-9]+<anon_inode:\[fanotify\]>/ { if ($0 ~ /=[[:space:]]*[1-9]/) n++; next }
+        /<\.\.\. read resumed>/ {
+          if (pending[$1] && $0 ~ /=[[:space:]]*[1-9]/) n++
+          delete pending[$1]; next
+        }
+        END { print n+0 }')
       note "pre-content events delivered after the unmark: $after"
       [ "$after" = "0" ] \
         && case_pass "C14: warm reads bypassed the daemon entirely" \

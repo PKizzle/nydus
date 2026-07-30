@@ -12,7 +12,12 @@ EROFS + `fscache` (`cachefiles`) on-demand path, which has been removed.
 
 1. The daemon opens a fanotify group with `FAN_CLASS_PRE_CONTENT` and places a `FAN_PRE_ACCESS`
    mark — **only** that; never `FAN_OPEN_PERM`, which would block every open including the
-   daemon's own — on every sparse data blob in the staging directory.
+   daemon's own — on each sparse data blob in the staging directory whose cache is not already
+   complete. A blob that is already fully cached is left unmarked, and a blob is unmarked again
+   as soon as its cache fills: a pre-content mark suppresses kernel readahead on the file it
+   guards, so keeping one over a complete blob would slow down precisely the reads that no
+   longer need the daemon. Marks are placed on the cache file's own descriptor rather than on
+   the `blob_<i>` device path; the two are hardlinks to one inode.
 2. It mounts the image with the in-kernel EROFS driver. The **bootstrap is the mount source**; the
    data blobs are `device=` options in device-table order:
    `mount("<bootstrap>", <mountpoint>, "erofs", MS_RDONLY|MS_NODEV|MS_NOSUID,

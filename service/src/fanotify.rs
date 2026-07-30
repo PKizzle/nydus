@@ -7,8 +7,11 @@
 //! [`FanotifyHandler`] works by:
 //! 1. Creating a fanotify group with `FAN_CLASS_PRE_CONTENT`.
 //! 2. Placing marks (`FAN_PRE_ACCESS` **only** — never `FAN_OPEN_PERM`, which would
-//!    block every open including the daemon's own) on the sparse data-blob device
-//!    files (hardlinks of each blob's `.blob.data` cache file — same inode).
+//!    block every open including the daemon's own) on each sparse data blob that is
+//!    not already fully cached. The mark goes on the blob's `.blob.data` cache file,
+//!    which is the same inode as its `blob_<i>` EROFS device file. A blob is unmarked
+//!    again once its cache fills, so warm reads bypass the daemon and regain kernel
+//!    readahead — see [`FanotifyHandler::disarm_if_complete`].
 //! 3. Issuing a file-backed EROFS mount with the **bootstrap as the mount source**
 //!    and the data blobs as `device=` options:
 //!    `mount("<bootstrap>", mountpoint, "erofs", MS_RDONLY|MS_NODEV|MS_NOSUID,
@@ -122,6 +125,10 @@ struct BlobBacking {
     /// [`FanotifyHandler::invalidate`] re-marks *unconditionally* rather than consulting it.
     /// So a stale value in either direction costs at most one redundant `fanotify_mark`, and
     /// cannot leave an unmarked blob whose bytes are about to be punched away.
+    ///
+    /// The one place the hint is not merely an optimisation of itself is
+    /// [`FanotifyHandler::from_restored_fd`], which inherits live marks without calling `arm()`
+    /// and so must set this explicitly; see the note there.
     armed: AtomicBool,
 }
 
@@ -480,13 +487,26 @@ impl FanotifyHandler {
         threads: usize,
         fan_file: File,
     ) -> Result<Self> {
-        Self::assemble(
+        let handler = Self::assemble(
             blob_dir,
             mountpoint,
             blob_cache_mgr,
             threads,
             OwnedFd::from(fan_file),
-        )
+        )?;
+
+        // `assemble` starts every backing at `armed == false`, which is right for a fresh group
+        // whose marks `arm()` has yet to place. Here the marks came across with the fd, and this
+        // path deliberately never calls `arm()` -- so leaving the hint at `false` would make
+        // `disarm_if_complete` short-circuit forever and silently cost the successor daemon the
+        // whole optimisation. Claiming armed for a blob the predecessor had already disarmed is
+        // the harmless direction: the redundant `FAN_MARK_REMOVE` answers `ENOENT`, which
+        // `set_mark` already treats as success.
+        for backing in &handler.blob_backings {
+            backing.armed.store(true, Ordering::Release);
+        }
+
+        Ok(handler)
     }
 
     /// Assemble the in-memory handler state around an already-created fanotify group `fan_fd`.
@@ -640,8 +660,15 @@ impl FanotifyHandler {
     /// once a blob finishes filling while the mount is live.
     pub fn arm(&self) -> Result<()> {
         // `device_blobs[i]` is the hardlink to `blob_backings[i]`'s cache file: the vector is
-        // built from the backings, in order, immediately after they are sorted.
-        debug_assert_eq!(self.device_blobs.len(), self.blob_backings.len());
+        // built from the backings, in order, immediately after they are sorted. A hard assert
+        // rather than a `debug_assert`, because the release build is where it would matter:
+        // `zip` stops at the shorter vector, so a divergence here would silently leave the tail
+        // blobs unmarked and hand their reads to EROFS as zeros.
+        assert_eq!(
+            self.device_blobs.len(),
+            self.blob_backings.len(),
+            "fanotify: device files and blob backings are built together and must stay aligned"
+        );
         for (backing, blob_path) in self.blob_backings.iter().zip(self.device_blobs.iter()) {
             // A missing device file is always pathological — assemble() just created
             // every entry in `device_blobs`. Skipping it would leave the sparse file
@@ -665,10 +692,17 @@ impl FanotifyHandler {
                 );
                 continue;
             }
+            // Named by the blob, not by `blob_path`: the mark goes on the cache file's own
+            // descriptor, and the device path above is its hardlink.
             backing
                 .set_mark(self.fan_fd.as_raw_fd(), libc::FAN_MARK_ADD)
                 .map_err(|e| {
-                    std::io::Error::other(format!("fanotify_mark on {:?} failed: {}", blob_path, e))
+                    std::io::Error::other(format!(
+                        "fanotify_mark on blob {} (device file {:?}) failed: {}",
+                        backing.blob.blob_info().blob_id(),
+                        blob_path,
+                        e
+                    ))
                 })?;
             backing.armed.store(true, Ordering::Release);
         }
@@ -677,10 +711,17 @@ impl FanotifyHandler {
 
     /// Drop a blob's mark once its cache holds every byte.
     ///
-    /// Called after a fetch has completed, while the caller still holds the blob's `io_lock`
-    /// **shared** -- which is what makes this safe against [`Self::invalidate`], since that takes
-    /// the same lock exclusively and so cannot be punching bytes out from under a blob we are
-    /// in the middle of unmarking.
+    /// Two different things make this safe, and it is worth keeping them apart:
+    ///
+    /// * Against [`Self::invalidate`]: the caller still holds the blob's `io_lock` **shared**,
+    ///   and invalidation takes it exclusively, so bytes cannot be punched out from under a
+    ///   blob we are in the middle of unmarking.
+    /// * Against a *concurrent fetch* on another worker, the lock gives nothing -- it is shared,
+    ///   so those workers hold it too. What rules that race out is the storage layer's ordering:
+    ///   a chunk's bytes are pwritten before its ready bit is set (`persist_chunk_data` in
+    ///   `storage/src/cache/cachedfile.rs`), and `is_all_data_ready` is exactly "no chunk is
+    ///   still not-ready". So an all-ready blob cannot have a write still in flight, and
+    ///   unmarking it cannot expose an unfilled hole.
     ///
     /// Failure is logged and swallowed. The mark staying on is the status quo, not a hazard, and
     /// a read that has just been served correctly must not be turned into a denial because an
