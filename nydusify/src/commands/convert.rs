@@ -44,20 +44,48 @@ pub enum SourceSpec {
     Directory(PathBuf),
 }
 
+/// Does this `--source` value name a filesystem path rather than an image reference?
+///
+/// An OCI reference can never begin with `/`, `./` or `../`: its first component is a registry
+/// host or a repository name, and neither may start with a dot or a slash. So these prefixes
+/// are an unambiguous statement of intent, and a value carrying one is held to it instead of
+/// being handed to the registry parser -- where `./rootfs.tar` would otherwise resolve to a
+/// registry host literally named `.`.
+fn looks_like_a_path(value: &str) -> bool {
+    value.starts_with('/') || value.starts_with("./") || value.starts_with("../")
+}
+
 /// Decide whether a `--source` value names a local directory or an image.
 ///
-/// Existence on disk is the test, and it is deliberately one-way: an image reference
-/// that happens to collide with a directory in the working directory would be
-/// misread, but the reverse -- a directory silently treated as a registry reference --
-/// fails much later and far more confusingly, in a pull against a registry that has
-/// never heard of it.
-fn classify_source(value: &str) -> SourceSpec {
+/// Existence on disk is the test for anything that does not already look like a path, and it is
+/// deliberately one-way: an image reference that happens to collide with a directory in the
+/// working directory is misread, but the reverse -- a directory silently treated as a registry
+/// reference -- fails much later and far more confusingly.
+///
+/// Directories are canonicalised, which matters for more than tidiness: `nydus-image` builds its
+/// root node with `symlink_metadata`, so handing it a symlink to a directory yields a root that
+/// is not a directory and therefore an empty layer, with no diagnostic at all.
+fn classify_source(value: &str) -> Result<SourceSpec> {
     let path = Path::new(value);
     if path.is_dir() {
-        SourceSpec::Directory(path.to_path_buf())
-    } else {
-        SourceSpec::Image(value.to_string())
+        let canonical = path
+            .canonicalize()
+            .with_context(|| format!("resolve --source directory {value}"))?;
+        return Ok(SourceSpec::Directory(canonical));
     }
+    if looks_like_a_path(value) {
+        let what = if path.symlink_metadata().is_ok() {
+            "is not a directory"
+        } else {
+            "does not exist"
+        };
+        bail!(
+            "--source {value} {what}; a path-like source must be a directory, and an image \
+             reference cannot begin with {:?}",
+            value.split('/').next().unwrap_or(value)
+        );
+    }
+    Ok(SourceSpec::Image(value.to_string()))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -83,14 +111,20 @@ pub enum PrefetchInput {
 /// dropped on the way through.
 #[derive(Deserialize)]
 struct AccessPatternDoc {
-    #[serde(default)]
-    version: Option<String>,
+    version: String,
     files: Vec<AccessPatternFile>,
 }
 
 #[derive(Deserialize)]
 struct AccessPatternFile {
     path: String,
+    /// `[[offset, size], ...]`, the reason this flag exists over `--prefetch-dir`.
+    ///
+    /// Modelled only so a malformed shape is caught here; the builder reads the ranges out of
+    /// the file itself, not out of this type.
+    #[serde(default)]
+    #[allow(dead_code)]
+    ranges: Option<Vec<[u64; 2]>>,
 }
 
 /// Reject an access-pattern file that would produce a useless or confusing optimize run.
@@ -108,13 +142,11 @@ fn validate_prefetch_pattern_file(path: &Path) -> Result<()> {
             path.display()
         )
     })?;
-    if let Some(version) = doc.version.as_deref()
-        && version != "v1"
-    {
+    if doc.version != "v1" {
         bail!(
             "--prefetch-pattern-file {} declares version {:?}; only \"v1\" is understood",
             path.display(),
-            version
+            doc.version
         );
     }
     if doc.files.is_empty() {
@@ -150,7 +182,11 @@ pub async fn run(args: ConvertArgs) -> Result<()> {
 }
 
 pub fn plan(args: &ConvertArgs) -> Result<ConvertPlan> {
-    let sources: Vec<SourceSpec> = args.source.iter().map(|s| classify_source(s)).collect();
+    let sources: Vec<SourceSpec> = args
+        .source
+        .iter()
+        .map(|s| classify_source(s))
+        .collect::<Result<_>>()?;
     if sources.is_empty() {
         bail!("--source is required");
     }
@@ -188,6 +224,26 @@ pub fn plan(args: &ConvertArgs) -> Result<ConvertPlan> {
             bail!(
                 "--all-platforms cannot be combined with multiple --source values: the sources \
                  are stacked into one image, so exactly one platform is converted (use --platform)"
+            );
+        }
+        // Same reason as --all-platforms, which would otherwise be the only way in: a comma
+        // list is expanded into one conversion per platform, and a directory source has no
+        // per-architecture variant to offer them -- the same bytes would be stacked into every
+        // architecture's image and labelled as native to it.
+        if let Some(platform) = args.platform.as_deref()
+            && platform.contains(',')
+        {
+            bail!(
+                "--platform {platform} names more than one platform, which cannot be combined \
+                 with multiple --source values: the sources are stacked into one image, so \
+                 exactly one platform is converted"
+            );
+        }
+        if args.with_referrer {
+            bail!(
+                "--with-referrer cannot be combined with multiple --source values: the referrer \
+                 artifact is attached to the uppermost image source, which would advertise the \
+                 stacked image as a plain nydus conversion of that one image"
             );
         }
     }
@@ -525,6 +581,20 @@ mod tests {
                 r#"{"version":"v1","files":[{"path":"usr/bin/app"}]}"#,
                 "absolute",
             ),
+            // `ranges` is the whole reason this flag exists over `--prefetch-dir`, so a
+            // malformed one must not sail through to a warning buried in the build log.
+            (
+                r#"{"version":"v1","files":[{"path":"/a","ranges":"everything"}]}"#,
+                "parse",
+            ),
+            (
+                r#"{"version":"v1","files":[{"path":"/a","ranges":[[0,1,2]]}]}"#,
+                "parse",
+            ),
+            (
+                r#"{"version":"v1","files":[{"path":"/a","ranges":[[-1,5]]}]}"#,
+                "parse",
+            ),
         ];
         for (body, expected) in cases {
             let f = pattern_file(body);
@@ -580,14 +650,15 @@ mod tests {
         ))
         .unwrap();
 
-        // Stacking order is preserved verbatim: it is the merge order.
+        // Stacking order is preserved verbatim: it is the merge order. Directories come back
+        // canonicalised, so compare against the resolved paths.
         assert_eq!(
             plan.sources,
             vec![
-                SourceSpec::Directory(lower.path().into()),
+                SourceSpec::Directory(lower.path().canonicalize().unwrap()),
                 SourceSpec::Image("localhost:5000/base:v1".into()),
                 SourceSpec::Image("localhost:5000/app:v2".into()),
-                SourceSpec::Directory(upper.path().into()),
+                SourceSpec::Directory(upper.path().canonicalize().unwrap()),
             ]
         );
         // ...but the anchor is the uppermost *image*, even with a directory above it.
@@ -604,13 +675,50 @@ mod tests {
     }
 
     #[test]
-    fn a_missing_path_is_treated_as_an_image_reference_not_a_directory() {
-        // Classification is by existence, so a typo'd path becomes a registry
-        // reference and fails at pull time rather than being silently skipped.
-        let plan = plan(&convert_args(&["./no/such/dir"], &[])).unwrap();
+    fn a_path_like_source_that_is_not_a_directory_is_refused() {
+        // `./x` cannot be an image reference -- the registry parser would read the leading
+        // "." as a hostname -- so each of these is caught here rather than in a pull.
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("rootfs.tar");
+        std::fs::write(&file, b"x").unwrap();
+        let dangling = dir.path().join("dangling");
+        std::os::unix::fs::symlink(dir.path().join("nowhere"), &dangling).unwrap();
+
+        for (value, needle) in [
+            (file.to_str().unwrap(), "is not a directory"),
+            (dangling.to_str().unwrap(), "is not a directory"),
+            ("./no/such/dir", "does not exist"),
+        ] {
+            let err = plan(&convert_args(&[value], &[])).unwrap_err().to_string();
+            assert!(err.contains(needle), "{value} should say {needle}: {err}");
+        }
+
+        // A bare name is still an image reference, even though nothing of that name exists.
+        let plan = plan(&convert_args(&["localhost:5000/app:v1"], &[])).unwrap();
         assert_eq!(
             plan.sources,
-            vec![SourceSpec::Image("./no/such/dir".into())]
+            vec![SourceSpec::Image("localhost:5000/app:v1".into())]
+        );
+    }
+
+    #[test]
+    fn a_symlinked_directory_source_is_resolved_to_its_target() {
+        // `nydus-image` stats the root with symlink_metadata, so a symlink root is not a
+        // directory to it and the layer comes out empty with no diagnostic.
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let plan = plan(&convert_args(
+            &["localhost:5000/app:v1", link.to_str().unwrap()],
+            &[],
+        ))
+        .unwrap();
+        assert_eq!(
+            plan.sources[1],
+            SourceSpec::Directory(real.canonicalize().unwrap())
         );
     }
 
@@ -618,24 +726,54 @@ mod tests {
     fn stacking_is_refused_for_the_options_it_cannot_honour() {
         let d = tempfile::tempdir().unwrap();
         let sources = ["localhost:5000/app:v1", d.path().to_str().unwrap()];
-        for (flag, needle) in [("--oci-ref", "zran"), ("--all-platforms", "one platform")] {
-            let err = plan(&convert_args(&sources, &[flag]))
+        for (flags, needle) in [
+            (vec!["--oci-ref"], "zran"),
+            (vec!["--all-platforms"], "one platform"),
+            (vec!["--source-archive", "/nonexistent.tar"], "single image"),
+            (
+                vec!["--platform", "linux/amd64,linux/arm64"],
+                "more than one platform",
+            ),
+            (vec!["--with-referrer"], "uppermost image source"),
+        ] {
+            let err = plan(&convert_args(&sources, &flags))
                 .unwrap_err()
                 .to_string();
             assert!(
                 err.contains(needle),
-                "{flag} should mention {needle}: {err}"
+                "{flags:?} should mention {needle}: {err}"
             );
         }
         // ...and none of them is refused for an ordinary single-source convert.
-        plan(&convert_args(&["localhost:5000/app:v1"], &["--oci-ref"])).unwrap();
+        for flags in [
+            vec!["--oci-ref"],
+            vec!["--platform", "linux/amd64,linux/arm64"],
+            vec!["--with-referrer"],
+        ] {
+            plan(&convert_args(&["localhost:5000/app:v1"], &flags)).unwrap();
+        }
     }
 
     #[test]
-    fn a_pattern_file_without_a_version_field_is_accepted() {
-        // The field is optional in the document `nydus-image` consumes; only a *wrong*
-        // version is an error.
+    fn a_pattern_file_without_a_version_field_is_rejected() {
+        // `PrefetchJson` in builder/src/optimize_prefetch.rs declares `version: String`, so a
+        // version-less document dies inside `nydus-image` -- and a failed optimize only warns,
+        // which is precisely the silent failure this validation exists to prevent.
         let f = pattern_file(r#"{"files":[{"path":"/a"}]}"#);
+        let err = validate_prefetch_pattern_file(f.path())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("version"), "got: {err}");
+    }
+
+    #[test]
+    fn a_pattern_file_with_ranges_round_trips_the_shapes_the_builder_accepts() {
+        let f = pattern_file(
+            r#"{"version":"v1","files":[
+                 {"path":"/usr/bin/app","ranges":[[0,4096],[8192,512]]},
+                 {"path":"/etc/conf"}
+               ]}"#,
+        );
         validate_prefetch_pattern_file(f.path()).unwrap();
     }
 }

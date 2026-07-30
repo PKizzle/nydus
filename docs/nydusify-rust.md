@@ -37,6 +37,60 @@ nydusify convert \
   --target myregistry/repo:tag-nydus
 ```
 
+### Stacking several sources into one image
+
+`--source` is repeatable, and each value is either an image reference or a **local directory**.
+The sources are stacked lowest-first — the same order `nydus-image merge` applies, so a file
+present in more than one source is served from the uppermost one that has it:
+
+```shell
+nydusify convert \
+  --source myregistry/base:v1 \
+  --source ./site-config \
+  --source ./model-weights \
+  --target myregistry/app:v1-nydus
+```
+
+Directories are built with `nydus-image create --type dir-rafs` (a directory is content as-is: no
+whiteouts, no layer semantics) and are canonicalised first, so a symlink to a directory builds its
+target. A `--source` value is read as a path when it exists as a directory, or when it begins with
+`/`, `./` or `../` — prefixes an OCI reference can never carry. A path-like value that is not a
+directory is refused up front rather than handed to the registry parser.
+
+At least one source must be an image reference: the **uppermost image** anchors the conversion,
+and the converted image inherits its config — environment, entrypoint, architecture. Four options
+are refused in combination with multiple sources, each for a concrete reason:
+
+| Option | Why it cannot be honoured |
+|---|---|
+| `--oci-ref` | zran indexes offsets into a layer's original gzip stream; a directory has none. |
+| `--source-archive` | Reads exactly one image. |
+| `--all-platforms`, or a comma-separated `--platform` | The sources are stacked into one image, so exactly one platform is converted. |
+| `--with-referrer` | The artifact is attached to the uppermost image source, which would advertise the stacked image as a plain conversion of that one image. |
+
+### Prefetch pattern files
+
+`--prefetch-pattern-file` takes a JSON access-pattern document and passes it to `nydus-image
+optimize --prefetch-files` byte-for-byte, so per-file **byte ranges** survive — which is what it
+offers over `--prefetch-dir`. `ranges` is `[[offset, size], …]` and may be omitted to prefetch the
+whole file:
+
+```json
+{
+  "version": "v1",
+  "files": [
+    { "path": "/usr/bin/app", "ranges": [[0, 4096], [8192, 512]] },
+    { "path": "/etc/app/config.toml" }
+  ]
+}
+```
+
+The document is validated before any conversion work starts — `version` must be present and `v1`,
+`files` must be non-empty, paths must be absolute inside the image, and `ranges` must have the
+shape above. This matters because a failed optimize is deliberately **not** fatal to a conversion:
+the image is still published, just un-optimised, so an unvalidated typo would cost a full
+convert-and-push to discover and surface only as a warning in the log.
+
 Close the loop with the snapshotter's referrer serving (default-on, ARCHITECTURE.md Decision 8) by
 also pushing a referrer artifact attached to the *source* image:
 
@@ -87,8 +141,9 @@ Useful flags (see `--help` for the full list; `nydusify/src/cli.rs` is the sourc
   specifying `--target` explicitly (mutually exclusive with `--target`).
 - `--fs-version {5,6}` (default `6`), `--compressor` (default `zstd`), `--fs-chunk-size` /
   `--chunk-size` (default `0x100000`).
-- `--prefetch-dir` / `--prefetch-patterns` (read patterns from stdin) — honored via `nydus-image
-  optimize --prefetch-files` in both modes, baking prefetch hints into the bootstrap.
+- `--prefetch-dir` / `--prefetch-patterns` (read patterns from stdin) / `--prefetch-pattern-file`
+  — honored via `nydus-image optimize --prefetch-files` in both modes, baking prefetch hints into
+  the bootstrap. The three are mutually exclusive. See [Prefetch pattern files](#prefetch-pattern-files).
 - `--backend-type {registry,oss,s3,localfs}` + `--backend-config`/`--backend-config-file` — **only
   `registry` (the default) is implemented today**; other backend types are validated but rejected
   with an honest "not yet supported" error, not silently ignored.

@@ -89,6 +89,14 @@ impl BuildInput {
                 .unwrap_or_else(|| "dir".to_string()),
         }
     }
+
+    /// How this input is named in an error, so a failed build says which source it was.
+    fn describe(&self) -> String {
+        match self {
+            BuildInput::Layer(layer) => format!("layer {}", layer.digest),
+            BuildInput::Directory(dir) => format!("directory {}", dir.display()),
+        }
+    }
 }
 
 /// The pulled source image (single platform).
@@ -762,7 +770,8 @@ fn build_artifact(
     let nydus_image = request.driver.builder.as_path();
     let fs_version = request.driver.fs_version.as_str();
     let convert_root = workspace.join("convert");
-    std::fs::create_dir_all(&convert_root)?;
+    std::fs::create_dir_all(&convert_root)
+        .with_context(|| format!("create conversion workspace {}", convert_root.display()))?;
 
     let mut layer_bootstraps = Vec::with_capacity(inputs.len());
     let mut new_blobs = Vec::new();
@@ -794,7 +803,11 @@ fn build_artifact(
                 &request.driver.compressor,
             ),
         };
-        run_nydus_image(nydus_image, &args, "create")?;
+        run_nydus_image(
+            nydus_image,
+            &args,
+            &format!("create from {}", input.describe()),
+        )?;
         // A layer with no file content -- only directories, or only whiteouts --
         // yields a bootstrap but no data blob, and that is perfectly ordinary
         // (postgres:latest has a 116-byte layer holding one empty directory).
@@ -904,7 +917,6 @@ fn targz_ref_args(
     ]
 }
 
-/// `nydus-image create --type targz-rafs` (standard, new data blob) args.
 /// `nydus-image create --type dir-rafs` args for a local directory source.
 ///
 /// `dir-rafs` walks the directory itself rather than a tar stream, so the directory is
@@ -932,6 +944,7 @@ fn dir_rafs_args(
     ]
 }
 
+/// `nydus-image create --type targz-rafs` (standard, new data blob) args.
 fn targz_rafs_args(
     layer: &Path,
     bootstrap_out: &Path,
@@ -1537,6 +1550,24 @@ mod tests {
         let s = to_strings(&args);
         assert!(s.windows(2).any(|w| w == ["--type", "targz-rafs"]));
         assert!(s.windows(2).any(|w| w == ["--compressor", "zstd"]));
+    }
+
+    #[test]
+    fn directory_create_args_use_dir_rafs_and_pass_the_directory_last() {
+        let args = dir_rafs_args(
+            Path::new("/srv/rootfs"),
+            Path::new("/w/l0/bootstrap"),
+            Path::new("/w/l0"),
+            "6",
+            "zstd",
+        );
+        let s = to_strings(&args);
+        assert!(s.windows(2).any(|w| w == ["--type", "dir-rafs"]));
+        assert!(s.windows(2).any(|w| w == ["--compressor", "zstd"]));
+        assert!(s.windows(2).any(|w| w == ["--fs-version", "6"]));
+        // The source is positional, so it must come after every flag -- and it is passed as
+        // an OsString argv entry, never through a shell, so spaces and newlines are literal.
+        assert_eq!(s.last().unwrap(), "/srv/rootfs");
     }
 
     #[test]
