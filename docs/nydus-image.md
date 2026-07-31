@@ -41,6 +41,15 @@ There are two ways to specify where to save the resulting data blob:
 nydus-image create -t dir-rafs \
   -D /path/to/output/directory \
   /path/to/source/dir
+
+# Leave paths out of the build with --exclude (repeatable). Paths are absolute
+# *inside the image*, so /etc/app.conf means <source dir>/etc/app.conf, and
+# excluding a directory excludes everything under it. Directory sources only:
+# a tar-based conversion has to reproduce its input layer faithfully.
+nydus-image create -t dir-rafs \
+  --exclude /etc/app.conf --exclude /var/cache \
+  -D /path/to/output/directory \
+  /path/to/source/dir
   
 [root@image-service]# nydus-image create -t dir-rafs -D images/ src 
 [2023-03-29 16:34:28.092347 +08:00] INFO successfully built RAFS filesystem: 

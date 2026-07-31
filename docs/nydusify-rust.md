@@ -125,11 +125,13 @@ before it can mount, so a file placed here is readable without fetching a single
 mounting the image. Entries are written with uid/gid 0 and a zero mtime, so re-running the same
 conversion produces the same layer digest.
 
-Two cases are refused up front. Two files sharing a base name would both be stored under that
-name and one would silently shadow the other. A file *inside* one of the directory sources would
-have its bytes built into that source's data blob **and** copied into the bootstrap layer — two
-copies with nothing keeping them in step; `nydus-image` has no `--exclude` to suppress the first,
-so move the file outside the source tree.
+A file may live inside one of the directory sources: it is passed to that source's build as
+`nydus-image create --exclude`, so its bytes land in the bootstrap layer only and the image does
+not carry two copies of it. This is the usual arrangement — keep the file with the tree it
+describes, and it still travels in the layer that is cheap to reach.
+
+One case is refused up front: two files sharing a base name, since both would be stored under
+that name and one would silently shadow the other.
 
 ### Prefetch pattern files
 

@@ -179,12 +179,12 @@ pub(crate) fn validate_prefetch_pattern_file(path: &Path) -> Result<()> {
 /// collide: the tar would carry both entries and a reader would see whichever it reached last.
 /// Rejecting is the only honest answer -- there is no name left to disambiguate them by.
 ///
-/// A file that lives inside one of the directory sources is also refused. Its bytes would be
-/// built into that source's data blob *and* copied into the bootstrap layer, so the image would
-/// carry two copies that nothing keeps in step. `nydus-image` has no `--exclude` to suppress the
-/// first copy, so until it does, saying so is better than shipping the duplicate quietly.
-fn validate_append_in_bootstrap(files: &[PathBuf], sources: &[SourceSpec]) -> Result<()> {
+/// A file inside one of the directory sources is allowed: the converter passes it to that
+/// source's build as `nydus-image create --exclude`, so its bytes land in the bootstrap layer
+/// only and the image does not carry two copies with nothing keeping them in step.
+fn validate_append_in_bootstrap(files: &[PathBuf]) -> Result<Vec<PathBuf>> {
     let mut seen: BTreeMap<String, &Path> = BTreeMap::new();
+    let mut canonical = Vec::with_capacity(files.len());
     for path in files {
         validate_existing_file(path, "--append-in-bootstrap")?;
 
@@ -208,24 +208,16 @@ fn validate_append_in_bootstrap(files: &[PathBuf], sources: &[SourceSpec]) -> Re
             );
         }
 
-        let canonical = path
-            .canonicalize()
-            .with_context(|| format!("resolve --append-in-bootstrap {}", path.display()))?;
-        for source in sources {
-            if let SourceSpec::Directory(dir) = source
-                && canonical.starts_with(dir)
-            {
-                bail!(
-                    "--append-in-bootstrap {} is inside the directory source {}, so its bytes \
-                     would be built into that source's data blob as well as copied into the \
-                     bootstrap layer; move it outside the source tree",
-                    path.display(),
-                    dir.display()
-                );
-            }
-        }
+        // Canonicalised, and that is load-bearing rather than tidiness: the converter decides
+        // whether a file sits inside a directory source by `strip_prefix`ing the source's own
+        // canonical path. A non-canonical path here would not match, no `--exclude` would be
+        // emitted, and the file would silently end up in both the data blob and the bootstrap.
+        canonical.push(
+            path.canonicalize()
+                .with_context(|| format!("resolve --append-in-bootstrap {}", path.display()))?,
+        );
     }
-    Ok(())
+    Ok(canonical)
 }
 
 pub async fn run(args: ConvertArgs) -> Result<()> {
@@ -387,7 +379,7 @@ pub fn plan(args: &ConvertArgs) -> Result<ConvertPlan> {
         validate_existing_file(path, "--prefetch-pattern-file")?;
         validate_prefetch_pattern_file(path)?;
     }
-    validate_append_in_bootstrap(&args.append_in_bootstrap, &sources)?;
+    let append_in_bootstrap = validate_append_in_bootstrap(&args.append_in_bootstrap)?;
     if let Some(path) = &args.source_archive {
         validate_existing_file(path, "--source-archive")?;
     }
@@ -437,7 +429,7 @@ pub fn plan(args: &ConvertArgs) -> Result<ConvertPlan> {
         effective_oci: args.oci || args.oci_ref,
         fs_version: args.fs_version.clone(),
         prefetch,
-        append_in_bootstrap: args.append_in_bootstrap.clone(),
+        append_in_bootstrap,
     })
 }
 
@@ -891,9 +883,11 @@ mod tests {
     }
 
     #[test]
-    fn an_appended_file_inside_a_directory_source_is_refused() {
-        // Its bytes would be built into that source's data blob and copied into the
-        // bootstrap layer: two copies of one file, with nothing keeping them in step.
+    fn an_appended_file_inside_a_directory_source_is_recorded_canonically() {
+        // It is allowed -- the converter excludes it from that source's build -- but only
+        // because the path recorded here is canonical: the converter decides "is this inside
+        // the source" by strip_prefix against the source's own canonical path, so a
+        // non-canonical path would emit no --exclude and duplicate the file silently.
         let dir = tempfile::tempdir().unwrap();
         let src = dir.path().join("rootfs");
         std::fs::create_dir_all(src.join("etc")).unwrap();
@@ -915,8 +909,15 @@ mod tests {
         let Commands::Convert(args) = cli.command else {
             panic!("expected convert")
         };
-        let err = plan(&args).unwrap_err().to_string();
-        assert!(err.contains("is inside the directory source"), "got: {err}");
+        let plan = plan(&args).unwrap();
+
+        let canonical_inside = inside.canonicalize().unwrap();
+        assert_eq!(plan.append_in_bootstrap, vec![canonical_inside.clone()]);
+        // The source it sits under is canonical too, so the prefix relationship holds.
+        let SourceSpec::Directory(recorded_src) = &plan.sources[1] else {
+            panic!("expected a directory source")
+        };
+        assert!(canonical_inside.starts_with(recorded_src));
     }
 
     #[test]

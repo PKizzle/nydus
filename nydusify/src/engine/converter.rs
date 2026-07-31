@@ -862,6 +862,7 @@ fn build_artifact(
                 &out_dir,
                 fs_version,
                 &request.driver.compressor,
+                &excludes_for_directory(dir, &request.append_in_bootstrap),
             ),
         };
         run_nydus_image(
@@ -988,8 +989,9 @@ fn dir_rafs_args(
     blob_out_dir: &Path,
     fs_version: &str,
     compressor: &str,
+    excludes: &[PathBuf],
 ) -> Vec<OsString> {
-    vec![
+    let mut args: Vec<OsString> = vec![
         "create".into(),
         "--type".into(),
         "dir-rafs".into(),
@@ -1001,8 +1003,30 @@ fn dir_rafs_args(
         bootstrap_out.into(),
         "-D".into(),
         blob_out_dir.into(),
-        dir.into(),
-    ]
+    ];
+    for exclude in excludes {
+        args.push("--exclude".into());
+        args.push(exclude.into());
+    }
+    // Positional, so it stays last.
+    args.push(dir.into());
+    args
+}
+
+/// In-image paths to exclude from `dir`'s build: the `--append-in-bootstrap` files that live
+/// inside it.
+///
+/// Those files travel in the bootstrap layer instead, so building them into this source's data
+/// blob as well would put two copies in the image with nothing keeping them in step.
+fn excludes_for_directory(dir: &Path, append_in_bootstrap: &[PathBuf]) -> Vec<PathBuf> {
+    append_in_bootstrap
+        .iter()
+        .filter_map(|file| {
+            file.strip_prefix(dir)
+                .ok()
+                .map(|relative| Path::new("/").join(relative))
+        })
+        .collect()
 }
 
 /// `nydus-image create --type targz-rafs` (standard, new data blob) args.
@@ -1628,14 +1652,37 @@ mod tests {
             Path::new("/w/l0"),
             "6",
             "zstd",
+            &[PathBuf::from("/etc/app.conf")],
         );
         let s = to_strings(&args);
         assert!(s.windows(2).any(|w| w == ["--type", "dir-rafs"]));
         assert!(s.windows(2).any(|w| w == ["--compressor", "zstd"]));
         assert!(s.windows(2).any(|w| w == ["--fs-version", "6"]));
+        assert!(s.windows(2).any(|w| w == ["--exclude", "/etc/app.conf"]));
         // The source is positional, so it must come after every flag -- and it is passed as
         // an OsString argv entry, never through a shell, so spaces and newlines are literal.
         assert_eq!(s.last().unwrap(), "/srv/rootfs");
+    }
+
+    #[test]
+    fn only_appended_files_under_a_directory_are_excluded_from_its_build() {
+        let appended = [
+            PathBuf::from("/srv/rootfs/etc/app.conf"),
+            PathBuf::from("/srv/rootfs/NOTICE"),
+            // Outside the source: it has nothing to exclude from this build.
+            PathBuf::from("/elsewhere/model-card.json"),
+            // A sibling whose path merely starts with the same characters.
+            PathBuf::from("/srv/rootfs-backup/other.conf"),
+        ];
+        let excludes = excludes_for_directory(Path::new("/srv/rootfs"), &appended);
+        assert_eq!(
+            excludes,
+            vec![PathBuf::from("/etc/app.conf"), PathBuf::from("/NOTICE"),],
+            "excludes are in-image paths, rooted at the source directory"
+        );
+
+        // Nothing appended means no --exclude at all, not an empty one.
+        assert!(excludes_for_directory(Path::new("/srv/rootfs"), &[]).is_empty());
     }
 
     #[test]

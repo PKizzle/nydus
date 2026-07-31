@@ -425,6 +425,14 @@ fn prepare_cmd_args(bti_string: &'static str) -> App {
                         .value_parser(clap::value_parser!(PathBuf))
                         .required(false)
                 )
+                .arg(
+                    Arg::new("exclude")
+                        .long("exclude")
+                        .help("Leave an absolute in-image path out of the build, e.g. /etc/app.conf; excluding a directory excludes its contents. Repeatable, and only for directory sources")
+                        .value_parser(clap::value_parser!(PathBuf))
+                        .action(ArgAction::Append)
+                        .required(false)
+                )
         );
 
     let app = app.subcommand(
@@ -1295,6 +1303,21 @@ impl Command {
         build_ctx.set_chunk_size(chunk_size);
         build_ctx.set_batch_size(batch_size);
         build_ctx.set_blob_block_size(block_size);
+
+        if let Some(excludes) = matches.get_many::<PathBuf>("exclude") {
+            let excludes: Vec<PathBuf> = excludes.cloned().collect();
+            // Only the directory builders honour excludes. A tar-based conversion must
+            // reproduce its input layer faithfully, so accepting the flag there would silently
+            // produce an image that disagrees with the layer it claims to be.
+            if conversion_type != ConversionType::DirectoryToRafs {
+                bail!(
+                    "--exclude only applies to a directory source (--type dir-rafs), not to \
+                     conversion type `{}`",
+                    conversion_type
+                );
+            }
+            build_ctx.set_excludes(excludes)?;
+        }
 
         let blob_cache_generator = match blob_cache_storage {
             Some(storage) => Some(BlobCacheGenerator::new(storage)?),

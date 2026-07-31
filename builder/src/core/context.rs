@@ -6,7 +6,7 @@
 
 use std::any::Any;
 use std::borrow::Cow;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::convert::TryFrom;
 use std::fs::{File, OpenOptions, remove_file, rename};
 use std::io::{BufWriter, Cursor, Read, Seek, Write};
@@ -18,7 +18,7 @@ use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 use std::{fmt, fs};
 
-use anyhow::{Context, Error, Result, anyhow};
+use anyhow::{Context, Error, Result, anyhow, bail};
 use nydus_utils::crc32;
 use nydus_utils::crypt::{self, Cipher, CipherContext};
 use sha2::{Digest, Sha256};
@@ -1411,6 +1411,14 @@ pub struct BuildContext {
     pub is_chunkdict_generated: bool,
     /// Nydus attributes for different build behavior.
     pub attributes: Attributes,
+    /// In-image paths to leave out of the build, as absolute paths rooted at the source
+    /// directory (`/etc/app.conf`, not `<source>/etc/app.conf`).
+    ///
+    /// Excluding a directory excludes everything under it: the walk never descends into a path
+    /// it has skipped. Only the directory-source builders honour this -- a tar-based conversion
+    /// has to reproduce its input layer faithfully, so dropping entries from one would produce
+    /// an image that disagrees with the layer it claims to be.
+    pub excludes: HashSet<PathBuf>,
 }
 
 impl BuildContext {
@@ -1491,7 +1499,41 @@ impl BuildContext {
             is_chunkdict_generated: false,
 
             attributes,
+            excludes: HashSet::new(),
         }
+    }
+
+    /// Leave `paths` (absolute, rooted at the source directory) out of the build.
+    ///
+    /// Rejects a path that is not absolute rather than silently matching nothing: an exclude
+    /// that quietly fails to exclude is worse than no exclude at all, because the caller has
+    /// already stopped worrying about the file.
+    pub fn set_excludes(&mut self, paths: Vec<PathBuf>) -> Result<()> {
+        for path in &paths {
+            if !path.is_absolute() {
+                bail!(
+                    "--exclude {} must be absolute inside the image, e.g. /etc/app.conf",
+                    path.display()
+                );
+            }
+        }
+        self.excludes = paths.into_iter().collect();
+        Ok(())
+    }
+
+    /// Whether `target` -- an in-image path from [`Node::generate_target`] -- is excluded,
+    /// either by name or by sitting under an excluded directory.
+    pub fn is_excluded(&self, target: &Path) -> bool {
+        if self.excludes.is_empty() {
+            return false;
+        }
+        if self.excludes.contains(target) {
+            return true;
+        }
+        target
+            .ancestors()
+            .skip(1)
+            .any(|ancestor| self.excludes.contains(ancestor))
     }
 
     pub fn set_fs_version(&mut self, fs_version: RafsVersion) {
@@ -1563,6 +1605,7 @@ impl Default for BuildContext {
             is_chunkdict_generated: false,
 
             attributes: Attributes::default(),
+            excludes: HashSet::new(),
         }
     }
 }
@@ -1792,5 +1835,44 @@ mod tests {
         assert!(writer.flush().is_ok());
         assert!(writer.finalize(None).is_ok());
         assert_eq!(writer.pos().unwrap(), 11);
+    }
+
+    #[test]
+    fn excluding_a_directory_excludes_everything_under_it() {
+        let mut ctx = BuildContext::default();
+        assert!(
+            !ctx.is_excluded(Path::new("/anything")),
+            "an empty exclude set must not match"
+        );
+
+        ctx.set_excludes(vec![
+            PathBuf::from("/etc/app.conf"),
+            PathBuf::from("/dropdir"),
+        ])
+        .unwrap();
+
+        assert!(ctx.is_excluded(Path::new("/etc/app.conf")));
+        assert!(ctx.is_excluded(Path::new("/dropdir")));
+        assert!(ctx.is_excluded(Path::new("/dropdir/inside.txt")));
+        assert!(ctx.is_excluded(Path::new("/dropdir/deep/nested.txt")));
+
+        // The parent of an excluded file survives, and so does anything merely sharing a
+        // name prefix with an excluded directory.
+        assert!(!ctx.is_excluded(Path::new("/etc")));
+        assert!(!ctx.is_excluded(Path::new("/etc/other.conf")));
+        assert!(!ctx.is_excluded(Path::new("/dropdir-sibling")));
+        assert!(!ctx.is_excluded(Path::new("/")));
+    }
+
+    #[test]
+    fn a_relative_exclude_is_rejected_rather_than_matching_nothing() {
+        let mut ctx = BuildContext::default();
+        let err = ctx
+            .set_excludes(vec![PathBuf::from("etc/app.conf")])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("must be absolute"), "got: {err}");
+        // ...and nothing was recorded, so a rejected call cannot half-apply.
+        assert!(!ctx.is_excluded(Path::new("/etc/app.conf")));
     }
 }

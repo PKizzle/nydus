@@ -48,6 +48,12 @@ impl FilesystemTreeBuilder {
         for child in children {
             let path = child.path();
             let target = Node::generate_target(&path, &ctx.source_path);
+            // Skipped before the node is built, so an excluded directory costs neither a walk of
+            // its contents nor a blob entry for them.
+            if ctx.is_excluded(&target) {
+                debug!("excluding {} from the build", target.display());
+                continue;
+            }
             let mut file_size: u64 = 0;
             if ctx.attributes.is_external(&target)
                 && let Some(value) = ctx.attributes.get_value(&target, "file_size")
