@@ -131,6 +131,17 @@ pub struct Platform {
     /// Architecture variant (e.g. `v8` for arm64).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub variant: Option<String>,
+    /// Required OS features. Nydus manifests inside a dual-manifest index carry
+    /// `["nydus.remoteimage.v1"]` here: current nydus parsers key on the descriptor's
+    /// `artifactType` instead, but strict platform matchers (go-containerregistry and
+    /// friends) treat an unknown required feature as "does not match" and skip the
+    /// entry — which is precisely what keeps a scanner off the nydus half.
+    #[serde(
+        default,
+        rename = "os.features",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub os_features: Option<Vec<String>>,
 }
 
 /// An OCI image manifest (also parses docker schema-2 manifests).

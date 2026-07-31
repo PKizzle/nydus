@@ -380,6 +380,16 @@ pub struct ConvertArgs {
         default_value = "5s"
     )]
     pub push_retry_delay: String,
+    /// Publish the target tag as an OCI index carrying BOTH the original OCI manifest
+    /// and the converted nydus manifest, instead of the nydus manifest alone.
+    ///
+    /// The original manifest rides along byte-identical (OCI entries first, nydus after,
+    /// marked `artifactType: application/vnd.nydus.image.manifest.v1+json` plus the legacy
+    /// `os.features` marker) — so scanners and plain runtimes resolve the OCI half while
+    /// nydus-aware consumers find the nydus half. This is the Go tool's `--merge-platform`
+    /// behaviour under an honest name; our `--merge-platform` means multi-arch merging.
+    #[arg(long = "attach-oci-manifest")]
+    pub attach_oci_manifest: bool,
     /// Pack an extra file into the bootstrap layer, alongside `image/image.boot`.
     ///
     /// Repeatable. Each file is stored under its own base name, so a consumer that pulls

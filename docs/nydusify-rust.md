@@ -86,6 +86,41 @@ The same five options are refused here, for the matching reason — there is no 
 registry or manifest for them to refer to — plus `--target-suffix`, which has no source
 reference to derive a target from.
 
+## `--attach-oci-manifest`: one tag, scannable and accelerated
+
+`convert --attach-oci-manifest` publishes the target tag as an OCI **index** carrying two
+manifests: the source image's own manifest, byte-identical, first — and the converted nydus
+manifest after it, marked with `artifactType: application/vnd.nydus.image.manifest.v1+json`
+plus the legacy `os.features: ["nydus.remoteimage.v1"]`:
+
+```shell
+nydusify convert \
+  --source myregistry/app:v1 \
+  --target myregistry/app:v1 \
+  --attach-oci-manifest
+```
+
+Consumers sort themselves out by how they read the index. Nydus parsers key on the
+`artifactType` (or the legacy feature marker) and take the nydus half. Strict platform
+matchers — go-containerregistry and therefore trivy — treat the unknown required OS feature as
+"no match" and skip the nydus entry, landing on the OCI half: the image stays scannable.
+Consumers that ignore both markers and take the first platform match (plain containerd,
+docker) get the OCI half, because ordering puts it first — never the nydus one.
+
+Because the OCI manifest is republished unmodified, existing digest pins keep resolving and a
+scan of the OCI half is a scan of the original image. (The Go accel-service prepends an empty
+layer to the OCI half; we deliberately do not.) In `--oci-ref` mode the two halves share their
+big layers — the gzip layers ARE the nydus data blobs — so the index costs only the zran
+indexes and bootstrap in extra storage.
+
+Requires exactly one image `--source`, a registry target, and a single platform (multi-arch
+composition is a follow-up).
+
+> **Divergence from Go nydusify:** upstream's `--merge-platform` is this dual-manifest compat
+> feature. Ours reuses that flag name for merging multiple **converted architectures** into an
+> index, and the compat feature lives here under `--attach-oci-manifest` instead. If you are
+> migrating scripts from the Go tool, `--merge-platform` does not do what it did there.
+
 ## `nydusify optimize`
 
 Rebuild an already-published nydus image's prefetch layout without re-converting it:

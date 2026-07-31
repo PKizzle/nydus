@@ -82,6 +82,9 @@ pub struct ConvertRequest {
     pub output_json: Option<PathBuf>,
     /// Extra files packed into the bootstrap layer beside `image/image.boot`.
     pub append_in_bootstrap: Vec<PathBuf>,
+    /// Publish the target tag as an OCI index carrying both the untouched source OCI
+    /// manifest and the nydus manifest (Go `merge_manifest` layout).
+    pub attach_oci_manifest: bool,
     pub driver: NydusDriverConfig,
 }
 
@@ -105,6 +108,7 @@ impl ConvertRequest {
         Ok(Self {
             source: plan.source.clone(),
             append_in_bootstrap: plan.append_in_bootstrap.clone(),
+            attach_oci_manifest: args.attach_oci_manifest,
             sources: plan.sources.clone(),
             source_archive: args.source_archive.clone(),
             target: plan.target.clone(),

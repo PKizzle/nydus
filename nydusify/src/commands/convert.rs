@@ -344,6 +344,34 @@ pub fn plan(args: &ConvertArgs) -> Result<ConvertPlan> {
         }
     }
 
+    if args.attach_oci_manifest {
+        // The attached manifest IS the source image's manifest, byte-identical -- so the
+        // conversion must be exactly "one image, converted", or the index would claim an
+        // equivalence that does not hold.
+        if sources.len() > 1 || anchor.is_none() {
+            bail!(
+                "--attach-oci-manifest republishes the source image's own manifest beside \
+                 the nydus one, so exactly one image --source is required"
+            );
+        }
+        if args.source_archive.is_some() || args.target_archive.is_some() {
+            bail!(
+                "--attach-oci-manifest publishes an index to a registry; it cannot be \
+                 combined with --source-archive or --target-archive"
+            );
+        }
+        if args.all_platforms
+            || args.merge_platform
+            || args.platform.as_deref().is_some_and(|p| p.contains(','))
+        {
+            bail!(
+                "--attach-oci-manifest currently converts a single platform; combining it \
+                 with multi-arch (--all-platforms/--merge-platform/a --platform list) is a \
+                 follow-up"
+            );
+        }
+    }
+
     if args.target.is_some() && args.target_suffix.is_some() {
         bail!("--target conflicts with --target-suffix");
     }
@@ -966,6 +994,55 @@ mod tests {
             plan.sources[1],
             SourceSpec::Directory(real.canonicalize().unwrap())
         );
+    }
+
+    #[test]
+    fn attach_oci_manifest_is_gated_to_the_single_image_case() {
+        let d = tempfile::tempdir().unwrap();
+        // Exactly one image source: fine.
+        plan(&convert_args(
+            &["localhost:5000/app:v1"],
+            &["--attach-oci-manifest"],
+        ))
+        .unwrap();
+
+        for (sources, extra, needle) in [
+            // Stacked sources: the index would claim the result IS the source image.
+            (
+                vec!["localhost:5000/app:v1", d.path().to_str().unwrap()],
+                vec!["--attach-oci-manifest"],
+                "exactly one image --source",
+            ),
+            (
+                vec![d.path().to_str().unwrap()],
+                vec!["--attach-oci-manifest"],
+                "exactly one image --source",
+            ),
+            (
+                vec!["localhost:5000/app:v1"],
+                vec!["--attach-oci-manifest", "--target-archive", "/tmp/x.tar"],
+                "registry",
+            ),
+            (
+                vec!["localhost:5000/app:v1"],
+                vec![
+                    "--attach-oci-manifest",
+                    "--platform",
+                    "linux/amd64,linux/arm64",
+                ],
+                "single platform",
+            ),
+            (
+                vec!["localhost:5000/app:v1"],
+                vec!["--attach-oci-manifest", "--merge-platform"],
+                "single platform",
+            ),
+        ] {
+            let err = plan(&convert_args(&sources, &extra))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(needle), "{extra:?} should say {needle}: {err}");
+        }
     }
 
     #[test]

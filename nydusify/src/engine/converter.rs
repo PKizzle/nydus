@@ -117,6 +117,9 @@ struct PulledSource {
     source_size: u64,
     /// Raw image-config JSON, reused verbatim as the nydus image config.
     config_bytes: Vec<u8>,
+    /// The resolved per-platform source manifest, byte-identical as fetched.
+    /// `--attach-oci-manifest` republishes it beside the nydus manifest.
+    manifest_bytes: Vec<u8>,
     layers: Vec<PulledLayer>,
 }
 
@@ -424,6 +427,13 @@ async fn convert_one_platform(
     let output = build_artifact(request, &inputs, workspace)?;
 
     // ---- push (or write a local archive) ----
+    // With --attach-oci-manifest the nydus manifest goes in by digest; the tag is taken by
+    // the dual-manifest index pushed after it.
+    let push_target = if request.attach_oci_manifest {
+        PushTarget::ByDigest
+    } else {
+        push_target
+    };
     let pushed = match &request.target_archive {
         Some(archive) => export_artifact(
             request,
@@ -471,6 +481,19 @@ async fn convert_one_platform(
             &data_blob_files,
             &output.bootstrap,
             subject,
+            retry,
+        )
+        .await?;
+    }
+
+    if request.attach_oci_manifest {
+        attach_oci_manifest_and_push_index(
+            target_client,
+            target_ref,
+            source_ref,
+            same_registry,
+            &source,
+            &pushed.manifest,
             retry,
         )
         .await?;
@@ -614,6 +637,7 @@ fn pull_source_from_archive(
         referrer_subject: Some(referrer_subject),
         platform: plat,
         source_size: manifest.layers.iter().map(|l| l.size).sum(),
+        manifest_bytes: imported.manifest_bytes.clone(),
         config_bytes,
         layers,
     })
@@ -693,6 +717,7 @@ async fn gather_sources(
                 },
                 source_size: 0,
                 config_bytes: synthesize_image_config(&os, &architecture, variant.as_deref())?,
+                manifest_bytes: Vec::new(),
                 layers: Vec::new(),
             }
         }
@@ -780,6 +805,7 @@ async fn pull_source(
         referrer_subject: Some(referrer_subject),
         platform: plat,
         source_size,
+        manifest_bytes: image_bytes,
         config_bytes,
         layers,
     })
@@ -1180,6 +1206,141 @@ fn parse_prefetch_files(patterns: &str) -> Vec<String> {
 
 /// A pushed per-platform nydus manifest plus the total bytes of nydus content
 /// it published (data blobs + bootstrap + config + manifest), for reporting.
+
+/// `artifactType` current nydus parsers use to spot the nydus manifest inside a dual index
+/// (`contrib/nydusify/pkg/parser`), plus the legacy `os.features` marker parsers before
+/// v2.3.5 keyed on. Both are set on the nydus entry.
+const NYDUS_MANIFEST_ARTIFACT_TYPE: &str = "application/vnd.nydus.image.manifest.v1+json";
+const NYDUS_OS_FEATURE: &str = "nydus.remoteimage.v1";
+
+/// Publish the target tag as an OCI index carrying the untouched source OCI manifest and the
+/// just-pushed nydus manifest.
+///
+/// Layout follows the Go ecosystem's `merge_manifest` (goharbor/acceleration-service
+/// `makeManifestIndex`): OCI entries first, nydus entries after, the nydus descriptor marked
+/// via `artifactType`. Two deliberate divergences. The OCI manifest is **not** modified --
+/// accel-service prepends an empty layer to defeat Harbor-side layer reuse, but a
+/// byte-identical manifest is the whole point here: existing digest pins keep resolving and a
+/// scan of the OCI half is a scan of the original image. And the legacy `os.features` marker
+/// is kept alongside `artifactType`, because strict platform matchers treat an unknown
+/// required feature as "no match" and skip the nydus half -- exactly what a scanner should do.
+///
+/// Ordering is load-bearing: consumers that ignore both markers and take the first platform
+/// match (plain containerd, docker) must land on the standard image, never the nydus one.
+#[allow(clippy::too_many_arguments)]
+async fn attach_oci_manifest_and_push_index(
+    target_client: &RegistryClient,
+    target_ref: &ImageReference,
+    source_ref: Option<&ImageReference>,
+    same_registry: bool,
+    source: &PulledSource,
+    nydus_manifest: &Descriptor,
+    retry: &RetryPolicy,
+) -> Result<()> {
+    let source_ref = source_ref
+        .context("--attach-oci-manifest requires an image --source (plan enforces this)")?;
+    let repo = &target_ref.repo;
+    let manifest: Manifest = serde_json::from_slice(&source.manifest_bytes)
+        .context("re-parse the source manifest for --attach-oci-manifest")?;
+    let oci_media_type = manifest
+        .media_type
+        .clone()
+        .unwrap_or_else(|| registry_client::types::MEDIA_TYPE_OCI_MANIFEST.to_string());
+    let oci_digest = registry_client::types::sha256_digest(&source.manifest_bytes);
+
+    // The OCI half must be resolvable from the target repo. Converting in place -- source and
+    // target being the same repo, the migration case -- everything is already there.
+    let same_repo = same_registry && source_ref.repo == target_ref.repo;
+    if !same_repo {
+        for layer in &source.layers {
+            if target_client.head_blob(repo, &layer.digest).await? {
+                continue;
+            }
+            let mounted = same_registry
+                && target_client
+                    .mount_blob(repo, &layer.digest, &source_ref.repo)
+                    .await
+                    .unwrap_or(false);
+            if !mounted {
+                retry
+                    .run("push source layer", || {
+                        target_client.push_blob_file(repo, &layer.path)
+                    })
+                    .await
+                    .with_context(|| format!("push source layer {}", layer.digest))?;
+            }
+        }
+        if !target_client
+            .head_blob(repo, &manifest.config.digest)
+            .await?
+        {
+            retry
+                .run("push source config", || {
+                    target_client.push_blob_bytes(repo, &source.config_bytes)
+                })
+                .await
+                .context("push the source image config")?;
+        }
+        retry
+            .run("push source manifest", || {
+                target_client.push_manifest(
+                    repo,
+                    &oci_digest,
+                    &oci_media_type,
+                    &source.manifest_bytes,
+                )
+            })
+            .await
+            .context("push the source manifest by digest")?;
+    }
+
+    let index_bytes = serde_json::to_vec(&dual_manifest_index(
+        Descriptor {
+            media_type: oci_media_type,
+            digest: oci_digest,
+            size: source.manifest_bytes.len() as u64,
+            platform: Some(source.platform.clone()),
+            ..Descriptor::default()
+        },
+        nydus_manifest,
+        &source.platform,
+    ))
+    .context("serialize the dual-manifest index")?;
+    retry
+        .run("push dual-manifest index", || {
+            target_client.push_manifest(
+                repo,
+                target_ref.manifest_reference(),
+                index_media_type(true),
+                &index_bytes,
+            )
+        })
+        .await
+        .context("push the dual-manifest index")?;
+    info!(
+        target = %target_ref,
+        "published dual-manifest index: OCI + nydus under one tag"
+    );
+    Ok(())
+}
+
+/// Assemble the dual-manifest index: `[oci, nydus]`, nydus marked by `artifactType` and the
+/// legacy `os.features`. Pure so the layout -- the part consumers key on -- is testable.
+fn dual_manifest_index(
+    oci_desc: Descriptor,
+    nydus_manifest: &Descriptor,
+    platform: &registry_client::types::Platform,
+) -> Index {
+    let mut nydus_platform = platform.clone();
+    nydus_platform.os_features = Some(vec![NYDUS_OS_FEATURE.to_string()]);
+    let nydus_desc = Descriptor {
+        artifact_type: Some(NYDUS_MANIFEST_ARTIFACT_TYPE.to_string()),
+        platform: Some(nydus_platform),
+        ..nydus_manifest.clone()
+    };
+    assemble_index(true, vec![oci_desc, nydus_desc])
+}
+
 struct PushedArtifact {
     manifest: Descriptor,
     target_size: u64,
@@ -1683,6 +1844,63 @@ mod tests {
 
         // Nothing appended means no --exclude at all, not an empty one.
         assert!(excludes_for_directory(Path::new("/srv/rootfs"), &[]).is_empty());
+    }
+
+    #[test]
+    fn dual_manifest_index_layout_is_what_each_consumer_keys_on() {
+        let platform = registry_client::types::Platform {
+            architecture: "arm64".into(),
+            os: "linux".into(),
+            ..Default::default()
+        };
+        let oci = Descriptor {
+            media_type: "application/vnd.oci.image.manifest.v1+json".into(),
+            digest: "sha256:aaaa".into(),
+            size: 100,
+            platform: Some(platform.clone()),
+            ..Descriptor::default()
+        };
+        let nydus = Descriptor {
+            media_type: "application/vnd.oci.image.manifest.v1+json".into(),
+            digest: "sha256:bbbb".into(),
+            size: 200,
+            ..Descriptor::default()
+        };
+        let index = dual_manifest_index(oci, &nydus, &platform);
+
+        // OCI first: a consumer that ignores the markers and takes the first platform match
+        // (plain containerd, docker) must land on the standard image.
+        assert_eq!(index.manifests.len(), 2);
+        assert_eq!(index.manifests[0].digest, "sha256:aaaa");
+        assert_eq!(index.manifests[0].artifact_type, None);
+        assert!(
+            index.manifests[0]
+                .platform
+                .as_ref()
+                .is_some_and(|p| p.os_features.is_none()),
+            "the OCI entry must not carry the nydus feature marker"
+        );
+
+        // The nydus entry carries BOTH markers: artifactType for current nydus parsers,
+        // os.features for pre-v2.3.5 parsers and for strict platform matchers to skip.
+        let n = &index.manifests[1];
+        assert_eq!(n.digest, "sha256:bbbb");
+        assert_eq!(
+            n.artifact_type.as_deref(),
+            Some("application/vnd.nydus.image.manifest.v1+json")
+        );
+        assert_eq!(
+            n.platform.as_ref().unwrap().os_features.as_deref(),
+            Some(&["nydus.remoteimage.v1".to_string()][..])
+        );
+
+        // os.features serializes under its wire name, not as Rust field casing.
+        let json = serde_json::to_string(&index).unwrap();
+        assert!(
+            json.contains("\"os.features\":[\"nydus.remoteimage.v1\"]"),
+            "{json}"
+        );
+        assert!(!json.contains("os_features"), "{json}");
     }
 
     #[test]
