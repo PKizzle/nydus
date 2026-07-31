@@ -385,6 +385,27 @@ fn build_erofs_device_options(blobs: &[PathBuf]) -> Result<String> {
     Ok(options)
 }
 
+/// Whether anything is mounted exactly at `mountpoint`.
+///
+/// Reads `/proc/self/mounts` rather than comparing `st_dev` with the parent, which cannot tell a
+/// mount from a bind of the same filesystem. Paths with spaces are octal-escaped there, so the
+/// escaped form is matched too. An unreadable `/proc` answers `false`, which keeps the caller on
+/// the mount path -- failing to mount is a loud, immediate error, whereas wrongly skipping the
+/// mount would leave the image unserved with nothing to say so.
+fn is_mounted_at(mountpoint: &Path) -> bool {
+    let target = mountpoint.display().to_string();
+    let escaped = target.replace(' ', "\\040");
+    std::fs::read_to_string("/proc/self/mounts")
+        .map(|mounts| {
+            mounts.lines().any(|line| {
+                line.split_whitespace()
+                    .nth(1)
+                    .is_some_and(|path| path == target || path == escaped)
+            })
+        })
+        .unwrap_or(false)
+}
+
 // Issue a file-backed EROFS mount via `mount(2)` (kernel ≥ 6.12).
 //
 // The **bootstrap** is the mount source: it holds the EROFS superblock, inode metadata and the
@@ -761,7 +782,26 @@ impl FanotifyHandler {
     /// Mount the EROFS filesystem after all marks are in place.
     ///
     /// This must be called **after** `new()`, **after** `arm()`, and **after** the workers start.
+    ///
+    /// A mountpoint that already carries a live mount is left alone, and that is the whole
+    /// point rather than a shortcut. When a handler is rebuilt for an image whose kernel mount
+    /// survived -- the "healed in place" path, where the supervisor deliberately stops the old
+    /// daemon *without* unmounting so live container overlays are not torn away -- the marks
+    /// armed above are on the same `.blob.data` cache inodes the existing mount already reads
+    /// through. Mounting again would stack a second EROFS on the same target: new opens would
+    /// see the fresh mount, the old one would stay pinned with no way to reach it, and every
+    /// subsequent rebuild would add another layer. Nothing unmounts them, because the
+    /// reconciler will not tear down a directory whose mount is still active, so the stack only
+    /// ever grows. Observed 578 deep on one production mountpoint before this guard existed.
     pub fn mount(&self) -> Result<()> {
+        if is_mounted_at(&self.mountpoint) {
+            info!(
+                "fanotify: {} is already mounted; re-armed the marks over the live EROFS mount \
+                 instead of stacking a second one",
+                self.mountpoint.display()
+            );
+            return Ok(());
+        }
         mount_erofs(&self.bootstrap_path, &self.device_blobs, &self.mountpoint)
     }
 
@@ -1799,5 +1839,23 @@ mod tests {
             "bytes were discarded despite a failed revoke"
         );
         assert!(err.to_string().contains("read-only"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn is_mounted_at_recognises_a_real_mountpoint_and_rejects_a_plain_directory() {
+        use super::is_mounted_at;
+        use std::path::Path;
+        // `/proc` is mounted on every host this code runs on; a temp dir under it is not.
+        assert!(is_mounted_at(Path::new("/proc")));
+
+        let dir = vmm_sys_util::tempdir::TempDir::new().unwrap();
+        assert!(
+            !is_mounted_at(dir.as_path()),
+            "a plain directory must not look mounted, or mount() would skip and leave the \
+             image unserved"
+        );
+
+        // A path that merely shares a prefix with a mountpoint is not one.
+        assert!(!is_mounted_at(Path::new("/proc-not-really")));
     }
 }
