@@ -24,7 +24,7 @@ use registry_client::Descriptor;
 use registry_client::types::{
     History, ImageConfig, Index, MEDIA_TYPE_DOCKER_CONFIG, MEDIA_TYPE_DOCKER_MANIFEST,
     MEDIA_TYPE_DOCKER_MANIFEST_LIST, MEDIA_TYPE_NYDUS_BLOB, MEDIA_TYPE_OCI_CONFIG,
-    MEDIA_TYPE_OCI_INDEX, MEDIA_TYPE_OCI_LAYER_GZIP, MEDIA_TYPE_OCI_MANIFEST, Manifest,
+    MEDIA_TYPE_OCI_INDEX, MEDIA_TYPE_OCI_LAYER_GZIP, MEDIA_TYPE_OCI_MANIFEST, Manifest, RootFs,
 };
 
 /// Annotation set on nydus data-blob layers so containerd's snapshotter
@@ -132,6 +132,50 @@ pub fn rebuild_image_config(config_bytes: &[u8], layer_digests: &[String]) -> Re
     });
 
     serde_json::to_vec(&config).context("serialize rewritten nydus image config")
+}
+
+/// Build a minimal image config for a conversion with no source image to inherit one from.
+///
+/// A conversion whose `--source` values are all local directories has no runtime config to
+/// preserve -- no entrypoint, no env, no exposed ports -- so the honest output is an image that
+/// declares only what is actually known: its platform and its layers. `rootfs.diff_ids` is left
+/// empty here because [`rebuild_image_config`] replaces it with the built layer set, exactly as
+/// it does for a pulled config.
+///
+/// This is what upstream's v3 converter emits for the same case, which matters for
+/// interoperability: an image built here and one built there describe themselves the same way.
+pub fn synthesize_image_config(
+    os: &str,
+    architecture: &str,
+    variant: Option<&str>,
+) -> Result<Vec<u8>> {
+    let mut extra = BTreeMap::from([
+        ("os".to_string(), serde_json::Value::String(os.to_string())),
+        (
+            "architecture".to_string(),
+            serde_json::Value::String(architecture.to_string()),
+        ),
+        (
+            "config".to_string(),
+            serde_json::Value::Object(serde_json::Map::new()),
+        ),
+    ]);
+    if let Some(variant) = variant {
+        extra.insert(
+            "variant".to_string(),
+            serde_json::Value::String(variant.to_string()),
+        );
+    }
+
+    let config = ImageConfig {
+        rootfs: RootFs {
+            type_: "layers".to_string(),
+            diff_ids: Vec::new(),
+        },
+        history: Vec::new(),
+        extra,
+    };
+    serde_json::to_vec(&config).context("serialize synthesized nydus image config")
 }
 
 /// Assemble the nydus image [`Manifest`] from an already-pushed config
@@ -243,6 +287,36 @@ pub fn validate_nydus_manifest(manifest: &Manifest) -> Result<&Descriptor> {
 mod tests {
     use super::*;
     use registry_client::types::{MEDIA_TYPE_DOCKER_MANIFEST_LIST, MEDIA_TYPE_OCI_LAYER_TAR_GZIP};
+
+    #[test]
+    fn a_synthesized_config_declares_its_platform_and_survives_the_diff_id_rewrite() {
+        let raw = synthesize_image_config("linux", "arm64", Some("v8")).unwrap();
+        let doc: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+        assert_eq!(doc["os"], "linux");
+        assert_eq!(doc["architecture"], "arm64");
+        assert_eq!(doc["variant"], "v8");
+        assert_eq!(doc["rootfs"]["type"], "layers");
+
+        // The synthesized config is fed through the same rewrite a pulled one gets, so the
+        // built layer set has to land in it exactly the same way.
+        let rebuilt =
+            rebuild_image_config(&raw, &["sha256:aa".to_string(), "sha256:bb".to_string()])
+                .unwrap();
+        let doc: serde_json::Value = serde_json::from_slice(&rebuilt).unwrap();
+        assert_eq!(
+            doc["rootfs"]["diff_ids"],
+            serde_json::json!(["sha256:aa", "sha256:bb"])
+        );
+        assert_eq!(doc["os"], "linux");
+        assert_eq!(doc["history"][0]["comment"], BOOTSTRAP_HISTORY_COMMENT);
+    }
+
+    #[test]
+    fn a_synthesized_config_omits_the_variant_when_there_is_none() {
+        let raw = synthesize_image_config("linux", "amd64", None).unwrap();
+        let doc: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+        assert!(doc.get("variant").is_none(), "got: {doc}");
+    }
 
     #[test]
     fn media_types_switch_on_docker2oci() {

@@ -22,7 +22,10 @@ pub struct ConvertPlan {
     /// The image reference the conversion is anchored to: the uppermost `--source`
     /// that is an image. It supplies the runtime config, the platform, and the repo
     /// that reused blobs are mounted from.
-    pub source: String,
+    ///
+    /// `None` when every source is a local directory, in which case a minimal config is
+    /// synthesised instead and every option that needs a source image is refused.
+    pub source: Option<String>,
     /// Every source in stacking order, lowest first. A single-entry list is the
     /// ordinary one-image conversion.
     pub sources: Vec<SourceSpec>,
@@ -171,7 +174,8 @@ pub async fn run(args: ConvertArgs) -> Result<()> {
     let prefetch_patterns = read_prefetch_patterns(&plan)?;
     let request = ConvertRequest::from_convert_args(&args, &plan, prefetch_patterns)?;
     info!(
-        source = %plan.source,
+        source = plan.source.as_deref().unwrap_or("(directories only)"),
+        sources = plan.sources.len(),
         target = %plan.target,
         mode = ?plan.mode,
         oci_ref = plan.oci_ref,
@@ -190,20 +194,14 @@ pub fn plan(args: &ConvertArgs) -> Result<ConvertPlan> {
     if sources.is_empty() {
         bail!("--source is required");
     }
-    // The uppermost image source anchors the conversion. Without one there is no config
-    // to inherit, no platform to resolve against and no repo to mount reused blobs from,
-    // all of which the pipeline below assumes exist.
-    let anchor = sources
-        .iter()
-        .rev()
-        .find_map(|s| match s {
-            SourceSpec::Image(reference) => Some(reference.clone()),
-            SourceSpec::Directory(_) => None,
-        })
-        .with_context(|| {
-            "every --source is a local directory; at least one must be an image reference, \
-             whose config (env, entrypoint, architecture) the converted image inherits"
-        })?;
+    // The uppermost image source anchors the conversion: the converted image inherits its
+    // config, and its registry is where reused blobs are mounted from. There need not be one
+    // -- a conversion of nothing but local directories synthesises a minimal config instead --
+    // but its absence rules out every option that needs a source image to point at.
+    let anchor = sources.iter().rev().find_map(|s| match s {
+        SourceSpec::Image(reference) => Some(reference.clone()),
+        SourceSpec::Directory(_) => None,
+    });
 
     if sources.len() > 1 {
         // Each of these is incompatible with stacking for a concrete reason, and saying
@@ -248,12 +246,65 @@ pub fn plan(args: &ConvertArgs) -> Result<ConvertPlan> {
         }
     }
 
+    if anchor.is_none() {
+        // Nothing but directories: the image config is synthesised rather than inherited, and
+        // there is no source image, registry or manifest for these options to refer to.
+        for (rejected, flag, why) in [
+            (
+                args.oci_ref,
+                "--oci-ref",
+                "zran indexes offsets into a layer's original gzip stream, and a directory has none",
+            ),
+            (
+                args.source_archive.is_some(),
+                "--source-archive",
+                "it reads an image, so it cannot be combined with directory-only sources",
+            ),
+            (
+                args.with_referrer,
+                "--with-referrer",
+                "the artifact is attached to a source image manifest, and there is none",
+            ),
+            (
+                args.target_suffix.is_some(),
+                "--target-suffix",
+                "it derives the target from the source image reference, and there is none \
+                 (pass --target)",
+            ),
+            (
+                args.all_platforms,
+                "--all-platforms",
+                "there is no source index to enumerate; a directory has one platform, the one \
+                 given by --platform",
+            ),
+        ] {
+            if rejected {
+                bail!("{flag} needs an image --source: {why}");
+            }
+        }
+        if let Some(platform) = args.platform.as_deref()
+            && platform.contains(',')
+        {
+            bail!(
+                "--platform {platform} names more than one platform, but the sources are all \
+                 local directories: the same bytes would be stacked into every architecture's \
+                 image and labelled as native to it"
+            );
+        }
+    }
+
     if args.target.is_some() && args.target_suffix.is_some() {
         bail!("--target conflicts with --target-suffix");
     }
     let target = match (&args.target, &args.target_suffix) {
         (Some(target), None) => target.clone(),
-        (None, Some(suffix)) => add_reference_suffix(&anchor, suffix)?,
+        // `--target-suffix` is refused above when there is no anchor to derive from.
+        (None, Some(suffix)) => add_reference_suffix(
+            anchor
+                .as_deref()
+                .context("--target-suffix needs an image --source to derive the target from")?,
+            suffix,
+        )?,
         (None, None) => bail!("--target or --target-suffix is required"),
         (Some(_), Some(_)) => unreachable!(),
     };
@@ -628,7 +679,7 @@ mod tests {
     #[test]
     fn a_single_image_source_plans_exactly_as_before() {
         let plan = plan(&convert_args(&["localhost:5000/app:v1"], &[])).unwrap();
-        assert_eq!(plan.source, "localhost:5000/app:v1");
+        assert_eq!(plan.source.as_deref(), Some("localhost:5000/app:v1"));
         assert_eq!(
             plan.sources,
             vec![SourceSpec::Image("localhost:5000/app:v1".into())]
@@ -662,16 +713,72 @@ mod tests {
             ]
         );
         // ...but the anchor is the uppermost *image*, even with a directory above it.
-        assert_eq!(plan.source, "localhost:5000/app:v2");
+        assert_eq!(plan.source.as_deref(), Some("localhost:5000/app:v2"));
     }
 
     #[test]
-    fn a_directory_only_conversion_is_refused_with_the_reason() {
+    fn a_directory_only_conversion_plans_without_an_anchor() {
+        let lower = tempfile::tempdir().unwrap();
+        let upper = tempfile::tempdir().unwrap();
+        let plan = plan(&convert_args(
+            &[
+                lower.path().to_str().unwrap(),
+                upper.path().to_str().unwrap(),
+            ],
+            &[],
+        ))
+        .unwrap();
+        // No image to inherit from: the config is synthesised at build time instead.
+        assert_eq!(plan.source, None);
+        assert_eq!(
+            plan.sources,
+            vec![
+                SourceSpec::Directory(lower.path().canonicalize().unwrap()),
+                SourceSpec::Directory(upper.path().canonicalize().unwrap()),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_directory_only_conversion_refuses_what_needs_a_source_image() {
         let d = tempfile::tempdir().unwrap();
-        let err = plan(&convert_args(&[d.path().to_str().unwrap()], &[]))
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("at least one must be an image"), "got: {err}");
+        let dir = d.path().to_str().unwrap();
+        for (flags, needle) in [
+            (vec!["--oci-ref"], "gzip stream"),
+            (
+                vec!["--source-archive", "/nonexistent.tar"],
+                "reads an image",
+            ),
+            (vec!["--with-referrer"], "source image manifest"),
+            (vec!["--all-platforms"], "no source index"),
+            (
+                vec!["--platform", "linux/amd64,linux/arm64"],
+                "more than one platform",
+            ),
+        ] {
+            let err = plan(&convert_args(&[dir], &flags)).unwrap_err().to_string();
+            assert!(
+                err.contains(needle),
+                "{flags:?} should mention {needle}: {err}"
+            );
+        }
+
+        // --target-suffix has nothing to derive a target from without an image source.
+        let mut argv = vec![
+            "nydusify".to_string(),
+            "convert".to_string(),
+            "--source".to_string(),
+            dir.to_string(),
+            "--target-suffix".to_string(),
+            "-nydus".to_string(),
+        ];
+        argv.retain(|a| a != "--target");
+        let cli = Cli::parse_from(argv);
+        let Commands::Convert(args) = cli.command else {
+            panic!("expected convert")
+        };
+        let err = plan(&args).unwrap_err().to_string();
+        assert!(err.contains("--target-suffix"), "got: {err}");
     }
 
     #[test]

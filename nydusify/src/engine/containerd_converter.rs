@@ -39,7 +39,7 @@ impl ImageConverter for ContainerdConverter {
     async fn convert(&self, request: ConvertRequest) -> Result<()> {
         let workspace = request.prepare_workspace()?;
         info!(
-            source = %request.source,
+            source = request.source.as_deref().unwrap_or("(directories only)"),
             target = %request.target,
             tmp_dir = %workspace.path().display(),
             driver = "nydus",
@@ -55,7 +55,8 @@ impl ImageConverter for ContainerdConverter {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct ConvertRequest {
     /// The image reference the conversion is anchored to (the uppermost image `--source`).
-    pub source: String,
+    /// `None` for a conversion whose sources are all local directories.
+    pub source: Option<String>,
     /// Every `--source` in stacking order, lowest first. One entry is the ordinary
     /// single-image conversion; more than one stacks directories and images together.
     pub sources: Vec<SourceSpec>,

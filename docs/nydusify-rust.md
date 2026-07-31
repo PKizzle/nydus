@@ -57,9 +57,9 @@ target. A `--source` value is read as a path when it exists as a directory, or w
 `/`, `./` or `../` — prefixes an OCI reference can never carry. A path-like value that is not a
 directory is refused up front rather than handed to the registry parser.
 
-At least one source must be an image reference: the **uppermost image** anchors the conversion,
-and the converted image inherits its config — environment, entrypoint, architecture. Four options
-are refused in combination with multiple sources, each for a concrete reason:
+When one of the sources is an image, the **uppermost image** anchors the conversion and the
+converted image inherits its config — environment, entrypoint, architecture. Four options are
+refused in combination with multiple sources, each for a concrete reason:
 
 | Option | Why it cannot be honoured |
 |---|---|
@@ -67,6 +67,24 @@ are refused in combination with multiple sources, each for a concrete reason:
 | `--source-archive` | Reads exactly one image. |
 | `--all-platforms`, or a comma-separated `--platform` | The sources are stacked into one image, so exactly one platform is converted. |
 | `--with-referrer` | The artifact is attached to the uppermost image source, which would advertise the stacked image as a plain conversion of that one image. |
+
+#### Directory-only conversions
+
+Every source may be a directory, in which case there is no image config to inherit and a minimal
+one is synthesized instead — the platform (`--platform`, or the host) and the built layers, and
+nothing else. There is deliberately no entrypoint, env or working directory: nothing in a
+directory says what they should be, and inventing them would be worse than leaving them empty.
+
+```shell
+nydusify convert \
+  --source ./rootfs \
+  --target myregistry/app:v1-nydus \
+  --platform linux/arm64
+```
+
+The same five options are refused here, for the matching reason — there is no source image,
+registry or manifest for them to refer to — plus `--target-suffix`, which has no source
+reference to derive a target from.
 
 ### Prefetch pattern files
 

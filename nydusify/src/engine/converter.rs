@@ -41,6 +41,7 @@ use crate::engine::containerd_converter::ConvertRequest;
 use crate::engine::manifest::{
     assemble_index, assemble_manifest, bootstrap_descriptor, config_media_type,
     data_blob_descriptor, index_media_type, manifest_media_type, rebuild_image_config,
+    synthesize_image_config,
 };
 use crate::engine::oci::{
     all_platform_selectors, blob_hex, client_options, is_index, parse_platform_list,
@@ -106,7 +107,10 @@ struct PulledSource {
     /// manifest; for one platform of a multi-arch source it is that
     /// platform's manifest (so a merged conversion attaches one referrer per
     /// platform, each resolvable from its own subject).
-    referrer_subject: Descriptor,
+    ///
+    /// `None` for a directory-only conversion: there is no source manifest to be the subject
+    /// of a referrer, which is why `--with-referrer` is refused for one.
+    referrer_subject: Option<Descriptor>,
     /// The platform this manifest targets (index entry + reporting).
     platform: registry_client::types::Platform,
     /// Sum of the source layer (compressed) sizes, for `--output-json`.
@@ -134,20 +138,33 @@ pub async fn run_conversion(request: &ConvertRequest, workspace: &Path) -> Resul
     reject_unsupported(request)?;
     let started = std::time::Instant::now();
 
-    let source_ref = ImageReference::parse(&request.source)
-        .with_context(|| format!("parse --source {}", request.source))?;
+    // Both are `None` when every `--source` is a local directory: there is no source image to
+    // parse and no registry to pull one from. Every option that would need them is refused at
+    // plan time, so the pipeline below only has to skip the pull.
+    let source_ref = request
+        .source
+        .as_deref()
+        .map(|source| {
+            ImageReference::parse(source).with_context(|| format!("parse --source {source}"))
+        })
+        .transpose()?;
     let target_ref = ImageReference::parse(&request.target)
         .with_context(|| format!("parse --target {}", request.target))?;
 
-    let source_client = RegistryClient::new(
-        &source_ref.api_host,
-        client_options(
-            request.source_insecure,
-            request.source_plain_http,
-            &request.ca_cert_files,
-        ),
-    )
-    .context("build source registry client")?;
+    let source_client = source_ref
+        .as_ref()
+        .map(|source_ref| {
+            RegistryClient::new(
+                &source_ref.api_host,
+                client_options(
+                    request.source_insecure,
+                    request.source_plain_http,
+                    &request.ca_cert_files,
+                ),
+            )
+            .context("build source registry client")
+        })
+        .transpose()?;
     let target_client = RegistryClient::new(
         &target_ref.api_host,
         client_options(
@@ -157,20 +174,31 @@ pub async fn run_conversion(request: &ConvertRequest, workspace: &Path) -> Resul
         ),
     )
     .context("build target registry client")?;
-    let same_registry = source_ref.api_host == target_ref.api_host;
+    let same_registry = source_ref
+        .as_ref()
+        .is_some_and(|s| s.api_host == target_ref.api_host);
     let retry = RetryPolicy::from_flags(request.push_retry_count, &request.push_retry_delay);
 
     // Resolve which platforms to convert from the top-level source reference.
-    let plan = resolve_platform_plan(request, &source_client, &source_ref).await?;
+    let plan = match (&source_client, &source_ref) {
+        (Some(client), Some(source_ref)) => {
+            resolve_platform_plan(request, client, source_ref).await?
+        }
+        // Directory-only: there is no index to enumerate, and a multi-platform selection was
+        // refused at plan time, so `--platform` (or the host default) is the whole answer.
+        _ => PlatformPlan {
+            selectors: parse_platform_list(&request.platforms)?,
+        },
+    };
 
     if plan.selectors.len() == 1 {
         // Single platform: push the manifest directly at the target tag —
         // byte-for-byte the pre-multi-platform behavior (no index wrapper).
         let outcome = convert_one_platform(
             request,
-            &source_client,
+            source_client.as_ref(),
             &target_client,
-            &source_ref,
+            source_ref.as_ref(),
             &target_ref,
             same_registry,
             &plan.selectors[0],
@@ -215,9 +243,9 @@ pub async fn run_conversion(request: &ConvertRequest, workspace: &Path) -> Resul
         // the tag), each in its own workspace subdir so builds don't collide.
         let outcome = convert_one_platform(
             request,
-            &source_client,
+            source_client.as_ref(),
             &target_client,
-            &source_ref,
+            source_ref.as_ref(),
             &target_ref,
             same_registry,
             selector,
@@ -356,9 +384,9 @@ async fn resolve_platform_plan(
 #[allow(clippy::too_many_arguments)]
 async fn convert_one_platform(
     request: &ConvertRequest,
-    source_client: &RegistryClient,
+    source_client: Option<&RegistryClient>,
     target_client: &RegistryClient,
-    source_ref: &ImageReference,
+    source_ref: Option<&ImageReference>,
     target_ref: &ImageReference,
     same_registry: bool,
     platform: &str,
@@ -384,7 +412,7 @@ async fn convert_one_platform(
         None => gather_sources(request, source_client, source_ref, platform, workspace).await?,
     };
     info!(
-        source = %source_ref,
+        source = source_ref.map(|r| r.to_string()).as_deref().unwrap_or("(directories only)"),
         platform = %platform,
         sources = request.sources.len(),
         inputs = inputs.len(),
@@ -431,16 +459,22 @@ async fn convert_one_platform(
         .map(|l| l.path.clone())
         .collect();
     data_blob_files.extend(output.new_blobs.iter().cloned());
-    maybe_push_referrer(
-        request.driver.with_referrer,
-        source_client,
-        &source_ref.repo,
-        &data_blob_files,
-        &output.bootstrap,
-        &source.referrer_subject,
-        retry,
-    )
-    .await?;
+    // A referrer needs a source image to be the subject of; `--with-referrer` is refused at
+    // plan time without one, so there is nothing to publish here for a directory-only convert.
+    if let (Some(source_client), Some(source_ref), Some(subject)) =
+        (source_client, source_ref, &source.referrer_subject)
+    {
+        maybe_push_referrer(
+            request.driver.with_referrer,
+            source_client,
+            &source_ref.repo,
+            &data_blob_files,
+            &output.bootstrap,
+            subject,
+            retry,
+        )
+        .await?;
+    }
 
     Ok(PlatformOutcome {
         target_size: pushed.target_size,
@@ -577,7 +611,7 @@ fn pull_source_from_archive(
     }
 
     Ok(PulledSource {
-        referrer_subject,
+        referrer_subject: Some(referrer_subject),
         platform: plat,
         source_size: manifest.layers.iter().map(|l| l.size).sum(),
         config_bytes,
@@ -598,8 +632,8 @@ fn pull_source_from_archive(
 /// spread across registries with differing settings are not supported.
 async fn gather_sources(
     request: &ConvertRequest,
-    client: &RegistryClient,
-    anchor_ref: &ImageReference,
+    client: Option<&RegistryClient>,
+    anchor_ref: Option<&ImageReference>,
     platform: &str,
     workspace: &Path,
 ) -> Result<(PulledSource, Vec<BuildInput>)> {
@@ -609,9 +643,18 @@ async fn gather_sources(
     for spec in &request.sources {
         match spec {
             SourceSpec::Image(reference) => {
+                let (Some(client), Some(anchor_ref)) = (client, anchor_ref) else {
+                    // Unreachable: a source list holding an image is exactly what makes the
+                    // caller build a client, so this cannot be reached without those two
+                    // falling out of step.
+                    bail!(
+                        "--source {reference} is an image reference but no source registry \
+                         client was built for it"
+                    );
+                };
                 // The anchor is already parsed and validated by the caller; re-parsing it
                 // would duplicate the error handling for no benefit.
-                let image_ref = if reference == &request.source {
+                let image_ref = if request.source.as_deref() == Some(reference.as_str()) {
                     anchor_ref.clone()
                 } else {
                     ImageReference::parse(reference)
@@ -633,9 +676,27 @@ async fn gather_sources(
         }
     }
 
-    let anchor = anchor.context(
-        "no image source was pulled; --source must include at least one image reference",
-    )?;
+    // With no image among the sources there is nothing to inherit a config from, so synthesise
+    // a minimal one. Everything downstream treats it exactly like a pulled config: the
+    // diff_ids are rewritten to match the built layers either way.
+    let anchor = match anchor {
+        Some(pulled) => pulled,
+        None => {
+            let (os, architecture, variant) = crate::engine::oci::parse_platform(platform)?;
+            PulledSource {
+                referrer_subject: None,
+                platform: registry_client::types::Platform {
+                    architecture: architecture.clone(),
+                    os: os.clone(),
+                    variant: variant.clone(),
+                    ..Default::default()
+                },
+                source_size: 0,
+                config_bytes: synthesize_image_config(&os, &architecture, variant.as_deref())?,
+                layers: Vec::new(),
+            }
+        }
+    };
     Ok((anchor, inputs))
 }
 
@@ -716,7 +777,7 @@ async fn pull_source(
     }
 
     Ok(PulledSource {
-        referrer_subject,
+        referrer_subject: Some(referrer_subject),
         platform: plat,
         source_size,
         config_bytes,
@@ -1105,7 +1166,9 @@ async fn push_artifact(
     request: &ConvertRequest,
     client: &RegistryClient,
     target_ref: &ImageReference,
-    source_ref: &ImageReference,
+    // `None` for a directory-only conversion, which has no source repo to mount blobs from --
+    // and no reused layers to mount either, since `--oci-ref` is refused without an image.
+    source_ref: Option<&ImageReference>,
     same_registry: bool,
     source: &PulledSource,
     output: &ConversionOutput,
@@ -1119,9 +1182,14 @@ async fn push_artifact(
 
     // Reused original layers (--oci-ref): mount on a same-registry target, else push.
     for layer in &output.reused_layers {
-        let mounted = if same_registry && source_ref.repo != target_ref.repo {
+        let source_repo = source_ref.map(|r| &r.repo);
+        let mounted = if same_registry && source_repo.is_some_and(|r| r != &target_ref.repo) {
             client
-                .mount_blob(repo, &layer.digest, &source_ref.repo)
+                .mount_blob(
+                    repo,
+                    &layer.digest,
+                    source_repo.expect("checked just above"),
+                )
                 .await
                 .unwrap_or(false)
         } else {
