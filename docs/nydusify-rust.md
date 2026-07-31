@@ -86,6 +86,27 @@ The same five options are refused here, for the matching reason — there is no 
 registry or manifest for them to refer to — plus `--target-suffix`, which has no source
 reference to derive a target from.
 
+## `nydusify optimize`
+
+Rebuild an already-published nydus image's prefetch layout without re-converting it:
+
+```shell
+nydusify optimize \
+  --source myregistry/app:v1-nydus \
+  --target myregistry/app:v1-nydus-opt \
+  --prefetch-pattern-file ./access-pattern.json
+```
+
+The pattern file uses the same schema and validation as `convert --prefetch-pattern-file`
+(see [Prefetch pattern files](#prefetch-pattern-files)). The source image's data blobs stay
+where they are — `nydus-image optimize` range-reads the chunks the pattern names straight out of
+the source registry rather than downloading every blob — and the pushed image reuses every
+original data layer, appending one new blob holding the prefetched bytes plus a rewritten
+bootstrap whose prefetch table points at it.
+
+Unlike the optimize step folded into `convert`, which warns and publishes an un-optimized image
+when it fails, this command exists only to optimize: any failure is fatal and nothing is pushed.
+
 ### Extra files in the bootstrap layer
 
 `--append-in-bootstrap` (repeatable) packs a file into the bootstrap layer beside

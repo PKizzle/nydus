@@ -9,6 +9,7 @@ pub mod common;
 pub mod convert;
 pub mod copy;
 pub mod mount;
+pub mod optimize;
 
 use anyhow::Result;
 
@@ -20,6 +21,7 @@ pub async fn execute(command: Commands) -> Result<()> {
         Commands::Check(args) => check::run(*args).await,
         Commands::Mount(args) => mount::run(*args).await,
         Commands::Copy(args) => copy::run(*args).await,
+        Commands::Optimize(args) => optimize::run(*args).await,
         Commands::Commit(args) => commit::run(*args).await,
         Commands::Chunkdict(ChunkdictCommands::Generate(args)) => chunkdict::run(*args).await,
     }

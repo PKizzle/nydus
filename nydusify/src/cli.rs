@@ -37,6 +37,8 @@ pub enum Commands {
     Mount(Box<MountArgs>),
     /// Copy an image from source to target.
     Copy(Box<CopyArgs>),
+    /// Optimize an existing Nydus image's prefetch layout and push the result.
+    Optimize(Box<OptimizeArgs>),
     /// Commit a running container's writable layer into a new Nydus image.
     Commit(Box<CommitArgs>),
     /// Deduplicate chunks across Nydus images (experimental).
@@ -522,6 +524,62 @@ pub struct CopyArgs {
         default_value = "nydus-image"
     )]
     pub nydus_image: PathBuf,
+}
+
+/// `nydusify optimize` — rebuild an existing nydus image's prefetch layout.
+///
+/// Unlike the optimize step folded into `convert`, which is best-effort because the conversion
+/// still has a usable image to publish without it, this command exists only to optimize: a
+/// failure here is fatal and nothing is pushed.
+#[derive(Clone, Debug, Eq, PartialEq, Args)]
+pub struct OptimizeArgs {
+    /// Source nydus image reference.
+    #[arg(long, short = 's', env = "SOURCE")]
+    pub source: String,
+    /// Target reference for the optimized image.
+    #[arg(long, short = 't', env = "TARGET")]
+    pub target: String,
+    /// JSON access-pattern document listing the files (and byte ranges) to prefetch.
+    ///
+    /// Same schema `convert --prefetch-pattern-file` takes:
+    /// `{"version":"v1","files":[{"path":"/usr/bin/app","ranges":[[0,4096]]}]}`.
+    #[arg(long = "prefetch-pattern-file", value_name = "FILE")]
+    pub prefetch_pattern_file: PathBuf,
+    #[arg(long = "source-insecure", env = "SOURCE_INSECURE")]
+    pub source_insecure: bool,
+    #[arg(long = "target-insecure", env = "TARGET_INSECURE")]
+    pub target_insecure: bool,
+    #[arg(long = "plain-http", env = "PLAIN_HTTP")]
+    pub plain_http: bool,
+    #[arg(long = "source-plain-http", env = "SOURCE_PLAIN_HTTP")]
+    pub source_plain_http: bool,
+    #[arg(long = "target-plain-http", env = "TARGET_PLAIN_HTTP")]
+    pub target_plain_http: bool,
+    #[arg(long = "ca-cert", env = "CA_CERT", value_name = "FILE")]
+    pub ca_cert: Vec<PathBuf>,
+    /// Platform to optimize (defaults to the host platform).
+    #[arg(long)]
+    pub platform: Option<String>,
+    #[arg(long = "work-dir", env = "WORK_DIR", default_value = "./tmp")]
+    pub work_dir: PathBuf,
+    #[arg(
+        long = "nydus-image",
+        env = "NYDUS_IMAGE",
+        default_value = "nydus-image"
+    )]
+    pub nydus_image: PathBuf,
+    #[arg(
+        long = "push-retry-count",
+        env = "PUSH_RETRY_COUNT",
+        default_value_t = 3
+    )]
+    pub push_retry_count: u32,
+    #[arg(
+        long = "push-retry-delay",
+        env = "PUSH_RETRY_DELAY",
+        default_value = "5s"
+    )]
+    pub push_retry_delay: String,
 }
 
 pub fn default_platform() -> String {

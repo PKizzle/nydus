@@ -140,7 +140,7 @@ struct AccessPatternFile {
 /// deliberately non-fatal during conversion (the image is still published, just un-optimised),
 /// so a typo in this file would otherwise cost a full convert-and-push to discover, and only
 /// as a warning buried in the log.
-fn validate_prefetch_pattern_file(path: &Path) -> Result<()> {
+pub(crate) fn validate_prefetch_pattern_file(path: &Path) -> Result<()> {
     let raw = std::fs::read(path)
         .with_context(|| format!("read --prefetch-pattern-file {}", path.display()))?;
     let doc: AccessPatternDoc = serde_json::from_slice(&raw).with_context(|| {
