@@ -21,7 +21,7 @@ use nydus_rafs::metadata::RafsSuper;
 use nydus_rafs::metadata::RafsVersion;
 use nydus_rafs::metadata::layout::RafsBlobTable;
 use nydus_storage::backend::BlobBackend;
-use nydus_storage::device::BlobInfo;
+use nydus_storage::device::{BlobFeatures, BlobInfo};
 use nydus_storage::meta::BatchContextGenerator;
 use nydus_storage::meta::BlobChunkInfoV2Ondisk;
 use nydus_utils::compress;
@@ -71,7 +71,12 @@ impl PrefetchBlobState {
             0,
             ctx.chunk_size,
             u32::MAX,
-            ctx.blob_features,
+            // The prefetch blob's chunk info is written as `BlobChunkInfoV2Ondisk` below
+            // (`batch.generate_chunk_info`), and its `meta_ci_*` sizes are accumulated in units
+            // of that type. Without this bit the blob would declare the v1 layout while
+            // carrying v2 records, and `RafsV6Blob::validate` rejects the bootstrap: it sizes
+            // the chunk-info table as `chunk_count * 16` and finds `chunk_count * 24`.
+            ctx.blob_features | BlobFeatures::CHUNK_INFO_V2,
         );
         blob_info.set_compressor(ctx.compressor);
         blob_info.set_separated_with_prefetch_files_feature(true);
@@ -558,6 +563,29 @@ mod tests {
         // PrefetchFileInfo implements Clone
         let cloned = infos[0].clone();
         assert_eq!(cloned.path, infos[0].path);
+    }
+
+    #[test]
+    fn the_prefetch_blob_declares_the_chunk_info_layout_it_actually_writes() {
+        // `process_prefetch_node` grows `meta_ci_*` by `size_of::<BlobChunkInfoV2Ondisk>()` per
+        // chunk and stores v2 records. If the blob does not also declare CHUNK_INFO_V2,
+        // `RafsV6Blob::validate` sizes the table as `chunk_count * 16`, finds `chunk_count * 24`
+        // and rejects the whole bootstrap -- so every prefetch-optimized image fails
+        // `nydus-image check` while the conversion itself reports success.
+        let ctx = BuildContext::default();
+        // Non-vacuous only while the bit is absent from the context it is OR'd into: if a
+        // default build ever gains CHUNK_INFO_V2, this test would pass without the fix.
+        assert!(
+            !ctx.blob_features.contains(BlobFeatures::CHUNK_INFO_V2),
+            "context already declares CHUNK_INFO_V2; this test no longer proves anything"
+        );
+
+        let tmp = TempFile::new().unwrap();
+        let state = PrefetchBlobState::new(&ctx, 0, tmp.as_path().parent().unwrap()).unwrap();
+        assert!(
+            state.blob_info.has_feature(BlobFeatures::CHUNK_INFO_V2),
+            "prefetch blob must declare the v2 chunk-info layout it writes"
+        );
     }
 
     fn make_chunk(file_offset: u64, uncompressed_size: u32) -> NodeChunk {
