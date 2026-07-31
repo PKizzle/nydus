@@ -86,6 +86,30 @@ The same five options are refused here, for the matching reason — there is no 
 registry or manifest for them to refer to — plus `--target-suffix`, which has no source
 reference to derive a target from.
 
+### Extra files in the bootstrap layer
+
+`--append-in-bootstrap` (repeatable) packs a file into the bootstrap layer beside
+`image/image.boot`, under its own base name:
+
+```shell
+nydusify convert \
+  --source ./rootfs \
+  --target myregistry/app:v1-nydus \
+  --append-in-bootstrap ./model-card.json \
+  --append-in-bootstrap ./NOTICE
+```
+
+The point is reachability: the snapshotter already pulls the bootstrap layer and nothing else
+before it can mount, so a file placed here is readable without fetching a single data blob or
+mounting the image. Entries are written with uid/gid 0 and a zero mtime, so re-running the same
+conversion produces the same layer digest.
+
+Two cases are refused up front. Two files sharing a base name would both be stored under that
+name and one would silently shadow the other. A file *inside* one of the directory sources would
+have its bytes built into that source's data blob **and** copied into the bootstrap layer — two
+copies with nothing keeping them in step; `nydus-image` has no `--exclude` to suppress the first,
+so move the file outside the source tree.
+
 ### Prefetch pattern files
 
 `--prefetch-pattern-file` takes a JSON access-pattern document and passes it to `nydus-image

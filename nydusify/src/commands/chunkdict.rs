@@ -356,7 +356,7 @@ async fn push_chunkdict_image(
     }
 
     // Bootstrap, as the same gzip'd tar layer every other nydus image uses.
-    let boot_layer = bootstrap_layer::pack(chunkdict_bootstrap)?;
+    let boot_layer = bootstrap_layer::pack(chunkdict_bootstrap, &[])?;
     let boot_digest = retry
         .run("push chunkdict bootstrap", || {
             client.push_blob_bytes(&target_ref.repo, &boot_layer.gzip_bytes)

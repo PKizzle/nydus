@@ -80,6 +80,8 @@ pub struct ConvertRequest {
     pub target_plain_http: bool,
     pub work_dir: PathBuf,
     pub output_json: Option<PathBuf>,
+    /// Extra files packed into the bootstrap layer beside `image/image.boot`.
+    pub append_in_bootstrap: Vec<PathBuf>,
     pub driver: NydusDriverConfig,
 }
 
@@ -102,6 +104,7 @@ impl ConvertRequest {
 
         Ok(Self {
             source: plan.source.clone(),
+            append_in_bootstrap: plan.append_in_bootstrap.clone(),
             sources: plan.sources.clone(),
             source_archive: args.source_archive.clone(),
             target: plan.target.clone(),

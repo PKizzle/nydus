@@ -1223,7 +1223,7 @@ async fn push_artifact(
     // not as a raw blob under a bespoke media type: containerd has to be able to
     // unpack it with its normal tar+gzip path (no stream processor), and the
     // snapshotter reads the bootstrap out of the expanded snapshot.
-    let boot_layer = bootstrap_layer::pack(&output.bootstrap)?;
+    let boot_layer = bootstrap_layer::pack(&output.bootstrap, &request.append_in_bootstrap)?;
     let boot_digest = retry
         .run("push nydus bootstrap", || {
             client.push_blob_bytes(repo, &boot_layer.gzip_bytes)
@@ -1334,7 +1334,7 @@ fn export_artifact(
         });
     }
 
-    let boot_layer = bootstrap_layer::pack(&output.bootstrap)?;
+    let boot_layer = bootstrap_layer::pack(&output.bootstrap, &request.append_in_bootstrap)?;
     let boot_path = staging.join("bootstrap.tar.gz");
     std::fs::write(&boot_path, &boot_layer.gzip_bytes)
         .with_context(|| format!("stage bootstrap layer {}", boot_path.display()))?;

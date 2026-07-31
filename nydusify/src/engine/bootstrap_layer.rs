@@ -59,25 +59,57 @@ pub struct BootstrapLayer {
     pub diff_id: String,
 }
 
-/// Package `bootstrap` into a gzip'd tar layer containing `image/image.boot`.
-pub fn pack(bootstrap: &Path) -> Result<BootstrapLayer> {
+/// Append one file to the layer tar with fixed ownership and mtime.
+///
+/// Everything that could vary between two runs of the same conversion is pinned, so the layer
+/// digest depends on the content alone -- a converted image has to be reproducible.
+fn append_entry(
+    builder: &mut tar::Builder<&mut Vec<u8>>,
+    name: &str,
+    bytes: &[u8],
+    what: &str,
+) -> Result<()> {
+    let mut header = tar::Header::new_gnu();
+    header.set_size(bytes.len() as u64);
+    header.set_mode(0o644);
+    header.set_mtime(0);
+    header.set_uid(0);
+    header.set_gid(0);
+    header.set_entry_type(tar::EntryType::Regular);
+    header.set_cksum();
+    builder
+        .append_data(&mut header, name, bytes)
+        .with_context(|| format!("append {what} to the bootstrap layer tar"))
+}
+
+/// Package `bootstrap` into a gzip'd tar layer containing `image/image.boot`, plus any
+/// `append_files` stored beside it under their base names.
+pub fn pack(bootstrap: &Path, append_files: &[PathBuf]) -> Result<BootstrapLayer> {
     let data = std::fs::read(bootstrap)
         .with_context(|| format!("read bootstrap {}", bootstrap.display()))?;
 
     let mut tar_bytes = Vec::new();
     {
         let mut builder = tar::Builder::new(&mut tar_bytes);
-        let mut header = tar::Header::new_gnu();
-        header.set_size(data.len() as u64);
-        header.set_mode(0o644);
-        header.set_mtime(0);
-        header.set_uid(0);
-        header.set_gid(0);
-        header.set_entry_type(tar::EntryType::Regular);
-        header.set_cksum();
-        builder
-            .append_data(&mut header, BOOTSTRAP_FILE_NAME_IN_LAYER, data.as_slice())
-            .context("append image/image.boot to the bootstrap layer tar")?;
+        append_entry(
+            &mut builder,
+            BOOTSTRAP_FILE_NAME_IN_LAYER,
+            &data,
+            "image/image.boot",
+        )?;
+
+        // Extra files ride alongside the bootstrap under their own base names, so a consumer
+        // that only pulls this layer can read them without the data blobs. Names are checked
+        // for collisions when the conversion is planned, not here.
+        for path in append_files {
+            let bytes = std::fs::read(path)
+                .with_context(|| format!("read --append-in-bootstrap {}", path.display()))?;
+            let name = path.file_name().and_then(|n| n.to_str()).with_context(|| {
+                format!("--append-in-bootstrap {} has no file name", path.display())
+            })?;
+            append_entry(&mut builder, name, &bytes, name)?;
+        }
+
         builder
             .into_inner()
             .context("finish the bootstrap layer tar")?;
@@ -211,7 +243,7 @@ mod tests {
     #[test]
     fn packs_the_bootstrap_at_the_path_the_snapshotter_reads() {
         let (_dir, path) = write_temp(b"RAFS-BOOTSTRAP-BYTES");
-        let layer = pack(&path).unwrap();
+        let layer = pack(&path, &[]).unwrap();
 
         // Round-trip: ungzip, untar, and confirm both the entry path and content.
         let mut tar_bytes = Vec::new();
@@ -237,13 +269,86 @@ mod tests {
         assert_eq!(entries[0].1, b"RAFS-BOOTSTRAP-BYTES");
     }
 
+    /// Ungzip + untar a packed layer into `(entry path, content)` pairs.
+    fn entries_of(layer: &BootstrapLayer) -> Vec<(String, Vec<u8>)> {
+        let mut tar_bytes = Vec::new();
+        flate2::read::GzDecoder::new(layer.gzip_bytes.as_slice())
+            .read_to_end(&mut tar_bytes)
+            .unwrap();
+        tar::Archive::new(tar_bytes.as_slice())
+            .entries()
+            .unwrap()
+            .map(|e| {
+                let mut e = e.unwrap();
+                let p = e.path().unwrap().to_string_lossy().into_owned();
+                let mut buf = Vec::new();
+                e.read_to_end(&mut buf).unwrap();
+                (p, buf)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn appended_files_ride_beside_the_bootstrap_under_their_base_names() {
+        let (dir, path) = write_temp(b"RAFS-BOOTSTRAP-BYTES");
+        let extra = dir.path().join("model-card.json");
+        std::fs::write(&extra, br#"{"name":"demo"}"#).unwrap();
+        let nested = dir.path().join("nested");
+        std::fs::create_dir(&nested).unwrap();
+        let deep = nested.join("NOTICE");
+        std::fs::write(&deep, b"legal text").unwrap();
+
+        let layer = pack(&path, &[extra, deep]).unwrap();
+        let entries = entries_of(&layer);
+
+        assert_eq!(entries.len(), 3);
+        // The bootstrap stays first and at its full path; extras are flattened to base names.
+        assert_eq!(entries[0].0, BOOTSTRAP_FILE_NAME_IN_LAYER);
+        assert_eq!(entries[0].1, b"RAFS-BOOTSTRAP-BYTES");
+        assert_eq!(entries[1].0, "model-card.json");
+        assert_eq!(entries[1].1, br#"{"name":"demo"}"#);
+        assert_eq!(entries[2].0, "NOTICE");
+        assert_eq!(entries[2].1, b"legal text");
+    }
+
+    #[test]
+    fn packing_the_same_inputs_twice_yields_the_same_digest() {
+        // Ownership and mtime are pinned so a converted image is reproducible; an appended
+        // file's own mtime must not leak into the layer digest.
+        let (dir, path) = write_temp(b"bootstrap");
+        let extra = dir.path().join("extra.txt");
+        std::fs::write(&extra, b"same bytes").unwrap();
+
+        let first = pack(&path, std::slice::from_ref(&extra)).unwrap();
+        std::fs::write(&extra, b"same bytes").unwrap();
+        let second = pack(&path, std::slice::from_ref(&extra)).unwrap();
+
+        assert_eq!(first.digest, second.digest);
+        assert_eq!(first.diff_id, second.diff_id);
+    }
+
+    #[test]
+    fn extract_still_finds_the_bootstrap_past_appended_entries() {
+        // `extract` scans for image/image.boot; appended entries must not shadow it.
+        let (dir, path) = write_temp(b"THE-BOOTSTRAP");
+        let extra = dir.path().join("sidecar.json");
+        std::fs::write(&extra, b"{}").unwrap();
+        let layer = pack(&path, &[extra]).unwrap();
+
+        let layer_path = dir.path().join("layer.tar.gz");
+        std::fs::write(&layer_path, &layer.gzip_bytes).unwrap();
+        let out = dir.path().join("extracted.boot");
+        extract(&layer_path, &out).unwrap();
+        assert_eq!(std::fs::read(&out).unwrap(), b"THE-BOOTSTRAP");
+    }
+
     #[test]
     fn diff_id_is_the_tar_digest_not_the_gzip_digest() {
         // containerd recomputes the diff id from the uncompressed tar while
         // unpacking; returning the gzip digest here fails the pull with a
         // mismatched-diff-id error.
         let (_dir, path) = write_temp(b"bootstrap");
-        let layer = pack(&path).unwrap();
+        let layer = pack(&path, &[]).unwrap();
 
         assert_ne!(layer.digest, layer.diff_id);
         assert_eq!(layer.digest, sha256_digest(&layer.gzip_bytes));
@@ -258,7 +363,7 @@ mod tests {
     #[test]
     fn pack_then_extract_round_trips() {
         let (dir, path) = write_temp(b"BOOTSTRAP-CONTENT-42");
-        let layer = pack(&path).unwrap();
+        let layer = pack(&path, &[]).unwrap();
 
         let layer_path = dir.path().join("layer.tar.gz");
         std::fs::write(&layer_path, &layer.gzip_bytes).unwrap();
@@ -321,7 +426,7 @@ mod tests {
         // The bound must not be so eager that it rejects a legitimate layer
         // sitting just under it.
         let (dir, path) = write_temp(b"SMALL-BOOTSTRAP");
-        let layer = pack(&path).unwrap();
+        let layer = pack(&path, &[]).unwrap();
         let layer_path = dir.path().join("layer.tar.gz");
         std::fs::write(&layer_path, &layer.gzip_bytes).unwrap();
 
@@ -354,8 +459,8 @@ mod tests {
         let (_d1, p1) = write_temp(b"same-bytes");
         let (_d2, p2) = write_temp(b"same-bytes");
 
-        let a = pack(&p1).unwrap();
-        let b = pack(&p2).unwrap();
+        let a = pack(&p1, &[]).unwrap();
+        let b = pack(&p2, &[]).unwrap();
 
         assert_eq!(a.digest, b.digest);
         assert_eq!(a.diff_id, b.diff_id);

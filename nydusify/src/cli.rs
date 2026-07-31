@@ -378,6 +378,13 @@ pub struct ConvertArgs {
         default_value = "5s"
     )]
     pub push_retry_delay: String,
+    /// Pack an extra file into the bootstrap layer, alongside `image/image.boot`.
+    ///
+    /// Repeatable. Each file is stored under its own base name, so a consumer that pulls
+    /// only the bootstrap layer — the snapshotter does exactly that — can read it without
+    /// touching the data blobs or mounting the image.
+    #[arg(long = "append-in-bootstrap", value_name = "FILE")]
+    pub append_in_bootstrap: Vec<PathBuf>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Args)]

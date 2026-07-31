@@ -420,7 +420,7 @@ async fn push_committed_image(
     // The bootstrap travels as an ordinary gzip'd tar holding `image/image.boot`
     // — the shape containerd unpacks with no stream processor and the
     // snapshotter reads back (see engine::bootstrap_layer).
-    let boot_layer = bootstrap_layer::pack(merged_bootstrap)?;
+    let boot_layer = bootstrap_layer::pack(merged_bootstrap, &[])?;
     let boot_digest = retry
         .run("push committed bootstrap", || {
             target_client.push_blob_bytes(repo, &boot_layer.gzip_bytes)

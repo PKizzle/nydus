@@ -2,6 +2,7 @@
 //
 // SPDX-License-Identifier: (Apache-2.0 AND BSD-3-Clause)
 
+use std::collections::BTreeMap;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
@@ -35,6 +36,9 @@ pub struct ConvertPlan {
     pub effective_oci: bool,
     pub fs_version: String,
     pub prefetch: PrefetchInput,
+    /// Extra files packed into the bootstrap layer next to `image/image.boot`, each under
+    /// its own base name.
+    pub append_in_bootstrap: Vec<PathBuf>,
 }
 
 /// One `--source` value, classified.
@@ -165,6 +169,61 @@ fn validate_prefetch_pattern_file(path: &Path) -> Result<()> {
             path.display(),
             bad.path
         );
+    }
+    Ok(())
+}
+
+/// Validate the files `--append-in-bootstrap` names, and the names they will be stored under.
+///
+/// Each file is packed at its base name, so two files from different directories that share one
+/// collide: the tar would carry both entries and a reader would see whichever it reached last.
+/// Rejecting is the only honest answer -- there is no name left to disambiguate them by.
+///
+/// A file that lives inside one of the directory sources is also refused. Its bytes would be
+/// built into that source's data blob *and* copied into the bootstrap layer, so the image would
+/// carry two copies that nothing keeps in step. `nydus-image` has no `--exclude` to suppress the
+/// first copy, so until it does, saying so is better than shipping the duplicate quietly.
+fn validate_append_in_bootstrap(files: &[PathBuf], sources: &[SourceSpec]) -> Result<()> {
+    let mut seen: BTreeMap<String, &Path> = BTreeMap::new();
+    for path in files {
+        validate_existing_file(path, "--append-in-bootstrap")?;
+
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .with_context(|| {
+                format!(
+                    "--append-in-bootstrap {} has no usable file name to store it under",
+                    path.display()
+                )
+            })?
+            .to_string();
+        if let Some(previous) = seen.insert(name.clone(), path) {
+            bail!(
+                "--append-in-bootstrap {} and {} would both be stored as {:?} in the bootstrap \
+                 layer; rename one of them",
+                previous.display(),
+                path.display(),
+                name
+            );
+        }
+
+        let canonical = path
+            .canonicalize()
+            .with_context(|| format!("resolve --append-in-bootstrap {}", path.display()))?;
+        for source in sources {
+            if let SourceSpec::Directory(dir) = source
+                && canonical.starts_with(dir)
+            {
+                bail!(
+                    "--append-in-bootstrap {} is inside the directory source {}, so its bytes \
+                     would be built into that source's data blob as well as copied into the \
+                     bootstrap layer; move it outside the source tree",
+                    path.display(),
+                    dir.display()
+                );
+            }
+        }
     }
     Ok(())
 }
@@ -328,6 +387,7 @@ pub fn plan(args: &ConvertArgs) -> Result<ConvertPlan> {
         validate_existing_file(path, "--prefetch-pattern-file")?;
         validate_prefetch_pattern_file(path)?;
     }
+    validate_append_in_bootstrap(&args.append_in_bootstrap, &sources)?;
     if let Some(path) = &args.source_archive {
         validate_existing_file(path, "--source-archive")?;
     }
@@ -377,6 +437,7 @@ pub fn plan(args: &ConvertArgs) -> Result<ConvertPlan> {
         effective_oci: args.oci || args.oci_ref,
         fs_version: args.fs_version.clone(),
         prefetch,
+        append_in_bootstrap: args.append_in_bootstrap.clone(),
     })
 }
 
@@ -779,6 +840,83 @@ mod tests {
         };
         let err = plan(&args).unwrap_err().to_string();
         assert!(err.contains("--target-suffix"), "got: {err}");
+    }
+
+    #[test]
+    fn appended_bootstrap_files_are_checked_before_any_conversion_work() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a");
+        let b = dir.path().join("b");
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        std::fs::write(a.join("notes.txt"), b"one").unwrap();
+        std::fs::write(b.join("notes.txt"), b"two").unwrap();
+
+        let plan_with = |files: &[&Path]| {
+            let mut argv = vec![
+                "nydusify".to_string(),
+                "convert".to_string(),
+                "--source".to_string(),
+                "localhost:5000/app:v1".to_string(),
+                "--target".to_string(),
+                "localhost:5000/app:v1-nydus".to_string(),
+            ];
+            for f in files {
+                argv.push("--append-in-bootstrap".to_string());
+                argv.push(f.display().to_string());
+            }
+            let cli = Cli::parse_from(argv);
+            let Commands::Convert(args) = cli.command else {
+                panic!("expected convert")
+            };
+            plan(&args)
+        };
+
+        // Both would be stored as "notes.txt"; one would silently shadow the other.
+        let err = plan_with(&[&a.join("notes.txt"), &b.join("notes.txt")])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("would both be stored as"), "got: {err}");
+
+        // A missing file is caught here, not several minutes into a conversion.
+        let err = plan_with(&[&dir.path().join("nope.txt")])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("--append-in-bootstrap"), "got: {err}");
+
+        // Distinct base names are fine, and reach the plan verbatim.
+        std::fs::write(b.join("b.txt"), b"two").unwrap();
+        let plan = plan_with(&[&a.join("notes.txt"), &b.join("b.txt")]).unwrap();
+        assert_eq!(plan.append_in_bootstrap.len(), 2);
+    }
+
+    #[test]
+    fn an_appended_file_inside_a_directory_source_is_refused() {
+        // Its bytes would be built into that source's data blob and copied into the
+        // bootstrap layer: two copies of one file, with nothing keeping them in step.
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("rootfs");
+        std::fs::create_dir_all(src.join("etc")).unwrap();
+        let inside = src.join("etc/app.conf");
+        std::fs::write(&inside, b"key = value").unwrap();
+
+        let cli = Cli::parse_from([
+            "nydusify",
+            "convert",
+            "--source",
+            "localhost:5000/app:v1",
+            "--source",
+            src.to_str().unwrap(),
+            "--target",
+            "localhost:5000/app:v1-nydus",
+            "--append-in-bootstrap",
+            inside.to_str().unwrap(),
+        ]);
+        let Commands::Convert(args) = cli.command else {
+            panic!("expected convert")
+        };
+        let err = plan(&args).unwrap_err().to_string();
+        assert!(err.contains("is inside the directory source"), "got: {err}");
     }
 
     #[test]
