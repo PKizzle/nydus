@@ -120,6 +120,10 @@ struct PulledSource {
     /// The resolved per-platform source manifest, byte-identical as fetched.
     /// `--attach-oci-manifest` republishes it beside the nydus manifest.
     manifest_bytes: Vec<u8>,
+    /// When the source tag resolved through an index: its entries, verbatim.
+    /// `--attach-oci-manifest` preserves every one of them -- replacing a multi-arch
+    /// tag with a single-arch index would silently break the other architectures.
+    source_index_entries: Option<Vec<Descriptor>>,
     layers: Vec<PulledLayer>,
 }
 
@@ -638,6 +642,7 @@ fn pull_source_from_archive(
         platform: plat,
         source_size: manifest.layers.iter().map(|l| l.size).sum(),
         manifest_bytes: imported.manifest_bytes.clone(),
+        source_index_entries: None,
         config_bytes,
         layers,
     })
@@ -718,6 +723,7 @@ async fn gather_sources(
                 source_size: 0,
                 config_bytes: synthesize_image_config(&os, &architecture, variant.as_deref())?,
                 manifest_bytes: Vec::new(),
+                source_index_entries: None,
                 layers: Vec::new(),
             }
         }
@@ -740,17 +746,18 @@ async fn pull_source(
 
     // Resolve an index/manifest-list down to this platform's manifest, and
     // capture the platform descriptor for the index entry.
-    let (image_bytes, image_digest, plat) =
+    let (image_bytes, image_digest, plat, index_entries) =
         if is_index(fetched.content_type.as_deref(), &fetched.bytes) {
             let index: Index =
                 serde_json::from_slice(&fetched.bytes).context("parse source image index")?;
+            let entries = index.manifests.clone();
             let selected = select_platform(&index, platform)?;
             let plat = selected.platform.clone().unwrap_or_default();
             let img = client
                 .get_manifest(repo, &selected.digest)
                 .await
                 .with_context(|| format!("fetch platform manifest {}", selected.digest))?;
-            (img.bytes, img.digest, plat)
+            (img.bytes, img.digest, plat, Some(entries))
         } else {
             // Single-arch source: honor the requested platform selector for the
             // index entry's platform field (a single-arch image carries no
@@ -762,7 +769,7 @@ async fn pull_source(
                 variant,
                 ..Default::default()
             };
-            (fetched.bytes, fetched.digest, plat)
+            (fetched.bytes, fetched.digest, plat, None)
         };
 
     // The referrer subject and fallback tag resolve against THIS manifest.
@@ -806,6 +813,7 @@ async fn pull_source(
         platform: plat,
         source_size,
         manifest_bytes: image_bytes,
+        source_index_entries: index_entries,
         config_bytes,
         layers,
     })
@@ -1204,9 +1212,6 @@ fn parse_prefetch_files(patterns: &str) -> Vec<String> {
 // Push
 // ---------------------------------------------------------------------------
 
-/// A pushed per-platform nydus manifest plus the total bytes of nydus content
-/// it published (data blobs + bootstrap + config + manifest), for reporting.
-
 /// `artifactType` current nydus parsers use to spot the nydus manifest inside a dual index
 /// (`contrib/nydusify/pkg/parser`), plus the legacy `os.features` marker parsers before
 /// v2.3.5 keyed on. Both are set on the nydus entry.
@@ -1294,14 +1299,30 @@ async fn attach_oci_manifest_and_push_index(
             .context("push the source manifest by digest")?;
     }
 
-    let index_bytes = serde_json::to_vec(&dual_manifest_index(
-        Descriptor {
+    let base_entries = match &source.source_index_entries {
+        Some(entries) => {
+            // Preserve every original entry; the other architectures' manifests already
+            // live in this repo only in the same-repo case, and copying an arbitrary
+            // index's whole tree is out of scope.
+            if !same_repo {
+                bail!(
+                    "--attach-oci-manifest onto a multi-entry source index is only \
+                     supported when source and target are the same repository; converting \
+                     {source_ref} into {target_ref} would drop the entries not copied"
+                );
+            }
+            entries.clone()
+        }
+        None => vec![Descriptor {
             media_type: oci_media_type,
             digest: oci_digest,
             size: source.manifest_bytes.len() as u64,
             platform: Some(source.platform.clone()),
             ..Descriptor::default()
-        },
+        }],
+    };
+    let index_bytes = serde_json::to_vec(&dual_manifest_index(
+        base_entries,
         nydus_manifest,
         &source.platform,
     ))
@@ -1324,10 +1345,11 @@ async fn attach_oci_manifest_and_push_index(
     Ok(())
 }
 
-/// Assemble the dual-manifest index: `[oci, nydus]`, nydus marked by `artifactType` and the
-/// legacy `os.features`. Pure so the layout -- the part consumers key on -- is testable.
+/// Assemble the dual-manifest index: the untouched base entries first, the nydus manifest
+/// last, marked by `artifactType` and the legacy `os.features`. Pure so the layout -- the
+/// part consumers key on -- is testable.
 fn dual_manifest_index(
-    oci_desc: Descriptor,
+    base_entries: Vec<Descriptor>,
     nydus_manifest: &Descriptor,
     platform: &registry_client::types::Platform,
 ) -> Index {
@@ -1338,9 +1360,13 @@ fn dual_manifest_index(
         platform: Some(nydus_platform),
         ..nydus_manifest.clone()
     };
-    assemble_index(true, vec![oci_desc, nydus_desc])
+    let mut manifests = base_entries;
+    manifests.push(nydus_desc);
+    assemble_index(true, manifests)
 }
 
+/// A pushed per-platform nydus manifest plus the total bytes of nydus content
+/// it published (data blobs + bootstrap + config + manifest), for reporting.
 struct PushedArtifact {
     manifest: Descriptor,
     target_size: u64,
@@ -1866,7 +1892,7 @@ mod tests {
             size: 200,
             ..Descriptor::default()
         };
-        let index = dual_manifest_index(oci, &nydus, &platform);
+        let index = dual_manifest_index(vec![oci], &nydus, &platform);
 
         // OCI first: a consumer that ignores the markers and takes the first platform match
         // (plain containerd, docker) must land on the standard image.
@@ -1901,6 +1927,47 @@ mod tests {
             "{json}"
         );
         assert!(!json.contains("os_features"), "{json}");
+    }
+
+    #[test]
+    fn dual_manifest_index_preserves_every_original_index_entry() {
+        // Replacing a multi-arch tag must not cost the other architectures: the original
+        // amd64 entry (and any attestation entries) ride along verbatim, nydus appended last.
+        let platform = registry_client::types::Platform {
+            architecture: "arm64".into(),
+            os: "linux".into(),
+            ..Default::default()
+        };
+        let amd64 = Descriptor {
+            digest: "sha256:amd64".into(),
+            platform: Some(registry_client::types::Platform {
+                architecture: "amd64".into(),
+                os: "linux".into(),
+                ..Default::default()
+            }),
+            ..Descriptor::default()
+        };
+        let arm64 = Descriptor {
+            digest: "sha256:arm64".into(),
+            platform: Some(platform.clone()),
+            ..Descriptor::default()
+        };
+        let nydus = Descriptor {
+            digest: "sha256:nydus".into(),
+            ..Descriptor::default()
+        };
+        let index = dual_manifest_index(vec![amd64, arm64], &nydus, &platform);
+        assert_eq!(
+            index
+                .manifests
+                .iter()
+                .map(|m| m.digest.as_str())
+                .collect::<Vec<_>>(),
+            ["sha256:amd64", "sha256:arm64", "sha256:nydus"]
+        );
+        assert!(index.manifests[0].artifact_type.is_none());
+        assert!(index.manifests[1].artifact_type.is_none());
+        assert!(index.manifests[2].artifact_type.is_some());
     }
 
     #[test]
