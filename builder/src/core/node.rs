@@ -1037,6 +1037,7 @@ impl Node {
     /// Set extended attributes for the node.
     pub fn set_xattr(&mut self, xattr: RafsXAttrs) {
         let mut info = self.info.deref().clone();
+        self.inode.set_has_xattr(!xattr.is_empty());
         info.xattrs = xattr;
         self.info = Arc::new(info);
     }
