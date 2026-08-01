@@ -269,17 +269,34 @@ async fn detect(image_ref: &str, config: &SnapshotterConfig) -> Result<Option<Re
     // computes the digest locally from the body bytes, so registries that
     // omit the optional Docker-Content-Digest header resolve correctly too
     // (they once classified every image as StandardOci).
+    let mut top_bytes: Option<Vec<u8>> = None;
     let digest = if let Some(digest) = parsed.digest.clone() {
         digest
     } else if let Some(tag) = parsed.tag.as_deref() {
         match client.get_manifest(repo, tag).await {
-            Ok(fetched) => fetched.digest,
+            Ok(fetched) => {
+                let digest = fetched.digest;
+                top_bytes = Some(fetched.bytes);
+                digest
+            }
             Err(RegistryError::NotFound { .. }) => return Ok(None),
             Err(e) => return Err(e).context("resolve subject manifest digest"),
         }
     } else {
         return Ok(None);
     };
+
+    // (0) Dual-manifest index (nydusify `--attach-oci-manifest` / Go `merge_manifest`): the
+    // nydus manifest may be a sibling entry in the image's own index, marked by artifactType
+    // or the legacy os.features. More authoritative than any referrer -- it is part of the
+    // image -- and this is the only place it gets noticed: containerd resolves the OCI half
+    // (first platform match), so Prepare alone would ride the plain-OCI path and the
+    // pre-built nydus artifact would go unused.
+    if let Some(bytes) = top_bytes.as_deref()
+        && let Some(info) = classify_dual_index(bytes)
+    {
+        return Ok(Some(info));
+    }
 
     // (1) Native referrers API. Deliberately NO server-side artifactType
     // filter: the snapshotter recognizes both nydus artifacts (nydusify's
@@ -335,6 +352,50 @@ async fn detect(image_ref: &str, config: &SnapshotterConfig) -> Result<Option<Re
 /// [`detect_from_oci_json`] — the single classification code path (bootstrap
 /// annotation first, media types second), so the referrers-API and
 /// fallback-tag branches can never drift apart.
+/// The artifactType nydusify's `--attach-oci-manifest` (and Go `merge_manifest`) put on the
+/// nydus manifest entry of a dual index, plus the pre-v2.3.5 os.features marker.
+const NYDUS_MANIFEST_ARTIFACT_TYPE: &str = "application/vnd.nydus.image.manifest.v1+json";
+const NYDUS_OS_FEATURE: &str = "nydus.remoteimage.v1";
+
+/// Spot a nydus manifest published as a sibling entry of the image's own index.
+///
+/// Only entries for this node's platform count: a dual index for amd64+arm64 carries one
+/// nydus entry per converted platform, and serving another architecture's bootstrap would
+/// produce a rootfs of the wrong machine. The returned `bootstrap_digest` is the nydus
+/// MANIFEST digest -- `materialize_bootstrap` already probes manifests and walks to their
+/// nydus-bootstrap layer.
+fn classify_dual_index(index_bytes: &[u8]) -> Option<ReferrerInfo> {
+    let index = serde_json::from_slice::<registry_client::Index>(index_bytes).ok()?;
+    let arch = go_arch(std::env::consts::ARCH);
+    let entry = index.manifests.iter().find(|m| {
+        let marked = m.artifact_type.as_deref() == Some(NYDUS_MANIFEST_ARTIFACT_TYPE)
+            || m.platform
+                .as_ref()
+                .and_then(|p| p.os_features.as_ref())
+                .is_some_and(|f| f.iter().any(|x| x == NYDUS_OS_FEATURE));
+        let platform_ok = m
+            .platform
+            .as_ref()
+            .is_none_or(|p| p.os == "linux" && p.architecture == arch);
+        marked && platform_ok
+    })?;
+    debug!(nydus_manifest = %entry.digest, "found nydus sibling manifest in the image's own index");
+    Some(ReferrerInfo {
+        image_type: ImageType::NydusRafs,
+        bootstrap_digest: Some(entry.digest.clone()),
+        fs_driver_hint: None,
+    })
+}
+
+/// rustc arch -> GOARCH, the vocabulary OCI platform entries use.
+fn go_arch(arch: &str) -> &str {
+    match arch {
+        "x86_64" => "amd64",
+        "aarch64" => "arm64",
+        other => other,
+    }
+}
+
 fn classify_referrers_index(index: &registry_client::Index) -> Result<ReferrerInfo> {
     let payload = serde_json::to_vec(index).context("serialize referrers index for detection")?;
     detect_from_oci_json(&payload)
@@ -597,6 +658,10 @@ pub async fn materialize_bootstrap(
 
     // Never write or mount an unverified bootstrap.
     verify_bootstrap_digest(&bytes, &final_digest)?;
+    // A referrer artifact ships the bootstrap raw; a nydus image manifest (the dual-index
+    // path) ships it as a gzip tar holding image/image.boot. Unwrap AFTER digest
+    // verification -- the declared digest is of the layer blob, not its contents.
+    let bytes = maybe_unwrap_bootstrap_layer(bytes)?;
     let path = write_bootstrap(&dir, &final_digest, &bytes)?;
     info!(image = %image_ref, bootstrap = %final_digest, path = %path.display(), "materialized referrer bootstrap");
     Ok(path)
@@ -639,6 +704,51 @@ fn fallback_referrers_tag(digest: &str) -> String {
 
 fn global_cache() -> &'static Mutex<ReferrerCache> {
     REFERRER_CACHE.get_or_init(|| Mutex::new(ReferrerCache::new(DEFAULT_CACHE_CAPACITY)))
+}
+
+/// Ceiling on the decompressed bootstrap layer: far above any real bootstrap, low enough
+/// that a hostile few-KB gzip cannot OOM the snapshotter.
+const MAX_BOOTSTRAP_LAYER_BYTES: u64 = 1024 * 1024 * 1024;
+
+/// If `bytes` is a gzip'd (or plain) tar carrying `image/image.boot`, return that entry;
+/// otherwise return `bytes` unchanged (a raw referrer bootstrap).
+fn maybe_unwrap_bootstrap_layer(bytes: Vec<u8>) -> Result<Vec<u8>> {
+    use std::io::Read as _;
+    let tar_bytes: std::borrow::Cow<'_, [u8]> = if bytes.starts_with(&[0x1f, 0x8b]) {
+        let mut buf = Vec::new();
+        flate2::read::GzDecoder::new(bytes.as_slice())
+            .take(MAX_BOOTSTRAP_LAYER_BYTES.saturating_add(1))
+            .read_to_end(&mut buf)
+            .context("gunzip nydus bootstrap layer")?;
+        if buf.len() as u64 > MAX_BOOTSTRAP_LAYER_BYTES {
+            bail!(
+                "bootstrap layer decompresses past {MAX_BOOTSTRAP_LAYER_BYTES} bytes; refusing to buffer it"
+            );
+        }
+        std::borrow::Cow::Owned(buf)
+    } else if bytes.len() > 262 && &bytes[257..262] == b"ustar" {
+        std::borrow::Cow::Borrowed(bytes.as_slice())
+    } else {
+        // Raw bootstrap (RAFS superblock), the referrer-artifact shape.
+        return Ok(bytes);
+    };
+
+    let mut archive = tar::Archive::new(tar_bytes.as_ref());
+    for entry in archive.entries().context("read bootstrap layer tar")? {
+        let mut entry = entry.context("read bootstrap layer tar entry")?;
+        if entry
+            .path()
+            .map(|p| p.as_os_str() == "image/image.boot")
+            .unwrap_or(false)
+        {
+            let mut out = Vec::new();
+            entry
+                .read_to_end(&mut out)
+                .context("extract image/image.boot")?;
+            return Ok(out);
+        }
+    }
+    bail!("bootstrap layer tar carries no image/image.boot entry")
 }
 
 #[cfg(test)]
@@ -778,6 +888,95 @@ mod tests {
         assert_eq!(opts.timeout, Some(Duration::from_secs(5)));
         assert_eq!(opts.raw_auth.as_deref(), Some("dXNlcjpwYXNz"));
         assert!(!opts.use_docker_config);
+    }
+
+    fn dual_index_bytes(
+        artifact_type: Option<&str>,
+        os_features: Option<&str>,
+        arch: &str,
+    ) -> Vec<u8> {
+        let features = os_features
+            .map(|f| format!(",\"os.features\":[\"{f}\"]"))
+            .unwrap_or_default();
+        let at = artifact_type
+            .map(|a| format!(",\"artifactType\":\"{a}\""))
+            .unwrap_or_default();
+        format!(
+            "{{\"schemaVersion\":2,\"mediaType\":\"application/vnd.oci.image.index.v1+json\",\"manifests\":[\
+             {{\"mediaType\":\"application/vnd.oci.image.manifest.v1+json\",\"digest\":\"sha256:oci\",\"size\":1,\"platform\":{{\"os\":\"linux\",\"architecture\":\"{arch}\"}}}},\
+             {{\"mediaType\":\"application/vnd.oci.image.manifest.v1+json\",\"digest\":\"sha256:nydus\",\"size\":1{at},\"platform\":{{\"os\":\"linux\",\"architecture\":\"{arch}\"{features}}}}}]}}"
+        )
+        .into_bytes()
+    }
+
+    #[test]
+    fn dual_index_sibling_is_detected_by_either_marker_for_this_arch() {
+        let arch = super::go_arch(std::env::consts::ARCH).to_string();
+        for (at, osf) in [
+            (Some("application/vnd.nydus.image.manifest.v1+json"), None),
+            (None, Some("nydus.remoteimage.v1")),
+        ] {
+            let info = super::classify_dual_index(&dual_index_bytes(at, osf, &arch))
+                .expect("marked sibling must be detected");
+            assert_eq!(info.image_type, ImageType::NydusRafs);
+            assert_eq!(info.bootstrap_digest.as_deref(), Some("sha256:nydus"));
+        }
+    }
+
+    #[test]
+    fn dual_index_sibling_for_another_arch_or_unmarked_is_ignored() {
+        // Another architecture's nydus entry must not be served here.
+        let other = if std::env::consts::ARCH == "aarch64" {
+            "amd64"
+        } else {
+            "arm64"
+        };
+        assert!(
+            super::classify_dual_index(&dual_index_bytes(
+                Some("application/vnd.nydus.image.manifest.v1+json"),
+                None,
+                other
+            ))
+            .is_none()
+        );
+        // An index with no marked entry, and a plain manifest body, both classify as nothing.
+        let arch = super::go_arch(std::env::consts::ARCH).to_string();
+        assert!(super::classify_dual_index(&dual_index_bytes(None, None, &arch)).is_none());
+        assert!(super::classify_dual_index(b"{\"schemaVersion\":2,\"config\":{}}").is_none());
+    }
+
+    #[test]
+    fn bootstrap_layer_unwrap_handles_all_three_shapes() {
+        use std::io::Write as _;
+        // gzip tar with image/image.boot
+        let mut tarb = Vec::new();
+        {
+            let mut b = tar::Builder::new(&mut tarb);
+            let mut h = tar::Header::new_gnu();
+            h.set_size(9);
+            h.set_cksum();
+            b.append_data(&mut h, "image/image.boot", &b"BOOTSTRAP"[..])
+                .unwrap();
+            b.into_inner().unwrap();
+        }
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        gz.write_all(&tarb).unwrap();
+        let gzipped = gz.finish().unwrap();
+        assert_eq!(
+            super::maybe_unwrap_bootstrap_layer(gzipped).unwrap(),
+            b"BOOTSTRAP"
+        );
+        // plain tar
+        assert_eq!(
+            super::maybe_unwrap_bootstrap_layer(tarb).unwrap(),
+            b"BOOTSTRAP"
+        );
+        // raw bootstrap passes through untouched
+        let raw = vec![0u8; 64];
+        assert_eq!(
+            super::maybe_unwrap_bootstrap_layer(raw.clone()).unwrap(),
+            raw
+        );
     }
 
     #[test]
