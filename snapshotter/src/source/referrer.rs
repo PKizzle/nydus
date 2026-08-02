@@ -271,6 +271,16 @@ async fn detect(image_ref: &str, config: &SnapshotterConfig) -> Result<Option<Re
     // (they once classified every image as StandardOci).
     let mut top_bytes: Option<Vec<u8>> = None;
     let digest = if let Some(digest) = parsed.digest.clone() {
+        // kubelet resolves tags to digests before CRI ever pulls, so production image refs
+        // arrive digest-pinned -- and that digest names the top-level object (the dual index
+        // itself, verified against a live pull). Without fetching it here, dual-manifest
+        // detection would only ever fire for tag-form refs (ctr, tests), never for a pod.
+        match client.get_manifest(repo, &digest).await {
+            Ok(fetched) => top_bytes = Some(fetched.bytes),
+            Err(e) => {
+                debug!(%digest, error = %e, "could not fetch pinned top-level manifest; skipping dual-index detection");
+            }
+        }
         digest
     } else if let Some(tag) = parsed.tag.as_deref() {
         match client.get_manifest(repo, tag).await {
