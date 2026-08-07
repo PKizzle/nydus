@@ -443,4 +443,145 @@ mod tests {
             "the entry must not have been written outside the destination"
         );
     }
+
+    /// Build a tar whose single regular entry carries `name` verbatim, bypassing
+    /// the tar crate's own refusal to write hostile paths.
+    fn tar_with_raw_entry_name(name: &[u8], data: &[u8]) -> Vec<u8> {
+        let mut header = tar::Header::new_gnu();
+        header.set_size(data.len() as u64);
+        header.set_mode(0o644);
+        header.set_entry_type(tar::EntryType::Regular);
+        {
+            let field = &mut header.as_gnu_mut().unwrap().name;
+            field[..name.len()].copy_from_slice(name);
+        }
+        header.set_cksum();
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(header.as_bytes());
+        bytes.extend_from_slice(data);
+        bytes.resize(bytes.len().div_ceil(512) * 512, 0);
+        bytes.extend_from_slice(&[0u8; 1024]); // two zero blocks terminate a tar
+        bytes
+    }
+
+    fn unpack_bytes(bytes: &[u8], dest: &Path) -> Result<()> {
+        let mut archive = tar::Archive::new(std::io::Cursor::new(bytes.to_vec()));
+        unpack_sanitized(&mut archive, dest)
+    }
+
+    #[test]
+    fn unpack_creates_parent_directories_for_nested_entries() {
+        // A layout tarball names blobs `blobs/sha256/<hex>`, so the nested-path
+        // case is the normal one, not an edge case.
+        let dir = tempfile::tempdir().unwrap();
+        let mut builder = tar::Builder::new(Vec::new());
+        let payload = b"nested";
+        let mut header = tar::Header::new_gnu();
+        header.set_size(payload.len() as u64);
+        header.set_mode(0o644);
+        header.set_entry_type(tar::EntryType::Regular);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, "blobs/sha256/abc", &payload[..])
+            .unwrap();
+        let bytes = builder.into_inner().unwrap();
+
+        let dest = dir.path().join("dest");
+        unpack_bytes(&bytes, &dest).unwrap();
+        assert_eq!(
+            std::fs::read(dest.join("blobs").join("sha256").join("abc")).unwrap(),
+            payload
+        );
+    }
+
+    #[test]
+    fn unpack_accepts_dot_slash_prefixed_entries() {
+        // `docker save` and `ctr images export` emit `./`-prefixed names and a
+        // bare `.` directory entry. Those are CurDir components, not ParentDir,
+        // so the guard must let them through — rejecting them would make the
+        // importer useless against real archives.
+        let dir = tempfile::tempdir().unwrap();
+        let bytes = tar_with_raw_entry_name(b"./index.json", b"{}");
+
+        let dest = dir.path().join("dest");
+        unpack_bytes(&bytes, &dest).unwrap();
+        assert_eq!(std::fs::read(dest.join("index.json")).unwrap(), b"{}");
+    }
+
+    #[test]
+    fn unpack_refuses_absolute_entry_paths() {
+        // Upstream normalizes an absolute name into the destination; we reject it
+        // outright. An OCI layout has no business naming absolute paths, and
+        // refusing is the safer half of the ambiguity.
+        let dir = tempfile::tempdir().unwrap();
+        let bytes = tar_with_raw_entry_name(b"/etc/nydus-pwned", b"x");
+
+        let dest = dir.path().join("dest");
+        let err = unpack_bytes(&bytes, &dest).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("escapes"),
+            "expected the traversal guard to fire, got: {err:#}"
+        );
+        assert!(!Path::new("/etc/nydus-pwned").exists());
+    }
+
+    #[test]
+    fn unpack_refuses_traversal_hidden_mid_path() {
+        // `a/../../b` has no leading `..`, so a guard that only inspected the
+        // first component would pass it through.
+        let dir = tempfile::tempdir().unwrap();
+        let bytes = tar_with_raw_entry_name(b"blobs/../../escaped", b"x");
+
+        let dest = dir.path().join("dest");
+        let err = unpack_bytes(&bytes, &dest).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("escapes"),
+            "expected the traversal guard to fire, got: {err:#}"
+        );
+        assert!(!dir.path().join("escaped").exists());
+    }
+
+    #[test]
+    fn unpack_does_not_follow_a_symlink_out_of_the_destination() {
+        // The traversal guard is per-entry-name, so it cannot see this one: a
+        // legal-looking symlink is planted first, then a legal-looking file is
+        // written "through" it. `unpack_in` is what refuses; this pins that we
+        // still rely on an implementation that does.
+        let dir = tempfile::tempdir().unwrap();
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+
+        let mut builder = tar::Builder::new(Vec::new());
+        let mut link = tar::Header::new_gnu();
+        link.set_size(0);
+        link.set_mode(0o777);
+        link.set_entry_type(tar::EntryType::Symlink);
+        builder
+            .append_link(&mut link, "escape", outside.to_str().unwrap())
+            .unwrap();
+        let payload = b"pwned";
+        let mut file = tar::Header::new_gnu();
+        file.set_size(payload.len() as u64);
+        file.set_mode(0o644);
+        file.set_entry_type(tar::EntryType::Regular);
+        file.set_cksum();
+        builder
+            .append_data(&mut file, "escape/planted", &payload[..])
+            .unwrap();
+        let bytes = builder.into_inner().unwrap();
+
+        let dest = dir.path().join("dest");
+        // `unpack_in` refuses the second entry with "trying to unpack outside of
+        // destination path" — the symlink itself is legal and does get created.
+        let err = unpack_bytes(&bytes, &dest).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("outside of destination"),
+            "expected unpack_in to refuse the symlinked entry, got: {err:#}"
+        );
+        assert!(
+            !outside.join("planted").exists(),
+            "a symlinked entry must not write outside the destination"
+        );
+    }
 }

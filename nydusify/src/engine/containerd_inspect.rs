@@ -421,6 +421,21 @@ mod tests {
         assert!(lower.is_empty());
     }
 
+    /// The Go committer indexed `mount[0]` straight after fetching the snapshot
+    /// mounts and panicked when containerd returned none (upstream 1ba59b8d).
+    /// This port cannot: it scans printed lines, so "no mounts" is just an empty
+    /// input that has to produce the same diagnostic as unusable output.
+    #[test]
+    fn no_mounts_at_all_is_an_error_not_a_panic() {
+        for stdout in ["", "\n", "   \n\t\n"] {
+            let err = parse_overlay_mount(stdout).unwrap_err();
+            assert!(
+                err.to_string().contains("no overlay mount"),
+                "unexpected for {stdout:?}: {err}"
+            );
+        }
+    }
+
     #[test]
     fn accepts_the_flag_and_value_written_together() {
         let (upper, _) =
