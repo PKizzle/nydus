@@ -985,8 +985,15 @@ impl RegistryReader {
         // Handle redirect request and cache redirect url
         if need_redirect {
             if let Some(location) = resp.headers().get("location") {
-                let location = location.to_str().unwrap();
-                let mut location = Url::parse(location)
+                // A `Location` may be relative (RFC 7231 allows a relative-ref, and
+                // registries behind a path-rewriting proxy do emit one), so resolve it
+                // against the request URL instead of parsing it as absolute. `Url::join`
+                // returns an absolute Location unchanged, so this covers both forms.
+                let location = location.to_str().map_err(|e| {
+                    RegistryBackendError::Common(format!("invalid Location header, {}", e))
+                })?;
+                let mut location = Url::parse(url.as_str())
+                    .and_then(|base| base.join(location))
                     .map_err(|e| RegistryBackendError::Url(location.to_string(), e))?;
                 // Note: Some P2P proxy server supports only scheme specified origin blob server,
                 // so we need change scheme to `blob_url_scheme` here
@@ -2398,6 +2405,42 @@ mod tests {
         // not an instant in the past (which would underflow or refresh forever).
         assert_eq!(token_refresh_at(1_000_000, 1), 1_000_000);
         assert_eq!(token_refresh_at(0, 0), 0);
+    }
+
+    #[test]
+    fn test_redirect_location_resolves_relative_against_request_url() {
+        // A `Location` may be a relative-ref (RFC 7231), which registries behind a
+        // path-rewriting proxy do emit. `Url::parse` alone rejects those with
+        // RelativeUrlWithoutBase, so the blob read must join against the request URL.
+        // Mirrors the resolution in RegistryReader::try_read.
+        let request_url = "https://registry.example.com/v2/library/busybox/blobs/sha256:abc";
+        let resolve = |location: &str| {
+            Url::parse(request_url)
+                .and_then(|base| base.join(location))
+                .map(|u| u.to_string())
+        };
+
+        // Absolute Location (the common case) passes through unchanged, including
+        // a redirect to a different host such as an S3/CDN presigned URL.
+        assert_eq!(
+            resolve("https://cdn.example.net/blob?sig=x").unwrap(),
+            "https://cdn.example.net/blob?sig=x"
+        );
+        // Root-relative and path-relative forms resolve against the request URL
+        // instead of failing to parse.
+        assert_eq!(
+            resolve("/v2/other/blobs/sha256:def").unwrap(),
+            "https://registry.example.com/v2/other/blobs/sha256:def"
+        );
+        assert_eq!(
+            resolve("../blobs/deadbeef").unwrap(),
+            "https://registry.example.com/v2/library/busybox/blobs/deadbeef"
+        );
+        // Careful: a bare `sha256:def` is NOT path-relative — `sha256:` parses as a
+        // URI scheme, so it resolves to itself. Only colon-free refs are relative.
+        assert_eq!(resolve("sha256:def").unwrap(), "sha256:def");
+        // Without the base, a relative Location is not a URL at all.
+        assert!(Url::parse("/v2/other/blobs/sha256:def").is_err());
     }
 
     #[test]
