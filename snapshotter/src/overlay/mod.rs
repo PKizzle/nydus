@@ -23,7 +23,7 @@ use containerd_snapshots::api::types::Mount;
 use labels::{bootstrap_digest_from_key, image_ref, is_image_ref_like, normalize_parent};
 use mounts::{bind_mount, overlay_mount};
 pub use paths::snapshot_dir_name;
-use paths::{dir_usage, fs_dir, snapshot_dir, work_dir};
+use paths::{dir_usage, ensure_short_link, fs_dir, remove_short_link, snapshot_dir, work_dir};
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -213,6 +213,7 @@ impl OverlayEngine {
         debug!(key, "remove snapshot");
         let dir = self.snapshot_dir(key);
         store.remove(key)?;
+        remove_short_link(&self.config.snapshotter.root, key)?;
         if dir.exists() {
             fs::remove_dir_all(&dir).with_context(|| {
                 format!("failed to remove snapshot directory {}", dir.display())
@@ -364,6 +365,10 @@ impl OverlayEngine {
         )])
     }
 
+    /// Resolve `parent`'s chain to lowerdir paths, as `<root>/l/<hash>` short
+    /// symlinks (Docker overlay2's `l/` trick): the 65-char snapshot dir names
+    /// would otherwise overflow the kernel's one-page mount-option limit at
+    /// ~52 layers even after containerd's lowerdir compaction.
     fn lower_dirs(&self, store: &SnapshotStore, parent: &str) -> Result<Vec<PathBuf>> {
         store
             .parent_chain(parent)?
@@ -371,7 +376,7 @@ impl OverlayEngine {
             .map(|snapshot| {
                 let path = self.fs_dir(&snapshot.key);
                 if path.is_dir() {
-                    Ok(path)
+                    ensure_short_link(&self.config.snapshotter.root, &snapshot.key)
                 } else {
                     bail!(
                         "snapshot {} is missing filesystem directory {}",
@@ -514,11 +519,18 @@ mod tests {
         let mounts = expect_mounts(engine.prepare(&store, "child", "base", &labels).unwrap());
 
         assert_eq!(mounts[0].r#type, "overlay");
-        assert!(
-            mounts[0]
-                .options
-                .iter()
-                .any(|opt| opt.starts_with("lowerdir="))
+        let lowerdir = mounts[0]
+            .options
+            .iter()
+            .find(|opt| opt.starts_with("lowerdir="))
+            .expect("overlay mount has a lowerdir option");
+        // Lowerdirs are the short `l/<16-hex>` links, not the long snapshot
+        // dir names — that's what keeps deep chains under the one-page limit.
+        let expected_link = dir.path().join("l").join(paths::short_link_name("base"));
+        assert_eq!(*lowerdir, format!("lowerdir={}", expected_link.display()));
+        assert_eq!(
+            std::fs::canonicalize(&expected_link).unwrap(),
+            std::fs::canonicalize(engine.fs_dir("base")).unwrap()
         );
         assert!(
             mounts[0]
@@ -569,6 +581,72 @@ mod tests {
 
         assert!(!snapshot_dir.exists());
         assert!(store.stat("active").is_err());
+    }
+
+    #[test]
+    fn remove_deletes_short_link() {
+        let dir = tempdir().unwrap();
+        let (engine, store) = test_engine(dir.path());
+        let labels = HashMap::new();
+
+        engine.prepare(&store, "base-active", "", &labels).unwrap();
+        engine
+            .commit(&store, "base", "base-active", &HashMap::new())
+            .unwrap();
+        // Mounting a child materialises base's short link.
+        expect_mounts(engine.prepare(&store, "child", "base", &labels).unwrap());
+        let link = dir.path().join("l").join(paths::short_link_name("base"));
+        assert!(std::fs::symlink_metadata(&link).is_ok());
+
+        engine.remove(&store, "child").unwrap();
+        engine.remove(&store, "base").unwrap();
+
+        assert!(std::fs::symlink_metadata(&link).is_err());
+    }
+
+    /// The field failure this scheme fixes: 52 committed layers with realistic
+    /// `sha256:<64-hex>` keys (65-char snapshot dir names) overflow the
+    /// one-page mount-option budget with long lowerdir paths, but fit easily
+    /// as `l/<16-hex>` short links.
+    #[test]
+    fn deep_layer_chain_stays_within_mount_option_budget() {
+        let dir = tempdir().unwrap();
+        let (engine, store) = test_engine(dir.path());
+        let labels = HashMap::new();
+
+        let mut parent = String::new();
+        for i in 0..52 {
+            let name = format!("sha256:{i:064x}");
+            let active = format!("{name}-active");
+            engine.prepare(&store, &active, &parent, &labels).unwrap();
+            engine
+                .commit(&store, &name, &active, &HashMap::new())
+                .unwrap();
+            parent = name;
+        }
+
+        let mounts = expect_mounts(engine.prepare(&store, "top", &parent, &labels).unwrap());
+        assert_eq!(mounts[0].r#type, "overlay");
+        let lowerdir = mounts[0]
+            .options
+            .iter()
+            .find(|opt| opt.starts_with("lowerdir="))
+            .unwrap();
+        let entries: Vec<&str> = lowerdir["lowerdir=".len()..].split(':').collect();
+        assert_eq!(entries.len(), 52);
+        let link_dir = dir.path().join("l");
+        for entry in &entries {
+            let path = Path::new(entry);
+            assert_eq!(path.parent(), Some(link_dir.as_path()));
+            assert_eq!(path.file_name().unwrap().len(), 16);
+        }
+        // With the 65-char snapshot dir names this chain would have cost
+        // ~69 bytes per layer after compaction (the field failure: 3596 >
+        // 3584); as short links it compacts to 17 bytes per layer.
+        let long_form: Vec<PathBuf> = (0..52)
+            .map(|i| engine.fs_dir(&format!("sha256:{i:064x}")))
+            .collect();
+        assert!(mounts::ensure_lowerdir_budget(&long_form).is_err());
     }
 
     #[test]

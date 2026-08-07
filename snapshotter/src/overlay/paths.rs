@@ -4,8 +4,9 @@
 
 //! Stable on-disk path helpers for snapshot metadata and overlay directories.
 
-use anyhow::Result;
+use anyhow::{Context, Result, bail};
 use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 
 pub(super) fn snapshot_dir(root: &Path, key: &str) -> PathBuf {
@@ -39,6 +40,84 @@ pub fn snapshot_dir_name(key: &str) -> String {
         format!("{hash:016x}")
     } else {
         format!("{hash:016x}-{sanitized}")
+    }
+}
+
+/// Flat farm of short symlinks used only inside `lowerdir=` mount options,
+/// mirroring Docker overlay2's `l/` directory. The snapshot dir names above
+/// run ~65 chars and cost ~69 bytes per layer in the option string even after
+/// containerd's common-prefix compaction, capping plain-overlay chains at
+/// ~52 layers against the kernel's one-page mount-option limit. A 17-char
+/// link per layer raises that ceiling to ~200; the kernel resolves the
+/// symlinks during `mount(2)`, so the resulting overlay is identical.
+pub(super) fn short_link_dir(root: &Path) -> PathBuf {
+    root.join("l")
+}
+
+pub(super) fn short_link_name(key: &str) -> String {
+    format!("{:016x}", fnv1a64(key.as_bytes()))
+}
+
+pub(super) fn short_link_path(root: &Path, key: &str) -> PathBuf {
+    short_link_dir(root).join(short_link_name(key))
+}
+
+/// Target of a snapshot's short link, relative to `<root>/l/` so the whole
+/// root stays relocatable.
+fn short_link_target(key: &str) -> PathBuf {
+    PathBuf::from("..")
+        .join("snapshots")
+        .join(snapshot_dir_name(key))
+        .join("fs")
+}
+
+/// Ensure `<root>/l/<hash>` points at this snapshot's `fs/` dir and return
+/// the link path. Idempotent; a same-name link pointing elsewhere means a
+/// 64-bit FNV collision between live snapshot keys and is a hard error
+/// (`snapshot_dir_name` disambiguates via its 48-char key suffix, the flat
+/// link namespace cannot).
+pub(super) fn ensure_short_link(root: &Path, key: &str) -> Result<PathBuf> {
+    let link = short_link_path(root, key);
+    let target = short_link_target(key);
+    for _ in 0..2 {
+        match fs::read_link(&link) {
+            Ok(existing) if existing == target => return Ok(link),
+            Ok(existing) => bail!(
+                "short link {} already points at {} (expected {}); snapshot key hash collision",
+                link.display(),
+                existing.display(),
+                target.display()
+            ),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(e).with_context(|| format!("read short link {}", link.display()));
+            }
+        }
+        fs::create_dir_all(short_link_dir(root)).with_context(|| {
+            format!(
+                "create short link directory {}",
+                short_link_dir(root).display()
+            )
+        })?;
+        match std::os::unix::fs::symlink(&target, &link) {
+            Ok(()) => return Ok(link),
+            // Lost a creation race; loop once to validate the winner's target.
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(e) => {
+                return Err(e).with_context(|| format!("create short link {}", link.display()));
+            }
+        }
+    }
+    bail!("short link {} kept changing underneath us", link.display())
+}
+
+/// Remove a snapshot's short link if present.
+pub(super) fn remove_short_link(root: &Path, key: &str) -> Result<()> {
+    let link = short_link_path(root, key);
+    match fs::remove_file(&link) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e).with_context(|| format!("remove short link {}", link.display())),
     }
 }
 
@@ -94,6 +173,54 @@ mod tests {
         assert!(snap.starts_with(root.join("snapshots")));
         assert_eq!(fs_dir(root, "active"), snap.join("fs"));
         assert_eq!(work_dir(root, "active"), snap.join("work"));
+    }
+
+    #[test]
+    fn ensure_short_link_creates_relative_link_and_is_idempotent() {
+        let root = tempdir().unwrap();
+        let key = "sha256:0123456789abcdef";
+        fs::create_dir_all(fs_dir(root.path(), key)).unwrap();
+
+        let link = ensure_short_link(root.path(), key).unwrap();
+        assert_eq!(link, short_link_path(root.path(), key));
+        assert_eq!(
+            fs::read_link(&link).unwrap(),
+            Path::new("..")
+                .join("snapshots")
+                .join(snapshot_dir_name(key))
+                .join("fs")
+        );
+        // The relative target resolves to the real fs dir.
+        assert_eq!(
+            fs::canonicalize(&link).unwrap(),
+            fs::canonicalize(fs_dir(root.path(), key)).unwrap()
+        );
+        // Idempotent.
+        assert_eq!(ensure_short_link(root.path(), key).unwrap(), link);
+    }
+
+    #[test]
+    fn ensure_short_link_rejects_hash_collisions() {
+        let root = tempdir().unwrap();
+        let key = "collision-key";
+        fs::create_dir_all(short_link_dir(root.path())).unwrap();
+        std::os::unix::fs::symlink("../snapshots/other/fs", short_link_path(root.path(), key))
+            .unwrap();
+
+        let err = ensure_short_link(root.path(), key).unwrap_err();
+        assert!(err.to_string().contains("hash collision"), "{err}");
+    }
+
+    #[test]
+    fn remove_short_link_tolerates_missing_link() {
+        let root = tempdir().unwrap();
+        let key = "never-linked";
+        remove_short_link(root.path(), key).unwrap();
+
+        fs::create_dir_all(fs_dir(root.path(), key)).unwrap();
+        let link = ensure_short_link(root.path(), key).unwrap();
+        remove_short_link(root.path(), key).unwrap();
+        assert!(fs::symlink_metadata(&link).is_err());
     }
 
     #[test]
