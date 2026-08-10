@@ -121,52 +121,6 @@ jobs:
         name: benchmark-oci-${{ matrix.image }}
         path: smoke/${{ matrix.image }}-oci.json
 
-  benchmark-fsversion-v5:
-    runs-on: ${{ vars.RUNNER_OS || 'ubuntu-latest' }}
-    needs: [contrib-build, nydus-build]
-    strategy:
-      matrix:
-        include:
-          - image: wordpress
-            tag: 6.1.1
-          - image: node
-            tag: 19.8
-          - image: python
-            tag: 3.10.7
-          - image: golang
-            tag: 1.19.3
-          - image: ruby
-            tag: 3.1.3
-          - image: amazoncorretto
-            tag: 8-al2022-jdk
-    steps:
-    - name: Checkout
-      uses: actions/checkout@v6
-    - name: Download Nydus
-      uses: actions/download-artifact@v7
-      with:
-        name: nydus-artifact
-        path: target/release
-    - name: Download Nydusify
-      uses: actions/download-artifact@v7
-      with:
-        name: nydusify-artifact
-        path: target/release
-    - name: Prepare Environment
-      run: |
-        sudo bash misc/prepare.sh
-    - name: BenchMark Test
-      run: |
-        export BENCHMARK_TEST_IMAGE=${{ matrix.image }}:${{ matrix.tag }}
-        export BENCHMARK_MODE=fs-version-5
-        export BENCHMARK_METRIC_FILE=${{ matrix.image }}-fsversion-v5.json
-        sudo -E make smoke-benchmark
-    - name: Save BenchMark Result
-      uses: actions/upload-artifact@v6
-      with:
-        name: benchmark-fsversion-v5-${{ matrix.image }}
-        path: smoke/${{ matrix.image }}-fsversion-v5.json
-
   benchmark-fsversion-v6:
     runs-on: ${{ vars.RUNNER_OS || 'ubuntu-latest' }}
     needs: [contrib-build, nydus-build]
@@ -261,7 +215,7 @@ jobs:
 
   benchmark-result:
     runs-on: ${{ vars.RUNNER_OS || 'ubuntu-latest' }}
-    needs: [benchmark-oci, benchmark-fsversion-v5, benchmark-fsversion-v6, benchmark-zran]
+    needs: [benchmark-oci, benchmark-fsversion-v6, benchmark-zran]
     strategy:
       matrix:
         include:
@@ -284,11 +238,6 @@ jobs:
       uses: actions/download-artifact@v7
       with:
         name: benchmark-oci-${{ matrix.image }}
-        path: benchmark-result
-    - name: Download benchmark-fsversion-v5
-      uses: actions/download-artifact@v7
-      with:
-        name: benchmark-fsversion-v5-${{ matrix.image }}
         path: benchmark-result
     - name: Download benchmark-fsversion-v6
       uses: actions/download-artifact@v7
@@ -325,7 +274,6 @@ jobs:
         cd benchmark-result
         metric_files=(
           "${{ matrix.image }}-oci.json"
-          "${{ matrix.image }}-fsversion-v5.json"
           "${{ matrix.image }}-fsversion-v6.json"
           "${{ matrix.image }}-zran.json"
         )
