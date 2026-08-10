@@ -1361,14 +1361,37 @@ fn is_nydus_entry(entry: &Descriptor) -> bool {
 
 /// Same platform, ignoring `os.features` -- the nydus entry differs from its OCI sibling
 /// exactly there, so comparing it would never match.
+///
+/// Comparison is on NORMALISED fields, because the two sides are spelled by different
+/// hands: the stale entry carries whatever a previous run wrote, the new one comes from
+/// this run's `--platform` string. A strict `==` made re-conversion append a second nydus
+/// manifest whenever the spelling drifted -- `linux/arm64` vs `linux/arm64/v8` is the same
+/// platform, and `default_platform()` never emits a variant at all.
 fn same_platform(
     a: &registry_client::types::Platform,
     b: &registry_client::types::Platform,
 ) -> bool {
     a.architecture == b.architecture
         && a.os == b.os
-        && a.os_version == b.os_version
-        && a.variant == b.variant
+        && normalized_os_version(a) == normalized_os_version(b)
+        && normalized_variant(&a.architecture, a.variant.as_deref())
+            == normalized_variant(&b.architecture, b.variant.as_deref())
+}
+
+/// An absent `os.version` and an empty one mean the same thing.
+fn normalized_os_version(p: &registry_client::types::Platform) -> Option<&str> {
+    p.os_version.as_deref().filter(|v| !v.is_empty())
+}
+
+/// The variant, canonicalised the way containerd's platform matcher does: absent and
+/// empty are one value, and `arm64/v8` is the baseline arm64 (`v8` is what every arm64
+/// image is; tools disagree on whether to spell it).
+fn normalized_variant<'a>(architecture: &str, variant: Option<&'a str>) -> Option<&'a str> {
+    let variant = variant.filter(|v| !v.is_empty())?;
+    if architecture == "arm64" && variant == "v8" {
+        return None;
+    }
+    Some(variant)
 }
 
 /// Assemble the dual-manifest index: the base entries first, the nydus manifest last,
@@ -1401,14 +1424,22 @@ fn dual_manifest_index(
     let mut manifests: Vec<Descriptor> = base_entries
         .into_iter()
         .filter(|entry| {
-            let superseded = is_nydus_entry(entry)
-                && entry
-                    .platform
-                    .as_ref()
-                    .is_some_and(|p| same_platform(p, platform));
+            if !is_nydus_entry(entry) {
+                return true;
+            }
+            // A nydus entry with no platform at all is superseded too. nydusify always
+            // writes one (right above), so a platform-less entry came from an older or
+            // foreign tool; keeping it would leave the tag advertising two nydus
+            // manifests forever, with no way to tell which arch it was ever for --
+            // exactly the undefined resolution this replacement exists to prevent.
+            let superseded = match entry.platform.as_ref() {
+                Some(p) => same_platform(p, platform),
+                None => true,
+            };
             if superseded {
                 info!(
                     digest = %entry.digest,
+                    platform = ?entry.platform.as_ref().map(|p| format!("{}/{}", p.os, p.architecture)),
                     "replacing the existing nydus manifest for this platform"
                 );
             }
@@ -2074,6 +2105,105 @@ mod tests {
         assert_eq!(
             index.manifests.iter().filter(|m| is_nydus_entry(m)).count(),
             1
+        );
+    }
+
+    /// The stale entry and the new one are spelled by different hands: the old one carries
+    /// whatever a previous run wrote, the new one comes from this run's `--platform`. A
+    /// strict field compare appended a second nydus manifest whenever that drifted, which
+    /// is the very accumulation the replacement exists to stop.
+    #[test]
+    fn reconverting_supersedes_across_equivalent_platform_spellings() {
+        let cases: [(Option<&str>, Option<&str>, &str); 4] = [
+            // arm64/v8 IS baseline arm64; tools disagree on spelling it.
+            (Some("v8"), None, "stale v8 vs fresh unset"),
+            (None, Some("v8"), "stale unset vs fresh v8"),
+            // Absent and empty are one value.
+            (Some(""), None, "stale empty vs fresh unset"),
+            (None, Some(""), "stale unset vs fresh empty"),
+        ];
+        for (stale_variant, fresh_variant, case) in cases {
+            let platform = registry_client::types::Platform {
+                architecture: "arm64".into(),
+                os: "linux".into(),
+                variant: fresh_variant.map(str::to_string),
+                ..Default::default()
+            };
+            let mut stale = nydus_entry("sha256:stale", "arm64", true, true);
+            stale.platform.as_mut().unwrap().variant = stale_variant.map(str::to_string);
+            let fresh = Descriptor {
+                digest: "sha256:fresh".into(),
+                ..Descriptor::default()
+            };
+
+            let index = dual_manifest_index(vec![stale], &fresh, &platform);
+
+            assert_eq!(
+                index.manifests.iter().filter(|m| is_nydus_entry(m)).count(),
+                1,
+                "{case}: expected the stale entry to be replaced, got {:?}",
+                index
+                    .manifests
+                    .iter()
+                    .map(|m| m.digest.as_str())
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+
+    /// A genuinely different arch must NOT be swept away by the normalisation above.
+    #[test]
+    fn reconverting_keeps_other_architectures() {
+        let platform = registry_client::types::Platform {
+            architecture: "arm64".into(),
+            os: "linux".into(),
+            ..Default::default()
+        };
+        let other = nydus_entry("sha256:amd64-nydus", "amd64", true, true);
+        let fresh = Descriptor {
+            digest: "sha256:fresh".into(),
+            ..Descriptor::default()
+        };
+
+        let index = dual_manifest_index(vec![other], &fresh, &platform);
+
+        assert_eq!(
+            index
+                .manifests
+                .iter()
+                .map(|m| m.digest.as_str())
+                .collect::<Vec<_>>(),
+            ["sha256:amd64-nydus", "sha256:fresh"],
+            "another architecture's nydus entry is not this platform's stale entry"
+        );
+    }
+
+    /// nydusify always writes a platform on its nydus entry, so a platform-less one came
+    /// from an older or foreign tool. Keeping it would leave the tag advertising two nydus
+    /// manifests forever with no way to tell which arch it was for.
+    #[test]
+    fn reconverting_supersedes_a_platformless_nydus_entry() {
+        let platform = registry_client::types::Platform {
+            architecture: "arm64".into(),
+            os: "linux".into(),
+            ..Default::default()
+        };
+        let mut stale = nydus_entry("sha256:stale", "arm64", true, false);
+        stale.platform = None; // marked only by artifactType
+        let fresh = Descriptor {
+            digest: "sha256:fresh".into(),
+            ..Descriptor::default()
+        };
+
+        let index = dual_manifest_index(vec![stale], &fresh, &platform);
+
+        assert_eq!(
+            index
+                .manifests
+                .iter()
+                .map(|m| m.digest.as_str())
+                .collect::<Vec<_>>(),
+            ["sha256:fresh"]
         );
     }
 
