@@ -117,21 +117,41 @@ func (b *BenchmarkTestSuite) prepareImage(t *testing.T, ctx *tool.Context, image
 
 	metricData, err := os.ReadFile(convertMetricFile)
 	if err != nil {
-		t.Fatalf("can't read convert metric file")
+		t.Fatalf("can't read convert metric file %s: %v", convertMetricFile, err)
 		return 0, 0
 	}
-	var convertMetric map[string]int64
-	err = json.Unmarshal(metricData, &convertMetric)
-	if err != nil {
-		t.Fatalf("can't parsing convert metric file")
+	// The Rust nydusify writes a richer document than the Go tool it replaced:
+	// sizes stay integers, but ConversionElapsed is a duration string ("7.234s")
+	// and there are string/array members alongside (target, platforms). Decoding
+	// into map[string]int64, as this did, fails on any of those.
+	var convertMetric struct {
+		SourceImageSize   int64  `json:"SourceImageSize"`
+		TargetImageSize   int64  `json:"TargetImageSize"`
+		ConversionElapsed string `json:"ConversionElapsed"`
+	}
+	if err := json.Unmarshal(metricData, &convertMetric); err != nil {
+		// Report what was actually in the file: a schema drift here is otherwise
+		// indistinguishable from nydusify never writing one.
+		t.Fatalf("can't parse convert metric file %s: %v\ncontent: %s", convertMetricFile, err, metricData)
 		return 0, 0
 	}
+
+	var conversionElapsed time.Duration
+	if convertMetric.ConversionElapsed != "" {
+		conversionElapsed, err = time.ParseDuration(convertMetric.ConversionElapsed)
+		if err != nil {
+			t.Fatalf("can't parse ConversionElapsed %q from %s: %v",
+				convertMetric.ConversionElapsed, convertMetricFile, err)
+			return 0, 0
+		}
+	}
+
 	if b.snapshotter == "nydus" {
 		b.testImage = target
-		return convertMetric["TargetImageSize"], convertMetric["ConversionElapsed"]
+		return convertMetric.TargetImageSize, int64(conversionElapsed)
 	}
 	b.testImage = source
-	return convertMetric["SourceImageSize"], 0
+	return convertMetric.SourceImageSize, 0
 }
 
 func (b *BenchmarkTestSuite) dumpMetric() {
