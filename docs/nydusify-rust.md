@@ -116,6 +116,21 @@ indexes and bootstrap in extra storage.
 Requires exactly one image `--source`, a registry target, and a single platform (multi-arch
 composition is a follow-up).
 
+**Re-converting a tag is idempotent.** Pointing `convert --attach-oci-manifest` at a tag that
+already carries a nydus manifest *replaces* that manifest rather than adding a second one, so
+switching an existing tag between standard and `--oci-ref` mode, or republishing after a
+rebuild, leaves exactly one nydus entry per platform. Only the entry for the platform being
+converted is touched — a multi-arch tag can hold one nydus manifest per architecture, built by
+separate single-platform runs, and those are left alone.
+
+> This was a real bug, fixed 2026-08-10. `--attach-oci-manifest` republishes the source index
+> verbatim, and when source and target are the same tag that index already contains the previous
+> run's nydus entry — so it was carried forward and the new one appended after it. Three tags
+> re-converted from standard mode to `--oci-ref` ended up advertising two nydus manifests each,
+> the stale one still pointing at full RAFS blobs nothing referenced any more. Which of the two a
+> nydus consumer picks is undefined, so this was a correctness problem and not merely wasted
+> registry storage.
+
 > **Divergence from Go nydusify:** upstream's `--merge-platform` is this dual-manifest compat
 > feature. Ours reuses that flag name for merging multiple **converted architectures** into an
 > index, and the compat feature lives here under `--attach-oci-manifest` instead. If you are

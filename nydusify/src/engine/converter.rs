@@ -1345,9 +1345,47 @@ async fn attach_oci_manifest_and_push_index(
     Ok(())
 }
 
-/// Assemble the dual-manifest index: the untouched base entries first, the nydus manifest
-/// last, marked by `artifactType` and the legacy `os.features`. Pure so the layout -- the
-/// part consumers key on -- is testable.
+/// Does this index entry describe a nydus manifest?
+///
+/// Both markers are checked because they are written for different readers: current nydus
+/// parsers key on `artifactType`, while `os.features` carries the legacy marker for older
+/// parsers. An index assembled by another tool (or an older nydusify) may carry only one.
+fn is_nydus_entry(entry: &Descriptor) -> bool {
+    entry.artifact_type.as_deref() == Some(NYDUS_MANIFEST_ARTIFACT_TYPE)
+        || entry.platform.as_ref().is_some_and(|p| {
+            p.os_features
+                .as_ref()
+                .is_some_and(|f| f.iter().any(|feature| feature == NYDUS_OS_FEATURE))
+        })
+}
+
+/// Same platform, ignoring `os.features` -- the nydus entry differs from its OCI sibling
+/// exactly there, so comparing it would never match.
+fn same_platform(
+    a: &registry_client::types::Platform,
+    b: &registry_client::types::Platform,
+) -> bool {
+    a.architecture == b.architecture
+        && a.os == b.os
+        && a.os_version == b.os_version
+        && a.variant == b.variant
+}
+
+/// Assemble the dual-manifest index: the base entries first, the nydus manifest last,
+/// marked by `artifactType` and the legacy `os.features`. Pure so the layout -- the part
+/// consumers key on -- is testable.
+///
+/// Converting a tag that has already been converted REPLACES its nydus entry for this
+/// platform rather than appending a second one. Without that, a re-conversion accumulates
+/// stale nydus manifests: `--attach-oci-manifest` republishes the source index verbatim,
+/// and when source == target that index already contains the previous run's nydus entry.
+/// Observed in the wild on 2026-08-10 -- three tags re-converted from standard mode to
+/// `--oci-ref` ended up advertising two nydus manifests each, the stale one still pointing
+/// at now-unreferenced full RAFS blobs. Which of the two a consumer picks is undefined,
+/// so this is a correctness bug, not just wasted storage.
+///
+/// Only entries for *this* platform are dropped: a multi-arch tag can legitimately carry
+/// one nydus manifest per architecture, converted by separate runs.
 fn dual_manifest_index(
     base_entries: Vec<Descriptor>,
     nydus_manifest: &Descriptor,
@@ -1360,7 +1398,23 @@ fn dual_manifest_index(
         platform: Some(nydus_platform),
         ..nydus_manifest.clone()
     };
-    let mut manifests = base_entries;
+    let mut manifests: Vec<Descriptor> = base_entries
+        .into_iter()
+        .filter(|entry| {
+            let superseded = is_nydus_entry(entry)
+                && entry
+                    .platform
+                    .as_ref()
+                    .is_some_and(|p| same_platform(p, platform));
+            if superseded {
+                info!(
+                    digest = %entry.digest,
+                    "replacing the existing nydus manifest for this platform"
+                );
+            }
+            !superseded
+        })
+        .collect();
     manifests.push(nydus_desc);
     assemble_index(true, manifests)
 }
@@ -1968,6 +2022,129 @@ mod tests {
         assert!(index.manifests[0].artifact_type.is_none());
         assert!(index.manifests[1].artifact_type.is_none());
         assert!(index.manifests[2].artifact_type.is_some());
+    }
+
+    /// A descriptor shaped like a nydus entry this tool would have written.
+    fn nydus_entry(digest: &str, arch: &str, artifact_type: bool, os_feature: bool) -> Descriptor {
+        Descriptor {
+            digest: digest.into(),
+            artifact_type: artifact_type.then(|| NYDUS_MANIFEST_ARTIFACT_TYPE.to_string()),
+            platform: Some(registry_client::types::Platform {
+                architecture: arch.into(),
+                os: "linux".into(),
+                os_features: os_feature.then(|| vec![NYDUS_OS_FEATURE.to_string()]),
+                ..Default::default()
+            }),
+            ..Descriptor::default()
+        }
+    }
+
+    #[test]
+    fn reconverting_replaces_the_nydus_entry_instead_of_appending_a_second() {
+        // The regression this guards: --attach-oci-manifest republishes the source index
+        // verbatim, so re-converting a live tag (source == target) fed the previous run's
+        // nydus entry straight back in and the index ended up advertising two.
+        let platform = registry_client::types::Platform {
+            architecture: "arm64".into(),
+            os: "linux".into(),
+            ..Default::default()
+        };
+        let arm64 = Descriptor {
+            digest: "sha256:arm64".into(),
+            platform: Some(platform.clone()),
+            ..Descriptor::default()
+        };
+        let stale = nydus_entry("sha256:stale", "arm64", true, true);
+        let fresh = Descriptor {
+            digest: "sha256:fresh".into(),
+            ..Descriptor::default()
+        };
+
+        let index = dual_manifest_index(vec![arm64, stale], &fresh, &platform);
+
+        assert_eq!(
+            index
+                .manifests
+                .iter()
+                .map(|m| m.digest.as_str())
+                .collect::<Vec<_>>(),
+            ["sha256:arm64", "sha256:fresh"],
+            "the stale nydus entry must be gone, not carried alongside the new one"
+        );
+        assert_eq!(
+            index
+                .manifests
+                .iter()
+                .filter(|m| is_nydus_entry(m))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn reconverting_is_idempotent_however_the_old_entry_was_marked() {
+        // Older nydusify (and the Go tool) marked only os.features; a hand-assembled index
+        // might carry only artifactType. Either alone identifies a superseded entry.
+        let platform = registry_client::types::Platform {
+            architecture: "arm64".into(),
+            os: "linux".into(),
+            ..Default::default()
+        };
+        let fresh = Descriptor {
+            digest: "sha256:fresh".into(),
+            ..Descriptor::default()
+        };
+        for (artifact_type, os_feature) in [(true, false), (false, true), (true, true)] {
+            let stale = nydus_entry("sha256:stale", "arm64", artifact_type, os_feature);
+            let index = dual_manifest_index(vec![stale], &fresh, &platform);
+            assert_eq!(
+                index.manifests.len(),
+                1,
+                "artifact_type={artifact_type} os_feature={os_feature}"
+            );
+            assert_eq!(index.manifests[0].digest, "sha256:fresh");
+        }
+    }
+
+    #[test]
+    fn reconverting_keeps_other_architectures_nydus_entries() {
+        // A multi-arch tag can legitimately hold one nydus manifest per architecture,
+        // produced by separate single-platform runs. Converting arm64 must not evict amd64's.
+        let platform = registry_client::types::Platform {
+            architecture: "arm64".into(),
+            os: "linux".into(),
+            ..Default::default()
+        };
+        let amd64_oci = Descriptor {
+            digest: "sha256:amd64".into(),
+            platform: Some(registry_client::types::Platform {
+                architecture: "amd64".into(),
+                os: "linux".into(),
+                ..Default::default()
+            }),
+            ..Descriptor::default()
+        };
+        let amd64_nydus = nydus_entry("sha256:amd64-nydus", "amd64", true, true);
+        let arm64_nydus = nydus_entry("sha256:arm64-nydus", "arm64", true, true);
+        let fresh = Descriptor {
+            digest: "sha256:fresh".into(),
+            ..Descriptor::default()
+        };
+
+        let index = dual_manifest_index(
+            vec![amd64_oci, amd64_nydus, arm64_nydus],
+            &fresh,
+            &platform,
+        );
+
+        assert_eq!(
+            index
+                .manifests
+                .iter()
+                .map(|m| m.digest.as_str())
+                .collect::<Vec<_>>(),
+            ["sha256:amd64", "sha256:amd64-nydus", "sha256:fresh"]
+        );
     }
 
     #[test]
