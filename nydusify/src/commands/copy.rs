@@ -52,6 +52,18 @@ pub async fn run(args: CopyArgs) -> Result<()> {
         .with_context(|| format!("create staging dir in {}", args.work_dir.display()))?;
 
     if let Some(archive) = source_archive {
+        // Refuse rather than quietly copy one manifest. `copy_from_archive` resolves the
+        // layout to a single image, so honouring the flag here is impossible -- and the
+        // blanket bail that used to make this unreachable is gone, so without this the
+        // copy would report success having dropped every other platform.
+        if plan.all_platforms {
+            bail!(
+                "--all-platforms cannot read from the OCI archive {}: an archive is imported \
+                 as a single image (follow-up); copy from a registry, or drop --all-platforms \
+                 to copy the image the archive holds",
+                archive.display()
+            );
+        }
         return copy_from_archive(
             &args,
             &plan,
@@ -284,18 +296,20 @@ async fn copy_index_all_platforms(
     if index.manifests.is_empty() {
         bail!("source index {source_ref} lists no manifests; nothing to copy");
     }
+    let entries = distinct_entries(index);
+    // Count what will actually be pushed, not what the index lists: a digest named twice
+    // is copied once, and reporting the raw total overstates the work in both log lines.
+    let entry_count = entries.len();
     info!(
         source = %source_ref,
         target = %target_ref,
-        entries = index.manifests.len(),
+        entries = entry_count,
         "copying every index entry"
     );
-
-    let entries = distinct_entries(index);
-    if entries.len() < index.manifests.len() {
+    if entry_count < index.manifests.len() {
         debug!(
             total = index.manifests.len(),
-            distinct = entries.len(),
+            distinct = entry_count,
             "index names some digests more than once; copying each only once"
         );
     }
@@ -390,7 +404,7 @@ async fn copy_index_all_platforms(
     info!(
         target = %target_ref,
         manifest = %pushed,
-        entries = index.manifests.len(),
+        entries = entry_count,
         "copy complete: full index"
     );
     Ok(())
