@@ -2072,11 +2072,7 @@ mod tests {
             "the stale nydus entry must be gone, not carried alongside the new one"
         );
         assert_eq!(
-            index
-                .manifests
-                .iter()
-                .filter(|m| is_nydus_entry(m))
-                .count(),
+            index.manifests.iter().filter(|m| is_nydus_entry(m)).count(),
             1
         );
     }
@@ -2131,11 +2127,8 @@ mod tests {
             ..Descriptor::default()
         };
 
-        let index = dual_manifest_index(
-            vec![amd64_oci, amd64_nydus, arm64_nydus],
-            &fresh,
-            &platform,
-        );
+        let index =
+            dual_manifest_index(vec![amd64_oci, amd64_nydus, arm64_nydus], &fresh, &platform);
 
         assert_eq!(
             index
