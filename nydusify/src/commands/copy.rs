@@ -129,11 +129,8 @@ pub async fn run(args: CopyArgs) -> Result<()> {
     }
 
     let fetched = if top_is_index {
-        if plan.all_platforms {
-            // Unreachable via the branch above; kept so the flag never silently
-            // degrades if that guard is ever reordered.
-            warn!(source = %source_ref, "--all-platforms on a non-index source; copying it as-is");
-        }
+        // `--all-platforms` cannot reach here: the branch above returns for an
+        // index source, so this is the single-platform path by construction.
         warn!(
             source = %source_ref,
             platform = %plan.platform,
@@ -148,6 +145,15 @@ pub async fn run(args: CopyArgs) -> Result<()> {
             .await
             .with_context(|| format!("fetch platform manifest {}", selected.digest))?
     } else {
+        // A single-manifest source has no platforms to fan out over, so
+        // `--all-platforms` degrades to an ordinary copy. Say so: silence here
+        // reads as "copied every platform" when there was only ever one.
+        if plan.all_platforms {
+            warn!(
+                source = %source_ref,
+                "--all-platforms was passed but the source is a single manifest, not an index; copying it as-is"
+            );
+        }
         top
     };
     let manifest: Manifest =
