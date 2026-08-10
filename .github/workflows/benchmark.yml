@@ -54,9 +54,15 @@ jobs:
       uses: actions/upload-artifact@v6
       with:
         name: nydus-artifact
+        # containerd-nydus is required: misc/prepare.sh installs it and starts
+        # the nydus-snapshotter unit from it. Omitting it left every benchmark
+        # job failing at "Job for nydus-snapshotter.service failed" once
+        # prepare.sh moved to the in-repo Rust snapshotter. `make release`
+        # already builds it, and smoke.yml ships it the same way.
         path: |
           target/release/nydus-image
           target/release/nydusd
+          target/release/containerd-nydus
 
   benchmark-description:
     runs-on: ${{ vars.RUNNER_OS || 'ubuntu-latest' }}
