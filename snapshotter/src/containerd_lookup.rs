@@ -544,11 +544,7 @@ async fn resolve_gzip_layers_via_grpc(
 /// Pick the index child matching the host architecture/OS. Pure so tests
 /// can pin the GOARCH translation.
 fn pick_host_arch_child(index: &OciIndexWithPlatforms) -> Option<String> {
-    let host_arch = match std::env::consts::ARCH {
-        "x86_64" => "amd64",
-        "aarch64" => "arm64",
-        other => other,
-    };
+    let host_arch = registry_client::host_go_arch();
     let host_os = std::env::consts::OS;
     index
         .manifests

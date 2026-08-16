@@ -92,41 +92,98 @@ pub fn parse_platform_list(value: &str) -> Result<Vec<String>> {
     Ok(selectors)
 }
 
-/// Every index entry that carries a real platform, formatted as
+/// Every index entry that is a convertible image, formatted as
 /// `os/arch[/variant]` selectors. Used to expand `--all-platforms`.
 ///
-/// buildkit attaches SBOM/provenance attestations as extra index entries tagged
-/// `unknown/unknown` (their layers are `application/vnd.in-toto+json`, not tars).
-/// They are not images and must not be converted — `docker.io/library/busybox`
-/// carries them, so `--all-platforms` hits this on a very ordinary source.
+/// Three kinds of entry are excluded, all of which would otherwise become
+/// spurious conversion work:
+///
+/// * buildkit attaches SBOM/provenance attestations as extra index entries
+///   tagged `unknown/unknown` (their layers are `application/vnd.in-toto+json`,
+///   not tars). `docker.io/library/busybox` carries them, so `--all-platforms`
+///   hits this on a very ordinary source.
+/// * the nydus half of a dual-manifest index published by
+///   `--attach-oci-manifest`: it carries the *same* platform as its OCI sibling,
+///   so without this filter re-converting an already-attached tag yields the
+///   platform twice — either a nonsensical "source resolves to 2 platforms
+///   (linux/amd64, linux/amd64)" error, or (with `--merge-platform`) a doubled
+///   conversion publishing two entries for one platform.
+/// * exact duplicates after normalisation, so a hand-assembled index that names
+///   one platform twice still converts it once.
 pub fn all_platform_selectors(index: &Index) -> Vec<String> {
-    index
-        .manifests
-        .iter()
-        .filter_map(|d| d.platform.as_ref())
-        .filter(|p| !p.os.is_empty() && !p.architecture.is_empty())
-        .filter(|p| !(p.os == "unknown" && p.architecture == "unknown"))
-        .map(|p| match &p.variant {
+    let mut seen: Vec<(String, String, Option<String>)> = Vec::new();
+    let mut selectors = Vec::new();
+    for desc in &index.manifests {
+        if registry_client::is_nydus_entry(desc) {
+            continue;
+        }
+        let Some(p) = desc.platform.as_ref() else {
+            continue;
+        };
+        if p.os.is_empty() || p.architecture.is_empty() {
+            continue;
+        }
+        if p.os == "unknown" && p.architecture == "unknown" {
+            continue;
+        }
+        let key = (
+            p.os.clone(),
+            p.architecture.clone(),
+            p.normalized_variant().map(str::to_string),
+        );
+        if seen.contains(&key) {
+            continue;
+        }
+        seen.push(key);
+        selectors.push(match &p.variant {
             Some(v) => format!("{}/{}/{}", p.os, p.architecture, v),
             None => format!("{}/{}", p.os, p.architecture),
-        })
-        .collect()
+        });
+    }
+    selectors
 }
 
 /// Select the manifest descriptor matching `platform_selector` from an index.
+///
+/// Matching is on NORMALISED platforms (see
+/// [`registry_client::Platform::matches_selector`]): `linux/arm64` and
+/// `linux/arm64/v8` are one platform, because containerd's `platforms.Normalize`
+/// strips the `v8` while Docker Hub's manifest lists and UI spell it out — a
+/// user copying `linux/arm64/v8` from Hub must not miss a buildx-published
+/// `arm64` entry.
+///
+/// A selector naming no variant prefers an exact (normalised) match, but falls
+/// back to any entry for that os/arch so `linux/arm` still resolves against an
+/// index of `arm/v6` + `arm/v7`. That fallback is genuinely ambiguous — the
+/// entries are different images — so it is logged.
 pub fn select_platform<'a>(index: &'a Index, platform_selector: &str) -> Result<&'a Descriptor> {
     let (os, arch, variant) = parse_platform(platform_selector)?;
-    let matches = |d: &&Descriptor| {
-        d.platform.as_ref().is_some_and(|p| {
-            p.os == os
-                && p.architecture == arch
-                && variant
-                    .as_ref()
-                    .is_none_or(|v| p.variant.as_deref() == Some(v.as_str()))
-        })
+    let exact = |d: &&Descriptor| {
+        d.platform
+            .as_ref()
+            .is_some_and(|p| p.matches_selector(&os, &arch, variant.as_deref()))
     };
-    if let Some(found) = index.manifests.iter().find(matches) {
+    if let Some(found) = index.manifests.iter().find(exact) {
         return Ok(found);
+    }
+    if variant.is_none() {
+        let loose = |d: &&Descriptor| {
+            d.platform
+                .as_ref()
+                .is_some_and(|p| p.os == os && p.architecture == arch)
+        };
+        let mut candidates = index.manifests.iter().filter(loose);
+        if let Some(found) = candidates.next() {
+            if candidates.next().is_some() {
+                tracing::warn!(
+                    platform = platform_selector,
+                    chosen = ?found.platform.as_ref().and_then(|p| p.variant.as_deref()),
+                    "the index carries several variants for this platform; picking the first — \
+                     name the variant explicitly to choose"
+                );
+            }
+            return Ok(found);
+        }
     }
     let available: Vec<String> = index
         .manifests
@@ -234,6 +291,54 @@ mod tests {
         );
     }
 
+    /// containerd's `platforms.Normalize` strips arm64's `v8` (so buildx-pushed
+    /// indexes carry a bare `arm64`), while Docker Hub shows `linux/arm64/v8`.
+    /// A user copying either spelling must resolve against either index.
+    #[test]
+    fn select_platform_normalizes_the_arm64_v8_spelling() {
+        let bare = index_of(vec![platform_desc("linux", "arm64", None, "sha256:arm")]);
+        let spelled = index_of(vec![platform_desc(
+            "linux",
+            "arm64",
+            Some("v8"),
+            "sha256:arm",
+        )]);
+        for index in [&bare, &spelled] {
+            for selector in ["linux/arm64", "linux/arm64/v8"] {
+                assert_eq!(
+                    select_platform(index, selector).unwrap().digest,
+                    "sha256:arm",
+                    "{selector} must resolve regardless of how the index spells v8"
+                );
+            }
+        }
+    }
+
+    /// 32-bit arm variants are different images, so an explicit variant must be
+    /// honoured exactly; a bare `linux/arm` falls back to the first entry.
+    #[test]
+    fn select_platform_honours_explicit_arm_variants() {
+        let index = index_of(vec![
+            platform_desc("linux", "arm", Some("v7"), "sha256:v7"),
+            platform_desc("linux", "arm", Some("v6"), "sha256:v6"),
+        ]);
+        assert_eq!(
+            select_platform(&index, "linux/arm/v6").unwrap().digest,
+            "sha256:v6"
+        );
+        assert_eq!(
+            select_platform(&index, "linux/arm/v7").unwrap().digest,
+            "sha256:v7"
+        );
+        // Ambiguous, but resolvable: first entry wins (and is warned about).
+        assert_eq!(
+            select_platform(&index, "linux/arm").unwrap().digest,
+            "sha256:v7"
+        );
+        // A variant the index does not carry is a miss, not a loose match.
+        assert!(select_platform(&index, "linux/arm/v5").is_err());
+    }
+
     #[test]
     fn select_platform_reports_available_on_miss() {
         let index = index_of(vec![platform_desc("linux", "amd64", None, "sha256:amd")]);
@@ -299,6 +404,40 @@ mod tests {
         assert_eq!(
             all_platform_selectors(&index),
             vec!["linux/amd64".to_string(), "linux/arm64/v8".to_string()]
+        );
+    }
+
+    /// A tag published by `--attach-oci-manifest` holds the OCI manifest and
+    /// its nydus sibling under the SAME platform. Expanding `--all-platforms`
+    /// over it must yield that platform once, or the converter either refuses
+    /// ("resolves to 2 platforms (linux/amd64, linux/amd64)") or converts twice.
+    #[test]
+    fn all_platform_selectors_skips_the_nydus_half_of_a_dual_index() {
+        let mut nydus = platform_desc("linux", "amd64", None, "sha256:nydus");
+        nydus.artifact_type = Some(registry_client::NYDUS_MANIFEST_ARTIFACT_TYPE.to_string());
+        if let Some(p) = nydus.platform.as_mut() {
+            p.os_features = Some(vec![registry_client::NYDUS_OS_FEATURE.to_string()]);
+        }
+        let index = index_of(vec![
+            platform_desc("linux", "amd64", None, "sha256:oci"),
+            nydus,
+        ]);
+        assert_eq!(
+            all_platform_selectors(&index),
+            vec!["linux/amd64".to_string()]
+        );
+    }
+
+    /// Even without nydus markers, one platform named twice converts once.
+    #[test]
+    fn all_platform_selectors_dedupes_normalized_duplicates() {
+        let index = index_of(vec![
+            platform_desc("linux", "arm64", Some("v8"), "sha256:a"),
+            platform_desc("linux", "arm64", None, "sha256:b"),
+        ]);
+        assert_eq!(
+            all_platform_selectors(&index),
+            vec!["linux/arm64/v8".to_string()]
         );
     }
 }

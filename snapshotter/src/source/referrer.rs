@@ -362,11 +362,6 @@ async fn detect(image_ref: &str, config: &SnapshotterConfig) -> Result<Option<Re
 /// [`detect_from_oci_json`] — the single classification code path (bootstrap
 /// annotation first, media types second), so the referrers-API and
 /// fallback-tag branches can never drift apart.
-/// The artifactType nydusify's `--attach-oci-manifest` (and Go `merge_manifest`) put on the
-/// nydus manifest entry of a dual index, plus the pre-v2.3.5 os.features marker.
-const NYDUS_MANIFEST_ARTIFACT_TYPE: &str = "application/vnd.nydus.image.manifest.v1+json";
-const NYDUS_OS_FEATURE: &str = "nydus.remoteimage.v1";
-
 /// Spot a nydus manifest published as a sibling entry of the image's own index.
 ///
 /// Only entries for this node's platform count: a dual index for amd64+arm64 carries one
@@ -374,20 +369,23 @@ const NYDUS_OS_FEATURE: &str = "nydus.remoteimage.v1";
 /// produce a rootfs of the wrong machine. The returned `bootstrap_digest` is the nydus
 /// MANIFEST digest -- `materialize_bootstrap` already probes manifests and walks to their
 /// nydus-bootstrap layer.
+///
+/// A marked entry carrying NO platform is deliberately **not** matched. Such an entry can
+/// only come from a foreign tool (nydusify always writes a platform, and the legacy
+/// `os.features` marker lives inside `platform` so a legacy-marked entry necessarily has
+/// one), and nothing downstream would catch the mismatch: `materialize_bootstrap` only
+/// verifies the digest, the EROFS mount succeeds, and the wrong architecture surfaces as
+/// an exec-format error inside the container. Skipping it just falls through to the
+/// referrers API and the fallback tag.
 fn classify_dual_index(index_bytes: &[u8]) -> Option<ReferrerInfo> {
     let index = serde_json::from_slice::<registry_client::Index>(index_bytes).ok()?;
-    let arch = go_arch(std::env::consts::ARCH);
+    let host = registry_client::Platform {
+        architecture: registry_client::host_go_arch().to_string(),
+        os: "linux".to_string(),
+        ..registry_client::Platform::default()
+    };
     let entry = index.manifests.iter().find(|m| {
-        let marked = m.artifact_type.as_deref() == Some(NYDUS_MANIFEST_ARTIFACT_TYPE)
-            || m.platform
-                .as_ref()
-                .and_then(|p| p.os_features.as_ref())
-                .is_some_and(|f| f.iter().any(|x| x == NYDUS_OS_FEATURE));
-        let platform_ok = m
-            .platform
-            .as_ref()
-            .is_none_or(|p| p.os == "linux" && p.architecture == arch);
-        marked && platform_ok
+        registry_client::is_nydus_entry(m) && m.platform.as_ref().is_some_and(|p| p.matches(&host))
     })?;
     debug!(nydus_manifest = %entry.digest, "found nydus sibling manifest in the image's own index");
     Some(ReferrerInfo {
@@ -395,15 +393,6 @@ fn classify_dual_index(index_bytes: &[u8]) -> Option<ReferrerInfo> {
         bootstrap_digest: Some(entry.digest.clone()),
         fs_driver_hint: None,
     })
-}
-
-/// rustc arch -> GOARCH, the vocabulary OCI platform entries use.
-fn go_arch(arch: &str) -> &str {
-    match arch {
-        "x86_64" => "amd64",
-        "aarch64" => "arm64",
-        other => other,
-    }
 }
 
 fn classify_referrers_index(index: &registry_client::Index) -> Result<ReferrerInfo> {
@@ -919,9 +908,23 @@ mod tests {
         .into_bytes()
     }
 
+    /// A dual index whose nydus entry carries the given raw `"platform"` JSON
+    /// (or none at all), so the platform-matching rules can be pinned directly.
+    fn dual_index_with_nydus_platform(platform_json: Option<&str>) -> Vec<u8> {
+        let platform = platform_json
+            .map(|p| format!(",\"platform\":{p}"))
+            .unwrap_or_default();
+        format!(
+            "{{\"schemaVersion\":2,\"mediaType\":\"application/vnd.oci.image.index.v1+json\",\"manifests\":[\
+             {{\"mediaType\":\"application/vnd.oci.image.manifest.v1+json\",\"digest\":\"sha256:oci\",\"size\":1,\"platform\":{{\"os\":\"linux\",\"architecture\":\"amd64\"}}}},\
+             {{\"mediaType\":\"application/vnd.oci.image.manifest.v1+json\",\"digest\":\"sha256:nydus\",\"size\":1,\"artifactType\":\"application/vnd.nydus.image.manifest.v1+json\"{platform}}}]}}"
+        )
+        .into_bytes()
+    }
+
     #[test]
     fn dual_index_sibling_is_detected_by_either_marker_for_this_arch() {
-        let arch = super::go_arch(std::env::consts::ARCH).to_string();
+        let arch = registry_client::host_go_arch().to_string();
         for (at, osf) in [
             (Some("application/vnd.nydus.image.manifest.v1+json"), None),
             (None, Some("nydus.remoteimage.v1")),
@@ -950,9 +953,52 @@ mod tests {
             .is_none()
         );
         // An index with no marked entry, and a plain manifest body, both classify as nothing.
-        let arch = super::go_arch(std::env::consts::ARCH).to_string();
+        let arch = registry_client::host_go_arch().to_string();
         assert!(super::classify_dual_index(&dual_index_bytes(None, None, &arch)).is_none());
         assert!(super::classify_dual_index(b"{\"schemaVersion\":2,\"config\":{}}").is_none());
+    }
+
+    /// A marked entry with no platform at all must NOT be served: it can only
+    /// come from a foreign tool, it could have been built for any architecture,
+    /// and nothing downstream would notice the mismatch before the container
+    /// fails to exec.
+    #[test]
+    fn dual_index_sibling_without_a_platform_is_not_served() {
+        assert!(super::classify_dual_index(&dual_index_with_nydus_platform(None)).is_none());
+    }
+
+    /// `arm64` and `arm64/v8` are the same platform spelled two ways, so an
+    /// entry carrying either must be served on an arm64 node. 32-bit `arm`
+    /// variants are genuinely different images and must never conflate.
+    #[test]
+    fn dual_index_platform_matching_normalizes_variants() {
+        let host = registry_client::host_go_arch();
+
+        let with_variant =
+            format!("{{\"os\":\"linux\",\"architecture\":\"{host}\",\"variant\":\"v8\"}}");
+        let bare = format!("{{\"os\":\"linux\",\"architecture\":\"{host}\"}}");
+        // Only meaningful on arm64, where v8 is the baseline spelling; on other
+        // arches the variant is simply a mismatch, which the next case covers.
+        if host == "arm64" {
+            for platform in [with_variant.as_str(), bare.as_str()] {
+                assert!(
+                    super::classify_dual_index(&dual_index_with_nydus_platform(Some(platform)))
+                        .is_some(),
+                    "arm64 must match whether or not v8 is spelled out: {platform}"
+                );
+            }
+        }
+
+        // arm/v6 must not be served for an arm/v7 host and vice versa.
+        for (entry, other) in [("v6", "v7"), ("v7", "v6")] {
+            let platform =
+                format!("{{\"os\":\"linux\",\"architecture\":\"arm\",\"variant\":\"{entry}\"}}");
+            let info = super::classify_dual_index(&dual_index_with_nydus_platform(Some(&platform)));
+            assert!(
+                info.is_none(),
+                "arm/{entry} must not be served on a {host} node (nor conflated with arm/{other})"
+            );
+        }
     }
 
     #[test]

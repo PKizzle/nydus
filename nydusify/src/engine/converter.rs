@@ -31,7 +31,10 @@ use std::process::Command;
 
 use anyhow::{Context, Result, anyhow, bail};
 use registry_client::types::Manifest;
-use registry_client::{Descriptor, ImageReference, Index, RegistryClient};
+use registry_client::{
+    Descriptor, ImageReference, Index, NYDUS_MANIFEST_ARTIFACT_TYPE, NYDUS_OS_FEATURE,
+    RegistryClient, is_nydus_entry,
+};
 use tracing::{debug, info, warn};
 
 use crate::commands::convert::{ConversionMode, SourceSpec};
@@ -1212,12 +1215,6 @@ fn parse_prefetch_files(patterns: &str) -> Vec<String> {
 // Push
 // ---------------------------------------------------------------------------
 
-/// `artifactType` current nydus parsers use to spot the nydus manifest inside a dual index
-/// (`contrib/nydusify/pkg/parser`), plus the legacy `os.features` marker parsers before
-/// v2.3.5 keyed on. Both are set on the nydus entry.
-const NYDUS_MANIFEST_ARTIFACT_TYPE: &str = "application/vnd.nydus.image.manifest.v1+json";
-const NYDUS_OS_FEATURE: &str = "nydus.remoteimage.v1";
-
 /// Publish the target tag as an OCI index carrying the untouched source OCI manifest and the
 /// just-pushed nydus manifest.
 ///
@@ -1345,55 +1342,6 @@ async fn attach_oci_manifest_and_push_index(
     Ok(())
 }
 
-/// Does this index entry describe a nydus manifest?
-///
-/// Both markers are checked because they are written for different readers: current nydus
-/// parsers key on `artifactType`, while `os.features` carries the legacy marker for older
-/// parsers. An index assembled by another tool (or an older nydusify) may carry only one.
-fn is_nydus_entry(entry: &Descriptor) -> bool {
-    entry.artifact_type.as_deref() == Some(NYDUS_MANIFEST_ARTIFACT_TYPE)
-        || entry.platform.as_ref().is_some_and(|p| {
-            p.os_features
-                .as_ref()
-                .is_some_and(|f| f.iter().any(|feature| feature == NYDUS_OS_FEATURE))
-        })
-}
-
-/// Same platform, ignoring `os.features` -- the nydus entry differs from its OCI sibling
-/// exactly there, so comparing it would never match.
-///
-/// Comparison is on NORMALISED fields, because the two sides are spelled by different
-/// hands: the stale entry carries whatever a previous run wrote, the new one comes from
-/// this run's `--platform` string. A strict `==` made re-conversion append a second nydus
-/// manifest whenever the spelling drifted -- `linux/arm64` vs `linux/arm64/v8` is the same
-/// platform, and `default_platform()` never emits a variant at all.
-fn same_platform(
-    a: &registry_client::types::Platform,
-    b: &registry_client::types::Platform,
-) -> bool {
-    a.architecture == b.architecture
-        && a.os == b.os
-        && normalized_os_version(a) == normalized_os_version(b)
-        && normalized_variant(&a.architecture, a.variant.as_deref())
-            == normalized_variant(&b.architecture, b.variant.as_deref())
-}
-
-/// An absent `os.version` and an empty one mean the same thing.
-fn normalized_os_version(p: &registry_client::types::Platform) -> Option<&str> {
-    p.os_version.as_deref().filter(|v| !v.is_empty())
-}
-
-/// The variant, canonicalised the way containerd's platform matcher does: absent and
-/// empty are one value, and `arm64/v8` is the baseline arm64 (`v8` is what every arm64
-/// image is; tools disagree on whether to spell it).
-fn normalized_variant<'a>(architecture: &str, variant: Option<&'a str>) -> Option<&'a str> {
-    let variant = variant.filter(|v| !v.is_empty())?;
-    if architecture == "arm64" && variant == "v8" {
-        return None;
-    }
-    Some(variant)
-}
-
 /// Assemble the dual-manifest index: the base entries first, the nydus manifest last,
 /// marked by `artifactType` and the legacy `os.features`. Pure so the layout -- the part
 /// consumers key on -- is testable.
@@ -1433,7 +1381,7 @@ fn dual_manifest_index(
             // manifests forever, with no way to tell which arch it was ever for --
             // exactly the undefined resolution this replacement exists to prevent.
             let superseded = match entry.platform.as_ref() {
-                Some(p) => same_platform(p, platform),
+                Some(p) => p.matches(platform),
                 None => true,
             };
             if superseded {
