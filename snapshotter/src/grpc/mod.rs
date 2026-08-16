@@ -785,8 +785,9 @@ impl snapshots::Snapshotter for NydusSnapshotter {
                         return Ok(self.rewrite_mounts_with_daemon(&key, &daemon_mnt, false));
                     }
 
-                    // Referrer serving (default-off, opt-in). When
-                    // `features.referrer_detect` is enabled, consult the OCI
+                    // Referrer serving (on by default; see
+                    // `FeaturesConfig::default` and the test pinning it).
+                    // When `features.referrer_detect` is enabled, consult the OCI
                     // referrers API to see whether this image ref is a
                     // *published* nydus image (bootstrap distributed as a
                     // referrer artifact, the nydusify / Go-snapshotter model).

@@ -231,6 +231,9 @@ impl Reconciler {
             // 7. Sweep sidecar Image records whose subject image is gone.
             self.check_orphan_sidecars().await?;
 
+            // 7b. Sweep short links whose snapshot directory is gone.
+            self.check_orphan_short_links().await?;
+
             // 8. Clamp leaked daemon refcounts to the observed holder set.
             self.check_refcounts().await;
 
@@ -490,6 +493,32 @@ impl Reconciler {
         Ok(())
     }
 
+    /// Sweep `{root}/l/` short links whose snapshot directory is gone.
+    ///
+    /// `OverlayEngine::remove` unlinks a snapshot's short link best-effort:
+    /// aborting a removal over a derived symlink would strand the snapshot
+    /// DIRECTORY, whose name is the committed chain id, and `commit` refuses a
+    /// destination that already exists -- so the layer could never be pulled
+    /// again. The cost of that choice is a link that can outlive its snapshot,
+    /// which this reclaims. It also clears the only lasting form of an FNV
+    /// short-name collision: a stale link that would otherwise make a
+    /// colliding key's mounts fail until an operator intervened.
+    async fn check_orphan_short_links(&self) -> Result<()> {
+        let Some(snapshotter_root) = self
+            .supervisor
+            .daemons_root()
+            .parent()
+            .map(Path::to_path_buf)
+        else {
+            return Ok(());
+        };
+        let removed = sweep_orphan_short_links(&snapshotter_root.join("l"));
+        if removed > 0 {
+            info!(removed, "recon: orphan short-link sweep completed");
+        }
+        Ok(())
+    }
+
     /// Remove `{root}/daemons/<slug>/` directories that no longer correspond
     /// to a live daemon instance. Avoids removing the mountpoint while it is
     /// in use by checking `/proc/mounts` first.
@@ -581,6 +610,57 @@ impl Reconciler {
 /// The whole sweep is best-effort/non-fatal: an unreadable `work_dir` and per-dir
 /// removal failures are logged and skipped rather than propagated, so a transient
 /// filesystem hiccup never aborts a reconciliation pass.
+/// Remove `l/<hash>` symlinks whose target no longer resolves.
+///
+/// The link points at `../snapshots/<dir>/fs`, so "the snapshot is gone" is
+/// exactly "the target does not exist" -- no reverse lookup of the hashed key
+/// is needed, and a link whose snapshot is still live always resolves. Entries
+/// that are not symlinks are left alone: nothing here creates one, so it is not
+/// this sweep's business to guess what it is.
+///
+/// Best-effort throughout: an unreadable directory or a failed unlink is logged
+/// and skipped rather than propagated, so a filesystem hiccup never aborts a
+/// reconciliation pass. Returns the number of links removed.
+fn sweep_orphan_short_links(link_dir: &Path) -> usize {
+    let entries = match std::fs::read_dir(link_dir) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return 0,
+        Err(e) => {
+            warn!(
+                link_dir = %link_dir.display(),
+                error = %e,
+                "recon: failed to read the short-link dir; skipping sweep"
+            );
+            return 0;
+        }
+    };
+    let mut removed = 0usize;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        // `symlink_metadata` describes the link; `metadata` follows it, so a
+        // dangling link is exactly an Err here.
+        if !path.is_symlink() {
+            continue;
+        }
+        if std::fs::metadata(&path).is_ok() {
+            continue;
+        }
+        match std::fs::remove_file(&path) {
+            Ok(()) => {
+                debug!(link = %path.display(), "recon: removed orphan short link");
+                removed += 1;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => warn!(
+                link = %path.display(),
+                error = %e,
+                "recon: failed to remove orphan short link"
+            ),
+        }
+    }
+    removed
+}
+
 fn sweep_stale_job_dirs(
     work_dir: &Path,
     max_age: Duration,
@@ -946,5 +1026,47 @@ proc /proc proc rw,nosuid 0 0
         )
         .unwrap();
         assert_eq!(removed, 0);
+    }
+
+    /// A short link outlives its snapshot when `remove()` could not unlink it
+    /// (it deliberately does not fail the removal over one). The sweep is what
+    /// reclaims it -- and a link whose snapshot is still there must survive.
+    #[test]
+    fn orphan_short_links_are_swept_and_live_ones_kept() {
+        let root = tempfile::tempdir().unwrap();
+        let link_dir = root.path().join("l");
+        let snapshots = root.path().join("snapshots");
+        std::fs::create_dir_all(&link_dir).unwrap();
+        std::fs::create_dir_all(snapshots.join("live-snapshot/fs")).unwrap();
+
+        // Points at a snapshot that still exists.
+        std::os::unix::fs::symlink(
+            Path::new("..")
+                .join("snapshots")
+                .join("live-snapshot")
+                .join("fs"),
+            link_dir.join("aaaaaaaaaaaaaaaa"),
+        )
+        .unwrap();
+        // Points at a snapshot that is gone.
+        std::os::unix::fs::symlink(
+            Path::new("..")
+                .join("snapshots")
+                .join("removed-snapshot")
+                .join("fs"),
+            link_dir.join("bbbbbbbbbbbbbbbb"),
+        )
+        .unwrap();
+        // Not a symlink: not this sweep's business.
+        std::fs::write(link_dir.join("cccccccccccccccc"), b"stray").unwrap();
+
+        assert_eq!(sweep_orphan_short_links(&link_dir), 1);
+        assert!(link_dir.join("aaaaaaaaaaaaaaaa").is_symlink());
+        assert!(!link_dir.join("bbbbbbbbbbbbbbbb").exists());
+        assert!(link_dir.join("cccccccccccccccc").exists());
+
+        // Idempotent, and a missing dir is not an error.
+        assert_eq!(sweep_orphan_short_links(&link_dir), 0);
+        assert_eq!(sweep_orphan_short_links(&root.path().join("nope")), 0);
     }
 }

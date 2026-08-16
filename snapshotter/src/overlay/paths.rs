@@ -8,6 +8,7 @@ use anyhow::{Context, Result, bail};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use tracing::warn;
 
 pub(super) fn snapshot_dir(root: &Path, key: &str) -> PathBuf {
     root.join("snapshots").join(snapshot_dir_name(key))
@@ -89,6 +90,18 @@ pub(super) fn ensure_short_link(root: &Path, key: &str) -> Result<PathBuf> {
                 target.display()
             ),
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            // `readlink` answers EINVAL when the path exists but is not a
+            // symlink -- a plain file or directory left by a botched restore or
+            // a stray write. Nothing here ever creates one, and the name is
+            // ours to own, so replace it rather than wedging every mount of
+            // this snapshot behind an error no retry can clear.
+            Err(e) if e.raw_os_error() == Some(libc::EINVAL) => {
+                warn!(
+                    link = %link.display(),
+                    "short link path exists but is not a symlink; replacing it"
+                );
+                remove_short_link_path(&link)?;
+            }
             Err(e) => {
                 return Err(e).with_context(|| format!("read short link {}", link.display()));
             }
@@ -113,10 +126,17 @@ pub(super) fn ensure_short_link(root: &Path, key: &str) -> Result<PathBuf> {
 
 /// Remove a snapshot's short link if present.
 pub(super) fn remove_short_link(root: &Path, key: &str) -> Result<()> {
-    let link = short_link_path(root, key);
-    match fs::remove_file(&link) {
+    remove_short_link_path(&short_link_path(root, key))
+}
+
+/// Unlink one short-link path, tolerating "already gone". A directory left at
+/// the name (which nothing here creates) needs `remove_dir` instead.
+fn remove_short_link_path(link: &Path) -> Result<()> {
+    match fs::remove_file(link) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(_) if link.is_dir() => fs::remove_dir(link)
+            .with_context(|| format!("remove short link directory {}", link.display())),
         Err(e) => Err(e).with_context(|| format!("remove short link {}", link.display())),
     }
 }

@@ -275,11 +275,23 @@ async fn detect(image_ref: &str, config: &SnapshotterConfig) -> Result<Option<Re
         // arrive digest-pinned -- and that digest names the top-level object (the dual index
         // itself, verified against a live pull). Without fetching it here, dual-manifest
         // detection would only ever fire for tag-form refs (ctr, tests), never for a pod.
-        match client.get_manifest(repo, &digest).await {
-            Ok(fetched) => top_bytes = Some(fetched.bytes),
-            Err(e) => {
-                debug!(%digest, error = %e, "could not fetch pinned top-level manifest; skipping dual-index detection");
+        // containerd has already stored this exact object -- it resolved the
+        // ref before CRI pulled -- so read it off disk first. Skipping the
+        // round-trip matters: kubelet digest-pins every production ref, so
+        // otherwise EVERY image pays an extra registry GET on the Prepare path,
+        // and a transient failure means paying it again on the next Prepare
+        // (only resolved outcomes are cached).
+        match read_content_store_blob(&config.snapshotter.containerd.content_root(), &digest) {
+            Some(bytes) => {
+                debug!(%digest, "read pinned top-level manifest from the content store");
+                top_bytes = Some(bytes);
             }
+            None => match client.get_manifest(repo, &digest).await {
+                Ok(fetched) => top_bytes = Some(fetched.bytes),
+                Err(e) => {
+                    debug!(%digest, error = %e, "could not fetch pinned top-level manifest; skipping dual-index detection");
+                }
+            },
         }
         digest
     } else if let Some(tag) = parsed.tag.as_deref() {
@@ -362,6 +374,35 @@ async fn detect(image_ref: &str, config: &SnapshotterConfig) -> Result<Option<Re
 /// [`detect_from_oci_json`] — the single classification code path (bootstrap
 /// annotation first, media types second), so the referrers-API and
 /// fallback-tag branches can never drift apart.
+/// Read a digest-addressed blob out of containerd's content store, verifying
+/// it hashes to the digest asked for.
+///
+/// `None` for anything unexpected -- absent, unreadable, wrong algorithm,
+/// contents that do not match -- so every caller falls back to the registry
+/// rather than trusting a local file. The verification is what makes reading
+/// the store safe: the path is derived from the digest, so a file that hashes
+/// differently is corruption, not an alternative answer.
+fn read_content_store_blob(content_root: &Path, digest: &str) -> Option<Vec<u8>> {
+    let hex = digest.strip_prefix("sha256:")?;
+    if hex.is_empty() || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    // containerd names blobs with lowercase hex; normalise so an
+    // upper/mixed-case digest resolves on a case-sensitive filesystem too.
+    let hex = hex.to_ascii_lowercase();
+    let path = content_root.join("blobs").join("sha256").join(&hex);
+    let bytes = std::fs::read(&path).ok()?;
+    let actual = hex::encode(Sha256::digest(&bytes));
+    if actual != hex {
+        warn!(
+            path = %path.display(),
+            "content-store blob does not match its digest; ignoring it"
+        );
+        return None;
+    }
+    Some(bytes)
+}
+
 /// Spot a nydus manifest published as a sibling entry of the image's own index.
 ///
 /// Only entries for this node's platform count: a dual index for amd64+arm64 carries one
@@ -709,45 +750,79 @@ fn global_cache() -> &'static Mutex<ReferrerCache> {
 /// that a hostile few-KB gzip cannot OOM the snapshotter.
 const MAX_BOOTSTRAP_LAYER_BYTES: u64 = 1024 * 1024 * 1024;
 
+/// Path the bootstrap occupies inside a nydus bootstrap layer tar. Must match
+/// what nydusify packs (`nydusify/src/engine/bootstrap_layer.rs`).
+const BOOTSTRAP_FILE_NAME_IN_LAYER: &str = "image/image.boot";
+
 /// If `bytes` is a gzip'd (or plain) tar carrying `image/image.boot`, return that entry;
 /// otherwise return `bytes` unchanged (a raw referrer bootstrap).
+///
+/// The shape is sniffed rather than taken from the layer's media type because
+/// only one of the two callers has a descriptor to consult: the direct-blob
+/// path is reached precisely when the digest did NOT resolve to a manifest.
+/// What the sniff must not do is treat an unrecognised *compressed* layer as a
+/// raw bootstrap — that writes compressed bytes out as a RAFS superblock and
+/// fails much later, at the EROFS mount, with an error naming neither the
+/// layer nor its encoding. Known compressors are therefore rejected by name.
 fn maybe_unwrap_bootstrap_layer(bytes: Vec<u8>) -> Result<Vec<u8>> {
     use std::io::Read as _;
-    let tar_bytes: std::borrow::Cow<'_, [u8]> = if bytes.starts_with(&[0x1f, 0x8b]) {
-        let mut buf = Vec::new();
-        flate2::read::GzDecoder::new(bytes.as_slice())
-            .take(MAX_BOOTSTRAP_LAYER_BYTES.saturating_add(1))
-            .read_to_end(&mut buf)
-            .context("gunzip nydus bootstrap layer")?;
-        if buf.len() as u64 > MAX_BOOTSTRAP_LAYER_BYTES {
+    let is_tar = bytes.len() > 262 && &bytes[257..262] == b"ustar";
+    if !bytes.starts_with(&[0x1f, 0x8b]) && !is_tar {
+        if let Some(encoding) = unsupported_compression(&bytes) {
             bail!(
-                "bootstrap layer decompresses past {MAX_BOOTSTRAP_LAYER_BYTES} bytes; refusing to buffer it"
+                "nydus bootstrap layer is {encoding}-compressed; only gzip'd or plain tar \
+                 bootstrap layers are supported"
             );
         }
-        std::borrow::Cow::Owned(buf)
-    } else if bytes.len() > 262 && &bytes[257..262] == b"ustar" {
-        std::borrow::Cow::Borrowed(bytes.as_slice())
-    } else {
         // Raw bootstrap (RAFS superblock), the referrer-artifact shape.
         return Ok(bytes);
-    };
+    }
 
-    let mut archive = tar::Archive::new(tar_bytes.as_ref());
+    // Stream: gunzip feeds the tar reader directly and only the wanted entry is
+    // buffered, so a big bootstrap costs its own size rather than that plus the
+    // whole decompressed tar. The limit still bounds a hostile few-KB gzip.
+    let limited = std::io::Read::take(bytes.as_slice(), MAX_BOOTSTRAP_LAYER_BYTES);
+    let reader: Box<dyn std::io::Read> = if is_tar {
+        Box::new(limited)
+    } else {
+        Box::new(flate2::read::GzDecoder::new(limited))
+    };
+    let mut archive = tar::Archive::new(reader);
     for entry in archive.entries().context("read bootstrap layer tar")? {
         let mut entry = entry.context("read bootstrap layer tar entry")?;
         if entry
             .path()
-            .map(|p| p.as_os_str() == "image/image.boot")
+            .map(|p| p.as_os_str() == BOOTSTRAP_FILE_NAME_IN_LAYER)
             .unwrap_or(false)
         {
             let mut out = Vec::new();
-            entry
+            std::io::Read::take(&mut entry, MAX_BOOTSTRAP_LAYER_BYTES.saturating_add(1))
                 .read_to_end(&mut out)
                 .context("extract image/image.boot")?;
+            if out.len() as u64 > MAX_BOOTSTRAP_LAYER_BYTES {
+                bail!(
+                    "bootstrap layer decompresses past {MAX_BOOTSTRAP_LAYER_BYTES} bytes; refusing to buffer it"
+                );
+            }
             return Ok(out);
         }
     }
-    bail!("bootstrap layer tar carries no image/image.boot entry")
+    bail!("bootstrap layer tar carries no {BOOTSTRAP_FILE_NAME_IN_LAYER} entry")
+}
+
+/// Name the compression of a layer this code cannot read, so the failure says
+/// what is wrong instead of surfacing as a corrupt-superblock mount error.
+fn unsupported_compression(bytes: &[u8]) -> Option<&'static str> {
+    const PROBES: [(&[u8], &str); 4] = [
+        (&[0x28, 0xb5, 0x2f, 0xfd], "zstd"),
+        (&[0xfd, b'7', b'z', b'X'], "xz"),
+        (b"BZh", "bzip2"),
+        (&[0x04, 0x22, 0x4d, 0x18], "lz4"),
+    ];
+    PROBES
+        .iter()
+        .find(|(magic, _)| bytes.starts_with(magic))
+        .map(|(_, name)| *name)
 }
 
 #[cfg(test)]
@@ -958,6 +1033,47 @@ mod tests {
         assert!(super::classify_dual_index(b"{\"schemaVersion\":2,\"config\":{}}").is_none());
     }
 
+    /// Reading the pinned manifest locally is what removes a registry
+    /// round-trip from every digest-pinned Prepare, but only a blob that
+    /// actually hashes to the digest asked for may be used -- anything else
+    /// falls back to the registry.
+    #[test]
+    fn content_store_blobs_are_read_only_when_they_verify() {
+        let root = tempfile::tempdir().unwrap();
+        let blobs = root.path().join("blobs").join("sha256");
+        std::fs::create_dir_all(&blobs).unwrap();
+
+        let body = br#"{"schemaVersion":2,"manifests":[]}"#;
+        let hex = hex::encode(Sha256::digest(body));
+        std::fs::write(blobs.join(&hex), body).unwrap();
+
+        assert_eq!(
+            super::read_content_store_blob(root.path(), &format!("sha256:{hex}")).as_deref(),
+            Some(body.as_slice())
+        );
+        // Uppercase hex names the same blob: containerd writes lowercase, so
+        // the lookup normalises rather than missing on a case-sensitive fs.
+        assert_eq!(
+            super::read_content_store_blob(root.path(), &format!("sha256:{}", hex.to_uppercase()))
+                .as_deref(),
+            Some(body.as_slice())
+        );
+
+        // Present but corrupt: must not be trusted.
+        let liar = hex::encode(Sha256::digest(b"something else"));
+        std::fs::write(blobs.join(&liar), b"not what the name says").unwrap();
+        assert!(super::read_content_store_blob(root.path(), &format!("sha256:{liar}")).is_none());
+
+        // Absent, wrong algorithm, and malformed all fall back.
+        assert!(
+            super::read_content_store_blob(root.path(), &format!("sha256:{}", "0".repeat(64)))
+                .is_none()
+        );
+        assert!(super::read_content_store_blob(root.path(), "sha512:abcd").is_none());
+        assert!(super::read_content_store_blob(root.path(), "sha256:../escape").is_none());
+        assert!(super::read_content_store_blob(root.path(), "sha256:").is_none());
+    }
+
     /// A marked entry with no platform at all must NOT be served: it can only
     /// come from a foreign tool, it could have been built for any architecture,
     /// and nothing downstream would notice the mismatch before the container
@@ -1033,6 +1149,29 @@ mod tests {
             super::maybe_unwrap_bootstrap_layer(raw.clone()).unwrap(),
             raw
         );
+    }
+
+    /// A compression this cannot read must be named at fetch time. Treating it
+    /// as a raw bootstrap writes compressed bytes out as a RAFS superblock, and
+    /// the failure then surfaces at the EROFS mount, naming neither the layer
+    /// nor its encoding.
+    #[test]
+    fn an_unreadable_compression_is_reported_not_mistaken_for_a_bootstrap() {
+        for (magic, name) in [
+            (vec![0x28, 0xb5, 0x2f, 0xfd], "zstd"),
+            (vec![0xfd, b'7', b'z', b'X', b'Z'], "xz"),
+            (b"BZh9".to_vec(), "bzip2"),
+            (vec![0x04, 0x22, 0x4d, 0x18], "lz4"),
+        ] {
+            let mut body = magic;
+            body.extend_from_slice(&[0u8; 64]);
+            let err = super::maybe_unwrap_bootstrap_layer(body)
+                .expect_err("a compressed layer must not pass as a raw bootstrap");
+            assert!(
+                err.to_string().contains(name),
+                "error should name {name}: {err}"
+            );
+        }
     }
 
     #[test]

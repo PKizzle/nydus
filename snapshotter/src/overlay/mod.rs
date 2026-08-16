@@ -209,15 +209,35 @@ impl OverlayEngine {
     }
 
     /// Remove a snapshot.
+    ///
+    /// Ordering is load-bearing. `store.remove` commits first and is the point
+    /// of no return: once the row is gone, a retry of this Remove fails with
+    /// "snapshot does not exist" and can never reach the cleanup below. So
+    /// everything after it must either succeed or be survivable, and the
+    /// snapshot DIRECTORY is the part that must go -- its name is the committed
+    /// chain id, and `commit` refuses a destination that already exists, so a
+    /// stranded directory makes every future pull of that same layer fail until
+    /// an operator deletes it by hand.
+    ///
+    /// The `l/<hash>` symlink is derived, cheap to recreate, and swept by the
+    /// reconciler, so a failure to unlink it is logged rather than propagated:
+    /// letting it abort the removal would trade a dangling symlink for a
+    /// permanently un-repullable layer.
     pub fn remove(&self, store: &SnapshotStore, key: &str) -> Result<()> {
         debug!(key, "remove snapshot");
         let dir = self.snapshot_dir(key);
         store.remove(key)?;
-        remove_short_link(&self.config.snapshotter.root, key)?;
         if dir.exists() {
             fs::remove_dir_all(&dir).with_context(|| {
                 format!("failed to remove snapshot directory {}", dir.display())
             })?;
+        }
+        if let Err(e) = remove_short_link(&self.config.snapshotter.root, key) {
+            warn!(
+                key,
+                error = %e,
+                "failed to remove the snapshot's short link; leaving it for the reconciler"
+            );
         }
         Ok(())
     }
@@ -602,6 +622,46 @@ mod tests {
         engine.remove(&store, "base").unwrap();
 
         assert!(std::fs::symlink_metadata(&link).is_err());
+    }
+
+    /// The short link is derived state; the snapshot DIRECTORY is not. Its name
+    /// is the committed chain id and `commit` refuses an existing destination,
+    /// so a directory stranded by a failed unlink makes that layer un-pullable
+    /// forever -- and the store row is already gone, so no retry can reach the
+    /// cleanup. Removal must therefore survive an un-unlinkable short link.
+    #[test]
+    fn remove_deletes_the_directory_even_when_the_short_link_cannot_be_unlinked() {
+        let dir = tempdir().unwrap();
+        let (engine, store) = test_engine(dir.path());
+        let labels = HashMap::new();
+
+        engine.prepare(&store, "base-active", "", &labels).unwrap();
+        engine
+            .commit(&store, "base", "base-active", &HashMap::new())
+            .unwrap();
+        expect_mounts(engine.prepare(&store, "child", "base", &labels).unwrap());
+        engine.remove(&store, "child").unwrap();
+
+        // Make the unlink fail the way a botched restore would: replace the
+        // link with a NON-EMPTY directory, which neither remove_file nor
+        // remove_dir can delete.
+        let link = dir.path().join("l").join(paths::short_link_name("base"));
+        std::fs::remove_file(&link).unwrap();
+        std::fs::create_dir(&link).unwrap();
+        std::fs::write(link.join("occupant"), b"blocks rmdir").unwrap();
+
+        let snapshot_dir = engine.snapshot_dir("base");
+        assert!(snapshot_dir.exists());
+
+        engine
+            .remove(&store, "base")
+            .expect("a stuck short link must not fail the removal");
+
+        assert!(
+            !snapshot_dir.exists(),
+            "the snapshot directory must be gone"
+        );
+        assert!(store.stat("base").is_err());
     }
 
     /// The field failure this scheme fixes: 52 committed layers with realistic
