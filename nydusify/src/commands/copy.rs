@@ -100,38 +100,51 @@ pub async fn run(args: CopyArgs) -> Result<()> {
         .with_context(|| format!("fetch source manifest {source_ref}"))?;
     let top_is_index = is_index(top.content_type.as_deref(), &top.bytes);
 
+    // Both registry-target paths below need the same target client, built from
+    // the same flags; an archive target has no registry to build one against.
+    // Constructed once so a future auth or TLS flag cannot reach one path only.
+    let registry_target = match &target_archive {
+        Some(_) => None,
+        None => {
+            let target_ref = ImageReference::parse(&target)
+                .with_context(|| format!("parse --target {target}"))?;
+            let target_client = RegistryClient::new(
+                &target_ref.api_host,
+                client_options(
+                    args.target_insecure,
+                    args.plain_http || args.target_plain_http,
+                    &args.ca_cert,
+                ),
+            )
+            .context("build target registry client")?;
+            let same_registry = source_ref.api_host == target_ref.api_host;
+            Some((target_ref, target_client, same_registry))
+        }
+    };
+
     // `--all-platforms` copies the index whole: every entry, then the index
     // bytes verbatim. Handled before the single-platform path because that path
     // reduces the source to one manifest and cannot be reused here.
     if plan.all_platforms && top_is_index {
-        if let Some(archive) = &target_archive {
+        let Some((target_ref, target_client, same_registry)) = &registry_target else {
             bail!(
                 "--all-platforms cannot export to the OCI archive {}: the layout would need one \
                  manifest per platform and `export` writes a single image (follow-up); copy to a \
                  registry, or pick one platform with --platform",
-                archive.display()
+                target_archive
+                    .as_ref()
+                    .expect("registry_target is None only for an archive target")
+                    .display()
             );
-        }
+        };
         let index: Index =
             serde_json::from_slice(&top.bytes).context("parse source image index")?;
-        let target_ref =
-            ImageReference::parse(&target).with_context(|| format!("parse --target {target}"))?;
-        let target_client = RegistryClient::new(
-            &target_ref.api_host,
-            client_options(
-                args.target_insecure,
-                args.plain_http || args.target_plain_http,
-                &args.ca_cert,
-            ),
-        )
-        .context("build target registry client")?;
-        let same_registry = source_ref.api_host == target_ref.api_host;
         return copy_index_all_platforms(
             &source_client,
             &source_ref,
-            &target_client,
-            &target_ref,
-            same_registry,
+            target_client,
+            target_ref,
+            *same_registry,
             &index,
             &top,
             staging.path(),
@@ -184,18 +197,8 @@ pub async fn run(args: CopyArgs) -> Result<()> {
         .await;
     }
 
-    let target_ref =
-        ImageReference::parse(&target).with_context(|| format!("parse --target {target}"))?;
-    let target_client = RegistryClient::new(
-        &target_ref.api_host,
-        client_options(
-            args.target_insecure,
-            args.plain_http || args.target_plain_http,
-            &args.ca_cert,
-        ),
-    )
-    .context("build target registry client")?;
-    let same_registry = source_ref.api_host == target_ref.api_host;
+    let (target_ref, target_client, same_registry) =
+        registry_target.expect("an archive target returned via export_from_registry above");
 
     // Copy the config blob and every layer.
     copy_blob(
@@ -363,7 +366,7 @@ async fn copy_index_all_platforms(
             .as_deref()
             .or(child.content_type.as_deref())
             .unwrap_or(MEDIA_TYPE_OCI_MANIFEST);
-        retry
+        let pushed = retry
             .run("push index entry", || {
                 target_client.push_manifest(
                     &target_ref.repo,
@@ -374,6 +377,16 @@ async fn copy_index_all_platforms(
             })
             .await
             .with_context(|| format!("push index entry {} to {target_ref}", desc.digest))?;
+        // A child is pushed BY DIGEST, so a registry that stored something else
+        // leaves the index about to be pushed naming content the target does not
+        // have under that digest. That is a broken tag, not a warning.
+        if let Some(stored) = pushed.server_disagrees() {
+            bail!(
+                "target registry stored index entry {} as {stored}; the copied index would \
+                 reference a manifest that does not exist under the original digest",
+                desc.digest
+            );
+        }
     }
 
     // The index last: every descriptor it names now exists in the target.
@@ -394,10 +407,14 @@ async fn copy_index_all_platforms(
         .await
         .with_context(|| format!("push index to {target_ref}"))?;
 
-    if pushed != top.digest {
+    // The index bytes go up verbatim, so the local digest of what was sent
+    // always equals `top.digest` -- comparing those two can never detect
+    // anything. Only the digest the REGISTRY reports for what it stored can,
+    // and a registry that reports nothing leaves the question unanswered.
+    if let Some(stored) = pushed.server_disagrees() {
         warn!(
             source_digest = %top.digest,
-            target_digest = %pushed,
+            target_digest = %stored,
             "target registry re-serialised the index; the copied tag does NOT keep the source digest"
         );
     }
@@ -556,33 +573,19 @@ async fn copy_blob(
     staging: &Path,
     retry: &RetryPolicy,
 ) -> Result<()> {
-    if target_client.head_blob(target_repo, digest).await? {
-        debug!(%digest, "blob already present in target; skipping");
-        return Ok(());
-    }
-    if same_registry
-        && source_repo != target_repo
-        && target_client
-            .mount_blob(target_repo, digest, source_repo)
-            .await
-            .unwrap_or(false)
-    {
-        debug!(%digest, from = %source_repo, "cross-repo mounted blob");
-        return Ok(());
-    }
-    let tmp = staging.join(blob_hex(digest));
-    source_client
-        .get_blob_to_file(source_repo, digest, &tmp)
-        .await
-        .with_context(|| format!("download blob {digest}"))?;
-    retry
-        .run("copy blob", || {
-            target_client.push_blob_file(target_repo, &tmp)
-        })
-        .await
-        .with_context(|| format!("push blob {digest}"))?;
-    let _ = std::fs::remove_file(&tmp);
-    Ok(())
+    crate::engine::oci::ensure_blob_in_repo(
+        target_client,
+        target_repo,
+        Some(source_repo),
+        same_registry,
+        digest,
+        crate::engine::oci::BlobSource::Download {
+            client: source_client,
+            staging,
+        },
+        retry,
+    )
+    .await
 }
 
 fn ensure_dir(path: &Path) -> Result<()> {

@@ -8,8 +8,11 @@
 
 use std::path::Path;
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use registry_client::{Descriptor, FetchedManifest, Index, RegistryClient, RegistryClientOptions};
+use tracing::debug;
+
+use crate::engine::retry::RetryPolicy;
 
 /// Build [`RegistryClientOptions`] from the CLI's `--*-insecure` /
 /// `--plain-http` / `--ca-cert` switches, keeping the secure, time-bounded
@@ -198,6 +201,82 @@ pub fn select_platform<'a>(index: &'a Index, platform_selector: &str) -> Result<
         "no manifest in the index matches platform {platform_selector:?}; available: [{}]",
         available.join(", ")
     )
+}
+
+/// Where a blob's bytes come from when it actually has to be uploaded.
+pub enum BlobSource<'a> {
+    /// Already on local disk (the converter downloaded it to build from).
+    File(&'a Path),
+    /// Download from the source registry into `staging` first, then upload.
+    Download {
+        client: &'a RegistryClient,
+        staging: &'a Path,
+    },
+}
+
+/// Make `digest` resolvable in `target_repo`, doing the least work that
+/// achieves it: nothing when source and target are the same repo, nothing when
+/// the target already has it, a cross-repo mount when both repos live on one
+/// registry, and only failing that an upload.
+///
+/// This is the one place that cascade is written. It used to exist four times —
+/// in `copy`, in `optimize`, and twice in the converter — with subtly different
+/// semantics each time, so a fix to the mount fallback or the retry behaviour
+/// had to be rediscovered for each copy.
+pub async fn ensure_blob_in_repo(
+    target_client: &RegistryClient,
+    target_repo: &str,
+    source_repo: Option<&str>,
+    same_registry: bool,
+    digest: &str,
+    source: BlobSource<'_>,
+    retry: &RetryPolicy,
+) -> Result<()> {
+    // Same repo on the same registry: the blob is literally already there, and
+    // a HEAD would only confirm what the reference guarantees.
+    if same_registry && source_repo == Some(target_repo) {
+        return Ok(());
+    }
+    if target_client.head_blob(target_repo, digest).await? {
+        debug!(%digest, "blob already present in target; skipping");
+        return Ok(());
+    }
+    if same_registry
+        && let Some(from) = source_repo
+        && target_client
+            .mount_blob(target_repo, digest, from)
+            .await
+            .unwrap_or(false)
+    {
+        debug!(%digest, %from, "cross-repo mounted blob");
+        return Ok(());
+    }
+    match source {
+        BlobSource::File(path) => {
+            retry
+                .run("push blob", || {
+                    target_client.push_blob_file(target_repo, path)
+                })
+                .await
+                .with_context(|| format!("push blob {digest}"))?;
+        }
+        BlobSource::Download { client, staging } => {
+            let from = source_repo.context("downloading a blob needs a source repository")?;
+            let tmp = staging.join(blob_hex(digest));
+            client
+                .get_blob_to_file(from, digest, &tmp)
+                .await
+                .with_context(|| format!("download blob {digest}"))?;
+            retry
+                .run("copy blob", || {
+                    target_client.push_blob_file(target_repo, &tmp)
+                })
+                .await
+                .with_context(|| format!("push blob {digest}"))?;
+            let _ = std::fs::remove_file(&tmp);
+        }
+    }
+    Ok(())
 }
 
 /// Fetch a manifest by `reference`, resolving an image index down to the single

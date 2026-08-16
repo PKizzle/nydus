@@ -158,6 +158,38 @@ pub struct FetchedManifest {
     pub content_type: Option<String>,
 }
 
+/// The outcome of a manifest PUT.
+///
+/// The two digests have different provenance and answer different questions:
+/// [`digest`](Self::digest) is what we sent, [`server_digest`](Self::server_digest)
+/// is what the registry says it stored. Only comparing across that boundary can
+/// detect a registry that rewrote the manifest on the way in.
+#[derive(Clone, Debug)]
+pub struct PushedManifest {
+    /// sha256 of the bytes pushed, computed locally.
+    pub digest: String,
+    /// The digest the registry reported for the stored manifest
+    /// (`Docker-Content-Digest`, else the `Location` tail). `None` when the
+    /// registry reported neither, in which case nothing can be concluded.
+    pub server_digest: Option<String>,
+}
+
+impl PushedManifest {
+    /// The stored digest, when the registry reported one that differs from the
+    /// bytes pushed. `None` covers both "agrees" and "did not say".
+    pub fn server_disagrees(&self) -> Option<&str> {
+        self.server_digest
+            .as_deref()
+            .filter(|stored| !stored.eq_ignore_ascii_case(&self.digest))
+    }
+}
+
+impl std::fmt::Display for PushedManifest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.digest)
+    }
+}
+
 /// Request body for a single attempt. Rebuildable, so the 401-retry can
 /// resend it (a streaming body cannot be replayed once consumed).
 enum BodySource<'a> {
@@ -470,15 +502,20 @@ impl RegistryClient {
     }
 
     /// PUT a manifest (`/v2/<repo>/manifests/<reference>`) with the given
-    /// `Content-Type`. `reference` may be a tag or a digest. Returns the
-    /// manifest's computed `sha256:<hex>` digest.
+    /// `Content-Type`. `reference` may be a tag or a digest.
+    ///
+    /// The returned [`PushedManifest`] carries both the digest of the bytes
+    /// sent and — separately — the digest the registry says it stored, so a
+    /// caller can tell a registry that re-serialised the manifest from one that
+    /// stored it verbatim. Comparing the local digest against another local
+    /// digest cannot detect anything.
     pub async fn push_manifest(
         &self,
         repo: &str,
         reference: &str,
         media_type: &str,
         bytes: &[u8],
-    ) -> Result<String, RegistryError> {
+    ) -> Result<PushedManifest, RegistryError> {
         let url = self.manifest_url(repo, reference);
         let content_type =
             HeaderValue::from_str(media_type).context("invalid manifest media type")?;
@@ -497,7 +534,33 @@ impl RegistryClient {
                 .error_for_status(response, &format!("manifest push {repo}:{reference}"), &url)
                 .await);
         }
-        Ok(sha256_digest(bytes))
+        // The spec has the registry echo the stored digest in
+        // Docker-Content-Digest; `Location` ends in it too (end-7 returns
+        // 201 Created with the canonical manifest URL), so fall back to that.
+        let headers = response.headers();
+        let server_digest = headers
+            .get("docker-content-digest")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string)
+            .or_else(|| {
+                headers
+                    .get(LOCATION)
+                    .and_then(|value| value.to_str().ok())
+                    .and_then(|loc| loc.rsplit('/').next())
+                    .filter(|tail| tail.starts_with("sha256:"))
+                    .map(str::to_string)
+            });
+        let pushed = PushedManifest {
+            digest: sha256_digest(bytes),
+            server_digest,
+        };
+        if let Some(stored) = pushed.server_disagrees() {
+            warn!(
+                %repo, %reference, %stored, sent = %pushed.digest,
+                "registry stored a manifest with a different digest than the bytes pushed"
+            );
+        }
+        Ok(pushed)
     }
 
     /// GET the OCI 1.1 referrers list for `subject_digest`
@@ -1361,6 +1424,44 @@ mod tests {
             mounted,
             "https://r/v2/x/blobs/uploads/?mount=sha256%3Aabc&from=team%2Fbase"
         );
+    }
+
+    /// The point of splitting the two digests: a comparison is only meaningful
+    /// across the local/server boundary. Comparing the local digest with itself
+    /// (what the copy path used to do) can never report anything.
+    #[test]
+    fn only_a_server_reported_digest_can_disagree() {
+        let sent = sha256_digest(b"an index");
+
+        // Registry echoed the same digest: agreement, nothing to report.
+        let agreed = PushedManifest {
+            digest: sent.clone(),
+            server_digest: Some(sent.clone()),
+        };
+        assert_eq!(agreed.server_disagrees(), None);
+        // Case differences in hex are not a disagreement.
+        let upper = PushedManifest {
+            digest: sent.clone(),
+            server_digest: Some(sent.to_uppercase().replace("SHA256", "sha256")),
+        };
+        assert_eq!(upper.server_disagrees(), None);
+
+        // Registry stored something else: the case worth a warning.
+        let other = sha256_digest(b"re-serialised");
+        let rewritten = PushedManifest {
+            digest: sent.clone(),
+            server_digest: Some(other.clone()),
+        };
+        assert_eq!(rewritten.server_disagrees(), Some(other.as_str()));
+
+        // Registry said nothing: unknown, not "agrees".
+        let silent = PushedManifest {
+            digest: sent.clone(),
+            server_digest: None,
+        };
+        assert_eq!(silent.server_disagrees(), None);
+        // Display stays the local digest, so existing log lines are unchanged.
+        assert_eq!(silent.to_string(), sent);
     }
 
     #[compio::test]

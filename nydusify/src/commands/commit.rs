@@ -484,11 +484,11 @@ async fn push_committed_image(
         })
         .await
         .with_context(|| format!("push the committed manifest to {target_ref}"))?;
-    debug_assert_eq!(pushed_digest, sha256_digest(&manifest_bytes));
+    debug_assert_eq!(pushed_digest.digest, sha256_digest(&manifest_bytes));
 
     Ok(Descriptor {
         media_type: media_type.to_string(),
-        digest: pushed_digest,
+        digest: pushed_digest.digest,
         size: manifest_bytes.len() as u64,
         ..Descriptor::default()
     })

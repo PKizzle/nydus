@@ -35,7 +35,7 @@ use registry_client::{
     Descriptor, ImageReference, Index, NYDUS_MANIFEST_ARTIFACT_TYPE, NYDUS_OS_FEATURE,
     RegistryClient, is_nydus_entry,
 };
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
 use crate::commands::convert::{ConversionMode, SourceSpec};
 use crate::engine::artifact::maybe_push_referrer;
@@ -192,7 +192,8 @@ pub async fn run_conversion(request: &ConvertRequest, workspace: &Path) -> Resul
     // Resolve which platforms to convert from the top-level source reference.
     let plan = match (&source_client, &source_ref) {
         (Some(client), Some(source_ref)) => {
-            resolve_platform_plan(request, client, source_ref).await?
+            let same_repo = same_registry && source_ref.repo == target_ref.repo;
+            resolve_platform_plan(request, client, source_ref, same_repo).await?
         }
         // Directory-only: there is no index to enumerate, and a multi-platform selection was
         // refused at plan time, so `--platform` (or the host default) is the whole answer.
@@ -343,6 +344,7 @@ async fn resolve_platform_plan(
     request: &ConvertRequest,
     client: &RegistryClient,
     source_ref: &ImageReference,
+    same_repo: bool,
 ) -> Result<PlatformPlan> {
     let fetched = client
         .get_manifest(&source_ref.repo, source_ref.manifest_reference())
@@ -371,6 +373,24 @@ async fn resolve_platform_plan(
 
     let index: Index =
         serde_json::from_slice(&fetched.bytes).context("parse source image index")?;
+
+    // `--attach-oci-manifest` republishes the source index's entries beside the
+    // nydus manifest, and cross-repo it can only honestly publish the platform
+    // it actually copied. Refuse HERE, where the index is already in hand:
+    // discovering it after the conversion, the nydus push and the source-blob
+    // copies leaves the target repo full of digest-pinned garbage under no tag.
+    if request.attach_oci_manifest && !same_repo {
+        let real = real_image_entries(&index.manifests);
+        if real.len() > 1 {
+            bail!(
+                "--attach-oci-manifest onto a multi-platform source index is only supported \
+                 when source and target are the same repository; converting {source_ref} \
+                 ({} platforms) into another repository would drop the entries not copied",
+                real.len()
+            );
+        }
+    }
+
     let selectors = if request.all_platforms {
         let all = all_platform_selectors(&index);
         if all.is_empty() {
@@ -501,6 +521,7 @@ async fn convert_one_platform(
             same_registry,
             &source,
             &pushed.manifest,
+            request.driver.oci_ref,
             retry,
         )
         .await?;
@@ -755,6 +776,12 @@ async fn pull_source(
                 serde_json::from_slice(&fetched.bytes).context("parse source image index")?;
             let entries = index.manifests.clone();
             let selected = select_platform(&index, platform)?;
+            if registry_client::is_nydus_entry(selected) {
+                bail!(
+                    "the entry selected for platform {platform:?} in {source_ref} is the tag's \
+                     nydus manifest, not an OCI image; a nydus image cannot be a conversion source"
+                );
+            }
             let plat = selected.platform.clone().unwrap_or_default();
             let img = client
                 .get_manifest(repo, &selected.digest)
@@ -762,9 +789,9 @@ async fn pull_source(
                 .with_context(|| format!("fetch platform manifest {}", selected.digest))?;
             (img.bytes, img.digest, plat, Some(entries))
         } else {
-            // Single-arch source: honor the requested platform selector for the
-            // index entry's platform field (a single-arch image carries no
-            // platform of its own in the manifest).
+            // Single-arch source: the requested selector is only a starting
+            // point. It is replaced below by the image config's own os/arch,
+            // which is what the image actually IS -- see `platform_from_config`.
             let (os, arch, variant) = crate::engine::oci::parse_platform(platform)?;
             let plat = registry_client::types::Platform {
                 architecture: arch,
@@ -795,6 +822,27 @@ async fn pull_source(
         .await
         .with_context(|| format!("fetch image config {}", manifest.config.digest))?;
 
+    // A single-manifest source carries no platform of its own in the manifest,
+    // but its CONFIG does -- and that is what the image actually is. Trusting
+    // the requested selector instead (which defaults to the converting host)
+    // published an index claiming, say, linux/amd64 for an arm64-only image:
+    // amd64 nodes then pull an arm64 rootfs and arm64 nodes match nothing, so
+    // the tag breaks for every architecture, silently, at publish time.
+    let plat = match (index_entries.as_ref(), platform_from_config(&config_bytes)) {
+        (None, Some(from_config)) => {
+            if !from_config.matches(&plat) {
+                warn!(
+                    requested = platform,
+                    actual = %format_platform(&from_config),
+                    "the source image is not the requested platform; labeling it with what its \
+                     config says it is"
+                );
+            }
+            from_config
+        }
+        _ => plat,
+    };
+
     let layers_dir = workspace.join("layers");
     std::fs::create_dir_all(&layers_dir)
         .with_context(|| format!("create layers dir {}", layers_dir.display()))?;
@@ -820,6 +868,83 @@ async fn pull_source(
         config_bytes,
         layers,
     })
+}
+
+/// The entries of the index the target tag currently resolves to.
+///
+/// `Ok(None)` means there is nothing to merge into and the caller should use
+/// what it already has: the tag does not exist yet, or it holds a plain
+/// manifest rather than an index (the pre-`--attach-oci-manifest` shape, which
+/// this run is about to replace wholesale).
+async fn current_tag_entries(
+    client: &RegistryClient,
+    target_ref: &ImageReference,
+) -> Result<Option<Vec<Descriptor>>> {
+    let fetched = match client
+        .get_manifest(&target_ref.repo, target_ref.manifest_reference())
+        .await
+    {
+        Ok(fetched) => fetched,
+        Err(registry_client::RegistryError::NotFound { .. }) => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    if !is_index(fetched.content_type.as_deref(), &fetched.bytes) {
+        return Ok(None);
+    }
+    let index: Index =
+        serde_json::from_slice(&fetched.bytes).context("parse the target tag's current index")?;
+    Ok(Some(index.manifests))
+}
+
+/// The index entries that carry a real image.
+///
+/// Two kinds do not: buildkit's SBOM/provenance attestations (tagged
+/// `unknown/unknown`, layers are in-toto JSON, and attached by default since
+/// buildx v0.11 — so even a single-arch `docker buildx build --push` produces a
+/// two-entry index), and the nydus half of a dual-manifest index. Counting
+/// either as a platform makes a single-platform image look multi-platform.
+fn real_image_entries(entries: &[Descriptor]) -> Vec<&Descriptor> {
+    entries
+        .iter()
+        .filter(|d| !registry_client::is_nydus_entry(d))
+        .filter(|d| {
+            d.platform
+                .as_ref()
+                .is_none_or(|p| !(p.os == "unknown" && p.architecture == "unknown"))
+        })
+        .collect()
+}
+
+/// The platform an image config declares for itself.
+///
+/// `architecture` and `os` are required by the OCI image-config spec; a config
+/// missing either is not one this can speak for, so the caller keeps whatever
+/// it had. `variant` and `os.version` are optional and carried through when
+/// present.
+fn platform_from_config(config_bytes: &[u8]) -> Option<registry_client::types::Platform> {
+    let config: serde_json::Value = serde_json::from_slice(config_bytes).ok()?;
+    let string_field = |key: &str| {
+        config
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
+    Some(registry_client::types::Platform {
+        architecture: string_field("architecture")?,
+        os: string_field("os")?,
+        variant: string_field("variant"),
+        os_version: string_field("os.version"),
+        os_features: None,
+    })
+}
+
+/// `os/arch[/variant]`, for log lines.
+fn format_platform(p: &registry_client::types::Platform) -> String {
+    match p.variant.as_deref().filter(|v| !v.is_empty()) {
+        Some(v) => format!("{}/{}/{}", p.os, p.architecture, v),
+        None => format!("{}/{}", p.os, p.architecture),
+    }
 }
 
 /// Reject source layers `nydus-image create --type targz-*` cannot ingest.
@@ -1237,6 +1362,10 @@ async fn attach_oci_manifest_and_push_index(
     same_registry: bool,
     source: &PulledSource,
     nydus_manifest: &Descriptor,
+    // `layers_already_pushed`: whether the nydus push already made the source
+    // layers resolvable in the target repo (true in `--oci-ref`, where they ARE
+    // the nydus data blobs).
+    layers_already_pushed: bool,
     retry: &RetryPolicy,
 ) -> Result<()> {
     let source_ref = source_ref
@@ -1254,22 +1383,23 @@ async fn attach_oci_manifest_and_push_index(
     // target being the same repo, the migration case -- everything is already there.
     let same_repo = same_registry && source_ref.repo == target_ref.repo;
     if !same_repo {
-        for layer in &source.layers {
-            if target_client.head_blob(repo, &layer.digest).await? {
-                continue;
-            }
-            let mounted = same_registry
-                && target_client
-                    .mount_blob(repo, &layer.digest, &source_ref.repo)
-                    .await
-                    .unwrap_or(false);
-            if !mounted {
-                retry
-                    .run("push source layer", || {
-                        target_client.push_blob_file(repo, &layer.path)
-                    })
-                    .await
-                    .with_context(|| format!("push source layer {}", layer.digest))?;
+        // In `--oci-ref` the nydus image REUSES the original layers, so
+        // `push_artifact` has just mounted or pushed every one of them into
+        // this repo. HEADing them again would be one guaranteed-hit round-trip
+        // per layer -- 50 of them on an ordinary image.
+        if !layers_already_pushed {
+            for layer in &source.layers {
+                crate::engine::oci::ensure_blob_in_repo(
+                    target_client,
+                    repo,
+                    Some(source_ref.repo.as_str()),
+                    same_registry,
+                    &layer.digest,
+                    crate::engine::oci::BlobSource::File(&layer.path),
+                    retry,
+                )
+                .await
+                .with_context(|| format!("push source layer {}", layer.digest))?;
             }
         }
         if !target_client
@@ -1296,27 +1426,57 @@ async fn attach_oci_manifest_and_push_index(
             .context("push the source manifest by digest")?;
     }
 
+    // The descriptor for the OCI half we just made resolvable in the target repo.
+    let converted_entry = Descriptor {
+        media_type: oci_media_type,
+        digest: oci_digest,
+        size: source.manifest_bytes.len() as u64,
+        platform: Some(source.platform.clone()),
+        ..Descriptor::default()
+    };
     let base_entries = match &source.source_index_entries {
+        // Same repo: preserve every original entry verbatim -- the other
+        // architectures' manifests already live here, and replacing a
+        // multi-arch tag with a single-arch index would break them.
+        Some(entries) if same_repo => entries.clone(),
+        // Cross-repo: only the platform actually copied can be published. A
+        // multi-platform source was already refused at plan time; what remains
+        // is a single-image index (buildx wraps even single-arch builds in one,
+        // beside its attestation entries), whose sole image is the one just
+        // converted.
         Some(entries) => {
-            // Preserve every original entry; the other architectures' manifests already
-            // live in this repo only in the same-repo case, and copying an arbitrary
-            // index's whole tree is out of scope.
-            if !same_repo {
-                bail!(
-                    "--attach-oci-manifest onto a multi-entry source index is only \
-                     supported when source and target are the same repository; converting \
-                     {source_ref} into {target_ref} would drop the entries not copied"
+            let dropped = entries.len() - real_image_entries(entries).len();
+            if dropped > 0 {
+                info!(
+                    dropped,
+                    "not copying the source index's non-image entries (buildkit attestations) \
+                     into another repository"
                 );
             }
-            entries.clone()
+            vec![converted_entry]
         }
-        None => vec![Descriptor {
-            media_type: oci_media_type,
-            digest: oci_digest,
-            size: source.manifest_bytes.len() as u64,
-            platform: Some(source.platform.clone()),
-            ..Descriptor::default()
-        }],
+        None => vec![converted_entry],
+    };
+    // Merge into what the tag holds RIGHT NOW, not into the index captured when
+    // the pull started. Conversion takes minutes, and the tag is a shared
+    // mutable cell: republishing the stale entries silently reverts anything
+    // pushed meanwhile (a CI build resurrected as the OCI half), and two
+    // per-architecture runs -- the workflow this tool documents -- each erase
+    // the other's nydus entry. Nothing in the distribution spec offers a
+    // portable compare-and-swap, so this re-reads late and keeps the window to
+    // the round-trip below rather than the whole run.
+    let base_entries = match current_tag_entries(target_client, target_ref).await {
+        Ok(Some(current)) => current,
+        Ok(None) => base_entries,
+        Err(e) => {
+            warn!(
+                target = %target_ref,
+                error = %e,
+                "could not re-read the target tag before publishing; merging into the index as \
+                 it was when this run started"
+            );
+            base_entries
+        }
     };
     let index_bytes = serde_json::to_vec(&dual_manifest_index(
         base_entries,
@@ -1426,30 +1586,18 @@ async fn push_artifact(
 
     // Reused original layers (--oci-ref): mount on a same-registry target, else push.
     for layer in &output.reused_layers {
-        let source_repo = source_ref.map(|r| &r.repo);
-        let mounted = if same_registry && source_repo.is_some_and(|r| r != &target_ref.repo) {
-            client
-                .mount_blob(
-                    repo,
-                    &layer.digest,
-                    source_repo.expect("checked just above"),
-                )
-                .await
-                .unwrap_or(false)
-        } else {
-            // Same repo: the blob is already there. Cross-registry: must push.
-            same_registry
-        };
-        if !mounted {
-            retry
-                .run("push reused layer", || {
-                    client.push_blob_file(repo, &layer.path)
-                })
-                .await
-                .with_context(|| format!("push reused layer {}", layer.digest))?;
-        } else {
-            debug!(%repo, digest = %layer.digest, "reused layer already present / mounted");
-        }
+        let source_repo = source_ref.map(|r| r.repo.as_str());
+        crate::engine::oci::ensure_blob_in_repo(
+            client,
+            repo,
+            source_repo,
+            same_registry,
+            &layer.digest,
+            crate::engine::oci::BlobSource::File(&layer.path),
+            retry,
+        )
+        .await
+        .with_context(|| format!("push reused layer {}", layer.digest))?;
         let size = file_len(&layer.path)?;
         data_blobs.push(data_blob_descriptor(layer.digest.clone(), size));
     }
@@ -1532,7 +1680,7 @@ async fn push_artifact(
     Ok(PushedArtifact {
         manifest: Descriptor {
             media_type: media_type.to_string(),
-            digest: pushed_digest,
+            digest: pushed_digest.digest,
             size: manifest_bytes.len() as u64,
             ..Descriptor::default()
         },
@@ -1831,6 +1979,82 @@ mod tests {
         args.iter()
             .map(|a| a.to_string_lossy().into_owned())
             .collect()
+    }
+
+    /// A single-manifest source has no platform in its manifest, so the index
+    /// entry must be labeled from the CONFIG. Labeling it with the requested
+    /// selector (which defaults to the converting host) published an index
+    /// claiming linux/amd64 for an arm64-only image — breaking the tag for
+    /// every architecture at once.
+    #[test]
+    fn platform_comes_from_the_image_config() {
+        let config = br#"{
+            "architecture": "arm64",
+            "os": "linux",
+            "variant": "v8",
+            "rootfs": {"type": "layers", "diff_ids": []}
+        }"#;
+        let plat = platform_from_config(config).expect("a config with os+architecture");
+        assert_eq!(plat.architecture, "arm64");
+        assert_eq!(plat.os, "linux");
+        assert_eq!(plat.variant.as_deref(), Some("v8"));
+        assert_eq!(format_platform(&plat), "linux/arm64/v8");
+
+        // An arm64 image must NOT compare equal to the amd64 host default.
+        let host_default = registry_client::types::Platform {
+            architecture: "amd64".to_string(),
+            os: "linux".to_string(),
+            ..Default::default()
+        };
+        assert!(!plat.matches(&host_default));
+    }
+
+    #[test]
+    fn platform_from_config_needs_both_os_and_architecture() {
+        assert!(platform_from_config(br#"{"os": "linux"}"#).is_none());
+        assert!(platform_from_config(br#"{"architecture": "amd64"}"#).is_none());
+        assert!(platform_from_config(br#"{"architecture": "", "os": "linux"}"#).is_none());
+        assert!(platform_from_config(b"not json").is_none());
+        // Optional fields absent is fine.
+        let plat = platform_from_config(br#"{"architecture":"amd64","os":"linux"}"#).unwrap();
+        assert_eq!(plat.variant, None);
+        assert_eq!(plat.os_version, None);
+    }
+
+    /// buildx attaches an `unknown/unknown` attestation entry by default, so a
+    /// single-arch build is published as a two-entry index. Counting that as a
+    /// second platform made cross-repo `--attach-oci-manifest` refuse an
+    /// ordinary single-arch source.
+    #[test]
+    fn attestations_and_nydus_entries_are_not_platforms() {
+        let image = Descriptor {
+            digest: "sha256:image".to_string(),
+            platform: Some(registry_client::types::Platform {
+                architecture: "amd64".to_string(),
+                os: "linux".to_string(),
+                ..Default::default()
+            }),
+            ..Descriptor::default()
+        };
+        let attestation = Descriptor {
+            digest: "sha256:att".to_string(),
+            platform: Some(registry_client::types::Platform {
+                architecture: "unknown".to_string(),
+                os: "unknown".to_string(),
+                ..Default::default()
+            }),
+            ..Descriptor::default()
+        };
+        let nydus = Descriptor {
+            digest: "sha256:nydus".to_string(),
+            artifact_type: Some(NYDUS_MANIFEST_ARTIFACT_TYPE.to_string()),
+            platform: image.platform.clone(),
+            ..Descriptor::default()
+        };
+        let entries = vec![image.clone(), attestation, nydus];
+        let real = real_image_entries(&entries);
+        assert_eq!(real.len(), 1, "only the image itself is a platform");
+        assert_eq!(real[0].digest, image.digest);
     }
 
     #[test]

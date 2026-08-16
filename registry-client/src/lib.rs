@@ -65,7 +65,9 @@ pub mod reference;
 pub mod tls;
 pub mod types;
 
-pub use client::{FetchedManifest, RegistryClient, RegistryClientOptions, filter_referrers};
+pub use client::{
+    FetchedManifest, PushedManifest, RegistryClient, RegistryClientOptions, filter_referrers,
+};
 pub use error::RegistryError;
 pub use reference::ImageReference;
 pub use types::{

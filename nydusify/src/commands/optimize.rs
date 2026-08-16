@@ -32,7 +32,7 @@ use crate::engine::manifest::{
     ANNOTATION_NYDUS_BOOTSTRAP, assemble_manifest, bootstrap_descriptor, config_media_type,
     data_blob_descriptor, manifest_media_type, rebuild_image_config, validate_nydus_manifest,
 };
-use crate::engine::oci::{blob_hex, client_options, fetch_platform_manifest};
+use crate::engine::oci::{client_options, fetch_platform_manifest};
 use crate::engine::retry::RetryPolicy;
 
 use super::common::{resolve_platform, validate_existing_file};
@@ -376,31 +376,19 @@ async fn copy_blob(
     staging: &Path,
     retry: &RetryPolicy,
 ) -> Result<()> {
-    if target_client.head_blob(target_repo, digest).await? {
-        return Ok(());
-    }
-    if same_registry
-        && source_repo != target_repo
-        && target_client
-            .mount_blob(target_repo, digest, source_repo)
-            .await
-            .unwrap_or(false)
-    {
-        return Ok(());
-    }
-    let tmp = staging.join(blob_hex(digest));
-    source_client
-        .get_blob_to_file(source_repo, digest, &tmp)
-        .await
-        .with_context(|| format!("download data blob {digest}"))?;
-    retry
-        .run("copy data blob", || {
-            target_client.push_blob_file(target_repo, &tmp)
-        })
-        .await
-        .with_context(|| format!("push data blob {digest}"))?;
-    let _ = std::fs::remove_file(&tmp);
-    Ok(())
+    crate::engine::oci::ensure_blob_in_repo(
+        target_client,
+        target_repo,
+        Some(source_repo),
+        same_registry,
+        digest,
+        crate::engine::oci::BlobSource::Download {
+            client: source_client,
+            staging,
+        },
+        retry,
+    )
+    .await
 }
 
 fn ensure_work_dir(dir: &Path) -> Result<&Path> {
