@@ -5,6 +5,7 @@
 use std::path::Path;
 
 use anyhow::{Context, Result, anyhow, bail};
+use futures::stream::{self, StreamExt as _, TryStreamExt as _};
 use registry_client::types::{MEDIA_TYPE_OCI_INDEX, MEDIA_TYPE_OCI_MANIFEST, Manifest};
 use registry_client::{ImageReference, Index, RegistryClient};
 use serde::Serialize;
@@ -284,6 +285,11 @@ fn distinct_entries(index: &Index) -> Vec<&registry_client::types::Descriptor> {
 /// They are referenced by the index, so dropping them would leave it pointing at
 /// blobs the target does not have -- a broken tag that only fails later, when
 /// something actually resolves that descriptor.
+/// How many blob copies run at once. Small on purpose: each is a full
+/// HEAD/GET/PUT chain against two registries, and the point is to overlap
+/// latency, not to saturate a shared registry or the node's disk.
+const BLOB_COPY_CONCURRENCY: usize = 4;
+
 #[allow(clippy::too_many_arguments)]
 async fn copy_index_all_platforms(
     source_client: &RegistryClient,
@@ -316,6 +322,14 @@ async fn copy_index_all_platforms(
             "index names some digests more than once; copying each only once"
         );
     }
+    // Resolve every entry first, so the blob set can be deduplicated across the
+    // whole index before anything is copied. Multi-arch images routinely share
+    // a config or layer digest between entries, and copying a digest once is
+    // both less work and a precondition for doing the copies concurrently:
+    // `copy_blob` stages through a digest-named file, so two copies of one
+    // digest would be writing the same path.
+    let mut children = Vec::with_capacity(entry_count);
+    let mut blob_digests: Vec<String> = Vec::new();
     for desc in entries {
         let child = source_client
             .get_manifest(&source_ref.repo, &desc.digest)
@@ -344,20 +358,33 @@ async fn copy_index_all_platforms(
         debug!(digest = %desc.digest, %platform, layers = manifest.layers.len(), "copying index entry");
 
         for blob in std::iter::once(&manifest.config).chain(manifest.layers.iter()) {
-            copy_blob(
-                source_client,
-                &source_ref.repo,
-                target_client,
-                &target_ref.repo,
-                same_registry,
-                &blob.digest,
-                staging,
-                retry,
-            )
-            .await
-            .with_context(|| format!("copy blob {} of entry {}", blob.digest, desc.digest))?;
+            if !blob_digests.contains(&blob.digest) {
+                blob_digests.push(blob.digest.clone());
+            }
         }
+        children.push((desc, child, manifest));
+    }
 
+    // Each blob is an independent HEAD/GET/PUT chain, so run a few at a time
+    // instead of paying the sum of every round-trip: a 4-platform index of
+    // 50-layer images is ~200 of them.
+    let copies = stream::iter(blob_digests.iter().map(|digest| {
+        copy_blob(
+            source_client,
+            &source_ref.repo,
+            target_client,
+            &target_ref.repo,
+            same_registry,
+            digest,
+            staging,
+            retry,
+        )
+    }))
+    .buffer_unordered(BLOB_COPY_CONCURRENCY)
+    .try_collect::<Vec<()>>();
+    copies.await.context("copy index blobs")?;
+
+    for (desc, child, manifest) in children {
         // By digest, and with the child's own media type -- re-typing a docker
         // schema-2 manifest as OCI would change its bytes, hence its digest, and
         // the index descriptor would no longer point at it.
