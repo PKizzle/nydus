@@ -355,6 +355,17 @@ impl RegistryState {
         Ok(url.to_string())
     }
 
+    /// Whether a failed request looks like "we spoke TLS to a plaintext
+    /// registry", the one condition under which an https reader is allowed to
+    /// downgrade to http (and only with `skip_verify`).
+    ///
+    /// KNOWN GAP: the matched strings are OpenSSL's, from when this client used
+    /// it. On rustls the same situation surfaces as
+    /// `InvalidMessage(InvalidContentType)`, which matches none of them, so the
+    /// fallback does not fire. Widening it is a plaintext downgrade and wants
+    /// its own change: verified against a local plain-HTTP listener on
+    /// 2026-08-16, where an https reader with `skip_verify` failed outright
+    /// rather than falling back.
     fn needs_fallback_http(&self, e: &dyn Error) -> bool {
         if !self.skip_verify {
             return false;
@@ -889,11 +900,14 @@ impl RegistryReader {
         allow_retry: bool,
         context: &mut BackendContext,
     ) -> RegistryResult<usize> {
-        let url = format!("/blobs/sha256:{}", self.blob_id);
-        let url = self
+        // Mutable because the HTTP fallback below re-resolves it: a relative
+        // `Location` is joined against this, so it must be the URL the response
+        // actually came from, not the one the first attempt failed on.
+        let path = format!("/blobs/sha256:{}", self.blob_id);
+        let mut url = self
             .state
-            .url(url.as_str(), &[])
-            .map_err(|e| RegistryBackendError::Url(url, e))?;
+            .url(path.as_str(), &[])
+            .map_err(|e| RegistryBackendError::Url(path, e))?;
         let mut headers = HeaderMap::new();
         let end_at = offset + buf.len() as u64 - 1;
         let range = format!("bytes={}-{}", offset, end_at);
@@ -954,11 +968,15 @@ impl RegistryReader {
                 if self.state.needs_fallback_http(&e) =>
             {
                 self.state.fallback_http();
-                let url = format!("/blobs/sha256:{}", self.blob_id);
-                let url = self
+                // Reassign, never shadow: the redirect handling below joins a
+                // relative `Location` against `url`, and a scheme-shadowed copy
+                // that dies at the end of this arm would leave it resolving
+                // against the https URL whose TLS handshake just failed.
+                let path = format!("/blobs/sha256:{}", self.blob_id);
+                url = self
                     .state
-                    .url(url.as_str(), &[])
-                    .map_err(|e| RegistryBackendError::Url(url, e))?;
+                    .url(path.as_str(), &[])
+                    .map_err(|e| RegistryBackendError::Url(path, e))?;
                 self.request::<&[u8]>(
                     Method::GET,
                     url.as_str(),
@@ -2441,6 +2459,98 @@ mod tests {
         assert_eq!(resolve("sha256:def").unwrap(), "sha256:def");
         // Without the base, a relative Location is not a URL at all.
         assert!(Url::parse("/v2/other/blobs/sha256:def").is_err());
+    }
+
+    /// The join above is only correct if production code joins against the URL
+    /// the response actually came from, which a test that re-implements the
+    /// join over a literal cannot observe. This drives the real `_try_read`
+    /// against a server that answers with a relative `Location`, so the
+    /// resolution, the redirect request and the body all have to line up.
+    ///
+    /// Note what this deliberately does NOT cover: the same join is also
+    /// reached after `needs_fallback_http` downgrades an https reader to http,
+    /// which is the case where the request URL and the originally-built URL
+    /// differ. That path is unreachable from a test today because
+    /// `needs_fallback_http` matches OpenSSL's wording ("wrong version
+    /// number", "ssl") while this client is rustls, which reports
+    /// `InvalidMessage(InvalidContentType)` for the same situation -- see the
+    /// note on that function.
+    #[cfg(feature = "backend-registry")]
+    #[test]
+    fn test_relative_redirect_is_resolved_against_the_request_url() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::sync::atomic::AtomicUsize;
+
+        const BODY: &[u8] = b"redirected-blob-body";
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        // Requests seen: the initial GET, then the redirect it named.
+        let http_requests = Arc::new(AtomicUsize::new(0));
+
+        let shutdown_srv = shutdown.clone();
+        let http_srv = http_requests.clone();
+        thread::spawn(move || {
+            listener.set_nonblocking(true).unwrap();
+            while !shutdown_srv.load(Ordering::Relaxed) {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    thread::sleep(std::time::Duration::from_millis(5));
+                    continue;
+                };
+                stream.set_nonblocking(false).unwrap();
+                let mut buf = [0u8; 2048];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                if n == 0 {
+                    continue;
+                }
+                let seen = http_srv.fetch_add(1, Ordering::Relaxed);
+                let response = if seen == 0 {
+                    // Relative Location: the shape a path-rewriting proxy in
+                    // front of a plain-HTTP registry emits.
+                    "HTTP/1.1 307 Temporary Redirect\r\n\
+                     Location: /v2/library/test/blobs/redirected\r\n\
+                     Content-Length: 0\r\nConnection: close\r\n\r\n"
+                        .to_string()
+                } else {
+                    format!(
+                        "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        BODY.len(),
+                        String::from_utf8_lossy(BODY)
+                    )
+                };
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+
+        let config = RegistryConfig {
+            scheme: "http".to_string(),
+            host: addr.to_string(),
+            repo: "library/test".to_string(),
+            retry_limit: 0,
+            timeout: 5,
+            connect_timeout: 5,
+            ..Default::default()
+        };
+        let registry = Registry::new(&config, Some("test-relative-redirect")).unwrap();
+        let reader = registry.get_reader("sha256:abc").unwrap();
+
+        let mut buf = vec![0u8; BODY.len()];
+        let read = reader.try_read(&mut buf, 0);
+        shutdown.store(true, Ordering::Relaxed);
+
+        let read = read.expect("the redirected blob read must succeed");
+        assert_eq!(read, BODY.len());
+        assert_eq!(&buf, BODY);
+        // Two requests: the blob GET and the redirect it named. A relative
+        // Location that failed to resolve would error out before the second.
+        assert_eq!(
+            http_requests.load(Ordering::Relaxed),
+            2,
+            "the relative Location must resolve into a fetchable redirect request"
+        );
     }
 
     #[test]

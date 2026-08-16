@@ -381,6 +381,18 @@ impl<'a> TarballTreeBuilder<'a> {
                 hardlink_target = Some(tmp_tree);
                 flags |= RafsInodeFlags::HARDLINK;
                 tmp_node.inode.set_has_hardlink(true);
+                // Both names are one inode, so both must report one set of
+                // metadata -- see the note on extraction semantics below. Taking
+                // it from the target matches what the xattr copy further down
+                // already does; leaving the link's own header values here made
+                // RAFS v5 emit two inodes sharing an ino but disagreeing on
+                // mode/uid/gid/mtime (a state no kernel can produce), and RAFS
+                // v6, where the two names share one on-disk inode region, decide
+                // between them by dump order.
+                mode = tmp_node.inode.mode();
+                uid = tmp_node.inode.uid();
+                gid = tmp_node.inode.gid();
+                mtime = tmp_node.inode.mtime();
                 tmp_node.inode.ino()
             } else if tmp_node.is_dir() {
                 bail!(
@@ -394,10 +406,16 @@ impl<'a> TarballTreeBuilder<'a> {
                 // nodes carry all their information in the inode, so nothing gets duplicated in
                 // the data blob.
                 //
-                // Extracting a hardlink entry doesn't apply the metadata from its header: the
-                // name is created with link(2) and resolves to the inode of the target. So all
-                // metadata comes from the target node, and the generated filesystem matches what
-                // extracting the tarball produces even if the two headers disagree.
+                // Metadata comes from the target, here and in the regular-file branch above.
+                // A hardlink name is created with link(2) and resolves to the target's inode,
+                // so the two names cannot carry different metadata however the archive spells
+                // it -- what they must never do is disagree. Which side wins is a real choice:
+                // GNU tar creates the link and applies nothing from its header, while
+                // containerd's and moby's layer extractors fall through to chown/chmod/chtimes
+                // afterwards and so let the LINK's header overwrite the target's. Producers
+                // that archive a real filesystem (GNU tar, bsdtar, Go's tar.FileInfoHeader as
+                // used by buildkit) lstat one inode for both names and emit identical headers,
+                // so the two conventions only diverge on synthesized archives.
                 mode = tmp_node.inode.mode();
                 uid = tmp_node.inode.uid();
                 gid = tmp_node.inode.gid();
@@ -763,7 +781,20 @@ mod tests {
     // distinguishable from one built from the hardlink header.
     fn create_hardlink_tar(path: &Path) {
         let mut tar = tar::Builder::new(File::create(path).unwrap());
-        append_entry(&mut tar, "foo", EntryType::Regular, None, b"hello");
+        // The regular target carries the same distinguishing metadata as the
+        // sym/fifo targets, so a node built from the target is distinguishable
+        // from one built from the link entry's own (default) header.
+        append_entry_with_meta(
+            &mut tar,
+            "foo",
+            EntryType::Regular,
+            None,
+            b"hello",
+            TARGET_MODE,
+            TARGET_UID,
+            TARGET_GID,
+            TARGET_MTIME,
+        );
         for (name, entry_type) in [("sym", EntryType::Symlink), ("fifo", EntryType::Fifo)] {
             let link_name = (entry_type == EntryType::Symlink).then_some("foo");
             append_entry_with_meta(
@@ -909,6 +940,13 @@ mod tests {
         assert_eq!(foo_link.inode.size(), 5);
         assert_eq!(foo_link.inode.child_count(), 1);
         assert_eq!(foo_link.chunks.len(), 1);
+        // ...and both names must report ONE set of metadata. `foo-link`'s own
+        // header carries the append_entry defaults (0o644, uid/gid/mtime 0),
+        // which differ from the target's, so this fails if the link keeps them:
+        // v5 would emit two inodes sharing an ino but disagreeing, and v6, where
+        // both names share one on-disk inode region, would resolve the conflict
+        // by dump order.
+        assert_metadata_from_target(&foo_link, &foo, libc::S_IFREG);
 
         // The same tarball must also convert end to end, including blob and bootstrap dump.
         let mut ctx = create_context(source_path, version);
