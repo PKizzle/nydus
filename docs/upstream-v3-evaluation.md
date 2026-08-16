@@ -3,6 +3,22 @@
 *Assessed 2026-07-25 against `upstream/v3` @ `3f9e12ed`. Re-check before acting on any of this —
 the branch is young and moving.*
 
+> **Re-checked 2026-08-16** (`upstream/v3`, 147 commits, tag `v3.0.0-alpha.1`). The decision below
+> is unchanged, and the zran gap that drives it still holds: `git grep -i zran upstream/v3` returns
+> nothing, which is the cheapest single signal to re-run. What did change:
+> - It is no longer near-single-author. The commit list is the core maintainers (Gaius, imeoer,
+>   yansong.ys, Peng Tao) and there are now two alpha tags. Treat it as upstream's real next major,
+>   **not** a side experiment — while still respecting its own "not ready for production" warning.
+> - Layout moved on again: `nydus-accessor/` and the Go nydusify are gone, replaced by a workspace
+>   split (`nydus`, `nydus-core`, `nydus-storage`, `nydus-backend`, `nydus-config`, `nydus-error`,
+>   `nydus-format`, `nydus-telemetry`). Its workspace deps include `tokio`, against our
+>   no-tokio-in-`service/` rule.
+> - **CDC (content-defined chunking)** lives on `upstream/copilot/nydus-v3-chunk-digest-optimization`
+>   (v3 + 8 commits). It is not a portable algorithm: every CDC type belongs to the `LPBLMETA` blob
+>   metadata format and the new `LocalBlobCache` read path, neither of which exists here. Porting it
+>   means adopting a second on-disk format beside RAFS v5/v6. **Not doing it.**
+> - Item #5 below has been costed and largely dissolved; item #3 has been costed. See both.
+
 ## What it is
 
 `dragonflyoss/nydus`'s `v3` branch is **not a v3 of this codebase**. It is an **orphan branch**:
@@ -111,12 +127,62 @@ Ranked. None of these require adopting v3's format.
 3. **Chunk/group decoupling.** v3 separates the dedup unit (`chunk_block_bits`, BLAKE3, 1 MiB) from
    the compression/IO unit (`group_block_bits`, zstd, 4 MiB). RAFS v6 conflates them, forcing a
    dedup-ratio vs read-amplification tradeoff. The most interesting architectural idea on the branch.
+
+   *Costed 2026-08-16.* We are **not** starting from zero: batch mode already decouples the two,
+   but only for small chunks. [builder/src/core/node.rs:550](../builder/src/core/node.rs#L550) packs
+   a chunk into a shared compression unit only when the file has exactly one chunk
+   (`child_count() == 1`) **and** `d_size < batch_size / 2`; the read side is
+   [storage/src/meta/batch.rs](../storage/src/meta/batch.rs) plus `chunk_info_v2.rs`. So it is a
+   small-file packer, not a general IO unit, and the dedup granularity is still `chunk_size`.
+
+   Two ports, very different in size:
+   - **Cheap, builder-only, no format change**: lift the `child_count() == 1` and
+     `d_size < batch_size / 2` restrictions so any run of chunks can share a compression unit.
+     The v2 chunk-info format already carries the batch indirection, so nothing on disk changes
+     shape. Measurable today on real images via the convert cron; a day's work plus numbers.
+   - **Full decoupling**: let `chunk_size` shrink for dedup while the compressed/IO unit stays
+     large. That is a RAFS v6 blob-meta feature flag, builder rework, `cachedfile` read-path
+     rework, and a back-compat story. Weeks, and it needs the cheap version's numbers first.
+
+   **Tension to settle before either.** This document already records (see "Where we are ahead")
+   that we fetch chunk-granular while v3 fetches a whole 4 MiB group per fault, and calls that
+   "read amplification, not a win". Decoupling buys compression and dedup ratio by moving the IO
+   unit **up** — the same direction. On the fanotify path, where a fault should pull the least
+   possible, that is a regression unless the read unit stays independent of the compression unit.
+   Do not port this as "match v3"; port it only with cold-start numbers on both axes.
 4. **Trace-driven `optimize` redirect blob.** v3 records first-access `(blob, group)` order and emits
    a new layer whose groups redirect to `(source_blob_index, source_group_index)`, turning scattered
    cold-start range reads into one sequential fetch. Strictly stronger than the prefetch file list
    `snapshotter/src/prefetch_profile.rs` produces, and it composes with zran rather than conflicting.
 5. **Cross-process prefetch election** — `MAP_SHARED` readiness bitmap plus a per-blob `flock` on a
    `.prefetch.lock`, so N concurrent cold starts result in exactly one warming stream.
+
+   *Costed 2026-08-16 — mostly moot for us; do not schedule it.* Both halves were re-derived,
+   and the conclusion is that our architecture already has what this buys.
+   - **The bitmap half already exists.** v3's `nydus-storage/src/group_map.rs` (`LPGRPMAP`) is a
+     re-derivation of our [storage/src/cache/state/persist_map.rs](../storage/src/cache/state/persist_map.rs):
+     same `MAP_SHARED` mmap (via `utils/src/filemap.rs`), same 4096-byte header, same sticky
+     all-ready latch (`MAGIC_ALL_READY` ↔ `GROUP_MAP_FLAG_ALL_READY`), same atomic bit array.
+     Groups instead of chunks is the only difference. Nothing to port.
+   - **The lock half is portable but buys us little.** v3's
+     `nydus-storage/src/cache/group_lock.rs` is 245 lines depending on nothing but `std`, `libc`
+     and `tracing` — OFD byte-range locks, one byte per group, per-blob lock file, released by the
+     kernel if the holder dies. It is a clean, better design than the `flock` this item proposed.
+     But its own doc states the precondition: *"Within a process the caller must already have
+     elected a single fetcher"* — which is precisely what
+     [storage/src/cache/state/blob_state_map.rs](../storage/src/cache/state/blob_state_map.rs)
+     `check_ready_and_mark_pending` + `inflight_tracer` already does for us. v3 needs the
+     cross-process layer because it is one process per image (see the capability table above);
+     our snapshotter runs **one in-process daemon serving every image on the node**
+     (CLAUDE.md gotcha #6), so the second fetcher it would deduplicate does not exist.
+   - **Residual value, not worth 245 lines today**: the hot-upgrade/takeover window where two
+     daemons briefly share a cache dir, and `nydus-image`/nydusify subprocesses pointed at the
+     same cache. Revisit only if takeover is measured re-fetching.
+   - Cost if ever wanted: the file ports nearly verbatim; the hook is one `acquire` between
+     `check_ready_and_mark_pending` returning not-ready and the backend read at
+     [storage/src/cache/cachedfile.rs:1295](../storage/src/cache/cachedfile.rs#L1295). Note we
+     are chunk-granular where v3 is 4 MiB-group-granular, so this is one `F_OFD_SETLKW` syscall
+     per chunk on the cold path, not per group — measure before believing it is free.
 6. **Test cases we lack**, from `tests/integration/fanotify_test.go`: range-boundedness measured via
    allocated blocks on the sparse cache, warm re-read allocating ~nothing, and a fanotify-vs-FUSE
    perf harness with cold-page columns.
