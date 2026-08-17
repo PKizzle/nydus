@@ -199,6 +199,15 @@ jobs:
   create-release:
     runs-on: ${{ vars.RUNNER_OS || 'ubuntu-latest' }}
     needs: [prepare-tarball-linux, prepare-tarball-darwin]
+    # The repository default for GITHUB_TOKEN is read-only, so a job that
+    # creates a release has to ask for write explicitly -- without this the
+    # tarballs build fine and the upload dies with a bare "403 / Too many
+    # retries", which reads like a flaky network rather than a permission.
+    # `goreleaser` and `provenance` below already declare it; this job was the
+    # one that did not, which is why v3.0.0 built completely and published
+    # nothing.
+    permissions:
+      contents: write
     steps:
     - uses: actions/checkout@v6
     - name: sanity-check snapshotter version against tag
