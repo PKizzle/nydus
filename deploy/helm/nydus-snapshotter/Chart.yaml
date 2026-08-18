@@ -6,7 +6,7 @@ description: >-
   Deploys a privileged DaemonSet; does NOT edit host containerd config by default.
 type: application
 version: 0.1.1
-appVersion: "3.0.0"
+appVersion: "3.0.1"
 keywords:
   - containerd
   - snapshotter
