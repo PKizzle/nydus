@@ -6,7 +6,7 @@ below is the same.
 
 > **Platform:** the runtime path is Linux-only. The fanotify/EROFS on-demand driver needs kernel
 > ≥ 6.14; on older kernels the probe automatically falls back to fusedev (`/dev/fuse`) or a block
-> device. See the platform note in [../CLAUDE.md](../CLAUDE.md).
+> device.
 
 ## 1. Build / install the binary
 

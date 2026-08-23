@@ -1,9 +1,9 @@
 # Evaluating upstream's `v3` branch
 
-*Assessed 2026-07-25 against `upstream/v3` @ `3f9e12ed`. Re-check before acting on any of this —
-the branch is young and moving.*
+*Assessed against `upstream/v3` @ `3f9e12ed`, re-checked at tag `v3.0.0-alpha.1` (147 commits).
+Re-check before acting on any of this — the branch is young and moving.*
 
-> **Re-checked 2026-08-16** (`upstream/v3`, 147 commits, tag `v3.0.0-alpha.1`). The decision below
+> **Re-checked at tag `v3.0.0-alpha.1`** (`upstream/v3`, 147 commits). The decision below
 > is unchanged, and the zran gap that drives it still holds: `git grep -i zran upstream/v3` returns
 > nothing, which is the cheapest single signal to re-run. What did change:
 > - It is no longer near-single-author. The commit list is the core maintainers (Gaius, imeoer,
@@ -16,8 +16,8 @@ the branch is young and moving.*
 > - **CDC (content-defined chunking)** lives on `upstream/copilot/nydus-v3-chunk-digest-optimization`
 >   (v3 + 8 commits). It is not a portable algorithm: every CDC type belongs to the `LPBLMETA` blob
 >   metadata format and the new `LocalBlobCache` read path, neither of which exists here. Porting it
->   means adopting a second on-disk format beside RAFS v5/v6. **Not doing it.**
-> - Item #5 below has been costed and largely dissolved; item #3 has been costed. See both.
+>   means adopting a second on-disk format beside RAFS v5/v6. **Out of scope for this fork.**
+> - Items #3 and #5 below carry detailed assessments; #5 largely dissolves against our architecture.
 
 ## What it is
 
@@ -57,15 +57,14 @@ Against this fork, v3 is a large capability regression:
 The zran gap is the decisive one. v3's `nydus build` accepts only a directory
 (`ConversionType::DirNydus` is the sole variant), so every conversion fully extracts and re-encodes
 each OCI layer. It cannot reference an unmodified gzip layer as its data blob, which is the entire
-basis of our node-local acceleration path ([CLAUDE.md](../CLAUDE.md#node-local-acceleration)).
+basis of our node-local acceleration path ([ARCHITECTURE.md](../ARCHITECTURE.md), *Node-Local Acceleration*).
 
 **Do not rebase onto v3, and do not track it as a merge target.** Its value to us is as an
 independent second implementation of the fanotify pre-content path to compare against.
 
 ## What we took from it
 
-Four real defects on our side, found by that comparison and fixed in the same change as this
-document:
+Four real defects on our side, found by that comparison and since fixed:
 
 1. **`FAN_Q_OVERFLOW` was silently swallowed.** `EventFdGuard::new` marked `fd < 0` as answered and
    `process_event_buffer` never looked at the overflow record, so a kernel queue overflow — which
@@ -109,10 +108,10 @@ Ranked. None of these require adopting v3's format.
    saving. We already own the latch (`storage/src/cache/state/persist_map.rs`, `MAGIC_ALL_READY`)
    and simply never consult it from `handle_event`.
 
-   This used to be listed as blocked on `cull_cache()`: an unmarked blob whose cache was later
-   punched would serve zeros. That blocker is now **structural rather than incidental**, which makes
-   the port tractable. `cull_cache` has been replaced by `FanotifyHandler::invalidate`, the single
-   function through which cached bytes may be discarded, and it already owns the general invariant:
+   The hazard to control: an unmarked blob whose cache is later punched would serve zeros. The
+   protection against it is **structural rather than incidental**, which makes the port tractable:
+   `FanotifyHandler::invalidate` is the single function through which cached bytes may be
+   discarded, and it already owns the general invariant:
    *every promise that data is present must be revoked before the data goes away*. It revokes the
    chunk map first (`BlobObject::reset_data_ready`), then punches, under a per-blob `io_lock` that
    also excludes in-flight fetches.
@@ -128,7 +127,7 @@ Ranked. None of these require adopting v3's format.
    the compression/IO unit (`group_block_bits`, zstd, 4 MiB). RAFS v6 conflates them, forcing a
    dedup-ratio vs read-amplification tradeoff. The most interesting architectural idea on the branch.
 
-   *Costed 2026-08-16.* We are **not** starting from zero: batch mode already decouples the two,
+   We are **not** starting from zero: batch mode already decouples the two,
    but only for small chunks. [builder/src/core/node.rs:550](../builder/src/core/node.rs#L550) packs
    a chunk into a shared compression unit only when the file has exactly one chunk
    (`child_count() == 1`) **and** `d_size < batch_size / 2`; the read side is
@@ -139,10 +138,11 @@ Ranked. None of these require adopting v3's format.
    - **Cheap, builder-only, no format change**: lift the `child_count() == 1` and
      `d_size < batch_size / 2` restrictions so any run of chunks can share a compression unit.
      The v2 chunk-info format already carries the batch indirection, so nothing on disk changes
-     shape. Measurable today on real images via the convert cron; a day's work plus numbers.
+     shape. Measurable on real images via the convert cron.
    - **Full decoupling**: let `chunk_size` shrink for dedup while the compressed/IO unit stays
      large. That is a RAFS v6 blob-meta feature flag, builder rework, `cachedfile` read-path
-     rework, and a back-compat story. Weeks, and it needs the cheap version's numbers first.
+     rework, and a back-compat story. Substantially larger, and it needs the cheap version's
+     numbers first.
 
    **Tension to settle before either.** This document already records (see "Where we are ahead")
    that we fetch chunk-granular while v3 fetches a whole 4 MiB group per fault, and calls that
@@ -157,8 +157,7 @@ Ranked. None of these require adopting v3's format.
 5. **Cross-process prefetch election** — `MAP_SHARED` readiness bitmap plus a per-blob `flock` on a
    `.prefetch.lock`, so N concurrent cold starts result in exactly one warming stream.
 
-   *Costed 2026-08-16 — mostly moot for us; do not schedule it.* Both halves were re-derived,
-   and the conclusion is that our architecture already has what this buys.
+   Mostly moot for us: our architecture already has what this buys.
    - **The bitmap half already exists.** v3's `nydus-storage/src/group_map.rs` (`LPGRPMAP`) is a
      re-derivation of our [storage/src/cache/state/persist_map.rs](../storage/src/cache/state/persist_map.rs):
      same `MAP_SHARED` mmap (via `utils/src/filemap.rs`), same 4096-byte header, same sticky
@@ -173,8 +172,8 @@ Ranked. None of these require adopting v3's format.
      [storage/src/cache/state/blob_state_map.rs](../storage/src/cache/state/blob_state_map.rs)
      `check_ready_and_mark_pending` + `inflight_tracer` already does for us. v3 needs the
      cross-process layer because it is one process per image (see the capability table above);
-     our snapshotter runs **one in-process daemon serving every image on the node**
-     (CLAUDE.md gotcha #6), so the second fetcher it would deduplicate does not exist.
+     our snapshotter runs **one in-process daemon serving every image on the node**, so
+     the second fetcher it would deduplicate does not exist.
    - **Residual value, not worth 245 lines today**: the hot-upgrade/takeover window where two
      daemons briefly share a cache dir, and `nydus-image`/nydusify subprocesses pointed at the
      same cache. Revisit only if takeover is measured re-fetching.

@@ -1,7 +1,6 @@
 # Nydus Architecture
 
 > **Version:** 3.0 (Rust snapshotter rewrite)
-> **Last updated:** 2026-07-12
 > **Status:** Implementation in progress
 
 ## Overview
@@ -77,7 +76,7 @@ fanotify (≥6.14, CAP_SYS_ADMIN) → fusedev (/dev/fuse) → blockdev (loop/NBD
   `grpc.health.v1.Health` service are served by **cyper-axum** (hyper-on-compio) over a `tonic`
   `Routes` router — no tokio runtime, no second transport (`snapshotter/src/grpc/mod.rs`). The same
   hyper-on-compio server backs the sysctl UDS admin API (`snapshotter/src/sysctl.rs`).
-- **In-process nydus-service (FUSE/fanotify) I/O**: has **zero tokio** (see CLAUDE.md gotcha #1).
+- **In-process nydus-service (FUSE/fanotify) I/O**: has **zero tokio** (Decision 3).
   This is the `service/` crate, linked in-process. The fanotify event loop is `mio`-poll plus
   blocking libc reads on its own OS thread (`service/src/fanotify.rs`); FUSE runs synchronous
   `svc_loop` std threads (`service/src/fusedev.rs`); blob io_uring reads (`blob_cache.rs`) and the
@@ -319,8 +318,8 @@ containerd ──gRPC──▶ NydusSnapshotter::prepare()
 The `FanotifyHandler` is self-contained: given a bootstrap + blob-cache config it self-stages the
 EROFS device files (hardlinks to each data blob's `.blob.data` cache file, the same inode the kernel
 reads), arms `FAN_PRE_ACCESS` marks **after** its workers are draining, and mounts EROFS with the
-bootstrap as source and the data blobs as `device=` options. See the *fanotify on-demand* gotchas in
-[CLAUDE.md](./CLAUDE.md) and the integration tests in `misc/fanotify/`.
+bootstrap as source and the data blobs as `device=` options. See the integration tests in
+`misc/fanotify/`.
 
 ### Node-Local Acceleration (standard OCI image)
 
@@ -418,8 +417,7 @@ working implementations, not stubs:
 - **`mount`** — pulls the bootstrap via `registry-client` and spawns a foreground `nydusd` fusedev
   process backed by a registry backend, unmounting on SIGINT/SIGTERM. Registry backend only today
   (oss/s3/localfs are validated-but-rejected, follow-up); Linux-only in practice, since `nydusd`'s
-  FUSE serving path is part of the Linux-only runtime surface (see the platform note at the top of
-  CLAUDE.md).
+  FUSE serving path is part of the Linux-only runtime surface.
 
 All four are built on the new `registry-client/` crate (bearer-auth OCI distribution client: pull,
 push, `HEAD`/mount-blob dedup — the piece that never existed anywhere in the Rust workspace before)

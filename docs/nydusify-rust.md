@@ -15,8 +15,8 @@ containerd's `ctr` to inspect the container it is snapshotting.
 
 > **Platform:** `nydusify convert`/`check`/`copy` are pure networking + subprocess orchestration
 > and build/run anywhere `nydus-image` runs (including macOS for `check`/`convert` tooling). `mount`
-> spawns `nydusd` as a foreground FUSE daemon, which is part of the Linux-only runtime surface (see
-> the platform note at the top of [CLAUDE.md](../CLAUDE.md)) — treat it as Linux-only in practice.
+> spawns `nydusd` as a foreground FUSE daemon, which is part of the Linux-only runtime surface —
+> treat it as Linux-only in practice.
 
 ## `nydusify convert`
 
@@ -123,7 +123,7 @@ rebuild, leaves exactly one nydus entry per platform. Only the entry for the pla
 converted is touched — a multi-arch tag can hold one nydus manifest per architecture, built by
 separate single-platform runs, and those are left alone.
 
-> This was a real bug, fixed 2026-08-10. `--attach-oci-manifest` republishes the source index
+> This was a real bug. `--attach-oci-manifest` republishes the source index
 > verbatim, and when source and target are the same tag that index already contains the previous
 > run's nydus entry — so it was carried forward and the new one appended after it. Three tags
 > re-converted from standard mode to `--oci-ref` ended up advertising two nydus manifests each,
