@@ -112,8 +112,7 @@ signal-hook = "0.3"
 # `blocking::unblock` + `handle.block_on` and shut down in `Drop`, so no tokio
 # task ever touches a nydusd session thread. tokio is also pulled by the
 # peripheral NRI plugin (ttrpc) and transitively by tonic/hyper-util for sync
-# types. See ARCHITECTURE.md Decision 3 and CLAUDE.md gotcha #1 for the full
-# rule and this exception.
+# types. See ARCHITECTURE.md Decision 3 for the full rule and this exception.
 tokio = { version = "1", features = ["full"] }
 tokio-stream = "0.1"
 tonic = { version = "0.14", features = ["transport"] }

@@ -734,9 +734,8 @@ impl DaemonSupervisor {
         let mountpoint = daemon_root.join("mnt");
         // The fanotify cache `work_dir` doubles as the EROFS staging dir: the
         // fanotify handler self-stages device files as hardlinks to the
-        // per-layer cache files inside it (CLAUDE.md §"Fanotify on-demand
-        // runtime constraints"). Keep it next to the daemon dir so per-image
-        // cleanup is one `rm -rf`.
+        // per-layer cache files inside it. Keep it next to the daemon dir so
+        // per-image cleanup is one `rm -rf`.
         let stage_dir = daemon_root.join("stage");
         fs::create_dir_all(&mountpoint).with_context(|| {
             format!(

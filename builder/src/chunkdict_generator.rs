@@ -487,7 +487,8 @@ mod tests {
 
     #[test]
     fn file_offsets_accumulate_uncompressed_sizes() {
-        // The regression this guards: `file_offset` used to be `index * compressed_size`.
+        // Regression guard: `file_offset` must accumulate uncompressed sizes, not
+        // stride by `index * compressed_size`.
         // These chunks compress unevenly, so a compressed stride produces offsets that
         // do not describe the uncompressed stream at all.
         let chunks = vec![

@@ -363,9 +363,8 @@ impl RegistryState {
     /// it. On rustls the same situation surfaces as
     /// `InvalidMessage(InvalidContentType)`, which matches none of them, so the
     /// fallback does not fire. Widening it is a plaintext downgrade and wants
-    /// its own change: verified against a local plain-HTTP listener on
-    /// 2026-08-16, where an https reader with `skip_verify` failed outright
-    /// rather than falling back.
+    /// its own change. Verified against a local plain-HTTP listener: an https
+    /// reader with `skip_verify` fails outright rather than falling back.
     fn needs_fallback_http(&self, e: &dyn Error) -> bool {
         if !self.skip_verify {
             return false;

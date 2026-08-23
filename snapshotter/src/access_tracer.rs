@@ -25,7 +25,7 @@
 //! before the tracer even settles. Settle then triggers the optimize step,
 //! which reuses stage 1's work dir when present (see `auto_zran`).
 //!
-//! Concurrency note (CLAUDE.md gotcha #1): the event loop runs on its own OS
+//! Concurrency note: the event loop runs on its own OS
 //! thread (`std::thread::Builder`), not on the gRPC compio runtime. Each
 //! fanotify event is processed synchronously; the snapshotter's main runtime
 //! is never blocked.
@@ -604,7 +604,7 @@ impl AccessTracer {
         for path in to_remove {
             if let Some(state) = mounts.remove(&path) {
                 // Refcounted: other images' captures share the same vfsmount
-                // mark, so removing it outright here used to silently end
+                // mark, so removing it outright here would silently end
                 // event delivery for every other in-flight capture.
                 self.release_mark(state.mark_dev, &path);
             }

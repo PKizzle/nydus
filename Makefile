@@ -127,7 +127,7 @@ endef
 # `thiserror` enums: those macros returned a bare errno and discarded the message the call site
 # wrote, so a failure that had a perfectly good explanation surfaced as "Invalid argument (os
 # error 22)". Nothing should
-# reintroduce them. Scoped to `*.rs` so prose (CLAUDE.md, this comment) can name what it is
+# reintroduce them. Scoped to `*.rs` so prose (docs, this comment) can name what it is
 # telling you not to write.
 #
 # `grep -P`, not `-E`: `\b` is undefined in POSIX ERE and git grep matches *nothing* for the

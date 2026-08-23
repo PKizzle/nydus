@@ -1510,7 +1510,7 @@ async fn attach_oci_manifest_and_push_index(
 /// platform rather than appending a second one. Without that, a re-conversion accumulates
 /// stale nydus manifests: `--attach-oci-manifest` republishes the source index verbatim,
 /// and when source == target that index already contains the previous run's nydus entry.
-/// Observed in the wild on 2026-08-10 -- three tags re-converted from standard mode to
+/// Observed in the wild -- three tags re-converted from standard mode to
 /// `--oci-ref` ended up advertising two nydus manifests each, the stale one still pointing
 /// at now-unreferenced full RAFS blobs. Which of the two a consumer picks is undefined,
 /// so this is a correctness bug, not just wasted storage.

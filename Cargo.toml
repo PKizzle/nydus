@@ -46,7 +46,7 @@ hex = "0.4.3"
 # `nydusctl` speaks HTTP/1 to the daemon's unix socket over compio, using hyper's
 # low-level client — the same tokio-free pattern as nydus-storage's http-proxy
 # backend. Deliberately NOT hyper-util/hyperlocal: both are tokio-bound, and the
-# workspace runs on compio (see CLAUDE.md).
+# workspace runs on compio (see ARCHITECTURE.md, Decision 3).
 # The driver features are named explicitly rather than inherited from nydus-storage:
 # a `--bin nydusctl` build must stand on its own, since relying on feature unification
 # is what let the tokio dependency hide here in the first place.

@@ -54,9 +54,9 @@ pub async fn run(args: CopyArgs) -> Result<()> {
 
     if let Some(archive) = source_archive {
         // Refuse rather than quietly copy one manifest. `copy_from_archive` resolves the
-        // layout to a single image, so honouring the flag here is impossible -- and the
-        // blanket bail that used to make this unreachable is gone, so without this the
-        // copy would report success having dropped every other platform.
+        // layout to a single image, so honouring the flag here is impossible -- and no
+        // earlier check makes this unreachable, so without this the copy would report
+        // success having dropped every other platform.
         if plan.all_platforms {
             bail!(
                 "--all-platforms cannot read from the OCI archive {}: an archive is imported \
@@ -701,8 +701,8 @@ mod tests {
         assert_eq!(plan.platform, default_platform());
     }
 
-    /// `--all-platforms` used to be rejected outright in `run`. Planning must now
-    /// accept it, so this is the regression guard for that bail coming back.
+    /// Planning must accept `--all-platforms`; this is the regression guard
+    /// against `run` rejecting it outright again.
     #[test]
     fn accepts_all_platforms() {
         let mut args = base_args();

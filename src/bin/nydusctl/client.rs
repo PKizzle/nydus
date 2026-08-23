@@ -52,8 +52,8 @@ impl NydusdClient {
     /// status code and the collected body.
     ///
     /// Speaks HTTP/1 over a compio `UnixStream` with hyper's low-level client — the same
-    /// tokio-free pattern as `nydus-storage`'s http-proxy backend (see CLAUDE.md on the
-    /// workspace runtime split). `nydusctl` runs one request per invocation, so a
+    /// tokio-free pattern as `nydus-storage`'s http-proxy backend (see ARCHITECTURE.md on
+    /// the workspace runtime split). `nydusctl` runs one request per invocation, so a
     /// connection pool would buy nothing.
     async fn request(
         &self,
