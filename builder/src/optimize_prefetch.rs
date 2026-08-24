@@ -25,9 +25,11 @@ use nydus_storage::device::{BlobFeatures, BlobInfo};
 use nydus_storage::meta::BatchContextGenerator;
 use nydus_storage::meta::BlobChunkInfoV2Ondisk;
 use nydus_utils::compress;
+use nydus_utils::digest::RafsDigest;
 use serde::Deserialize;
 use sha2::Digest;
 use std::cmp::{max, min};
+use std::collections::HashMap;
 use std::mem::size_of;
 use std::sync::Arc;
 pub struct OptimizePrefetch {}
@@ -36,6 +38,21 @@ struct PrefetchBlobState {
     blob_info: BlobInfo,
     blob_ctx: BlobContext,
     blob_writer: Box<dyn Artifact>,
+    /// Where each distinct chunk landed in the prefetch blob, keyed by digest.
+    ///
+    /// The bootstrap's chunk info table is deduplicated by (digest, blob index)
+    /// when it is dumped, so a blob may hold only ONE entry per digest. Copying
+    /// an identical chunk in a second time would give it a second index that no
+    /// table entry describes, and every inode pointing at it would dangle.
+    written_chunks: HashMap<RafsDigest, WrittenChunk>,
+}
+
+/// The position a chunk was written to inside the prefetch blob.
+#[derive(Clone, Copy)]
+struct WrittenChunk {
+    index: u32,
+    compressed_offset: u64,
+    uncompressed_offset: u64,
 }
 
 #[derive(Clone)]
@@ -91,6 +108,7 @@ impl PrefetchBlobState {
             blob_info,
             blob_ctx,
             blob_writer,
+            written_chunks: HashMap::new(),
         })
     }
 }
@@ -309,6 +327,19 @@ impl OptimizePrefetch {
 
             let inner = Arc::make_mut(&mut chunk.inner);
 
+            // An identical chunk already copied in is reused rather than written a
+            // second time: the chunk info table holds one entry per (digest, blob),
+            // so a second copy would carry an index nothing describes and every
+            // inode pointing at it would fail to resolve. Files sharing content -
+            // the s6-rc `type` files of an s6-overlay image, say - hit this.
+            if let Some(written) = prefetch_state.written_chunks.get(inner.id()).copied() {
+                inner.set_blob_index(blob_info.blob_index());
+                inner.set_index(written.index);
+                inner.set_compressed_offset(written.compressed_offset);
+                inner.set_uncompressed_offset(written.uncompressed_offset);
+                continue;
+            }
+
             let reader = backend
                 .clone()
                 .get_reader(&blob_id.clone())
@@ -326,6 +357,14 @@ impl OptimizePrefetch {
             blob_ctx.chunk_count += 1;
             inner.set_compressed_offset(blob_ctx.current_compressed_offset);
             inner.set_uncompressed_offset(blob_ctx.current_uncompressed_offset);
+            prefetch_state.written_chunks.insert(
+                *inner.id(),
+                WrittenChunk {
+                    index: inner.index(),
+                    compressed_offset: inner.compressed_offset(),
+                    uncompressed_offset: inner.uncompressed_offset(),
+                },
+            );
             let mut aligned_d_size: u64 = inner.uncompressed_size() as u64;
             if let RafsBlobTable::V6(_) = blob_table {
                 aligned_d_size = nydus_utils::try_round_up_4k(inner.uncompressed_size())
