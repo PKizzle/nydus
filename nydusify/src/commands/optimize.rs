@@ -32,7 +32,7 @@ use crate::engine::manifest::{
     ANNOTATION_NYDUS_BOOTSTRAP, assemble_manifest, bootstrap_descriptor, config_media_type,
     data_blob_descriptor, manifest_media_type, rebuild_image_config, validate_nydus_manifest,
 };
-use crate::engine::oci::{client_options, fetch_platform_manifest};
+use crate::engine::oci::{client_options, fetch_nydus_platform_manifest};
 use crate::engine::retry::RetryPolicy;
 
 use super::common::{resolve_platform, validate_existing_file};
@@ -99,7 +99,7 @@ pub async fn run(args: OptimizeArgs) -> Result<()> {
     let work = workspace.path();
 
     // ---- resolve the source image ----
-    let fetched = fetch_platform_manifest(
+    let fetched = fetch_nydus_platform_manifest(
         &source_client,
         &source_ref.repo,
         source_ref.manifest_reference(),

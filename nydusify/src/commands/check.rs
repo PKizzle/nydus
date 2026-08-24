@@ -16,7 +16,7 @@ use crate::cli::CheckArgs;
 use crate::engine::artifact::{REFERRER_ARTIFACT_TYPE, fallback_referrers_tag};
 use crate::engine::bootstrap_layer;
 use crate::engine::manifest::validate_nydus_manifest;
-use crate::engine::oci::{client_options, fetch_platform_manifest};
+use crate::engine::oci::{client_options, fetch_nydus_platform_manifest};
 
 use super::common::resolve_backend_config;
 
@@ -46,7 +46,7 @@ pub async fn run(args: CheckArgs) -> Result<()> {
     info!(target = %target_ref, platform = %plan.platform, "checking nydus image");
 
     // (1) Pull the target manifest and validate it is a nydus image.
-    let fetched = fetch_platform_manifest(
+    let fetched = fetch_nydus_platform_manifest(
         &target_client,
         &target_ref.repo,
         target_ref.manifest_reference(),

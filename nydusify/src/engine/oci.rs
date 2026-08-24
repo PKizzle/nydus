@@ -160,20 +160,52 @@ pub fn all_platform_selectors(index: &Index) -> Vec<String> {
 /// index of `arm/v6` + `arm/v7`. That fallback is genuinely ambiguous — the
 /// entries are different images — so it is logged.
 pub fn select_platform<'a>(index: &'a Index, platform_selector: &str) -> Result<&'a Descriptor> {
+    select_matching_platform(index, platform_selector, |_| true)
+}
+
+/// Select the NYDUS manifest matching `platform_selector`, falling back to the
+/// plain platform match when the index marks no nydus entry.
+///
+/// `--attach-oci-manifest` publishes both halves of a conversion under one tag,
+/// for the same platform, with the OCI half deliberately FIRST so that plain
+/// consumers land on it. A reader that wants the nydus half therefore cannot take
+/// the first platform match the way [`select_platform`] does — it has to key on
+/// the nydus markers, exactly as the snapshotter does.
+///
+/// The fallback is what keeps an unmarked image working: a plain nydus manifest
+/// list, which is what a conversion without `--attach-oci-manifest` publishes,
+/// carries no marker on its entries and is still a nydus image.
+pub fn select_nydus_platform<'a>(
+    index: &'a Index,
+    platform_selector: &str,
+) -> Result<&'a Descriptor> {
+    match select_matching_platform(index, platform_selector, registry_client::is_nydus_entry) {
+        Ok(found) => Ok(found),
+        Err(_) => select_platform(index, platform_selector),
+    }
+}
+
+fn select_matching_platform<'a>(
+    index: &'a Index,
+    platform_selector: &str,
+    keep: impl Fn(&Descriptor) -> bool,
+) -> Result<&'a Descriptor> {
     let (os, arch, variant) = parse_platform(platform_selector)?;
     let exact = |d: &&Descriptor| {
-        d.platform
-            .as_ref()
-            .is_some_and(|p| p.matches_selector(&os, &arch, variant.as_deref()))
+        keep(d)
+            && d.platform
+                .as_ref()
+                .is_some_and(|p| p.matches_selector(&os, &arch, variant.as_deref()))
     };
     if let Some(found) = index.manifests.iter().find(exact) {
         return Ok(found);
     }
     if variant.is_none() {
         let loose = |d: &&Descriptor| {
-            d.platform
-                .as_ref()
-                .is_some_and(|p| p.os == os && p.architecture == arch)
+            keep(d)
+                && d.platform
+                    .as_ref()
+                    .is_some_and(|p| p.os == os && p.architecture == arch)
         };
         let mut candidates = index.manifests.iter().filter(loose);
         if let Some(found) = candidates.next() {
@@ -289,13 +321,36 @@ pub async fn fetch_platform_manifest(
     reference: &str,
     platform: &str,
 ) -> Result<FetchedManifest> {
+    fetch_selected_manifest(client, repo, reference, platform, select_platform).await
+}
+
+/// Fetch the nydus manifest for `platform` behind a reference that may be an
+/// index. Readers of a converted image want this rather than
+/// [`fetch_platform_manifest`], whose first-match rule lands on the OCI half of a
+/// dual-manifest tag. See [`select_nydus_platform`].
+pub async fn fetch_nydus_platform_manifest(
+    client: &RegistryClient,
+    repo: &str,
+    reference: &str,
+    platform: &str,
+) -> Result<FetchedManifest> {
+    fetch_selected_manifest(client, repo, reference, platform, select_nydus_platform).await
+}
+
+async fn fetch_selected_manifest(
+    client: &RegistryClient,
+    repo: &str,
+    reference: &str,
+    platform: &str,
+    select: for<'a> fn(&'a Index, &str) -> Result<&'a Descriptor>,
+) -> Result<FetchedManifest> {
     let fetched = client.get_manifest(repo, reference).await?;
     if !is_index(fetched.content_type.as_deref(), &fetched.bytes) {
         return Ok(fetched);
     }
     let index: Index = serde_json::from_slice(&fetched.bytes)
         .map_err(|e| anyhow!("parse image index for {repo}:{reference}: {e}"))?;
-    let selected = select_platform(&index, platform)?;
+    let selected = select(&index, platform)?;
     Ok(client.get_manifest(repo, &selected.digest).await?)
 }
 
@@ -448,6 +503,51 @@ mod tests {
         // A malformed member fails the whole list up front.
         assert!(parse_platform_list("linux/amd64,linux").is_err());
         assert!(parse_platform_list("  ,  ").is_err());
+    }
+
+    fn nydus_desc(os: &str, arch: &str, digest: &str) -> Descriptor {
+        let mut d = platform_desc(os, arch, None, digest);
+        d.artifact_type = Some(registry_client::NYDUS_MANIFEST_ARTIFACT_TYPE.to_string());
+        d
+    }
+
+    #[test]
+    fn select_nydus_platform_prefers_the_nydus_half_of_a_dual_manifest_index() {
+        // --attach-oci-manifest orders the OCI half first, for the same platform,
+        // so a first-match selection lands on the wrong one.
+        let index = index_of(vec![
+            platform_desc("linux", "amd64", None, "sha256:oci-amd"),
+            platform_desc("linux", "arm64", None, "sha256:oci-arm"),
+            nydus_desc("linux", "arm64", "sha256:nydus-arm"),
+        ]);
+        assert_eq!(
+            select_platform(&index, "linux/arm64").unwrap().digest,
+            "sha256:oci-arm"
+        );
+        assert_eq!(
+            select_nydus_platform(&index, "linux/arm64").unwrap().digest,
+            "sha256:nydus-arm"
+        );
+        // A platform with no nydus entry still resolves to its OCI manifest.
+        assert_eq!(
+            select_nydus_platform(&index, "linux/amd64").unwrap().digest,
+            "sha256:oci-amd"
+        );
+    }
+
+    #[test]
+    fn select_nydus_platform_falls_back_to_an_unmarked_index() {
+        // A conversion published without --attach-oci-manifest is a nydus image
+        // whose entries carry no marker at all.
+        let index = index_of(vec![
+            platform_desc("linux", "amd64", None, "sha256:amd"),
+            platform_desc("linux", "arm64", None, "sha256:arm"),
+        ]);
+        assert_eq!(
+            select_nydus_platform(&index, "linux/arm64").unwrap().digest,
+            "sha256:arm"
+        );
+        assert!(select_nydus_platform(&index, "linux/ppc64le").is_err());
     }
 
     #[test]

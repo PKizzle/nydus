@@ -55,7 +55,7 @@ use crate::engine::manifest::{
     ANNOTATION_NYDUS_BOOTSTRAP, assemble_manifest, bootstrap_descriptor, config_media_type,
     data_blob_descriptor, manifest_media_type, rebuild_image_config, validate_nydus_manifest,
 };
-use crate::engine::oci::{blob_hex, client_options, fetch_platform_manifest};
+use crate::engine::oci::{blob_hex, client_options, fetch_nydus_platform_manifest};
 use crate::engine::overlay_diff::write_upper_layer_tar;
 use crate::engine::retry::RetryPolicy;
 
@@ -183,7 +183,7 @@ pub async fn run(args: CommitArgs) -> Result<()> {
     let retry = RetryPolicy::from_flags(args.push_retry_count, &args.push_retry_delay);
 
     // (2) Pull the base nydus image: manifest, config, and bootstrap.
-    let fetched = fetch_platform_manifest(
+    let fetched = fetch_nydus_platform_manifest(
         &source_client,
         &source_ref.repo,
         source_ref.manifest_reference(),
