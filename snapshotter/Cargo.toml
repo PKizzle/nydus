@@ -4,7 +4,7 @@ name = "nydus-snapshotter"
 # appVersion read this. Keep it in lockstep with the release tag's
 # major.minor (release.yml warns on mismatch); helm-release.yml stamps the
 # actual chart version from the tag.
-version = "3.0.1"
+version = "3.0.2"
 description = "Containerd remote snapshotter for Nydus image service (Rust rewrite)"
 authors = ["The Nydus Developers"]
 license = "Apache-2.0 OR BSD-3-Clause"
