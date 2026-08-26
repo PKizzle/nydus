@@ -238,7 +238,12 @@ pub async fn run_conversion(request: &ConvertRequest, workspace: &Path) -> Resul
     // Multi-platform: --merge-platform is required (mirrors the Go tool — we do
     // not silently pick one, nor push N tag-less manifests with no index to
     // find them by).
-    if !request.driver.merge_manifest {
+    //
+    // Not with --attach-oci-manifest, though. The flag exists to ask for an index
+    // assembled from the platforms; attaching publishes one per platform already,
+    // each merged into what the tag holds, so there is nothing left to request and
+    // no way to end up with tag-less manifests.
+    if !request.driver.merge_manifest && !request.attach_oci_manifest {
         bail!(
             "source resolves to {} platforms ({}); pass --merge-platform to publish them as one \
              multi-arch image, or --platform to pick one",
@@ -266,6 +271,22 @@ pub async fn run_conversion(request: &ConvertRequest, workspace: &Path) -> Resul
         )
         .await?;
         outcomes.push(outcome);
+    }
+
+    // With --attach-oci-manifest each platform has already published the tag, merging
+    // its own pair into whatever the tag held at that moment. The index below carries
+    // the nydus manifests alone, so pushing it here would drop every OCI manifest that
+    // the pairs exist to preserve.
+    if request.attach_oci_manifest {
+        if let Some(path) = &request.output_json {
+            write_output_json(path, &target_ref, &outcomes, started.elapsed().as_secs_f64())?;
+        }
+        info!(
+            target = %target_ref,
+            platforms = outcomes.len(),
+            "convert complete: published one OCI + nydus pair per platform under one tag"
+        );
+        return Ok(());
     }
 
     // Assemble and push the OCI image index at the target tag.

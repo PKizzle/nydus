@@ -360,16 +360,6 @@ pub fn plan(args: &ConvertArgs) -> Result<ConvertPlan> {
                  combined with --source-archive or --target-archive"
             );
         }
-        if args.all_platforms
-            || args.merge_platform
-            || args.platform.as_deref().is_some_and(|p| p.contains(','))
-        {
-            bail!(
-                "--attach-oci-manifest currently converts a single platform; combining it \
-                 with multi-arch (--all-platforms/--merge-platform/a --platform list) is a \
-                 follow-up"
-            );
-        }
     }
 
     if args.target.is_some() && args.target_suffix.is_some() {
@@ -997,12 +987,28 @@ mod tests {
     }
 
     #[test]
-    fn attach_oci_manifest_is_gated_to_the_single_image_case() {
+    fn attach_oci_manifest_is_gated_to_what_it_can_pair() {
         let d = tempfile::tempdir().unwrap();
         // Exactly one image source: fine.
         plan(&convert_args(
             &["localhost:5000/app:v1"],
             &["--attach-oci-manifest"],
+        ))
+        .unwrap();
+
+        // Several architectures are fine too: each publishes its own pair into the tag.
+        plan(&convert_args(
+            &["localhost:5000/app:v1"],
+            &["--attach-oci-manifest", "--all-platforms"],
+        ))
+        .unwrap();
+        plan(&convert_args(
+            &["localhost:5000/app:v1"],
+            &[
+                "--attach-oci-manifest",
+                "--platform",
+                "linux/amd64,linux/arm64",
+            ],
         ))
         .unwrap();
 
@@ -1022,20 +1028,6 @@ mod tests {
                 vec!["localhost:5000/app:v1"],
                 vec!["--attach-oci-manifest", "--target-archive", "/tmp/x.tar"],
                 "registry",
-            ),
-            (
-                vec!["localhost:5000/app:v1"],
-                vec![
-                    "--attach-oci-manifest",
-                    "--platform",
-                    "linux/amd64,linux/arm64",
-                ],
-                "single platform",
-            ),
-            (
-                vec!["localhost:5000/app:v1"],
-                vec!["--attach-oci-manifest", "--merge-platform"],
-                "single platform",
             ),
         ] {
             let err = plan(&convert_args(&sources, &extra))
