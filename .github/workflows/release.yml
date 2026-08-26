@@ -210,6 +210,10 @@ jobs:
       contents: write
     steps:
     - uses: actions/checkout@v6
+      with:
+        # The release notes are built from the range between this tag and the
+        # previous one, which a shallow checkout does not contain.
+        fetch-depth: 0
     - name: sanity-check snapshotter version against tag
       if: startsWith(github.ref, 'refs/tags/')
       run: |
@@ -233,15 +237,44 @@ jobs:
         echo "EOF" >> $GITHUB_ENV
         tag=$(echo $GITHUB_REF | cut -d/ -f3-)
         echo "tag=${tag}" >> $GITHUB_ENV
+
+        # Release notes: what the tagger wrote, then what actually changed.
+        #
+        # GitHub's generated notes list merged pull requests, and this fork
+        # commits straight to its branch, so they came out as nothing but a
+        # compare link -- which is why v3.0.1 and v3.0.2 shipped without a
+        # changelog. The history is right here; it just has to be read.
+        prev=$(git describe --tags --abbrev=0 "${tag}^" 2>/dev/null || echo "")
+        {
+          echo "notes<<NOTES_EOF"
+          # An annotated tag's message is the summary written when the release
+          # was cut. Its first line repeats the release title, so it is dropped
+          # along with the blank line under it.
+          # Leading blank line dropped with the subject; trailing ones dropped
+          # so the changelog heading below sits one blank line away.
+          git tag -l --format='%(contents)' "$tag" | tail -n +2 |
+            sed '/./,$!d' | sed -e :a -e '/^\n*$/{$d;N;};/\n$/ba'
+          if [ -n "$prev" ]; then
+            echo
+            echo "## Changelog"
+            echo
+            git log --reverse --pretty='* %s (`%h`)' "${prev}..${tag}"
+            echo
+            echo "**Full changelog**: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/compare/${prev}...${tag}"
+          fi
+          echo "NOTES_EOF"
+        } >> $GITHUB_ENV
         cat $GITHUB_ENV
     - name: push release
       if: github.event_name == 'push'
       uses: softprops/action-gh-release@v1
       with:
         name: "Nydus Image Service ${{ env.tag }}"
-        body: |
-          Binaries download mirror (sync within a few hours): https://registry.npmmirror.com/binary.html?path=nydus/${{ env.tag }}/
-        generate_release_notes: true
+        body: ${{ env.notes }}
+        # Off: the generated notes are built from merged pull requests, and this
+        # fork has none, so they add a compare link and nothing else. The notes
+        # above carry that link themselves.
+        generate_release_notes: false
         files: |
           ${{ env.tarballs }}
 
