@@ -279,7 +279,12 @@ pub async fn run_conversion(request: &ConvertRequest, workspace: &Path) -> Resul
     // the pairs exist to preserve.
     if request.attach_oci_manifest {
         if let Some(path) = &request.output_json {
-            write_output_json(path, &target_ref, &outcomes, started.elapsed().as_secs_f64())?;
+            write_output_json(
+                path,
+                &target_ref,
+                &outcomes,
+                started.elapsed().as_secs_f64(),
+            )?;
         }
         info!(
             target = %target_ref,
