@@ -44,6 +44,16 @@ work_dir = "/var/lib/containerd-nydus/cache"
 # pre-content marks — ext4 works, tmpfs does not.
 gc_period = "6h"
 
+# Optional cgroup v2 memory controls for the snapshotter and its in-process
+# daemons. The process remains in its systemd service cgroup. memory_high is
+# a soft reclaim threshold; memory_max writes the hard memory.max limit and
+# can cause an OOM kill, so it is normally left unset. There is intentionally
+# no generic default: size these controls for the host.
+# [snapshotter.cgroup]
+# enable = true
+# memory_high = "512Mi"
+# memory_max = "2Gi"
+
 [snapshotter.features]
 # Detect nydus artifacts published as OCI referrers of the original image.
 referrer_detect = true

@@ -37,6 +37,7 @@ pub mod auto_accel_oci;
 pub mod auto_accel_sidecar;
 pub mod auto_zran;
 pub mod cache;
+pub mod cgroup;
 pub mod config;
 pub mod containerd_lookup;
 pub mod content_store;

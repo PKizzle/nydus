@@ -413,6 +413,19 @@ pub enum ConfigError {
          drive the daemon. Remove the extra section(s)."
     )]
     MultiplePullBackends { configured: String },
+    #[error(
+        "[snapshotter.cgroup].memory_high ({memory_high}) exceeds memory_max ({memory_max})"
+    )]
+    CgroupMemoryHighExceedsMax {
+        memory_high: String,
+        memory_max: String,
+    },
+    #[error("invalid [snapshotter.cgroup].{field} value {value:?}: {reason}")]
+    InvalidCgroupMemorySetting {
+        field: &'static str,
+        value: String,
+        reason: String,
+    },
 }
 
 /// Daemon lifecycle configuration.
@@ -694,15 +707,83 @@ impl Default for TarfsConfig {
     }
 }
 
-/// Cgroup configuration.
+/// cgroup v2 configuration for the snapshotter's existing service cgroup.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct CgroupConfig {
-    /// Enable cgroup resource limits.
+    /// Enable cgroup resource controls.
     #[serde(default)]
     pub enable: bool,
-    /// Memory limit (e.g. "1Gi").
+    /// Soft `memory.high` threshold (e.g. `"1Gi"`). Above this threshold the
+    /// kernel reclaims the snapshotter cgroup before considering OOM kills.
     #[serde(default)]
-    pub memory_limit: Option<String>,
+    pub memory_high: Option<String>,
+    /// Hard `memory.max` limit (e.g. `"2Gi"`). Exceeding it can cause an OOM
+    /// kill in this cgroup, so prefer `memory_high` unless a hard bound is an
+    /// explicit deployment requirement.
+    ///
+    /// `memory_limit` is accepted as a deserialization-only alias for the
+    /// no-op setting accepted before 3.0.3. New configurations must use the
+    /// cgroup-v2-consistent `memory_max` spelling.
+    #[serde(default, alias = "memory_limit")]
+    pub memory_max: Option<String>,
+}
+
+/// Normalized cgroup v2 controls. `max` remains represented by the literal
+/// string cgroup v2 expects; all byte values are decimal strings.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct CgroupMemoryControls {
+    pub memory_high: Option<String>,
+    pub memory_max: Option<String>,
+}
+
+impl CgroupConfig {
+    /// Return validated cgroup controls normalized to the byte values cgroup
+    /// v2 expects. Empty strings retain their historical "unset" meaning.
+    pub fn memory_controls(&self) -> Result<CgroupMemoryControls, ConfigError> {
+        let memory_high = normalize_memory_setting("memory_high", &self.memory_high)?;
+        let memory_max = normalize_memory_setting("memory_max", &self.memory_max)?;
+
+        if let (Some(memory_high), Some(memory_max)) = (&memory_high, &memory_max) {
+            if memory_high != "max"
+                && memory_max != "max"
+                && memory_high.parse::<u64>().expect("normalized byte value")
+                    > memory_max.parse::<u64>().expect("normalized byte value")
+            {
+                return Err(ConfigError::CgroupMemoryHighExceedsMax {
+                    memory_high: memory_high.clone(),
+                    memory_max: memory_max.clone(),
+                });
+            }
+        }
+
+        if !self.enable {
+            return Ok(CgroupMemoryControls::default());
+        }
+        Ok(CgroupMemoryControls {
+            memory_high,
+            memory_max,
+        })
+    }
+}
+
+fn normalize_memory_setting(
+    field: &'static str,
+    value: &Option<String>,
+) -> Result<Option<String>, ConfigError> {
+    let Some(value) = value
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(None);
+    };
+    crate::cgroup::normalize_memory_value(value)
+        .map(Some)
+        .map_err(|error| ConfigError::InvalidCgroupMemorySetting {
+            field,
+            value: value.to_string(),
+            reason: error.to_string(),
+        })
 }
 
 /// Background node-local zran conversion configuration.
@@ -1167,10 +1248,12 @@ impl BackendsConfig {
 
 impl SnapshotterConfig {
     /// Validate the parsed configuration after [`Self::resolve_profile`].
-    /// Currently checks the `[backends.*]` selection; extend as new
-    /// cross-section invariants appear.
+    /// Checks the `[backends.*]` selection and resource controls; extend as
+    /// new cross-section invariants appear.
     pub fn validate(&self) -> Result<(), ConfigError> {
-        self.backends.validate()
+        self.backends.validate()?;
+        self.snapshotter.cgroup.memory_controls()?;
+        Ok(())
     }
 }
 
@@ -1428,6 +1511,59 @@ mod tests {
         assert_eq!(config.snapshotter.profile, Profile::Containerd);
         assert!(config.snapshotter.sysctl.enable);
         assert!(!config.snapshotter.auto_zran.enable);
+    }
+
+    #[test]
+    fn cgroup_memory_controls_preserve_soft_and_hard_semantics() {
+        let config: SnapshotterConfig = toml::from_str(
+            r#"
+            [snapshotter.cgroup]
+            enable = true
+            memory_high = "512Mi"
+            memory_max = "2Gi"
+            "#,
+        )
+        .expect("cgroup config parses");
+        assert_eq!(
+            config.snapshotter.cgroup.memory_controls().unwrap(),
+            CgroupMemoryControls {
+                memory_high: Some("536870912".to_string()),
+                memory_max: Some("2147483648".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn cgroup_memory_high_cannot_exceed_hard_limit() {
+        let config: SnapshotterConfig = toml::from_str(
+            r#"
+            [snapshotter.cgroup]
+            enable = true
+            memory_high = "2Gi"
+            memory_max = "512Mi"
+            "#,
+        )
+        .expect("cgroup config parses");
+        assert!(matches!(
+            config.snapshotter.cgroup.memory_controls(),
+            Err(ConfigError::CgroupMemoryHighExceedsMax { .. })
+        ));
+    }
+
+    #[test]
+    fn cgroup_legacy_memory_limit_alias_remains_readable() {
+        let config: SnapshotterConfig = toml::from_str(
+            r#"
+            [snapshotter.cgroup]
+            enable = true
+            memory_limit = "2Gi"
+            "#,
+        )
+        .expect("legacy cgroup config parses");
+        assert_eq!(
+            config.snapshotter.cgroup.memory_controls().unwrap().memory_max,
+            Some("2147483648".to_string())
+        );
     }
 
     #[test]

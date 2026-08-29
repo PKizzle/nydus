@@ -234,6 +234,28 @@ async fn main() -> Result<()> {
         anyhow::bail!("configuration error: {e}");
     }
 
+    // Apply controls to this process's existing systemd cgroup. Keeping the
+    // process in that cgroup preserves systemd's service accounting while
+    // giving its file/slab cache a reclaim point before an all-in-one node is
+    // globally memory pressured.
+    let cgroup_controls = config.snapshotter.cgroup.memory_controls()?;
+    if let Some(memory_high) = cgroup_controls.memory_high {
+        let target = nydus_snapshotter::cgroup::apply_memory_high(&memory_high)?;
+        info!(
+            memory_high = %memory_high,
+            cgroup_control = %target.display(),
+            "applied snapshotter cgroup memory.high"
+        );
+    }
+    if let Some(memory_max) = cgroup_controls.memory_max {
+        let target = nydus_snapshotter::cgroup::apply_memory_max(&memory_max)?;
+        info!(
+            memory_max = %memory_max,
+            cgroup_control = %target.display(),
+            "applied snapshotter cgroup memory.max"
+        );
+    }
+
     // Fail fast with an actionable message if auto_zran is on but the resolved
     // containerd socket is missing — otherwise this surfaces as a late,
     // opaque gRPC connect error deep in the conversion path.

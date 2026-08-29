@@ -81,6 +81,37 @@ curl -s --unix-socket /run/containerd-nydus/containerd-nydus-api.sock \
   http://localhost/debug/allocator | jq .
 ```
 
+## cgroup v2 memory controls
+
+The snapshotter and its in-process Nydus daemons share the snapshotter
+systemd service cgroup. Nydus never moves itself into a child cgroup: doing so
+would make systemd's service accounting incomplete. An operator can configure
+the existing cgroup at snapshotter startup instead:
+
+```toml
+[snapshotter.cgroup]
+enable = true
+# Reclaim file/slab cache under pressure before considering an OOM kill.
+memory_high = "512Mi"
+# Optional hard cap. Leave unset unless an OOM boundary is explicitly wanted.
+# memory_max = "2Gi"
+```
+
+- `memory_high` writes cgroup v2's `memory.high`. It is a soft threshold: the
+  kernel throttles and reclaims from this cgroup before it reaches global
+  memory pressure. This is the normal choice for image-cache control.
+- `memory_max` writes `memory.max`. It is a genuine hard limit and can OOM
+  kill work in the snapshotter service if reclaim cannot bring it below the
+  cap. It is available for deployments that need a strict boundary, but must
+  be higher than `memory_high` when both are set.
+
+Values accept bytes, `K`/`M`/`G`/`T`, `Ki`/`Mi`/`Gi`/`Ti`, or `max`. Empty
+values are unset. `memory_limit` is accepted only as a compatibility alias for
+the pre-3.0.3 no-op setting; use `memory_max` in all new configuration. The
+controls are applied on every snapshotter start, so the configuration remains
+the source of truth if another service-manager action rewrites the cgroup
+files.
+
 ## Prometheus metrics
 
 `GET /metrics` (Prometheus text) is always served on the sysctl Unix socket. An **optional** TCP
