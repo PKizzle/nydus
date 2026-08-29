@@ -241,7 +241,12 @@ impl RegistryClient {
         } else {
             Client::builder().use_rustls_default()
         };
+        // Use Cyper's portable resolver instead of relying on the OS resolver
+        // implementation. In particular, macOS's dynamic resolver configuration
+        // is not consistently available through the libc lookup path used by
+        // Hyper, while Hickory reads the configured DNS servers directly.
         let client = builder
+            .hickory_dns(true)
             .build()
             .context("failed to build registry HTTP client")?;
         let basic_auth = match (opts.credentials.as_ref(), opts.raw_auth.as_ref()) {
