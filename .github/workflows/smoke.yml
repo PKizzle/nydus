@@ -23,11 +23,16 @@ on:
 # Cancel superseded runs for the same PR (or branch push) so rapid pushes don't
 # pile up redundant work.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  # Use the branch name for both push and pull_request events so an open PR
+  # does not run the workflow twice for one commit.
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref_name }}
   cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
+  # Fall back to direct VCS access when proxy.golang.org rate-limits module
+  # downloads. A comma separator only falls back for 404/410 responses.
+  GOPROXY: "https://proxy.golang.org|direct"
 
 jobs:
   contrib-build:
@@ -270,11 +275,22 @@ jobs:
     runs-on: ${{ vars.RUNNER_OS || 'ubuntu-latest' }}
     env:
       CARGO_TERM_COLOR: always
-      HAS_CODECOV_CREDENTIALS: ${{ secrets.CODECOV_TOKEN != '' && '1' || '' }}
     outputs:
-      has-codecov-credentials: ${{ env.HAS_CODECOV_CREDENTIALS }}
+      has-codecov-credentials: ${{ steps.codecov-credentials.outputs.available }}
     steps:
       - uses: actions/checkout@v6
+      # A job output generated from a step is reliable for Dependabot and fork
+      # PRs, where repository secrets are deliberately not made available.
+      - name: Check Codecov credentials
+        id: codecov-credentials
+        env:
+          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+        run: |
+          if [ -n "${CODECOV_TOKEN}" ]; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "available=false" >> "$GITHUB_OUTPUT"
+          fi
       - name: Rust Cache
         uses: Swatinem/rust-cache@v2
         with:
@@ -479,7 +495,7 @@ jobs:
           smoke-missing-lines.txt
 
   upload-coverage-to-codecov:
-    if: github.event_name != 'pull_request' && needs.nydus-unit-test-coverage.outputs.has-codecov-credentials
+    if: github.event_name != 'pull_request' && needs.nydus-unit-test-coverage.outputs.has-codecov-credentials == 'true'
     runs-on: ${{ vars.RUNNER_OS || 'ubuntu-latest' }}
     needs: [nydus-unit-test-coverage]
     env:
@@ -563,19 +579,18 @@ jobs:
             print(f"- {file_name}")
         PY
     - name: Upload coverage to Codecov
-      uses: codecov/codecov-action@v5
-      env:
-        CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+      uses: codecov/codecov-action@v7
       with:
         files: ./codecov.json
         verbose: true
         fail_ci_if_error: true
+        token: ${{ secrets.CODECOV_TOKEN }}
 
   upload-pr-coverage-to-codecov:
     # Skip on forks without a CODECOV_TOKEN secret (the upload sets
     # fail_ci_if_error, so without the token it would fail the whole run).
     # Mirrors the guard on `upload-coverage-to-codecov`.
-    if: github.event_name == 'pull_request' && needs.nydus-unit-test-coverage.outputs.has-codecov-credentials
+    if: github.event_name == 'pull_request' && needs.nydus-unit-test-coverage.outputs.has-codecov-credentials == 'true'
     runs-on: ${{ vars.RUNNER_OS || 'ubuntu-latest' }}
     needs: [nydus-unit-test-coverage, nydus-integration-test-coverage]
     env:
@@ -663,13 +678,12 @@ jobs:
             print(f"- {file_name}")
         PY
     - name: Upload merged coverage to Codecov
-      uses: codecov/codecov-action@v5
-      env:
-        CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+      uses: codecov/codecov-action@v7
       with:
         files: ./codecov.json,./smoke-codecov.json
         verbose: true
         fail_ci_if_error: true
+        token: ${{ secrets.CODECOV_TOKEN }}
 
   nydus-cargo-deny:
     name: cargo-deny

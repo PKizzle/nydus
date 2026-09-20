@@ -10,6 +10,13 @@ on:
     - cron: '0 4 * * *'
   workflow_dispatch:
 
+# A branch with an open pull request otherwise runs this expensive matrix twice
+# (once for `push` and once for `pull_request`).  Apart from wasting runners,
+# the duplicate `go install` calls can exhaust proxy.golang.org's rate limit.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref_name }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
 
@@ -17,6 +24,9 @@ env:
   CARGO_TERM_COLOR: always
   DRAGONFLY_VERSION: "2.4.3"
   CLIENT_VERSION: "1.3.3"
+  # `|` makes Go fall back to direct VCS access for transient proxy failures
+  # (including HTTP 429); the usual comma form only falls back for 404/410.
+  GOPROXY: "https://proxy.golang.org|direct"
 
 jobs:
   nydus-build:

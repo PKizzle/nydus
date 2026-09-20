@@ -413,9 +413,7 @@ pub enum ConfigError {
          drive the daemon. Remove the extra section(s)."
     )]
     MultiplePullBackends { configured: String },
-    #[error(
-        "[snapshotter.cgroup].memory_high ({memory_high}) exceeds memory_max ({memory_max})"
-    )]
+    #[error("[snapshotter.cgroup].memory_high ({memory_high}) exceeds memory_max ({memory_max})")]
     CgroupMemoryHighExceedsMax {
         memory_high: String,
         memory_max: String,
@@ -1561,7 +1559,12 @@ mod tests {
         )
         .expect("legacy cgroup config parses");
         assert_eq!(
-            config.snapshotter.cgroup.memory_controls().unwrap().memory_max,
+            config
+                .snapshotter
+                .cgroup
+                .memory_controls()
+                .unwrap()
+                .memory_max,
             Some("2147483648".to_string())
         );
     }
