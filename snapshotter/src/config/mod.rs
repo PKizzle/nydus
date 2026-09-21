@@ -741,17 +741,16 @@ impl CgroupConfig {
         let memory_high = normalize_memory_setting("memory_high", &self.memory_high)?;
         let memory_max = normalize_memory_setting("memory_max", &self.memory_max)?;
 
-        if let (Some(memory_high), Some(memory_max)) = (&memory_high, &memory_max) {
-            if memory_high != "max"
-                && memory_max != "max"
-                && memory_high.parse::<u64>().expect("normalized byte value")
-                    > memory_max.parse::<u64>().expect("normalized byte value")
-            {
-                return Err(ConfigError::CgroupMemoryHighExceedsMax {
-                    memory_high: memory_high.clone(),
-                    memory_max: memory_max.clone(),
-                });
-            }
+        if let (Some(memory_high), Some(memory_max)) = (&memory_high, &memory_max)
+            && memory_high != "max"
+            && memory_max != "max"
+            && memory_high.parse::<u64>().expect("normalized byte value")
+                > memory_max.parse::<u64>().expect("normalized byte value")
+        {
+            return Err(ConfigError::CgroupMemoryHighExceedsMax {
+                memory_high: memory_high.clone(),
+                memory_max: memory_max.clone(),
+            });
         }
 
         if !self.enable {
