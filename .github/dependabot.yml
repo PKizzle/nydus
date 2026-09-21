@@ -1,12 +1,22 @@
 version: 2
 updates:
   - package-ecosystem: "gomod"
-    directory: "/contrib/"
+    directory: "/smoke/"
+    schedule:
+      interval: "weekly"
+
+  - package-ecosystem: "gomod"
+    directory: "/smoke/dragonfly/"
     schedule:
       interval: "weekly"
 
   - package-ecosystem: "cargo"
     directory: "/"
+    schedule:
+      interval: "weekly"
+
+  - package-ecosystem: "cargo"
+    directory: "/contrib/nydus-backend-proxy/"
     schedule:
       interval: "weekly"
 
