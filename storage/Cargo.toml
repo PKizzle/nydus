@@ -110,9 +110,9 @@ nydus-utils = { version = "0.6.0", path = "../utils", features = [
 ] }
 once_cell = { version = "1" }
 # The `request` module moved out of `dragonfly-client-util` into its own crate at 1.4.0.
-# Pinned exactly because the split showed that this API is not covered by semver in
-# practice, and a silent minor bump breaks the build (upstream v3 pins it the same way).
-dragonfly-client-request = { version = "=1.4.2", optional = true }
+# Keep it pinned exactly: minor releases have changed the request/response API, so each
+# upgrade needs an explicit compatibility review.
+dragonfly-client-request = { version = "=1.7.4", optional = true }
 rand = { version = "0.10" }
 
 [dev-dependencies]
@@ -198,6 +198,7 @@ backend-dragonfly-proxy = [
     "dep:tokio",
     "dragonfly-client-request",
     "http",
+    "rustls",
     "url",
 ]
 

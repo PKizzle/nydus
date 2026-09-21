@@ -6,18 +6,19 @@
 //!
 //! This entire module is gated behind `backend-dragonfly-proxy`.
 
-use std::io::Read;
+use std::io::{self, Read};
 use std::time::Duration;
 use std::{
     collections::HashMap,
     sync::{Arc, RwLock},
 };
-use tokio::io::AsyncRead;
 use tokio::runtime::Runtime;
 
+use bytes::{Buf, Bytes};
 use dragonfly_client_request::Request;
 use dragonfly_client_request::errors::Error;
 use dragonfly_client_request::{Body, GetRequest, GetResponse, Proxy};
+use futures_util::StreamExt;
 use http::StatusCode;
 use http::header::HeaderMap;
 use log::info;
@@ -67,7 +68,15 @@ pub enum ProxyError {
 /// *is* cloned out to callers and stays.)
 static PROXY_SDK_CLIENT: LazyLock<RwLock<HashMap<String, Arc<ProxySDKClient>>>> =
     LazyLock::new(|| RwLock::new(HashMap::new()));
+static RUSTLS_PROVIDER: LazyLock<()> = LazyLock::new(|| {
+    // Dragonfly enables tonic's AWS-LC feature while Nydus enables ring for
+    // compio. rustls cannot auto-select when both providers are compiled in,
+    // so retain Nydus' existing ring policy explicitly. If an embedding
+    // application already selected a provider, leave its choice intact.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+});
 static PROXY_RUNTIME: LazyLock<Result<Runtime, String>> = LazyLock::new(|| {
+    ensure_rustls_provider();
     tokio::runtime::Builder::new_multi_thread()
         .thread_name("nydus-backend-proxy-runtime")
         .worker_threads(10)
@@ -75,6 +84,10 @@ static PROXY_RUNTIME: LazyLock<Result<Runtime, String>> = LazyLock::new(|| {
         .build()
         .map_err(|e| format!("failed to create proxy tokio runtime: {}", e))
 });
+
+pub(crate) fn ensure_rustls_provider() {
+    LazyLock::force(&RUSTLS_PROVIDER);
+}
 
 pub(crate) fn runtime() -> &'static Runtime {
     PROXY_RUNTIME
@@ -95,8 +108,9 @@ pub(crate) fn runtime() -> &'static Runtime {
     )),
     allow(dead_code)
 )]
-pub(crate) struct SyncAdapter<R> {
-    inner: R,
+pub(crate) struct SyncAdapter {
+    inner: Body,
+    chunk: Bytes,
 }
 
 #[cfg_attr(
@@ -108,15 +122,35 @@ pub(crate) struct SyncAdapter<R> {
     )),
     allow(dead_code)
 )]
-impl<R> SyncAdapter<R> {
-    pub fn new(inner: R) -> Self {
-        Self { inner }
+impl SyncAdapter {
+    pub fn new(inner: Body) -> Self {
+        Self {
+            inner,
+            chunk: Bytes::new(),
+        }
     }
 }
 
-impl<R: AsyncRead + Unpin> Read for SyncAdapter<R> {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        runtime().block_on(async { tokio::io::AsyncReadExt::read(&mut self.inner, buf).await })
+impl Read for SyncAdapter {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+
+        loop {
+            if !self.chunk.is_empty() {
+                let len = buf.len().min(self.chunk.len());
+                buf[..len].copy_from_slice(&self.chunk[..len]);
+                self.chunk.advance(len);
+                return Ok(len);
+            }
+
+            match runtime().block_on(self.inner.next()) {
+                Some(Ok(chunk)) => self.chunk = chunk,
+                Some(Err(err)) => return Err(io::Error::other(err)),
+                None => return Ok(0),
+            }
+        }
     }
 }
 
@@ -142,6 +176,7 @@ impl ProxySDKClient {
             content_for_calculating_task_id: None,
             enable_task_id_based_blob_digest: true,
             priority,
+            replicas: 2,
             timeout: Duration::from_secs(5),
             client_cert: None,
         };
@@ -169,7 +204,7 @@ impl ProxySDKClient {
                         success: true,
                         status_code: err.status_code,
                         header: header_map,
-                        reader: None,
+                        body: None,
                     })
                 }
                 Error::ProxyError(err) => match err.status_code {
@@ -239,11 +274,14 @@ mod tests {
     use std::thread;
     use std::time::Duration;
 
+    fn body(chunks: Vec<dragonfly_client_request::Result<Bytes>>) -> Body {
+        Box::new(futures_util::stream::iter(chunks))
+    }
+
     #[test]
     fn test_sync_adapter_reads_data() {
         let data = b"hello dragonfly proxy";
-        let cursor = tokio::io::BufReader::new(std::io::Cursor::new(data.to_vec()));
-        let mut adapter = SyncAdapter::new(cursor);
+        let mut adapter = SyncAdapter::new(body(vec![Ok(Bytes::from_static(data))]));
         let mut buf = vec![0u8; 64];
         let n = adapter.read(&mut buf).unwrap();
         assert_eq!(&buf[..n], data);
@@ -251,7 +289,7 @@ mod tests {
 
     #[test]
     fn test_sync_adapter_empty() {
-        let mut adapter = SyncAdapter::new(tokio::io::empty());
+        let mut adapter = SyncAdapter::new(body(Vec::new()));
         let mut buf = vec![0u8; 16];
         let n = adapter.read(&mut buf).unwrap();
         assert_eq!(n, 0);
@@ -260,8 +298,7 @@ mod tests {
     #[test]
     fn test_sync_adapter_partial_reads() {
         let data = b"abcdefghij";
-        let cursor = tokio::io::BufReader::new(std::io::Cursor::new(data.to_vec()));
-        let mut adapter = SyncAdapter::new(cursor);
+        let mut adapter = SyncAdapter::new(body(vec![Ok(Bytes::from_static(data))]));
 
         let mut all = Vec::new();
         let mut buf = [0u8; 3];
@@ -312,10 +349,9 @@ mod tests {
 
     #[test]
     fn test_sync_adapter_uses_proxy_runtime() {
-        // SyncAdapter uses the proxy runtime for async reads
+        // SyncAdapter uses the proxy runtime to poll the async body stream.
         let data = b"runtime test data";
-        let cursor = tokio::io::BufReader::new(std::io::Cursor::new(data.to_vec()));
-        let mut adapter = SyncAdapter::new(cursor);
+        let mut adapter = SyncAdapter::new(body(vec![Ok(Bytes::from_static(data))]));
         let mut buf = vec![0u8; 64];
         // This implicitly uses runtime() — verifies the runtime is functional
         let n = adapter.read(&mut buf).unwrap();

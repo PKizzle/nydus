@@ -33,7 +33,7 @@ use crate::backend::proxy;
 use crate::backend::proxy::ProxySDKClients;
 
 #[cfg(feature = "backend-dragonfly-proxy")]
-use dragonfly_client_request::GetResponse;
+use dragonfly_client_request::{Body, GetResponse};
 
 const HEADER_ENV_PREFIX: &str = "NYDUS_HEADER_";
 const HEADER_USER_AGENT: &str = "User-Agent";
@@ -90,8 +90,10 @@ impl Response {
             Self::Http(resp) => Box::new(resp),
             #[cfg(feature = "backend-dragonfly-proxy")]
             Self::ProxySDK(resp) => {
-                let reader = resp.reader.unwrap_or(Box::new(tokio::io::empty()));
-                Box::new(proxy::SyncAdapter::new(reader))
+                let body: Body = resp
+                    .body
+                    .unwrap_or_else(|| Box::new(futures_util::stream::empty()));
+                Box::new(proxy::SyncAdapter::new(body))
             }
         }
     }
@@ -109,12 +111,14 @@ impl Response {
             Self::Http(mut resp) => Ok(resp.copy_to_slice(writer) as u64),
             #[cfg(feature = "backend-dragonfly-proxy")]
             Self::ProxySDK(resp) => {
-                let mut reader = resp.reader.unwrap_or(Box::new(tokio::io::empty()));
-                proxy::runtime()
-                    .block_on(async {
-                        tokio::io::copy(&mut reader, &mut std::io::Cursor::new(writer)).await
-                    })
-                    .map_err(|e| format!("{}", e))
+                let body: Body = resp
+                    .body
+                    .unwrap_or_else(|| Box::new(futures_util::stream::empty()));
+                std::io::copy(
+                    &mut proxy::SyncAdapter::new(body),
+                    &mut std::io::Cursor::new(writer),
+                )
+                .map_err(|e| format!("{}", e))
             }
         }
     }
@@ -732,15 +736,16 @@ mod tests {
         headers: Option<HeaderMap>,
         body: Option<&[u8]>,
     ) -> GetResponse {
-        let reader: Option<Box<dyn tokio::io::AsyncRead + Unpin + Send>> = body.map(|b| {
-            Box::new(tokio::io::BufReader::new(std::io::Cursor::new(b.to_vec())))
-                as Box<dyn tokio::io::AsyncRead + Unpin + Send>
+        let body: Option<Body> = body.map(|body| {
+            Box::new(futures_util::stream::once(std::future::ready(Ok(
+                bytes::Bytes::copy_from_slice(body),
+            )))) as Body
         });
         GetResponse {
             success: status.is_some_and(|s| s.is_success()),
             status_code: status,
             header: headers.unwrap_or_default(),
-            reader,
+            body,
         }
     }
 

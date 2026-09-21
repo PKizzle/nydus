@@ -405,10 +405,10 @@ and trigger fallback to the HTTP proxy path.
 | `backend-dragonfly-proxy` | `dragonfly-client-request`, `cyper`, `http`, `url` | Dragonfly P2P proxy integration: the SDK path **and** the HTTP-proxy `X-Dragonfly-Error-Type` typed-error handling. |
 
 `backend-dragonfly-proxy` is **opt-in — it is NOT in `default`**. It pulls the
-third-party `dragonfly-client-request`, which hardcodes `native-tls` (OpenSSL on
-Linux) and spins up its own tokio runtime; that is the sole remaining consumer of
-both OpenSSL and tokio in the default build and would block the fully-static musl
-build. Enable it explicitly on a **glibc** target when Dragonfly P2P is required:
+third-party `dragonfly-client-request` and its reqwest/tonic dependency graph,
+and spins up its own tokio runtime. Keeping that graph opt-in lets the default
+build remain on the compio runtime alone. Enable it explicitly when Dragonfly P2P
+is required:
 
 ```bash
 cargo build --release --features backend-dragonfly-proxy
@@ -437,8 +437,8 @@ a dedicated tokio runtime bridges the gap:
 - A 10-thread multi-threaded runtime (`nydus-backend-proxy-runtime`) is created
   once per process.
 - `ProxySDKClient::request()` blocks on this runtime to execute async SDK calls.
-- `SyncAdapter<R>` wraps async readers as sync `Read` implementors using
-  `runtime.block_on()` for each read call.
+- `SyncAdapter` exposes the SDK's async `Bytes` stream as a synchronous `Read`
+  implementation using `runtime.block_on()` when it needs the next chunk.
 - SDK clients are cached per scheduler endpoint in a static
   `RwLock<HashMap<String, Arc<ProxySDKClient>>>`.
 

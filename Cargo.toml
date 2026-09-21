@@ -135,9 +135,8 @@ backend-oss = ["nydus-storage/backend-oss"]
 backend-registry = ["nydus-storage/backend-registry"]
 backend-s3 = ["nydus-storage/backend-s3"]
 # Opt-in only — NOT in `default`. Pulls the third-party dragonfly-client-request,
-# which hardcodes native-tls (OpenSSL on Linux, which blocks the musl-static
-# build) and spins up its own tokio runtime (the default build runs solely on
-# compio). Enable explicitly on a glibc target when Dragonfly P2P is required.
+# its reqwest/tonic dependency graph, and a dedicated tokio runtime (the default
+# build runs solely on compio). Enable explicitly when Dragonfly P2P is required.
 backend-dragonfly-proxy = ["nydus-storage/backend-dragonfly-proxy"]
 
 dedup = ["nydus-storage/dedup"]

@@ -644,6 +644,9 @@ impl Connection {
     }
 
     fn build_connection(proxy: &str, config: &ConnectionConfig) -> ConnectionResult<Client> {
+        #[cfg(feature = "backend-dragonfly-proxy")]
+        super::proxy::ensure_rustls_provider();
+
         // Note: cyper has no client-level request/connect timeout; the request
         // timeout is applied per-call via `compio::time::timeout` in `call_inner`.
         let mut cb = Client::builder()
