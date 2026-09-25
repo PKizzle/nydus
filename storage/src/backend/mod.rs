@@ -25,7 +25,7 @@ use fuse_backend_rs::file_buf::FileVolatileSlice;
 use nydus_utils::metrics::{BackendMetrics, ERROR_HOLDER};
 
 use crate::StorageError;
-use crate::utils::{alloc_buf, copyv};
+use crate::utils::{AlignedBuf, alloc_buf, copyv};
 
 #[cfg(any(
     feature = "backend-oss",
@@ -509,7 +509,6 @@ pub trait BlobReader: Send + Sync {
             let buf = unsafe { std::slice::from_raw_parts_mut(bufs[0].as_ptr(), bufs[0].len()) };
             self.read(buf, offset)
         } else {
-            // Use std::alloc to avoid zeroing the allocated buffer.
             let size = bufs.iter().fold(0usize, move |size, s| size + s.len());
             let size = std::cmp::min(size, max_size);
             let mut data = alloc_buf(size);
@@ -576,7 +575,7 @@ pub trait BlobBackend: Send + Sync {
 
 /// A buffered reader for `BlobReader` object.
 pub struct BlobBufReader {
-    buf: Vec<u8>,
+    buf: AlignedBuf,
     pos: usize,
     len: usize,
     start: u64,

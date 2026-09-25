@@ -22,7 +22,7 @@ use tar::{EntryType, Header};
 
 use crate::backend::{BlobBufReader, BlobReader};
 use crate::factory::BlobFactory;
-use crate::utils::alloc_buf;
+use crate::utils::{AlignedBuf, alloc_buf};
 
 /// File name for RAFS data chunks.
 pub const TOC_ENTRY_BLOB_RAW: &str = "image.blob";
@@ -451,7 +451,7 @@ impl TocEntryList {
     fn read_toc_header(
         reader: &dyn BlobReader,
         location: &TocLocation,
-    ) -> MetaResult<(Vec<u8>, u64)> {
+    ) -> MetaResult<(AlignedBuf, u64)> {
         location.validate()?;
         let (offset, size) = if location.auto_detect {
             let blob_size = reader

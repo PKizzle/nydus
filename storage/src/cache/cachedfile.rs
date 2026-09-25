@@ -36,7 +36,7 @@ use crate::device::{
     BlobObject, BlobPrefetchRequest,
 };
 use crate::meta::{BlobCompressionContextInfo, BlobMetaChunk};
-use crate::utils::{MemSliceCursor, alloc_buf, copyv, readv};
+use crate::utils::{AlignedBuf, MemSliceCursor, alloc_buf, copyv, readv};
 use crate::{RAFS_BATCH_SIZE_TO_GAP_SHIFT, RAFS_DEFAULT_CHUNK_SIZE, StorageError, StorageResult};
 
 const DOWNLOAD_META_RETRY_COUNT: u32 = 5;
@@ -914,17 +914,18 @@ impl BlobCache for FileCacheEntry {
                 })?;
 
                 // Decompress if needed
-                let data = if chunk.is_compressed() {
-                    let mut decompressed = alloc_buf(chunk.uncompressed_size() as usize);
+                let mut decompressed;
+                let data: &[u8] = if chunk.is_compressed() {
+                    decompressed = alloc_buf(chunk.uncompressed_size() as usize);
                     self.decompress_chunk_data(&decrypted, &mut decompressed, true)?;
-                    decompressed
+                    &decompressed
                 } else {
-                    decrypted.to_vec()
+                    &decrypted
                 };
 
                 // Encrypt for cache-level at-rest encryption if configured
-                let persist_data = if !self.is_cache_encrypted {
-                    data
+                if !self.is_cache_encrypted {
+                    Self::persist_cached_data(&self.file, chunk.uncompressed_offset(), data)
                 } else {
                     let (key, iv) = self
                         .cache_cipher_context
@@ -952,10 +953,8 @@ impl BlobCache for FileCacheEntry {
                         encrypted[pos..pos + ENCRYPTION_PAGE_SIZE].copy_from_slice(enc.as_ref());
                         pos += ENCRYPTION_PAGE_SIZE;
                     }
-                    encrypted
-                };
-
-                Self::persist_cached_data(&self.file, chunk.uncompressed_offset(), &persist_data)
+                    Self::persist_cached_data(&self.file, chunk.uncompressed_offset(), &encrypted)
+                }
             }
         })();
 
@@ -1226,7 +1225,7 @@ impl FileCacheEntry {
         Ok(())
     }
 
-    fn adjust_buffer_for_dio(&self, buf: &mut Vec<u8>) {
+    fn adjust_buffer_for_dio(&self, buf: &mut AlignedBuf) {
         assert_eq!(buf.capacity() % 0x1000, 0);
         if buf.len() != buf.capacity() {
             // Padding with 0 for direct IO.
@@ -1758,7 +1757,7 @@ impl Drop for FileCacheEntry {
 enum DataBuffer {
     #[allow(dead_code)]
     Reuse(ManuallyDrop<Vec<u8>>),
-    Allocated(Vec<u8>),
+    Allocated(AlignedBuf),
 }
 
 impl DataBuffer {
@@ -1786,7 +1785,9 @@ impl DataBuffer {
     /// Make sure it owns the underlying memory buffer.
     fn convert_to_owned_buffer(self) -> Self {
         if let DataBuffer::Reuse(data) = self {
-            DataBuffer::Allocated((*data).to_vec())
+            let mut owned = alloc_buf(data.len());
+            owned.copy_from_slice(&data);
+            DataBuffer::Allocated(owned)
         } else {
             self
         }
@@ -2084,9 +2085,10 @@ mod tests {
     #[test]
     fn test_data_buffer_already_allocated() {
         // Covers the `else` branch of convert_to_owned_buffer (Allocated passthrough)
-        let data = vec![0x42u8; 16];
+        let mut data = alloc_buf(16);
+        data.fill(0x42);
         let buf = DataBuffer::Allocated(data);
-        assert_eq!(buf.size(), 16);
+        assert_eq!(buf.size(), 4096);
         let converted = buf.convert_to_owned_buffer();
         assert_eq!(converted.slice()[0], 0x42);
         assert!(converted.size() >= 16);

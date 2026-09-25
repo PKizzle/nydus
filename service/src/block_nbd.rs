@@ -26,10 +26,9 @@ use compio::net::UnixStream;
 use futures_util::{FutureExt, select};
 use mio::Waker;
 use nydus_api::{BlobCacheEntry, BuildTimeInfo};
-use nydus_storage::utils::alloc_buf;
 
 use crate::blob_cache::{BlobCacheMgr, generate_blob_key};
-use crate::block_device::BlockDevice;
+use crate::block_device::{BlockDevice, alloc_io_buf};
 use crate::daemon::{
     DaemonState, DaemonStateMachineContext, DaemonStateMachineInput, DaemonStateMachineSubscriber,
     NydusDaemon,
@@ -282,7 +281,7 @@ impl NbdWorker {
 
         let block_size = device.block_size();
         let mut code = NBD_OK;
-        let mut data_buf = alloc_buf(len as usize);
+        let mut data_buf = alloc_io_buf(len as usize);
         if magic != NBD_REQUEST_MAGIC
             || !pos.is_multiple_of(block_size)
             || !(len as u64).is_multiple_of(block_size)

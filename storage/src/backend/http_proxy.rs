@@ -534,7 +534,7 @@ mod tests {
                 })
                 .unwrap();
             assert_eq!(size, 3);
-            assert_eq!(buf, CONTENT.as_bytes()[0..3]);
+            assert_eq!(&*buf, &CONTENT.as_bytes()[0..3]);
 
             println!();
             println!("testing read() full......");
