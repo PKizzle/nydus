@@ -389,6 +389,17 @@ impl Connection {
     /// Create a new connection according to the configuration.
     pub fn new(config: &ConnectionConfig) -> ConnectionResult<Arc<Connection>> {
         info!("backend config: {:?}", config);
+        // Select the rustls crypto provider before anything can construct a
+        // cyper client. Two paths race to be first: `build_connection` on a
+        // worker thread, and the proxy health thread spawned at the end of
+        // this function, which calls `Client::new()` directly. Installing from
+        // one of them only is not enough -- with both `ring` and `aws-lc-rs`
+        // linked in (dragonfly pulls aws-lc-rs through tonic) rustls cannot
+        // auto-select and panics inside `ClientConfig::builder`, and that
+        // panic lands on whichever thread got there first. This is the one
+        // point both paths pass through.
+        #[cfg(feature = "backend-dragonfly-proxy")]
+        super::proxy::ensure_rustls_provider();
         // Per-thread cyper clients are built lazily inside the compio runtime
         // (cyper's hickory resolver needs `Runtime::current()` at build time).
 
@@ -1254,5 +1265,27 @@ mod tests {
         drop(conn);
 
         wait_for_proxy_owners(&proxy, 0);
+    }
+
+    /// `Connection::new` must leave a rustls crypto provider selected.
+    ///
+    /// The proxy health thread it spawns calls `Client::new()` directly rather
+    /// than going through `build_connection`, so it reaches rustls without
+    /// passing the installation there. With both `ring` and `aws-lc-rs` linked
+    /// (dragonfly pulls aws-lc-rs in through tonic) rustls cannot auto-select
+    /// and panics on that thread; nydusd then never mounts and the only
+    /// symptom is a mountpoint timeout.
+    #[cfg(feature = "backend-dragonfly-proxy")]
+    #[test]
+    fn test_connection_new_selects_crypto_provider() {
+        let conn = health_check_connection();
+
+        assert!(
+            rustls::crypto::CryptoProvider::get_default().is_some(),
+            "Connection::new must select a crypto provider before the proxy \
+             health thread constructs a cyper client"
+        );
+
+        conn.shutdown();
     }
 }
