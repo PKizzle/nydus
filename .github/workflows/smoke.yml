@@ -231,7 +231,7 @@ jobs:
           export NYDUS_NYDUSIFY_$version_export=/usr/bin/nydus-$version/nydusify
         done
 
-        curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh | sudo sh -s -- -b /usr/bin v2.1.6
+        curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh | sudo sh -s -- -b /usr/bin v2.14.0
         sudo -E env "PATH=$PATH" make smoke-only
 
   nydus-unit-test:
@@ -428,7 +428,7 @@ jobs:
           export NYDUS_NYDUSIFY_$version_export=/usr/bin/nydus-$version/nydusify
         done
 
-        curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh | sudo sh -s -- -b /usr/bin v2.1.6
+        curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh | sudo sh -s -- -b /usr/bin v2.14.0
         echo "Smoke binary environment:"
         env | grep '^NYDUS_' | sort
         echo "LLVM_PROFILE_FILE=${LLVM_PROFILE_FILE}"
