@@ -114,7 +114,7 @@ jobs:
         export BENCHMARK_MODE=oci
         export BENCHMARK_METRIC_FILE=${{ matrix.image }}-oci.json
         export SNAPSHOTTER=overlayfs
-        sudo -E make smoke-benchmark
+        sudo -E env "PATH=$PATH" make smoke-benchmark
     - name: Save BenchMark Result
       uses: actions/upload-artifact@v6
       with:
@@ -160,7 +160,7 @@ jobs:
         export BENCHMARK_TEST_IMAGE=${{ matrix.image }}:${{ matrix.tag }}
         export BENCHMARK_MODE=fs-version-6
         export BENCHMARK_METRIC_FILE=${{ matrix.image }}-fsversion-v6.json
-        sudo -E make smoke-benchmark
+        sudo -E env "PATH=$PATH" make smoke-benchmark
     - name: Save BenchMark Result
       uses: actions/upload-artifact@v6
       with:
@@ -206,7 +206,7 @@ jobs:
         export BENCHMARK_TEST_IMAGE=${{ matrix.image }}:${{ matrix.tag }}
         export BENCHMARK_MODE=zran
         export BENCHMARK_METRIC_FILE=${{ matrix.image }}-zran.json
-        sudo -E make smoke-benchmark
+        sudo -E env "PATH=$PATH" make smoke-benchmark
     - name: Save BenchMark Result
       uses: actions/upload-artifact@v6
       with:

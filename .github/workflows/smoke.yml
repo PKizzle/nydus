@@ -231,8 +231,18 @@ jobs:
           export NYDUS_NYDUSIFY_$version_export=/usr/bin/nydus-$version/nydusify
         done
 
-        curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh | sudo sh -s -- -b /usr/bin v2.1.6
-        sudo -E make smoke-only
+        # Build the linter with the toolchain this workflow selected.
+        # golangci-lint refuses to load a config whose module targets a newer
+        # Go language version than the build it ships, and its release binaries
+        # trail the version the smoke modules pin, so a prebuilt tarball is not
+        # reliably usable here. Building from source also avoids upstream's
+        # install script: it is fetched unpinned from `master`, and its
+        # checksum grep matches the SBOM entry as well as the tarball (their
+        # names share a prefix), so it compares the wrong digest and aborts.
+        mkdir -p /tmp/golangci-lint-bin
+        GOBIN=/tmp/golangci-lint-bin go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.14.0
+        sudo install -m 755 /tmp/golangci-lint-bin/golangci-lint /usr/bin/golangci-lint
+        sudo -E env "PATH=$PATH" make smoke-only
 
   nydus-unit-test:
     runs-on: ${{ vars.RUNNER_OS || 'ubuntu-latest' }}
@@ -428,7 +438,17 @@ jobs:
           export NYDUS_NYDUSIFY_$version_export=/usr/bin/nydus-$version/nydusify
         done
 
-        curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh | sudo sh -s -- -b /usr/bin v2.1.6
+        # Build the linter with the toolchain this workflow selected.
+        # golangci-lint refuses to load a config whose module targets a newer
+        # Go language version than the build it ships, and its release binaries
+        # trail the version the smoke modules pin, so a prebuilt tarball is not
+        # reliably usable here. Building from source also avoids upstream's
+        # install script: it is fetched unpinned from `master`, and its
+        # checksum grep matches the SBOM entry as well as the tarball (their
+        # names share a prefix), so it compares the wrong digest and aborts.
+        mkdir -p /tmp/golangci-lint-bin
+        GOBIN=/tmp/golangci-lint-bin go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.14.0
+        sudo install -m 755 /tmp/golangci-lint-bin/golangci-lint /usr/bin/golangci-lint
         echo "Smoke binary environment:"
         env | grep '^NYDUS_' | sort
         echo "LLVM_PROFILE_FILE=${LLVM_PROFILE_FILE}"
@@ -442,7 +462,7 @@ jobs:
         printf '%s\n' "${probe_profraw_files[@]}"
         cargo llvm-cov clean --workspace --profraw-only
 
-        sudo -E make smoke-only
+        sudo -E env "PATH=$PATH" make smoke-only
 
         mapfile -t profraw_files < <(find "${CARGO_LLVM_COV_TARGET_DIR}" -maxdepth 1 -name '*.profraw' -print | sort)
         echo "Generated ${#profraw_files[@]} smoke profraw files"
@@ -743,7 +763,7 @@ jobs:
     - name: Performance Test
       run: |
         export PERFORMANCE_TEST_MODE=${{ matrix.mode }}
-        sudo -E make smoke-performance
+        sudo -E env "PATH=$PATH" make smoke-performance
 
   # Correctness gate for the containerd -> gRPC Prepare/Commit/Mounts loop:
   # plain-OCI overlay path (no daemon) + nydus fusedev path + health probes +
@@ -833,7 +853,7 @@ jobs:
     - name: Takeover Test
       run: |
         export NEW_NYDUSD_BINARY_PATH=target/release/nydusd
-        sudo -E make smoke-takeover
+        sudo -E env "PATH=$PATH" make smoke-takeover
     - name: Dump nydus-snapshotter logs
       if: always()
       run: |
