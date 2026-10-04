@@ -74,7 +74,7 @@ func (d *DescartesItem) Str() string {
 		if s, ok := val.(string); ok {
 			sb.WriteString(s)
 		} else {
-			sb.WriteString(fmt.Sprintf("%v", val))
+			fmt.Fprintf(&sb, "%v", val)
 		}
 	}
 	return sb.String()
