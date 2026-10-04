@@ -763,54 +763,13 @@ impl Bootstrap {
         Self::v6_align_to_block(bootstrap_ctx, block_size)?;
 
         // Prepare device slots.
-        let mut pos = bootstrap_ctx
+        let pos = bootstrap_ctx
             .writer
             .seek_to_end()
             .context("failed to seek to bootstrap's end for chunk table")?;
         assert_eq!(pos % block_size, 0);
-        let mut devtable: Vec<RafsV6Device> = Vec::new();
-        let mut block_count = 0u32;
-        let mut inlined_chunk_digest = true;
-        for entry in blobs.iter() {
-            let mut devslot = RafsV6Device::new();
-            // blob id is String, which is processed by sha256.finalize().
-            if entry.blob_id().is_empty() {
-                bail!(" blob id is empty");
-            } else if entry.blob_id().len() > 64 {
-                bail!(format!(
-                    "blob id length is bigger than 64 bytes, blob id {:?}",
-                    entry.blob_id()
-                ));
-            } else if entry.uncompressed_size() / block_size > u32::MAX as u64 {
-                bail!(format!(
-                    "uncompressed blob size (0x:{:x}) is too big",
-                    entry.uncompressed_size()
-                ));
-            }
-            if !entry.has_feature(BlobFeatures::INLINED_CHUNK_DIGEST) {
-                inlined_chunk_digest = false;
-            }
-            let cnt = (entry.uncompressed_size() / block_size) as u32;
-            if block_count.checked_add(cnt).is_none() {
-                bail!(
-                    "Too many data blocks in RAFS filesystem, block size 0x{:x}, block count 0x{:x}",
-                    block_size,
-                    block_count as u64 + cnt as u64
-                );
-            }
-            let mapped_blkaddr = Self::v6_align_mapped_blkaddr(block_size, pos)?;
-            pos = (mapped_blkaddr + cnt) as u64 * block_size;
-            block_count += cnt;
-
-            let id = entry.blob_id();
-            let id = id.as_bytes();
-            let mut blob_id = [0u8; 64];
-            blob_id[..id.len()].copy_from_slice(id);
-            devslot.set_blob_id(&blob_id);
-            devslot.set_blocks(cnt);
-            devslot.set_mapped_blkaddr(mapped_blkaddr);
-            devtable.push(devslot);
-        }
+        let (devtable, block_count, inlined_chunk_digest) =
+            Self::v6_build_devtable(&blobs, block_size, pos)?;
 
         // Dump super block
         let mut sb = RafsV6SuperBlock::new();
@@ -821,7 +780,10 @@ impl Bootstrap {
         }
         sb.set_inos(bootstrap_ctx.get_next_ino() - 1);
         sb.set_blocks(block_count);
-        sb.set_root_nid(root_nid as u16);
+        let root_nid = u16::try_from(root_nid).with_context(|| {
+            format!("root inode nid 0x{root_nid:x} does not fit the 16-bit superblock field")
+        })?;
+        sb.set_root_nid(root_nid);
         sb.set_meta_addr(meta_addr);
         sb.set_extra_devices(blob_table_entries as u16);
         bootstrap_ctx.writer.seek(SeekFrom::Start(0))?;
@@ -891,6 +853,72 @@ impl Bootstrap {
             .flush()
             .context("failed to flush bootstrap")?;
         Ok(())
+    }
+
+    /// Lay out one device slot per data blob, starting at byte offset `pos`.
+    ///
+    /// Returns the slots, the total data block count and whether every blob
+    /// carries inlined chunk digests. Every block address is a 32-bit EROFS
+    /// field, so both the running block count and each blob's end address are
+    /// checked: the mapped address also covers the metadata region and the
+    /// alignment padding, so it can overflow where the block count alone does not.
+    fn v6_build_devtable(
+        blobs: &[Arc<BlobInfo>],
+        block_size: u64,
+        mut pos: u64,
+    ) -> Result<(Vec<RafsV6Device>, u32, bool)> {
+        let mut devtable: Vec<RafsV6Device> = Vec::new();
+        let mut block_count = 0u32;
+        let mut inlined_chunk_digest = true;
+        for entry in blobs.iter() {
+            let mut devslot = RafsV6Device::new();
+            // blob id is String, which is processed by sha256.finalize().
+            if entry.blob_id().is_empty() {
+                bail!(" blob id is empty");
+            } else if entry.blob_id().len() > 64 {
+                bail!(format!(
+                    "blob id length is bigger than 64 bytes, blob id {:?}",
+                    entry.blob_id()
+                ));
+            } else if entry.uncompressed_size() / block_size > u32::MAX as u64 {
+                bail!(format!(
+                    "uncompressed blob size (0x:{:x}) is too big",
+                    entry.uncompressed_size()
+                ));
+            }
+            if !entry.has_feature(BlobFeatures::INLINED_CHUNK_DIGEST) {
+                inlined_chunk_digest = false;
+            }
+            let cnt = (entry.uncompressed_size() / block_size) as u32;
+            if block_count.checked_add(cnt).is_none() {
+                bail!(
+                    "Too many data blocks in RAFS filesystem, block size 0x{:x}, block count 0x{:x}",
+                    block_size,
+                    block_count as u64 + cnt as u64
+                );
+            }
+            let mapped_blkaddr = Self::v6_align_mapped_blkaddr(block_size, pos)?;
+            let Some(end_blkaddr) = mapped_blkaddr.checked_add(cnt) else {
+                bail!(
+                    "RAFS data blocks exceed the 32-bit block address space, block size 0x{:x}, end block address 0x{:x}",
+                    block_size,
+                    mapped_blkaddr as u64 + cnt as u64
+                );
+            };
+            pos = end_blkaddr as u64 * block_size;
+            block_count += cnt;
+
+            let id = entry.blob_id();
+            let id = id.as_bytes();
+            let mut blob_id = [0u8; 64];
+            blob_id[..id.len()].copy_from_slice(id);
+            devslot.set_blob_id(&blob_id);
+            devslot.set_blocks(cnt);
+            devslot.set_mapped_blkaddr(mapped_blkaddr);
+            devtable.push(devslot);
+        }
+
+        Ok((devtable, block_count, inlined_chunk_digest))
     }
 
     fn v6_align_mapped_blkaddr(block_size: u64, addr: u64) -> Result<u32> {
@@ -1078,5 +1106,46 @@ mod tests {
         assert!(!pyc_node.v6_compact_inode);
 
         std::fs::remove_file(&pa_pyc).unwrap();
+    }
+
+    fn devtable_blob(uncompressed_blocks: u64) -> Arc<BlobInfo> {
+        Arc::new(BlobInfo::new(
+            0,
+            "a".repeat(64),
+            uncompressed_blocks * EROFS_BLOCK_SIZE_4096,
+            0,
+            RAFS_DEFAULT_CHUNK_SIZE as u32,
+            0,
+            BlobFeatures::INLINED_CHUNK_DIGEST,
+        ))
+    }
+
+    #[test]
+    fn test_v6_build_devtable_maps_blobs_after_metadata() {
+        let blobs = vec![devtable_blob(16), devtable_blob(8)];
+        // Metadata ends at 4 KiB; data starts at the next 512 KiB segment.
+        let (devtable, block_count, inlined) =
+            Bootstrap::v6_build_devtable(&blobs, EROFS_BLOCK_SIZE_4096, EROFS_BLOCK_SIZE_4096)
+                .unwrap();
+        assert_eq!(block_count, 24);
+        assert!(inlined);
+        assert_eq!(devtable.len(), 2);
+        let seg_blocks = (V6_BLOCK_SEG_ALIGNMENT / EROFS_BLOCK_SIZE_4096) as u32;
+        assert_eq!(devtable[0].mapped_blkaddr(), seg_blocks);
+        assert_eq!(devtable[1].mapped_blkaddr(), 2 * seg_blocks);
+    }
+
+    #[test]
+    fn test_v6_build_devtable_rejects_block_address_overflow() {
+        // The block count fits in u32, but the blob is mapped after the
+        // metadata segment, so its end address does not.
+        let blobs = vec![devtable_blob(u32::MAX as u64 - 1)];
+        let err =
+            Bootstrap::v6_build_devtable(&blobs, EROFS_BLOCK_SIZE_4096, EROFS_BLOCK_SIZE_4096)
+                .unwrap_err();
+        assert!(
+            err.to_string().contains("32-bit block address space"),
+            "{err:#}"
+        );
     }
 }

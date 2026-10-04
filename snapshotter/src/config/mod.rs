@@ -646,6 +646,10 @@ pub struct FeaturesConfig {
     pub referrer_detect: bool,
     #[serde(default)]
     pub encryption: bool,
+    /// Prefetch files ahead of first access on fusedev RAFS mounts: the runtime
+    /// prefetch list learned from access profiles, or the bootstrap's own
+    /// prefetch table. ON by default. The fanotify and blockdev paths have no
+    /// RAFS instance to drive a file list and ignore this flag.
     #[serde(default = "default_true")]
     pub prefetch: bool,
     #[serde(default = "default_true")]
