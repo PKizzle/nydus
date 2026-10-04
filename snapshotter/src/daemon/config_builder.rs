@@ -14,7 +14,8 @@ use anyhow::Context;
 use nydus_api::{
     BLOB_CACHE_TYPE_META_BLOB, BackendConfigV2, BlobCacheEntry, BlobCacheEntryConfigV2,
     CacheConfigV2, ConfigV2, FanotifyConfig, FileCacheConfig, HttpProxyConfig, LocalFsConfig,
-    OssConfig, RafsConfigV2, RegistryConfig, S3Config,
+    OssConfig, PrefetchConfigV2, RafsConfigV2, RegistryConfig, S3Config,
+    default_prefetch_batch_size, default_prefetch_threads_count,
 };
 use serde_json::json;
 use tracing::warn;
@@ -33,6 +34,29 @@ const BACKEND_RETRY_LIMIT: u8 = 3;
 /// nydus-api `default_http_timeout`.
 const DEFAULT_HTTP_TIMEOUT_SECS: u32 = 5;
 
+/// Prefetch settings for a RAFS daemon, driven by `[snapshotter.features] prefetch`.
+///
+/// The same value goes into both `cache.prefetch` and `rafs.prefetch`: `Rafs::import`
+/// only walks the runtime prefetch list or the bootstrap's prefetch table when
+/// `rafs.prefetch.enable` is set, and the blob-cache workers drop every request
+/// unless `cache.prefetch.enable` is set too, so one without the other prefetches
+/// nothing. `prefetch_all` stays off so only the listed files are fetched ahead
+/// of time; an image that asks for a full prefetch through its own prefetch table
+/// still gets one.
+fn rafs_prefetch_config(cfg: &SnapshotterConfig) -> PrefetchConfigV2 {
+    if !cfg.snapshotter.features.prefetch {
+        return PrefetchConfigV2::default();
+    }
+    PrefetchConfigV2 {
+        enable: true,
+        threads_count: default_prefetch_threads_count(),
+        batch_size: default_prefetch_batch_size(),
+        bandwidth_limit: 0,
+        prefetch_all: false,
+        stream_prefetch: false,
+    }
+}
+
 /// Build a `ConfigV2` for the daemon pull path: the storage backend selected
 /// from the unified `[backends.*]` TOML config, paired with a filecache.
 ///
@@ -50,12 +74,13 @@ pub fn build_daemon_config(
     daemon_id: &str,
 ) -> anyhow::Result<ConfigV2> {
     let backend = build_backend_config(cfg, image_ref, auth)?;
+    let prefetch = rafs_prefetch_config(cfg);
 
     let cache = CacheConfigV2 {
         cache_type: "filecache".to_string(),
         cache_compressed: false,
         cache_validate: false,
-        prefetch: Default::default(),
+        prefetch: prefetch.clone(),
         file_cache: Some(FileCacheConfig {
             work_dir: cache_work_dir.display().to_string(),
             disable_indexed_map: cfg.snapshotter.cache.disable_indexed,
@@ -74,7 +99,7 @@ pub fn build_daemon_config(
         iostats_files: false,
         access_pattern: false,
         latest_read_files: false,
-        prefetch: Default::default(),
+        prefetch,
     };
 
     Ok(ConfigV2 {
@@ -423,12 +448,16 @@ pub fn build_blob_cache_entry(
     bootstrap: &Path,
 ) -> anyhow::Result<BlobCacheEntry> {
     let cfg_v2 = build_daemon_config(cfg, image_ref, cache_work_dir, auth, daemon_id)?;
+    // A blob-cache entry has no RAFS instance to send prefetch requests, so
+    // enabled workers would only sit idle.
+    let mut cache = cfg_v2.cache.unwrap_or_default();
+    cache.prefetch = PrefetchConfigV2::default();
     let entry_config = BlobCacheEntryConfigV2 {
         version: cfg_v2.version,
         id: cfg_v2.id,
         backend: cfg_v2.backend.unwrap_or_default(),
         external_backends: cfg_v2.external_backends,
-        cache: cfg_v2.cache.unwrap_or_default(),
+        cache,
         metadata_path: Some(bootstrap.display().to_string()),
     };
     let value = json!({
@@ -523,6 +552,52 @@ mod tests {
         );
         assert_eq!(config.backend.backend_type, "registry");
         assert_eq!(config.cache.cache_type, "filecache");
+        assert!(
+            !config.cache.prefetch.enable,
+            "blob-cache entries have no RAFS instance to drive prefetch"
+        );
+    }
+
+    #[test]
+    fn prefetch_feature_enables_cache_and_rafs_prefetch_together() {
+        let cfg = SnapshotterConfig::default();
+        assert!(cfg.snapshotter.features.prefetch, "prefetch defaults on");
+        let image = parse_image_ref("docker.io/library/nginx:latest").unwrap();
+        let cv2 = build_daemon_config(
+            &cfg,
+            &image,
+            &PathBuf::from("/var/lib/containerd-nydus/cache/nginx"),
+            None,
+            "test-daemon",
+        )
+        .unwrap();
+
+        let cache = &cv2.cache.as_ref().unwrap().prefetch;
+        let rafs = &cv2.rafs.as_ref().unwrap().prefetch;
+        assert!(cache.enable && rafs.enable);
+        assert_eq!(cache, rafs);
+        assert!(!rafs.prefetch_all, "only listed files are prefetched");
+        assert!(!rafs.stream_prefetch);
+        assert!(cv2.validate(), "enabled prefetch needs non-zero threads");
+    }
+
+    #[test]
+    fn prefetch_feature_off_disables_both_sides() {
+        let mut cfg = SnapshotterConfig::default();
+        cfg.snapshotter.features.prefetch = false;
+        let image = parse_image_ref("docker.io/library/nginx:latest").unwrap();
+        let cv2 = build_daemon_config(
+            &cfg,
+            &image,
+            &PathBuf::from("/var/lib/containerd-nydus/cache/nginx"),
+            None,
+            "test-daemon",
+        )
+        .unwrap();
+
+        assert!(!cv2.cache.as_ref().unwrap().prefetch.enable);
+        assert!(!cv2.rafs.as_ref().unwrap().prefetch.enable);
+        assert!(cv2.validate());
     }
 
     #[test]
