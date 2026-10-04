@@ -1,7 +1,32 @@
 # Evaluating upstream's `v3` branch
 
-*Assessed against `upstream/v3` @ `3f9e12ed`, re-checked at tag `v3.0.0-alpha.1` (147 commits).
-Re-check before acting on any of this — the branch is young and moving.*
+*Assessed against `upstream/v3` @ `3f9e12ed`, re-checked at tags `v3.0.0-alpha.1` and
+`v3.0.0-beta.1` (`fc2c3dfc`), last at branch head `02156def` (240 commits). Re-check before acting
+on any of this — the branch is still moving.*
+
+> **Re-checked at `v3.0.0-beta.1` / `02156def`.** Beta was the trigger to revisit; the decision
+> below still holds, because neither precondition for adopting v3 is met:
+> - **(a) Accelerating an unmodified OCI tag without a push — not met.** The new "native" EROFS
+>   layers (`c9c9f714`, `--compressor erofs-none|erofs-lz4|erofs-zstd`) are *re-encoded* full blobs
+>   laid out `[layer data][bootstrap][footer]` with a `RAW_DEVICE` flag. Lazy-loading them is a
+>   stated non-goal (`docs/nydus.md`), and the registry backend refuses them. `02953b94` lets a
+>   *local* native blob be the kernel device directly, so the closest node-local recipe is a full
+>   decompressed on-disk copy with no lazy loading — what an EROFS-unpack snapshotter already does.
+>   Gzip support is **decode-only** (`flate2` `MultiGzDecoder` on build input); there is still no
+>   zran. `02156def` normalises layer tars to match containerd's `archive.Apply` before building;
+>   it does not change what is served.
+> - **(b) Snapshotter integration — not met.** No snapshotter or proxy-plugin code exists. The
+>   manifest layout is reused, but the blob format underneath is incompatible with a nydusd v2.
+> - **Format stability.** The README still warns formats may change and it is not production-ready,
+>   and the format broke again in this range: magics renamed `LP*` → `ND*` (`373215af`, old blobs
+>   rejected), version fields replaced by compat/incompat feature bits (`a3a7c996`, the first real
+>   extensibility story), and a new content-defined chunk-group layout (`1a69b3e9`).
+> - **Tokio on the I/O path.** One lazy, process-wide registry runtime (`cb62e7c7`, 2 workers,
+>   ≤ 8 blocking threads for DNS); synchronous FUSE/fanotify callers block on it for every remote
+>   fetch. Still at odds with our no-tokio-in-`service/` rule.
+>
+> Re-run the same two checks next time: `git grep -i zran upstream/v3` (still empty) and
+> `git grep -il snapshotter upstream/v3 -- '*.rs'` (still empty).
 
 > **Re-checked at tag `v3.0.0-alpha.1`** (`upstream/v3`, 147 commits). The decision below
 > is unchanged, and the zran gap that drives it still holds: `git grep -i zran upstream/v3` returns
@@ -34,21 +59,21 @@ No `rafs/`, no `service/`, no `storage/`, no snapshotter.
 
 Its format family is new and deliberately incompatible — `docs/nydus.md` lists "preserve on-disk
 compatibility with earlier Nydus image formats (RAFS v5/v6)" as an explicit **non-goal**. Bootstraps
-are native EROFS images, not RAFS metadata. Magics: `LPFOOTER` (4 KiB footer at EOF), `LPBLMETA`
-(blob meta), `LPGRPMAP` (runtime readiness bitmap). Old artifacts are rejected by magic check; there
-is no migration path.
+are native EROFS images, not RAFS metadata. Magics: `NDFOOTER` (4 KiB footer at EOF), `NDBLMETA`
+(blob meta), `NDGRPMAP` (runtime readiness bitmap) — `LP*` before `373215af`. Old artifacts are
+rejected by magic check; there is no migration path.
 
 ## Decision: not adopting it
 
-Against this fork, v3 is a large capability regression:
+Against this fork, v3 is a large capability regression (v3 column as of `02156def`):
 
 | | our fork | upstream v3 |
 |---|---|---|
 | containerd snapshotter | yes (`snapshotter/`) | **none** — no gRPC/proxy-plugin at all |
-| zran / `targz-ref` | yes, end to end | **none**, and structurally impossible — no gzip/deflate dependency exists in the crate |
-| backends | registry, localfs, oss, s3, localdisk, http-proxy, mirrors | `local` + `registry` only |
-| compressors | lz4, zstd, gzip, none | `{none, zstd}` |
-| digesters | blake3, sha256 | `{blake3}` |
+| zran / `targz-ref` | yes, end to end | **none** — gzip is decoded on build input only; every layer is re-encoded |
+| backends | registry, localfs, oss, s3, localdisk, http-proxy, mirrors | `local`, `registry`, Dragonfly |
+| compressors | lz4, zstd, gzip, none | `{none, zstd, lz4}` + native `erofs-{none,lz4,zstd}` |
+| digesters | blake3, sha256 | `{blake3, none}` |
 | hot upgrade / takeover | yes | none — start/SIGTERM/exit |
 | multi-image per daemon | yes | one process, one image |
 | cache invalidation | `invalidate()` (revoke chunk map, then punch) | none |
@@ -82,6 +107,20 @@ Four real defects on our side, found by that comparison and since fixed:
 4. **Untrusted image mounted with `flags = 0`** (no `nodev`, no `nosuid`) and an unbounded
    `device=` option string against `mount(2)`'s one-page limit, which truncates silently.
 
+Two more from checking v3's beta fixes against the same areas here:
+
+5. **Runtime prefetch never ran on fusedev mounts.** `[snapshotter.features] prefetch` defaulted on
+   but nothing read it; the daemon config carried `prefetch.enable = false` for both the cache and
+   RAFS sections, so the runtime prefetch list and the bootstrap's prefetch table were discarded.
+   v3's "auto" prefetch scope (`6dff1f43`) is what prompted the check.
+   ([snapshotter/src/daemon/config_builder.rs](../snapshotter/src/daemon/config_builder.rs))
+6. **Unchecked 32-bit arithmetic in the v6 superblock writer.** A blob's end block address
+   (`mapped_blkaddr + cnt`) could wrap where the running block-count check passed, and the root
+   nid was truncated with `as u16`. Both now fail the build. v3's `74f703c7` is the analogue; its
+   other layout fixes (`e26a629c` build-time field, `5ca6e942` symlink inlining, `4155bdda`
+   compact-inode mtime, `c10fbbeb` hardlinks across merge) do not apply here.
+   ([builder/src/core/v6.rs](../builder/src/core/v6.rs))
+
 ## Where we are ahead
 
 Worth knowing so these do not get "fixed" toward v3's behaviour:
@@ -103,24 +142,10 @@ Worth knowing so these do not get "fixed" toward v3's behaviour:
 
 Ranked. None of these require adopting v3's format.
 
-1. **Skip arming fully-ready blobs.** A pre-content mark disables kernel readahead on that file, so
-   dropping the mark once a blob is fully cached restores it — a larger win than any per-event
-   saving. We already own the latch (`storage/src/cache/state/persist_map.rs`, `MAGIC_ALL_READY`)
-   and simply never consult it from `handle_event`.
-
-   The hazard to control: an unmarked blob whose cache is later punched would serve zeros. The
-   protection against it is **structural rather than incidental**, which makes the port tractable:
-   `FanotifyHandler::invalidate` is the single function through which cached bytes may be
-   discarded, and it already owns the general invariant:
-   *every promise that data is present must be revoked before the data goes away*. It revokes the
-   chunk map first (`BlobObject::reset_data_ready`), then punches, under a per-blob `io_lock` that
-   also excludes in-flight fetches.
-
-   So a skip-arming port has one requirement: un-arming must be recorded on the `BlobBacking`, and
-   `invalidate` must re-`fanotify_mark` as step 0, before the revoke. Landing it anywhere else
-   reintroduces the hazard; landing it there cannot, because `invalidate` is the only path that
-   discards bytes. See the ordering rationale on `invalidate` and the two `invalidate_in_order`
-   tests, which pin the sequence and the fail-closed behaviour when the revoke fails.
+1. **Skip arming fully-ready blobs — done.** A blob's mark is dropped once its cache is complete,
+   restoring kernel readahead, and `FanotifyHandler::invalidate` re-arms the mark as step 0 before
+   revoking readiness and discarding bytes (`invalidation_rearms_and_revokes_readiness_before_discarding_bytes`
+   pins the order). v3 reached the same design independently at beta.
 2. **Request coalescing** on `(blob, aligned_range)`. Container start has many tasks paging the same
    library; today each faulting reader issues its own `fetch_range_uncompressed`.
 3. **Chunk/group decoupling.** v3 separates the dedup unit (`chunk_block_bits`, BLAKE3, 1 MiB) from
@@ -185,9 +210,18 @@ Ranked. None of these require adopting v3's format.
 6. **Test cases we lack**, from `tests/integration/fanotify_test.go`: range-boundedness measured via
    allocated blocks on the sparse cache, warm re-read allocating ~nothing, and a fanotify-vs-FUSE
    perf harness with cold-page columns.
+7. **Build layer tars the way containerd applies them** (v3 `02156def`). The tarball builder
+   diverges from `archive.Apply` in two places: `builder/src/tarball.rs` keeps `..` path
+   components (`Path::components().as_path()` does not strip `ParentDir`), and
+   `insert_into_tree` (`builder/src/lib.rs`) attaches a member `a/b/f` beneath a node `a` even
+   when `a` is a symlink, where containerd resolves through it. On the transparent-accel path a
+   silently different tree is the worst possible failure, so the cheap guard comes first: reject
+   `..` components and members whose parent resolves to a symlink, and let the image fall back to
+   plain overlay. Full `archive.Apply` fidelity (including which hardlink member's metadata wins
+   on the shared inode) is the larger follow-up. Nydusify's own archive extraction already rejects
+   `ParentDir` (`nydusify/src/engine/oci_archive.rs`).
 
-## Unrelated follow-up
-
-Upstream `29ab52f7` fixed a tar path-traversal (Zip-Slip) in the Go nydusify we deleted. The commit
-does not apply, but the bug class might: audit `nydusify/src/engine/artifact.rs` and
-`snapshotter/src/local_accel.rs` for `../` sanitisation on tar entry names before extraction.
+Not worth porting: concurrent multi-blob reads (`c66b591b`; our per-blob loop in
+`rafs/src/fs.rs` only matters for chunk-dict files spanning blobs, never on the fanotify path),
+byte-offset readdir cookies (`3540f513`; ordinal cookies are stable on a read-only image), and
+the runtime `fetch_size` knob (tied to v3's group layout).
