@@ -40,7 +40,9 @@ use crate::engine::manifest::{
     assemble_manifest, bootstrap_descriptor, config_media_type, data_blob_descriptor,
     manifest_media_type, rebuild_image_config, validate_nydus_manifest,
 };
-use crate::engine::oci::{client_options, fetch_platform_manifest};
+use crate::engine::oci::{
+    BlobSource, client_options, ensure_blob_in_repo, fetch_platform_manifest,
+};
 use crate::engine::retry::RetryPolicy;
 
 /// File name `nydus-image` expects inside each staged source directory.
@@ -57,6 +59,10 @@ struct BuildOutput {
 /// One resolved source image: where it came from and what it is made of.
 struct SourceImage {
     reference: ImageReference,
+    /// Client for the source's registry, with the source-side TLS and
+    /// plain-HTTP settings: the config and any dictionary blob that has to be
+    /// copied rather than mounted are read through it.
+    client: RegistryClient,
     manifest: Manifest,
     /// Bootstrap staged where `nydus-image` can infer a name/tag from it.
     staged_bootstrap: PathBuf,
@@ -131,6 +137,7 @@ pub async fn run(args: ChunkdictArgs) -> Result<()> {
         target_plain_http,
         &blob_ids,
         &chunkdict_bootstrap,
+        &work_dir,
     )
     .await
 }
@@ -216,6 +223,7 @@ async fn stage_source(
 
     Ok(SourceImage {
         reference,
+        client,
         manifest,
         staged_bootstrap: renamed,
     })
@@ -284,18 +292,28 @@ pub fn dedup_blob_ids(blobs: &[String]) -> Vec<String> {
         .collect()
 }
 
-/// Look up a blob's size from whichever source manifest carries it.
+/// Pick the source a dictionary blob is placed from, and the blob's size.
 ///
-/// The dictionary's blobs all come from the sources, so their descriptors are
-/// already known; this avoids a HEAD per blob.
-fn blob_size(sources: &[SourceImage], digest: &str) -> Option<u64> {
-    sources.iter().find_map(|s| {
+/// Every dictionary blob is a data layer of at least one source, so its
+/// descriptor is already known and needs no HEAD. When several sources carry
+/// it, one on the target's registry wins: the blob can then be cross-repo
+/// mounted instead of downloaded and re-uploaded.
+fn pick_blob_source<'a>(
+    sources: &'a [SourceImage],
+    digest: &str,
+    target_host: &str,
+) -> Option<(&'a SourceImage, u64)> {
+    let size_in = |s: &SourceImage| {
         s.manifest
             .layers
             .iter()
             .find(|l| l.digest == digest)
             .map(|l| l.size)
-    })
+    };
+    let carriers = || sources.iter().filter_map(|s| size_in(s).map(|n| (s, n)));
+    carriers()
+        .find(|(s, _)| s.reference.api_host == target_host)
+        .or_else(|| carriers().next())
 }
 
 async fn push_chunkdict_image(
@@ -305,6 +323,7 @@ async fn push_chunkdict_image(
     plain_http: bool,
     blob_ids: &[String],
     chunkdict_bootstrap: &Path,
+    work_dir: &Path,
 ) -> Result<()> {
     let client = RegistryClient::new(
         &target_ref.api_host,
@@ -313,45 +332,39 @@ async fn push_chunkdict_image(
     .context("build target registry client")?;
     let retry = RetryPolicy::from_flags(args.push_retry_count, &args.push_retry_delay);
 
-    // The dictionary's data blobs already exist in the source repos, so they are
-    // cross-repo mounted where the registry allows it and only re-pushed when it
-    // does not. A blob whose bytes we never downloaded cannot be pushed, so a
-    // failed mount against a different registry is a hard error rather than a
-    // silent half-image.
+    // The dictionary's data blobs already exist in the source repos. Each one is
+    // skipped when the target has it, cross-repo mounted when the target shares
+    // the source's registry, and otherwise downloaded from the source and
+    // re-uploaded, so the dictionary can be published to any registry.
+    let staging = work_dir.join("blobs");
+    std::fs::create_dir_all(&staging)
+        .with_context(|| format!("create blob staging dir {}", staging.display()))?;
     let mut data_blobs = Vec::with_capacity(blob_ids.len());
     for id in blob_ids {
         let digest = format!("sha256:{id}");
-        let size = blob_size(sources, &digest).with_context(|| {
-            format!("blob {digest} from the chunk dictionary is not in any source manifest")
+        let (source, size) = pick_blob_source(sources, &digest, &target_ref.api_host)
+            .with_context(|| {
+                format!("blob {digest} from the chunk dictionary is not in any source manifest")
+            })?;
+        ensure_blob_in_repo(
+            &client,
+            &target_ref.repo,
+            Some(&source.reference.repo),
+            source.reference.api_host == target_ref.api_host,
+            &digest,
+            BlobSource::Download {
+                client: &source.client,
+                staging: &staging,
+            },
+            &retry,
+        )
+        .await
+        .with_context(|| {
+            format!(
+                "place dictionary blob {digest} from {} in {}",
+                source.reference, target_ref
+            )
         })?;
-
-        if !client
-            .head_blob(&target_ref.repo, &digest)
-            .await
-            .unwrap_or(false)
-        {
-            let mut mounted = false;
-            for source in sources {
-                if source.reference.api_host == target_ref.api_host
-                    && client
-                        .mount_blob(&target_ref.repo, &digest, &source.reference.repo)
-                        .await
-                        .unwrap_or(false)
-                {
-                    mounted = true;
-                    break;
-                }
-            }
-            if !mounted {
-                bail!(
-                    "cannot place dictionary blob {digest} in {}: it lives in the source \
-                     registry and cross-repo mount was refused or unavailable. Publish the \
-                     dictionary to the same registry as its sources.",
-                    target_ref.repo
-                );
-            }
-            debug!(digest = %digest, "mounted dictionary blob from source repo");
-        }
         data_blobs.push(data_blob_descriptor(digest, size));
     }
 
@@ -372,7 +385,7 @@ async fn push_chunkdict_image(
     // Reuse the first source's config so the dictionary image carries a sane
     // platform/rootfs shape, with diff ids rewritten for its own layer set.
     let first = &sources[0];
-    let config_bytes = fetch_config_bytes(args, first, plain_http).await?;
+    let config_bytes = fetch_config_bytes(first).await?;
     let diff_ids: Vec<String> = data_blobs
         .iter()
         .map(|d| d.digest.clone())
@@ -419,17 +432,9 @@ async fn push_chunkdict_image(
 }
 
 /// Fetch the image config blob of a source, to reuse as the dictionary's.
-async fn fetch_config_bytes(
-    args: &ChunkdictArgs,
-    source: &SourceImage,
-    plain_http: bool,
-) -> Result<Vec<u8>> {
-    let client = RegistryClient::new(
-        &source.reference.api_host,
-        client_options(args.source_insecure, plain_http, &args.ca_cert),
-    )
-    .context("build source registry client for config")?;
-    client
+async fn fetch_config_bytes(source: &SourceImage) -> Result<Vec<u8>> {
+    source
+        .client
         .get_blob(&source.reference.repo, &source.manifest.config.digest)
         .await
         .with_context(|| {
@@ -523,5 +528,50 @@ mod tests {
             "ccc".to_string(),
         ]);
         assert_eq!(ids, vec!["bbb", "aaa", "ccc"]);
+    }
+
+    fn source_with_layers(reference: &str, layers: &[(&str, u64)]) -> SourceImage {
+        let reference = ImageReference::parse(reference).unwrap();
+        let client = RegistryClient::new(&reference.api_host, Default::default()).unwrap();
+        let manifest = Manifest {
+            layers: layers
+                .iter()
+                .map(|(digest, size)| Descriptor {
+                    digest: digest.to_string(),
+                    size: *size,
+                    ..Descriptor::default()
+                })
+                .collect(),
+            ..Manifest::default()
+        };
+        SourceImage {
+            reference,
+            client,
+            manifest,
+            staged_bootstrap: PathBuf::new(),
+        }
+    }
+
+    #[compio::test]
+    async fn blob_source_prefers_a_carrier_on_the_target_registry() {
+        let sources = [
+            source_with_layers("other.example/a:1", &[("sha256:aa", 7)]),
+            source_with_layers("target.example/b:1", &[("sha256:aa", 7)]),
+        ];
+        let (source, size) = pick_blob_source(&sources, "sha256:aa", "target.example").unwrap();
+        assert_eq!(source.reference.api_host, "target.example");
+        assert_eq!(size, 7);
+    }
+
+    #[compio::test]
+    async fn blob_source_falls_back_to_a_carrier_on_another_registry() {
+        let sources = [
+            source_with_layers("target.example/b:1", &[("sha256:bb", 3)]),
+            source_with_layers("other.example/a:1", &[("sha256:aa", 9)]),
+        ];
+        let (source, size) = pick_blob_source(&sources, "sha256:aa", "target.example").unwrap();
+        assert_eq!(source.reference.api_host, "other.example");
+        assert_eq!(size, 9);
+        assert!(pick_blob_source(&sources, "sha256:cc", "target.example").is_none());
     }
 }

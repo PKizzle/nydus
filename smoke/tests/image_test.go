@@ -177,7 +177,11 @@ func testNydusifyCopy(t *testing.T, ctx tool.Context, source, target, logLevel, 
 }
 
 func (i *ImageTestSuite) TestGenerateChunkdicts() test.Generator {
-	images := []string{"redis:7.0.1", "redis:7.0.2", "redis:7.0.3"}
+	// The last image is held out for conversion; the rest train the dictionary.
+	// nydus-image trains on floor(70%) of an image's versions and only scores
+	// chunks repeated across training versions, so fewer than three training
+	// versions always produce an empty dictionary with no data blobs.
+	images := []string{"redis:7.0.1", "redis:7.0.2", "redis:7.0.3", "redis:7.0.4"}
 	var sources []string
 	for _, image := range images {
 		image = i.prepareImage(i.T, image)
@@ -237,6 +241,23 @@ func (i *ImageTestSuite) TestChundict(t *testing.T, ctx tool.Context, images []s
 	)
 	tool.RunWithoutOutput(t, generateCmd)
 	log.Println("generateCmd:", generateCmd)
+
+	// Publish the same dictionary under a different registry host. 127.0.0.1
+	// and localhost reach the same registry, but to nydusify they are different
+	// registries, so cross-repo mount is off the table and every dictionary blob
+	// has to be downloaded from its source and re-uploaded. The repository is
+	// new, so no blob is already linked there, and the registry refuses a
+	// manifest whose blobs are not in the repository: a successful generate
+	// proves they all arrived.
+	registryHost := strings.SplitN(testImage, "/", 2)[0]
+	crossRegistryHost := strings.Replace(registryHost, "localhost:", "127.0.0.1:", 1)
+	require.NotEqual(t, registryHost, crossRegistryHost, "smoke registry is expected at localhost")
+	crossRegistryChunkdict := fmt.Sprintf("%s/chunkdict-cross-registry:%s", crossRegistryHost, uuid.NewString())
+	crossRegistryCmd := fmt.Sprintf(
+		"%s %s chunkdict generate --sources %s --target %s --source-insecure --target-insecure --nydus-image %s --work-dir %s",
+		ctx.Binary.Nydusify, logLevel, targetsStr, crossRegistryChunkdict, ctx.Binary.Builder, filepath.Join(ctx.Env.WorkDir, "generate-cross-registry"),
+	)
+	tool.RunWithoutOutput(t, crossRegistryCmd)
 
 	// Covert test image by chunkdict.
 	target := fmt.Sprintf("%s-nydus-%s", testImage, uuid.NewString())
