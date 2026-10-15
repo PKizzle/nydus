@@ -1,8 +1,10 @@
 name: Miri Test
 
 on:
+  # `push` covers long-lived branches only; a feature branch runs through its pull request,
+  # so one push to a branch with an open pull request runs the suite once.
   push:
-    branches: ["**", "stable/**"]
+    branches: [master, production, "stable/**"]
     paths-ignore: [ '**.md', '**.png', '**.jpg', '**.svg', '**/docs/**' ]
   pull_request:
     branches: ["**", "stable/**"]

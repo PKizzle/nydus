@@ -1,8 +1,12 @@
 name: E2E Test With Dragonfly
 
 on:
+  # `push` covers long-lived branches only; a feature branch runs through its pull request.
+  # Both triggers share the concurrency group below, so a push run on a branch with an open
+  # pull request would be cancelled by the pull_request run and reported as failed.
   push:
-    branches: ["**", "stable/**"]
+    branches: [master, production, "stable/**"]
+    paths-ignore: ['**.md', '**.png', '**.jpg', '**.svg', '**/docs/**']
   pull_request:
     branches: ["**", "stable/**"]
     paths-ignore: ['**.md', '**.png', '**.jpg', '**.svg', '**/docs/**']
