@@ -136,6 +136,9 @@ pub enum Error {
     Vfs(#[from] VfsError),
 
     // fusedev
+    /// Reading the mount table (`getmntinfo`) failed.
+    #[error("failed to read the mount table, {0}")]
+    ReadMountTable(#[source] io::Error),
     #[error("failed to create FUSE server, {0}")]
     CreateFuseServer(io::Error),
     // Fuse session has been shutdown.
