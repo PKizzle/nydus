@@ -4,6 +4,7 @@
 
 use crate::meta::{BLOB_CCT_CHUNK_SIZE_MASK, BlobCompressionContext, BlobMetaChunkInfo};
 use crate::meta::{MetaError, MetaResult};
+use nydus_utils::filemap::FromMapped;
 
 const BLOB_CC_V1_CHUNK_COMP_OFFSET_MASK: u64 = 0xff_ffff_ffff;
 const BLOB_CC_V1_CHUNK_UNCOMP_OFFSET_MASK: u64 = 0xfff_ffff_f000;
@@ -22,6 +23,8 @@ pub struct BlobChunkInfoV1Ondisk {
     // 20bits: size (low), 4bits: size (high), offset: 40bits
     pub(crate) comp_info: u64,
 }
+
+unsafe impl FromMapped for BlobChunkInfoV1Ondisk {}
 
 impl BlobMetaChunkInfo for BlobChunkInfoV1Ondisk {
     fn compressed_offset(&self) -> u64 {
