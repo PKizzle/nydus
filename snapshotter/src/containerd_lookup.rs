@@ -96,12 +96,6 @@ struct CrictlImage {
 }
 
 #[derive(Deserialize)]
-struct OciIndex {
-    #[serde(default)]
-    manifests: Vec<OciDescriptor>,
-}
-
-#[derive(Deserialize)]
 struct OciManifest {
     #[serde(default)]
     layers: Vec<OciDescriptor>,
@@ -406,14 +400,12 @@ async fn walk_manifest_via_grpc(
         .with_context(|| format!("fetch manifest {digest}"))?;
     // Try as index first (multi-arch); if no `manifests` field, treat as
     // manifest. Recursion is bounded by OCI nesting (index → manifest).
-    if let Ok(index) = serde_json::from_slice::<OciIndex>(&bytes)
+    if let Ok(index) = serde_json::from_slice::<OciIndexWithPlatforms>(&bytes)
         && !index.manifests.is_empty()
     {
-        for child in index.manifests {
-            if let Err(e) =
-                Box::pin(walk_manifest_via_grpc(cs, &child.digest, image_ref, out)).await
-            {
-                debug!(child = %child.digest, error = %e, "child manifest fetch failed");
+        for child in walkable_children(&index) {
+            if let Err(e) = Box::pin(walk_manifest_via_grpc(cs, child, image_ref, out)).await {
+                debug!(child = %child, error = %e, "child manifest fetch failed");
             }
         }
         return Ok(());
@@ -544,19 +536,37 @@ async fn resolve_gzip_layers_via_grpc(
 /// Pick the index child matching the host architecture/OS. Pure so tests
 /// can pin the GOARCH translation.
 fn pick_host_arch_child(index: &OciIndexWithPlatforms) -> Option<String> {
-    let host_arch = registry_client::host_go_arch();
-    let host_os = std::env::consts::OS;
     index
         .manifests
         .iter()
-        .find(|child| {
-            child
-                .platform
-                .as_ref()
-                .map(|p| p.architecture == host_arch && p.os == host_os)
-                .unwrap_or(false)
-        })
+        .find(|child| is_host_platform(child))
         .map(|child| child.digest.clone())
+}
+
+/// Index children worth walking for the chainID map: every child matching
+/// the host architecture/OS (variants such as arm64/v8 all match), or every
+/// child when none does. containerd pulls only the host-platform child, so
+/// the others (foreign arches, `unknown/unknown` attestation manifests) are
+/// absent locally and each fetch is a wasted NotFound round-trip. The
+/// fallback keeps indices without platform info, and images pulled for a
+/// foreign platform, resolvable.
+fn walkable_children(index: &OciIndexWithPlatforms) -> Vec<&str> {
+    let host: Vec<&str> = index
+        .manifests
+        .iter()
+        .filter(|child| is_host_platform(child))
+        .map(|child| child.digest.as_str())
+        .collect();
+    if !host.is_empty() {
+        return host;
+    }
+    index.manifests.iter().map(|c| c.digest.as_str()).collect()
+}
+
+fn is_host_platform(child: &OciIndexEntry) -> bool {
+    child.platform.as_ref().is_some_and(|p| {
+        p.architecture == registry_client::host_go_arch() && p.os == std::env::consts::OS
+    })
 }
 
 /// Filter a manifest's layers down to the gzip data layers the auto-accel
@@ -618,7 +628,9 @@ struct OciIndexEntry {
 
 #[derive(Deserialize)]
 struct OciPlatform {
+    #[serde(default)]
     architecture: String,
+    #[serde(default)]
     os: String,
 }
 
@@ -693,12 +705,12 @@ fn walk_manifest_via_cli(
         &["ctr", "-n", "k8s.io", "content", "get", digest],
         &["k3s", "ctr", "-n", "k8s.io", "content", "get", digest],
     ])?;
-    if let Ok(index) = serde_json::from_slice::<OciIndex>(&bytes)
+    if let Ok(index) = serde_json::from_slice::<OciIndexWithPlatforms>(&bytes)
         && !index.manifests.is_empty()
     {
-        for child in index.manifests {
-            if let Err(e) = walk_manifest_via_cli(&child.digest, image_ref, out) {
-                debug!(child = %child.digest, error = %e, "child manifest fetch failed");
+        for child in walkable_children(&index) {
+            if let Err(e) = walk_manifest_via_cli(child, image_ref, out) {
+                debug!(child = %child, error = %e, "child manifest fetch failed");
             }
         }
         return Ok(());
@@ -817,6 +829,66 @@ fn run_first_ok(candidates: &[&[&str]]) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn index_from_json(json: serde_json::Value) -> OciIndexWithPlatforms {
+        serde_json::from_value(json).expect("valid index JSON")
+    }
+
+    fn entry(digest: &str, arch: &str, os: &str) -> serde_json::Value {
+        serde_json::json!({
+            "digest": digest,
+            "platform": { "architecture": arch, "os": os }
+        })
+    }
+
+    /// A multi-arch index lists foreign arches and attestation manifests
+    /// that containerd never pulls; only the host child is walked.
+    #[test]
+    fn walkable_children_keeps_only_host_platform() {
+        let host = registry_client::host_go_arch();
+        let os = std::env::consts::OS;
+        let foreign = if host == "amd64" { "s390x" } else { "amd64" };
+        let index = index_from_json(serde_json::json!({ "manifests": [
+            entry("sha256:foreign", foreign, os),
+            entry("sha256:host", host, os),
+            entry("sha256:ppc", "ppc64le", os),
+            entry("sha256:attest-host", "unknown", "unknown"),
+            entry("sha256:attest-foreign", "unknown", "unknown"),
+            entry("sha256:other-os", host, "windows"),
+        ]}));
+        assert_eq!(walkable_children(&index), vec!["sha256:host"]);
+        assert_eq!(pick_host_arch_child(&index).as_deref(), Some("sha256:host"));
+    }
+
+    /// Variants (arm64/v8 vs bare arm64) all match the host arch, so no
+    /// child that could be the host's manifest is dropped.
+    #[test]
+    fn walkable_children_keeps_every_host_variant() {
+        let host = registry_client::host_go_arch();
+        let os = std::env::consts::OS;
+        let index = index_from_json(serde_json::json!({ "manifests": [
+            entry("sha256:bare", host, os),
+            { "digest": "sha256:v8",
+              "platform": { "architecture": host, "os": os, "variant": "v8" } },
+            entry("sha256:foreign", "riscv-none", os),
+        ]}));
+        assert_eq!(walkable_children(&index), vec!["sha256:bare", "sha256:v8"]);
+    }
+
+    /// Without platform info (or with no host match) every child is walked.
+    #[test]
+    fn walkable_children_falls_back_to_all_without_host_match() {
+        let index = index_from_json(serde_json::json!({ "manifests": [
+            { "digest": "sha256:a" },
+            { "digest": "sha256:b", "platform": {} },
+            entry("sha256:c", "riscv-none", "plan9"),
+        ]}));
+        assert_eq!(
+            walkable_children(&index),
+            vec!["sha256:a", "sha256:b", "sha256:c"]
+        );
+        assert_eq!(pick_host_arch_child(&index), None);
+    }
 
     /// chainID computation is the contract with containerd's snapshot
     /// naming. `chain[0] = diff[0]`, `chain[i] = sha256(chain[i-1] + " " +

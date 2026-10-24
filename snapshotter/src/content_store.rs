@@ -36,7 +36,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tonic::Code;
 use tonic::metadata::MetadataValue;
-use tracing::{debug, instrument};
+use tracing::{debug, error, instrument};
 
 /// Generated containerd protos. Module nesting must match the protobuf
 /// package paths (`containerd.types`, `containerd.services.content.v1`,
@@ -411,8 +411,25 @@ impl ContentStoreClient {
     /// auto-accel manifest JSON). Goes through the Read RPC so we don't
     /// depend on on-disk layout for arbitrary content; for large gzip-layer
     /// blobs use `blob_path()` + a streaming reader instead.
-    #[instrument(level = "debug", skip(self), err)]
+    ///
+    /// A digest absent from the store is an expected outcome for callers
+    /// (e.g. index children of foreign platforms), so NotFound is logged at
+    /// debug; every other failure is logged at error. Read RPC errors keep
+    /// their `tonic::Status` in the chain so the code can be inspected.
+    #[instrument(level = "debug", skip(self))]
     pub async fn fetch_bytes(&self, digest: &str) -> Result<Vec<u8>> {
+        let result = self.read_bytes(digest).await;
+        if let Err(e) = &result {
+            if is_not_found(e) {
+                debug!(error = %e);
+            } else {
+                error!(error = %e);
+            }
+        }
+        result
+    }
+
+    async fn read_bytes(&self, digest: &str) -> Result<Vec<u8>> {
         let inner = self.inner.clone();
         let digest_owned = digest.to_string();
         blocking::unblock(move || {
@@ -428,12 +445,14 @@ impl ContentStoreClient {
                     .read(request)
                     .await
                     .map_err(|status| {
-                        anyhow::anyhow!("containerd Read({digest_owned}) failed: {status}")
+                        let msg = format!("containerd Read({digest_owned}) failed: {status}");
+                        anyhow::Error::new(status).context(msg)
                     })?
                     .into_inner();
                 let mut out = Vec::new();
                 while let Some(chunk) = response.message().await.map_err(|status| {
-                    anyhow::anyhow!("containerd Read({digest_owned}) stream failed: {status}")
+                    let msg = format!("containerd Read({digest_owned}) stream failed: {status}");
+                    anyhow::Error::new(status).context(msg)
                 })? {
                     out.extend_from_slice(&chunk.data);
                 }
@@ -702,6 +721,11 @@ fn attach_namespace<T>(request: &mut tonic::Request<T>, namespace: &str) -> Resu
     Ok(())
 }
 
+fn is_not_found(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<tonic::Status>()
+        .is_some_and(|s| s.code() == Code::NotFound)
+}
+
 fn sha256_of_bytes(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
@@ -765,6 +789,20 @@ mod tests {
                 "/var/lib/containerd/io.containerd.content.v1.content/blobs/sha256/abc123"
             )
         );
+    }
+
+    /// NotFound stays recognisable under the context `fetch_bytes` and its
+    /// callers attach; other codes and non-gRPC errors do not match.
+    #[test]
+    fn is_not_found_sees_status_through_context() {
+        let wrap = |status: tonic::Status| {
+            anyhow::Error::new(status)
+                .context("containerd Read(sha256:x) failed")
+                .context("fetch manifest sha256:x")
+        };
+        assert!(is_not_found(&wrap(tonic::Status::not_found("gone"))));
+        assert!(!is_not_found(&wrap(tonic::Status::unavailable("down"))));
+        assert!(!is_not_found(&anyhow::anyhow!("connect failed")));
     }
 
     #[test]
