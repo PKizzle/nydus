@@ -55,6 +55,7 @@ mod directory;
 mod merge;
 mod optimize_prefetch;
 mod stargz;
+mod tar_reader;
 mod tarball;
 
 /// Trait to generate a RAFS filesystem from the source.
@@ -313,7 +314,15 @@ impl TarBuilder {
                 match tmp_tree.get_child_idx(target_paths[idx].as_bytes()) {
                     Some(i) => {
                         if idx == target_paths_len - 1 {
-                            tmp_tree.children[i].set_node(node);
+                            // A later entry replaces an earlier one, as extraction does: a
+                            // directory over a directory keeps its entries, anything else
+                            // replaces the whole subtree.
+                            let child = &mut tmp_tree.children[i];
+                            if node.is_dir() && child.borrow_mut_node().is_dir() {
+                                child.set_node(node);
+                            } else {
+                                *child = Tree::new(node);
+                            }
                             break;
                         } else {
                             tmp_tree = &mut tmp_tree.children[i];

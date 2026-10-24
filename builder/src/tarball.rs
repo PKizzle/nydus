@@ -15,6 +15,7 @@
 //!   -- optionally dump file data associated with the tar header into RAFS data blob
 //! - arrange all generated RAFS nodes into a RAFS filesystem tree
 //! - dump the RAFS filesystem tree into RAFS metadata blob
+use std::collections::VecDeque;
 use std::ffi::{OsStr, OsString};
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, Read, Seek, SeekFrom};
@@ -23,7 +24,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use anyhow::{Context, Result, anyhow, bail};
-use tar::{Archive, Entry, EntryType, Header};
+use tar::{EntryType, Header};
 
 use nydus_rafs::metadata::RafsVersion;
 use nydus_rafs::metadata::inode::{InodeWrapper, RafsInodeFlags, RafsV6Inode};
@@ -46,6 +47,7 @@ use super::core::context::{
 };
 use super::core::node::{Node, NodeInfo};
 use super::core::tree::Tree;
+use super::tar_reader::{Member, Members};
 use super::{Builder, TarBuilder, build_bootstrap, dump_bootstrap, finalize_blob};
 
 enum CompressionType {
@@ -200,11 +202,7 @@ impl<'a> TarballTreeBuilder<'a> {
         };
 
         let is_seekable = reader.seekable();
-        let mut tar = Archive::new(reader);
-        tar.set_ignore_zeros(true);
-        tar.set_preserve_mtime(true);
-        tar.set_preserve_permissions(true);
-        tar.set_unpack_xattrs(true);
+        let mut members = Members::new(reader, is_seekable);
 
         // Prepare scratch buffer for dumping file data.
         if self.buf.len() < self.ctx.chunk_size as usize {
@@ -216,22 +214,25 @@ impl<'a> TarballTreeBuilder<'a> {
         let mut tree = Tree::new(root);
 
         // Generate RAFS node for each tar entry, and optionally adding missing parents.
-        let entries = if is_seekable {
-            tar.entries_with_seek()
-                .context("tarball: failed to read entries from tar")?
-        } else {
-            tar.entries()
-                .context("tarball: failed to read entries from tar")?
-        };
-        for entry in entries {
-            let mut entry = entry.context("tarball: failed to read entry from tar")?;
-            let path = entry
-                .path()
-                .context("tarball: failed to to get path from tar entry")?;
-            let path = PathBuf::from("/").join(path);
-            let path = path.components().as_path();
-            if !self.builder.is_stargz_special_files(path) {
-                self.parse_entry(&mut tree, &mut entry, path)?;
+        while let Some(member) = members
+            .next_member()
+            .context("tarball: failed to read entry from tar")?
+        {
+            let path = resolve_path(&tree, &clean_path(&member.path))
+                .with_context(|| format!("tarball: entry {}", show(&member.path)))?;
+            if member.header.entry_type().is_pax_global_extensions() {
+                // Apply ignores a global header, after removing whatever its name held and
+                // creating its parent directories.
+                // shortcut: only a header named at the root and naming nothing is accepted,
+                // which covers the `pax_global_header` of `git archive`.
+                if path.parent() != Some(Path::new("/")) || tree.get_node(&path).is_some() {
+                    bail!("tarball: unsupported pax global header {}", path.display());
+                }
+                continue;
+            }
+            // Apply ignores a member resolving to the root directory.
+            if path != Path::new("/") && !self.builder.is_stargz_special_files(&path) {
+                self.parse_entry(&mut tree, &member, &mut members.data(), &path)?;
             }
         }
 
@@ -246,10 +247,11 @@ impl<'a> TarballTreeBuilder<'a> {
     fn parse_entry<R: Read>(
         &mut self,
         tree: &mut Tree,
-        entry: &mut Entry<R>,
+        entry: &Member,
+        data: &mut R,
         path: &Path,
     ) -> Result<()> {
-        let header = entry.header();
+        let header = &entry.header;
         let entry_type = header.entry_type();
         if entry_type.is_gnu_longname() {
             return Err(anyhow!("tarball: unsupported gnu_longname from tar header"));
@@ -273,10 +275,10 @@ impl<'a> TarballTreeBuilder<'a> {
             ));
         }
 
-        let mut file_size = entry.size();
+        let mut file_size = entry.size;
         let name = Self::get_file_name(path)?;
         let mut mode = Self::get_mode(header)?;
-        let (mut uid, mut gid) = Self::get_uid_gid(self.ctx, header)?;
+        let (mut uid, mut gid) = Self::get_uid_gid(self.ctx, entry)?;
         let mut mtime = header.mtime().unwrap_or_default();
         let mut flags = match self.ctx.fs_version {
             RafsVersion::V5 => RafsInodeFlags::default(),
@@ -309,20 +311,17 @@ impl<'a> TarballTreeBuilder<'a> {
 
         // Parse symlink
         let (mut symlink, mut symlink_size) = if entry_type.is_symlink() {
-            let symlink_link_path = entry
-                .link_name()
-                .context("tarball: failed to get target path for tar symlink entry")?
-                .ok_or_else(|| anyhow!("tarball: failed to get symlink target for tar entry"))?;
-            let symlink_size = symlink_link_path.as_os_str().byte_size();
+            if entry.link.is_empty() {
+                bail!("tarball: failed to get symlink target for tar entry");
+            }
+            let symlink_link_path = OsStr::from_bytes(&entry.link);
+            let symlink_size = symlink_link_path.byte_size();
             if symlink_size > u16::MAX as usize {
                 bail!("tarball: symlink target from tar entry is too big");
             }
             file_size = symlink_size as u64;
             flags |= RafsInodeFlags::SYMLINK;
-            (
-                Some(symlink_link_path.as_os_str().to_owned()),
-                symlink_size as u16,
-            )
+            (Some(symlink_link_path.to_owned()), symlink_size as u16)
         } else {
             (None, 0)
         };
@@ -337,51 +336,30 @@ impl<'a> TarballTreeBuilder<'a> {
 
         // Parse xattrs
         let mut xattrs = RafsXAttrs::new();
-        if let Some(exts) = entry.pax_extensions()? {
-            for p in exts {
-                match p {
-                    Ok(pax) => {
-                        let prefix = b"SCHILY.xattr.";
-                        let key = pax.key_bytes();
-                        if key.starts_with(prefix) {
-                            let x_key = OsStr::from_bytes(&key[prefix.len()..]);
-                            xattrs.add(x_key.to_os_string(), pax.value_bytes().to_vec())?;
-                        }
-                    }
-                    Err(e) => {
-                        return Err(anyhow!(
-                            "tarball: failed to parse PaxExtension from tar header, {}",
-                            e
-                        ));
-                    }
-                }
+        for (key, value) in &entry.pax {
+            if let Some(x_key) = key.strip_prefix(b"SCHILY.xattr.") {
+                xattrs.add(OsStr::from_bytes(x_key).to_os_string(), value.clone())?;
             }
         }
 
         // Handle hardlink ino
         let mut hardlink_target = None;
         let ino = if entry_type.is_hard_link() {
-            let link_path = entry
-                .link_name()
-                .context("tarball: failed to get target path for tar hardlink entry")?
-                .ok_or_else(|| anyhow!("tarball: failed to get hardlink target for tar entry"))?;
-            let link_path = PathBuf::from("/").join(link_path);
-            let link_path = link_path.components().as_path();
-            let targets = Node::generate_target_vec(link_path);
-            assert!(!targets.is_empty());
-            let mut tmp_tree: &Tree = tree;
-            for name in &targets[1..] {
-                match tmp_tree.get_child_idx(name.as_bytes()) {
-                    Some(idx) => tmp_tree = &tmp_tree.children[idx],
-                    None => {
-                        bail!(
-                            "tarball: unknown target {} for hardlink {}",
-                            link_path.display(),
-                            path.display()
-                        );
-                    }
-                }
+            if entry.link.is_empty() {
+                bail!("tarball: failed to get hardlink target for tar entry");
             }
+            // Like containerd's `hardlinkRootPath`, the link name is resolved as it is, not
+            // cleaned first, and its last component is not followed.
+            let link_path = resolve_path(tree, &entry.link)
+                .with_context(|| format!("tarball: hardlink target {}", show(&entry.link)))?;
+            let link_path = link_path.as_path();
+            let Some(tmp_tree) = tree.get_node(link_path) else {
+                bail!(
+                    "tarball: unknown target {} for hardlink {}",
+                    link_path.display(),
+                    path.display()
+                );
+            };
             let mut tmp_node = tmp_tree.borrow_mut_node();
             if tmp_node.is_reg() {
                 hardlink_target = Some(tmp_tree);
@@ -521,7 +499,7 @@ impl<'a> TarballTreeBuilder<'a> {
                 self.ctx,
                 self.blob_mgr,
                 self.blob_writer,
-                Some(entry),
+                Some(data),
                 &mut self.buf,
             )?;
         }
@@ -534,16 +512,11 @@ impl<'a> TarballTreeBuilder<'a> {
         self.builder.insert_into_tree(tree, node)
     }
 
-    fn get_uid_gid(ctx: &BuildContext, header: &Header) -> Result<(u32, u32)> {
-        let uid = if ctx.explicit_uidgid {
-            header.uid().unwrap_or_default()
+    fn get_uid_gid(ctx: &BuildContext, entry: &Member) -> Result<(u32, u32)> {
+        let (uid, gid) = if ctx.explicit_uidgid {
+            (entry.uid, entry.gid)
         } else {
-            0
-        };
-        let gid = if ctx.explicit_uidgid {
-            header.gid().unwrap_or_default()
-        } else {
-            0
+            (0, 0)
         };
         if uid > u32::MAX as u64 || gid > u32::MAX as u64 {
             bail!(
@@ -613,6 +586,86 @@ impl<'a> TarballTreeBuilder<'a> {
             Ok((CompressionType::None, buf_reader))
         }
     }
+}
+
+/// Most symlinks followed while resolving one member name, as in continuity's `fs.RootPath`.
+const MAX_SYMLINKS: usize = 255;
+
+fn show(p: &[u8]) -> String {
+    String::from_utf8_lossy(p).into_owned()
+}
+
+/// Cleans a member name lexically, as containerd's `filepath.Clean` does before resolving it:
+/// `.` and empty components go, and `..` removes the component before it, never the root.
+fn clean_path(name: &[u8]) -> Vec<u8> {
+    let mut out: Vec<&[u8]> = Vec::new();
+    for c in name.split(|&b| b == b'/') {
+        match c {
+            b"" | b"." => {}
+            b".." => {
+                out.pop();
+            }
+            c => out.push(c),
+        }
+    }
+    out.join(&b'/')
+}
+
+/// Resolves a member name to the absolute path containerd's `archive.Apply` lands it on:
+/// relative to the root of the layer, `..` stops at the root, and each leading component that
+/// is a symlink from an earlier member is followed within the root, while the last component
+/// is not. Only symlinks of this layer are known, the layers below it are not.
+fn resolve_path(tree: &Tree, name: &[u8]) -> Result<PathBuf> {
+    let mut pending: VecDeque<Vec<u8>> = name.split(|&b| b == b'/').map(<[u8]>::to_vec).collect();
+    // `trees[i]` is the tree at `resolved[..i]`, `None` once a component does not exist.
+    let mut resolved: Vec<Vec<u8>> = Vec::new();
+    let mut trees: Vec<Option<&Tree>> = vec![Some(tree)];
+    let mut followed = 0;
+    while let Some(c) = pending.pop_front() {
+        match c.as_slice() {
+            b"" | b"." => continue,
+            b".." => {
+                if resolved.pop().is_some() {
+                    trees.pop();
+                }
+                continue;
+            }
+            _ => {}
+        }
+        let child =
+            trees[trees.len() - 1].and_then(|t| t.get_child_idx(&c).map(|i| &t.children[i]));
+        resolved.push(c);
+        trees.push(child);
+        if pending.is_empty() {
+            break;
+        }
+        let Some(child) = child else { continue };
+        let node = child.borrow_mut_node();
+        if node.is_dir() {
+            continue;
+        }
+        let Some(target) = node.info.symlink.clone().filter(|_| node.is_symlink()) else {
+            bail!("{} is not a directory", show(&resolved.join(&b'/')));
+        };
+        followed += 1;
+        if followed > MAX_SYMLINKS {
+            bail!("too many levels of symbolic links");
+        }
+        resolved.pop();
+        trees.pop();
+        if target.as_bytes().starts_with(b"/") {
+            resolved.clear();
+            trees.truncate(1);
+        }
+        for c in target.as_bytes().split(|&b| b == b'/').rev() {
+            pending.push_front(c.to_vec());
+        }
+    }
+    let mut path = PathBuf::from("/");
+    for c in &resolved {
+        path.push(OsStr::from_bytes(c));
+    }
+    Ok(path)
 }
 
 /// Builder to create RAFS filesystems from tarballs.
@@ -858,15 +911,14 @@ mod tests {
     }
 
     fn build_tree(ctx: &mut BuildContext) -> Result<Tree> {
+        build_tree_as(ctx, ConversionType::TarToRafs)
+    }
+
+    fn build_tree_as(ctx: &mut BuildContext, ty: ConversionType) -> Result<Tree> {
         let mut blob_mgr = BlobManager::new(digest::Algorithm::Sha256, false);
         let mut blob_writer: Box<dyn Artifact> = Box::<NoopArtifactWriter>::default();
-        let mut tree_builder = TarballTreeBuilder::new(
-            ConversionType::TarToRafs,
-            ctx,
-            &mut blob_mgr,
-            blob_writer.as_mut(),
-            0,
-        );
+        let mut tree_builder =
+            TarballTreeBuilder::new(ty, ctx, &mut blob_mgr, blob_writer.as_mut(), 0);
         tree_builder.build_tree()
     }
 
@@ -1109,8 +1161,8 @@ mod tests {
         tar.finish().unwrap();
 
         let mut ctx = create_context(source_path, RafsVersion::V6);
-        let err = build_tree(&mut ctx).err().unwrap();
-        assert!(err.to_string().contains("PaxExtension"), "{}", err);
+        let err = format!("{:#}", build_tree(&mut ctx).err().unwrap());
+        assert!(err.contains("bad PAX record"), "{}", err);
     }
 
     #[test]
@@ -1309,5 +1361,419 @@ mod tests {
         assert_eq!(xattr_count(&sb, "foo-link"), 0);
         assert_eq!(xattr_count(&sb, "zzz1"), 0);
         assert_eq!(xattr_count(&sb, "zzz2"), 0);
+    }
+
+    // Layer tars below are written byte by byte, because the `tar` crate's writer refuses
+    // most of the member names and records that containerd's `archive.Apply` has to cope with.
+    const REG: u8 = b'0';
+    const LINK: u8 = b'1';
+    const SYMLINK: u8 = b'2';
+    const DIR: u8 = b'5';
+
+    fn octal(field: &mut [u8], value: u64) {
+        let s = format!("{:0width$o}\0", value, width = field.len() - 1);
+        field.copy_from_slice(s.as_bytes());
+    }
+
+    fn pax_record(key: &str, value: &[u8]) -> Vec<u8> {
+        // "<len> <key>=<value>\n", where <len> counts the whole record including itself.
+        let body = [b" ", key.as_bytes(), b"=", value, b"\n"].concat();
+        let mut len = body.len() + 1;
+        while (len.to_string().len() + body.len()) != len {
+            len = len.to_string().len() + body.len();
+        }
+        [len.to_string().as_bytes(), &body].concat()
+    }
+
+    #[derive(Default)]
+    struct RawTar(Vec<u8>);
+
+    impl RawTar {
+        fn member(
+            mut self,
+            typeflag: u8,
+            name: &[u8],
+            link: &[u8],
+            mode: u64,
+            data: &[u8],
+        ) -> Self {
+            let mut h = [0u8; 512];
+            h[..name.len()].copy_from_slice(name);
+            octal(&mut h[100..108], mode);
+            octal(&mut h[108..116], 0);
+            octal(&mut h[116..124], 0);
+            octal(&mut h[124..136], data.len() as u64);
+            octal(&mut h[136..148], 0);
+            h[156] = typeflag;
+            h[157..157 + link.len()].copy_from_slice(link);
+            h[257..263].copy_from_slice(b"ustar\0");
+            h[263..265].copy_from_slice(b"00");
+            octal(&mut h[329..337], 0);
+            octal(&mut h[337..345], 0);
+            h[148..156].fill(b' ');
+            let sum: u64 = h.iter().map(|&b| b as u64).sum();
+            h[148..156].copy_from_slice(format!("{:06o}\0 ", sum).as_bytes());
+            self.0.extend_from_slice(&h);
+            self.0.extend_from_slice(data);
+            self.0.resize(self.0.len().div_ceil(512) * 512, 0);
+            self
+        }
+        fn reg(self, name: &str, data: &[u8]) -> Self {
+            self.member(REG, name.as_bytes(), b"", 0o644, data)
+        }
+        fn dir(self, name: &str) -> Self {
+            self.member(DIR, name.as_bytes(), b"", 0o755, b"")
+        }
+        fn sym(self, name: &str, target: &str) -> Self {
+            self.member(SYMLINK, name.as_bytes(), target.as_bytes(), 0o777, b"")
+        }
+        fn link(self, name: &str, target: &str) -> Self {
+            self.member(LINK, name.as_bytes(), target.as_bytes(), 0o644, b"")
+        }
+        fn pax(self, typeflag: u8, records: &[(&str, &[u8])]) -> Self {
+            let body: Vec<u8> = records.iter().flat_map(|(k, v)| pax_record(k, v)).collect();
+            self.member(typeflag, b"PaxHeaders/member", b"", 0o644, &body)
+        }
+        fn finish(mut self) -> Vec<u8> {
+            self.0.extend_from_slice(&[0u8; 1024]);
+            self.0
+        }
+    }
+
+    fn layer_ctx(tar: &[u8]) -> (vmm_sys_util::tempdir::TempDir, BuildContext) {
+        let tmp_dir = vmm_sys_util::tempdir::TempDir::new().unwrap();
+        let source_path = tmp_dir.as_path().join("layer.tar");
+        std::fs::write(&source_path, tar).unwrap();
+        let ctx = create_context(source_path, RafsVersion::V6);
+        (tmp_dir, ctx)
+    }
+
+    fn build_layer(tar: &[u8]) -> Bootstrap {
+        let (_tmp, mut ctx) = layer_ctx(tar);
+        build_rafs(&mut ctx)
+    }
+
+    fn build_layer_err(tar: &[u8]) -> String {
+        let (_tmp, mut ctx) = layer_ctx(tar);
+        format!(
+            "{:#}",
+            build_tree(&mut ctx).err().expect("layer must be rejected")
+        )
+    }
+
+    // Every path in the tree with its file type, in DFS order.
+    fn outline(bootstrap: &Bootstrap) -> Vec<String> {
+        let mut out = Vec::new();
+        bootstrap
+            .tree
+            .walk_dfs_pre(&mut |t| {
+                let node = t.borrow_mut_node();
+                out.push(format!("{} {}", node.target().display(), node.file_type()));
+                Ok(())
+            })
+            .unwrap();
+        out
+    }
+
+    #[test]
+    fn test_pax_path_and_linkpath_may_hold_newlines() {
+        // PAX records are length-prefixed, so a value may contain '\n'.
+        let tar = RawTar::default()
+            .pax(b'x', &[("path", b"a\nb")])
+            .reg("placeholder", b"data")
+            .pax(b'x', &[("linkpath", b"x\ny")])
+            .sym("s", "placeholder")
+            .finish();
+        let bootstrap = build_layer(&tar);
+        assert_eq!(get_node(&bootstrap, "/a\nb").inode.size(), 4);
+        assert!(bootstrap.tree.get_node(Path::new("/placeholder")).is_none());
+        let s = get_node(&bootstrap, "/s");
+        assert_eq!(s.info.symlink, Some(OsString::from("x\ny")));
+    }
+
+    #[test]
+    fn test_pax_xattr_may_hold_newlines() {
+        let tar = RawTar::default()
+            .pax(
+                b'x',
+                &[
+                    ("SCHILY.xattr.user.k", b"v\nw"),
+                    ("SCHILY.xattr.user.other", b"z"),
+                ],
+            )
+            .reg("f", b"data")
+            .finish();
+        let bootstrap = build_layer(&tar);
+        let f = get_node(&bootstrap, "/f");
+        assert_eq!(
+            f.info
+                .xattrs
+                .get(OsStr::new("user.k"))
+                .map(|v| v.as_slice()),
+            Some(&b"v\nw"[..])
+        );
+        assert_eq!(
+            f.info
+                .xattrs
+                .get(OsStr::new("user.other"))
+                .map(|v| v.as_slice()),
+            Some(&b"z"[..])
+        );
+    }
+
+    #[test]
+    fn test_pax_sparse_1_0_is_rejected() {
+        // GNU sparse 1.0: the map is stored in front of the data, the real name in a record.
+        let data = b"1\n0\n4\n".to_vec();
+        let mut data = data;
+        data.resize(512, 0);
+        data.extend_from_slice(b"abcd");
+        let tar = RawTar::default()
+            .pax(
+                b'x',
+                &[
+                    ("GNU.sparse.major", b"1"),
+                    ("GNU.sparse.minor", b"0"),
+                    ("GNU.sparse.name", b"sparse"),
+                    ("GNU.sparse.realsize", b"8192"),
+                ],
+            )
+            .reg("GNUSparseFile.0/sparse", &data)
+            .finish();
+        let err = build_layer_err(&tar);
+        assert!(err.contains("sparse"), "{}", err);
+    }
+
+    #[test]
+    fn test_pax_sparse_0_1_is_rejected() {
+        let tar = RawTar::default()
+            .pax(
+                b'x',
+                &[
+                    ("GNU.sparse.size", b"8192"),
+                    ("GNU.sparse.numblocks", b"1"),
+                    ("GNU.sparse.map", b"4096,4"),
+                ],
+            )
+            .reg("GNUSparseFile.0/sparse", b"abcd")
+            .finish();
+        let err = build_layer_err(&tar);
+        assert!(err.contains("sparse"), "{}", err);
+    }
+
+    #[test]
+    fn test_member_names_resolve_lexically_within_root() {
+        let tar = RawTar::default()
+            .reg("./a//b/../c", b"c")
+            .reg("/etc/x", b"x")
+            .reg("../escape", b"e")
+            .reg("../../a/../up", b"u")
+            .finish();
+        let bootstrap = build_layer(&tar);
+        assert_eq!(
+            outline(&bootstrap),
+            [
+                "/ dir",
+                "/a dir",
+                "/a/c file",
+                "/escape file",
+                "/etc dir",
+                "/etc/x file",
+                "/up file",
+            ]
+        );
+    }
+
+    #[test]
+    fn test_member_names_resolve_through_earlier_symlinks() {
+        let tar = RawTar::default()
+            .sym("a", "/")
+            .reg("a/evil", b"1")
+            .sym("b", "..")
+            .reg("b/evil2", b"2")
+            .dir("d/")
+            .sym("l", "d")
+            .reg("l/f", b"3")
+            .sym("m", "../../d/../d")
+            .reg("m/g", b"4")
+            .finish();
+        let bootstrap = build_layer(&tar);
+        assert_eq!(
+            outline(&bootstrap),
+            [
+                "/ dir",
+                "/a symlink",
+                "/b symlink",
+                "/d dir",
+                "/d/f file",
+                "/d/g file",
+                "/evil file",
+                "/evil2 file",
+                "/l symlink",
+                "/m symlink",
+            ]
+        );
+    }
+
+    #[test]
+    fn test_symlink_loop_is_rejected() {
+        let tar = RawTar::default().sym("l", "l/x").reg("l/f", b"").finish();
+        let err = build_layer_err(&tar);
+        assert!(err.contains("symbolic links"), "{}", err);
+    }
+
+    #[test]
+    fn test_parent_regular_file_is_rejected() {
+        let tar = RawTar::default().reg("x", b"").reg("x/y", b"").finish();
+        let err = build_layer_err(&tar);
+        assert!(err.contains("not a directory"), "{}", err);
+    }
+
+    #[test]
+    fn test_hardlink_target_resolves_through_symlink() {
+        let tar = RawTar::default()
+            .dir("etc/")
+            .reg("etc/passwd", b"root")
+            .sym("l", "/etc")
+            .link("p", "l/passwd")
+            .finish();
+        let bootstrap = build_layer(&tar);
+        let passwd = get_node(&bootstrap, "/etc/passwd");
+        let p = get_node(&bootstrap, "/p");
+        assert!(p.is_hardlink());
+        assert_eq!(p.inode.ino(), passwd.inode.ino());
+    }
+
+    #[test]
+    fn test_later_duplicate_member_wins() {
+        let tar = RawTar::default()
+            .reg("f", b"AAAA")
+            .reg("f", b"BB")
+            .dir("d/")
+            .reg("d/x", b"")
+            .reg("d", b"file")
+            .dir("e/")
+            .reg("e/y", b"")
+            .dir("e/")
+            .finish();
+        let bootstrap = build_layer(&tar);
+        assert_eq!(get_node(&bootstrap, "/f").inode.size(), 2);
+        assert_eq!(
+            outline(&bootstrap),
+            ["/ dir", "/d file", "/e dir", "/e/y file", "/f file"]
+        );
+    }
+
+    #[test]
+    fn test_hardlink_keeps_inode_of_overwritten_target() {
+        // The link names the inode holding "AAAA"; replacing `f` afterwards unlinks only `f`.
+        let tar = RawTar::default()
+            .reg("f", b"AAAA")
+            .link("h", "f")
+            .reg("f", b"BB")
+            .finish();
+        let bootstrap = build_layer(&tar);
+        let f = get_node(&bootstrap, "/f");
+        let h = get_node(&bootstrap, "/h");
+        assert_eq!(f.inode.size(), 2);
+        assert_eq!(h.inode.size(), 4);
+        assert_ne!(f.inode.ino(), h.inode.ino());
+        assert_eq!(f.inode.nlink(), 1);
+        assert_eq!(h.inode.nlink(), 1);
+    }
+
+    #[test]
+    fn test_root_member_is_ignored() {
+        // Apply skips a member resolving to the root, so its metadata never lands.
+        let tar = RawTar::default()
+            .member(DIR, b"./", b"", 0o700, b"")
+            .reg("f", b"")
+            .finish();
+        let bootstrap = build_layer(&tar);
+        let root = get_node(&bootstrap, "/");
+        assert_eq!(root.inode.mode() & 0o7777, 0o755);
+    }
+
+    #[test]
+    fn test_pax_global_header_is_ignored() {
+        // `git archive` writes one of these in front of every archive.
+        let tar = RawTar::default()
+            .member(
+                b'g',
+                b"pax_global_header",
+                b"",
+                0o666,
+                &pax_record("comment", b"0123abcd"),
+            )
+            .reg("f", b"")
+            .finish();
+        let bootstrap = build_layer(&tar);
+        assert_eq!(outline(&bootstrap), ["/ dir", "/f file"]);
+    }
+
+    #[test]
+    fn test_members_after_end_of_archive_are_ignored() {
+        let mut tar = RawTar::default().reg("f", b"").finish();
+        tar.extend_from_slice(&RawTar::default().reg("hidden", b"").finish());
+        let bootstrap = build_layer(&tar);
+        assert_eq!(outline(&bootstrap), ["/ dir", "/f file"]);
+    }
+
+    #[test]
+    fn test_tar_ref_chunk_offsets_follow_pax_headers() {
+        // In tar-ref (and zran) mode chunks address the original stream, so a member read
+        // through PAX headers must report the offset its data really has in the tar.
+        let mut tar = pax_payload_tar();
+        // Whatever follows the end-of-archive marker is no member, but still part of the blob.
+        tar.extend_from_slice(&RawTar::default().reg("hidden", b"").finish());
+        let (_tmp, mut ctx) = layer_ctx(&tar);
+        ctx.conversion_type = ConversionType::TarToRef;
+        ctx.blob_features.insert(BlobFeatures::SEPARATE);
+        let tree = build_tree_as(&mut ctx, ConversionType::TarToRef).unwrap();
+        let node = get_tree_node(&tree, "/long\nname");
+        let offset = node.chunks[0].inner.compressed_offset() as usize;
+        assert_eq!(&tar[offset..offset + 7], b"payload");
+        assert!(tree.get_node(Path::new("/hidden")).is_none());
+        assert_eq!(
+            ctx.blob_tar_reader.as_ref().unwrap().position(),
+            tar.len() as u64
+        );
+    }
+
+    fn pax_payload_tar() -> Vec<u8> {
+        RawTar::default()
+            .pax(
+                b'x',
+                &[("path", b"long\nname"), ("SCHILY.xattr.user.k", b"v")],
+            )
+            .reg("placeholder", b"payload")
+            .finish()
+    }
+
+    fn get_tree_node(tree: &Tree, path: &str) -> Node {
+        tree.get_node(Path::new(path))
+            .unwrap()
+            .borrow_mut_node()
+            .clone()
+    }
+
+    #[test]
+    fn test_targz_ref_reads_members_through_pax_headers() {
+        let tar = pax_payload_tar();
+        let gz = compress::compress(&tar, compress::Algorithm::GZip)
+            .unwrap()
+            .0;
+        let (_tmp, mut ctx) = layer_ctx(&gz);
+        ctx.conversion_type = ConversionType::TargzToRef;
+        ctx.blob_features.insert(BlobFeatures::SEPARATE);
+        let tree = build_tree_as(&mut ctx, ConversionType::TargzToRef).unwrap();
+        let node = get_tree_node(&tree, "/long\nname");
+        assert_eq!(node.chunks.len(), 1);
+        let chunk = &node.chunks[0].inner;
+        assert!(chunk.is_compressed());
+        assert_eq!(
+            chunk.id(),
+            &RafsDigest::from_buf(b"payload", digest::Algorithm::Sha256)
+        );
     }
 }
