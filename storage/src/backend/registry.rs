@@ -158,6 +158,23 @@ fn respond(resp: request::Response, catch_status: bool) -> RegistryResult<reques
     }
 }
 
+/// Check the status of a blob GET that carried `Range: <range>` starting at `offset`.
+///
+/// Only `206 Partial Content` carries the requested range. A server or proxy that ignores
+/// `Range` answers `200` with the whole blob, which is the requested data only when the
+/// range starts at offset 0; anything else would put bytes from the wrong offset into the
+/// cache. A 3xx here is a redirect that was not followed and carries no blob data.
+fn check_range_status(status: StatusCode, offset: u64, range: &str) -> RegistryResult<()> {
+    if status == StatusCode::PARTIAL_CONTENT || (status == StatusCode::OK && offset == 0) {
+        return Ok(());
+    }
+    Err(RegistryBackendError::Request(
+        ConnectionError::ErrorWithMsg(format!(
+            "unexpected HTTP {status} response to Range {range}"
+        )),
+    ))
+}
+
 #[derive(Default)]
 struct Cache(RwLock<String>);
 
@@ -940,14 +957,7 @@ impl RegistryReader {
                 // Try read again only once
                 return self._try_read(buf, offset, false, context);
             }
-            if !is_success_status(status) {
-                return Err(RegistryBackendError::Request(
-                    ConnectionError::ErrorWithMsg(format!(
-                        "unexpected status {} reading blob from cached redirect",
-                        status
-                    )),
-                ));
-            }
+            check_range_status(status, offset, &range)?;
             return Ok(written);
         }
 
@@ -1049,15 +1059,7 @@ impl RegistryReader {
                         buf,
                     )
                     .map_err(request_err_to_registry)?;
-                if !is_success_status(rstatus) {
-                    return Err(RegistryBackendError::Request(
-                        ConnectionError::ErrorWithMsg(format!(
-                            "unexpected status {} reading blob from redirect {}",
-                            rstatus,
-                            location.as_str()
-                        )),
-                    ));
-                }
+                check_range_status(rstatus, offset, &range)?;
                 trace!(
                     "redirect cache for blob={}, status={}",
                     self.blob_id, status
@@ -1067,14 +1069,19 @@ impl RegistryReader {
                     .set(self.blob_id.clone(), location.as_str().to_string());
                 return Ok(written);
             }
-            // `need_redirect` but no `location` header: fall through and let the
-            // copy below surface the (degenerate) response as-is.
+            // `need_redirect` but no `location` header: rejected below as a non-range status.
         } else {
             resp = respond(resp, true)?;
         }
 
+        let status = resp.status();
+        check_range_status(status, offset, &range)?;
         resp.copy_to(buf)
-            .map_err(|e| RegistryBackendError::Transport(std::io::Error::other(e)))
+            .map_err(|e| {
+                RegistryBackendError::Transport(std::io::Error::other(format!(
+                    "HTTP {status} response to Range {range}; copying blob body failed: {e}"
+                )))
+            })
             .map(|size| size as usize)
     }
 
@@ -1098,8 +1105,8 @@ impl RegistryReader {
 
         // Only add Range header if offset > 0 (open-ended range to stream from offset).
         // When offset == 0: NO Range header — dfdaemon downloads full blob and caches it.
+        let range = format!("bytes={}-", offset);
         if offset > 0 {
-            let range = format!("bytes={}-", offset);
             headers.insert("Range", range.parse().unwrap());
         }
 
@@ -1112,13 +1119,7 @@ impl RegistryReader {
             context,
         )?;
 
-        let status = resp.status();
-        if !is_success_status(status) {
-            return Err(RegistryBackendError::Common(format!(
-                "stream_read failed, status: {}",
-                status,
-            )));
-        }
+        check_range_status(resp.status(), offset, &range)?;
 
         Ok(resp.reader())
     }
@@ -2550,6 +2551,82 @@ mod tests {
             2,
             "the relative Location must resolve into a fetchable redirect request"
         );
+    }
+
+    /// Serve `response` to every request on a fresh port; returns the address and a stop flag.
+    #[cfg(feature = "backend-registry")]
+    fn serve_canned(response: String) -> (std::net::SocketAddr, Arc<AtomicBool>) {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown_srv = shutdown.clone();
+        thread::spawn(move || {
+            listener.set_nonblocking(true).unwrap();
+            while !shutdown_srv.load(Ordering::Relaxed) {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    thread::sleep(std::time::Duration::from_millis(5));
+                    continue;
+                };
+                stream.set_nonblocking(false).unwrap();
+                let mut buf = [0u8; 2048];
+                if stream.read(&mut buf).unwrap_or(0) == 0 {
+                    continue;
+                }
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+        (addr, shutdown)
+    }
+
+    #[cfg(feature = "backend-registry")]
+    #[test]
+    fn test_range_read_rejects_responses_that_ignore_the_range() {
+        const BLOB: &[u8] = b"0123456789abcdefghij";
+        let read_at = |response: String, offset: u64, len: usize| {
+            let (addr, shutdown) = serve_canned(response);
+            let config = RegistryConfig {
+                scheme: "http".to_string(),
+                host: addr.to_string(),
+                repo: "library/test".to_string(),
+                retry_limit: 0,
+                timeout: 5,
+                connect_timeout: 5,
+                ..Default::default()
+            };
+            let registry = Registry::new(&config, Some("test-range-status")).unwrap();
+            let reader = registry.get_reader("sha256:abc").unwrap();
+            let mut buf = vec![0u8; len];
+            let res = reader.try_read(&mut buf, offset).map(|n| buf[..n].to_vec());
+            shutdown.store(true, Ordering::Relaxed);
+            res
+        };
+        let full = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            BLOB.len(),
+            String::from_utf8_lossy(BLOB)
+        );
+
+        // A server ignoring `Range` returns the whole blob from offset 0: correct only
+        // when the requested range starts there.
+        assert_eq!(read_at(full.clone(), 0, 5).unwrap(), &BLOB[..5]);
+        let err = read_at(full, 10, 5).unwrap_err();
+        assert!(err.to_string().contains("200"), "{err}");
+
+        let partial = "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 10-14/20\r\n\
+                       Content-Length: 5\r\nConnection: close\r\n\r\nabcde"
+            .to_string();
+        assert_eq!(read_at(partial, 10, 5).unwrap(), b"abcde");
+
+        // A redirect without `Location` carries no blob data.
+        let redirect = "HTTP/1.1 307 Temporary Redirect\r\nContent-Length: 5\r\n\
+                        Connection: close\r\n\r\nnoise"
+            .to_string();
+        let err = read_at(redirect, 0, 5).unwrap_err();
+        assert!(err.to_string().contains("307"), "{err}");
     }
 
     #[test]
