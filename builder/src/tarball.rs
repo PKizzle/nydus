@@ -1712,6 +1712,31 @@ mod tests {
     }
 
     #[test]
+    fn test_header_only_members_have_no_data() {
+        // Go reads no data for link, device, directory and fifo members whatever their size
+        // field says, so the next header follows right after theirs.
+        let mut tar = RawTar::default().sym("s", "f").reg("f", b"").finish();
+        octal(&mut tar[124..136], 512);
+        tar[148..156].fill(b' ');
+        let sum: u64 = tar[..512].iter().map(|&b| b as u64).sum();
+        tar[148..156].copy_from_slice(format!("{:06o}\0 ", sum).as_bytes());
+        let bootstrap = build_layer(&tar);
+        assert_eq!(outline(&bootstrap), ["/ dir", "/f file", "/s symlink"]);
+    }
+
+    #[test]
+    fn test_legacy_trailing_slash_member_is_directory() {
+        // A type '\0' member whose name ends in '/' is a directory, as Go reads it.
+        let tar = RawTar::default()
+            .member(0, b"d/", b"", 0o750, b"")
+            .reg("d/x", b"")
+            .finish();
+        let bootstrap = build_layer(&tar);
+        assert_eq!(outline(&bootstrap), ["/ dir", "/d dir", "/d/x file"]);
+        assert_eq!(get_node(&bootstrap, "/d").inode.mode() & 0o7777, 0o750);
+    }
+
+    #[test]
     fn test_members_after_end_of_archive_are_ignored() {
         let mut tar = RawTar::default().reg("f", b"").finish();
         tar.extend_from_slice(&RawTar::default().reg("hidden", b"").finish());

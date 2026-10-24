@@ -128,10 +128,20 @@ impl<R: Read + Seek> Members<R> {
             if let Some(link) = long_link {
                 member.link = link;
             }
-            if member.size != size {
-                self.data_left = member.size;
-                self.pad = (BLOCK - member.size % BLOCK) % BLOCK;
+            // Legacy archives mark a directory with a trailing slash on a type '\0' member.
+            if member.header.as_bytes()[156] == 0 && member.path.ends_with(b"/") {
+                member.header.set_entry_type(tar::EntryType::Directory);
             }
+            // Go's `isHeaderOnlyType`: these members have no data, whatever their size field
+            // says, and the next header follows right after theirs.
+            if matches!(
+                member.header.entry_type().as_byte(),
+                b'1' | b'2' | b'3' | b'4' | b'5' | b'6'
+            ) {
+                member.size = 0;
+            }
+            self.data_left = member.size;
+            self.pad = (BLOCK - member.size % BLOCK) % BLOCK;
             return Ok(Some(member));
         }
     }
