@@ -39,7 +39,7 @@ use nydus_utils::{
 };
 
 use crate::metadata::{
-    DOT, DOTDOT, Inode, RafsInode, RafsInodeWalkAction, RafsSuper, RafsSuperMeta,
+    DOT, DOTDOT, Inode, RAFS_MAX_NAME, RafsInode, RafsInodeWalkAction, RafsSuper, RafsSuperMeta,
 };
 use crate::prefetch::BlobPrefetcher;
 use crate::{RafsError, RafsIoReader, RafsResult};
@@ -61,7 +61,7 @@ pub const RAFS_DEFAULT_ENTRY_TIMEOUT: u64 = RAFS_DEFAULT_ATTR_TIMEOUT;
 /// is a warning.
 fn fuse_err(e: RafsError) -> Error {
     let errno = e.errno();
-    if matches!(errno, libc::ENOENT | libc::ENOTDIR) {
+    if matches!(errno, libc::ENOENT | libc::ENOTDIR | libc::ENAMETOOLONG) {
         debug!("rafs: {} (answering errno {})", e, errno);
     } else {
         warn!("rafs: {} (answering errno {})", e, errno);
@@ -641,6 +641,13 @@ impl FileSystem for Rafs {
     fn lookup(&self, _ctx: &Context, ino: u64, name: &CStr) -> Result<Entry> {
         let mut rec = FopRecorder::settle(Lookup, ino, &self.ios);
         let target = OsStr::from_bytes(name.to_bytes());
+        // FUSE only enforces FUSE_NAME_MAX (1024), not the 255 bytes statfs advertises.
+        if target.len() > RAFS_MAX_NAME {
+            return Err(fuse_err(RafsError::NameTooLong(format!(
+                "lookup of a {}-byte name",
+                target.len()
+            ))));
+        }
         let parent = self.sb.get_inode(ino, self.digest_validate)?;
         if !parent.is_dir() {
             return Err(Error::from_raw_os_error(libc::ENOTDIR));
@@ -814,7 +821,7 @@ impl FileSystem for Rafs {
 
         // This matches the behavior of libfuse as it returns these values if the
         // filesystem doesn't implement this method.
-        st.f_namemax = 255;
+        st.f_namemax = RAFS_MAX_NAME as _;
         st.f_bsize = 512;
         st.f_fsid = self.sb.meta.magic as u64;
         #[cfg(target_os = "macos")]
@@ -1205,6 +1212,32 @@ mod tests {
             i_gid: 1000,
             i_time: 12345678,
         }
+    }
+
+    #[test]
+    fn test_lookup_name_too_long() {
+        use std::ffi::CString;
+        use std::path::PathBuf;
+
+        use nydus_api::ConfigV2;
+
+        let root_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap();
+        let path = PathBuf::from(root_dir).join("../tests/texture/bootstrap/rafs-v6-2.2.boot");
+        let (sb, _) =
+            RafsSuper::load_from_file(path, Arc::new(ConfigV2::default()), false).unwrap();
+        let root = sb.superblock.root_ino();
+        let rafs = Rafs {
+            sb: Arc::new(sb),
+            ..make_test_rafs()
+        };
+
+        let name = CString::new("a".repeat(255)).unwrap();
+        let entry = rafs.lookup(&Context::default(), root, &name).unwrap();
+        assert_eq!(entry.inode, 0, "a missing name is a negative entry");
+
+        let name = CString::new("a".repeat(256)).unwrap();
+        let err = rafs.lookup(&Context::default(), root, &name).unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(libc::ENAMETOOLONG));
     }
 
     #[test]

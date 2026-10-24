@@ -102,6 +102,10 @@ pub enum RafsError {
     /// The operation requires a directory and the inode is not one.
     #[error("{0}")]
     NotDirectory(String),
+    /// A name component is longer than `RAFS_MAX_NAME` (255) bytes, the limit EROFS and
+    /// `statfs` advertise.
+    #[error("{0}")]
+    NameTooLong(String),
     /// A table, index or handle referenced by the metadata is unusable.
     #[error("{0}")]
     BadDescriptor(String),
@@ -152,6 +156,7 @@ impl RafsError {
         match self {
             RafsError::NotFound(_) => libc::ENOENT,
             RafsError::NotDirectory(_) => libc::ENOTDIR,
+            RafsError::NameTooLong(_) => libc::ENAMETOOLONG,
             RafsError::BadDescriptor(_) => libc::EBADF,
             RafsError::PermissionDenied(_) => libc::EACCES,
             RafsError::Unsupported => libc::EOPNOTSUPP,
@@ -471,6 +476,7 @@ mod tests {
         let cases: Vec<(RafsError, i32)> = vec![
             (RafsError::NotFound("x".into()), libc::ENOENT),
             (RafsError::NotDirectory("x".into()), libc::ENOTDIR),
+            (RafsError::NameTooLong("x".into()), libc::ENAMETOOLONG),
             (RafsError::BadDescriptor("x".into()), libc::EBADF),
             (RafsError::PermissionDenied("x".into()), libc::EACCES),
             (RafsError::Unsupported, libc::EOPNOTSUPP),
