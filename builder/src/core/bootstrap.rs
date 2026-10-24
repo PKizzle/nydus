@@ -7,8 +7,9 @@ use anyhow::{Context, Error, Result};
 use nydus_utils::digest::{self, RafsDigest};
 use std::ops::Deref;
 
+use nydus_rafs::RafsError;
 use nydus_rafs::metadata::layout::{RAFS_V5_ROOT_INODE, RafsBlobTable};
-use nydus_rafs::metadata::{RafsSuper, RafsSuperConfig, RafsSuperFlags};
+use nydus_rafs::metadata::{RAFS_MAX_NAME, RafsSuper, RafsSuperConfig, RafsSuperFlags};
 
 use crate::{ArtifactStorage, BlobManager, BootstrapContext, BootstrapManager, BuildContext, Tree};
 
@@ -109,6 +110,16 @@ impl Bootstrap {
         for child in tree.children.iter_mut() {
             let child_node = child.node.clone();
             let mut child_node = child_node.borrow_mut();
+            // Every tree source (directory, tar, stargz, merged bootstraps) passes through here.
+            // The kernel rejects a whole EROFS dirent block holding a longer name as corrupt.
+            if child.name().len() > RAFS_MAX_NAME {
+                return Err(RafsError::NameTooLong(format!(
+                    "name of {} is {} bytes, longer than the {RAFS_MAX_NAME}-byte limit",
+                    child_node.target().display(),
+                    child.name().len()
+                ))
+                .into());
+            }
             let index = bootstrap_ctx.generate_next_ino();
             child_node.index = index;
             if ctx.fs_version.is_v5() {
@@ -209,5 +220,72 @@ impl Bootstrap {
         // of lower node to layered_chunk_dict for chunk deduplication on next.
         Tree::from_bootstrap(&rs, &mut blob_mgr.layered_chunk_dict)
             .context("failed to build tree from bootstrap")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use nydus_rafs::metadata::RafsVersion;
+    use nydus_utils::compress;
+    use vmm_sys_util::tempdir::TempDir;
+
+    use super::*;
+    use crate::attributes::Attributes;
+    use crate::{Builder, ConversionType, Features, Prefetch, TarballBuilder, WhiteoutSpec};
+
+    fn build_tar_with_name(version: RafsVersion, name: &str) -> Result<()> {
+        let tmp = TempDir::new().unwrap();
+        let tar_path = tmp.as_path().join("layer.tar");
+        let mut tar = tar::Builder::new(std::fs::File::create(&tar_path).unwrap());
+        let mut header = tar::Header::new_gnu();
+        header.set_size(0);
+        header.set_mode(0o644);
+        header.set_entry_type(tar::EntryType::Regular);
+        tar.append_data(&mut header, format!("dir/{name}"), &[][..])
+            .unwrap();
+        tar.into_inner().unwrap();
+
+        let mut ctx = BuildContext::new(
+            "test".to_string(),
+            true,
+            0,
+            compress::Algorithm::None,
+            digest::Algorithm::Sha256,
+            true,
+            WhiteoutSpec::Oci,
+            ConversionType::TarToRafs,
+            tar_path,
+            Prefetch::default(),
+            None,
+            None,
+            false,
+            Features::new(),
+            false,
+            Attributes::default(),
+        );
+        ctx.fs_version = version;
+        let bootstrap = tmp.as_path().join("bootstrap");
+        let mut bootstrap_mgr =
+            BootstrapManager::new(Some(ArtifactStorage::SingleFile(bootstrap)), None);
+        let mut blob_mgr = BlobManager::new(digest::Algorithm::Sha256, false);
+        TarballBuilder::new(ConversionType::TarToRafs)
+            .build(&mut ctx, &mut bootstrap_mgr, &mut blob_mgr)
+            .map(|_| ())
+    }
+
+    #[test]
+    fn test_reject_name_longer_than_255_bytes() {
+        for version in [RafsVersion::V5, RafsVersion::V6] {
+            build_tar_with_name(version, &"a".repeat(255)).unwrap();
+
+            let err = build_tar_with_name(version, &"a".repeat(256)).unwrap_err();
+            assert!(
+                matches!(
+                    err.chain().find_map(|e| e.downcast_ref::<RafsError>()),
+                    Some(RafsError::NameTooLong(_))
+                ),
+                "{version:?}: {err:#}"
+            );
+        }
     }
 }
