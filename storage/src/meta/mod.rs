@@ -542,20 +542,25 @@ impl BlobCompressionContextInfo {
             )));
         }
 
-        let mut filemap = FileMapState::new(file, 0, expected_size, enable_write).map_err(|e| {
+        let filemap = FileMapState::new(file, 0, expected_size, enable_write).map_err(|e| {
             MetaError::io(format!("failed to mmap blob meta file {}", meta_path), e)
         })?;
         let base = filemap
             .validate_range(0, expected_size)
             .map_err(|e| MetaError::io("blob meta file is shorter than its header claims", e))?;
-        let header = filemap
-            .get_mut::<BlobCompressionContextHeader>(aligned_uncompressed_size)
-            .map_err(|e| MetaError::io("failed to reach the blob meta header", e))?;
+        let header =
+            unsafe { filemap.get_ref::<BlobCompressionContextHeader>(aligned_uncompressed_size) }
+                .map_err(|e| MetaError::io("failed to reach the blob meta header", e))?;
         if !Self::validate_header(blob_info, header)? {
             if let Some(reader) = reader {
                 let buffer =
                     unsafe { std::slice::from_raw_parts_mut(base as *mut u8, expected_size) };
                 Self::read_metadata(blob_info, reader, buffer)?;
+                // Re-read: no header reference may live across the write above.
+                let header = unsafe {
+                    filemap.get_ref::<BlobCompressionContextHeader>(aligned_uncompressed_size)
+                }
+                .map_err(|e| MetaError::io("failed to reach the blob meta header", e))?;
                 if !Self::validate_header(blob_info, header)? {
                     return Err(MetaError::NotFound(
                         "blob meta header is still invalid after re-reading it".to_string(),
@@ -585,10 +590,12 @@ impl BlobCompressionContextInfo {
         };
 
         if blob_info.has_feature(BlobFeatures::BATCH) {
-            let header = state
-                .blob_meta_file_map
-                .get_mut::<BlobCompressionContextHeader>(aligned_uncompressed_size)
-                .map_err(|e| MetaError::io("failed to reach the blob meta header", e))?;
+            let header = unsafe {
+                state
+                    .blob_meta_file_map
+                    .get_ref::<BlobCompressionContextHeader>(aligned_uncompressed_size)
+            }
+            .map_err(|e| MetaError::io("failed to reach the blob meta header", e))?;
             let inflate_offset = header.s_ci_zran_offset as usize;
             let inflate_count = header.s_ci_zran_count as usize;
             let batch_inflate_size = inflate_count * size_of::<BatchInflateContext>();
@@ -605,10 +612,12 @@ impl BlobCompressionContextInfo {
             };
             state.batch_info_array = ManuallyDrop::new(array);
         } else if blob_info.has_feature(BlobFeatures::ZRAN) {
-            let header = state
-                .blob_meta_file_map
-                .get_mut::<BlobCompressionContextHeader>(aligned_uncompressed_size)
-                .map_err(|e| MetaError::io("failed to reach the blob meta header", e))?;
+            let header = unsafe {
+                state
+                    .blob_meta_file_map
+                    .get_ref::<BlobCompressionContextHeader>(aligned_uncompressed_size)
+            }
+            .map_err(|e| MetaError::io("failed to reach the blob meta header", e))?;
             let zran_offset = header.s_ci_zran_offset as usize;
             let zran_count = header.s_ci_zran_count as usize;
             let ci_zran_size = header.s_ci_zran_size as usize;
