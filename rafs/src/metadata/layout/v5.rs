@@ -384,6 +384,27 @@ pub struct RafsV5InodeTable {
     pub data: Vec<u32>,
 }
 
+/// Get inode offset in the metadata blob of an inode from a Rafs v5 inode table.
+pub(crate) fn rafsv5_inode_offset(table: &[u32], ino: Inode) -> RafsResult<u32> {
+    if ino == 0 || ino > table.len() as u64 {
+        return Err(RafsError::NotFound(format!(
+            "v5: inode number {} is out of range of the inode table ({} entries)",
+            ino,
+            table.len()
+        )));
+    }
+
+    let offset = u32::from_le(table[(ino - 1) as usize]) as usize;
+    if offset <= (RAFSV5_SUPERBLOCK_SIZE >> 3) || offset >= (1usize << 29) {
+        return Err(RafsError::InvalidMetadata(format!(
+            "invalid offset 0x{:x} for inode {}",
+            offset, ino
+        )));
+    }
+
+    Ok((offset << 3) as u32)
+}
+
 impl RafsV5InodeTable {
     /// Create a new instance of `RafsV5InodeTable`.
     pub fn new(entries: usize) -> Self {
@@ -435,23 +456,7 @@ impl RafsV5InodeTable {
 
     /// Get inode offset in the metadata blob of an inode.
     pub fn get(&self, ino: Inode) -> RafsResult<u32> {
-        if ino == 0 || ino > self.data.len() as u64 {
-            return Err(RafsError::NotFound(format!(
-                "v5: inode number {} is out of range of the inode table ({} entries)",
-                ino,
-                self.data.len()
-            )));
-        }
-
-        let offset = u32::from_le(self.data[(ino - 1) as usize]) as usize;
-        if offset <= (RAFSV5_SUPERBLOCK_SIZE >> 3) || offset >= (1usize << 29) {
-            return Err(RafsError::InvalidMetadata(format!(
-                "invalid offset 0x{:x} for inode {}",
-                offset, ino
-            )));
-        }
-
-        Ok((offset << 3) as u32)
+        rafsv5_inode_offset(&self.data, ino)
     }
 
     /// Load inode offset table for a `RafsIoReader` object.

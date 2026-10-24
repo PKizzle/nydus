@@ -149,7 +149,6 @@ impl BatchContextGenerator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::mem::ManuallyDrop;
 
     #[test]
     fn test_batch_inflate_context() {
@@ -184,15 +183,12 @@ mod tests {
         generator.add_context(4);
 
         let (ctx_data, _) = generator.to_vec().unwrap();
-        let ctx_vec = unsafe {
-            ManuallyDrop::new(Vec::from_raw_parts(
-                ctx_data.as_slice().as_ptr() as *mut BatchInflateContext,
-                1,
-                1,
-            ))
-        };
-        assert_eq!(ctx_vec[0].compressed_size(), 4);
-        assert_eq!(ctx_vec[0].uncompressed_batch_size(), 4);
+        assert_eq!(ctx_data.len(), size_of::<BatchInflateContext>());
+        // `ctx_data` is a byte buffer with no alignment guarantee for the context.
+        let ctx =
+            unsafe { std::ptr::read_unaligned(ctx_data.as_ptr() as *const BatchInflateContext) };
+        assert_eq!(ctx.compressed_size(), 4);
+        assert_eq!(ctx.uncompressed_batch_size(), 4);
 
         generator.clear_chunk_data_buf();
         assert!(generator.chunk_data_buf_is_empty());
