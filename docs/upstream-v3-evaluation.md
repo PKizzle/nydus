@@ -1,8 +1,15 @@
 # Evaluating upstream's `v3` branch
 
 *Assessed against `upstream/v3` @ `3f9e12ed`, re-checked at tags `v3.0.0-alpha.1` and
-`v3.0.0-beta.1` (`fc2c3dfc`), last at branch head `02156def` (240 commits). Re-check before acting
-on any of this — the branch is still moving.*
+`v3.0.0-beta.1` (`fc2c3dfc`) and `v3.0.0-beta.3` (`bdff19e9`), last at branch head `8e92cc2f`
+(266 commits). Re-check before acting on any of this — the branch is still moving.*
+
+> **Re-checked at `v3.0.0-beta.3` / `8e92cc2f`.** Decision unchanged: `git grep -i zran upstream/v3`
+> and `git grep -il snapshotter upstream/v3 -- '*.rs'` are both still empty, and tokio still drives
+> the registry backend, which `ca510d2c` rewrote around a `Transport` trait. Beyond that the range
+> adds a diskless chunk-group cache (`fac658de`), FUSE hot-upgrade via `fuser` session handoff
+> (`28c051c0`..`8e92cc2f`) and a Rust port of Go `archive/tar` plus `archive.Apply` semantics
+> (`1090eb8f`). Comparing those fixes with this tree found defects 7–11 below.
 
 > **Re-checked at `v3.0.0-beta.1` / `02156def`.** Beta was the trigger to revisit; the decision
 > below still holds, because neither precondition for adopting v3 is met:
@@ -117,9 +124,31 @@ Two more from checking v3's beta fixes against the same areas here:
 6. **Unchecked 32-bit arithmetic in the v6 superblock writer.** A blob's end block address
    (`mapped_blkaddr + cnt`) could wrap where the running block-count check passed, and the root
    nid was truncated with `as u16`. Both now fail the build. v3's `74f703c7` is the analogue; its
-   other layout fixes (`e26a629c` build-time field, `5ca6e942` symlink inlining, `4155bdda`
-   compact-inode mtime, `c10fbbeb` hardlinks across merge) do not apply here.
+   other layout fixes (`e26a629c` build-time field, `5ca6e942` symlink inlining, `c10fbbeb`
+   hardlinks across merge) do not apply here.
    ([builder/src/core/v6.rs](../builder/src/core/v6.rs))
+
+Five more from the `beta.3` range:
+
+7. **Layer tars were not read the way containerd applies them** (`1090eb8f`, `02156def`). The
+   `tar` crate split PAX records at newlines, took PAX sparse files for regular files holding the
+   sparse map, and applied members after the end-of-archive marker; the builder kept `..`
+   components (a panic), attached members beneath symlinks instead of resolving through them, and
+   gave a regular file children. `builder/src/tar_reader.rs` now reads members as Go's
+   `archive/tar` does, `builder/src/tarball.rs` resolves names lexically and through earlier
+   symlinks within the root, and PAX sparse files are rejected.
+8. **A chunk map could outlive its data file.** The cache GC evicts files one by one, so a blob's
+   `.blob.data` could go while its `.chunk_map` stayed; the next open created a sparse data file
+   under a map marking chunks ready, served as zeros (`c9c9f714`'s stale group map). The file cache
+   now drops such a map and the GC evicts the pair together.
+9. **`WWW-Authenticate` parsing** (`ca510d2c`): panicked on non-ASCII bytes, matched schemes case
+   sensitively, required the optional `service`, cut values at `=` and preferred Basic over
+   Bearer. Both the nydusd backend and `registry-client` now parse a challenge list.
+10. **Names over 255 bytes** (`b331d530`) built into images the kernel rejects with
+    `EFSCORRUPTED`, and FUSE lookup answered them with a cached `ENOENT`. The build now fails and
+    lookup answers `ENAMETOOLONG`.
+11. **Compact v6 inodes would drop mtime** (`4155bdda`). No builder emits compact inodes today, but
+    `v6_set_inode_compact` now keeps an inode extended unless its mtime is the epoch.
 
 ## Where we are ahead
 
@@ -210,16 +239,12 @@ Ranked. None of these require adopting v3's format.
 6. **Test cases we lack**, from `tests/integration/fanotify_test.go`: range-boundedness measured via
    allocated blocks on the sparse cache, warm re-read allocating ~nothing, and a fanotify-vs-FUSE
    perf harness with cold-page columns.
-7. **Build layer tars the way containerd applies them** (v3 `02156def`). The tarball builder
-   diverges from `archive.Apply` in two places: `builder/src/tarball.rs` keeps `..` path
-   components (`Path::components().as_path()` does not strip `ParentDir`), and
-   `insert_into_tree` (`builder/src/lib.rs`) attaches a member `a/b/f` beneath a node `a` even
-   when `a` is a symlink, where containerd resolves through it. On the transparent-accel path a
-   silently different tree is the worst possible failure, so the cheap guard comes first: reject
-   `..` components and members whose parent resolves to a symlink, and let the image fall back to
-   plain overlay. Full `archive.Apply` fidelity (including which hardlink member's metadata wins
-   on the shared inode) is the larger follow-up. Nydusify's own archive extraction already rejects
-   `ParentDir` (`nydusify/src/engine/oci_archive.rs`).
+7. **Rest of `archive.Apply` fidelity.** Names resolve through symlinks of their own layer only;
+   containerd resolves against the whole rootfs, so a layer writing `lib/foo` over a lower layer's
+   `lib -> usr/lib` still diverges (the per-layer builder has no view of lower layers). Also not
+   modelled: PAX `mtime`, xattr filtering (`trusted.*`, `user.*` on special files), setgid parent
+   groups, directory mtime restamping, invalid whiteout names, and which hardlink member's
+   metadata wins on the shared inode.
 
 Not worth porting: concurrent multi-blob reads (`c66b591b`; our per-blob loop in
 `rafs/src/fs.rs` only matters for chunk-dict files spanning blobs, never on the fanotify path),
