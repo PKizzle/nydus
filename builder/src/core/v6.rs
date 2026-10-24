@@ -85,13 +85,17 @@ impl Node {
     }
 
     /// Update whether compact mode can be used for this inode or not.
+    ///
+    /// A compact inode has no mtime field: readers (and the kernel) report the superblock build
+    /// time, which is always 0, so only an inode whose mtime is exactly the epoch may be compact.
     pub fn v6_set_inode_compact(&mut self) {
         self.v6_compact_inode = !(self.info.v6_force_extended_inode
             || self.inode.uid() > u16::MAX as u32
             || self.inode.gid() > u16::MAX as u32
             || self.inode.nlink() > u16::MAX as u32
             || self.inode.size() > u32::MAX as u64
-            || self.path().extension() == Some(OsStr::new("pyc")));
+            || self.inode.mtime() != 0
+            || self.inode.mtime_nsec() != 0);
     }
 
     /// Layout the normal inode (except directory inode) into the meta blob.
@@ -951,6 +955,7 @@ mod tests {
     fn test_set_v6_offset() {
         let pa = TempDir::new().unwrap();
         let pa_aa = TempFile::new_in(pa.as_path()).unwrap();
+        pa_aa.as_file().set_modified(std::time::UNIX_EPOCH).unwrap();
         let mut node = Node::from_fs_object(
             RafsVersion::V6,
             pa.as_path().to_path_buf(),
@@ -1072,40 +1077,32 @@ mod tests {
 
     #[test]
     fn test_set_v6_inode_compact() {
+        use std::time::{Duration, UNIX_EPOCH};
+
+        // A compact inode has no mtime field; it reads back as the superblock build time (0).
         let pa = TempDir::new().unwrap();
-        let pa_reg = TempFile::new_in(pa.as_path()).unwrap();
-        let pa_pyc = pa.as_path().join("foo.pyc");
-        let _ = File::create(&pa_pyc).unwrap();
-
-        let reg_node = Node::from_fs_object(
-            RafsVersion::V6,
-            pa.as_path().to_path_buf(),
-            pa_reg.as_path().to_path_buf(),
-            Overlay::UpperAddition,
-            RAFS_DEFAULT_CHUNK_SIZE as u32,
-            0,
-            false,
-            false,
-        )
-        .unwrap();
-
-        assert!(reg_node.v6_compact_inode);
-
-        let pyc_node = Node::from_fs_object(
-            RafsVersion::V6,
-            pa.as_path().to_path_buf(),
-            pa_pyc.as_path().to_path_buf(),
-            Overlay::UpperAddition,
-            RAFS_DEFAULT_CHUNK_SIZE as u32,
-            0,
-            false,
-            false,
-        )
-        .unwrap();
-
-        assert!(!pyc_node.v6_compact_inode);
-
-        std::fs::remove_file(&pa_pyc).unwrap();
+        let cases = [
+            ("secs", UNIX_EPOCH + Duration::new(1_700_000_000, 0), false),
+            ("nsecs", UNIX_EPOCH + Duration::new(0, 1), false),
+            ("epoch", UNIX_EPOCH, true),
+            ("epoch.pyc", UNIX_EPOCH, true),
+        ];
+        for (name, mtime, compact) in cases {
+            let path = pa.as_path().join(name);
+            File::create(&path).unwrap().set_modified(mtime).unwrap();
+            let node = Node::from_fs_object(
+                RafsVersion::V6,
+                pa.as_path().to_path_buf(),
+                path,
+                Overlay::UpperAddition,
+                RAFS_DEFAULT_CHUNK_SIZE as u32,
+                0,
+                false,
+                false,
+            )
+            .unwrap();
+            assert_eq!(node.v6_compact_inode, compact, "{name}");
+        }
     }
 
     fn devtable_blob(uncompressed_blocks: u64) -> Arc<BlobInfo> {
