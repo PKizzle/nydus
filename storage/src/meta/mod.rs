@@ -960,12 +960,22 @@ impl BlobCompressionContextInfo {
             // time, the memory consumption and performance impact are relatively
             // small.
             let mut uncompressed = vec![0u8; uncompressed_size as usize];
-            compress::decompress(
+            let decompressed_size = compress::decompress(
                 &decrypted,
                 &mut uncompressed,
                 blob_info.meta_ci_compressor(),
             )
             .map_err(|e| MetaError::io("failed to decompress the blob meta data", e))?;
+            // LZ4 and zstd report a short output as success; the zero-filled tail would read as
+            // empty chunk info entries.
+            if decompressed_size != uncompressed.len() {
+                return Err(MetaError::Corrupted(format!(
+                    "blob meta for blob {} decompressed to {} bytes, expect {}",
+                    blob_info.blob_id(),
+                    decompressed_size,
+                    uncompressed.len()
+                )));
+            }
             Cow::Owned(uncompressed)
         } else {
             decrypted

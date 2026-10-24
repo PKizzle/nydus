@@ -494,4 +494,58 @@ mod tests {
         assert_eq!(&buffer[0x1000..], header.as_bytes());
         assert_eq!(&buffer[0..uncompressed_size], data);
     }
+
+    #[test]
+    fn test_read_metadata_rejects_short_decompression() {
+        // Enough repetitive entries that every algorithm actually compresses them.
+        let chunks = vec![
+            BlobChunkInfoV1Ondisk {
+                uncomp_info: 0x01ff_f000_0000_0000,
+                comp_info: 0x00ff_f000_0000_0000,
+            };
+            64
+        ];
+        let data = unsafe {
+            std::slice::from_raw_parts(
+                chunks.as_ptr() as *const u8,
+                chunks.len() * std::mem::size_of::<BlobChunkInfoV1Ondisk>(),
+            )
+        };
+
+        for algo in [compress::Algorithm::Lz4Block, compress::Algorithm::Zstd] {
+            let temp = TempFile::new().unwrap();
+            let (buf, compressed) = compress::compress(data, algo).unwrap();
+            assert!(compressed);
+            temp.as_file().write_all(&buf).unwrap();
+            let header = BlobCompressionContextHeader::default();
+            temp.as_file().write_all(header.as_bytes()).unwrap();
+
+            let mut blob_info = BlobInfo::new(
+                0,
+                "dummy".to_string(),
+                0,
+                0,
+                RAFS_MAX_CHUNK_SIZE as u32,
+                0,
+                BlobFeatures::default(),
+            );
+            // The header claims one chunk info entry more than the compressed stream holds.
+            let claimed = data.len() + std::mem::size_of::<BlobChunkInfoV1Ondisk>();
+            blob_info.set_blob_meta_info(0, buf.len() as u64, claimed as u64, algo as u32);
+
+            let reader: Arc<dyn BlobReader> = Arc::new(DummyBlobReader {
+                metrics: BackendMetrics::new("dummy", "localfs"),
+                file: temp.as_file().try_clone().unwrap(),
+            });
+            let meta = TempFile::new().unwrap();
+            let err =
+                BlobCompressionContextInfo::read_metadata(&blob_info, &reader, meta.as_file())
+                    .unwrap_err();
+            assert!(
+                matches!(err, crate::meta::MetaError::Corrupted(_)),
+                "{algo}: {err}"
+            );
+            assert_eq!(std::fs::metadata(meta.as_path()).unwrap().len(), 0);
+        }
+    }
 }
