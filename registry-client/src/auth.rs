@@ -209,18 +209,36 @@ pub fn auth_header_value(auth: &str) -> Result<HeaderValue> {
 }
 
 /// Parse a `WWW-Authenticate` header value into a [`BearerChallenge`].
-/// Returns `None` for non-Bearer schemes (e.g. `Basic realm=...`) or a
-/// challenge without a realm.
+/// Returns `None` when the header has no Bearer challenge (e.g. only
+/// `Basic realm=...`) or the Bearer challenge has no realm. The header may
+/// list several challenges; scheme and parameter names are case-insensitive.
 pub fn parse_bearer_challenge(value: &str) -> Option<BearerChallenge> {
-    let value = value.trim();
-    let params = value.strip_prefix("Bearer ")?;
+    let mut in_bearer = false;
+    let mut seen_bearer = false;
     let mut realm = None;
     let mut service = None;
     let mut scope = None;
-    for part in split_header_params(params) {
-        let (key, raw_value) = part.split_once('=')?;
+    for part in split_header_params(value) {
+        // A part whose first token is not followed by `=` starts a new challenge.
+        let first_end = part.find([' ', '\t', '=']).unwrap_or(part.len());
+        let param = if part[first_end..].trim_start().starts_with('=') {
+            part
+        } else {
+            if seen_bearer {
+                break;
+            }
+            in_bearer = part[..first_end].eq_ignore_ascii_case("Bearer");
+            seen_bearer = in_bearer;
+            part[first_end..].trim()
+        };
+        if !in_bearer {
+            continue;
+        }
+        let Some((key, raw_value)) = param.split_once('=') else {
+            continue;
+        };
         let decoded = raw_value.trim().trim_matches('"').to_string();
-        match key.trim() {
+        match key.trim().to_ascii_lowercase().as_str() {
             "realm" => realm = Some(decoded),
             "service" => service = Some(decoded),
             "scope" => scope = Some(decoded),
@@ -483,6 +501,33 @@ mod tests {
     fn bearer_challenge_parser_rejects_basic_and_missing_realm() {
         assert!(parse_bearer_challenge(r#"Basic realm="registry""#).is_none());
         assert!(parse_bearer_challenge(r#"Bearer service="registry""#).is_none());
+    }
+
+    #[test]
+    fn bearer_challenge_parser_handles_challenge_lists_and_case() {
+        let parsed =
+            parse_bearer_challenge(r#"bearer REALM="https://auth.local/token",Service="s""#)
+                .unwrap();
+        assert_eq!(parsed.realm, "https://auth.local/token");
+        assert_eq!(parsed.service.as_deref(), Some("s"));
+
+        // Bearer after another challenge, and another challenge after Bearer whose
+        // params must not leak into it.
+        let parsed = parse_bearer_challenge(
+            r#"Basic realm="b", Bearer realm="https://auth.local/token",service="s""#,
+        )
+        .unwrap();
+        assert_eq!(parsed.realm, "https://auth.local/token");
+        let parsed =
+            parse_bearer_challenge(r#"Bearer realm="https://auth.local/token", Basic realm="b""#)
+                .unwrap();
+        assert_eq!(parsed.realm, "https://auth.local/token");
+        assert_eq!(parsed.service, None);
+
+        // A malformed parameter is skipped instead of discarding the challenge.
+        let parsed =
+            parse_bearer_challenge(r#"Bearer realm="https://auth.local/token",junk"#).unwrap();
+        assert_eq!(parsed.realm, "https://auth.local/token");
     }
 
     #[test]

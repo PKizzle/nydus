@@ -440,6 +440,12 @@ pub trait BlobCache: Send + Sync {
     }
 
     /// Validate chunk data.
+    ///
+    /// When digest validation is enabled (by local configuration or `force_validation`),
+    /// the chunk data is always verified against its cryptographic digest. The xxh3/CRC32
+    /// checksums are only a lightweight transport check when digest validation is disabled:
+    /// their flags and values come from the blob meta, which is fetched from the backend
+    /// and not authenticated, so they must never decide whether the digest gets checked.
     fn validate_chunk_data(
         &self,
         chunk: &dyn BlobChunkInfo,
@@ -448,32 +454,33 @@ pub trait BlobCache: Send + Sync {
     ) -> StorageResult<usize> {
         let d_size = chunk.uncompressed_size() as usize;
         if buffer.len() != d_size {
-            Err(StorageError::InvalidData(
+            return Err(StorageError::InvalidData(
                 "uncompressed size and buffer size doesn't match".to_string(),
-            ))
-        } else if (self.need_validation()
-            || chunk.has_xxh3()
-            || chunk.has_crc32()
-            || force_validation)
-            && !self.is_legacy_stargz()
-            && !self.check_digest(chunk, buffer)
-        {
-            Err(StorageError::InvalidData(
-                "data digest value doesn't match".to_string(),
-            ))
-        } else {
-            Ok(d_size)
+            ));
         }
-    }
+        if self.is_legacy_stargz() {
+            return Ok(d_size);
+        }
 
-    fn check_digest(&self, chunk: &dyn BlobChunkInfo, buffer: &[u8]) -> bool {
-        if chunk.has_xxh3() {
-            check_xxh3(buffer, chunk.xxh3())
-        } else if chunk.has_crc32() {
-            check_crc(buffer, chunk.crc32())
-        } else {
-            check_hash(buffer, chunk.chunk_id(), self.blob_digester())
+        if self.need_validation() || force_validation {
+            if !check_hash(buffer, chunk.chunk_id(), self.blob_digester()) {
+                return Err(StorageError::InvalidData(
+                    "data digest value doesn't match".to_string(),
+                ));
+            }
+        } else if chunk.has_xxh3() {
+            if !check_xxh3(buffer, chunk.xxh3()) {
+                return Err(StorageError::InvalidData(
+                    "chunk xxh3 value doesn't match".to_string(),
+                ));
+            }
+        } else if chunk.has_crc32() && !check_crc(buffer, chunk.crc32()) {
+            return Err(StorageError::InvalidData(
+                "chunk crc32 value doesn't match".to_string(),
+            ));
         }
+
+        Ok(d_size)
     }
 
     /// Cache pre-read compressed chunk data from a streaming source.

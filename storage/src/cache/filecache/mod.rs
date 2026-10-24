@@ -251,20 +251,28 @@ impl FileCacheEntry {
                 Arc::new(BlobStateMap::from(NoopChunkMap::new(true))) as Arc<dyn ChunkMap>;
             (file, None, chunk_map, true, true, false)
         } else {
-            let (chunk_map, is_direct_chunkmap) =
-                Self::create_chunk_map(mgr, &blob_info, &blob_file_path)?;
-            // Validation is supported by RAFS v5 (which has no meta_ci) or v6 with chunk digest array.
-            let validation_supported = !blob_info.meta_ci_is_valid()
-                || blob_info.has_feature(BlobFeatures::INLINED_CHUNK_DIGEST);
-            let need_validation = ((mgr.validate && validation_supported) || !is_direct_chunkmap)
-                && !is_legacy_stargz;
-            // Set cache file to its expected size.
             let suffix = if mgr.cache_raw_data {
                 BLOB_RAW_FILE_SUFFIX
             } else {
                 BLOB_DATA_FILE_SUFFIX
             };
             let blob_data_file_path = blob_file_path.clone() + suffix;
+            let cached_file_size = if mgr.cache_raw_data {
+                blob_info.compressed_data_size()
+            } else {
+                blob_info.uncompressed_size()
+            };
+            Self::drop_stale_chunk_map(&blob_file_path, &blob_data_file_path, cached_file_size)?;
+            let (chunk_map, is_direct_chunkmap) =
+                Self::create_chunk_map(mgr, &blob_info, &blob_file_path)?;
+            // Validation is supported by RAFS v5 (which has no meta_ci) or v6 with chunk digest array.
+            // External blobs carry no chunk digest, so they can't be validated by digest.
+            let validation_supported = !blob_info.meta_ci_is_valid()
+                || blob_info.has_feature(BlobFeatures::INLINED_CHUNK_DIGEST);
+            let need_validation = ((mgr.validate && validation_supported) || !is_direct_chunkmap)
+                && !is_legacy_stargz
+                && !blob_info.is_external();
+            // Set cache file to its expected size.
             let file = OpenOptions::new()
                 .create(true)
                 .truncate(false)
@@ -276,11 +284,6 @@ impl FileCacheEntry {
                 .metadata()
                 .map_err(|e| StorageError::cache_io("stat the blob cache file", e))?
                 .len();
-            let cached_file_size = if mgr.cache_raw_data {
-                blob_info.compressed_data_size()
-            } else {
-                blob_info.uncompressed_size()
-            };
             if file_size == 0 || file_size < cached_file_size {
                 file.set_len(cached_file_size)
                     .map_err(|e| StorageError::cache_io("size the blob cache file", e))?;
@@ -388,6 +391,38 @@ impl FileCacheEntry {
             user_io_batch_size: mgr.user_io_batch_size,
             prefetch_config,
         })
+    }
+
+    /// Remove a persisted chunk map whose data file is missing or shorter than expected.
+    ///
+    /// The map and the data file are separate files that can be deleted independently (cache
+    /// GC, manual cleanup). A map that marks chunks ready over a freshly created sparse data
+    /// file would serve its holes as zeros, and on the fanotify path an all-ready blob is not
+    /// even armed, so the kernel would read those holes without an event.
+    fn drop_stale_chunk_map(
+        blob_file: &str,
+        data_file: &str,
+        expected_size: u64,
+    ) -> StorageResult<()> {
+        let intact = match std::fs::metadata(data_file) {
+            Ok(m) => m.len() >= expected_size,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+            Err(e) => return Err(StorageError::cache_io("stat the blob data file", e)),
+        };
+        if intact {
+            return Ok(());
+        }
+        let map_file = format!("{}{}.chunk_map", blob_file, BLOB_DATA_FILE_SUFFIX);
+        match std::fs::remove_file(&map_file) {
+            Ok(()) => {
+                warn!(
+                    "blob data file {data_file} is missing or truncated, reset chunk map {map_file}"
+                );
+                Ok(())
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(StorageError::cache_io("remove the stale chunk map", e)),
+        }
     }
 
     fn create_chunk_map(
@@ -941,6 +976,43 @@ mod tests {
         // Once the last reference goes, it becomes collectable again.
         drop(cache);
         assert!(mgr.gc(None), "the manager should be collectable once idle");
+    }
+
+    #[test]
+    fn test_stale_chunk_map_is_dropped_with_its_data_file() {
+        use crate::cache::state::IndexedChunkMap;
+        use crate::test::MockChunkInfo;
+
+        let dir = vmm_sys_util::tempdir::TempDir::new().unwrap();
+        let blob = dir.as_path().join("blob").display().to_string();
+        let data = format!("{blob}{BLOB_DATA_FILE_SUFFIX}");
+        let chunk = MockChunkInfo {
+            index: 1,
+            ..Default::default()
+        };
+        let ready_after_reopen = |expected_size: u64| {
+            FileCacheEntry::drop_stale_chunk_map(&blob, &data, expected_size).unwrap();
+            let map = IndexedChunkMap::new(&data, 4, true).unwrap();
+            map.is_ready(&chunk).unwrap()
+        };
+
+        std::fs::write(&data, vec![0u8; 8192]).unwrap();
+        IndexedChunkMap::new(&data, 4, true)
+            .unwrap()
+            .set_ready_and_clear_pending(&chunk)
+            .unwrap();
+        // Intact data file: the map is kept.
+        assert!(ready_after_reopen(8192));
+        // Data file shorter than expected: the ready bits cover holes, so the map goes.
+        assert!(!ready_after_reopen(16384));
+
+        IndexedChunkMap::new(&data, 4, true)
+            .unwrap()
+            .set_ready_and_clear_pending(&chunk)
+            .unwrap();
+        // Data file deleted (cache GC, manual cleanup) while the map survived.
+        std::fs::remove_file(&data).unwrap();
+        assert!(!ready_after_reopen(8192));
     }
 
     #[test]

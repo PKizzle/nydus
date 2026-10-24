@@ -332,6 +332,62 @@ mod tests {
     }
 
     #[test]
+    fn test_v6_directory_build_preserves_mtime() {
+        use std::time::{Duration, UNIX_EPOCH};
+
+        use nydus_rafs::metadata::RafsSuper;
+
+        use crate::{ArtifactStorage, BlobManager, BootstrapManager, Builder, ConversionType};
+
+        let source = TempDir::new().unwrap();
+        let cases = [
+            ("epoch", UNIX_EPOCH),
+            ("secs", UNIX_EPOCH + Duration::new(1_700_000_000, 0)),
+            (
+                "nsecs",
+                UNIX_EPOCH + Duration::new(1_700_000_000, 123_456_789),
+            ),
+            ("only-nsecs", UNIX_EPOCH + Duration::new(0, 1)),
+        ];
+        for (name, mtime) in cases {
+            let file = fs::File::create(source.as_path().join(name)).unwrap();
+            file.set_modified(mtime).unwrap();
+        }
+
+        let bootstrap = vmm_sys_util::tempfile::TempFile::new().unwrap();
+        let mut ctx = BuildContext {
+            fs_version: RafsVersion::V6,
+            conversion_type: ConversionType::DirectoryToRafs,
+            source_path: source.as_path().to_path_buf(),
+            ..Default::default()
+        };
+        let mut bootstrap_mgr = BootstrapManager::new(
+            Some(ArtifactStorage::SingleFile(
+                bootstrap.as_path().to_path_buf(),
+            )),
+            None,
+        );
+        let mut blob_mgr = BlobManager::new(ctx.digester, false);
+        DirectoryBuilder::new()
+            .build(&mut ctx, &mut bootstrap_mgr, &mut blob_mgr)
+            .unwrap();
+
+        let (rs, _) =
+            RafsSuper::load_from_file(bootstrap.as_path(), ctx.configuration.clone(), false)
+                .unwrap();
+        for (name, mtime) in cases {
+            let ino = rs.ino_from_path(&Path::new("/").join(name)).unwrap();
+            let attr = rs.get_inode(ino, false).unwrap().get_attr();
+            let want = mtime.duration_since(UNIX_EPOCH).unwrap();
+            assert_eq!(
+                (attr.mtime, attr.mtimensec),
+                (want.as_secs(), want.subsec_nanos()),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
     fn test_directory_builder_new() {
         let _builder = DirectoryBuilder::new();
         assert_eq!(std::mem::size_of::<DirectoryBuilder>(), 0);

@@ -3509,6 +3509,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "tar",
+ "thiserror 2.0.18",
  "vmm-sys-util 0.15.0",
  "xattr",
 ]

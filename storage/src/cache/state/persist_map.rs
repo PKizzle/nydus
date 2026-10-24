@@ -100,8 +100,7 @@ impl PersistMap {
             .map_err(|e| StorageError::cache_io("dup the chunk map fd", e))?;
         let mut filemap = FileMapState::new(file2, 0, expected_size as usize, true)
             .map_err(|e| StorageError::cache_io("mmap the chunk map file", e))?;
-        let header = filemap
-            .get_mut::<Header>(0)
+        let header = unsafe { filemap.get_mut::<Header>(0) }
             .map_err(|e| StorageError::cache_io("reach the chunk map contents", e))?;
         if header.magic != MAGIC1 {
             if !create {
@@ -113,8 +112,7 @@ impl PersistMap {
             // There's race window between "file.set_len()" and "file.write(&header)". If that
             // happens, all file content should be zero. Detect the race window and write out
             // header again to fix it.
-            let content = filemap
-                .get_slice::<u8>(0, expected_size as usize)
+            let content = unsafe { filemap.get_slice::<u8>(0, expected_size as usize) }
                 .map_err(|e| StorageError::cache_io("reach the chunk map contents", e))?;
             for c in content {
                 if *c != 0 {
@@ -129,8 +127,7 @@ impl PersistMap {
             Self::write_header(&mut file, expected_size)?;
         }
 
-        let header = filemap
-            .get_mut::<Header>(0)
+        let header = unsafe { filemap.get_mut::<Header>(0) }
             .map_err(|e| StorageError::cache_io("reach the chunk map contents", e))?;
         let mut not_ready_count = chunk_count;
         if header.version >= 1 {
@@ -147,16 +144,14 @@ impl PersistMap {
             } else {
                 let mut ready_count = 0;
                 for idx in HEADER_SIZE..expected_size as usize {
-                    let current = filemap
-                        .get_ref::<AtomicU8>(idx)
+                    let current = unsafe { filemap.get_ref::<AtomicU8>(idx) }
                         .map_err(|e| StorageError::cache_io("reach the chunk map contents", e))?;
                     let val = current.load(Ordering::Acquire);
                     ready_count += val.count_ones() as u32;
                 }
 
                 if ready_count >= chunk_count {
-                    let header = filemap
-                        .get_mut::<Header>(0)
+                    let header = unsafe { filemap.get_mut::<Header>(0) }
                         .map_err(|e| StorageError::cache_io("reach the chunk map contents", e))?;
                     header.all_ready = MAGIC_ALL_READY;
                     let _ = file.sync_all();
@@ -222,7 +217,7 @@ impl PersistMap {
     #[inline]
     fn read_u8(&self, idx: u32) -> u8 {
         let start = HEADER_SIZE + (idx as usize >> 3);
-        let current = self.filemap.get_ref::<AtomicU8>(start).unwrap();
+        let current = unsafe { self.filemap.get_ref::<AtomicU8>(start) }.unwrap();
 
         current.load(Ordering::Acquire)
     }
@@ -232,7 +227,7 @@ impl PersistMap {
         let mask = Self::index_to_mask(idx);
         let expected = current | mask;
         let start = HEADER_SIZE + (idx as usize >> 3);
-        let atomic_value = self.filemap.get_ref::<AtomicU8>(start).unwrap();
+        let atomic_value = unsafe { self.filemap.get_ref::<AtomicU8>(start) }.unwrap();
 
         atomic_value
             .compare_exchange(current, expected, Ordering::Acquire, Ordering::Relaxed)
@@ -310,16 +305,15 @@ impl PersistMap {
         // Written through an `AtomicU32` rather than `get_mut::<Header>`, which needs `&mut
         // self` the `Arc<dyn ChunkMap>` this hangs off cannot provide. `offset_of!` keeps the
         // two views of the header from drifting apart.
-        let all_ready = self
-            .filemap
-            .get_ref::<AtomicU32>(std::mem::offset_of!(Header, all_ready))
-            .map_err(|e| StorageError::cache_io("reach the chunk map contents", e))?;
+        let all_ready = unsafe {
+            self.filemap
+                .get_ref::<AtomicU32>(std::mem::offset_of!(Header, all_ready))
+        }
+        .map_err(|e| StorageError::cache_io("reach the chunk map contents", e))?;
         all_ready.store(0, Ordering::Release);
 
         for idx in HEADER_SIZE..size {
-            let byte = self
-                .filemap
-                .get_ref::<AtomicU8>(idx)
+            let byte = unsafe { self.filemap.get_ref::<AtomicU8>(idx) }
                 .map_err(|e| StorageError::cache_io("reach the chunk map contents", e))?;
             byte.store(0, Ordering::Release);
         }
