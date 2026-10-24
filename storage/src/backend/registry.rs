@@ -158,6 +158,70 @@ fn respond(resp: request::Response, catch_status: bool) -> RegistryResult<reques
     }
 }
 
+/// Split a `WWW-Authenticate` value into `(scheme, params)` challenges.
+///
+/// Parameter names are lowercased; quoted values are unquoted (with backslash escapes) and may
+/// contain `,` and `=`. A malformed parameter is skipped rather than failing the challenge.
+fn parse_challenges(source: &str) -> Vec<(String, HashMap<String, String>)> {
+    // Split at commas outside quoted strings.
+    let mut items = Vec::new();
+    let (mut cur, mut quoted, mut escaped) = (String::new(), false, false);
+    for c in source.chars() {
+        match c {
+            _ if escaped => {
+                cur.push(c);
+                escaped = false;
+            }
+            '\\' if quoted => {
+                cur.push(c);
+                escaped = true;
+            }
+            '"' => {
+                cur.push(c);
+                quoted = !quoted;
+            }
+            ',' if !quoted => items.push(std::mem::take(&mut cur)),
+            _ => cur.push(c),
+        }
+    }
+    items.push(cur);
+
+    let mut challenges: Vec<(String, HashMap<String, String>)> = Vec::new();
+    for item in items.iter().map(|i| i.trim()).filter(|i| !i.is_empty()) {
+        // An item whose first token is not followed by `=` starts a new challenge:
+        // `Scheme` or `Scheme key=value`.
+        let first_end = item.find([' ', '\t', '=']).unwrap_or(item.len());
+        let param = if item[first_end..].trim_start().starts_with('=') {
+            item
+        } else {
+            challenges.push((item[..first_end].to_string(), HashMap::new()));
+            item[first_end..].trim()
+        };
+        let Some((challenge, (key, value))) = challenges.last_mut().zip(param.split_once('='))
+        else {
+            continue;
+        };
+        let value = value.trim();
+        let value = match value.strip_prefix('"').and_then(|v| v.strip_suffix('"')) {
+            Some(inner) => {
+                let mut out = String::with_capacity(inner.len());
+                let mut chars = inner.chars();
+                while let Some(c) = chars.next() {
+                    out.push(if c == '\\' {
+                        chars.next().unwrap_or(c)
+                    } else {
+                        c
+                    });
+                }
+                out
+            }
+            None => value.to_string(),
+        };
+        challenge.1.insert(key.trim().to_ascii_lowercase(), value);
+    }
+    challenges
+}
+
 /// Check the status of a blob GET that carried `Range: <range>` starting at `offset`.
 ///
 /// Only `206 Partial Content` carries the requested range. A server or proxy that ignores
@@ -567,11 +631,15 @@ impl RegistryState {
                     ("scope", auth.scope.as_str()),
                     ("client_id", REGISTRY_CLIENT_ID),
                 ];
-                query = Some(&query_params_get);
+                // `service` is optional in the challenge; omit it rather than send it empty.
+                let skip = usize::from(auth.service.is_empty());
+                query = Some(&query_params_get[skip..]);
             }
             Method::POST => {
                 let mut form = HashMap::new();
-                form.insert("service".to_string(), auth.service.clone());
+                if !auth.service.is_empty() {
+                    form.insert("service".to_string(), auth.service.clone());
+                }
                 form.insert("scope".to_string(), auth.scope.clone());
                 form.insert("client_id".to_string(), REGISTRY_CLIENT_ID.to_string());
                 body = Some(ReqBody::Form(form));
@@ -618,55 +686,38 @@ impl RegistryState {
 
     /// Parse `www-authenticate` response header respond from registry server
     /// The header format like: `Bearer realm="https://auth.my-registry.com/token",service="my-registry.com",scope="repository:test/repo:pull,push"`
+    ///
+    /// The header is an RFC 7235 challenge list: schemes and parameter names are
+    /// case-insensitive, quoted values may contain `,` and `=`, and one header may carry
+    /// several challenges, of which Bearer is preferred. `service` is optional.
     fn parse_auth(source: &HeaderValue) -> Option<Auth> {
-        let source = source.to_str().unwrap();
-        let source: Vec<&str> = source.splitn(2, ' ').collect();
-        if source.len() < 2 {
-            return None;
-        }
-        let scheme = source[0].trim();
-        let pairs = source[1].trim();
-        let pairs = pairs.split("\",");
-        let mut paras = HashMap::new();
-        for pair in pairs {
-            let pair: Vec<&str> = pair.trim().split('=').collect();
-            if pair.len() < 2 {
-                return None;
-            }
-            let key = pair[0].trim();
-            let value = pair[1].trim().trim_matches('"');
-            paras.insert(key, value);
-        }
+        let source = String::from_utf8_lossy(source.as_bytes());
+        let challenges = parse_challenges(&source);
+        let find = |scheme: &str| {
+            challenges
+                .iter()
+                .find(|(s, _)| s.eq_ignore_ascii_case(scheme))
+                .map(|(_, params)| params)
+        };
 
-        match scheme {
-            "Basic" => {
-                let realm = if let Some(realm) = paras.get("realm") {
-                    (*realm).to_string()
-                } else {
-                    String::new()
-                };
-                Some(Auth::Basic(BasicAuth { realm }))
-            }
-            "Bearer" => {
-                if !paras.contains_key("realm") || !paras.contains_key("service") {
-                    return None;
-                }
-
-                let scope = if let Some(scope) = paras.get("scope") {
-                    (*scope).to_string()
-                } else {
-                    debug!("no scope specified for token auth challenge");
-                    String::new()
-                };
-
-                Some(Auth::Bearer(BearerAuth {
-                    realm: (*paras.get("realm").unwrap()).to_string(),
-                    service: (*paras.get("service").unwrap()).to_string(),
-                    scope,
-                }))
-            }
-            _ => None,
+        if let Some(params) = find("Bearer") {
+            let realm = params.get("realm")?.clone();
+            let service = params.get("service").cloned().unwrap_or_default();
+            let scope = params.get("scope").cloned().unwrap_or_else(|| {
+                debug!("no scope specified for token auth challenge");
+                String::new()
+            });
+            return Some(Auth::Bearer(BearerAuth {
+                realm,
+                service,
+                scope,
+            }));
         }
+        find("Basic").map(|params| {
+            Auth::Basic(BasicAuth {
+                realm: params.get("realm").cloned().unwrap_or_default(),
+            })
+        })
     }
 
     fn fallback_http(&self) {
@@ -1704,16 +1755,24 @@ mod tests {
         let header = HeaderValue::from_str(str).unwrap();
         assert!(RegistryState::parse_auth(&header).is_none());
 
+        // A malformed parameter is skipped; the bare scheme still selects Basic.
         let header = HeaderValue::from_static("Basic realm");
-        assert!(RegistryState::parse_auth(&header).is_none());
+        assert!(matches!(
+            RegistryState::parse_auth(&header),
+            Some(Auth::Basic(b)) if b.realm.is_empty()
+        ));
 
         let header = HeaderValue::from_static("");
         assert!(RegistryState::parse_auth(&header).is_none());
 
+        // `service` is optional.
         let header = HeaderValue::from_static(
             "Bearer realm=\"https://auth.my-registry.com/token\",scope=\"repository:test/repo:pull\"",
         );
-        assert!(RegistryState::parse_auth(&header).is_none());
+        assert!(matches!(
+            RegistryState::parse_auth(&header),
+            Some(Auth::Bearer(b)) if b.service.is_empty() && b.scope == "repository:test/repo:pull"
+        ));
 
         let header = HeaderValue::from_static(
             "Bearer service=\"my-registry.com\",scope=\"repository:test/repo:pull\"",
@@ -2255,7 +2314,66 @@ mod tests {
         let hdr =
             HeaderValue::from_str(r#"Bearer realm="https://auth.example.com/token""#).unwrap();
         let auth = RegistryState::parse_auth(&hdr);
-        assert!(auth.is_none(), "Bearer without service should return None");
+        assert!(matches!(
+            auth,
+            Some(Auth::Bearer(b)) if b.realm == "https://auth.example.com/token" && b.service.is_empty()
+        ));
+    }
+
+    #[test]
+    fn test_parse_auth_challenge_list() {
+        // Scheme and parameter names are case-insensitive.
+        let hdr = HeaderValue::from_static(r#"bearer REALM="https://a.example/t",Service="s""#);
+        assert!(matches!(
+            RegistryState::parse_auth(&hdr),
+            Some(Auth::Bearer(b)) if b.realm == "https://a.example/t" && b.service == "s"
+        ));
+        let hdr = HeaderValue::from_static("BASIC");
+        assert!(matches!(
+            RegistryState::parse_auth(&hdr),
+            Some(Auth::Basic(_))
+        ));
+
+        // Quoted values keep `,`, `=` and escaped quotes.
+        let hdr = HeaderValue::from_static(
+            r#"Bearer realm="https://a.example/token?x=1,y=2",service="s",scope="repository:r:pull,push",error="say \"hi\"""#,
+        );
+        assert!(matches!(
+            RegistryState::parse_auth(&hdr),
+            Some(Auth::Bearer(b)) if b.realm == "https://a.example/token?x=1,y=2"
+                && b.scope == "repository:r:pull,push"
+        ));
+
+        // Unquoted values and whitespace around `=`.
+        let hdr = HeaderValue::from_static("Bearer realm = https://a.example/t , service=s");
+        assert!(matches!(
+            RegistryState::parse_auth(&hdr),
+            Some(Auth::Bearer(b)) if b.realm == "https://a.example/t" && b.service == "s"
+        ));
+
+        // Several challenges in one header: Bearer wins over Basic in either order.
+        for value in [
+            r#"Basic realm="b", Bearer realm="https://a.example/t",service="s""#,
+            r#"Bearer realm="https://a.example/t",service="s", Basic realm="b""#,
+        ] {
+            let hdr = HeaderValue::from_str(value).unwrap();
+            assert!(
+                matches!(RegistryState::parse_auth(&hdr), Some(Auth::Bearer(b)) if b.service == "s"),
+                "{value}"
+            );
+        }
+        let hdr = HeaderValue::from_static(r#"Digest realm="d", Basic realm="b""#);
+        assert!(matches!(
+            RegistryState::parse_auth(&hdr),
+            Some(Auth::Basic(b)) if b.realm == "b"
+        ));
+
+        // Bytes outside visible ASCII must not panic.
+        let hdr = HeaderValue::from_bytes(b"Basic realm=\"r\xe9gistry\"").unwrap();
+        assert!(matches!(
+            RegistryState::parse_auth(&hdr),
+            Some(Auth::Basic(_))
+        ));
     }
 
     #[test]
