@@ -239,7 +239,9 @@ impl BlobCacheMgr for DummyCacheMgr {
             compressor: blob_info.compressor(),
             digester: blob_info.digester(),
             is_legacy_stargz: blob_info.is_legacy_stargz(),
-            need_validation: self.need_validation && !blob_info.is_legacy_stargz(),
+            need_validation: self.need_validation
+                && !blob_info.is_legacy_stargz()
+                && !blob_info.is_external(),
         }))
     }
 
@@ -256,18 +258,207 @@ impl Drop for DummyCacheMgr {
 mod tests {
     use std::fs::OpenOptions;
 
+    use std::any::Any;
+
     use nydus_api::ConfigV2;
+    use nydus_utils::crc32::{self, Crc32};
+    use nydus_utils::digest::RafsDigest;
     use nydus_utils::metrics::BackendMetrics;
     use vmm_sys_util::tempdir::TempDir;
 
     use crate::{
         cache::state::IndexedChunkMap,
-        device::{BlobIoChunk, BlobIoRange},
+        device::{BlobChunkFlags, BlobIoChunk, BlobIoRange},
         meta::tests::DummyBlobReader,
         test::{MockBackend, MockChunkInfo},
     };
 
     use super::*;
+
+    /// A chunk carrying an XXH3-64 checksum, which `MockChunkInfo` has no slot for.
+    struct Xxh3Chunk(MockChunkInfo, u64);
+
+    impl BlobChunkInfo for Xxh3Chunk {
+        fn chunk_id(&self) -> &RafsDigest {
+            self.0.chunk_id()
+        }
+        fn id(&self) -> u32 {
+            self.0.id()
+        }
+        fn blob_index(&self) -> u32 {
+            self.0.blob_index()
+        }
+        fn compressed_offset(&self) -> u64 {
+            self.0.compressed_offset()
+        }
+        fn compressed_size(&self) -> u32 {
+            self.0.compressed_size()
+        }
+        fn uncompressed_offset(&self) -> u64 {
+            self.0.uncompressed_offset()
+        }
+        fn uncompressed_size(&self) -> u32 {
+            self.0.uncompressed_size()
+        }
+        fn is_batch(&self) -> bool {
+            false
+        }
+        fn is_compressed(&self) -> bool {
+            false
+        }
+        fn is_encrypted(&self) -> bool {
+            false
+        }
+        fn has_crc32(&self) -> bool {
+            false
+        }
+        fn crc32(&self) -> u32 {
+            0
+        }
+        fn has_xxh3(&self) -> bool {
+            true
+        }
+        fn xxh3(&self) -> u64 {
+            self.1
+        }
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+    }
+
+    fn new_validation_cache(need_validation: bool, is_legacy_stargz: bool) -> DummyCache {
+        let info = BlobInfo::new(
+            0,
+            "blob-0".to_string(),
+            800,
+            0,
+            8,
+            100,
+            BlobFeatures::empty(),
+        );
+        DummyCache {
+            blob_id: "0".to_string(),
+            blob_info: Arc::new(info),
+            chunk_map: Arc::new(NoopChunkMap::new(false)),
+            reader: Arc::new(MockBackend {
+                metrics: BackendMetrics::new("dummy", "localfs"),
+            }),
+            compressor: compress::Algorithm::None,
+            digester: digest::Algorithm::Sha256,
+            is_legacy_stargz,
+            need_validation,
+        }
+    }
+
+    #[test]
+    fn test_validate_chunk_data() {
+        let data = b"nydus-chunk-data";
+        let tampered = b"nydus-chunk-evil";
+        assert_eq!(data.len(), tampered.len());
+
+        // The chunk digest is trusted (anchored in the bootstrap), while the checksum flags
+        // and values come from the unauthenticated blob meta. Model a backend that substitutes
+        // the chunk data and supplies a matching checksum.
+        let chunk = MockChunkInfo {
+            block_id: RafsDigest::from_buf(data, digest::Algorithm::Sha256),
+            flags: BlobChunkFlags::HAS_CRC32,
+            uncompress_size: data.len() as u32,
+            crc32: Crc32::new(crc32::Algorithm::Crc32Iscsi).from_buf(tampered),
+            ..Default::default()
+        };
+        let plain_chunk = MockChunkInfo {
+            block_id: RafsDigest::from_buf(data, digest::Algorithm::Sha256),
+            flags: BlobChunkFlags::empty(),
+            uncompress_size: data.len() as u32,
+            ..Default::default()
+        };
+        let xxh3_chunk = Xxh3Chunk(
+            MockChunkInfo {
+                block_id: RafsDigest::from_buf(data, digest::Algorithm::Sha256),
+                uncompress_size: data.len() as u32,
+                ..Default::default()
+            },
+            nydus_utils::xxh3::checksum(tampered),
+        );
+
+        // Digest validation enabled: the digest must be checked, a matching checksum is not enough.
+        let cache = new_validation_cache(true, false);
+        let err = cache
+            .validate_chunk_data(&chunk, tampered, false)
+            .unwrap_err();
+        assert!(matches!(err, StorageError::InvalidData(_)));
+        assert!(err.to_string().contains("digest"), "{err}");
+        assert_eq!(
+            cache.validate_chunk_data(&chunk, data, false).unwrap(),
+            data.len()
+        );
+        assert!(
+            cache
+                .validate_chunk_data(&xxh3_chunk, tampered, false)
+                .is_err()
+        );
+        assert_eq!(
+            cache.validate_chunk_data(&xxh3_chunk, data, false).unwrap(),
+            data.len()
+        );
+        assert!(
+            cache
+                .validate_chunk_data(&plain_chunk, tampered, false)
+                .is_err()
+        );
+        assert_eq!(
+            cache
+                .validate_chunk_data(&plain_chunk, data, false)
+                .unwrap(),
+            data.len()
+        );
+
+        // Digest validation disabled: only the checksum is checked, if available.
+        let cache = new_validation_cache(false, false);
+        assert_eq!(
+            cache.validate_chunk_data(&chunk, tampered, false).unwrap(),
+            data.len()
+        );
+        let err = cache.validate_chunk_data(&chunk, data, false).unwrap_err();
+        assert!(err.to_string().contains("crc32"), "{err}");
+        assert_eq!(
+            cache
+                .validate_chunk_data(&xxh3_chunk, tampered, false)
+                .unwrap(),
+            data.len()
+        );
+        let err = cache
+            .validate_chunk_data(&xxh3_chunk, data, false)
+            .unwrap_err();
+        assert!(err.to_string().contains("xxh3"), "{err}");
+        assert_eq!(
+            cache
+                .validate_chunk_data(&plain_chunk, tampered, false)
+                .unwrap(),
+            data.len()
+        );
+
+        // Forced validation behaves like enabled digest validation.
+        assert!(cache.validate_chunk_data(&chunk, tampered, true).is_err());
+        assert_eq!(
+            cache.validate_chunk_data(&chunk, data, true).unwrap(),
+            data.len()
+        );
+
+        // Buffer size must match the uncompressed chunk size.
+        assert!(
+            cache
+                .validate_chunk_data(&chunk, &tampered[..8], false)
+                .is_err()
+        );
+
+        // Legacy stargz blobs have no verifiable chunk digest or checksum.
+        let cache = new_validation_cache(true, true);
+        assert_eq!(
+            cache.validate_chunk_data(&chunk, tampered, false).unwrap(),
+            data.len()
+        );
+    }
 
     #[test]
     fn test_dummy_cache() {
@@ -471,6 +662,36 @@ mod tests {
             DummyCacheMgr::new(cfg.get_cache_config().unwrap(), Arc::new(backend), false).unwrap();
         assert!(mgr.init().is_ok());
         assert!(!mgr.gc(Some("blob-0")));
+
+        // Digest validation is enabled by the config, so a regular blob gets validated.
+        let info = Arc::new(BlobInfo::new(
+            0,
+            "blob-0".to_string(),
+            800,
+            0,
+            8,
+            100,
+            BlobFeatures::empty(),
+        ));
+        assert!(mgr.get_blob_cache(&info).unwrap().need_validation());
+
+        // External blobs have no chunk digest (their chunk id is all zero), so digest
+        // validation must be skipped for them or every read would fail.
+        let external_info = Arc::new(BlobInfo::new(
+            1,
+            "blob-1".to_string(),
+            800,
+            0,
+            8,
+            100,
+            BlobFeatures::EXTERNAL,
+        ));
+        assert!(
+            !mgr.get_blob_cache(&external_info)
+                .unwrap()
+                .need_validation()
+        );
+
         let _bak = mgr.backend();
         mgr.check_stat();
         mgr.destroy();
