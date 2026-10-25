@@ -44,4 +44,9 @@ jobs:
         CARGO_BIN=$(which cargo)
         RUSTUP_BIN=$(which rustup)
         sudo -E RUSTUP=${RUSTUP_BIN} make miri-ut-nextest 2>&1 | tee miri-ut.log
-        grep -C 2 'Undefined Behavior' miri-ut.log
+        # Tests Miri cannot run (file-backed mmap, foreign calls) fail without failing the job;
+        # any Undefined Behavior does.
+        if grep -C 2 'Undefined Behavior' miri-ut.log; then
+          echo "::error::Miri reported Undefined Behavior"
+          exit 1
+        fi

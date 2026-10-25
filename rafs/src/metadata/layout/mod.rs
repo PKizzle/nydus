@@ -69,7 +69,7 @@ macro_rules! impl_bootstrap_converter {
             type Error = std::io::Error;
 
             fn try_from(buf: &mut [u8]) -> std::result::Result<Self, Self::Error> {
-                let ptr = buf.as_ptr() as *mut u8 as *const u8;
+                let ptr = buf.as_mut_ptr();
                 if buf.len() != size_of::<$T>()
                     || ptr as usize & (std::mem::align_of::<$T>() - 1) != 0
                 {
@@ -79,7 +79,7 @@ macro_rules! impl_bootstrap_converter {
                     ));
                 }
 
-                Ok(unsafe { &mut *(ptr as *const $T as *mut $T) })
+                Ok(unsafe { &mut *(ptr as *mut $T) })
             }
         }
 
