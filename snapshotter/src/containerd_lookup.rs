@@ -38,7 +38,7 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use tracing::{debug, info, warn};
 
-use crate::content_store::ContentStoreClient;
+use crate::content_store::{ContentStoreClient, is_not_found, is_rpc_failure};
 
 /// Acquire a lock without panicking on poisoning. A previous panic while a
 /// lock was held would only have left the cache in a partially-populated
@@ -93,12 +93,6 @@ struct CrictlImage {
     #[serde(default)]
     #[serde(rename = "repoDigests")]
     repo_digests: Vec<String>,
-}
-
-#[derive(Deserialize)]
-struct OciIndex {
-    #[serde(default)]
-    manifests: Vec<OciDescriptor>,
 }
 
 #[derive(Deserialize)]
@@ -195,15 +189,16 @@ impl ContainerdLookup {
 
     async fn refresh(&self) -> Result<()> {
         let mut map: HashMap<String, String> = HashMap::new();
-        match &self.content_store {
+        let failed = match &self.content_store {
             Some(cs) => self.refresh_via_grpc(cs, &mut map).await?,
             None => {
                 // CLI fallback: spawning crictl/ctr is slow and blocking —
                 // keep it off the gRPC runtime.
-                let walked = blocking::unblock(walk_images_via_cli).await?;
+                let (walked, failed) = blocking::unblock(walk_images_via_cli).await?;
                 map = walked;
+                failed
             }
-        }
+        };
         let count = map.len();
         let mut cache = lock_cache(&self.cache);
         for (k, v) in map {
@@ -211,25 +206,35 @@ impl ContainerdLookup {
         }
         info!(
             entries = count,
+            failed,
             total = cache.len(),
             "containerd image-ref cache refreshed"
         );
         Ok(())
     }
 
+    /// Walk every image record into `map`; returns how many records
+    /// resolved to nothing. Their digests come from Images.List, so a
+    /// failure is a record whose content is missing or unreadable.
     async fn refresh_via_grpc(
         &self,
         cs: &ContentStoreClient,
         map: &mut HashMap<String, String>,
-    ) -> Result<()> {
+    ) -> Result<usize> {
         let records = cs.images_list().await.context("containerd Images.List")?;
+        let mut failed = 0;
         for group in group_records_by_target(&records) {
             if let Err(e) = walk_manifest_via_grpc(cs, &group.target, &group.display_ref, map).await
             {
-                debug!(image = %group.display_ref, error = %e, "walk_manifest failed");
+                failed += 1;
+                if is_rpc_failure(&e) {
+                    debug!(image = %group.display_ref, error = %format_args!("{e:#}"), "image walk failed");
+                } else {
+                    warn!(image = %group.display_ref, error = %format_args!("{e:#}"), "image walk failed");
+                }
             }
         }
-        Ok(())
+        Ok(failed)
     }
 
     /// Forward direction: resolve an image reference to its manifest digest
@@ -406,17 +411,30 @@ async fn walk_manifest_via_grpc(
         .with_context(|| format!("fetch manifest {digest}"))?;
     // Try as index first (multi-arch); if no `manifests` field, treat as
     // manifest. Recursion is bounded by OCI nesting (index → manifest).
-    if let Ok(index) = serde_json::from_slice::<OciIndex>(&bytes)
+    if let Ok(index) = serde_json::from_slice::<OciIndexWithPlatforms>(&bytes)
         && !index.manifests.is_empty()
     {
-        for child in index.manifests {
-            if let Err(e) =
-                Box::pin(walk_manifest_via_grpc(cs, &child.digest, image_ref, out)).await
-            {
-                debug!(child = %child.digest, error = %e, "child manifest fetch failed");
+        let (host, rest) = walkable_children(&index);
+        let mut host_results = Vec::with_capacity(host.len());
+        for child in host {
+            let result = Box::pin(walk_manifest_via_grpc(cs, child, image_ref, out)).await;
+            if let Err(e) = &result {
+                debug!(child = %child, error = %format_args!("{e:#}"), "host-platform child walk failed");
+            }
+            host_results.push(result);
+        }
+        let mut rest_resolved = false;
+        if walk_rest_children(&host_results, is_not_found) {
+            for child in rest {
+                match Box::pin(walk_manifest_via_grpc(cs, child, image_ref, out)).await {
+                    Ok(()) => rest_resolved = true,
+                    Err(e) => {
+                        debug!(child = %child, error = %format_args!("{e:#}"), "child walk failed")
+                    }
+                }
             }
         }
-        return Ok(());
+        return index_walk_result(digest, host_results, rest_resolved);
     }
     let manifest: OciManifest = serde_json::from_slice(&bytes)?;
     let bootstrap_indices = collect_bootstrap_layers(&manifest, image_ref, out);
@@ -441,6 +459,11 @@ fn collect_bootstrap_layers(
     image_ref: &str,
     out: &mut HashMap<String, String>,
 ) -> Vec<usize> {
+    if manifest.layers.is_empty() && manifest.config.is_none() {
+        // Typically an index whose `manifests` failed to parse (e.g. a
+        // non-object `platform`) falling through to the manifest parse.
+        debug!(image = %image_ref, "manifest has neither layers nor config; nothing to register");
+    }
     let mut bootstrap_indices: Vec<usize> = Vec::new();
     for (i, layer) in manifest.layers.iter().enumerate() {
         let is_bootstrap = layer
@@ -524,10 +547,23 @@ async fn resolve_gzip_layers_via_grpc(
     digest: &str,
     content_root: &std::path::Path,
 ) -> Result<(String, Vec<crate::local_accel::GzipLayer>)> {
+    // The digest is the image record's target or the host child picked
+    // from it, never speculative, so a miss is worth a warning; "no host
+    // match" and "no gzip layers" are normal for many images and stay at
+    // the caller's debug.
     let bytes = cs
         .fetch_bytes(digest)
         .await
-        .with_context(|| format!("fetch manifest {digest}"))?;
+        .with_context(|| format!("fetch manifest {digest}"))
+        .inspect_err(|e| {
+            if !is_rpc_failure(e) {
+                warn!(
+                    manifest = %digest,
+                    error = %format_args!("{e:#}"),
+                    "image manifest not in content store; auto-accel falls back to overlay"
+                );
+            }
+        })?;
     if let Ok(index) = serde_json::from_slice::<OciIndexWithPlatforms>(&bytes)
         && !index.manifests.is_empty()
     {
@@ -544,19 +580,77 @@ async fn resolve_gzip_layers_via_grpc(
 /// Pick the index child matching the host architecture/OS. Pure so tests
 /// can pin the GOARCH translation.
 fn pick_host_arch_child(index: &OciIndexWithPlatforms) -> Option<String> {
-    let host_arch = registry_client::host_go_arch();
-    let host_os = std::env::consts::OS;
     index
         .manifests
         .iter()
-        .find(|child| {
-            child
-                .platform
-                .as_ref()
-                .map(|p| p.architecture == host_arch && p.os == host_os)
-                .unwrap_or(false)
-        })
+        .find(|child| is_host_platform(child))
         .map(|child| child.digest.clone())
+}
+
+/// Index children for the chainID map, split into `(host, rest)`: the
+/// children matching the host architecture/OS (variants such as arm64/v8
+/// and `os.features` all match), then every other child in index order.
+/// containerd by default pulls only the host-platform child, so the rest
+/// (foreign arches, `unknown/unknown` attestation manifests) are usually
+/// absent and are walked only when `walk_rest_children` says so. That
+/// fallback keeps indices without platform info, and images pulled for a
+/// foreign platform (`--platform`, tarball import), resolvable.
+fn walkable_children(index: &OciIndexWithPlatforms) -> (Vec<&str>, Vec<&str>) {
+    let (mut host, mut rest) = (Vec::new(), Vec::new());
+    for child in &index.manifests {
+        let group = if is_host_platform(child) {
+            &mut host
+        } else {
+            &mut rest
+        };
+        group.push(child.digest.as_str());
+    }
+    (host, rest)
+}
+
+/// Whether to walk the non-host children: only when no host child
+/// resolved and every host failure is a miss (`is_miss`), so a transport
+/// error or a broken host manifest never fans out to every foreign child.
+/// True for an index with no host child.
+fn walk_rest_children(
+    host_results: &[Result<()>],
+    is_miss: impl Fn(&anyhow::Error) -> bool,
+) -> bool {
+    host_results.iter().all(|r| r.as_ref().is_err_and(&is_miss))
+}
+
+/// Outcome of an index walk: Ok when any child resolved, otherwise one
+/// error for the caller to log, preferring a host failure that is not a
+/// plain miss because it says more.
+fn index_walk_result(
+    digest: &str,
+    host_results: Vec<Result<()>>,
+    rest_resolved: bool,
+) -> Result<()> {
+    if rest_resolved || host_results.iter().any(Result::is_ok) {
+        return Ok(());
+    }
+    let mut errors: Vec<anyhow::Error> = host_results.into_iter().filter_map(Result::err).collect();
+    if errors.is_empty() {
+        bail!("no child manifest of index {digest} is in the content store");
+    }
+    let e = errors.swap_remove(errors.iter().position(|e| !is_not_found(e)).unwrap_or(0));
+    if is_not_found(&e) {
+        Err(e.context(format!(
+            "host-platform manifest or config of index {digest} not in content store; \
+             pull in flight or content missing"
+        )))
+    } else {
+        Err(e.context(format!(
+            "host-platform manifest of index {digest} unreadable"
+        )))
+    }
+}
+
+fn is_host_platform(child: &OciIndexEntry) -> bool {
+    child.platform.as_ref().is_some_and(|p| {
+        p.architecture == registry_client::host_go_arch() && p.os == std::env::consts::OS
+    })
 }
 
 /// Filter a manifest's layers down to the gzip data layers the auto-accel
@@ -618,7 +712,9 @@ struct OciIndexEntry {
 
 #[derive(Deserialize)]
 struct OciPlatform {
+    #[serde(default)]
     architecture: String,
+    #[serde(default)]
     os: String,
 }
 
@@ -660,13 +756,16 @@ fn preferred_ref(repo_tags: &[String], name: &str) -> String {
 // subprocesses — callers run these via `blocking::unblock` only.
 // ---------------------------------------------------------------------------
 
-fn walk_images_via_cli() -> Result<HashMap<String, String>> {
+/// CLI twin of `refresh_via_grpc`: the cache map and how many image
+/// digests resolved to nothing.
+fn walk_images_via_cli() -> Result<(HashMap<String, String>, usize)> {
     let out = run_first_ok(&[
         &["crictl", "images", "-o", "json"],
         &["k3s", "crictl", "images", "-o", "json"],
     ])?;
     let parsed: CrictlImages = serde_json::from_slice(&out)?;
     let mut map: HashMap<String, String> = HashMap::new();
+    let mut failed = 0;
     for img in parsed.images {
         // Use repoDigests when available; they carry both ref and manifest
         // digest. repoTags alone carry no digest to walk from.
@@ -677,11 +776,12 @@ fn walk_images_via_cli() -> Result<HashMap<String, String>> {
             };
             let ref_name = preferred_ref(&img.repo_tags, name);
             if let Err(e) = walk_manifest_via_cli(manifest_digest, &ref_name, &mut map) {
-                debug!(image = %ref_name, error = %e, "walk_manifest failed");
+                failed += 1;
+                warn!(image = %ref_name, error = %format_args!("{e:#}"), "image walk failed");
             }
         }
     }
-    Ok(map)
+    Ok((map, failed))
 }
 
 fn walk_manifest_via_cli(
@@ -693,15 +793,32 @@ fn walk_manifest_via_cli(
         &["ctr", "-n", "k8s.io", "content", "get", digest],
         &["k3s", "ctr", "-n", "k8s.io", "content", "get", digest],
     ])?;
-    if let Ok(index) = serde_json::from_slice::<OciIndex>(&bytes)
+    if let Ok(index) = serde_json::from_slice::<OciIndexWithPlatforms>(&bytes)
         && !index.manifests.is_empty()
     {
-        for child in index.manifests {
-            if let Err(e) = walk_manifest_via_cli(&child.digest, image_ref, out) {
-                debug!(child = %child.digest, error = %e, "child manifest fetch failed");
+        let (host, rest) = walkable_children(&index);
+        let mut host_results = Vec::with_capacity(host.len());
+        for child in host {
+            let result = walk_manifest_via_cli(child, image_ref, out);
+            if let Err(e) = &result {
+                debug!(child = %child, error = %format_args!("{e:#}"), "host-platform child walk failed");
+            }
+            host_results.push(result);
+        }
+        let mut rest_resolved = false;
+        // A failed `ctr content get` does not say why, so every host
+        // failure counts as a miss here.
+        if walk_rest_children(&host_results, |_| true) {
+            for child in rest {
+                match walk_manifest_via_cli(child, image_ref, out) {
+                    Ok(()) => rest_resolved = true,
+                    Err(e) => {
+                        debug!(child = %child, error = %format_args!("{e:#}"), "child walk failed")
+                    }
+                }
             }
         }
-        return Ok(());
+        return index_walk_result(digest, host_results, rest_resolved);
     }
     let manifest: OciManifest = serde_json::from_slice(&bytes)?;
     let bootstrap_indices = collect_bootstrap_layers(&manifest, image_ref, out);
@@ -817,6 +934,150 @@ fn run_first_ok(candidates: &[&[&str]]) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn index_from_json(json: serde_json::Value) -> OciIndexWithPlatforms {
+        serde_json::from_value(json).expect("valid index JSON")
+    }
+
+    fn entry(digest: &str, arch: &str, os: &str) -> serde_json::Value {
+        serde_json::json!({
+            "digest": digest,
+            "platform": { "architecture": arch, "os": os }
+        })
+    }
+
+    /// A multi-arch index lists foreign arches and attestation manifests
+    /// that containerd by default does not pull; the host child is walked
+    /// first and the rest only as a fallback.
+    #[test]
+    fn walkable_children_puts_host_platform_first() {
+        let host = registry_client::host_go_arch();
+        let os = std::env::consts::OS;
+        let foreign = if host == "amd64" { "s390x" } else { "amd64" };
+        let index = index_from_json(serde_json::json!({ "manifests": [
+            entry("sha256:foreign", foreign, os),
+            entry("sha256:host", host, os),
+            entry("sha256:ppc", "ppc64le", os),
+            entry("sha256:attest-host", "unknown", "unknown"),
+            entry("sha256:attest-foreign", "unknown", "unknown"),
+            entry("sha256:other-os", host, "windows"),
+        ]}));
+        let (host_children, rest) = walkable_children(&index);
+        assert_eq!(host_children, vec!["sha256:host"]);
+        assert_eq!(
+            rest,
+            vec![
+                "sha256:foreign",
+                "sha256:ppc",
+                "sha256:attest-host",
+                "sha256:attest-foreign",
+                "sha256:other-os",
+            ]
+        );
+        assert_eq!(pick_host_arch_child(&index).as_deref(), Some("sha256:host"));
+    }
+
+    /// Variants (arm64/v8 vs bare arm64) and `os.features` (the nydus
+    /// sibling of a dual-image index) all match the host, so no child that
+    /// could be the host's manifest or its nydus bootstrap is demoted.
+    #[test]
+    fn walkable_children_keeps_every_host_variant() {
+        let host = registry_client::host_go_arch();
+        let os = std::env::consts::OS;
+        let index = index_from_json(serde_json::json!({ "manifests": [
+            entry("sha256:bare", host, os),
+            { "digest": "sha256:v8",
+              "platform": { "architecture": host, "os": os, "variant": "v8" } },
+            { "digest": "sha256:nydus",
+              "platform": { "architecture": host, "os": os,
+                            "os.features": ["nydus.remoteimage.v1"] } },
+            entry("sha256:foreign", "riscv-none", os),
+        ]}));
+        let (host_children, rest) = walkable_children(&index);
+        assert_eq!(
+            host_children,
+            vec!["sha256:bare", "sha256:v8", "sha256:nydus"]
+        );
+        assert_eq!(rest, vec!["sha256:foreign"]);
+    }
+
+    /// Without platform info (or with no host match) every child is in the
+    /// fallback set, and the fallback is always walked.
+    #[test]
+    fn walkable_children_falls_back_to_all_without_host_match() {
+        let index = index_from_json(serde_json::json!({ "manifests": [
+            { "digest": "sha256:a" },
+            { "digest": "sha256:b", "platform": {} },
+            entry("sha256:c", "riscv-none", "plan9"),
+        ]}));
+        let (host_children, rest) = walkable_children(&index);
+        assert!(host_children.is_empty());
+        assert_eq!(rest, vec!["sha256:a", "sha256:b", "sha256:c"]);
+        assert!(walk_rest_children(&[], is_not_found));
+        assert_eq!(pick_host_arch_child(&index), None);
+    }
+
+    fn not_found(digest: &str) -> Result<()> {
+        Err(anyhow::Error::new(tonic::Status::not_found("gone"))
+            .context(format!("fetch manifest {digest}")))
+    }
+
+    /// An image pulled for a foreign platform (`ctr pull --platform`, a
+    /// foreign tarball import, binfmt emulation) has its own child locally
+    /// but not the host child: the host child's NotFound falls through to
+    /// the rest, and the foreign child resolving makes the index resolve.
+    #[test]
+    fn walkable_children_walks_foreign_child_when_host_child_missing() {
+        let host = registry_client::host_go_arch();
+        let os = std::env::consts::OS;
+        let foreign = if host == "amd64" { "arm64" } else { "amd64" };
+        let index = index_from_json(serde_json::json!({ "manifests": [
+            entry("sha256:foreign", foreign, os),
+            entry("sha256:host", host, os),
+        ]}));
+        let (host_children, rest) = walkable_children(&index);
+        assert_eq!(host_children, vec!["sha256:host"]);
+        assert_eq!(rest, vec!["sha256:foreign"]);
+
+        assert!(walk_rest_children(
+            &[not_found("sha256:host")],
+            is_not_found
+        ));
+        assert!(index_walk_result("sha256:idx", vec![not_found("sha256:host")], true).is_ok());
+    }
+
+    /// The fallback never runs when a host child resolved or failed for a
+    /// reason other than absence, and an index nothing resolved for is an
+    /// error the refresh logs once, naming the expected cause.
+    #[test]
+    fn index_walk_stays_on_host_unless_every_host_child_is_missing() {
+        let down = || Err(anyhow::Error::new(tonic::Status::unavailable("down")));
+        assert!(!walk_rest_children(
+            &[not_found("sha256:a"), Ok(())],
+            is_not_found
+        ));
+        assert!(!walk_rest_children(&[down()], is_not_found));
+        assert!(
+            index_walk_result("sha256:idx", vec![not_found("sha256:a"), Ok(())], false).is_ok()
+        );
+
+        let err = index_walk_result("sha256:idx", vec![not_found("sha256:a")], false).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("pull in flight or content missing"),
+            "{err:#}"
+        );
+        assert!(is_not_found(&err));
+
+        let err = index_walk_result("sha256:idx", vec![not_found("sha256:a"), down()], false)
+            .unwrap_err();
+        assert!(
+            !is_not_found(&err),
+            "the non-miss failure is reported: {err:#}"
+        );
+
+        let err = index_walk_result("sha256:idx", vec![], false).unwrap_err();
+        assert!(err.to_string().contains("sha256:idx"), "{err}");
+    }
 
     /// chainID computation is the contract with containerd's snapshot
     /// naming. `chain[0] = diff[0]`, `chain[i] = sha256(chain[i-1] + " " +
