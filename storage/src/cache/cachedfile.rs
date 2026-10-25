@@ -154,13 +154,10 @@ impl FileCacheMeta {
     }
 
     // Serialize reloads after background failure, with a fixed cooldown on reload errors.
+    // Readers arriving during a reload wait for it: a `None` here fails their read.
     fn reload_blob_meta(&self) -> Option<Arc<BlobCompressionContextInfo>> {
         let loader = self.loader.as_ref()?;
-        let mut next_retry = match loader.next_retry.try_lock() {
-            Ok(guard) => guard,
-            Err(std::sync::TryLockError::WouldBlock) => return None,
-            Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
-        };
+        let mut next_retry = loader.next_retry.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(m) = self.meta.lock().unwrap().as_ref() {
             return Some(m.clone());
         }
@@ -2620,6 +2617,59 @@ mod tests {
             &reloaded,
             &file_cache_meta.get_blob_meta().unwrap()
         ));
+    }
+
+    #[test]
+    fn test_file_cache_meta_reload_under_contention_waits_for_the_in_flight_reload() {
+        use vmm_sys_util::tempdir::TempDir;
+
+        let root_dir = &std::env::var("CARGO_MANIFEST_DIR").expect("$CARGO_MANIFEST_DIR");
+        let fixture = std::path::PathBuf::from(root_dir).join(
+            "../tests/texture/zran/233c72f2b6b698c07021c4da367cfe2dff4f049efbaa885ca0ff760ea297865a.blob.meta",
+        );
+        let dir = TempDir::new().unwrap();
+        let path = dir.as_path().join("cached");
+        std::fs::copy(fixture, path.with_extension("blob.meta")).unwrap();
+        let mut blob_info = BlobInfo::new(
+            0,
+            "233c72f2b6b698c07021c4da367cfe2dff4f049efbaa885ca0ff760ea297865a".to_string(),
+            0x16c6000,
+            9839040,
+            RAFS_DEFAULT_CHUNK_SIZE as u32,
+            0xa3,
+            BlobFeatures::ALIGNED
+                | BlobFeatures::INLINED_FS_META
+                | BlobFeatures::CHUNK_INFO_V2
+                | BlobFeatures::ZRAN,
+        );
+        blob_info.set_blob_meta_info(0, 0xa1290, 0xa1290, compress::Algorithm::None as u32);
+        let file_cache_meta = FileCacheMeta {
+            has_error: Arc::new(AtomicBool::new(true)),
+            meta: Arc::new(Mutex::new(None)),
+            loader: Some(Arc::new(FileCacheMetaLoader {
+                blob_file: path.display().to_string(),
+                blob_info: Arc::new(blob_info),
+                reader: None,
+                validation: false,
+                next_retry: Mutex::new(Instant::now()),
+            })),
+        };
+
+        // A reload in flight holds `next_retry`; a concurrent reader must wait for it
+        // and get the metadata instead of failing the read.
+        let loader = file_cache_meta.loader.clone().unwrap();
+        let guard = loader.next_retry.lock().unwrap();
+        let reader = std::thread::spawn({
+            let meta = file_cache_meta.clone();
+            move || meta.get_blob_meta()
+        });
+        std::thread::sleep(Duration::from_millis(50));
+        drop(guard);
+        let reloaded = reader
+            .join()
+            .unwrap()
+            .expect("a reader arriving during a reload must get the metadata");
+        assert_eq!(reloaded.state.chunk_info_array.len(), 0xa3);
     }
 
     #[test]
