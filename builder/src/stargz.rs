@@ -968,7 +968,7 @@ mod tests {
             )]
         );
         assert_eq!(builder.blob_size, Some(4128));
-        tmp_dir.push("e60676aef5cc0d5caca9f4c8031f5b0c8392a0611d44c8e1bbc46dbf7fe7bfef");
+        tmp_dir.push("a99f3500c172fdd8314fa3303f528a7fc8d80126980393f4331547868c068cfd");
         assert_eq!(
             builder.bootstrap_path.unwrap(),
             tmp_dir.to_str().unwrap().to_string()

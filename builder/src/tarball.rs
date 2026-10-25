@@ -1918,7 +1918,7 @@ mod tests {
     fn test_missing_parents_are_implicit_until_declared() {
         let tar = RawTar::default().reg("a/b/c", b"").dir("a/").finish();
         let bootstrap = build_layer(&tar);
-        assert_eq!(implicit_dirs(&bootstrap.tree), ["/", "/a/b"]);
+        assert_eq!(implicit_dirs(&bootstrap.tree), ["/a/b"]);
         assert!(get_node(&bootstrap, "/a/b").is_dir());
     }
 
@@ -1954,6 +1954,20 @@ mod tests {
     fn test_implicit_dir_flag_round_trips_v5() {
         let tar = RawTar::default().reg("a/b/c", b"").dir("a/").finish();
         let tree = round_trip_layer(RafsVersion::V5, &tar, false);
-        assert_eq!(implicit_dirs(&tree), ["/", "/a/b"]);
+        assert_eq!(implicit_dirs(&tree), ["/a/b"]);
+    }
+
+    #[test]
+    fn test_implicit_dir_flag_round_trips_v6() {
+        let tar = RawTar::default().reg("a/b/c", b"").dir("a/").finish();
+        let tree = round_trip_layer(RafsVersion::V6, &tar, false);
+        assert_eq!(implicit_dirs(&tree), ["/a/b"]);
+        assert!(!get_tree_node(&tree, "/a").inode.is_implicit_dir());
+
+        // With file data the bootstrap carries a blob table, which moves the inode area.
+        let tar = RawTar::default().reg("a/b/c", b"data").finish();
+        let tree = round_trip_layer(RafsVersion::V6, &tar, true);
+        assert_eq!(implicit_dirs(&tree), ["/a", "/a/b"]);
+        assert_eq!(get_tree_node(&tree, "/a/b/c").inode.size(), 4);
     }
 }

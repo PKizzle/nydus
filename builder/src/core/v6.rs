@@ -18,8 +18,8 @@ use nydus_rafs::metadata::layout::v6::{
     EROFS_BLOCK_BITS_9, EROFS_BLOCK_SIZE_512, EROFS_DEVTABLE_OFFSET, EROFS_INODE_CHUNK_BASED,
     EROFS_INODE_FLAT_INLINE, EROFS_INODE_FLAT_PLAIN, EROFS_INODE_SLOT_SIZE, EROFS_SUPER_BLOCK_SIZE,
     EROFS_SUPER_OFFSET, RafsV6BlobTable, RafsV6Device, RafsV6Dirent, RafsV6InodeChunkAddr,
-    RafsV6InodeChunkHeader, RafsV6OndiskInode, RafsV6SuperBlock, RafsV6SuperBlockExt, align_offset,
-    block_bits_from_size, calculate_nid, new_v6_inode,
+    RafsV6InodeChunkHeader, RafsV6OndiskInode, RafsV6PrefetchTable, RafsV6SuperBlock,
+    RafsV6SuperBlockExt, align_offset, block_bits_from_size, calculate_nid, new_v6_inode,
 };
 use nydus_storage::device::{BlobFeatures, BlobInfo};
 use nydus_utils::{root_tracer, round_down, round_up, timing_tracer};
@@ -642,10 +642,10 @@ impl Bootstrap {
         //     |
         // +---+---------+------------+-------------+----------------------------------------------+
         // |   |         |            |             |                 |         |                  |
-        // |1k |super    |extended    | blob table  |  prefetch table | inodes  | chunk info table |
-        // |   |block    |superblock+ |             |                 |         |                  |
-        // |   |         |devslot     |             |                 |         |                  |
-        // +---+---------+------------+-------------+----------------------------------------------+
+        // |1k |super    |extended    | blob table  |  prefetch table | implicit  | inodes  | chunk info table |
+        // |   |block    |superblock+ |             |                 | dir table |         |                  |
+        // |   |         |devslot     |             |                 |           |         |                  |
+        // +---+---------+------------+-------------+-----------------+-----------+---------+------------------+
 
         let block_size = ctx.v6_block_size();
         let blobs = blob_table.get_all();
@@ -684,9 +684,21 @@ impl Bootstrap {
         // Because in some OS, ino == 0 represents corresponding file is deleted.
         let root_node_offset = self.tree.borrow_mut_node().v6_offset;
         let orig_meta_addr = root_node_offset - block_size;
-        let meta_addr = if blob_table_size > 0 {
+        let mut implicit_dir_count = 0usize;
+        self.tree.walk_bfs(true, &mut |n| {
+            if n.borrow_mut_node().inode.is_implicit_dir() {
+                implicit_dir_count += 1;
+            }
+            Ok(())
+        })?;
+        let implicit_dir_table_size = (implicit_dir_count * size_of::<u32>()) as u64;
+        let implicit_dir_table_offset = align_offset(
+            blob_table_offset + blob_table_size + prefetch_table_size as u64,
+            size_of::<u64>() as u64,
+        );
+        let meta_addr = if blob_table_size > 0 || implicit_dir_table_size > 0 {
             align_offset(
-                blob_table_offset + blob_table_size + prefetch_table_size as u64,
+                implicit_dir_table_offset + implicit_dir_table_size,
                 block_size,
             )
         } else {
@@ -711,24 +723,45 @@ impl Bootstrap {
         // If HashChunkDict is used here, it will cause duplication. The chunks are removed,
         // resulting in incomplete chunk info.
         let mut chunk_cache = BTreeMap::new();
+        let mut implicit_dirs = RafsV6PrefetchTable::new();
 
         // Dump bootstrap
         timing_tracer!(
             {
                 self.tree.walk_bfs(true, &mut |n| {
-                    n.borrow_mut_node().dump_bootstrap_v6(
+                    let mut node = n.borrow_mut_node();
+                    node.dump_bootstrap_v6(
                         ctx,
                         bootstrap_ctx.writer.as_mut(),
                         orig_meta_addr,
                         meta_addr,
                         &mut chunk_cache,
                         &blobs,
-                    )
+                    )?;
+                    if node.inode.is_implicit_dir() {
+                        // `dump_bootstrap_v6` sets the inode number to the final nid.
+                        implicit_dirs.add_entry(u32::try_from(node.inode.ino())?);
+                    }
+                    Ok(())
                 })
             },
             "dump_bootstrap"
         )?;
         Self::v6_align_to_block(bootstrap_ctx, block_size)?;
+
+        if implicit_dir_table_size > 0 {
+            assert_eq!(implicit_dirs.len(), implicit_dir_count);
+            implicit_dirs.inodes.sort_unstable();
+            ext_sb.set_implicit_dir_table_offset(implicit_dir_table_offset);
+            ext_sb.set_implicit_dir_table_size(implicit_dir_table_size as u32);
+            bootstrap_ctx
+                .writer
+                .seek_offset(implicit_dir_table_offset)
+                .context("failed seek implicit directory table offset")?;
+            implicit_dirs
+                .store(bootstrap_ctx.writer.as_mut())
+                .context("failed to dump implicit directory table")?;
+        }
 
         // `Node` offset might be updated during above inodes dumping. So `get_prefetch_table` after it.
         if prefetch_table_size > 0 {
