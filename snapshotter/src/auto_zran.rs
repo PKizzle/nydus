@@ -1007,13 +1007,16 @@ fn write_base_artifact(work_dir: &Path, artifact: &NodeLocalArtifact) -> Result<
 
 /// Load a persisted base artifact IF its on-disk inputs (merged bootstrap +
 /// backend dir, plus the prefetch blob when the artifact claims one) are
-/// still present. This is the seam that decides stage-2 behavior: `Some` ⇒
-/// reuse (optimize only — or upload-only when `prefetch_blob_id` is already
+/// still present and its `format_version` is [`AUTO_ACCEL_MANIFEST_VERSION`].
+/// This is the seam that decides stage-2 behavior: `Some` ⇒ reuse (optimize only — or upload-only when `prefetch_blob_id` is already
 /// set by a prior optimize whose upload failed); `None` ⇒ run the full
 /// pipeline.
 fn load_reusable_base_artifact(work_dir: &Path) -> Option<NodeLocalArtifact> {
     let bytes = std::fs::read(base_artifact_path(work_dir)).ok()?;
     let artifact: NodeLocalArtifact = serde_json::from_slice(&bytes).ok()?;
+    if artifact.format_version != AUTO_ACCEL_MANIFEST_VERSION {
+        return None;
+    }
     let prefetch_ok = artifact
         .prefetch_blob_id
         .as_ref()
@@ -1834,6 +1837,7 @@ mod tests {
             layer_blob_ids: vec!["deadbeef".to_string()],
             zran_index_blob_ids: vec![Some("cafef00d".to_string())],
             prefetch_blob_id: None,
+            format_version: AUTO_ACCEL_MANIFEST_VERSION,
         };
 
         // No artifact.json yet → full pipeline.
@@ -1851,6 +1855,41 @@ mod tests {
         // artifact.json remains → force the full pipeline rather than optimize
         // against a missing input.
         std::fs::remove_file(&bootstrap).unwrap();
+        assert!(load_reusable_base_artifact(work_dir).is_none());
+    }
+
+    /// A work dir left by a build whose artifact format differs (no stamp, or an older
+    /// one) is not reused: its merged bootstrap may carry merge results the current
+    /// manifest version exists to discard, so stage 2 must run the full pipeline.
+    #[test]
+    fn load_reusable_base_artifact_rejects_stale_format_version() {
+        let tmp = tempfile::tempdir().unwrap();
+        let work_dir = tmp.path();
+        let backend = work_dir.join("backend");
+        std::fs::create_dir_all(&backend).unwrap();
+        let bootstrap = work_dir.join("bootstrap");
+        std::fs::write(&bootstrap, b"merged-bootstrap").unwrap();
+        let artifact = NodeLocalArtifact {
+            bootstrap,
+            backend_dir: backend,
+            work_dir: work_dir.to_path_buf(),
+            layer_blob_ids: vec!["deadbeef".to_string()],
+            zran_index_blob_ids: vec![Some("cafef00d".to_string())],
+            prefetch_blob_id: None,
+            format_version: AUTO_ACCEL_MANIFEST_VERSION,
+        };
+        write_base_artifact(work_dir, &artifact).unwrap();
+        assert!(load_reusable_base_artifact(work_dir).is_some());
+
+        let path = base_artifact_path(work_dir);
+        let mut json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        json.as_object_mut().unwrap().remove("format_version");
+        std::fs::write(&path, serde_json::to_vec(&json).unwrap()).unwrap();
+        assert!(load_reusable_base_artifact(work_dir).is_none());
+
+        json["format_version"] = serde_json::json!(AUTO_ACCEL_MANIFEST_VERSION - 1);
+        std::fs::write(&path, serde_json::to_vec(&json).unwrap()).unwrap();
         assert!(load_reusable_base_artifact(work_dir).is_none());
     }
 
@@ -1874,6 +1913,7 @@ mod tests {
             layer_blob_ids: vec!["deadbeef".to_string()],
             zran_index_blob_ids: vec![Some("cafef00d".to_string())],
             prefetch_blob_id: Some("prefetch01".to_string()),
+            format_version: AUTO_ACCEL_MANIFEST_VERSION,
         };
         write_base_artifact(work_dir, &artifact).unwrap();
 
