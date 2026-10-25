@@ -812,10 +812,9 @@ impl StargzBuilder {
                     // to the target's.
                     node.set_xattr(target.info.xattrs.clone());
                 }
-                None => bail!(
-                    "stargz: failed to get target node for hardlink {}",
-                    k.display()
-                ),
+                // A later entry replaced the subtree holding this name; the hardlink went
+                // with it, as extraction would have dropped it too.
+                None => continue,
             }
         }
 
@@ -917,14 +916,7 @@ mod tests {
         ArtifactStorage, ConversionType, Features, Prefetch, WhiteoutSpec, attributes::Attributes,
     };
 
-    #[test]
-    fn test_build_stargz_toc() {
-        let tmp_dir = vmm_sys_util::tempdir::TempDir::new().unwrap();
-        let mut tmp_dir = tmp_dir.as_path().to_path_buf();
-        let root_dir = &std::env::var("CARGO_MANIFEST_DIR").expect("$CARGO_MANIFEST_DIR");
-        let source_path =
-            PathBuf::from(root_dir).join("../tests/texture/stargz/estargz_sample.json");
-        let prefetch = Prefetch::default();
+    fn stargz_ctx(source_path: PathBuf, tmp_dir: &Path) -> BuildContext {
         let mut ctx = BuildContext::new(
             "".to_string(),
             true,
@@ -935,8 +927,11 @@ mod tests {
             WhiteoutSpec::Oci,
             ConversionType::EStargzIndexToRef,
             source_path,
-            prefetch,
-            Some(ArtifactStorage::FileDir((tmp_dir.clone(), String::new()))),
+            Prefetch::default(),
+            Some(ArtifactStorage::FileDir((
+                tmp_dir.to_path_buf(),
+                String::new(),
+            ))),
             None,
             false,
             Features::new(),
@@ -945,6 +940,17 @@ mod tests {
         );
         ctx.fs_version = RafsVersion::V6;
         ctx.conversion_type = ConversionType::EStargzToRafs;
+        ctx
+    }
+
+    #[test]
+    fn test_build_stargz_toc() {
+        let tmp_dir = vmm_sys_util::tempdir::TempDir::new().unwrap();
+        let mut tmp_dir = tmp_dir.as_path().to_path_buf();
+        let root_dir = &std::env::var("CARGO_MANIFEST_DIR").expect("$CARGO_MANIFEST_DIR");
+        let source_path =
+            PathBuf::from(root_dir).join("../tests/texture/stargz/estargz_sample.json");
+        let mut ctx = stargz_ctx(source_path, &tmp_dir);
         let mut bootstrap_mgr = BootstrapManager::new(
             Some(ArtifactStorage::FileDir((tmp_dir.clone(), String::new()))),
             None,
@@ -967,6 +973,56 @@ mod tests {
             builder.bootstrap_path.unwrap(),
             tmp_dir.to_str().unwrap().to_string()
         )
+    }
+
+    #[test]
+    fn test_hardlink_under_a_replaced_directory_is_dropped_with_it() {
+        // A file entry over a directory replaces the whole subtree, hardlinks included.
+        let tmp_dir = vmm_sys_util::tempdir::TempDir::new().unwrap();
+        let tmp_dir = tmp_dir.as_path();
+        let toc = tmp_dir.join("toc.json");
+        std::fs::write(
+            &toc,
+            r#"{"version": 1, "entries": [
+              {"name": "t", "type": "reg", "size": 4, "mode": 33188, "offset": 0,
+               "digest": "sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+               "chunkDigest": "sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"},
+              {"name": "d/", "type": "dir", "mode": 16877},
+              {"name": "d/h", "type": "hardlink", "linkName": "t", "mode": 33188},
+              {"name": "d", "type": "reg", "size": 4, "mode": 33188, "offset": 512,
+               "digest": "sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+               "chunkDigest": "sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"}
+            ]}"#,
+        )
+        .unwrap();
+        let mut ctx = stargz_ctx(toc, tmp_dir);
+        let mut bootstrap_mgr = BootstrapManager::new(
+            Some(ArtifactStorage::FileDir((
+                tmp_dir.to_path_buf(),
+                String::new(),
+            ))),
+            None,
+        );
+        let mut blob_mgr = BlobManager::new(digest::Algorithm::Sha256, false);
+        let mut builder = StargzBuilder::new(0x1000, &ctx);
+
+        let mut bootstrap_ctx = bootstrap_mgr.create_ctx(ctx.v6_block_size()).unwrap();
+        let tree = builder.build_tree(&mut ctx, 0).unwrap();
+        let mut bootstrap = build_bootstrap(
+            &mut ctx,
+            &mut bootstrap_mgr,
+            &mut bootstrap_ctx,
+            &mut blob_mgr,
+            tree,
+        )
+        .unwrap();
+        builder.fix_chunk_info(&mut ctx, &mut blob_mgr).unwrap();
+        builder
+            .fix_nodes(&mut bootstrap)
+            .expect("a hardlink whose target subtree was replaced is dropped with it");
+        let d = bootstrap.tree.get_node(Path::new("/d")).unwrap();
+        assert!(d.borrow_mut_node().is_reg());
+        assert!(bootstrap.tree.get_node(Path::new("/d/h")).is_none());
     }
 
     #[test]
