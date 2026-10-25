@@ -449,10 +449,11 @@ impl Request {
             .map_err(RequestError::Connection)
     }
 
-    /// Like `call_stream`, but returns the HTTP status with the byte count
-    /// instead of folding non-success into an error. The registry read path
-    /// uses this to stream a 200 blob body while still seeing 401/403 (stale
-    /// cached redirect) without an error round-trip.
+    /// Like `call_stream`, but returns the HTTP status and `Content-Range` with
+    /// the byte count instead of folding non-success into an error. The registry
+    /// read path uses this to stream a 200 blob body while still seeing 401/403
+    /// (stale cached redirect) without an error round-trip, and to check which
+    /// range the body carries.
     #[allow(clippy::too_many_arguments)]
     pub fn call_stream_status(
         &self,
@@ -463,7 +464,7 @@ impl Request {
         context: &mut BackendContext,
         temp_disable_proxy: bool,
         dst: &mut [u8],
-    ) -> RequestResult<(StatusCode, usize)> {
+    ) -> RequestResult<(StatusCode, Option<HeaderValue>, usize)> {
         // The Dragonfly SDK path can't stream into `dst`; fall back to buffered.
         #[cfg(feature = "backend-dragonfly-proxy")]
         {
@@ -486,11 +487,12 @@ impl Request {
                     temp_disable_proxy,
                 )?;
                 let status = resp.status();
+                let content_range = resp.headers().get(http::header::CONTENT_RANGE).cloned();
                 let written = resp
                     .copy_to(dst)
                     .map(|n| n as usize)
                     .map_err(RequestError::Common)?;
-                return Ok((status, written));
+                return Ok((status, content_range, written));
             }
         }
 

@@ -14,7 +14,7 @@ use std::{fmt, thread};
 use arc_swap::{ArcSwap, ArcSwapOption};
 use base64::Engine;
 pub use http::header::HeaderMap;
-use http::header::{CONTENT_LENGTH, HeaderValue};
+use http::header::{CONTENT_LENGTH, CONTENT_RANGE, HeaderValue};
 use http::{Method, StatusCode};
 use url::{ParseError, Url};
 
@@ -222,19 +222,47 @@ fn parse_challenges(source: &str) -> Vec<(String, HashMap<String, String>)> {
     challenges
 }
 
-/// Check the status of a blob GET that carried `Range: <range>` starting at `offset`.
+/// Check a blob GET that carried `Range: <range>` starting at `offset`.
 ///
-/// Only `206 Partial Content` carries the requested range. A server or proxy that ignores
-/// `Range` answers `200` with the whole blob, which is the requested data only when the
-/// range starts at offset 0; anything else would put bytes from the wrong offset into the
-/// cache. A 3xx here is a redirect that was not followed and carries no blob data.
-fn check_range_status(status: StatusCode, offset: u64, range: &str) -> RegistryResult<()> {
-    if status == StatusCode::PARTIAL_CONTENT || (status == StatusCode::OK && offset == 0) {
+/// `Content-Range` decides which bytes the body carries: a `206` or `200` whose
+/// `Content-Range` starts at `offset` is the requested range (dfdaemon < 1.4.0 serves a
+/// Range it satisfied itself as `200 OK` with a correct `Content-Range`). A `206` without
+/// the header is trusted as the requested range; a `200` without it is the whole blob,
+/// which is the requested data only at offset 0. Anything else would put bytes from the
+/// wrong offset into the cache. A 3xx here is a redirect that was not followed and
+/// carries no blob data.
+fn check_range_status(
+    status: StatusCode,
+    content_range: Option<&HeaderValue>,
+    offset: u64,
+    range: &str,
+) -> RegistryResult<()> {
+    // `bytes <start>-<end>/<total>`; `bytes */<total>` has no start and never matches.
+    let start = content_range
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.trim().strip_prefix("bytes "))
+        .and_then(|v| v.split_once('-'))
+        .and_then(|(start, _)| start.trim().parse::<u64>().ok());
+    let ok = match (status, start) {
+        (StatusCode::PARTIAL_CONTENT | StatusCode::OK, Some(start)) => start == offset,
+        (StatusCode::PARTIAL_CONTENT, None) => content_range.is_none(),
+        (StatusCode::OK, None) => content_range.is_none() && offset == 0,
+        _ => false,
+    };
+    if ok {
         return Ok(());
     }
+    let content_range = content_range
+        .map(|v| {
+            format!(
+                " (Content-Range: {})",
+                String::from_utf8_lossy(v.as_bytes())
+            )
+        })
+        .unwrap_or_default();
     Err(RegistryBackendError::Request(
         ConnectionError::ErrorWithMsg(format!(
-            "unexpected HTTP {status} response to Range {range}"
+            "unexpected HTTP {status} response to Range {range}{content_range}"
         )),
     ))
 }
@@ -985,7 +1013,7 @@ impl RegistryReader {
         if let Some(cached_redirect) = cached_redirect {
             // Hot path: the cached redirect is the final blob URL, so stream the
             // body straight into `buf` instead of buffering the whole blob first.
-            let (status, written) = self
+            let (status, content_range, written) = self
                 .request
                 .call_stream_status(
                     Method::GET,
@@ -1008,7 +1036,7 @@ impl RegistryReader {
                 // Try read again only once
                 return self._try_read(buf, offset, false, context);
             }
-            check_range_status(status, offset, &range)?;
+            check_range_status(status, content_range.as_ref(), offset, &range)?;
             return Ok(written);
         }
 
@@ -1098,7 +1126,7 @@ impl RegistryReader {
 
                 // Stream the blob from the redirect target, then cache the URL so
                 // subsequent reads take the hot path above.
-                let (rstatus, written) = self
+                let (rstatus, content_range, written) = self
                     .request
                     .call_stream_status(
                         Method::GET,
@@ -1110,7 +1138,7 @@ impl RegistryReader {
                         buf,
                     )
                     .map_err(request_err_to_registry)?;
-                check_range_status(rstatus, offset, &range)?;
+                check_range_status(rstatus, content_range.as_ref(), offset, &range)?;
                 trace!(
                     "redirect cache for blob={}, status={}",
                     self.blob_id, status
@@ -1126,7 +1154,7 @@ impl RegistryReader {
         }
 
         let status = resp.status();
-        check_range_status(status, offset, &range)?;
+        check_range_status(status, resp.headers().get(CONTENT_RANGE), offset, &range)?;
         resp.copy_to(buf)
             .map_err(|e| {
                 RegistryBackendError::Transport(std::io::Error::other(format!(
@@ -1170,7 +1198,12 @@ impl RegistryReader {
             context,
         )?;
 
-        check_range_status(resp.status(), offset, &range)?;
+        check_range_status(
+            resp.status(),
+            resp.headers().get(CONTENT_RANGE),
+            offset,
+            &range,
+        )?;
 
         Ok(resp.reader())
     }
@@ -2745,6 +2778,23 @@ mod tests {
             .to_string();
         let err = read_at(redirect, 0, 5).unwrap_err();
         assert!(err.to_string().contains("307"), "{err}");
+
+        // dfdaemon < 1.4.0 serves a Range it satisfied itself as `200 OK` with a
+        // correct `Content-Range`: the header, not the status, says which bytes arrived.
+        let ok_with_range = "HTTP/1.1 200 OK\r\nContent-Range: bytes 10-14/20\r\n\
+                             Content-Length: 5\r\nConnection: close\r\n\r\nabcde"
+            .to_string();
+        assert_eq!(read_at(ok_with_range, 10, 5).unwrap(), b"abcde");
+
+        // A 206 whose `Content-Range` starts elsewhere carries the wrong bytes.
+        let wrong_partial = "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-4/20\r\n\
+                             Content-Length: 5\r\nConnection: close\r\n\r\n01234"
+            .to_string();
+        let err = read_at(wrong_partial, 10, 5).unwrap_err();
+        assert!(
+            err.to_string().contains("206") && err.to_string().contains("bytes 0-4/20"),
+            "{err}"
+        );
     }
 
     #[test]
