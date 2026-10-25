@@ -34,6 +34,11 @@ use std::time::{Duration, Instant};
 use async_channel::{Receiver, Sender};
 use tracing::{debug, info, warn};
 
+/// Version of `AutoAccelManifest`. A sidecar whose manifest carries another version is treated as
+/// absent and reconverted; bump it when the artifact's content changes for every image (such as
+/// the layer merge rules), since the record name does not change.
+pub const AUTO_ACCEL_MANIFEST_VERSION: u32 = 2;
+
 /// Auto-accel sidecar manifest written into containerd's content store
 /// alongside the bootstrap + zran index + prefetch blobs. The whole JSON is
 /// itself a content blob (so spegel mirrors it), and we register it under
@@ -1038,6 +1043,18 @@ async fn existing_sidecar_state(
             return (SidecarState::Absent, None);
         }
     };
+    // Conservative: an unreadable manifest counts as base so the optimize stage still runs.
+    let state = match sidecar_manifest(deps, &existing.digest).await {
+        Ok(manifest) => sidecar_state_of(&manifest),
+        Err(e) => {
+            debug!(image_name = %image_name, error = ?e, "auto-accel prefetch-state probe failed; treating sidecar as base");
+            SidecarState::Base
+        }
+    };
+    if state == SidecarState::Absent {
+        info!(image_name = %image_name, "auto-accel sidecar has a stale manifest version; re-converting");
+        return (SidecarState::Absent, None);
+    }
     match completeness_check(deps, &existing.digest).await {
         Ok(true) => {}
         Ok(false) => {
@@ -1049,21 +1066,14 @@ async fn existing_sidecar_state(
             return (SidecarState::Absent, None);
         }
     }
-    let state = match sidecar_has_prefetch(deps, &existing.digest).await {
-        Ok(true) => SidecarState::Optimized,
-        Ok(false) => SidecarState::Base,
-        Err(e) => {
-            // Conservative: treat as base so the optimize stage still runs.
-            debug!(image_name = %image_name, error = ?e, "auto-accel prefetch-state probe failed; treating sidecar as base");
-            SidecarState::Base
-        }
-    };
     (state, Some(existing.digest))
 }
 
-/// Parse an on-store OCI sidecar manifest → its config blob (our
-/// `AutoAccelManifest`) → report whether it carries a prefetch blob.
-async fn sidecar_has_prefetch(deps: &ConversionDeps, oci_manifest_digest: &str) -> Result<bool> {
+/// Parse an on-store OCI sidecar manifest → its config blob (our `AutoAccelManifest`).
+async fn sidecar_manifest(
+    deps: &ConversionDeps,
+    oci_manifest_digest: &str,
+) -> Result<AutoAccelManifest> {
     let manifest_bytes = deps.content_store.fetch_bytes(oci_manifest_digest).await?;
     let oci: serde_json::Value = serde_json::from_slice(&manifest_bytes)
         .with_context(|| format!("parse OCI manifest {oci_manifest_digest}"))?;
@@ -1075,9 +1085,20 @@ async fn sidecar_has_prefetch(deps: &ConversionDeps, oci_manifest_digest: &str) 
             anyhow::anyhow!("oci manifest {oci_manifest_digest} missing config.digest")
         })?;
     let config_bytes = deps.content_store.fetch_bytes(config_digest).await?;
-    let manifest: AutoAccelManifest = serde_json::from_slice(&config_bytes)
-        .with_context(|| format!("parse auto-accel config blob {config_digest}"))?;
-    Ok(manifest.prefetch_blob.is_some())
+    serde_json::from_slice(&config_bytes)
+        .with_context(|| format!("parse auto-accel config blob {config_digest}"))
+}
+
+/// A sidecar of another manifest version is reconverted; otherwise the prefetch blob tells a
+/// base sidecar from an optimized one.
+fn sidecar_state_of(manifest: &AutoAccelManifest) -> SidecarState {
+    if manifest.version != AUTO_ACCEL_MANIFEST_VERSION {
+        SidecarState::Absent
+    } else if manifest.prefetch_blob.is_some() {
+        SidecarState::Optimized
+    } else {
+        SidecarState::Base
+    }
 }
 
 /// Upload a converted artifact as a content-store sidecar (bootstrap + zran
@@ -1208,7 +1229,7 @@ async fn upload_artifact(
 
     // (5) AutoAccelManifest goes up as the OCI image *config* blob.
     let manifest = AutoAccelManifest {
-        version: 1,
+        version: AUTO_ACCEL_MANIFEST_VERSION,
         subject_manifest_digest: manifest_digest.clone(),
         image_ref: job.image.clone(),
         bootstrap: AutoAccelDescriptor {
@@ -1484,6 +1505,41 @@ mod tests {
                 timestamp_unix: 1,
             }],
         )
+    }
+
+    fn manifest(version: u32, prefetch: bool) -> AutoAccelManifest {
+        let desc = AutoAccelDescriptor {
+            digest: "sha256:0".to_string(),
+            size: 1,
+        };
+        AutoAccelManifest {
+            version,
+            subject_manifest_digest: "sha256:1".to_string(),
+            image_ref: "registry.local/app:1".to_string(),
+            bootstrap: desc.clone(),
+            zran_indexes: Vec::new(),
+            prefetch_blob: prefetch.then_some(desc),
+            architecture: default_oci_architecture(),
+            os: default_oci_os(),
+            rootfs: default_oci_rootfs(),
+        }
+    }
+
+    #[test]
+    fn sidecar_state_treats_stale_manifest_version_as_absent() {
+        assert_eq!(
+            sidecar_state_of(&manifest(AUTO_ACCEL_MANIFEST_VERSION, false)),
+            SidecarState::Base
+        );
+        assert_eq!(
+            sidecar_state_of(&manifest(AUTO_ACCEL_MANIFEST_VERSION, true)),
+            SidecarState::Optimized
+        );
+        // Sidecars written by an older manifest version are reconverted.
+        assert_eq!(
+            sidecar_state_of(&manifest(AUTO_ACCEL_MANIFEST_VERSION - 1, true)),
+            SidecarState::Absent
+        );
     }
 
     #[test]

@@ -35,7 +35,7 @@ use crate::auto_accel_oci::{
 // only by `role_for_media_type`'s test (#[cfg(test)] module below) — keep
 // the import there rather than at the file top so a stale prod-side rename
 // doesn't fail the build only in test mode.
-use crate::auto_zran::AutoAccelManifest;
+use crate::auto_zran::{AUTO_ACCEL_MANIFEST_VERSION, AutoAccelManifest};
 use crate::config::PeerMirrorConfig;
 use crate::content_store::{ContentInfo, ContentStoreClient};
 use crate::peer_mirror::{FetchResult, PeerMirror, PullOutcome, build_peer_mirror};
@@ -229,10 +229,10 @@ impl SidecarLocator {
             );
             return Ok(None);
         }
-        if manifest.version != 1 {
+        if manifest.version != AUTO_ACCEL_MANIFEST_VERSION {
             debug!(
                 version = manifest.version,
-                "auto-accel manifest is newer than this snapshotter supports; ignoring"
+                "auto-accel manifest version is not the one this snapshotter serves; ignoring"
             );
             return Ok(None);
         }
