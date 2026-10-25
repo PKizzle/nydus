@@ -1042,9 +1042,13 @@ impl FanotifyHandler {
     fn process_event_buffer(&self, buf: &[u8]) -> Result<()> {
         let mut offset = 0usize;
         while offset + std::mem::size_of::<libc::fanotify_event_metadata>() <= buf.len() {
-            // SAFETY: we verified the buffer has enough bytes.
-            let meta =
-                unsafe { &*(buf.as_ptr().add(offset) as *const libc::fanotify_event_metadata) };
+            // SAFETY: we verified the buffer has enough bytes; the event buffer is a `Vec<u8>` with no
+            // alignment guarantee, so the record is copied out rather than referenced.
+            let meta = unsafe {
+                std::ptr::read_unaligned(
+                    buf.as_ptr().add(offset) as *const libc::fanotify_event_metadata
+                )
+            };
 
             // fanotify(7) mandates checking the metadata version before consuming an
             // event; a mismatched kernel ABI must fail loudly, not be misparsed.
@@ -1109,7 +1113,7 @@ impl FanotifyHandler {
             // with EIO and closes the fd, so the blocked reader errors instead
             // of hanging in D-state behind an unanswerable event.
             let guard = EventFdGuard::new(self, meta.fd as RawFd);
-            let response = match self.handle_event(meta, &buf[offset..offset + meta_len]) {
+            let response = match self.handle_event(&meta, &buf[offset..offset + meta_len]) {
                 Ok(()) => FAN_ALLOW,
                 Err(e) => {
                     warn!("fanotify: failed to serve pre-content event: {}", e);
@@ -1191,8 +1195,11 @@ impl FanotifyHandler {
         let mut cursor = std::mem::size_of::<libc::fanotify_event_metadata>();
         while cursor + std::mem::size_of::<fanotify_event_info_header>() <= raw_buf.len() {
             // SAFETY: bounds checked by the loop condition.
-            let hdr =
-                unsafe { &*(raw_buf.as_ptr().add(cursor) as *const fanotify_event_info_header) };
+            let hdr = unsafe {
+                std::ptr::read_unaligned(
+                    raw_buf.as_ptr().add(cursor) as *const fanotify_event_info_header
+                )
+            };
             let hdr_len = hdr.len as usize;
             if hdr_len < std::mem::size_of::<fanotify_event_info_header>()
                 || cursor + hdr_len > raw_buf.len()
@@ -1204,7 +1211,9 @@ impl FanotifyHandler {
             {
                 // SAFETY: verified the record is large enough for `fanotify_event_info_range`.
                 return Some(unsafe {
-                    *(raw_buf.as_ptr().add(cursor) as *const fanotify_event_info_range)
+                    std::ptr::read_unaligned(
+                        raw_buf.as_ptr().add(cursor) as *const fanotify_event_info_range
+                    )
                 });
             }
             cursor += hdr_len;
@@ -1454,8 +1463,13 @@ fn invalidate_in_order(
 fn for_each_parsable_event(buf: &[u8], mut f: impl FnMut(&libc::fanotify_event_metadata)) {
     let mut offset = 0usize;
     while offset + std::mem::size_of::<libc::fanotify_event_metadata>() <= buf.len() {
-        // SAFETY: we verified the buffer has enough bytes.
-        let meta = unsafe { &*(buf.as_ptr().add(offset) as *const libc::fanotify_event_metadata) };
+        // SAFETY: we verified the buffer has enough bytes; the event buffer is a `Vec<u8>` with no
+        // alignment guarantee, so the record is copied out rather than referenced.
+        let meta = unsafe {
+            std::ptr::read_unaligned(
+                buf.as_ptr().add(offset) as *const libc::fanotify_event_metadata
+            )
+        };
         let meta_len = meta.event_len as usize;
         if meta.vers != libc::FANOTIFY_METADATA_VERSION
             || meta_len < std::mem::size_of::<libc::fanotify_event_metadata>()
@@ -1463,7 +1477,7 @@ fn for_each_parsable_event(buf: &[u8], mut f: impl FnMut(&libc::fanotify_event_m
         {
             break;
         }
-        f(meta);
+        f(&meta);
         offset += meta_len;
     }
 }
@@ -1685,7 +1699,9 @@ mod tests {
         // The FAN_Q_OVERFLOW record is what `process_event_buffer` keys on to fail
         // closed. Guard the two properties that make it detectable.
         let buf = event_header(FAN_NOFD, FAN_Q_OVERFLOW, 0);
-        let meta = unsafe { &*(buf.as_ptr() as *const libc::fanotify_event_metadata) };
+        let meta = unsafe {
+            std::ptr::read_unaligned(buf.as_ptr() as *const libc::fanotify_event_metadata)
+        };
         assert_eq!(meta.fd, FAN_NOFD);
         assert_ne!(meta.mask & FAN_Q_OVERFLOW, 0);
         assert_eq!(meta.vers, libc::FANOTIFY_METADATA_VERSION);
