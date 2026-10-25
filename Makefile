@@ -187,8 +187,10 @@ ut-nextest:
 # install miri first from https://github.com/rust-lang/miri/
 # nydus-snapshotter is excluded from Miri: it links compio (io_uring) + mimalloc
 # and is FFI/syscall-heavy, which Miri cannot execute.
+# cache::dedup:: is excluded because its r2d2 pool parks threads through parking_lot_core,
+# whose futex syscall Miri reports as Undefined Behavior; that code is third-party.
 miri-ut-nextest:
-	$(CARGO_COV_FLAGS) MIRIFLAGS=-Zmiri-disable-isolation TEST_WORKDIR_PREFIX=$(TEST_WORKDIR_PREFIX) RUST_BACKTRACE=1 ${RUSTUP} run nightly cargo miri nextest run --no-fail-fast --filter-expr 'test(test) - test(integration) - test(deduplicate::tests) - test(inode_bitmap::tests::test_inode_bitmap)' --workspace $(EXCLUDE_PACKAGES) --exclude nydus-snapshotter $(CARGO_COMMON) $(CARGO_BUILD_FLAGS)
+	$(CARGO_COV_FLAGS) MIRIFLAGS=-Zmiri-disable-isolation TEST_WORKDIR_PREFIX=$(TEST_WORKDIR_PREFIX) RUST_BACKTRACE=1 ${RUSTUP} run nightly cargo miri nextest run --no-fail-fast --filter-expr 'test(test) - test(integration) - test(deduplicate::tests) - test(cache::dedup::) - test(inode_bitmap::tests::test_inode_bitmap)' --workspace $(EXCLUDE_PACKAGES) --exclude nydus-snapshotter $(CARGO_COMMON) $(CARGO_BUILD_FLAGS)
 
 smoke-only:
 	CARGO_COV_FLAGS="$(CARGO_COV_FLAGS)" make -C smoke test
