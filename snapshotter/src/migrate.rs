@@ -181,6 +181,7 @@ pub fn migrate_store(
             created_at: snapshot.created_at.unwrap_or(now),
             updated_at: snapshot.updated_at.or(snapshot.created_at).unwrap_or(now),
             labels: snapshot.labels.clone(),
+            usage: None,
         };
 
         if params.commit {
