@@ -1875,4 +1875,29 @@ mod tests {
             &RafsDigest::from_buf(b"payload", digest::Algorithm::Sha256)
         );
     }
+
+    #[test]
+    fn test_missing_parent_sorting_before_a_sibling_holds_its_children() {
+        // `root/` is synthesized after `tmp/` exists and sorts before it.
+        let tar = RawTar::default()
+            .reg("tmp/x", b"")
+            .reg("root/.bashrc", b"")
+            .finish();
+        let bootstrap = build_layer(&tar);
+        assert!(
+            bootstrap
+                .tree
+                .get_node(Path::new("/root/.bashrc"))
+                .is_some()
+        );
+        assert_eq!(
+            bootstrap
+                .tree
+                .get_node(Path::new("/tmp"))
+                .unwrap()
+                .children
+                .len(),
+            1
+        );
+    }
 }
