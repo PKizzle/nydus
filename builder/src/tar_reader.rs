@@ -36,7 +36,7 @@ pub enum TarError {
     Unsupported(String),
 }
 
-type Result<T> = std::result::Result<T, TarError>;
+type TarResult<T> = std::result::Result<T, TarError>;
 
 /// A member of the archive with its GNU long name and PAX records applied.
 pub struct Member {
@@ -75,7 +75,7 @@ impl<R: Read + Seek> Members<R> {
 
     /// Returns the next member, or `None` after the end-of-archive marker. Everything after
     /// the marker is read and discarded, so a digest over the stream covers all of it.
-    pub fn next_member(&mut self) -> Result<Option<Member>> {
+    pub fn next_member(&mut self) -> TarResult<Option<Member>> {
         let mut pax: Option<Vec<(Vec<u8>, Vec<u8>)>> = None;
         let mut long_name = None;
         let mut long_link = None;
@@ -160,7 +160,7 @@ impl<R: Read + Seek> Members<R> {
         }
     }
 
-    fn skip_rest(&mut self) -> Result<()> {
+    fn skip_rest(&mut self) -> TarResult<()> {
         let n = self.data_left.checked_add(self.pad);
         (self.data_left, self.pad) = (0, 0);
         let n = n
@@ -177,7 +177,7 @@ impl<R: Read + Seek> Members<R> {
         Ok(())
     }
 
-    fn read_body(&mut self, size: u64) -> Result<Vec<u8>> {
+    fn read_body(&mut self, size: u64) -> TarResult<Vec<u8>> {
         // Extension headers live in memory; bound what a hostile archive can make us allocate.
         if size > 1 << 20 {
             return Err(malformed(format!("extension header of {} bytes", size)));
@@ -190,7 +190,7 @@ impl<R: Read + Seek> Members<R> {
 
     /// Reads the next header, `None` at the end of the archive: an end-of-file at a block
     /// boundary or two zero blocks. A zero block followed by anything else is malformed.
-    fn read_header(&mut self) -> Result<Option<Header>> {
+    fn read_header(&mut self) -> TarResult<Option<Header>> {
         let mut header = Header::new_old();
         if !self.read_block(header.as_mut_bytes())? {
             return Ok(None);
@@ -208,7 +208,7 @@ impl<R: Read + Seek> Members<R> {
     }
 
     /// Fills `buf`, returning false at a clean end-of-file.
-    fn read_block(&mut self, buf: &mut [u8]) -> Result<bool> {
+    fn read_block(&mut self, buf: &mut [u8]) -> TarResult<bool> {
         let mut read = 0;
         while read < buf.len() {
             match self.inner.read(&mut buf[read..]) {
@@ -251,7 +251,7 @@ fn truncated() -> TarError {
     malformed("unexpected end of archive")
 }
 
-fn check_size(size: u64) -> Result<u64> {
+fn check_size(size: u64) -> TarResult<u64> {
     if size > MAX_SIZE {
         return Err(malformed(format!("member size {size} out of range")));
     }
@@ -340,7 +340,7 @@ fn parse_numeric(f: &[u8]) -> Option<i64> {
 }
 
 /// Go accepts a checksum computed over the header bytes as unsigned or as signed values.
-fn verify_checksum(header: &Header) -> Result<()> {
+fn verify_checksum(header: &Header) -> TarResult<()> {
     let stored = header
         .cksum()
         .map_err(|_| malformed("unreadable header checksum"))?;
@@ -358,7 +358,7 @@ fn verify_checksum(header: &Header) -> Result<()> {
 
 /// Splits a PAX header body into its records, `<len> <key>=<value>\n` each, where `<len>`
 /// counts the whole record. The value runs up to the final newline and may contain more.
-fn parse_pax(mut buf: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+fn parse_pax(mut buf: &[u8]) -> TarResult<Vec<(Vec<u8>, Vec<u8>)>> {
     let bad = || malformed("bad PAX record");
     let mut records = Vec::new();
     while !buf.is_empty() {
@@ -383,7 +383,7 @@ fn parse_pax(mut buf: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
 }
 
 /// Applies the PAX records Go's reader interprets; an empty value keeps the header's.
-fn apply_pax(member: &mut Member, records: Vec<(Vec<u8>, Vec<u8>)>) -> Result<()> {
+fn apply_pax(member: &mut Member, records: Vec<(Vec<u8>, Vec<u8>)>) -> TarResult<()> {
     for (key, value) in &records {
         if key.starts_with(b"GNU.sparse.") {
             // shortcut: sparse members are rejected, not expanded; they also cannot be served
