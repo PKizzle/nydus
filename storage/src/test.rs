@@ -67,6 +67,7 @@ pub(crate) struct MockChunkInfo {
     pub file_offset: u64,
     pub index: u32,
     pub crc32: u32,
+    pub xxh3: u64,
 }
 
 impl MockChunkInfo {
@@ -102,6 +103,14 @@ impl BlobChunkInfo for MockChunkInfo {
 
     fn crc32(&self) -> u32 {
         if self.has_crc32() { self.crc32 } else { 0 }
+    }
+
+    fn has_xxh3(&self) -> bool {
+        self.flags.contains(BlobChunkFlags::HAS_XXH3)
+    }
+
+    fn xxh3(&self) -> u64 {
+        if self.has_xxh3() { self.xxh3 } else { 0 }
     }
 
     fn as_any(&self) -> &dyn Any {

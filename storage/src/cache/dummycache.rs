@@ -258,8 +258,6 @@ impl Drop for DummyCacheMgr {
 mod tests {
     use std::fs::OpenOptions;
 
-    use std::any::Any;
-
     use nydus_api::ConfigV2;
     use nydus_utils::crc32::{self, Crc32};
     use nydus_utils::digest::RafsDigest;
@@ -274,57 +272,6 @@ mod tests {
     };
 
     use super::*;
-
-    /// A chunk carrying an XXH3-64 checksum, which `MockChunkInfo` has no slot for.
-    struct Xxh3Chunk(MockChunkInfo, u64);
-
-    impl BlobChunkInfo for Xxh3Chunk {
-        fn chunk_id(&self) -> &RafsDigest {
-            self.0.chunk_id()
-        }
-        fn id(&self) -> u32 {
-            self.0.id()
-        }
-        fn blob_index(&self) -> u32 {
-            self.0.blob_index()
-        }
-        fn compressed_offset(&self) -> u64 {
-            self.0.compressed_offset()
-        }
-        fn compressed_size(&self) -> u32 {
-            self.0.compressed_size()
-        }
-        fn uncompressed_offset(&self) -> u64 {
-            self.0.uncompressed_offset()
-        }
-        fn uncompressed_size(&self) -> u32 {
-            self.0.uncompressed_size()
-        }
-        fn is_batch(&self) -> bool {
-            false
-        }
-        fn is_compressed(&self) -> bool {
-            false
-        }
-        fn is_encrypted(&self) -> bool {
-            false
-        }
-        fn has_crc32(&self) -> bool {
-            false
-        }
-        fn crc32(&self) -> u32 {
-            0
-        }
-        fn has_xxh3(&self) -> bool {
-            true
-        }
-        fn xxh3(&self) -> u64 {
-            self.1
-        }
-        fn as_any(&self) -> &dyn Any {
-            self
-        }
-    }
 
     fn new_validation_cache(need_validation: bool, is_legacy_stargz: bool) -> DummyCache {
         let info = BlobInfo::new(
@@ -372,90 +319,57 @@ mod tests {
             uncompress_size: data.len() as u32,
             ..Default::default()
         };
-        let xxh3_chunk = Xxh3Chunk(
-            MockChunkInfo {
-                block_id: RafsDigest::from_buf(data, digest::Algorithm::Sha256),
-                uncompress_size: data.len() as u32,
-                ..Default::default()
-            },
-            nydus_utils::xxh3::checksum(tampered),
-        );
+        let xxh3_chunk = MockChunkInfo {
+            block_id: RafsDigest::from_buf(data, digest::Algorithm::Sha256),
+            flags: BlobChunkFlags::HAS_XXH3,
+            uncompress_size: data.len() as u32,
+            xxh3: nydus_utils::xxh3::checksum(tampered),
+            ..Default::default()
+        };
 
         // Digest validation enabled: the digest must be checked, a matching checksum is not enough.
         let cache = new_validation_cache(true, false);
-        let err = cache
-            .validate_chunk_data(&chunk, tampered, false)
-            .unwrap_err();
+        let err = cache.validate_chunk_data(&chunk, tampered).unwrap_err();
         assert!(matches!(err, StorageError::InvalidData(_)));
         assert!(err.to_string().contains("digest"), "{err}");
+        assert_eq!(cache.validate_chunk_data(&chunk, data).unwrap(), data.len());
+        assert!(cache.validate_chunk_data(&xxh3_chunk, tampered).is_err());
         assert_eq!(
-            cache.validate_chunk_data(&chunk, data, false).unwrap(),
+            cache.validate_chunk_data(&xxh3_chunk, data).unwrap(),
             data.len()
         );
-        assert!(
-            cache
-                .validate_chunk_data(&xxh3_chunk, tampered, false)
-                .is_err()
-        );
+        assert!(cache.validate_chunk_data(&plain_chunk, tampered).is_err());
         assert_eq!(
-            cache.validate_chunk_data(&xxh3_chunk, data, false).unwrap(),
-            data.len()
-        );
-        assert!(
-            cache
-                .validate_chunk_data(&plain_chunk, tampered, false)
-                .is_err()
-        );
-        assert_eq!(
-            cache
-                .validate_chunk_data(&plain_chunk, data, false)
-                .unwrap(),
+            cache.validate_chunk_data(&plain_chunk, data).unwrap(),
             data.len()
         );
 
         // Digest validation disabled: only the checksum is checked, if available.
         let cache = new_validation_cache(false, false);
         assert_eq!(
-            cache.validate_chunk_data(&chunk, tampered, false).unwrap(),
+            cache.validate_chunk_data(&chunk, tampered).unwrap(),
             data.len()
         );
-        let err = cache.validate_chunk_data(&chunk, data, false).unwrap_err();
+        let err = cache.validate_chunk_data(&chunk, data).unwrap_err();
         assert!(err.to_string().contains("crc32"), "{err}");
         assert_eq!(
-            cache
-                .validate_chunk_data(&xxh3_chunk, tampered, false)
-                .unwrap(),
+            cache.validate_chunk_data(&xxh3_chunk, tampered).unwrap(),
             data.len()
         );
-        let err = cache
-            .validate_chunk_data(&xxh3_chunk, data, false)
-            .unwrap_err();
+        let err = cache.validate_chunk_data(&xxh3_chunk, data).unwrap_err();
         assert!(err.to_string().contains("xxh3"), "{err}");
         assert_eq!(
-            cache
-                .validate_chunk_data(&plain_chunk, tampered, false)
-                .unwrap(),
-            data.len()
-        );
-
-        // Forced validation behaves like enabled digest validation.
-        assert!(cache.validate_chunk_data(&chunk, tampered, true).is_err());
-        assert_eq!(
-            cache.validate_chunk_data(&chunk, data, true).unwrap(),
+            cache.validate_chunk_data(&plain_chunk, tampered).unwrap(),
             data.len()
         );
 
         // Buffer size must match the uncompressed chunk size.
-        assert!(
-            cache
-                .validate_chunk_data(&chunk, &tampered[..8], false)
-                .is_err()
-        );
+        assert!(cache.validate_chunk_data(&chunk, &tampered[..8]).is_err());
 
         // Legacy stargz blobs have no verifiable chunk digest or checksum.
         let cache = new_validation_cache(true, true);
         assert_eq!(
-            cache.validate_chunk_data(&chunk, tampered, false).unwrap(),
+            cache.validate_chunk_data(&chunk, tampered).unwrap(),
             data.len()
         );
     }
@@ -565,6 +479,7 @@ mod tests {
             file_offset: 0,
             index: 0,
             crc32: 0,
+            ..Default::default()
         });
         iovec.push(BlobIoDesc::new(
             Arc::new(info.clone()),
@@ -591,6 +506,7 @@ mod tests {
             file_offset: 0,
             index: 0,
             crc32: 0,
+            ..Default::default()
         });
 
         let chunk3: Arc<dyn BlobChunkInfo> = Arc::new(MockChunkInfo {
@@ -604,6 +520,7 @@ mod tests {
             file_offset: 0,
             index: 0,
             crc32: 0,
+            ..Default::default()
         });
 
         let mut iovec = BlobIoVec::new(Arc::new(info.clone()));
