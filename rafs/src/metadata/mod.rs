@@ -746,6 +746,9 @@ pub struct RafsSuper {
     pub meta: RafsSuperMeta,
     /// Rafs filesystem super block.
     pub superblock: Arc<dyn RafsSuperBlock>,
+    /// Sorted inode numbers of directories synthesized for missing tar parents (v6 keeps them in
+    /// a table referenced from the extended superblock, v5 in the inode flags).
+    pub implicit_dirs: Vec<u32>,
 }
 
 impl Default for RafsSuper {
@@ -755,6 +758,7 @@ impl Default for RafsSuper {
             validate_digest: false,
             meta: RafsSuperMeta::default(),
             superblock: Arc::new(NoopSuperBlock::new()),
+            implicit_dirs: Vec::new(),
         }
     }
 }

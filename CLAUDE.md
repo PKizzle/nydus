@@ -153,6 +153,11 @@ nydus/
    back into overlay mount specs; consumers that need real paths must `canonicalize()` (the access
    tracer already does).
 10. **Nydus blob layers bypass stream processors**: `application/vnd.oci.image.layer.nydus.blob.v1` layers are NOT routed through a containerd stream processor. On `Prepare`, the snapshotter classifies the layer via `containerd.io/snapshot/nydus-blob`, commits the target snapshot directly, and returns gRPC `AlreadyExists` so containerd's image-unpacker skips extraction. See [snapshotter/src/source/labels.rs](snapshotter/src/source/labels.rs) and `OverlayEngine::prepare`.
+11. **Layer merge emulates containerd's overlay apply path**: a directory synthesized for a missing tar
+    parent is marked `IMPLICIT_DIR` (v5 inode flag; v6 nid table referenced from the extended
+    superblock) and the merge keeps a lower directory's metadata under it, while an explicit directory
+    entry replaces it. Per-layer `create` and `merge` must be the same `nydus-image` build. Rules and
+    accepted deviations: "Layer apply model" in [docs/nydus-image.md](docs/nydus-image.md).
 
 ## Node-local acceleration (transparent, no tag change)
 

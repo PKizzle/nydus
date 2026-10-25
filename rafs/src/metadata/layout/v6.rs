@@ -459,8 +459,13 @@ pub struct RafsV6SuperBlockExt {
     s_prefetch_table_offset: u64,
     s_prefetch_table_size: u32,
     s_padding: u32,
+    /// Absolute offset of the implicit-directory nid table (8-aligned, 0 = none). The table is
+    /// nydus-private: the kernel reads only the EROFS superblock.
+    s_implicit_dir_table_offset: u64,
+    /// Size of the implicit-directory nid table in bytes (multiple of 4, 0 = none).
+    s_implicit_dir_table_size: u32,
     /// Reserved
-    s_reserved: [u8; 200],
+    s_reserved: [u8; 188],
 }
 
 impl_bootstrap_converter!(RafsV6SuperBlockExt);
@@ -537,6 +542,7 @@ impl RafsV6SuperBlockExt {
         let blob_range = MetaRange::new(blob_offset, blob_size, true)?;
 
         let mut chunk_info_tbl_range = None;
+        let mut prefetch_tbl_range = None;
         if self.chunk_table_size() > 0 {
             let chunk_tbl_offset = self.chunk_table_offset();
             let chunk_tbl_size = self.chunk_table_size();
@@ -590,6 +596,37 @@ impl RafsV6SuperBlockExt {
             {
                 return Err(RafsError::InvalidMetadata(
                     "chunk information table intersects with prefetch table in Rafs v6 extended superblock".to_string(),
+                ));
+            }
+            prefetch_tbl_range = Some(prefetch_range);
+        }
+
+        if self.implicit_dir_table_size() > 0 {
+            let tbl_offset = self.implicit_dir_table_offset();
+            let tbl_size = self.implicit_dir_table_size() as u64;
+            if tbl_offset < block_size
+                || !tbl_size.is_multiple_of(size_of::<u32>() as u64)
+                || tbl_offset < devslot_end
+                || tbl_offset.checked_add(tbl_size).is_none()
+                || tbl_offset + tbl_size > meta_size
+            {
+                return Err(RafsError::InvalidMetadata(format!(
+                    "invalid implicit directory table offset 0x{:x}/size 0x{:x} in Rafs v6 extended superblock",
+                    tbl_offset, tbl_size
+                )));
+            }
+            let range = MetaRange::new(tbl_offset, tbl_size, false)?;
+            if blob_range.intersect_with(&range)
+                || chunk_info_tbl_range
+                    .as_ref()
+                    .is_some_and(|r| r.intersect_with(&range))
+                || prefetch_tbl_range
+                    .as_ref()
+                    .is_some_and(|r| r.intersect_with(&range))
+            {
+                return Err(RafsError::InvalidMetadata(
+                    "implicit directory table intersects with another table in Rafs v6 extended superblock"
+                        .to_string(),
                 ));
             }
         }
@@ -686,6 +723,18 @@ impl RafsV6SuperBlockExt {
         s_prefetch_table_offset,
         u64
     );
+    impl_pub_getter_setter!(
+        implicit_dir_table_offset,
+        set_implicit_dir_table_offset,
+        s_implicit_dir_table_offset,
+        u64
+    );
+    impl_pub_getter_setter!(
+        implicit_dir_table_size,
+        set_implicit_dir_table_size,
+        s_implicit_dir_table_size,
+        u32
+    );
 }
 
 impl RafsStore for RafsV6SuperBlockExt {
@@ -709,7 +758,9 @@ impl Default for RafsV6SuperBlockExt {
             s_prefetch_table_offset: 0,
             s_prefetch_table_size: 0,
             s_padding: u32::to_le(0),
-            s_reserved: [0u8; 200],
+            s_implicit_dir_table_offset: 0,
+            s_implicit_dir_table_size: 0,
+            s_reserved: [0u8; 188],
         }
     }
 }
@@ -2723,6 +2774,49 @@ mod tests {
             ext.s_flags & RafsSuperFlags::ENCRYPTION_ASE_128_XTS.bits(),
             0
         );
+    }
+
+    #[test]
+    fn test_rafs_v6_super_block_ext_implicit_dir_table() {
+        let mut ext = RafsV6SuperBlockExt::new();
+        ext.set_compressor(compress::Algorithm::None);
+        ext.set_digester(digest::Algorithm::Sha256);
+        ext.set_chunk_size(0x10_0000);
+        ext.set_blob_table_offset(EROFS_BLOCK_SIZE_4096);
+        ext.set_implicit_dir_table_offset(EROFS_BLOCK_SIZE_4096 + 8);
+        ext.set_implicit_dir_table_size(8);
+        assert_eq!(ext.implicit_dir_table_offset(), EROFS_BLOCK_SIZE_4096 + 8);
+        assert_eq!(ext.implicit_dir_table_size(), 8);
+
+        let meta = RafsSuperMeta {
+            blkszbits: EROFS_BLOCK_BITS_12,
+            ..RafsSuperMeta::default()
+        };
+        let end = 3 * EROFS_BLOCK_SIZE_4096;
+        ext.validate(end, &meta).unwrap();
+
+        let (mut reader, mut writer) = get_streams();
+        writer
+            .seek_offset((EROFS_SUPER_OFFSET + EROFS_SUPER_BLOCK_SIZE) as u64)
+            .unwrap();
+        ext.store(&mut writer).unwrap();
+        writer.flush().unwrap();
+        let mut loaded = RafsV6SuperBlockExt::new();
+        loaded.load(&mut reader).unwrap();
+        assert_eq!(
+            loaded.implicit_dir_table_offset(),
+            EROFS_BLOCK_SIZE_4096 + 8
+        );
+        assert_eq!(loaded.implicit_dir_table_size(), 8);
+
+        // Misaligned size, table past the end, and table inside the superblock are rejected.
+        ext.set_implicit_dir_table_size(6);
+        assert!(ext.validate(end, &meta).is_err());
+        ext.set_implicit_dir_table_size(8);
+        ext.set_implicit_dir_table_offset(end - 4);
+        assert!(ext.validate(end, &meta).is_err());
+        ext.set_implicit_dir_table_offset(EROFS_BLOCK_SIZE_4096 - 8);
+        assert!(ext.validate(end, &meta).is_err());
     }
 
     #[test]

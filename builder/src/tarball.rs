@@ -614,7 +614,9 @@ fn clean_path(name: &[u8]) -> Vec<u8> {
 /// Resolves a member name to the absolute path containerd's `archive.Apply` lands it on:
 /// relative to the root of the layer, `..` stops at the root, and each leading component that
 /// is a symlink from an earlier member is followed within the root, while the last component
-/// is not. Only symlinks of this layer are known, the layers below it are not.
+/// is not. Symlinks of lower layers are not followed: `archive.Apply` on an overlay snapshot
+/// resolves against the empty upperdir, so a lower symlink is shadowed by the directory the
+/// member implies (see "Layer apply model" in docs/nydus-image.md).
 fn resolve_path(tree: &Tree, name: &[u8]) -> Result<PathBuf> {
     let mut pending: VecDeque<Vec<u8>> = name.split(|&b| b == b'/').map(<[u8]>::to_vec).collect();
     // `trees[i]` is the tree at `resolved[..i]`, `None` once a component does not exist.
@@ -1899,5 +1901,222 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    fn implicit_dirs(tree: &Tree) -> Vec<String> {
+        let mut out = Vec::new();
+        tree.walk_dfs_pre(&mut |t| {
+            let node = t.borrow_mut_node();
+            if node.inode.is_implicit_dir() {
+                out.push(node.target().display().to_string());
+            }
+            Ok(())
+        })
+        .unwrap();
+        out
+    }
+
+    #[test]
+    fn test_missing_parents_are_implicit_until_declared() {
+        let tar = RawTar::default().reg("a/b/c", b"").dir("a/").finish();
+        let bootstrap = build_layer(&tar);
+        assert_eq!(implicit_dirs(&bootstrap.tree), ["/a/b"]);
+        assert!(get_node(&bootstrap, "/a/b").is_dir());
+    }
+
+    // Builds the layer into the bootstrap file `path`, optionally over a parent bootstrap.
+    fn build_layer_file(
+        version: RafsVersion,
+        tar: &[u8],
+        path: &Path,
+        parent: Option<&Path>,
+        with_blob: bool,
+    ) {
+        let dir = path.parent().unwrap();
+        let source_path = dir.join(format!("{}.tar", path.file_name().unwrap().display()));
+        std::fs::write(&source_path, tar).unwrap();
+        let mut ctx = create_context(source_path, version);
+        if with_blob {
+            ctx.blob_storage = Some(ArtifactStorage::FileDir((dir.to_path_buf(), String::new())));
+        }
+        let mut bootstrap_mgr = BootstrapManager::new(
+            Some(ArtifactStorage::SingleFile(path.to_path_buf())),
+            parent.map(|p| p.display().to_string()),
+        );
+        let mut blob_mgr = BlobManager::new(digest::Algorithm::Sha256, false);
+        TarballBuilder::new(ConversionType::TarToRafs)
+            .build(&mut ctx, &mut bootstrap_mgr, &mut blob_mgr)
+            .unwrap();
+    }
+
+    fn load_tree(path: &Path) -> Tree {
+        let (rs, _) = nydus_rafs::metadata::RafsSuper::load_from_file(
+            path,
+            Arc::new(nydus_api::ConfigV2::default()),
+            false,
+        )
+        .unwrap();
+        Tree::from_bootstrap(&rs, &mut ()).unwrap()
+    }
+
+    // Builds the layer into a bootstrap file and loads the tree back from it.
+    fn round_trip_layer(version: RafsVersion, tar: &[u8], with_blob: bool) -> Tree {
+        let tmp_dir = vmm_sys_util::tempdir::TempDir::new().unwrap();
+        let path = tmp_dir.as_path().join("bootstrap");
+        build_layer_file(version, tar, &path, None, with_blob);
+        load_tree(&path)
+    }
+
+    #[test]
+    fn test_implicit_dir_flag_round_trips_v5() {
+        let tar = RawTar::default().reg("a/b/c", b"").dir("a/").finish();
+        let tree = round_trip_layer(RafsVersion::V5, &tar, false);
+        assert_eq!(implicit_dirs(&tree), ["/a/b"]);
+    }
+
+    #[test]
+    fn test_implicit_dir_flag_round_trips_v6() {
+        let tar = RawTar::default().reg("a/b/c", b"").dir("a/").finish();
+        let tree = round_trip_layer(RafsVersion::V6, &tar, false);
+        assert_eq!(implicit_dirs(&tree), ["/a/b"]);
+        assert!(!get_tree_node(&tree, "/a").inode.is_implicit_dir());
+
+        // With file data the bootstrap carries a blob table, which moves the inode area.
+        let tar = RawTar::default().reg("a/b/c", b"data").finish();
+        let tree = round_trip_layer(RafsVersion::V6, &tar, true);
+        assert_eq!(implicit_dirs(&tree), ["/a", "/a/b"]);
+        assert_eq!(get_tree_node(&tree, "/a/b/c").inode.size(), 4);
+    }
+
+    // Every node as `path type mode [-> target] [user.k]`, in DFS order.
+    fn render(tree: &Tree) -> Vec<String> {
+        let mut out = Vec::new();
+        tree.walk_dfs_pre(&mut |t| {
+            let node = t.borrow_mut_node();
+            let mut line = format!(
+                "{} {} {:o}",
+                node.target().display(),
+                node.file_type(),
+                node.inode.mode() & 0o7777
+            );
+            if let Some(target) = &node.info.symlink {
+                line.push_str(&format!(" -> {}", target.display()));
+            }
+            if node.info.xattrs.get(OsStr::new("user.k")).is_some() {
+                line.push_str(" user.k");
+            }
+            out.push(line);
+            Ok(())
+        })
+        .unwrap();
+        out
+    }
+
+    fn lower_layer_tar() -> Vec<u8> {
+        RawTar::default()
+            .pax(b'x', &[("SCHILY.xattr.user.k", b"v")])
+            .member(DIR, b"tmp/", b"", 0o1777, b"")
+            .member(DIR, b"root/", b"", 0o700, b"")
+            .sym("lib", "usr/lib")
+            .dir("usr/")
+            .dir("usr/lib/")
+            .reg("usr/lib/libc.so", b"")
+            .finish()
+    }
+
+    fn implicit_parent_layer_tar() -> Vec<u8> {
+        RawTar::default()
+            .reg("tmp/x", b"")
+            .reg("root/.bashrc", b"")
+            .reg("lib/libfoo.so", b"")
+            .reg("newdir/f", b"")
+            .finish()
+    }
+
+    const MERGED_OVER_IMPLICIT_PARENTS: [&str; 12] = [
+        "/ dir 755",
+        "/lib dir 755",
+        "/lib/libfoo.so file 644",
+        "/newdir dir 755",
+        "/newdir/f file 644",
+        "/root dir 700",
+        "/root/.bashrc file 644",
+        "/tmp dir 1777 user.k",
+        "/tmp/x file 644",
+        "/usr dir 755",
+        "/usr/lib dir 755",
+        "/usr/lib/libc.so file 644",
+    ];
+
+    fn test_merge_keeps_lower_metadata_under_implicit_parent(version: RafsVersion) {
+        let tmp_dir = vmm_sys_util::tempdir::TempDir::new().unwrap();
+        let dir = tmp_dir.as_path();
+        let b0 = dir.join("b0");
+        let b1 = dir.join("b1");
+        let b2 = dir.join("b2");
+        build_layer_file(version, &lower_layer_tar(), &b0, None, false);
+        build_layer_file(version, &implicit_parent_layer_tar(), &b1, None, false);
+        build_layer_file(
+            version,
+            &RawTar::default().dir("tmp/").finish(),
+            &b2,
+            None,
+            false,
+        );
+
+        let merge = |sources: Vec<PathBuf>, out: &Path| {
+            let mut ctx = BuildContext {
+                fs_version: version,
+                ..Default::default()
+            };
+            crate::Merger::merge(
+                &mut ctx,
+                None,
+                sources,
+                None,
+                None,
+                None,
+                None,
+                None,
+                ArtifactStorage::SingleFile(out.to_path_buf()),
+                None,
+                Arc::new(nydus_api::ConfigV2::new("cfg")),
+            )
+            .unwrap();
+            render(&load_tree(out))
+        };
+
+        // An implicit parent over a lower directory keeps the lower directory, over a lower
+        // symlink it shadows it.
+        let merged = merge(vec![b0.clone(), b1.clone()], &dir.join("m01"));
+        assert_eq!(merged, MERGED_OVER_IMPLICIT_PARENTS);
+
+        // An explicit directory entry replaces the lower directory.
+        let merged = merge(vec![b0.clone(), b1.clone(), b2], &dir.join("m012"));
+        assert_eq!(merged[7], "/tmp dir 755");
+
+        // The same rule applies when the lower is supplied as a parent bootstrap.
+        let over_parent = dir.join("over-parent");
+        build_layer_file(
+            version,
+            &implicit_parent_layer_tar(),
+            &over_parent,
+            Some(&b0),
+            false,
+        );
+        assert_eq!(
+            render(&load_tree(&over_parent)),
+            MERGED_OVER_IMPLICIT_PARENTS
+        );
+    }
+
+    #[test]
+    fn test_merge_keeps_lower_metadata_under_implicit_parent_v5() {
+        test_merge_keeps_lower_metadata_under_implicit_parent(RafsVersion::V5);
+    }
+
+    #[test]
+    fn test_merge_keeps_lower_metadata_under_implicit_parent_v6() {
+        test_merge_keeps_lower_metadata_under_implicit_parent(RafsVersion::V6);
     }
 }

@@ -255,6 +255,27 @@ impl InodeWrapper {
         }
     }
 
+    /// Check whether the directory was synthesized for a missing tar parent.
+    pub fn is_implicit_dir(&self) -> bool {
+        match self {
+            InodeWrapper::V5(i) => i.i_flags.contains(RafsInodeFlags::IMPLICIT_DIR),
+            InodeWrapper::V6(i) => i.i_flags.contains(RafsInodeFlags::IMPLICIT_DIR),
+            InodeWrapper::Ref(i) => {
+                RafsInodeFlags::from_bits_truncate(i.flags()).contains(RafsInodeFlags::IMPLICIT_DIR)
+            }
+        }
+    }
+
+    /// Set whether the directory was synthesized for a missing tar parent.
+    pub fn set_implicit_dir(&mut self, enable: bool) {
+        self.ensure_owned();
+        match self {
+            InodeWrapper::V5(i) => i.i_flags.set(RafsInodeFlags::IMPLICIT_DIR, enable),
+            InodeWrapper::V6(i) => i.i_flags.set(RafsInodeFlags::IMPLICIT_DIR, enable),
+            InodeWrapper::Ref(_i) => unimplemented!(),
+        }
+    }
+
     /// Get inode number.
     pub fn ino(&self) -> Inode {
         match self {
@@ -752,6 +773,9 @@ bitflags! {
         const XATTR = 0x0000_0004;
         /// Inode chunks has holes.
         const HAS_HOLE = 0x0000_0008;
+        /// Directory synthesized for a missing tar parent; consumed by the layer merge and never
+        /// visible in a mounted filesystem.
+        const IMPLICIT_DIR = 0x0000_0010;
    }
 }
 
@@ -832,6 +856,17 @@ mod tests {
         wrapper_v6.set_has_xattr(false);
         assert!(!wrapper_v5.has_xattr());
         assert!(!wrapper_v6.has_xattr());
+        assert!(!wrapper_v5.is_implicit_dir());
+        assert!(!wrapper_v6.is_implicit_dir());
+        assert!(!wrapper_cache_v5.is_implicit_dir());
+        wrapper_v5.set_implicit_dir(true);
+        wrapper_v6.set_implicit_dir(true);
+        assert!(wrapper_v5.is_implicit_dir());
+        assert!(wrapper_v6.is_implicit_dir());
+        wrapper_v5.set_implicit_dir(false);
+        wrapper_v6.set_implicit_dir(false);
+        assert!(!wrapper_v5.is_implicit_dir());
+        assert!(!wrapper_v6.is_implicit_dir());
         wrapper_v5.set_ino(0x0000_0001);
         wrapper_v6.set_ino(0x0000_0002);
         assert_eq!(wrapper_v5.ino(), 0x0000_0001);

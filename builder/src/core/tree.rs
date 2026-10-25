@@ -248,10 +248,18 @@ impl Tree {
         for u in modified {
             let mut u_node = u.borrow_mut_node();
             if let Some(idx) = self.get_child_idx(&u.name) {
-                u_node.overlay = Overlay::UpperModification;
-                self.children[idx].node = u.node.clone();
-                if !u_node.is_dir() {
-                    self.children[idx].children.clear();
+                // containerd's `mkparent` copies the lower directory's metadata into the
+                // upperdir, so a synthesized parent keeps the lower directory and only its
+                // children are overlaid. Over anything else the directory shadows the lower node.
+                let keeps_lower = u_node.is_dir()
+                    && u_node.inode.is_implicit_dir()
+                    && self.children[idx].borrow_mut_node().is_dir();
+                if !keeps_lower {
+                    u_node.overlay = Overlay::UpperModification;
+                    self.children[idx].node = u.node.clone();
+                    if !u_node.is_dir() {
+                        self.children[idx].children.clear();
+                    }
                 }
             } else {
                 u_node.overlay = Overlay::UpperAddition;
@@ -374,7 +382,11 @@ impl<'a> MetadataTreeBuilder<'a> {
         // to avoid breaking hardlink detecting logic.
         let src_dev = u64::MAX;
         let rdev = inode.rdev() as u64;
-        let inode = InodeWrapper::from_inode_info(inode.clone());
+        let mut inode = InodeWrapper::from_inode_info(inode.clone());
+        if u32::try_from(inode.ino()).is_ok_and(|nid| rs.implicit_dirs.binary_search(&nid).is_ok())
+        {
+            inode.set_implicit_dir(true);
+        }
         let source = PathBuf::from("/");
         let target = Node::generate_target(&path, &source);
         let target_vec = Node::generate_target_vec(&target);

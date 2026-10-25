@@ -8,7 +8,9 @@ use std::sync::Arc;
 
 use super::direct_v6::DirectSuperBlockV6;
 use super::layout::RAFS_SUPER_VERSION_V6;
-use super::layout::v6::{RafsV6PrefetchTable, RafsV6SuperBlock, RafsV6SuperBlockExt};
+use super::layout::v6::{
+    EROFS_BLOCK_SIZE_4096, RafsV6PrefetchTable, RafsV6SuperBlock, RafsV6SuperBlockExt,
+};
 use super::*;
 use super::{RafsMode, RafsSuper, RafsSuperBlock, RafsSuperFlags};
 
@@ -57,6 +59,18 @@ impl RafsSuper {
             "prefetch table offset {} entries {} ",
             self.meta.prefetch_table_offset, self.meta.prefetch_table_entries
         );
+
+        if ext_sb.implicit_dir_table_size() > 0 {
+            let mut table = RafsV6PrefetchTable::new();
+            table.load_prefetch_table_from(
+                r,
+                ext_sb.implicit_dir_table_offset(),
+                ext_sb.implicit_dir_table_size() as usize / size_of::<u32>(),
+            )?;
+            self.implicit_dirs = table.inodes;
+            self.implicit_dirs.sort_unstable();
+            r.seek_to_offset(EROFS_BLOCK_SIZE_4096)?;
+        }
 
         match self.mode {
             RafsMode::Direct => {

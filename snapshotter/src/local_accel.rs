@@ -29,6 +29,8 @@ use std::process::Command;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
+use crate::auto_zran::AUTO_ACCEL_MANIFEST_VERSION;
+
 /// A gzip layer of the source image as it exists in containerd's content store.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GzipLayer {
@@ -134,6 +136,10 @@ pub struct NodeLocalArtifact {
     /// prefetch hint, packed for one-shot warm-up; it lives at
     /// `backend_dir.join(id)`.
     pub prefetch_blob_id: Option<String>,
+    /// [`AUTO_ACCEL_MANIFEST_VERSION`] of the build that produced the merged bootstrap. A
+    /// persisted artifact without it (`0`) or with another value is not reused.
+    #[serde(default)]
+    pub format_version: u32,
 }
 
 /// Build the args for a per-layer `nydus-image create --type targz-ref` conversion.
@@ -374,6 +380,7 @@ pub fn convert(
         layer_blob_ids: blob_ids,
         zran_index_blob_ids,
         prefetch_blob_id,
+        format_version: AUTO_ACCEL_MANIFEST_VERSION,
     })
 }
 
