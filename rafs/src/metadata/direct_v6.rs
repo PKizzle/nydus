@@ -1371,12 +1371,13 @@ impl RafsInodeExt for OndiskInodeWrapper {
             )
         })?;
         let chunk_addr = unsafe { state.map.get_ref::<RafsV6InodeChunkAddr>(offset) }?;
-        let has_device = self.mapping.device.lock().unwrap().has_device();
+        // Cloned out of the lock: `get_chunk_info` can reload blob.meta from the backend,
+        // and holding the lock across that stalls every other chunk lookup.
+        let device = self.mapping.device.lock().unwrap().clone();
 
-        if state.meta.has_inlined_chunk_digest() && has_device {
+        if state.meta.has_inlined_chunk_digest() && device.has_device() {
             let blob_index = chunk_addr.blob_index()?;
             let chunk_index = chunk_addr.blob_ci_index();
-            let device = self.mapping.device.lock().unwrap();
             device
                 .get_chunk_info(blob_index, chunk_index)
                 .ok_or_else(|| {

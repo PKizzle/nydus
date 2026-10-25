@@ -63,6 +63,16 @@ const FILE_HASH_CHUNK: usize = 1024 * 1024;
 /// error JSON there; anything larger is truncated noise.
 const MAX_ERROR_BODY_BYTES: u64 = 4 * 1024;
 
+/// Total attempts for an idempotent (`GET`/`HEAD`) request that fails with a
+/// `5xx` or a transport error. Registries answer transient `5xx` under
+/// concurrent pushes (`registry:2`'s filesystem driver rewrites link files in
+/// place, so a read racing a push of the same digest sees an empty link and
+/// returns `500 UNKNOWN`).
+const IDEMPOTENT_ATTEMPTS: u32 = 4;
+
+/// Delay before the first idempotent retry; doubled for each further one.
+const IDEMPOTENT_RETRY_DELAY: Duration = Duration::from_millis(250);
+
 /// Per-call disambiguator for [`RegistryClient::get_blob_to_file`]'s temp
 /// file name, on top of the process id. The pid alone only makes the name
 /// unique per *process*: two concurrent `get_blob_to_file` calls in the same
@@ -878,9 +888,45 @@ impl RegistryClient {
         })
     }
 
+    /// Send one logical request. `GET`/`HEAD` are retried with exponential
+    /// backoff on a `5xx` or transport error (up to [`IDEMPOTENT_ATTEMPTS`]);
+    /// other methods, timeouts and non-`5xx` statuses are returned as-is.
+    async fn send_once(
+        &self,
+        method: Method,
+        url: &str,
+        headers: &[(HeaderName, HeaderValue)],
+        body: &BodySource<'_>,
+        auth: Option<HeaderValue>,
+        timeout: Option<Duration>,
+    ) -> Result<Response, RegistryError> {
+        let idempotent = method == Method::GET || method == Method::HEAD;
+        let mut delay = IDEMPOTENT_RETRY_DELAY;
+        let mut attempt = 1;
+        loop {
+            let result = self
+                .send_attempt(method.clone(), url, headers, body, auth.clone(), timeout)
+                .await;
+            let failure = match &result {
+                Ok(response) if response.status().is_server_error() => {
+                    format!("HTTP {}", response.status())
+                }
+                Err(RegistryError::Other(err)) => format!("{err:#}"),
+                _ => return result,
+            };
+            if !idempotent || attempt >= IDEMPOTENT_ATTEMPTS {
+                return result;
+            }
+            warn!(%method, url, attempt, error = %failure, ?delay, "registry request failed; retrying");
+            compio::time::sleep(delay).await;
+            delay *= 2;
+            attempt += 1;
+        }
+    }
+
     /// One attempt: build the request (headers, optional auth, body) and send
     /// it with the per-request timeout.
-    async fn send_once(
+    async fn send_attempt(
         &self,
         method: Method,
         url: &str,
@@ -1537,6 +1583,90 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("exceeds cap of 1024 bytes"));
+    }
+
+    /// Serve `responses` in order on a loopback port, one connection each,
+    /// and return the port plus a handle yielding the request lines seen.
+    fn serve_raw(responses: Vec<String>) -> (u16, std::thread::JoinHandle<Vec<String>>) {
+        use std::io::{BufRead, BufReader, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = std::thread::spawn(move || {
+            let mut seen = Vec::new();
+            for response in responses {
+                let (stream, _) = listener.accept().unwrap();
+                let mut reader = BufReader::new(stream);
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                seen.push(line.trim().to_string());
+                loop {
+                    let mut header = String::new();
+                    reader.read_line(&mut header).unwrap();
+                    if header == "\r\n" || header.is_empty() {
+                        break;
+                    }
+                }
+                reader.get_mut().write_all(response.as_bytes()).unwrap();
+            }
+            seen
+        });
+        (port, handle)
+    }
+
+    fn raw_response(status: &str, body: &str) -> String {
+        format!(
+            "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    fn loopback_client(port: u16) -> RegistryClient {
+        RegistryClient::new(
+            &format!("127.0.0.1:{port}"),
+            RegistryClientOptions {
+                plain_http: true,
+                use_docker_config: false,
+                ..RegistryClientOptions::default()
+            },
+        )
+        .unwrap()
+    }
+
+    #[compio::test]
+    async fn manifest_get_retries_a_transient_server_error() {
+        let manifest = r#"{"schemaVersion":2}"#;
+        let (port, server) = serve_raw(vec![
+            raw_response(
+                "500 Internal Server Error",
+                r#"{"errors":[{"code":"UNKNOWN"}]}"#,
+            ),
+            raw_response("200 OK", manifest),
+        ]);
+        let fetched = loopback_client(port)
+            .get_manifest("app", "v1")
+            .await
+            .unwrap();
+        assert_eq!(fetched.bytes, manifest.as_bytes());
+        assert_eq!(server.join().unwrap().len(), 2);
+    }
+
+    #[compio::test]
+    async fn manifest_put_is_not_retried_on_server_error() {
+        let (port, server) = serve_raw(vec![raw_response("500 Internal Server Error", "")]);
+        let err = loopback_client(port)
+            .push_manifest(
+                "app",
+                "v1",
+                "application/vnd.oci.image.manifest.v1+json",
+                b"{}",
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, RegistryError::Http { status: 500, .. }),
+            "{err}"
+        );
+        assert_eq!(server.join().unwrap().len(), 1);
     }
 
     #[test]

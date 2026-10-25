@@ -16,7 +16,10 @@ use log::{Level, max_level};
 
 use cyper::{Client, RequestBuilder};
 use futures_util::StreamExt;
-use http::{Method, StatusCode, header::HeaderMap};
+use http::{
+    Method, StatusCode,
+    header::{CONTENT_RANGE, HeaderMap, HeaderValue},
+};
 use url::Url;
 
 use nydus_api::{HttpProxyConfig, OssConfig, ProxyConfig, RegistryConfig, S3Config};
@@ -804,8 +807,10 @@ impl Connection {
 
     /// Streaming variant of `call_inner` for the blob read path: stream the
     /// response body directly into `dst` (no full-body allocation) and return
-    /// `(status, bytes_written, error_body)`. Used only for GET range reads, so
-    /// there is no request body.
+    /// `(status, content_range, bytes_written, error_body)`. Used only for GET
+    /// range reads, so there is no request body; `content_range` is the
+    /// response's `Content-Range` header, which the caller needs to tell which
+    /// bytes a `200` carries.
     fn call_inner_stream(
         &self,
         is_proxy: bool,
@@ -814,7 +819,7 @@ impl Connection {
         query: &Option<&[(&str, &str)]>,
         headers: &HeaderMap,
         dst: &mut [u8],
-    ) -> ConnectionResult<(StatusCode, usize, Option<String>)> {
+    ) -> ConnectionResult<(StatusCode, Option<HeaderValue>, usize, Option<String>)> {
         let timeout = self.timeout;
         let url_owned = url.to_string();
         let req_method = method.clone();
@@ -858,6 +863,7 @@ impl Connection {
             };
 
             let status = resp.status();
+            let content_range = resp.headers().get(CONTENT_RANGE).cloned();
             if is_success_status(status) {
                 // Stream the body straight into `dst` - no full-body allocation.
                 let mut written = 0usize;
@@ -871,11 +877,16 @@ impl Connection {
                     dst[written..written + n].copy_from_slice(&chunk[..n]);
                     written += n;
                 }
-                Ok((status, written, None))
+                Ok((status, content_range, written, None))
             } else {
                 // Buffer the (small) error body for the caller's message.
                 let body = resp.bytes().await.map_err(ConnectionError::Common)?;
-                Ok((status, 0, Some(String::from_utf8_lossy(&body).into_owned())))
+                Ok((
+                    status,
+                    content_range,
+                    0,
+                    Some(String::from_utf8_lossy(&body).into_owned()),
+                ))
             }
         })
     }
@@ -884,7 +895,7 @@ impl Connection {
     /// proxy with origin fallback like the buffered path, but streams the
     /// response body into `dst` and returns the number of bytes written.
     /// Proxy-aware streaming core: streams the response body into `dst` and
-    /// returns `(status, bytes_written, error_body)` *without* applying
+    /// returns `(status, content_range, bytes_written, error_body)` *without* applying
     /// `catch_status`. Callers decide how to treat the status (e.g. registry
     /// inspects 307/401/403 itself). Shared by `call_stream` and
     /// `call_stream_status`.
@@ -896,7 +907,7 @@ impl Connection {
         headers: &HeaderMap,
         skip_proxy: bool,
         dst: &mut [u8],
-    ) -> ConnectionResult<(StatusCode, usize, Option<String>)> {
+    ) -> ConnectionResult<(StatusCode, Option<HeaderValue>, usize, Option<String>)> {
         if self.shutdown.load(Ordering::Acquire) {
             return Err(ConnectionError::Disconnected);
         }
@@ -918,7 +929,7 @@ impl Connection {
                         replaced_url = r.as_str();
                     }
                 }
-                let (status, written, err) = self.call_inner_stream(
+                let (status, content_range, written, err) = self.call_inner_stream(
                     true,
                     method.clone(),
                     replaced_url,
@@ -927,7 +938,7 @@ impl Connection {
                     &mut *dst,
                 )?;
                 if !proxy.fallback || status < StatusCode::INTERNAL_SERVER_ERROR {
-                    return Ok((status, written, err));
+                    return Ok((status, content_range, written, err));
                 }
                 warn!("Request proxy server failed, fallback to original server");
             } else if !proxy.fallback {
@@ -951,7 +962,7 @@ impl Connection {
         skip_proxy: bool,
         dst: &mut [u8],
     ) -> ConnectionResult<usize> {
-        let (status, written, err) =
+        let (status, _content_range, written, err) =
             self.call_stream_status_err(method, url, query, headers, skip_proxy, dst)?;
         if catch_status && !is_success_status(status) {
             return Err(ConnectionError::ErrorWithMsg(err.unwrap_or_default()));
@@ -959,10 +970,10 @@ impl Connection {
         Ok(written)
     }
 
-    /// Like `call_stream`, but returns the HTTP status alongside the byte count
-    /// instead of folding non-success into an error. Used by the registry blob
-    /// read path, which must distinguish 200 (stream the blob) from 401/403 (a
-    /// stale cached redirect to retry).
+    /// Like `call_stream`, but returns the HTTP status and `Content-Range` alongside
+    /// the byte count instead of folding non-success into an error. Used by the
+    /// registry blob read path, which must distinguish 200 (stream the blob) from
+    /// 401/403 (a stale cached redirect to retry) and check which range arrived.
     pub fn call_stream_status(
         &self,
         method: Method,
@@ -971,10 +982,10 @@ impl Connection {
         headers: &HeaderMap,
         skip_proxy: bool,
         dst: &mut [u8],
-    ) -> ConnectionResult<(StatusCode, usize)> {
-        let (status, written, _err) =
+    ) -> ConnectionResult<(StatusCode, Option<HeaderValue>, usize)> {
+        let (status, content_range, written, _err) =
             self.call_stream_status_err(method, url, query, headers, skip_proxy, dst)?;
-        Ok((status, written))
+        Ok((status, content_range, written))
     }
 }
 

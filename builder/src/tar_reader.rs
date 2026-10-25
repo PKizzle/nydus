@@ -8,7 +8,9 @@
 //! where the `tar` crate does not: PAX records are framed by their length and may hold newlines,
 //! a second PAX header replaces the first, nothing after the end-of-archive marker is a member,
 //! and a GNU sparse file described by PAX records is recognised instead of being taken for a
-//! regular file holding the sparse map. Header fields are still decoded by [`tar::Header`].
+//! regular file holding the sparse map. The member name is decoded here because Go applies the
+//! USTAR `prefix` field to more headers than the `tar` crate does; the other header fields are
+//! still decoded by [`tar::Header`].
 //!
 //! Member data is read straight from the underlying reader with no buffering of its own, so the
 //! position of that reader is the offset of the data in the tar stream. The tar-ref and zran
@@ -19,6 +21,9 @@ use std::io::{self, Read, Seek, SeekFrom};
 use tar::Header;
 
 const BLOCK: u64 = 512;
+/// Largest member size accepted; Go rejects sizes of 2^63 and above, and a skip of
+/// `size + padding` must fit a `SeekFrom::Current` offset.
+const MAX_SIZE: u64 = i64::MAX as u64 - BLOCK;
 
 /// Errors from reading a layer tar.
 #[derive(Debug, thiserror::Error)]
@@ -31,7 +36,7 @@ pub enum TarError {
     Unsupported(String),
 }
 
-type Result<T> = std::result::Result<T, TarError>;
+type TarResult<T> = std::result::Result<T, TarError>;
 
 /// A member of the archive with its GNU long name and PAX records applied.
 pub struct Member {
@@ -70,7 +75,7 @@ impl<R: Read + Seek> Members<R> {
 
     /// Returns the next member, or `None` after the end-of-archive marker. Everything after
     /// the marker is read and discarded, so a digest over the stream covers all of it.
-    pub fn next_member(&mut self) -> Result<Option<Member>> {
+    pub fn next_member(&mut self) -> TarResult<Option<Member>> {
         let mut pax: Option<Vec<(Vec<u8>, Vec<u8>)>> = None;
         let mut long_name = None;
         let mut long_link = None;
@@ -82,7 +87,7 @@ impl<R: Read + Seek> Members<R> {
                 }
                 return Ok(None);
             };
-            let size = header.entry_size()?;
+            let size = check_size(header.entry_size()?)?;
             self.data_left = size;
             self.pad = (BLOCK - size % BLOCK) % BLOCK;
             match header.entry_type().as_byte() {
@@ -102,7 +107,7 @@ impl<R: Read + Seek> Members<R> {
             }
 
             let mut member = Member {
-                path: header.path_bytes().into_owned(),
+                path: header_name(header.as_bytes()),
                 link: header
                     .link_name_bytes()
                     .map(|l| l.into_owned())
@@ -121,6 +126,7 @@ impl<R: Read + Seek> Members<R> {
             }
             if let Some(records) = pax {
                 apply_pax(&mut member, records)?;
+                check_size(member.size)?;
             }
             if let Some(name) = long_name {
                 member.path = name;
@@ -154,21 +160,24 @@ impl<R: Read + Seek> Members<R> {
         }
     }
 
-    fn skip_rest(&mut self) -> Result<()> {
-        let n = self.data_left + self.pad;
+    fn skip_rest(&mut self) -> TarResult<()> {
+        let n = self.data_left.checked_add(self.pad);
         (self.data_left, self.pad) = (0, 0);
+        let n = n
+            .and_then(|n| i64::try_from(n).ok())
+            .ok_or_else(|| malformed("member size overflows the archive"))?;
         if n == 0 {
             return Ok(());
         }
         if self.seekable {
-            self.inner.seek(SeekFrom::Current(n as i64))?;
-        } else if io::copy(&mut (&mut self.inner).take(n), &mut io::sink())? != n {
+            self.inner.seek(SeekFrom::Current(n))?;
+        } else if io::copy(&mut (&mut self.inner).take(n as u64), &mut io::sink())? != n as u64 {
             return Err(truncated());
         }
         Ok(())
     }
 
-    fn read_body(&mut self, size: u64) -> Result<Vec<u8>> {
+    fn read_body(&mut self, size: u64) -> TarResult<Vec<u8>> {
         // Extension headers live in memory; bound what a hostile archive can make us allocate.
         if size > 1 << 20 {
             return Err(malformed(format!("extension header of {} bytes", size)));
@@ -181,7 +190,7 @@ impl<R: Read + Seek> Members<R> {
 
     /// Reads the next header, `None` at the end of the archive: an end-of-file at a block
     /// boundary or two zero blocks. A zero block followed by anything else is malformed.
-    fn read_header(&mut self) -> Result<Option<Header>> {
+    fn read_header(&mut self) -> TarResult<Option<Header>> {
         let mut header = Header::new_old();
         if !self.read_block(header.as_mut_bytes())? {
             return Ok(None);
@@ -199,7 +208,7 @@ impl<R: Read + Seek> Members<R> {
     }
 
     /// Fills `buf`, returning false at a clean end-of-file.
-    fn read_block(&mut self, buf: &mut [u8]) -> Result<bool> {
+    fn read_block(&mut self, buf: &mut [u8]) -> TarResult<bool> {
         let mut read = 0;
         while read < buf.len() {
             match self.inner.read(&mut buf[read..]) {
@@ -242,6 +251,13 @@ fn truncated() -> TarError {
     malformed("unexpected end of archive")
 }
 
+fn check_size(size: u64) -> TarResult<u64> {
+    if size > MAX_SIZE {
+        return Err(malformed(format!("member size {size} out of range")));
+    }
+    Ok(size)
+}
+
 fn eof_is_truncated(e: io::Error) -> TarError {
     if e.kind() == io::ErrorKind::UnexpectedEof {
         truncated()
@@ -257,8 +273,74 @@ fn cut_nul(mut b: Vec<u8>) -> Vec<u8> {
     b
 }
 
+fn until_nul(b: &[u8]) -> &[u8] {
+    &b[..b.iter().position(|&c| c == 0).unwrap_or(b.len())]
+}
+
+/// The member name as Go's `archive/tar` reads it (`Reader.readHeader`): the USTAR `prefix`
+/// applies to every `ustar\0` header whatever its version, is 131 bytes long under the STAR
+/// `tar\0` trailer, and is also used for a GNU header whose atime or ctime field does not
+/// parse as a number, which is how pre-Go1.8 writers put the prefix there.
+fn header_name(h: &[u8; 512]) -> Vec<u8> {
+    let name = until_nul(&h[..100]);
+    let prefix = match (&h[257..263], &h[263..265]) {
+        (b"ustar\0", _) if &h[508..512] == b"tar\0" => until_nul(&h[345..476]),
+        (b"ustar\0", _) => until_nul(&h[345..500]),
+        (b"ustar ", b" \0") => {
+            let unparsable = |f: &[u8]| f[0] != 0 && parse_numeric(f).is_none();
+            let prefix = until_nul(&h[345..500]);
+            if (unparsable(&h[345..357]) || unparsable(&h[357..369]))
+                && prefix.iter().all(|&c| c < 0x80)
+            {
+                prefix
+            } else {
+                &[]
+            }
+        }
+        _ => &[],
+    };
+    if prefix.is_empty() {
+        name.to_vec()
+    } else {
+        [prefix, b"/", name].concat()
+    }
+}
+
+/// Go's `parser.parseNumeric`: base-256 when the high bit of the first byte is set, with
+/// values that do not fit 63 bits rejected, otherwise octal with NULs and spaces around it.
+fn parse_numeric(f: &[u8]) -> Option<i64> {
+    if f[0] & 0x80 != 0 {
+        let inv = if f[0] & 0x40 != 0 { 0xff } else { 0 };
+        let mut x: u64 = 0;
+        for (i, &c) in f.iter().enumerate() {
+            let c = if i == 0 { (c ^ inv) & 0x7f } else { c ^ inv };
+            if x >> 56 != 0 {
+                return None;
+            }
+            x = x << 8 | c as u64;
+        }
+        if x >> 63 != 0 {
+            return None;
+        }
+        return Some(if inv == 0xff { !(x as i64) } else { x as i64 });
+    }
+    let mut digits = f;
+    while let [b' ' | 0, rest @ ..] = digits {
+        digits = rest;
+    }
+    while let [rest @ .., b' ' | 0] = digits {
+        digits = rest;
+    }
+    let digits = until_nul(digits);
+    if !digits.iter().all(|c| (b'0'..=b'7').contains(c)) {
+        return None;
+    }
+    // At most 12 octal digits, so this cannot overflow.
+    Some(digits.iter().fold(0i64, |x, &c| x << 3 | (c - b'0') as i64))
+}
+
 /// Go accepts a checksum computed over the header bytes as unsigned or as signed values.
-fn verify_checksum(header: &Header) -> Result<()> {
+fn verify_checksum(header: &Header) -> TarResult<()> {
     let stored = header
         .cksum()
         .map_err(|_| malformed("unreadable header checksum"))?;
@@ -276,7 +358,7 @@ fn verify_checksum(header: &Header) -> Result<()> {
 
 /// Splits a PAX header body into its records, `<len> <key>=<value>\n` each, where `<len>`
 /// counts the whole record. The value runs up to the final newline and may contain more.
-fn parse_pax(mut buf: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+fn parse_pax(mut buf: &[u8]) -> TarResult<Vec<(Vec<u8>, Vec<u8>)>> {
     let bad = || malformed("bad PAX record");
     let mut records = Vec::new();
     while !buf.is_empty() {
@@ -301,7 +383,7 @@ fn parse_pax(mut buf: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
 }
 
 /// Applies the PAX records Go's reader interprets; an empty value keeps the header's.
-fn apply_pax(member: &mut Member, records: Vec<(Vec<u8>, Vec<u8>)>) -> Result<()> {
+fn apply_pax(member: &mut Member, records: Vec<(Vec<u8>, Vec<u8>)>) -> TarResult<()> {
     for (key, value) in &records {
         if key.starts_with(b"GNU.sparse.") {
             // shortcut: sparse members are rejected, not expanded; they also cannot be served
@@ -343,6 +425,56 @@ fn apply_pax(member: &mut Member, records: Vec<(Vec<u8>, Vec<u8>)>) -> Result<()
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A USTAR header block with `size` written as given (octal or base-256).
+    fn raw_header(typeflag: u8, name: &[u8], size: &[u8; 12]) -> [u8; 512] {
+        let mut h = [0u8; 512];
+        h[..name.len()].copy_from_slice(name);
+        h[100..108].copy_from_slice(b"0000644\0");
+        h[124..136].copy_from_slice(size);
+        h[156] = typeflag;
+        h[257..265].copy_from_slice(b"ustar\x0000");
+        h[148..156].fill(b' ');
+        let sum: u64 = h.iter().map(|&b| b as u64).sum();
+        h[148..156].copy_from_slice(format!("{:06o}\0 ", sum).as_bytes());
+        h
+    }
+
+    #[test]
+    fn test_member_size_beyond_i64_is_rejected_not_seeked() {
+        // Base-256 sizes a seekable skip would turn into a negative or wrapped seek:
+        // 2^64 - 512 re-reads the same header forever, u64::MAX wraps the padding sum.
+        for size in [
+            &[
+                0x80, 0, 0, 0, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xfe, 0x00,
+            ],
+            &[
+                0x80, 0, 0, 0, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+            ],
+            &[0x80, 0, 0, 0, 0x80, 0, 0, 0, 0, 0, 0, 0],
+        ] {
+            let mut tar = raw_header(b'g', b"pax_global_header", size).to_vec();
+            tar.extend_from_slice(&raw_header(b'0', b"a", b"00000000001\0"));
+            tar.extend_from_slice(&[b'x'; 512]);
+            tar.extend_from_slice(&[0u8; 1024]);
+            for seekable in [true, false] {
+                let mut members = Members::new(io::Cursor::new(&tar), seekable);
+                assert!(
+                    matches!(members.next_member(), Err(TarError::Malformed(_))),
+                    "size {size:02x?} seekable {seekable}"
+                );
+            }
+        }
+        // A PAX `size` record is bounded the same way.
+        let records = b"28 size=9223372036854775296\n";
+        let mut tar = raw_header(b'x', b"pax", b"00000000034\0").to_vec();
+        tar.extend_from_slice(records);
+        tar.resize(1024, 0);
+        tar.extend_from_slice(&raw_header(b'0', b"a", b"00000000000\0"));
+        tar.extend_from_slice(&[0u8; 1024]);
+        let mut members = Members::new(io::Cursor::new(&tar), true);
+        assert!(matches!(members.next_member(), Err(TarError::Malformed(_))));
+    }
 
     #[test]
     fn test_parse_pax_keeps_newlines_in_values() {

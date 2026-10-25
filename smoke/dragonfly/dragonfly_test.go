@@ -165,6 +165,8 @@ func TestDragonflyE2E(t *testing.T) {
 			"nydusd should not report xxh3 mismatch errors")
 		assert.NotContains(t, newLogs, "chunk crc32 value doesn't match",
 			"nydusd should not report crc32 mismatch errors")
+		assert.NotContains(t, newLogs, "unexpected http",
+			"nydusd should not reject dfdaemon range responses")
 
 		if len(readErrors) > 0 {
 			t.Logf("read errors (%d):\n  %s", len(readErrors),
