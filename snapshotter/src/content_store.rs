@@ -412,18 +412,22 @@ impl ContentStoreClient {
     /// depend on on-disk layout for arbitrary content; for large gzip-layer
     /// blobs use `blob_path()` + a streaming reader instead.
     ///
-    /// A digest absent from the store is an expected outcome for callers
-    /// (e.g. index children of foreign platforms), so NotFound is logged at
-    /// debug; every other failure is logged at error. Read RPC errors keep
-    /// their `tonic::Status` in the chain so the code can be inspected.
+    /// A digest absent from the store is not necessarily a fault: a
+    /// host-matching index child that was never pulled, or a sidecar blob
+    /// containerd garbage-collected (see `completeness_check` in
+    /// auto_zran.rs). NotFound is therefore logged at debug and left to the
+    /// caller, which knows whether the digest was speculative; every other
+    /// failure is logged here at error, and callers do not log it again
+    /// (`is_rpc_failure`). Read RPC errors keep their `tonic::Status` in
+    /// the chain so `is_not_found` can classify them.
     #[instrument(level = "debug", skip(self))]
     pub async fn fetch_bytes(&self, digest: &str) -> Result<Vec<u8>> {
         let result = self.read_bytes(digest).await;
         if let Err(e) = &result {
             if is_not_found(e) {
-                debug!(error = %e);
+                debug!(error = %e, "containerd content read failed");
             } else {
-                error!(error = %e);
+                error!(error = %e, "containerd content read failed");
             }
         }
         result
@@ -444,16 +448,14 @@ impl ContentStoreClient {
                 let mut response = client
                     .read(request)
                     .await
-                    .map_err(|status| {
-                        let msg = format!("containerd Read({digest_owned}) failed: {status}");
-                        anyhow::Error::new(status).context(msg)
-                    })?
+                    .map_err(|status| read_error(&digest_owned, "failed", status))?
                     .into_inner();
                 let mut out = Vec::new();
-                while let Some(chunk) = response.message().await.map_err(|status| {
-                    let msg = format!("containerd Read({digest_owned}) stream failed: {status}");
-                    anyhow::Error::new(status).context(msg)
-                })? {
+                while let Some(chunk) = response
+                    .message()
+                    .await
+                    .map_err(|status| read_error(&digest_owned, "stream failed", status))?
+                {
                     out.extend_from_slice(&chunk.data);
                 }
                 Ok(out)
@@ -721,9 +723,24 @@ fn attach_namespace<T>(request: &mut tonic::Request<T>, namespace: &str) -> Resu
     Ok(())
 }
 
-fn is_not_found(e: &anyhow::Error) -> bool {
+/// A Read RPC error that keeps the `tonic::Status` downcastable under its
+/// message, so `is_not_found`/`is_rpc_failure` see the code.
+fn read_error(digest: &str, what: &str, status: tonic::Status) -> anyhow::Error {
+    let msg = format!("containerd Read({digest}) {what}: {status}");
+    anyhow::Error::new(status).context(msg)
+}
+
+/// The content-store read of this error's digest answered NotFound.
+pub(crate) fn is_not_found(e: &anyhow::Error) -> bool {
     e.downcast_ref::<tonic::Status>()
         .is_some_and(|s| s.code() == Code::NotFound)
+}
+
+/// A gRPC failure other than NotFound, which `fetch_bytes` has already
+/// logged at error; callers that log fetch failures skip these.
+pub(crate) fn is_rpc_failure(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<tonic::Status>()
+        .is_some_and(|s| s.code() != Code::NotFound)
 }
 
 fn sha256_of_bytes(bytes: &[u8]) -> String {
@@ -791,8 +808,9 @@ mod tests {
         );
     }
 
-    /// NotFound stays recognisable under the context `fetch_bytes` and its
-    /// callers attach; other codes and non-gRPC errors do not match.
+    /// NotFound stays recognisable under the context `read_bytes` and
+    /// `walk_manifest_via_grpc` attach (`fetch_bytes` attaches none); other
+    /// codes and non-gRPC errors do not match.
     #[test]
     fn is_not_found_sees_status_through_context() {
         let wrap = |status: tonic::Status| {
@@ -803,6 +821,25 @@ mod tests {
         assert!(is_not_found(&wrap(tonic::Status::not_found("gone"))));
         assert!(!is_not_found(&wrap(tonic::Status::unavailable("down"))));
         assert!(!is_not_found(&anyhow::anyhow!("connect failed")));
+    }
+
+    /// The error `read_bytes` builds is the one `fetch_bytes` classifies:
+    /// if it stops carrying the `tonic::Status`, every NotFound is logged
+    /// at error again.
+    #[test]
+    fn read_error_keeps_status_downcastable() {
+        let e = read_error("sha256:x", "failed", tonic::Status::not_found("gone"));
+        assert!(is_not_found(&e));
+        assert!(!is_rpc_failure(&e));
+        assert!(e.to_string().contains("containerd Read(sha256:x)"), "{e}");
+        let e = read_error(
+            "sha256:x",
+            "stream failed",
+            tonic::Status::unavailable("down"),
+        );
+        assert!(!is_not_found(&e));
+        assert!(is_rpc_failure(&e));
+        assert!(!is_rpc_failure(&anyhow::anyhow!("connect failed")));
     }
 
     #[test]
