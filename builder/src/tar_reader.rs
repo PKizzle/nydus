@@ -8,7 +8,9 @@
 //! where the `tar` crate does not: PAX records are framed by their length and may hold newlines,
 //! a second PAX header replaces the first, nothing after the end-of-archive marker is a member,
 //! and a GNU sparse file described by PAX records is recognised instead of being taken for a
-//! regular file holding the sparse map. Header fields are still decoded by [`tar::Header`].
+//! regular file holding the sparse map. The member name is decoded here because Go applies the
+//! USTAR `prefix` field to more headers than the `tar` crate does; the other header fields are
+//! still decoded by [`tar::Header`].
 //!
 //! Member data is read straight from the underlying reader with no buffering of its own, so the
 //! position of that reader is the offset of the data in the tar stream. The tar-ref and zran
@@ -105,7 +107,7 @@ impl<R: Read + Seek> Members<R> {
             }
 
             let mut member = Member {
-                path: header.path_bytes().into_owned(),
+                path: header_name(header.as_bytes()),
                 link: header
                     .link_name_bytes()
                     .map(|l| l.into_owned())
@@ -269,6 +271,72 @@ fn cut_nul(mut b: Vec<u8>) -> Vec<u8> {
         b.truncate(i);
     }
     b
+}
+
+fn until_nul(b: &[u8]) -> &[u8] {
+    &b[..b.iter().position(|&c| c == 0).unwrap_or(b.len())]
+}
+
+/// The member name as Go's `archive/tar` reads it (`Reader.readHeader`): the USTAR `prefix`
+/// applies to every `ustar\0` header whatever its version, is 131 bytes long under the STAR
+/// `tar\0` trailer, and is also used for a GNU header whose atime or ctime field does not
+/// parse as a number, which is how pre-Go1.8 writers put the prefix there.
+fn header_name(h: &[u8; 512]) -> Vec<u8> {
+    let name = until_nul(&h[..100]);
+    let prefix = match (&h[257..263], &h[263..265]) {
+        (b"ustar\0", _) if &h[508..512] == b"tar\0" => until_nul(&h[345..476]),
+        (b"ustar\0", _) => until_nul(&h[345..500]),
+        (b"ustar ", b" \0") => {
+            let unparsable = |f: &[u8]| f[0] != 0 && parse_numeric(f).is_none();
+            let prefix = until_nul(&h[345..500]);
+            if (unparsable(&h[345..357]) || unparsable(&h[357..369]))
+                && prefix.iter().all(|&c| c < 0x80)
+            {
+                prefix
+            } else {
+                &[]
+            }
+        }
+        _ => &[],
+    };
+    if prefix.is_empty() {
+        name.to_vec()
+    } else {
+        [prefix, b"/", name].concat()
+    }
+}
+
+/// Go's `parser.parseNumeric`: base-256 when the high bit of the first byte is set, with
+/// values that do not fit 63 bits rejected, otherwise octal with NULs and spaces around it.
+fn parse_numeric(f: &[u8]) -> Option<i64> {
+    if f[0] & 0x80 != 0 {
+        let inv = if f[0] & 0x40 != 0 { 0xff } else { 0 };
+        let mut x: u64 = 0;
+        for (i, &c) in f.iter().enumerate() {
+            let c = if i == 0 { (c ^ inv) & 0x7f } else { c ^ inv };
+            if x >> 56 != 0 {
+                return None;
+            }
+            x = x << 8 | c as u64;
+        }
+        if x >> 63 != 0 {
+            return None;
+        }
+        return Some(if inv == 0xff { !(x as i64) } else { x as i64 });
+    }
+    let mut digits = f;
+    while let [b' ' | 0, rest @ ..] = digits {
+        digits = rest;
+    }
+    while let [rest @ .., b' ' | 0] = digits {
+        digits = rest;
+    }
+    let digits = until_nul(digits);
+    if !digits.iter().all(|c| (b'0'..=b'7').contains(c)) {
+        return None;
+    }
+    // At most 12 octal digits, so this cannot overflow.
+    Some(digits.iter().fold(0i64, |x, &c| x << 3 | (c - b'0') as i64))
 }
 
 /// Go accepts a checksum computed over the header bytes as unsigned or as signed values.

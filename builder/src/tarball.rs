@@ -1389,13 +1389,18 @@ mod tests {
     struct RawTar(Vec<u8>);
 
     impl RawTar {
-        fn member(
+        fn member(self, typeflag: u8, name: &[u8], link: &[u8], mode: u64, data: &[u8]) -> Self {
+            self.member_with(typeflag, name, link, mode, data, |_| {})
+        }
+        /// `tweak` edits the header block before its checksum is computed.
+        fn member_with(
             mut self,
             typeflag: u8,
             name: &[u8],
             link: &[u8],
             mode: u64,
             data: &[u8],
+            tweak: impl FnOnce(&mut [u8; 512]),
         ) -> Self {
             let mut h = [0u8; 512];
             h[..name.len()].copy_from_slice(name);
@@ -1410,6 +1415,7 @@ mod tests {
             h[263..265].copy_from_slice(b"00");
             octal(&mut h[329..337], 0);
             octal(&mut h[337..345], 0);
+            tweak(&mut h);
             h[148..156].fill(b' ');
             let sum: u64 = h.iter().map(|&b| b as u64).sum();
             h[148..156].copy_from_slice(format!("{:06o}\0 ", sum).as_bytes());
@@ -1473,6 +1479,74 @@ mod tests {
             })
             .unwrap();
         out
+    }
+
+    // The USTAR `prefix` field as Go's archive/tar reads it, since containerd and the
+    // scanners see that name: a header that lands a file elsewhere here is a different image.
+    fn prefixed_member(tweak: impl FnOnce(&mut [u8; 512])) -> Vec<u8> {
+        RawTar::default()
+            .member_with(REG, b"etc/ld.so.preload", b"", 0o644, b"x", |h| {
+                h[345..360].copy_from_slice(b"usr/share/doc/x");
+                tweak(h);
+            })
+            .finish()
+    }
+
+    #[test]
+    fn test_ustar_prefix_applies_to_any_ustar_version() {
+        let tar = prefixed_member(|h| h[263..265].copy_from_slice(b"  "));
+        let bootstrap = build_layer(&tar);
+        assert_eq!(
+            get_node(&bootstrap, "/usr/share/doc/x/etc/ld.so.preload")
+                .inode
+                .size(),
+            1
+        );
+        assert!(bootstrap.tree.get_node(Path::new("/etc")).is_none());
+    }
+
+    #[test]
+    fn test_ustar_prefix_applies_with_version_00() {
+        let bootstrap = build_layer(&prefixed_member(|_| {}));
+        assert!(get_node(&bootstrap, "/usr/share/doc/x/etc/ld.so.preload").is_reg());
+        assert!(bootstrap.tree.get_node(Path::new("/etc")).is_none());
+    }
+
+    #[test]
+    fn test_star_trailer_shortens_the_prefix_to_131_bytes() {
+        let tar = RawTar::default()
+            .member_with(REG, b"f", b"", 0o644, b"x", |h| {
+                h[345..476].fill(b'a');
+                h[476..500].fill(b'b');
+                h[508..512].copy_from_slice(b"tar\0");
+            })
+            .finish();
+        let bootstrap = build_layer(&tar);
+        let dir = "a".repeat(131);
+        assert!(get_node(&bootstrap, &format!("/{dir}/f")).is_reg());
+    }
+
+    #[test]
+    fn test_gnu_header_with_unparsable_atime_falls_back_to_the_prefix() {
+        // The prefix field overlays GNU atime/ctime; a prefix that is not a number is
+        // how a pre-Go1.8 writer's output looks, and Go reads it as the prefix.
+        let tar = prefixed_member(|h| h[257..265].copy_from_slice(b"ustar  \0"));
+        let bootstrap = build_layer(&tar);
+        assert!(get_node(&bootstrap, "/usr/share/doc/x/etc/ld.so.preload").is_reg());
+        assert!(bootstrap.tree.get_node(Path::new("/etc")).is_none());
+    }
+
+    #[test]
+    fn test_gnu_header_with_valid_atime_has_no_prefix() {
+        let tar = RawTar::default()
+            .member_with(REG, b"etc/ld.so.preload", b"", 0o644, b"x", |h| {
+                h[257..265].copy_from_slice(b"ustar  \0");
+                octal(&mut h[345..357], 1_700_000_000);
+                octal(&mut h[357..369], 1_700_000_000);
+            })
+            .finish();
+        let bootstrap = build_layer(&tar);
+        assert!(get_node(&bootstrap, "/etc/ld.so.preload").is_reg());
     }
 
     #[test]
