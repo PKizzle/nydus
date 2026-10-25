@@ -45,7 +45,9 @@ jobs:
         RUSTUP_BIN=$(which rustup)
         sudo -E RUSTUP=${RUSTUP_BIN} make miri-ut-nextest 2>&1 | tee miri-ut.log
         # Tests Miri cannot run (file-backed mmap, foreign calls) fail without failing the job;
-        # any Undefined Behavior does.
+        # any Undefined Behavior does. A log without a test summary means Miri never ran
+        # (build failure), which must not pass as "no UB found".
+        grep -q 'Summary \[' miri-ut.log || { echo "::error::Miri produced no test summary"; exit 1; }
         if grep -C 2 'Undefined Behavior' miri-ut.log; then
           echo "::error::Miri reported Undefined Behavior"
           exit 1
