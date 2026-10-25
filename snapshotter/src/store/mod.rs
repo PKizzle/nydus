@@ -53,7 +53,8 @@ impl SnapshotStore {
 
         // `manual_journal_persist(true)` because every mutating call below
         // (create/commit/remove/update/set_image_ref/import_snapshot) ends with
-        // `self.persist(PersistMode::SyncAll)`. Without this flag fjall ALSO
+        // `self.persist(PersistMode::SyncAll)` -- except `record_usage`, whose
+        // cached value is only a walk to redo if lost. Without this flag fjall ALSO
         // fdatasyncs after every batch (the default), so each operation incurs
         // two fsyncs — wasted on a Pi where journal writes are the slowest
         // step. Owning the persist decision also lets us pair the durability

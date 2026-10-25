@@ -253,12 +253,15 @@ impl OverlayEngine {
         if let Some(usage) = info.usage {
             return Ok(usage);
         }
-        let usage = dir_usage(&self.fs_dir(key))?;
+        let fs_dir = self.fs_dir(key);
+        let usage = dir_usage(&fs_dir)?;
+        // A missing fs dir measures (0, 0), which must not stick once the dir appears.
         if info.kind == SnapshotKind::Committed.as_str()
+            && fs_dir.exists()
             && let Err(e) = store.record_usage(key, usage)
         {
-            // Usually a concurrent Remove; the measured value is still correct.
-            debug!(key, error = %e, "failed to cache committed snapshot usage");
+            // The measured value is still correct; only the cache write failed.
+            warn!(key, error = %e, "failed to cache committed snapshot usage");
         }
         Ok(usage)
     }
@@ -548,6 +551,28 @@ mod tests {
         assert_eq!(after.1, before.1 + 1);
         assert!(after.0 >= before.0 + 4096);
         assert_eq!(store.stat("child").unwrap().usage, None);
+    }
+
+    #[test]
+    fn usage_is_not_cached_when_the_fs_dir_is_absent() {
+        let dir = tempdir().unwrap();
+        let (engine, store) = test_engine(dir.path());
+
+        engine
+            .prepare(&store, "base-active", "", &HashMap::new())
+            .unwrap();
+        engine
+            .commit(&store, "base", "base-active", &HashMap::new())
+            .unwrap();
+        std::fs::remove_dir_all(engine.fs_dir("base")).unwrap();
+        assert_eq!(engine.usage(&store, "base").unwrap(), (0, 0));
+        assert_eq!(store.stat("base").unwrap().usage, None);
+
+        std::fs::create_dir_all(engine.fs_dir("base")).unwrap();
+        std::fs::write(engine.fs_dir("base").join("a"), b"hello").unwrap();
+        let usage = engine.usage(&store, "base").unwrap();
+        assert_eq!(usage.1, 2);
+        assert_eq!(store.stat("base").unwrap().usage, Some(usage));
     }
 
     #[test]
