@@ -1900,4 +1900,60 @@ mod tests {
             1
         );
     }
+
+    fn implicit_dirs(tree: &Tree) -> Vec<String> {
+        let mut out = Vec::new();
+        tree.walk_dfs_pre(&mut |t| {
+            let node = t.borrow_mut_node();
+            if node.inode.is_implicit_dir() {
+                out.push(node.target().display().to_string());
+            }
+            Ok(())
+        })
+        .unwrap();
+        out
+    }
+
+    #[test]
+    fn test_missing_parents_are_implicit_until_declared() {
+        let tar = RawTar::default().reg("a/b/c", b"").dir("a/").finish();
+        let bootstrap = build_layer(&tar);
+        assert_eq!(implicit_dirs(&bootstrap.tree), ["/", "/a/b"]);
+        assert!(get_node(&bootstrap, "/a/b").is_dir());
+    }
+
+    // Builds the layer into a bootstrap file and loads the tree back from it.
+    fn round_trip_layer(version: RafsVersion, tar: &[u8], with_blob: bool) -> Tree {
+        let tmp_dir = vmm_sys_util::tempdir::TempDir::new().unwrap();
+        let tmp_dir = tmp_dir.as_path().to_path_buf();
+        let source_path = tmp_dir.join("layer.tar");
+        std::fs::write(&source_path, tar).unwrap();
+        let mut ctx = create_context(source_path, version);
+        if with_blob {
+            ctx.blob_storage = Some(ArtifactStorage::FileDir((tmp_dir.clone(), String::new())));
+        }
+        let bootstrap_path = tmp_dir.join("bootstrap");
+        let mut bootstrap_mgr = BootstrapManager::new(
+            Some(ArtifactStorage::SingleFile(bootstrap_path.clone())),
+            None,
+        );
+        let mut blob_mgr = BlobManager::new(digest::Algorithm::Sha256, false);
+        TarballBuilder::new(ConversionType::TarToRafs)
+            .build(&mut ctx, &mut bootstrap_mgr, &mut blob_mgr)
+            .unwrap();
+        let (rs, _) = nydus_rafs::metadata::RafsSuper::load_from_file(
+            &bootstrap_path,
+            Arc::new(nydus_api::ConfigV2::default()),
+            false,
+        )
+        .unwrap();
+        Tree::from_bootstrap(&rs, &mut ()).unwrap()
+    }
+
+    #[test]
+    fn test_implicit_dir_flag_round_trips_v5() {
+        let tar = RawTar::default().reg("a/b/c", b"").dir("a/").finish();
+        let tree = round_trip_layer(RafsVersion::V5, &tar, false);
+        assert_eq!(implicit_dirs(&tree), ["/", "/a/b"]);
+    }
 }

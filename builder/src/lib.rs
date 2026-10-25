@@ -359,6 +359,7 @@ impl TarBuilder {
         inode.set_nlink(2);
         inode.set_name_size(name.len());
         inode.set_rdev(u32::MAX);
+        inode.set_implicit_dir(true);
 
         let source = PathBuf::from("/");
         let target_vec = target_paths.to_vec();
