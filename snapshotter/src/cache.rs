@@ -215,14 +215,17 @@ impl CacheManager {
         );
         // A chunk map marks chunks of its data file as cached; left behind without that
         // file it would serve the holes of a re-created sparse file as data. Evict them
-        // together.
+        // together. A `.blob.raw` file keeps its map under the `.blob.data` name.
         let orphaned_maps: HashSet<PathBuf> = candidates
             .iter()
             .filter(|entry| entry.kind == CacheArtifactKind::BlobData)
             .map(|entry| {
-                let mut map = entry.path.clone().into_os_string();
-                map.push(".chunk_map");
-                PathBuf::from(map)
+                let path = entry.path.to_string_lossy();
+                let data = match path.strip_suffix(".blob.raw") {
+                    Some(base) => format!("{base}.blob.data"),
+                    None => path.into_owned(),
+                };
+                PathBuf::from(data + ".chunk_map")
             })
             .collect();
         candidates.extend(
@@ -439,7 +442,7 @@ fn classify_artifact(path: &Path) -> CacheArtifactKind {
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or_default();
-    if name.ends_with(".blob.data") || name == "blob.data" {
+    if name.ends_with(".blob.data") || name == "blob.data" || name.ends_with(".blob.raw") {
         CacheArtifactKind::BlobData
     } else if name.ends_with(".blob.meta") || name == "blob.meta" {
         CacheArtifactKind::BlobMeta
@@ -562,6 +565,37 @@ mod tests {
             "the chunk map must not outlive its data file"
         );
         assert!(other_map.exists(), "an unrelated map stays");
+        assert_eq!(report.removed_files, 2);
+    }
+
+    #[test]
+    fn gc_evicts_a_chunk_map_with_its_raw_data_file() {
+        let dir = tempdir().unwrap();
+        let cache = dir.path().join("cache").join("image");
+        fs::create_dir_all(&cache).unwrap();
+        // A raw-data cache (`cache_raw_data`) keeps its map under the `.blob.data` name.
+        let raw = cache.join("abc.blob.raw");
+        let map = cache.join("abc.blob.data.chunk_map");
+        fs::write(&raw, vec![0u8; 64]).unwrap();
+        fs::write(&map, b"map").unwrap();
+        assert_eq!(classify_artifact(&raw), CacheArtifactKind::BlobData);
+
+        let manager = CacheManager::new(dir.path().join("cache"));
+        let report = manager
+            .garbage_collect(
+                &CacheGcPolicy {
+                    max_bytes: Some(6),
+                    ..CacheGcPolicy::default()
+                },
+                &HashSet::new(),
+            )
+            .unwrap();
+
+        assert!(!raw.exists());
+        assert!(
+            !map.exists(),
+            "the chunk map must not outlive its raw data file"
+        );
         assert_eq!(report.removed_files, 2);
     }
 
