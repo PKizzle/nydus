@@ -248,10 +248,18 @@ impl Tree {
         for u in modified {
             let mut u_node = u.borrow_mut_node();
             if let Some(idx) = self.get_child_idx(&u.name) {
-                u_node.overlay = Overlay::UpperModification;
-                self.children[idx].node = u.node.clone();
-                if !u_node.is_dir() {
-                    self.children[idx].children.clear();
+                // containerd's `mkparent` copies the lower directory's metadata into the
+                // upperdir, so a synthesized parent keeps the lower directory and only its
+                // children are overlaid. Over anything else the directory shadows the lower node.
+                let keeps_lower = u_node.is_dir()
+                    && u_node.inode.is_implicit_dir()
+                    && self.children[idx].borrow_mut_node().is_dir();
+                if !keeps_lower {
+                    u_node.overlay = Overlay::UpperModification;
+                    self.children[idx].node = u.node.clone();
+                    if !u_node.is_dir() {
+                        self.children[idx].children.clear();
+                    }
                 }
             } else {
                 u_node.overlay = Overlay::UpperAddition;
