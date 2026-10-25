@@ -19,6 +19,9 @@ use std::io::{self, Read, Seek, SeekFrom};
 use tar::Header;
 
 const BLOCK: u64 = 512;
+/// Largest member size accepted; Go rejects sizes of 2^63 and above, and a skip of
+/// `size + padding` must fit a `SeekFrom::Current` offset.
+const MAX_SIZE: u64 = i64::MAX as u64 - BLOCK;
 
 /// Errors from reading a layer tar.
 #[derive(Debug, thiserror::Error)]
@@ -82,7 +85,7 @@ impl<R: Read + Seek> Members<R> {
                 }
                 return Ok(None);
             };
-            let size = header.entry_size()?;
+            let size = check_size(header.entry_size()?)?;
             self.data_left = size;
             self.pad = (BLOCK - size % BLOCK) % BLOCK;
             match header.entry_type().as_byte() {
@@ -121,6 +124,7 @@ impl<R: Read + Seek> Members<R> {
             }
             if let Some(records) = pax {
                 apply_pax(&mut member, records)?;
+                check_size(member.size)?;
             }
             if let Some(name) = long_name {
                 member.path = name;
@@ -155,14 +159,17 @@ impl<R: Read + Seek> Members<R> {
     }
 
     fn skip_rest(&mut self) -> Result<()> {
-        let n = self.data_left + self.pad;
+        let n = self.data_left.checked_add(self.pad);
         (self.data_left, self.pad) = (0, 0);
+        let n = n
+            .and_then(|n| i64::try_from(n).ok())
+            .ok_or_else(|| malformed("member size overflows the archive"))?;
         if n == 0 {
             return Ok(());
         }
         if self.seekable {
-            self.inner.seek(SeekFrom::Current(n as i64))?;
-        } else if io::copy(&mut (&mut self.inner).take(n), &mut io::sink())? != n {
+            self.inner.seek(SeekFrom::Current(n))?;
+        } else if io::copy(&mut (&mut self.inner).take(n as u64), &mut io::sink())? != n as u64 {
             return Err(truncated());
         }
         Ok(())
@@ -240,6 +247,13 @@ fn malformed(msg: impl Into<String>) -> TarError {
 
 fn truncated() -> TarError {
     malformed("unexpected end of archive")
+}
+
+fn check_size(size: u64) -> Result<u64> {
+    if size > MAX_SIZE {
+        return Err(malformed(format!("member size {size} out of range")));
+    }
+    Ok(size)
 }
 
 fn eof_is_truncated(e: io::Error) -> TarError {
@@ -343,6 +357,56 @@ fn apply_pax(member: &mut Member, records: Vec<(Vec<u8>, Vec<u8>)>) -> Result<()
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A USTAR header block with `size` written as given (octal or base-256).
+    fn raw_header(typeflag: u8, name: &[u8], size: &[u8; 12]) -> [u8; 512] {
+        let mut h = [0u8; 512];
+        h[..name.len()].copy_from_slice(name);
+        h[100..108].copy_from_slice(b"0000644\0");
+        h[124..136].copy_from_slice(size);
+        h[156] = typeflag;
+        h[257..265].copy_from_slice(b"ustar\x0000");
+        h[148..156].fill(b' ');
+        let sum: u64 = h.iter().map(|&b| b as u64).sum();
+        h[148..156].copy_from_slice(format!("{:06o}\0 ", sum).as_bytes());
+        h
+    }
+
+    #[test]
+    fn test_member_size_beyond_i64_is_rejected_not_seeked() {
+        // Base-256 sizes a seekable skip would turn into a negative or wrapped seek:
+        // 2^64 - 512 re-reads the same header forever, u64::MAX wraps the padding sum.
+        for size in [
+            &[
+                0x80, 0, 0, 0, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xfe, 0x00,
+            ],
+            &[
+                0x80, 0, 0, 0, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+            ],
+            &[0x80, 0, 0, 0, 0x80, 0, 0, 0, 0, 0, 0, 0],
+        ] {
+            let mut tar = raw_header(b'g', b"pax_global_header", size).to_vec();
+            tar.extend_from_slice(&raw_header(b'0', b"a", b"00000000001\0"));
+            tar.extend_from_slice(&[b'x'; 512]);
+            tar.extend_from_slice(&[0u8; 1024]);
+            for seekable in [true, false] {
+                let mut members = Members::new(io::Cursor::new(&tar), seekable);
+                assert!(
+                    matches!(members.next_member(), Err(TarError::Malformed(_))),
+                    "size {size:02x?} seekable {seekable}"
+                );
+            }
+        }
+        // A PAX `size` record is bounded the same way.
+        let records = b"28 size=9223372036854775296\n";
+        let mut tar = raw_header(b'x', b"pax", b"00000000034\0").to_vec();
+        tar.extend_from_slice(records);
+        tar.resize(1024, 0);
+        tar.extend_from_slice(&raw_header(b'0', b"a", b"00000000000\0"));
+        tar.extend_from_slice(&[0u8; 1024]);
+        let mut members = Members::new(io::Cursor::new(&tar), true);
+        assert!(matches!(members.next_member(), Err(TarError::Malformed(_))));
+    }
 
     #[test]
     fn test_parse_pax_keeps_newlines_in_values() {
