@@ -239,12 +239,12 @@ Ranked. None of these require adopting v3's format.
 6. **Test cases we lack**, from `tests/integration/fanotify_test.go`: range-boundedness measured via
    allocated blocks on the sparse cache, warm re-read allocating ~nothing, and a fanotify-vs-FUSE
    perf harness with cold-page columns.
-7. **Rest of `archive.Apply` fidelity.** Names resolve through symlinks of their own layer only;
-   containerd resolves against the whole rootfs, so a layer writing `lib/foo` over a lower layer's
-   `lib -> usr/lib` still diverges (the per-layer builder has no view of lower layers). Also not
-   modelled: PAX `mtime`, xattr filtering (`trusted.*`, `user.*` on special files), setgid parent
-   groups, directory mtime restamping, invalid whiteout names, and which hardlink member's
-   metadata wins on the shared inode.
+7. **Rest of `archive.Apply` fidelity.** Names resolve through symlinks of their own layer only
+   and synthesized parents keep a lower directory's metadata, matching containerd's overlay fast
+   path (see "Layer apply model" in [nydus-image.md](nydus-image.md)). Not modelled: PAX `mtime`,
+   xattr filtering (`trusted.*`, `user.*` on special files), setgid parent groups, directory
+   mtime restamping, wall-clock mtime on synthesized parents, invalid whiteout names, and which
+   hardlink member's metadata wins on the shared inode.
 
 Not worth porting: concurrent multi-blob reads (`c66b591b`; our per-blob loop in
 `rafs/src/fs.rs` only matters for chunk-dict files spanning blobs, never on the fanotify path),

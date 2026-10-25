@@ -191,6 +191,38 @@ data blobs: ["9e50ae5ac02b2ef6ffb86075720e49d95d8240eed4717dd8ac9c68cadba00762"]
 -rw-r--r-- 1 root root 20480 3月  29 17:02 df01f389850b79cd5a6ca6db98495bb457aa0821b0558351c55537551322fb96
 ```
 
+### Layer apply model
+
+The merge emulates what containerd produces with an overlay snapshotter (`core/diff/apply/apply_linux.go`
+fast path): each layer tar is applied into an **empty upperdir**, and overlayfs then merges the result over
+the lower layers. Two consequences shape the rules:
+
+- A member whose parent directory is missing from the tar gets one from `mkparent`: created 0755 and then
+  given the mode, ownership, times and xattrs of the top-most lower directory of that path when one exists.
+- overlayfs merges a directory over a lower directory, and an upper directory **shadows** a lower symlink or
+  file; lower symlinks are never followed when a path is resolved.
+
+Per-layer conversion therefore marks every directory it synthesizes for a missing parent (`IMPLICIT_DIR`:
+in RAFS v5 an inode flag, in RAFS v6 a table of nids referenced from the extended superblock; the marker is
+never visible in a mounted filesystem). The merge applies three cases to such a directory:
+
+| upper synthesized directory over | result |
+|---|---|
+| a lower directory | the lower directory is kept (metadata and xattrs), only its children are overlaid |
+| a lower symlink or file | the directory replaces it, with the synthesized defaults |
+| nothing | the directory is inserted |
+
+An explicit directory entry in the upper layer replaces the lower node. The root is never
+marked: `archive.Apply` ignores root members and overlayfs shows the fresh upperdir's own attributes.
+
+Accepted deviations from containerd: a synthesized directory keeps mtime 0 where containerd stamps the
+wall-clock time, and a directory that shadows a lower symlink gets the synthesized defaults where containerd
+copies the symlink target's metadata from the first lowerdir where it resolves. Both live in the merge
+logic only, not in the on-disk format.
+
+Per-layer `create` and `merge` must run on the same `nydus-image` build: a `merge` without marker support
+replaces lower directories, and a `create` without it writes no marker.
+
 ## Unpack Nydus Image
 `nydus-image` tool supports to unpack Nydus image to a tar file.
 ```shell

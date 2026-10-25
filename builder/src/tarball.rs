@@ -614,7 +614,9 @@ fn clean_path(name: &[u8]) -> Vec<u8> {
 /// Resolves a member name to the absolute path containerd's `archive.Apply` lands it on:
 /// relative to the root of the layer, `..` stops at the root, and each leading component that
 /// is a symlink from an earlier member is followed within the root, while the last component
-/// is not. Only symlinks of this layer are known, the layers below it are not.
+/// is not. Symlinks of lower layers are not followed: `archive.Apply` on an overlay snapshot
+/// resolves against the empty upperdir, so a lower symlink is shadowed by the directory the
+/// member implies (see "Layer apply model" in docs/nydus-image.md).
 fn resolve_path(tree: &Tree, name: &[u8]) -> Result<PathBuf> {
     let mut pending: VecDeque<Vec<u8>> = name.split(|&b| b == b'/').map(<[u8]>::to_vec).collect();
     // `trees[i]` is the tree at `resolved[..i]`, `None` once a component does not exist.
