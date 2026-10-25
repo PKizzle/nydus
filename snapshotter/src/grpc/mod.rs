@@ -1998,6 +1998,7 @@ ead2bc6bac86c94fd0bfe3dda6bd9c1dc39bf2bd2446f8048aee82f437584bb";
             created_at: 0,
             updated_at: 0,
             labels: labels(lbls),
+            usage: None,
         }
     }
 

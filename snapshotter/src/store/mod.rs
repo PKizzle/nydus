@@ -148,6 +148,7 @@ impl SnapshotStore {
             created_at: now,
             updated_at: now,
             labels: labels.clone(),
+            usage: None,
         };
         let encoded = encode_snapshot(&info)?;
 
@@ -198,6 +199,7 @@ impl SnapshotStore {
             created_at: now,
             updated_at: now,
             labels: labels.clone(),
+            usage: None,
         };
 
         tx.insert(
@@ -321,6 +323,32 @@ impl SnapshotStore {
         Ok(())
     }
 
+    /// Cache the measured usage of a committed snapshot.
+    ///
+    /// Not a user-visible change, so `updated_at` is left alone, and the write
+    /// is not fsynced: losing it on a crash only costs one more walk.
+    pub fn record_usage(&self, key: &str, usage: (i64, i64)) -> Result<()> {
+        let mut tx = self.db.write_tx();
+        let value = tx
+            .get(&self.snapshots, key.as_bytes())
+            .with_context(|| format!("failed to read snapshot {key}"))?
+            .with_context(|| format!("snapshot {key} does not exist"))?;
+        let mut info =
+            decode_snapshot(&value).with_context(|| format!("failed to decode snapshot {key}"))?;
+        if info.kind != SnapshotKind::Committed.as_str() {
+            bail!("snapshot {key} is not committed; its usage is not cacheable");
+        }
+        info.usage = Some(usage);
+        tx.insert(
+            &self.snapshots,
+            key.as_bytes().to_vec(),
+            encode_snapshot(&info)?,
+        );
+        tx.commit()
+            .with_context(|| format!("failed to record usage for snapshot {key}"))?;
+        Ok(())
+    }
+
     /// Import a complete snapshot record from legacy metadata.
     ///
     /// This is intentionally stricter than an upsert: migration/recovery should
@@ -421,6 +449,11 @@ pub struct SnapshotInfo {
     pub created_at: i64,
     pub updated_at: i64,
     pub labels: HashMap<String, String>,
+    /// Cached `(size, inodes)` of a committed snapshot's diff directory.
+    /// Committed snapshots are immutable, so the walk is done at most once;
+    /// containerd's CRI asks for every snapshot's usage after each restart.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<(i64, i64)>,
 }
 
 fn encode_snapshot(info: &SnapshotInfo) -> Result<Vec<u8>> {
@@ -625,6 +658,15 @@ mod tests {
     }
 
     #[test]
+    fn record_without_usage_field_decodes() {
+        let info = decode_snapshot(
+            br#"{"key":"k","parent":null,"kind":"kind_committed","fs_driver":"fusedev","image_ref":null,"created_at":1,"updated_at":2,"labels":{}}"#,
+        )
+        .unwrap();
+        assert_eq!(info.usage, None);
+    }
+
+    #[test]
     fn import_snapshot_preserves_legacy_record() {
         let dir = tempdir().unwrap();
         let store_path = dir.path().join("metadata.fjall");
@@ -641,6 +683,7 @@ mod tests {
                 "containerd.io/snapshot.ref".to_string(),
                 "docker.io/example/image:nydus".to_string(),
             )]),
+            usage: None,
         };
 
         store.import_snapshot(info.clone()).unwrap();

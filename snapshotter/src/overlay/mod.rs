@@ -242,10 +242,25 @@ impl OverlayEngine {
         Ok(())
     }
 
-    /// Return disk usage for the snapshot's diff directory.
+    /// Return disk usage `(size, inodes)` for the snapshot's diff directory.
+    ///
+    /// Active and view snapshots are walked on every call. A committed
+    /// snapshot is immutable, so its first walk is cached in the store and
+    /// later calls -- including the one-per-snapshot sweep containerd's CRI
+    /// runs after every restart -- are a metadata read.
     pub fn usage(&self, store: &SnapshotStore, key: &str) -> Result<(i64, i64)> {
-        let _ = store.stat(key)?;
-        dir_usage(&self.fs_dir(key))
+        let info = store.stat(key)?;
+        if let Some(usage) = info.usage {
+            return Ok(usage);
+        }
+        let usage = dir_usage(&self.fs_dir(key))?;
+        if info.kind == SnapshotKind::Committed.as_str()
+            && let Err(e) = store.record_usage(key, usage)
+        {
+            // Usually a concurrent Remove; the measured value is still correct.
+            debug!(key, error = %e, "failed to cache committed snapshot usage");
+        }
+        Ok(usage)
     }
 
     /// Walk the parent chain starting at `parent` and return Nydus meta info
@@ -506,6 +521,33 @@ mod tests {
             PrepareOutcome::Mounts(m) => m,
             PrepareOutcome::AlreadyExists { .. } => Vec::new(),
         }
+    }
+
+    #[test]
+    fn usage_is_cached_for_committed_and_walked_for_active() {
+        let dir = tempdir().unwrap();
+        let (engine, store) = test_engine(dir.path());
+        let labels = HashMap::new();
+
+        engine.prepare(&store, "base-active", "", &labels).unwrap();
+        std::fs::write(engine.fs_dir("base-active").join("a"), b"hello").unwrap();
+        engine
+            .commit(&store, "base", "base-active", &HashMap::new())
+            .unwrap();
+        let committed = engine.usage(&store, "base").unwrap();
+        assert_eq!(store.stat("base").unwrap().usage, Some(committed));
+
+        // A later change on disk is not re-walked: the cached value is served.
+        std::fs::write(engine.fs_dir("base").join("b"), vec![0u8; 4096]).unwrap();
+        assert_eq!(engine.usage(&store, "base").unwrap(), committed);
+
+        engine.prepare(&store, "child", "base", &labels).unwrap();
+        let before = engine.usage(&store, "child").unwrap();
+        std::fs::write(engine.fs_dir("child").join("c"), vec![0u8; 4096]).unwrap();
+        let after = engine.usage(&store, "child").unwrap();
+        assert_eq!(after.1, before.1 + 1);
+        assert!(after.0 >= before.0 + 4096);
+        assert_eq!(store.stat("child").unwrap().usage, None);
     }
 
     #[test]
