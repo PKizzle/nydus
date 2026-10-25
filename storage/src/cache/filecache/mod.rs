@@ -100,6 +100,7 @@ impl FileCacheMgr {
             return Ok(entry);
         }
 
+        // Unserialized: a racing opener's drop_stale_chunk_map can unlink this map; restart re-fetches.
         let entry = FileCacheEntry::new_file_cache(
             self,
             blob.clone(),

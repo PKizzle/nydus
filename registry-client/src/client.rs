@@ -23,8 +23,8 @@
 //! through the transparent `Other` catch-all.
 
 use crate::auth::{
-    BearerChallenge, Credentials, TokenCache, auth_header_value, docker_config_auth,
-    fetch_bearer_token, mount_scope, parse_bearer_challenge, percent_encode_query, pull_scope,
+    BearerChallenge, Credentials, TokenCache, auth_header_value, bearer_challenge,
+    docker_config_auth, fetch_bearer_token, mount_scope, percent_encode_query, pull_scope,
     push_scope,
 };
 use crate::error::RegistryError;
@@ -38,7 +38,6 @@ use cyper::{Client, Response};
 use futures::StreamExt;
 use http::header::{
     ACCEPT, AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, HeaderName, HeaderValue, LOCATION,
-    WWW_AUTHENTICATE,
 };
 use http::{Method, StatusCode};
 use sha2::{Digest as _, Sha256};
@@ -839,12 +838,7 @@ impl RegistryClient {
         if response.status() != StatusCode::UNAUTHORIZED {
             return Ok(response);
         }
-        let Some(challenge) = response
-            .headers()
-            .get(WWW_AUTHENTICATE)
-            .and_then(|value| value.to_str().ok())
-            .and_then(parse_bearer_challenge)
-        else {
+        let Some(challenge) = bearer_challenge(response.headers()) else {
             // Basic-only (or absent) challenge: the first attempt already sent
             // basic auth when available, so there is nothing left to try.
             return Ok(response);

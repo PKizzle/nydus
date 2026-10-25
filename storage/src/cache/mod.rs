@@ -402,11 +402,10 @@ pub trait BlobCache: Send + Sync {
             chunk.compressed_offset(),
             duration
         );
-        self.validate_chunk_data(chunk, buffer, false)
-            .map_err(|e| {
-                warn!("failed to read data from backend, {}", e);
-                e
-            })?;
+        self.validate_chunk_data(chunk, buffer).map_err(|e| {
+            warn!("failed to read data from backend, {}", e);
+            e
+        })?;
 
         Ok(c_buf)
     }
@@ -441,8 +440,9 @@ pub trait BlobCache: Send + Sync {
 
     /// Validate chunk data.
     ///
-    /// When digest validation is enabled (by local configuration or `force_validation`),
-    /// the chunk data is always verified against its cryptographic digest. The xxh3/CRC32
+    /// When digest validation is enabled, the chunk data is always verified against its
+    /// cryptographic digest. Chunk digests inlined in the blob meta are only trustworthy when
+    /// the bootstrap carries `blob_toc_digest`, which anchors that meta. The xxh3/CRC32
     /// checksums are only a lightweight transport check when digest validation is disabled:
     /// their flags and values come from the blob meta, which is fetched from the backend
     /// and not authenticated, so they must never decide whether the digest gets checked.
@@ -450,7 +450,6 @@ pub trait BlobCache: Send + Sync {
         &self,
         chunk: &dyn BlobChunkInfo,
         buffer: &[u8],
-        force_validation: bool,
     ) -> StorageResult<usize> {
         let d_size = chunk.uncompressed_size() as usize;
         if buffer.len() != d_size {
@@ -462,7 +461,7 @@ pub trait BlobCache: Send + Sync {
             return Ok(d_size);
         }
 
-        if self.need_validation() || force_validation {
+        if self.need_validation() {
             if !check_hash(buffer, chunk.chunk_id(), self.blob_digester()) {
                 return Err(StorageError::InvalidData(
                     "data digest value doesn't match".to_string(),
@@ -705,7 +704,7 @@ impl<'a, 'b> ChunkDecompressState<'a, 'b> {
         self.cache
             .decompress_chunk_data(&decrypted_buffer, &mut buffer, chunk.is_compressed())?;
         self.cache
-            .validate_chunk_data(chunk, &buffer, false)
+            .validate_chunk_data(chunk, &buffer)
             .map_err(|e| {
                 warn!("failed to read data from backend, {}", e);
                 e
@@ -817,6 +816,7 @@ mod tests {
             file_offset: 0,
             index: 0,
             crc32: 0,
+            ..Default::default()
         }) as Arc<dyn BlobChunkInfo>;
         let chunk2 = Arc::new(MockChunkInfo {
             block_id: Default::default(),
@@ -829,6 +829,7 @@ mod tests {
             file_offset: 0x1000,
             index: 1,
             crc32: 0,
+            ..Default::default()
         }) as Arc<dyn BlobChunkInfo>;
         let chunk3 = Arc::new(MockChunkInfo {
             block_id: Default::default(),
@@ -841,6 +842,7 @@ mod tests {
             file_offset: 0x1000,
             index: 1,
             crc32: 0,
+            ..Default::default()
         }) as Arc<dyn BlobChunkInfo>;
 
         let cb = |_merged| {};

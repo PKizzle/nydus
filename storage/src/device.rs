@@ -1691,6 +1691,7 @@ mod tests {
             file_offset: 0,
             index: 3,
             crc32: 0,
+            ..Default::default()
         });
         let iochunk: BlobIoChunk = chunk.clone().into();
 
@@ -1724,6 +1725,7 @@ mod tests {
             file_offset: 0,
             index: 0,
             crc32: 0,
+            ..Default::default()
         }) as Arc<dyn BlobChunkInfo>;
         let chunk2 = Arc::new(MockChunkInfo {
             block_id: Default::default(),
@@ -1736,6 +1738,7 @@ mod tests {
             file_offset: 0x1000,
             index: 1,
             crc32: 0,
+            ..Default::default()
         }) as Arc<dyn BlobChunkInfo>;
         let chunk3 = Arc::new(MockChunkInfo {
             block_id: Default::default(),
@@ -1748,6 +1751,7 @@ mod tests {
             file_offset: 0x3000,
             index: 1,
             crc32: 0,
+            ..Default::default()
         }) as Arc<dyn BlobChunkInfo>;
 
         let desc1 = BlobIoDesc {
@@ -1810,6 +1814,7 @@ mod tests {
             file_offset: 0,
             index: 0,
             crc32: 0,
+            ..Default::default()
         }) as Arc<dyn BlobChunkInfo>;
         let mut iovec = BlobIoVec::new(blob1.clone());
         iovec.push(BlobIoDesc::new(blob1, BlobIoChunk(chunk1), 0, 0x1000, true));
@@ -1834,6 +1839,7 @@ mod tests {
             file_offset: 0x1000,
             index: 1,
             crc32: 0,
+            ..Default::default()
         }) as Arc<dyn BlobChunkInfo>;
         let mut iovec2 = BlobIoVec::new(blob2.clone());
         iovec2.push(BlobIoDesc::new(blob2, BlobIoChunk(chunk2), 0, 0x1000, true));
@@ -1873,6 +1879,7 @@ mod tests {
                 file_offset: 2 * chunk_idx as u64 * chunk_size as u64,
                 index: chunk_idx,
                 crc32: 0,
+                ..Default::default()
             }) as Arc<dyn BlobChunkInfo>;
             let desc = BlobIoDesc::new(large_blob.clone(), BlobIoChunk(chunk), 0, chunk_size, true);
             if chunk_idx < chunk_count / 2 {

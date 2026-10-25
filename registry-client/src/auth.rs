@@ -252,12 +252,26 @@ pub fn parse_bearer_challenge(value: &str) -> Option<BearerChallenge> {
     })
 }
 
+/// The Bearer challenge of a response, read from every `WWW-Authenticate` field: several
+/// fields form one comma-separated challenge list (RFC 9110 5.3).
+pub(crate) fn bearer_challenge(headers: &http::HeaderMap) -> Option<BearerChallenge> {
+    let joined = headers
+        .get_all(http::header::WWW_AUTHENTICATE)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .collect::<Vec<_>>()
+        .join(", ");
+    parse_bearer_challenge(&joined)
+}
+
 fn split_header_params(value: &str) -> Vec<&str> {
     let mut out = Vec::new();
     let mut start = 0usize;
-    let mut quoted = false;
+    let (mut quoted, mut escaped) = (false, false);
     for (idx, ch) in value.char_indices() {
         match ch {
+            _ if escaped => escaped = false,
+            '\\' if quoted => escaped = true,
             '"' => quoted = !quoted,
             ',' if !quoted => {
                 out.push(value[start..idx].trim());
@@ -495,6 +509,28 @@ mod tests {
             parsed.scope.as_deref(),
             Some("repository:team/app:pull,push repository:team/base:pull")
         );
+    }
+
+    #[test]
+    fn bearer_challenge_parser_keeps_escaped_quotes_inside_values() {
+        let parsed = parse_bearer_challenge(r#"Bearer error="say \"hi", realm="r""#).unwrap();
+        assert_eq!(parsed.realm, "r");
+    }
+
+    #[test]
+    fn bearer_challenge_reads_every_header_field() {
+        let mut headers = http::HeaderMap::new();
+        headers.append(
+            http::header::WWW_AUTHENTICATE,
+            HeaderValue::from_static(r#"Basic realm="r""#),
+        );
+        headers.append(
+            http::header::WWW_AUTHENTICATE,
+            HeaderValue::from_static(r#"Bearer realm="https://auth.local/token",service="s""#),
+        );
+        let parsed = bearer_challenge(&headers).unwrap();
+        assert_eq!(parsed.realm, "https://auth.local/token");
+        assert_eq!(parsed.service.as_deref(), Some("s"));
     }
 
     #[test]

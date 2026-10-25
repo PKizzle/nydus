@@ -1765,7 +1765,7 @@ impl FileCacheEntry {
                 .read_exact(buffer)
                 .map_err(|e| StorageError::cache_io("read the cache file", e))?;
         }
-        self.validate_chunk_data(chunk, buffer, false)?;
+        self.validate_chunk_data(chunk, buffer)?;
         Ok(())
     }
 

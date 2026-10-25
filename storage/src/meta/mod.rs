@@ -995,6 +995,10 @@ impl BlobCompressionContextInfo {
         file.write_all_at(&uncompressed, 0)
             .map_err(|e| MetaError::io("failed to write the blob meta table", e))?;
         // The header goes last, so a reader that finds a valid header also finds the table.
+        // Header-last only orders page-cache visibility; the table must be durable before the
+        // header is written, or a power loss can persist a valid header over a missing table.
+        file.sync_data()
+            .map_err(|e| MetaError::io("failed to flush the blob meta table", e))?;
         file.write_all_at(&header, aligned_uncompressed_size)
             .map_err(|e| MetaError::io("failed to write the blob meta header", e))?;
         file.sync_data()

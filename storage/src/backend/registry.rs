@@ -717,19 +717,28 @@ impl RegistryState {
     ///
     /// The header is an RFC 7235 challenge list: schemes and parameter names are
     /// case-insensitive, quoted values may contain `,` and `=`, and one header may carry
-    /// several challenges, of which Bearer is preferred. `service` is optional.
-    fn parse_auth(source: &HeaderValue) -> Option<Auth> {
-        let source = String::from_utf8_lossy(source.as_bytes());
+    /// several challenges, of which a Bearer one with a realm is preferred. `service` is
+    /// optional.
+    fn parse_auth<'a>(fields: impl IntoIterator<Item = &'a HeaderValue>) -> Option<Auth> {
+        // Several header fields form one comma-separated challenge list (RFC 9110 5.3).
+        let source = fields
+            .into_iter()
+            .map(|v| String::from_utf8_lossy(v.as_bytes()))
+            .collect::<Vec<_>>()
+            .join(", ");
         let challenges = parse_challenges(&source);
-        let find = |scheme: &str| {
+        let find = |scheme: &str, key: &str| {
             challenges
                 .iter()
-                .find(|(s, _)| s.eq_ignore_ascii_case(scheme))
+                .find(|(s, p)| {
+                    s.eq_ignore_ascii_case(scheme) && (key.is_empty() || p.contains_key(key))
+                })
                 .map(|(_, params)| params)
         };
 
-        if let Some(params) = find("Bearer") {
-            let realm = params.get("realm")?.clone();
+        // A Bearer challenge without a realm (e.g. only `error=`) cannot fetch a token.
+        if let Some(params) = find("Bearer", "realm") {
+            let realm = params["realm"].clone();
             let service = params.get("service").cloned().unwrap_or_default();
             let scope = params.get("scope").cloned().unwrap_or_else(|| {
                 debug!("no scope specified for token auth challenge");
@@ -741,7 +750,7 @@ impl RegistryState {
                 scope,
             }));
         }
-        find("Basic").map(|params| {
+        find("Basic", "").map(|params| {
             Auth::Basic(BasicAuth {
                 realm: params.get("realm").cloned().unwrap_or_default(),
             })
@@ -939,38 +948,38 @@ impl RegistryReader {
                     .map_err(request_err_to_registry)?;
             };
 
-            if let Some(resp_auth_header) = resp.headers().get(HEADER_WWW_AUTHENTICATE) {
-                // Get token from registry authorization server
-                if let Some(auth) = RegistryState::parse_auth(resp_auth_header) {
-                    let auth_header = self.state.get_auth_header(auth, &self.request)?;
+            // Get token from registry authorization server
+            if let Some(auth) =
+                RegistryState::parse_auth(resp.headers().get_all(HEADER_WWW_AUTHENTICATE))
+            {
+                let auth_header = self.state.get_auth_header(auth, &self.request)?;
 
-                    headers.insert(
-                        HEADER_AUTHORIZATION,
-                        HeaderValue::from_str(auth_header.as_str()).unwrap(),
-                    );
+                headers.insert(
+                    HEADER_AUTHORIZATION,
+                    HeaderValue::from_str(auth_header.as_str()).unwrap(),
+                );
 
-                    // Try to request registry server with `authorization` header again
-                    let resp = self
-                        .request
-                        .call(
-                            method,
-                            url,
-                            None,
-                            data,
-                            &mut headers,
-                            catch_status,
-                            context,
-                            false,
-                        )
-                        .map_err(request_err_to_registry)?;
+                // Try to request registry server with `authorization` header again
+                let resp = self
+                    .request
+                    .call(
+                        method,
+                        url,
+                        None,
+                        data,
+                        &mut headers,
+                        catch_status,
+                        context,
+                        false,
+                    )
+                    .map_err(request_err_to_registry)?;
 
-                    let status = resp.status();
-                    if is_success_status(status) {
-                        // Cache authorization header for next request
-                        self.state.cached_auth.set(&last_cached_auth, auth_header)
-                    }
-                    return respond(resp, catch_status);
+                let status = resp.status();
+                if is_success_status(status) {
+                    // Cache authorization header for next request
+                    self.state.cached_auth.set(&last_cached_auth, auth_header)
                 }
+                return respond(resp, catch_status);
             }
         }
 
@@ -1753,7 +1762,7 @@ mod tests {
     fn test_parse_auth() {
         let str = "Bearer realm=\"https://auth.my-registry.com/token\",service=\"my-registry.com\",scope=\"repository:test/repo:pull,push\"";
         let header = HeaderValue::from_str(str).unwrap();
-        let auth = RegistryState::parse_auth(&header).unwrap();
+        let auth = RegistryState::parse_auth([&header]).unwrap();
         match auth {
             Auth::Bearer(auth) => {
                 assert_eq!(&auth.realm, "https://auth.my-registry.com/token");
@@ -1766,7 +1775,7 @@ mod tests {
         // No scope is accetpable
         let str = "Bearer realm=\"https://auth.my-registry.com/token\",service=\"my-registry.com\"";
         let header = HeaderValue::from_str(str).unwrap();
-        let auth = RegistryState::parse_auth(&header).unwrap();
+        let auth = RegistryState::parse_auth([&header]).unwrap();
         match auth {
             Auth::Bearer(auth) => {
                 assert_eq!(&auth.realm, "https://auth.my-registry.com/token");
@@ -1778,7 +1787,7 @@ mod tests {
 
         let str = "Basic realm=\"https://auth.my-registry.com/token\"";
         let header = HeaderValue::from_str(str).unwrap();
-        let auth = RegistryState::parse_auth(&header).unwrap();
+        let auth = RegistryState::parse_auth([&header]).unwrap();
         match auth {
             Auth::Basic(auth) => assert_eq!(&auth.realm, "https://auth.my-registry.com/token"),
             _ => panic!("failed to parse `Basic` authentication header"),
@@ -1786,34 +1795,34 @@ mod tests {
 
         let str = "Base realm=\"https://auth.my-registry.com/token\"";
         let header = HeaderValue::from_str(str).unwrap();
-        assert!(RegistryState::parse_auth(&header).is_none());
+        assert!(RegistryState::parse_auth([&header]).is_none());
 
         // A malformed parameter is skipped; the bare scheme still selects Basic.
         let header = HeaderValue::from_static("Basic realm");
         assert!(matches!(
-            RegistryState::parse_auth(&header),
+            RegistryState::parse_auth([&header]),
             Some(Auth::Basic(b)) if b.realm.is_empty()
         ));
 
         let header = HeaderValue::from_static("");
-        assert!(RegistryState::parse_auth(&header).is_none());
+        assert!(RegistryState::parse_auth([&header]).is_none());
 
         // `service` is optional.
         let header = HeaderValue::from_static(
             "Bearer realm=\"https://auth.my-registry.com/token\",scope=\"repository:test/repo:pull\"",
         );
         assert!(matches!(
-            RegistryState::parse_auth(&header),
+            RegistryState::parse_auth([&header]),
             Some(Auth::Bearer(b)) if b.service.is_empty() && b.scope == "repository:test/repo:pull"
         ));
 
         let header = HeaderValue::from_static(
             "Bearer service=\"my-registry.com\",scope=\"repository:test/repo:pull\"",
         );
-        assert!(RegistryState::parse_auth(&header).is_none());
+        assert!(RegistryState::parse_auth([&header]).is_none());
 
         let header = HeaderValue::from_static("Basic realm=\"harbor\"");
-        let auth = RegistryState::parse_auth(&header).unwrap();
+        let auth = RegistryState::parse_auth([&header]).unwrap();
         match auth {
             Auth::Basic(auth) => assert_eq!(&auth.realm, "harbor"),
             _ => panic!("failed to parse `Basic` authentication header with explicit realm"),
@@ -2335,7 +2344,7 @@ mod tests {
     #[test]
     fn test_parse_auth_basic_with_realm() {
         let hdr = HeaderValue::from_str(r#"Basic realm="https://registry.example.com""#).unwrap();
-        let auth = RegistryState::parse_auth(&hdr);
+        let auth = RegistryState::parse_auth([&hdr]);
         assert!(matches!(
             auth,
             Some(Auth::Basic(b)) if b.realm == "https://registry.example.com"
@@ -2346,7 +2355,7 @@ mod tests {
     fn test_parse_auth_bearer_missing_service() {
         let hdr =
             HeaderValue::from_str(r#"Bearer realm="https://auth.example.com/token""#).unwrap();
-        let auth = RegistryState::parse_auth(&hdr);
+        let auth = RegistryState::parse_auth([&hdr]);
         assert!(matches!(
             auth,
             Some(Auth::Bearer(b)) if b.realm == "https://auth.example.com/token" && b.service.is_empty()
@@ -2358,12 +2367,12 @@ mod tests {
         // Scheme and parameter names are case-insensitive.
         let hdr = HeaderValue::from_static(r#"bearer REALM="https://a.example/t",Service="s""#);
         assert!(matches!(
-            RegistryState::parse_auth(&hdr),
+            RegistryState::parse_auth([&hdr]),
             Some(Auth::Bearer(b)) if b.realm == "https://a.example/t" && b.service == "s"
         ));
         let hdr = HeaderValue::from_static("BASIC");
         assert!(matches!(
-            RegistryState::parse_auth(&hdr),
+            RegistryState::parse_auth([&hdr]),
             Some(Auth::Basic(_))
         ));
 
@@ -2372,7 +2381,7 @@ mod tests {
             r#"Bearer realm="https://a.example/token?x=1,y=2",service="s",scope="repository:r:pull,push",error="say \"hi\"""#,
         );
         assert!(matches!(
-            RegistryState::parse_auth(&hdr),
+            RegistryState::parse_auth([&hdr]),
             Some(Auth::Bearer(b)) if b.realm == "https://a.example/token?x=1,y=2"
                 && b.scope == "repository:r:pull,push"
         ));
@@ -2380,7 +2389,7 @@ mod tests {
         // Unquoted values and whitespace around `=`.
         let hdr = HeaderValue::from_static("Bearer realm = https://a.example/t , service=s");
         assert!(matches!(
-            RegistryState::parse_auth(&hdr),
+            RegistryState::parse_auth([&hdr]),
             Some(Auth::Bearer(b)) if b.realm == "https://a.example/t" && b.service == "s"
         ));
 
@@ -2391,21 +2400,40 @@ mod tests {
         ] {
             let hdr = HeaderValue::from_str(value).unwrap();
             assert!(
-                matches!(RegistryState::parse_auth(&hdr), Some(Auth::Bearer(b)) if b.service == "s"),
+                matches!(RegistryState::parse_auth([&hdr]), Some(Auth::Bearer(b)) if b.service == "s"),
                 "{value}"
             );
         }
         let hdr = HeaderValue::from_static(r#"Digest realm="d", Basic realm="b""#);
         assert!(matches!(
-            RegistryState::parse_auth(&hdr),
+            RegistryState::parse_auth([&hdr]),
             Some(Auth::Basic(b)) if b.realm == "b"
         ));
 
         // Bytes outside visible ASCII must not panic.
         let hdr = HeaderValue::from_bytes(b"Basic realm=\"r\xe9gistry\"").unwrap();
         assert!(matches!(
-            RegistryState::parse_auth(&hdr),
+            RegistryState::parse_auth([&hdr]),
             Some(Auth::Basic(_))
+        ));
+    }
+
+    #[test]
+    fn test_parse_auth_bearer_without_realm_falls_back_to_basic() {
+        let hdr = HeaderValue::from_static(r#"Basic realm="r", Bearer error="invalid_token""#);
+        assert!(matches!(
+            RegistryState::parse_auth([&hdr]),
+            Some(Auth::Basic(b)) if b.realm == "r"
+        ));
+    }
+
+    #[test]
+    fn test_parse_auth_reads_every_header_field() {
+        let basic = HeaderValue::from_static(r#"Basic realm="r""#);
+        let bearer = HeaderValue::from_static(r#"Bearer realm="https://a.example/t",service="s""#);
+        assert!(matches!(
+            RegistryState::parse_auth([&basic, &bearer]),
+            Some(Auth::Bearer(b)) if b.service == "s"
         ));
     }
 
@@ -2415,7 +2443,7 @@ mod tests {
             r#"Bearer realm="https://auth.example.com/token",service="example.com""#,
         )
         .unwrap();
-        let auth = RegistryState::parse_auth(&hdr);
+        let auth = RegistryState::parse_auth([&hdr]);
         assert!(matches!(
             auth,
             Some(Auth::Bearer(b)) if b.scope.is_empty() && b.realm == "https://auth.example.com/token"
@@ -2425,7 +2453,7 @@ mod tests {
     #[test]
     fn test_parse_auth_unknown_scheme() {
         let hdr = HeaderValue::from_str(r#"Digest realm="example.com""#).unwrap();
-        let auth = RegistryState::parse_auth(&hdr);
+        let auth = RegistryState::parse_auth([&hdr]);
         assert!(auth.is_none());
     }
 
