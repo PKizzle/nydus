@@ -219,6 +219,12 @@ struct DaemonInstance {
     /// is "ballast" that `release_holder` drains on releases for unknown keys
     /// (pre-restart holders being removed).
     holders: StdMutex<HashSet<String>>,
+    /// The subset of `holders` restored from a persisted record rather than
+    /// acquired by this process. Such a key predates every snapshot-store
+    /// listing the reconciler takes, so its absence from one means its
+    /// snapshot is gone (its `remove()` was missed) and the key is pruned. A
+    /// key acquired since can postdate the listing and is never pruned.
+    restored_holders: StdMutex<HashSet<String>>,
     /// Mio poller kept alive for the entire lifetime of the daemon - the
     /// `Waker` passed into `create_fuse_daemon` borrows its registry.
     _poll: Arc<Mutex<Poll>>,
@@ -841,6 +847,7 @@ impl DaemonSupervisor {
             daemon,
             refcount: AtomicUsize::new(0),
             holders: StdMutex::new(HashSet::new()),
+            restored_holders: StdMutex::new(HashSet::new()),
             failover_armed: AtomicBool::new(armed),
             _poll: poll,
         }))
@@ -910,35 +917,51 @@ impl DaemonSupervisor {
     /// acquired is a no-op (modulo restore ballast — see `DaemonInstance::holders`),
     /// so double-removes cannot underflow another snapshot's reference.
     pub async fn release(&self, image_ref: &str, holder: &str) -> Result<()> {
-        let mut instances = self.instances.write().await;
-        let should_stop = if let Some(inst) = instances.get(image_ref) {
-            inst.release_holder(holder) == 0
-        } else {
-            return Ok(());
+        let should_stop = {
+            let instances = self.instances.read().await;
+            let Some(inst) = instances.get(image_ref) else {
+                return Ok(());
+            };
+            let remaining = inst.release_holder(holder);
+            if remaining > 0
+                && let Err(e) = self.persist_instance_record(inst, true).await
+            {
+                warn!(image_ref, error = %e, "failed to persist daemon record");
+            }
+            remaining == 0
         };
-
         if should_stop {
-            self.teardown_unreferenced(&mut instances, image_ref).await;
-        } else if let Some(inst) = instances.get(image_ref)
-            && let Err(e) = self.persist_instance_record(inst, true).await
-        {
-            warn!(image_ref, error = %e, "failed to persist daemon record");
+            self.teardown_if_unreferenced(image_ref).await;
         }
         Ok(())
     }
 
-    /// Remove the daemon for `image_ref` from `instances` (the caller holds
-    /// the write lock, so no acquire can race the teardown), stop it, unmount
-    /// it, and persist it as stopped.
-    async fn teardown_unreferenced(
-        &self,
-        instances: &mut HashMap<String, Arc<DaemonInstance>>,
-        image_ref: &str,
-    ) {
-        let Some(inst) = instances.remove(image_ref) else {
-            return;
+    /// Stop, unmount and persist as stopped the daemon for `image_ref` if its
+    /// refcount is still zero. Returns whether it was torn down.
+    ///
+    /// The instance leaves the map under the write lock, so no acquire can
+    /// reach it afterwards; the stop itself runs on the blocking pool with no
+    /// instances lock held, because unmounting a busy fanotify EROFS mount
+    /// retries for seconds. The per-image start lock is held throughout, so a
+    /// concurrent ensure cannot start a daemon over (and adopt) the mount
+    /// being torn down. The failover state is cleared only after the unmount.
+    async fn teardown_if_unreferenced(&self, image_ref: &str) -> bool {
+        let start_lock = self.start_lock(image_ref).await;
+        let _guard = start_lock.lock().await;
+        let inst = {
+            let mut instances = self.instances.write().await;
+            match instances.get(image_ref) {
+                Some(inst) if inst.refcount.load(Ordering::SeqCst) == 0 => {
+                    instances.remove(image_ref)
+                }
+                _ => None,
+            }
         };
-        if let Err(e) = stop_unreferenced_instance(&inst) {
+        let Some(inst) = inst else {
+            return false;
+        };
+        let stopping = inst.clone();
+        if let Err(e) = blocking::unblock(move || stop_unreferenced_instance(&stopping)).await {
             warn!(image_ref, error = %e, "failed to stop nydus daemon cleanly");
         }
         if let Err(e) = self.persist_instance_record(&inst, false).await {
@@ -947,6 +970,7 @@ impl DaemonSupervisor {
         // Fully torn down: a preserved fd or state blob left behind would
         // revive a daemon nobody references on the next start.
         self.clear_failover_state(&slug_for(image_ref));
+        true
     }
 
     /// Clamp daemon refcounts down to the holders that actually exist.
@@ -957,29 +981,42 @@ impl DaemonSupervisor {
     /// restored from records for holders that disappeared while the
     /// snapshotter was down) otherwise inflates monotonically and pins
     /// daemons forever. Shrink-only by design: the target floors at the
-    /// live in-memory holder count, unhealthy daemons are skipped, and holders
-    /// are never mutated.
+    /// in-memory holder count and unhealthy daemons are skipped. The only
+    /// holders dropped are keys restored from a record that `observed` no
+    /// longer contains (see `DaemonInstance::restored_holders`); the caller
+    /// passes `observed` only when the whole store listing resolved.
     ///
     /// A healthy daemon whose target is zero — no tracked and no observed
     /// holder — is torn down exactly as `release()` would have: no `remove()`
     /// will ever reach it, so it would otherwise live forever. This includes a
     /// daemon pre-warmed through `spawn_instance` that no snapshot has
-    /// acquired by the next pass. The whole pass runs under the instances
-    /// write lock, so no acquire can race the teardown.
+    /// acquired by the next pass. The teardown re-checks the refcount under
+    /// the write lock, so a daemon acquired in between is kept.
     pub async fn reconcile_refcounts(
         &self,
         observed: &HashMap<String, HashSet<String>>,
     ) -> RefcountReconReport {
         let mut report = RefcountReconReport::default();
-        let mut instances = self.instances.write().await;
+        let instances = self.instances.write().await;
         let mut unheld = Vec::new();
         for (image_ref, inst) in instances.iter() {
             report.checked += 1;
             if !is_healthy_state(inst.daemon.get_state()) {
                 continue;
             }
-            let tracked = inst.holders.lock().unwrap().len();
-            let observed_holders = observed.get(image_ref).map_or(0, |keys| keys.len());
+            let observed_keys = observed.get(image_ref);
+            let tracked = {
+                let mut holders = inst.holders.lock().unwrap();
+                inst.restored_holders.lock().unwrap().retain(|key| {
+                    let live = observed_keys.is_some_and(|keys| keys.contains(key));
+                    if !live {
+                        holders.remove(key);
+                    }
+                    live
+                });
+                holders.len()
+            };
+            let observed_holders = observed_keys.map_or(0, |keys| keys.len());
             let target = tracked.max(observed_holders);
             if target == 0 {
                 unheld.push(image_ref.clone());
@@ -1009,10 +1046,12 @@ impl DaemonSupervisor {
                 });
             }
         }
+        drop(instances);
         for image_ref in unheld {
-            info!(image_ref, "stopping nydus daemon that no snapshot holds");
-            self.teardown_unreferenced(&mut instances, &image_ref).await;
-            report.stopped += 1;
+            if self.teardown_if_unreferenced(&image_ref).await {
+                info!(image_ref, "stopped nydus daemon that no snapshot holds");
+                report.stopped += 1;
+            }
         }
         report
     }
@@ -1275,6 +1314,7 @@ impl DaemonSupervisor {
             let bootstrap = old.bootstrap.clone();
             let refcount = old.refcount.load(Ordering::SeqCst);
             let holders: HashSet<String> = old.holders.lock().unwrap().clone();
+            let restored_holders: HashSet<String> = old.restored_holders.lock().unwrap().clone();
             warn!(image_ref, state = %before_state, "recovering unhealthy nydus daemon");
 
             // Consumer preservation depends on what is mounted:
@@ -1312,6 +1352,7 @@ impl DaemonSupervisor {
                     // real holder into keyless ballast that release() can
                     // never drain.
                     *instance.holders.lock().unwrap() = holders;
+                    *instance.restored_holders.lock().unwrap() = restored_holders;
                     let after_state = format!("{:?}", instance.daemon.get_state());
                     if let Err(e) = self.persist_instance_record(&instance, true).await {
                         warn!(image_ref, error = %e, "failed to persist recovered daemon record");
@@ -1582,6 +1623,7 @@ impl DaemonSupervisor {
                 daemon,
                 refcount: AtomicUsize::new(0),
                 holders: StdMutex::new(HashSet::new()),
+                restored_holders: StdMutex::new(HashSet::new()),
                 _poll: poll,
                 // Blockdev/EROFS export has no fuse fd to preserve.
                 failover_armed: AtomicBool::new(false),
@@ -1657,6 +1699,7 @@ impl DaemonSupervisor {
                 daemon,
                 refcount: AtomicUsize::new(0),
                 holders: StdMutex::new(HashSet::new()),
+                restored_holders: StdMutex::new(HashSet::new()),
                 _poll: poll,
                 // Tarfs is a kernel mount; there is no fuse fd to preserve.
                 failover_armed: AtomicBool::new(false),
@@ -1729,6 +1772,7 @@ impl DaemonSupervisor {
             daemon,
             refcount: AtomicUsize::new(0),
             holders: StdMutex::new(HashSet::new()),
+            restored_holders: StdMutex::new(HashSet::new()),
             failover_armed: AtomicBool::new(armed),
             _poll: poll,
         }))
@@ -1943,6 +1987,7 @@ impl DaemonSupervisor {
                 Ok(instance) => {
                     let (refcount, holders) = restored_holder_state(&record);
                     instance.refcount.store(refcount, Ordering::SeqCst);
+                    *instance.restored_holders.lock().unwrap() = holders.clone();
                     *instance.holders.lock().unwrap() = holders;
                     if let Err(e) = self.persist_instance_record(&instance, true).await {
                         warn!(image_ref = %record.image_ref, error = %e, "failed to persist rebuilt daemon record");
@@ -2177,6 +2222,7 @@ impl DaemonSupervisor {
             bootstrap,
             daemon,
             refcount: AtomicUsize::new(refcount),
+            restored_holders: StdMutex::new(holders.clone()),
             holders: StdMutex::new(holders),
             _poll: poll,
             // The fd stays in systemd's store across restarts, so this daemon is
@@ -2287,6 +2333,7 @@ impl DaemonSupervisor {
             bootstrap: record.bootstrap.clone(),
             daemon,
             refcount: AtomicUsize::new(refcount),
+            restored_holders: StdMutex::new(holders.clone()),
             holders: StdMutex::new(holders),
             _poll: poll,
             // The fd stays in systemd's store (it holds its own dup), so this
@@ -3317,9 +3364,15 @@ pub fn slug_for(image_ref: &str) -> String {
 /// for tests that need a live daemon without any kernel mount.
 #[cfg(test)]
 fn test_daemon_instance(image_ref: &str, mountpoint: PathBuf) -> DaemonInstance {
-    let daemon: Arc<dyn NydusDaemon> = Arc::new(BlockdevDaemon::new(
+    let daemon: Arc<dyn NydusDaemon> = Arc::new(test_blockdev_daemon(mountpoint.clone()));
+    test_instance_with_daemon(image_ref, mountpoint, daemon)
+}
+
+#[cfg(test)]
+fn test_blockdev_daemon(mountpoint: PathBuf) -> BlockdevDaemon {
+    BlockdevDaemon::new(
         "holder-test".to_string(),
-        mountpoint.clone(),
+        mountpoint,
         BuildTimeInfo {
             package_ver: "test".to_string(),
             git_commit: String::new(),
@@ -3327,7 +3380,15 @@ fn test_daemon_instance(image_ref: &str, mountpoint: PathBuf) -> DaemonInstance 
             profile: "test".to_string(),
             rustc: String::new(),
         },
-    ));
+    )
+}
+
+#[cfg(test)]
+fn test_instance_with_daemon(
+    image_ref: &str,
+    mountpoint: PathBuf,
+    daemon: Arc<dyn NydusDaemon>,
+) -> DaemonInstance {
     DaemonInstance {
         image_ref: image_ref.into(),
         mountpoint,
@@ -3335,6 +3396,7 @@ fn test_daemon_instance(image_ref: &str, mountpoint: PathBuf) -> DaemonInstance 
         daemon,
         refcount: AtomicUsize::new(0),
         holders: StdMutex::new(HashSet::new()),
+        restored_holders: StdMutex::new(HashSet::new()),
         _poll: Arc::new(Mutex::new(Poll::new().unwrap())),
         failover_armed: AtomicBool::new(false),
     }
@@ -3689,6 +3751,145 @@ mod tests {
         )]);
         let report = runtime.block_on(supervisor.reconcile_refcounts(&observed));
         assert_eq!(report.clamped, 0);
+    }
+
+    /// A daemon shell whose `umount()` blocks like a busy EROFS unmount retry.
+    struct SlowUmountDaemon(BlockdevDaemon);
+
+    impl DaemonStateMachineSubscriber for SlowUmountDaemon {
+        fn on_event(&self, event: DaemonStateMachineInput) -> nydus_service::Result<()> {
+            self.0.on_event(event)
+        }
+    }
+
+    impl NydusDaemon for SlowUmountDaemon {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+        fn id(&self) -> Option<String> {
+            self.0.id()
+        }
+        fn version(&self) -> BuildTimeInfo {
+            self.0.version()
+        }
+        fn get_state(&self) -> DaemonState {
+            self.0.get_state()
+        }
+        fn set_state(&self, state: DaemonState) {
+            self.0.set_state(state)
+        }
+        fn start(&self) -> nydus_service::Result<()> {
+            self.0.start()
+        }
+        fn umount(&self) -> nydus_service::Result<()> {
+            std::thread::sleep(Duration::from_millis(600));
+            Ok(())
+        }
+        fn wait(&self) -> nydus_service::Result<()> {
+            Ok(())
+        }
+        fn supervisor(&self) -> Option<String> {
+            None
+        }
+        fn save(&self) -> nydus_service::Result<()> {
+            Ok(())
+        }
+        fn restore(&self) -> nydus_service::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Unmounting a busy mount retries for seconds. It must run off the
+    /// reactor and without the instances lock, or every other image's
+    /// Prepare/Mounts/Remove stalls behind it.
+    #[test]
+    fn release_teardown_does_not_block_other_images() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = SnapshotterConfig::default();
+        config.snapshotter.root = dir.path().to_path_buf();
+        let supervisor = DaemonSupervisor::new(config);
+        let runtime = compio::runtime::Runtime::new().unwrap();
+        let slow_mnt = dir.path().join("daemons/slow/mnt");
+        let slow = test_instance_with_daemon(
+            "slow",
+            slow_mnt.clone(),
+            Arc::new(SlowUmountDaemon(test_blockdev_daemon(slow_mnt))),
+        );
+        slow.acquire_holder("k1");
+        let other = test_daemon_instance("other", dir.path().join("daemons/other/mnt"));
+        runtime.block_on(async {
+            let mut instances = supervisor.instances.write().await;
+            instances.insert("slow".to_string(), Arc::new(slow));
+            instances.insert("other".to_string(), Arc::new(other));
+        });
+
+        let waited = runtime.block_on(async {
+            let start = Instant::now();
+            let (released, waited) = futures::join!(supervisor.release("slow", "k1"), async {
+                compio::time::sleep(Duration::from_millis(50)).await;
+                supervisor
+                    .acquire_live_instance("other", None, "k2")
+                    .await
+                    .expect("other daemon stays live");
+                start.elapsed()
+            });
+            released.unwrap();
+            waited
+        });
+
+        assert!(
+            waited < Duration::from_millis(400),
+            "acquiring another image waited {waited:?} behind a teardown"
+        );
+        let live = runtime.block_on(supervisor.active_slugs());
+        assert!(!live.contains(&slug_for("slow")));
+    }
+
+    #[test]
+    fn reconcile_refcounts_prunes_restored_holders_gone_from_the_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = SnapshotterConfig::default();
+        config.snapshotter.root = dir.path().to_path_buf();
+        let supervisor = DaemonSupervisor::new(config);
+        let runtime = compio::runtime::Runtime::new().unwrap();
+        let inst = Arc::new(test_daemon_instance(
+            "img",
+            dir.path().join("daemons/img/mnt"),
+        ));
+        let restored = HashSet::from(["k-gone".to_string(), "k-live".to_string()]);
+        *inst.holders.lock().unwrap() = restored.clone();
+        *inst.restored_holders.lock().unwrap() = restored;
+        inst.refcount.store(2, Ordering::SeqCst);
+        // Acquired by this process: may postdate the store listing.
+        inst.acquire_holder("k-new");
+        runtime.block_on(async {
+            supervisor
+                .instances
+                .write()
+                .await
+                .insert("img".to_string(), inst.clone());
+        });
+
+        let observed = HashMap::from([("img".to_string(), HashSet::from(["k-live".to_string()]))]);
+        runtime.block_on(supervisor.reconcile_refcounts(&observed));
+        assert_eq!(
+            *inst.holders.lock().unwrap(),
+            HashSet::from(["k-live".to_string(), "k-new".to_string()])
+        );
+        assert_eq!(inst.refcount.load(Ordering::SeqCst), 2);
+
+        runtime.block_on(supervisor.reconcile_refcounts(&HashMap::new()));
+        assert_eq!(
+            *inst.holders.lock().unwrap(),
+            HashSet::from(["k-new".to_string()]),
+            "a live-acquired key is never pruned"
+        );
+        assert_eq!(inst.refcount.load(Ordering::SeqCst), 1);
+        assert!(
+            runtime
+                .block_on(supervisor.active_slugs())
+                .contains(&slug_for("img"))
+        );
     }
 
     #[test]
