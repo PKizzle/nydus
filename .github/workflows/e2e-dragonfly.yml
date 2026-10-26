@@ -257,7 +257,7 @@ jobs:
       - name: Run Dragonfly E2E tests (${{ matrix.mode }})
         run: |
           cd smoke/dragonfly
-          sudo -E env "PATH=$PATH" \
+          bash ../../misc/sudo-env.sh PATH 'GO*' -- \
             TEST_MODE=${{ matrix.mode }} \
             NYDUSD_BIN=/usr/local/bin/nydusd \
             NYDUSD_CONFIG=${{ github.workspace }}/${{ matrix.config }} \
@@ -382,7 +382,7 @@ jobs:
       - name: Run proxy error simulation tests
         run: |
           cd smoke/dragonfly
-          sudo -E env "PATH=$PATH" \
+          bash ../../misc/sudo-env.sh PATH 'GO*' -- \
             REPO_ROOT=${{ github.workspace }} \
             NYDUSD_BIN=/usr/local/bin/nydusd \
             BOOTSTRAP_PATH=/tmp/nydus-proxy-error-test/bootstrap \
