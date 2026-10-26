@@ -332,10 +332,11 @@ impl Reconciler {
             }
         };
         let report = self.supervisor.reconcile_refcounts(&observed).await;
-        if report.clamped > 0 {
+        if report.clamped > 0 || report.stopped > 0 {
             info!(
                 checked = report.checked,
                 clamped = report.clamped,
+                stopped = report.stopped,
                 "refcount reconciliation clamped leaked references"
             );
         }
