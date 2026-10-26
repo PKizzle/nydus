@@ -1987,11 +1987,13 @@ impl DaemonSupervisor {
     /// consumed or never parked and their records are gone. A dead FUSE mount
     /// (possibly stacked many deep by earlier daemon generations — observed 9
     /// deep in production) fails every consumer, and a fresh `Prepare` would
-    /// stack yet another layer. An EROFS mount without an instance has no
-    /// fanotify group behind it, so reads of chunks never fetched are not
-    /// filled and return the sparse holes' zeros; it is detached when no
-    /// overlay lowerdir references it. A referenced one is left for the next
-    /// `Prepare`, which re-arms marks on it in place.
+    /// stack yet another layer. A fanotify EROFS mount (its source is the
+    /// bootstrap file) without an instance has no fanotify group behind it, so
+    /// reads of chunks never fetched are not filled and return the sparse
+    /// holes' zeros; it is detached when no overlay lowerdir references it. A
+    /// referenced one is left for the next `Prepare`, which re-arms marks on
+    /// it in place. Blockdev and tarfs EROFS mounts sit on a loop or dm device
+    /// with all data present, need no userspace daemon, and are left alone.
     ///
     /// Call at startup after `restore_from_store` + `rebuild_from_records`
     /// (so every adoptable mount already has its instance) and before the gRPC
@@ -2013,10 +2015,10 @@ impl DaemonSupervisor {
             }
             let mountpoint = entry.path().join("mnt");
             let mut popped = 0usize;
-            while let Some(fstype) = mount_fstype_at(&mountpoint) {
+            while let Some((mount_source, fstype)) = mount_at(&mountpoint) {
                 let overlay_refs = overlay_refs_of(&mountpoint);
-                if !orphan_mount_is_sweepable(&fstype, overlay_refs) {
-                    if fstype == "erofs" {
+                if !orphan_mount_is_sweepable(&mount_source, &fstype, overlay_refs) {
+                    if fstype == "erofs" && overlay_refs > 0 {
                         warn!(
                             slug,
                             overlay_refs,
@@ -3052,8 +3054,12 @@ fn adoption_route(mounted_fstype: Option<&str>) -> AdoptionRoute {
 /// Whether startup may detach an instance-less mount of `fstype` that
 /// `overlay_refs` container overlays use as a lowerdir: a dead FUSE mount
 /// always, an unguarded EROFS mount only once nothing uses it.
-fn orphan_mount_is_sweepable(fstype: &str, overlay_refs: usize) -> bool {
-    fstype.contains("fuse") || (fstype == "erofs" && overlay_refs == 0)
+///
+/// Only a fanotify EROFS mount is unguarded without its daemon; its source is
+/// the bootstrap file. Blockdev/tarfs EROFS mounts have a `/dev/` source.
+fn orphan_mount_is_sweepable(mount_source: &str, fstype: &str, overlay_refs: usize) -> bool {
+    fstype.contains("fuse")
+        || (fstype == "erofs" && !mount_source.starts_with("/dev/") && overlay_refs == 0)
 }
 
 /// Outcome of a bounded filesystem probe.
@@ -3135,8 +3141,14 @@ fn overlay_references(options: &str, daemon_mnt: &str) -> bool {
 
 /// Filesystem type of the mount at `mountpoint` (`/proc/self/mounts` field 3),
 /// or `None` when nothing is mounted there.
-#[cfg(target_os = "linux")]
 fn mount_fstype_at(mountpoint: &Path) -> Option<String> {
+    mount_at(mountpoint).map(|(_, fstype)| fstype)
+}
+
+/// Source and filesystem type (`/proc/self/mounts` fields 1 and 3) of the
+/// top mount at `mountpoint`, or `None` when nothing is mounted there.
+#[cfg(target_os = "linux")]
+fn mount_at(mountpoint: &Path) -> Option<(String, String)> {
     let target = mountpoint.display().to_string();
     let escaped = target.replace(' ', "\\040");
     fs::read_to_string("/proc/self/mounts")
@@ -3144,15 +3156,16 @@ fn mount_fstype_at(mountpoint: &Path) -> Option<String> {
         .lines()
         .filter_map(|line| {
             let mut fields = line.split_whitespace();
-            let path = fields.nth(1)?;
+            let source = fields.next()?;
+            let path = fields.next()?;
             let fstype = fields.next()?;
-            (path == target || path == escaped).then(|| fstype.to_string())
+            (path == target || path == escaped).then(|| (source.to_string(), fstype.to_string()))
         })
         .next_back() // last entry wins: the top of any mount stack
 }
 
 #[cfg(not(target_os = "linux"))]
-fn mount_fstype_at(_mountpoint: &Path) -> Option<String> {
+fn mount_at(_mountpoint: &Path) -> Option<(String, String)> {
     None
 }
 
@@ -3513,10 +3526,19 @@ mod tests {
 
     #[test]
     fn orphan_mount_sweep_spares_referenced_erofs_and_foreign_mounts() {
-        assert!(orphan_mount_is_sweepable("fuse.nydusfs", 3));
-        assert!(orphan_mount_is_sweepable("erofs", 0));
-        assert!(!orphan_mount_is_sweepable("erofs", 1));
-        assert!(!orphan_mount_is_sweepable("ext4", 0));
+        let bootstrap = "/var/lib/nydus/auto-accel/abc/backend/bootstrap";
+        assert!(orphan_mount_is_sweepable("nydusfs", "fuse.nydusfs", 3));
+        assert!(orphan_mount_is_sweepable(bootstrap, "erofs", 0));
+        assert!(!orphan_mount_is_sweepable(bootstrap, "erofs", 1));
+        assert!(!orphan_mount_is_sweepable("/dev/sda1", "ext4", 0));
+        // Blockdev and tarfs EROFS sit on a loop or dm-verity device and need
+        // no userspace daemon: an idle one is healthy, not unguarded.
+        assert!(!orphan_mount_is_sweepable("/dev/loop3", "erofs", 0));
+        assert!(!orphan_mount_is_sweepable(
+            "/dev/mapper/nydus-x",
+            "erofs",
+            0
+        ));
     }
 
     /// Releasing the last holder of an auto-accel daemon removes its EROFS
