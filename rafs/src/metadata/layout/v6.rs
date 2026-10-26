@@ -2026,6 +2026,7 @@ impl RafsV6BlobTable {
         blob_table_size: u32,
         chunk_size: u32,
         flags: RafsSuperFlags,
+        block_size: u64,
     ) -> RafsResult<()> {
         if blob_table_size == 0 {
             return Ok(());
@@ -2043,7 +2044,8 @@ impl RafsV6BlobTable {
                     "invalid Rafs v6 blob entry".to_string(),
                 ));
             }
-            let blob_info = blob.to_blob_info()?;
+            let mut blob_info = blob.to_blob_info()?;
+            blob_info.set_block_size(block_size);
             self.entries.push(Arc::new(blob_info));
         }
 

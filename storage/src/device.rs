@@ -182,6 +182,9 @@ pub struct BlobInfo {
 
     /// is chunkdict generated
     is_chunkdict_generated: bool,
+
+    /// RAFS v6: EROFS block size of the filesystem; aligned blobs start chunks on its boundaries.
+    block_size: u64,
 }
 
 impl BlobInfo {
@@ -226,6 +229,7 @@ impl BlobInfo {
             cipher_ctx: None,
 
             is_chunkdict_generated: false,
+            block_size: 0x1000,
         };
 
         blob_info.compute_features();
@@ -271,6 +275,16 @@ impl BlobInfo {
     /// Get the is_chunkdict_generated flag.
     pub fn is_chunkdict_generated(&self) -> bool {
         self.is_chunkdict_generated
+    }
+
+    /// Get the EROFS block size of the filesystem the blob belongs to.
+    pub fn block_size(&self) -> u64 {
+        self.block_size
+    }
+
+    /// Set the EROFS block size of the filesystem the blob belongs to.
+    pub fn set_block_size(&mut self, block_size: u64) {
+        self.block_size = block_size;
     }
 
     /// Get the blob index in the blob array.
