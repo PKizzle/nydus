@@ -30,6 +30,17 @@ use crate::{Bootstrap, BootstrapContext, BuildContext, ConversionType, Tree};
 
 const V6_BLOCK_SEG_ALIGNMENT: u64 = 0x8_0000;
 
+/// RAFS v6 data layout violations detected while dumping a bootstrap.
+#[derive(Debug, thiserror::Error)]
+pub enum V6LayoutError {
+    /// The kernel reads chunk data at `blkaddr * block_size`, so a chunk that does not start on
+    /// a block boundary would be read from the wrong bytes.
+    #[error(
+        "chunk uncompressed offset 0x{offset:x} is not aligned to the {block_size}-byte EROFS block size"
+    )]
+    MisalignedChunk { offset: u64, block_size: u64 },
+}
+
 // Rafs v6 dedicated methods
 impl Node {
     /// Dump RAFS v6 inode metadata to meta blob.
@@ -465,6 +476,16 @@ impl Node {
         let mut chunks: Vec<u8> = Vec::new();
         for chunk in self.chunks.iter() {
             let offset = chunk.inner.uncompressed_offset();
+            let external =
+                blobs[chunk.inner.blob_index() as usize].has_feature(BlobFeatures::EXTERNAL);
+            // External blobs are not EROFS devices, so their chunks carry no usable blkaddr.
+            if !external && !offset.is_multiple_of(ctx.v6_block_size()) {
+                return Err(V6LayoutError::MisalignedChunk {
+                    offset,
+                    block_size: ctx.v6_block_size(),
+                }
+                .into());
+            }
             let blk_addr = ctx.v6_block_addr(offset).with_context(|| {
                 format!(
                     "failed to compute blk_addr for chunk with uncompressed offset 0x{:x}",
@@ -478,8 +499,6 @@ impl Node {
             v6_chunk.set_block_addr(blk_addr);
 
             chunks.extend(v6_chunk.as_ref());
-            let external =
-                blobs[chunk.inner.blob_index() as usize].has_feature(BlobFeatures::EXTERNAL);
             let chunk_index = if external {
                 Some(chunk.inner.index())
             } else {
@@ -917,7 +936,7 @@ impl Bootstrap {
                     "blob id length is bigger than 64 bytes, blob id {:?}",
                     entry.blob_id()
                 ));
-            } else if entry.uncompressed_size() / block_size > u32::MAX as u64 {
+            } else if entry.uncompressed_size().div_ceil(block_size) > u32::MAX as u64 {
                 bail!(format!(
                     "uncompressed blob size (0x:{:x}) is too big",
                     entry.uncompressed_size()
@@ -926,7 +945,8 @@ impl Bootstrap {
             if !entry.has_feature(BlobFeatures::INLINED_CHUNK_DIGEST) {
                 inlined_chunk_digest = false;
             }
-            let cnt = (entry.uncompressed_size() / block_size) as u32;
+            // Round up so the device covers the blob's last, partially filled block.
+            let cnt = entry.uncompressed_size().div_ceil(block_size) as u32;
             if block_count.checked_add(cnt).is_none() {
                 bail!(
                     "Too many data blocks in RAFS filesystem, block size 0x{:x}, block count 0x{:x}",

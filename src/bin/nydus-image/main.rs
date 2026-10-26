@@ -1181,6 +1181,13 @@ impl Command {
                         conversion_type
                     );
                 }
+                // Tarfs addresses the tar stream in 512-byte blocks.
+                if matches.get_one::<String>("block-size").is_some() {
+                    bail!(
+                        "conversion type '{}' conflicts with '--block-size'",
+                        conversion_type
+                    );
+                }
                 if parent_path.is_some() {
                     bail!(
                         "conversion type '{}' conflicts with '--parent-bootstrap'",

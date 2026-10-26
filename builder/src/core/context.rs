@@ -441,12 +441,12 @@ impl BlobCacheGenerator {
         &self,
         chunk_data: &[u8],
         chunk_info: &ChunkWrapper,
-        aligned_d_size: u32,
+        aligned_d_size: u64,
     ) -> Result<()> {
         let mut guard = self.blob_data.lock().unwrap();
         let curr_pos = guard.seek(std::io::SeekFrom::End(0))?;
-        if curr_pos < chunk_info.uncompressed_offset() + aligned_d_size as u64 {
-            guard.set_len(chunk_info.uncompressed_offset() + aligned_d_size as u64)?;
+        if curr_pos < chunk_info.uncompressed_offset() + aligned_d_size {
+            guard.set_len(chunk_info.uncompressed_offset() + aligned_d_size)?;
         }
 
         guard.seek(std::io::SeekFrom::Start(chunk_info.uncompressed_offset()))?;
@@ -1557,6 +1557,16 @@ impl BuildContext {
             size
         );
         self.blob_block_size = size;
+    }
+
+    /// Alignment of chunk start offsets in an aligned data blob. RAFS v6 addresses chunk data
+    /// as `blkaddr * block_size`, so v6 chunks start on EROFS block boundaries; v5 uses 4 KiB.
+    pub fn chunk_alignment(&self) -> u64 {
+        if self.fs_version.is_v6() {
+            self.v6_block_size()
+        } else {
+            EROFS_BLOCK_SIZE_4096
+        }
     }
 
     pub fn set_configuration(&mut self, config: Arc<ConfigV2>) {

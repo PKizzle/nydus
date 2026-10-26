@@ -38,7 +38,7 @@ use nydus_utils::compress::zlib_random::ZranContext;
 use nydus_utils::crypt::decrypt_with_context;
 use nydus_utils::digest::{DigestData, RafsDigest};
 use nydus_utils::filemap::{FileMapState, MappedOrOwned, MappedSlice};
-use nydus_utils::{compress, crypt};
+use nydus_utils::{compress, crypt, round_up};
 
 use crate::backend::BlobReader;
 use crate::device::v5::BlobV5ChunkInfo;
@@ -151,6 +151,9 @@ pub use zran::{ZranContextGenerator, ZranInflateContext};
 mod batch;
 pub use batch::{BatchContextGenerator, BatchInflateContext};
 
+/// Largest EROFS block size an aligned blob pads chunk starts to; RAFS v6 places every chunk on
+/// a block boundary, so the padding after a chunk can reach past its 4 KiB-aligned end.
+const MAX_CHUNK_ALIGNMENT: u64 = 0x1_0000;
 const BLOB_CCT_MAGIC: u32 = 0xb10bb10bu32;
 const BLOB_CCT_HEADER_SIZE: u64 = 0x1000u64;
 const BLOB_CCT_CHUNK_SIZE_MASK: u64 = 0xff_ffff;
@@ -697,7 +700,8 @@ impl BlobCompressionContextInfo {
 
     /// Get data chunks covering uncompressed data range `[start, start + size)`.
     ///
-    /// For 4k-aligned uncompressed data chunks, there may be padding areas between data chunks.
+    /// For block-aligned uncompressed data chunks (4 KiB up to 64 KiB), there may be padding
+    /// areas between data chunks and after the last one.
     ///
     /// The method returns error if any of following condition is true:
     /// - range [start, start + size) is invalid.
@@ -1715,7 +1719,7 @@ impl BlobMetaChunkArray {
                 index += 1;
             }
 
-            if zran_end >= end {
+            if round_up(zran_end, MAX_CHUNK_ALIGNMENT) >= end {
                 return Ok(vec);
             }
             return Err(MetaError::InvalidMetadata(format!(
@@ -1737,14 +1741,18 @@ impl BlobMetaChunkArray {
                 index += 1;
 
                 let entry = Self::get_chunk_entry(state, chunk_info_array, index)?;
-                if entry.uncompressed_offset() != last_end {
+                let offset = entry.uncompressed_offset();
+                if offset < last_end || offset > round_up(last_end, MAX_CHUNK_ALIGNMENT) {
                     return Err(MetaError::InvalidMetadata(format!(
                         "mismatch uncompressed {} size {} last_end {}",
-                        entry.uncompressed_offset(),
+                        offset,
                         entry.uncompressed_size(),
                         last_end
                     )));
-                } else if last_end >= end && entry.aligned_uncompressed_end() >= batch_end {
+                }
+                // `[last_end, offset)` is block padding in front of this chunk.
+                last_end = offset;
+                if last_end >= end && entry.aligned_uncompressed_end() >= batch_end {
                     // Avoid read amplify if next chunk is too big.
                     return Ok(vec);
                 }
@@ -1756,7 +1764,7 @@ impl BlobMetaChunkArray {
                 }
             }
 
-            if last_end >= end {
+            if round_up(last_end, MAX_CHUNK_ALIGNMENT) >= end {
                 Ok(vec)
             } else {
                 Err(MetaError::InvalidMetadata(format!(
@@ -2807,5 +2815,48 @@ pub(crate) mod tests {
         let chunks = meta.add_more_chunks(&chunks, 0x6000).unwrap();
         let chunk_ids: Vec<_> = chunks.iter().map(|c| c.id()).collect();
         assert_eq!(chunk_ids, vec![0, 1, 2]);
+    }
+
+    /// With a 16 KiB EROFS block size, chunks start on 16 KiB boundaries, so the padding after a
+    /// chunk extends past its 4 KiB-aligned end and the blob ends in a partially filled block.
+    #[test]
+    fn test_get_chunks_uncompressed_with_block_padding() {
+        let mut chunk0 = BlobChunkInfoV2Ondisk::default();
+        chunk0.set_uncompressed_offset(0);
+        chunk0.set_uncompressed_size(5000);
+        chunk0.set_compressed_offset(0);
+        chunk0.set_compressed_size(5000);
+
+        let mut chunk1 = BlobChunkInfoV2Ondisk::default();
+        chunk1.set_uncompressed_offset(0x4000);
+        chunk1.set_uncompressed_size(200_000);
+        chunk1.set_compressed_offset(5000);
+        chunk1.set_compressed_size(200_000);
+
+        let state = BlobCompressionContext {
+            chunk_info_array: BlobMetaChunkArray::V2(vec![chunk0, chunk1].into()),
+            compressed_size: 205_000,
+            uncompressed_size: 0x38000,
+            blob_features: (BlobFeatures::ALIGNED | BlobFeatures::CHUNK_INFO_V2).bits(),
+            ..Default::default()
+        };
+        let meta = BlobCompressionContextInfo {
+            state: Arc::new(state),
+        };
+
+        // A block-sized read of chunk 0 also covers its padding up to chunk 1.
+        let chunks = meta.get_chunks_uncompressed(0, 0x4000, 0).unwrap();
+        let chunk_ids: Vec<_> = chunks.iter().map(|c| c.id()).collect();
+        assert_eq!(chunk_ids, vec![0]);
+
+        // A read spanning the padding between the chunks.
+        let chunks = meta.get_chunks_uncompressed(0, 0x8000, 0).unwrap();
+        let chunk_ids: Vec<_> = chunks.iter().map(|c| c.id()).collect();
+        assert_eq!(chunk_ids, vec![0, 1]);
+
+        // The blob's last block ends in padding past chunk 1's 4 KiB-aligned end.
+        let chunks = meta.get_chunks_uncompressed(0x34000, 0x4000, 0).unwrap();
+        let chunk_ids: Vec<_> = chunks.iter().map(|c| c.id()).collect();
+        assert_eq!(chunk_ids, vec![1]);
     }
 }
