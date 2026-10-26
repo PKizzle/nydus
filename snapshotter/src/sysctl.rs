@@ -1819,6 +1819,7 @@ mod tests {
             bootstrap: dir.path().join("snapshots/base/fs/image/image.boot"),
             refcount: 0,
             holders: 0,
+            holder_keys: Vec::new(),
             state: "STOPPED".to_string(),
             live: false,
             updated_at: 1,
