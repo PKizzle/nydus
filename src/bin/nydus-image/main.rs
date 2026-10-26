@@ -1182,7 +1182,7 @@ impl Command {
                     );
                 }
                 // Tarfs addresses the tar stream in 512-byte blocks.
-                if matches.get_one::<String>("block-size").is_some() {
+                if matches.value_source("block-size") != Some(ValueSource::DefaultValue) {
                     bail!(
                         "conversion type '{}' conflicts with '--block-size'",
                         conversion_type
@@ -2428,6 +2428,8 @@ mod tests {
 
     use super::Command;
     use nydus_api::ConfigV2;
+    use nydus_utils::trace::{EventTracerClass, TimingTracerClass, TraceClass};
+    use nydus_utils::{register_tracer, root_tracer};
 
     #[test]
     fn test_ensure_file() {
@@ -2456,5 +2458,46 @@ mod tests {
 
         let err = Command::execute_inspect_request(&mut inspector, "icheck abc").unwrap_err();
         assert!(err.to_string().contains("invalid arguments"));
+    }
+
+    fn create_tarfs(extra: &[&str]) -> anyhow::Result<()> {
+        let dir = vmm_sys_util::tempdir::TempDir::new().unwrap();
+        let tar = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/texture/tar/all-entry-type.tar")
+            .display()
+            .to_string();
+        std::fs::create_dir(dir.as_path().join("blobs")).unwrap();
+        let blob_dir = dir.as_path().join("blobs").display().to_string();
+        let bootstrap = dir.as_path().join("bootstrap").display().to_string();
+        let mut args = vec![
+            "nydus-image",
+            "create",
+            "--type",
+            "tar-tarfs",
+            "--blob-dir",
+            &blob_dir,
+            "--bootstrap",
+            &bootstrap,
+        ];
+        args.extend_from_slice(extra);
+        args.push(&tar);
+        let cmd = super::prepare_cmd_args(super::BTI_STRING.as_str()).get_matches_from(args);
+        register_tracer!(TraceClass::Timing, TimingTracerClass);
+        register_tracer!(TraceClass::Event, EventTracerClass);
+        Command::create(cmd.subcommand_matches("create").unwrap(), &super::BTI)
+    }
+
+    #[test]
+    fn test_create_tarfs_with_default_block_size() {
+        create_tarfs(&[]).unwrap();
+    }
+
+    #[test]
+    fn test_create_tarfs_rejects_explicit_block_size() {
+        let err = create_tarfs(&["--block-size", "4096"]).unwrap_err();
+        assert!(
+            err.to_string().contains("conflicts with '--block-size'"),
+            "{err}"
+        );
     }
 }
