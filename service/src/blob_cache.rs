@@ -68,6 +68,8 @@ pub struct MetaBlobConfig {
     blobs: Mutex<Vec<Arc<DataBlobConfig>>>,
     blob_extra_infos: HashMap<String, RafsBlobExtraInfo>,
     is_tarfs_mode: bool,
+    /// `log2` of the EROFS block size recorded in the bootstrap superblock.
+    block_bits: u8,
 }
 
 impl MetaBlobConfig {
@@ -98,6 +100,11 @@ impl MetaBlobConfig {
     /// Check whether the filesystem is in `TARFS` mode.
     pub fn is_tarfs_mode(&self) -> bool {
         self.is_tarfs_mode
+    }
+
+    /// Get `log2` of the filesystem's EROFS block size, the unit of its block addresses.
+    pub fn block_bits(&self) -> u8 {
+        self.block_bits
     }
 
     fn add_data_blob(&self, blob: Arc<DataBlobConfig>) {
@@ -161,6 +168,7 @@ impl BlobConfig {
         config: Arc<ConfigV2>,
         blob_extra_infos: HashMap<String, RafsBlobExtraInfo>,
         is_tarfs_mode: bool,
+        block_bits: u8,
     ) -> Self {
         let scoped_blob_id = generate_blob_key(&domain_id, &blob_id);
 
@@ -172,6 +180,7 @@ impl BlobConfig {
             blobs: Mutex::new(Vec::new()),
             blob_extra_infos,
             is_tarfs_mode,
+            block_bits,
         }))
     }
 
@@ -521,6 +530,7 @@ impl BlobCacheMgr {
             config,
             blob_extra_infos,
             rs.meta.flags.contains(RafsSuperFlags::TARTFS_MODE),
+            rs.meta.blkszbits,
         );
         // Safe to unwrap because it's a meta blob object.
         let meta_obj = meta.meta_config().unwrap();
@@ -593,9 +603,9 @@ impl MetaBlob {
         Ok(MetaBlob { file, size })
     }
 
-    /// Get number of blocks in unit of EROFS_BLOCK_SIZE.
-    pub fn blocks(&self) -> u32 {
-        (self.size >> EROFS_BLOCK_BITS_12) as u32
+    /// Get size of the metadata blob in bytes.
+    pub fn size(&self) -> u64 {
+        self.size
     }
 
     /// Read data from the cached metadata blob in asynchronous mode.
@@ -793,6 +803,7 @@ mod tests {
             blobs: Mutex::new(Vec::new()),
             blob_extra_infos: HashMap::new(),
             is_tarfs_mode: false,
+            block_bits: EROFS_BLOCK_BITS_12,
         };
         assert_eq!(blob.path(), &path);
         assert_eq!(blob.blob_id(), "123456789-123");
@@ -1059,7 +1070,7 @@ mod tests {
                     .unwrap()
                     .block_on(MetaBlob::new(&source_path))
                     .unwrap();
-                assert_eq!(meta_blob.blocks(), 5);
+                assert_eq!(meta_blob.size(), 5 * EROFS_BLOCK_SIZE_4096);
                 let buf = vec![0u8; 4096];
                 let (res, buf) = meta_blob.async_read(0, buf).await;
                 assert_eq!(res.unwrap(), 4096);

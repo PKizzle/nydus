@@ -3604,6 +3604,7 @@ dependencies = [
  "mio 1.2.2",
  "nix 0.31.3",
  "nydus-api",
+ "nydus-builder",
  "nydus-rafs",
  "nydus-storage",
  "nydus-upgrade",

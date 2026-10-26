@@ -26,9 +26,6 @@ use compio::buf::{BufResult, IntoInner, IoBuf, IoBufMut, SetLen};
 use compio::io::AsyncWriteAt;
 use dbs_allocator::{Constraint, IntervalTree, NodeState, Range};
 use nydus_api::BlobCacheEntry;
-use nydus_rafs::metadata::layout::v6::{
-    EROFS_BLOCK_BITS_9, EROFS_BLOCK_BITS_12, EROFS_BLOCK_SIZE_512, EROFS_BLOCK_SIZE_4096,
-};
 use nydus_storage::utils::{AlignedBuf, alloc_buf};
 use nydus_utils::digest::{self, RafsDigest};
 use nydus_utils::round_up;
@@ -145,7 +142,8 @@ pub struct BlockDevice {
     blob_id: String,
     cache_mgr: Arc<BlobCacheMgr>,
     ranges: IntervalTree<BlockRange>,
-    is_tarfs_mode: bool,
+    /// `log2` of the EROFS block size, read from the bootstrap superblock (9 in tarfs mode).
+    block_bits: u8,
 }
 
 impl BlockDevice {
@@ -189,13 +187,20 @@ impl BlockDevice {
             Some(BlobConfig::MetaBlob(v)) => v,
         };
         let is_tarfs_mode = meta_blob_config.is_tarfs_mode();
+        let block_bits = meta_blob_config.block_bits();
+        let block_size = 1u64 << block_bits;
         let meta_blob = MetaBlob::new(meta_blob_config.path()).await?;
+        if !meta_blob.size().is_multiple_of(block_size)
+            || meta_blob.size() >> block_bits > u32::MAX as u64
+        {
+            return Err(Error::InvalidArguments(format!(
+                "block_device: metadata blob size 0x{:x} is invalid for block size {}",
+                meta_blob.size(),
+                block_size
+            )));
+        }
+        let blocks = (meta_blob.size() >> block_bits) as u32;
         let meta_blob = Rc::new(meta_blob);
-        let blocks = if is_tarfs_mode {
-            meta_blob.blocks() * 8
-        } else {
-            meta_blob.blocks()
-        };
         let constraint = Constraint::new(blocks).min(0u32).max(blocks - 1);
         let range = ranges.allocate(&constraint).ok_or_else(|| {
             Error::BlockDevice(format!(
@@ -247,11 +252,8 @@ impl BlockDevice {
                 ranges.update(&range, BlockRange::Hole);
             }
 
-            let blocks = if is_tarfs_mode {
-                blob_info.uncompressed_size() >> EROFS_BLOCK_BITS_9
-            } else {
-                blob_info.uncompressed_size() >> EROFS_BLOCK_BITS_12
-            };
+            // Matches the device-table block count, which covers the blob's last partial block.
+            let blocks = blob_info.uncompressed_size().div_ceil(block_size);
             if blocks > u32::MAX as u64
                 || blocks + extra_info.mapped_blkaddr as u64 > u32::MAX as u64
             {
@@ -280,7 +282,7 @@ impl BlockDevice {
             blob_id,
             cache_mgr,
             ranges,
-            is_tarfs_mode,
+            block_bits,
         })
     }
 
@@ -301,29 +303,17 @@ impl BlockDevice {
 
     /// Get block size of block device.
     pub fn block_size(&self) -> u64 {
-        if self.is_tarfs_mode {
-            EROFS_BLOCK_SIZE_512
-        } else {
-            EROFS_BLOCK_SIZE_4096
-        }
+        1 << self.block_bits
     }
 
     /// Convert data size to number of blocks.
     pub fn size_to_blocks(&self, sz: u64) -> u64 {
-        if self.is_tarfs_mode {
-            sz >> EROFS_BLOCK_BITS_9
-        } else {
-            sz >> EROFS_BLOCK_BITS_12
-        }
+        sz >> self.block_bits
     }
 
     /// Convert number of blocks to data size.
     pub fn blocks_to_size(&self, blocks: u32) -> u64 {
-        if self.is_tarfs_mode {
-            (blocks as u64) << EROFS_BLOCK_BITS_9
-        } else {
-            (blocks as u64) << EROFS_BLOCK_BITS_12
-        }
+        (blocks as u64) << self.block_bits
     }
 
     /// Read block range [start, start + blocks) from the block device.
@@ -818,6 +808,9 @@ mod tests {
     use super::*;
     use crate::blob_cache::generate_blob_key;
     use nydus_api::BlobCacheEntry;
+    use nydus_rafs::metadata::layout::v6::{
+        EROFS_BLOCK_BITS_9, EROFS_BLOCK_BITS_12, EROFS_BLOCK_SIZE_512, EROFS_BLOCK_SIZE_4096,
+    };
     use nydus_utils::digest::{DigestHasher, RafsDigest};
     use std::fs::{self, File};
     use std::io::{BufReader, Read};
@@ -1004,11 +997,11 @@ mod tests {
     fn test_block_size() {
         let mut device = create_block_device();
 
-        assert!(!device.is_tarfs_mode);
+        assert_eq!(device.block_bits, EROFS_BLOCK_BITS_12);
         assert_eq!(device.block_size(), EROFS_BLOCK_SIZE_4096);
         assert_ne!(device.block_size(), EROFS_BLOCK_SIZE_512);
 
-        device.is_tarfs_mode = true;
+        device.block_bits = EROFS_BLOCK_BITS_9;
         assert_ne!(device.block_size(), EROFS_BLOCK_SIZE_4096);
         assert_eq!(device.block_size(), EROFS_BLOCK_SIZE_512);
     }
@@ -1017,13 +1010,13 @@ mod tests {
     fn test_size_to_blocks() {
         let mut device = create_block_device();
 
-        assert!(!device.is_tarfs_mode);
+        assert_eq!(device.block_bits, EROFS_BLOCK_BITS_12);
         assert_eq!(device.size_to_blocks(0), 0);
         assert_eq!(device.size_to_blocks(4096), 1);
         assert_ne!(device.size_to_blocks(4096), 4096);
         assert_ne!(device.size_to_blocks(4096), 8);
 
-        device.is_tarfs_mode = true;
+        device.block_bits = EROFS_BLOCK_BITS_9;
         assert_eq!(device.size_to_blocks(0), 0);
         assert_eq!(device.size_to_blocks(512), 1);
         assert_ne!(device.size_to_blocks(512), 512);
@@ -1034,17 +1027,106 @@ mod tests {
     fn test_blocks_to_size() {
         let mut device = create_block_device();
 
-        assert!(!device.is_tarfs_mode);
+        assert_eq!(device.block_bits, EROFS_BLOCK_BITS_12);
         assert_eq!(device.blocks_to_size(0), 0);
         assert_eq!(device.blocks_to_size(1), 4096);
         assert_ne!(device.blocks_to_size(4096), 4096);
         assert_ne!(device.blocks_to_size(8), 4096);
 
-        device.is_tarfs_mode = true;
+        device.block_bits = EROFS_BLOCK_BITS_9;
         assert_eq!(device.blocks_to_size(0), 0);
         assert_eq!(device.blocks_to_size(1), 512);
         assert_ne!(device.blocks_to_size(512), 512);
         assert_ne!(device.blocks_to_size(1), 4096);
+    }
+
+    /// Build a v6 image at `block_size` into `dir` and return its blob cache entry and the
+    /// content of its one data file.
+    fn build_image(dir: &TempDir, block_size: u64) -> (BlobCacheEntry, Vec<u8>) {
+        use nydus_builder::{
+            ArtifactStorage, BlobManager, BootstrapManager, BuildContext, Builder, ConversionType,
+            DirectoryBuilder,
+        };
+        use nydus_rafs::metadata::RafsVersion;
+
+        let source = dir.as_path().join("source");
+        let blobs = dir.as_path().join("blobs");
+        let cache = dir.as_path().join("cache");
+        for d in [&source, &blobs, &cache] {
+            fs::create_dir(d).unwrap();
+        }
+        let content: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8 + 1).collect();
+        fs::write(source.join("data"), &content).unwrap();
+        let bootstrap = dir.as_path().join("bootstrap");
+
+        let mut ctx = BuildContext {
+            fs_version: RafsVersion::V6,
+            conversion_type: ConversionType::DirectoryToRafs,
+            source_path: source,
+            aligned_chunk: true,
+            blob_storage: Some(ArtifactStorage::FileDir((blobs.clone(), String::new()))),
+            ..Default::default()
+        };
+        ctx.set_blob_block_size(block_size);
+        let mut bootstrap_mgr =
+            BootstrapManager::new(Some(ArtifactStorage::SingleFile(bootstrap.clone())), None);
+        let mut blob_mgr = BlobManager::new(ctx.digester, false);
+        DirectoryBuilder::new()
+            .build(&mut ctx, &mut bootstrap_mgr, &mut blob_mgr)
+            .unwrap();
+
+        let config = format!(
+            r#"{{
+            "type": "bootstrap",
+            "id": "rafs-v6-{block_size}",
+            "domain_id": "domain-{block_size}",
+            "config_v2": {{
+                "version": 2,
+                "id": "factory",
+                "backend": {{ "type": "localfs", "localfs": {{ "dir": "{}" }} }},
+                "cache": {{ "type": "filecache", "filecache": {{ "work_dir": "{}" }} }},
+                "metadata_path": "{}"
+            }}
+        }}"#,
+            blobs.display(),
+            cache.display(),
+            bootstrap.display()
+        );
+        let mut entry: BlobCacheEntry = serde_json::from_str(&config).unwrap();
+        assert!(entry.prepare_configuration_info());
+        (entry, content)
+    }
+
+    /// The exporter must address the device in the image's own block size: the builder stamps
+    /// `mapped_blkaddr` and the chunk block addresses in those units.
+    #[test]
+    fn test_block_device_follows_image_block_size() {
+        for block_size in [EROFS_BLOCK_SIZE_4096, 16384] {
+            let tmp_dir = TempDir::new().unwrap();
+            let (entry, content) = build_image(&tmp_dir, block_size);
+            let device = compio::runtime::Runtime::new()
+                .unwrap()
+                .block_on(BlockDevice::new(entry))
+                .unwrap();
+            assert_eq!(device.block_size(), block_size);
+            assert_eq!(device.size_to_blocks(block_size * 3), 3);
+            assert_eq!(device.blocks_to_size(3), block_size * 3);
+
+            // The data blob is the last range on the device; its one chunk starts the blob.
+            let blocks = content.len().div_ceil(block_size as usize) as u32;
+            let start = device.blocks() - blocks;
+            compio::runtime::Runtime::new()
+                .unwrap()
+                .block_on(async move {
+                    let buf = vec![0u8; blocks as usize * block_size as usize];
+                    let (res, buf) = device.async_read(start, blocks, buf).await;
+                    assert_eq!(res.unwrap(), buf.len());
+                    assert!(
+                        buf[..content.len()] == content[..],
+                        "block size {block_size}"
+                    );
+                });
+        }
     }
 
     fn sha256_digest<R: Read>(mut reader: R) -> Result<String> {
