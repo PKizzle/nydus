@@ -53,6 +53,12 @@ pub const NYDUS_FS_DRIVER: &str = "containerd.io/snapshot/nydus-fs-driver";
 /// reference held by the key.
 pub const NYDUS_DAEMON_IMAGE_REF: &str = "containerd.io/snapshot/nydus-daemon-image-ref";
 
+/// Bootstrap the daemon served the snapshot from at `Prepare`, stamped next to
+/// [`NYDUS_DAEMON_IMAGE_REF`]. The image ref is usually a tag that can be
+/// repointed; the bootstrap path is per-content (keyed by manifest or
+/// bootstrap digest), so `Mounts` only reuses a daemon serving this one.
+pub const NYDUS_DAEMON_BOOTSTRAP: &str = "containerd.io/snapshot/nydus-daemon-bootstrap";
+
 /// Classification of a snapshot's underlying layer based on its labels.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LayerKind {
