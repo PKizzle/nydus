@@ -9,10 +9,16 @@ set -u
 # Requirements: Linux >= 6.14 with CONFIG_FANOTIFY_ACCESS_PERMISSIONS=y, run as root (mount(2)),
 # and ROOT on a fs that supports fanotify pre-content (ext4 works; tmpfs returns ENOTSUP).
 # Override the binaries via env, e.g. NYDUS_IMAGE=... NYDUSD=... ROOT=...
+# BLOCK_SIZE selects the EROFS block size (4096, 16384, 65536); the kernel mounts block sizes
+# up to its page size.
 NI="${NYDUS_IMAGE:-$(command -v nydus-image || echo ./target/release/nydus-image)}"
 ND="${NYDUSD:-$(command -v nydusd || echo ./target/release/nydusd)}"
 ROOT="${ROOT:-/var/tmp/fan-rt}"   # must NOT be tmpfs
+BLOCK_SIZE="${BLOCK_SIZE:-4096}"
 LOG=$ROOT/nydusd.log
+# Match only this run's daemon, so a host running other nydusd instances is left alone. The
+# bracket keeps the pattern from matching the `sudo pkill` command line that carries it.
+DAEMON="[s]ingleton --config $ROOT/config.json"
 
 step() { echo; echo "### $* ###"; }
 fail() { echo "FAIL: $*"; CLEANUP=1; finish 1; }
@@ -21,14 +27,14 @@ finish() {
   rc=${1:-0}
   step "cleanup"
   sudo umount "$ROOT/mnt" 2>/dev/null
-  sudo pkill -f "nydusd singleton" 2>/dev/null
+  sudo pkill -f "$DAEMON" 2>/dev/null
   sleep 1
   exit "$rc"
 }
 
 step "reset dirs"
 sudo umount "$ROOT/mnt" 2>/dev/null
-sudo pkill -f "nydusd singleton" 2>/dev/null
+sudo pkill -f "$DAEMON" 2>/dev/null
 sleep 1
 rm -rf "$ROOT"
 mkdir -p "$ROOT"/{src,src/sub,out,backend,stage,mnt}
@@ -43,8 +49,8 @@ SRC_RAND=$(sha256sum  "$ROOT/src/random.bin" | awk '{print $1}')
 SRC_SMALL=$(sha256sum "$ROOT/src/sub/small.txt" | awk '{print $1}')
 echo "src hello=$SRC_HELLO rand=$SRC_RAND small=$SRC_SMALL"
 
-step "nydus-image create (RAFS v6, compressor none, block-size 4096)"
-"$NI" create --fs-version 6 --compressor none --block-size 4096 \
+step "nydus-image create (RAFS v6, compressor none, block-size $BLOCK_SIZE)"
+"$NI" create --fs-version 6 --compressor none --block-size "$BLOCK_SIZE" \
   -B "$ROOT/out/bootstrap" -D "$ROOT/out" "$ROOT/src" || fail "nydus-image create"
 ls -la "$ROOT/out"
 
@@ -78,7 +84,7 @@ sudo "$ND" singleton --config "$ROOT/config.json" \
 sleep 4
 
 step "mount table"
-mount | grep -i erofs || { echo "--- nydusd.log ---"; cat "$LOG"; fail "EROFS not mounted"; }
+mount | grep -F "$ROOT/mnt type erofs" || { echo "--- nydusd.log ---"; cat "$LOG"; fail "EROFS not mounted"; }
 
 step "post-mount stage inode/blocks (blob_0 should now be sized; data starts sparse)"
 stat -c '%n ino=%i size=%s blocks=%b' "$ROOT/stage/blob_0" "$ROOT/stage/$BLOB.blob.data"
