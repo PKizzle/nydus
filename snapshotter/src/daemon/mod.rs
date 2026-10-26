@@ -534,9 +534,22 @@ impl DaemonSupervisor {
         bootstrap: &Path,
         holder: &str,
     ) -> Option<Arc<MountHandle>> {
+        self.acquire_live_instance(image_ref, Some(bootstrap), holder)
+            .await
+    }
+
+    /// Register `holder` on the healthy daemon already serving `image_ref`
+    /// (and `bootstrap`, when given) and return its handle; `None` when no such
+    /// daemon is live. Idempotent per holder, like the `ensure_*` paths.
+    pub async fn acquire_live_instance(
+        &self,
+        image_ref: &str,
+        bootstrap: Option<&Path>,
+        holder: &str,
+    ) -> Option<Arc<MountHandle>> {
         let instances = self.instances.read().await;
         let inst = instances.get(image_ref)?;
-        if inst.bootstrap != bootstrap
+        if bootstrap.is_some_and(|b| inst.bootstrap != b)
             || !matches!(
                 inst.daemon.get_state(),
                 DaemonState::RUNNING | DaemonState::READY
@@ -3190,6 +3203,44 @@ pub fn slug_for(image_ref: &str) -> String {
     }
 }
 
+/// A RUNNING in-process instance backed by an inert [`BlockdevDaemon`] shell,
+/// for tests that need a live daemon without any kernel mount.
+#[cfg(test)]
+fn test_daemon_instance(image_ref: &str, mountpoint: PathBuf) -> DaemonInstance {
+    let daemon: Arc<dyn NydusDaemon> = Arc::new(BlockdevDaemon::new(
+        "holder-test".to_string(),
+        mountpoint.clone(),
+        BuildTimeInfo {
+            package_ver: "test".to_string(),
+            git_commit: String::new(),
+            build_time: String::new(),
+            profile: "test".to_string(),
+            rustc: String::new(),
+        },
+    ));
+    DaemonInstance {
+        image_ref: image_ref.into(),
+        mountpoint,
+        bootstrap: PathBuf::from("/tmp/bootstrap"),
+        daemon,
+        refcount: AtomicUsize::new(0),
+        holders: StdMutex::new(HashSet::new()),
+        _poll: Arc::new(Mutex::new(Poll::new().unwrap())),
+        failover_armed: AtomicBool::new(false),
+    }
+}
+
+#[cfg(test)]
+impl DaemonSupervisor {
+    /// Register a live test instance for `image_ref` mounted at `mountpoint`.
+    pub(crate) async fn insert_test_instance(&self, image_ref: &str, mountpoint: PathBuf) {
+        self.instances.write().await.insert(
+            image_ref.to_string(),
+            Arc::new(test_daemon_instance(image_ref, mountpoint)),
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3229,27 +3280,7 @@ mod tests {
     }
 
     fn test_instance() -> DaemonInstance {
-        let daemon: Arc<dyn NydusDaemon> = Arc::new(BlockdevDaemon::new(
-            "holder-test".to_string(),
-            PathBuf::from("/tmp/nydus-holder-test"),
-            BuildTimeInfo {
-                package_ver: "test".to_string(),
-                git_commit: String::new(),
-                build_time: String::new(),
-                profile: "test".to_string(),
-                rustc: String::new(),
-            },
-        ));
-        DaemonInstance {
-            image_ref: "img".into(),
-            mountpoint: PathBuf::from("/tmp/nydus-holder-test"),
-            bootstrap: PathBuf::from("/tmp/bootstrap"),
-            daemon,
-            refcount: AtomicUsize::new(0),
-            holders: StdMutex::new(HashSet::new()),
-            _poll: Arc::new(Mutex::new(Poll::new().unwrap())),
-            failover_armed: AtomicBool::new(false),
-        }
+        test_daemon_instance("img", PathBuf::from("/tmp/nydus-holder-test"))
     }
 
     #[test]
