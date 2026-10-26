@@ -77,7 +77,8 @@ a debug-level log. This is expected — RAFS only supports Linux xattr namespace
 ## Limitations
 
 - **Cross-architecture block size**: Bootstraps built with `--block-size 16384` or `65536`
-  require a **Linux host with matching page size** to mount via EROFS. The FUSE path on
+  require a **Linux host whose page size is at least that large** to mount via EROFS; the
+  default `4096` mounts everywhere. The FUSE path on
   macOS works with any block size since FUSE abstracts the page cache.
 - **No fanotify / EROFS mount** on macOS — use `nydusd fuse` instead.
 - **macFUSE must be installed separately** — it is not bundled with nydus.
