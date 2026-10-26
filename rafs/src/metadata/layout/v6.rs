@@ -40,8 +40,8 @@ pub const EROFS_BLOCK_SIZE_4096: u64 = 1u64 << EROFS_BLOCK_BITS_12;
 pub const EROFS_BLOCK_BITS_9: u8 = 9;
 /// EROFS logical block size (512 B).
 pub const EROFS_BLOCK_SIZE_512: u64 = 1u64 << EROFS_BLOCK_BITS_9;
-/// Bits of EROFS logical block size (16 KiB), required for hosts with 16 KiB pages
-/// (e.g. Apple Silicon, Raspberry Pi 5 when configured with 16 KiB page size).
+/// Bits of EROFS logical block size (16 KiB), the page size of e.g. Apple Silicon and
+/// Raspberry Pi 5 configured with 16 KiB pages.
 pub const EROFS_BLOCK_BITS_14: u8 = 14;
 /// EROFS logical block size (16 KiB).
 pub const EROFS_BLOCK_SIZE_16384: u64 = 1u64 << EROFS_BLOCK_BITS_14;
@@ -53,9 +53,9 @@ pub const EROFS_BLOCK_SIZE_65536: u64 = 1u64 << EROFS_BLOCK_BITS_16;
 
 /// Convert an EROFS `s_blkszbits` value to its byte block size.
 ///
-/// Returns `None` for unsupported bit values. The kernel EROFS driver requires the
-/// filesystem block size to equal the host page size, so callers building bootstraps
-/// for a specific target host should pick the bit value matching that host's page size.
+/// Returns `None` for unsupported bit values. The kernel EROFS driver mounts block sizes up to
+/// the host page size and rejects larger ones, so 4 KiB mounts on every host and a bootstrap
+/// built for a specific host may use that host's page size.
 #[inline]
 pub fn block_size_from_bits(bits: u8) -> Option<u64> {
     match bits {

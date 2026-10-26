@@ -1374,9 +1374,8 @@ pub struct BuildContext {
     pub batch_size: u32,
     /// EROFS / RAFS v6 logical block size in bytes (4 KiB, 16 KiB or 64 KiB).
     ///
-    /// The kernel EROFS driver requires this to match the host page size when mounting,
-    /// so cross-architecture image producers should set it to the consumer's page size.
-    /// Defaults to 4096 for backward compatibility.
+    /// The kernel EROFS driver mounts block sizes up to the host page size, so the default
+    /// 4096 mounts everywhere and a larger value must not exceed the consumer's page size.
     pub blob_block_size: u64,
     /// Version number of output metadata and data blob.
     pub fs_version: RafsVersion,
