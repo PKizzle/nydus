@@ -561,6 +561,38 @@ impl NydusSnapshotter {
         Ok(Some(handle.mountpoint().to_path_buf()))
     }
 
+    /// Daemon mountpoint for a snapshot `prepare()` routed to a daemon without
+    /// a nydus meta layer in its chain (auto-accel or referrer serving), which
+    /// recorded the serving image in the [`labels::NYDUS_DAEMON_IMAGE_REF`]
+    /// label. containerd starts the task from `Mounts(key)`, so this must
+    /// return the same daemon mount `prepare()` did.
+    ///
+    /// Reuses the live daemon (holding it once per key); a daemon that is gone
+    /// is restarted through the auto-accel route when its sidecar still
+    /// resolves. `Ok(None)` falls back to the plain overlay, which carries the
+    /// same image content unaccelerated.
+    async fn resolve_stamped_daemon_mount(
+        &self,
+        image_ref: &str,
+        key: &str,
+    ) -> Result<Option<PathBuf>, SnapshotterError> {
+        if let Some(handle) = self
+            .supervisor
+            .acquire_live_instance(image_ref, None, key)
+            .await
+        {
+            return Ok(Some(handle.mountpoint().to_path_buf()));
+        }
+        let restarted = self.resolve_auto_accel_mount(image_ref, key).await?;
+        if restarted.is_none() {
+            warn!(
+                key,
+                image_ref, "daemon stamped on snapshot is not running; serving the plain overlay"
+            );
+        }
+        Ok(restarted)
+    }
+
     fn rewrite_mounts_with_daemon(
         &self,
         key: &str,
@@ -690,6 +722,11 @@ impl snapshots::Snapshotter for NydusSnapshotter {
             if let Some((_, daemon_mnt)) = self.resolve_nydus_mount(&parent, &labels, &key).await? {
                 return Ok(self.rewrite_mounts_with_daemon(&key, &daemon_mnt, readonly));
             }
+            if let Some(image_ref) = labels.get(crate::source::labels::NYDUS_DAEMON_IMAGE_REF)
+                && let Some(daemon_mnt) = self.resolve_stamped_daemon_mount(image_ref, &key).await?
+            {
+                return Ok(self.rewrite_mounts_with_daemon(&key, &daemon_mnt, readonly));
+            }
 
             self.overlay.mounts(store, &key).map_err(|e| {
                 warn!(key, error = %e, "mounts snapshot failed");
@@ -778,7 +815,7 @@ impl snapshots::Snapshotter for NydusSnapshotter {
                         && let Some(daemon_mnt) =
                             self.resolve_auto_accel_mount(image_ref, &key).await?
                     {
-                        debug!(key, parent, mountpoint = %daemon_mnt.display(), "prepared auto-accel rootfs");
+                        info!(key, parent, image_ref, mountpoint = %daemon_mnt.display(), "prepared auto-accel rootfs");
                         // No nydus meta layer exists in this chain for remove()
                         // to find the daemon by — record it on the snapshot.
                         self.stamp_daemon_ref_label(&key, image_ref);
@@ -1601,6 +1638,72 @@ mod tests {
             !mounts.is_empty(),
             "flag-off prepare must return the overlay mounts unchanged"
         );
+    }
+
+    fn plain_prepare_snapshotter(root: &Path) -> NydusSnapshotter {
+        let mut config = SnapshotterConfig::default();
+        config.snapshotter.root = root.to_path_buf();
+        config.snapshotter.features.referrer_detect = false;
+        test_snapshotter_with_config(root, config)
+    }
+
+    /// containerd starts a task from `Mounts(key)`, not from the `Prepare`
+    /// reply, so a snapshot that `Prepare` routed to a daemon (auto-accel or
+    /// referrer: stamped with the daemon-ref label) must get the same daemon
+    /// mount back from `mounts()`, holding the daemon exactly once.
+    #[compio::test]
+    async fn mounts_routes_stamped_snapshot_to_live_daemon() {
+        let dir = tempdir().unwrap();
+        let snapshotter = plain_prepare_snapshotter(dir.path());
+        let image_ref = "registry.invalid.test/team/app:1";
+        let key = "accel-rootfs";
+        snapshotter
+            .prepare(key.to_string(), String::new(), HashMap::new())
+            .await
+            .unwrap();
+        snapshotter.stamp_daemon_ref_label(key, image_ref);
+        let daemon_mnt = dir.path().join("daemons/app/mnt");
+        snapshotter
+            .supervisor
+            .insert_test_instance(image_ref, daemon_mnt.clone())
+            .await;
+
+        for _ in 0..2 {
+            let mounts = snapshotter.mounts(key.to_string()).await.unwrap();
+            assert_eq!(mounts.len(), 1);
+            let lowerdir = format!("lowerdir={}", daemon_mnt.display());
+            assert!(
+                mounts[0].options.contains(&lowerdir),
+                "expected {lowerdir} in {:?}",
+                mounts[0].options
+            );
+        }
+        let record = snapshotter
+            .supervisor
+            .daemon_record(image_ref)
+            .await
+            .unwrap();
+        assert_eq!(
+            record.refcount, 1,
+            "repeated Mounts must hold the daemon once"
+        );
+        assert_eq!(record.holders, 1);
+    }
+
+    /// With the stamped daemon gone and no way to restart it, `mounts()` falls
+    /// back to the plain overlay rather than failing the task start.
+    #[compio::test]
+    async fn mounts_falls_back_to_overlay_when_stamped_daemon_is_gone() {
+        let dir = tempdir().unwrap();
+        let snapshotter = plain_prepare_snapshotter(dir.path());
+        let key = "accel-rootfs";
+        let plain = snapshotter
+            .prepare(key.to_string(), String::new(), HashMap::new())
+            .await
+            .unwrap();
+        snapshotter.stamp_daemon_ref_label(key, "registry.invalid.test/team/app:1");
+        let mounts = snapshotter.mounts(key.to_string()).await.unwrap();
+        assert_eq!(mounts, plain);
     }
 
     #[compio::test]
