@@ -909,7 +909,7 @@ impl DaemonSupervisor {
 
         if should_stop {
             if let Some(inst) = instances.remove(image_ref) {
-                if let Err(e) = stop_instance(&inst) {
+                if let Err(e) = stop_unreferenced_instance(&inst) {
                     warn!(image_ref, error = %e, "failed to stop nydus daemon cleanly");
                 }
                 if let Err(e) = self.persist_instance_record(&inst, false).await {
@@ -1941,21 +1941,23 @@ impl DaemonSupervisor {
         rebuilt
     }
 
-    /// Sweep `daemons/<slug>/mnt` mountpoints that are FUSE-mounted but have
-    /// no live instance, and detach their whole mount stack.
+    /// Sweep `daemons/<slug>/mnt` mountpoints that have no live instance and
+    /// detach their whole mount stack.
     ///
     /// These are corpses no other startup path reaches: their fds were
-    /// consumed or never parked and their records are gone, yet the dead
-    /// mounts (possibly stacked many deep by earlier daemon generations —
-    /// observed 9 deep in production) still occupy the mountpoint, so any
-    /// consumer fails and a fresh `Prepare` would stack yet another layer.
-    /// Idle EROFS kernel mounts are deliberately left alone: they serve
-    /// cached reads fine and the next `Prepare` re-adopts them in place.
+    /// consumed or never parked and their records are gone. A dead FUSE mount
+    /// (possibly stacked many deep by earlier daemon generations — observed 9
+    /// deep in production) fails every consumer, and a fresh `Prepare` would
+    /// stack yet another layer. An EROFS mount without an instance has no
+    /// fanotify group behind it, so reads of chunks never fetched are not
+    /// filled and return the sparse holes' zeros; it is detached when no
+    /// overlay lowerdir references it. A referenced one is left for the next
+    /// `Prepare`, which re-arms marks on it in place.
     ///
     /// Call at startup after `restore_from_store` + `rebuild_from_records`
-    /// (so every adoptable mount already has its instance). Returns the
-    /// number of mountpoints cleaned.
-    pub async fn sweep_orphaned_fuse_mounts(&self) -> usize {
+    /// (so every adoptable mount already has its instance) and before the gRPC
+    /// server accepts a `Prepare`. Returns the number of mountpoints cleaned.
+    pub async fn sweep_orphaned_mounts(&self) -> usize {
         let live_slugs: std::collections::HashSet<String> = {
             let instances = self.instances.read().await;
             instances.keys().map(|r| slug_for(r)).collect()
@@ -1972,19 +1974,30 @@ impl DaemonSupervisor {
             }
             let mountpoint = entry.path().join("mnt");
             let mut popped = 0usize;
-            while mount_fstype_at(&mountpoint).is_some_and(|t| t.contains("fuse")) {
+            while let Some(fstype) = mount_fstype_at(&mountpoint) {
+                let overlay_refs = overlay_refs_of(&mountpoint);
+                if !orphan_mount_is_sweepable(&fstype, overlay_refs) {
+                    if fstype == "erofs" {
+                        warn!(
+                            slug,
+                            overlay_refs,
+                            "orphaned erofs mount is still a container lowerdir; leaving it for the next Prepare"
+                        );
+                    }
+                    break;
+                }
                 if popped >= 64 {
-                    warn!(slug, "orphaned fuse mount stack deeper than 64; giving up");
+                    warn!(slug, "orphaned mount stack deeper than 64; giving up");
                     break;
                 }
                 if let Err(e) = detach_mount_lazy(&mountpoint) {
-                    warn!(slug, error = %e, "failed to detach orphaned fuse mount");
+                    warn!(slug, fstype, error = %e, "failed to detach orphaned mount");
                     break;
                 }
                 popped += 1;
             }
             if popped > 0 {
-                info!(slug, layers = popped, "swept orphaned fuse mount stack");
+                info!(slug, layers = popped, "swept orphaned mount stack");
                 cleaned += 1;
             }
         }
@@ -2979,6 +2992,13 @@ fn adoption_route(mounted_fstype: Option<&str>) -> AdoptionRoute {
     }
 }
 
+/// Whether startup may detach an instance-less mount of `fstype` that
+/// `overlay_refs` container overlays use as a lowerdir: a dead FUSE mount
+/// always, an unguarded EROFS mount only once nothing uses it.
+fn orphan_mount_is_sweepable(fstype: &str, overlay_refs: usize) -> bool {
+    fstype.contains("fuse") || (fstype == "erofs" && overlay_refs == 0)
+}
+
 /// Outcome of a bounded filesystem probe.
 #[derive(Debug)]
 enum ProbeOutcome {
@@ -3107,6 +3127,26 @@ fn stop_daemon_keep_mount(inst: &DaemonInstance) {
     if let Err(e) = inst.daemon.wait() {
         warn!(image_ref = %inst.image_ref, error = %e, "wait failed");
     }
+}
+
+/// Stop an instance nothing references any more and remove its kernel mount.
+///
+/// A fanotify daemon's `umount()` only stops its handlers and leaves the EROFS
+/// mount in place (the in-place restart path relies on that), so the mount is
+/// removed here first: each handler is drained and its mount unmounted while
+/// the group fd is still open, because `fanotify_release()` fail-opens every
+/// event still queued when the fd closes.
+fn stop_unreferenced_instance(inst: &DaemonInstance) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    if let Some(controller) = inst
+        .daemon
+        .as_any()
+        .downcast_ref::<nydus_service::ServiceController>()
+        && let Err(e) = controller.unregister_fanotify_handlers()
+    {
+        warn!(image_ref = %inst.image_ref, error = %e, "failed to unmount fanotify EROFS mount");
+    }
+    stop_instance(inst)
 }
 
 fn stop_instance(inst: &DaemonInstance) -> Result<()> {
@@ -3411,6 +3451,47 @@ mod tests {
         assert_eq!(adoption_route(Some("fuseblk")), AdoptionRoute::Fusedev);
         assert_eq!(adoption_route(Some("overlay")), AdoptionRoute::Evict);
         assert_eq!(adoption_route(None), AdoptionRoute::Evict);
+    }
+
+    #[test]
+    fn orphan_mount_sweep_spares_referenced_erofs_and_foreign_mounts() {
+        assert!(orphan_mount_is_sweepable("fuse.nydusfs", 3));
+        assert!(orphan_mount_is_sweepable("erofs", 0));
+        assert!(!orphan_mount_is_sweepable("erofs", 1));
+        assert!(!orphan_mount_is_sweepable("ext4", 0));
+    }
+
+    /// Releasing the last holder of an auto-accel daemon removes its EROFS
+    /// mount. `NYDUS_E2E_ROOT` is an ext4 dir holding `artifact/bootstrap` and
+    /// the localfs `artifact/backend/` of a zran image.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "needs root, Linux >= 6.14 and an ext4 work dir; run misc/fanotify/release-unmount-test.sh"]
+    fn release_unmounts_fanotify_erofs() {
+        let root = PathBuf::from(std::env::var("NYDUS_E2E_ROOT").expect("NYDUS_E2E_ROOT unset"));
+        let bootstrap = root.join("artifact/bootstrap");
+        let backend = root.join("artifact/backend");
+        let mut config = SnapshotterConfig::default();
+        config.snapshotter.root = root.join("snapshotter");
+        let supervisor = DaemonSupervisor::new(config);
+        let runtime = compio::runtime::Runtime::new().unwrap();
+        let image_ref = "e2e.invalid/release/app:1";
+
+        let handle = runtime
+            .block_on(supervisor.ensure_instance_local(image_ref, &bootstrap, &backend, "k1"))
+            .unwrap();
+        let mountpoint = handle.mountpoint().to_path_buf();
+        assert_eq!(mount_fstype_at(&mountpoint).as_deref(), Some("erofs"));
+        assert!(fs::read_dir(&mountpoint).unwrap().next().is_some());
+
+        runtime
+            .block_on(supervisor.release(image_ref, "k1"))
+            .unwrap();
+        assert!(
+            !is_mounted_at(&mountpoint),
+            "EROFS mount at {} outlived its released daemon",
+            mountpoint.display()
+        );
     }
 
     #[test]
