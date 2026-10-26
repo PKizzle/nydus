@@ -90,18 +90,22 @@ nydusd \
 
 ## Block size and host page size
 
-EROFS requires the filesystem logical block size to equal the host page size. Build the bootstrap
-for the target host with `nydus-image create --block-size <bytes>`:
+The EROFS logical block size may be smaller than or equal to the host page size; current kernels
+mount sub-page blocks, but reject a block size larger than the page size. `4096`, the default of
+`nydus-image create --block-size <bytes>`, is therefore the portable choice and mounts on every
+host below. A page-sized block size is supported as well:
 
-| Host page size | `--block-size` | Typical hosts |
+| Host page size | Mountable `--block-size` | Typical hosts |
 | --- | --- | --- |
-| 4 KiB  | `4096`  | x86_64, Raspberry Pi 4 |
-| 16 KiB | `16384` | Apple Silicon, Raspberry Pi 5 (16K page config) |
-| 64 KiB | `65536` | some aarch64 / ppc64le distros |
+| 4 KiB  | `4096` | x86_64, Raspberry Pi 4 |
+| 16 KiB | `4096`, `16384` | Apple Silicon, Raspberry Pi 5 (16K page config) |
+| 64 KiB | `4096`, `16384`, `65536` | some aarch64 / ppc64le distros |
 
 A single `nydusd` / `nydus-image` binary handles all three at runtime; the size is recorded in the
-RAFS v6 superblock (`s_blkszbits`). Mounting a bootstrap whose block size does not match the host
-page size is rejected by the EROFS driver, so build per target page size.
+RAFS v6 superblock (`s_blkszbits`). The builder starts every chunk on a block boundary and sizes
+each device table entry to cover its whole blob, since the kernel locates data only through block
+addresses. `runtime-test.sh` and `export-block-test.sh` take `BLOCK_SIZE=` to verify a block size
+in the kernel.
 
 ## Cache eviction
 
@@ -143,7 +147,7 @@ sudo NYDUS_IMAGE=./target/release/nydus-image NYDUSD=./target/release/nydusd \
 
 - **Reads return `EIO`** — the daemon failed to fetch a range (backend/network error). Check
   `nydusd` logs and backend connectivity.
-- **`mount: erofs … wrong fs type`** — the bootstrap's block size does not match the host page
-  size; rebuild with the matching `--block-size`.
+- **`mount: erofs … wrong fs type`** — the bootstrap's block size is larger than the host page
+  size; rebuild with `--block-size 4096` or the host's page size.
 - **No events / hangs on first read** — the kernel is below 6.14 or
   `CONFIG_FANOTIFY_ACCESS_PERMISSIONS` is not enabled; fall back to `nydusd fuse`.

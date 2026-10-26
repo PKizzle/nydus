@@ -314,7 +314,7 @@ fn prepare_cmd_args(bti_string: &'static str) -> App {
                 .arg(
                     Arg::new("block-size")
                         .long("block-size")
-                        .help("EROFS/RAFS v6 logical block size in bytes; must match the consumer host's page size. Supported: 4096, 16384, 65536. Default: 4096.")
+                        .help("EROFS/RAFS v6 logical block size in bytes; must not exceed the consumer host's page size. Supported: 4096, 16384, 65536. Default: 4096.")
                         .required(false)
                         .value_parser(["4096", "16384", "65536"])
                         .default_value("4096"),
