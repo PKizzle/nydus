@@ -35,6 +35,25 @@ pub struct ZranInflateContext {
     __reserved2: u8,
 }
 
+#[cfg(test)]
+impl ZranInflateContext {
+    /// An inflate context decompressing `out_len` bytes from the start of the stream.
+    pub(crate) fn with_out_len(out_len: u32) -> Self {
+        ZranInflateContext {
+            in_offset: 0,
+            out_offset: 0,
+            dict_offset: 0,
+            in_len: 0,
+            out_len: u32::to_le(out_len),
+            dict_size: 0,
+            ctx_byte: 0,
+            ctx_bits: 0,
+            __reserved1: 0,
+            __reserved2: 0,
+        }
+    }
+}
+
 impl ZranInflateContext {
     /// Get offset into the compressed stream.
     pub fn in_offset(&self) -> u64 {

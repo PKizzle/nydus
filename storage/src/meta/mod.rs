@@ -2904,4 +2904,66 @@ pub(crate) mod tests {
             Err(MetaError::InvalidMetadata(_))
         ));
     }
+
+    /// Blob meta for an aligned ZRan blob of `block_size`: every chunk decompresses from the one
+    /// inflate context, as the chunks of a small targz-ref layer do.
+    fn aligned_zran_blob_meta(
+        block_size: u64,
+        chunks: &[(u64, u32)],
+        uncompressed_size: u64,
+    ) -> BlobCompressionContextInfo {
+        let mut zran_offset = 0;
+        let chunks: Vec<_> = chunks
+            .iter()
+            .map(|&(offset, size)| {
+                let mut chunk = BlobChunkInfoV2Ondisk::default();
+                chunk.set_zran(true);
+                chunk.set_zran_index(0);
+                chunk.set_zran_offset(zran_offset);
+                zran_offset += size;
+                chunk.set_compressed(true);
+                chunk.set_compressed_offset(0);
+                chunk.set_compressed_size(0x100);
+                chunk.set_uncompressed_offset(offset);
+                chunk.set_uncompressed_size(size);
+                chunk
+            })
+            .collect();
+        let state = BlobCompressionContext {
+            chunk_info_array: BlobMetaChunkArray::V2(chunks.into()),
+            zran_info_array: vec![ZranInflateContext::with_out_len(zran_offset)].into(),
+            compressed_size: 0x100,
+            uncompressed_size,
+            blob_features: (BlobFeatures::ALIGNED
+                | BlobFeatures::ZRAN
+                | BlobFeatures::CHUNK_INFO_V2)
+                .bits(),
+            block_size,
+            ..Default::default()
+        };
+        BlobCompressionContextInfo {
+            state: Arc::new(state),
+        }
+    }
+
+    /// The ZRan path ends a range at the last chunk's end rounded up to the blob's block size:
+    /// the block padding there resolves, anything beyond it is a missing chunk entry.
+    #[test]
+    fn test_get_chunks_uncompressed_zran_tail_follows_block_size() {
+        // 16 KiB blob: chunk 1 ends at 0x34d40, its block padding runs to 0x38000.
+        let meta = aligned_zran_blob_meta(0x4000, &[(0, 5000), (0x4000, 200_000)], 0x3c000);
+        assert_eq!(chunk_ids(&meta, 0x34000, 0x4000).unwrap(), vec![0, 1]);
+        assert!(matches!(
+            chunk_ids(&meta, 0x34000, 0x8000),
+            Err(MetaError::InvalidMetadata(_))
+        ));
+
+        // 4 KiB blob: chunk 1 ends at 0x3000, so nothing past it is padding.
+        let meta = aligned_zran_blob_meta(0x1000, &[(0, 0x1000), (0x1000, 0x2000)], 0x5000);
+        assert_eq!(chunk_ids(&meta, 0x2000, 0x1000).unwrap(), vec![0, 1]);
+        assert!(matches!(
+            chunk_ids(&meta, 0x2000, 0x2000),
+            Err(MetaError::InvalidMetadata(_))
+        ));
+    }
 }
