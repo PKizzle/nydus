@@ -271,6 +271,25 @@ impl ServiceController {
         result
     }
 
+    /// Unregister every fanotify handler, unmounting each EROFS mount before its
+    /// group fd drops (see [`unregister_fanotify_handler`](Self::unregister_fanotify_handler)).
+    ///
+    /// This is the full teardown for a daemon nothing references any more. The
+    /// `Stop` state-machine path (`umount()` → `stop_services`) only stops the
+    /// handlers and leaves the mount in place, which is what an in-place restart
+    /// over a live mount needs. Every handler is attempted; the last error is
+    /// returned.
+    pub fn unregister_fanotify_handlers(&self) -> std::io::Result<()> {
+        let image_ids: Vec<String> = self.fanotify.lock().unwrap().keys().cloned().collect();
+        let mut result = Ok(());
+        for image_id in image_ids {
+            if let Err(e) = self.unregister_fanotify_handler(&image_id) {
+                result = Err(e);
+            }
+        }
+        result
+    }
+
     /// Unmount a fanotify-backed EROFS mount, retrying while it is busy.
     ///
     /// Bounded at `UMOUNT_MAX_ATTEMPTS` × `UMOUNT_RETRY_INTERVAL` (≈10s). Each retry is
@@ -669,6 +688,13 @@ mod tests {
     fn test_get_blob_cache_mgr_is_some() {
         let service_controller = create_service_controller();
         assert!(service_controller.get_blob_cache_mgr().is_some());
+    }
+
+    #[test]
+    fn test_unregister_fanotify_handlers_without_handlers_is_ok() {
+        let service_controller = create_service_controller();
+        assert!(service_controller.unregister_fanotify_handlers().is_ok());
+        assert!(!service_controller.fanotify_enabled.load(Ordering::Acquire));
     }
 
     #[test]

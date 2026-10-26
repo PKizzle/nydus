@@ -533,7 +533,7 @@ impl Reconciler {
             })
             .unwrap_or_default();
 
-        let removed = sweep_stale_daemon_dirs(&daemons_root, &active, &busy)?;
+        let removed = sweep_stale_daemon_dirs(&daemons_root, &active, &busy, self.interval)?;
         if removed > 0 {
             info!(removed, "recon: stale daemon dir sweep completed");
         }
@@ -743,10 +743,15 @@ fn sweep_stale_job_dirs(
 ///   `kill -9` drop parked FUSE fds and leave live mounts serverless;
 /// - non-directory entries (stray files are not daemon state and `remove_dir_all`
 ///   would fail on them anyway).
+///
+/// Directories modified less than `min_age` ago are also spared: a daemon start
+/// creates `daemons/<slug>/` (mountpoint, stage dir) before its instance is
+/// registered, so a sweep in that window would delete a starting daemon's state.
 fn sweep_stale_daemon_dirs(
     daemons_root: &Path,
     active_slugs: &HashSet<String>,
     busy_mounts: &HashSet<PathBuf>,
+    min_age: Duration,
 ) -> Result<usize> {
     let entries = match std::fs::read_dir(daemons_root) {
         Ok(e) => e,
@@ -771,6 +776,14 @@ fn sweep_stale_daemon_dirs(
             continue;
         }
         if active_slugs.contains(&name) {
+            continue;
+        }
+        let age = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .map(|modified| modified.elapsed().unwrap_or_default())
+            .unwrap_or_default();
+        if age < min_age {
             continue;
         }
         // Skip if anything under this dir is still mounted.
@@ -917,7 +930,8 @@ proc /proc proc rw,nosuid 0 0
         std::fs::create_dir_all(&stale).unwrap();
 
         let removed =
-            sweep_stale_daemon_dirs(tmp.path(), &HashSet::new(), &HashSet::new()).unwrap();
+            sweep_stale_daemon_dirs(tmp.path(), &HashSet::new(), &HashSet::new(), Duration::ZERO)
+                .unwrap();
 
         assert_eq!(removed, 1);
         assert!(
@@ -925,6 +939,30 @@ proc /proc proc rw,nosuid 0 0
             "records dir must survive"
         );
         assert!(!stale.exists(), "stale slug dir must still be swept");
+    }
+
+    #[test]
+    fn sweep_stale_daemon_dirs_spares_dirs_younger_than_min_age() {
+        // `start_instance` creates `daemons/<slug>/` before the instance is
+        // registered; a sweep in that window must not delete it.
+        let tmp = tempfile::tempdir().unwrap();
+        let starting = touch_dir_with_age(tmp.path(), "cccc-starting", Duration::from_secs(5));
+        let stale = touch_dir_with_age(tmp.path(), "dddd-stale", Duration::from_secs(7200));
+
+        let removed = sweep_stale_daemon_dirs(
+            tmp.path(),
+            &HashSet::new(),
+            &HashSet::new(),
+            Duration::from_secs(60),
+        )
+        .unwrap();
+
+        assert_eq!(removed, 1);
+        assert!(
+            starting.exists(),
+            "a daemon dir still starting must survive"
+        );
+        assert!(!stale.exists());
     }
 
     #[test]
@@ -939,7 +977,7 @@ proc /proc proc rw,nosuid 0 0
         let active: HashSet<String> = ["aaaa-live".to_string()].into();
         let busy: HashSet<PathBuf> = [mounted_dir.join("mnt")].into();
 
-        let removed = sweep_stale_daemon_dirs(tmp.path(), &active, &busy).unwrap();
+        let removed = sweep_stale_daemon_dirs(tmp.path(), &active, &busy, Duration::ZERO).unwrap();
 
         assert_eq!(removed, 0);
         assert!(active_dir.exists());
