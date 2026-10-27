@@ -26,7 +26,7 @@ use nydus_storage::{RAFS_MAX_CHUNK_SIZE, RAFS_MAX_CHUNKS_PER_BLOB};
 use nydus_utils::compact::makedev;
 use nydus_utils::compress::{self, compute_compressed_gzip_size};
 use nydus_utils::digest::{self, DigestData, RafsDigest};
-use nydus_utils::{ByteSize, lazy_drop, root_tracer, timing_tracer, try_round_up_4k};
+use nydus_utils::{ByteSize, lazy_drop, root_tracer, round_up, timing_tracer};
 use serde::{Deserialize, Serialize};
 
 use crate::core::context::{Artifact, NoopArtifactWriter};
@@ -475,8 +475,7 @@ impl StargzBuilder {
                 }
 
                 let aligned_chunk_size = if ctx.aligned_chunk {
-                    // Safe to unwrap because `chunk_size` is much less than u32::MAX.
-                    try_round_up_4k(uncompress_size).unwrap()
+                    round_up(uncompress_size, ctx.chunk_alignment())
                 } else {
                     uncompress_size
                 };

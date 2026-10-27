@@ -404,4 +404,83 @@ mod tests {
         let _builder = FilesystemTreeBuilder::new();
         assert_eq!(std::mem::size_of::<FilesystemTreeBuilder>(), 0);
     }
+
+    /// The kernel locates chunk data only through `blkaddr * block_size` and the device table,
+    /// so every chunk must start on a block boundary and each device must cover its whole blob.
+    #[test]
+    fn test_v6_chunk_layout_follows_block_size() {
+        use nydus_rafs::RafsIoRead;
+        use nydus_rafs::metadata::RafsSuper;
+        use nydus_rafs::metadata::layout::v6::RafsV6Device;
+
+        use crate::{ArtifactStorage, BlobManager, BootstrapManager, Builder, ConversionType};
+
+        let source = TempDir::new().unwrap();
+        fs::write(source.as_path().join("a-small"), vec![0x5au8; 5000]).unwrap();
+        let big: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+        fs::write(source.as_path().join("b-big"), big).unwrap();
+
+        for block_size in [4096u64, 16384, 65536] {
+            let blob_dir = TempDir::new().unwrap();
+            let bootstrap = vmm_sys_util::tempfile::TempFile::new().unwrap();
+            let mut ctx = BuildContext {
+                fs_version: RafsVersion::V6,
+                conversion_type: ConversionType::DirectoryToRafs,
+                source_path: source.as_path().to_path_buf(),
+                aligned_chunk: true,
+                blob_storage: Some(ArtifactStorage::FileDir((
+                    blob_dir.as_path().to_path_buf(),
+                    String::new(),
+                ))),
+                ..Default::default()
+            };
+            ctx.set_blob_block_size(block_size);
+            let mut bootstrap_mgr = BootstrapManager::new(
+                Some(ArtifactStorage::SingleFile(
+                    bootstrap.as_path().to_path_buf(),
+                )),
+                None,
+            );
+            let mut blob_mgr = BlobManager::new(ctx.digester, false);
+            DirectoryBuilder::new()
+                .build(&mut ctx, &mut bootstrap_mgr, &mut blob_mgr)
+                .unwrap();
+
+            let (rs, _) =
+                RafsSuper::load_from_file(bootstrap.as_path(), ctx.configuration.clone(), false)
+                    .unwrap();
+            let root = rs.get_inode(rs.superblock.root_ino(), false).unwrap();
+            for name in ["a-small", "b-big"] {
+                let inode = root.get_child_by_name(name.as_ref()).unwrap();
+                for idx in 0..inode.get_chunk_count() {
+                    // The lookup resolves the on-disk chunk address, whose blkaddr must
+                    // equal `uncompressed_offset / block_size` exactly.
+                    let chunk = inode.get_chunk_info(idx).unwrap();
+                    assert_eq!(
+                        chunk.uncompressed_offset() % block_size,
+                        0,
+                        "{name} chunk {idx} at 0x{:x} is not {block_size}-aligned",
+                        chunk.uncompressed_offset()
+                    );
+                }
+            }
+
+            let blobs = rs.superblock.get_blob_infos();
+            assert_eq!(blobs.len(), 1);
+            assert_eq!(rs.meta.blob_device_table_count, 1);
+            let mut reader: Box<dyn RafsIoRead> =
+                Box::new(fs::File::open(bootstrap.as_path()).unwrap());
+            reader
+                .seek_to_offset(rs.meta.blob_device_table_offset)
+                .unwrap();
+            let mut devslot = RafsV6Device::new();
+            devslot.load(&mut reader).unwrap();
+            assert!(
+                devslot.blocks() as u64 * block_size >= blobs[0].uncompressed_size(),
+                "{} blocks of {block_size} do not cover blob size 0x{:x}",
+                devslot.blocks(),
+                blobs[0].uncompressed_size()
+            );
+        }
+    }
 }

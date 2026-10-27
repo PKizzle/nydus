@@ -11,6 +11,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use hex::FromHex;
 use nydus_api::ConfigV2;
+use nydus_rafs::metadata::layout::v6::{EROFS_BLOCK_SIZE_4096, block_size_from_bits};
 use nydus_rafs::metadata::{RafsSuper, RafsVersion};
 use nydus_storage::device::{BlobFeatures, BlobInfo};
 use nydus_utils::crypt;
@@ -162,6 +163,7 @@ impl Merger {
 
         let mut fs_version = RafsVersion::V6;
         let mut chunk_size = None;
+        let mut block_size = None;
 
         for (layer_idx, bootstrap_path) in sources.iter().enumerate() {
             let (rs, _) = RafsSuper::load_from_file(bootstrap_path, config_v2.clone(), false)
@@ -183,6 +185,23 @@ impl Merger {
             if config.as_ref().unwrap().is_tarfs_mode {
                 ctx.conversion_type = ConversionType::TarToTarfs;
                 ctx.blob_features |= BlobFeatures::TARFS;
+            } else {
+                // Layer chunks keep their block-aligned offsets, so the merged image must use
+                // the layers' block size, and all layers must agree on it.
+                let size = block_size_from_bits(rs.meta.blkszbits).unwrap_or(EROFS_BLOCK_SIZE_4096);
+                match block_size {
+                    Some(expected) => ensure!(
+                        size == expected,
+                        "can not merge bootstraps with inconsistent block size, current bootstrap {:?} with block size {}, expected {}",
+                        bootstrap_path,
+                        size,
+                        expected,
+                    ),
+                    None => {
+                        ctx.set_blob_block_size(size);
+                        block_size = Some(size);
+                    }
+                }
             }
 
             let mut parent_blob_added = false;
@@ -612,5 +631,60 @@ mod tests {
         let build_output = build_output.unwrap();
         println!("BuildOutput: {}", build_output);
         assert_eq!(build_output.blob_size, Some(16));
+    }
+
+    /// Chunks of a 16 KiB layer start on 16 KiB boundaries, so the merged bootstrap must keep that
+    /// block size: storage holds each blob's padding to the filesystem's block size.
+    #[test]
+    fn test_merger_merge_keeps_source_block_size() {
+        use crate::{BlobManager, BootstrapManager, Builder, ConversionType, DirectoryBuilder};
+        use vmm_sys_util::tempdir::TempDir;
+
+        let source = TempDir::new().unwrap();
+        std::fs::write(source.as_path().join("a"), vec![1u8; 5000]).unwrap();
+        std::fs::write(source.as_path().join("b"), vec![2u8; 20000]).unwrap();
+        let blob_dir = TempDir::new().unwrap();
+        let layer = TempFile::new().unwrap();
+        let mut ctx = BuildContext {
+            fs_version: RafsVersion::V6,
+            conversion_type: ConversionType::DirectoryToRafs,
+            source_path: source.as_path().to_path_buf(),
+            aligned_chunk: true,
+            blob_storage: Some(ArtifactStorage::FileDir((
+                blob_dir.as_path().to_path_buf(),
+                String::new(),
+            ))),
+            ..Default::default()
+        };
+        ctx.set_blob_block_size(16384);
+        let mut bootstrap_mgr = BootstrapManager::new(
+            Some(ArtifactStorage::SingleFile(layer.as_path().to_path_buf())),
+            None,
+        );
+        let mut blob_mgr = BlobManager::new(ctx.digester, false);
+        DirectoryBuilder::new()
+            .build(&mut ctx, &mut bootstrap_mgr, &mut blob_mgr)
+            .unwrap();
+
+        let mut ctx = BuildContext::default();
+        let (target, merged) = make_tmp_target();
+        Merger::merge(
+            &mut ctx,
+            None,
+            vec![layer.as_path().to_path_buf()],
+            None,
+            None,
+            None,
+            None,
+            None,
+            target,
+            None,
+            Arc::new(ConfigV2::new("cfg")),
+        )
+        .unwrap();
+        let (rs, _) =
+            RafsSuper::load_from_file(merged.as_path(), Arc::new(ConfigV2::new("cfg")), false)
+                .unwrap();
+        assert_eq!(rs.meta.blkszbits, 14);
     }
 }

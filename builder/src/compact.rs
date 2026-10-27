@@ -17,7 +17,7 @@ use nydus_rafs::metadata::{RafsSuper, RafsVersion};
 use nydus_storage::backend::BlobBackend;
 use nydus_storage::utils::alloc_buf;
 use nydus_utils::digest::RafsDigest;
-use nydus_utils::{digest, try_round_up_4k};
+use nydus_utils::{digest, round_up};
 use serde::{Deserialize, Serialize};
 use sha2::Digest;
 
@@ -177,7 +177,10 @@ impl ChunkSet {
             new_blob_ctx.compressed_blob_size += chunk.compressed_size() as u64;
 
             let aligned_size = if aligned_chunk {
-                try_round_up_4k(chunk.uncompressed_size()).unwrap()
+                round_up(
+                    chunk.uncompressed_size() as u64,
+                    build_ctx.chunk_alignment(),
+                )
             } else {
                 chunk.uncompressed_size() as u64
             };

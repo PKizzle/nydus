@@ -441,12 +441,12 @@ impl BlobCacheGenerator {
         &self,
         chunk_data: &[u8],
         chunk_info: &ChunkWrapper,
-        aligned_d_size: u32,
+        aligned_d_size: u64,
     ) -> Result<()> {
         let mut guard = self.blob_data.lock().unwrap();
         let curr_pos = guard.seek(std::io::SeekFrom::End(0))?;
-        if curr_pos < chunk_info.uncompressed_offset() + aligned_d_size as u64 {
-            guard.set_len(chunk_info.uncompressed_offset() + aligned_d_size as u64)?;
+        if curr_pos < chunk_info.uncompressed_offset() + aligned_d_size {
+            guard.set_len(chunk_info.uncompressed_offset() + aligned_d_size)?;
         }
 
         guard.seek(std::io::SeekFrom::Start(chunk_info.uncompressed_offset()))?;
@@ -1374,9 +1374,8 @@ pub struct BuildContext {
     pub batch_size: u32,
     /// EROFS / RAFS v6 logical block size in bytes (4 KiB, 16 KiB or 64 KiB).
     ///
-    /// The kernel EROFS driver requires this to match the host page size when mounting,
-    /// so cross-architecture image producers should set it to the consumer's page size.
-    /// Defaults to 4096 for backward compatibility.
+    /// The kernel EROFS driver mounts block sizes up to the host page size, so the default
+    /// 4096 mounts everywhere and a larger value must not exceed the consumer's page size.
     pub blob_block_size: u64,
     /// Version number of output metadata and data blob.
     pub fs_version: RafsVersion,
@@ -1557,6 +1556,16 @@ impl BuildContext {
             size
         );
         self.blob_block_size = size;
+    }
+
+    /// Alignment of chunk start offsets in an aligned data blob. RAFS v6 addresses chunk data
+    /// as `blkaddr * block_size`, so v6 chunks start on EROFS block boundaries; v5 uses 4 KiB.
+    pub fn chunk_alignment(&self) -> u64 {
+        if self.fs_version.is_v6() {
+            self.v6_block_size()
+        } else {
+            EROFS_BLOCK_SIZE_4096
+        }
     }
 
     pub fn set_configuration(&mut self, config: Arc<ConfigV2>) {

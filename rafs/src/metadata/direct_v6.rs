@@ -88,9 +88,8 @@ impl DirectMappingState {
         if self.is_tarfs() {
             EROFS_BLOCK_SIZE_512
         } else {
-            // Honour the superblock's recorded block size so 16 KiB / 64 KiB-page hosts
-            // can mount bootstraps built for their page size. Falls back to 4 KiB for
-            // images that predate variable-block-size support (blkszbits == 0).
+            // Honour the superblock's recorded block size. Falls back to 4 KiB for images
+            // that predate variable-block-size support (blkszbits == 0).
             block_size_from_bits(self.meta.blkszbits).unwrap_or(EROFS_BLOCK_SIZE_4096)
         }
     }
@@ -212,7 +211,13 @@ impl DirectSuperBlockV6 {
         let mut blob_table = RafsV6BlobTable::new();
         let meta = &old_state.meta;
         r.seek(SeekFrom::Start(meta.blob_table_offset))?;
-        blob_table.load(r, meta.blob_table_size, meta.chunk_size, meta.flags)?;
+        blob_table.load(
+            r,
+            meta.blob_table_size,
+            meta.chunk_size,
+            meta.flags,
+            old_state.block_size(),
+        )?;
         let blob_extra_infos = rafsv6_load_blob_extra_info(meta, r)?;
 
         let file_map = FileMapState::new(file, 0, len as usize, false)?;

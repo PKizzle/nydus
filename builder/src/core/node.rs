@@ -25,7 +25,7 @@ use nydus_rafs::metadata::{Inode, RafsVersion};
 use nydus_storage::device::BlobFeatures;
 use nydus_storage::meta::{BlobChunkInfoV2Ondisk, BlobMetaChunkInfo};
 use nydus_utils::digest::{DigestHasher, RafsDigest};
-use nydus_utils::{ByteSize, div_round_up, event_tracer, root_tracer, try_round_up_4k};
+use nydus_utils::{ByteSize, div_round_up, event_tracer, root_tracer, round_up};
 use nydus_utils::{compress, crc32, crypt, xxh3};
 use parse_size::parse_size;
 use sha2::digest::Digest;
@@ -531,14 +531,13 @@ impl Node {
     ) -> Result<(Option<BlobChunkInfoV2Ondisk>, Option<u32>)> {
         let d_size = chunk_data.len() as u32;
         let aligned_d_size = if ctx.aligned_chunk {
-            // Safe to unwrap because `chunk_size` is much less than u32::MAX.
-            try_round_up_4k(d_size).unwrap()
+            round_up(d_size as u64, ctx.chunk_alignment())
         } else {
-            d_size
+            d_size as u64
         };
         let pre_d_offset = blob_ctx.current_uncompressed_offset;
-        blob_ctx.uncompressed_blob_size = pre_d_offset + aligned_d_size as u64;
-        blob_ctx.current_uncompressed_offset += aligned_d_size as u64;
+        blob_ctx.uncompressed_blob_size = pre_d_offset + aligned_d_size;
+        blob_ctx.current_uncompressed_offset += aligned_d_size;
         chunk.set_uncompressed_offset(pre_d_offset);
         chunk.set_uncompressed_size(d_size);
 
