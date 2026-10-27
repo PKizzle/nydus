@@ -323,12 +323,12 @@ async fn main() -> Result<()> {
         info!(rebuilt, "rebuilt nydus daemons from persisted records");
     }
 
-    // Finally, detach any dead FUSE mount stacks left by daemons that no
-    // longer have a record or preserved fd (e.g. mounts stranded by a
-    // predecessor that predates record persistence).
-    let swept = supervisor.sweep_orphaned_fuse_mounts().await;
+    // Finally, detach mount stacks left by daemons that no longer have a
+    // record or preserved fd: dead FUSE mounts, and EROFS mounts no container
+    // uses. Runs before the gRPC server starts, so no Prepare can race it.
+    let swept = supervisor.sweep_orphaned_mounts().await;
     if swept > 0 {
-        info!(swept, "swept orphaned fuse mounts under the daemons root");
+        info!(swept, "swept orphaned mounts under the daemons root");
     }
 
     // Open the fjall snapshot store HERE — not inside the server task — so the
