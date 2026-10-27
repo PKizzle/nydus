@@ -13,6 +13,12 @@ GOPROXY ?=
 TESTS ?= .*
 GO_TEST_BUILD_FLAGS ?=
 
+# The variables the smoke binary reads, forwarded across sudo by name.
+SUDO_ENV = ../misc/sudo-env.sh PATH PLAIN_HTTP LLVM_PROFILE_FILE TEST_WORKDIR_PREFIX \
+	WORK_DIR SKIP_CASES TEST_MODE REPO_ROOT REGISTRY_PORT DISABLE_REGISTRY BOOTSTRAP_PATH \
+	NEW_NYDUSD_BINARY_PATH 'NYDUS_*' '*_CONFIG' 'PERFORMANCE_*' 'BENCHMARK_*' 'TAKEOVER_*' \
+	'SNAPSHOTTER*' --
+
 ifdef GOPROXY
 PROXY := GOPROXY=${GOPROXY}
 endif
@@ -29,21 +35,21 @@ build:
 test: build
 	golangci-lint run --timeout=5m
 	$(CARGO_COV_FLAGS) \
-		   sudo -E ./smoke.test -test.v -test.timeout 10m -test.parallel=16 -test.run=$(TESTS)
+		   bash $(SUDO_ENV) ./smoke.test -test.v -test.timeout 10m -test.parallel=16 -test.run=$(TESTS)
 
 # PERFORMANCE_TEST_MODE=fs-version-5 \
 # PERFORMANCE_TEST_IMAGE=wordpress:latest \
 # make test-performance
 test-performance: build
 	$(CARGO_COV_FLAGS) PERFORMANCE_TEST=True \
-		   sudo -E ./smoke.test -test.v -test.timeout 10m -test.parallel=1 -test.run=TestPerformance
+		   bash $(SUDO_ENV) ./smoke.test -test.v -test.timeout 10m -test.parallel=1 -test.run=TestPerformance
 
 # BENCHMARK_TEST_IMAGE=wordpress:6.1.1 \
 # BENCHMARK_MODE=fs-version-6 \
 # make test-benchmark
 test-benchmark: build
 	$(CARGO_COV_FLAGS) BENCHMARK_TEST=True \
-		   sudo -E ./smoke.test -test.v -test.timeout 10m -test.parallel=1 -test.run=TestBenchmark
+		   bash $(SUDO_ENV) ./smoke.test -test.v -test.timeout 10m -test.parallel=1 -test.run=TestBenchmark
 
 # WORK_DIR=/tmp \
 # NYDUS_STABLE_VERSION=v2.2.3 \
@@ -67,4 +73,4 @@ test-compatibility: build
 # NEW_NYDUSD_BINARY_PATH=target/release/nydusd
 test-takeover: build
 	$(CARGO_COV_FLAGS) TAKEOVER_TEST=true \
-		   sudo -E ./smoke.test -test.v -test.timeout 10m -test.parallel=1 -test.run=TestTakeover
+		   bash $(SUDO_ENV) ./smoke.test -test.v -test.timeout 10m -test.parallel=1 -test.run=TestTakeover

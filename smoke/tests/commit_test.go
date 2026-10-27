@@ -73,9 +73,10 @@ func (c *CommitTestSuite) TestCommitAndCheck(ctx tool.Context, image, commitedIm
 
 	// commit container
 	committedContainerName := fmt.Sprintf("%s-committed", containerName)
-	// -E so the harness-wide PLAIN_HTTP reaches nydusify: the smoke registry
-	// speaks plain HTTP and the Rust nydusify never downgrades silently.
-	commitCmd := fmt.Sprintf("sudo -E %s commit --container %s --target %s --with-path /nydus-volume", ctx.Binary.Nydusify, containerID, commitedImage)
+	// PLAIN_HTTP is set explicitly because sudo does not reliably forward the
+	// environment (sudo-rs ignores -E): the smoke registry speaks plain HTTP and
+	// the Rust nydusify never downgrades silently.
+	commitCmd := fmt.Sprintf("sudo env PLAIN_HTTP=true %s commit --container %s --target %s --with-path /nydus-volume", ctx.Binary.Nydusify, containerID, commitedImage)
 	tool.RunWithoutOutput(c.t, commitCmd)
 
 	// run committed container
