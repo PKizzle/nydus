@@ -241,7 +241,7 @@ jobs:
         mkdir -p /tmp/golangci-lint-bin
         GOBIN=/tmp/golangci-lint-bin go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.14.0
         sudo install -m 755 /tmp/golangci-lint-bin/golangci-lint /usr/bin/golangci-lint
-        sudo -E env "PATH=$PATH" make smoke-only
+        make smoke-only
 
   nydus-unit-test:
     runs-on: ${{ vars.RUNNER_OS || 'ubuntu-latest' }}
@@ -275,10 +275,8 @@ jobs:
         fi
     - name: Unit Test
       run: |
-        CARGO_HOME=${HOME}/.cargo
-        CARGO_BIN=$(which cargo)
-        RUSTUP_BIN=$(which rustup)
-        sudo -E RUSTUP=${RUSTUP_BIN} make ut-nextest
+        export RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}" CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
+        bash misc/sudo-env.sh PATH RUSTUP_HOME 'CARGO_*' -- make ut-nextest RUSTUP="$(command -v rustup)"
 
   nydus-unit-test-coverage:
     runs-on: ${{ vars.RUNNER_OS || 'ubuntu-latest' }}
@@ -312,10 +310,8 @@ jobs:
         run: bash misc/install-protoc.sh
       - name: Generate code coverage
         run: |
-          CARGO_HOME=${HOME}/.cargo
-          CARGO_BIN=$(which cargo)
-          RUSTUP_BIN=$(which rustup)
-          sudo -E RUSTUP=${RUSTUP_BIN} make coverage-codecov
+          export RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}" CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
+          bash misc/sudo-env.sh PATH RUSTUP_HOME 'CARGO_*' -- make coverage-codecov RUSTUP="$(command -v rustup)"
       - name: Upload nydus coverage file
         uses: actions/upload-artifact@v6
         with:
@@ -451,17 +447,17 @@ jobs:
         echo "Smoke binary environment:"
         env | grep '^NYDUS_' | sort
         echo "LLVM_PROFILE_FILE=${LLVM_PROFILE_FILE}"
-        sudo -E env | grep '^LLVM_PROFILE_FILE='
-        sudo -E env | grep '^NYDUS_' | sort
+        bash misc/sudo-env.sh LLVM_PROFILE_FILE 'NYDUS_*' -- env | grep '^LLVM_PROFILE_FILE='
+        bash misc/sudo-env.sh LLVM_PROFILE_FILE 'NYDUS_*' -- env | grep '^NYDUS_' | sort
 
         echo "Rust binary coverage probe before smoke:"
-        sudo -E /usr/bin/nydus-latest/nydus-image --version || true
+        sudo /usr/bin/nydus-latest/nydus-image --version || true
         mapfile -t probe_profraw_files < <(find "${CARGO_LLVM_COV_TARGET_DIR}" -maxdepth 1 -name '*.profraw' -print | sort)
         echo "Generated ${#probe_profraw_files[@]} probe profraw files"
         printf '%s\n' "${probe_profraw_files[@]}"
         cargo llvm-cov clean --workspace --profraw-only
 
-        sudo -E env "PATH=$PATH" make smoke-only
+        make smoke-only
 
         mapfile -t profraw_files < <(find "${CARGO_LLVM_COV_TARGET_DIR}" -maxdepth 1 -name '*.profraw' -print | sort)
         echo "Generated ${#profraw_files[@]} smoke profraw files"
@@ -761,7 +757,7 @@ jobs:
     - name: Performance Test
       run: |
         export PERFORMANCE_TEST_MODE=${{ matrix.mode }}
-        sudo -E env "PATH=$PATH" make smoke-performance
+        make smoke-performance
 
   # Correctness gate for the containerd -> gRPC Prepare/Commit/Mounts loop:
   # plain-OCI overlay path (no daemon) + nydus fusedev path + health probes +
@@ -851,7 +847,7 @@ jobs:
     - name: Takeover Test
       run: |
         export NEW_NYDUSD_BINARY_PATH=target/release/nydusd
-        sudo -E env "PATH=$PATH" make smoke-takeover
+        make smoke-takeover
     - name: Dump nydus-snapshotter logs
       if: always()
       run: |
