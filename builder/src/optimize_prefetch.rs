@@ -20,6 +20,7 @@ use nydus_api::ConfigV2;
 use nydus_rafs::metadata::RafsSuper;
 use nydus_rafs::metadata::RafsVersion;
 use nydus_rafs::metadata::layout::RafsBlobTable;
+use nydus_rafs::metadata::layout::v6::block_size_from_bits;
 use nydus_storage::backend::BlobBackend;
 use nydus_storage::device::{BlobFeatures, BlobInfo};
 use nydus_storage::meta::BatchContextGenerator;
@@ -38,6 +39,8 @@ struct PrefetchBlobState {
     blob_info: BlobInfo,
     blob_ctx: BlobContext,
     blob_writer: Box<dyn Artifact>,
+    /// Start-offset alignment of chunks copied into the prefetch blob.
+    chunk_alignment: u64,
     /// Where each distinct chunk landed in the prefetch blob, keyed by digest.
     ///
     /// The bootstrap's chunk info table is deduplicated by (digest, blob index)
@@ -109,6 +112,7 @@ impl PrefetchBlobState {
             blob_ctx,
             blob_writer,
             written_chunks: HashMap::new(),
+            chunk_alignment: ctx.chunk_alignment(),
         })
     }
 }
@@ -367,8 +371,8 @@ impl OptimizePrefetch {
             );
             let mut aligned_d_size: u64 = inner.uncompressed_size() as u64;
             if let RafsBlobTable::V6(_) = blob_table {
-                aligned_d_size = nydus_utils::try_round_up_4k(inner.uncompressed_size())
-                    .ok_or_else(|| anyhow!("invalid size"))?;
+                aligned_d_size =
+                    nydus_utils::round_up(aligned_d_size, prefetch_state.chunk_alignment);
                 let info = batch.generate_chunk_info(
                     blob_ctx.current_compressed_offset,
                     blob_ctx.current_uncompressed_offset,
@@ -433,6 +437,12 @@ pub fn update_ctx_from_bootstrap(
 
     ctx.fs_version =
         RafsVersion::try_from(sb.meta.version).context("Failed to get RAFS version")?;
+    // The rebuilt bootstrap keeps the source image's EROFS block size.
+    if ctx.fs_version.is_v6() && !config.is_tarfs_mode {
+        let block_size = block_size_from_bits(sb.meta.blkszbits)
+            .ok_or_else(|| anyhow!("invalid block size bits {} in bootstrap", sb.meta.blkszbits))?;
+        ctx.set_blob_block_size(block_size);
+    }
     ctx.compressor = config.compressor;
     Ok(sb)
 }
