@@ -520,23 +520,24 @@ impl AutoZranManager {
     /// base stage, so this queues even when a base job for the same image is
     /// already queued/done. Origin [`JobOrigin::Settle`]: when no base sidecar
     /// exists the worker runs the full pipeline (settle-before-base race).
-    pub fn try_enqueue_profile(&self, profile: &PrefetchProfile) {
-        self.enqueue_profile(profile, JobOrigin::Settle);
+    /// Returns whether the job was accepted onto the queue.
+    pub fn try_enqueue_profile(&self, profile: &PrefetchProfile) -> bool {
+        self.enqueue_profile(profile, JobOrigin::Settle)
     }
 
     /// Shared body of [`Self::try_enqueue_profile`] and the recon sweep,
     /// parameterized by origin so the worker's re-optimize gate can tell a live
     /// settle apart from a replayed profile.
-    fn enqueue_profile(&self, profile: &PrefetchProfile, origin: JobOrigin) {
+    fn enqueue_profile(&self, profile: &PrefetchProfile, origin: JobOrigin) -> bool {
         let Some(job) = AutoZranJob::from_profile(profile, origin) else {
             self.state
                 .metrics
                 .skipped_total
                 .fetch_add(1, Ordering::Relaxed);
             debug!(image = %profile.image, "auto-zran skipped empty prefetch profile");
-            return;
+            return false;
         };
-        self.enqueue(job);
+        self.enqueue(job)
     }
 
     /// Recon slow-pass driver for the wedge-at-Base limitation: re-enqueue
@@ -594,7 +595,8 @@ impl AutoZranManager {
     /// [`MAX_CONVERSION_FAILURES`]), then dedupes on `(image, stage)` via
     /// `queued_or_done`, then `try_send`s onto the bounded channel, rolling
     /// the dedupe key back if the send fails so the job can be retried later.
-    fn enqueue(&self, job: AutoZranJob) {
+    /// Returns whether the job was accepted onto the queue.
+    fn enqueue(&self, job: AutoZranJob) -> bool {
         if self.state.enqueue_suppressed(&job.image, Instant::now()) {
             self.state
                 .metrics
@@ -605,7 +607,7 @@ impl AutoZranManager {
                 stage = job.stage.tag(),
                 "auto-zran enqueue suppressed by failure backoff"
             );
-            return;
+            return false;
         }
         let key = dedupe_key(&job.image, job.stage);
         match self.state.queued_or_done.lock() {
@@ -616,7 +618,7 @@ impl AutoZranManager {
                         .skipped_total
                         .fetch_add(1, Ordering::Relaxed);
                     debug!(image = %job.image, stage = job.stage.tag(), "auto-zran job already queued");
-                    return;
+                    return false;
                 }
             }
             Err(_) => {
@@ -625,7 +627,7 @@ impl AutoZranManager {
                     .dropped_total
                     .fetch_add(1, Ordering::Relaxed);
                 warn!(image = %job.image, "auto-zran dedupe set lock poisoned; dropping job");
-                return;
+                return false;
             }
         }
 
@@ -640,11 +642,13 @@ impl AutoZranManager {
             if let Ok(mut seen) = self.state.queued_or_done.lock() {
                 seen.remove(&key);
             }
+            false
         } else {
             self.state
                 .metrics
                 .queued_total
                 .fetch_add(1, Ordering::Relaxed);
+            true
         }
     }
 }
@@ -709,6 +713,10 @@ fn map_sched(class: ConfigSchedClass) -> AccelSchedClass {
 enum SidecarState {
     /// No complete sidecar (absent, or present-but-missing-blobs → re-convert).
     Absent,
+    /// A sidecar written under another [`AUTO_ACCEL_MANIFEST_VERSION`]: never served, so it
+    /// is re-converted. Unlike `Absent` the image is a proven candidate, so the sweep's
+    /// re-optimize gate lets it through instead of waiting for a base that is never built.
+    Stale,
     /// A complete BASE sidecar (no prefetch blob): servable, upgradeable.
     Base,
     /// A complete OPTIMIZED sidecar (has a packed prefetch blob).
@@ -787,6 +795,7 @@ async fn run_conversion(
         manifest = %manifest_digest,
         layers = info.layers.len(),
         prefetch_files = job.prefetch_files.len(),
+        ?existing,
         "auto-zran starting conversion"
     );
 
@@ -835,7 +844,7 @@ async fn run_base_stage(
     image_name: &str,
     existing: SidecarState,
 ) -> Result<()> {
-    if existing != SidecarState::Absent {
+    if matches!(existing, SidecarState::Base | SidecarState::Optimized) {
         // A base or optimized sidecar already exists — base is redundant.
         // Do NOT mark accelerated: leave the tracer capturing so the optimize
         // stage still fires (it will skip if already optimized).
@@ -1054,9 +1063,8 @@ async fn existing_sidecar_state(
             SidecarState::Base
         }
     };
-    if state == SidecarState::Absent {
-        info!(image_name = %image_name, "auto-accel sidecar has a stale manifest version; re-converting");
-        return (SidecarState::Absent, None);
+    if state == SidecarState::Stale {
+        return (SidecarState::Stale, None);
     }
     match completeness_check(deps, &existing.digest).await {
         Ok(true) => {}
@@ -1092,11 +1100,11 @@ async fn sidecar_manifest(
         .with_context(|| format!("parse auto-accel config blob {config_digest}"))
 }
 
-/// A sidecar of another manifest version is reconverted; otherwise the prefetch blob tells a
-/// base sidecar from an optimized one.
+/// A sidecar of another manifest version is stale; otherwise the prefetch blob tells a base
+/// sidecar from an optimized one.
 fn sidecar_state_of(manifest: &AutoAccelManifest) -> SidecarState {
     if manifest.version != AUTO_ACCEL_MANIFEST_VERSION {
-        SidecarState::Absent
+        SidecarState::Stale
     } else if manifest.prefetch_blob.is_some() {
         SidecarState::Optimized
     } else {
@@ -1529,7 +1537,7 @@ mod tests {
     }
 
     #[test]
-    fn sidecar_state_treats_stale_manifest_version_as_absent() {
+    fn sidecar_state_treats_other_manifest_versions_as_stale() {
         assert_eq!(
             sidecar_state_of(&manifest(AUTO_ACCEL_MANIFEST_VERSION, false)),
             SidecarState::Base
@@ -1541,7 +1549,7 @@ mod tests {
         // Sidecars written by an older manifest version are reconverted.
         assert_eq!(
             sidecar_state_of(&manifest(AUTO_ACCEL_MANIFEST_VERSION - 1, true)),
-            SidecarState::Absent
+            SidecarState::Stale
         );
     }
 
@@ -1719,8 +1727,9 @@ mod tests {
         };
         let profile = profile("registry.local/app:1");
 
-        manager.try_enqueue_profile(&profile);
-        manager.try_enqueue_profile(&profile);
+        // The tracer logs this result, so a deduplicated settle must not read as queued.
+        assert!(manager.try_enqueue_profile(&profile));
+        assert!(!manager.try_enqueue_profile(&profile));
 
         let queued = receiver.try_recv().unwrap();
         let status = manager.status();
@@ -1741,8 +1750,8 @@ mod tests {
             state: state.clone(),
         };
 
-        manager.try_enqueue_profile(&profile("registry.local/first:1"));
-        manager.try_enqueue_profile(&profile("registry.local/second:1"));
+        assert!(manager.try_enqueue_profile(&profile("registry.local/first:1")));
+        assert!(!manager.try_enqueue_profile(&profile("registry.local/second:1")));
 
         let status = manager.status();
         assert_eq!(status.queued_total, 1);
@@ -1992,10 +2001,18 @@ mod tests {
             JobOrigin::ReconSweep,
             SidecarState::Optimized
         ));
+        // A stale-version sidecar is never served and no base job rebuilds it for a pod that
+        // keeps running, so the sweep must reconvert it rather than wait for a base.
+        assert!(!sweep_job_deferred(
+            AutoZranStage::Optimize,
+            JobOrigin::ReconSweep,
+            SidecarState::Stale
+        ));
         // Base jobs are never gated by this rule, regardless of origin/state.
         for origin in [JobOrigin::Settle, JobOrigin::ReconSweep] {
             for existing in [
                 SidecarState::Absent,
+                SidecarState::Stale,
                 SidecarState::Base,
                 SidecarState::Optimized,
             ] {
