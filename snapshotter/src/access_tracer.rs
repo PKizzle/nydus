@@ -940,8 +940,7 @@ fn flush_profile(inner: &Inner, image_ref: &str, files: Vec<String>) -> Result<(
         .settled_total
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let enqueued = if let Some(auto_zran) = inner.auto_zran.get() {
-        auto_zran.try_enqueue_profile(&profile);
-        true
+        auto_zran.try_enqueue_profile(&profile)
     } else {
         // `set_auto_zran` was never back-filled (see its doc comment): the
         // capture side is fully working (we just persisted a profile), but
