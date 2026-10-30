@@ -674,6 +674,16 @@ fn gzip_layers_from_manifest(
         if is_nydus {
             continue;
         }
+        // zran gives random access into gzip streams only. Checked before the blob lookup so a
+        // zstd image reports why it is not a candidate instead of failing inside the converter
+        // on an unparsable tar header. Both `tar+gzip` (OCI) and `tar.gzip` (Docker) end in gzip.
+        if !layer.media_type.ends_with("gzip") {
+            bail!(
+                "layer {} is {}; node-local acceleration needs gzip layers",
+                layer.digest,
+                layer.media_type
+            );
+        }
         let hex = layer
             .digest
             .strip_prefix("sha256:")
@@ -934,6 +944,23 @@ fn run_first_ok(candidates: &[&[&str]]) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gzip_layers_reject_non_gzip_layers_before_reading_blobs() {
+        let manifest: OciManifest = serde_json::from_value(serde_json::json!({ "layers": [
+            { "digest": "sha256:aa", "mediaType": "application/vnd.oci.image.layer.v1.tar+zstd" },
+        ]}))
+        .unwrap();
+        // The content root does not exist: the media type must be rejected first.
+        let err =
+            gzip_layers_from_manifest(&manifest, "sha256:m", std::path::Path::new("/nonexistent"))
+                .unwrap_err()
+                .to_string();
+        assert!(
+            err.contains("tar+zstd") && err.contains("needs gzip"),
+            "{err}"
+        );
+    }
 
     fn index_from_json(json: serde_json::Value) -> OciIndexWithPlatforms {
         serde_json::from_value(json).expect("valid index JSON")
