@@ -129,11 +129,13 @@ jobs:
             ghcr_repo=${{ env.REGISTRY }}/${GITHUB_REPOSITORY,,}
 
             # push oci image to ghcr/local for zran reference
-            sudo docker pull $I:latest
-            sudo docker tag $I:latest $ghcr_repo/$I
-            sudo docker tag $I:latest localhost:5000/$I
-            sudo DOCKER_CONFIG=$HOME/.docker docker push $ghcr_repo/$I
-            sudo docker push localhost:5000/$I
+            # not docker pull/push: Docker's containerd image store cannot re-push
+            # a pulled multi-arch index whose other platforms it never fetched
+            sudo DOCKER_CONFIG=$HOME/.docker nydusify copy \
+                 --source $I:latest --target $ghcr_repo/$I --platform linux/amd64
+            sudo DOCKER_CONFIG=$HOME/.docker nydusify copy \
+                 --source $I:latest --target localhost:5000/$I --platform linux/amd64 \
+                 --target-plain-http
 
             # for pre-built images
             sudo DOCKER_CONFIG=$HOME/.docker nydusify convert \
