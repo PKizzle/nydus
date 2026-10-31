@@ -115,8 +115,8 @@ reaches containerd through `containerd_grpc.rs`.
 ### Hook point
 
 - `containerd_lookup::gzip_layers_from_manifest` returns a typed error,
-  `LayerError::Missing { digests: Vec<String> }` (thiserror), instead of the formatted string.
-  The other variants keep today's messages.
+  `MissingLayers { manifest, digests }` (thiserror), naming every absent blob instead of the
+  first one. The other failures keep today's messages.
 - `auto_zran::run_conversion` handles `Missing`:
   - call the backfill once;
   - resolve the manifest again;
@@ -133,15 +133,20 @@ reaches containerd through `containerd_grpc.rs`.
 
 - **Source:** `OCIRegistry { reference, resolver { host_dir, auth_stream } }`.
 - **Destination:** `ImageStore` with:
-  - name `nydus.auto-accel.local/backfill:<manifest hex>`;
+  - name `nydus.layer-backfill.local/image:<manifest hex>`, outside the
+    `nydus.auto-accel.local/` prefix that the reconciler and the peer-mirror self-check treat
+    as sidecars;
   - `platforms` set to the host platform only;
   - no `unpacks`.
 
   Without unpacks, containerd's transfer pull (`core/transfer/local/pull.go`) runs its plain
   fetch handler over every descriptor, skipping content that is already present.
+- **Reference:** the image's repository pinned to the resolved manifest digest, so a tag that
+  moved since the pull cannot change what is fetched.
 - **Temporary record:** a dedicated name keeps CRI's own image record and its labels untouched.
   The temporary record also roots the fetched blobs while the transfer runs. Once the transfer
-  finishes, the record is deleted (also when the transfer fails). The blobs then stay referenced
+  finishes, the record is deleted (also when the transfer fails); the worker deletes records a
+  crash left behind when it starts. The blobs then stay referenced
   by the real image's manifest (`containerd.io/gc.ref.content.l.<n>`).
 - **Routing:** `host_dir` is the containerd hosts directory, so the fetch takes the same route as
   a normal pull on that node. On the k3s cluster, that means the embedded registry mirror for
