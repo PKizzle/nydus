@@ -39,6 +39,7 @@ pub mod auto_zran;
 pub mod cache;
 pub mod cgroup;
 pub mod config;
+pub mod containerd_grpc;
 pub mod containerd_lookup;
 pub mod content_store;
 pub mod daemon;

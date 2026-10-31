@@ -130,6 +130,11 @@ prost-types = "0.14"
 # `tower::service_fn` + `hyper_util::rt::TokioIo<tokio::net::UnixStream>`.
 hyper-util = { version = "0.1", features = ["client-legacy"] }
 tower = { version = "0.5", features = ["util"] }
+# HTTP/2 client connection to containerd's gRPC socket, driven by compio through cyper-core's
+# executor, timer and stream adapter (see containerd_grpc.rs). The root manifest patches
+# cyper-core to the vendored copy in third_party/cyper-core.
+hyper = { version = "1.10", features = ["client", "http2"] }
+cyper-core = { version = "0.9", default-features = false }
 # Global allocator for containerd-nydus (see its main.rs): compio owned-buffer
 # completion I/O churns small allocations; mimalloc's thread-local pools help.
 mimalloc = "0.1"
