@@ -3753,12 +3753,17 @@ mod tests {
         assert_eq!(report.clamped, 0);
     }
 
-    /// A daemon shell whose `umount()` blocks like a busy EROFS unmount retry.
-    struct SlowUmountDaemon(BlockdevDaemon);
+    /// A daemon shell whose `umount()` blocks like a busy EROFS unmount retry, until the test
+    /// opens `gate` (or 10 s pass). `opened` records which of the two ended it.
+    struct SlowUmountDaemon {
+        inner: BlockdevDaemon,
+        gate: StdMutex<std::sync::mpsc::Receiver<()>>,
+        opened: Arc<AtomicBool>,
+    }
 
     impl DaemonStateMachineSubscriber for SlowUmountDaemon {
         fn on_event(&self, event: DaemonStateMachineInput) -> nydus_service::Result<()> {
-            self.0.on_event(event)
+            self.inner.on_event(event)
         }
     }
 
@@ -3767,22 +3772,24 @@ mod tests {
             self
         }
         fn id(&self) -> Option<String> {
-            self.0.id()
+            self.inner.id()
         }
         fn version(&self) -> BuildTimeInfo {
-            self.0.version()
+            self.inner.version()
         }
         fn get_state(&self) -> DaemonState {
-            self.0.get_state()
+            self.inner.get_state()
         }
         fn set_state(&self, state: DaemonState) {
-            self.0.set_state(state)
+            self.inner.set_state(state)
         }
         fn start(&self) -> nydus_service::Result<()> {
-            self.0.start()
+            self.inner.start()
         }
         fn umount(&self) -> nydus_service::Result<()> {
-            std::thread::sleep(Duration::from_millis(600));
+            let gate = self.gate.lock().unwrap();
+            let opened = gate.recv_timeout(Duration::from_secs(10)).is_ok();
+            self.opened.store(opened, Ordering::SeqCst);
             Ok(())
         }
         fn wait(&self) -> nydus_service::Result<()> {
@@ -3810,10 +3817,16 @@ mod tests {
         let supervisor = DaemonSupervisor::new(config);
         let runtime = compio::runtime::Runtime::new().unwrap();
         let slow_mnt = dir.path().join("daemons/slow/mnt");
+        let (open_gate, gate) = std::sync::mpsc::channel();
+        let opened = Arc::new(AtomicBool::new(false));
         let slow = test_instance_with_daemon(
             "slow",
             slow_mnt.clone(),
-            Arc::new(SlowUmountDaemon(test_blockdev_daemon(slow_mnt))),
+            Arc::new(SlowUmountDaemon {
+                inner: test_blockdev_daemon(slow_mnt),
+                gate: StdMutex::new(gate),
+                opened: opened.clone(),
+            }),
         );
         slow.acquire_holder("k1");
         let other = test_daemon_instance("other", dir.path().join("daemons/other/mnt"));
@@ -3823,23 +3836,24 @@ mod tests {
             instances.insert("other".to_string(), Arc::new(other));
         });
 
-        let waited = runtime.block_on(async {
-            let start = Instant::now();
-            let (released, waited) = futures::join!(supervisor.release("slow", "k1"), async {
+        // The teardown's unmount stays blocked until the other image has been acquired. An
+        // acquire queued behind the teardown can only finish after the unmount gives up.
+        runtime.block_on(async {
+            let (released, ()) = futures::join!(supervisor.release("slow", "k1"), async {
                 compio::time::sleep(Duration::from_millis(50)).await;
                 supervisor
                     .acquire_live_instance("other", None, "k2")
                     .await
                     .expect("other daemon stays live");
-                start.elapsed()
+                // Fails only once the unmount gave up waiting, which the assert reports.
+                let _ = open_gate.send(());
             });
             released.unwrap();
-            waited
         });
 
         assert!(
-            waited < Duration::from_millis(400),
-            "acquiring another image waited {waited:?} behind a teardown"
+            opened.load(Ordering::SeqCst),
+            "acquiring another image waited behind a teardown"
         );
         let live = runtime.block_on(supervisor.active_slugs());
         assert!(!live.contains(&slug_for("slow")));
