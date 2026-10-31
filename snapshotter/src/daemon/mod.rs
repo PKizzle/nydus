@@ -41,7 +41,7 @@ use tracing::{debug, info, warn};
 
 use crate::config::{FsDriverType, SnapshotterConfig};
 use crate::daemon::config_builder::{
-    build_auto_accel_config, build_blob_cache_entry, build_daemon_config,
+    build_auto_accel_blob_cache_entry, build_blob_cache_entry, build_daemon_config,
 };
 use crate::daemon::image_ref::{ImageRef, parse_image_ref};
 use crate::prefetch_profile::runtime_prefetch_for_image;
@@ -797,18 +797,42 @@ impl DaemonSupervisor {
             Arc::new(Waker::new(poll.registry(), Token(1)).context("failed to create mio Waker")?);
         let poll = Arc::new(Mutex::new(poll));
 
-        let cfg_v2 = build_auto_accel_config(backend_dir, &stage_dir, &mountpoint, &daemon_id);
-        let cfg_json =
-            serde_json::to_value(&cfg_v2).context("failed to serialise auto-accel ConfigV2")?;
+        // The daemon learns its data blobs only from this blob list: without the
+        // bootstrap entry the handler finds no data blob, mounts EROFS without
+        // any `device=`, and every file read fails with EIO.
+        let entry = build_auto_accel_blob_cache_entry(
+            backend_dir,
+            &stage_dir,
+            &mountpoint,
+            &daemon_id,
+            &staged_bootstrap,
+        )?;
+        let cfg_json = serde_json::json!({ "blobs": [entry] });
+        // The process-wide blob factory keys cache managers by config, which is
+        // the same for every start of this image, so it would hand back the
+        // previous daemon's cache entries; drop the idle ones, whose files the
+        // stale daemon-dir sweep may already have deleted.
+        nydus_storage::factory::BLOB_FACTORY.gc(None);
+
+        // Only a mount of this staged bootstrap is healed in place. Any other
+        // one, such as a mount without data devices that answers every read
+        // with EIO, is replaced.
+        if let Some((source, _)) = mount_at(&mountpoint)
+            && Path::new(&source.replace("\\040", " ")) != staged_bootstrap
+        {
+            warn!(image_ref = %image_ref_str, source, "replacing a mount of another bootstrap");
+            detach_mount_stack(&mountpoint)
+                .with_context(|| format!("failed to detach {}", mountpoint.display()))?;
+        }
 
         let supervisor_sock = supervisor_sock_path(&slug);
-        let backend_dir_str = backend_dir.display().to_string();
+        let stage_dir_str = stage_dir.display().to_string();
         let mountpoint_str = mountpoint.display().to_string();
         let threads_str = threads.to_string();
         let daemon = create_daemon(
             Some(daemon_id.clone()),
             Some(supervisor_sock.display().to_string()),
-            Some(&backend_dir_str),
+            Some(&stage_dir_str),
             Some(&mountpoint_str),
             Some(threads_str.as_str()),
             Some(cfg_json),
@@ -3624,7 +3648,12 @@ mod tests {
             .unwrap();
         let mountpoint = handle.mountpoint().to_path_buf();
         assert_eq!(mount_fstype_at(&mountpoint).as_deref(), Some("erofs"));
-        assert!(fs::read_dir(&mountpoint).unwrap().next().is_some());
+        // File data, not just the directory listing the bootstrap alone serves.
+        assert!(
+            fs::read_to_string(mountpoint.join("hello.txt"))
+                .unwrap()
+                .starts_with("RELEASE_OK_")
+        );
 
         runtime
             .block_on(supervisor.release(image_ref, "k1"))
@@ -3634,6 +3663,98 @@ mod tests {
             "EROFS mount at {} outlived its released daemon",
             mountpoint.display()
         );
+    }
+
+    /// Read every regular file under `dir`; returns the file count and the failures.
+    #[cfg(target_os = "linux")]
+    fn read_every_file(dir: &Path) -> (usize, Vec<String>) {
+        let mut total = 0;
+        let mut failed = Vec::new();
+        let mut stack = vec![dir.to_path_buf()];
+        while let Some(d) = stack.pop() {
+            for entry in fs::read_dir(&d).unwrap() {
+                let entry = entry.unwrap();
+                let ft = entry.file_type().unwrap();
+                if ft.is_dir() {
+                    stack.push(entry.path());
+                } else if ft.is_file() {
+                    total += 1;
+                    if let Err(e) = fs::read(entry.path()) {
+                        failed.push(format!("{}: {e}", entry.path().display()));
+                    }
+                }
+            }
+        }
+        (total, failed)
+    }
+
+    /// An auto-accel daemon serves file data, not just metadata, and keeps
+    /// serving it when the image is released and acquired again: after the
+    /// stale daemon-dir sweep deleted its cache, and over a leftover EROFS
+    /// mount that has no data devices. `NYDUS_E2E_ROOT` is an ext4 dir
+    /// holding `artifact/bootstrap` and the localfs `artifact/backend/` of a
+    /// zran image.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "needs root, Linux >= 6.14 and an ext4 work dir; run misc/fanotify/auto-accel-restart-test.sh"]
+    fn auto_accel_daemon_serves_file_data_across_restarts() {
+        let root = PathBuf::from(std::env::var("NYDUS_E2E_ROOT").expect("NYDUS_E2E_ROOT unset"));
+        let bootstrap = root.join("artifact/bootstrap");
+        let backend = root.join("artifact/backend");
+        let mut config = SnapshotterConfig::default();
+        config.snapshotter.root = root.join("snapshotter");
+        let supervisor = DaemonSupervisor::new(config);
+        let runtime = compio::runtime::Runtime::new().unwrap();
+        let image_ref = "e2e.invalid/restart/app:1";
+
+        for round in [
+            "first start",
+            "after the dir sweep",
+            "over a device-less mount",
+        ] {
+            let handle = runtime
+                .block_on(supervisor.ensure_instance_local(image_ref, &bootstrap, &backend, round))
+                .unwrap_or_else(|e| panic!("{round}: {e:#}"));
+            let mountpoint = handle.mountpoint().to_path_buf();
+            let (total, failed) = read_every_file(&mountpoint);
+            assert!(
+                total > 0,
+                "{round}: no files under {}",
+                mountpoint.display()
+            );
+            assert!(
+                failed.is_empty(),
+                "{round}: {} of {total} reads failed: {failed:#?}",
+                failed.len()
+            );
+            drop(handle);
+            runtime
+                .block_on(supervisor.release(image_ref, round))
+                .unwrap();
+            assert!(
+                !is_mounted_at(&mountpoint),
+                "{round}: mount outlived its daemon"
+            );
+
+            let daemon_dir = mountpoint.parent().unwrap();
+            match round {
+                // The recon sweep removes a stopped daemon's dir, cache included.
+                "first start" => fs::remove_dir_all(daemon_dir).unwrap(),
+                // Mount the bootstrap the way earlier releases did: without any
+                // `device=` option, so EROFS reads it as one flat device.
+                "after the dir sweep" => {
+                    fs::create_dir_all(&mountpoint).unwrap();
+                    let status = std::process::Command::new("mount")
+                        .args(["-t", "erofs", "-o", "ro"])
+                        .arg(&bootstrap)
+                        .arg(&mountpoint)
+                        .status()
+                        .unwrap();
+                    assert!(status.success(), "planting a device-less mount failed");
+                }
+                _ => {}
+            }
+        }
     }
 
     #[test]

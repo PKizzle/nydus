@@ -24,6 +24,7 @@
 
 use std::fs::File;
 use std::io::{ErrorKind, Result};
+use std::os::unix::fs::FileExt;
 use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -31,6 +32,7 @@ use std::sync::{Arc, Barrier, Mutex, RwLock};
 
 use mio::unix::SourceFd;
 use mio::{Events, Interest, Poll, Token, Waker};
+use nydus_rafs::metadata::layout::v6::{EROFS_SUPER_OFFSET, RafsV6SuperBlock};
 
 use crate::blob_cache::{BlobCacheMgr, DataBlob};
 use crate::fanotify_sys::{
@@ -646,6 +648,24 @@ impl FanotifyHandler {
                 ))
             })?;
             device_blobs.push(device_path);
+        }
+
+        // EROFS mounts a multi-device image given no `device=` option as one flat device, so
+        // every data read lands past the bootstrap's end and fails with EIO. Refuse unless each
+        // device in the bootstrap's table is backed, e.g. when no blob-cache entry was registered
+        // for this bootstrap or a data blob failed to open above.
+        let mut sb = RafsV6SuperBlock::new();
+        File::open(&bootstrap_path)?.read_exact_at(sb.as_mut(), EROFS_SUPER_OFFSET as u64)?;
+        if device_blobs.len() != sb.extra_devices() as usize {
+            return Err(std::io::Error::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "fanotify: bootstrap {} has {} data devices but {} data blobs are backed",
+                    bootstrap_path.display(),
+                    sb.extra_devices(),
+                    device_blobs.len()
+                ),
+            ));
         }
 
         Ok(FanotifyHandler {
@@ -1540,6 +1560,33 @@ mod tests {
     }
 
     use super::*;
+
+    /// A bootstrap with data devices and no registered data blob would mount as one flat
+    /// device and answer every file read with EIO, so the handler must refuse it.
+    #[test]
+    fn test_refuses_bootstrap_whose_devices_have_no_data_blob() {
+        let dir = vmm_sys_util::tempdir::TempDir::new().unwrap();
+        let root = std::env::var("CARGO_MANIFEST_DIR").unwrap();
+        // This bootstrap's device table holds one data blob.
+        std::fs::copy(
+            format!("{root}/../tests/texture/bootstrap/rafs-v6-2.2.boot"),
+            dir.as_path().join("bootstrap"),
+        )
+        .unwrap();
+        // Any pollable fd stands in for a group fd: the check runs before it is used.
+        let group = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC) };
+        assert!(group >= 0);
+        let err = FanotifyHandler::from_restored_fd(
+            dir.as_path().to_str().unwrap(),
+            dir.as_path().join("mnt").to_str().unwrap(),
+            Arc::new(BlobCacheMgr::new()),
+            1,
+            unsafe { File::from_raw_fd(group) },
+        )
+        .err()
+        .expect("a handler without data blobs must be refused");
+        assert_eq!(err.kind(), ErrorKind::InvalidInput, "{err}");
+    }
 
     /// Serialize a `fanotify_event_info_range` record to raw bytes.
     fn range_record(offset: u64, count: u64) -> Vec<u8> {

@@ -376,7 +376,11 @@ pub fn build_auto_accel_config(
         cache_compressed: false,
         cache_validate: false,
         prefetch: Default::default(),
-        file_cache: None,
+        // The fanotify cache is a file cache whose `.blob.data` files are the EROFS devices.
+        file_cache: Some(FileCacheConfig {
+            work_dir: stage_dir.display().to_string(),
+            ..Default::default()
+        }),
         fanotify: Some(FanotifyConfig {
             work_dir: stage_dir.display().to_string(),
             mountpoint: daemon_mountpoint.display().to_string(),
