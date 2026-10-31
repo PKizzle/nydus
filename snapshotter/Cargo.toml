@@ -135,6 +135,9 @@ tower = { version = "0.5", features = ["util"] }
 # cyper-core to the vendored copy in third_party/cyper-core.
 hyper = { version = "1.10", features = ["client", "http2"] }
 cyper-core = { version = "0.9", default-features = false }
+# Marks the containerd channel's future `Send` for containerd-snapshots' handlers while asserting
+# it is only polled on its compio thread (see containerd_grpc.rs).
+send_wrapper = { version = "0.6", features = ["futures"] }
 # Global allocator for containerd-nydus (see its main.rs): compio owned-buffer
 # completion I/O churns small allocations; mimalloc's thread-local pools help.
 mimalloc = "0.1"
