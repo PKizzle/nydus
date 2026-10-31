@@ -2,22 +2,24 @@
 //
 // SPDX-License-Identifier: (Apache-2.0 AND BSD-3-Clause)
 
-//! Node-local acceleration: convert a standard OCI image's gzip layers into a RAFS v6 + zran
-//! artifact **locally**, with no registry push and no image-tag change, then serve it on demand
-//! through the fanotify pre-content path.
+//! Node-local acceleration: convert a standard OCI image's layers into a RAFS v6 artifact that
+//! references them in place, **locally**, with no registry push and no image-tag change, then
+//! serve it on demand through the fanotify pre-content path. gzip layers are referenced through
+//! zran, zstd layers through contexts starting at zstd frame boundaries, and uncompressed tar
+//! layers directly; `nydus-image create --type targz-ref` picks the method from the layer bytes.
 //!
-//! The data model (verified end-to-end): in OCI a gzip layer's digest *is* the sha256 of its
-//! compressed bytes, and that is exactly the id nydus uses for the referenced zran data blob and
+//! The data model (verified end-to-end): in OCI a layer's digest *is* the sha256 of its
+//! compressed bytes, and that is exactly the id nydus uses for the referenced data blob and
 //! the key containerd's content store files it under. So a `localfs` backend pointed at the content
 //! store serves the layers byte-for-byte with zero re-download; the only new artifacts are the
 //! merged bootstrap and the tiny per-layer zran index blobs, generated here.
 //!
 //! Pipeline (each step is a verified `nydus-image` invocation — see
 //! `misc/fanotify/zran-multilayer-test.sh`):
-//!   1. for each gzip layer:  `nydus-image create --type targz-ref --fs-version 6 -B <b_i> -D <d_i> <layer>`
+//!   1. for each layer:       `nydus-image create --type targz-ref --fs-version 6 -B <b_i> -D <d_i> <layer>`
 //!   2. merge:                `nydus-image merge -B <bootstrap> --original-blob-ids <d0,d1,..> <b0> <b1> ..`
-//!   3. stage a `localfs` backend dir holding the gzip layers (symlinked from the content store,
-//!      keyed by digest) plus the per-layer zran index blobs.
+//!   3. stage a `localfs` backend dir holding the layers (symlinked from the content store,
+//!      keyed by digest) plus the per-layer index blobs.
 //!
 //! The resulting `(bootstrap, backend_dir, work_dir)` feeds a fanotify `BlobCacheEntry`; the
 //! `FanotifyHandler` self-stages the EROFS device files and serves reads on demand.
@@ -31,17 +33,17 @@ use serde::{Deserialize, Serialize};
 
 use crate::auto_zran::AUTO_ACCEL_MANIFEST_VERSION;
 
-/// A gzip layer of the source image as it exists in containerd's content store.
+/// A layer of the source image (tar, gzip or zstd) as it exists in containerd's content store.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct GzipLayer {
-    /// OCI digest of the gzip layer (`sha256:...` or bare hex). This is also the nydus zran data
-    /// blob id and the content-store key.
+pub struct SourceLayer {
+    /// OCI digest of the layer (`sha256:...` or bare hex). This is also the nydus data blob id
+    /// and the content-store key.
     pub digest: String,
-    /// Path to the gzip layer blob in the content store.
+    /// Path to the layer blob in the content store.
     pub path: PathBuf,
 }
 
-impl GzipLayer {
+impl SourceLayer {
     /// Bare lowercase hex of the digest (strips an optional `sha256:` / `algo:` prefix), which is
     /// how nydus names the data blob and how the localfs backend files it.
     pub fn blob_id(&self) -> &str {
@@ -285,7 +287,7 @@ fn expect_single_output(dir: &Path, exclude: Option<&Path>) -> Result<PathBuf> {
 /// empty the optimize step is skipped and `prefetch_blob_id` is `None`.
 pub fn convert(
     config: &LocalAccelConfig,
-    layers: &[GzipLayer],
+    layers: &[SourceLayer],
     prefetch_files: &[String],
 ) -> Result<NodeLocalArtifact> {
     if layers.is_empty() {
@@ -536,12 +538,12 @@ mod tests {
 
     #[test]
     fn blob_id_strips_algorithm_prefix() {
-        let l = GzipLayer {
+        let l = SourceLayer {
             digest: "sha256:deadbeef".into(),
             path: "/x".into(),
         };
         assert_eq!(l.blob_id(), "deadbeef");
-        let l2 = GzipLayer {
+        let l2 = SourceLayer {
             digest: "cafef00d".into(),
             path: "/x".into(),
         };

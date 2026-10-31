@@ -28,6 +28,7 @@ cargo run -p nydus-snapshotter --bin containerd-nydus -- --config /etc/nydus/con
 sudo NYDUS_IMAGE=./target/release/nydus-image NYDUSD=./target/release/nydusd \
   misc/fanotify/runtime-test.sh         # plain blob fetch path
 sudo misc/fanotify/zran-multilayer-test.sh   # node-local zran convert + merge + serve
+sudo misc/fanotify/ref-layer-formats-test.sh # gzip + tar + multi/single-frame zstd layers, one image
 sudo misc/fanotify/precontent-cases.sh       # fail-closed + strace ground truth + ENOSPC (needs strace)
 # Any of the image-building checks at another EROFS block size (must not exceed the page size)
 sudo BLOCK_SIZE=16384 NYDUS_IMAGE=... NYDUSD=... misc/fanotify/runtime-test.sh
@@ -167,8 +168,8 @@ nydus/
 The intended way to accelerate a **standard OCI image** is node-local and registry-free: no second
 tag, no pushed artifact, `original:tag` is served faster than the original. Mechanism:
 
-1. `original:tag` is pulled normally (P2P via spegel); its gzip layers land in containerd's content
-   store keyed by digest. **An OCI gzip-layer digest is exactly the nydus zran data-blob id and the
+1. `original:tag` is pulled normally (P2P via spegel); its layers land in containerd's content
+   store keyed by digest. **An OCI layer digest is exactly the nydus data-blob id and the
    content-store key**, so a `localfs` backend over the content store serves layers with zero
    re-download. containerd skips fetching a layer whose snapshot already exists, so a blob
    garbage-collected while its snapshot lived on stays missing; before converting, the worker
@@ -177,8 +178,13 @@ tag, no pushed artifact, `original:tag` is served faster than the original. Mech
 2. `snapshotter/src/local_accel.rs::convert()` builds a RAFS v6 + zran artifact **locally**:
    `nydus-image create --type targz-ref --fs-version 6` per layer, then `nydus-image merge
    --original-blob-ids <digests>`. The only new blobs are the merged bootstrap and tiny per-layer
-   zran index blobs.
-3. The artifact is served on demand through the fanotify path (gzip ranges decompressed lazily into
+   index blobs. `targz-ref` sniffs each layer: gzip gets zran contexts, uncompressed tar is
+   referenced directly, and zstd gets zran-layout contexts with empty dictionaries that start at
+   zstd frame boundaries (the blob records `compressor = zstd`). zstd cannot resume inside a frame,
+   so a context larger than `RAFS_MAX_CHUNK_SIZE` (single-frame layers) is served by a per-blob
+   forward decoding cursor (`ZstdStreamCursor`) instead of being read into memory; a read behind
+   the cursor restarts at the frame start.
+3. The artifact is served on demand through the fanotify path (compressed ranges decoded lazily into
    the cache), so the container starts before the image is fully materialised.
 
 Status: **fully wired end-to-end.** The conversion + serving pipeline is verified (single +
