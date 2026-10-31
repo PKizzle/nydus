@@ -308,14 +308,6 @@ impl SidecarLocator {
         ensure_present(&bootstrap_src, "bootstrap")?;
         let bootstrap_dst = stage_dir.join("bootstrap");
         copy_atomic(&bootstrap_src, &bootstrap_dst)?;
-        // 5. The daemon's fanotify service discovers its inputs from the
-        //    backend dir alone (`service/src/fanotify.rs::discover_blobs`
-        //    requires a file literally named `bootstrap` next to the data
-        //    blobs), so the bootstrap must ALSO live inside backend_dir —
-        //    without it `ensure_instance_local` fails with "no bootstrap
-        //    file in blob directory" on every node.
-        let backend_bootstrap = backend_dir.join("bootstrap");
-        copy_atomic(&bootstrap_src, &backend_bootstrap)?;
 
         Ok(StagedSidecar {
             bootstrap: bootstrap_dst,

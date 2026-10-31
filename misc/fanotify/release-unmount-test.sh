@@ -24,7 +24,6 @@ META=$(ls "$ROOT/out" | grep -v "^$(basename "$BOOTSTRAP")\$" | head -1)
 cp "$ROOT/layer.tar.gz" "$ROOT/artifact/backend/$DATA"
 cp "$ROOT/out/$META" "$ROOT/artifact/backend/$META"
 cp "$BOOTSTRAP" "$ROOT/artifact/bootstrap"
-cp "$BOOTSTRAP" "$ROOT/artifact/backend/bootstrap"   # the staged sidecar layout has it beside the blobs
 
 NYDUS_E2E_ROOT="$ROOT" "$CARGO" test -p nydus-snapshotter --lib \
   daemon::tests::release_unmounts_fanotify_erofs -- --ignored --exact --nocapture \
