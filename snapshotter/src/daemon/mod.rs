@@ -1128,10 +1128,11 @@ impl DaemonSupervisor {
     ///
     /// FUSE mounts round-trip the daemon with a readdir on a dedicated thread
     /// bounded by `timeout` — a daemonless fuse mount either errors
-    /// (`ENOTCONN`) or hangs, both reported dead. Kernel (EROFS) mounts serve
-    /// reads regardless of daemon state, so their health is the handler's
-    /// state (a dead handler means unmaterialized ranges stop filling). An
-    /// instance whose mountpoint has nothing mounted at all is dead outright.
+    /// (`ENOTCONN`) or hangs, both reported dead. Kernel (EROFS) mounts need a
+    /// healthy handler state and must serve one byte of file data the same way:
+    /// a directory listing comes from the bootstrap alone and passes even on a
+    /// mount whose data devices are missing. An instance whose mountpoint has
+    /// nothing mounted at all is dead outright.
     ///
     /// The blocking waits run through `blocking::unblock`, never on the compio
     /// reactor. A probe that times out leaves its thread behind (a D-state
@@ -1159,9 +1160,19 @@ impl DaemonSupervisor {
         for (slug, image_ref, mountpoint, state) in instances {
             let fstype = mount_fstype_at(&mountpoint);
             let started = Instant::now();
+            let state_str = format!("{state:?}");
+            let state_ok = is_healthy_state(state);
             let (healthy, error) = match fstype.as_deref() {
                 None => (false, Some("nothing mounted at the mountpoint".to_string())),
-                Some(t) if t.contains("fuse") => {
+                Some(t) if !t.contains("fuse") && !state_ok => {
+                    (false, Some(format!("daemon state {state_str}")))
+                }
+                Some(t) => {
+                    let probe: fn(&Path) -> Result<(), String> = if t.contains("fuse") {
+                        readdir_probe
+                    } else {
+                        read_data_probe
+                    };
                     if self.probe_backoff_active(&slug, timeout) {
                         (false, Some("previous probe still hung".to_string()))
                     } else {
@@ -1169,8 +1180,7 @@ impl DaemonSupervisor {
                             .lock()
                             .unwrap()
                             .insert(slug.clone(), Instant::now());
-                        let outcome = probe_readdir_with_timeout(mountpoint.clone(), timeout).await;
-                        match outcome {
+                        match probe_with_timeout(mountpoint.clone(), timeout, probe).await {
                             ProbeOutcome::Ok => {
                                 self.probes_in_flight.lock().unwrap().remove(&slug);
                                 (true, None)
@@ -1186,16 +1196,6 @@ impl DaemonSupervisor {
                                 (false, Some(format!("probe timed out after {timeout:?}")))
                             }
                         }
-                    }
-                }
-                Some(_) => {
-                    // Kernel mount: reads are served by the kernel; the daemon
-                    // must be healthy for on-demand fills to keep working.
-                    let state_str = format!("{state:?}");
-                    if is_healthy_state(state) {
-                        (true, None)
-                    } else {
-                        (false, Some(format!("daemon state {state_str}")))
                     }
                 }
             };
@@ -3145,27 +3145,64 @@ enum ProbeOutcome {
 /// `timeout`. The wait happens on the blocking pool, never the compio reactor.
 /// On timeout the probe thread is abandoned (it may be stuck in
 /// uninterruptible I/O and cannot be cancelled); callers bound re-probing.
-async fn probe_readdir_with_timeout(mountpoint: PathBuf, timeout: Duration) -> ProbeOutcome {
+async fn probe_with_timeout(
+    mountpoint: PathBuf,
+    timeout: Duration,
+    probe: fn(&Path) -> Result<(), String>,
+) -> ProbeOutcome {
     blocking::unblock(move || {
         let (tx, rx) = std::sync::mpsc::channel();
         let spawned = std::thread::Builder::new()
             .name("nydus-mount-probe".into())
             .spawn(move || {
-                let result = fs::read_dir(&mountpoint)
-                    .and_then(|mut entries| entries.next().transpose())
-                    .map(|_| ());
-                let _ = tx.send(result);
+                let _ = tx.send(probe(&mountpoint));
             });
         if let Err(e) = spawned {
             return ProbeOutcome::Error(format!("failed to spawn probe thread: {e}"));
         }
         match rx.recv_timeout(timeout) {
             Ok(Ok(())) => ProbeOutcome::Ok,
-            Ok(Err(e)) => ProbeOutcome::Error(e.to_string()),
+            Ok(Err(e)) => ProbeOutcome::Error(e),
             Err(_) => ProbeOutcome::TimedOut,
         }
     })
     .await
+}
+
+fn readdir_probe(mountpoint: &Path) -> Result<(), String> {
+    fs::read_dir(mountpoint)
+        .and_then(|mut entries| entries.next().transpose())
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
+/// Read one byte of the first non-empty regular file found breadth-first within
+/// `READ_PROBE_ENTRIES` directory entries; a mount with no such file passes.
+fn read_data_probe(mountpoint: &Path) -> Result<(), String> {
+    use std::io::Read;
+    const READ_PROBE_ENTRIES: usize = 256;
+    let failed = |path: &Path, e: std::io::Error| format!("{}: {e}", path.display());
+    let mut dirs = std::collections::VecDeque::from([mountpoint.to_path_buf()]);
+    let mut seen = 0;
+    while let Some(dir) = dirs.pop_front() {
+        for entry in fs::read_dir(&dir).map_err(|e| failed(&dir, e))? {
+            seen += 1;
+            if seen > READ_PROBE_ENTRIES {
+                return Ok(());
+            }
+            let entry = entry.map_err(|e| failed(&dir, e))?;
+            let path = entry.path();
+            let meta = entry.metadata().map_err(|e| failed(&path, e))?;
+            if meta.is_dir() {
+                dirs.push_back(path);
+            } else if meta.is_file() && meta.len() > 0 {
+                return fs::File::open(&path)
+                    .and_then(|mut f| f.read_exact(&mut [0u8; 1]))
+                    .map_err(|e| failed(&path, e));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Number of overlay mounts whose `lowerdir=` chain references `mountpoint` —
@@ -3782,17 +3819,34 @@ mod tests {
         let runtime = compio::runtime::Runtime::new().unwrap();
         let dir = tempfile::tempdir().unwrap();
         // Healthy: readable directory.
-        let outcome = runtime.block_on(probe_readdir_with_timeout(
+        let outcome = runtime.block_on(probe_with_timeout(
             dir.path().to_path_buf(),
             Duration::from_secs(2),
+            readdir_probe,
         ));
         assert!(matches!(outcome, ProbeOutcome::Ok), "got {outcome:?}");
         // Error: nonexistent path.
-        let outcome = runtime.block_on(probe_readdir_with_timeout(
+        let outcome = runtime.block_on(probe_with_timeout(
             dir.path().join("missing"),
             Duration::from_secs(2),
+            readdir_probe,
         ));
         assert!(matches!(outcome, ProbeOutcome::Error(_)), "got {outcome:?}");
+    }
+
+    #[test]
+    fn read_data_probe_reads_the_first_non_empty_file() {
+        let dir = tempfile::tempdir().unwrap();
+        // Nothing to read: a mount without non-empty files passes.
+        assert_eq!(read_data_probe(dir.path()), Ok(()));
+        fs::write(dir.path().join("empty"), b"").unwrap();
+        fs::create_dir(dir.path().join("etc")).unwrap();
+        fs::write(dir.path().join("etc/passwd"), b"root:x:0:0").unwrap();
+        assert_eq!(read_data_probe(dir.path()), Ok(()));
+        // A path that cannot be listed is reported with the path.
+        let missing = dir.path().join("missing");
+        let err = read_data_probe(&missing).unwrap_err();
+        assert!(err.contains("missing"), "{err}");
     }
 
     #[test]
