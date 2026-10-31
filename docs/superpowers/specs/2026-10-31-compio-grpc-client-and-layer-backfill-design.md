@@ -31,10 +31,9 @@ deletes the unreferenced blob; the next image with the same layer is pulled with
 
 Evidence:
 
-- On `raspberrypi-5-1`, 25 images lack at least one layer blob. Every missing blob belongs to a
-  layer whose snapshot was created before the image now referencing it was pulled. One example
-  is Home Assistant's base layer: its snapshot dates from 2026-07-16, and the four manifests that
-  reference it arrived between 2026-08-29 and 2026-10-12.
+- On a long-running node, about two dozen images lacked at least one layer blob. Every missing
+  blob belonged to a layer whose snapshot was created before the image now referencing it was
+  pulled.
 - Reproduced with a private containerd 2.2.2. The steps are: pull `alpine:3.20`, create a
   container, run `images rm --sync` (the layer blob is deleted, the snapshots remain), then pull
   again. The second pull transfers about 30 KB and the layer blob stays absent.
@@ -175,7 +174,7 @@ The stream is closed when the transfer ends. Credential values are never logged.
 - the `k3s` profile preset sets `/var/lib/rancher/k3s/agent/etc/containerd/certs.d`;
 - the stock profile leaves it unset, so containerd uses its default resolver.
 
-No change is needed in k3s-config.
+No change is needed in the node's containerd or k3s configuration.
 
 ### Observability
 
@@ -204,9 +203,8 @@ No change is needed in k3s-config.
 
 ## Deployment
 
-- **Part 1:** canary on `raspberrypi-4-1`. Check that `Prepare`, sidecar upload and peer sidecar
+- **Part 1:** canary on one node. Check that `Prepare`, sidecar upload and peer sidecar
   resolution work, and that no containerd errors appear over a soak, before the other nodes.
-- **Part 2:** on `raspberrypi-5-1`, the existing gaps in gzip images (cert-manager, coredns,
-  cloudnative-pg) exercise the backfill. Home Assistant is zstd, so the non-gzip check
-  (PKizzle/nydus#24) rejects it before any blob lookup; it is not a backfill case until zstd
-  support exists.
+- **Part 2:** a node with existing gaps in gzip images exercises the backfill. zstd images are
+  rejected before any blob lookup by the non-gzip check (PKizzle/nydus#24); they are not a
+  backfill case until zstd support exists.

@@ -1162,7 +1162,7 @@ End the body with:
 
 - [ ] **Step 3: Canary (after merge and release, with the user's go-ahead)**
 
-On `raspberrypi-4-1` only, check over a soak of at least an hour:
+On a single canary node only, check over a soak of at least an hour:
 
 ```bash
 sudo journalctl -u nydus-snapshotter --since "-1h" -o cat | grep -ciE "containerd (Info|Read|Write|Images)|failed to connect to containerd"

@@ -31,8 +31,8 @@ One image may mix all three. Each layer picks its route from its media type.
   unit.
 - Most zstd layers in practice are one frame (Home Assistant: 22 of 22). Decode throughput,
   single-threaded, measured with Home Assistant's largest layer (376 MiB compressed,
-  1394 MiB decompressed): 330 MiB/s on raspberrypi-5-1 (4.2 s for the whole layer) and
-  100–130 MiB/s on raspberrypi-4-1 (10.5–13.8 s).
+  1394 MiB decompressed): 330 MiB/s on a Raspberry Pi 5 (4.2 s for the whole layer) and
+  100–130 MiB/s on a Raspberry Pi 4 (10.5–13.8 s).
 
 ## Design
 
@@ -104,4 +104,4 @@ with an empty dictionary whose `in_offset` is a frame start.
   gzip, uncompressed, multi-frame zstd and single-frame zstd layers is converted, merged,
   mounted through fanotify/EROFS and compared file by file with the unpacked tars.
 - **snapshotter unit tests:** media-type selection.
-- **Cluster:** on raspberrypi-5-1, Home Assistant converts and starts from the accelerated mount.
+- **Deployment:** Home Assistant converts and starts from the accelerated mount on a Raspberry Pi 5.
