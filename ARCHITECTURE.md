@@ -76,6 +76,15 @@ fanotify (≥6.14, CAP_SYS_ADMIN) → fusedev (/dev/fuse) → blockdev (loop/NBD
   `grpc.health.v1.Health` service are served by **cyper-axum** (hyper-on-compio) over a `tonic`
   `Routes` router — no tokio runtime, no second transport (`snapshotter/src/grpc/mod.rs`). The same
   hyper-on-compio server backs the sysctl UDS admin API (`snapshotter/src/sysctl.rs`).
+- **gRPC client to containerd**: the Content/Images clients (`snapshotter/src/content_store.rs`)
+  are tonic's generated clients on `ContainerdChannel` (`snapshotter/src/containerd_grpc.rs`), a
+  tower service that speaks HTTP/2 over containerd's Unix socket with hyper's client connection on
+  compio (`cyper_core::{HyperStream, CompioExecutor, CompioTimer}`). tonic contributes generated
+  code and the codec only. The channel caches one connection per thread (the connection task and
+  `HyperStream` are pinned to their compio thread), sets the `containerd-namespace` header, and
+  replaces a closed connection on the next call without retrying the failed one. Its future is
+  wrapped in `send_wrapper::SendWrapper` because containerd-snapshots' handler futures must be
+  `Send`; compio never moves a task between threads.
 - **In-process nydus-service (FUSE/fanotify) I/O**: has **zero tokio** (Decision 3).
   This is the `service/` crate, linked in-process. The fanotify event loop is `mio`-poll plus
   blocking libc reads on its own OS thread (`service/src/fanotify.rs`); FUSE runs synchronous
@@ -84,14 +93,12 @@ fanotify (≥6.14, CAP_SYS_ADMIN) → fusedev (/dev/fuse) → blockdev (loop/NBD
   in place of tokio's `select!`/broadcast/time. `service/Cargo.toml` carries no tokio dependency at
   all. `nydus-storage`'s default build is likewise tokio-free — `tokio` is `optional = true`,
   gated behind the non-default `backend-dragonfly-proxy` feature (own tokio runtime for the
-  Dragonfly SDK proxy path only). The one deliberately-spawned tokio runtime is the isolated
-  2-worker runtime in `snapshotter/src/content_store.rs` that drives the tonic *client* to
-  containerd's Content/Images gRPC (tonic transport pins its futures to a tokio reactor); it is
-  quarantined behind `blocking::unblock` + `handle.block_on` and dropped on teardown, so it never
-  runs on a nydusd session thread and compio still owns the snapshotter's event loop. Otherwise the
-  `tokio` crate shows up in `cargo tree` for the `containerd-nydus` binary only because
-  `h2`/`hyper`/`tonic`/`cyper-axum` pull it in for trait/type compatibility — nothing else spawns a
-  runtime. Never hand any nydusd session thread a tokio runtime handle.
+  Dragonfly SDK proxy path only). The snapshotter starts no tokio runtime at all: the `tokio`
+  crate shows up in `cargo tree` for the `containerd-nydus` binary only because
+  `h2`/`hyper`/`tonic`/`cyper-axum` pull it in for trait/type compatibility. tonic's `transport`
+  feature is still compiled, solely because containerd-snapshots' generated client names
+  `tonic::transport::Channel` (see `snapshotter/Cargo.toml`); nothing calls it. Never start a tokio
+  runtime in the snapshotter or hand one to a nydusd session thread.
 - **Metadata store**: **fjall** — an embedded LSM key/value store — one serialized snapshot record
   per key (`snapshotter/src/store/mod.rs`, on-disk dir `metadata.fjall`). Replaces the Go
   snapshotter's bbolt `MetaStore`; there is no SQL/relational schema and no SQLite. The journal is
