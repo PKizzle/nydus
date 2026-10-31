@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::meta::{MetaError, MetaResult};
+use nydus_utils::filemap::FromMapped;
 use std::fmt::{Display, Formatter};
 use std::sync::atomic::{AtomicU8, Ordering};
 
@@ -36,6 +37,8 @@ pub struct BlobChunkInfoV2Ondisk {
     // attached misc data
     pub(crate) data: u64,
 }
+
+unsafe impl FromMapped for BlobChunkInfoV2Ondisk {}
 
 impl BlobChunkInfoV2Ondisk {
     pub(crate) fn set_compressed(&mut self, compressed: bool) {

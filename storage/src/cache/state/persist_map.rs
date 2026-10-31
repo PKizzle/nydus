@@ -4,12 +4,12 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::fs::{File, OpenOptions};
-use std::io::Write;
+use std::io::{self, Write};
 use std::os::unix::io::AsRawFd;
 use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
 
 use nydus_utils::div_round_up;
-use nydus_utils::filemap::{FileMapState, clone_file};
+use nydus_utils::filemap::{FileMapState, FromMapped, clone_file};
 
 use crate::utils::readahead;
 use crate::{StorageError, StorageResult};
@@ -31,6 +31,8 @@ pub(crate) struct Header {
     pub reserved: [u8; HEADER_RESERVED_SIZE],
 }
 
+unsafe impl FromMapped for Header {}
+
 impl Header {
     pub fn as_slice(&self) -> &[u8] {
         unsafe {
@@ -40,6 +42,30 @@ impl Header {
             )
         }
     }
+}
+
+/// Get the byte at `offset` in a chunk map mapping as an atomic.
+fn atomic_byte(filemap: &FileMapState, offset: usize) -> io::Result<&AtomicU8> {
+    let ptr = filemap.validate_range(offset, 1)?;
+    // Safe because the byte is in the writable mapping, which outlives the reference. The bitmap
+    // is only ever accessed atomically, and the header is only read this way before it's written.
+    Ok(unsafe { AtomicU8::from_ptr(ptr.cast_mut()) })
+}
+
+/// Get the header's `all_ready` word in a chunk map mapping as an atomic.
+fn atomic_all_ready(filemap: &FileMapState) -> io::Result<&AtomicU32> {
+    let ptr = filemap
+        .validate_range(std::mem::offset_of!(Header, all_ready), size_of::<u32>())?
+        .cast::<u32>();
+    if !ptr.is_aligned() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "unaligned chunk map header",
+        ));
+    }
+    // Safe because the word is aligned and in the writable mapping, which outlives the reference,
+    // and once the map is open the word is only accessed atomically.
+    Ok(unsafe { AtomicU32::from_ptr(ptr.cast_mut()) })
 }
 
 pub(crate) struct PersistMap {
@@ -68,6 +94,15 @@ impl PersistMap {
             .truncate(!persist)
             .open(filename)
             .map_err(|err| StorageError::cache_io("open the chunk map file", err))?;
+        // Other processes sharing the cache directory may open the same file, so initialize and
+        // check it under a file lock. Outside the lock only the bitmap changes, through atomic
+        // operations.
+        if create {
+            file.lock()
+        } else {
+            file.lock_shared()
+        }
+        .map_err(|e| StorageError::cache_io("lock the chunk map file", e))?;
 
         let file_size = file
             .metadata()
@@ -98,7 +133,10 @@ impl PersistMap {
 
         let file2 = clone_file(file.as_raw_fd())
             .map_err(|e| StorageError::cache_io("dup the chunk map fd", e))?;
-        let mut filemap = FileMapState::new(file2, 0, expected_size as usize, true)
+        // Safe because the header is written through `file` only under the exclusive file lock,
+        // while no reference into the mapping is alive, and the bitmap is accessed only through
+        // atomic operations.
+        let mut filemap = unsafe { FileMapState::new(file2, 0, expected_size as usize, true) }
             .map_err(|e| StorageError::cache_io("mmap the chunk map file", e))?;
         let header = unsafe { filemap.get_mut::<Header>(0) }
             .map_err(|e| StorageError::cache_io("reach the chunk map contents", e))?;
@@ -109,13 +147,12 @@ impl PersistMap {
                 ));
             }
 
-            // There's race window between "file.set_len()" and "file.write(&header)". If that
-            // happens, all file content should be zero. Detect the race window and write out
-            // header again to fix it.
-            let content = unsafe { filemap.get_slice::<u8>(0, expected_size as usize) }
-                .map_err(|e| StorageError::cache_io("reach the chunk map contents", e))?;
-            for c in content {
-                if *c != 0 {
+            // A process that stopped between "file.set_len()" and "file.write(&header)" leaves a
+            // file whose content is all zero. Detect that and write out the header again.
+            for idx in 0..expected_size as usize {
+                let byte = atomic_byte(&filemap, idx)
+                    .map_err(|e| StorageError::cache_io("reach the chunk map contents", e))?;
+                if byte.load(Ordering::Acquire) != 0 {
                     return Err(StorageError::InvalidData(format!(
                         "invalid blob chunk_map file header: {:?}",
                         filename
@@ -144,7 +181,7 @@ impl PersistMap {
             } else {
                 let mut ready_count = 0;
                 for idx in HEADER_SIZE..expected_size as usize {
-                    let current = unsafe { filemap.get_ref::<AtomicU8>(idx) }
+                    let current = atomic_byte(&filemap, idx)
                         .map_err(|e| StorageError::cache_io("reach the chunk map contents", e))?;
                     let val = current.load(Ordering::Acquire);
                     ready_count += val.count_ones() as u32;
@@ -161,6 +198,10 @@ impl PersistMap {
                 }
             }
         }
+
+        // The mapping holds a duplicate of `file`, which shares the lock, so release it explicitly.
+        file.unlock()
+            .map_err(|e| StorageError::cache_io("unlock the chunk map file", e))?;
 
         readahead(file.as_raw_fd(), 0, expected_size);
         if !persist {
@@ -217,7 +258,7 @@ impl PersistMap {
     #[inline]
     fn read_u8(&self, idx: u32) -> u8 {
         let start = HEADER_SIZE + (idx as usize >> 3);
-        let current = unsafe { self.filemap.get_ref::<AtomicU8>(start) }.unwrap();
+        let current = atomic_byte(&self.filemap, start).unwrap();
 
         current.load(Ordering::Acquire)
     }
@@ -227,7 +268,7 @@ impl PersistMap {
         let mask = Self::index_to_mask(idx);
         let expected = current | mask;
         let start = HEADER_SIZE + (idx as usize >> 3);
-        let atomic_value = unsafe { self.filemap.get_ref::<AtomicU8>(start) }.unwrap();
+        let atomic_value = atomic_byte(&self.filemap, start).unwrap();
 
         atomic_value
             .compare_exchange(current, expected, Ordering::Acquire, Ordering::Relaxed)
@@ -303,17 +344,14 @@ impl PersistMap {
         // bitmap is being zeroed a concurrent reader must not still see "all ready".
         //
         // Written through an `AtomicU32` rather than `get_mut::<Header>`, which needs `&mut
-        // self` the `Arc<dyn ChunkMap>` this hangs off cannot provide. `offset_of!` keeps the
-        // two views of the header from drifting apart.
-        let all_ready = unsafe {
-            self.filemap
-                .get_ref::<AtomicU32>(std::mem::offset_of!(Header, all_ready))
-        }
-        .map_err(|e| StorageError::cache_io("reach the chunk map contents", e))?;
+        // self` the `Arc<dyn ChunkMap>` this hangs off cannot provide. `atomic_all_ready` uses
+        // `offset_of!` to keep the two views of the header from drifting apart.
+        let all_ready = atomic_all_ready(&self.filemap)
+            .map_err(|e| StorageError::cache_io("reach the chunk map contents", e))?;
         all_ready.store(0, Ordering::Release);
 
         for idx in HEADER_SIZE..size {
-            let byte = unsafe { self.filemap.get_ref::<AtomicU8>(idx) }
+            let byte = atomic_byte(&self.filemap, idx)
                 .map_err(|e| StorageError::cache_io("reach the chunk map contents", e))?;
             byte.store(0, Ordering::Release);
         }

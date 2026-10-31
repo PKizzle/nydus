@@ -8,6 +8,7 @@ use std::slice;
 
 use nydus_utils::compress::zlib_random::{ZranChunkInfo, ZranContext, ZranGenerator, ZranReader};
 use nydus_utils::compress::zstd_frames::{ZstdFrameGenerator, ZstdFrameReader};
+use nydus_utils::filemap::FromMapped;
 
 use crate::RAFS_DEFAULT_CHUNK_SIZE;
 use crate::meta::chunk_info_v2::BlobChunkInfoV2Ondisk;
@@ -54,6 +55,8 @@ impl ZranInflateContext {
         }
     }
 }
+
+unsafe impl FromMapped for ZranInflateContext {}
 
 impl ZranInflateContext {
     /// Get offset into the compressed stream.

@@ -138,11 +138,11 @@ impl DirectSuperBlockV6 {
         state: &Guard<Arc<DirectMappingState>>,
         offset: usize,
     ) -> RafsResult<&dyn RafsV6OndiskInode> {
-        let i: &RafsV6InodeCompact = unsafe { state.map.get_ref(offset) }?;
+        let i: &RafsV6InodeCompact = state.map.get_ref(offset)?;
         if i.format() & EROFS_I_VERSION_BITS == 0 {
             Ok(i)
         } else {
-            let i = unsafe { state.map.get_ref::<RafsV6InodeExtended>(offset) }?;
+            let i = state.map.get_ref::<RafsV6InodeExtended>(offset)?;
             Ok(i)
         }
     }
@@ -220,7 +220,8 @@ impl DirectSuperBlockV6 {
         )?;
         let blob_extra_infos = rafsv6_load_blob_extra_info(meta, r)?;
 
-        let file_map = FileMapState::new(file, 0, len as usize, false)?;
+        // Safe because nydus only reads the bootstrap, which must not change while it's mounted.
+        let file_map = unsafe { FileMapState::new(file, 0, len as usize, false) }?;
         let state = DirectMappingState {
             meta: old_state.meta.clone(),
             blob_table,
@@ -395,7 +396,10 @@ impl OndiskInodeWrapper {
         if size_of::<RafsV6Dirent>() * (index + 1) >= state.block_size() as usize {
             Err(RafsError::InvalidImageData)
         } else if let Some(offset) = offset.checked_add(size_of::<RafsV6Dirent>() * index) {
-            unsafe { state.map.get_ref(offset) }.map_err(|_e| RafsError::InvalidImageData)
+            state
+                .map
+                .get_ref(offset)
+                .map_err(|_e| RafsError::InvalidImageData)
         } else {
             Err(RafsError::InvalidImageData)
         }
@@ -432,12 +436,10 @@ impl OndiskInodeWrapper {
                     )
                 })?;
 
-                unsafe {
-                    state
-                        .map
-                        .get_slice(offset + de.e_nameoff as usize, len as usize)
-                }
-                .map_err(|_e| RafsError::InvalidImageData)?
+                state
+                    .map
+                    .get_slice(offset + de.e_nameoff as usize, len as usize)
+                    .map_err(|_e| RafsError::InvalidImageData)?
             }
             Ordering::Equal => {
                 let base = de.e_nameoff as u64;
@@ -461,7 +463,9 @@ impl OndiskInodeWrapper {
                     Ordering::Less => return Err(RafsError::InvalidImageData),
                 };
 
-                let buf: &[u8] = unsafe { state.map.get_slice(offset + base as usize, len) }
+                let buf: &[u8] = state
+                    .map
+                    .get_slice(offset + base as usize, len)
                     .map_err(|_e| RafsError::InvalidImageData)?;
                 // Use this trick to temporarily decide entry name's length. Improve this?
                 let mut l: usize = 0;
@@ -642,7 +646,10 @@ impl OndiskInodeWrapper {
         let base = Self::inode_xattr_size(inode) + base_index * size_of::<RafsV6InodeChunkAddr>();
         if let Some(offset) = base.checked_add(self.offset) {
             let count = total_chunks as usize - base_index;
-            unsafe { state.map.get_slice(offset, count) }.map_err(|_e| RafsError::InvalidImageData)
+            state
+                .map
+                .get_slice(offset, count)
+                .map_err(|_e| RafsError::InvalidImageData)
         } else {
             Err(RafsError::InvalidImageData)
         }
@@ -1025,7 +1032,7 @@ impl RafsInode for OndiskInodeWrapper {
             self.offset + Self::inode_size(inode) + size_of::<RafsV6XattrIbodyHeader>();
         let mut remaining = (total - 1) as usize * size_of::<RafsV6XattrEntry>();
         while remaining > 0 {
-            let e: &RafsV6XattrEntry = unsafe { state.map.get_ref(offset) }?;
+            let e: &RafsV6XattrEntry = state.map.get_ref(offset)?;
             if e.name_len() as usize + e.value_size() as usize > remaining {
                 return Err(RafsError::InvalidMetadata(format!(
                     "v6: invalid xattr name size {}",
@@ -1033,20 +1040,16 @@ impl RafsInode for OndiskInodeWrapper {
                 )));
             }
             let mut xa_name = recover_namespace(e.name_index())?;
-            let suffix: &[u8] = unsafe {
-                state.map.get_slice(
-                    offset + size_of::<RafsV6XattrEntry>(),
-                    e.name_len() as usize,
-                )
-            }?;
+            let suffix: &[u8] = state.map.get_slice(
+                offset + size_of::<RafsV6XattrEntry>(),
+                e.name_len() as usize,
+            )?;
             xa_name.push(OsStr::from_bytes(suffix));
             if xa_name == name {
-                let data: &[u8] = unsafe {
-                    state.map.get_slice(
-                        offset + size_of::<RafsV6XattrEntry>() + e.name_len() as usize,
-                        e.value_size() as usize,
-                    )
-                }?;
+                let data: &[u8] = state.map.get_slice(
+                    offset + size_of::<RafsV6XattrEntry>() + e.name_len() as usize,
+                    e.value_size() as usize,
+                )?;
                 return Ok(Some(data.to_vec()));
             }
 
@@ -1075,19 +1078,17 @@ impl RafsInode for OndiskInodeWrapper {
             self.offset + Self::inode_size(inode) + size_of::<RafsV6XattrIbodyHeader>();
         let mut remaining = (total - 1) as usize * size_of::<RafsV6XattrEntry>();
         while remaining > 0 {
-            let e: &RafsV6XattrEntry = unsafe { state.map.get_ref(offset) }?;
+            let e: &RafsV6XattrEntry = state.map.get_ref(offset)?;
             if e.name_len() as usize + e.value_size() as usize > remaining {
                 return Err(RafsError::InvalidMetadata(format!(
                     "v6: invalid xattr name size {}",
                     e.name_len()
                 )));
             }
-            let name: &[u8] = unsafe {
-                state.map.get_slice(
-                    offset + size_of::<RafsV6XattrEntry>(),
-                    e.name_len() as usize,
-                )
-            }?;
+            let name: &[u8] = state.map.get_slice(
+                offset + size_of::<RafsV6XattrEntry>(),
+                e.name_len() as usize,
+            )?;
             let ns = recover_namespace(e.name_index())?;
             let mut xa = ns.into_vec();
             xa.extend_from_slice(name);
@@ -1121,7 +1122,7 @@ impl RafsInode for OndiskInodeWrapper {
         let offset = self
             .data_block_offset(&state, inode, 0)
             .map_err(err_invalidate_data)?;
-        let buf: &[u8] = unsafe { state.map.get_slice(offset, inode.size() as usize) }?;
+        let buf: &[u8] = state.map.get_slice(offset, inode.size() as usize)?;
         Ok(bytes_to_os_str(buf).to_os_string())
     }
 
@@ -1375,7 +1376,7 @@ impl RafsInodeExt for OndiskInodeWrapper {
                 "v6: invalid offset or index to calculate chunk address".to_string(),
             )
         })?;
-        let chunk_addr = unsafe { state.map.get_ref::<RafsV6InodeChunkAddr>(offset) }?;
+        let chunk_addr = state.map.get_ref::<RafsV6InodeChunkAddr>(offset)?;
         // Cloned out of the lock: `get_chunk_info` can reload blob.meta from the backend,
         // and holding the lock across that stalls every other chunk lookup.
         let device = self.mapping.device.lock().unwrap().clone();
@@ -1455,7 +1456,7 @@ impl DirectChunkInfoV6 {
                 offset, state.meta.chunk_table_offset, state.meta.chunk_table_size
             )));
         }
-        let chunk = unsafe { state.map.get_ref::<RafsV5ChunkInfo>(offset) }?;
+        let chunk = state.map.get_ref::<RafsV5ChunkInfo>(offset)?;
         Ok(Self {
             mapping,
             offset,
@@ -1475,7 +1476,7 @@ impl DirectChunkInfoV6 {
     /// so it's safe to dereference the underlying OndiskChunkInfo object.
     fn v5_chunk<'a>(&self, state: &'a DirectMappingState) -> &'a RafsV5ChunkInfo {
         // Safe to unwrap() because we have validated the offset in DirectChunkInfoV6::new().
-        unsafe { state.map.get_ref::<RafsV5ChunkInfo>(self.offset) }.unwrap()
+        state.map.get_ref::<RafsV5ChunkInfo>(self.offset).unwrap()
     }
 }
 
