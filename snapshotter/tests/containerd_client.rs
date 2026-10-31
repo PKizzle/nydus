@@ -106,6 +106,20 @@ fn content_and_images_round_trip_and_survive_a_containerd_restart() {
         assert_eq!(info.labels["nydus.test/role"], "fixture");
         assert_eq!(client.fetch_bytes(&digest).await.unwrap(), small);
 
+        // Root the small blob with its own image record right away. The image-record checks
+        // below repoint and delete another record, and containerd's GC (triggered by deletes
+        // and run again at startup) collects content nothing references.
+        client
+            .images_create(
+                "nydus.test/keep:1",
+                &digest,
+                small.len() as u64,
+                OCI_MANIFEST,
+                labels(),
+            )
+            .await
+            .unwrap();
+
         // Larger than tonic's 4 MiB default frame: exercises the raised encoding limit and a
         // multi-chunk Read stream.
         let big: Vec<u8> = (0..6 * 1024 * 1024u32).map(|i| (i % 251) as u8).collect();
@@ -149,19 +163,6 @@ fn content_and_images_round_trip_and_survive_a_containerd_restart() {
         // An absent digest is NotFound, not an error.
         let absent = format!("sha256:{}", "0".repeat(64));
         assert!(client.info(&absent).await.unwrap().is_none());
-
-        // Root the small blob with an image record so containerd's GC keeps it across the
-        // restart below; unreferenced content is collected when containerd starts.
-        client
-            .images_create(
-                "nydus.test/keep:1",
-                &digest,
-                small.len() as u64,
-                OCI_MANIFEST,
-                labels(),
-            )
-            .await
-            .unwrap();
     });
 
     // Restart containerd: the cached connection dies, and the next call must reach the new
