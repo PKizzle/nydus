@@ -35,40 +35,17 @@ use std::sync::Arc;
 use tonic::Code;
 use tracing::{debug, error, instrument};
 
-/// Generated containerd protos. Module nesting must match the protobuf
-/// package paths (`containerd.types`, `containerd.services.content.v1`,
-/// `containerd.services.images.v1`) so the cross-package `super::…` refs
-/// the prost generator emits (e.g. `Image.target:
-/// super::super::super::types::Descriptor`) resolve.
-mod containerd {
-    pub mod types {
-        tonic::include_proto!("containerd.types");
-    }
-    pub mod services {
-        pub mod content {
-            pub mod v1 {
-                tonic::include_proto!("containerd.services.content.v1");
-            }
-        }
-        pub mod images {
-            pub mod v1 {
-                tonic::include_proto!("containerd.services.images.v1");
-            }
-        }
-    }
-}
-
-use containerd::services::content::v1::{
+use crate::containerd_api::services::content::v1::{
     InfoRequest, ListContentRequest, ReadContentRequest, UpdateRequest, WriteAction,
     WriteContentRequest, content_client::ContentClient,
 };
 
-use containerd::services::images::v1::{
+use crate::containerd_api::services::images::v1::{
     CreateImageRequest, DeleteImageRequest, GetImageRequest, Image, ListImagesRequest,
     UpdateImageRequest, images_client::ImagesClient,
 };
 
-use containerd::types as types_proto;
+use crate::containerd_api::types as types_proto;
 
 /// A snapshot of one content-store blob's metadata.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -253,7 +230,7 @@ impl ContentStoreClient {
         if labels.is_empty() {
             return Ok(());
         }
-        let info = containerd::services::content::v1::Info {
+        let info = crate::containerd_api::services::content::v1::Info {
             digest: digest.to_string(),
             labels: labels.clone(),
             ..Default::default()

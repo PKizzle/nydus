@@ -16,7 +16,8 @@
 
 use crate::access_tracer::AccessTracer;
 use crate::config::{AutoZranConfig, ContainerdConfig, SchedClass as ConfigSchedClass};
-use crate::containerd_lookup::ContainerdLookup;
+use crate::containerd_lookup::{ContainerdLookup, ManifestInfo, MissingLayers};
+use crate::containerd_transfer::{BackfillReport, LayerBackfill};
 use crate::content_store::ContentStoreClient;
 use crate::local_accel::{
     self, LocalAccelConfig, NodeLocalArtifact, SchedClass as AccelSchedClass,
@@ -135,6 +136,7 @@ pub struct ConversionDeps {
     pub containerd: ContainerdConfig,
     pub containerd_lookup: Arc<ContainerdLookup>,
     pub access_tracer: Arc<AccessTracer>,
+    pub layer_backfill: LayerBackfill,
 }
 
 /// Which half of the two-stage conversion a job represents.
@@ -659,6 +661,14 @@ async fn worker_loop(
     receiver: Receiver<AutoZranJob>,
     state: Arc<AutoZranState>,
 ) {
+    match deps.layer_backfill.remove_stale_records().await {
+        Ok(0) => {}
+        Ok(removed) => info!(
+            removed,
+            "auto-zran removed stale layer-backfill image records"
+        ),
+        Err(e) => warn!(error = ?e, "auto-zran could not sweep stale layer-backfill image records"),
+    }
     while let Ok(job) = receiver.recv().await {
         state.mark_started(&job);
         match run_conversion(&config, &deps, &job).await {
@@ -670,6 +680,25 @@ async fn worker_loop(
             }
         }
     }
+}
+
+/// Resolve a job's manifest. When layer blobs are missing, backfill them once and resolve
+/// again; blobs still missing then fail the job through the normal strike path, naming them.
+async fn resolve_with_backfill(
+    resolve: impl AsyncFn() -> Result<ManifestInfo>,
+    backfill: impl AsyncFnOnce(&MissingLayers) -> Result<BackfillReport>,
+) -> Result<ManifestInfo> {
+    let err = match resolve().await {
+        Ok(info) => return Ok(info),
+        Err(err) => err,
+    };
+    let Some(missing) = err.downcast_ref::<MissingLayers>() else {
+        return Err(err);
+    };
+    backfill(missing)
+        .await
+        .with_context(|| format!("backfill: {missing}"))?;
+    resolve().await
 }
 
 /// Terminal disposition of a worker job, distinguishing a real conversion from
@@ -751,13 +780,20 @@ async fn run_conversion(
     deps: &ConversionDeps,
     job: &AutoZranJob,
 ) -> Result<ConversionOutcome> {
-    // (1) Resolve manifest + layers. A sweep-replayed profile whose image no
-    // longer resolves is not a live candidate — defer quietly instead of
-    // burning a failure strike (a live settle keeps the hard error).
-    let info = match deps
-        .containerd_lookup
-        .manifest_info(&job.image, &deps.containerd.content_root())
-        .await
+    // (1) Resolve manifest + layers, backfilling layer blobs containerd never
+    // fetched. A sweep-replayed profile whose image no longer resolves is not a
+    // live candidate — defer quietly instead of burning a failure strike (a live
+    // settle keeps the hard error).
+    let content_root = deps.containerd.content_root();
+    let info = match resolve_with_backfill(
+        async || {
+            deps.containerd_lookup
+                .manifest_info(&job.image, &content_root)
+                .await
+        },
+        async |missing| deps.layer_backfill.fetch(&job.image, missing).await,
+    )
+    .await
     {
         Ok(info) => info,
         Err(e) if job.origin == JobOrigin::ReconSweep => {
@@ -1504,6 +1540,101 @@ fn dedupe_key(image: &str, stage: AutoZranStage) -> String {
 mod tests {
     use super::*;
     use crate::nri::AccessProfileRecord;
+
+    fn missing(digests: &[&str]) -> anyhow::Error {
+        MissingLayers {
+            manifest: "sha256:m".to_string(),
+            digests: digests.iter().map(|d| d.to_string()).collect(),
+        }
+        .into()
+    }
+
+    fn resolved() -> ManifestInfo {
+        ManifestInfo {
+            manifest_digest: "sha256:m".to_string(),
+            layers: vec![],
+        }
+    }
+
+    fn report() -> BackfillReport {
+        BackfillReport {
+            blobs: 1,
+            bytes: 1,
+            duration: Duration::ZERO,
+        }
+    }
+
+    /// Runs `resolve_with_backfill` against scripted resolve results; returns the outcome,
+    /// the number of resolves, and the digests each backfill call saw.
+    fn run_backfill_hook(
+        mut results: Vec<Result<ManifestInfo>>,
+        backfill_result: Result<BackfillReport>,
+    ) -> (Result<ManifestInfo>, usize, Vec<Vec<String>>) {
+        results.reverse();
+        let results = std::cell::RefCell::new(results);
+        let resolves = std::cell::Cell::new(0);
+        let backfills = std::cell::RefCell::new(Vec::new());
+        let outcome = compio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(resolve_with_backfill(
+                async || {
+                    resolves.set(resolves.get() + 1);
+                    results
+                        .borrow_mut()
+                        .pop()
+                        .expect("unexpected extra resolve")
+                },
+                async |missing: &MissingLayers| {
+                    backfills.borrow_mut().push(missing.digests.clone());
+                    backfill_result
+                },
+            ));
+        (outcome, resolves.get(), backfills.into_inner())
+    }
+
+    #[test]
+    fn backfill_runs_once_for_missing_layers_and_resolves_again() {
+        let (outcome, resolves, backfills) = run_backfill_hook(
+            vec![Err(missing(&["sha256:a", "sha256:b"])), Ok(resolved())],
+            Ok(report()),
+        );
+        assert_eq!(outcome.unwrap().manifest_digest, "sha256:m");
+        assert_eq!(resolves, 2);
+        assert_eq!(backfills, vec![vec!["sha256:a", "sha256:b"]]);
+    }
+
+    #[test]
+    fn layers_still_missing_after_a_backfill_fail_without_a_second_backfill() {
+        let (outcome, resolves, backfills) = run_backfill_hook(
+            vec![Err(missing(&["sha256:a"])), Err(missing(&["sha256:a"]))],
+            Ok(report()),
+        );
+        let err = outcome.unwrap_err();
+        assert!(err.downcast_ref::<MissingLayers>().is_some(), "{err:#}");
+        assert_eq!((resolves, backfills.len()), (2, 1));
+    }
+
+    #[test]
+    fn a_failed_backfill_fails_the_job_naming_the_missing_layers() {
+        let (outcome, resolves, _) = run_backfill_hook(
+            vec![Err(missing(&["sha256:a"]))],
+            Err(anyhow::anyhow!("registry said no")),
+        );
+        let err = format!("{:#}", outcome.unwrap_err());
+        assert!(
+            err.contains("sha256:a") && err.contains("registry said no"),
+            "{err}"
+        );
+        assert_eq!(resolves, 1);
+    }
+
+    #[test]
+    fn other_resolve_errors_skip_the_backfill() {
+        let (outcome, resolves, backfills) =
+            run_backfill_hook(vec![Err(anyhow::anyhow!("not pulled"))], Ok(report()));
+        assert!(outcome.is_err());
+        assert_eq!((resolves, backfills.len()), (1, 0));
+    }
 
     fn profile(image: &str) -> PrefetchProfile {
         PrefetchProfile::from_access_records(
