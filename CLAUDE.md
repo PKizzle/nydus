@@ -195,9 +195,9 @@ prepare path (`snapshotter/src/grpc/mod.rs`) resolves an existing accel sidecar
 stage-2 optimize/prefetch upload — worker logic in `snapshotter/src/auto_zran.rs`, artifact
 build in `local_accel.rs`, serving via `DaemonSupervisor::ensure_instance`. Still unverified in
 automation: a live containerd-GC race against a slow peer fetch mid-promotion, a multi-node
-spegel sidecar-fetch soak, and the fanotify path in CI (GitHub runners are kernel < 6.14;
-`misc/fanotify/*.sh` covers it on a modern host — CI covers the fusedev loop via
-`misc/snapshotter-e2e.sh`).
+spegel sidecar-fetch soak. CI covers the fusedev loop via `misc/snapshotter-e2e.sh`, and runs the
+fanotify path (`misc/fanotify/run-all.sh`) inside a virtme-ng VM booting a pinned >= 6.14 mainline
+kernel, independent of the runner's own kernel: `.github/workflows/fanotify-vm.yml`.
 
 Do NOT reintroduce the tag-suffix / referrer-push approach for transparent accel — it was
 explicitly rejected because it changes the tag and the snapshotter never consults referrers. Use

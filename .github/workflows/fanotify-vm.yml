@@ -1,0 +1,99 @@
+name: Fanotify VM
+
+# The fanotify/EROFS on-demand path needs Linux >= 6.14 (FAN_PRE_ACCESS). Hosted runners move
+# kernels without notice, so this job does not test against theirs: it builds on the runner and
+# runs misc/fanotify/run-all.sh as root inside a virtme-ng VM booting a pinned Ubuntu mainline
+# kernel, with the runner's filesystem shared in.
+on:
+  push:
+    paths: &paths
+      - 'service/src/fanotify*'
+      - 'storage/**'
+      - 'rafs/**'
+      - 'builder/**'
+      - 'utils/**'
+      - 'snapshotter/src/daemon/**'
+      - 'misc/fanotify/**'
+      - '.github/workflows/fanotify-vm.yml'
+  pull_request:
+    paths: *paths
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref_name }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Ubuntu mainline build; bump all four together (sha256 from the release's CHECKSUMS file).
+  KERNEL_URL: https://kernel.ubuntu.com/mainline/v6.18.55/amd64
+  KERNEL_IMAGE_DEB: linux-image-unsigned-6.18.55-061855-generic_6.18.55-061855.202610031245_amd64.deb
+  KERNEL_MODULES_DEB: linux-modules-6.18.55-061855-generic_6.18.55-061855.202610031245_amd64.deb
+  KERNEL_SHA256: |
+    510c01027df618ed21f2ab7027f946e7e8d64e4c88702722577470dca03ee30f  linux-image-unsigned-6.18.55-061855-generic_6.18.55-061855.202610031245_amd64.deb
+    0f532598e00ba37515288eda4b53426ee7ce53abb99d949c911873c679d6aaf5  linux-modules-6.18.55-061855-generic_6.18.55-061855.202610031245_amd64.deb
+  VIRTME_NG_VERSION: "1.41"
+
+jobs:
+  fanotify-vm:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v6
+    - name: Rust Cache
+      uses: Swatinem/rust-cache@v2
+      with:
+        cache-on-failure: true
+        shared-key: Linux-cargo-amd64-fanotify-vm
+    - uses: dsherret/rust-toolchain-file@v1
+    - name: Install protoc
+      run: bash misc/install-protoc.sh
+    - name: Build nydusd, nydus-image and the snapshotter test binary
+      run: |
+        cargo build --release --bin nydusd --bin nydus-image
+        BIN=$(cargo test -p nydus-snapshotter --lib --no-run --message-format=json \
+          | jq -r 'select(.profile.test and .executable != null and (.target.kind | index("lib"))) | .executable' | tail -1)
+        test -x "$BIN"
+        echo "SNAPSHOTTER_TEST_BIN=$BIN" >> "$GITHUB_ENV"
+    - name: Install VM tooling
+      run: |
+        sudo apt-get update -qq
+        sudo apt-get install -y -qq qemu-system-x86 virtiofsd zstd e2fsprogs strace
+        pipx install "virtme-ng==$VIRTME_NG_VERSION"
+        # Let the runner user open /dev/kvm.
+        echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+          | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+        sudo udevadm control --reload-rules && sudo udevadm trigger --name-match=kvm
+        ls -l /dev/kvm
+    - name: Fetch kernel
+      run: |
+        K="$RUNNER_TEMP/kernel"; mkdir -p "$K"; cd "$K"
+        curl -fsSLO "$KERNEL_URL/$KERNEL_IMAGE_DEB"
+        curl -fsSLO "$KERNEL_URL/$KERNEL_MODULES_DEB"
+        echo "$KERNEL_SHA256" | sha256sum -c
+        dpkg-deb -x "$KERNEL_IMAGE_DEB" root; dpkg-deb -x "$KERNEL_MODULES_DEB" root
+        CONFIG=$(ls root/boot/config-*)
+        grep -E '^CONFIG_FANOTIFY_ACCESS_PERMISSIONS=y|^CONFIG_EROFS_FS=' "$CONFIG"
+        grep -q '^CONFIG_FANOTIFY_ACCESS_PERMISSIONS=y' "$CONFIG"
+        echo "VMLINUZ=$(ls "$K"/root/boot/vmlinuz-*)" >> "$GITHUB_ENV"
+    - name: Run misc/fanotify in the VM
+      run: |
+        echo "runner kernel: $(uname -r)"
+        vng --run "$VMLINUZ" --user root --cpus 4 --memory 6G --rwdir "$RUNNER_TEMP" --exec "
+          set -e
+          modprobe erofs
+          uname -r
+          [ \"\$(printf '6.14\n%s\n' \"\$(uname -r)\" | sort -V | head -1)\" = 6.14 ]
+          grep -w erofs /proc/filesystems
+          # The runner's resolv.conf links into /run, empty in the guest; the registry backend's
+          # resolver fails to build without one (precontent-cases C11 then times out retrying).
+          mkdir -p /run/systemd/resolve
+          [ -e /etc/resolv.conf ] || echo 'nameserver 127.0.0.1' > /run/systemd/resolve/stub-resolv.conf
+          cat /etc/resolv.conf
+          cd '$GITHUB_WORKSPACE'
+          NYDUS_IMAGE='$GITHUB_WORKSPACE/target/release/nydus-image' \
+          NYDUSD='$GITHUB_WORKSPACE/target/release/nydusd' \
+          SNAPSHOTTER_TEST_BIN='$SNAPSHOTTER_TEST_BIN' \
+          IMG='$RUNNER_TEMP/fanotify-ci.img' \
+          bash misc/fanotify/run-all.sh"
