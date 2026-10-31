@@ -62,7 +62,11 @@ not need to own into this repository.
 - **`snapshotter/src/containerd_grpc.rs`** (new). `ContainerdChannel` is a cloneable handle to
   one HTTP/2 connection to containerd's Unix socket:
   `compio::net::UnixStream` → `cyper_core::HyperStream` → `hyper::client::conn::http2::handshake`
-  with cyper's `CompioExecutor`. The connection task runs on the compio runtime.
+  with cyper's `CompioExecutor` and `CompioTimer` (both in `third_party/cyper-core`). The
+  connection task runs on the compio runtime. The timer is what hyper's HTTP/2 keep-alive pings
+  and handshake timeout need; without one, hyper panics as soon as either is enabled (the gap
+  reported in grpc/grpc-rust#2040). Keep-alive pings are enabled so that a containerd that went
+  away is noticed before the next call.
   - It implements tower's `Service<http::Request<tonic::body::Body>>`, so tonic's generated
     clients (`ContentClient<ContainerdChannel>` and so on) run on it unchanged.
   - The connection is established lazily and shared by all calls (HTTP/2 multiplexing). Today a
