@@ -105,17 +105,12 @@ async-channel = "2.3"
 blocking = "1.6"
 futures = "0.3"
 signal-hook = "0.3"
-# The snapshotter's own event loop runs on compio; the ONE sanctioned tokio
-# runtime is the isolated 2-worker runtime `content_store.rs` builds solely to
-# drive the tonic *client* to containerd's Content/Images gRPC services (tonic's
-# transport pins its futures to a tokio reactor). It is fully quarantined behind
-# `blocking::unblock` + `handle.block_on` and shut down in `Drop`, so no tokio
-# task ever touches a nydusd session thread. tokio is also pulled by the
-# peripheral NRI plugin (ttrpc) and transitively by tonic/hyper-util for sync
-# types. See ARCHITECTURE.md Decision 3 for the full rule and this exception.
-tokio = { version = "1", features = ["full"] }
-tokio-stream = "0.1"
-tonic = { version = "0.14", features = ["transport"] }
+# Everything in the snapshotter runs on compio, including its gRPC client to containerd
+# (containerd_grpc.rs: hyper HTTP/2 over a compio Unix socket via cyper-core). tonic supplies the
+# generated clients, the codec and the `Routes` router the server is built from; its tokio
+# transport is not built. tokio is only a type dependency of h2/hyper/tonic, and nothing starts a
+# tokio runtime. See ARCHITECTURE.md Decision 3.
+tonic = { version = "0.14", default-features = false, features = ["codegen", "router"] }
 tonic-prost = "0.14"
 # Standard grpc.health.v1.Health service so containerd's proxy-plugin dialer and
 # grpc_health_probe can check readiness. tonic-health is a runtime-agnostic tower
@@ -128,8 +123,15 @@ prost-types = "0.14"
 # UDS connector for the containerd Content gRPC client. tonic 0.14 transport
 # needs a tower::Service<Uri> connector and an `Io` adapter; we drive both via
 # `tower::service_fn` + `hyper_util::rt::TokioIo<tokio::net::UnixStream>`.
-hyper-util = { version = "0.1", features = ["client-legacy"] }
 tower = { version = "0.5", features = ["util"] }
+# HTTP/2 client connection to containerd's gRPC socket, driven by compio through cyper-core's
+# executor, timer and stream adapter (see containerd_grpc.rs). The root manifest patches
+# cyper-core to the vendored copy in third_party/cyper-core.
+hyper = { version = "1.10", features = ["client", "http2"] }
+cyper-core = { version = "0.9", default-features = false }
+# Marks the containerd channel's future `Send` for containerd-snapshots' handlers while asserting
+# it is only polled on its compio thread (see containerd_grpc.rs).
+send_wrapper = { version = "0.6", features = ["futures"] }
 # Global allocator for containerd-nydus (see its main.rs): compio owned-buffer
 # completion I/O churns small allocations; mimalloc's thread-local pools help.
 mimalloc = "0.1"
@@ -194,16 +196,15 @@ nydus-utils = { version = "0.6.0", path = "../utils" }
 [dev-dependencies]
 tempfile = "3"
 assert_cmd = "2"
-# Drive a real tonic gRPC client (over tokio) against the compio cyper-axum
-# server in the gRPC transport round-trip test.
-tonic = { version = "0.14", features = ["transport"] }
-tokio = { version = "1", features = ["rt", "macros"] }
 
 [build-dependencies]
 # Generates tonic 0.14 gRPC client bindings for containerd's Content service
 # (proto vendored under snapshotter/proto/). The prost codegen split moved to
 # `tonic-prost-build` in 0.14; matches `containerd-snapshots`' own build.rs.
-tonic-prost-build = "0.14"
+# Without the default `transport` feature: it makes generated clients (ours and, through build
+# feature unification, containerd-snapshots') name `tonic::transport::Channel`, which would
+# require tonic's tokio transport.
+tonic-prost-build = { version = "0.14", default-features = false, features = ["cleanup-markdown"] }
 
 [features]
 default = [
