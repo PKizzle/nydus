@@ -107,14 +107,10 @@ futures = "0.3"
 signal-hook = "0.3"
 # Everything in the snapshotter runs on compio, including its gRPC client to containerd
 # (containerd_grpc.rs: hyper HTTP/2 over a compio Unix socket via cyper-core). tonic supplies the
-# generated clients, the codec and the `Routes` router the server is built from. Nothing here
-# uses its tokio transport and nothing starts a tokio runtime; tokio is only a type dependency
-# of h2/hyper/tonic. `transport` stays enabled solely because containerd-snapshots' build.rs
-# leaves tonic-prost-build's `build_transport` on, so its generated `SnapshotsClient::connect`
-# names `tonic::transport::Channel`, while its Cargo.toml enables only `codegen`. Drop
-# `transport` once rust-extensions generates its client with `build_transport(false)`. See
-# ARCHITECTURE.md Decision 3.
-tonic = { version = "0.14", default-features = false, features = ["codegen", "router", "transport"] }
+# generated clients, the codec and the `Routes` router the server is built from; its tokio
+# transport is not built. tokio is only a type dependency of h2/hyper/tonic, and nothing starts a
+# tokio runtime. See ARCHITECTURE.md Decision 3.
+tonic = { version = "0.14", default-features = false, features = ["codegen", "router"] }
 tonic-prost = "0.14"
 # Standard grpc.health.v1.Health service so containerd's proxy-plugin dialer and
 # grpc_health_probe can check readiness. tonic-health is a runtime-agnostic tower
@@ -205,7 +201,10 @@ assert_cmd = "2"
 # Generates tonic 0.14 gRPC client bindings for containerd's Content service
 # (proto vendored under snapshotter/proto/). The prost codegen split moved to
 # `tonic-prost-build` in 0.14; matches `containerd-snapshots`' own build.rs.
-tonic-prost-build = "0.14"
+# Without the default `transport` feature: it makes generated clients (ours and, through build
+# feature unification, containerd-snapshots') name `tonic::transport::Channel`, which would
+# require tonic's tokio transport.
+tonic-prost-build = { version = "0.14", default-features = false, features = ["cleanup-markdown"] }
 
 [features]
 default = [
