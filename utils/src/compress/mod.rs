@@ -13,6 +13,8 @@ use self::lz4_standard::*;
 
 #[cfg(feature = "zran")]
 pub mod zlib_random;
+#[cfg(feature = "zran")]
+pub mod zstd_frames;
 
 const COMPRESSION_MINIMUM_RATIO: usize = 100;
 

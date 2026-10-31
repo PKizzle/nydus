@@ -40,7 +40,7 @@ use nydus_storage::factory::BlobFactory;
 use nydus_storage::meta::toc::{TocEntryList, TocLocation};
 use nydus_storage::meta::{
     BatchContextGenerator, BlobChunkInfoV2Ondisk, BlobCompressionContextHeader, BlobMetaChunkArray,
-    BlobMetaChunkInfo, ZranContextGenerator, toc,
+    BlobMetaChunkInfo, ZranContextGenerator, ZstdContextGenerator, toc,
 };
 use nydus_utils::digest::DigestData;
 use nydus_utils::{BufReaderInfo, compress, digest, div_round_up, round_down, try_round_up_4k};
@@ -1395,7 +1395,7 @@ pub struct BuildContext {
     /// Storage writing blob to single file or a directory.
     pub blob_storage: Option<ArtifactStorage>,
     pub external_blob_storage: Option<ArtifactStorage>,
-    pub blob_zran_generator: Option<Mutex<ZranContextGenerator<File>>>,
+    pub blob_zran_generator: Option<Mutex<RefContextGenerator>>,
     pub blob_batch_generator: Option<Mutex<BatchContextGenerator>>,
     pub blob_tar_reader: Option<BufReaderInfo<File>>,
     pub blob_features: BlobFeatures,
@@ -1688,6 +1688,54 @@ impl BuildOutput {
             bootstrap_path,
             external_bootstrap_path,
         })
+    }
+}
+
+/// Random-access context generator for a compressed tarball referenced in place by a `*-ref`
+/// conversion: zran contexts for gzip, frame-aligned contexts for zstd.
+pub enum RefContextGenerator {
+    Gzip(ZranContextGenerator<File>),
+    Zstd(ZstdContextGenerator<File>),
+}
+
+impl RefContextGenerator {
+    /// Begin a data chunk at the current read position.
+    pub fn start_chunk(&mut self, chunk_size: u64) -> std::io::Result<u32> {
+        match self {
+            Self::Gzip(generator) => generator.start_chunk(chunk_size),
+            Self::Zstd(generator) => generator.start_chunk(),
+        }
+    }
+
+    /// Finish the data chunk begun by [`Self::start_chunk`].
+    pub fn finish_chunk(&mut self) -> std::io::Result<BlobChunkInfoV2Ondisk> {
+        match self {
+            Self::Gzip(generator) => generator.finish_chunk(),
+            Self::Zstd(generator) => generator.finish_chunk(),
+        }
+    }
+
+    /// Serialized contexts and their count, for the blob meta.
+    pub fn to_vec(&mut self) -> std::io::Result<(Vec<u8>, u32)> {
+        match self {
+            Self::Gzip(generator) => generator.to_vec(),
+            Self::Zstd(generator) => generator.to_vec(),
+        }
+    }
+
+    /// Size and SHA-256 of the compressed tarball. A zstd tarball is read to its end first.
+    pub fn data_size_and_digest(&mut self) -> std::io::Result<(u64, sha2::Sha256)> {
+        match self {
+            Self::Gzip(generator) => {
+                let reader = generator.reader();
+                Ok((reader.get_data_size(), reader.get_data_digest()))
+            }
+            Self::Zstd(generator) => {
+                generator.finish()?;
+                let reader = generator.reader();
+                Ok((reader.get_data_size(), reader.get_data_digest()))
+            }
+        }
     }
 }
 
