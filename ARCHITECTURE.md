@@ -95,9 +95,10 @@ fanotify (≥6.14, CAP_SYS_ADMIN) → fusedev (/dev/fuse) → blockdev (loop/NBD
   gated behind the non-default `backend-dragonfly-proxy` feature (own tokio runtime for the
   Dragonfly SDK proxy path only). The snapshotter starts no tokio runtime at all: the `tokio`
   crate shows up in `cargo tree` for the `containerd-nydus` binary only because
-  `h2`/`hyper`/`tonic`/`cyper-axum` pull it in for trait/type compatibility. tonic's `transport`
-  feature is still compiled, solely because containerd-snapshots' generated client names
-  `tonic::transport::Channel` (see `snapshotter/Cargo.toml`); nothing calls it. Never start a tokio
+  `h2`/`hyper`/`tonic`/`cyper-axum` pull it in for trait/type compatibility; tonic's `transport`
+  feature is not built. Keep `tonic-prost-build` without its default `transport` feature: build
+  dependencies share features across the graph, so enabling it anywhere makes every generated
+  client, containerd-snapshots' included, name `tonic::transport::Channel`. Never start a tokio
   runtime in the snapshotter or hand one to a nydusd session thread.
 - **Metadata store**: **fjall** — an embedded LSM key/value store — one serialized snapshot record
   per key (`snapshotter/src/store/mod.rs`, on-disk dir `metadata.fjall`). Replaces the Go
