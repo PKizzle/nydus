@@ -3667,6 +3667,7 @@ dependencies = [
  "registry-client",
  "rustls",
  "rustls-platform-verifier",
+ "send_wrapper",
  "sendfd",
  "serde",
  "serde_json",

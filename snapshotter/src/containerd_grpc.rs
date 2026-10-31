@@ -29,6 +29,7 @@ use cyper_core::{CompioExecutor, CompioTimer, HyperStream};
 use http::header::HeaderValue;
 use hyper::body::Incoming;
 use hyper::client::conn::http2::{self, SendRequest};
+use send_wrapper::SendWrapper;
 use tracing::debug;
 
 /// HTTP/2 PING interval. With `keep_alive_while_idle`, a containerd that went away is noticed
@@ -120,7 +121,11 @@ impl ContainerdChannel {
 impl tower::Service<http::Request<tonic::body::Body>> for ContainerdChannel {
     type Response = http::Response<Incoming>;
     type Error = ChannelError;
-    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>>>>;
+    // `Send` because containerd-snapshots' handler futures must be `Send`, while compio's socket
+    // future is not. `SendWrapper` asserts at poll time that the future stays on the thread that
+    // created it, which compio guarantees (tasks never migrate) and the thread-local connection
+    // cache already relies on. cyper-core wraps its stream the same way.
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
 
     fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         // Readiness is checked per request on the shared connection inside `call`.
@@ -128,11 +133,11 @@ impl tower::Service<http::Request<tonic::body::Body>> for ContainerdChannel {
     }
 
     fn call(&mut self, request: http::Request<tonic::body::Body>) -> Self::Future {
-        Box::pin(Self::send(
+        Box::pin(SendWrapper::new(Self::send(
             self.socket.clone(),
             self.namespace.clone(),
             request,
-        ))
+        )))
     }
 }
 
@@ -166,10 +171,7 @@ async fn sender(socket: &Path) -> Result<Sender, ChannelError> {
         return Ok(sender);
     }
     let sender = connect(socket).await?;
-    CONNECTIONS.with(|c| {
-        c.borrow_mut()
-            .insert(socket.to_path_buf(), sender.clone())
-    });
+    CONNECTIONS.with(|c| c.borrow_mut().insert(socket.to_path_buf(), sender.clone()));
     Ok(sender)
 }
 
@@ -235,20 +237,22 @@ mod tests {
             let (ready_tx, ready_rx) = mpsc::channel();
             let (stop_tx, stop_rx) = async_channel::bounded::<()>(1);
             let thread = std::thread::spawn(move || {
-                compio::runtime::Runtime::new().unwrap().block_on(async move {
-                    let listener = compio::net::UnixListener::bind(&socket).await.unwrap();
-                    let (reporter, health) = tonic_health::server::health_reporter();
-                    reporter
-                        .set_service_status("", tonic_health::ServingStatus::Serving)
-                        .await;
-                    let app = wrap(tonic::service::Routes::new(health).into_axum_router());
-                    ready_tx.send(()).unwrap();
-                    let serve = std::future::IntoFuture::into_future(cyper_axum::serve(
-                        listener,
-                        app.into_make_service(),
-                    ));
-                    futures::future::select(Box::pin(serve), Box::pin(stop_rx.recv())).await;
-                });
+                compio::runtime::Runtime::new()
+                    .unwrap()
+                    .block_on(async move {
+                        let listener = compio::net::UnixListener::bind(&socket).await.unwrap();
+                        let (reporter, health) = tonic_health::server::health_reporter();
+                        reporter
+                            .set_service_status("", tonic_health::ServingStatus::Serving)
+                            .await;
+                        let app = wrap(tonic::service::Routes::new(health).into_axum_router());
+                        ready_tx.send(()).unwrap();
+                        let serve = std::future::IntoFuture::into_future(cyper_axum::serve(
+                            listener,
+                            app.into_make_service(),
+                        ));
+                        futures::future::select(Box::pin(serve), Box::pin(stop_rx.recv())).await;
+                    });
             });
             ready_rx.recv().unwrap();
             Self {
