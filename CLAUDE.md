@@ -170,7 +170,10 @@ tag, no pushed artifact, `original:tag` is served faster than the original. Mech
 1. `original:tag` is pulled normally (P2P via spegel); its gzip layers land in containerd's content
    store keyed by digest. **An OCI gzip-layer digest is exactly the nydus zran data-blob id and the
    content-store key**, so a `localfs` backend over the content store serves layers with zero
-   re-download.
+   re-download. containerd skips fetching a layer whose snapshot already exists, so a blob
+   garbage-collected while its snapshot lived on stays missing; before converting, the worker
+   has containerd fetch such blobs through its Transfer service (`containerd_transfer.rs`,
+   credentials answered from the runtime auth store, routed via `containerd.hosts_dir`).
 2. `snapshotter/src/local_accel.rs::convert()` builds a RAFS v6 + zran artifact **locally**:
    `nydus-image create --type targz-ref --fs-version 6` per layer, then `nydus-image merge
    --original-blob-ids <digests>`. The only new blobs are the merged bootstrap and tiny per-layer

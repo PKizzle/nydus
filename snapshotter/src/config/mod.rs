@@ -159,6 +159,7 @@ pub enum Profile {
 struct ProfileDefaults {
     containerd_address: PathBuf,
     content_root: PathBuf,
+    hosts_dir: Option<PathBuf>,
     mirror_preset: MirrorPreset,
 }
 
@@ -171,11 +172,13 @@ impl Profile {
             Profile::K3s => ProfileDefaults {
                 containerd_address: PathBuf::from(K3S_CONTAINERD_SOCKET),
                 content_root: PathBuf::from(K3S_CONTENT_ROOT),
+                hosts_dir: Some(PathBuf::from(K3S_HOSTS_DIR)),
                 mirror_preset: MirrorPreset::K3sSpegel,
             },
             Profile::Auto | Profile::Containerd => ProfileDefaults {
                 containerd_address: PathBuf::from(STOCK_CONTAINERD_SOCKET),
                 content_root: PathBuf::from(STOCK_CONTENT_ROOT),
+                hosts_dir: None,
                 mirror_preset: MirrorPreset::None,
             },
         }
@@ -199,6 +202,10 @@ pub const K3S_ETC_DIR: &str = "/etc/rancher/k3s";
 /// fallback uses it, but kept next to its socket for symmetry).
 pub const K3S_CONTENT_ROOT: &str =
     "/var/lib/rancher/k3s/agent/containerd/io.containerd.content.v1.content";
+/// k3s registry hosts directory (`hosts.toml` per registry, rendered from
+/// `registries.yaml`), handed to containerd's Transfer service so a layer backfill takes
+/// the same mirror route as a CRI pull.
+pub const K3S_HOSTS_DIR: &str = "/var/lib/rancher/k3s/agent/etc/containerd/certs.d";
 /// Stock-containerd content-store root. Used by both the containerd profile
 /// table AND the `ContainerdConfig::content_root` accessor fallback — keep
 /// them referencing this one const so they can never drift apart.
@@ -311,6 +318,9 @@ impl SnapshotterConfig {
         if containerd.content_root.is_none() {
             containerd.content_root = Some(table.content_root.clone());
         }
+        if containerd.hosts_dir.is_none() {
+            containerd.hosts_dir = table.hosts_dir.clone();
+        }
 
         // Peer-mirror preset (profile-derived when unset) then the
         // preset-derived mirror fields.
@@ -349,6 +359,8 @@ impl SnapshotterConfig {
             address,
             namespace: _,
             content_root,
+            // Legitimately `None` after resolution (stock profile): containerd's default.
+            hosts_dir: _,
         } = &self.snapshotter.containerd;
         debug_assert!(
             address.is_some() && content_root.is_some(),
@@ -929,6 +941,12 @@ pub struct ContainerdConfig {
     /// like `address`; read via [`Self::content_root`].
     #[serde(default)]
     pub content_root: Option<PathBuf>,
+    /// Registry hosts directory (`<host>/hosts.toml`) containerd resolves registry
+    /// endpoints from when the snapshotter asks it to fetch content (auto-accel layer
+    /// backfill). The k3s profile fills it in; `None` lets containerd use its default
+    /// resolver, which is right for a stock containerd without mirror config.
+    #[serde(default)]
+    pub hosts_dir: Option<PathBuf>,
 }
 
 impl Default for ContainerdConfig {
@@ -937,6 +955,7 @@ impl Default for ContainerdConfig {
             address: None,
             namespace: default_containerd_namespace(),
             content_root: None,
+            hosts_dir: None,
         }
     }
 }
@@ -1935,6 +1954,10 @@ content_root = "/custom/content"
         assert_eq!(
             config.snapshotter.containerd.content_root(),
             PathBuf::from("/var/lib/rancher/k3s/agent/containerd/io.containerd.content.v1.content")
+        );
+        assert_eq!(
+            config.snapshotter.containerd.hosts_dir,
+            Some(PathBuf::from(K3S_HOSTS_DIR))
         );
         assert_eq!(
             config.snapshotter.peer_mirror.preset,

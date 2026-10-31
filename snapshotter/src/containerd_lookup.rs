@@ -653,15 +653,27 @@ fn is_host_platform(child: &OciIndexEntry) -> bool {
     })
 }
 
+/// A manifest's gzip layers that are absent from the content store. containerd skips fetching
+/// a layer whose snapshot already exists, so a layer whose blob was garbage-collected while its
+/// snapshot lived on stays missing after later pulls; the auto-accel worker backfills them.
+#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
+#[error("manifest {manifest}: layer blobs not in the content store: {}", digests.join(", "))]
+pub struct MissingLayers {
+    pub manifest: String,
+    pub digests: Vec<String>,
+}
+
 /// Filter a manifest's layers down to the gzip data layers the auto-accel
 /// path consumes, resolving each to its on-disk content-store path. Pure
-/// (filesystem check aside) and shared by the gRPC and CLI paths.
+/// (filesystem check aside) and shared by the gRPC and CLI paths. Absent blobs
+/// fail with [`MissingLayers`], naming all of them.
 fn gzip_layers_from_manifest(
     manifest: &OciManifest,
     digest: &str,
     content_root: &std::path::Path,
 ) -> Result<Vec<crate::local_accel::GzipLayer>> {
     let mut layers = Vec::with_capacity(manifest.layers.len());
+    let mut missing = Vec::new();
     for layer in &manifest.layers {
         // Skip nydus-bootstrap / nydus-blob layers — they're not gzip data
         // layers from the auto-accel path's perspective.
@@ -690,16 +702,20 @@ fn gzip_layers_from_manifest(
             .unwrap_or(&layer.digest);
         let path = content_root.join("blobs").join("sha256").join(hex);
         if !path.is_file() {
-            bail!(
-                "layer {} not present at {} (content store out of sync?)",
-                layer.digest,
-                path.display()
-            );
+            missing.push(layer.digest.clone());
+            continue;
         }
         layers.push(crate::local_accel::GzipLayer {
             digest: layer.digest.clone(),
             path,
         });
+    }
+    if !missing.is_empty() {
+        return Err(MissingLayers {
+            manifest: digest.to_string(),
+            digests: missing,
+        }
+        .into());
     }
     if layers.is_empty() {
         bail!("manifest {digest} has no gzip layers");
@@ -959,6 +975,31 @@ mod tests {
         assert!(
             err.contains("tar+zstd") && err.contains("needs gzip"),
             "{err}"
+        );
+    }
+
+    #[test]
+    fn gzip_layers_name_every_missing_blob() {
+        let root = tempfile::tempdir().unwrap();
+        let blobs = root.path().join("blobs/sha256");
+        std::fs::create_dir_all(&blobs).unwrap();
+        std::fs::write(blobs.join("bb"), b"present").unwrap();
+        let gzip = "application/vnd.oci.image.layer.v1.tar+gzip";
+        let manifest: OciManifest = serde_json::from_value(serde_json::json!({ "layers": [
+            { "digest": "sha256:aa", "mediaType": gzip },
+            { "digest": "sha256:bb", "mediaType": gzip },
+            { "digest": "sha256:cc", "mediaType": gzip },
+        ]}))
+        .unwrap();
+        let err = gzip_layers_from_manifest(&manifest, "sha256:m", root.path()).unwrap_err();
+        // Downcastable through the context callers attach.
+        let err = err.context("resolve manifest");
+        assert_eq!(
+            err.downcast_ref::<MissingLayers>(),
+            Some(&MissingLayers {
+                manifest: "sha256:m".to_string(),
+                digests: vec!["sha256:aa".to_string(), "sha256:cc".to_string()],
+            })
         );
     }
 
