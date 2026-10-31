@@ -6,7 +6,8 @@ use std::io::{BufReader, Read, Result};
 use std::mem::size_of;
 use std::slice;
 
-use nydus_utils::compress::zlib_random::{ZranContext, ZranGenerator, ZranReader};
+use nydus_utils::compress::zlib_random::{ZranChunkInfo, ZranContext, ZranGenerator, ZranReader};
+use nydus_utils::compress::zstd_frames::{ZstdFrameGenerator, ZstdFrameReader};
 
 use crate::RAFS_DEFAULT_CHUNK_SIZE;
 use crate::meta::chunk_info_v2::BlobChunkInfoV2Ondisk;
@@ -187,51 +188,107 @@ impl<R: Read> ZranContextGenerator<R> {
     /// Finish the transaction to generate a data chunk and return the chunk info struct.
     pub fn finish_chunk(&mut self) -> Result<BlobChunkInfoV2Ondisk> {
         let info = self.generator.end_read()?;
-        let mut chunk = BlobChunkInfoV2Ondisk::default();
-        chunk.set_compressed_offset(info.in_pos);
-        chunk.set_compressed_size(info.in_len);
-        chunk.set_uncompressed_offset(self.uncomp_pos);
-        chunk.set_uncompressed_size(info.ci_len);
-        chunk.set_zran(true);
-        chunk.set_zran_index(info.ci_index);
-        chunk.set_zran_offset(info.ci_offset);
-        chunk.set_compressed(true);
-        chunk.set_encrypted(false);
-
-        self.uncomp_pos += round_up_4k(info.ci_len as u64);
-
-        Ok(chunk)
+        Ok(chunk_from_context_info(&info, &mut self.uncomp_pos))
     }
 
     /// Convert all the zlib/gzip random access information to a u8 vector.
     pub fn to_vec(&self) -> Result<(Vec<u8>, u32)> {
-        let mut data = Vec::new();
-        let records = self.generator.get_compression_ctx_array();
-        let mut dict_off = 0;
+        contexts_to_vec(self.generator.get_compression_ctx_array())
+    }
+}
 
-        for info in records {
-            let ctx = ZranInflateContext {
-                in_offset: u64::to_le(info.in_offset),
-                out_offset: u64::to_le(info.out_offset),
-                dict_offset: u64::to_le(dict_off),
-                in_len: u32::to_le(info.in_len),
-                out_len: u32::to_le(info.out_len),
-                dict_size: u32::to_le(info.dict.len() as u32),
-                ctx_byte: info.ctx_byte,
-                ctx_bits: info.ctx_bits,
-                __reserved1: 0,
-                __reserved2: 0,
-            };
-            data.extend_from_slice(ctx.as_slice());
-            dict_off += info.dict.len() as u64;
-        }
-        for info in records {
-            if !info.dict.is_empty() {
-                data.extend_from_slice(&info.dict);
-            }
-        }
+/// The chunk record for a chunk decoded through a random-access context, placed at
+/// `*uncomp_pos` in the uncompressed blob, which advances past it.
+fn chunk_from_context_info(info: &ZranChunkInfo, uncomp_pos: &mut u64) -> BlobChunkInfoV2Ondisk {
+    let mut chunk = BlobChunkInfoV2Ondisk::default();
+    chunk.set_compressed_offset(info.in_pos);
+    chunk.set_compressed_size(info.in_len);
+    chunk.set_uncompressed_offset(*uncomp_pos);
+    chunk.set_uncompressed_size(info.ci_len);
+    chunk.set_zran(true);
+    chunk.set_zran_index(info.ci_index);
+    chunk.set_zran_offset(info.ci_offset);
+    chunk.set_compressed(true);
+    chunk.set_encrypted(false);
 
-        Ok((data, records.len() as u32))
+    *uncomp_pos += round_up_4k(info.ci_len as u64);
+
+    chunk
+}
+
+/// Serialize random-access contexts: the [ZranInflateContext] table, then the dictionaries.
+fn contexts_to_vec(records: &[ZranContext]) -> Result<(Vec<u8>, u32)> {
+    let mut data = Vec::new();
+    let mut dict_off = 0;
+
+    for info in records {
+        let ctx = ZranInflateContext {
+            in_offset: u64::to_le(info.in_offset),
+            out_offset: u64::to_le(info.out_offset),
+            dict_offset: u64::to_le(dict_off),
+            in_len: u32::to_le(info.in_len),
+            out_len: u32::to_le(info.out_len),
+            dict_size: u32::to_le(info.dict.len() as u32),
+            ctx_byte: info.ctx_byte,
+            ctx_bits: info.ctx_bits,
+            __reserved1: 0,
+            __reserved2: 0,
+        };
+        data.extend_from_slice(ctx.as_slice());
+        dict_off += info.dict.len() as u64;
+    }
+    for info in records {
+        if !info.dict.is_empty() {
+            data.extend_from_slice(&info.dict);
+        }
+    }
+
+    Ok((data, records.len() as u32))
+}
+
+/// Struct to generate random-access contexts for a zstd stream. The contexts use the zran
+/// layout with empty dictionaries, each starting at a zstd frame boundary; blobs built with it
+/// record `zstd` as their compressor, which is how readers tell them from gzip zran blobs.
+pub struct ZstdContextGenerator<R> {
+    generator: ZstdFrameGenerator<R>,
+    uncomp_pos: u64,
+}
+
+impl<R: Read> ZstdContextGenerator<R> {
+    /// Create a generator over `file`, whose first bytes `initial` a format sniffer already read.
+    pub fn new(file: R, initial: &[u8]) -> Result<Self> {
+        let reader = ZstdFrameReader::new(file, initial)?;
+        Ok(Self {
+            generator: ZstdFrameGenerator::new(reader),
+            uncomp_pos: 0,
+        })
+    }
+
+    /// Get reader to read decompressed data.
+    pub fn reader(&self) -> ZstdFrameReader<R> {
+        self.generator.reader()
+    }
+
+    /// Begin transaction to generate a data chunk for a file.
+    pub fn start_chunk(&mut self) -> Result<u32> {
+        self.generator.begin_read()
+    }
+
+    /// Finish the transaction to generate a data chunk and return the chunk info struct.
+    pub fn finish_chunk(&mut self) -> Result<BlobChunkInfoV2Ondisk> {
+        let info = self.generator.end_read()?;
+        Ok(chunk_from_context_info(&info, &mut self.uncomp_pos))
+    }
+
+    /// Read the stream to its end so contexts, size and digest cover all of it.
+    pub fn finish(&mut self) -> Result<()> {
+        self.generator.finish()
+    }
+
+    /// Convert all the zstd random access information to a u8 vector.
+    pub fn to_vec(&mut self) -> Result<(Vec<u8>, u32)> {
+        self.finish()?;
+        contexts_to_vec(self.generator.get_compression_ctx_array())
     }
 }
 

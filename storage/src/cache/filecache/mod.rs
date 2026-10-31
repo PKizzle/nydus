@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
 use nydus_api::CacheConfigV2;
 use nydus_utils::crypt;
@@ -387,6 +387,7 @@ impl FileCacheEntry {
             is_tarfs,
             is_batch,
             is_zran,
+            zstd_stream_cursor: Mutex::new(None),
             dio_enabled: false,
             need_validation,
             user_io_batch_size: mgr.user_io_batch_size,
