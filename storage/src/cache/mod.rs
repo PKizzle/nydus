@@ -18,11 +18,12 @@
 
 use std::cmp;
 use std::io::Result;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use fuse_backend_rs::file_buf::FileVolatileSlice;
 use nydus_utils::compress::zlib_random::ZranDecoder;
+use nydus_utils::compress::zstd_frames::{self, ZstdStreamCursor};
 use nydus_utils::crypt::{self, Cipher, CipherContext};
 use nydus_utils::{compress, digest};
 
@@ -189,6 +190,12 @@ pub trait BlobCache: Send + Sync {
         false
     }
 
+    /// The forward decoding cursor for zstd contexts too large to decode in memory, for caches
+    /// that serve them.
+    fn zstd_stream_cursor(&self) -> Option<&Mutex<Option<ZstdStreamCursor>>> {
+        None
+    }
+
     /// Check whether need to validate the data chunk by digest value.
     fn need_validation(&self) -> bool;
 
@@ -254,6 +261,15 @@ pub trait BlobCache: Send + Sync {
     where
         Self: Sized,
     {
+        let chunk_refs: Vec<&dyn BlobChunkInfo> = chunks.iter().map(|v| v.as_ref()).collect();
+        if zstd_streamed(self, &chunk_refs)? {
+            return Ok(ChunkDecompressState::new_zstd_stream(
+                blob_offset,
+                self,
+                chunk_refs,
+            ));
+        }
+
         // Read requested data from the backend by altogether.
         let mut c_buf = alloc_buf(blob_size);
         let start = Instant::now();
@@ -307,6 +323,15 @@ pub trait BlobCache: Send + Sync {
     where
         Self: Sized,
     {
+        let chunk_refs: Vec<&dyn BlobChunkInfo> = chunks.iter().map(|v| v.as_ref()).collect();
+        if zstd_streamed(self, &chunk_refs)? {
+            return Ok(ChunkDecompressState::new_zstd_stream(
+                blob_offset,
+                self,
+                chunk_refs,
+            ));
+        }
+
         let mut c_buf = alloc_buf(blob_size);
         let start = Instant::now();
         let source = if prefetch {
@@ -503,12 +528,32 @@ pub trait BlobCache: Send + Sync {
     }
 }
 
+/// Whether `chunks` include one in a zstd context too large to decode in memory. Such requests
+/// are decoded chunk by chunk through the cache's [ZstdStreamCursor] instead of reading the
+/// whole compressed range up front.
+fn zstd_streamed(cache: &dyn BlobCache, chunks: &[&dyn BlobChunkInfo]) -> StorageResult<bool> {
+    if !cache.is_zran() || cache.blob_compressor() != compress::Algorithm::Zstd {
+        return Ok(false);
+    }
+    let meta = cache.get_blob_meta_info()?.ok_or_else(|| {
+        StorageError::InvalidState("failed to get blob meta object for zstd".to_string())
+    })?;
+    for chunk in chunks {
+        let (ctx, _) = meta.get_zran_context(meta.get_zran_index(chunk.id())?)?;
+        if ctx.out_len as u64 > RAFS_MAX_CHUNK_SIZE {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// An iterator to enumerate decompressed data for chunks.
 pub struct ChunkDecompressState<'a, 'b> {
     blob_offset: u64,
     chunk_idx: usize,
     batch_idx: u32,
     zran_idx: u32,
+    zstd_stream: bool,
     cache: &'a dyn BlobCache,
     chunks: Vec<&'b dyn BlobChunkInfo>,
     c_buf: AlignedBuf,
@@ -527,10 +572,22 @@ impl<'a, 'b> ChunkDecompressState<'a, 'b> {
             chunk_idx: 0,
             batch_idx: u32::MAX,
             zran_idx: u32::MAX,
+            zstd_stream: false,
             cache,
             chunks,
             c_buf,
             d_buf: AlignedBuf::default(),
+        }
+    }
+
+    fn new_zstd_stream(
+        blob_offset: u64,
+        cache: &'a dyn BlobCache,
+        chunks: Vec<&'b dyn BlobChunkInfo>,
+    ) -> Self {
+        ChunkDecompressState {
+            zstd_stream: true,
+            ..Self::new(blob_offset, cache, chunks, AlignedBuf::default())
         }
     }
 
@@ -608,12 +665,20 @@ impl<'a, 'b> ChunkDecompressState<'a, 'b> {
         let c_offset = (c_offset - self.blob_offset) as usize;
         let input = &self.c_buf[c_offset..c_offset + c_size as usize];
         let mut output = alloc_buf(ctx.out_len as usize);
-        let mut decoder = ZranDecoder::new().map_err(|e| {
-            StorageError::InvalidData(format!("failed to build zran decoder, {}", e))
-        })?;
-        decoder
-            .uncompress(&ctx, Some(dict), input, &mut output)
-            .map_err(|e| StorageError::InvalidData(format!("failed to zran-decompress, {}", e)))?;
+        if self.cache.blob_compressor() == compress::Algorithm::Zstd {
+            zstd_frames::decompress_context(input, &mut output).map_err(|e| {
+                StorageError::InvalidData(format!("failed to zstd-decompress, {}", e))
+            })?;
+        } else {
+            let mut decoder = ZranDecoder::new().map_err(|e| {
+                StorageError::InvalidData(format!("failed to build zran decoder, {}", e))
+            })?;
+            decoder
+                .uncompress(&ctx, Some(dict), input, &mut output)
+                .map_err(|e| {
+                    StorageError::InvalidData(format!("failed to zran-decompress, {}", e))
+                })?;
+        }
         self.d_buf = output;
 
         Ok(())
@@ -674,6 +739,30 @@ impl<'a, 'b> ChunkDecompressState<'a, 'b> {
         Ok(buffer)
     }
 
+    fn next_zstd_stream(&mut self, chunk: &dyn BlobChunkInfo) -> StorageResult<AlignedBuf> {
+        let meta = self.cache.get_blob_meta_info()?.ok_or_else(|| {
+            StorageError::InvalidState("failed to get blob meta object for zstd".to_string())
+        })?;
+        let (ctx, _) = meta.get_zran_context(meta.get_zran_index(chunk.id())?)?;
+        let offset = meta.get_zran_offset(chunk.id())? as u64;
+        let cursor = self
+            .cache
+            .zstd_stream_cursor()
+            .ok_or(StorageError::Unsupported)?;
+        let reader = self.cache.reader();
+        // Use alloc_buf here to ensure 4k alignment for later use
+        // in adjust_buffer_for_dio.
+        let mut buffer = alloc_buf(chunk.uncompressed_size() as usize);
+        let mut cursor = cursor.lock().unwrap();
+        ZstdStreamCursor::read(&mut cursor, &ctx, offset, &mut buffer, |buf, off| {
+            reader.read(buf, off).map_err(|e| {
+                std::io::Error::other(format!("failed to read from the backend, {}", e))
+            })
+        })
+        .map_err(|e| StorageError::InvalidData(format!("failed to zstd-decompress, {}", e)))?;
+        Ok(buffer)
+    }
+
     fn next_buf(&mut self, chunk: &dyn BlobChunkInfo) -> StorageResult<AlignedBuf> {
         let c_offset = chunk.compressed_offset();
         let c_size = chunk.compressed_size();
@@ -729,7 +818,9 @@ impl Iterator for ChunkDecompressState<'_, '_> {
         let cache = self.cache;
         let chunk = self.chunks[self.chunk_idx];
         self.chunk_idx += 1;
-        let res = if cache.is_batch() {
+        let res = if self.zstd_stream {
+            self.next_zstd_stream(chunk)
+        } else if cache.is_batch() {
             self.next_batch(chunk)
         } else if cache.is_zran() {
             self.next_zran(chunk)
