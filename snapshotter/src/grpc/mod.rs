@@ -2048,11 +2048,12 @@ mod tests {
     }
 
     /// End-to-end check of the gRPC transport: serve the containerd snapshots
-    /// service over compio (cyper-axum + hyper http2) and drive it with a *real*
-    /// tonic gRPC client. A `Stat` of a missing key must come back as a clean
-    /// `NotFound` gRPC status, exercising the whole path that containerd uses —
-    /// HTTP/2 connect, gRPC request decode, handler dispatch, gRPC error encode,
-    /// HTTP/2 response — without needing a real containerd.
+    /// service over compio (cyper-axum + hyper http2) on a Unix socket, as in
+    /// production, and drive it with tonic's generated client on the compio
+    /// `ContainerdChannel` the snapshotter uses to reach containerd. A `Stat`
+    /// of a missing key must come back as a clean `NotFound` gRPC status,
+    /// exercising HTTP/2 connect, gRPC request decode, handler dispatch, gRPC
+    /// error encode and the HTTP/2 response, without needing a real containerd.
     #[test]
     fn grpc_transport_round_trips_a_real_client_over_compio() {
         use containerd_snapshots::api::snapshots::v1::{
@@ -2061,13 +2062,17 @@ mod tests {
 
         let dir = tempdir().unwrap();
         let server_root = dir.path().to_path_buf();
-        let (addr_tx, addr_rx) = std::sync::mpsc::channel();
+        let socket = dir.path().join("snapshotter.sock");
+        let server_socket = socket.clone();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             compio::runtime::Runtime::new()
                 .unwrap()
                 .block_on(async move {
-                    let listener = compio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-                    addr_tx.send(listener.local_addr().unwrap()).unwrap();
+                    let listener = compio::net::UnixListener::bind(&server_socket)
+                        .await
+                        .unwrap();
+                    ready_tx.send(()).unwrap();
                     let snapshotter = test_snapshotter(&server_root);
                     let grpc = snapshots::server(Arc::new(snapshotter));
                     let app = snapshots::tonic::service::Routes::new(grpc).into_axum_router();
@@ -2076,25 +2081,22 @@ mod tests {
                         .unwrap();
                 });
         });
-        let addr = addr_rx.recv().unwrap();
+        ready_rx.recv().unwrap();
 
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(async move {
-            let channel = tonic::transport::Endpoint::from_shared(format!("http://{addr}"))
-                .unwrap()
-                .connect()
-                .await
-                .expect("tonic client should connect to the compio cyper-axum gRPC server");
-            let mut client = SnapshotsClient::new(channel);
-            let status = client
-                .stat(StatSnapshotRequest {
-                    snapshotter: String::new(),
-                    key: "does-not-exist".to_string(),
-                })
-                .await
-                .expect_err("stat of a missing snapshot should return a gRPC error");
-            assert_eq!(status.code(), snapshots::tonic::Code::NotFound);
-        });
+        compio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(async move {
+                let channel = crate::containerd_grpc::ContainerdChannel::new(&socket, "k8s.io");
+                let mut client = SnapshotsClient::new(channel);
+                let status = client
+                    .stat(StatSnapshotRequest {
+                        snapshotter: String::new(),
+                        key: "does-not-exist".to_string(),
+                    })
+                    .await
+                    .expect_err("stat of a missing snapshot should return a gRPC error");
+                assert_eq!(status.code(), snapshots::tonic::Code::NotFound);
+            });
 
         // The detached server thread keeps serving; keep its root alive.
         std::mem::forget(dir);
