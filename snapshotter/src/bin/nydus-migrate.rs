@@ -291,7 +291,9 @@ fn analyze_config(args: ConfigArgs) -> Result<()> {
     );
 
     if args.commit {
-        bail!("config file writing is not implemented yet; write the TOML config with your configuration management instead");
+        bail!(
+            "config file writing is not implemented yet; write the TOML config with your configuration management instead"
+        );
     }
 
     Ok(())
