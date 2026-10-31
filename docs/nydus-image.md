@@ -94,6 +94,11 @@ data blobs: ["d3bb8a2cdb6778cbdc31d97be88ef00217d29e4c119f41ef0a4d9f202088d813"]
 ```
 
 ### Build RAFS Filesystem in Zran Mode from a tar.gz File
+
+`targz-ref` references the source tarball in place. It accepts gzip (zran contexts), uncompressed
+tar, and zstd: zstd contexts start at frame boundaries, so multi-frame layers (zstd:chunked, the
+zstd seekable format) decode in small units, while a single-frame layer is decoded forward from
+its start on demand. A zstd frame may decode to at most 4 GiB.
 ```shell
 nydus-image create -t targz-ref \
   -D /path/to/output/directory \
