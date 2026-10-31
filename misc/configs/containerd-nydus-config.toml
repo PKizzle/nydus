@@ -106,9 +106,13 @@ exclude_globs = ["/proc/**", "/sys/**", "/dev/**", "/tmp/**", "/run/**", "/var/r
 address = "/run/containerd/containerd.sock"
 namespace = "k8s.io"
 content_root = "/var/lib/containerd/io.containerd.content.v1.content"
+# Registry hosts dir containerd uses when auto-accel backfills missing layer blobs.
+# Unset means containerd's default resolver; set it to match a CRI `config_path`:
+# hosts_dir = "/etc/containerd/certs.d"
 # k3s equivalents:
 # address = "/run/k3s/containerd/containerd.sock"
 # content_root = "/var/lib/rancher/k3s/agent/containerd/io.containerd.content.v1.content"
+# hosts_dir = "/var/lib/rancher/k3s/agent/etc/containerd/certs.d"
 
 # Peer registry mirror (e.g. Spegel) for cross-node sidecar pulls. On k3s the
 # "k3s-spegel" preset (profile-derived) fills endpoint + mTLS cert paths;

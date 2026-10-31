@@ -101,7 +101,7 @@ pub fn runtime_auth_records() -> Result<Vec<RuntimeAuthRecord>, RuntimeAuthError
     Ok(records)
 }
 
-fn runtime_auth(image_ref: &ImageRef) -> Option<String> {
+pub(crate) fn runtime_auth(image_ref: &ImageRef) -> Option<String> {
     let mut store = runtime_store().lock().ok()?;
     store.prune_expired(SystemTime::now());
     auth_candidates(image_ref)

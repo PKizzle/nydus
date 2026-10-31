@@ -58,6 +58,7 @@ impl Containerd {
             address: Some(self.root.join("containerd.sock")),
             namespace: "nydus-test".to_string(),
             content_root: Some(self.root.join("root/io.containerd.content.v1.content")),
+            hosts_dir: None,
         }
     }
 

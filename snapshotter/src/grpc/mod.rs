@@ -1400,6 +1400,10 @@ pub async fn serve_with_supervisor(
                 containerd: config.snapshotter.containerd.clone(),
                 containerd_lookup: containerd_lookup.clone(),
                 access_tracer: access_tracer.clone(),
+                layer_backfill: crate::containerd_transfer::LayerBackfill::new(
+                    &config.snapshotter.containerd,
+                    content_store.clone(),
+                ),
             };
             let auto_zran = AutoZranManager::start(&config.snapshotter.auto_zran, deps);
             // Back-fill the access_tracer's auto_zran link now that the
