@@ -24,6 +24,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Transfer payloads travel as `google.protobuf.Any`, so nothing imports these.
         "containerd/api/types/transfer/registry.proto",
         "containerd/api/types/transfer/imagestore.proto",
+        "containerd/api/types/transfer/progress.proto",
     ];
     let paths: Vec<PathBuf> = services.iter().map(|p| proto_dir.join(p)).collect();
 

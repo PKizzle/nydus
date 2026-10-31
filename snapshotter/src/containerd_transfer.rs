@@ -16,6 +16,10 @@
 //! a `Streaming` stream registered as the resolver's `auth_stream`. Requests are answered from
 //! the runtime credential store (`/api/v1/auth`), or anonymously when it has nothing.
 //!
+//! A second stream receives containerd's transfer progress. A transfer is abandoned only when
+//! no blob has advanced for [`STALL_TIMEOUT`], so a slow registry connection is never cut off,
+//! while a fetch that hangs cannot block the serial conversion worker forever.
+//!
 //! The destination image record exists only to root the fetched blobs while the transfer
 //! runs; it is deleted afterwards, and the real image's manifest keeps the blobs referenced.
 
@@ -24,11 +28,11 @@ use crate::containerd_api::services::streaming::v1::{
     StreamInit, streaming_client::StreamingClient,
 };
 use crate::containerd_api::services::transfer::v1::{
-    TransferRequest, transfer_client::TransferClient,
+    TransferOptions, TransferRequest, transfer_client::TransferClient,
 };
 use crate::containerd_api::types::Platform;
 use crate::containerd_api::types::transfer::{
-    AuthRequest, AuthResponse, AuthType, ImageStore, OciRegistry, RegistryResolver,
+    AuthRequest, AuthResponse, AuthType, ImageStore, OciRegistry, Progress, RegistryResolver,
 };
 use crate::containerd_grpc::ContainerdChannel;
 use crate::containerd_lookup::MissingLayers;
@@ -39,6 +43,7 @@ use base64::Engine as _;
 use futures::future::{Either, select};
 use prost::Message;
 use prost_types::Any;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::pin::pin;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -52,14 +57,14 @@ const OCI_REGISTRY_TYPE: &str = "containerd.types.transfer.OCIRegistry";
 const IMAGE_STORE_TYPE: &str = "containerd.types.transfer.ImageStore";
 const AUTH_REQUEST_TYPE: &str = "containerd.types.transfer.AuthRequest";
 const AUTH_RESPONSE_TYPE: &str = "containerd.types.transfer.AuthResponse";
+const PROGRESS_TYPE: &str = "containerd.types.transfer.Progress";
 
 /// Prefix of the temporary image records. Distinct from `nydus.auto-accel.local/`, whose
 /// records the reconciler and the peer-mirror self-check treat as sidecars.
 const RECORD_PREFIX: &str = "nydus.layer-backfill.local/";
 
-/// Upper bound for one transfer. The conversion worker is serial, so a fetch stuck on an
-/// unresponsive registry must not hold every other conversion back.
-const TRANSFER_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+/// How long a transfer may go without any blob advancing before it is abandoned.
+const STALL_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 
 /// What one backfill restored.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -95,9 +100,7 @@ impl LayerBackfill {
         let started = Instant::now();
         let reference = pinned_reference(image, &missing.manifest)?;
         let record = record_name(&missing.manifest);
-        let transfer = compio::time::timeout(TRANSFER_TIMEOUT, self.transfer(&reference, &record))
-            .await
-            .unwrap_or_else(|_| Err(anyhow!("transfer timed out after {TRANSFER_TIMEOUT:?}")));
+        let transfer = self.transfer(&reference, &record).await;
         // Delete the record whether or not the transfer succeeded: a partial fetch leaves it
         // behind too, and the real image's manifest is what keeps the fetched blobs.
         let cleanup = self.content_store.images_delete(&record).await;
@@ -140,49 +143,112 @@ impl LayerBackfill {
     }
 
     async fn transfer(&self, reference: &str, record: &str) -> Result<()> {
-        let stream_id = auth_stream_id();
+        let auth_id = stream_id("auth");
+        let progress_id = stream_id("progress");
+        let (auth_out, mut auth_in) = self.open_stream(&auth_id).await?;
+        let (_progress_out, mut progress_in) = self.open_stream(&progress_id).await?;
+
+        let request = transfer_request(
+            reference,
+            record,
+            &auth_id,
+            &progress_id,
+            self.hosts_dir.as_ref(),
+        );
+        let mut client = TransferClient::new(self.channel.clone());
+        let transfer = pin!(client.transfer(request));
+        let responder = pin!(async {
+            while let Some(request) = auth_in.message().await? {
+                auth_out.send(answer_auth(&request)?).await?;
+            }
+            anyhow::Ok(())
+        });
+        let watchdog = pin!(watch_progress(
+            async || progress_in.message().await.ok().flatten(),
+            STALL_TIMEOUT,
+        ));
+        // Resolves only with a stall; an auth stream that ends early is logged and the
+        // transfer reports whatever it causes.
+        let stalled = pin!(async {
+            match select(responder, watchdog).await {
+                Either::Left((auth, watchdog)) => {
+                    if let Err(e) = auth {
+                        warn!(error = %format!("{e:#}"), "layer backfill auth stream failed");
+                    }
+                    watchdog.await
+                }
+                Either::Right((stall, _)) => stall,
+            }
+        });
+        // Dropping the transfer call on a stall resets its HTTP/2 stream, which cancels the
+        // fetch inside containerd.
+        match select(transfer, stalled).await {
+            Either::Left((result, _)) => result.map(drop).map_err(|status| anyhow!("{status}")),
+            Either::Right((stall, _)) => Err(stall),
+        }
+    }
+
+    /// Open a `Streaming` stream registered under `id`, returning its sender and receiver.
+    async fn open_stream(
+        &self,
+        id: &str,
+    ) -> Result<(async_channel::Sender<Any>, tonic::Streaming<Any>)> {
         let (outbound, requests) = async_channel::unbounded::<Any>();
         outbound
-            .send(to_any(
-                STREAM_INIT_TYPE,
-                &StreamInit {
-                    id: stream_id.clone(),
-                },
-            ))
+            .send(to_any(STREAM_INIT_TYPE, &StreamInit { id: id.to_string() }))
             .await?;
         let mut inbound = StreamingClient::new(self.channel.clone())
             .stream(requests)
             .await
-            .map_err(|status| anyhow!("open auth stream: {status}"))?
+            .map_err(|status| anyhow!("open stream {id}: {status}"))?
             .into_inner();
         // containerd acknowledges once the stream is registered under its ID; the transfer
         // must not reference it before that.
         inbound
             .message()
             .await
-            .map_err(|status| anyhow!("auth stream handshake: {status}"))?
-            .context("auth stream closed during handshake")?;
-
-        let request = transfer_request(reference, record, &stream_id, self.hosts_dir.as_ref());
-        let mut client = TransferClient::new(self.channel.clone());
-        let transfer = pin!(client.transfer(request));
-        let responder = pin!(async {
-            while let Some(request) = inbound.message().await? {
-                outbound.send(answer_auth(&request)?).await?;
-            }
-            anyhow::Ok(())
-        });
-        let result = match select(transfer, responder).await {
-            Either::Left((result, _)) => result,
-            Either::Right((auth, transfer)) => {
-                if let Err(e) = auth {
-                    warn!(error = %format!("{e:#}"), "layer backfill auth stream failed");
-                }
-                transfer.await
-            }
-        };
-        result.map(drop).map_err(|status| anyhow!("{status}"))
+            .map_err(|status| anyhow!("stream {id} handshake: {status}"))?
+            .with_context(|| format!("stream {id} closed during handshake"))?;
+        Ok((outbound, inbound))
     }
+}
+
+/// Resolves with an error once `stall` passes without any blob advancing in the progress
+/// reported by `next`; never resolves while progress keeps coming. A progress stream that ends
+/// stops the watch rather than counting as a stall.
+async fn watch_progress(
+    mut next: impl AsyncFnMut() -> Option<Any>,
+    stall: Duration,
+) -> anyhow::Error {
+    let mut seen = HashMap::new();
+    let mut deadline = Instant::now() + stall;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        match compio::time::timeout(remaining, next()).await {
+            Err(_) => {
+                return anyhow!("transfer stalled: no blob advanced for {stall:?}");
+            }
+            Ok(Some(update)) => {
+                if progress_advanced(&mut seen, &update) {
+                    deadline = Instant::now() + stall;
+                }
+            }
+            Ok(None) => std::future::pending::<()>().await,
+        }
+    }
+}
+
+/// Whether `update` reports something new: a blob not seen before, a new event for it, or
+/// more bytes. Re-sent unchanged values do not count.
+fn progress_advanced(seen: &mut HashMap<String, (String, i64)>, update: &Any) -> bool {
+    if update.type_url != PROGRESS_TYPE {
+        return false;
+    }
+    let Ok(progress) = Progress::decode(update.value.as_slice()) else {
+        return false;
+    };
+    let state = (progress.event, progress.progress);
+    seen.insert(progress.name, state.clone()).as_ref() != Some(&state)
 }
 
 fn to_any(type_url: &str, message: &impl Message) -> Any {
@@ -192,10 +258,10 @@ fn to_any(type_url: &str, message: &impl Message) -> Any {
     }
 }
 
-fn auth_stream_id() -> String {
+fn stream_id(purpose: &str) -> String {
     static NEXT: AtomicU64 = AtomicU64::new(0);
     format!(
-        "nydus-layer-backfill-{}-{}",
+        "nydus-layer-backfill-{purpose}-{}-{}",
         std::process::id(),
         NEXT.fetch_add(1, Ordering::Relaxed)
     )
@@ -225,6 +291,7 @@ fn transfer_request(
     reference: &str,
     record: &str,
     auth_stream: &str,
+    progress_stream: &str,
     hosts_dir: Option<&PathBuf>,
 ) -> TransferRequest {
     let source = OciRegistry {
@@ -246,7 +313,9 @@ fn transfer_request(
     TransferRequest {
         source: Some(to_any(OCI_REGISTRY_TYPE, &source)),
         destination: Some(to_any(IMAGE_STORE_TYPE, &destination)),
-        options: None,
+        options: Some(TransferOptions {
+            progress_stream: progress_stream.to_string(),
+        }),
     }
 }
 
@@ -302,7 +371,8 @@ mod tests {
         );
 
         let hosts = PathBuf::from("/etc/containerd/certs.d");
-        let request = transfer_request(&reference, &record, "stream-1", Some(&hosts));
+        let request = transfer_request(&reference, &record, "stream-1", "stream-2", Some(&hosts));
+        assert_eq!(request.options.unwrap().progress_stream, "stream-2");
 
         let source = request.source.unwrap();
         assert_eq!(source.type_url, "containerd.types.transfer.OCIRegistry");
@@ -446,6 +516,90 @@ mod tests {
                 "temporary image record left behind"
             );
         });
+    }
+
+    fn progress(name: &str, event: &str, bytes: i64) -> Any {
+        to_any(
+            PROGRESS_TYPE,
+            &Progress {
+                event: event.to_string(),
+                name: name.to_string(),
+                progress: bytes,
+                ..Default::default()
+            },
+        )
+    }
+
+    #[test]
+    fn only_new_progress_counts_as_advancing() {
+        let mut seen = HashMap::new();
+        assert!(progress_advanced(
+            &mut seen,
+            &progress("layer", "downloading", 0)
+        ));
+        assert!(!progress_advanced(
+            &mut seen,
+            &progress("layer", "downloading", 0)
+        ));
+        assert!(progress_advanced(
+            &mut seen,
+            &progress("layer", "downloading", 10)
+        ));
+        assert!(progress_advanced(
+            &mut seen,
+            &progress("config", "downloading", 10)
+        ));
+        assert!(progress_advanced(
+            &mut seen,
+            &progress("layer", "complete", 10)
+        ));
+        assert!(!progress_advanced(&mut seen, &auth_request("x/y:1")));
+    }
+
+    /// Feeds `updates`, one every `interval`, then repeats the last one forever.
+    fn ticker(updates: Vec<Any>, interval: Duration) -> impl AsyncFnMut() -> Option<Any> {
+        let mut updates = updates.into_iter();
+        let mut last = None;
+        async move || {
+            compio::time::sleep(interval).await;
+            if let Some(next) = updates.next() {
+                last = Some(next);
+            }
+            last.clone()
+        }
+    }
+
+    #[test]
+    fn slow_but_moving_transfers_are_not_stalled() {
+        let runtime = compio::runtime::Runtime::new().unwrap();
+        // 20 updates 30 ms apart outlast the 100 ms stall window several times over.
+        let updates = (0..20)
+            .map(|i| progress("layer", "downloading", i))
+            .collect();
+        let watch = watch_progress(
+            ticker(updates, Duration::from_millis(30)),
+            Duration::from_millis(100),
+        );
+        let started = Instant::now();
+        let err = runtime.block_on(watch);
+        // It stalls only after the updates stop advancing (20 × 30 ms ≈ 600 ms).
+        assert!(started.elapsed() >= Duration::from_millis(600), "{err:#}");
+        assert!(format!("{err:#}").contains("stalled"));
+    }
+
+    #[test]
+    fn repeated_identical_progress_stalls() {
+        let runtime = compio::runtime::Runtime::new().unwrap();
+        let watch = watch_progress(
+            ticker(
+                vec![progress("layer", "downloading", 5)],
+                Duration::from_millis(10),
+            ),
+            Duration::from_millis(100),
+        );
+        let started = Instant::now();
+        runtime.block_on(watch);
+        assert!(started.elapsed() < Duration::from_secs(2));
     }
 
     #[test]
