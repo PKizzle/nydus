@@ -20,7 +20,6 @@ env:
   # lowercase (this one is not). Expression syntax has no lowercase function, so
   # each job that pushes derives it with ${GITHUB_REPOSITORY,,} instead.
   IMAGE_LIST_PATH: misc/top_images/image_list.txt
-  FSCK_PATCH_PATH: misc/top_images/fsck.patch
 
 jobs:
   nydusify-build:
@@ -77,7 +76,7 @@ jobs:
         run: |
           sudo apt-get update && sudo apt-get install -y build-essential git autotools-dev automake libtool pkg-config uuid-dev liblz4-dev
           git clone https://git.kernel.org/pub/scm/linux/kernel/git/xiang/erofs-utils.git
-          cd erofs-utils && git checkout v1.6 && git apply ../${{ env.FSCK_PATCH_PATH }} && ./autogen.sh && ./configure CFLAGS="-g -O2 -std=gnu17" && make && cd ..
+          cd erofs-utils && git checkout v1.9.4 && ./autogen.sh && ./configure && make && cd ..
           sudo cp erofs-utils/fsck/fsck.erofs /usr/local/bin/
       - name: Upload fsck.erofs
         uses: actions/upload-artifact@v6
