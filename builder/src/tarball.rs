@@ -1264,7 +1264,7 @@ mod tests {
 
     #[test]
     fn test_zran_metadata_after_chunk_deduplication() {
-        use nydus_storage::backend::{localfs::LocalFs, BlobBackend};
+        use nydus_storage::backend::{BlobBackend, localfs::LocalFs};
         use nydus_storage::meta::BlobCompressionContextInfo;
         use nydus_utils::compress::zlib_random::ZranDecoder;
 

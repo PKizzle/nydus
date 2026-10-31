@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Node-local serve of every referenced layer encoding: gzip (zran), uncompressed tar,
-# multi-frame zstd (frame-aligned contexts decoded in memory) and single-frame zstd larger than
+# multi-frame zstd (frame-aligned contexts decoded in memory), multi-frame zstd whose duplicate
+# files leave more contexts than chunks after deduplication, and single-frame zstd larger than
 # RAFS_MAX_CHUNK_SIZE (decoded by the forward stream cursor). Each layer is converted with
 # `targz-ref`, the four are merged and served through fanotify/EROFS, and every file is compared
 # with its source. The single-frame layer is read last-file-first, so the cursor decodes forward
@@ -13,12 +14,13 @@ umount -l "$R/mnt" 2>/dev/null; pkill -9 -f "nydusd singleton" 2>/dev/null; slee
 rm -rf "$R"; mkdir -p "$R"/{src,out,backend,stage,mnt}
 
 # Source trees, one per layer, with distinct paths so every file comes from exactly one layer.
-mkdir -p "$R/src/gz/etc" "$R/src/tar/opt" "$R/src/zmulti/srv" "$R/src/zsingle/var"
+mkdir -p "$R/src/gz/etc" "$R/src/tar/opt" "$R/src/zmulti/srv" "$R/src/zdedup/dup" "$R/src/zsingle/var"
 echo gzip-layer > "$R/src/gz/etc/gz.txt"
 head -c 300000 /dev/urandom > "$R/src/gz/etc/gz.bin"
 echo tar-layer > "$R/src/tar/opt/tar.txt"
 head -c 2500000 /dev/urandom > "$R/src/tar/opt/tar.bin"
 for i in 1 2 3 4 5; do head -c $((700000 * i)) /dev/urandom | base64 > "$R/src/zmulti/srv/f$i.txt"; done
+for i in $(seq 1 60); do echo "same content" > "$R/src/zdedup/dup/f$i.txt"; done
 # Compressible, so ~54 MiB decompressed fits in a few MiB of zstd: one frame, far beyond 16 MiB.
 head -c 40000000 /dev/urandom | base64 > "$R/src/zsingle/var/big.txt"
 echo last-member > "$R/src/zsingle/var/zz-last.txt"
@@ -36,10 +38,16 @@ for part in "$R"/zmulti.part.*; do
   [ $n = 2 ] && printf '\x50\x2a\x4d\x18\x04\x00\x00\x00meta' >> "$R/zmulti.tar.zst"
 done
 echo "multi-frame zstd layer: $n frames + 1 skippable"
+# Duplicate files in 2 KiB frames: deduplication keeps one chunk, but every frame a file starts
+# in gets a context, so contexts outnumber chunks.
+tar -C "$R/src/zdedup" -cf "$R/zdedup.tar" .
+split -b 2048 -d -a 4 "$R/zdedup.tar" "$R/zdedup.part."
+: > "$R/zdedup.tar.zst"
+for part in "$R"/zdedup.part.*; do zstd -q -c "$part" >> "$R/zdedup.tar.zst"; done
 # Single-frame zstd with an 8 MiB window, like real image layers.
 tar -C "$R/src/zsingle" -cf - ./var/big.txt ./var/zz-last.txt | zstd -q -3 --long=23 -o "$R/zsingle.tar.zst"
 
-LAYERS="gz.tar.gz plain.tar zmulti.tar.zst zsingle.tar.zst"
+LAYERS="gz.tar.gz plain.tar zmulti.tar.zst zdedup.tar.zst zsingle.tar.zst"
 IDS=""; BOOTS=""
 for layer in $LAYERS; do
   out="$R/out/$layer"; mkdir -p "$out"
@@ -80,6 +88,7 @@ compare zsingle var/big.txt   # behind the cursor: restart at the frame start
 compare gz etc/gz.txt; compare gz etc/gz.bin
 compare tar opt/tar.txt; compare tar opt/tar.bin
 for i in 5 1 3 2 4; do compare zmulti srv/f$i.txt; done
+for i in 60 1 30; do compare zdedup dup/f$i.txt; done
 grep -i "error\|panic" "$R/log" | sed 's/\x1b\[[0-9;]*m//g' | head -5
 
 echo; [ $P = 1 ] && echo "==== REF LAYER FORMATS: PASS ====" || echo "==== REF LAYER FORMATS: FAIL ===="
