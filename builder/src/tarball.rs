@@ -32,14 +32,17 @@ use nydus_rafs::metadata::layout::RafsXAttrs;
 use nydus_rafs::metadata::layout::v5::RafsV5Inode;
 use nydus_storage::RAFS_MAX_CHUNKS_PER_BLOB;
 use nydus_storage::device::BlobFeatures;
-use nydus_storage::meta::ZranContextGenerator;
+use nydus_storage::meta::{ZranContextGenerator, ZstdContextGenerator};
 use nydus_utils::compact::makedev;
 use nydus_utils::compress::ZlibDecoder;
 use nydus_utils::compress::zlib_random::{ZRAN_READER_BUF_SIZE, ZranReader};
+use nydus_utils::compress::zstd_frames::{ZstdFrameReader, is_zstd_magic};
 use nydus_utils::digest::RafsDigest;
-use nydus_utils::{BufReaderInfo, ByteSize, div_round_up, lazy_drop, root_tracer, timing_tracer};
+use nydus_utils::{
+    BufReaderInfo, ByteSize, compress, div_round_up, lazy_drop, root_tracer, timing_tracer,
+};
 
-use crate::core::context::{Artifact, NoopArtifactWriter};
+use crate::core::context::{Artifact, NoopArtifactWriter, RefContextGenerator};
 
 use super::core::blob::Blob;
 use super::core::context::{
@@ -53,6 +56,7 @@ use super::{Builder, TarBuilder, build_bootstrap, dump_bootstrap, finalize_blob}
 enum CompressionType {
     None,
     Gzip,
+    Zstd,
 }
 
 enum TarReader {
@@ -63,6 +67,7 @@ enum TarReader {
     TarGzFile(Box<ZlibDecoder<File>>),
     TarGzBufReader(Box<ZlibDecoder<BufReader<File>>>),
     ZranReader(ZranReader<File>),
+    ZstdFrameReader(ZstdFrameReader<File>),
 }
 
 impl Read for TarReader {
@@ -75,6 +80,7 @@ impl Read for TarReader {
             TarReader::TarGzFile(f) => f.read(buf),
             TarReader::TarGzBufReader(b) => b.read(buf),
             TarReader::ZranReader(f) => f.read(buf),
+            TarReader::ZstdFrameReader(f) => f.read(buf),
         }
     }
 }
@@ -149,9 +155,21 @@ impl<'a> TarballTreeBuilder<'a> {
                 (CompressionType::Gzip, buf_reader) => {
                     let generator = ZranContextGenerator::from_buf_reader(buf_reader)?;
                     let reader = generator.reader();
-                    self.ctx.blob_zran_generator = Some(Mutex::new(generator));
+                    self.ctx.blob_zran_generator =
+                        Some(Mutex::new(RefContextGenerator::Gzip(generator)));
                     self.ctx.blob_features.insert(BlobFeatures::ZRAN);
                     TarReader::ZranReader(reader)
+                }
+                (CompressionType::Zstd, buf_reader) => {
+                    let initial = buf_reader.buffer().to_vec();
+                    let generator = ZstdContextGenerator::new(buf_reader.into_inner(), &initial)?;
+                    let reader = generator.reader();
+                    self.ctx.blob_zran_generator =
+                        Some(Mutex::new(RefContextGenerator::Zstd(generator)));
+                    self.ctx.blob_features.insert(BlobFeatures::ZRAN);
+                    // Readers tell zstd contexts from gzip ones by the blob's compressor.
+                    self.ctx.compressor = compress::Algorithm::Zstd;
+                    TarReader::ZstdFrameReader(reader)
                 }
                 (CompressionType::None, buf_reader) => {
                     self.ty = ConversionType::TarToRef;
@@ -163,6 +181,9 @@ impl<'a> TarballTreeBuilder<'a> {
             ConversionType::EStargzToRafs
             | ConversionType::TargzToRafs
             | ConversionType::TarToRafs => match Self::detect_compression_algo(file)? {
+                (CompressionType::Zstd, _) => {
+                    bail!("tarball: zstd input is supported for ref conversions only")
+                }
                 (CompressionType::Gzip, buf_reader) => {
                     if is_file {
                         let mut file = buf_reader.into_inner();
@@ -576,13 +597,15 @@ impl<'a> TarballTreeBuilder<'a> {
     fn detect_compression_algo(file: File) -> Result<(CompressionType, BufReader<File>)> {
         // Use 64K buffer to keep consistence with zlib-random.
         let mut buf_reader = BufReader::with_capacity(ZRAN_READER_BUF_SIZE, file);
-        let mut buf = [0u8; 3];
-        buf_reader.read_exact(&mut buf)?;
-        if buf[0] == 0x1f && buf[1] == 0x8b && buf[2] == 0x08 {
-            buf_reader.seek_relative(-3).unwrap();
+        let mut buf = [0u8; 4];
+        let n = buf_reader.read(&mut buf)?;
+        let n = n + buf_reader.read(&mut buf[n..])?;
+        buf_reader.seek_relative(-(n as i64))?;
+        if n >= 3 && buf[0] == 0x1f && buf[1] == 0x8b && buf[2] == 0x08 {
             Ok((CompressionType::Gzip, buf_reader))
+        } else if n == 4 && is_zstd_magic(&buf) {
+            Ok((CompressionType::Zstd, buf_reader))
         } else {
-            buf_reader.seek_relative(-3).unwrap();
             Ok((CompressionType::None, buf_reader))
         }
     }

@@ -23,6 +23,7 @@ use std::time::{Duration, Instant};
 use fuse_backend_rs::file_buf::FileVolatileSlice;
 use nix::sys::uio;
 use nydus_utils::compress::Decoder;
+use nydus_utils::compress::zstd_frames::ZstdStreamCursor;
 use nydus_utils::crypt::{self, Cipher, CipherContext};
 use nydus_utils::metrics::{BlobcacheMetrics, Metric};
 use nydus_utils::{DelayType, Delayer, FileRangeReader, compress, digest, round_up_usize};
@@ -265,6 +266,8 @@ pub(crate) struct FileCacheEntry {
     pub(crate) is_batch: bool,
     // The blob is based on ZRan decompression algorithm.
     pub(crate) is_zran: bool,
+    // Forward decoder for zstd contexts too large to decode in memory.
+    pub(crate) zstd_stream_cursor: Mutex<Option<ZstdStreamCursor>>,
     // True if direct IO is enabled for the `self.file`, supported for fscache only.
     pub(crate) dio_enabled: bool,
     // Data from the file cache should be validated before use.
@@ -709,6 +712,10 @@ impl BlobCache for FileCacheEntry {
 
     fn is_zran(&self) -> bool {
         self.is_zran
+    }
+
+    fn zstd_stream_cursor(&self) -> Option<&Mutex<Option<ZstdStreamCursor>>> {
+        Some(&self.zstd_stream_cursor)
     }
 
     fn need_validation(&self) -> bool {

@@ -238,10 +238,10 @@ impl ContainerdLookup {
     }
 
     /// Forward direction: resolve an image reference to its manifest digest
-    /// and ordered gzip layer list (lower→upper), with each layer's on-disk
+    /// and ordered layer list (lower→upper), with each layer's on-disk
     /// path in containerd's content store. Returns an error if the image
     /// isn't known to containerd, has no compatible architecture in a
-    /// multi-arch index, or carries no readable gzip layers.
+    /// multi-arch index, or carries no layers node-local acceleration reads.
     ///
     /// This is on-demand (not cached); the conversion path needs a single
     /// resolution per image and the call cost is two or three Content.Read
@@ -291,7 +291,7 @@ impl ContainerdLookup {
             );
         };
         let (final_digest, layers) =
-            resolve_gzip_layers_via_grpc(cs, &target, content_root).await?;
+            resolve_accel_layers_via_grpc(cs, &target, content_root).await?;
         Ok(ManifestInfo {
             manifest_digest: final_digest,
             layers,
@@ -521,35 +521,36 @@ fn register_chain_ids(
 }
 
 /// Layer + manifest summary used by the auto-accel pipeline. The layer list
-/// is gzip-only (skipping nydus-bootstrap / nydus-blob layers, which the
-/// auto-accel path doesn't consume) in OCI manifest order, lower → upper.
+/// holds the tar, gzip and zstd layers (skipping nydus-bootstrap / nydus-blob
+/// layers, which the auto-accel path doesn't consume) in OCI manifest order,
+/// lower → upper.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ManifestInfo {
     /// The image's manifest digest (`sha256:...`). The auto-accel sidecar
     /// uses this as the `containerd.io/gc.ref.content.subject` label — an
     /// *outgoing* GC edge that keeps the original manifest (and its layers)
-    /// alive while the sidecar exists, because the zran indexes read the
-    /// original gzip layers from the content store at serve time. The
+    /// alive while the sidecar exists, because the index blobs read the
+    /// original layers from the content store at serve time. The
     /// sidecar's own lifetime is bounded by its synthetic Image record, which
     /// the reconciler deletes once the subject image is gone.
     pub manifest_digest: String,
-    /// Gzip layers in device-table order with their on-disk content-store
+    /// Layers in device-table order with their on-disk content-store
     /// paths already resolved.
-    pub layers: Vec<crate::local_accel::GzipLayer>,
+    pub layers: Vec<crate::local_accel::SourceLayer>,
 }
 
 /// Resolve an index/manifest digest to (manifest_digest, gzip_layers) for
 /// the current host's architecture, reading blobs via gRPC. For a
 /// single-manifest digest this is a pass-through; for a multi-arch index
 /// we pick the matching child by GOARCH.
-async fn resolve_gzip_layers_via_grpc(
+async fn resolve_accel_layers_via_grpc(
     cs: &ContentStoreClient,
     digest: &str,
     content_root: &std::path::Path,
-) -> Result<(String, Vec<crate::local_accel::GzipLayer>)> {
+) -> Result<(String, Vec<crate::local_accel::SourceLayer>)> {
     // The digest is the image record's target or the host child picked
     // from it, never speculative, so a miss is worth a warning; "no host
-    // match" and "no gzip layers" are normal for many images and stay at
+    // match" and "no data layers" are normal for many images and stay at
     // the caller's debug.
     let bytes = cs
         .fetch_bytes(digest)
@@ -569,11 +570,11 @@ async fn resolve_gzip_layers_via_grpc(
     {
         let child = pick_host_arch_child(&index)
             .with_context(|| format!("no manifest in index {digest} matches this host"))?;
-        return Box::pin(resolve_gzip_layers_via_grpc(cs, &child, content_root)).await;
+        return Box::pin(resolve_accel_layers_via_grpc(cs, &child, content_root)).await;
     }
     let manifest: OciManifest = serde_json::from_slice(&bytes)
         .map_err(|e| anyhow::anyhow!("parse manifest {digest}: {e}"))?;
-    let layers = gzip_layers_from_manifest(&manifest, digest, content_root)?;
+    let layers = accel_layers_from_manifest(&manifest, digest, content_root)?;
     Ok((digest.to_string(), layers))
 }
 
@@ -653,7 +654,19 @@ fn is_host_platform(child: &OciIndexEntry) -> bool {
     })
 }
 
-/// A manifest's gzip layers that are absent from the content store. containerd skips fetching
+/// Whether a layer of this media type can be referenced in place: uncompressed, gzip or zstd
+/// tar, in OCI (`tar+gzip`) or Docker (`tar.gzip`) spelling.
+fn is_referenceable_layer(media_type: &str) -> bool {
+    ["tar", "tar+gzip", "tar.gzip", "tar+zstd", "tar.zstd"]
+        .iter()
+        .any(|suffix| {
+            media_type
+                .strip_suffix(suffix)
+                .is_some_and(|rest| rest.ends_with('.'))
+        })
+}
+
+/// A manifest's layers that are absent from the content store. containerd skips fetching
 /// a layer whose snapshot already exists, so a layer whose blob was garbage-collected while its
 /// snapshot lived on stays missing after later pulls; the auto-accel worker backfills them.
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
@@ -663,19 +676,19 @@ pub struct MissingLayers {
     pub digests: Vec<String>,
 }
 
-/// Filter a manifest's layers down to the gzip data layers the auto-accel
+/// Filter a manifest's layers down to the data layers the auto-accel
 /// path consumes, resolving each to its on-disk content-store path. Pure
 /// (filesystem check aside) and shared by the gRPC and CLI paths. Absent blobs
 /// fail with [`MissingLayers`], naming all of them.
-fn gzip_layers_from_manifest(
+fn accel_layers_from_manifest(
     manifest: &OciManifest,
     digest: &str,
     content_root: &std::path::Path,
-) -> Result<Vec<crate::local_accel::GzipLayer>> {
+) -> Result<Vec<crate::local_accel::SourceLayer>> {
     let mut layers = Vec::with_capacity(manifest.layers.len());
     let mut missing = Vec::new();
     for layer in &manifest.layers {
-        // Skip nydus-bootstrap / nydus-blob layers — they're not gzip data
+        // Skip nydus-bootstrap / nydus-blob layers — they're not data
         // layers from the auto-accel path's perspective.
         let is_nydus = layer
             .annotations
@@ -686,12 +699,13 @@ fn gzip_layers_from_manifest(
         if is_nydus {
             continue;
         }
-        // zran gives random access into gzip streams only. Checked before the blob lookup so a
-        // zstd image reports why it is not a candidate instead of failing inside the converter
-        // on an unparsable tar header. Both `tar+gzip` (OCI) and `tar.gzip` (Docker) end in gzip.
-        if !layer.media_type.ends_with("gzip") {
+        // Layers are referenced in place: gzip through zran, zstd through frame-aligned
+        // contexts, uncompressed tar directly. Checked before the blob lookup so any other
+        // encoding reports why the image is not a candidate instead of failing inside the
+        // converter on an unparsable tar header.
+        if !is_referenceable_layer(&layer.media_type) {
             bail!(
-                "layer {} is {}; node-local acceleration needs gzip layers",
+                "layer {} is {}; node-local acceleration needs tar, gzip or zstd layers",
                 layer.digest,
                 layer.media_type
             );
@@ -705,7 +719,7 @@ fn gzip_layers_from_manifest(
             missing.push(layer.digest.clone());
             continue;
         }
-        layers.push(crate::local_accel::GzipLayer {
+        layers.push(crate::local_accel::SourceLayer {
             digest: layer.digest.clone(),
             path,
         });
@@ -718,7 +732,7 @@ fn gzip_layers_from_manifest(
         .into());
     }
     if layers.is_empty() {
-        bail!("manifest {digest} has no gzip layers");
+        bail!("manifest {digest} has no data layers");
     }
     Ok(layers)
 }
@@ -892,7 +906,7 @@ fn manifest_info_via_cli(image_ref: &str, content_root: &std::path::Path) -> Res
             continue;
         };
         let (final_digest, gzip_layers) =
-            resolve_gzip_layers_via_cli(&manifest_digest, content_root)?;
+            resolve_accel_layers_via_cli(&manifest_digest, content_root)?;
         return Ok(ManifestInfo {
             manifest_digest: final_digest,
             layers: gzip_layers,
@@ -904,10 +918,10 @@ fn manifest_info_via_cli(image_ref: &str, content_root: &std::path::Path) -> Res
     )
 }
 
-fn resolve_gzip_layers_via_cli(
+fn resolve_accel_layers_via_cli(
     digest: &str,
     content_root: &std::path::Path,
-) -> Result<(String, Vec<crate::local_accel::GzipLayer>)> {
+) -> Result<(String, Vec<crate::local_accel::SourceLayer>)> {
     let bytes = run_first_ok(&[
         &["ctr", "-n", "k8s.io", "content", "get", digest],
         &["k3s", "ctr", "-n", "k8s.io", "content", "get", digest],
@@ -917,11 +931,11 @@ fn resolve_gzip_layers_via_cli(
     {
         let child = pick_host_arch_child(&index)
             .with_context(|| format!("no manifest in index {digest} matches this host"))?;
-        return resolve_gzip_layers_via_cli(&child, content_root);
+        return resolve_accel_layers_via_cli(&child, content_root);
     }
     let manifest: OciManifest = serde_json::from_slice(&bytes)
         .map_err(|e| anyhow::anyhow!("parse manifest {digest}: {e}"))?;
-    let layers = gzip_layers_from_manifest(&manifest, digest, content_root)?;
+    let layers = accel_layers_from_manifest(&manifest, digest, content_root)?;
     Ok((digest.to_string(), layers))
 }
 
@@ -962,20 +976,41 @@ mod tests {
     use super::*;
 
     #[test]
-    fn gzip_layers_reject_non_gzip_layers_before_reading_blobs() {
+    fn accel_layers_reject_other_encodings_before_reading_blobs() {
         let manifest: OciManifest = serde_json::from_value(serde_json::json!({ "layers": [
-            { "digest": "sha256:aa", "mediaType": "application/vnd.oci.image.layer.v1.tar+zstd" },
+            { "digest": "sha256:aa", "mediaType": "application/vnd.oci.image.layer.v1.tar+bzip2" },
         ]}))
         .unwrap();
         // The content root does not exist: the media type must be rejected first.
         let err =
-            gzip_layers_from_manifest(&manifest, "sha256:m", std::path::Path::new("/nonexistent"))
+            accel_layers_from_manifest(&manifest, "sha256:m", std::path::Path::new("/nonexistent"))
                 .unwrap_err()
                 .to_string();
         assert!(
-            err.contains("tar+zstd") && err.contains("needs gzip"),
+            err.contains("tar+bzip2") && err.contains("needs tar"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn referenceable_layer_media_types() {
+        for media_type in [
+            "application/vnd.oci.image.layer.v1.tar",
+            "application/vnd.oci.image.layer.v1.tar+gzip",
+            "application/vnd.oci.image.layer.v1.tar+zstd",
+            "application/vnd.oci.image.layer.nondistributable.v1.tar+gzip",
+            "application/vnd.docker.image.rootfs.diff.tar.gzip",
+            "application/vnd.docker.image.rootfs.diff.tar.zstd",
+        ] {
+            assert!(is_referenceable_layer(media_type), "{media_type}");
+        }
+        for media_type in [
+            "application/vnd.oci.image.layer.v1.tar+bzip2",
+            "application/vnd.oci.image.config.v1+json",
+            "application/octet-stream",
+        ] {
+            assert!(!is_referenceable_layer(media_type), "{media_type}");
+        }
     }
 
     #[test]
@@ -991,7 +1026,7 @@ mod tests {
             { "digest": "sha256:cc", "mediaType": gzip },
         ]}))
         .unwrap();
-        let err = gzip_layers_from_manifest(&manifest, "sha256:m", root.path()).unwrap_err();
+        let err = accel_layers_from_manifest(&manifest, "sha256:m", root.path()).unwrap_err();
         // Downcastable through the context callers attach.
         let err = err.context("resolve manifest");
         assert_eq!(

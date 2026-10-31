@@ -33,6 +33,7 @@ pub use self::core::chunk_dict::{ChunkDict, HashChunkDict, parse_chunk_dict_arg}
 pub use self::core::context::{
     ArtifactStorage, ArtifactWriter, BlobCacheGenerator, BlobContext, BlobManager,
     BootstrapContext, BootstrapManager, BuildContext, BuildOutput, ConversionType,
+    RefContextGenerator,
 };
 pub use self::core::feature::{Feature, Features};
 pub use self::core::node::{ChunkSource, NodeChunk};
@@ -237,10 +238,9 @@ fn finalize_blob(
                 // Use `sha256(tarball)` as `blob_id`. A tarball without files will fall through
                 // this path because `Blob::dump()` hasn't generated `blob_ctx.blob_id`.
                 if let Some(zran) = &ctx.blob_zran_generator {
-                    let reader = zran.lock().unwrap().reader();
-                    blob_ctx.compressed_blob_size = reader.get_data_size();
+                    let (size, hash) = zran.lock().unwrap().data_size_and_digest()?;
+                    blob_ctx.compressed_blob_size = size;
                     if blob_ctx.blob_id.is_empty() {
-                        let hash = reader.get_data_digest();
                         blob_ctx.blob_id = sha256_digest_hex(hash.finalize());
                     }
                 } else if let Some(tar_reader) = &ctx.blob_tar_reader {

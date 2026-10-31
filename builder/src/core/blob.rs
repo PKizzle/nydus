@@ -59,10 +59,9 @@ impl Blob {
                 // Use `sha256(tarball)` as `blob_id` for ref-type conversions.
                 if let Some((_, blob_ctx)) = blob_mgr.get_current_blob() {
                     if let Some(zran) = &ctx.blob_zran_generator {
-                        let reader = zran.lock().unwrap().reader();
-                        blob_ctx.compressed_blob_size = reader.get_data_size();
+                        let (size, hash) = zran.lock().unwrap().data_size_and_digest()?;
+                        blob_ctx.compressed_blob_size = size;
                         if blob_ctx.blob_id.is_empty() {
-                            let hash = reader.get_data_digest();
                             blob_ctx.blob_id = crate::sha256_digest_hex(hash.finalize());
                         }
                     } else if let Some(tar_reader) = &ctx.blob_tar_reader {
