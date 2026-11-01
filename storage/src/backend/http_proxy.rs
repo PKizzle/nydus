@@ -6,13 +6,16 @@
 
 use compio::net::UnixStream;
 use cyper_core::HyperStream;
-use http::{HeaderMap, HeaderValue, Method, Request};
+use http::{HeaderMap, HeaderValue, Method, Request, StatusCode};
 use http_body_util::{BodyExt, Full};
 use hyper::body::Bytes;
 use nydus_api::HttpProxyConfig;
 use nydus_utils::metrics::BackendMetrics;
 
-use super::connection::{Connection, ConnectionConfig, ConnectionError, block_on_http};
+use super::connection::{
+    Connection, ConnectionConfig, ConnectionError, block_on_http, check_range_status,
+    is_success_status,
+};
 use super::{BackendContext, BackendError, BackendResult, BlobBackend, BlobReader};
 use crate::backend::request;
 use std::path::Path;
@@ -43,6 +46,9 @@ pub enum HttpProxyError {
     /// Failed to get response from the remote http server.
     #[error("failed to get response, {0}")]
     RemoteRequest(#[source] ConnectionError),
+    /// The proxy answered with a status or `Content-Range` that does not carry the requested data.
+    #[error("unexpected response, {0}")]
+    Response(#[source] ConnectionError),
     /// Failed to build local http request.
     #[error("failed to build http request, {0}")]
     BuildHttpRequest(#[source] http::Error),
@@ -128,7 +134,7 @@ impl LocalClient {
         only_head: bool,
         offset: u64,
         len: Option<usize>,
-    ) -> BackendResult<(HeaderMap<HeaderValue>, Vec<u8>)> {
+    ) -> BackendResult<(StatusCode, HeaderMap<HeaderValue>, Vec<u8>)> {
         let stream = UnixStream::connect(self.socket.as_str())
             .await
             .map_err(HttpProxyError::LocalConnect)?;
@@ -156,6 +162,7 @@ impl LocalClient {
             .send_request(req)
             .await
             .map_err(HttpProxyError::LocalRequest)?;
+        let status = resp.status();
         let headers = resp.headers().clone();
         let body = if only_head {
             Vec::new()
@@ -172,15 +179,33 @@ impl LocalClient {
         // The connection task is done once the request completed and the sender
         // dropped; its result (clean close vs. peer reset) is not actionable here.
         let _ = conn_task.await;
-        Ok((headers, body))
+        Ok((status, headers, body))
     }
 
     fn get_headers(&self) -> BackendResult<HeaderMap<HeaderValue>> {
-        block_on_http(self.do_req(true, 0, None)).map(|(headers, _)| headers)
+        let (status, headers, _) = block_on_http(self.do_req(true, 0, None))?;
+        if !is_success_status(status) {
+            return Err(
+                HttpProxyError::Response(ConnectionError::ErrorWithMsg(format!(
+                    "HTTP {status} response to HEAD"
+                )))
+                .into(),
+            );
+        }
+        Ok(headers)
     }
 
     fn try_read(&self, offset: u64, len: usize) -> BackendResult<Vec<u8>> {
-        block_on_http(self.do_req(false, offset, Some(len))).map(|(_, body)| body)
+        let (status, headers, body) = block_on_http(self.do_req(false, offset, Some(len)))?;
+        let range = range_str_for_header(offset, Some(len));
+        check_range_status(
+            status,
+            headers.get(http::header::CONTENT_RANGE),
+            offset,
+            &range,
+        )
+        .map_err(HttpProxyError::Response)?;
+        Ok(body)
     }
 }
 
@@ -227,6 +252,10 @@ impl BlobReader for HttpProxyReader {
         offset: u64,
         ctx: Option<&mut BackendContext>,
     ) -> BackendResult<usize> {
+        // An empty read has no HTTP range to express it.
+        if buf.is_empty() {
+            return Ok(0);
+        }
         match &self.client {
             Client::Local(client) => {
                 let content = client.try_read(offset, buf.len())?;
@@ -262,6 +291,13 @@ impl BlobReader for HttpProxyReader {
                         false,
                     )
                     .map_err(BackendError::Request)?;
+                check_range_status(
+                    resp.status(),
+                    resp.headers().get(http::header::CONTENT_RANGE),
+                    offset,
+                    &range,
+                )
+                .map_err(HttpProxyError::Response)?;
                 Ok(resp
                     .copy_to(buf)
                     .map_err(|e| HttpProxyError::Transport(std::io::Error::other(e)))
@@ -347,10 +383,7 @@ impl Drop for HttpProxy {
 #[cfg(test)]
 mod tests {
 
-    use crate::{
-        backend::{BlobBackend, http_proxy::HttpProxy},
-        utils::alloc_buf,
-    };
+    use crate::backend::{BlobBackend, http_proxy::HttpProxy};
 
     use http::{Request, status};
     use http_body_util::Full;
@@ -360,194 +393,162 @@ mod tests {
     use hyper_util::rt::TokioIo;
     use hyper_util::server::conn::auto::Builder;
     use nydus_api::HttpProxyConfig;
-    use std::{
-        cmp,
-        fs::{self},
-        net::{IpAddr, Ipv4Addr, SocketAddr},
-        path::Path,
-        thread,
-        time::Duration,
-    };
+    use std::{cmp, thread};
     use tokio::net::{TcpListener, UnixListener};
-    use tokio::runtime::Runtime;
+    use vmm_sys_util::tempdir::TempDir;
 
     use super::Bytes;
 
     const CONTENT: &str = "some content for test";
-    const SOCKET_PATH: &str = "/tmp/nydus-test-local-http-proxy.sock";
 
-    /// Build a tokio runtime for the test mock servers (the backend under test
-    /// is on compio; only the test harness uses tokio).
-    fn build_tokio_runtime(name: &str, thread_num: usize) -> std::io::Result<Runtime> {
-        tokio::runtime::Builder::new_multi_thread()
-            .thread_name(name)
-            .worker_threads(thread_num)
-            .enable_all()
-            .build()
+    /// How the mock proxy answers a GET.
+    #[derive(Clone, Copy)]
+    enum Mode {
+        /// `206` with the requested range and its `Content-Range`.
+        Range,
+        /// `404` with an error page as the body.
+        NotFound,
+        /// `200` with the whole blob, ignoring `Range`.
+        FullBody,
     }
 
-    fn parse_range_header(range_str: &str) -> (u64, Option<u64>) {
+    fn parse_range_header(range_str: &str) -> (u64, u64) {
         let range_str = range_str.trim_start_matches("bytes=");
-        let range: Vec<&str> = range_str.split('-').collect();
-        let start = range[0].parse::<u64>().unwrap();
-        let end = match range[1] {
-            "" => None,
-            _ => Some(cmp::min(
-                range[1].parse::<u64>().unwrap(),
-                (CONTENT.len() - 1) as u64,
-            )),
+        let (start, end) = range_str.split_once('-').unwrap();
+        let end = match end {
+            "" => CONTENT.len() as u64 - 1,
+            e => cmp::min(e.parse::<u64>().unwrap(), CONTENT.len() as u64 - 1),
         };
-        (start, end)
+        (start.parse().unwrap(), end)
     }
 
     async fn server_handler(
+        mode: Mode,
         req: Request<Incoming>,
     ) -> Result<Response<Full<Bytes>>, std::convert::Infallible> {
-        match *req.method() {
-            hyper::Method::HEAD => Ok::<_, std::convert::Infallible>(
-                Response::builder()
-                    .status(200)
-                    .header(http::header::CONTENT_LENGTH, CONTENT.len())
-                    .body(Full::new(Bytes::new()))
-                    .unwrap(),
-            ),
-            hyper::Method::GET => {
+        let resp = Response::builder();
+        let resp = match (req.method().clone(), mode) {
+            (hyper::Method::HEAD, _) => resp
+                .status(200)
+                .header(http::header::CONTENT_LENGTH, CONTENT.len())
+                .body(Full::new(Bytes::new())),
+            (hyper::Method::GET, Mode::Range) => {
                 let range = req.headers()[http::header::RANGE].to_str().unwrap();
-                println!("range: {}", range);
                 let (start, end) = parse_range_header(range);
-                let length = match end {
-                    Some(e) => e - start + 1,
-                    None => CONTENT.len() as u64,
-                };
-                println!("start: {}, end: {:?}, length: {}", start, end, length);
-                let end = match end {
-                    Some(e) => e,
-                    None => (CONTENT.len() - 1) as u64,
-                };
-                let content = CONTENT.as_bytes()[start as usize..(end + 1) as usize].to_vec();
-                Ok::<_, std::convert::Infallible>(
-                    Response::builder()
-                        .status(200)
-                        .header(http::header::CONTENT_LENGTH, length)
-                        .body(Full::new(Bytes::from(content)))
-                        .unwrap(),
-                )
+                let content = CONTENT.as_bytes()[start as usize..=end as usize].to_vec();
+                resp.status(206)
+                    .header(
+                        http::header::CONTENT_RANGE,
+                        format!("bytes {}-{}/{}", start, end, CONTENT.len()),
+                    )
+                    .body(Full::new(Bytes::from(content)))
             }
-            _ => Ok::<_, std::convert::Infallible>(
-                Response::builder()
-                    .status(status::StatusCode::METHOD_NOT_ALLOWED)
-                    .body(Full::new(Bytes::new()))
-                    .unwrap(),
-            ),
-        }
+            (hyper::Method::GET, Mode::NotFound) => resp
+                .status(404)
+                .body(Full::new(Bytes::from_static(b"404 page not found\n"))),
+            (hyper::Method::GET, Mode::FullBody) => resp
+                .status(200)
+                .body(Full::new(Bytes::from_static(CONTENT.as_bytes()))),
+            _ => resp
+                .status(status::StatusCode::METHOD_NOT_ALLOWED)
+                .body(Full::new(Bytes::new())),
+        };
+        Ok(resp.unwrap())
+    }
+
+    fn serve<S>(mode: Mode, stream: S)
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    {
+        tokio::spawn(async move {
+            Builder::new(hyper_util::rt::TokioExecutor::new())
+                .serve_connection(
+                    TokioIo::new(stream),
+                    service_fn(move |req| server_handler(mode, req)),
+                )
+                .await
+                .ok();
+        });
+    }
+
+    /// Start a local (unix socket) and a remote (TCP) mock proxy answering in `mode`, and return
+    /// a backend for each. The servers run on a tokio runtime; only the test harness uses tokio.
+    fn proxies(mode: Mode, dir: &TempDir) -> Vec<HttpProxy> {
+        let socket = dir.as_path().join("proxy.sock");
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let (unix, tcp) = rt.block_on(async {
+            (
+                UnixListener::bind(&socket).unwrap(),
+                TcpListener::bind("127.0.0.1:0").await.unwrap(),
+            )
+        });
+        let port = tcp.local_addr().unwrap().port();
+        thread::spawn(move || {
+            rt.block_on(async move {
+                loop {
+                    tokio::select! {
+                        Ok((s, _)) = unix.accept() => serve(mode, s),
+                        Ok((s, _)) = tcp.accept() => serve(mode, s),
+                    }
+                }
+            });
+        });
+
+        [
+            socket.display().to_string(),
+            format!("http://127.0.0.1:{port}"),
+        ]
+        .iter()
+        .map(|addr| {
+            let config: HttpProxyConfig = serde_json::from_value(serde_json::json!({
+                "addr": addr,
+                "path": "/namespace/<repo>/blobs",
+            }))
+            .unwrap();
+            let id = format!("test-http-proxy-{port}-{}", addr.len());
+            HttpProxy::new(&config, Some(&id)).unwrap()
+        })
+        .collect()
     }
 
     #[test]
     fn test_head_and_get() {
-        thread::spawn(|| {
-            let rt = build_tokio_runtime("test-local-http-proxy-server", 1).unwrap();
-            rt.block_on(async {
-                println!("\nstarting local http proxy server......");
-                let path = Path::new(SOCKET_PATH);
-                if path.exists() {
-                    fs::remove_file(path).unwrap();
-                }
-                let listener = UnixListener::bind(path).unwrap();
-                loop {
-                    let (stream, _) = listener.accept().await.unwrap();
-                    let io = TokioIo::new(stream);
-                    tokio::spawn(async move {
-                        Builder::new(hyper_util::rt::TokioExecutor::new())
-                            .serve_connection(io, service_fn(server_handler))
-                            .await
-                            .ok();
-                    });
-                }
-            });
-        });
-
-        thread::spawn(|| {
-            let rt = build_tokio_runtime("test-remote-http-proxy-server", 1).unwrap();
-            rt.block_on(async {
-                println!("\nstarting remote http proxy server......");
-                let listener = TcpListener::bind(SocketAddr::new(
-                    IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
-                    9977,
-                ))
-                .await
-                .unwrap();
-                loop {
-                    let (stream, _) = listener.accept().await.unwrap();
-                    let io = TokioIo::new(stream);
-                    tokio::spawn(async move {
-                        Builder::new(hyper_util::rt::TokioExecutor::new())
-                            .serve_connection(io, service_fn(server_handler))
-                            .await
-                            .ok();
-                    });
-                }
-            });
-        });
-
-        // wait for server to start
-        thread::sleep(Duration::from_secs(5));
-
-        // start the client and test
-        let test_list: Vec<(String, String)> = vec![
-            (
-                format!(
-                    "{{\"addr\":\"{}\",\"path\":\"/namespace/<repo>/blobs\"}}",
-                    SOCKET_PATH,
-                ),
-                "test-local-http-proxy".to_string(),
-            ),
-            (
-                "{\"addr\":\"http://127.0.0.1:9977\",\"path\":\"/namespace/<repo>/blobs\"}"
-                    .to_string(),
-                "test-remote-http-proxy".to_string(),
-            ),
-        ];
-        for test_case in test_list.iter() {
-            let config: HttpProxyConfig = serde_json::from_str(test_case.0.as_str()).unwrap();
-            let backend = HttpProxy::new(&config, Some(test_case.1.as_str())).unwrap();
+        let dir = TempDir::new().unwrap();
+        for backend in proxies(Mode::Range, &dir) {
             let reader = backend.get_reader("blob_id").unwrap();
+            assert_eq!(reader.blob_size().unwrap(), CONTENT.len() as u64);
 
-            println!();
-            println!("testing blob_size()......");
-            let blob_size = reader
-                .blob_size()
-                .map_err(|e| {
-                    println!("blob_size() failed: {}", e);
-                    e
-                })
-                .unwrap();
-            assert_eq!(blob_size, CONTENT.len() as u64);
+            let mut buf = vec![0u8; 3];
+            assert_eq!(reader.try_read(&mut buf, 0).unwrap(), 3);
+            assert_eq!(buf, &CONTENT.as_bytes()[0..3]);
 
-            println!();
-            println!("testing read() range......");
-            let mut buf = alloc_buf(3);
-            let size = reader
-                .try_read(&mut buf, 0)
-                .map_err(|e| {
-                    println!("read() range failed: {}", e);
-                    e
-                })
-                .unwrap();
-            assert_eq!(size, 3);
-            assert_eq!(&*buf, &CONTENT.as_bytes()[0..3]);
+            assert_eq!(reader.try_read(&mut buf, 5).unwrap(), 3);
+            assert_eq!(buf, &CONTENT.as_bytes()[5..8]);
 
-            println!();
-            println!("testing read() full......");
-            let mut buf = alloc_buf(80);
-            let size = reader
-                .try_read(&mut buf, 0)
-                .map_err(|e| {
-                    println!("read() range failed: {}", e);
-                    e
-                })
-                .unwrap();
-            assert_eq!(size, CONTENT.len());
+            let mut buf = vec![0u8; 80];
+            assert_eq!(reader.try_read(&mut buf, 0).unwrap(), CONTENT.len());
             assert_eq!(&buf[0..CONTENT.len()], CONTENT.as_bytes());
+
+            // An empty read has no HTTP range and must not issue one.
+            assert_eq!(reader.try_read(&mut [], 0).unwrap(), 0);
+        }
+    }
+
+    /// A response that does not carry the requested range must fail the read instead of
+    /// being copied into the cache as chunk data.
+    #[test]
+    fn test_get_rejects_responses_without_the_range() {
+        for mode in [Mode::NotFound, Mode::FullBody] {
+            let dir = TempDir::new().unwrap();
+            for backend in proxies(mode, &dir) {
+                let reader = backend.get_reader("blob_id").unwrap();
+                let mut buf = vec![0u8; 3];
+                assert!(reader.try_read(&mut buf, 5).is_err());
+            }
         }
     }
 }

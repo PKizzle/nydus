@@ -281,9 +281,7 @@ pub trait BlobCache: Send + Sync {
         let nr_read = self
             .reader()
             .read_with_source(c_buf.as_mut_slice(), blob_offset, source)
-            .map_err(|e| {
-                StorageError::InvalidData(format!("failed to read from the backend, {}", e))
-            })?;
+            .map_err(StorageError::backend)?;
         if nr_read != blob_size {
             return Err(StorageError::InvalidData(format!(
                 "request for {} bytes but got {} bytes",
@@ -343,9 +341,7 @@ pub trait BlobCache: Send + Sync {
             .reader()
             .read_with_source_async(c_buf.as_mut_slice(), blob_offset, source)
             .await
-            .map_err(|e| {
-                StorageError::InvalidData(format!("failed to read from the backend, {}", e))
-            })?;
+            .map_err(StorageError::backend)?;
         if nr_read != blob_size {
             return Err(StorageError::InvalidData(format!(
                 "request for {} bytes but got {} bytes",
@@ -382,9 +378,10 @@ pub trait BlobCache: Send + Sync {
         if self.is_zran() || self.is_batch() {
             return Err(StorageError::Unsupported);
         } else if !chunk.is_compressed() && !chunk.is_encrypted() {
-            let size = self.reader().read(buffer, offset).map_err(|e| {
-                StorageError::InvalidData(format!("failed to read from the backend, {}", e))
-            })?;
+            let size = self
+                .reader()
+                .read(buffer, offset)
+                .map_err(StorageError::backend)?;
             if size != buffer.len() {
                 return Err(StorageError::InvalidData(
                     "storage backend returns less data than requested".to_string(),
@@ -400,9 +397,7 @@ pub trait BlobCache: Send + Sync {
             let size = self
                 .reader()
                 .read(raw_buffer.as_mut_slice(), offset)
-                .map_err(|e| {
-                    StorageError::InvalidData(format!("failed to read from the backend, {}", e))
-                })?;
+                .map_err(StorageError::backend)?;
             if size != raw_buffer.len() {
                 return Err(StorageError::InvalidData(
                     "storage backend returns less data than requested".to_string(),
@@ -755,11 +750,9 @@ impl<'a, 'b> ChunkDecompressState<'a, 'b> {
         let mut buffer = alloc_buf(chunk.uncompressed_size() as usize);
         let mut cursor = cursor.lock().unwrap();
         ZstdStreamCursor::read(&mut cursor, &ctx, offset, &mut buffer, |buf, off| {
-            reader.read(buf, off).map_err(|e| {
-                std::io::Error::other(format!("failed to read from the backend, {}", e))
-            })
+            reader.read(buf, off).map_err(std::io::Error::other)
         })
-        .map_err(|e| StorageError::InvalidData(format!("failed to zstd-decompress, {}", e)))?;
+        .map_err(StorageError::Decompress)?;
         Ok(buffer)
     }
 
@@ -792,12 +785,6 @@ impl<'a, 'b> ChunkDecompressState<'a, 'b> {
         let mut buffer = alloc_buf(d_size);
         self.cache
             .decompress_chunk_data(&decrypted_buffer, &mut buffer, chunk.is_compressed())?;
-        self.cache
-            .validate_chunk_data(chunk, &buffer)
-            .map_err(|e| {
-                warn!("failed to read data from backend, {}", e);
-                e
-            })?;
         Ok(buffer)
     }
 
@@ -827,6 +814,13 @@ impl Iterator for ChunkDecompressState<'_, '_> {
         } else {
             self.next_buf(chunk)
         };
+        let res = res.and_then(|buffer| {
+            cache.validate_chunk_data(chunk, &buffer).map_err(|e| {
+                warn!("failed to read data from backend, {}", e);
+                e
+            })?;
+            Ok(buffer)
+        });
         Some(res.map_err(std::io::Error::from))
     }
 }
@@ -884,6 +878,215 @@ mod tests {
     use crate::test::MockChunkInfo;
 
     use super::*;
+
+    mod zran {
+        use nydus_utils::digest::RafsDigest;
+        use nydus_utils::metrics::BackendMetrics;
+
+        use super::*;
+        use crate::backend::{BackendError, BackendResult};
+        use crate::cache::state::NoopChunkMap;
+        use crate::device::BlobPrefetchRequest;
+        use crate::meta::{
+            BlobChunkInfoV2Ondisk, BlobCompressionContext, BlobMetaChunkArray, ZranInflateContext,
+        };
+
+        /// Serves `data`, or fails every read with `errno`.
+        struct MemReader {
+            data: Vec<u8>,
+            errno: Option<i32>,
+            metrics: Arc<BackendMetrics>,
+        }
+
+        impl BlobReader for MemReader {
+            fn blob_size(&self) -> BackendResult<u64> {
+                Ok(self.data.len() as u64)
+            }
+
+            fn try_read(&self, buf: &mut [u8], offset: u64) -> BackendResult<usize> {
+                if let Some(errno) = self.errno {
+                    let e = std::io::Error::from_raw_os_error(errno);
+                    return Err(BackendError::CopyData(StorageError::cache_io("pread", e)));
+                }
+                let data = &self.data[offset as usize..];
+                let n = buf.len().min(data.len());
+                buf[..n].copy_from_slice(&data[..n]);
+                Ok(n)
+            }
+
+            fn metrics(&self) -> &BackendMetrics {
+                &self.metrics
+            }
+        }
+
+        /// A zstd zran blob with one context holding one zstd frame, and one chunk at its start.
+        struct ZstdBlob {
+            meta: Arc<BlobCompressionContextInfo>,
+            reader: MemReader,
+            chunk_map: Arc<dyn ChunkMap>,
+            cursor: Mutex<Option<ZstdStreamCursor>>,
+        }
+
+        impl ZstdBlob {
+            /// `ctx_len` decoded bytes of `byte`; a context over `RAFS_MAX_CHUNK_SIZE` is streamed.
+            fn new(byte: u8, ctx_len: usize, errno: Option<i32>) -> Self {
+                let data = vec![byte; ctx_len];
+                let (frame, compressed) =
+                    compress::compress(&data, compress::Algorithm::Zstd).unwrap();
+                assert!(compressed);
+                let mut chunk = BlobChunkInfoV2Ondisk::default();
+                chunk.set_zran(true);
+                chunk.set_zran_index(0);
+                chunk.set_zran_offset(0);
+                let state = BlobCompressionContext {
+                    chunk_info_array: BlobMetaChunkArray::V2(vec![chunk].into()),
+                    zran_info_array: vec![
+                        ZranInflateContext::with_out_len(ctx_len as u32)
+                            .with_in_len(frame.len() as u32),
+                    ]
+                    .into(),
+                    ..Default::default()
+                };
+                ZstdBlob {
+                    meta: Arc::new(BlobCompressionContextInfo {
+                        state: Arc::new(state),
+                    }),
+                    reader: MemReader {
+                        data: frame.into_owned(),
+                        errno,
+                        metrics: BackendMetrics::new("zstd-zran-test", "mock"),
+                    },
+                    chunk_map: Arc::new(NoopChunkMap::new(false)),
+                    cursor: Mutex::new(None),
+                }
+            }
+
+            /// Decode the chunk, whose digest says it holds 0x1000 bytes of `b'a'`.
+            fn read_chunk(&self) -> StorageResult<std::io::Result<AlignedBuf>> {
+                let chunk: Arc<dyn BlobChunkInfo> = Arc::new(MockChunkInfo {
+                    block_id: RafsDigest::from_buf(&[b'a'; 0x1000], digest::Algorithm::Sha256),
+                    uncompress_size: 0x1000,
+                    ..Default::default()
+                });
+                let chunks = [chunk];
+                let mut bufs =
+                    self.read_chunks_from_backend(0, self.reader.data.len(), &chunks, false)?;
+                Ok(bufs.next().unwrap())
+            }
+        }
+
+        impl BlobCache for ZstdBlob {
+            fn blob_id(&self) -> &str {
+                "zstd-zran-test"
+            }
+            fn blob_uncompressed_size(&self) -> StorageResult<u64> {
+                Ok(0)
+            }
+            fn blob_compressed_size(&self) -> StorageResult<u64> {
+                Ok(self.reader.data.len() as u64)
+            }
+            fn blob_compressor(&self) -> compress::Algorithm {
+                compress::Algorithm::Zstd
+            }
+            fn blob_cipher(&self) -> crypt::Algorithm {
+                crypt::Algorithm::None
+            }
+            fn blob_cipher_object(&self) -> Arc<Cipher> {
+                Default::default()
+            }
+            fn blob_cipher_context(&self) -> Option<CipherContext> {
+                None
+            }
+            fn blob_digester(&self) -> digest::Algorithm {
+                digest::Algorithm::Sha256
+            }
+            fn is_legacy_stargz(&self) -> bool {
+                false
+            }
+            fn is_zran(&self) -> bool {
+                true
+            }
+            fn zstd_stream_cursor(&self) -> Option<&Mutex<Option<ZstdStreamCursor>>> {
+                Some(&self.cursor)
+            }
+            fn need_validation(&self) -> bool {
+                true
+            }
+            fn reader(&self) -> &dyn BlobReader {
+                &self.reader
+            }
+            fn get_chunk_map(&self) -> &Arc<dyn ChunkMap> {
+                &self.chunk_map
+            }
+            fn get_chunk_info(&self, _chunk_index: u32) -> Option<Arc<dyn BlobChunkInfo>> {
+                None
+            }
+            fn start_prefetch(&self) -> StorageResult<()> {
+                Ok(())
+            }
+            fn stop_prefetch(&self) -> StorageResult<()> {
+                Ok(())
+            }
+            fn is_prefetch_active(&self) -> bool {
+                false
+            }
+            fn prefetch(
+                &self,
+                _cache: Arc<dyn BlobCache>,
+                _prefetches: &[BlobPrefetchRequest],
+                _bios: &[BlobIoDesc],
+            ) -> StorageResult<usize> {
+                Err(StorageError::Unsupported)
+            }
+            fn read(
+                &self,
+                _iovec: &mut BlobIoVec,
+                _buffers: &[FileVolatileSlice],
+            ) -> StorageResult<usize> {
+                Err(StorageError::Unsupported)
+            }
+            fn get_blob_meta_info(&self) -> StorageResult<Option<Arc<BlobCompressionContextInfo>>> {
+                Ok(Some(self.meta.clone()))
+            }
+        }
+
+        const STREAMED: usize = RAFS_MAX_CHUNK_SIZE as usize + 0x1000;
+
+        /// `cache.validate = true` must check the digest of zran chunks, both those decoded in
+        /// memory and those decoded by the zstd stream cursor.
+        #[test]
+        fn test_zran_chunks_are_validated() {
+            for ctx_len in [0x2000, STREAMED] {
+                let genuine = ZstdBlob::new(b'a', ctx_len, None);
+                assert_eq!(&genuine.read_chunk().unwrap().unwrap()[..], &[b'a'; 0x1000]);
+
+                // A blob that decodes cleanly to data other than the chunk's.
+                let tampered = ZstdBlob::new(b'b', ctx_len, None);
+                let err = tampered.read_chunk().unwrap().unwrap_err();
+                assert_eq!(
+                    err.kind(),
+                    std::io::ErrorKind::InvalidData,
+                    "{ctx_len}: {err}"
+                );
+            }
+        }
+
+        /// A backend read failure keeps its errno, whether the read fetched the compressed range
+        /// up front or was issued by the zstd stream decoder.
+        #[test]
+        fn test_backend_errno_survives_zran_reads() {
+            let blob = ZstdBlob::new(b'a', 0x2000, Some(libc::ENOSPC));
+            let Err(err) = blob.read_chunk() else {
+                panic!("the read must fail");
+            };
+            assert_eq!(nydus_utils::source_errno(&err), Some(libc::ENOSPC), "{err}");
+
+            let blob = ZstdBlob::new(b'a', STREAMED, Some(libc::ENOSPC));
+            let err = blob.read_chunk().unwrap().unwrap_err();
+            assert_eq!(nydus_utils::source_errno(&err), Some(libc::ENOSPC), "{err}");
+            assert_eq!(err.raw_os_error(), Some(libc::ENOSPC));
+        }
+    }
 
     #[test]
     fn test_io_merge_state_new() {

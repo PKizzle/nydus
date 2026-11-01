@@ -371,6 +371,50 @@ pub(crate) fn respond(resp: Response, catch_status: bool) -> ConnectionResult<Re
     }
 }
 
+/// Check a blob GET that carried `Range: <range>` starting at `offset`.
+///
+/// `Content-Range` decides which bytes the body carries: a `206` or `200` whose
+/// `Content-Range` starts at `offset` is the requested range (dfdaemon < 1.4.0 serves a
+/// Range it satisfied itself as `200 OK` with a correct `Content-Range`). A `206` without
+/// the header is trusted as the requested range; a `200` without it is the whole blob,
+/// which is the requested data only at offset 0. Anything else would put bytes from the
+/// wrong offset into the cache. A 3xx here is a redirect that was not followed and
+/// carries no blob data.
+#[cfg(any(feature = "backend-registry", feature = "backend-http-proxy"))]
+pub(crate) fn check_range_status(
+    status: StatusCode,
+    content_range: Option<&HeaderValue>,
+    offset: u64,
+    range: &str,
+) -> ConnectionResult<()> {
+    // `bytes <start>-<end>/<total>`; `bytes */<total>` has no start and never matches.
+    let start = content_range
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.trim().strip_prefix("bytes "))
+        .and_then(|v| v.split_once('-'))
+        .and_then(|(start, _)| start.trim().parse::<u64>().ok());
+    let ok = match (status, start) {
+        (StatusCode::PARTIAL_CONTENT | StatusCode::OK, Some(start)) => start == offset,
+        (StatusCode::PARTIAL_CONTENT, None) => content_range.is_none(),
+        (StatusCode::OK, None) => content_range.is_none() && offset == 0,
+        _ => false,
+    };
+    if ok {
+        return Ok(());
+    }
+    let content_range = content_range
+        .map(|v| {
+            format!(
+                " (Content-Range: {})",
+                String::from_utf8_lossy(v.as_bytes())
+            )
+        })
+        .unwrap_or_default();
+    Err(ConnectionError::ErrorWithMsg(format!(
+        "unexpected HTTP {status} response to Range {range}{content_range}"
+    )))
+}
+
 /// A network connection to communicate with remote server.
 #[derive(Debug)]
 pub(crate) struct Connection {

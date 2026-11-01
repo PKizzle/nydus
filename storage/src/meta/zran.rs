@@ -54,6 +54,12 @@ impl ZranInflateContext {
             __reserved2: 0,
         }
     }
+
+    /// Set the size of the compressed data the context decodes.
+    pub(crate) fn with_in_len(mut self, in_len: u32) -> Self {
+        self.in_len = u32::to_le(in_len);
+        self
+    }
 }
 
 unsafe impl FromMapped for ZranInflateContext {}
