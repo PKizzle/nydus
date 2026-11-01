@@ -333,7 +333,7 @@ mod tests {
         use registry_client::types::{MEDIA_TYPE_OCI_INDEX, Platform};
         let leaf = |arch: &str| Descriptor {
             media_type: MEDIA_TYPE_OCI_MANIFEST.to_string(),
-            digest: format!("sha256:{arch}"),
+            digest: registry_client::sha256_digest(arch.as_bytes()),
             size: 10,
             platform: Some(Platform {
                 architecture: arch.to_string(),
@@ -399,9 +399,12 @@ mod tests {
     #[test]
     fn assemble_puts_bootstrap_last_and_preserves_blob_order() {
         let config = Descriptor::for_bytes(MEDIA_TYPE_OCI_CONFIG, b"{}");
-        let d0 = data_blob_descriptor("sha256:0".into(), 1);
-        let d1 = data_blob_descriptor("sha256:1".into(), 2);
-        let boot = bootstrap_descriptor("sha256:boot".into(), "sha256:bootdiff".into(), 3);
+        // Real-shaped digests: the manifest is reparsed below, and parsing
+        // validates them.
+        let digest = |s: &str| registry_client::sha256_digest(s.as_bytes());
+        let d0 = data_blob_descriptor(digest("0"), 1);
+        let d1 = data_blob_descriptor(digest("1"), 2);
+        let boot = bootstrap_descriptor(digest("boot"), digest("bootdiff"), 3);
         let manifest = assemble_manifest(true, config, vec![d0, d1], boot);
 
         assert_eq!(manifest.schema_version, 2);
@@ -410,8 +413,8 @@ mod tests {
             Some(MEDIA_TYPE_OCI_MANIFEST)
         );
         assert_eq!(manifest.layers.len(), 3);
-        assert_eq!(manifest.layers[0].digest, "sha256:0");
-        assert_eq!(manifest.layers[1].digest, "sha256:1");
+        assert_eq!(manifest.layers[0].digest, digest("0"));
+        assert_eq!(manifest.layers[1].digest, digest("1"));
         // Bootstrap is last and carries the meta annotation.
         let last = manifest.layers.last().unwrap();
         assert_eq!(last.media_type, MEDIA_TYPE_OCI_LAYER_GZIP);

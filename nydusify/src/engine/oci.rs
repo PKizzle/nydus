@@ -243,6 +243,8 @@ pub enum BlobSource<'a> {
     Download {
         client: &'a RegistryClient,
         staging: &'a Path,
+        /// The descriptor's size, which caps the download.
+        size: u64,
     },
 }
 
@@ -292,11 +294,15 @@ pub async fn ensure_blob_in_repo(
                 .await
                 .with_context(|| format!("push blob {digest}"))?;
         }
-        BlobSource::Download { client, staging } => {
+        BlobSource::Download {
+            client,
+            staging,
+            size,
+        } => {
             let from = source_repo.context("downloading a blob needs a source repository")?;
             let tmp = staging.join(blob_hex(digest));
             client
-                .get_blob_to_file(from, digest, &tmp)
+                .get_blob_to_file(from, digest, size, &tmp)
                 .await
                 .with_context(|| format!("download blob {digest}"))?;
             retry

@@ -70,10 +70,6 @@ pub struct CommitArgs {
     /// layers, so a commit loop cannot grow a manifest without bound.
     #[arg(long = "maximum-times", default_value_t = 400)]
     pub maximum_times: usize,
-    /// `nsenter` binary used to enter the container's mount namespace for
-    /// `--with-path`.
-    #[arg(long = "nsenter", env = "NSENTER", default_value = "nsenter")]
-    pub nsenter: PathBuf,
     /// containerd CLI used to inspect the container.
     #[arg(long = "containerd-cli", env = "CONTAINERD_CLI", default_value = "ctr")]
     pub containerd_cli: PathBuf,
@@ -423,26 +419,9 @@ pub struct CheckArgs {
     /// and target). Repeatable; ignored when `--*-insecure` is set.
     #[arg(long = "ca-cert", env = "CA_CERT", value_delimiter = ',')]
     pub ca_cert: Vec<PathBuf>,
-    #[arg(long = "source-backend-type", value_enum, env = "SOURCE_BACKEND_TYPE")]
-    pub source_backend_type: Option<BackendType>,
-    #[arg(long = "source-backend-config", env = "SOURCE_BACKEND_CONFIG")]
-    pub source_backend_config: Option<String>,
-    #[arg(
-        long = "source-backend-config-file",
-        env = "SOURCE_BACKEND_CONFIG_FILE"
-    )]
-    pub source_backend_config_file: Option<PathBuf>,
-    #[arg(long = "target-backend-type", value_enum, env = "TARGET_BACKEND_TYPE")]
-    pub target_backend_type: Option<BackendType>,
-    #[arg(long = "target-backend-config", env = "TARGET_BACKEND_CONFIG")]
-    pub target_backend_config: Option<String>,
-    #[arg(
-        long = "target-backend-config-file",
-        env = "TARGET_BACKEND_CONFIG_FILE"
-    )]
-    pub target_backend_config_file: Option<PathBuf>,
-    #[arg(long = "multi-platform", env = "MULTI_PLATFORM")]
-    pub multi_platform: bool,
+    // No backend, `--multi-platform` or `--nydusd` flags: `check` reads only
+    // the manifest and bootstrap of one platform and mounts nothing, so they
+    // would be accepted and silently ignored.
     #[arg(long, default_value_t = default_platform())]
     pub platform: String,
     #[arg(long = "work-dir", env = "WORK_DIR", default_value = "./output")]
@@ -453,8 +432,6 @@ pub struct CheckArgs {
         default_value = "nydus-image"
     )]
     pub nydus_image: PathBuf,
-    #[arg(long = "nydusd", env = "NYDUSD", default_value = "nydusd")]
-    pub nydusd: PathBuf,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Args)]

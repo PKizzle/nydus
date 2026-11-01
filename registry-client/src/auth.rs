@@ -298,6 +298,10 @@ pub(crate) fn percent_encode_query(value: &str) -> String {
     out
 }
 
+/// Upper bound on a token response body. A JWT is a few KiB; the cap keeps a
+/// hostile token service from making us buffer an unbounded body.
+const MAX_TOKEN_BODY_BYTES: u64 = 1024 * 1024;
+
 #[derive(Debug, Deserialize)]
 struct RegistryTokenResponse {
     token: Option<String>,
@@ -374,9 +378,13 @@ pub async fn fetch_bearer_token(
             response.status()
         );
     }
-    response
-        .json::<RegistryTokenResponse>()
-        .await
+    let body = crate::client::collect_bounded(
+        response.bytes_stream(),
+        MAX_TOKEN_BODY_BYTES,
+        "registry token response",
+    )
+    .await?;
+    serde_json::from_slice::<RegistryTokenResponse>(&body)
         .context("failed to decode registry token response")?
         .into_bearer()
         .context("registry token response did not include a token")

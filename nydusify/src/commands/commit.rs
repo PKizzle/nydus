@@ -34,12 +34,12 @@
 //! A bind-mounted volume is a separate mount over the merged view, so nothing
 //! written into it ever reaches the overlay upperdir the diff walks -- an
 //! ordinary commit cannot see it at all. `--with-path` covers those: each named
-//! path is tarred out of the *running* container's mount namespace with
-//! `nsenter` and merged as its own layer, after the writable one, so it shadows
-//! whatever the rootfs had at that location just as the mount did.
+//! path is read out of the *running* container's mount view through
+//! `/proc/<pid>/root` and merged as its own layer, after the writable one, so
+//! it shadows whatever the rootfs had at that location just as the mount did.
 
 use std::ffi::OsString;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context, Result, bail};
@@ -280,7 +280,7 @@ pub async fn run(args: CommitArgs) -> Result<()> {
         );
         for (idx, path) in plan.with_path.iter().enumerate() {
             let tar = work_dir.join(format!("blob-mount-{idx}.tar"));
-            copy_from_container(&args.nsenter, pid, path, &tar)?;
+            copy_from_container(pid, path, &tar)?;
             extra_layers.push(build_rafs_layer(
                 &args.nydus_image,
                 &tar,
@@ -530,7 +530,7 @@ async fn copy_blob_to_target(
     // not have to fit in memory.
     let staged = work_dir.join(format!("base-{}", blob_hex(&layer.digest)));
     source_client
-        .get_blob_to_file(&source_ref.repo, &layer.digest, &staged)
+        .get_blob_to_file(&source_ref.repo, &layer.digest, layer.size, &staged)
         .await
         .with_context(|| format!("fetch base blob {} from {source_ref}", layer.digest))?;
     let result = retry
@@ -620,74 +620,34 @@ fn build_rafs_layer(
     })
 }
 
-/// Tar an absolute path out of the running container's mount namespace.
+/// Tar an absolute path out of the running container.
 ///
 /// `--with-path` exists for bind-mounted volumes: they are separate mounts over
 /// the merged view, so nothing they contain ever reaches the overlay upperdir
-/// an ordinary commit walks. Reading them means entering the container's mount
-/// namespace, which is what `nsenter` is for.
-fn copy_from_container(nsenter: &Path, pid: u32, path: &Path, out: &Path) -> Result<()> {
-    if !path.is_absolute() {
-        bail!(
-            "--with-path {} must be absolute: it is resolved inside the container, \
-             where the working directory is not ours",
-            path.display()
-        );
-    }
-    let tar = std::fs::File::create(out)
-        .with_context(|| format!("create mount tar {}", out.display()))?;
-    let args = nsenter_tar_args(pid, path);
-    debug!(binary = %nsenter.display(), ?args, "reading a path out of the container");
-
-    let output = Command::new(nsenter)
-        .args(&args)
-        .stdout(tar)
-        .output()
-        .with_context(|| {
-            format!(
-                "spawn `{}` to read {} out of the container (install util-linux, or point \
-                 --nsenter at it)",
-                nsenter.display(),
-                path.display()
-            )
-        })?;
-    if !output.status.success() {
-        bail!(
-            "reading {} out of container pid {pid} failed ({}): {}",
-            path.display(),
-            output.status,
-            String::from_utf8_lossy(&output.stderr).trim(),
-        );
-    }
-    // `tar` warns on unreadable files rather than failing; surface that instead
-    // of silently committing a partial volume.
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    if !stderr.trim().is_empty() {
-        warn!(path = %path.display(), "tar reported: {}", stderr.trim());
-    }
-    info!(path = %path.display(), bytes = file_len(out)?, "read a path out of the container");
+/// an ordinary commit walks. They are read from the host side through
+/// `/proc/<pid>/root`, the container's own mount view, by this process: nothing
+/// from the container's filesystem is ever executed (see `engine::volume_tar`).
+#[cfg(target_os = "linux")]
+fn copy_from_container(pid: u32, path: &Path, out: &Path) -> Result<()> {
+    let root = PathBuf::from(format!("/proc/{pid}/root"));
+    let stats = crate::engine::volume_tar::write_volume_tar(&root, path, out)
+        .with_context(|| format!("read {} out of container pid {pid}", path.display()))?;
+    info!(
+        path = %path.display(),
+        entries = stats.entries,
+        skipped = stats.skipped,
+        bytes = file_len(out)?,
+        "read a path out of the container"
+    );
     Ok(())
 }
 
-/// `nsenter --target <pid> --mount -- tar ... -cf - <path>` args, matching what
-/// the Go nydusify runs.
-fn nsenter_tar_args(pid: u32, path: &Path) -> Vec<OsString> {
-    vec![
-        "--target".into(),
-        pid.to_string().into(),
-        "--mount".into(),
-        "--".into(),
-        "tar".into(),
-        // Keep xattrs (capabilities, SELinux labels); do not abort the whole
-        // commit because one file in a volume is unreadable; keep the leading
-        // `/` so the entry lands at the same absolute path in the layer.
-        "--xattrs".into(),
-        "--ignore-failed-read".into(),
-        "--absolute-names".into(),
-        "-cf".into(),
-        "-".into(),
-        path.into(),
-    ]
+#[cfg(not(target_os = "linux"))]
+fn copy_from_container(_pid: u32, path: &Path, _out: &Path) -> Result<()> {
+    bail!(
+        "--with-path {} needs Linux: it reads the container's mount view through /proc",
+        path.display()
+    )
 }
 
 /// Read fs version, compressor and blob table out of a bootstrap, via
@@ -881,6 +841,17 @@ pub fn plan(args: &CommitArgs) -> Result<CommitPlan> {
                 path.display()
             );
         }
+        // The path becomes the layer's entry names, which cannot hold `..`.
+        if path.parent().is_none()
+            || path
+                .components()
+                .any(|c| matches!(c, Component::ParentDir | Component::CurDir))
+        {
+            bail!(
+                "--with-path {} must name a path below / without `.` or `..` components",
+                path.display()
+            );
+        }
     }
     // Committing onto the tag the container is running from would replace the
     // base image out from under it while its blobs are still being read.
@@ -915,7 +886,6 @@ mod tests {
             source: None,
             with_path: Vec::new(),
             maximum_times: 400,
-            nsenter: PathBuf::from("nsenter"),
             containerd_cli: PathBuf::from("ctr"),
             containerd_namespace: "default".to_string(),
             containerd_address: None,
@@ -1104,6 +1074,15 @@ mod tests {
     }
 
     #[test]
+    fn rejects_a_with_path_that_climbs_or_names_the_root() {
+        for bad in ["/", "/data/../etc"] {
+            let mut args = base_args();
+            args.with_path = vec![PathBuf::from(bad)];
+            assert!(plan(&args).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
     fn carries_absolute_with_paths_into_the_plan() {
         let mut args = base_args();
         args.with_path = vec![PathBuf::from("/data"), PathBuf::from("/srv/cache")];
@@ -1114,28 +1093,6 @@ mod tests {
             plan.with_path,
             vec![PathBuf::from("/data"), PathBuf::from("/srv/cache")]
         );
-    }
-
-    #[test]
-    fn nsenter_args_enter_the_mount_namespace_and_keep_absolute_names() {
-        let args: Vec<String> = nsenter_tar_args(31337, Path::new("/data"))
-            .iter()
-            .map(|a| a.to_string_lossy().into_owned())
-            .collect();
-
-        assert!(args.windows(2).any(|w| w == ["--target", "31337"]));
-        assert!(args.contains(&"--mount".to_string()));
-        // Everything after `--` is the command run inside the namespace.
-        let sep = args.iter().position(|a| a == "--").unwrap();
-        assert_eq!(args[sep + 1], "tar");
-        // Without --absolute-names tar strips the leading `/` and the entry
-        // lands at the wrong place in the layer.
-        assert!(args.contains(&"--absolute-names".to_string()));
-        assert!(args.contains(&"--xattrs".to_string()));
-        assert!(args.contains(&"--ignore-failed-read".to_string()));
-        // Streamed to stdout, with the path last.
-        assert!(args.windows(2).any(|w| w == ["-cf", "-"]));
-        assert_eq!(args.last().unwrap(), "/data");
     }
 
     #[test]

@@ -7,7 +7,7 @@ use std::path::Path;
 use anyhow::{Context, Result, anyhow, bail};
 use futures::stream::{self, StreamExt as _, TryStreamExt as _};
 use registry_client::types::{MEDIA_TYPE_OCI_INDEX, MEDIA_TYPE_OCI_MANIFEST, Manifest};
-use registry_client::{ImageReference, Index, RegistryClient};
+use registry_client::{Descriptor, ImageReference, Index, RegistryClient};
 use serde::Serialize;
 use tracing::{debug, info, warn};
 
@@ -208,7 +208,7 @@ pub async fn run(args: CopyArgs) -> Result<()> {
         &target_client,
         &target_ref.repo,
         same_registry,
-        &manifest.config.digest,
+        &manifest.config,
         staging.path(),
         &retry,
     )
@@ -221,7 +221,7 @@ pub async fn run(args: CopyArgs) -> Result<()> {
             &target_client,
             &target_ref.repo,
             same_registry,
-            &layer.digest,
+            layer,
             staging.path(),
             &retry,
         )
@@ -329,7 +329,7 @@ async fn copy_index_all_platforms(
     // `copy_blob` stages through a digest-named file, so two copies of one
     // digest would be writing the same path.
     let mut children = Vec::with_capacity(entry_count);
-    let mut blob_digests: Vec<String> = Vec::new();
+    let mut blobs: Vec<Descriptor> = Vec::new();
     for desc in entries {
         let child = source_client
             .get_manifest(&source_ref.repo, &desc.digest)
@@ -358,8 +358,8 @@ async fn copy_index_all_platforms(
         debug!(digest = %desc.digest, %platform, layers = manifest.layers.len(), "copying index entry");
 
         for blob in std::iter::once(&manifest.config).chain(manifest.layers.iter()) {
-            if !blob_digests.contains(&blob.digest) {
-                blob_digests.push(blob.digest.clone());
+            if !blobs.iter().any(|b| b.digest == blob.digest) {
+                blobs.push(blob.clone());
             }
         }
         children.push((desc, child, manifest));
@@ -368,14 +368,14 @@ async fn copy_index_all_platforms(
     // Each blob is an independent HEAD/GET/PUT chain, so run a few at a time
     // instead of paying the sum of every round-trip: a 4-platform index of
     // 50-layer images is ~200 of them.
-    let copies = stream::iter(blob_digests.iter().map(|digest| {
+    let copies = stream::iter(blobs.iter().map(|blob| {
         copy_blob(
             source_client,
             &source_ref.repo,
             target_client,
             &target_ref.repo,
             same_registry,
-            digest,
+            blob,
             staging,
             retry,
         )
@@ -468,7 +468,7 @@ async fn export_from_registry(
     for desc in std::iter::once(&manifest.config).chain(manifest.layers.iter()) {
         let path = staging.join(blob_hex(&desc.digest));
         source_client
-            .get_blob_to_file(&source_ref.repo, &desc.digest, &path)
+            .get_blob_to_file(&source_ref.repo, &desc.digest, desc.size, &path)
             .await
             .with_context(|| format!("download blob {}", desc.digest))?;
         blobs.push(ArchiveBlob {
@@ -511,7 +511,7 @@ async fn copy_from_archive(
     staging: &Path,
 ) -> Result<()> {
     let unpacked = staging.join("layout");
-    let imported = oci_archive::import(archive, &unpacked)
+    let imported = oci_archive::import(archive, &unpacked, &plan.platform)
         .with_context(|| format!("import archive {}", archive.display()))?;
     info!(
         archive = %archive.display(),
@@ -551,7 +551,7 @@ async fn copy_from_archive(
             debug!(digest = %desc.digest, "blob already present in target; skipping");
             continue;
         }
-        let path = imported.blob_path(&desc.digest)?;
+        let path = imported.blob_path(desc)?;
         retry
             .run("push archived blob", || {
                 client.push_blob_file(&target_ref.repo, &path)
@@ -596,7 +596,7 @@ async fn copy_blob(
     target_client: &RegistryClient,
     target_repo: &str,
     same_registry: bool,
-    digest: &str,
+    blob: &Descriptor,
     staging: &Path,
     retry: &RetryPolicy,
 ) -> Result<()> {
@@ -605,10 +605,11 @@ async fn copy_blob(
         target_repo,
         Some(source_repo),
         same_registry,
-        digest,
+        &blob.digest,
         crate::engine::oci::BlobSource::Download {
             client: source_client,
             staging,
+            size: blob.size,
         },
         retry,
     )

@@ -25,7 +25,9 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use registry_client::Descriptor;
-use registry_client::types::{Index, Manifest, verify_digest};
+use registry_client::types::{Index, Manifest, verify_digest, verify_file_digest};
+
+use crate::engine::oci::{is_index, select_platform};
 use tracing::debug;
 
 /// Marker file every OCI layout carries, and the only version we emit.
@@ -74,23 +76,34 @@ pub struct ImportedImage {
 }
 
 impl ImportedImage {
-    /// On-disk path of a blob named by `digest`.
-    pub fn blob_path(&self, digest: &str) -> Result<PathBuf> {
-        let hex = digest
-            .strip_prefix("sha256:")
-            .with_context(|| format!("unsupported digest algorithm in {digest}"))?;
-        let path = self.blobs_dir.join("sha256").join(hex);
-        if !path.is_file() {
-            bail!("archive is missing blob {digest}");
+    /// On-disk path of the blob `desc` names, after checking that the file
+    /// holds exactly the bytes the manifest promises: the archive is untrusted
+    /// and its blobs are pushed or built from as they are.
+    pub fn blob_path(&self, desc: &Descriptor) -> Result<PathBuf> {
+        let digest = &desc.digest;
+        let path = blob_file(&self.blobs_dir, digest)?;
+        let md = std::fs::symlink_metadata(&path)
+            .with_context(|| format!("archive is missing blob {digest}"))?;
+        if !md.is_file() {
+            bail!("archive blob {digest} is not a regular file");
         }
+        if md.len() != desc.size {
+            bail!(
+                "archive blob {digest} is {} bytes, but the manifest says {}",
+                md.len(),
+                desc.size
+            );
+        }
+        verify_file_digest(&path, digest)?;
         Ok(path)
     }
 }
 
-/// Unpack an OCI layout tarball into `dest` and resolve its single image.
+/// Unpack an OCI layout tarball into `dest` and resolve the image for
+/// `platform` in it.
 ///
 /// `dest` is expected to be an empty staging directory owned by the caller.
-pub fn import(archive: &Path, dest: &Path) -> Result<ImportedImage> {
+pub fn import(archive: &Path, dest: &Path, platform: &str) -> Result<ImportedImage> {
     let file = std::fs::File::open(archive)
         .with_context(|| format!("open archive {}", archive.display()))?;
     // Accept a gzip'd archive too: `docker save | gzip` is a common shape and
@@ -114,36 +127,31 @@ pub fn import(archive: &Path, dest: &Path) -> Result<ImportedImage> {
     let index: Index = serde_json::from_slice(&index_bytes)
         .with_context(|| format!("parse {INDEX_FILE} in {}", archive.display()))?;
 
-    let descriptor = index
-        .manifests
-        .first()
-        .cloned()
-        .with_context(|| format!("archive {} lists no manifests", archive.display()))?;
-    if index.manifests.len() > 1 {
-        debug!(
-            count = index.manifests.len(),
-            "archive holds several manifests; importing the first"
-        );
-    }
-
     let blobs_dir = dest.join("blobs");
-    let hex = descriptor
-        .digest
-        .strip_prefix("sha256:")
-        .with_context(|| format!("unsupported digest algorithm in {}", descriptor.digest))?;
-    let manifest_path = blobs_dir.join("sha256").join(hex);
-    let manifest_bytes = std::fs::read(&manifest_path)
-        .with_context(|| format!("read manifest blob {}", manifest_path.display()))?;
-    verify_digest(&manifest_bytes, &descriptor.digest)
-        .context("archive manifest does not match the digest index.json records")?;
-    let manifest: Manifest =
-        serde_json::from_slice(&manifest_bytes).context("parse archive manifest")?;
-
-    let ref_name = descriptor
+    let top = pick_entry(&index, platform)
+        .with_context(|| format!("select an image from archive {}", archive.display()))?;
+    // The name is recorded on the top-level entry, also when that entry is an
+    // index (what `ctr images export` writes for a multi-platform image).
+    let ref_name = top
         .annotations
         .as_ref()
         .and_then(|a| a.get(ANNOTATION_REF_NAME))
         .cloned();
+    let mut descriptor = top.clone();
+    let mut manifest_bytes = read_manifest_blob(&blobs_dir, &descriptor)?;
+    if is_index(Some(&descriptor.media_type), &manifest_bytes) {
+        let nested: Index = serde_json::from_slice(&manifest_bytes)
+            .with_context(|| format!("parse index {}", descriptor.digest))?;
+        descriptor = select_platform(&nested, platform)
+            .with_context(|| format!("select {platform} from index {}", descriptor.digest))?
+            .clone();
+        manifest_bytes = read_manifest_blob(&blobs_dir, &descriptor)?;
+        if is_index(Some(&descriptor.media_type), &manifest_bytes) {
+            bail!("archive nests indexes more than one level deep");
+        }
+    }
+    let manifest: Manifest =
+        serde_json::from_slice(&manifest_bytes).context("parse archive manifest")?;
 
     Ok(ImportedImage {
         manifest_bytes,
@@ -154,10 +162,45 @@ pub fn import(archive: &Path, dest: &Path) -> Result<ImportedImage> {
     })
 }
 
+/// The `index.json` entry to import: the only one, or the one for `platform`.
+fn pick_entry<'a>(index: &'a Index, platform: &str) -> Result<&'a Descriptor> {
+    match index.manifests.as_slice() {
+        [] => bail!("the archive lists no manifests"),
+        [only] => Ok(only),
+        _ => select_platform(index, platform),
+    }
+}
+
+/// Read a manifest or index blob and check it against its descriptor.
+fn read_manifest_blob(blobs_dir: &Path, desc: &Descriptor) -> Result<Vec<u8>> {
+    let path = blob_file(blobs_dir, &desc.digest)?;
+    if !std::fs::symlink_metadata(&path).is_ok_and(|md| md.is_file()) {
+        bail!("archive is missing manifest blob {}", desc.digest);
+    }
+    let bytes =
+        std::fs::read(&path).with_context(|| format!("read manifest blob {}", path.display()))?;
+    verify_digest(&bytes, &desc.digest)
+        .context("archive manifest does not match the digest its index records")?;
+    Ok(bytes)
+}
+
+/// `<blobs_dir>/sha256/<hex>`. The digest was validated when its descriptor was
+/// parsed, so the hex is safe to join.
+fn blob_file(blobs_dir: &Path, digest: &str) -> Result<PathBuf> {
+    let hex = digest
+        .strip_prefix("sha256:")
+        .with_context(|| format!("unsupported digest algorithm in {digest}"))?;
+    Ok(blobs_dir.join("sha256").join(hex))
+}
+
 /// Unpack `archive` into `dest`, refusing entries that escape it.
 ///
 /// A tarball is untrusted input; without this a `../` entry would let it write
-/// anywhere the process can (the classic Zip-Slip).
+/// anywhere the process can (the classic Zip-Slip). Only regular files and
+/// directories are unpacked: an OCI layout has no use for anything else, and a
+/// planted symlink at `blobs/sha256/<hex>` would make us read (and push) a
+/// host file of the archive's choosing. `docker save` adds symlinks for its
+/// legacy layout, so the rest is skipped rather than refused.
 fn unpack_sanitized<R: std::io::Read>(archive: &mut tar::Archive<R>, dest: &Path) -> Result<()> {
     std::fs::create_dir_all(dest)
         .with_context(|| format!("create archive staging dir {}", dest.display()))?;
@@ -171,6 +214,11 @@ fn unpack_sanitized<R: std::io::Read>(archive: &mut tar::Archive<R>, dest: &Path
             )
         }) {
             bail!("archive entry {:?} escapes the extraction directory", path);
+        }
+        let kind = entry.header().entry_type();
+        if !kind.is_file() && !kind.is_dir() {
+            debug!(?path, ?kind, "skipping a non-regular archive entry");
+            continue;
         }
         entry
             .unpack_in(dest)
@@ -278,7 +326,173 @@ fn append_bytes<W: Write>(builder: &mut tar::Builder<W>, name: &str, bytes: &[u8
 #[cfg(test)]
 mod tests {
     use super::*;
-    use registry_client::types::{MEDIA_TYPE_OCI_MANIFEST, sha256_digest};
+    use registry_client::types::{MEDIA_TYPE_OCI_INDEX, MEDIA_TYPE_OCI_MANIFEST, sha256_digest};
+
+    const PLATFORM: &str = "linux/amd64";
+
+    /// A layout tar built entry by entry: `(name, Some(bytes))` is a regular
+    /// file, `(name, None)` with a `link` target a symlink.
+    fn layout_tar(dir: &Path, files: &[(&str, &[u8])], symlinks: &[(&str, &Path)]) -> PathBuf {
+        let mut builder = tar::Builder::new(Vec::new());
+        for (name, target) in symlinks {
+            let mut link = tar::Header::new_gnu();
+            link.set_size(0);
+            link.set_mode(0o777);
+            link.set_entry_type(tar::EntryType::Symlink);
+            builder.append_link(&mut link, name, target).unwrap();
+        }
+        for (name, bytes) in files {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(bytes.len() as u64);
+            header.set_mode(0o644);
+            header.set_entry_type(tar::EntryType::Regular);
+            header.set_cksum();
+            builder.append_data(&mut header, name, *bytes).unwrap();
+        }
+        let path = dir.join("layout.tar");
+        std::fs::write(&path, builder.into_inner().unwrap()).unwrap();
+        path
+    }
+
+    fn blob_name(digest: &str) -> String {
+        format!("blobs/sha256/{}", digest.strip_prefix("sha256:").unwrap())
+    }
+
+    fn index_json(entries: &[serde_json::Value]) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": MEDIA_TYPE_OCI_INDEX,
+            "manifests": entries,
+        }))
+        .unwrap()
+    }
+
+    fn manifest_entry(bytes: &[u8], arch: Option<&str>) -> serde_json::Value {
+        let mut entry = serde_json::json!({
+            "mediaType": MEDIA_TYPE_OCI_MANIFEST,
+            "digest": sha256_digest(bytes),
+            "size": bytes.len(),
+        });
+        if let Some(arch) = arch {
+            entry["platform"] = serde_json::json!({"os": "linux", "architecture": arch});
+        }
+        entry
+    }
+
+    #[test]
+    fn a_planted_symlink_blob_is_not_read_through() {
+        // The layer blob is a symlink to a host file whose bytes even match the
+        // manifest. Following it would push that host file to the registry.
+        let dir = tempfile::tempdir().unwrap();
+        let secret = dir.path().join("host-secret");
+        std::fs::write(&secret, b"host secret").unwrap();
+        let config = staged(dir.path(), "config", b"{}");
+        let layer = staged(dir.path(), "layer", b"host secret");
+        let manifest = sample_manifest(&config, &layer);
+        let index = index_json(&[manifest_entry(&manifest, None)]);
+        let archive = layout_tar(
+            dir.path(),
+            &[
+                ("index.json", &index),
+                (&blob_name(&sha256_digest(&manifest)), &manifest),
+                (&blob_name(&config.digest), b"{}"),
+            ],
+            &[(&blob_name(&layer.digest), &secret)],
+        );
+
+        let imported = import(&archive, &dir.path().join("dest"), PLATFORM).unwrap();
+        let err = imported
+            .blob_path(&imported.manifest.layers[0])
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("missing blob"), "{err:#}");
+    }
+
+    #[test]
+    fn archive_blobs_are_checked_against_the_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = staged(dir.path(), "config", b"{}");
+        let layer = staged(dir.path(), "layer", b"the real layer");
+        let manifest = sample_manifest(&config, &layer);
+        let index = index_json(&[manifest_entry(&manifest, None)]);
+        let archive = layout_tar(
+            dir.path(),
+            &[
+                ("index.json", &index),
+                (&blob_name(&sha256_digest(&manifest)), &manifest),
+                (&blob_name(&config.digest), b"{}"),
+                // Same length, other bytes.
+                (&blob_name(&layer.digest), b"a forged layer"),
+            ],
+            &[],
+        );
+
+        let imported = import(&archive, &dir.path().join("dest"), PLATFORM).unwrap();
+        imported.blob_path(&imported.manifest.config).unwrap();
+        let err = imported
+            .blob_path(&imported.manifest.layers[0])
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("digest mismatch"), "{err:#}");
+    }
+
+    #[test]
+    fn import_selects_the_requested_platform() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = staged(dir.path(), "config", b"{}");
+        let amd = staged(dir.path(), "amd", b"amd64 layer");
+        let arm = staged(dir.path(), "arm", b"arm64 layer");
+        let amd_manifest = sample_manifest(&config, &amd);
+        let arm_manifest = sample_manifest(&config, &arm);
+        let files = |index: &[u8]| -> Vec<(String, Vec<u8>)> {
+            vec![
+                ("index.json".into(), index.to_vec()),
+                (
+                    blob_name(&sha256_digest(&amd_manifest)),
+                    amd_manifest.clone(),
+                ),
+                (
+                    blob_name(&sha256_digest(&arm_manifest)),
+                    arm_manifest.clone(),
+                ),
+            ]
+        };
+        let entries = [
+            manifest_entry(&amd_manifest, Some("amd64")),
+            manifest_entry(&arm_manifest, Some("arm64")),
+        ];
+
+        // Two platform entries at the top of index.json.
+        let flat = files(&index_json(&entries));
+        let flat: Vec<(&str, &[u8])> = flat
+            .iter()
+            .map(|(n, b)| (n.as_str(), b.as_slice()))
+            .collect();
+        let sub = dir.path().join("flat");
+        std::fs::create_dir_all(&sub).unwrap();
+        let archive = layout_tar(&sub, &flat, &[]);
+        let imported = import(&archive, &sub.join("dest"), "linux/arm64").unwrap();
+        assert_eq!(imported.manifest.layers[0].digest, arm.digest);
+
+        // One top entry that is itself an index, as `ctr images export` writes.
+        let nested = index_json(&entries);
+        let top = serde_json::json!({
+            "mediaType": MEDIA_TYPE_OCI_INDEX,
+            "digest": sha256_digest(&nested),
+            "size": nested.len(),
+            "annotations": {ANNOTATION_REF_NAME: "app:multi"},
+        });
+        let mut all = files(&index_json(&[top]));
+        all.push((blob_name(&sha256_digest(&nested)), nested.clone()));
+        let all: Vec<(&str, &[u8])> = all
+            .iter()
+            .map(|(n, b)| (n.as_str(), b.as_slice()))
+            .collect();
+        let sub = dir.path().join("nested");
+        std::fs::create_dir_all(&sub).unwrap();
+        let archive = layout_tar(&sub, &all, &[]);
+        let imported = import(&archive, &sub.join("dest"), "linux/arm64").unwrap();
+        assert_eq!(imported.manifest.layers[0].digest, arm.digest);
+        assert_eq!(imported.ref_name.as_deref(), Some("app:multi"));
+    }
 
     fn staged(dir: &Path, name: &str, bytes: &[u8]) -> ArchiveBlob {
         let path = dir.join(name);
@@ -342,7 +556,7 @@ mod tests {
         .unwrap();
 
         let dest = dir.path().join("unpacked");
-        let imported = import(&archive, &dest).unwrap();
+        let imported = import(&archive, &dest, PLATFORM).unwrap();
 
         assert_eq!(imported.manifest_bytes, manifest_bytes);
         assert_eq!(
@@ -351,16 +565,12 @@ mod tests {
         );
         assert_eq!(imported.manifest.layers.len(), 1);
         // Every blob the manifest names is present and intact.
-        let cfg = imported
-            .blob_path(&imported.manifest.config.digest)
-            .unwrap();
+        let cfg = imported.blob_path(&imported.manifest.config).unwrap();
         assert_eq!(
             std::fs::read(cfg).unwrap(),
             b"{\"architecture\":\"amd64\"}".to_vec()
         );
-        let lyr = imported
-            .blob_path(&imported.manifest.layers[0].digest)
-            .unwrap();
+        let lyr = imported.blob_path(&imported.manifest.layers[0]).unwrap();
         assert_eq!(std::fs::read(lyr).unwrap(), b"layer-bytes-here".to_vec());
     }
 
@@ -383,7 +593,7 @@ mod tests {
         .unwrap();
 
         let dest = dir.path().join("unpacked");
-        import(&archive, &dest).unwrap();
+        import(&archive, &dest, PLATFORM).unwrap();
         // Corrupt the manifest blob in place, then re-import from the directory
         // by rebuilding an archive around the tampered bytes.
         let hex = sha256_digest(&manifest_bytes)
@@ -400,7 +610,7 @@ mod tests {
             b.append_dir_all(".", &dest).unwrap();
             b.into_inner().unwrap();
         }
-        let err = import(&repacked, &dir.path().join("unpacked2")).unwrap_err();
+        let err = import(&repacked, &dir.path().join("unpacked2"), PLATFORM).unwrap_err();
         assert!(
             format!("{err:#}").contains("digest"),
             "expected a digest mismatch, got: {err:#}"
@@ -433,7 +643,7 @@ mod tests {
         bytes.extend_from_slice(&[0u8; 1024]); // two zero blocks terminate a tar
         std::fs::write(&archive, &bytes).unwrap();
 
-        let err = import(&archive, &dir.path().join("dest")).unwrap_err();
+        let err = import(&archive, &dir.path().join("dest"), PLATFORM).unwrap_err();
         assert!(
             format!("{err:#}").contains("escapes"),
             "expected the traversal guard to fire, got: {err:#}"
@@ -546,8 +756,8 @@ mod tests {
     fn unpack_does_not_follow_a_symlink_out_of_the_destination() {
         // The traversal guard is per-entry-name, so it cannot see this one: a
         // legal-looking symlink is planted first, then a legal-looking file is
-        // written "through" it. `unpack_in` is what refuses; this pins that we
-        // still rely on an implementation that does.
+        // written "through" it. The symlink is never created, so the file lands
+        // inside the destination.
         let dir = tempfile::tempdir().unwrap();
         let outside = dir.path().join("outside");
         std::fs::create_dir_all(&outside).unwrap();
@@ -572,13 +782,8 @@ mod tests {
         let bytes = builder.into_inner().unwrap();
 
         let dest = dir.path().join("dest");
-        // `unpack_in` refuses the second entry with "trying to unpack outside of
-        // destination path" — the symlink itself is legal and does get created.
-        let err = unpack_bytes(&bytes, &dest).unwrap_err();
-        assert!(
-            format!("{err:#}").contains("outside of destination"),
-            "expected unpack_in to refuse the symlinked entry, got: {err:#}"
-        );
+        unpack_bytes(&bytes, &dest).unwrap();
+        assert!(!dest.join("escape").is_symlink());
         assert!(
             !outside.join("planted").exists(),
             "a symlinked entry must not write outside the destination"

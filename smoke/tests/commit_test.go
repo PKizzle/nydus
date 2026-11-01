@@ -51,7 +51,7 @@ func (c *CommitTestSuite) TestCommitAndCheck(ctx tool.Context, image, commitedIm
 	// A bind-mounted volume is a separate mount over the merged view, so nothing
 	// written into it ever reaches the overlay upperdir an ordinary commit walks.
 	// --with-path is the only way to capture it, and it reads the path out of the
-	// container's mount namespace with nsenter.
+	// container's mount view through /proc/<pid>/root.
 	volumeDir := path.Join(ctx.Env.WorkDir, "volume")
 	require.NoError(c.t, os.MkdirAll(volumeDir, 0755))
 	require.NoError(c.t, os.WriteFile(path.Join(volumeDir, "volume-file"), []byte("This is a Nydus volume\n"), 0644))

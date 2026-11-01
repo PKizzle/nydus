@@ -13,8 +13,14 @@
 //! | upperdir                                  | OCI layer                     |
 //! |-------------------------------------------|-------------------------------|
 //! | character device, rdev 0/0                | `.wh.<name>`, an empty file   |
+//! | regular file with an `overlay.whiteout` xattr | `.wh.<name>`, an empty file |
 //! | directory with `overlay.opaque` = `y`     | the dir + `.wh..wh..opq` in it |
+//! | a file the container named `.wh.<x>`      | skipped with a warning        |
 //! | anything else                             | copied through                |
+//!
+//! A name starting with `.wh.` is a deletion in an OCI layer, so a file the
+//! container itself called that cannot be published: copied through, it would
+//! delete `<x>` from the image instead of adding a file.
 //!
 //! `overlay.*` xattrs are the kernel's own bookkeeping and never belong in a
 //! published layer, so they are stripped; every other xattr is carried across as
@@ -88,6 +94,8 @@ pub struct DiffStats {
     pub opaque_dirs: u64,
     /// Unix sockets skipped — they have no tar representation.
     pub skipped_sockets: u64,
+    /// Files skipped because their name starts with `.wh.`.
+    pub skipped_whiteout_names: u64,
 }
 
 impl DiffStats {
@@ -154,7 +162,15 @@ fn append_dir_contents<W: io::Write>(
 
         reject_unsupported_markers(&child_abs, &child_rel)?;
 
-        if is_whiteout(&md) {
+        if is_oci_whiteout_name(&name) {
+            warn!(
+                path = %child_rel.display(),
+                "skipping a file named like an OCI whiteout: publishing it would delete a lower entry"
+            );
+            stats.skipped_whiteout_names += 1;
+            continue;
+        }
+        if is_whiteout(&md) || (md.is_file() && has_whiteout_xattr(&child_abs)?) {
             append_whiteout(builder, &child_rel)?;
             stats.whiteouts += 1;
             continue;
@@ -196,7 +212,7 @@ fn append_entry<W: io::Write>(builder: &mut Builder<W>, abs: &Path, rel: &Path) 
 /// apply to the record that follows, so this must be written immediately before
 /// the entry itself.
 fn append_pax_xattrs<W: io::Write>(builder: &mut Builder<W>, abs: &Path, rel: &Path) -> Result<()> {
-    let xattrs = collect_xattrs(abs)?;
+    let xattrs = collect_xattrs(abs, false)?;
     if xattrs.is_empty() {
         return Ok(());
     }
@@ -207,10 +223,17 @@ fn append_pax_xattrs<W: io::Write>(builder: &mut Builder<W>, abs: &Path, rel: &P
 }
 
 /// Read every xattr of `path` that belongs in the published layer, keyed by its
-/// PAX record name. Symlinks are not dereferenced.
-fn collect_xattrs(path: &Path) -> Result<BTreeMap<String, Vec<u8>>> {
+/// PAX record name. A symlink at `path` itself is dereferenced only with
+/// `deref`, which is how a `/proc/self/fd/<n>` path reaches the file behind
+/// the descriptor.
+pub(crate) fn collect_xattrs(path: &Path, deref: bool) -> Result<BTreeMap<String, Vec<u8>>> {
     let mut out = BTreeMap::new();
-    let names = match xattr::list(path) {
+    let listed = if deref {
+        xattr::list_deref(path)
+    } else {
+        xattr::list(path)
+    };
+    let names = match listed {
         Ok(names) => names,
         Err(e) if is_absent_or_unsupported(&e) => return Ok(out),
         Err(e) => return Err(e).with_context(|| format!("list xattrs of {}", path.display())),
@@ -231,7 +254,12 @@ fn collect_xattrs(path: &Path) -> Result<BTreeMap<String, Vec<u8>>> {
             );
             continue;
         }
-        match xattr::get(path, &name) {
+        let value = if deref {
+            xattr::get_deref(path, &name)
+        } else {
+            xattr::get(path, &name)
+        };
+        match value {
             Ok(Some(value)) => {
                 out.insert(format!("{PAX_XATTR_PREFIX}{key}"), value);
             }
@@ -283,6 +311,25 @@ fn append_empty_file<W: io::Write>(builder: &mut Builder<W>, rel: &Path) -> Resu
 /// An overlayfs deletion marker: a character device with device number 0/0.
 fn is_whiteout(md: &Metadata) -> bool {
     md.file_type().is_char_device() && md.rdev() == 0
+}
+
+/// Whether `name` would read as a whiteout or opaque marker in an OCI layer.
+pub fn is_oci_whiteout_name(name: &std::path::Path) -> bool {
+    name.as_os_str()
+        .as_encoded_bytes()
+        .starts_with(OCI_WHITEOUT_PREFIX.as_bytes())
+}
+
+/// An overlayfs xattr whiteout (kernel 6.7+): an empty regular file carrying
+/// `overlay.whiteout`, which overlayfs reads as a deletion just like a 0/0
+/// character device.
+fn has_whiteout_xattr(path: &Path) -> Result<bool> {
+    for namespace in OVERLAY_XATTR_NAMESPACES {
+        if read_overlay_xattr(path, namespace, "whiteout")?.is_some() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Whether the directory hides everything below it (`overlay.opaque` = `"y"`).
@@ -464,6 +511,45 @@ mod tests {
         );
         assert_eq!(entries[1].1, EntryType::Regular);
         assert_eq!(entries[1].2, 0);
+        fs::remove_file(&out).unwrap();
+    }
+
+    #[test]
+    fn xattr_whiteouts_become_oci_whiteouts() {
+        let upper = tempfile::tempdir().unwrap();
+        let gone = upper.path().join("gone");
+        fs::write(&gone, b"").unwrap();
+        if xattr::set(&gone, "user.overlay.whiteout", b"").is_err() {
+            eprintln!("skipping: filesystem does not support user xattrs");
+            return;
+        }
+        let out = upper
+            .path()
+            .parent()
+            .unwrap()
+            .join("upper-xattr-whiteout.tar");
+
+        let stats = write_upper_layer_tar(upper.path(), &out).unwrap();
+
+        assert_eq!(stats.whiteouts, 1);
+        assert_eq!(paths(&read_tar(&out)), vec![".wh.gone"]);
+        fs::remove_file(&out).unwrap();
+    }
+
+    #[test]
+    fn files_named_like_whiteouts_are_not_published() {
+        // Published as is, `.wh.passwd` would delete /etc/passwd from the image.
+        let upper = tempfile::tempdir().unwrap();
+        fs::create_dir(upper.path().join("etc")).unwrap();
+        fs::write(upper.path().join("etc/.wh.passwd"), b"").unwrap();
+        fs::write(upper.path().join("etc/.wh..wh..opq"), b"").unwrap();
+        fs::write(upper.path().join("etc/hosts"), b"127.0.0.1").unwrap();
+        let out = upper.path().parent().unwrap().join("upper-wh-names.tar");
+
+        let stats = write_upper_layer_tar(upper.path(), &out).unwrap();
+
+        assert_eq!(stats.skipped_whiteout_names, 2);
+        assert_eq!(paths(&read_tar(&out)), vec!["etc", "etc/hosts"]);
         fs::remove_file(&out).unwrap();
     }
 

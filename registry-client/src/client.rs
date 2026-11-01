@@ -30,6 +30,7 @@ use crate::auth::{
 use crate::error::RegistryError;
 use crate::types::{
     Index, MANIFEST_ACCEPT, MEDIA_TYPE_OCI_INDEX, MEDIA_TYPE_OCTET_STREAM, sha256_digest,
+    validate_digest,
 };
 use anyhow::{Context, Result, anyhow, bail};
 use compio::BufResult;
@@ -51,7 +52,8 @@ use tracing::{debug, warn};
 /// get_manifest`] / [`RegistryClient::get_blob`]. Exists so a hostile or
 /// misbehaving registry cannot OOM the caller; 512 MiB is deliberately
 /// generous (a merged nydus bootstrap stays well under it). File downloads
-/// ([`RegistryClient::get_blob_to_file`]) stream to disk and are not capped.
+/// ([`RegistryClient::get_blob_to_file`]) stream to disk and are capped at the
+/// descriptor's size instead.
 const MAX_REGISTRY_BODY_BYTES: u64 = 512 * 1024 * 1024;
 
 /// Chunk size for hashing local files before upload.
@@ -71,6 +73,14 @@ const IDEMPOTENT_ATTEMPTS: u32 = 4;
 
 /// Delay before the first idempotent retry; doubled for each further one.
 const IDEMPOTENT_RETRY_DELAY: Duration = Duration::from_millis(250);
+
+/// How one blob download attempt failed: [`Download::Interrupted`] when the
+/// body broke off and a fresh attempt may succeed, [`Download::Failed`] when
+/// it cannot (bad digest, oversized body, local I/O).
+enum Download {
+    Interrupted(RegistryError),
+    Failed(RegistryError),
+}
 
 /// Per-call disambiguator for [`RegistryClient::get_blob_to_file`]'s temp
 /// file name, on top of the process id. The pid alone only makes the name
@@ -353,54 +363,100 @@ impl RegistryClient {
 
     /// GET a blob and stream it to `path` (via an adjacent temp file renamed
     /// into place), verifying the sha256 digest as chunks arrive. Returns the
-    /// number of bytes written. Not size-capped: the destination is disk.
+    /// number of bytes written.
+    ///
+    /// `size` is the descriptor's size: a body that runs past it fails at
+    /// once, so a hostile registry cannot fill the disk. A body that breaks off
+    /// mid-stream (transport error or stall) is downloaded again from the
+    /// start, up to [`IDEMPOTENT_ATTEMPTS`] times; a digest or size mismatch
+    /// and local write errors are not retried.
     pub async fn get_blob_to_file(
         &self,
         repo: &str,
         digest: &str,
+        size: u64,
         path: &Path,
     ) -> Result<u64, RegistryError> {
-        let response = self.get_blob_response(repo, digest).await?;
+        let mut delay = IDEMPOTENT_RETRY_DELAY;
+        let mut attempt = 1;
+        loop {
+            match self.download_blob_once(repo, digest, size, path).await {
+                Err(Download::Interrupted(e)) if attempt < IDEMPOTENT_ATTEMPTS => {
+                    warn!(%digest, attempt, error = %e, ?delay, "blob download broke off; retrying");
+                    compio::time::sleep(delay).await;
+                    delay *= 2;
+                    attempt += 1;
+                }
+                Err(Download::Interrupted(e) | Download::Failed(e)) => return Err(e),
+                Ok(written) => return Ok(written),
+            }
+        }
+    }
+
+    async fn download_blob_once(
+        &self,
+        repo: &str,
+        digest: &str,
+        size: u64,
+        path: &Path,
+    ) -> Result<u64, Download> {
+        let response = self
+            .get_blob_response(repo, digest)
+            .await
+            .map_err(Download::Failed)?;
         if let Some(parent) = path.parent()
             && !parent.as_os_str().is_empty()
         {
             std::fs::create_dir_all(parent)
-                .with_context(|| format!("create blob directory {}", parent.display()))?;
+                .with_context(|| format!("create blob directory {}", parent.display()))
+                .map_err(|e| Download::Failed(e.into()))?;
         }
         let seq = TEMP_FILE_SEQ.fetch_add(1, Ordering::Relaxed);
         let tmp = path.with_extension(format!("part.{}.{seq}", std::process::id()));
         let mut file = compio::fs::File::create(&tmp)
             .await
-            .with_context(|| format!("create blob temp file {}", tmp.display()))?;
+            .with_context(|| format!("create blob temp file {}", tmp.display()))
+            .map_err(|e| Download::Failed(e.into()))?;
 
         let mut hasher = Sha256::new();
         let mut written = 0u64;
         let mut stream = Box::pin(response.bytes_stream());
-        let result: Result<(), RegistryError> = async {
+        let result: Result<(), Download> = async {
             loop {
                 let next = stream.next();
                 let item = match self.timeout {
                     Some(duration) => {
                         compio::time::timeout(duration, next).await.map_err(|_| {
-                            RegistryError::Timeout(format!("blob download for {digest} stalled"))
+                            Download::Interrupted(RegistryError::Timeout(format!(
+                                "blob download for {digest} stalled"
+                            )))
                         })?
                     }
                     None => next.await,
                 };
                 let Some(chunk) = item else { break };
-                let chunk = chunk.with_context(|| format!("read blob chunk for {digest}"))?;
-                hasher.update(&chunk);
+                let chunk = chunk
+                    .with_context(|| format!("read blob chunk for {digest}"))
+                    .map_err(|e| Download::Interrupted(e.into()))?;
                 let len = chunk.len() as u64;
+                if written + len > size {
+                    return Err(Download::Failed(RegistryError::Other(anyhow!(
+                        "blob {digest} is larger than the {size} bytes its descriptor declares"
+                    ))));
+                }
+                hasher.update(&chunk);
                 let BufResult(write_result, _) = file.write_all_at(chunk, written).await;
-                write_result.with_context(|| format!("write blob to {}", tmp.display()))?;
+                write_result
+                    .with_context(|| format!("write blob to {}", tmp.display()))
+                    .map_err(|e| Download::Failed(e.into()))?;
                 written += len;
             }
             let computed = format!("sha256:{}", hex::encode(hasher.finalize()));
             if !computed.eq_ignore_ascii_case(digest) {
-                return Err(RegistryError::DigestMismatch {
+                return Err(Download::Failed(RegistryError::DigestMismatch {
                     expected: digest.to_string(),
                     actual: computed,
-                });
+                }));
             }
             Ok(())
         }
@@ -413,10 +469,10 @@ impl RegistryClient {
         if let Err(e) = std::fs::rename(&tmp, path) {
             // Don't leave the `.part` temp file behind on a failed rename.
             let _ = std::fs::remove_file(&tmp);
-            return Err(RegistryError::Other(
+            return Err(Download::Failed(RegistryError::Other(
                 anyhow::Error::new(e)
                     .context(format!("rename blob into place at {}", path.display())),
-            ));
+            )));
         }
         Ok(written)
     }
@@ -644,6 +700,7 @@ impl RegistryClient {
     /// GET the blob endpoint and ensure a success status (shared by the
     /// in-memory and to-file downloads).
     async fn get_blob_response(&self, repo: &str, digest: &str) -> Result<Response, RegistryError> {
+        validate_digest(digest)?;
         let url = self.blob_url(repo, digest);
         let response = self
             .request_with_auth(
@@ -861,6 +918,19 @@ impl RegistryClient {
             .scope
             .clone()
             .unwrap_or_else(|| requested_scope.to_string());
+        // The challenge names the realm, so a registry reached over https could
+        // otherwise steer our credentials onto a cleartext connection. Only a
+        // client the operator already put on plain http may send them there.
+        let is_https = |url: &str| {
+            url.get(..8)
+                .is_some_and(|p| p.eq_ignore_ascii_case("https://"))
+        };
+        if self.basic_auth.is_some() && !is_https(&challenge.realm) && is_https(&self.base) {
+            return Err(RegistryError::Auth(format!(
+                "refusing to send registry credentials to the non-https token realm {}",
+                challenge.realm
+            )));
+        }
         let bearer = fetch_bearer_token(
             &self.client,
             challenge,
@@ -1141,7 +1211,11 @@ async fn read_bounded(
 /// it needs no direct dependency on the `bytes` crate and tests can drive it
 /// with a plain `futures::stream::iter` of `Vec<u8>` chunks. The stream is
 /// boxed internally so callers don't need to prove `Unpin` themselves.
-async fn collect_bounded<S, B, E>(stream: S, max_bytes: u64, label: &str) -> Result<Vec<u8>>
+pub(crate) async fn collect_bounded<S, B, E>(
+    stream: S,
+    max_bytes: u64,
+    label: &str,
+) -> Result<Vec<u8>>
 where
     S: futures::Stream<Item = std::result::Result<B, E>>,
     B: AsRef<[u8]>,
@@ -1217,20 +1291,20 @@ mod tests {
         "manifests": [
             {
                 "mediaType": "application/vnd.oci.image.manifest.v1+json",
-                "digest": "sha256:nydusartifact000000000000000000000000000000000000000000000000000",
+                "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                 "size": 1234,
                 "artifactType": "application/vnd.oci.image.layer.nydus.blob.v1",
                 "annotations": {"containerd.io/snapshot/nydus-fs-driver": "fanotify"}
             },
             {
                 "mediaType": "application/vnd.oci.image.manifest.v1+json",
-                "digest": "sha256:sbomartifact0000000000000000000000000000000000000000000000000000",
+                "digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
                 "size": 5678,
                 "artifactType": "application/spdx+json"
             },
             {
                 "mediaType": "application/vnd.oci.image.manifest.v1+json",
-                "digest": "sha256:untyped000000000000000000000000000000000000000000000000000000000",
+                "digest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
                 "size": 9
             }
         ]
@@ -1270,11 +1344,7 @@ mod tests {
         let mut index: Index = serde_json::from_str(REFERRERS_INDEX_JSON).unwrap();
         filter_referrers(&mut index, "application/vnd.oci.image.layer.nydus.blob.v1");
         assert_eq!(index.manifests.len(), 1);
-        assert!(
-            index.manifests[0]
-                .digest
-                .starts_with("sha256:nydusartifact")
-        );
+        assert!(index.manifests[0].digest.starts_with("sha256:aaaa"));
 
         // No matches (including descriptors without any artifactType) leaves
         // an empty, still-valid index.
@@ -1661,6 +1731,111 @@ mod tests {
             "{err}"
         );
         assert_eq!(server.join().unwrap().len(), 1);
+    }
+
+    #[compio::test]
+    async fn blob_download_restarts_a_body_that_breaks_off() {
+        let body = "the whole blob";
+        let digest = sha256_digest(body.as_bytes());
+        // Promises the full length, sends five bytes, hangs up.
+        let truncated = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\nthe w",
+            body.len()
+        );
+        let (port, server) = serve_raw(vec![truncated, raw_response("200 OK", body)]);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("blob");
+
+        let written = loopback_client(port)
+            .get_blob_to_file("app", &digest, body.len() as u64, &path)
+            .await
+            .unwrap();
+
+        assert_eq!(written, body.len() as u64);
+        assert_eq!(std::fs::read(&path).unwrap(), body.as_bytes());
+        assert_eq!(server.join().unwrap().len(), 2);
+    }
+
+    #[compio::test]
+    async fn blob_download_stops_at_the_descriptor_size() {
+        let body = "x".repeat(4096);
+        let digest = sha256_digest(body.as_bytes());
+        let (port, server) = serve_raw(vec![raw_response("200 OK", &body)]);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("blob");
+
+        let err = loopback_client(port)
+            .get_blob_to_file("app", &digest, 16, &path)
+            .await
+            .unwrap_err();
+
+        assert!(
+            err.to_string().contains("larger than the 16 bytes"),
+            "{err}"
+        );
+        // Not retried, and nothing left behind.
+        assert_eq!(server.join().unwrap().len(), 1);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    #[compio::test]
+    async fn blob_download_refuses_a_path_like_digest_before_touching_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested").join("blob");
+        // Nothing listens there: the digest must be refused before any request.
+        let err = loopback_client(1)
+            .get_blob_to_file("app", "sha256:../../../etc/passwd", 1, &path)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("invalid digest"), "{err}");
+        assert!(!dir.path().join("nested").exists());
+    }
+
+    #[compio::test]
+    async fn credentials_never_go_to_a_cleartext_token_realm() {
+        let client = RegistryClient::new(
+            "registry.local:5000",
+            RegistryClientOptions {
+                raw_auth: Some("dXNlcjpwYXNz".to_string()),
+                use_docker_config: false,
+                ..RegistryClientOptions::default()
+            },
+        )
+        .unwrap();
+        let challenge = BearerChallenge {
+            // Nothing listens there either: the refusal comes first.
+            realm: "http://127.0.0.1:1/token".to_string(),
+            service: None,
+            scope: None,
+        };
+        let err = client
+            .acquire_bearer(&challenge, "repository:app:pull")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("non-https token realm"), "{err}");
+    }
+
+    #[compio::test]
+    async fn token_response_body_is_bounded() {
+        let huge = format!("{{\"token\":\"{}\"}}", "a".repeat(2 * 1024 * 1024));
+        let (port, server) = serve_raw(vec![raw_response("200 OK", &huge)]);
+        let challenge = BearerChallenge {
+            realm: format!("http://127.0.0.1:{port}/token"),
+            service: None,
+            scope: None,
+        };
+        let err = fetch_bearer_token(
+            &loopback_client(port).client,
+            &challenge,
+            "repository:app:pull",
+            None,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("exceeds cap"), "{err:#}");
+        // The server may see the connection drop mid-write; that is the point.
+        let _ = server.join();
     }
 
     #[test]

@@ -3524,6 +3524,7 @@ dependencies = [
  "nydus-api",
  "nydus-rafs",
  "nydus-storage",
+ "nydus-utils",
 ]
 
 [[package]]
