@@ -15,6 +15,8 @@ on:
       - 'builder/**'
       - 'utils/**'
       - 'snapshotter/src/daemon/**'
+      - 'snapshotter/src/local_accel.rs'
+      - 'snapshotter/src/auto_accel_sidecar.rs'
       - 'misc/fanotify/**'
       - '.github/workflows/fanotify-vm.yml'
   pull_request:
