@@ -31,20 +31,36 @@ jobs:
         save-if: ${{ github.ref == 'refs/heads/master' }}
     - name: Install cargo nextest
       uses: taiki-e/install-action@nextest
-    - name: Install Miri
-      run: |
-        rustup toolchain install nightly --component miri
-        rustup override set nightly
-        cargo miri setup
     - name: Install protoc
       run: bash misc/install-protoc.sh
+    - name: Select a Miri nightly
+      run: |
+        # Use the newest nightly that builds the workspace under Miri. A nightly compiler
+        # regression falls back to an older nightly with a warning instead of failing the job;
+        # only "no nightly of the last week builds" fails here.
+        broken=""
+        for days in 0 1 2 3 4 5 6 7; do
+          tc="nightly-$(date -u -d "-$days day" +%F)"
+          # A nightly may not be published yet, or may ship without Miri.
+          rustup toolchain install "$tc" --profile minimal --component miri,rust-src || continue
+          if RUSTUP_TOOLCHAIN="$tc" cargo miri setup \
+             && make miri-ut-build MIRI_TOOLCHAIN="$tc" RUSTUP="$(command -v rustup)"; then
+            [ -z "$broken" ] || echo "::warning::$broken do not build the workspace under Miri; using $tc"
+            echo "MIRI_TOOLCHAIN=$tc" >> "$GITHUB_ENV"
+            echo "RUSTUP_TOOLCHAIN=$tc" >> "$GITHUB_ENV"
+            exit 0
+          fi
+          broken="${broken:+$broken, }$tc"
+        done
+        echo "::error::no nightly of the last 8 days builds the workspace under Miri ($broken)"
+        exit 1
     - name: Unit Test with Miri
       run: |
         export RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}" CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
         # The sysroot `cargo miri setup` built lives under this user's cache dir, not root's.
         MIRI_SYSROOT="$(cargo miri setup --print-sysroot)"
         export MIRI_SYSROOT
-        bash misc/sudo-env.sh PATH RUSTUP_HOME 'CARGO_*' MIRI_SYSROOT -- make miri-ut-nextest RUSTUP="$(command -v rustup)" 2>&1 | tee miri-ut.log
+        bash misc/sudo-env.sh PATH RUSTUP_HOME 'CARGO_*' MIRI_SYSROOT -- make miri-ut-nextest MIRI_TOOLCHAIN="$MIRI_TOOLCHAIN" RUSTUP="$(command -v rustup)" 2>&1 | tee miri-ut.log
         # Tests Miri cannot run (file-backed mmap, foreign calls) fail without failing the job;
         # any Undefined Behavior does. A log without a test summary means Miri never ran
         # (build failure), which must not pass as "no UB found". The summary is matched on
