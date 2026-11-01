@@ -163,7 +163,8 @@ impl ErofsPageCacheMountPlan {
     }
 
     pub fn erofs_mount_options(&self) -> Vec<String> {
-        vec!["ro".to_string(), "loop".to_string()]
+        // The metadata image is untrusted: ignore its setuid bits and device nodes.
+        ["ro", "nosuid", "nodev", "loop"].map(String::from).to_vec()
     }
 
     pub fn overlay_mount_options(&self) -> Result<Vec<String>> {
@@ -338,7 +339,10 @@ mod tests {
             "/run/nydus/erofs/app",
             "/run/nydus/overlay/app",
         );
-        assert_eq!(plan.erofs_mount_options(), vec!["ro", "loop"]);
+        assert_eq!(
+            plan.erofs_mount_options(),
+            vec!["ro", "nosuid", "nodev", "loop"]
+        );
         let options = plan.overlay_mount_options().unwrap();
         assert!(options.contains(&"lowerdir=/run/nydus/erofs/app".to_string()));
         assert!(options.contains(&"ro".to_string()));
@@ -355,7 +359,10 @@ mod tests {
         let commands = plan.mount_commands().unwrap();
         assert_eq!(commands.len(), 2);
         assert_eq!(commands[0].program, "mount");
-        assert_eq!(commands[0].args[0..4], ["-t", "erofs", "-o", "ro,loop"]);
+        assert_eq!(
+            commands[0].args[0..4],
+            ["-t", "erofs", "-o", "ro,nosuid,nodev,loop"]
+        );
         assert_eq!(commands[1].args[0..4], ["-t", "overlay", "overlay", "-o"]);
         assert!(commands[1].args[4].contains("lowerdir=/run/nydus/erofs/app"));
 

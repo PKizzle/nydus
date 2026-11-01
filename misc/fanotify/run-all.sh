@@ -46,6 +46,7 @@ run ref-layer-formats-test "==== REF LAYER FORMATS: PASS ===="
 run release-unmount-test "==== RELEASE-UNMOUNT: PASS ===="
 run auto-accel-restart-test "==== AUTO-ACCEL RESTART: PASS ===="
 run precontent-cases "==== FANOTIFY PRE-CONTENT CASES: PASS ===="
+run export-block-test "==== EXPORT BLOCK (4096): PASS"
 
 umount -l "$FS"
 echo
