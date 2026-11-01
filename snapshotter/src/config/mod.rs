@@ -1092,7 +1092,8 @@ pub struct PeerMirrorConfig {
     pub discovery_ttl: String,
     /// Per-endpoint timeout for one mirror request. Sidecar artifacts are
     /// small (bootstrap ≈ 1 MiB, indexes ≈ KiBs), so keep this short — a
-    /// slow peer must not stall pod creation.
+    /// slow peer must not stall pod creation. Covers the body read as well as
+    /// the response headers; a whole sidecar pull gets three of these.
     #[serde(default = "default_peer_mirror_request_timeout")]
     pub request_timeout: String,
     /// Statically-pinned peer mirror endpoints, tried after discovered
