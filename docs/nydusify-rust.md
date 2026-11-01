@@ -220,9 +220,11 @@ nydusify convert \
 `--with-referrer` pushes an OCI 1.1 referrer artifact (`subject` = the source image manifest
 descriptor captured at pull time) to the *source* repo, both by digest (native referrers-API
 registries) and under the `sha256-<subject-hex>` fallback tag (registries such as Zot/older Harbor
-without native support). A node running the snapshotter with `referrer_detect` enabled (the
-default) will detect and serve it transparently the next time that source tag is pulled — no
-change to the tag itself, no separate mount.
+without native support). A node running the snapshotter with `referrer_detect = true` (off by
+default) serves it transparently the next time that source tag is pulled — no change to the tag
+itself, no separate mount — once the referrer manifest is signed with `cosign sign --key` and the
+public key is trusted for the repository in `[[snapshotter.referrer_trust.rules]]`. An unsigned
+referrer is never served: anyone with push access to the repository could attach one.
 
 ## Layer shapes in the produced image
 
@@ -447,9 +449,13 @@ more versions of the same image, to get a dictionary worth using.
 nydusify convert --oci-ref --with-referrer   (push side: publishes the referrer artifact)
             │
             ▼
-snapshotter Prepare() detects the referrer (referrer_detect = true, default)
+cosign sign --key <key> <repo>@<referrer-manifest-digest>
             │
             ▼
+snapshotter Prepare() detects the referrer (referrer_detect = true, opt-in)
+            │
+            ▼
+checks the cosign signature against [snapshotter.referrer_trust] and the blob binding,
 fetches + digest-verifies the bootstrap, mounts via DaemonSupervisor::ensure_instance
             │
             ▼

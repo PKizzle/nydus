@@ -179,28 +179,49 @@ against containerd's full-layer *extraction*, not download (spegel already makes
 The alternative referrer/tag-suffix approach was rejected: it changes the tag and the snapshotter
 never consults referrers.
 
-### 8. Referrer Detection and Serving (default-on)
+### 8. Referrer Detection and Serving (opt-in, signature-gated)
 
-The snapshotter detects and **serves** *published* nydus images (the OCI-referrer distribution
-model nydusify / the Go snapshotter produce) via the OCI referrers API, gated behind
-`[snapshotter.features].referrer_detect` (**default on**, `snapshotter/src/source/referrer.rs`).
-Resolution rides the shared `registry-client` crate: the **native OCI 1.1 referrers API**
-(`GET /v2/<repo>/referrers/<digest>`) is asked first, and the `sha256-<subject-hex>` fallback tag
-second (for registries without referrers-API support) — the same two shapes `nydusify convert
---with-referrer` publishes.
-Serving (backlog item **B4b**) is implemented and e2e-verified: on detecting a published nydus
-image during `Prepare`, the snapshotter fetches the referrer artifact manifest, resolves the
-bootstrap blob digest (detection and materialization share one priority selector — the
-`nydus-bootstrap` annotation first, then the bootstrap media type — so a data blob can never be
-mistaken for the bootstrap; a manifest with nydus blobs but no identifiable bootstrap classifies
-as standard OCI and falls through safely), downloads and digest-verifies the bootstrap, then
-mounts it via `DaemonSupervisor::ensure_instance` — including full registry-backend serving of the
-data blobs.
-Every failure in that path falls through to a plain overlay mount, so referrer resolution never
-blocks a pod. Note this is orthogonal to *transparent* node-local acceleration (Decision 7), which
-never consults referrers. The push side of the loop is the Rust `nydusify convert --with-referrer`
-(see "In Scope (v1.0): Rust nydusify converter" below) — it publishes exactly the artifact shape
-this section consumes.
+The snapshotter can detect and **serve** *published* nydus images (the OCI-referrer distribution
+model nydusify / the Go snapshotter produce), gated behind `[snapshotter.features].referrer_detect`
+(**default off**, `snapshotter/src/source/referrer.rs`). Resolution rides the shared
+`registry-client` crate: the **native OCI 1.1 referrers API** (`GET /v2/<repo>/referrers/<digest>`)
+is asked first, and the `sha256-<subject-hex>` fallback tag second (for registries without
+referrers-API support) — the same two shapes `nydusify convert --with-referrer` publishes.
+
+Anyone who can push to the image's repository can attach a referrer, and the bootstrap defines the
+whole file tree (names, modes, setuid bits, owners, symlinks, range mapping), so a verified data
+blob proves nothing about the filesystem served from it. A referrer is therefore served only when
+all of these hold (`snapshotter/src/source/trust.rs`):
+
+- its manifest's `subject` is the image being prepared (a referrer cannot be replayed onto
+  another image through the fallback tag);
+- the first `[[snapshotter.referrer_trust.rules]]` entry whose `scope` glob matches
+  `<registry>/<repository>` lists a public key (ECDSA P-256 or Ed25519 PEM) that verifies a
+  **cosign key-based signature** of the referrer manifest: the `sha256-<manifest-hex>.sig` tag, a
+  simple-signing payload whose `critical.image.docker-manifest-digest` is the referrer manifest
+  digest, signed in the `dev.cosignproject.cosign/signature` layer annotation;
+- every blob in the bootstrap's blob table (and every zran index blob) is listed in the signed
+  manifest.
+
+cosign's OCI 1.1 referrer / sigstore-bundle storage, keyless (Fulcio/Rekor) and notation
+signatures are not supported; a rule naming `cosign-keyless` or `notation` refuses every referrer
+in its scope. Every digest that becomes a path, file name or tag must be `sha256:<64 lowercase
+hex>`.
+
+A nydus manifest published as a sibling entry of the image's **own index** (the dual image,
+`nydusify --attach-oci-manifest`) is not a referrer: the image digest already names it. It is
+detected under `[snapshotter.features].dual_index_detect` (default on), needs no signature, and
+gets the same blob-binding check against its own manifest.
+
+On a served hit, `Prepare` downloads and digest-verifies the bootstrap (one priority selector —
+the `nydus-bootstrap` annotation first, then the bootstrap media type — so a data blob can never
+be mistaken for the bootstrap), then mounts it via `DaemonSupervisor::ensure_instance`, with the
+registry backend serving the data blobs. Every failure, including every trust refusal, logs one
+warning and falls through to a plain overlay mount, so referrer resolution never blocks a pod.
+Note this is orthogonal to *transparent* node-local acceleration (Decision 7), which never
+consults referrers. The push side of the loop is the Rust `nydusify convert --with-referrer` (see
+"In Scope (v1.0): Rust nydusify converter" below), followed by `cosign sign --key` on the
+referrer manifest digest.
 
 ### 9. Auto-Accel Timing (Two-Stage Conversion)
 

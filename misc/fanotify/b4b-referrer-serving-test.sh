@@ -2,16 +2,11 @@
 # B4b: serve a PUBLISHED nydus image (bootstrap distributed as an OCI referrer
 # artifact, the nydusify / Go-snapshotter model) from a registry, on demand.
 #
-# Two halves, verified end-to-end (both PASS on Linux 7.0 + a self-signed HTTPS
-# `registry:2`, kernel >= 6.14 required for the fanotify path):
-#   1. FETCH   — `snapshotter/tests/b4b_referrer_e2e.rs` drives the actual
-#                `materialize_bootstrap_blocking` against a live registry for
-#                BOTH digest shapes (artifact-manifest and direct bootstrap-blob),
-#                incl. the data-blob-before-bootstrap layer ordering that the
-#                loose selection predicate used to mishandle.
-#   2. SERVE   — THIS script: build a nydus image, push its data blob + a
-#                referrer artifact manifest to a registry, then mount via nydusd
-#                with a REGISTRY backend and verify reads reproduce the source.
+# This script covers SERVE: build a nydus image, push its data blob + a
+# referrer artifact manifest to a registry, then mount via nydusd with a
+# REGISTRY backend and verify reads reproduce the source. Detection, the
+# cosign trust policy and bootstrap materialization are covered by
+# `misc/referrer/trust-e2e.sh` (snapshotter/tests/referrer_trust_e2e.rs).
 #
 # A nydus data-blob id == the blob's content sha256, so it is addressable at
 # /v2/<repo>/blobs/sha256:<blob_id>; the daemon fetches ranges on demand.

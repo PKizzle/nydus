@@ -55,10 +55,29 @@ gc_period = "6h"
 # memory_max = "2Gi"
 
 [snapshotter.features]
-# Detect nydus artifacts published as OCI referrers of the original image.
-referrer_detect = true
+# Serve nydus artifacts published as OCI referrers of the original image. Off by
+# default: a referrer is served only when [snapshotter.referrer_trust] trusts it.
+referrer_detect = false
+# Serve the nydus entry of a dual image's own index (no signature needed: the
+# image digest names it).
+dual_index_detect = true
 prefetch = true
 metrics = true
+
+# Who may publish a served referrer. The first rule whose scope glob matches
+# "<registry>/<repository>" decides ("*" stays within one path segment, "**"
+# spans segments); the referrer manifest must carry a cosign key-based
+# signature (`cosign sign --key`) from one of its public keys (ECDSA P-256 or
+# Ed25519 PEM). verifier = "cosign-keyless" or "notation" is not supported and
+# refuses every referrer in its scope.
+# [[snapshotter.referrer_trust.rules]]
+# scope = "ghcr.io/acme/*"
+# verifier = "cosign-key"
+# public_keys = ["""
+# -----BEGIN PUBLIC KEY-----
+# ...
+# -----END PUBLIC KEY-----
+# """]
 
 # System-controller HTTP API over a unix socket: daemon records/upgrade,
 # cache GC, prefetch profiles, runtime auth, GET /metrics, and the
