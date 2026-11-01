@@ -77,4 +77,6 @@ TOML
   BACKFILL_HOSTS_DIR="$bf/hosts" BACKFILL_IMAGE="$image" BACKFILL_REGISTRY=localhost:5000 \
   BACKFILL_AUTH=$(printf %s "$creds" | base64) \
     cargo test -j2 -p nydus-snapshotter --lib containerd_transfer::tests::backfill_restores -- \
-      --ignored --nocapture'
+      --ignored --nocapture | tee /tmp/backfill-test.log
+  # A filter or #[ignore] change that leaves nothing to run must not pass.
+  grep -q "test result: ok\. [1-9][0-9]* passed" /tmp/backfill-test.log'

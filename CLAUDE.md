@@ -203,9 +203,10 @@ prepare path (`snapshotter/src/grpc/mod.rs`) resolves an existing accel sidecar
 (the base sidecar is final: `nydus-image optimize` refuses zran/tar-ref blobs) — worker logic in `snapshotter/src/auto_zran.rs`, artifact
 build in `local_accel.rs`, serving via `DaemonSupervisor::ensure_instance`. Still unverified in
 automation: a live containerd-GC race against a slow peer fetch mid-promotion, a multi-node
-spegel sidecar-fetch soak. CI covers the fusedev loop via `misc/snapshotter-e2e.sh`, and runs the
-fanotify path (`misc/fanotify/run-all.sh`) inside a virtme-ng VM booting a pinned >= 6.14 mainline
-kernel, independent of the runner's own kernel: `.github/workflows/fanotify-vm.yml`.
+spegel sidecar-fetch soak. CI covers the fusedev, blockdev and tarfs loops via
+`misc/snapshotter-e2e.sh`, and runs the fanotify path (`misc/fanotify/run-all.sh`) inside virtme-ng
+VMs booting two pinned mainline kernels, the 6.18.y floor and the newest 7.3.y, independent of the
+runner's own kernel: `.github/workflows/fanotify-vm.yml`.
 
 Do NOT reintroduce the tag-suffix / referrer-push approach for transparent accel — it was
 explicitly rejected because it changes the tag and the snapshotter never consults referrers. Use
