@@ -28,8 +28,8 @@ use tracing::{debug, info, warn};
 
 use crate::auto_accel_oci::{
     AUTO_ACCEL_BOOTSTRAP_MEDIATYPE, AUTO_ACCEL_CONFIG_MEDIATYPE,
-    AUTO_ACCEL_LAYER_DIGEST_ANNOTATION, AUTO_ACCEL_PREFETCH_MEDIATYPE, OCI_MANIFEST_MEDIATYPE,
-    OciImageManifest,
+    AUTO_ACCEL_LAYER_DIGEST_ANNOTATION, AUTO_ACCEL_PREFETCH_MEDIATYPE,
+    AUTO_ACCEL_SUBJECT_ANNOTATION, OCI_MANIFEST_MEDIATYPE, OciImageManifest,
 };
 // `AUTO_ACCEL_INDEX_MEDIATYPE` is the producer's per-layer media type, used
 // only by `role_for_media_type`'s test (#[cfg(test)] module below) — keep
@@ -38,7 +38,9 @@ use crate::auto_accel_oci::{
 use crate::auto_zran::{AUTO_ACCEL_MANIFEST_VERSION, AutoAccelManifest};
 use crate::config::PeerMirrorConfig;
 use crate::content_store::{ContentInfo, ContentStoreClient};
-use crate::peer_mirror::{FetchResult, PeerMirror, PullOutcome, build_peer_mirror};
+use crate::peer_mirror::{
+    FetchResult, MAX_MANIFEST_BYTES, PeerMirror, PullOutcome, build_peer_mirror,
+};
 
 const LABEL_ROLE: &str = "containerd.io/snapshot/nydus.auto-accel.role";
 const LABEL_SUBJECT: &str = "containerd.io/gc.ref.content.subject";
@@ -320,81 +322,32 @@ impl SidecarLocator {
     /// the peer mirrors. Returns `PullOutcome::Disabled` when the
     /// mirror isn't configured (silent fallback to overlay), otherwise
     /// maps the HTTP responses into one of the four outcomes.
+    ///
+    /// The whole sidecar is fetched and verified before anything is written,
+    /// so a peer that fails any check leaves no trace in the content store.
     async fn peer_pull(&self, manifest_digest: &str, synthetic_ref: &str) -> PullOutcome {
         let Some(mirror) = self.peer_mirror.as_ref() else {
             return PullOutcome::Disabled;
         };
-
-        let (host, repo, tag) = match split_synthetic_ref(synthetic_ref) {
-            Some(parts) => parts,
-            None => {
-                return PullOutcome::RegistryError {
-                    status: 0,
-                    body: format!("malformed synthetic ref {synthetic_ref}"),
-                };
-            }
+        let sidecar = match fetch_peer_sidecar(mirror, manifest_digest, synthetic_ref).await {
+            Ok(s) => s,
+            Err(o) => return o,
         };
 
-        // 1. Manifest fetch. The mirror's query template supplies the
-        //    load-bearing query parameter (Spegel's `?ns=<registry>`); an
-        //    empty template yields no query string.
-        let manifest_path = with_query(
-            &format!("/v2/{repo}/manifests/{tag}"),
-            &mirror.artifact_query(&host),
-        );
-        let manifest_bytes = match mirror.fetch(&manifest_path, Some(ACCEPT_MANIFEST)).await {
-            FetchResult::Ok(b) => b,
-            FetchResult::Outcome(o) => return o,
-            FetchResult::NotFound => return PullOutcome::NotFound,
-            FetchResult::Error { status, body } => {
-                return PullOutcome::RegistryError { status, body };
-            }
-        };
-        // Verify before anything touches the content store: `write_bytes` computes
-        // the store key from the *received* bytes, so without this check corrupt
-        // peer data "succeeds" under its own digest, the Image record registers,
-        // `resolve_or_pull` never re-pulls (record exists), and `stage()` fails on
-        // the missing real digest forever — silently degrading the node to overlay.
-        if let Err(e) = verify_sha256(&manifest_bytes, manifest_digest) {
-            return PullOutcome::RegistryError {
-                status: 0,
-                body: format!("peer mirror returned corrupt manifest: {e}"),
-            };
-        }
-
-        // 2. Parse the OCI wrapper first so the manifest write below can
-        //    carry `gc.ref.content.config` + `gc.ref.content.l.<n>`
-        //    labels pointing at every blob the manifest references.
-        //    Without these labels containerd's GC orphans the just-
-        //    written config + layer blobs the moment GC runs (it does
-        //    NOT parse manifest JSON for GC walking — operators have to
-        //    mirror the references into labels). The producer (auto_zran)
-        //    mirrors the same pattern; consumer must match so the second
-        //    pod on this node doesn't refetch.
-        let oci: OciImageManifest = match serde_json::from_slice(&manifest_bytes) {
-            Ok(m) => m,
-            Err(e) => {
-                return PullOutcome::RegistryError {
-                    status: 0,
-                    body: format!("parse oci manifest pulled from the peer mirror: {e}"),
-                };
-            }
-        };
-        if oci.media_type != OCI_MANIFEST_MEDIATYPE {
-            return PullOutcome::RegistryError {
-                status: 0,
-                body: format!(
-                    "unexpected manifest mediaType {}; expected {}",
-                    oci.media_type, OCI_MANIFEST_MEDIATYPE
-                ),
-            };
-        }
-
-        let subject_labels = manifest_blob_labels(manifest_digest, synthetic_ref, &oci);
+        // The manifest write carries `gc.ref.content.config` +
+        // `gc.ref.content.l.<n>` labels pointing at every blob the manifest
+        // references. Without these labels containerd's GC orphans the
+        // just-written config + layer blobs the moment GC runs (it does NOT
+        // parse manifest JSON for GC walking). The producer (auto_zran)
+        // mirrors the same pattern; consumer must match so the second pod on
+        // this node doesn't refetch.
+        let subject_labels = manifest_blob_labels(manifest_digest, synthetic_ref, &sidecar.oci);
+        // `write_bytes` keys the manifest by the digest of its own bytes; the
+        // tag is synthetic, so no digest was known before the fetch.
         let manifest_digest_in_store = match self
             .content_store
             .write_bytes(
-                &manifest_bytes,
+                &sidecar.manifest,
                 &format!(
                     "nydus-auto-accel-peer-manifest:{}",
                     strip_sha256(manifest_digest)
@@ -412,55 +365,41 @@ impl SidecarLocator {
             }
         };
 
-        // 2a. Config blob.
-        if let Err(o) = self
-            .peer_pull_blob(
-                mirror,
+        for blob in &sidecar.blobs {
+            let labels = labels_for_role(
                 manifest_digest,
-                &host,
-                &repo,
-                &oci.config.digest,
-                AUTO_ACCEL_CONFIG_MEDIATYPE,
+                blob.role,
                 synthetic_ref,
-                None,
-            )
-            .await
-        {
-            return o;
-        }
-
-        // 2b. Each layer blob (bootstrap, indexes, optional prefetch).
-        for layer in &oci.layers {
-            let role = role_for_media_type(&layer.media_type);
-            let layer_digest = layer
-                .annotations
-                .get(AUTO_ACCEL_LAYER_DIGEST_ANNOTATION)
-                .cloned();
-            if let Err(o) = self
-                .peer_pull_blob(
-                    mirror,
-                    manifest_digest,
-                    &host,
-                    &repo,
-                    &layer.digest,
-                    role,
-                    synthetic_ref,
-                    layer_digest,
+                blob.layer_digest.clone(),
+            );
+            if let Err(e) = self
+                .content_store
+                .write_bytes(
+                    &blob.bytes,
+                    &format!(
+                        "nydus-auto-accel-peer-{}:{}",
+                        blob.role,
+                        strip_sha256(&blob.digest)
+                    ),
+                    labels,
                 )
                 .await
             {
-                return o;
+                return PullOutcome::RegistryError {
+                    status: 0,
+                    body: format!("write blob {} to content store failed: {e}", blob.digest),
+                };
             }
         }
 
-        // 3. Register the Image record locally so the next pod hits
-        //    `images_get` straight away.
+        // Register the Image record locally so the next pod hits
+        // `images_get` straight away.
         if let Err(e) = self
             .content_store
             .images_create(
                 synthetic_ref,
                 &manifest_digest_in_store,
-                manifest_bytes.len() as u64,
+                sidecar.manifest.len() as u64,
                 OCI_MANIFEST_MEDIATYPE,
                 image_record_labels(manifest_digest),
             )
@@ -478,60 +417,117 @@ impl SidecarLocator {
 
         PullOutcome::Ok
     }
+}
 
-    /// Pull one blob by digest via the peer mirror and write it into the
-    /// local content store with the right role + layer-digest labels. Returns
-    /// `Ok(())` on success or the `PullOutcome` to propagate on failure.
-    #[allow(clippy::too_many_arguments)]
-    async fn peer_pull_blob(
-        &self,
-        mirror: &Arc<PeerMirror>,
-        manifest_digest: &str,
-        host: &str,
-        repo: &str,
-        blob_digest: &str,
-        role: &str,
-        synthetic_ref: &str,
-        layer_digest: Option<String>,
-    ) -> std::result::Result<(), PullOutcome> {
-        let path = with_query(
-            &format!("/v2/{repo}/blobs/{blob_digest}"),
-            &mirror.artifact_query(host),
-        );
-        let bytes = match mirror.fetch(&path, None).await {
-            FetchResult::Ok(b) => b,
-            FetchResult::Outcome(o) => return Err(o),
-            FetchResult::NotFound => return Err(PullOutcome::NotFound),
-            FetchResult::Error { status, body } => {
-                return Err(PullOutcome::RegistryError { status, body });
-            }
-        };
-        // See peer_pull(): unverified bytes would be committed under their own
-        // (wrong) digest and permanently poison this node's sidecar for the image.
-        if let Err(e) = verify_sha256(&bytes, blob_digest) {
-            return Err(PullOutcome::RegistryError {
-                status: 0,
-                body: format!("peer mirror returned corrupt blob: {e}"),
-            });
-        }
-        let labels = labels_for_role(manifest_digest, role, synthetic_ref, layer_digest);
-        self.content_store
-            .write_bytes(
-                &bytes,
-                &format!(
-                    "nydus-auto-accel-peer-{}:{}",
-                    role,
-                    strip_sha256(blob_digest)
-                ),
-                labels,
-            )
-            .await
-            .map_err(|e| PullOutcome::RegistryError {
-                status: 0,
-                body: format!("write blob {blob_digest} to content store failed: {e}"),
-            })?;
-        Ok(())
+/// A sidecar fetched from the peer mirror whose every byte has been checked.
+struct PeerSidecar {
+    manifest: Vec<u8>,
+    oci: OciImageManifest,
+    /// The config blob first, then each layer in manifest order.
+    blobs: Vec<PeerBlob>,
+}
+
+struct PeerBlob {
+    digest: String,
+    role: &'static str,
+    layer_digest: Option<String>,
+    bytes: Vec<u8>,
+}
+
+fn pull_error(body: String) -> PullOutcome {
+    PullOutcome::RegistryError { status: 0, body }
+}
+
+/// Fetch the sidecar for `manifest_digest` from the peer mirror and verify
+/// it. Peers are untrusted and the tag is synthetic, so the manifest is
+/// bound to the image by its subject annotation (and the config's
+/// `subject_manifest_digest`), and every blob by its descriptor digest and
+/// size. All fetches share one deadline.
+async fn fetch_peer_sidecar(
+    mirror: &Arc<PeerMirror>,
+    manifest_digest: &str,
+    synthetic_ref: &str,
+) -> std::result::Result<PeerSidecar, PullOutcome> {
+    let (host, repo, tag) = split_synthetic_ref(synthetic_ref)
+        .ok_or_else(|| pull_error(format!("malformed synthetic ref {synthetic_ref}")))?;
+    let deadline = mirror.pull_deadline();
+    // The mirror's query template supplies the load-bearing query parameter
+    // (Spegel's `?ns=<registry>`); an empty template yields no query string.
+    let query = mirror.artifact_query(&host);
+    let fetch = async |path: String, accept: Option<&str>, max_bytes: u64| match mirror
+        .fetch(&with_query(&path, &query), accept, max_bytes, deadline)
+        .await
+    {
+        FetchResult::Ok(b) => Ok(b),
+        FetchResult::Outcome(o) => Err(o),
+        FetchResult::NotFound => Err(PullOutcome::NotFound),
+        FetchResult::Error { status, body } => Err(PullOutcome::RegistryError { status, body }),
+    };
+
+    let manifest = fetch(
+        format!("/v2/{repo}/manifests/{tag}"),
+        Some(ACCEPT_MANIFEST),
+        MAX_MANIFEST_BYTES,
+    )
+    .await?;
+    let oci: OciImageManifest = serde_json::from_slice(&manifest).map_err(|e| {
+        pull_error(format!(
+            "parse oci manifest pulled from the peer mirror: {e}"
+        ))
+    })?;
+    if oci.media_type != OCI_MANIFEST_MEDIATYPE {
+        return Err(pull_error(format!(
+            "unexpected manifest mediaType {}; expected {}",
+            oci.media_type, OCI_MANIFEST_MEDIATYPE
+        )));
     }
+    let subject = oci.annotations.get(AUTO_ACCEL_SUBJECT_ANNOTATION);
+    if subject.map(String::as_str) != Some(manifest_digest) {
+        return Err(pull_error(format!(
+            "peer mirror sidecar has subject {subject:?}, expected {manifest_digest}"
+        )));
+    }
+
+    let config = (&oci.config, AUTO_ACCEL_CONFIG_MEDIATYPE, None);
+    let layers = oci.layers.iter().map(|l| {
+        (
+            l,
+            role_for_media_type(&l.media_type),
+            l.annotations
+                .get(AUTO_ACCEL_LAYER_DIGEST_ANNOTATION)
+                .cloned(),
+        )
+    });
+    let mut blobs = Vec::with_capacity(oci.layers.len() + 1);
+    for (desc, role, layer_digest) in std::iter::once(config).chain(layers) {
+        let bytes = fetch(format!("/v2/{repo}/blobs/{}", desc.digest), None, desc.size).await?;
+        // Unverified bytes would be committed under their own (wrong) digest:
+        // the Image record registers, `resolve_or_pull` never re-pulls, and
+        // `stage()` fails on the missing real digest forever.
+        verify_sha256(&bytes, &desc.digest)
+            .map_err(|e| pull_error(format!("peer mirror returned corrupt blob: {e}")))?;
+        blobs.push(PeerBlob {
+            digest: desc.digest.clone(),
+            role,
+            layer_digest,
+            bytes,
+        });
+    }
+
+    let config: AutoAccelManifest = serde_json::from_slice(&blobs[0].bytes)
+        .map_err(|e| pull_error(format!("parse auto-accel config from the peer mirror: {e}")))?;
+    if config.subject_manifest_digest != manifest_digest {
+        return Err(pull_error(format!(
+            "peer mirror sidecar config has subject {}, expected {manifest_digest}",
+            config.subject_manifest_digest
+        )));
+    }
+
+    Ok(PeerSidecar {
+        manifest,
+        oci,
+        blobs,
+    })
 }
 
 /// When multiple auto-accel manifests claim the same subject (e.g. two nodes
@@ -914,5 +910,222 @@ mod tests {
         // Base labels still present.
         assert_eq!(labels.get(LABEL_SUBJECT).unwrap(), "sha256:subject");
         assert_eq!(labels.get(LABEL_ROLE).unwrap(), "manifest");
+    }
+
+    mod peer {
+        use super::*;
+        use crate::auto_accel_oci::{OciManifestInputs, build_oci_manifest};
+        use crate::auto_zran::{AutoAccelDescriptor, AutoAccelLayerDescriptor};
+        use crate::peer_mirror::test_support::{self, Reply};
+        use std::time::Duration;
+
+        const SUBJECT: &str =
+            "sha256:1111111111111111111111111111111111111111111111111111111111111111";
+        const OTHER: &str =
+            "sha256:2222222222222222222222222222222222222222222222222222222222222222";
+
+        fn sha256(bytes: &[u8]) -> String {
+            use sha2::{Digest, Sha256};
+            format!("sha256:{}", hex::encode(Sha256::digest(bytes)))
+        }
+
+        /// A sidecar for `SUBJECT` as the producer publishes it.
+        struct Sidecar {
+            manifest: OciImageManifest,
+            config: serde_json::Value,
+            bootstrap: Vec<u8>,
+            index: Vec<u8>,
+        }
+
+        impl Sidecar {
+            fn new() -> Self {
+                let bootstrap = b"bootstrap".to_vec();
+                let index = b"zran index".to_vec();
+                let mut sidecar = Self {
+                    manifest: build_oci_manifest(&OciManifestInputs {
+                        subject_manifest_digest: SUBJECT,
+                        config_digest: "",
+                        config_size: 0,
+                        bootstrap: &AutoAccelDescriptor {
+                            digest: sha256(&bootstrap),
+                            size: bootstrap.len() as u64,
+                        },
+                        zran_indexes: &[AutoAccelLayerDescriptor {
+                            layer_digest: OTHER.to_string(),
+                            digest: sha256(&index),
+                            size: index.len() as u64,
+                        }],
+                        prefetch_blob: None,
+                    }),
+                    config: serde_json::json!({
+                        "version": AUTO_ACCEL_MANIFEST_VERSION,
+                        "subject_manifest_digest": SUBJECT,
+                        "image_ref": "example.com/app:1",
+                        "bootstrap": {"digest": sha256(&bootstrap), "size": bootstrap.len()},
+                        "zran_indexes": [],
+                        "prefetch_blob": null,
+                    }),
+                    bootstrap,
+                    index,
+                };
+                sidecar.set_config(sidecar.config.clone());
+                sidecar
+            }
+
+            fn set_config(&mut self, config: serde_json::Value) {
+                let bytes = serde_json::to_vec(&config).unwrap();
+                self.manifest.config.digest = sha256(&bytes);
+                self.manifest.config.size = bytes.len() as u64;
+                self.config = config;
+            }
+
+            /// Serve the sidecar, with `tweak` applied to the route table.
+            fn serve(&self, tweak: impl FnOnce(&mut HashMap<String, Reply>)) -> String {
+                let name = crate::auto_zran::auto_accel_image_name(SUBJECT);
+                let (_, repo, tag) = split_synthetic_ref(&name).unwrap();
+                let blob = |d: &str| format!("/v2/{repo}/blobs/{d}");
+                let config = serde_json::to_vec(&self.config).unwrap();
+                let mut routes = HashMap::from([
+                    (
+                        format!("/v2/{repo}/manifests/{tag}"),
+                        Reply::Body(serde_json::to_vec(&self.manifest).unwrap()),
+                    ),
+                    (blob(&self.manifest.config.digest), Reply::Body(config)),
+                    (
+                        blob(&sha256(&self.bootstrap)),
+                        Reply::Body(self.bootstrap.clone()),
+                    ),
+                    (blob(&sha256(&self.index)), Reply::Body(self.index.clone())),
+                ]);
+                tweak(&mut routes);
+                test_support::serve(routes)
+            }
+
+            fn bootstrap_path(&self) -> String {
+                let name = crate::auto_zran::auto_accel_image_name(SUBJECT);
+                let (_, repo, _) = split_synthetic_ref(&name).unwrap();
+                format!("/v2/{repo}/blobs/{}", sha256(&self.bootstrap))
+            }
+        }
+
+        /// Fetch `SUBJECT`'s sidecar from `url` on its own thread, failing
+        /// the test instead of hanging it.
+        fn fetch(url: &str, request_timeout: Duration) -> Result<PeerSidecar, PullOutcome> {
+            let mirror = test_support::mirror(url, request_timeout);
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let name = crate::auto_zran::auto_accel_image_name(SUBJECT);
+                let result = compio::runtime::Runtime::new()
+                    .unwrap()
+                    .block_on(fetch_peer_sidecar(&mirror, SUBJECT, &name));
+                let _ = tx.send(result);
+            });
+            rx.recv_timeout(Duration::from_secs(10))
+                .expect("peer sidecar fetch hung")
+        }
+
+        fn fetch_err(url: &str, request_timeout: Duration) -> String {
+            match fetch(url, request_timeout) {
+                Ok(_) => panic!("peer sidecar unexpectedly verified"),
+                Err(PullOutcome::RegistryError { body, .. }) => body,
+                Err(o) => panic!("unexpected outcome {o:?}"),
+            }
+        }
+
+        #[test]
+        fn valid_sidecar_verifies() {
+            let sidecar = Sidecar::new();
+            let got = fetch(&sidecar.serve(|_| {}), Duration::from_secs(5)).unwrap();
+            let roles: Vec<_> = got.blobs.iter().map(|b| b.role).collect();
+            assert_eq!(roles, [AUTO_ACCEL_CONFIG_MEDIATYPE, "bootstrap", "index"]);
+            assert_eq!(got.blobs[1].bytes, sidecar.bootstrap);
+            assert_eq!(got.blobs[2].layer_digest.as_deref(), Some(OTHER));
+        }
+
+        #[test]
+        fn sidecar_for_another_image_is_rejected() {
+            let mut sidecar = Sidecar::new();
+            sidecar
+                .manifest
+                .annotations
+                .insert(AUTO_ACCEL_SUBJECT_ANNOTATION.to_string(), OTHER.to_string());
+            let err = fetch_err(&sidecar.serve(|_| {}), Duration::from_secs(5));
+            assert!(err.contains("subject"), "unexpected error: {err}");
+        }
+
+        #[test]
+        fn config_for_another_image_is_rejected() {
+            let mut sidecar = Sidecar::new();
+            let mut config = sidecar.config.clone();
+            config["subject_manifest_digest"] = OTHER.into();
+            sidecar.set_config(config);
+            let err = fetch_err(&sidecar.serve(|_| {}), Duration::from_secs(5));
+            assert!(
+                err.contains("config has subject"),
+                "unexpected error: {err}"
+            );
+        }
+
+        #[test]
+        fn blob_with_wrong_digest_is_rejected() {
+            let sidecar = Sidecar::new();
+            let path = sidecar.bootstrap_path();
+            let url = sidecar.serve(|r| {
+                r.insert(path, Reply::Body(b"bootstrqp".to_vec()));
+            });
+            let err = fetch_err(&url, Duration::from_secs(5));
+            assert!(err.contains("digest mismatch"), "unexpected error: {err}");
+        }
+
+        #[test]
+        fn blob_larger_than_its_descriptor_is_rejected() {
+            let sidecar = Sidecar::new();
+            let path = sidecar.bootstrap_path();
+            let url = sidecar.serve(|r| {
+                r.insert(path, Reply::Endless(1 << 20));
+            });
+            let err = fetch_err(&url, Duration::from_secs(5));
+            assert!(err.contains("exceeds"), "unexpected error: {err}");
+        }
+
+        #[test]
+        fn peer_stalling_mid_sidecar_times_out() {
+            let sidecar = Sidecar::new();
+            let path = sidecar.bootstrap_path();
+            let url = sidecar.serve(|r| {
+                r.insert(path, Reply::StallAfterHeaders);
+            });
+            let err = fetch_err(&url, Duration::from_millis(300));
+            assert!(err.contains("timed out"), "unexpected error: {err}");
+        }
+
+        /// `peer_pull` gets past verification to the content-store write
+        /// (here a containerd socket that does not exist).
+        #[test]
+        fn peer_pull_of_a_valid_sidecar_reaches_the_content_store() {
+            let dir = tempfile::tempdir().unwrap();
+            let url = Sidecar::new().serve(|_| {});
+            let content_store = ContentStoreClient::new(&crate::config::ContainerdConfig {
+                address: Some(dir.path().join("containerd.sock")),
+                ..Default::default()
+            })
+            .unwrap();
+            let locator = SidecarLocator {
+                content_store,
+                stage_root: dir.path().join("auto-accel"),
+                peer_mirror: Some(test_support::mirror(&url, Duration::from_secs(5))),
+                stage_locks: Arc::default(),
+            };
+            let name = crate::auto_zran::auto_accel_image_name(SUBJECT);
+            let outcome = compio::runtime::Runtime::new()
+                .unwrap()
+                .block_on(locator.peer_pull(SUBJECT, &name));
+            match outcome {
+                PullOutcome::RegistryError { body, .. } => {
+                    assert!(body.contains("write manifest"), "unexpected error: {body}")
+                }
+                o => panic!("unexpected outcome {o:?}"),
+            }
+        }
     }
 }

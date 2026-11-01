@@ -39,7 +39,8 @@
 //!
 //! Failover semantics live in [`PeerMirror::fetch`]: primary (local
 //! mirror) first, then discovered + static peers in rotated order, a
-//! short per-request timeout, and a cooldown that skips peers that
+//! short per-request timeout that covers the body read, a deadline for the
+//! whole sidecar pull, a body size cap, and a cooldown that skips peers that
 //! recently failed at the transport layer.
 //!
 //! Threading: cyper's `Client` is `!Send + !Sync` (Rc-based, targets the
@@ -57,6 +58,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
+use futures::StreamExt;
 use http::header::ACCEPT;
 use serde::Deserialize;
 use tracing::{debug, info, warn};
@@ -67,6 +69,17 @@ use crate::config::{PeerDiscoveryMode, PeerMirrorConfig};
 /// error, timeout) is skipped before being retried. Keeps a dead node
 /// from adding its full request timeout to every sidecar pull.
 const PEER_COOLDOWN: Duration = Duration::from_secs(60);
+
+/// A whole sidecar pull may take this many `request_timeout`s before
+/// [`PeerMirror::pull_deadline`] cuts it off.
+const PULL_BUDGET_REQUESTS: u32 = 3;
+
+/// Largest manifest accepted from a peer. The OCI distribution spec lets
+/// registries refuse manifests above 4 MiB; a sidecar manifest is a few KiB.
+pub const MAX_MANIFEST_BYTES: u64 = 4 << 20;
+
+/// Bytes kept from a non-2xx response body; it is only logged.
+const ERROR_BODY_CAP: u64 = 4096;
 
 /// Categorised outcome of a Spegel pull attempt for the synthetic
 /// auto-accel ref. Discovery treats `NotFound` as a clean miss (no peer
@@ -321,6 +334,13 @@ impl PeerMirror {
         cooldown.insert(endpoint.to_string(), Instant::now());
     }
 
+    /// Deadline for one whole sidecar pull (manifest plus every blob, across
+    /// all endpoints). The pull runs inside `Prepare`, so a peer that stalls
+    /// must cost a bounded delay, never a hung pod start.
+    pub fn pull_deadline(&self) -> Instant {
+        Instant::now() + self.request_timeout * PULL_BUDGET_REQUESTS
+    }
+
     /// GET + body read against the ordered endpoint list.
     ///
     /// Iteration rules:
@@ -333,121 +353,146 @@ impl PeerMirror {
     ///   errors or 404s and at least one errored, surface the LAST error
     ///   (richest triage data for the operator).
     ///
+    /// Peers are untrusted, so every attempt is bounded: send and body read
+    /// share one `request_timeout`, a body longer than `max_bytes` is
+    /// rejected without buffering it, and the whole call (discovery refresh
+    /// included) gives up at `deadline`.
+    ///
     /// `path_and_query` MUST start with `/v2/...` and include the
     /// load-bearing `?ns=<registry>` query parameter.
     pub async fn fetch(
         self: &Arc<Self>,
         path_and_query: &str,
         accept: Option<&str>,
+        max_bytes: u64,
+        deadline: Instant,
     ) -> FetchResult {
         let this = Arc::clone(self);
         let path = path_and_query.to_string();
         let accept = accept.map(str::to_string);
         blocking::unblock(move || {
             block_on_http(async move {
-                if let Some(discovery) = &this.discovery {
-                    // Refresh on this blocking thread so the gRPC runtime
-                    // never waits on the Kubernetes API.
-                    discovery.refresh_if_stale().await;
-                }
-                let client = match cached_client(this.tls.clone()) {
-                    Ok(c) => c,
-                    Err(e) => {
-                        return FetchResult::Outcome(PullOutcome::RegistryError {
+                let budget = deadline.saturating_duration_since(Instant::now());
+                match compio::time::timeout(budget, this.fetch_inner(&path, accept, max_bytes))
+                    .await
+                {
+                    Ok(result) => result,
+                    Err(_) => {
+                        debug!(target: "nydus_snapshotter::peer_mirror", path = %path, "peer mirror: pull deadline exceeded");
+                        FetchResult::Outcome(PullOutcome::RegistryError {
                             status: 0,
-                            body: e.to_string(),
-                        });
-                    }
-                };
-                let endpoints = this.endpoints_for_attempt();
-                let mut last_error: Option<FetchResult> = None;
-                let mut last_outcome: Option<FetchResult> = None;
-                for endpoint in &endpoints {
-                    let url = format!("{endpoint}{path}");
-                    debug!(target: "nydus_snapshotter::peer_mirror", url = %url, "peer mirror attempt");
-                    let req_builder = match client.get(&url) {
-                        Ok(r) => r,
-                        Err(e) => {
-                            debug!(target: "nydus_snapshotter::peer_mirror", url = %url, error = %e, "peer mirror: invalid URL");
-                            last_outcome = Some(FetchResult::Outcome(PullOutcome::RegistryError {
-                                status: 0,
-                                body: format!("invalid peer mirror URL {url}: {e}"),
-                            }));
-                            continue;
-                        }
-                    };
-                    let req = if let Some(ref accept) = accept {
-                        match req_builder.header(ACCEPT, accept.as_str()) {
-                            Ok(r) => r,
-                            Err(e) => {
-                                last_outcome =
-                                    Some(FetchResult::Outcome(PullOutcome::RegistryError {
-                                        status: 0,
-                                        body: format!("invalid Accept header for {url}: {e}"),
-                                    }));
-                                continue;
-                            }
-                        }
-                    } else {
-                        req_builder
-                    };
-                    let response =
-                        match compio::time::timeout(this.request_timeout, req.send()).await {
-                            Ok(Ok(r)) => r,
-                            Ok(Err(e)) => {
-                                debug!(target: "nydus_snapshotter::peer_mirror", url = %url, error = %e, "peer mirror: transport error");
-                                this.mark_peer_failed(endpoint);
-                                last_outcome =
-                                    Some(FetchResult::Outcome(PullOutcome::RegistryError {
-                                        status: 0,
-                                        body: format!("transport error for {url}: {e}"),
-                                    }));
-                                continue;
-                            }
-                            Err(_) => {
-                                debug!(target: "nydus_snapshotter::peer_mirror", url = %url, "peer mirror: request timeout");
-                                this.mark_peer_failed(endpoint);
-                                last_outcome =
-                                    Some(FetchResult::Outcome(PullOutcome::RegistryError {
-                                        status: 0,
-                                        body: format!("peer mirror request timed out for {url}"),
-                                    }));
-                                continue;
-                            }
-                        };
-                    let status = response.status();
-                    debug!(target: "nydus_snapshotter::peer_mirror", url = %url, status = %status, "peer mirror: response");
-                    match http_status_to_outcome(status.as_u16()) {
-                        StatusOutcome::Ok => match response.bytes().await {
-                            Ok(b) => return FetchResult::Ok(b.to_vec()),
-                            Err(e) => {
-                                last_outcome =
-                                    Some(FetchResult::Outcome(PullOutcome::RegistryError {
-                                        status: status.as_u16(),
-                                        body: format!("read body for {url}: {e}"),
-                                    }));
-                            }
-                        },
-                        StatusOutcome::NotFound => {
-                            // Try the next peer; keep going.
-                        }
-                        StatusOutcome::Error => {
-                            let body = response.text().await.unwrap_or_default();
-                            last_error = Some(FetchResult::Error {
-                                status: status.as_u16(),
-                                body,
-                            });
-                        }
+                            body: format!("peer mirror pull deadline exceeded fetching {path}"),
+                        })
                     }
                 }
-                // No 2xx from any endpoint. Prefer surfacing a real Error
-                // (operator wants to see 5xx / TLS / transport failure)
-                // over a NotFound, since NotFound is the expected
-                // "nobody has it" case.
-                last_error.or(last_outcome).unwrap_or(FetchResult::NotFound)
             })
         })
         .await
+    }
+
+    async fn fetch_inner(&self, path: &str, accept: Option<String>, max_bytes: u64) -> FetchResult {
+        if let Some(discovery) = &self.discovery {
+            // Refresh on this blocking thread so the gRPC runtime
+            // never waits on the Kubernetes API.
+            discovery.refresh_if_stale().await;
+        }
+        let client = match cached_client(self.tls.clone()) {
+            Ok(c) => c,
+            Err(e) => {
+                return FetchResult::Outcome(PullOutcome::RegistryError {
+                    status: 0,
+                    body: e.to_string(),
+                });
+            }
+        };
+        let endpoints = self.endpoints_for_attempt();
+        let mut last_error: Option<FetchResult> = None;
+        let mut last_outcome: Option<FetchResult> = None;
+        for endpoint in &endpoints {
+            let url = format!("{endpoint}{path}");
+            debug!(target: "nydus_snapshotter::peer_mirror", url = %url, "peer mirror attempt");
+            let req_builder = match client.get(&url) {
+                Ok(r) => r,
+                Err(e) => {
+                    debug!(target: "nydus_snapshotter::peer_mirror", url = %url, error = %e, "peer mirror: invalid URL");
+                    last_outcome = Some(FetchResult::Outcome(PullOutcome::RegistryError {
+                        status: 0,
+                        body: format!("invalid peer mirror URL {url}: {e}"),
+                    }));
+                    continue;
+                }
+            };
+            let req = if let Some(ref accept) = accept {
+                match req_builder.header(ACCEPT, accept.as_str()) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        last_outcome = Some(FetchResult::Outcome(PullOutcome::RegistryError {
+                            status: 0,
+                            body: format!("invalid Accept header for {url}: {e}"),
+                        }));
+                        continue;
+                    }
+                }
+            } else {
+                req_builder
+            };
+            let attempt = async {
+                let response = req.send().await?;
+                let status = response.status().as_u16();
+                let body = match http_status_to_outcome(status) {
+                    StatusOutcome::Ok => Some(read_capped(response, max_bytes).await),
+                    StatusOutcome::NotFound => None,
+                    StatusOutcome::Error => Some(read_capped(response, ERROR_BODY_CAP).await),
+                };
+                Ok::<_, cyper::Error>((status, body))
+            };
+            let (status, body) = match compio::time::timeout(self.request_timeout, attempt).await {
+                Ok(Ok(r)) => r,
+                Ok(Err(e)) => {
+                    debug!(target: "nydus_snapshotter::peer_mirror", url = %url, error = %e, "peer mirror: transport error");
+                    self.mark_peer_failed(endpoint);
+                    last_outcome = Some(FetchResult::Outcome(PullOutcome::RegistryError {
+                        status: 0,
+                        body: format!("transport error for {url}: {e}"),
+                    }));
+                    continue;
+                }
+                Err(_) => {
+                    debug!(target: "nydus_snapshotter::peer_mirror", url = %url, "peer mirror: request timeout");
+                    self.mark_peer_failed(endpoint);
+                    last_outcome = Some(FetchResult::Outcome(PullOutcome::RegistryError {
+                        status: 0,
+                        body: format!("peer mirror request timed out for {url}"),
+                    }));
+                    continue;
+                }
+            };
+            debug!(target: "nydus_snapshotter::peer_mirror", url = %url, status, "peer mirror: response");
+            match (http_status_to_outcome(status), body) {
+                (StatusOutcome::Ok, Some(Ok(b))) => return FetchResult::Ok(b),
+                (StatusOutcome::Ok, Some(Err(e))) => {
+                    last_outcome = Some(FetchResult::Outcome(PullOutcome::RegistryError {
+                        status,
+                        body: format!("read body for {url}: {e}"),
+                    }));
+                }
+                (StatusOutcome::Error, body) => {
+                    let body = match body {
+                        Some(Ok(b)) => String::from_utf8_lossy(&b).into_owned(),
+                        Some(Err(e)) => e,
+                        None => String::new(),
+                    };
+                    last_error = Some(FetchResult::Error { status, body });
+                }
+                // 404: try the next peer; keep going.
+                _ => {}
+            }
+        }
+        // No 2xx from any endpoint. Prefer surfacing a real Error
+        // (operator wants to see 5xx / TLS / transport failure)
+        // over a NotFound, since NotFound is the expected
+        // "nobody has it" case.
+        last_error.or(last_outcome).unwrap_or(FetchResult::NotFound)
     }
 
     /// The local (primary) mirror endpoint — always tried first by
@@ -542,6 +587,30 @@ impl PeerMirror {
         })
         .await
     }
+}
+
+/// Read a response body, failing as soon as it grows past `max_bytes`
+/// instead of buffering whatever a peer chooses to send.
+async fn read_capped(
+    mut response: cyper::Response,
+    max_bytes: u64,
+) -> std::result::Result<Vec<u8>, String> {
+    let too_long = |len: u64| format!("body of {len}+ bytes exceeds the {max_bytes}-byte limit");
+    if let Some(len) = response.content_length()
+        && len > max_bytes
+    {
+        return Err(too_long(len));
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response.next().await {
+        let chunk = chunk.map_err(|e| e.to_string())?;
+        let len = (body.len() + chunk.len()) as u64;
+        if len > max_bytes {
+            return Err(too_long(len));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
 }
 
 /// Kubernetes node discovery: `GET /api/v1/nodes` on the local API
@@ -914,6 +983,95 @@ fn build_tls_config(
         .context("build rustls ClientConfig for peer mirror")
 }
 
+/// A plain-HTTP mock peer mirror for unit tests.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::collections::HashMap;
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use super::PeerMirror;
+
+    /// What the mock answers for one path (query string ignored).
+    #[derive(Clone)]
+    pub(crate) enum Reply {
+        Body(Vec<u8>),
+        /// Send 200 headers, then never send the body.
+        StallAfterHeaders,
+        /// Stream this many bytes with no `Content-Length`.
+        Endless(usize),
+    }
+
+    /// Serve `routes` on 127.0.0.1; unknown paths get 404. Returns the base URL.
+    pub(crate) fn serve(routes: HashMap<String, Reply>) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let routes = Arc::new(routes);
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let routes = routes.clone();
+                std::thread::spawn(move || handle(stream, &routes));
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    fn handle(mut stream: TcpStream, routes: &HashMap<String, Reply>) {
+        let mut req = Vec::new();
+        let mut buf = [0u8; 1024];
+        while !req.windows(4).any(|w| w == b"\r\n\r\n") {
+            match stream.read(&mut buf) {
+                Ok(0) | Err(_) => return,
+                Ok(n) => req.extend_from_slice(&buf[..n]),
+            }
+        }
+        let req = String::from_utf8_lossy(&req);
+        let path = req.split(' ').nth(1).unwrap_or("");
+        let path = path.split('?').next().unwrap_or("");
+        let _ = match routes.get(path) {
+            None => stream.write_all(
+                b"HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+            ),
+            Some(Reply::Body(body)) => stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .and_then(|()| stream.write_all(body)),
+            Some(Reply::StallAfterHeaders) => {
+                let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nconnection: close\r\n\r\n");
+                // Hold the connection until the client gives up.
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(30)));
+                let _ = stream.read(&mut buf);
+                Ok(())
+            }
+            Some(Reply::Endless(len)) => stream
+                .write_all(b"HTTP/1.1 200 OK\r\nconnection: close\r\n\r\n")
+                .and_then(|()| stream.write_all(&vec![b'x'; *len])),
+        };
+    }
+
+    /// A mirror with `primary` as its only endpoint and no TLS or discovery.
+    pub(crate) fn mirror(primary: &str, request_timeout: Duration) -> Arc<PeerMirror> {
+        Arc::new(PeerMirror {
+            tls: None,
+            primary: primary.to_string(),
+            query_template: "ns={registry}".to_string(),
+            static_peers: Vec::new(),
+            discovery: None,
+            request_timeout,
+            rotation: AtomicUsize::new(0),
+            cooldown: Mutex::new(HashMap::new()),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1057,6 +1215,91 @@ mod tests {
             rotation: AtomicUsize::new(0),
             cooldown: Mutex::new(HashMap::new()),
         })
+    }
+
+    /// Run `fetch` on its own thread so a hang fails the test instead of
+    /// wedging the test binary. Returns the failure body of a non-2xx result.
+    fn fetch_body_or_error(
+        mirror: Arc<PeerMirror>,
+        path: &str,
+        max_bytes: u64,
+        deadline: Instant,
+    ) -> std::result::Result<Vec<u8>, String> {
+        let path = path.to_string();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let result = compio::runtime::Runtime::new()
+                .unwrap()
+                .block_on(mirror.fetch(&path, None, max_bytes, deadline));
+            let _ = tx.send(match result {
+                FetchResult::Ok(b) => Ok(b),
+                FetchResult::NotFound => Err("not found".to_string()),
+                FetchResult::Error { status, body } => Err(format!("HTTP {status}: {body}")),
+                FetchResult::Outcome(o) => Err(format!("{o:?}")),
+            });
+        });
+        rx.recv_timeout(Duration::from_secs(10))
+            .expect("peer mirror fetch hung")
+    }
+
+    fn mock(path: &str, reply: test_support::Reply) -> String {
+        test_support::serve(HashMap::from([(path.to_string(), reply)]))
+    }
+
+    /// A peer that sends headers and then stalls is cut off by the
+    /// per-request timeout, which covers the body read as well as `send()`.
+    #[test]
+    fn peer_stalling_after_headers_times_out() {
+        let url = mock("/v2/r/blobs/b", test_support::Reply::StallAfterHeaders);
+        let mirror = test_support::mirror(&url, Duration::from_millis(300));
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let err = fetch_body_or_error(mirror, "/v2/r/blobs/b", 4096, deadline).unwrap_err();
+        assert!(err.contains("timed out"), "unexpected result: {err}");
+    }
+
+    /// The pull deadline bounds a fetch even when the per-request timeout
+    /// alone would let it run much longer.
+    #[test]
+    fn pull_deadline_cuts_off_a_long_request_timeout() {
+        let url = mock("/v2/r/blobs/b", test_support::Reply::StallAfterHeaders);
+        let mirror = test_support::mirror(&url, Duration::from_secs(60));
+        let deadline = Instant::now() + Duration::from_millis(300);
+        let err = fetch_body_or_error(mirror, "/v2/r/blobs/b", 4096, deadline).unwrap_err();
+        assert!(
+            err.contains("deadline exceeded"),
+            "unexpected result: {err}"
+        );
+    }
+
+    /// `pull_deadline` grants a fixed number of request timeouts.
+    #[test]
+    fn pull_deadline_is_a_multiple_of_the_request_timeout() {
+        let mirror = test_support::mirror("http://127.0.0.1:1", Duration::from_secs(10));
+        let budget = mirror.pull_deadline() - Instant::now();
+        assert!(budget <= Duration::from_secs(30) && budget > Duration::from_secs(29));
+    }
+
+    /// A body past the caller's cap is rejected, whether the peer declares
+    /// its length up front or streams it without one.
+    #[test]
+    fn body_longer_than_the_cap_is_rejected() {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        for reply in [
+            test_support::Reply::Body(vec![b'x'; 2048]),
+            test_support::Reply::Endless(1 << 20),
+        ] {
+            let url = mock("/v2/r/blobs/b", reply);
+            let mirror = test_support::mirror(&url, Duration::from_secs(5));
+            let err = match fetch_body_or_error(mirror, "/v2/r/blobs/b", 1024, deadline) {
+                Ok(b) => panic!("accepted a {}-byte body", b.len()),
+                Err(e) => e,
+            };
+            assert!(err.contains("exceeds"), "unexpected result: {err}");
+        }
+        let url = mock("/v2/r/blobs/b", test_support::Reply::Body(vec![b'x'; 1024]));
+        let mirror = test_support::mirror(&url, Duration::from_secs(5));
+        let body = fetch_body_or_error(mirror, "/v2/r/blobs/b", 1024, deadline).unwrap();
+        assert_eq!(body.len(), 1024);
     }
 
     /// `artifact_query` expands the mirror's template with the registry host;

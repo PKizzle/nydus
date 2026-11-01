@@ -153,6 +153,14 @@ it's set) — kept only because a misconfigured or unhealthy Spegel instance (e.
 content, and the fan-out routed around that class of failure during the same testing. It is
 scheduled for removal after a production soak of default-off.
 
+Peers are untrusted, and a sidecar pull runs inside `Prepare`. The pull
+(`fetch_peer_sidecar` in `snapshotter/src/auto_accel_sidecar.rs`) fetches the whole sidecar before
+writing anything to the content store. The sidecar tag is synthetic, so no manifest digest is known
+in advance. The manifest is bound to the image by its subject annotation and its config's
+`subject_manifest_digest`, and each blob by its descriptor digest. Each request attempt (send plus
+body read) gets `request_timeout`. The whole pull gets three of those across all endpoints. A body
+longer than its descriptor size (4 MiB for a manifest) is rejected while it streams.
+
 **Peer-mirror self-check.** When peer_mirror is enabled, `PeerMirrorSelfCheck`
 (`snapshotter/src/peer_mirror_selfcheck.rs`) periodically probes the *local* mirror endpoint for a
 digest already known to be in the *local* content store. A miss (404) means the node's embedded
