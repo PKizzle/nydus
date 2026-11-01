@@ -6,7 +6,9 @@
 # optimize does write one, it runs the root-only
 # `auto_accel_daemon_serves_file_data_across_restarts` test, which reads every file of the
 # mount three times: on the first start, after the daemon dir was swept, and over a leftover
-# EROFS mount without data devices, releasing the daemon in between.
+# EROFS mount without data devices, releasing the daemon in between. It then injects a panic
+# into one of two daemons' fanotify workers and checks that only that daemon fails and that the
+# reconciler's recovery restarts it, and that a failed registration stops its workers.
 #
 # Needs root, Linux >= 6.14, cargo, and ROOT on ext4 (tmpfs has no pre-content marks).
 set -u
@@ -65,9 +67,18 @@ for shape in $shapes; do
   NYDUS_E2E_ROOT="$ROOT/$shape" "$CARGO" test -p nydus-snapshotter --lib \
     daemon::tests::auto_accel_daemon_serves_file_data_across_restarts -- --ignored --exact --nocapture \
     || fail "the auto-accel daemon did not serve every file of the $shape artifact"
-  if grep -q " $ROOT/$shape/snapshotter/daemons/" /proc/self/mounts; then
-    grep " $ROOT/$shape/snapshotter/daemons/" /proc/self/mounts
-    fail "mount still present under $ROOT/$shape/snapshotter/daemons"
-  fi
+  # A worker panic fails only its image's daemon, and the reconciler restarts it.
+  NYDUS_E2E_ROOT="$ROOT/$shape" "$CARGO" test -p nydus-snapshotter --lib \
+    daemon::tests::auto_accel_worker_panic_fails_only_its_daemon_until_recovered -- --ignored --exact --nocapture \
+    || fail "a worker panic was not contained to its daemon and recovered ($shape artifact)"
+  for dir in snapshotter snapshotter-panic; do
+    if grep -q " $ROOT/$shape/$dir/daemons/" /proc/self/mounts; then
+      grep " $ROOT/$shape/$dir/daemons/" /proc/self/mounts
+      fail "mount still present under $ROOT/$shape/$dir/daemons"
+    fi
+  done
 done
+"$CARGO" test -p nydus-snapshotter --lib \
+  daemon::tests::failed_fanotify_registration_stops_its_workers -- --ignored --exact --nocapture \
+  || fail "a failed fanotify registration left its workers running"
 echo "==== AUTO-ACCEL RESTART: PASS ===="
