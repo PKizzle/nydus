@@ -2714,19 +2714,22 @@ fn mount_blockdev_erofs(disk_image: PathBuf, mountpoint: PathBuf) -> Result<()> 
     }
     // Use the nix wrapper around `mount(2)` directly instead of shelling
     // out to `/sbin/mount`. Avoids arg-escaping foot-guns and lifts a
-    // dependency on the host's mount CLI being on PATH. `MS_RDONLY`
-    // covers the `-o ro` option; loop-back attachment for the disk image
-    // happens inside the kernel for `erofs` when the source is a file.
+    // dependency on the host's mount CLI being on PATH. Loop-back attachment
+    // for the disk image happens inside the kernel for `erofs` when the source
+    // is a file. The image is untrusted, so its setuid bits and device nodes
+    // are not honoured on this host-side mount; container overlays stacked on
+    // it apply their own mount flags.
+    use nix::mount::MsFlags;
     nix::mount::mount(
         Some(disk_image.as_path()),
         &mountpoint,
         Some("erofs"),
-        nix::mount::MsFlags::MS_RDONLY,
+        MsFlags::MS_RDONLY | MsFlags::MS_NOSUID | MsFlags::MS_NODEV,
         None::<&str>,
     )
     .with_context(|| {
         format!(
-            "mount -t erofs -o ro,loop {} {} failed",
+            "mount -t erofs -o ro,nosuid,nodev,loop {} {} failed",
             disk_image.display(),
             mountpoint.display()
         )
@@ -3662,6 +3665,34 @@ mod tests {
             "erofs",
             0
         ));
+    }
+
+    /// The blockdev/tarfs EROFS mount ignores setuid bits and device nodes in
+    /// the image. `NYDUS_E2E_ROOT` holds `disk.img`, an EROFS block image.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "needs root and an EROFS disk image; run misc/fanotify/export-block-test.sh"]
+    fn blockdev_erofs_mount_is_nosuid_nodev() {
+        let root = PathBuf::from(std::env::var("NYDUS_E2E_ROOT").expect("NYDUS_E2E_ROOT unset"));
+        let mountpoint = root.join("blockdev-mnt");
+        mount_blockdev_erofs(root.join("disk.img"), mountpoint.clone()).unwrap();
+        let target = mountpoint.display().to_string();
+        let options = fs::read_to_string("/proc/self/mounts")
+            .unwrap()
+            .lines()
+            .filter_map(|line| {
+                let fields: Vec<&str> = line.split_whitespace().collect();
+                (fields.get(1) == Some(&target.as_str())).then(|| fields[3].to_string())
+            })
+            .next_back();
+        unmount_blockdev_erofs(&mountpoint).unwrap();
+        let options = options.expect("blockdev EROFS mount missing from /proc/self/mounts");
+        for flag in ["ro", "nosuid", "nodev"] {
+            assert!(
+                options.split(',').any(|o| o == flag),
+                "{flag} missing from {options}"
+            );
+        }
     }
 
     /// Releasing the last holder of an auto-accel daemon removes its EROFS

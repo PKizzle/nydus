@@ -4,12 +4,14 @@
 # EROFS disk image, loop-mounts that image with the kernel EROFS driver and compares every file
 # with its source. The kernel follows only block addresses and the device table here, so this
 # catches layout errors that `nydus-image check` and FUSE reads (chunk-table offsets) do not.
+# It then mounts the image through the snapshotter's blockdev mount and checks ro,nosuid,nodev.
 set -u
 
-# Requirements: Linux with EROFS, run as root (mount(2), loop devices). The kernel mounts block
+# Requirements: Linux with EROFS, cargo, run as root (mount(2), loop devices). The kernel mounts block
 # sizes up to its page size, so BLOCK_SIZE above the page size fails at mount time.
 # Override via env, e.g. NYDUS_IMAGE=... ROOT=... BLOCK_SIZE=16384
 NI="${NYDUS_IMAGE:-$(command -v nydus-image || echo ./target/release/nydus-image)}"
+CARGO="${CARGO:-cargo}"
 ROOT="${ROOT:-/var/tmp/export-block}"
 BLOCK_SIZE="${BLOCK_SIZE:-4096}"
 
@@ -48,8 +50,13 @@ SRC_SUMS=$(cd "$ROOT/src" && find . -type f | sort | xargs sha256sum)
 MNT_SUMS=$(cd "$ROOT/mnt" && find . -type f | sort | xargs sha256sum 2>&1)
 echo "$MNT_SUMS"
 if [ "$SRC_SUMS" = "$MNT_SUMS" ]; then
+  cleanup
+  step "snapshotter blockdev mount flags (ro,nosuid,nodev)"
+  NYDUS_E2E_ROOT="$ROOT" "$CARGO" test -p nydus-snapshotter --lib \
+    daemon::tests::blockdev_erofs_mount_is_nosuid_nodev -- --ignored --exact --nocapture \
+    || fail "blockdev EROFS mount flags"
   echo; echo "==== EXPORT BLOCK ($BLOCK_SIZE): PASS (reads match source) ===="
-  cleanup; exit 0
+  exit 0
 fi
 diff <(echo "$SRC_SUMS") <(echo "$MNT_SUMS")
 echo; echo "==== EXPORT BLOCK ($BLOCK_SIZE): FAIL ===="

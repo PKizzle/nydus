@@ -1280,6 +1280,30 @@ pub async fn serve(mut config: SnapshotterConfig) -> Result<()> {
     .await
 }
 
+/// Create the snapshotter root and its `snapshots/` and `daemons/` subtrees as
+/// 0700, and tighten them if they already exist with a wider mode. They hold
+/// container upperdirs and mounted image content, including setuid binaries a
+/// root container can plant, so other host users must not be able to reach
+/// them. Only root needs access: containerd, runc and kubelet all run as root,
+/// and an overlay resolves its lowerdirs once at mount time.
+fn create_private_dirs(root: &Path) -> Result<()> {
+    use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
+    for dir in [
+        root.to_path_buf(),
+        root.join("snapshots"),
+        root.join("daemons"),
+    ] {
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&dir)
+            .with_context(|| format!("creating {}", dir.display()))?;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+            .with_context(|| format!("restricting {} to 0700", dir.display()))?;
+    }
+    Ok(())
+}
+
 /// Build the snapshot store at the path the config implies. Separate from
 /// `serve_with_supervisor` so the binary entry point can open the store before
 /// the runtime spawns the server task — that way it can `persist_now()` on a
@@ -1287,8 +1311,8 @@ pub async fn serve(mut config: SnapshotterConfig) -> Result<()> {
 /// which matters because the server task may be cancelled by runtime drop
 /// before its inner Drops fire.
 pub fn open_store_for_config(config: &SnapshotterConfig) -> Result<Arc<SnapshotStore>> {
-    std::fs::create_dir_all(&config.snapshotter.root)?;
     let root = PathBuf::from(&config.snapshotter.root);
+    create_private_dirs(&root)?;
     let store = Arc::new(SnapshotStore::open(&root.join("metadata.fjall"))?);
     // Import a legacy Go-snapshotter bbolt `metadata.db` (if one sits under
     // the root and the fjall store is fresh) so operators don't have to run
@@ -1604,6 +1628,21 @@ pub async fn serve_with_supervisor(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn create_private_dirs_creates_and_tightens_0700() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("root");
+        // An existing root from an older install, left world-traversable.
+        std::fs::create_dir(&root).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
+        create_private_dirs(&root).unwrap();
+        for dir in [root.clone(), root.join("snapshots"), root.join("daemons")] {
+            let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o7777;
+            assert_eq!(mode, 0o700, "{} has mode {mode:o}", dir.display());
+        }
+    }
+
     use super::*;
     use crate::metrics::CacheMetricSnapshot;
     use crate::source::{NYDUS_DATA_LAYER, TARGET_SNAPSHOT_REF};
