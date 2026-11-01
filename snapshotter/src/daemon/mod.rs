@@ -1126,13 +1126,13 @@ impl DaemonSupervisor {
     /// Probe every live daemon instance's mountpoint and report which mounts
     /// are dead from a consumer's point of view.
     ///
-    /// FUSE mounts round-trip the daemon with a readdir on a dedicated thread
-    /// bounded by `timeout` — a daemonless fuse mount either errors
-    /// (`ENOTCONN`) or hangs, both reported dead. Kernel (EROFS) mounts need a
-    /// healthy handler state and must serve one byte of file data the same way:
-    /// a directory listing comes from the bootstrap alone and passes even on a
-    /// mount whose data devices are missing. An instance whose mountpoint has
-    /// nothing mounted at all is dead outright.
+    /// Every mount must serve one byte of file data on a dedicated thread
+    /// bounded by `timeout`: a directory listing comes from the bootstrap alone
+    /// and passes even when every data read fails (a FUSE daemon whose backend
+    /// is unreachable, an EROFS mount whose data devices are missing). A
+    /// daemonless fuse mount either errors (`ENOTCONN`) or hangs, both reported
+    /// dead. Kernel (EROFS) mounts also need a healthy handler state. An
+    /// instance whose mountpoint has nothing mounted at all is dead outright.
     ///
     /// The blocking waits run through `blocking::unblock`, never on the compio
     /// reactor. A probe that times out leaves its thread behind (a D-state
@@ -1167,12 +1167,7 @@ impl DaemonSupervisor {
                 Some(t) if !t.contains("fuse") && !state_ok => {
                     (false, Some(format!("daemon state {state_str}")))
                 }
-                Some(t) => {
-                    let probe: fn(&Path) -> Result<(), String> = if t.contains("fuse") {
-                        readdir_probe
-                    } else {
-                        read_data_probe
-                    };
+                Some(_) => {
                     if self.probe_backoff_active(&slug, timeout) {
                         (false, Some("previous probe still hung".to_string()))
                     } else {
@@ -1180,7 +1175,8 @@ impl DaemonSupervisor {
                             .lock()
                             .unwrap()
                             .insert(slug.clone(), Instant::now());
-                        match probe_with_timeout(mountpoint.clone(), timeout, probe).await {
+                        match probe_with_timeout(mountpoint.clone(), timeout, read_data_probe).await
+                        {
                             ProbeOutcome::Ok => {
                                 self.probes_in_flight.lock().unwrap().remove(&slug);
                                 (true, None)
@@ -3144,7 +3140,7 @@ enum ProbeOutcome {
     TimedOut,
 }
 
-/// Run one readdir against `mountpoint` on a dedicated thread, waiting at most
+/// Run `probe` against `mountpoint` on a dedicated thread, waiting at most
 /// `timeout`. The wait happens on the blocking pool, never the compio reactor.
 /// On timeout the probe thread is abandoned (it may be stuck in
 /// uninterruptible I/O and cannot be cancelled); callers bound re-probing.
@@ -3170,13 +3166,6 @@ async fn probe_with_timeout(
         }
     })
     .await
-}
-
-fn readdir_probe(mountpoint: &Path) -> Result<(), String> {
-    fs::read_dir(mountpoint)
-        .and_then(|mut entries| entries.next().transpose())
-        .map(|_| ())
-        .map_err(|e| e.to_string())
 }
 
 /// Read one byte of the first non-empty regular file found breadth-first within
@@ -3825,6 +3814,79 @@ mod tests {
         }
     }
 
+    /// A mount that lists its directories but cannot serve file data is dead:
+    /// a FUSE daemon whose registry is unreachable (through
+    /// `probe_mount_health`), and an EROFS mount of a v6 bootstrap without its
+    /// `device=` data devices. `NYDUS_E2E_ROOT` is a dir holding
+    /// `probe/bootstrap`, built from a tree with a `hello.txt`; its data blob
+    /// is deliberately absent.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "needs root, FUSE and EROFS; run misc/fanotify/mount-health-probe-test.sh"]
+    fn mount_health_probe_reports_mounts_without_data_dead() {
+        let root = PathBuf::from(std::env::var("NYDUS_E2E_ROOT").expect("NYDUS_E2E_ROOT unset"));
+        let mut config = SnapshotterConfig::default();
+        config.snapshotter.root = root.join("snapshotter");
+        config.snapshotter.cache.work_dir = root.join("cache");
+        // Nothing listens on port 1: every blob fetch is refused at once.
+        config.backends.registry = Some(crate::config::RegistryBackendConfig {
+            mirrors: Vec::new(),
+            skip_verify: false,
+            ca_cert_files: Vec::new(),
+            plain_http: true,
+            request_timeout: "1s".to_string(),
+        });
+        let supervisor = DaemonSupervisor::new(config);
+        let runtime = compio::runtime::Runtime::new().unwrap();
+        let image_ref = "127.0.0.1:1/probe/app:1";
+        // The FUSE read gives up only after the blob-meta fetch exhausts its
+        // retries (about 30s); a probe abandoned mid-read would wedge the
+        // test's exit in `fuse_flush` once the daemon is gone.
+        let timeout = Duration::from_secs(90);
+
+        let handle = runtime
+            .block_on(supervisor.ensure_instance(
+                image_ref,
+                &root.join("probe/bootstrap"),
+                "k1",
+                Some(FsDriverType::Fusedev),
+            ))
+            .unwrap_or_else(|e| panic!("fusedev start: {e:#}"));
+        let mountpoint = handle.mountpoint().to_path_buf();
+        assert!(mount_fstype_at(&mountpoint).is_some_and(|t| t.contains("fuse")));
+        assert!(fs::read_dir(&mountpoint).unwrap().count() > 0);
+        let report = runtime.block_on(supervisor.probe_mount_health(timeout));
+        let result = &report.results[0];
+        assert!(!result.healthy, "fuse mount without data reported healthy");
+        // Dead at the data read, not at the listing or a timeout.
+        let error = result.error.as_deref().unwrap_or_default();
+        assert!(error.contains("hello.txt"), "{error}");
+        drop(handle);
+        runtime
+            .block_on(supervisor.release(image_ref, "k1"))
+            .unwrap();
+
+        let mnt = root.join("erofs-mnt");
+        fs::create_dir_all(&mnt).unwrap();
+        let status = std::process::Command::new("mount")
+            .args(["-t", "erofs", "-o", "ro"])
+            .arg(root.join("probe/bootstrap"))
+            .arg(&mnt)
+            .status()
+            .unwrap();
+        assert!(
+            status.success(),
+            "mounting the bootstrap without devices failed"
+        );
+        assert!(fs::read_dir(&mnt).unwrap().count() > 0);
+        let outcome = runtime.block_on(probe_with_timeout(mnt.clone(), timeout, read_data_probe));
+        let _ = std::process::Command::new("umount").arg(&mnt).status();
+        assert!(
+            matches!(&outcome, ProbeOutcome::Error(e) if e.contains("hello.txt")),
+            "device-less EROFS mount: {outcome:?}"
+        );
+    }
+
     #[test]
     fn overlay_references_matches_whole_lowerdir_components() {
         let mnt = "/var/lib/nydus/daemons/slug/mnt";
@@ -3846,23 +3908,35 @@ mod tests {
     }
 
     #[test]
-    fn probe_readdir_with_timeout_reports_all_outcomes() {
+    fn probe_with_timeout_reports_all_outcomes() {
         let runtime = compio::runtime::Runtime::new().unwrap();
         let dir = tempfile::tempdir().unwrap();
         // Healthy: readable directory.
         let outcome = runtime.block_on(probe_with_timeout(
             dir.path().to_path_buf(),
             Duration::from_secs(2),
-            readdir_probe,
+            read_data_probe,
         ));
         assert!(matches!(outcome, ProbeOutcome::Ok), "got {outcome:?}");
         // Error: nonexistent path.
         let outcome = runtime.block_on(probe_with_timeout(
             dir.path().join("missing"),
             Duration::from_secs(2),
-            readdir_probe,
+            read_data_probe,
         ));
         assert!(matches!(outcome, ProbeOutcome::Error(_)), "got {outcome:?}");
+        // A probe stuck in the filesystem is abandoned once the timeout passes.
+        let started = Instant::now();
+        let outcome = runtime.block_on(probe_with_timeout(
+            dir.path().to_path_buf(),
+            Duration::from_millis(100),
+            |_| {
+                std::thread::sleep(Duration::from_secs(5));
+                Ok(())
+            },
+        ));
+        assert!(matches!(outcome, ProbeOutcome::TimedOut), "got {outcome:?}");
+        assert!(started.elapsed() < Duration::from_secs(2));
     }
 
     #[test]

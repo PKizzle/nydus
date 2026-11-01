@@ -491,8 +491,8 @@ pub struct ReconConfig {
     /// result as metrics + `GET /api/v1/mounts/health` (default true).
     #[serde(default = "default_true")]
     pub mount_probe: bool,
-    /// Per-mount probe timeout: a FUSE mount that cannot answer a readdir
-    /// within this window is reported dead (default "2s").
+    /// Per-mount probe timeout: a mount that cannot serve one byte of file
+    /// data within this window is reported dead (default "2s").
     #[serde(default = "default_mount_probe_timeout")]
     pub mount_probe_timeout: String,
 }

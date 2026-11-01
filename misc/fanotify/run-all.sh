@@ -45,6 +45,7 @@ run zran-multilayer-test "==== MULTI-LAYER ZRAN: PASS ===="
 run ref-layer-formats-test "==== REF LAYER FORMATS: PASS ===="
 run release-unmount-test "==== RELEASE-UNMOUNT: PASS ===="
 run auto-accel-restart-test "==== AUTO-ACCEL RESTART: PASS ===="
+run mount-health-probe-test "==== MOUNT-HEALTH PROBE: PASS ===="
 run precontent-cases "==== FANOTIFY PRE-CONTENT CASES: PASS ===="
 run export-block-test "==== EXPORT BLOCK (4096): PASS"
 
