@@ -981,6 +981,7 @@ fn local_accel_config(config: &AutoZranConfig, work_dir: &Path) -> LocalAccelCon
         work_dir: work_dir.to_path_buf(),
         sched: map_sched(config.sched_class),
         nice: config.nice,
+        sandbox: config.sandbox,
     }
 }
 
