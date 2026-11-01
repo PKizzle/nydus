@@ -961,6 +961,7 @@ fn main() -> Result<()> {
         .context("Invalid log rotation size")?;
 
     setup_logging(logging_file, level, rotation_size)?;
+    nydus_utils::panic_policy::abort_on_uncontained_panic();
 
     // Initialize and run the daemon controller event loop.
     nydus::register_signal_handler(signal::SIGINT, sig_exit);

@@ -126,6 +126,7 @@ struct InjectReport {
 }
 
 fn main() -> Result<()> {
+    nydus_utils::panic_policy::abort_on_uncontained_panic();
     let args = Args::parse();
     match args.command {
         BridgeCommand::Inject(inject) => {

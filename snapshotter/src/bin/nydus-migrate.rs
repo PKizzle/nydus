@@ -249,6 +249,7 @@ fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
+    nydus_utils::panic_policy::abort_on_uncontained_panic();
 
     match Args::parse().command {
         Command::Config(args) => analyze_config(args),

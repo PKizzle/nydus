@@ -972,6 +972,7 @@ fn main() -> Result<()> {
     let cmd = app.get_matches();
 
     init_log(&cmd)?;
+    nydus_utils::panic_policy::abort_on_uncontained_panic();
 
     register_tracer!(TraceClass::Timing, TimingTracerClass);
     register_tracer!(TraceClass::Event, EventTracerClass);

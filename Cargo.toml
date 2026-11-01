@@ -15,7 +15,10 @@ rust-version.workspace = true
 build = "build.rs"
 
 [profile.release]
-panic = "abort"
+# Unwinding lets a panic in one fanotify worker be contained to that image's daemon (see
+# `nydus_utils::panic_policy`). Every binary installs `abort_on_uncontained_panic`, so a panic
+# outside such a boundary still aborts the process.
+panic = "unwind"
 
 [profile.dev]
 opt-level = 1

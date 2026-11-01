@@ -69,6 +69,7 @@ struct Args {
 }
 
 fn main() -> Result<()> {
+    nydus_utils::panic_policy::abort_on_uncontained_panic();
     let args = Args::parse();
     if let Some(listen_socket) = args.nri_listen_socket.clone() {
         return serve_optimizer_plugin(NriTtrpcConfig {

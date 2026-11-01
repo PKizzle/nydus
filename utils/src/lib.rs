@@ -30,6 +30,7 @@ pub mod inode_bitmap;
 pub mod logger;
 pub mod metrics;
 pub mod mpmc;
+pub mod panic_policy;
 pub mod reader;
 pub mod trace;
 pub mod types;

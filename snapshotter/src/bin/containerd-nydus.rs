@@ -161,9 +161,8 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    // Surface panics from detached async tasks (e.g. the system-controller connection
-    // handlers): the async runtime catches them, so without a hook they vanish silently
-    // and only show up as a dropped/reset socket on the client side.
+    // Route every panic through tracing, so it reaches the snapshotter log before the
+    // process aborts below.
     let default_panic = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let location = info
@@ -179,6 +178,9 @@ async fn main() -> Result<()> {
         tracing::error!(location = %location, payload = %payload, "panic in snapshotter task");
         default_panic(info);
     }));
+    // Only a fanotify worker contains its own panics; any other panic aborts, and the
+    // service manager restarts the snapshotter.
+    nydus_utils::panic_policy::abort_on_uncontained_panic();
 
     info!(
         version = nydus_snapshotter::VERSION,
