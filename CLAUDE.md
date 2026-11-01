@@ -191,8 +191,8 @@ Status: **fully wired end-to-end.** The conversion + serving pipeline is verifie
 multi-layer) via `misc/fanotify/`, and the snapshotter `Prepare` lifecycle integration exists: the
 prepare path (`snapshotter/src/grpc/mod.rs`) resolves an existing accel sidecar
 (`resolve_auto_accel_mount`), enqueues stage-1 base conversion for new images
-(`AutoZranManager::try_enqueue_base`), and attaches the access tracer whose settle drives the
-stage-2 optimize/prefetch upload — worker logic in `snapshotter/src/auto_zran.rs`, artifact
+(`AutoZranManager::try_enqueue_base`), and attaches the access tracer whose settle ends stage 2
+(the base sidecar is final: `nydus-image optimize` refuses zran/tar-ref blobs) — worker logic in `snapshotter/src/auto_zran.rs`, artifact
 build in `local_accel.rs`, serving via `DaemonSupervisor::ensure_instance`. Still unverified in
 automation: a live containerd-GC race against a slow peer fetch mid-promotion, a multi-node
 spegel sidecar-fetch soak. CI covers the fusedev loop via `misc/snapshotter-e2e.sh`, and runs the

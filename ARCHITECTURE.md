@@ -216,7 +216,7 @@ roughly one conversion, not one conversion *plus* a settle timer:
    enqueues a base conversion job with an *empty* prefetch list (channel push only). A background
    worker thread (nice-19 / idle `SchedClass`, `snapshotter/src/auto_zran.rs`) runs
    `nydus-image create --type targz-ref` + `merge` with no access profile — `local_accel::convert`
-   with empty `prefetch_files` produces a fully servable artifact (the optimize step is skipped).
+   produces a fully servable artifact.
    As soon as this lands, the sidecar Image record is created/updated
    (`images_upsert`) and peers can fetch it — the peer-visible window shrinks to ≈ the base
    conversion's duration alone, not conversion + tracer settle.
@@ -225,12 +225,11 @@ roughly one conversion, not one conversion *plus* a settle timer:
    (order-preserving, `settle_idle` / `settle_max` bounded). A second source — the NRI optimizer
    plugin (`snapshotter/src/nri.rs`) — posts profiles to the sysctl API directly and force-settles
    on `StopContainer`.
-4. **Optimize stage on settle** (`AutoZranStage::Optimize`): once the tracer (or NRI) settles, the
-   *same* job key reuses stage 1's work directory — only `nydus-image optimize --prefetch-files`
-   re-runs, replacing the bootstrap and staging a packed prefetch blob. The sidecar is re-uploaded
-   and `images_upsert` **promotes** the Image record from the base manifest to the optimized one.
-   Nodes that already fetched the base sidecar keep working; new fetches get the optimized
-   artifact.
+4. **Optimize stage on settle** (`AutoZranStage::Optimize`): once the tracer (or NRI) settles,
+   the job ends the capture. The base sidecar is final: `nydus-image optimize` packs a prefetch
+   blob by copying chunk bytes, and a zran chunk decodes only with its layer's zran index, so
+   optimize refuses node-local artifacts. Without a sidecar (settle beat the base job), the stage
+   uploads stage 1's artifact from its work directory or converts first.
 5. **Running pods are never switched over.** There is no remount mechanism by design — the
    daemon-mounted, accelerated path only benefits the *next* pod (and peers), never the pod whose
    own access pattern produced the profile.

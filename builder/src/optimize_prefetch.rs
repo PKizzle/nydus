@@ -422,10 +422,10 @@ pub fn update_ctx_from_bootstrap(
     bootstrap_path: &Path,
 ) -> Result<RafsSuper> {
     let (sb, _) = RafsSuper::load_from_file(bootstrap_path, config, false)?;
+    let blobs = sb.superblock.get_blob_infos();
+    ensure_blobs_can_be_repacked(&blobs)?;
 
-    ctx.blob_features = sb
-        .superblock
-        .get_blob_infos()
+    ctx.blob_features = blobs
         .first()
         .ok_or_else(|| anyhow!("No blob info found in superblock"))?
         .features();
@@ -445,6 +445,22 @@ pub fn update_ctx_from_bootstrap(
     }
     ctx.compressor = config.compressor;
     Ok(sb)
+}
+
+/// The prefetch blob is packed by copying each chunk's compressed bytes and takes its features
+/// from the source blobs. A `SEPARATE` blob (zran, tar-ref) keeps its data in the original
+/// layer: a zran chunk's compressed range decodes only with the zran context held in a separate
+/// meta blob, and a prefetch blob that inherits `SEPARATE` names an all-zero meta blob id, so
+/// the result could not be read. Refuse instead of writing that image.
+fn ensure_blobs_can_be_repacked(blobs: &[Arc<BlobInfo>]) -> Result<()> {
+    if let Some(blob) = blobs.iter().find(|b| b.has_feature(BlobFeatures::SEPARATE)) {
+        bail!(
+            "blob {} references the data of an original layer (zran or tar-ref); \
+             optimize cannot repack its chunks into a prefetch blob",
+            blob.blob_id()
+        );
+    }
+    Ok(())
 }
 
 pub fn generate_prefetch_file_info(prefetch_file: &Path) -> Result<Vec<PrefetchFileInfo>> {
@@ -712,6 +728,31 @@ mod tests {
             size: 100,
         };
         assert!(!range_overlap(&mut chunk, &range));
+    }
+
+    #[test]
+    fn blobs_referencing_an_original_layer_are_not_repacked() {
+        let plain = Arc::new(BlobInfo::new(
+            0,
+            "plain".into(),
+            0,
+            0,
+            0,
+            0,
+            BlobFeatures::ALIGNED,
+        ));
+        let zran = Arc::new(BlobInfo::new(
+            1,
+            "zran".into(),
+            0,
+            0,
+            0,
+            0,
+            BlobFeatures::SEPARATE | BlobFeatures::ZRAN,
+        ));
+        ensure_blobs_can_be_repacked(std::slice::from_ref(&plain)).unwrap();
+        let err = ensure_blobs_can_be_repacked(&[plain, zran]).unwrap_err();
+        assert!(err.to_string().contains("zran"), "{err}");
     }
 
     #[test]
