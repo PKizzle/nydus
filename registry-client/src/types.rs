@@ -81,7 +81,9 @@ pub const MANIFEST_ACCEPT: &str = concat!(
 pub struct Descriptor {
     /// Media type of the referenced content.
     pub media_type: String,
-    /// Content digest (`sha256:<hex>`).
+    /// Content digest (`sha256:<hex>`). Validated on deserialization: callers
+    /// build file paths and URLs from it.
+    #[serde(deserialize_with = "deserialize_digest")]
     pub digest: String,
     /// Size of the referenced content in bytes.
     #[serde(default)]
@@ -359,6 +361,54 @@ pub fn sha256_digest(bytes: &[u8]) -> String {
     format!("sha256:{}", hex::encode(Sha256::digest(bytes)))
 }
 
+/// Check that `digest` is `sha256:<64 hex>` or `sha512:<128 hex>`, lowercase.
+///
+/// Digests come from manifests and indexes, which are untrusted input, and are
+/// joined into staging paths and request URLs. Anything outside this alphabet
+/// (`/`, `..`, `?`) would let a manifest name a path or URL of its choosing.
+pub fn validate_digest(digest: &str) -> Result<()> {
+    let (hex, len) = match digest.split_once(':') {
+        Some(("sha256", hex)) => (hex, 64),
+        Some(("sha512", hex)) => (hex, 128),
+        _ => bail!("invalid digest {digest:?}: expected sha256:<hex> or sha512:<hex>"),
+    };
+    if hex.len() != len || !hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+        bail!("invalid digest {digest:?}: expected {len} lowercase hex digits");
+    }
+    Ok(())
+}
+
+fn deserialize_digest<'de, D: serde::Deserializer<'de>>(d: D) -> Result<String, D::Error> {
+    let digest = String::deserialize(d)?;
+    validate_digest(&digest).map_err(serde::de::Error::custom)?;
+    Ok(digest)
+}
+
+/// Stream the file at `path` through sha256 and check it against `expected`.
+pub fn verify_file_digest(path: &std::path::Path, expected: &str) -> Result<()> {
+    use anyhow::Context as _;
+    let mut file = std::fs::File::open(path)
+        .with_context(|| format!("open {} to verify its digest", path.display()))?;
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; 1024 * 1024];
+    loop {
+        let n = std::io::Read::read(&mut file, &mut buf)
+            .with_context(|| format!("read {} to verify its digest", path.display()))?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    let got = format!("sha256:{}", hex::encode(hasher.finalize()));
+    if got != expected {
+        bail!(
+            "digest mismatch for {}: expected {expected}, computed {got}",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
 /// Verify that `bytes` hash to `expected` (a `sha256:<hex>` digest string).
 /// Only sha256 is supported; other algorithms are rejected.
 pub fn verify_digest(bytes: &[u8], expected: &str) -> Result<()> {
@@ -478,13 +528,13 @@ mod tests {
             "manifests": [
                 {
                     "mediaType": "application/vnd.oci.image.manifest.v1+json",
-                    "digest": "sha256:aaa",
+                    "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                     "size": 7143,
                     "platform": {"architecture": "amd64", "os": "linux"}
                 },
                 {
                     "mediaType": "application/vnd.oci.image.manifest.v1+json",
-                    "digest": "sha256:bbb",
+                    "digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
                     "size": 7682,
                     "platform": {"architecture": "arm64", "os": "linux", "variant": "v8"}
                 }
@@ -609,5 +659,40 @@ mod tests {
             .expect("uppercase hex must verify");
         verify_digest(b"tampered", &digest).expect_err("mismatch must be rejected");
         verify_digest(bytes, "sha512:deadbeef").expect_err("non-sha256 must be rejected");
+    }
+
+    #[test]
+    fn descriptors_with_path_like_digests_are_rejected() {
+        let parse = |digest: &str| {
+            serde_json::from_value::<Descriptor>(serde_json::json!({
+                "mediaType": MEDIA_TYPE_OCI_LAYER_TAR_GZIP,
+                "digest": digest,
+                "size": 1,
+            }))
+        };
+        let good = sha256_digest(b"x");
+        assert_eq!(parse(&good).unwrap().digest, good);
+        for bad in [
+            "sha256:../../../root/.ssh/id_rsa",
+            "sha256:abc",
+            "sha256:/etc/passwd",
+            &good.to_uppercase().replace("SHA256", "sha256"),
+            &good.replace("sha256:", "md5:"),
+            &format!("{good}/../x"),
+            "",
+        ] {
+            assert!(parse(bad).is_err(), "{bad:?} must be rejected");
+        }
+        let sha512 = format!("sha512:{}", "0".repeat(128));
+        assert!(parse(&sha512).is_ok());
+    }
+
+    #[test]
+    fn verify_file_digest_streams_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("blob");
+        std::fs::write(&path, b"archived bytes").unwrap();
+        verify_file_digest(&path, &sha256_digest(b"archived bytes")).unwrap();
+        assert!(verify_file_digest(&path, &sha256_digest(b"other")).is_err());
     }
 }

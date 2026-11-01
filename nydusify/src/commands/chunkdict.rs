@@ -355,6 +355,7 @@ async fn push_chunkdict_image(
             BlobSource::Download {
                 client: &source.client,
                 staging: &staging,
+                size,
             },
             &retry,
         )

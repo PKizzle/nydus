@@ -976,6 +976,10 @@ mod tests {
         assert!(!opts.use_docker_config);
     }
 
+    /// The nydus entry's digest in the dual-index fixtures.
+    const DUAL_NYDUS_DIGEST: &str =
+        "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
     fn dual_index_bytes(
         artifact_type: Option<&str>,
         os_features: Option<&str>,
@@ -989,8 +993,8 @@ mod tests {
             .unwrap_or_default();
         format!(
             "{{\"schemaVersion\":2,\"mediaType\":\"application/vnd.oci.image.index.v1+json\",\"manifests\":[\
-             {{\"mediaType\":\"application/vnd.oci.image.manifest.v1+json\",\"digest\":\"sha256:oci\",\"size\":1,\"platform\":{{\"os\":\"linux\",\"architecture\":\"{arch}\"}}}},\
-             {{\"mediaType\":\"application/vnd.oci.image.manifest.v1+json\",\"digest\":\"sha256:nydus\",\"size\":1{at},\"platform\":{{\"os\":\"linux\",\"architecture\":\"{arch}\"{features}}}}}]}}"
+             {{\"mediaType\":\"application/vnd.oci.image.manifest.v1+json\",\"digest\":\"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"size\":1,\"platform\":{{\"os\":\"linux\",\"architecture\":\"{arch}\"}}}},\
+             {{\"mediaType\":\"application/vnd.oci.image.manifest.v1+json\",\"digest\":\"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"size\":1{at},\"platform\":{{\"os\":\"linux\",\"architecture\":\"{arch}\"{features}}}}}]}}"
         )
         .into_bytes()
     }
@@ -1003,8 +1007,8 @@ mod tests {
             .unwrap_or_default();
         format!(
             "{{\"schemaVersion\":2,\"mediaType\":\"application/vnd.oci.image.index.v1+json\",\"manifests\":[\
-             {{\"mediaType\":\"application/vnd.oci.image.manifest.v1+json\",\"digest\":\"sha256:oci\",\"size\":1,\"platform\":{{\"os\":\"linux\",\"architecture\":\"amd64\"}}}},\
-             {{\"mediaType\":\"application/vnd.oci.image.manifest.v1+json\",\"digest\":\"sha256:nydus\",\"size\":1,\"artifactType\":\"application/vnd.nydus.image.manifest.v1+json\"{platform}}}]}}"
+             {{\"mediaType\":\"application/vnd.oci.image.manifest.v1+json\",\"digest\":\"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"size\":1,\"platform\":{{\"os\":\"linux\",\"architecture\":\"amd64\"}}}},\
+             {{\"mediaType\":\"application/vnd.oci.image.manifest.v1+json\",\"digest\":\"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"size\":1,\"artifactType\":\"application/vnd.nydus.image.manifest.v1+json\"{platform}}}]}}"
         )
         .into_bytes()
     }
@@ -1019,7 +1023,7 @@ mod tests {
             let info = super::classify_dual_index(&dual_index_bytes(at, osf, &arch))
                 .expect("marked sibling must be detected");
             assert_eq!(info.image_type, ImageType::NydusRafs);
-            assert_eq!(info.bootstrap_digest.as_deref(), Some("sha256:nydus"));
+            assert_eq!(info.bootstrap_digest.as_deref(), Some(DUAL_NYDUS_DIGEST));
         }
     }
 

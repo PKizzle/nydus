@@ -216,7 +216,7 @@ fn file_len(path: &Path) -> Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use registry_client::types::MEDIA_TYPE_OCI_MANIFEST;
+    use registry_client::types::{MEDIA_TYPE_OCI_MANIFEST, sha256_digest};
 
     fn subject_desc() -> Descriptor {
         Descriptor {
@@ -241,9 +241,12 @@ mod tests {
     #[test]
     fn referrer_manifest_matches_the_consumed_shape() {
         let config = Descriptor::for_bytes(MEDIA_TYPE_OCI_CONFIG, REFERRER_CONFIG_BYTES);
-        let d0 = referrer_data_blob_descriptor("sha256:d0".into(), 10);
-        let d1 = referrer_data_blob_descriptor("sha256:d1".into(), 20);
-        let boot = referrer_bootstrap_descriptor("sha256:boot".into(), 30);
+        // Real-shaped digests: the manifest is reparsed below, and parsing
+        // validates them.
+        let (d0_digest, d1_digest) = (sha256_digest(b"d0"), sha256_digest(b"d1"));
+        let d0 = referrer_data_blob_descriptor(d0_digest.clone(), 10);
+        let d1 = referrer_data_blob_descriptor(d1_digest.clone(), 20);
+        let boot = referrer_bootstrap_descriptor(sha256_digest(b"boot"), 30);
         let manifest = build_referrer_manifest(config, vec![d0, d1], boot, subject_desc());
 
         // artifactType is the nydus blob media type.
@@ -261,10 +264,10 @@ mod tests {
 
         // Layer ordering: data blobs first, bootstrap LAST.
         assert_eq!(manifest.layers.len(), 3);
-        assert_eq!(manifest.layers[0].digest, "sha256:d0");
+        assert_eq!(manifest.layers[0].digest, d0_digest);
         assert_eq!(manifest.layers[0].media_type, MEDIA_TYPE_NYDUS_BLOB);
         assert!(manifest.layers[0].annotations.is_none());
-        assert_eq!(manifest.layers[1].digest, "sha256:d1");
+        assert_eq!(manifest.layers[1].digest, d1_digest);
 
         // Bootstrap: correct media type + the nydus-bootstrap annotation.
         let bootstrap = manifest.layers.last().unwrap();

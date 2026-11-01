@@ -145,11 +145,7 @@ fn lookup_path(fs: &FileSystemState, path: &str) -> Result<Inode, i32> {
                 for stale in pending_forget {
                     fs.rafs.forget(&ctx, stale, 1);
                 }
-                // The RAFS FUSE boundary answers with a raw `Os` error, so `raw_os_error()`
-                // is the real errno. The fallback is `EIO`, not `ENOENT`: an error we cannot
-                // decode is a failure, and reporting it as "no such file" would tell the
-                // caller the path is absent when it may well exist.
-                return Err(e.raw_os_error().unwrap_or(libc::EIO));
+                return Err(errno_of(&e));
             }
         }
     }
@@ -164,10 +160,19 @@ fn lookup_path(fs: &FileSystemState, path: &str) -> Result<Inode, i32> {
         let dot = CString::new(".").map_err(|_| libc::EINVAL)?;
         fs.rafs
             .lookup(&ctx, fs.root_ino, &dot)
-            .map_err(|e| e.raw_os_error().unwrap_or(libc::EIO))?;
+            .map_err(|e| errno_of(&e))?;
     }
 
     Ok(ino)
+}
+
+/// The errno a lookup error carries, wherever in its chain it sits.
+///
+/// The fallback is `EIO`, not `ENOENT`: an error we cannot decode is a failure,
+/// and reporting it as "no such file" would tell the caller the path is absent
+/// when it may well exist.
+fn errno_of(e: &std::io::Error) -> i32 {
+    nydus_utils::source_errno(e).unwrap_or(libc::EIO)
 }
 
 /// Close the file handle returned by `nydus_fopen()`.
@@ -204,6 +209,16 @@ mod tests {
     fn fopen(fs: NydusFsHandle, path: &str) -> NydusFileHandle {
         let c = CString::new(path).unwrap();
         unsafe { nydus_fopen(fs, c.as_ptr()) }
+    }
+
+    #[test]
+    fn errno_survives_a_wrapped_lookup_error() {
+        let raw = std::io::Error::from_raw_os_error(libc::ENOSPC);
+        assert_eq!(errno_of(&raw), libc::ENOSPC);
+        // Context added around an OS error must not turn it into EIO.
+        let wrapped = std::io::Error::other(std::io::Error::from_raw_os_error(libc::ENOSPC));
+        assert_eq!(errno_of(&wrapped), libc::ENOSPC);
+        assert_eq!(errno_of(&std::io::Error::other("no errno")), libc::EIO);
     }
 
     #[test]

@@ -20,6 +20,7 @@ fuse-backend-rs = { workspace = true }
 nydus-api = { version = "0.6.0", path = "../api" }
 nydus-rafs = { version = "0.5.0", path = "../rafs" }
 nydus-storage = { version = "0.8.0", path = "../storage" }
+nydus-utils = { version = "0.6.0", path = "../utils" }
 
 [features]
 baekend-s3 = ["nydus-storage/backend-s3"]

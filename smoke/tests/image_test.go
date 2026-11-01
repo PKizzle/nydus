@@ -120,8 +120,8 @@ func (i *ImageTestSuite) TestConvertAndCopyImage(t *testing.T, ctx tool.Context,
 		nydusifyPath = ctx.Binary.NydusifyChecker
 	}
 	checkCmd := fmt.Sprintf(
-		"%s %s check --source %s --target %s --nydus-image %s --nydusd %s --work-dir %s",
-		nydusifyPath, logLevel, source, target, ctx.Binary.Builder, ctx.Binary.Nydusd, filepath.Join(ctx.Env.WorkDir, "check"),
+		"%s %s check --source %s --target %s --nydus-image %s --work-dir %s",
+		nydusifyPath, logLevel, source, target, ctx.Binary.Builder, filepath.Join(ctx.Env.WorkDir, "check"),
 	)
 	tool.RunWithoutOutput(t, checkCmd)
 
@@ -142,8 +142,8 @@ func testNydusifyCopy(t *testing.T, ctx tool.Context, source, target, logLevel, 
 
 	// Check copied image
 	checkCmd := fmt.Sprintf(
-		"%s %s check --source %s --target %s --nydus-image %s --nydusd %s --work-dir %s",
-		nydusifyPath, logLevel, source, targetCopied, ctx.Binary.Builder, ctx.Binary.Nydusd, filepath.Join(ctx.Env.WorkDir, "check"),
+		"%s %s check --source %s --target %s --nydus-image %s --work-dir %s",
+		nydusifyPath, logLevel, source, targetCopied, ctx.Binary.Builder, filepath.Join(ctx.Env.WorkDir, "check"),
 	)
 	tool.RunWithoutOutput(t, checkCmd)
 
@@ -170,8 +170,8 @@ func testNydusifyCopy(t *testing.T, ctx tool.Context, source, target, logLevel, 
 
 	// Check loaded image
 	checkCmd = fmt.Sprintf(
-		"%s %s check --source %s --target %s --nydus-image %s --nydusd %s --work-dir %s",
-		nydusifyPath, logLevel, source, targetLoaded, ctx.Binary.Builder, ctx.Binary.Nydusd, filepath.Join(ctx.Env.WorkDir, "check"),
+		"%s %s check --source %s --target %s --nydus-image %s --work-dir %s",
+		nydusifyPath, logLevel, source, targetLoaded, ctx.Binary.Builder, filepath.Join(ctx.Env.WorkDir, "check"),
 	)
 	tool.RunWithoutOutput(t, checkCmd)
 }
@@ -269,8 +269,8 @@ func (i *ImageTestSuite) TestChundict(t *testing.T, ctx tool.Context, images []s
 
 	// Check nydus image covert by chunkdict.
 	checkCmd := fmt.Sprintf(
-		"%s %s check --target %s --nydus-image %s --nydusd %s --work-dir %s",
-		ctx.Binary.Nydusify, logLevel, target, ctx.Binary.Builder, ctx.Binary.Nydusd, filepath.Join(ctx.Env.WorkDir, "check"),
+		"%s %s check --target %s --nydus-image %s --work-dir %s",
+		ctx.Binary.Nydusify, logLevel, target, ctx.Binary.Builder, filepath.Join(ctx.Env.WorkDir, "check"),
 	)
 	tool.RunWithoutOutput(t, checkCmd)
 	ctx.Destroy(t)

@@ -323,7 +323,9 @@ present is validated strictly: it must classify as a nydus artifact and its `sub
 source manifest digest, or `check` fails.
 
 There is no mount-diff / rootfs-comparison in this version (that needs a live `nydusd` mount of
-both images) — `check` validates manifest, bootstrap, and (when applicable) referrer linkage only.
+both images) — `check` validates manifest, bootstrap, and (when applicable) referrer linkage only,
+and it reads no data blob. It therefore has no `--nydusd`, `--multi-platform` or
+`--{source,target}-backend-*` flags: passing one is an error rather than a silent no-op.
 
 ## `nydusify copy`
 
@@ -381,7 +383,7 @@ How it works, and where each piece lives:
 |---|---|---|
 | inspect | `ctr container info` + `ctr snapshot mounts` yield the image ref and the overlay `upperdir` | `engine/containerd_inspect.rs` |
 | diff | the upperdir is walked into an OCI layer tar, translating overlayfs' markers | `engine/overlay_diff.rs` |
-| volumes | each `--with-path` is tarred out of the container's mount namespace (`nsenter`) | `commands/commit.rs` |
+| volumes | each `--with-path` is read through `/proc/<pid>/root` and tarred by nydusify itself | `engine/volume_tar.rs` |
 | build | `nydus-image create --type tar-rafs` (base's fs-version + compressor) | `commands/commit.rs` |
 | merge | `nydus-image merge --parent-bootstrap <base>` | `commands/commit.rs` |
 | push | reused base blobs + the new blob + bootstrap + rewritten config + manifest | `commands/commit.rs` |
@@ -401,7 +403,11 @@ Useful flags:
 - `--with-path <PATH>` (repeatable) — also commit an absolute path from *inside* the running
   container, as its own layer. Bind-mounted volumes are separate mounts over the merged view, so
   nothing written into them ever reaches the overlay upperdir an ordinary commit walks; this reads
-  them out of the container's mount namespace with `nsenter` (override the binary with `--nsenter`).
+  them from the host side through `/proc/<pid>/root`, the container's own mount view. nydusify
+  writes the tar itself and never runs a binary from the container: every path is resolved with
+  `openat2(RESOLVE_IN_ROOT | RESOLVE_NO_MAGICLINKS)` inside the container's root, symlinks in the
+  volume are archived rather than followed, and unreadable files are skipped with a warning. Needs
+  Linux ≥ 5.6 (`openat2`).
   It needs a task in `RUNNING` state — a container whose process has exited still has a writable
   layer worth committing, so the pid is only looked up when this flag is used. The resulting layers
   are merged *after* the writable layer, so a bind-mounted path shadows whatever the rootfs had at

@@ -153,7 +153,7 @@ pub async fn run(args: OptimizeArgs) -> Result<()> {
             &target_client,
             &target_ref.repo,
             same_registry,
-            &layer.digest,
+            layer,
             &staging,
             &retry,
         )
@@ -372,7 +372,7 @@ async fn copy_blob(
     target_client: &RegistryClient,
     target_repo: &str,
     same_registry: bool,
-    digest: &str,
+    blob: &Descriptor,
     staging: &Path,
     retry: &RetryPolicy,
 ) -> Result<()> {
@@ -381,10 +381,11 @@ async fn copy_blob(
         target_repo,
         Some(source_repo),
         same_registry,
-        digest,
+        &blob.digest,
         crate::engine::oci::BlobSource::Download {
             client: source_client,
             staging,
+            size: blob.size,
         },
         retry,
     )

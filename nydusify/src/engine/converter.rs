@@ -653,7 +653,7 @@ fn pull_source_from_archive(
     workspace: &Path,
 ) -> Result<PulledSource> {
     let unpacked = workspace.join("source-layout");
-    let imported = oci_archive::import(archive, &unpacked)
+    let imported = oci_archive::import(archive, &unpacked, platform)
         .with_context(|| format!("import --source-archive {}", archive.display()))?;
     let manifest = &imported.manifest;
     if manifest.layers.is_empty() {
@@ -676,14 +676,14 @@ fn pull_source_from_archive(
         imported.manifest_bytes.len() as u64,
         request.driver.docker2oci,
     );
-    let config_bytes = std::fs::read(imported.blob_path(&manifest.config.digest)?)
+    let config_bytes = std::fs::read(imported.blob_path(&manifest.config)?)
         .context("read image config from the source archive")?;
 
     let mut layers = Vec::with_capacity(manifest.layers.len());
     for layer in &manifest.layers {
         layers.push(PulledLayer {
             digest: layer.digest.clone(),
-            path: imported.blob_path(&layer.digest)?,
+            path: imported.blob_path(layer)?,
         });
     }
 
@@ -876,7 +876,7 @@ async fn pull_source(
     for layer in &manifest.layers {
         let path = layers_dir.join(blob_hex(&layer.digest));
         client
-            .get_blob_to_file(repo, &layer.digest, &path)
+            .get_blob_to_file(repo, &layer.digest, layer.size, &path)
             .await
             .with_context(|| format!("download layer {}", layer.digest))?;
         layers.push(PulledLayer {

@@ -18,14 +18,11 @@ use crate::engine::bootstrap_layer;
 use crate::engine::manifest::validate_nydus_manifest;
 use crate::engine::oci::{client_options, fetch_nydus_platform_manifest};
 
-use super::common::resolve_backend_config;
-
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct CheckPlan {
     pub source: Option<String>,
     pub target: String,
     pub platform: String,
-    pub multi_platform: bool,
 }
 
 pub async fn run(args: CheckArgs) -> Result<()> {
@@ -243,24 +240,10 @@ fn ensure_dir(path: &Path) -> Result<()> {
 }
 
 pub fn plan(args: &CheckArgs) -> Result<CheckPlan> {
-    let _ = resolve_backend_config(
-        args.source_backend_type,
-        args.source_backend_config.as_deref(),
-        args.source_backend_config_file.as_deref(),
-        "source-",
-    )?;
-    let _ = resolve_backend_config(
-        args.target_backend_type,
-        args.target_backend_config.as_deref(),
-        args.target_backend_config_file.as_deref(),
-        "target-",
-    )?;
-
     Ok(CheckPlan {
         source: args.source.clone(),
         target: args.target.clone(),
         platform: args.platform.clone(),
-        multi_platform: args.multi_platform,
     })
 }
 
@@ -268,8 +251,10 @@ pub fn plan(args: &CheckArgs) -> Result<CheckPlan> {
 mod tests {
     use std::path::PathBuf;
 
+    use clap::Parser;
+
     use super::*;
-    use crate::cli::{BackendType, default_platform};
+    use crate::cli::{Cli, default_platform};
 
     fn base_args() -> CheckArgs {
         CheckArgs {
@@ -281,53 +266,43 @@ mod tests {
             source_plain_http: false,
             target_plain_http: false,
             ca_cert: Vec::new(),
-            source_backend_type: None,
-            source_backend_config: None,
-            source_backend_config_file: None,
-            target_backend_type: None,
-            target_backend_config: None,
-            target_backend_config_file: None,
-            multi_platform: false,
             platform: default_platform(),
             work_dir: PathBuf::from("./output"),
             nydus_image: PathBuf::from("nydus-image"),
-            nydusd: PathBuf::from("nydusd"),
         }
     }
 
     #[test]
     fn builds_check_plan_from_args() {
-        let mut args = base_args();
-        args.multi_platform = true;
-
-        let plan = plan(&args).unwrap();
+        let plan = plan(&base_args()).unwrap();
 
         assert_eq!(
             plan.source.as_deref(),
             Some("registry.example.com/base:latest")
         );
         assert_eq!(plan.target, "registry.example.com/base:latest-nydus");
-        assert!(plan.multi_platform);
     }
 
     #[test]
-    fn rejects_target_backend_config_without_type() {
-        let mut args = base_args();
-        args.target_backend_config = Some("{}".to_string());
-
-        let err = plan(&args).unwrap_err();
-
-        assert!(
-            err.to_string()
-                .contains("--target-backend-type is required")
-        );
-    }
-
-    #[test]
-    fn accepts_registry_target_without_backend_config() {
-        let mut args = base_args();
-        args.target_backend_type = Some(BackendType::Registry);
-
-        assert!(plan(&args).is_ok());
+    fn flags_check_would_ignore_are_rejected() {
+        // `check` verifies the manifest and bootstrap only. A flag that
+        // promises more (a data mount, a backend, every platform) must fail
+        // instead of being parsed and dropped.
+        let parse = |extra: &[&str]| {
+            let mut argv = vec!["nydusify", "check", "--target", "r.example.com/a:b"];
+            argv.extend_from_slice(extra);
+            Cli::try_parse_from(argv)
+        };
+        assert!(parse(&[]).is_ok());
+        for extra in [
+            &["--nydusd", "/usr/bin/nydusd"][..],
+            &["--multi-platform"],
+            &["--source-backend-type", "registry"],
+            &["--target-backend-type", "registry"],
+            &["--source-backend-config", "{}"],
+            &["--target-backend-config-file", "/tmp/backend.json"],
+        ] {
+            assert!(parse(extra).is_err(), "{extra:?} must be rejected");
+        }
     }
 }

@@ -213,7 +213,7 @@ pub async fn fetch(
     if is_tar_layer(&descriptor.media_type) {
         let layer_path = work_dir.join("bootstrap.layer");
         client
-            .get_blob_to_file(repo, &descriptor.digest, &layer_path)
+            .get_blob_to_file(repo, &descriptor.digest, descriptor.size, &layer_path)
             .await
             .with_context(|| format!("download bootstrap layer {}", descriptor.digest))?;
         extract(&layer_path, &bootstrap_path)
@@ -221,7 +221,7 @@ pub async fn fetch(
     } else {
         // Published by an older build: the blob already is the bootstrap.
         client
-            .get_blob_to_file(repo, &descriptor.digest, &bootstrap_path)
+            .get_blob_to_file(repo, &descriptor.digest, descriptor.size, &bootstrap_path)
             .await
             .with_context(|| format!("download bootstrap {}", descriptor.digest))?;
     }

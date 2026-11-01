@@ -12,3 +12,5 @@ pub mod oci;
 pub mod oci_archive;
 pub mod overlay_diff;
 pub mod retry;
+#[cfg(target_os = "linux")]
+pub mod volume_tar;

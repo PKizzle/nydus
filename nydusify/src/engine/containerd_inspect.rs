@@ -334,8 +334,8 @@ fn mount_options(line: &str) -> Option<&str> {
 /// 0d1c9f1a...         31337    RUNNING
 /// ```
 ///
-/// A task in any state other than `RUNNING` has no process to enter, so it is
-/// rejected here rather than surfacing as an opaque `nsenter` failure.
+/// A task in any state other than `RUNNING` has no process whose root can be read, so it is
+/// rejected here rather than surfacing as an opaque `/proc/<pid>/root` failure.
 pub fn parse_task_pid(stdout: &str, container_id: &str) -> Result<u32> {
     let mut seen = 0usize;
     for line in stdout.lines() {
