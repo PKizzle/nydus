@@ -644,7 +644,8 @@ mod tests {
         std::fs::write(source.as_path().join("a"), vec![1u8; 5000]).unwrap();
         std::fs::write(source.as_path().join("b"), vec![2u8; 20000]).unwrap();
         let blob_dir = TempDir::new().unwrap();
-        let layer = TempFile::new().unwrap();
+        // Without `--original-blob-ids`, merge names the layer's blob after its bootstrap file.
+        let layer = blob_dir.as_path().join("ab".repeat(32));
         let mut ctx = BuildContext {
             fs_version: RafsVersion::V6,
             conversion_type: ConversionType::DirectoryToRafs,
@@ -657,10 +658,8 @@ mod tests {
             ..Default::default()
         };
         ctx.set_blob_block_size(16384);
-        let mut bootstrap_mgr = BootstrapManager::new(
-            Some(ArtifactStorage::SingleFile(layer.as_path().to_path_buf())),
-            None,
-        );
+        let mut bootstrap_mgr =
+            BootstrapManager::new(Some(ArtifactStorage::SingleFile(layer.clone())), None);
         let mut blob_mgr = BlobManager::new(ctx.digester, false);
         DirectoryBuilder::new()
             .build(&mut ctx, &mut bootstrap_mgr, &mut blob_mgr)
@@ -671,7 +670,7 @@ mod tests {
         Merger::merge(
             &mut ctx,
             None,
-            vec![layer.as_path().to_path_buf()],
+            vec![layer.clone()],
             None,
             None,
             None,

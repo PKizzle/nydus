@@ -195,6 +195,12 @@ impl FileCacheEntry {
         let is_batch = blob_info.has_feature(BlobFeatures::BATCH);
         let is_zran = blob_info.has_feature(BlobFeatures::ZRAN);
         let blob_id = blob_info.blob_id();
+        if !crate::utils::is_plain_file_name(&blob_id) {
+            return Err(StorageError::InvalidArgument(format!(
+                "blob id {:?} is not a plain file name",
+                blob_id
+            )));
+        }
         let blob_meta_id = if is_separate_meta {
             blob_info
                 .get_blob_meta_id()

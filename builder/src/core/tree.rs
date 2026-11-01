@@ -17,6 +17,7 @@
 //! - Traverse the merged tree (OverlayTree) to dump bootstrap and data blobs.
 
 use std::cell::{RefCell, RefMut};
+use std::collections::HashSet;
 use std::ffi::OsString;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
@@ -287,11 +288,16 @@ impl Tree {
 
 pub struct MetadataTreeBuilder<'a> {
     rs: &'a RafsSuper,
+    /// Directories already loaded: a directory reached twice means the bootstrap has a cycle.
+    loaded_dirs: RefCell<HashSet<Inode>>,
 }
 
 impl<'a> MetadataTreeBuilder<'a> {
     fn new(rs: &'a RafsSuper) -> Self {
-        Self { rs }
+        Self {
+            rs,
+            loaded_dirs: RefCell::new(HashSet::new()),
+        }
     }
 
     /// Build node tree by loading bootstrap file
@@ -306,6 +312,9 @@ impl<'a> MetadataTreeBuilder<'a> {
         if !inode.is_dir() {
             return Ok(Vec::new());
         }
+        if !self.loaded_dirs.borrow_mut().insert(ino) {
+            bail!("directory inode {} is reachable more than once", ino);
+        }
 
         let parent_path = if let Some(parent) = parent {
             parent.as_ref().join(inode.name())
@@ -315,7 +324,8 @@ impl<'a> MetadataTreeBuilder<'a> {
 
         let blobs = self.rs.superblock.get_blob_infos();
         let child_count = inode.get_child_count();
-        let mut children = Vec::with_capacity(child_count as usize);
+        // Counts come from untrusted inode fields, so they do not size allocations up front.
+        let mut children = Vec::new();
         for idx in 0..child_count {
             let child = inode.get_child_by_index(idx)?;
             let child_path = parent_path.join(child.name());
@@ -352,7 +362,7 @@ impl<'a> MetadataTreeBuilder<'a> {
     pub fn parse_node(rs: &RafsSuper, inode: Arc<dyn RafsInodeExt>, path: PathBuf) -> Result<Node> {
         let chunks = if inode.is_reg() {
             let chunk_count = inode.get_chunk_count();
-            let mut chunks = Vec::with_capacity(chunk_count as usize);
+            let mut chunks = Vec::new();
             for i in 0..chunk_count {
                 let cki = inode.get_chunk_info(i)?;
                 chunks.push(NodeChunk {
@@ -544,5 +554,48 @@ mod tests {
             .get_child_idx(tmpfile3.as_path().file_name().unwrap().as_bytes())
             .unwrap();
         assert!(idx == 0 || idx == 1);
+    }
+
+    /// A bootstrap whose root directory lists itself as a child must fail to load instead of
+    /// recursing until the stack overflows.
+    #[test]
+    fn test_from_bootstrap_rejects_directory_cycle() {
+        use nydus_api::ConfigV2;
+        use std::sync::Arc;
+
+        let root_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap();
+        let fixture = PathBuf::from(root_dir).join("../tests/texture/bootstrap/rafs-v6-2.2.boot");
+        let mut data = std::fs::read(&fixture).unwrap();
+        let config = Arc::new(ConfigV2::default());
+        let (rs, _) = RafsSuper::load_from_file(&fixture, config.clone(), false).unwrap();
+        Tree::from_bootstrap(&rs, &mut ()).unwrap();
+
+        // The root's dirent block starts with "." and "..", both pointing at the root
+        // (RafsV6Dirent { e_nid: u64, e_nameoff: u16, e_file_type: u8, reserved: u8 }); the
+        // dirent after them is the root's first child.
+        let root_nid = rs.superblock.root_ino();
+        let dirent = |nid: u64, nameoff: u16| -> Vec<u8> {
+            let mut d = nid.to_le_bytes().to_vec();
+            d.extend_from_slice(&nameoff.to_le_bytes());
+            d.extend_from_slice(&[2, 0]);
+            d
+        };
+        let pos = (1..=255u16)
+            .find_map(|count| {
+                let mut dots = dirent(root_nid, count * 12);
+                dots.extend(dirent(root_nid, count * 12 + 1));
+                data.windows(24).position(|w| w == dots)
+            })
+            .expect("root dirent block");
+        let child = pos + 24;
+        data[child..child + 8].copy_from_slice(&root_nid.to_le_bytes());
+
+        let tmp = TempFile::new().unwrap();
+        std::fs::write(tmp.as_path(), &data).unwrap();
+        let (rs, _) = RafsSuper::load_from_file(tmp.as_path(), config, false).unwrap();
+        let Err(err) = Tree::from_bootstrap(&rs, &mut ()) else {
+            panic!("a directory cycle loaded");
+        };
+        assert!(err.to_string().contains("more than once"), "{err:#}");
     }
 }

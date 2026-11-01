@@ -1284,6 +1284,17 @@ impl BlobCompressionContext {
         }
     }
 
+    /// Get a ZRan context by an index read from a chunk entry, which may be out of range.
+    fn zran_info(&self, zran_index: u32) -> MetaResult<&ZranInflateContext> {
+        self.zran_info_array
+            .get(zran_index as usize)
+            .ok_or(MetaError::IndexOutOfRange {
+                kind: "ZRan",
+                index: zran_index as u64,
+                max: self.zran_info_array.len() as u64,
+            })
+    }
+
     pub(crate) fn is_separate(&self) -> bool {
         self.blob_features & BlobFeatures::SEPARATE.bits() != 0
     }
@@ -1690,7 +1701,7 @@ impl BlobMetaChunkArray {
         // Special handling of ZRan chunks
         if entry.is_zran() {
             let zran_index = entry.get_zran_index()?;
-            let mut count = state.zran_info_array[zran_index as usize].out_size() as u64;
+            let mut count = state.zran_info(zran_index)?.out_size() as u64;
             let mut zran_last = zran_index;
             let mut zran_end = entry.aligned_uncompressed_end();
 
@@ -1718,7 +1729,7 @@ impl BlobMetaChunkArray {
                     ));
                 }
                 if entry.get_zran_index()? != zran_last {
-                    let ctx = &state.zran_info_array[entry.get_zran_index()? as usize];
+                    let ctx = state.zran_info(entry.get_zran_index()?)?;
                     if count + ctx.out_size() as u64 >= batch_size
                         && entry.uncompressed_offset() >= end
                     {
@@ -1809,7 +1820,7 @@ impl BlobMetaChunkArray {
         // Special handling of ZRan chunks
         if entry.is_zran() {
             let zran_index = entry.get_zran_index()?;
-            let pos = state.zran_info_array[zran_index as usize].in_offset();
+            let pos = state.zran_info(zran_index)?.in_offset();
             let mut zran_last = zran_index;
 
             while index > 0 {
@@ -1836,7 +1847,7 @@ impl BlobMetaChunkArray {
                     ));
                 }
                 if entry.get_zran_index()? != zran_last {
-                    let ctx = &state.zran_info_array[entry.get_zran_index()? as usize];
+                    let ctx = state.zran_info(entry.get_zran_index()?)?;
                     if ctx.in_offset() + ctx.in_size() as u64 - pos > batch_size
                         && entry.compressed_offset() > end
                     {
@@ -3054,6 +3065,31 @@ pub(crate) mod tests {
         BlobCompressionContextInfo {
             state: Arc::new(state),
         }
+    }
+
+    /// A chunkdict-generated blob skips per-entry validation on lookup, so the ZRan index of the
+    /// first chunk in a range reaches the context table unchecked.
+    #[test]
+    fn test_get_chunks_zran_index_out_of_range() {
+        let meta = aligned_zran_blob_meta(0x1000, &[(0, 0x1000)], 0x1000);
+        let mut state = Arc::try_unwrap(meta.state).ok().unwrap();
+        state.blob_features |= BlobFeatures::IS_CHUNKDICT_GENERATED.bits();
+        if let BlobMetaChunkArray::V2(chunks) = &mut state.chunk_info_array {
+            let mut v = chunks.to_vec();
+            v[0].set_zran_index(0xffff);
+            *chunks = v.into();
+        }
+        let meta = BlobCompressionContextInfo {
+            state: Arc::new(state),
+        };
+        assert!(matches!(
+            chunk_ids(&meta, 0, 0x1000),
+            Err(MetaError::IndexOutOfRange { kind: "ZRan", .. })
+        ));
+        assert!(matches!(
+            meta.get_chunks_compressed(0, 0x100, 0, false),
+            Err(MetaError::IndexOutOfRange { kind: "ZRan", .. })
+        ));
     }
 
     /// The ZRan path ends a range at the last chunk's end rounded up to the blob's block size:

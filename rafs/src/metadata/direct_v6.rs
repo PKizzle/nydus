@@ -152,9 +152,10 @@ impl DirectSuperBlockV6 {
         state: &Guard<Arc<DirectMappingState>>,
         nid: u64,
     ) -> RafsResult<OndiskInodeWrapper> {
-        if nid >= (usize::MAX / EROFS_INODE_SLOT_SIZE) as u64 {
+        // No inode lives at nid 0: `ino()` requires an offset past the start of the meta area.
+        if nid == 0 || nid >= (usize::MAX / EROFS_INODE_SLOT_SIZE) as u64 {
             Err(RafsError::InvalidMetadata(format!(
-                "v6: inode number 0x{:x} is too big",
+                "v6: invalid inode number 0x{:x}",
                 nid
             )))
         } else if let Some(offset) = self
@@ -415,7 +416,9 @@ impl OndiskInodeWrapper {
         index: usize,
         max_entries: usize,
     ) -> RafsResult<&'a OsStr> {
-        assert!(max_entries > 0);
+        if max_entries == 0 {
+            return Err(RafsError::InvalidImageData);
+        }
         let block_size = state.block_size();
         let offset = self.data_block_offset(state, inode, block_index)?;
         let de = self.get_entry(state, inode, block_index, index)?;
@@ -457,7 +460,10 @@ impl OndiskInodeWrapper {
                         if self.size().is_multiple_of(block_size) {
                             (block_size - base) as usize
                         } else {
-                            (self.size() % block_size - base) as usize
+                            (self.size() % block_size)
+                                .checked_sub(base)
+                                .ok_or(RafsError::InvalidImageData)?
+                                as usize
                         }
                     }
                     Ordering::Less => return Err(RafsError::InvalidImageData),
@@ -637,10 +643,9 @@ impl OndiskInodeWrapper {
         }
 
         let inode = self.disk_inode(state);
-        assert_eq!(
-            inode.format() >> EROFS_I_VERSION_BITS,
-            EROFS_INODE_CHUNK_BASED
-        );
+        if inode.format() >> EROFS_I_VERSION_BITS != EROFS_INODE_CHUNK_BASED {
+            return Err(RafsError::InvalidImageData);
+        }
 
         let base_index = base_index as usize;
         let base = Self::inode_xattr_size(inode) + base_index * size_of::<RafsV6InodeChunkAddr>();
@@ -749,10 +754,12 @@ impl OndiskInodeWrapper {
             .get_entry(state, inode, block_index, 0)
             .map_err(err_invalidate_data)?;
         let name_offset = head_entry.e_nameoff as usize;
-        if name_offset as u64 >= state.block_size()
+        // The names follow the dirent array, so a valid block holds at least one dirent.
+        if name_offset < size_of::<RafsV6Dirent>()
+            || name_offset as u64 >= state.block_size()
             || !name_offset.is_multiple_of(size_of::<RafsV6Dirent>())
         {
-            Err(RafsError::NotFound(format!(
+            Err(RafsError::InvalidMetadata(format!(
                 "v6: invalid e_nameoff {} from directory entry",
                 name_offset
             )))
@@ -1735,5 +1742,74 @@ mod tests {
         meta.flags |= RafsSuperFlags::TARTFS_MODE;
         let state = DirectMappingState::new(&meta);
         assert_eq!(state.block_size(), EROFS_BLOCK_SIZE_512);
+    }
+
+    fn v6_fixture() -> (std::path::PathBuf, Vec<u8>) {
+        let root_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap();
+        let path =
+            std::path::PathBuf::from(root_dir).join("../tests/texture/bootstrap/rafs-v6-2.2.boot");
+        let data = std::fs::read(&path).unwrap();
+        (path, data)
+    }
+
+    fn load_v6(data: &[u8]) -> RafsResult<crate::metadata::RafsSuper> {
+        let file = vmm_sys_util::tempfile::TempFile::new().unwrap();
+        std::fs::write(file.as_path(), data).unwrap();
+        crate::metadata::RafsSuper::load_from_file(
+            file.as_path(),
+            Arc::new(nydus_api::ConfigV2::default()),
+            false,
+        )
+        .map(|(sb, _)| sb)
+    }
+
+    #[test]
+    fn test_reject_blob_id_with_path_components() {
+        let (_, mut data) = v6_fixture();
+        let sb = load_v6(&data).unwrap();
+        let id = sb.superblock.get_blob_infos()[0].raw_blob_id().to_string();
+        assert!(BlobInfo::is_valid_blob_id(id.as_bytes()), "{id}");
+
+        let evil = format!("{:a<64}", "../../../../../../../../etc/kubernetes/x");
+        let mut patched = 0;
+        while let Some(pos) = data.windows(64).position(|w| w == id.as_bytes()) {
+            data[pos..pos + 64].copy_from_slice(evil.as_bytes());
+            patched += 1;
+        }
+        assert!(patched >= 2, "blob table and device table");
+        assert!(matches!(load_v6(&data), Err(RafsError::InvalidMetadata(_))));
+    }
+
+    /// A directory block whose first dirent claims `e_nameoff == 0` holds zero entries; a lookup
+    /// in it must fail as corrupt metadata, neither panicking nor answering ENOENT.
+    #[test]
+    fn test_lookup_in_dir_block_without_entries() {
+        let (path, mut data) = v6_fixture();
+        let sb = load_v6(&data).unwrap();
+        let mut dsb = DirectSuperBlockV6::new(&sb.meta);
+        let mut reader = Box::new(std::fs::File::open(&path).unwrap()) as RafsIoReader;
+        dsb.load(&mut reader).unwrap();
+        let state = dsb.state.load();
+        let root = dsb.inode_wrapper(&state, sb.meta.root_nid as u64).unwrap();
+        let block = root
+            .data_block_offset(&state, root.disk_inode(&state), 0)
+            .unwrap();
+        drop(state);
+
+        let nameoff = block + 8; // RafsV6Dirent { e_nid: u64, e_nameoff: u16, .. }
+        data[nameoff..nameoff + 2].copy_from_slice(&0u16.to_le_bytes());
+        let sb = load_v6(&data).unwrap();
+        let root = sb
+            .superblock
+            .get_inode(sb.superblock.root_ino(), false)
+            .unwrap();
+        assert!(matches!(
+            root.get_child_by_name(OsStr::new("anything")),
+            Err(RafsError::InvalidMetadata(_))
+        ));
+        assert!(matches!(
+            root.walk_children_inodes(0, &mut |_, _, _, _| Ok(RafsInodeWalkAction::Continue)),
+            Err(RafsError::InvalidMetadata(_))
+        ));
     }
 }

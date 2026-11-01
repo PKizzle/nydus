@@ -188,6 +188,15 @@ pub struct BlobInfo {
 }
 
 impl BlobInfo {
+    /// Whether a blob id read from image metadata is acceptable: 64 lowercase hex digits (a
+    /// sha256 digest), or the 64 `x` placeholder the builder writes for a blob with inlined meta.
+    /// Blob ids become cache and backend file names, so anything else is rejected at load.
+    pub fn is_valid_blob_id(id: &[u8]) -> bool {
+        id.len() == 64
+            && (id.iter().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+                || id.iter().all(|b| *b == b'x'))
+    }
+
     /// Create a new instance of `BlobInfo`.
     pub fn new(
         blob_index: u32,

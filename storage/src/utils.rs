@@ -21,6 +21,7 @@ use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
 use std::os::unix::io::RawFd;
 #[cfg(target_os = "linux")]
 use std::path::PathBuf;
+use std::path::{Component, Path};
 use std::slice::from_raw_parts_mut;
 #[cfg(target_os = "macos")]
 use std::{ffi::CStr, mem, os::raw::c_char};
@@ -437,6 +438,13 @@ impl AsMut<[u8]> for AlignedBuf {
 }
 
 /// Allocate initialized storage aligned for direct IO.
+/// Whether `name` joined onto a directory names an entry directly inside that directory, so a
+/// blob id read from image metadata cannot steer a cache or backend path elsewhere.
+pub fn is_plain_file_name(name: &str) -> bool {
+    let mut components = Path::new(name).components();
+    matches!(components.next(), Some(Component::Normal(_))) && components.next().is_none()
+}
+
 pub fn alloc_buf(size: usize) -> AlignedBuf {
     assert!(size < isize::MAX as usize);
     AlignedBuf {
@@ -465,6 +473,14 @@ mod tests {
     use super::*;
     use std::io::Write;
     use vmm_sys_util::tempfile::TempFile;
+
+    #[test]
+    fn test_is_plain_file_name() {
+        assert!(is_plain_file_name("abc.blob.data"));
+        for name in ["", ".", "..", "../x", "a/b", "/etc", "a/.."] {
+            assert!(!is_plain_file_name(name), "{name}");
+        }
+    }
 
     #[test]
     fn test_copyv() {

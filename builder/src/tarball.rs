@@ -914,7 +914,7 @@ mod tests {
 
     fn create_context(source_path: PathBuf, version: RafsVersion) -> BuildContext {
         let mut ctx = BuildContext::new(
-            "test".to_string(),
+            String::new(),
             true,
             0,
             compress::Algorithm::None,
@@ -1198,7 +1198,7 @@ mod tests {
         let source_path = PathBuf::from(root_dir).join("../tests/texture/tar/all-entry-type.tar");
         let prefetch = Prefetch::default();
         let mut ctx = BuildContext::new(
-            "test".to_string(),
+            String::new(),
             true,
             0,
             compress::Algorithm::None,
@@ -1234,7 +1234,7 @@ mod tests {
         let source_path = PathBuf::from(root_dir).join("../tests/texture/tar/all-entry-type.tar");
         let prefetch = Prefetch::default();
         let mut ctx = BuildContext::new(
-            "test".to_string(),
+            String::new(),
             true,
             0,
             compress::Algorithm::None,
@@ -1423,7 +1423,7 @@ mod tests {
         create_xattr_hardlink_tar(&source_path, xattr_on);
 
         let mut ctx = BuildContext::new(
-            "test".to_string(),
+            String::new(),
             true,
             0,
             compress::Algorithm::None,
