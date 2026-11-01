@@ -63,19 +63,23 @@ EOF
 P=1
 serve a "$R/la" && serve b "$R/lb" || P=0
 
+# A kernel built without CONFIG_EROFS_FS_PAGE_CACHE_SHARE ignores `inode_share` and mounts
+# anyway, just as one that drops it for an image without fingerprints, so the served mounts alone
+# cannot tell the two apart. `inode_share` without `domain_id` can: with the feature compiled in,
+# the kernel refuses that mount (EINVAL); without it, the option is ignored and the mount works.
 if [ $P = 1 ]; then
+  mkdir -p "$R/probe"
+  if mount -t erofs -o ro,inode_share "$R/a/stage/bootstrap" "$R/probe" 2>/dev/null; then
+    umount "$R/probe"
+    echo "==== INODE SHARE: SKIP (kernel $KREL built without CONFIG_EROFS_FS_PAGE_CACHE_SHARE) ===="
+    cleanup; exit 0
+  fi
   for n in a b; do
     opts=$(awk -v m="$R/$n/mnt" '$2 == m {print $4}' /proc/self/mounts)
     echo "mount $n: $opts"
     case ",$opts," in
       *,inode_share,*) ;;
-      *)
-        if grep -q "inode_share.*refused" "$R/$n/log" \
-          || dmesg 2>/dev/null | grep -q "inode_share option not supported"; then
-          echo "==== INODE SHARE: SKIP (kernel $KREL rejects inode_share: CONFIG_EROFS_FS_PAGE_CACHE_SHARE off) ===="
-          cleanup; exit 0
-        fi
-        echo "FAIL: $n mounted without inode_share (see dmesg: missing ishare xattrs?)"; P=0 ;;
+      *) echo "FAIL: $n mounted without inode_share although the kernel supports it"; P=0 ;;
     esac
   done
 fi

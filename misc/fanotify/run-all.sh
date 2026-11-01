@@ -49,7 +49,8 @@ run auto-accel-restart-test "==== AUTO-ACCEL RESTART: PASS ===="
 run mount-health-probe-test "==== MOUNT-HEALTH PROBE: PASS ===="
 run precontent-cases "==== FANOTIFY PRE-CONTENT CASES: PASS ===="
 run export-block-test "==== EXPORT BLOCK (4096): PASS"
-run inode-share-test "==== INODE SHARE: PASS ====" "==== INODE SHARE: SKIP (kernel $(uname -r) has no EROFS inode_share"
+# Skips only on kernels without the feature (< 7.0, or built without page cache sharing).
+run inode-share-test "==== INODE SHARE: PASS ====" "==== INODE SHARE: SKIP (kernel $(uname -r) "
 
 umount -l "$FS"
 echo
