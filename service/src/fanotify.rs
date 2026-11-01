@@ -32,7 +32,7 @@ use std::sync::{Arc, Barrier, Mutex, RwLock};
 
 use mio::unix::SourceFd;
 use mio::{Events, Interest, Poll, Token, Waker};
-use nydus_rafs::metadata::layout::v6::{EROFS_SUPER_OFFSET, RafsV6SuperBlock};
+use nydus_rafs::metadata::layout::v6::{EROFS_SUPER_OFFSET, RafsV6Device, RafsV6SuperBlock};
 
 use crate::blob_cache::{BlobCacheMgr, DataBlob};
 use crate::fanotify_sys::{
@@ -265,6 +265,10 @@ impl Drop for EventFdGuard<'_> {
 pub struct FanotifyHandler {
     /// Set to `false` to signal workers to exit.
     active: AtomicBool,
+    /// Set once a worker hits a fatal error or panics. From then on every worker denies every
+    /// event instead of serving it, and the owning daemon reports itself unhealthy so the
+    /// supervisor replaces the handler. See [`fail`](Self::fail).
+    failed: AtomicBool,
     /// Barrier that workers must reach before `stop()` returns.
     barrier: Barrier,
     /// Number of worker threads.
@@ -329,6 +333,55 @@ fn discover_blobs(blob_dir: &Path) -> Result<(PathBuf, Vec<PathBuf>)> {
     })?;
 
     Ok((bootstrap, blobs))
+}
+
+/// Test-only fault hook: the handler mounted at the given path panics on its next pre-access
+/// event, the way a bug in the fill path would.
+#[cfg(any(test, feature = "fault-injection"))]
+static PANIC_ON_NEXT_EVENT: Mutex<Option<PathBuf>> = Mutex::new(None);
+
+/// Make the handler mounted at `mountpoint` panic while handling its next pre-access event.
+#[cfg(any(test, feature = "fault-injection"))]
+pub fn inject_panic_on_next_event(mountpoint: &Path) {
+    *PANIC_ON_NEXT_EVENT.lock().unwrap() = Some(mountpoint.to_path_buf());
+}
+
+/// Blob ids of the bootstrap's EROFS device table, in device order.
+fn bootstrap_device_ids(bootstrap: &Path) -> Result<Vec<String>> {
+    let file = File::open(bootstrap)?;
+    let mut sb = RafsV6SuperBlock::new();
+    file.read_exact_at(sb.as_mut(), EROFS_SUPER_OFFSET as u64)?;
+    let slot_size = std::mem::size_of::<RafsV6Device>() as u64;
+    (0..sb.extra_devices() as u64)
+        .map(|i| {
+            let mut slot = RafsV6Device::new();
+            file.read_exact_at(slot.as_mut(), sb.device_table_offset() + i * slot_size)?;
+            Ok(String::from_utf8_lossy(slot.blob_id()).into_owned())
+        })
+        .collect()
+}
+
+/// Take, for each device-table slot in order, the item whose blob id is that slot's.
+///
+/// Fails unless every slot has one. The candidates may include blobs of other bootstraps the
+/// same blob cache manager serves; those are left out.
+fn order_by_device_table<T>(
+    device_ids: &[String],
+    mut items: Vec<T>,
+    blob_id: impl Fn(&T) -> String,
+) -> Result<Vec<T>> {
+    device_ids
+        .iter()
+        .map(|id| {
+            let pos = items.iter().position(|item| blob_id(item) == *id);
+            pos.map(|pos| items.swap_remove(pos)).ok_or_else(|| {
+                std::io::Error::new(
+                    ErrorKind::InvalidInput,
+                    format!("no registered data blob backs device {id}"),
+                )
+            })
+        })
+        .collect()
 }
 
 /// Maximum size of the `mount(2)` data argument.
@@ -630,43 +683,48 @@ impl FanotifyHandler {
             )
             .map_err(|e| std::io::Error::other(format!("mio register: {}", e)))?;
 
-        // Build the set of on-demand data blobs from the shared blob cache manager. Each
-        // `DataBlob` owns a handle to its sparse backing file; we record that file's identity so
-        // an incoming event fd can be resolved back to the blob without relying on path names.
-        let mut blob_backings = Vec::new();
+        // EROFS reads device `i` of the bootstrap's device table through the `i`-th `device=`
+        // option, so the backings follow that table, matched slot by slot on blob id. The blob
+        // cache manager may also hold other bootstraps' blobs, so a count alone could pair this
+        // bootstrap with the wrong layers -- and without any match, EROFS would read the image as
+        // one flat device and answer every data read with EIO. Nothing is linked below until
+        // every slot has its blob.
+        let device_ids = bootstrap_device_ids(&bootstrap_path)?;
+        let configs =
+            order_by_device_table(&device_ids, blob_cache_mgr.get_all_data_blobs(), |cfg| {
+                cfg.blob_info().blob_id()
+            })
+            .map_err(|e| {
+                std::io::Error::new(
+                    e.kind(),
+                    format!("fanotify: bootstrap {}: {e}", bootstrap_path.display()),
+                )
+            })?;
+
+        // Each `DataBlob` owns a handle to its sparse backing file; we record that file's
+        // identity so an incoming event fd can be resolved back to the blob without relying on
+        // path names.
         let runtime = compio::runtime::Runtime::new()
             .map_err(|e| std::io::Error::other(format!("fanotify: compio runtime: {}", e)))?;
-        for cfg in blob_cache_mgr.get_all_data_blobs() {
-            let blob = match runtime.block_on(DataBlob::new(&cfg)) {
-                Ok(b) => b,
-                Err(e) => {
-                    warn!(
-                        "fanotify: failed to open data blob {}: {}",
-                        cfg.blob_info().blob_id(),
-                        e
-                    );
-                    continue;
-                }
-            };
-            match fd_identity(blob.file().as_raw_fd()) {
-                Ok((dev, ino)) => blob_backings.push(BlobBacking {
-                    dev,
-                    ino,
-                    blob: AssertBlobThreadSafe(blob),
-                    io_lock: RwLock::new(()),
-                    armed: AtomicBool::new(false),
-                }),
-                Err(e) => warn!(
-                    "fanotify: failed to stat backing file for blob {}: {}",
+        let mut blob_backings = Vec::with_capacity(configs.len());
+        for cfg in configs {
+            let blob = runtime.block_on(DataBlob::new(&cfg)).map_err(|e| {
+                warn!(
+                    "fanotify: failed to open data blob {}: {}",
                     cfg.blob_info().blob_id(),
                     e
-                ),
-            }
+                );
+                std::io::Error::from(e)
+            })?;
+            let (dev, ino) = fd_identity(blob.file().as_raw_fd())?;
+            blob_backings.push(BlobBacking {
+                dev,
+                ino,
+                blob: AssertBlobThreadSafe(blob),
+                io_lock: RwLock::new(()),
+                armed: AtomicBool::new(false),
+            });
         }
-
-        // EROFS multi-device order must match the bootstrap's device table, i.e. blob index order.
-        // `get_all_data_blobs` iterates a hash map, so sort before assigning `blob_<i>` device names.
-        blob_backings.sort_by_key(|b| b.blob.blob_info().blob_index());
 
         // Materialise the EROFS device files from the cache. Each data blob's cache file
         // (`<work_dir>/<blob_id>.blob.data`) *is* the device the kernel reads on demand; hardlink it
@@ -698,24 +756,6 @@ impl FanotifyHandler {
             device_blobs.push(device_path);
         }
 
-        // EROFS mounts a multi-device image given no `device=` option as one flat device, so
-        // every data read lands past the bootstrap's end and fails with EIO. Refuse unless each
-        // device in the bootstrap's table is backed, e.g. when no blob-cache entry was registered
-        // for this bootstrap or a data blob failed to open above.
-        let mut sb = RafsV6SuperBlock::new();
-        File::open(&bootstrap_path)?.read_exact_at(sb.as_mut(), EROFS_SUPER_OFFSET as u64)?;
-        if device_blobs.len() != sb.extra_devices() as usize {
-            return Err(std::io::Error::new(
-                ErrorKind::InvalidInput,
-                format!(
-                    "fanotify: bootstrap {} has {} data devices but {} data blobs are backed",
-                    bootstrap_path.display(),
-                    sb.extra_devices(),
-                    device_blobs.len()
-                ),
-            ));
-        }
-
         let inode_share_domain = blob_cache_mgr.get_all_data_blobs().iter().find_map(|cfg| {
             cfg.config_v2()
                 .cache
@@ -728,6 +768,7 @@ impl FanotifyHandler {
 
         Ok(FanotifyHandler {
             active: AtomicBool::new(true),
+            failed: AtomicBool::new(false),
             barrier: Barrier::new(threads + 1),
             threads,
             fan_fd,
@@ -994,39 +1035,68 @@ impl FanotifyHandler {
         &self.blob_dir
     }
 
+    /// Whether a worker hit a fatal error or panicked. A failed handler answers every event
+    /// with `FAN_DENY_ERRNO(EIO)` until [`stop`](Self::stop); the owning daemon reports itself
+    /// unhealthy so the supervisor can replace it.
+    pub fn is_failed(&self) -> bool {
+        self.failed.load(Ordering::Acquire)
+    }
+
+    /// Mark the handler failed: every worker stops serving and denies whatever arrives.
+    ///
+    /// Serving on is not an option after any of the causes. A `FAN_Q_OVERFLOW` means the kernel
+    /// already fail-opened events, so the stream is known to have holes; a panic or a poisoned
+    /// lock means state shared by all workers may be half-updated. Denying rather than exiting
+    /// keeps the queue drained, so no reader waits in `D` state for the supervisor's restart.
+    pub(crate) fn fail(&self, reason: &dyn std::fmt::Display) {
+        if !self.failed.swap(true, Ordering::AcqRel) {
+            error!(
+                "fanotify: handler for {:?} failed ({}); denying every further event until it \
+                 is replaced",
+                self.mountpoint, reason
+            );
+        }
+    }
+
+    /// Run [`run_loop_inner`](Self::run_loop_inner) with panics contained to this handler.
+    fn run_contained(&self) -> Result<()> {
+        nydus_utils::panic_policy::contain(|| self.run_loop_inner()).unwrap_or_else(|_| {
+            Err(std::io::Error::other(
+                "fanotify worker panicked while handling events",
+            ))
+        })
+    }
+
     /// Run the fanotify event loop on a single worker thread.
     ///
     /// Blocks until `stop()` is called or an unrecoverable error occurs.
     ///
-    /// Every exit path — clean shutdown *and* error — participates in the shutdown
-    /// barrier. The barrier is sized `threads + 1` and [`stop`](Self::stop) blocks on
-    /// it, so a worker that returned early without waiting would deadlock `stop()`
-    /// forever (and, because the singleton calls `stop()` while holding its handlers
-    /// mutex, wedge every subsequent register/unregister daemon-wide). An erroring
-    /// worker therefore logs, wakes a sibling, and parks on the barrier until
-    /// `stop()` supplies the final waiter.
+    /// A fatal error or panic fails the whole handler (see [`fail`](Self::fail)), and the worker
+    /// carries on denying events until `stop()`. Only an error in that denying loop too, such as
+    /// a broken poller, ends the worker early.
+    ///
+    /// Every exit path participates in the shutdown barrier. The barrier is sized `threads + 1`
+    /// and [`stop`](Self::stop) blocks on it, so a worker that returned without waiting would
+    /// deadlock `stop()` forever (and, because the singleton calls `stop()` while holding its
+    /// handlers mutex, wedge every subsequent register/unregister daemon-wide).
     pub fn run_loop(&self) -> Result<()> {
-        // A panic anywhere in event handling must not skip the barrier: an
-        // unwinding worker thread would otherwise die silently and wedge
-        // `stop()` (and with it the singleton) forever. The per-event
-        // `EventFdGuard` has already denied the in-flight event during the
-        // unwind by the time we land here.
-        let result =
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.run_loop_inner()))
-                .unwrap_or_else(|_| {
-                    Err(std::io::Error::other(
-                        "fanotify worker panicked while handling events",
-                    ))
-                });
+        let result = self.run_contained();
         if let Err(ref e) = result {
-            error!(
-                "fanotify: worker exiting on error ({}); remaining workers keep serving, \
-                 parking on the shutdown barrier so stop() can complete",
-                e
-            );
-            // The cascade wake below is for the *clean* path; on error the group is
-            // still active, so this wake is a harmless no-op for siblings.
+            self.fail(e);
+            // The error may have cut a drain short, and the registration is edge-triggered:
+            // answer what is already queued before waiting for the next edge.
+            self.drain_deny_pending();
+            if self.active.load(Ordering::Acquire)
+                && let Err(e) = self.run_contained()
+            {
+                error!(
+                    "fanotify: worker for {:?} cannot keep denying events ({}); parking on the \
+                     shutdown barrier",
+                    self.mountpoint, e
+                );
+            }
         }
+        // Cascade the wake so a sibling still in `poll` sees a `stop()` this worker consumed.
         let _ = self.waker.wake();
         self.barrier.wait();
         result
@@ -1037,7 +1107,15 @@ impl FanotifyHandler {
         let mut buf = vec![0u8; EVENT_BUF_SIZE];
 
         loop {
-            match self.poller.lock().unwrap().poll(&mut events, None) {
+            // Only a panic inside `Poll::poll` itself can poison this lock; the poller holds no
+            // state of ours, so it can still drain events once the handler is marked failed.
+            let mut poller = self.poller.lock().unwrap_or_else(|poisoned| {
+                self.fail(&"poller lock poisoned");
+                poisoned.into_inner()
+            });
+            let polled = poller.poll(&mut events, None);
+            drop(poller);
+            match polled {
                 Ok(_) => {}
                 Err(e) if e.kind() == ErrorKind::Interrupted => continue,
                 Err(e) => {
@@ -1080,6 +1158,9 @@ impl FanotifyHandler {
             };
             match n {
                 0 => return Ok(()),
+                n if n > 0 && self.is_failed() => {
+                    self.deny_events_in_buffer(&buf[..n as usize]);
+                }
                 n if n > 0 => self.process_event_buffer(&buf[..n as usize])?,
                 _ => {
                     let err = std::io::Error::last_os_error();
@@ -1192,21 +1273,31 @@ impl FanotifyHandler {
             }
 
             // Serve the event; the response reflects whether the content is now available.
-            // The guard owns the event fd for exactly-once answering: if
-            // `handle_event` panics and unwinds through here, its Drop denies
-            // with EIO and closes the fd, so the blocked reader errors instead
-            // of hanging in D-state behind an unanswerable event.
+            // The guard owns the event fd for exactly-once answering. A panic in
+            // `handle_event` is contained per event, so it fails the handler and the rest of
+            // this batch is still answered (denied); were anything else here to unwind, the
+            // guard's Drop denies with EIO so the reader errors instead of hanging in D-state.
             let guard = EventFdGuard::new(self, meta.fd as RawFd);
-            let response = match self.handle_event(&meta, &buf[offset..offset + meta_len]) {
-                Ok(()) => FAN_ALLOW,
-                Err(e) => {
-                    warn!("fanotify: failed to serve pre-content event: {}", e);
-                    // Deny — never allow — so the reader gets an error instead of
-                    // the unfetched hole's zeros. The errno is the most specific
-                    // one we still hold (see `deny_errno_for`); EROFS flattens it
-                    // to EIO for readers coming through the mount, but denying is
-                    // what makes the read fail at all.
-                    fan_deny_errno(deny_errno_for(&e))
+            let raw = &buf[offset..offset + meta_len];
+            let response = if self.is_failed() {
+                fan_deny_errno(libc::EIO)
+            } else {
+                let served = nydus_utils::panic_policy::contain(|| self.handle_event(&meta, raw))
+                    .unwrap_or_else(|_| {
+                        self.fail(&"panic while serving a pre-content event");
+                        Err(std::io::Error::other("fanotify: event handler panicked"))
+                    });
+                match served {
+                    Ok(()) => FAN_ALLOW,
+                    Err(e) => {
+                        warn!("fanotify: failed to serve pre-content event: {}", e);
+                        // Deny — never allow — so the reader gets an error instead of
+                        // the unfetched hole's zeros. The errno is the most specific
+                        // one we still hold (see `deny_errno_for`); EROFS flattens it
+                        // to EIO for readers coming through the mount, but denying is
+                        // what makes the read fail at all.
+                        fan_deny_errno(deny_errno_for(&e))
+                    }
                 }
             };
             guard.finish(response);
@@ -1329,6 +1420,15 @@ impl FanotifyHandler {
         if (meta.mask & FAN_PRE_ACCESS) == 0 {
             return Ok(());
         }
+        #[cfg(any(test, feature = "fault-injection"))]
+        {
+            let mut target = PANIC_ON_NEXT_EVENT.lock().unwrap();
+            if target.as_deref() == Some(self.mountpoint.as_path()) {
+                *target = None;
+                drop(target);
+                panic!("injected fanotify worker panic");
+            }
+        }
         let range = match Self::parse_range(raw_buf) {
             Some(r) => r,
             // Every 6.14+ pre-access read carries a RANGE record. An event
@@ -1402,10 +1502,10 @@ impl FanotifyHandler {
         // marks them ready, and an invalidation interleaved between those two steps would
         // leave the map promising data that was just punched away. Concurrent fetches of
         // other ranges (and of other blobs) are unaffected.
-        let _serving = backing
-            .io_lock
-            .read()
-            .map_err(|_| std::io::Error::other("fanotify: blob io lock poisoned"))?;
+        let _serving = backing.io_lock.read().map_err(|_| {
+            self.fail(&"blob io lock poisoned");
+            std::io::Error::other("fanotify: blob io lock poisoned")
+        })?;
         obj.fetch_range_uncompressed(range.offset, count)?;
 
         // That fetch may have been the one that completed the blob. Still under the shared
@@ -1581,8 +1681,198 @@ fn fd_file_size(fd: RawFd) -> Result<u64> {
 // automatically from its fields — do not add blanket `unsafe impl`s here: they would
 // silently vouch for any future non-thread-safe field.
 
+/// A handler whose "group fd" is one end of a `SOCK_SEQPACKET` pair, so tests can feed it event
+/// buffers and read its responses without root or a 6.14 kernel.
+#[cfg(test)]
+pub(crate) mod testing {
+    use super::*;
+    use std::os::unix::fs::FileExt;
+    use vmm_sys_util::tempdir::TempDir;
+
+    pub(crate) struct SocketHandler {
+        pub handler: Arc<FanotifyHandler>,
+        /// The test's end: write event buffers, read `fanotify_response` records.
+        pub peer: OwnedFd,
+        pub workers: Vec<std::thread::JoinHandle<Result<()>>>,
+        _dir: TempDir,
+    }
+
+    /// Copy the fixture bootstrap into `dir`, letting `edit` change its superblock and first
+    /// device slot.
+    pub(crate) fn stage_bootstrap(
+        dir: &Path,
+        edit: impl FnOnce(&mut RafsV6SuperBlock, &mut RafsV6Device),
+    ) {
+        let root = std::env::var("CARGO_MANIFEST_DIR").unwrap();
+        let path = dir.join("bootstrap");
+        std::fs::copy(
+            format!("{root}/../tests/texture/bootstrap/rafs-v6-2.2.boot"),
+            &path,
+        )
+        .unwrap();
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        let mut sb = RafsV6SuperBlock::new();
+        file.read_exact_at(sb.as_mut(), EROFS_SUPER_OFFSET as u64)
+            .unwrap();
+        let mut slot = RafsV6Device::new();
+        let slot_off = sb.device_table_offset();
+        file.read_exact_at(slot.as_mut(), slot_off).unwrap();
+        edit(&mut sb, &mut slot);
+        file.write_all_at(slot.as_ref(), slot_off).unwrap();
+        file.write_all_at(sb.as_ref(), EROFS_SUPER_OFFSET as u64)
+            .unwrap();
+    }
+
+    impl SocketHandler {
+        /// Start `threads` workers over a bootstrap without data devices.
+        pub(crate) fn start(threads: usize) -> Self {
+            let dir = TempDir::new().unwrap();
+            stage_bootstrap(dir.as_path(), |sb, _| sb.set_extra_devices(0));
+            let mut fds = [0; 2];
+            let ret = unsafe {
+                libc::socketpair(
+                    libc::AF_UNIX,
+                    libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC,
+                    0,
+                    fds.as_mut_ptr(),
+                )
+            };
+            assert_eq!(ret, 0);
+            // Like a real group fd, the handler's end never blocks a read.
+            assert_eq!(
+                unsafe { libc::fcntl(fds[0], libc::F_SETFL, libc::O_NONBLOCK) },
+                0
+            );
+            let peer = unsafe { OwnedFd::from_raw_fd(fds[1]) };
+            let timeout = libc::timeval {
+                tv_sec: 5,
+                tv_usec: 0,
+            };
+            let ret = unsafe {
+                libc::setsockopt(
+                    fds[1],
+                    libc::SOL_SOCKET,
+                    libc::SO_RCVTIMEO,
+                    &timeout as *const _ as *const libc::c_void,
+                    std::mem::size_of::<libc::timeval>() as libc::socklen_t,
+                )
+            };
+            assert_eq!(ret, 0);
+            let handler = Arc::new(
+                FanotifyHandler::from_restored_fd(
+                    dir.as_path().to_str().unwrap(),
+                    dir.as_path().join("mnt").to_str().unwrap(),
+                    Arc::new(BlobCacheMgr::new()),
+                    threads,
+                    unsafe { File::from_raw_fd(fds[0]) },
+                )
+                .unwrap(),
+            );
+            let workers = (0..threads)
+                .map(|_| {
+                    let h = handler.clone();
+                    std::thread::spawn(move || h.run_loop())
+                })
+                .collect();
+            Self {
+                handler,
+                peer,
+                workers,
+                _dir: dir,
+            }
+        }
+
+        pub(crate) fn send(&self, buf: &[u8]) {
+            let n = unsafe {
+                libc::write(
+                    self.peer.as_raw_fd(),
+                    buf.as_ptr() as *const libc::c_void,
+                    buf.len(),
+                )
+            };
+            assert_eq!(n, buf.len() as isize);
+        }
+
+        /// Next `(event fd, response)`; panics after the 5 s receive timeout.
+        pub(crate) fn response(&self) -> (i32, u32) {
+            let mut resp = fanotify_response { fd: 0, response: 0 };
+            let n = unsafe {
+                libc::read(
+                    self.peer.as_raw_fd(),
+                    &mut resp as *mut _ as *mut libc::c_void,
+                    std::mem::size_of::<fanotify_response>(),
+                )
+            };
+            assert_eq!(
+                n,
+                std::mem::size_of::<fanotify_response>() as isize,
+                "no response: {}",
+                std::io::Error::last_os_error()
+            );
+            (resp.fd, resp.response)
+        }
+
+        /// Stop the handler; every worker must reach the shutdown barrier.
+        pub(crate) fn stop(self) {
+            self.handler.stop();
+            for worker in self.workers {
+                let _ = worker.join().unwrap();
+            }
+        }
+    }
+
+    /// A `FAN_PRE_ACCESS` event for `fd` with a one-block range record.
+    pub(crate) fn pre_access_event(fd: RawFd) -> Vec<u8> {
+        let range = fanotify_event_info_range {
+            hdr: fanotify_event_info_header {
+                info_type: FAN_EVENT_INFO_TYPE_RANGE,
+                pad: 0,
+                len: std::mem::size_of::<fanotify_event_info_range>() as u16,
+            },
+            pad: 0,
+            offset: 0,
+            count: 4096,
+        };
+        let meta = libc::fanotify_event_metadata {
+            event_len: (std::mem::size_of::<libc::fanotify_event_metadata>()
+                + std::mem::size_of::<fanotify_event_info_range>()) as u32,
+            vers: libc::FANOTIFY_METADATA_VERSION,
+            reserved: 0,
+            metadata_len: std::mem::size_of::<libc::fanotify_event_metadata>() as u16,
+            mask: FAN_PRE_ACCESS,
+            fd,
+            pid: 0,
+        };
+        // SAFETY: both are `#[repr(C)]` POD structs.
+        let mut buf = unsafe {
+            std::slice::from_raw_parts(&meta as *const _ as *const u8, std::mem::size_of_val(&meta))
+        }
+        .to_vec();
+        buf.extend_from_slice(unsafe {
+            std::slice::from_raw_parts(
+                &range as *const _ as *const u8,
+                std::mem::size_of_val(&range),
+            )
+        });
+        buf
+    }
+
+    /// An fd the handler may answer and close: it resolves to no blob, so a healthy handler
+    /// allows it.
+    pub(crate) fn event_fd() -> RawFd {
+        use std::os::fd::IntoRawFd;
+        File::open("/dev/null").unwrap().into_raw_fd()
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::testing::*;
+
     #[test]
     fn deny_errno_passthrough_table() {
         use super::deny_errno_for;
@@ -1650,6 +1940,124 @@ mod tests {
         .err()
         .expect("a handler without data blobs must be refused");
         assert_eq!(err.kind(), ErrorKind::InvalidInput, "{err}");
+    }
+
+    /// A wrong layer set of the right size must be refused, and before any device file is
+    /// linked: the blob cache manager may hold other bootstraps' blobs, so only the bootstrap's
+    /// own device table says which blob backs which device.
+    #[test]
+    fn refuses_data_blobs_that_do_not_match_the_device_table() {
+        const BLOB: &str = "be7d77eeb719f70884758d1aa800ed0fb09d701aaec469964e9d54325f0d5fef";
+        let root = std::env::var("CARGO_MANIFEST_DIR").unwrap();
+        let work = vmm_sys_util::tempdir::TempDir::new().unwrap();
+        std::fs::copy(
+            format!("{root}/../tests/texture/blobs/{BLOB}"),
+            work.as_path().join(BLOB),
+        )
+        .unwrap();
+        let config = r#"{
+            "type": "bootstrap", "id": "rafs-v6", "domain_id": "d",
+            "config_v2": {
+                "version": 2, "id": "factory",
+                "backend": { "type": "localfs", "localfs": { "dir": "WORK" } },
+                "cache": { "type": "filecache", "filecache": { "work_dir": "WORK" } },
+                "metadata_path": "ROOT/../tests/texture/bootstrap/rafs-v6-2.2.boot"
+            }
+        }"#
+        .replace("WORK", work.as_path().to_str().unwrap())
+        .replace("ROOT", &root);
+        let mut entry: nydus_api::config::BlobCacheEntry = serde_json::from_str(&config).unwrap();
+        assert!(entry.prepare_configuration_info());
+        let mgr = Arc::new(BlobCacheMgr::new());
+        mgr.add_blob_entry(&entry).unwrap();
+
+        let open = |device_id: &[u8; 64]| {
+            let dir = vmm_sys_util::tempdir::TempDir::new().unwrap();
+            stage_bootstrap(dir.as_path(), |_, slot| slot.set_blob_id(device_id));
+            let group = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC) };
+            let result = FanotifyHandler::from_restored_fd(
+                dir.as_path().to_str().unwrap(),
+                dir.as_path().join("mnt").to_str().unwrap(),
+                mgr.clone(),
+                1,
+                unsafe { File::from_raw_fd(group) },
+            );
+            (result.map(|_| ()), dir)
+        };
+
+        let err = open(&[b'a'; 64])
+            .0
+            .expect_err("another image's layer must be refused");
+        assert_eq!(err.kind(), ErrorKind::InvalidInput, "{err}");
+        assert!(
+            !work.as_path().join("blob_0").exists(),
+            "a refused bootstrap re-linked the device files"
+        );
+
+        open(BLOB.as_bytes().try_into().unwrap())
+            .0
+            .expect("the bootstrap's own layer is accepted");
+        assert!(work.as_path().join("blob_0").exists());
+    }
+
+    #[test]
+    fn device_table_order_comes_from_the_bootstrap() {
+        let ids = ["b".to_string(), "a".to_string()];
+        let items = vec!["x", "a", "b"];
+        assert_eq!(
+            order_by_device_table(&ids, items, |s| s.to_string()).unwrap(),
+            vec!["b", "a"]
+        );
+        let err = order_by_device_table(&ids, vec!["a"], |s| s.to_string()).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+    }
+
+    /// A panic while serving one event answers that event and the rest of its batch with
+    /// `EIO`, fails the handler, and leaves every worker able to reach the shutdown barrier.
+    #[test]
+    fn worker_panic_denies_the_batch_and_fails_the_handler() {
+        let h = SocketHandler::start(2);
+        inject_panic_on_next_event(h.handler.mountpoint());
+        let (a, b) = (event_fd(), event_fd());
+        let mut batch = pre_access_event(a);
+        batch.extend_from_slice(&pre_access_event(b));
+        h.send(&batch);
+        let deny = fan_deny_errno(libc::EIO);
+        assert_eq!(h.response(), (a, deny), "the panicking event is denied");
+        assert_eq!(h.response(), (b, deny), "the rest of its batch is denied");
+        assert!(h.handler.is_failed());
+
+        // A failed handler keeps answering, with errors, until it is stopped.
+        let c = event_fd();
+        h.send(&pre_access_event(c));
+        assert_eq!(h.response(), (c, deny));
+        h.stop();
+    }
+
+    /// `FAN_Q_OVERFLOW` fails the whole handler: no worker serves the stream afterwards.
+    #[test]
+    fn queue_overflow_stops_every_worker_from_serving() {
+        let h = SocketHandler::start(2);
+        // Sanity: a healthy handler allows an event that maps to no blob.
+        let a = event_fd();
+        h.send(&pre_access_event(a));
+        assert_eq!(h.response(), (a, FAN_ALLOW));
+
+        h.send(&event_header(FAN_NOFD, FAN_Q_OVERFLOW, 0));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !h.handler.is_failed() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "overflow did not fail the handler"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        for _ in 0..4 {
+            let fd = event_fd();
+            h.send(&pre_access_event(fd));
+            assert_eq!(h.response(), (fd, fan_deny_errno(libc::EIO)));
+        }
+        h.stop();
     }
 
     /// Serialize a `fanotify_event_info_range` record to raw bytes.

@@ -146,8 +146,12 @@ impl ServiceController {
 
         // Arm the marks now that workers are draining, then mount. Pre-content events raised by the
         // EROFS reads that follow the mount are served by the workers spawned above.
-        fanotify.arm()?;
-        fanotify.mount()?;
+        if let Err(e) = fanotify.arm().and_then(|()| fanotify.mount()) {
+            // The handler never reaches the map, so nothing else would stop it: its workers
+            // would poll forever and the group fd, with any marks already armed, would leak.
+            fanotify.stop();
+            return Err(e);
+        }
 
         let mut handlers = self.fanotify.lock().unwrap();
         handlers.insert(image_id.to_string(), fanotify);
@@ -262,8 +266,20 @@ impl ServiceController {
             let mountpoint = fanotify.mountpoint().to_path_buf();
             drop(handlers); // Release lock before unmounting
             result = Self::umount_fanotify_erofs(&fanotify, &mountpoint);
-            // Only now may the handler — and the group fd it owns — drop.
+            // Only now may the handler — and the group fd it owns — drop. The workers release
+            // their references just after the barrier `stop()` waited on; wait for that, so
+            // the cache managers are idle for the gc below.
+            for _ in 0..1000 {
+                if Arc::strong_count(&fanotify) == 1 {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
             drop(fanotify);
+            // Release the cache managers the handler held. The blob factory keys them by
+            // config, so an idle one would otherwise keep its cache files open after the
+            // daemon's directory is removed, and be handed to the next daemon for this image.
+            nydus_storage::factory::BLOB_FACTORY.gc(None);
         }
         if is_empty {
             self.fanotify_enabled.store(false, Ordering::Release);
@@ -353,7 +369,26 @@ impl NydusDaemon for ServiceController {
         self.bti.clone()
     }
 
+    /// The state machine's state, except that a serving daemon with a failed fanotify handler
+    /// reports `UNKNOWN`: it answers that image's reads with errors until it is replaced, and the
+    /// supervisor restarts any daemon that is neither `RUNNING` nor `READY`.
     fn get_state(&self) -> DaemonState {
+        let state = self.machine_state();
+        #[cfg(target_os = "linux")]
+        if matches!(state, DaemonState::RUNNING | DaemonState::READY)
+            && self
+                .fanotify
+                .lock()
+                .unwrap()
+                .values()
+                .any(|h| h.is_failed())
+        {
+            return DaemonState::UNKNOWN;
+        }
+        state
+    }
+
+    fn machine_state(&self) -> DaemonState {
         self.state.load(Ordering::Relaxed).into()
     }
 
@@ -695,6 +730,28 @@ mod tests {
         let service_controller = create_service_controller();
         assert!(service_controller.unregister_fanotify_handlers().is_ok());
         assert!(!service_controller.fanotify_enabled.load(Ordering::Acquire));
+    }
+
+    /// A failed handler makes the daemon unhealthy for the supervisor, while state-machine
+    /// transitions still see where the machine is (so `trigger_stop` sends both `Stop`s).
+    #[test]
+    fn failed_fanotify_handler_reports_the_daemon_unhealthy() {
+        let controller = create_service_controller();
+        controller.set_state(DaemonState::RUNNING);
+        let worker = crate::fanotify::testing::SocketHandler::start(1);
+        controller
+            .fanotify
+            .lock()
+            .unwrap()
+            .insert("img".to_string(), worker.handler.clone());
+        assert_eq!(controller.get_state(), DaemonState::RUNNING);
+
+        worker.handler.fail(&"test");
+        assert_eq!(controller.get_state(), DaemonState::UNKNOWN);
+        assert_eq!(controller.machine_state(), DaemonState::RUNNING);
+
+        controller.fanotify.lock().unwrap().clear();
+        worker.stop();
     }
 
     #[test]

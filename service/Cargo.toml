@@ -78,3 +78,6 @@ block-nbd = ["block-device", "bytes"]
 block-uffd = ["block-device"]
 
 coco = ["fuse-backend-rs/fusedev", "nydus-storage/backend-registry"]
+# Test-only fault hooks (`fanotify::inject_panic_on_next_event`); enabled by dev-dependencies,
+# never by a release build.
+fault-injection = []
