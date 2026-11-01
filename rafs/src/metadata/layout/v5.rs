@@ -667,6 +667,12 @@ impl RafsV5BlobTable {
             while pos < buf.len() && buf[pos] != 0 {
                 pos += 1;
             }
+            if !BlobInfo::is_valid_blob_id(&buf[8..pos]) {
+                return Err(RafsError::InvalidMetadata(format!(
+                    "v5: invalid blob id {:?} in blob table",
+                    String::from_utf8_lossy(&buf[8..pos])
+                )));
+            }
             let blob_id = std::str::from_utf8(&buf[8..pos])
                 .map(|v| v.to_owned())
                 .map_err(|e| RafsError::InvalidMetadata(e.to_string()))?;
@@ -1526,8 +1532,8 @@ pub mod tests {
         let third = Entry { foo: 5, bar: 6 };
 
         let first_id = "355d403e35d7120cbd6a145874a2705e6842ce9974985013ebdc1fa5199a0184";
-        let second_id = "19ebb6e9bdcbbce3f24d694fe20e0e552ae705ce079e26023ad0ecd61d4b130019ebb6e9bdcbbce3f24d694fe20e0e552ae705ce079e26023ad0ecd61d4";
-        let third_id = "19ebb6e9bdcbbce3f24d694fe20e0e552ae705ce079e";
+        let second_id = "19ebb6e9bdcbbce3f24d694fe20e0e552ae705ce079e26023ad0ecd61d4b1300";
+        let third_id = "be7d77eeb719f70884758d1aa800ed0fb09d701aaec469964e9d54325f0d5fef";
 
         let first_slice = unsafe { any_as_u8_slice(&first) };
         let second_slice = unsafe { any_as_u8_slice(&second) };
@@ -1595,16 +1601,35 @@ pub mod tests {
 
         blob_table.entries.truncate(0);
         file.seek(SeekFrom::Start(0)).unwrap();
-        blob_table
-            .load(
+        // A table cut inside an entry leaves a truncated blob id behind.
+        assert!(matches!(
+            blob_table.load(
                 &mut file,
                 (buffer.len() - 100) as u32,
                 RAFS_DEFAULT_CHUNK_SIZE as u32,
                 RafsSuperFlags::empty(),
-            )
-            .unwrap();
-        assert_eq!(blob_table.entries[0].blob_id(), first_id);
-        assert_eq!(blob_table.get_all().len(), 2);
+            ),
+            Err(RafsError::InvalidMetadata(_))
+        ));
+
+        // A 64-byte id with path components never reaches a `BlobInfo`.
+        let evil = format!("{:a<64}", "../../../../etc/shadow");
+        let mut buffer = vec![0u8; 8];
+        buffer.extend_from_slice(evil.as_bytes());
+        let mut file = TempFile::new().unwrap().into_file();
+        file.write_all(&buffer).unwrap();
+        std::io::Seek::seek(&mut file, SeekFrom::Start(0)).unwrap();
+        let mut file: RafsIoReader = Box::new(file);
+        let mut blob_table = RafsV5BlobTable::new();
+        assert!(matches!(
+            blob_table.load(
+                &mut file,
+                buffer.len() as u32,
+                RAFS_DEFAULT_CHUNK_SIZE as u32,
+                RafsSuperFlags::empty(),
+            ),
+            Err(RafsError::InvalidMetadata(_))
+        ));
     }
 
     #[test]
@@ -2037,7 +2062,7 @@ pub mod tests {
         let mut blob_table = RafsV5BlobTable::new();
         blob_table.extended = ext_table;
 
-        let blob_id = "test_blob_id\0";
+        let blob_id = "355d403e35d7120cbd6a145874a2705e6842ce9974985013ebdc1fa5199a0184\0";
         let mut blob_data = Vec::new();
         blob_data.extend_from_slice(&u32::to_le_bytes(0));
         blob_data.extend_from_slice(&u32::to_le_bytes(0));

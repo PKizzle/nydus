@@ -1454,20 +1454,11 @@ impl RafsV6Device {
 
     /// Validate the Rafs v6 Device slot.
     pub fn validate(&self) -> RafsResult<()> {
-        match String::from_utf8(self.blob_id.to_vec()) {
-            Ok(v) => {
-                if v.len() != BLOB_SHA256_LEN {
-                    return Err(RafsError::InvalidMetadata(format!(
-                        "Length of blob_id {} in RAFS v6 device entry is invalid",
-                        v.len()
-                    )));
-                }
-            }
-            Err(_) => {
-                return Err(RafsError::InvalidMetadata(
-                    "blob_id in RAFS v6 device entry is invalid".to_string(),
-                ));
-            }
+        if !BlobInfo::is_valid_blob_id(&self.blob_id) {
+            return Err(RafsError::InvalidMetadata(format!(
+                "invalid blob id {:?} in RAFS v6 device entry",
+                String::from_utf8_lossy(&self.blob_id)
+            )));
         }
 
         if self.blocks() == 0 {
@@ -1763,24 +1754,13 @@ impl RafsV6Blob {
     }
 
     fn validate(&self, blob_index: u32, chunk_size: u32, flags: RafsSuperFlags) -> bool {
-        match String::from_utf8(self.blob_id.to_vec()) {
-            Ok(v) => {
-                if v.len() != BLOB_SHA256_LEN {
-                    error!(
-                        "RafsV6Blob: idx {} blob id length {:x} is invalid",
-                        blob_index,
-                        v.len()
-                    );
-                    return false;
-                }
-            }
-            Err(_) => {
-                error!(
-                    "RafsV6Blob: idx {} blob_id from_utf8 is invalid",
-                    blob_index
-                );
-                return false;
-            }
+        if !BlobInfo::is_valid_blob_id(&self.blob_id) {
+            error!(
+                "RafsV6Blob: idx {} blob id {:?} is invalid",
+                blob_index,
+                String::from_utf8_lossy(&self.blob_id)
+            );
+            return false;
         }
 
         if u32::from_le(self.blob_index) != blob_index {
@@ -2579,6 +2559,27 @@ mod tests {
         device2.load(&mut reader).unwrap();
         assert_eq!(device2.blocks(), 0x1234);
         assert_eq!(device.blob_id(), &id);
+    }
+
+    #[test]
+    fn test_rafs_v6_device_blob_id_must_be_hex() {
+        let mut device = RafsV6Device::new();
+        device.set_blocks(1);
+        device.set_blob_id(&[b'a'; 64]);
+        device.validate().unwrap();
+        device.set_blob_id(&[b'x'; 64]);
+        device.validate().unwrap();
+
+        let mut id = [b'a'; 64];
+        id[..18].copy_from_slice(b"../../../etc/shado");
+        device.set_blob_id(&id);
+        assert!(device.validate().is_err());
+        device.set_blob_id(&[b'A'; 64]);
+        assert!(device.validate().is_err());
+        let mut id = [0u8; 64];
+        id[..4].copy_from_slice(b"abcd");
+        device.set_blob_id(&id);
+        assert!(device.validate().is_err());
     }
 
     #[test]

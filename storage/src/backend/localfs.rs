@@ -128,6 +128,11 @@ impl LocalFs {
     fn get_blob_path(&self, blob_id: &str) -> LocalFsResult<PathBuf> {
         let path = if !self.blob_file.is_empty() {
             Path::new(&self.blob_file).to_path_buf()
+        } else if !crate::utils::is_plain_file_name(blob_id) {
+            return Err(LocalFsError::BlobFile(format!(
+                "blob id {:?} is not a plain file name",
+                blob_id
+            )));
         } else {
             // Search blob file in dir and additionally in alt_dirs
             let is_valid = |dir: &PathBuf| -> bool {
@@ -300,6 +305,19 @@ mod tests {
         };
         let fs = LocalFs::new(&config, Some(filename)).unwrap();
         assert_eq!(fs.get_blob_path(filename).unwrap().to_str(), path.to_str());
+    }
+
+    #[test]
+    fn test_localfs_get_blob_path_stays_in_dir() {
+        let root = TempDir::new().unwrap();
+        let dir = root.as_path().join("blobs");
+        std::fs::create_dir(&dir).unwrap();
+        write_blob(&root.as_path().join("secret"), b"nydus");
+        let fs = new_localfs(&dir, None, Vec::new(), "secret");
+
+        assert!(fs.get_blob_path("../secret").is_err());
+        let absolute = root.as_path().join("secret");
+        assert!(fs.get_blob_path(absolute.to_str().unwrap()).is_err());
     }
 
     #[test]
