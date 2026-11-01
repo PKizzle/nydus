@@ -19,9 +19,11 @@ use nydus_rafs::metadata::layout::v6::{
     EROFS_INODE_FLAT_INLINE, EROFS_INODE_FLAT_PLAIN, EROFS_INODE_SLOT_SIZE, EROFS_SUPER_BLOCK_SIZE,
     EROFS_SUPER_OFFSET, RafsV6BlobTable, RafsV6Device, RafsV6Dirent, RafsV6InodeChunkAddr,
     RafsV6InodeChunkHeader, RafsV6OndiskInode, RafsV6PrefetchTable, RafsV6SuperBlock,
-    RafsV6SuperBlockExt, align_offset, block_bits_from_size, calculate_nid, new_v6_inode,
+    RafsV6SuperBlockExt, align_offset, block_bits_from_size, calculate_nid,
+    ishare_xattr_prefix_table, new_v6_inode,
 };
 use nydus_storage::device::{BlobFeatures, BlobInfo};
+use nydus_utils::digest::{self, DigestHasher, RafsDigest};
 use nydus_utils::{root_tracer, round_down, round_up, timing_tracer};
 
 use super::chunk_dict::DigestWithBlobIndex;
@@ -92,6 +94,45 @@ impl Node {
             self.v6_store_xattrs(ctx, f_bootstrap)?;
         }
 
+        Ok(())
+    }
+
+    /// Compute the page cache sharing fingerprint of a regular file and store it as the hidden
+    /// `RAFSV6_ISHARE_XATTR_NAME` xattr, before layout sizes the inode.
+    ///
+    /// The kernel's EROFS `inode_share` mode shares one page cache between files of a domain
+    /// whose fingerprints are byte-equal, so the value has to identify the file content alone.
+    /// It is a SHA-256 over the file size and each chunk's digest, which the builder computed
+    /// from the chunk's uncompressed data; the chunks must cover the file end to end. Nothing is
+    /// read from the source image's own metadata. Empty files carry no data to share and get none.
+    pub fn v6_set_inode_share_fingerprint(&mut self) -> Result<()> {
+        let size = self.inode.size();
+        if !self.is_reg() || size == 0 {
+            return Ok(());
+        }
+        let mut hasher = RafsDigest::hasher(digest::Algorithm::Sha256);
+        hasher.digest_update(b"nydus-rafs-chunks-v1\0");
+        hasher.digest_update(&size.to_le_bytes());
+        let mut covered = 0u64;
+        for chunk in &self.chunks {
+            let id = chunk.inner.id();
+            ensure!(
+                id.data != [0u8; 32],
+                "{}: chunk has no content digest, cannot fingerprint it",
+                self.path().display()
+            );
+            covered += chunk.inner.uncompressed_size() as u64;
+            hasher.digest_update(&chunk.inner.uncompressed_size().to_le_bytes());
+            hasher.digest_update(&id.data);
+        }
+        ensure!(
+            covered == size,
+            "{}: chunks cover {covered} of {size} bytes, cannot fingerprint it",
+            self.path().display()
+        );
+        Arc::make_mut(&mut self.info)
+            .xattrs
+            .set_ishare_fingerprint(hasher.digest_finalize().data.to_vec());
         Ok(())
     }
 
@@ -816,6 +857,22 @@ impl Bootstrap {
             "chunk_table offset {} size {}",
             chunk_table_offset, chunk_table_size
         );
+        // The kernel reads the long xattr prefix table from `xattr_prefix_start * 4`.
+        let ishare_prefix_offset = if ctx.inode_share_fingerprint {
+            let end = chunk_table_offset + chunk_table_size;
+            let offset = align_offset(end, 4);
+            bootstrap_ctx
+                .writer
+                .write_all(&vec![0u8; (offset - end) as usize])
+                .context("failed to pad before the xattr prefix table")?;
+            bootstrap_ctx
+                .writer
+                .write_all(&ishare_xattr_prefix_table())
+                .context("failed to dump xattr prefix table")?;
+            Some(offset)
+        } else {
+            None
+        };
         Self::v6_align_to_block(bootstrap_ctx, block_size)?;
 
         // Prepare device slots.
@@ -842,6 +899,9 @@ impl Bootstrap {
         sb.set_root_nid(root_nid);
         sb.set_meta_addr(meta_addr);
         sb.set_extra_devices(blob_table_entries as u16);
+        if let Some(offset) = ishare_prefix_offset {
+            sb.set_ishare_xattr_prefix(offset)?;
+        }
         bootstrap_ctx.writer.seek(SeekFrom::Start(0))?;
         sb.store(bootstrap_ctx.writer.as_mut())
             .context("failed to store SB")?;

@@ -35,9 +35,10 @@ EOF
 fi
 
 FAILED=""
-run() { # <script> <PASS line>
+run() { # <script> <PASS line> [<whole-suite SKIP line the kernel may legitimately print>]
   echo; echo "======== $1 ========"
   ROOT="$FS/$1" bash "$HERE/$1.sh" 2>&1 | tee "$FS/$1.log"
+  if [ -n "${3:-}" ] && grep -qF "$3" "$FS/$1.log"; then return; fi
   if ! grep -qF "$2" "$FS/$1.log" || grep -q "SKIP" "$FS/$1.log"; then FAILED="$FAILED $1"; fi
 }
 run runtime-test "==== FANOTIFY FETCH PATH: PASS"
@@ -48,6 +49,7 @@ run auto-accel-restart-test "==== AUTO-ACCEL RESTART: PASS ===="
 run mount-health-probe-test "==== MOUNT-HEALTH PROBE: PASS ===="
 run precontent-cases "==== FANOTIFY PRE-CONTENT CASES: PASS ===="
 run export-block-test "==== EXPORT BLOCK (4096): PASS"
+run inode-share-test "==== INODE SHARE: PASS ====" "==== INODE SHARE: SKIP (kernel $(uname -r) has no EROFS inode_share"
 
 umount -l "$FS"
 echo

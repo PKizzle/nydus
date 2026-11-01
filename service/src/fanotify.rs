@@ -288,6 +288,8 @@ pub struct FanotifyHandler {
     bootstrap_path: PathBuf,
     /// Device blob paths passed to the EROFS mount options.
     device_blobs: Vec<PathBuf>,
+    /// EROFS `domain_id` to mount with `inode_share`, from the blobs' fanotify cache config.
+    inode_share_domain: Option<String>,
 }
 
 // Helper: open the blob directory and enumerate blob files.
@@ -415,9 +417,55 @@ fn is_mounted_at(mountpoint: &Path) -> bool {
 // passed as `device=<path>` mount options in device-table order. The bootstrap itself is NOT a
 // `device=` entry, and the source must be the bootstrap path — passing a NULL/`none` source fails
 // with `EINVAL` ("special device none does not exist").
-fn mount_erofs(bootstrap: &Path, blobs: &[PathBuf], mountpoint: &Path) -> Result<()> {
+//
+// With `inode_share_domain`, the mount first asks for EROFS page cache sharing; a kernel that
+// rejects the options with `EINVAL` (no `inode_share` before 7.0) gets the plain mount instead.
+fn mount_erofs(
+    bootstrap: &Path,
+    blobs: &[PathBuf],
+    mountpoint: &Path,
+    inode_share_domain: Option<&str>,
+) -> Result<()> {
     let options = build_erofs_device_options(blobs)?;
+    if let Some(domain) = inode_share_domain {
+        match erofs_inode_share_options(&options, domain)
+            .and_then(|shared| mount_erofs_with(bootstrap, mountpoint, &shared))
+        {
+            Err(e) if e.kind() == ErrorKind::InvalidInput => warn!(
+                "fanotify: EROFS inode_share (domain {domain}) refused: {e}; mounting {} \
+                 without page cache sharing",
+                mountpoint.display()
+            ),
+            other => return other,
+        }
+    }
+    mount_erofs_with(bootstrap, mountpoint, &options)
+}
 
+/// Append `inode_share,domain_id=<domain>` to the device options.
+fn erofs_inode_share_options(device_options: &str, domain: &str) -> Result<String> {
+    if domain.is_empty() || domain.contains(',') {
+        return Err(std::io::Error::new(
+            ErrorKind::InvalidInput,
+            format!("invalid EROFS domain_id {domain:?}"),
+        ));
+    }
+    let share = format!("inode_share,domain_id={domain}");
+    let options = if device_options.is_empty() {
+        share
+    } else {
+        format!("{device_options},{share}")
+    };
+    if options.len() > MOUNT_DATA_MAX {
+        return Err(std::io::Error::new(
+            ErrorKind::InvalidInput,
+            "EROFS mount options with inode_share exceed the kernel limit",
+        ));
+    }
+    Ok(options)
+}
+
+fn mount_erofs_with(bootstrap: &Path, mountpoint: &Path, options: &str) -> Result<()> {
     let source_c = std::ffi::CString::new(bootstrap.as_os_str().as_encoded_bytes())
         .map_err(|e| std::io::Error::new(ErrorKind::InvalidInput, e))?;
     let mountpoint_c = std::ffi::CString::new(mountpoint.as_os_str().as_encoded_bytes())
@@ -668,6 +716,16 @@ impl FanotifyHandler {
             ));
         }
 
+        let inode_share_domain = blob_cache_mgr.get_all_data_blobs().iter().find_map(|cfg| {
+            cfg.config_v2()
+                .cache
+                .as_ref()?
+                .fanotify
+                .as_ref()?
+                .erofs_inode_share_domain
+                .clone()
+        });
+
         Ok(FanotifyHandler {
             active: AtomicBool::new(true),
             barrier: Barrier::new(threads + 1),
@@ -681,6 +739,7 @@ impl FanotifyHandler {
             blob_backings,
             bootstrap_path,
             device_blobs,
+            inode_share_domain,
         })
     }
 
@@ -822,7 +881,12 @@ impl FanotifyHandler {
             );
             return Ok(());
         }
-        mount_erofs(&self.bootstrap_path, &self.device_blobs, &self.mountpoint)
+        mount_erofs(
+            &self.bootstrap_path,
+            &self.device_blobs,
+            &self.mountpoint,
+            self.inode_share_domain.as_deref(),
+        )
     }
 
     /// Number of worker threads.
@@ -1711,6 +1775,25 @@ mod tests {
         let opts = build_erofs_device_options(std::slice::from_ref(&path))
             .expect("a single device at exactly the limit is valid");
         assert_eq!(opts.len(), MOUNT_DATA_MAX);
+    }
+
+    #[test]
+    fn test_inode_share_options_append_the_domain() {
+        assert_eq!(
+            erofs_inode_share_options("device=/c/blob_0", "d").unwrap(),
+            "device=/c/blob_0,inode_share,domain_id=d"
+        );
+        assert_eq!(
+            erofs_inode_share_options("", "d").unwrap(),
+            "inode_share,domain_id=d"
+        );
+        for bad in ["", "a,b"] {
+            let err = erofs_inode_share_options("device=/x", bad).unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        }
+        let full = "d".repeat(MOUNT_DATA_MAX - 10);
+        let err = erofs_inode_share_options(&full, "domain").unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
     }
 
     // ---- event buffer walking (Parts 2a / 2b) ----------------------------

@@ -534,6 +534,13 @@ fn prepare_cmd_args(bti_string: &'static str) -> App {
                     .required(false)
                     .help("RAFS blob toc size list separated by comma"),
             )
+            .arg(
+                Arg::new("inode-share-fingerprint")
+                    .long("inode-share-fingerprint")
+                    .help("Write a content fingerprint xattr on each regular file, for the EROFS `inode_share` mount option (Linux 7.0+) to share page cache between images")
+                    .action(ArgAction::SetTrue)
+                    .required(false),
+            )
             .arg(arg_config.clone())
             .arg(
                 Arg::new("SOURCE")
@@ -1642,6 +1649,7 @@ impl Command {
             .set_blob_accessible(matches.get_one::<String>("config").is_some());
         let mut ctx = BuildContext {
             prefetch: Self::get_prefetch(matches)?,
+            inode_share_fingerprint: matches.get_flag("inode-share-fingerprint"),
             ..Default::default()
         };
         ctx.configuration = config.clone();

@@ -592,7 +592,13 @@ impl NydusSnapshotter {
         // operator why acceleration is off.
         let handle = match self
             .supervisor
-            .ensure_instance_local(image_ref, &staged.bootstrap, &staged.backend_dir, holder)
+            .ensure_instance_local(
+                image_ref,
+                &staged.bootstrap,
+                &staged.backend_dir,
+                holder,
+                staged.built_on_node,
+            )
             .await
         {
             Ok(handle) => handle,

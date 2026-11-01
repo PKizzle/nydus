@@ -41,7 +41,8 @@ use tracing::{debug, info, warn};
 
 use crate::config::{FsDriverType, SnapshotterConfig};
 use crate::daemon::config_builder::{
-    build_auto_accel_blob_cache_entry, build_blob_cache_entry, build_daemon_config,
+    auto_accel_inode_share_domain, build_auto_accel_blob_cache_entry, build_blob_cache_entry,
+    build_daemon_config,
 };
 use crate::daemon::image_ref::{ImageRef, parse_image_ref};
 use crate::prefetch_profile::runtime_prefetch_for_image;
@@ -688,12 +689,16 @@ impl DaemonSupervisor {
     /// back to the overlay path; an unhealthy one is stopped and replaced.
     /// `holder` follows the same idempotent-per-snapshot-key contract as
     /// [`ensure_instance`](Self::ensure_instance).
+    ///
+    /// `built_on_node` says the bootstrap came from this node's `local_accel`, which alone makes
+    /// it eligible for EROFS page cache sharing (`[features] erofs_inode_share`).
     pub async fn ensure_instance_local(
         &self,
         image_ref: &str,
         bootstrap: &Path,
         backend_dir: &Path,
         holder: &str,
+        built_on_node: bool,
     ) -> Result<Arc<MountHandle>> {
         if image_ref.is_empty() {
             bail!("image reference must be non-empty to mount an auto-accel sidecar");
@@ -725,7 +730,7 @@ impl DaemonSupervisor {
             .await?;
 
         let instance = self
-            .start_local_instance(image_ref, bootstrap, backend_dir)
+            .start_local_instance(image_ref, bootstrap, backend_dir, built_on_node)
             .await
             .with_context(|| format!("failed to start auto-accel daemon for {image_ref}"))?;
         instance.acquire_holder(holder);
@@ -755,6 +760,7 @@ impl DaemonSupervisor {
         image_ref_str: &str,
         bootstrap: &Path,
         backend_dir: &Path,
+        built_on_node: bool,
     ) -> Result<Arc<DaemonInstance>> {
         let slug = slug_for(image_ref_str);
         let daemon_root = self.config.snapshotter.root.join("daemons").join(&slug);
@@ -806,6 +812,13 @@ impl DaemonSupervisor {
             &mountpoint,
             &daemon_id,
             &staged_bootstrap,
+            auto_accel_inode_share_domain(
+                self.config.snapshotter.features.erofs_inode_share,
+                built_on_node,
+                fs::read_to_string("/proc/sys/kernel/osrelease")
+                    .unwrap_or_default()
+                    .trim(),
+            ),
         )?;
         let cfg_json = serde_json::json!({ "blobs": [entry] });
         // The process-wide blob factory keys cache managers by config, which is
@@ -1278,7 +1291,9 @@ impl DaemonSupervisor {
     ) -> Result<Arc<DaemonInstance>> {
         match Self::accel_backend_for(bootstrap) {
             Some(backend_dir) => {
-                self.start_local_instance(image_ref, bootstrap, &backend_dir)
+                // A persisted record does not say who built the bootstrap, so a restarted
+                // instance mounts without page cache sharing.
+                self.start_local_instance(image_ref, bootstrap, &backend_dir, false)
                     .await
             }
             None => self.start_instance(image_ref, bootstrap, None).await,
@@ -3701,7 +3716,9 @@ mod tests {
         let image_ref = "e2e.invalid/release/app:1";
 
         let handle = runtime
-            .block_on(supervisor.ensure_instance_local(image_ref, &bootstrap, &backend, "k1"))
+            .block_on(
+                supervisor.ensure_instance_local(image_ref, &bootstrap, &backend, "k1", false),
+            )
             .unwrap();
         let mountpoint = handle.mountpoint().to_path_buf();
         assert_eq!(mount_fstype_at(&mountpoint).as_deref(), Some("erofs"));
@@ -3770,7 +3787,9 @@ mod tests {
             "over a device-less mount",
         ] {
             let handle = runtime
-                .block_on(supervisor.ensure_instance_local(image_ref, &bootstrap, &backend, round))
+                .block_on(
+                    supervisor.ensure_instance_local(image_ref, &bootstrap, &backend, round, false),
+                )
                 .unwrap_or_else(|e| panic!("{round}: {e:#}"));
             let mountpoint = handle.mountpoint().to_path_buf();
             let (total, failed) = read_every_file(&mountpoint);

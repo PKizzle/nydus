@@ -159,6 +159,9 @@ pub fn targz_ref_args(layer: &Path, bootstrap_out: &Path, blob_out_dir: &Path) -
 
 /// Build the args for `nydus-image merge` of the per-layer bootstraps (lower→upper) into one
 /// overlaid bootstrap. `original_blob_ids` are the gzip-layer digests in the same order.
+///
+/// The merge fingerprints every regular file for EROFS page cache sharing: this node computes
+/// the fingerprints itself, so its own artifacts are the ones it may mount with `inode_share`.
 pub fn merge_args(
     bootstrap_out: &Path,
     original_blob_ids: &[String],
@@ -170,6 +173,7 @@ pub fn merge_args(
         bootstrap_out.into(),
         "--original-blob-ids".into(),
         original_blob_ids.join(",").into(),
+        "--inode-share-fingerprint".into(),
     ];
     for b in layer_bootstraps {
         args.push(b.into());
@@ -469,6 +473,7 @@ mod tests {
         let s: Vec<String> = args.iter().map(|a| a.to_string_lossy().into()).collect();
         assert_eq!(s[0], "merge");
         assert!(s.windows(2).any(|w| w == ["--original-blob-ids", "d0,d1"]));
+        assert!(s.iter().any(|a| a == "--inode-share-fingerprint"));
         // sources follow, lower then upper
         assert_eq!(s[s.len() - 2], "/w/l0/bootstrap");
         assert_eq!(s[s.len() - 1], "/w/l1/bootstrap");

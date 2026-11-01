@@ -30,6 +30,7 @@ sudo NYDUS_IMAGE=./target/release/nydus-image NYDUSD=./target/release/nydusd \
 sudo misc/fanotify/zran-multilayer-test.sh   # node-local zran convert + merge + serve
 sudo misc/fanotify/ref-layer-formats-test.sh # gzip + tar + multi/single-frame zstd layers, one image
 sudo misc/fanotify/precontent-cases.sh       # fail-closed + strace ground truth + ENOSPC (needs strace)
+sudo misc/fanotify/inode-share-test.sh       # EROFS page cache sharing between two images (7.0+; skips below)
 # Any of the image-building checks at another EROFS block size (must not exceed the page size)
 sudo BLOCK_SIZE=16384 NYDUS_IMAGE=... NYDUSD=... misc/fanotify/runtime-test.sh
 sudo BLOCK_SIZE=16384 NYDUS_IMAGE=... misc/fanotify/export-block-test.sh   # export --block + loop mount
