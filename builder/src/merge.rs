@@ -300,11 +300,11 @@ impl Merger {
                 Ok(())
             })?;
 
-            if let Some(tree) = &mut tree {
-                tree.merge_overaly(ctx, upper)?;
-            } else {
-                tree = Some(upper);
-            }
+            // Without a parent bootstrap the first layer is applied to an empty root, as
+            // containerd applies it to an empty directory: its whiteouts and opaque markers
+            // hide nothing and are dropped.
+            let tree = tree.get_or_insert_with(|| Tree::new(upper.borrow_mut_node().clone()));
+            tree.merge_overaly(ctx, upper)?;
         }
 
         if ctx.conversion_type == ConversionType::TarToTarfs {

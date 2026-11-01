@@ -3,7 +3,8 @@
 # Builds a RAFS v6 image at BLOCK_SIZE, exports it with `nydus-image export --block` into a raw
 # EROFS disk image, loop-mounts that image with the kernel EROFS driver and compares every file
 # with its source. The kernel follows only block addresses and the device table here, so this
-# catches layout errors that `nydus-image check` and FUSE reads (chunk-table offsets) do not.
+# catches layout errors that FUSE reads (chunk-table offsets) do not, and confirms that
+# `nydus-image check` agrees with the kernel.
 # It then mounts the image through the snapshotter's blockdev mount and checks ro,nosuid,nodev.
 set -u
 
@@ -35,6 +36,7 @@ echo "subdir-small-file-marker" > "$ROOT/src/sub/small.txt"
 step "nydus-image create (RAFS v6, compressor none, block-size $BLOCK_SIZE)"
 "$NI" create --fs-version 6 --compressor none --block-size "$BLOCK_SIZE" \
   -B "$ROOT/out/bootstrap" -D "$ROOT/out" "$ROOT/src" || fail "nydus-image create"
+"$NI" check -B "$ROOT/out/bootstrap" --blob-dir "$ROOT/out" >/dev/null || fail "nydus-image check"
 
 step "nydus-image export --block"
 "$NI" export --block --bootstrap "$ROOT/out/bootstrap" --localfs-dir "$ROOT/out" \
