@@ -37,7 +37,8 @@ prefetch = false
 metrics = true
 
 # GitHub runner kernels are < 6.14, so fanotify (FAN_CLASS_PRE_CONTENT) is unavailable;
-# pin fusedev as the only candidate so the probe deterministically selects it.
+# pin fusedev as the only candidate so the probe deterministically selects it. The
+# snapshotter-e2e job swaps in blockdev and tarfs the same way.
 [[snapshotter.fs_drivers]]
 type = "fusedev"
 

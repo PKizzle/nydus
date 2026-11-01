@@ -58,7 +58,9 @@ jobs:
           shared-key: musl-${{ matrix.target }}
       - name: Assert no OpenSSL in the dependency tree
         run: |
-          if cargo tree --target ${{ matrix.target }} -i openssl-sys 2>/dev/null | grep -q openssl-sys; then
+          # A failing `cargo tree` must fail the step, not read as "no openssl-sys".
+          cargo tree --target ${{ matrix.target }} --prefix none > deps.txt
+          if grep -q '^openssl-sys ' deps.txt; then
             echo "::error::openssl-sys is back in the dependency tree; musl-static is broken"
             cargo tree --target ${{ matrix.target }} -i openssl-sys || true
             exit 1

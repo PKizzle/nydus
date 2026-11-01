@@ -43,6 +43,7 @@ run() { # <script> <PASS line>
 run runtime-test "==== FANOTIFY FETCH PATH: PASS"
 run zran-multilayer-test "==== MULTI-LAYER ZRAN: PASS ===="
 run ref-layer-formats-test "==== REF LAYER FORMATS: PASS ===="
+run b4b-referrer-serving-test "==== B4b REFERRER SERVING: PASS ===="
 run release-unmount-test "==== RELEASE-UNMOUNT: PASS ===="
 run auto-accel-restart-test "==== AUTO-ACCEL RESTART: PASS ===="
 run mount-health-probe-test "==== MOUNT-HEALTH PROBE: PASS ===="
