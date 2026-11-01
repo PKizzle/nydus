@@ -17,7 +17,7 @@ DOCKER ?= "true"
 CARGO ?= $(shell which cargo)
 RUSTUP ?= $(shell which rustup)
 MIRI_TOOLCHAIN ?= nightly
-MIRI_NEXTEST = $(CARGO_COV_FLAGS) MIRIFLAGS=-Zmiri-disable-isolation TEST_WORKDIR_PREFIX=$(TEST_WORKDIR_PREFIX) RUST_BACKTRACE=1 ${RUSTUP} run $(MIRI_TOOLCHAIN) cargo miri nextest run --no-fail-fast --filter-expr 'test(test) - test(integration) - test(deduplicate::tests) - test(cache::dedup::) - test(inode_bitmap::tests::test_inode_bitmap)' --workspace $(EXCLUDE_PACKAGES) --exclude nydus-snapshotter $(CARGO_COMMON) $(CARGO_BUILD_FLAGS)
+MIRI_NEXTEST = $(CARGO_COV_FLAGS) MIRIFLAGS=-Zmiri-disable-isolation TEST_WORKDIR_PREFIX=$(TEST_WORKDIR_PREFIX) RUST_BACKTRACE=1 ${RUSTUP} run $(MIRI_TOOLCHAIN) cargo miri nextest run --filter-expr 'test(test) - test(integration) - test(deduplicate::tests) - test(cache::dedup::) - test(inode_bitmap::tests::test_inode_bitmap)' --workspace $(EXCLUDE_PACKAGES) --exclude nydus-snapshotter $(CARGO_COMMON) $(CARGO_BUILD_FLAGS)
 CARGO_BUILD_GEARS = -v ~/.ssh/id_rsa:/root/.ssh/id_rsa -v ~/.cargo/git:/root/.cargo/git -v ~/.cargo/registry:/root/.cargo/registry
 SUDO = $(shell which sudo)
 CARGO_COMMON ?=
@@ -192,7 +192,7 @@ ut-nextest:
 # cache::dedup:: is excluded because its r2d2 pool parks threads through parking_lot_core,
 # whose futex syscall Miri reports as Undefined Behavior; that code is third-party.
 miri-ut-nextest:
-	$(MIRI_NEXTEST)
+	$(MIRI_NEXTEST) --no-fail-fast
 
 # Builds the Miri test binaries only: CI uses it to pick a nightly that compiles the workspace.
 miri-ut-build:
