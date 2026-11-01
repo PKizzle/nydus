@@ -2,8 +2,8 @@ name: Fanotify VM
 
 # The fanotify/EROFS on-demand path needs Linux >= 6.14 (FAN_PRE_ACCESS). Hosted runners move
 # kernels without notice, so this job does not test against theirs: it builds on the runner and
-# runs misc/fanotify/run-all.sh as root inside a virtme-ng VM booting a pinned Ubuntu mainline
-# kernel, with the runner's filesystem shared in.
+# runs misc/fanotify/run-all.sh as root inside virtme-ng VMs booting pinned Ubuntu mainline
+# kernels, with the runner's filesystem shared in.
 on:
   # `push` covers long-lived branches only; a feature branch runs through its pull request.
   push:
@@ -21,25 +21,42 @@ on:
     paths: *paths
   workflow_dispatch:
 
-concurrency:
-  group: ${{ github.workflow }}-${{ github.head_ref || github.ref_name }}
-  cancel-in-progress: true
-
 env:
   CARGO_TERM_COLOR: always
-  # Ubuntu mainline build; bump all four together (sha256 from the release's CHECKSUMS file).
-  KERNEL_URL: https://kernel.ubuntu.com/mainline/v6.18.55/amd64
-  KERNEL_IMAGE_DEB: linux-image-unsigned-6.18.55-061855-generic_6.18.55-061855.202610031245_amd64.deb
-  KERNEL_MODULES_DEB: linux-modules-6.18.55-061855-generic_6.18.55-061855.202610031245_amd64.deb
-  KERNEL_SHA256: |
-    510c01027df618ed21f2ab7027f946e7e8d64e4c88702722577470dca03ee30f  linux-image-unsigned-6.18.55-061855-generic_6.18.55-061855.202610031245_amd64.deb
-    0f532598e00ba37515288eda4b53426ee7ce53abb99d949c911873c679d6aaf5  linux-modules-6.18.55-061855-generic_6.18.55-061855.202610031245_amd64.deb
   VIRTME_NG_VERSION: "1.41"
 
 jobs:
   fanotify-vm:
+    name: fanotify-vm (${{ matrix.kernel }})
     runs-on: ubuntu-24.04
     timeout-minutes: 45
+    # Per leg, so the two kernels never cancel each other.
+    concurrency:
+      group: ${{ github.workflow }}-${{ github.head_ref || github.ref_name }}-${{ matrix.kernel }}
+      cancel-in-progress: true
+    strategy:
+      fail-fast: false
+      # Ubuntu mainline builds: 6.18.y is the supported floor, 7.3.y the newest kernel features.
+      # Per entry, bump all four together (sha256 from the release's CHECKSUMS file).
+      matrix:
+        include:
+        - kernel: 6.18.55
+          image_deb: linux-image-unsigned-6.18.55-061855-generic_6.18.55-061855.202610031245_amd64.deb
+          modules_deb: linux-modules-6.18.55-061855-generic_6.18.55-061855.202610031245_amd64.deb
+          sha256: |
+            510c01027df618ed21f2ab7027f946e7e8d64e4c88702722577470dca03ee30f  linux-image-unsigned-6.18.55-061855-generic_6.18.55-061855.202610031245_amd64.deb
+            0f532598e00ba37515288eda4b53426ee7ce53abb99d949c911873c679d6aaf5  linux-modules-6.18.55-061855-generic_6.18.55-061855.202610031245_amd64.deb
+        - kernel: 7.3.1
+          image_deb: linux-image-unsigned-7.3.1-070301-generic_7.3.1-070301.202610301300_amd64.deb
+          modules_deb: linux-modules-7.3.1-070301-generic_7.3.1-070301.202610301300_amd64.deb
+          sha256: |
+            93c7c059e51cd81d7aa817f0cb0d2a7e94c5b04642a8e20de8b4ab4628b6a357  linux-image-unsigned-7.3.1-070301-generic_7.3.1-070301.202610301300_amd64.deb
+            7f9a44175036fd63b01ec317ccace29e184261a794d39046902439458fb18c2f  linux-modules-7.3.1-070301-generic_7.3.1-070301.202610301300_amd64.deb
+    env:
+      KERNEL_URL: https://kernel.ubuntu.com/mainline/v${{ matrix.kernel }}/amd64
+      KERNEL_IMAGE_DEB: ${{ matrix.image_deb }}
+      KERNEL_MODULES_DEB: ${{ matrix.modules_deb }}
+      KERNEL_SHA256: ${{ matrix.sha256 }}
     steps:
     - name: Checkout
       uses: actions/checkout@v6
