@@ -196,6 +196,11 @@ nydus-service = { version = "0.5.0", path = "../service", features = [
 nydus-storage = { version = "0.8.0", path = "../storage" }
 nydus-utils = { version = "0.6.0", path = "../utils" }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+# Landlock sandbox for the node-local converter subprocesses (`local_accel::sandbox`).
+# Maintained by the Landlock author; adds only `enumflags2` to the graph.
+landlock = "0.4"
+
 [dev-dependencies]
 tempfile = "3"
 assert_cmd = "2"
