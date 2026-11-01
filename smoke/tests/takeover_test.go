@@ -26,6 +26,9 @@ import (
 
 const (
 	hotUpgradeRepeatCount = 6
+	// A file of the takeover test image that the container never reads while it serves
+	// the wait URL, so its bytes can only come through the daemon.
+	failoverProbeFile = "/usr/local/bin/docker-php-ext-configure"
 )
 
 var (
@@ -38,6 +41,7 @@ var (
 type TakeoverTestSuit struct {
 	t              *testing.T
 	ctx            *tool.Context
+	sourceImage    string
 	testImage      string
 	snapshotterCli *tool.SnapshotterClient
 }
@@ -54,6 +58,7 @@ func NewTakeoverTestSuit(t *testing.T) *TakeoverTestSuit {
 	return &TakeoverTestSuit{
 		t:              t,
 		ctx:            ctx,
+		sourceImage:    sourceImage,
 		testImage:      imageName,
 		snapshotterCli: snapshotterCli,
 	}
@@ -76,6 +81,7 @@ func (f *TakeoverTestSuit) TestFailover(t *testing.T) {
 
 	daemons, err := f.snapshotterCli.GetNydusDaemonInfos()
 	require.NoError(t, err, "get nydus daemon infos")
+	require.NotEmpty(t, daemons, "no nydus daemon serves the container, so nothing fails over")
 
 	// kill the nydus daemons
 	for _, daemon := range daemons {
@@ -88,6 +94,18 @@ func (f *TakeoverTestSuit) TestFailover(t *testing.T) {
 
 	// check the container by requesting its wait url
 	checkContainerAccess(t, imageName)
+
+	// The wait URL can be answered from the page cache. Drop it and read a file the
+	// container never touched, so the bytes must come through the recovered daemon.
+	tool.Run(t, "sudo sh -c 'echo 3 > /proc/sys/vm/drop_caches'")
+	want, err := tool.RunWithCombinedOutput(fmt.Sprintf(
+		"docker run --rm --entrypoint sha256sum %s %s", f.sourceImage, failoverProbeFile))
+	require.NoError(t, err, "checksum %s in the source image: %s", failoverProbeFile, want)
+	got, err := tool.RunWithCombinedOutput(fmt.Sprintf(
+		"sudo nerdctl --snapshotter %s exec %s sha256sum %s", snapshotter, containerName, failoverProbeFile))
+	require.NoError(t, err, "read %s through the recovered daemon: %s", failoverProbeFile, got)
+	require.Equal(t, strings.Fields(want)[0], strings.Fields(got)[0],
+		"%s differs after failover", failoverProbeFile)
 }
 
 func (f *TakeoverTestSuit) TestRestartSnapshotterHotUpgrade(t *testing.T) {
