@@ -5,7 +5,9 @@ name: Fanotify VM
 # runs misc/fanotify/run-all.sh as root inside a virtme-ng VM booting a pinned Ubuntu mainline
 # kernel, with the runner's filesystem shared in.
 on:
+  # `push` covers long-lived branches only; a feature branch runs through its pull request.
   push:
+    branches: [master, production, "stable/**"]
     paths: &paths
       - 'service/src/fanotify*'
       - 'storage/**'
