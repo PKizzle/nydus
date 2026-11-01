@@ -109,14 +109,11 @@ pub struct LocalAccelConfig {
 /// and uploaded as a content-store sidecar by the auto-zran worker.
 ///
 /// Serializable so the two-stage auto-accel pipeline can persist a base
-/// artifact (`convert` with empty prefetch) to `work_dir/artifact.json` and
-/// reload it on stage 2 to run `optimize_existing` without re-running
-/// create/merge.
+/// artifact to `work_dir/artifact.json` and reload it on stage 2 without
+/// re-running create/merge.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct NodeLocalArtifact {
-    /// Merged RAFS v6 bootstrap (the fanotify staging dir's `bootstrap`). When
-    /// `prefetch_files` was non-empty this is the OPTIMIZED bootstrap produced
-    /// by `nydus-image optimize`, with prefetch hints baked in.
+    /// Merged RAFS v6 bootstrap (the fanotify staging dir's `bootstrap`).
     pub bootstrap: PathBuf,
     /// `localfs` backend directory holding the gzip layers (symlinked, by
     /// blob_id) and the per-layer zran index blobs (real files, by blob_id).
@@ -133,10 +130,8 @@ pub struct NodeLocalArtifact {
     /// blob table never references them, and only their namespace entries
     /// survive into the merged bootstrap.
     pub zran_index_blob_ids: Vec<Option<String>>,
-    /// Optional prefetch blob id (only present when `convert` was called with
-    /// non-empty `prefetch_files`). The blob holds the chunks listed by the
-    /// prefetch hint, packed for one-shot warm-up; it lives at
-    /// `backend_dir.join(id)`.
+    /// Packed prefetch blob id, at `backend_dir.join(id)`. Always `None` from
+    /// [`convert`] (see there); kept so the sidecar manifest format is unchanged.
     pub prefetch_blob_id: Option<String>,
     /// [`AUTO_ACCEL_MANIFEST_VERSION`] of the build that produced the merged bootstrap. A
     /// persisted artifact without it (`0`) or with another value is not reused.
@@ -268,28 +263,14 @@ fn expect_at_most_one_output(dir: &Path, exclude: Option<&Path>) -> Result<Optio
     Ok(found)
 }
 
-/// Like [`expect_at_most_one_output`], for steps where an output file is mandatory.
-fn expect_single_output(dir: &Path, exclude: Option<&Path>) -> Result<PathBuf> {
-    expect_at_most_one_output(dir, exclude)?
-        .ok_or_else(|| anyhow::anyhow!("nydus-image produced no output file in {}", dir.display()))
-}
-
 /// Convert the gzip layers (lower→upper) of a standard OCI image into a
 /// node-local RAFS v6 + zran artifact. No registry interaction; the gzip
 /// layers are referenced in place.
 ///
-/// `prefetch_files` is an optional ordered list of in-image paths captured by
-/// the access tracer during pod startup; when non-empty, the merge step is
-/// followed by `nydus-image optimize --prefetch-files`, which bakes the hints
-/// into a new bootstrap (replacing the merged one) and writes a packed prefetch
-/// blob into `backend_dir`. The fanotify daemon uses the prefetch blob to
-/// warm-cache the listed chunks on first access. When `prefetch_files` is
-/// empty the optimize step is skipped and `prefetch_blob_id` is `None`.
-pub fn convert(
-    config: &LocalAccelConfig,
-    layers: &[SourceLayer],
-    prefetch_files: &[String],
-) -> Result<NodeLocalArtifact> {
+/// The artifact carries no prefetch blob: `nydus-image optimize` packs a prefetch blob by
+/// copying chunk bytes, and the chunks of a layer referenced in place decode only with that
+/// layer's zran index, so it refuses these artifacts.
+pub fn convert(config: &LocalAccelConfig, layers: &[SourceLayer]) -> Result<NodeLocalArtifact> {
     if layers.is_empty() {
         bail!("node-local conversion requires at least one layer");
     }
@@ -369,133 +350,15 @@ pub fn convert(
         "merge",
     )?;
 
-    let prefetch_blob_id = if prefetch_files.is_empty() {
-        None
-    } else {
-        Some(run_optimize(config, &backend, &bootstrap, prefetch_files)?)
-    };
-
     Ok(NodeLocalArtifact {
         bootstrap,
         backend_dir: backend,
         work_dir: stage.clone(),
         layer_blob_ids: blob_ids,
         zran_index_blob_ids,
-        prefetch_blob_id,
+        prefetch_blob_id: None,
         format_version: AUTO_ACCEL_MANIFEST_VERSION,
     })
-}
-
-/// Run ONLY the `nydus-image optimize` step against an artifact produced by an
-/// earlier [`convert`] call (with empty `prefetch_files`) whose `work_dir` is
-/// still on disk. This is the stage-2 half of the two-stage auto-accel
-/// pipeline: it reuses the merged bootstrap and the staged backend blobs in
-/// `artifact.work_dir`, so create/merge are NOT re-run. The merged bootstrap is
-/// replaced in place with the optimized one and a packed prefetch blob is added
-/// to the backend; the returned artifact is the input with `prefetch_blob_id`
-/// set.
-///
-/// `config.work_dir` MUST equal `artifact.work_dir` (the optimize step stages
-/// its scratch — `prefetch.json`, `optimize-out/`, `bootstrap.optimized` —
-/// under `config.work_dir`).
-pub fn optimize_existing(
-    config: &LocalAccelConfig,
-    artifact: &NodeLocalArtifact,
-    prefetch_files: &[String],
-) -> Result<NodeLocalArtifact> {
-    if prefetch_files.is_empty() {
-        bail!("optimize_existing requires a non-empty prefetch file list");
-    }
-    if !artifact.bootstrap.is_file() {
-        bail!(
-            "merged bootstrap missing at {}; cannot optimize in place",
-            artifact.bootstrap.display()
-        );
-    }
-    if !artifact.backend_dir.is_dir() {
-        bail!(
-            "backend dir missing at {}; cannot optimize in place",
-            artifact.backend_dir.display()
-        );
-    }
-    let prefetch_blob_id = run_optimize(
-        config,
-        &artifact.backend_dir,
-        &artifact.bootstrap,
-        prefetch_files,
-    )?;
-    Ok(NodeLocalArtifact {
-        prefetch_blob_id: Some(prefetch_blob_id),
-        ..artifact.clone()
-    })
-}
-
-/// Bake prefetch hints into the merged bootstrap via `nydus-image optimize`.
-/// Returns the id (= file name in `backend_dir`) of the new prefetch blob.
-///
-/// `nydus-image optimize --prefetch-files` expects a v1 JSON file (see
-/// `builder/src/optimize_prefetch.rs::PrefetchJson`); plain newline lists are
-/// rejected. `--blob-dir` (read-only: existing blobs the bootstrap references) and
-/// `--output-blob-dir` (write-only: the new prefetch blob) are independent
-/// directories in the `nydus-image` CLI, so the new blob is written into its own
-/// fresh, otherwise-empty dir instead of `backend` -- turning "find the new file"
-/// into a direct scan of a dir nothing else could have touched, then a single
-/// deterministic move into `backend`.
-fn run_optimize(
-    config: &LocalAccelConfig,
-    backend: &Path,
-    merged_bootstrap: &Path,
-    prefetch_files: &[String],
-) -> Result<String> {
-    let stage = config.work_dir.as_path();
-    let prefetch_json_path = stage.join("prefetch.json");
-    let prefetch_json = serde_json::json!({
-        "version": "v1",
-        "files": prefetch_files.iter().map(|p| {
-            serde_json::json!({ "path": p, "ranges": null })
-        }).collect::<Vec<_>>(),
-    });
-    std::fs::write(&prefetch_json_path, serde_json::to_vec(&prefetch_json)?)
-        .with_context(|| format!("writing {}", prefetch_json_path.display()))?;
-
-    let optimize_out_dir = stage.join("optimize-out");
-    fresh_dir(&optimize_out_dir)?;
-
-    let optimized_bootstrap = stage.join("bootstrap.optimized");
-    let args: Vec<OsString> = vec![
-        "optimize".into(),
-        "--bootstrap".into(),
-        merged_bootstrap.into(),
-        "--prefetch-files".into(),
-        prefetch_json_path.as_path().into(),
-        "--blob-dir".into(),
-        backend.into(),
-        "--output-bootstrap".into(),
-        optimized_bootstrap.as_path().into(),
-        "--output-blob-dir".into(),
-        optimize_out_dir.as_path().into(),
-    ];
-    run(
-        &config.nydus_image,
-        &args,
-        config.sched,
-        config.nice,
-        "optimize",
-    )?;
-
-    std::fs::rename(&optimized_bootstrap, merged_bootstrap)
-        .with_context(|| "replacing merged bootstrap with optimized one")?;
-
-    let new_blob = expect_single_output(&optimize_out_dir, None)
-        .context("locating optimize's new prefetch blob")?;
-    let blob_name = new_blob
-        .file_name()
-        .context("prefetch blob has no file name")?
-        .to_string_lossy()
-        .into_owned();
-    stage_blob(&new_blob, &backend.join(&blob_name), "prefetch blob")?;
-
-    Ok(blob_name)
 }
 
 /// Move `src` into the backend as `dst`, both of which live under the same
@@ -631,7 +494,7 @@ mod tests {
         let target = tmp.path().join("l0-abc123");
         std::fs::create_dir_all(&target).unwrap();
         // Simulate debris from a crashed earlier attempt: an old bootstrap AND an
-        // extra stray file that would trip `expect_single_output` if it were not
+        // extra stray file that would trip `expect_at_most_one_output` if it were not
         // wiped before the next invocation.
         std::fs::write(target.join("bootstrap"), b"old").unwrap();
         std::fs::write(target.join("stray-leftover"), b"old").unwrap();
@@ -648,25 +511,6 @@ mod tests {
         let target = tmp.path().join("does/not/exist/yet");
         fresh_dir(&target).unwrap();
         assert!(target.is_dir());
-    }
-
-    #[test]
-    fn expect_single_output_finds_the_one_non_excluded_file() {
-        let tmp = tempfile::tempdir().unwrap();
-        let bootstrap = tmp.path().join("bootstrap");
-        std::fs::write(&bootstrap, b"boot").unwrap();
-        let index = tmp.path().join("a1b2c3");
-        std::fs::write(&index, b"index").unwrap();
-
-        let found = expect_single_output(tmp.path(), Some(&bootstrap)).unwrap();
-        assert_eq!(found, index);
-    }
-
-    #[test]
-    fn expect_single_output_errors_on_empty_dir() {
-        let tmp = tempfile::tempdir().unwrap();
-        let err = expect_single_output(tmp.path(), None).unwrap_err();
-        assert!(err.to_string().contains("no output file"));
     }
 
     #[test]
@@ -697,14 +541,14 @@ mod tests {
     }
 
     #[test]
-    fn expect_single_output_errors_when_more_than_one_candidate_remains() {
+    fn expect_at_most_one_output_errors_when_more_than_one_candidate_remains() {
         // With a fresh, private dir this can only happen if nydus-image itself wrote
         // more than one file -- a real bug, which is why this stays an error rather
         // than a silent pick.
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join("blob-a"), b"a").unwrap();
         std::fs::write(tmp.path().join("blob-b"), b"b").unwrap();
-        let err = expect_single_output(tmp.path(), None).unwrap_err();
+        let err = expect_at_most_one_output(tmp.path(), None).unwrap_err();
         assert!(err.to_string().contains("more than one"));
     }
 }

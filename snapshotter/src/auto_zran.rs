@@ -38,7 +38,7 @@ use tracing::{debug, info, warn};
 /// Version of `AutoAccelManifest`. A sidecar whose manifest carries another version is treated as
 /// absent and reconverted; bump it when the artifact's content changes for every image (such as
 /// the layer merge rules), since the record name does not change.
-pub const AUTO_ACCEL_MANIFEST_VERSION: u32 = 2;
+pub const AUTO_ACCEL_MANIFEST_VERSION: u32 = 3;
 
 /// Auto-accel sidecar manifest written into containerd's content store
 /// alongside the bootstrap + zran index + prefetch blobs. The whole JSON is
@@ -152,10 +152,10 @@ pub enum AutoZranStage {
     /// immediately at the first eligible `prepare` so peers can fetch a
     /// sidecar as soon as it lands, long before this pod's tracer settles.
     Base,
-    /// The `nydus-image optimize` step (prefetch bootstrap + packed prefetch
-    /// blob). Enqueued on tracer settle. Reuses the `Base` stage's on-disk
-    /// `work_dir` when present (optimize only); otherwise runs the full
-    /// pipeline once WITH prefetch (handles "settle arrived before base").
+    /// Enqueued on tracer settle. Ends the capture once a sidecar exists; the
+    /// base sidecar is final (see [`run_optimize_stage`]). Without one it
+    /// uploads the `Base` stage's on-disk artifact or converts first (handles
+    /// "settle arrived before base").
     Optimize,
 }
 
@@ -814,7 +814,7 @@ async fn run_conversion(
     // mid-write, GC raced) read back as `Absent` so we re-convert rather
     // than mark-accelerated-then-fail-to-mount. Probed BEFORE the start log so
     // a gated sweep job produces no info-level noise.
-    let (existing, existing_manifest) = existing_sidecar_state(deps, &image_name).await;
+    let (existing, _) = existing_sidecar_state(deps, &image_name).await;
 
     if sweep_job_deferred(job.stage, job.origin, existing) {
         debug!(
@@ -857,7 +857,6 @@ async fn run_conversion(
                 &manifest_digest,
                 &image_name,
                 existing,
-                existing_manifest,
             )
             .await
         }
@@ -892,7 +891,7 @@ async fn run_base_stage(
     std::fs::create_dir_all(&work_dir)
         .with_context(|| format!("create work dir {}", work_dir.display()))?;
     let local_cfg = local_accel_config(config, &work_dir);
-    let artifact = blocking::unblock(move || local_accel::convert(&local_cfg, &layers, &[]))
+    let artifact = blocking::unblock(move || local_accel::convert(&local_cfg, &layers))
         .await
         .context("local_accel::convert (base) failed")?;
 
@@ -911,10 +910,10 @@ async fn run_base_stage(
     Ok(())
 }
 
-/// Stage 2: run the `nydus-image optimize` step and re-upload the (now
-/// optimized) sidecar, promoting the Image record from the base manifest to the
-/// optimized one. Reuses stage 1's on-disk work dir when present (optimize
-/// only); otherwise runs the full pipeline once WITH prefetch.
+/// Stage 2: end the capture once a sidecar exists. The base sidecar is final:
+/// `nydus-image optimize` refuses to repack a node-local artifact (its chunks
+/// decode only through the original layers' zran indexes). Without a sidecar,
+/// uploads stage 1's on-disk artifact when present, otherwise converts first.
 ///
 /// Drivers: the access tracer's settle, the NRI `StopContainer`
 /// force-settle, and the reconciler's slow-cadence
@@ -933,13 +932,12 @@ async fn run_optimize_stage(
     manifest_digest: &str,
     image_name: &str,
     existing: SidecarState,
-    existing_manifest: Option<String>,
 ) -> Result<()> {
-    if existing == SidecarState::Optimized {
-        // A peer's (or an earlier local) optimize won the race; this node's
-        // freshly captured profile is discarded — intentional: the first
-        // settled profile wins, re-optimization is a BACKLOG item.
-        info!(image = %job.image, "auto-zran optimize skip: sidecar already optimized");
+    if matches!(existing, SidecarState::Base | SidecarState::Optimized) {
+        // `nydus-image optimize` cannot repack a node-local artifact: its chunks live in the
+        // original layers and decode only with their zran index. The base sidecar is final, so
+        // the captured profile only ends the capture.
+        info!(image = %job.image, ?existing, "auto-zran optimize skip: sidecar already present");
         deps.access_tracer.mark_image_accelerated(&job.image);
         cleanup_work_dir(config, &job.image);
         return Ok(());
@@ -949,60 +947,21 @@ async fn run_optimize_stage(
     std::fs::create_dir_all(&work_dir)
         .with_context(|| format!("create work dir {}", work_dir.display()))?;
     let local_cfg = local_accel_config(config, &work_dir);
-    let prefetch_files = job.prefetch_files.clone();
 
     let artifact = if let Some(base) = load_reusable_base_artifact(&work_dir) {
-        if base.prefetch_blob_id.is_some() {
-            // A prior optimize run already rewrote the merged bootstrap in
-            // place and persisted the optimized artifact.json, but its upload
-            // failed. Re-running `nydus-image optimize` against the
-            // already-optimized bootstrap would be wrong, so go straight to
-            // the (re-)upload with the persisted artifact.
-            info!(image = %job.image, "auto-zran optimize: reusing already-optimized artifact (upload retry)");
-            base
-        } else {
-            // Stage 1 output is on disk: run ONLY optimize (create/merge
-            // skipped).
-            info!(image = %job.image, "auto-zran optimize: reusing base work dir (create/merge skipped)");
-            let optimized = blocking::unblock(move || {
-                local_accel::optimize_existing(&local_cfg, &base, &prefetch_files)
-            })
-            .await
-            .context("local_accel::optimize_existing failed")?;
-            // `optimize_existing` replaced the merged bootstrap IN PLACE, so
-            // persist the optimized artifact BEFORE the upload: if the upload
-            // fails and the job is retried, artifact.json would otherwise
-            // still claim `prefetch_blob_id: None` and the retry would
-            // re-optimize an already-optimized bootstrap.
-            if let Err(e) = write_base_artifact(&work_dir, &optimized) {
-                warn!(image = %job.image, error = ?e, "auto-zran failed to persist optimized artifact; an upload-failure retry may re-optimize");
-            }
-            optimized
-        }
+        // Stage 1 output is on disk but its sidecar is gone: upload it again.
+        info!(image = %job.image, "auto-zran optimize: reusing base work dir (create/merge skipped)");
+        base
     } else {
-        // No reusable base (settle beat base, or the dir was swept): run the
-        // full pipeline once WITH prefetch so the captured profile isn't lost.
-        info!(image = %job.image, "auto-zran optimize: no reusable base work dir; running full pipeline with prefetch");
-        blocking::unblock(move || local_accel::convert(&local_cfg, &layers, &prefetch_files))
+        // No reusable base (settle beat base, or the dir was swept): convert now.
+        info!(image = %job.image, "auto-zran optimize: no reusable base work dir; running the conversion");
+        blocking::unblock(move || local_accel::convert(&local_cfg, &layers))
             .await
-            .context("local_accel::convert (optimize full) failed")?
+            .context("local_accel::convert failed")?
     };
 
-    // When a BASE sidecar record existed pre-promotion, pin its manifest tree
-    // from the optimized manifest so a peer mid-pull of the base sidecar can't
-    // have its blobs GC'd out from under it (see `manifest_gc_labels`).
-    let base_manifest = (existing == SidecarState::Base)
-        .then_some(existing_manifest)
-        .flatten();
-    let image_record_ok = upload_artifact(
-        deps,
-        job,
-        manifest_digest,
-        image_name,
-        &artifact,
-        base_manifest.as_deref(),
-    )
-    .await?;
+    let image_record_ok =
+        upload_artifact(deps, job, manifest_digest, image_name, &artifact, None).await?;
 
     // Tell the tracer to stop capturing ONLY when the cross-node advertisement
     // is also wired (mirrors the original single-stage invariant): with
@@ -1053,9 +1012,7 @@ fn write_base_artifact(work_dir: &Path, artifact: &NodeLocalArtifact) -> Result<
 /// Load a persisted base artifact IF its on-disk inputs (merged bootstrap +
 /// backend dir, plus the prefetch blob when the artifact claims one) are
 /// still present and its `format_version` is [`AUTO_ACCEL_MANIFEST_VERSION`].
-/// This is the seam that decides stage-2 behavior: `Some` ⇒ reuse (optimize only — or upload-only when `prefetch_blob_id` is already
-/// set by a prior optimize whose upload failed); `None` ⇒ run the full
-/// pipeline.
+/// `Some` ⇒ stage 2 uploads it as is; `None` ⇒ stage 2 converts first.
 fn load_reusable_base_artifact(work_dir: &Path) -> Option<NodeLocalArtifact> {
     let bytes = std::fs::read(base_artifact_path(work_dir)).ok()?;
     let artifact: NodeLocalArtifact = serde_json::from_slice(&bytes).ok()?;
