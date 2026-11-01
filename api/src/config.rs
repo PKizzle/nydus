@@ -893,6 +893,11 @@ pub struct FanotifyConfig {
     /// Mountpoint for the EROFS filesystem.
     #[serde(default)]
     pub mountpoint: String,
+    /// Mount with the EROFS `inode_share,domain_id=<this>` options (Linux 7.0+), sharing page
+    /// cache with other mounts of the domain whose files carry equal fingerprint xattrs. Every
+    /// image in a domain must be trusted: a forged fingerprint aliases another image's pages.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub erofs_inode_share_domain: Option<String>,
 }
 
 impl FanotifyConfig {

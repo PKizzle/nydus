@@ -1184,9 +1184,14 @@ async fn upload_artifact(
 
     let bootstrap_meta = std::fs::metadata(&artifact.bootstrap)
         .with_context(|| format!("stat bootstrap {}", artifact.bootstrap.display()))?;
+    let mut bootstrap_labels = base_labels("bootstrap");
+    bootstrap_labels.insert(
+        crate::auto_accel_sidecar::LABEL_BUILT_ON_NODE.to_string(),
+        "true".to_string(),
+    );
     let bootstrap_digest = deps
         .content_store
-        .write_blob(&artifact.bootstrap, base_labels("bootstrap"))
+        .write_blob(&artifact.bootstrap, bootstrap_labels)
         .await
         .context("upload bootstrap")?;
 

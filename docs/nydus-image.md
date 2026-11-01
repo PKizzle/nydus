@@ -196,6 +196,14 @@ data blobs: ["9e50ae5ac02b2ef6ffb86075720e49d95d8240eed4717dd8ac9c68cadba00762"]
 -rw-r--r-- 1 root root 20480 3月  29 17:02 df01f389850b79cd5a6ca6db98495bb457aa0821b0558351c55537551322fb96
 ```
 
+`--inode-share-fingerprint` (RAFS v6) writes a content fingerprint on every non-empty regular
+file, for the EROFS `inode_share` mount option (Linux 7.0+): mounts sharing a `domain_id` then
+share one page cache for files with equal fingerprints. The fingerprint is a SHA-256 over the
+file size and its chunk digests, which `nydus-image` computed from the uncompressed data; it is
+stored as a hidden xattr (long prefix `nydus.fingerprint.v1`, base index 0) and declared with the
+`ishare_xattrs` superblock feature. Only mount images whose fingerprints you produced yourself in
+one domain: a forged fingerprint makes another image's file read this one's pages.
+
 ### Layer apply model
 
 The merge emulates what containerd produces with an overlay snapshotter (`core/diff/apply/apply_linux.go`

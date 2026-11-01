@@ -680,8 +680,52 @@ pub struct FeaturesConfig {
     pub prefetch: bool,
     #[serde(default = "default_true")]
     pub metrics: bool,
+    /// EROFS page cache sharing (`inode_share`) between auto-accel images this node built
+    /// itself; see [`ErofsInodeShare`].
     #[serde(default)]
-    pub erofs_page_cache_sharing: bool,
+    pub erofs_inode_share: ErofsInodeShare,
+}
+
+/// When auto-accel mounts use the EROFS `inode_share` option, which lets files with identical
+/// content in different images share one page cache.
+///
+/// Only artifacts built on this node by `local_accel` carry fingerprints the snapshotter trusts,
+/// so only they are ever mounted with it; registry and peer-fetched images never are, whatever
+/// this says, because a crafted fingerprint would alias another image's pages.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ErofsInodeShare {
+    /// On kernels >= 7.4, the first release whose shared mmaps keep their real inode alive.
+    #[default]
+    Auto,
+    /// On any kernel that accepts the option (7.0+). Meant for kernels below 7.4 that carry
+    /// the fix "erofs: hold real inodes for shared files" (mainline 7259fb011c14, a stable
+    /// backport or a cherry-pick), which `uname` cannot reveal; without it, mmap'd shared files
+    /// can fault once their real inode is evicted.
+    On,
+    /// Never.
+    Off,
+}
+
+impl ErofsInodeShare {
+    /// Kernel release from which `Auto` enables sharing.
+    pub const AUTO_MIN_KERNEL: (u32, u32) = (7, 4);
+
+    /// Whether to request `inode_share` on a kernel reporting `release` (`uname -r`).
+    pub fn enabled_for_kernel(self, release: &str) -> bool {
+        match self {
+            Self::On => true,
+            Self::Off => false,
+            Self::Auto => {
+                let mut parts = release
+                    .split(|c: char| !c.is_ascii_digit())
+                    .map(|p| p.parse::<u32>().unwrap_or(0));
+                let major = parts.next().unwrap_or(0);
+                let minor = parts.next().unwrap_or(0);
+                (major, minor) >= Self::AUTO_MIN_KERNEL
+            }
+        }
+    }
 }
 
 impl Default for FeaturesConfig {
@@ -695,7 +739,7 @@ impl Default for FeaturesConfig {
             encryption: false,
             prefetch: true,
             metrics: true,
-            erofs_page_cache_sharing: false,
+            erofs_inode_share: ErofsInodeShare::Auto,
         }
     }
 }
@@ -1755,9 +1799,35 @@ mod tests {
             "metrics: Default and serde default diverge"
         );
         assert_eq!(
-            structural.erofs_page_cache_sharing, deserialized.erofs_page_cache_sharing,
-            "erofs_page_cache_sharing: Default and serde default diverge"
+            structural.erofs_inode_share, deserialized.erofs_inode_share,
+            "erofs_inode_share: Default and serde default diverge"
         );
+    }
+
+    #[test]
+    fn erofs_inode_share_parses_and_gates_on_the_kernel() {
+        for (value, want) in [
+            ("auto", ErofsInodeShare::Auto),
+            ("on", ErofsInodeShare::On),
+            ("off", ErofsInodeShare::Off),
+        ] {
+            let parsed: FeaturesConfig =
+                toml::from_str(&format!("erofs_inode_share = \"{value}\"")).unwrap();
+            assert_eq!(parsed.erofs_inode_share, want, "{value}");
+        }
+        let empty: FeaturesConfig = toml::from_str("").unwrap();
+        assert_eq!(empty.erofs_inode_share, ErofsInodeShare::Auto);
+        assert!(toml::from_str::<FeaturesConfig>("erofs_inode_share = \"yes\"").is_err());
+
+        let auto = ErofsInodeShare::Auto;
+        assert!(!auto.enabled_for_kernel("6.18.55-061855-generic"));
+        assert!(!auto.enabled_for_kernel("7.3.1-070301-generic"));
+        assert!(auto.enabled_for_kernel("7.4.0-rc1"));
+        assert!(auto.enabled_for_kernel("7.10.2"));
+        assert!(auto.enabled_for_kernel("8.0.0"));
+        assert!(!auto.enabled_for_kernel("garbage"));
+        assert!(ErofsInodeShare::On.enabled_for_kernel("7.3.1"));
+        assert!(!ErofsInodeShare::Off.enabled_for_kernel("7.4.0"));
     }
 
     #[test]
