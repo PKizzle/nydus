@@ -948,7 +948,7 @@ async fn run_optimize_stage(
         .with_context(|| format!("create work dir {}", work_dir.display()))?;
     let local_cfg = local_accel_config(config, &work_dir);
 
-    let artifact = if let Some(base) = load_reusable_base_artifact(&work_dir) {
+    let artifact = if let Some(base) = load_reusable_base_artifact(&work_dir, &layers) {
         // Stage 1 output is on disk but its sidecar is gone: upload it again.
         info!(image = %job.image, "auto-zran optimize: reusing base work dir (create/merge skipped)");
         base
@@ -1009,14 +1009,25 @@ fn write_base_artifact(work_dir: &Path, artifact: &NodeLocalArtifact) -> Result<
     std::fs::write(&path, bytes).with_context(|| format!("write {}", path.display()))
 }
 
-/// Load a persisted base artifact IF its on-disk inputs (merged bootstrap +
-/// backend dir, plus the prefetch blob when the artifact claims one) are
-/// still present and its `format_version` is [`AUTO_ACCEL_MANIFEST_VERSION`].
+/// Load a persisted base artifact IF it was built from exactly `layers`, its
+/// on-disk inputs (merged bootstrap + backend dir, plus the prefetch blob when
+/// the artifact claims one) are still present and its `format_version` is
+/// [`AUTO_ACCEL_MANIFEST_VERSION`]. The work dir is keyed by image ref, so a
+/// tag repointed since stage 1 finds the old image's artifact there.
 /// `Some` ⇒ stage 2 uploads it as is; `None` ⇒ stage 2 converts first.
-fn load_reusable_base_artifact(work_dir: &Path) -> Option<NodeLocalArtifact> {
+fn load_reusable_base_artifact(
+    work_dir: &Path,
+    layers: &[local_accel::SourceLayer],
+) -> Option<NodeLocalArtifact> {
     let bytes = std::fs::read(base_artifact_path(work_dir)).ok()?;
     let artifact: NodeLocalArtifact = serde_json::from_slice(&bytes).ok()?;
-    if artifact.format_version != AUTO_ACCEL_MANIFEST_VERSION {
+    if artifact.format_version != AUTO_ACCEL_MANIFEST_VERSION
+        || !artifact
+            .layer_blob_ids
+            .iter()
+            .map(String::as_str)
+            .eq(layers.iter().map(local_accel::SourceLayer::blob_id))
+    {
         return None;
     }
     let prefetch_ok = artifact
@@ -1510,7 +1521,16 @@ mod tests {
         ManifestInfo {
             manifest_digest: "sha256:m".to_string(),
             layers: vec![],
+            chain_id: "sha256:c".to_string(),
         }
+    }
+
+    /// The source layers the `layer_blob_ids: ["deadbeef"]` fixtures were built from.
+    fn layers() -> Vec<local_accel::SourceLayer> {
+        vec![local_accel::SourceLayer {
+            digest: "sha256:deadbeef".to_string(),
+            path: PathBuf::from("/nonexistent"),
+        }]
     }
 
     fn report() -> BackfillReport {
@@ -1938,10 +1958,11 @@ mod tests {
         };
 
         // No artifact.json yet → full pipeline.
-        assert!(load_reusable_base_artifact(work_dir).is_none());
+        assert!(load_reusable_base_artifact(work_dir, &layers()).is_none());
 
         write_base_artifact(work_dir, &artifact).unwrap();
-        let reused = load_reusable_base_artifact(work_dir).expect("base artifact reusable");
+        let reused =
+            load_reusable_base_artifact(work_dir, &layers()).expect("base artifact reusable");
         assert_eq!(reused, artifact);
         assert!(
             reused.prefetch_blob_id.is_none(),
@@ -1952,7 +1973,7 @@ mod tests {
         // artifact.json remains → force the full pipeline rather than optimize
         // against a missing input.
         std::fs::remove_file(&bootstrap).unwrap();
-        assert!(load_reusable_base_artifact(work_dir).is_none());
+        assert!(load_reusable_base_artifact(work_dir, &layers()).is_none());
     }
 
     /// A work dir left by a build whose artifact format differs (no stamp, or an older
@@ -1976,18 +1997,52 @@ mod tests {
             format_version: AUTO_ACCEL_MANIFEST_VERSION,
         };
         write_base_artifact(work_dir, &artifact).unwrap();
-        assert!(load_reusable_base_artifact(work_dir).is_some());
+        assert!(load_reusable_base_artifact(work_dir, &layers()).is_some());
 
         let path = base_artifact_path(work_dir);
         let mut json: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         json.as_object_mut().unwrap().remove("format_version");
         std::fs::write(&path, serde_json::to_vec(&json).unwrap()).unwrap();
-        assert!(load_reusable_base_artifact(work_dir).is_none());
+        assert!(load_reusable_base_artifact(work_dir, &layers()).is_none());
 
         json["format_version"] = serde_json::json!(AUTO_ACCEL_MANIFEST_VERSION - 1);
         std::fs::write(&path, serde_json::to_vec(&json).unwrap()).unwrap();
-        assert!(load_reusable_base_artifact(work_dir).is_none());
+        assert!(load_reusable_base_artifact(work_dir, &layers()).is_none());
+    }
+
+    /// The work dir is keyed by image ref: after the tag moves to another
+    /// image, the artifact stage 1 left there for the old image must not be
+    /// uploaded as the new image's sidecar.
+    #[test]
+    fn load_reusable_base_artifact_rejects_another_images_layers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let work_dir = tmp.path();
+        let backend = work_dir.join("backend");
+        std::fs::create_dir_all(&backend).unwrap();
+        let bootstrap = work_dir.join("bootstrap");
+        std::fs::write(&bootstrap, b"merged-bootstrap").unwrap();
+        let artifact = NodeLocalArtifact {
+            bootstrap,
+            backend_dir: backend,
+            work_dir: work_dir.to_path_buf(),
+            layer_blob_ids: vec!["deadbeef".to_string()],
+            zran_index_blob_ids: vec![Some("cafef00d".to_string())],
+            prefetch_blob_id: None,
+            format_version: AUTO_ACCEL_MANIFEST_VERSION,
+        };
+        write_base_artifact(work_dir, &artifact).unwrap();
+        assert!(load_reusable_base_artifact(work_dir, &layers()).is_some());
+
+        let layer = |digest: &str| local_accel::SourceLayer {
+            digest: digest.to_string(),
+            path: PathBuf::from("/nonexistent"),
+        };
+        let repointed = [layer("sha256:0ddba11")];
+        assert!(load_reusable_base_artifact(work_dir, &repointed).is_none());
+        let extra_layer = [layer("sha256:deadbeef"), layer("sha256:0ddba11")];
+        assert!(load_reusable_base_artifact(work_dir, &extra_layer).is_none());
+        assert!(load_reusable_base_artifact(work_dir, &[]).is_none());
     }
 
     /// Fix for the "retry after failed optimize upload" seam: a persisted
@@ -2015,10 +2070,11 @@ mod tests {
         write_base_artifact(work_dir, &artifact).unwrap();
 
         // artifact.json claims a prefetch blob that is not on disk → None.
-        assert!(load_reusable_base_artifact(work_dir).is_none());
+        assert!(load_reusable_base_artifact(work_dir, &layers()).is_none());
 
         std::fs::write(backend.join("prefetch01"), b"packed-chunks").unwrap();
-        let reused = load_reusable_base_artifact(work_dir).expect("optimized artifact reusable");
+        let reused =
+            load_reusable_base_artifact(work_dir, &layers()).expect("optimized artifact reusable");
         assert_eq!(reused, artifact);
         assert!(reused.prefetch_blob_id.is_some());
     }

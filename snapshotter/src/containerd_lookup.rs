@@ -200,17 +200,31 @@ impl ContainerdLookup {
             }
         };
         let count = map.len();
-        let mut cache = lock_cache(&self.cache);
-        for (k, v) in map {
-            cache.entry(k).or_insert(v);
-        }
+        let total = self.merge_walk(map);
         info!(
             entries = count,
-            failed,
-            total = cache.len(),
-            "containerd image-ref cache refreshed"
+            failed, total, "containerd image-ref cache refreshed"
         );
         Ok(())
+    }
+
+    /// Fold one image-store walk into the cache. The walk wins over a cached
+    /// entry: a repointed tag must stop answering for the chain it left.
+    /// Returns the cache size.
+    fn merge_walk(&self, map: HashMap<String, String>) -> usize {
+        let mut cache = lock_cache(&self.cache);
+        cache.extend(map);
+        cache.len()
+    }
+
+    /// Drop `digest → image_ref` if the cache still holds that mapping, so the
+    /// next lookup walks containerd again. For a caller that found `image_ref`
+    /// no longer resolves to the content behind `digest`.
+    pub fn forget(&self, digest: &str, image_ref: &str) {
+        let mut cache = lock_cache(&self.cache);
+        if cache.get(digest).is_some_and(|r| r == image_ref) {
+            cache.remove(digest);
+        }
     }
 
     /// Walk every image record into `map`; returns how many records
@@ -290,12 +304,7 @@ impl ContainerdLookup {
                  make sure it's been pulled at least once"
             );
         };
-        let (final_digest, layers) =
-            resolve_accel_layers_via_grpc(cs, &target, content_root).await?;
-        Ok(ManifestInfo {
-            manifest_digest: final_digest,
-            layers,
-        })
+        resolve_accel_layers_via_grpc(cs, &target, content_root).await
     }
 }
 
@@ -537,6 +546,27 @@ pub struct ManifestInfo {
     /// Layers in device-table order with their on-disk content-store
     /// paths already resolved.
     pub layers: Vec<crate::local_accel::SourceLayer>,
+    /// Topmost chainID of the image's rootfs (from the config's diff_ids):
+    /// the parent snapshot of every container prepared from this manifest.
+    pub chain_id: String,
+}
+
+/// Topmost chainID of an image config's `rootfs.diff_ids`.
+fn top_chain_id(cfg_bytes: &[u8], manifest: &str) -> Result<String> {
+    let cfg: OciImageConfig = serde_json::from_slice(cfg_bytes)
+        .with_context(|| format!("parse image config of manifest {manifest}"))?;
+    chain_ids(&cfg.rootfs.diff_ids)
+        .pop()
+        .with_context(|| format!("image config of manifest {manifest} has no diff_ids"))
+}
+
+/// The config descriptor digest of a manifest; every image manifest has one.
+fn config_digest<'a>(manifest: &'a OciManifest, digest: &str) -> Result<&'a str> {
+    manifest
+        .config
+        .as_ref()
+        .map(|c| c.digest.as_str())
+        .with_context(|| format!("manifest {digest} has no config"))
 }
 
 /// Resolve an index/manifest digest to (manifest_digest, gzip_layers) for
@@ -547,7 +577,7 @@ async fn resolve_accel_layers_via_grpc(
     cs: &ContentStoreClient,
     digest: &str,
     content_root: &std::path::Path,
-) -> Result<(String, Vec<crate::local_accel::SourceLayer>)> {
+) -> Result<ManifestInfo> {
     // The digest is the image record's target or the host child picked
     // from it, never speculative, so a miss is worth a warning; "no host
     // match" and "no data layers" are normal for many images and stay at
@@ -575,7 +605,16 @@ async fn resolve_accel_layers_via_grpc(
     let manifest: OciManifest = serde_json::from_slice(&bytes)
         .map_err(|e| anyhow::anyhow!("parse manifest {digest}: {e}"))?;
     let layers = accel_layers_from_manifest(&manifest, digest, content_root)?;
-    Ok((digest.to_string(), layers))
+    let config = config_digest(&manifest, digest)?;
+    let cfg_bytes = cs
+        .fetch_bytes(config)
+        .await
+        .with_context(|| format!("fetch image config {config}"))?;
+    Ok(ManifestInfo {
+        manifest_digest: digest.to_string(),
+        layers,
+        chain_id: top_chain_id(&cfg_bytes, digest)?,
+    })
 }
 
 /// Pick the index child matching the host architecture/OS. Pure so tests
@@ -905,12 +944,7 @@ fn manifest_info_via_cli(image_ref: &str, content_root: &std::path::Path) -> Res
         let Some(manifest_digest) = matched_manifest else {
             continue;
         };
-        let (final_digest, gzip_layers) =
-            resolve_accel_layers_via_cli(&manifest_digest, content_root)?;
-        return Ok(ManifestInfo {
-            manifest_digest: final_digest,
-            layers: gzip_layers,
-        });
+        return resolve_accel_layers_via_cli(&manifest_digest, content_root);
     }
     bail!(
         "image {image_ref} not found in crictl images output; \
@@ -921,7 +955,7 @@ fn manifest_info_via_cli(image_ref: &str, content_root: &std::path::Path) -> Res
 fn resolve_accel_layers_via_cli(
     digest: &str,
     content_root: &std::path::Path,
-) -> Result<(String, Vec<crate::local_accel::SourceLayer>)> {
+) -> Result<ManifestInfo> {
     let bytes = run_first_ok(&[
         &["ctr", "-n", "k8s.io", "content", "get", digest],
         &["k3s", "ctr", "-n", "k8s.io", "content", "get", digest],
@@ -936,7 +970,17 @@ fn resolve_accel_layers_via_cli(
     let manifest: OciManifest = serde_json::from_slice(&bytes)
         .map_err(|e| anyhow::anyhow!("parse manifest {digest}: {e}"))?;
     let layers = accel_layers_from_manifest(&manifest, digest, content_root)?;
-    Ok((digest.to_string(), layers))
+    let config = config_digest(&manifest, digest)?;
+    let cfg_bytes = run_first_ok(&[
+        &["ctr", "-n", "k8s.io", "content", "get", config],
+        &["k3s", "ctr", "-n", "k8s.io", "content", "get", config],
+    ])
+    .with_context(|| format!("fetch image config {config}"))?;
+    Ok(ManifestInfo {
+        manifest_digest: digest.to_string(),
+        layers,
+        chain_id: top_chain_id(&cfg_bytes, digest)?,
+    })
 }
 
 /// Run the first command whose binary exists & exits successfully.
@@ -1180,6 +1224,49 @@ mod tests {
 
         let err = index_walk_result("sha256:idx", vec![], false).unwrap_err();
         assert!(err.to_string().contains("sha256:idx"), "{err}");
+    }
+
+    /// `app:v1` and `app:latest` both pointed at X and the cache answered
+    /// X's chain with `app:latest`. After `latest` moves to Y, the next walk
+    /// registers X's chain under `app:v1` only, and that must win.
+    #[test]
+    fn refresh_overwrites_an_entry_left_by_a_repointed_tag() {
+        let lookup = ContainerdLookup::new_cli_only();
+        let chain_x = "sha256:x".to_string();
+        lookup.merge_walk(HashMap::from([(chain_x.clone(), "app:latest".to_string())]));
+        lookup.merge_walk(HashMap::from([
+            (chain_x.clone(), "app:v1".to_string()),
+            ("sha256:y".to_string(), "app:latest".to_string()),
+        ]));
+        assert_eq!(lookup.lookup_cached(&chain_x).as_deref(), Some("app:v1"));
+        assert_eq!(
+            lookup.lookup_cached("sha256:y").as_deref(),
+            Some("app:latest")
+        );
+    }
+
+    #[test]
+    fn forget_drops_only_the_named_mapping() {
+        let lookup = ContainerdLookup::new_cli_only();
+        lookup.merge_walk(HashMap::from([(
+            "sha256:x".to_string(),
+            "app:v1".to_string(),
+        )]));
+        lookup.forget("sha256:x", "app:latest");
+        assert_eq!(lookup.lookup_cached("sha256:x").as_deref(), Some("app:v1"));
+        lookup.forget("sha256:x", "app:v1");
+        assert_eq!(lookup.lookup_cached("sha256:x"), None);
+    }
+
+    #[test]
+    fn top_chain_id_is_the_last_chain_id_of_the_config() {
+        let diff_ids = ["sha256:aa".to_string(), "sha256:bb".to_string()];
+        let cfg = serde_json::json!({"rootfs": {"type": "layers", "diff_ids": diff_ids}});
+        let top = top_chain_id(&serde_json::to_vec(&cfg).unwrap(), "sha256:m").unwrap();
+        assert_eq!(Some(&top), chain_ids(&diff_ids).last());
+
+        let empty = serde_json::json!({"rootfs": {"type": "layers", "diff_ids": []}});
+        assert!(top_chain_id(&serde_json::to_vec(&empty).unwrap(), "sha256:m").is_err());
     }
 
     /// chainID computation is the contract with containerd's snapshot
