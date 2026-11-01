@@ -10,6 +10,8 @@ set -u
 NI="${NYDUS_IMAGE:-./target/release/nydus-image}"
 ND="${NYDUSD:-./target/release/nydusd}"
 R="${ROOT:-/var/tmp/ref-formats}"
+# EROFS block size; the kernel mounts block sizes up to its page size.
+BLOCK_SIZE="${BLOCK_SIZE:-4096}"
 umount -l "$R/mnt" 2>/dev/null; pkill -9 -f "nydusd singleton" 2>/dev/null; sleep 1
 rm -rf "$R"; mkdir -p "$R"/{src,out,backend,stage,mnt}
 
@@ -51,7 +53,7 @@ LAYERS="gz.tar.gz plain.tar zmulti.tar.zst zdedup.tar.zst zsingle.tar.zst"
 IDS=""; BOOTS=""
 for layer in $LAYERS; do
   out="$R/out/$layer"; mkdir -p "$out"
-  boot=$("$NI" create --type targz-ref --fs-version 6 -D "$out" "$R/$layer" 2>&1 | tee "$out.log" | sed -n 's/^meta blob path: //p')
+  boot=$("$NI" create --type targz-ref --fs-version 6 --block-size "$BLOCK_SIZE" -D "$out" "$R/$layer" 2>&1 | tee "$out.log" | sed -n 's/^meta blob path: //p')
   [ -n "$boot" ] || { echo "create failed for $layer"; tail -5 "$out.log"; exit 1; }
   "$NI" check -B "$boot" >/dev/null 2>&1 || { echo "check failed for $layer"; exit 1; }
   digest=$(sha256sum "$R/$layer" | awk '{print $1}')
@@ -62,6 +64,7 @@ for layer in $LAYERS; do
 done
 "$NI" merge -B "$R/stage/bootstrap" --original-blob-ids "${IDS#,}" $BOOTS >/dev/null 2>&1 \
   || { echo "merge failed"; exit 1; }
+"$NI" check -B "$R/stage/bootstrap" --blob-dir "$R/backend" >/dev/null || { echo "check failed for the merged bootstrap"; exit 1; }
 
 cat > "$R/cfg.json" <<EOF
 { "blobs": [ { "type":"bootstrap","id":"b1","domain_id":"d1","config":{

@@ -39,6 +39,9 @@ pub enum V6LayoutError {
         "chunk uncompressed offset 0x{offset:x} is not aligned to the {block_size}-byte EROFS block size"
     )]
     MisalignedChunk { offset: u64, block_size: u64 },
+    /// Chunks address their blob by a `u8` device index, so the device table is capped.
+    #[error("{count} data blobs exceed the RAFS v6 limit of {max}")]
+    TooManyBlobs { count: usize, max: usize },
 }
 
 // Rafs v6 dedicated methods
@@ -397,7 +400,7 @@ impl Node {
                     .seek(SeekFrom::Start(dirent_off))
                     .context("failed seek file position for writing dirent")?;
                 f_bootstrap
-                    .write(dir_data.as_slice())
+                    .write_all(dir_data.as_slice())
                     .context("failed to write dirent data to meta blob")?;
 
                 // track where we're going to write.
@@ -454,7 +457,7 @@ impl Node {
                 .seek(SeekFrom::Start(tail_off as u64))
                 .context("failed seek for dir inode")?;
             f_bootstrap
-                .write(dir_data.as_slice())
+                .write_all(dir_data.as_slice())
                 .context("failed to store dirents")?;
         }
 
@@ -533,7 +536,7 @@ impl Node {
             .seek(SeekFrom::Start(offset))
             .with_context(|| format!("failed to seek to 0x{:x} for writing chunk data", offset))?;
         f_bootstrap
-            .write(chunks.as_slice())
+            .write_all(chunks.as_slice())
             .context("failed to write chunk data for file")?;
 
         Ok(())
@@ -560,7 +563,7 @@ impl Node {
                 .seek(SeekFrom::Start(tail_off))
                 .context("failed seek for dir inode")?;
             f_bootstrap
-                .write(symlink.as_bytes())
+                .write_all(symlink.as_bytes())
                 .context("filed to store symlink")?;
         }
 
@@ -675,7 +678,13 @@ impl Bootstrap {
             block_size,
         );
         let blob_table_entries = blobs.len();
-        assert!(blob_table_entries < u8::MAX as usize);
+        if blob_table_entries >= u8::MAX as usize {
+            return Err(V6LayoutError::TooManyBlobs {
+                count: blob_table_entries,
+                max: u8::MAX as usize - 1,
+            }
+            .into());
+        }
         trace!(
             "devtable len {} blob table offset {} blob table size {}",
             devtable_len, blob_table_offset, blob_table_size
@@ -1183,6 +1192,44 @@ mod tests {
         let seg_blocks = (V6_BLOCK_SEG_ALIGNMENT / EROFS_BLOCK_SIZE_4096) as u32;
         assert_eq!(devtable[0].mapped_blkaddr(), seg_blocks);
         assert_eq!(devtable[1].mapped_blkaddr(), 2 * seg_blocks);
+    }
+
+    #[test]
+    fn test_v6_dump_rejects_too_many_blobs() {
+        let root = TempDir::new().unwrap();
+        let node = Node::from_fs_object(
+            RafsVersion::V6,
+            root.as_path().to_path_buf(),
+            root.as_path().to_path_buf(),
+            Overlay::UpperAddition,
+            RAFS_DEFAULT_CHUNK_SIZE as u32,
+            0,
+            false,
+            false,
+        )
+        .unwrap();
+        let mut bootstrap = Bootstrap::new(Tree::new(node)).unwrap();
+        let mut ctx = BuildContext {
+            fs_version: RafsVersion::V6,
+            ..Default::default()
+        };
+        let mut bootstrap_ctx = BootstrapContext::new(None, false, EROFS_BLOCK_SIZE_4096).unwrap();
+        let table = RafsV6BlobTable {
+            entries: vec![devtable_blob(1); u8::MAX as usize],
+        };
+        let err = bootstrap
+            .v6_dump(&mut ctx, &mut bootstrap_ctx, &table)
+            .unwrap_err();
+        assert!(
+            matches!(
+                err.downcast_ref::<V6LayoutError>(),
+                Some(V6LayoutError::TooManyBlobs {
+                    count: 255,
+                    max: 254
+                })
+            ),
+            "{err:#}"
+        );
     }
 
     #[test]

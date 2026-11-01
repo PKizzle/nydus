@@ -220,6 +220,11 @@ never visible in a mounted filesystem). The merge applies three cases to such a 
 An explicit directory entry in the upper layer replaces the lower node. The root is never
 marked: `archive.Apply` ignores root members and overlayfs shows the fresh upperdir's own attributes.
 
+Without `--parent-bootstrap`, the first layer is applied to an empty root, as containerd applies it to an
+empty directory: its whiteouts (`.wh.<name>`) and opaque markers (`.wh..wh..opq`, or the overlayfs
+`trusted.overlay.opaque` xattr) hide nothing and are dropped. Whiteout names are compared as bytes, so a
+name that is not valid UTF-8 is handled like any other.
+
 Accepted deviations from containerd: a synthesized directory keeps mtime 0 where containerd stamps the
 wall-clock time, and a directory that shadows a lower symlink gets the synthesized defaults where containerd
 copies the symlink target's metadata from the first lowerdir where it resolves. Both live in the merge

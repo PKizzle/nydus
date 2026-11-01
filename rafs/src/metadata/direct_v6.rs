@@ -374,6 +374,24 @@ impl OndiskInodeWrapper {
         self.mapping.state.load()
     }
 
+    /// The on-disk address of chunk `idx`: the device and block the kernel reads it from.
+    pub fn get_chunk_addr(&self, idx: u32) -> RafsResult<RafsV6InodeChunkAddr> {
+        let state = self.state();
+        let inode = self.disk_inode(&state);
+        if !self.is_reg() || idx >= self.get_chunk_count() {
+            return Err(RafsError::NotFound("invalid chunk info".to_string()));
+        }
+
+        let base = OndiskInodeWrapper::inode_xattr_size(inode)
+            + (idx as usize * size_of::<RafsV6InodeChunkAddr>());
+        let offset = base.checked_add(self.offset).ok_or_else(|| {
+            RafsError::InvalidMetadata(
+                "v6: invalid offset or index to calculate chunk address".to_string(),
+            )
+        })?;
+        Ok(*state.map.get_ref::<RafsV6InodeChunkAddr>(offset)?)
+    }
+
     fn blocks_count(&self) -> u64 {
         self.blocks_count
     }
@@ -1371,19 +1389,7 @@ impl RafsInodeExt for OndiskInodeWrapper {
     /// It depends on Self::validate() to ensure valid memory layout.
     fn get_chunk_info(&self, idx: u32) -> RafsResult<Arc<dyn BlobChunkInfo>> {
         let state = self.state();
-        let inode = self.disk_inode(&state);
-        if !self.is_reg() || idx >= self.get_chunk_count() {
-            return Err(RafsError::NotFound("invalid chunk info".to_string()));
-        }
-
-        let base = OndiskInodeWrapper::inode_xattr_size(inode)
-            + (idx as usize * size_of::<RafsV6InodeChunkAddr>());
-        let offset = base.checked_add(self.offset).ok_or_else(|| {
-            RafsError::InvalidMetadata(
-                "v6: invalid offset or index to calculate chunk address".to_string(),
-            )
-        })?;
-        let chunk_addr = state.map.get_ref::<RafsV6InodeChunkAddr>(offset)?;
+        let chunk_addr = &self.get_chunk_addr(idx)?;
         // Cloned out of the lock: `get_chunk_info` can reload blob.meta from the backend,
         // and holding the lock across that stalls every other chunk lookup.
         let device = self.mapping.device.lock().unwrap().clone();
