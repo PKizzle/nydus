@@ -109,6 +109,12 @@ pub struct SnapshotterSection {
     /// table name via serde alias for back-compat.
     #[serde(default, alias = "spegel_mirror")]
     pub peer_mirror: PeerMirrorConfig,
+
+    /// Who may publish a referrer bootstrap the snapshotter serves. Consulted
+    /// only when `features.referrer_detect` is on; with no matching rule no
+    /// referrer is served.
+    #[serde(default)]
+    pub referrer_trust: ReferrerTrustConfig,
 }
 
 impl Default for SnapshotterSection {
@@ -131,6 +137,7 @@ impl Default for SnapshotterSection {
             auto_zran: AutoZranConfig::default(),
             containerd: ContainerdConfig::default(),
             peer_mirror: PeerMirrorConfig::default(),
+            referrer_trust: ReferrerTrustConfig::default(),
         }
     }
 }
@@ -430,6 +437,12 @@ pub enum ConfigError {
         memory_high: String,
         memory_max: String,
     },
+    #[error("invalid [[snapshotter.referrer_trust.rules]] entry {scope:?}")]
+    InvalidReferrerTrustRule {
+        scope: String,
+        #[source]
+        source: crate::source::trust::TrustError,
+    },
     #[error("invalid [snapshotter.cgroup].{field} value {value:?}: {reason}")]
     InvalidCgroupMemorySetting {
         field: &'static str,
@@ -642,20 +655,21 @@ pub struct MetricsConfig {
 /// Feature flags.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct FeaturesConfig {
-    /// Detect *published* nydus images via the OCI referrers API (the
-    /// referrer-artifact distribution model nydusify / the Go snapshotter
-    /// produce).
+    /// Serve *published* nydus images found as OCI referrers of the image
+    /// (the nydusify `--with-referrer` / Go-snapshotter distribution model).
     ///
-    /// ON by default. Serving is implemented (B4b) and e2e-verified: on a
-    /// `Prepare` for a published nydus image the snapshotter fetches and
-    /// sha256-verifies the bootstrap and mounts the daemon via the shared
-    /// `ensure_instance` path (nydusd's registry backend then serves data blobs
-    /// on demand). Every step is best-effort and NON-FATAL — any detection /
-    /// fetch / mount error falls through to plain overlay, so a pod is never
-    /// blocked, and results are cached. Set to `false` to disable referrer
-    /// probing entirely.
-    #[serde(default = "default_true")]
+    /// OFF by default: anyone who can push to a repository can attach a
+    /// referrer, and its bootstrap defines the whole file tree. When on, a
+    /// referrer is served only if `[snapshotter.referrer_trust]` trusts its
+    /// cosign signature (see `source::trust`). Every failure falls through to
+    /// plain overlay, so a pod is never blocked.
+    #[serde(default)]
     pub referrer_detect: bool,
+    /// Serve the nydus manifest published as a sibling entry of the image's own
+    /// index (a dual image, `nydusify --attach-oci-manifest`). The image digest
+    /// names that entry, so it needs no signature. ON by default.
+    #[serde(default = "default_true")]
+    pub dual_index_detect: bool,
     #[serde(default)]
     pub encryption: bool,
     /// Prefetch files ahead of first access on fusedev RAFS mounts: the runtime
@@ -674,15 +688,51 @@ impl Default for FeaturesConfig {
     fn default() -> Self {
         // Match the serde field defaults so `FeaturesConfig::default()` (used by
         // `SnapshotterConfig::default()`) and an omitted `[snapshotter.features]`
-        // table agree: referrer detection, prefetch, and metrics all default ON.
+        // table agree.
         Self {
-            referrer_detect: true,
+            referrer_detect: false,
+            dual_index_detect: true,
             encryption: false,
             prefetch: true,
             metrics: true,
             erofs_page_cache_sharing: false,
         }
     }
+}
+
+/// `[snapshotter.referrer_trust]` — the signature policy for referrer serving.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct ReferrerTrustConfig {
+    /// Checked in order; the first rule whose `scope` matches decides.
+    #[serde(default)]
+    pub rules: Vec<ReferrerTrustRule>,
+}
+
+/// One `[[snapshotter.referrer_trust.rules]]` entry.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ReferrerTrustRule {
+    /// Glob over `<registry>/<repository>` (e.g. `ghcr.io/acme/*`). `*` stays
+    /// within one path segment; `**` spans segments.
+    pub scope: String,
+    #[serde(default)]
+    pub verifier: ReferrerVerifier,
+    /// PEM `PUBLIC KEY`s (ECDSA P-256 or Ed25519), as `cosign generate-key-pair`
+    /// writes them. Any one verifying the signature is enough.
+    #[serde(default)]
+    pub public_keys: Vec<String>,
+}
+
+/// Signature scheme a trust rule requires.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ReferrerVerifier {
+    /// cosign key-based signature under the `sha256-<digest>.sig` tag.
+    #[default]
+    CosignKey,
+    /// Not supported: refuses every referrer in the rule's scope.
+    CosignKeyless,
+    /// Not supported: refuses every referrer in the rule's scope.
+    Notation,
 }
 
 /// `[snapshotter.tarfs]` — options for the tarfs (dm-verity block) driver.
@@ -1273,6 +1323,14 @@ impl SnapshotterConfig {
     pub fn validate(&self) -> Result<(), ConfigError> {
         self.backends.validate()?;
         self.snapshotter.cgroup.memory_controls()?;
+        for rule in &self.snapshotter.referrer_trust.rules {
+            crate::source::trust::validate_rule(rule).map_err(|source| {
+                ConfigError::InvalidReferrerTrustRule {
+                    scope: rule.scope.clone(),
+                    source,
+                }
+            })?;
+        }
         Ok(())
     }
 }
@@ -1639,31 +1697,29 @@ mod tests {
         assert!(!cfg.snapshotter.tarfs.verity);
     }
 
-    /// Referrer detection now ships ON (serving is implemented + e2e-verified;
-    /// every failure falls through to overlay). Pin both the struct default and
-    /// the "field absent from TOML" deserialize default so a config that never
-    /// mentions the flag gets detection enabled, and the two paths agree.
+    /// Referrer serving is opt-in: anyone who can push to a repository can
+    /// attach a referrer, and its bootstrap defines the whole file tree. Pin
+    /// both the struct default and the "field absent from TOML" default.
     #[test]
-    fn referrer_detect_defaults_on() {
+    fn referrer_detect_defaults_off() {
         assert!(
-            SnapshotterConfig::default()
+            !SnapshotterConfig::default()
                 .snapshotter
                 .features
                 .referrer_detect,
-            "referrer_detect must default on"
+            "referrer_detect must default off"
         );
         let features: FeaturesConfig =
             toml::from_str("").expect("empty features table must deserialize");
         assert!(
-            features.referrer_detect,
-            "an omitted referrer_detect must deserialize to on"
+            !features.referrer_detect,
+            "an omitted referrer_detect must deserialize to off"
         );
-        // An explicit opt-out must still be honoured.
-        let disabled: FeaturesConfig =
-            toml::from_str("referrer_detect = false").expect("explicit opt-out must deserialize");
+        let enabled: FeaturesConfig =
+            toml::from_str("referrer_detect = true").expect("explicit opt-in must deserialize");
         assert!(
-            !disabled.referrer_detect,
-            "an explicit referrer_detect = false must stay off"
+            enabled.referrer_detect,
+            "an explicit referrer_detect = true must stay on"
         );
     }
 
@@ -1680,6 +1736,10 @@ mod tests {
         assert_eq!(
             structural.referrer_detect, deserialized.referrer_detect,
             "referrer_detect: Default and serde default diverge"
+        );
+        assert_eq!(
+            structural.dual_index_detect, deserialized.dual_index_detect,
+            "dual_index_detect: Default and serde default diverge"
         );
         assert_eq!(
             structural.encryption, deserialized.encryption,

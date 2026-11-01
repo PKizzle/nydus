@@ -173,6 +173,9 @@ sha2 = "0.11"
 # implements `LowerHex`, so `format!("{:x}", hasher.finalize())` won't compile.
 # `hex` formats the digest into a hex string and is the idiomatic replacement.
 hex = "0.4"
+# Cosign signature verification for referrer trust (ECDSA P-256 / Ed25519);
+# already in the graph as the rustls crypto provider.
+ring = "0.17"
 # Used by `content_store` to look up the `k3s` / `ctr` binary at runtime.
 which = "8"
 # Used by `content_store::write_blob_from_data` for an O_CREAT|O_EXCL +

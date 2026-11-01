@@ -26,11 +26,19 @@ data:
 
     [snapshotter.features]
     referrer_detect = {{ .Values.config.features.referrerDetect }}
+    dual_index_detect = {{ .Values.config.features.dualIndexDetect }}
     prefetch = {{ .Values.config.features.prefetch }}
     metrics = {{ .Values.config.features.metrics }}
     # PLACEHOLDER: a TCP metrics endpoint (+ Service / Prometheus ServiceMonitor) is not
     # exposed yet — it depends on the separate metrics-endpoint change (C1). Once that
     # lands, surface `metrics_address = "0.0.0.0:<port>"` here and add the Service.
+    {{- range .Values.config.referrerTrust.rules }}
+
+    [[snapshotter.referrer_trust.rules]]
+    scope = {{ .scope | quote }}
+    verifier = {{ .verifier | default "cosign-key" | quote }}
+    public_keys = [{{ range $i, $key := .publicKeys }}{{ if $i }}, {{ end }}{{ $key | toJson }}{{ end }}]
+    {{- end }}
 
     {{- with .Values.config.peerMirror }}
     # Peer-mirror (registry-free P2P layer fetch via a node-local mirror, e.g. k3s'

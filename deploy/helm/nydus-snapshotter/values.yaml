@@ -81,12 +81,27 @@ config:
     - { type: blockdev, mode: loop, requireCaps: ["CAP_SYS_ADMIN"] }
     - { type: fusedev }
   features:
-    referrerDetect: true
+    # Referrer serving is opt-in and needs referrerTrust rules (cosign keys).
+    referrerDetect: false
+    dualIndexDetect: true
     prefetch: true
     # Enables the in-snapshotter metrics collector. NOTE: the TCP metrics endpoint +
     # its Service/ServiceMonitor are not wired here yet (depends on the metrics-endpoint
     # change, C1) — see the commented placeholder in templates/configmap.yaml.
     metrics: true
+  # Who may publish a referrer the snapshotter serves (only with referrerDetect: true).
+  # The first rule whose scope glob matches "<registry>/<repository>" decides; the
+  # referrer manifest must carry a `cosign sign --key` signature from one of its keys
+  # (ECDSA P-256 or Ed25519 PEM). Keyless and notation verifiers are not supported.
+  referrerTrust:
+    rules: []
+    # - scope: "ghcr.io/acme/*"
+    #   verifier: cosign-key
+    #   publicKeys:
+    #     - |
+    #       -----BEGIN PUBLIC KEY-----
+    #       ...
+    #       -----END PUBLIC KEY-----
   # Peer-mirror (registry-free P2P layer fetch via a node-local mirror such as k3s'
   # embedded Spegel). `preset` bundles endpoint + mTLS cert paths + peer-discovery:
   #   k3s-spegel -> k3s' embedded Spegel (endpoint 127.0.0.1:6443 + k3s agent certs +

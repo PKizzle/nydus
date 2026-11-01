@@ -867,31 +867,27 @@ impl snapshots::Snapshotter for NydusSnapshotter {
                         return Ok(self.rewrite_mounts_with_daemon(&key, &daemon_mnt, false));
                     }
 
-                    // Referrer serving (on by default; see
-                    // `FeaturesConfig::default` and the test pinning it).
-                    // When `features.referrer_detect` is enabled, consult the OCI
-                    // referrers API to see whether this image ref is a
-                    // *published* nydus image (bootstrap distributed as a
-                    // referrer artifact, the nydusify / Go-snapshotter model).
-                    // On a NydusRafs hit we fetch + digest-verify the bootstrap
-                    // (`materialize_bootstrap_blocking`) and mount the daemon
-                    // via the shared `ensure_instance` path — the very same
-                    // mount used by `resolve_nydus_mount` — then substitute the
-                    // daemon mount for the overlay. nydusd's registry backend
-                    // (built from `image_ref`) serves every data blob on demand
-                    // from `/v2/<repo>/blobs/sha256:<blob_id>`, so the bootstrap
-                    // is the only artifact materialized here.
+                    // Published nydus images: a nydus entry of the image's own
+                    // index (`features.dual_index_detect`, default on) or an
+                    // OCI referrer artifact (`features.referrer_detect`, default
+                    // off, served only when `[snapshotter.referrer_trust]`
+                    // accepts its cosign signature -- see `source::trust`). On a
+                    // NydusRafs hit we fetch + digest-verify the bootstrap
+                    // (`materialize_bootstrap_blocking`, which also enforces the
+                    // trust policy and blob binding) and mount the daemon via the
+                    // shared `ensure_instance` path, then substitute the daemon
+                    // mount for the overlay. nydusd's registry backend (built
+                    // from `image_ref`) serves every data blob on demand.
                     //
-                    // Like the auto-accel branch above, this is best-effort and
-                    // NON-FATAL: every detection / auth / network / materialize
-                    // / daemon-start error is swallowed and control falls through
-                    // to the overlay / access-tracer path, so a pod is NEVER
-                    // blocked on referrer serving. Runs off the gRPC runtime
-                    // (cyper is `!Send`) via the `*_blocking` helpers; the
-                    // module-global LRU caches both nydus hits and StandardOci
-                    // misses, so detection costs at most one registry round-trip
-                    // cluster-lifetime and the bootstrap is cached on disk.
-                    if self.config.snapshotter.features.referrer_detect
+                    // Best-effort and NON-FATAL: every detection / trust / auth /
+                    // network / materialize / daemon-start failure logs one
+                    // warning and falls through to the overlay / access-tracer
+                    // path, so a pod is NEVER blocked on this. Runs off the gRPC
+                    // runtime (cyper is `!Send`) via the `*_blocking` helpers;
+                    // detection results are cached per image ref and the
+                    // bootstrap is cached on disk.
+                    let features = &self.config.snapshotter.features;
+                    if (features.referrer_detect || features.dual_index_detect)
                         && let Some(image_ref) = image_ref.as_deref()
                     {
                         use crate::source::referrer::ImageType;
@@ -903,7 +899,7 @@ impl snapshots::Snapshotter for NydusSnapshotter {
                         {
                             Ok(info) => match info.image_type {
                                 ImageType::NydusRafs => {
-                                    if let Some(bootstrap_digest) = info.bootstrap_digest.as_deref() {
+                                    if let Some(bootstrap_digest) = info.bootstrap_digest.clone() {
                                         // `materialize_bootstrap_blocking` is
                                         // synchronous and blocks its thread on
                                         // the compio HTTP runtime; offload it
@@ -914,13 +910,13 @@ impl snapshots::Snapshotter for NydusSnapshotter {
                                         // `detect_referrer_blocking`).
                                         let materialized = {
                                             let image_ref = image_ref.to_string();
-                                            let bootstrap_digest = bootstrap_digest.to_string();
+                                            let info = info.clone();
                                             let config = self.config.clone();
                                             let root = self.config.snapshotter.root.clone();
                                             blocking::unblock(move || {
                                                 crate::source::referrer::materialize_bootstrap_blocking(
                                                     &image_ref,
-                                                    &bootstrap_digest,
+                                                    &info,
                                                     &config,
                                                     &root,
                                                 )
@@ -946,9 +942,10 @@ impl snapshots::Snapshotter for NydusSnapshotter {
                                                         handle.mountpoint().to_path_buf();
                                                     info!(
                                                         image = %image_ref,
-                                                        bootstrap = bootstrap_digest,
+                                                        manifest = %bootstrap_digest,
+                                                        referrer_subject = info.referrer_subject.as_deref().unwrap_or("<own index>"),
                                                         mountpoint = %mountpoint.display(),
-                                                        "serving published nydus image via OCI referrers (B4b)"
+                                                        "serving published nydus image"
                                                     );
                                                     // Like the auto-accel branch:
                                                     // no meta layer for remove()
@@ -968,9 +965,9 @@ impl snapshots::Snapshotter for NydusSnapshotter {
                                             },
                                             Err(e) => warn!(
                                                 image = %image_ref,
-                                                bootstrap = bootstrap_digest,
+                                                manifest = %bootstrap_digest,
                                                 error = format!("{e:#}"),
-                                                "failed to materialize referrer bootstrap; falling back to overlay"
+                                                "published nydus bootstrap not served; falling back to overlay"
                                             ),
                                         }
                                     } else {
@@ -1700,14 +1697,15 @@ mod tests {
     /// a plain OCI prepare (even with an image-ref label) returns the overlay
     /// mounts untouched and performs zero referrer interaction. If the referrer
     /// branch were not gated on the flag, this prepare would instead attempt a
-    /// live registry round-trip for the bogus ref. (The flag defaults ON, so
-    /// this test disables it explicitly to exercise the fall-through path.)
+    /// live registry round-trip for the bogus ref. (`dual_index_detect`
+    /// defaults ON, so this test disables both flags explicitly.)
     #[compio::test]
     async fn prepare_with_referrer_detect_off_returns_overlay_mounts() {
         let dir = tempdir().unwrap();
         let mut config = SnapshotterConfig::default();
         config.snapshotter.root = dir.path().to_path_buf();
         config.snapshotter.features.referrer_detect = false;
+        config.snapshotter.features.dual_index_detect = false;
         let snapshotter = test_snapshotter_with_config(dir.path(), config);
         assert!(
             !snapshotter.config.snapshotter.features.referrer_detect,
@@ -1732,6 +1730,7 @@ mod tests {
         let mut config = SnapshotterConfig::default();
         config.snapshotter.root = root.to_path_buf();
         config.snapshotter.features.referrer_detect = false;
+        config.snapshotter.features.dual_index_detect = false;
         test_snapshotter_with_config(root, config)
     }
 

@@ -17,6 +17,9 @@
 //! selection rules (annotation first, bootstrap media type second — never a
 //! loose "contains nydus" match, which once selected data blobs).
 //!
+//! Referrers are consulted only with `features.referrer_detect` (off by
+//! default) and served only when the trust policy in [`trust`] accepts them.
+//!
 //! `RegistryClient` is `!Send` (cyper/compio, Rc-based), so it is constructed
 //! and used entirely inside the `blocking::unblock` + thread-local compio
 //! runtime hops (`detect_referrer_blocking` /
@@ -26,11 +29,12 @@ use crate::cache::parse_duration;
 use crate::config::SnapshotterConfig;
 use crate::daemon::auth::resolve_auth;
 use crate::daemon::image_ref::{ImageRef, parse_image_ref};
+use crate::source::trust::{self, TrustError};
 use anyhow::{Context, Result, anyhow, bail};
 use registry_client::{RegistryClient, RegistryClientOptions, RegistryError};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
@@ -55,8 +59,15 @@ pub enum ImageType {
 #[derive(Clone, Debug)]
 pub struct ReferrerInfo {
     pub image_type: ImageType,
+    /// For a nydus hit, the digest of the nydus MANIFEST that carries the
+    /// bootstrap layer.
     pub bootstrap_digest: Option<String>,
     pub fs_driver_hint: Option<String>,
+    /// The image digest a referrer artifact was found for. `Some` means the
+    /// bootstrap comes from a referrer and must pass the trust policy
+    /// ([`trust`]); `None` means a nydus entry of the image's own index, which
+    /// the image digest already names.
+    pub referrer_subject: Option<String>,
 }
 
 /// Small bounded LRU cache for referrer detection results.
@@ -113,6 +124,8 @@ struct OciIndex {
 struct OciManifest {
     #[serde(default)]
     layers: Vec<OciDescriptor>,
+    #[serde(default)]
+    subject: Option<OciDescriptor>,
 }
 
 #[derive(Deserialize)]
@@ -314,10 +327,14 @@ async fn detect(image_ref: &str, config: &SnapshotterConfig) -> Result<Option<Re
     // image -- and this is the only place it gets noticed: containerd resolves the OCI half
     // (first platform match), so Prepare alone would ride the plain-OCI path and the
     // pre-built nydus artifact would go unused.
-    if let Some(bytes) = top_bytes.as_deref()
+    if config.snapshotter.features.dual_index_detect
+        && let Some(bytes) = top_bytes.as_deref()
         && let Some(info) = classify_dual_index(bytes)
     {
         return Ok(Some(info));
+    }
+    if !config.snapshotter.features.referrer_detect {
+        return Ok(None);
     }
 
     // (1) Native referrers API. Deliberately NO server-side artifactType
@@ -330,7 +347,10 @@ async fn detect(image_ref: &str, config: &SnapshotterConfig) -> Result<Option<Re
         Ok(index) => {
             let info = classify_referrers_index(&index)?;
             if info.image_type != ImageType::StandardOci {
-                return Ok(Some(info));
+                return Ok(Some(ReferrerInfo {
+                    referrer_subject: Some(digest),
+                    ..info
+                }));
             }
         }
         Err(RegistryError::ReferrersUnsupported) => {
@@ -353,7 +373,13 @@ async fn detect(image_ref: &str, config: &SnapshotterConfig) -> Result<Option<Re
         Ok(fetched) => {
             let info = detect_from_oci_json(&fetched.bytes)?;
             if info.image_type != ImageType::StandardOci {
-                return Ok(Some(info));
+                // The tag names the artifact manifest itself: serving resolves
+                // the bootstrap from it, and the trust policy signs it.
+                return Ok(Some(ReferrerInfo {
+                    bootstrap_digest: Some(fetched.digest),
+                    referrer_subject: Some(digest),
+                    ..info
+                }));
             }
         }
         // Absent tag or any other HTTP status: no fallback artifact
@@ -433,6 +459,7 @@ fn classify_dual_index(index_bytes: &[u8]) -> Option<ReferrerInfo> {
         image_type: ImageType::NydusRafs,
         bootstrap_digest: Some(entry.digest.clone()),
         fs_driver_hint: None,
+        referrer_subject: None,
     })
 }
 
@@ -459,12 +486,13 @@ pub fn detect_from_oci_json(payload: &[u8]) -> Result<ReferrerInfo> {
         // return the first data blob's digest as the "bootstrap" and the
         // serving path would mount data bytes as RAFS metadata. Target the
         // bootstrap layer specifically (annotation first, then a "bootstrap"
-        // media type), exactly like `select_nydus_bootstrap_layer`.
+        // media type), exactly like `materialize_bootstrap`.
         if let Some(boot) = bootstrap_layer_of(&manifest.layers) {
             return Ok(ReferrerInfo {
                 image_type: ImageType::NydusRafs,
                 bootstrap_digest: Some(boot.digest.clone()),
                 fs_driver_hint: boot.annotations.get(NYDUS_FS_DRIVER_HINT).cloned(),
+                referrer_subject: None,
             });
         }
         // EROFS/blockdev artifacts have no bootstrap layer; they are still
@@ -525,6 +553,7 @@ fn classify_descriptor(desc: &OciDescriptor) -> Option<ReferrerInfo> {
             image_type: ImageType::NydusRafs,
             bootstrap_digest: Some(desc.digest.clone()),
             fs_driver_hint: desc.annotations.get(NYDUS_FS_DRIVER_HINT).cloned(),
+            referrer_subject: None,
         });
     }
     if media_or_artifact.contains("erofs") || media_or_artifact.contains("blockdev") {
@@ -536,6 +565,7 @@ fn classify_descriptor(desc: &OciDescriptor) -> Option<ReferrerInfo> {
                 .get(NYDUS_FS_DRIVER_HINT)
                 .cloned()
                 .or_else(|| Some("blockdev".to_string())),
+            referrer_subject: None,
         });
     }
     None
@@ -546,33 +576,8 @@ fn standard_oci() -> ReferrerInfo {
         image_type: ImageType::StandardOci,
         bootstrap_digest: None,
         fs_driver_hint: None,
+        referrer_subject: None,
     }
-}
-
-/// If `manifest_bytes` parses as an OCI manifest with a non-empty `layers`
-/// array, return the digest of its nydus **bootstrap** layer. Returns `None`
-/// when the bytes are not a manifest with layers (e.g. a raw bootstrap blob) or
-/// when no layer qualifies as the bootstrap, so the caller falls back to the
-/// direct-blob path.
-///
-/// This deliberately does NOT reuse `classify_descriptor`'s loose "contains
-/// nydus/rafs" predicate: a published nydus artifact lists its **data-blob**
-/// layers with mediaType `application/vnd.oci.image.layer.nydus.blob.v1`, which
-/// also contains "nydus". Selecting the first such match would pick a data blob
-/// (typically listed before the bootstrap) and hand `ensure_instance` a blob
-/// that is not a valid RAFS bootstrap. Instead we target the bootstrap layer
-/// specifically, preferring the reliable annotation over a media-type match:
-///   1. a layer annotated `containerd.io/snapshot/nydus-bootstrap == "true"`;
-///   2. else a layer whose mediaType/artifactType contains "bootstrap"
-///      (nydus bootstrap layers use a `...bootstrap.nydus...` media type,
-///      distinct from `...layer.nydus.blob...` data blobs).
-fn select_nydus_bootstrap_layer(manifest_bytes: &[u8]) -> Option<String> {
-    let manifest = serde_json::from_slice::<OciManifest>(manifest_bytes).ok()?;
-    // Shared priority selection (annotation → bootstrap media type) with
-    // `detect_from_oci_json`'s layers branch, so the two consume-side paths
-    // (initial detection via the fallback tag, and the materialize-time
-    // artifact-manifest walk) can never drift apart again.
-    bootstrap_layer_of(&manifest.layers).map(|desc| desc.digest.clone())
 }
 
 /// Verify `bytes` hash to `expected` (a `sha256:<hex>` digest). Security-
@@ -588,16 +593,18 @@ fn verify_bootstrap_digest(bytes: &[u8], expected: &str) -> Result<()> {
     Ok(())
 }
 
-/// Digest-named on-disk path for a materialized bootstrap.
-fn bootstrap_cache_path(dir: &Path, digest: &str) -> PathBuf {
-    dir.join(format!("{}.boot", digest.replace(':', "-")))
+/// Digest-named on-disk path for a materialized bootstrap. The digest comes
+/// from a registry manifest, so only the canonical form may name a file.
+fn bootstrap_cache_path(dir: &Path, digest: &str) -> Result<PathBuf, TrustError> {
+    let digest = trust::validate_digest(digest)?;
+    Ok(dir.join(format!("{}.boot", digest.replace(':', "-"))))
 }
 
 /// Return the cached bootstrap path if it already exists on disk. Content-
 /// addressed + written atomically, so mere existence implies a complete,
 /// digest-verified file.
 fn cached_bootstrap(dir: &Path, digest: &str) -> Option<PathBuf> {
-    let path = bootstrap_cache_path(dir, digest);
+    let path = bootstrap_cache_path(dir, digest).ok()?;
     path.is_file().then_some(path)
 }
 
@@ -612,9 +619,9 @@ fn cached_bootstrap(dir: &Path, digest: &str) -> Option<PathBuf> {
 /// path — which `cached_bootstrap` then trusts forever ("existence implies a
 /// complete, digest-verified file").
 fn write_bootstrap(dir: &Path, digest: &str, bytes: &[u8]) -> Result<PathBuf> {
+    let path = bootstrap_cache_path(dir, digest)?;
     std::fs::create_dir_all(dir)
         .with_context(|| format!("create referrer bootstrap dir {}", dir.display()))?;
-    let path = bootstrap_cache_path(dir, digest);
     if let Ok(meta) = std::fs::metadata(&path)
         && meta.is_file()
         && meta.len() == bytes.len() as u64
@@ -635,75 +642,86 @@ fn write_bootstrap(dir: &Path, digest: &str, bytes: &[u8]) -> Result<PathBuf> {
     Ok(path)
 }
 
-/// Fetch and materialize the bootstrap for a published (referrer-distributed)
-/// nydus image, returning the on-disk path to the digest-verified bootstrap.
+/// Fetch and materialize the bootstrap of a detected nydus image, returning the
+/// on-disk path to the digest-verified bootstrap.
 ///
-/// `bootstrap_digest` (from [`ReferrerInfo`]) is EITHER an artifact-manifest
-/// digest (referrers-index path) or a bootstrap-blob digest (manifest-layers
-/// path). We probe the manifest endpoint first: if the digest resolves to an
-/// OCI manifest carrying a nydus-bootstrap layer, that layer's blob is the
-/// bootstrap; otherwise `bootstrap_digest` is itself the bootstrap blob and we
-/// fetch it directly. The final blob is sha256-verified before it touches disk.
+/// `info.bootstrap_digest` names the nydus manifest. A referrer
+/// (`info.referrer_subject` set) must name the prepared image as its subject
+/// and carry a signature the trust policy accepts. In every case each blob the
+/// bootstrap reads must be listed in that manifest. A refusal is returned as a
+/// [`TrustError`] in the chain.
 pub async fn materialize_bootstrap(
     image_ref: &str,
-    bootstrap_digest: &str,
+    info: &ReferrerInfo,
     config: &SnapshotterConfig,
     cache_dir: &Path,
 ) -> Result<PathBuf> {
+    let manifest_digest = trust::validate_digest(info.bootstrap_digest.as_deref().unwrap_or(""))?;
     let parsed = parse_image_ref(image_ref).context("invalid image reference")?;
     let client = build_registry_client(&parsed, config)?;
     let repo = parsed.repo.as_str();
     let dir = cache_dir.join("referrer-bootstraps");
 
-    // Fast path: the referrer digest may itself be the (already-materialized)
-    // bootstrap blob (manifest-layers path). Avoids any network round-trip.
-    if let Some(path) = cached_bootstrap(&dir, bootstrap_digest) {
-        debug!(image = %image_ref, bootstrap = bootstrap_digest, "reusing cached referrer bootstrap");
-        return Ok(path);
+    // By digest, so `get_manifest` verifies the bytes against it.
+    let fetched = client
+        .get_manifest(repo, manifest_digest)
+        .await
+        .with_context(|| format!("fetch nydus manifest {manifest_digest}"))?;
+    let manifest: OciManifest =
+        serde_json::from_slice(&fetched.bytes).context("parse nydus manifest")?;
+
+    if let Some(subject) = info.referrer_subject.as_deref() {
+        let actual = manifest.subject.as_ref().map(|s| s.digest.clone());
+        if actual.as_deref() != Some(subject) {
+            return Err(TrustError::SubjectMismatch {
+                expected: subject.to_string(),
+                actual,
+            }
+            .into());
+        }
+        trust::verify_referrer(
+            &client,
+            repo,
+            &format!("{}/{}", parsed.host, parsed.repo),
+            manifest_digest,
+            &config.snapshotter.referrer_trust,
+        )
+        .await?;
     }
 
-    // Probe the manifest endpoint. A bootstrap-blob digest 404s here, so an
-    // error just routes us to the direct-blob branch below. (`get_manifest`
-    // by digest also verifies the returned bytes against it.)
-    let layer_digest = match client.get_manifest(repo, bootstrap_digest).await {
-        Ok(fetched) => select_nydus_bootstrap_layer(&fetched.bytes),
-        Err(e) => {
-            debug!(image = %image_ref, bootstrap = bootstrap_digest, error = %e, "manifest probe failed; treating referrer digest as a bootstrap blob");
-            None
-        }
-    };
-
-    let (final_digest, bytes) = match layer_digest {
-        Some(layer_digest) => {
-            // Artifact-manifest path: the bootstrap is the nydus layer blob.
-            if let Some(path) = cached_bootstrap(&dir, &layer_digest) {
-                debug!(image = %image_ref, bootstrap = %layer_digest, "reusing cached referrer bootstrap layer");
-                return Ok(path);
-            }
+    let layer_digest = bootstrap_layer_of(&manifest.layers)
+        .map(|desc| desc.digest.clone())
+        .ok_or_else(|| anyhow!("nydus manifest {manifest_digest} has no bootstrap layer"))?;
+    trust::validate_digest(&layer_digest)?;
+    let path = match cached_bootstrap(&dir, &layer_digest) {
+        Some(path) => path,
+        None => {
             let bytes = client
                 .get_blob(repo, &layer_digest)
                 .await
                 .with_context(|| format!("fetch nydus bootstrap layer {layer_digest}"))?;
-            (layer_digest, bytes)
-        }
-        None => {
-            // Direct-blob path: bootstrap_digest is the bootstrap blob.
-            let bytes = client
-                .get_blob(repo, bootstrap_digest)
-                .await
-                .with_context(|| format!("fetch referrer bootstrap blob {bootstrap_digest}"))?;
-            (bootstrap_digest.to_string(), bytes)
+            // Never write or mount an unverified bootstrap.
+            verify_bootstrap_digest(&bytes, &layer_digest)?;
+            // A referrer artifact ships the bootstrap raw; a nydus image manifest
+            // (the dual-index path) ships it as a gzip tar holding
+            // image/image.boot. Unwrap AFTER digest verification -- the declared
+            // digest is of the layer blob, not its contents.
+            let bytes = maybe_unwrap_bootstrap_layer(bytes)?;
+            let path = write_bootstrap(&dir, &layer_digest, &bytes)?;
+            info!(image = %image_ref, bootstrap = %layer_digest, path = %path.display(), "materialized nydus bootstrap");
+            path
         }
     };
 
-    // Never write or mount an unverified bootstrap.
-    verify_bootstrap_digest(&bytes, &final_digest)?;
-    // A referrer artifact ships the bootstrap raw; a nydus image manifest (the dual-index
-    // path) ships it as a gzip tar holding image/image.boot. Unwrap AFTER digest
-    // verification -- the declared digest is of the layer blob, not its contents.
-    let bytes = maybe_unwrap_bootstrap_layer(bytes)?;
-    let path = write_bootstrap(&dir, &final_digest, &bytes)?;
-    info!(image = %image_ref, bootstrap = %final_digest, path = %path.display(), "materialized referrer bootstrap");
+    // Checked on cache hits too: the same bootstrap may arrive under a
+    // manifest that lists different blobs.
+    let listed: HashSet<String> = manifest
+        .layers
+        .iter()
+        .filter_map(|desc| desc.digest.strip_prefix("sha256:"))
+        .map(str::to_string)
+        .collect();
+    trust::check_blob_binding(&path, &listed)?;
     Ok(path)
 }
 
@@ -721,18 +739,12 @@ pub async fn materialize_bootstrap(
 /// usable from ordinary synchronous code.
 pub fn materialize_bootstrap_blocking(
     image_ref: &str,
-    bootstrap_digest: &str,
+    info: &ReferrerInfo,
     config: &SnapshotterConfig,
     cache_dir: &Path,
 ) -> Result<PathBuf> {
-    REFERRER_HTTP_RUNTIME.with(|rt| {
-        rt.block_on(materialize_bootstrap(
-            image_ref,
-            bootstrap_digest,
-            config,
-            cache_dir,
-        ))
-    })
+    REFERRER_HTTP_RUNTIME
+        .with(|rt| rt.block_on(materialize_bootstrap(image_ref, info, config, cache_dir)))
 }
 
 /// The referrers-API fallback tag for a subject digest: `sha256:<hex>`
@@ -1250,6 +1262,7 @@ mod tests {
             image_type: ImageType::NydusRafs,
             bootstrap_digest: Some("sha256:cachedboot".to_string()),
             fs_driver_hint: Some("fanotify".to_string()),
+            referrer_subject: None,
         };
         global_cache()
             .lock()
@@ -1263,18 +1276,24 @@ mod tests {
         assert_eq!(info.bootstrap_digest.as_deref(), Some("sha256:cachedboot"));
     }
 
+    /// The bootstrap layer `materialize_bootstrap` selects from manifest bytes.
+    fn select_nydus_bootstrap_layer(manifest_bytes: &[u8]) -> Option<String> {
+        let manifest = serde_json::from_slice::<OciManifest>(manifest_bytes).ok()?;
+        bootstrap_layer_of(&manifest.layers).map(|desc| desc.digest.clone())
+    }
+
     fn sha256_digest(bytes: &[u8]) -> String {
         format!("sha256:{}", hex::encode(Sha256::digest(bytes)))
     }
 
-    /// (i) Direct-blob case: a raw bootstrap blob is not JSON, so layer
-    /// selection returns None and `materialize_bootstrap` takes the direct path.
+    /// (i) Bytes that are not a manifest with a bootstrap layer select nothing,
+    /// and `materialize_bootstrap` refuses them.
     #[test]
     fn select_layer_returns_none_for_raw_bootstrap_blob() {
         // Arbitrary binary that is not valid OCI-manifest JSON.
         let blob = [0u8, 1, 2, 3, 0xff, 0xfe, b'{', b'x'];
         assert_eq!(select_nydus_bootstrap_layer(&blob), None);
-        // An empty-layers manifest is also treated as a direct blob.
+        // An empty-layers manifest selects nothing either.
         let empty = br#"{"layers":[]}"#;
         assert_eq!(select_nydus_bootstrap_layer(empty), None);
     }
@@ -1389,6 +1408,31 @@ mod tests {
         let second = write_bootstrap(&root, &digest, bytes).unwrap();
         assert_eq!(first, second);
         assert_eq!(std::fs::read(&second).unwrap(), bytes);
+    }
+
+    /// A digest becomes a file name only in its canonical `sha256:<64 lowercase
+    /// hex>` form: anything else could name a path outside the cache dir, or two
+    /// names for one blob.
+    #[test]
+    fn bootstrap_paths_require_a_canonical_digest() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("referrer-bootstraps");
+        let hex = "a".repeat(64);
+        for bad in [
+            "sha256:../../../etc/passwd".to_string(),
+            format!("sha256:{}", hex.to_ascii_uppercase()),
+            format!("sha256:{}", &hex[..63]),
+            format!("sha512:{hex}"),
+            format!("sha256:{hex}/x"),
+            hex.clone(),
+        ] {
+            assert!(
+                write_bootstrap(&root, &bad, b"x").is_err(),
+                "{bad:?} must not become a path"
+            );
+            assert!(cached_bootstrap(&root, &bad).is_none());
+        }
+        assert!(write_bootstrap(&root, &format!("sha256:{hex}"), b"x").is_ok());
     }
 
     /// StandardOci results are cached too, so a plain image also costs at most

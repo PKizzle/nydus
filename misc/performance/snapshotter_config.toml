@@ -32,6 +32,7 @@ address = "/run/containerd-nydus/system.sock"
 
 [snapshotter.features]
 referrer_detect = false
+dual_index_detect = false
 prefetch = false
 metrics = true
 

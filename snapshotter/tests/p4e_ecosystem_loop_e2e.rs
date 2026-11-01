@@ -5,15 +5,16 @@
 //! P4e ecosystem-loop e2e: prove the RUST NYDUSIFY push side and the
 //! SNAPSHOTTER consume side agree on the referrer-artifact contract.
 //!
-//! Unlike `b4b_referrer_e2e.rs` (which is handed explicit digests), this test
-//! is DISCOVERY-DRIVEN: it starts from the ORIGINAL image reference — exactly
+//! This test is DISCOVERY-DRIVEN: it starts from the ORIGINAL image reference — exactly
 //! what `prepare()` has — and exercises the full consume path:
 //!
 //!   1. `detect_referrer_with_config(<original ref>)` must classify the image
 //!      as `NydusRafs` by finding the artifact nydusify pushed (referrers API
 //!      or the `sha256-<subject>` fallback tag) and yield a bootstrap digest.
-//!   2. `materialize_bootstrap_blocking` must fetch + sha256-verify the
-//!      bootstrap through the artifact-manifest walk.
+//!   2. The test signs the artifact manifest the way `cosign sign --key` does
+//!      and trusts that key for the repository; `materialize_bootstrap_blocking`
+//!      must then verify the signature and blob binding, and fetch +
+//!      sha256-verify the bootstrap through the artifact-manifest walk.
 //!   3. The bytes must equal the bootstrap nydusify produced locally.
 //!
 //! Gated on `P4E_E2E=1` + a fixture pushed by `misc/p4e-ecosystem-loop-test.sh`:
@@ -25,13 +26,20 @@
 //! against the source rootfs) is the stronger, non-circular assertion; this
 //! test proves the DISCOVERY contract and hands the bootstrap over.
 
-use nydus_snapshotter::config::{RegistryBackendConfig, SnapshotterConfig};
+mod common;
+
+use nydus_snapshotter::config::{
+    ReferrerTrustRule, ReferrerVerifier, RegistryBackendConfig, SnapshotterConfig,
+};
+use nydus_snapshotter::daemon::image_ref::parse_image_ref;
 use nydus_snapshotter::source::referrer::{
     ImageType, detect_referrer_with_config, materialize_bootstrap_blocking,
 };
+use registry_client::{RegistryClient, RegistryClientOptions};
 
 fn skip_verify_config() -> SnapshotterConfig {
     let mut config = SnapshotterConfig::default();
+    config.snapshotter.features.referrer_detect = true;
     config.backends.registry = Some(RegistryBackendConfig {
         mirrors: Vec::new(),
         skip_verify: true,
@@ -54,8 +62,8 @@ fn discovery_driven_detect_and_materialize_from_original_ref() {
     let config = skip_verify_config();
 
     // 1. Discovery from the ORIGINAL ref — the exact call prepare() makes.
-    let info = compio::runtime::Runtime::new()
-        .expect("compio runtime")
+    let rt = compio::runtime::Runtime::new().expect("compio runtime");
+    let info = rt
         .block_on(detect_referrer_with_config(&image_ref, &config))
         .expect("referrer detection must succeed against the live registry");
     assert_eq!(
@@ -65,20 +73,43 @@ fn discovery_driven_detect_and_materialize_from_original_ref() {
     );
     let bootstrap_digest = info
         .bootstrap_digest
+        .clone()
         .expect("detection must yield a bootstrap digest");
     eprintln!("P4E-E2E: detected NydusRafs via referrers, digest={bootstrap_digest}");
 
-    // 2. Materialize through the artifact-manifest walk into the harness dir.
-    let path = materialize_bootstrap_blocking(
-        &image_ref,
-        &bootstrap_digest,
-        &config,
-        std::path::Path::new(&out_dir),
-    )
-    .expect("materialize (artifact-manifest walk)");
+    // 2. Sign the artifact with a fresh key and trust it for this repository.
+    let parsed = parse_image_ref(&image_ref).expect("parse image ref");
+    let (pair, pem) = common::key();
+    // RegistryClient::new needs a current compio runtime.
+    rt.block_on(async {
+        let client = RegistryClient::new(
+            &parsed.api_host,
+            RegistryClientOptions {
+                insecure_tls: true,
+                ..RegistryClientOptions::default()
+            },
+        )
+        .expect("registry client");
+        let registry = common::Registry {
+            client,
+            repo: parsed.repo.clone(),
+        };
+        registry.sign(&pair, &bootstrap_digest).await
+    });
+    let mut config = config;
+    config.snapshotter.referrer_trust.rules = vec![ReferrerTrustRule {
+        scope: format!("{}/{}", parsed.host, parsed.repo),
+        verifier: ReferrerVerifier::CosignKey,
+        public_keys: vec![pem],
+    }];
+
+    // 3. Materialize through the artifact-manifest walk into the harness dir.
+    let path =
+        materialize_bootstrap_blocking(&image_ref, &info, &config, std::path::Path::new(&out_dir))
+            .expect("materialize (artifact-manifest walk)");
     eprintln!("P4E-E2E: materialized bootstrap at {}", path.display());
 
-    // 3. Optional byte-compare when the harness kept nydusify's local copy;
+    // 4. Optional byte-compare when the harness kept nydusify's local copy;
     //    the harness's nydusd serve leg is the primary content assertion.
     if let Ok(expected_path) = std::env::var("P4E_EXPECTED") {
         let expected = std::fs::read(&expected_path).expect("read expected bootstrap");

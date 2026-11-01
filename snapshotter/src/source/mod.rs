@@ -10,6 +10,7 @@
 pub mod encryption;
 pub mod labels;
 pub mod referrer;
+pub mod trust;
 
 pub use labels::{
     CRI_IMAGE_REF, CRI_LAYER_DIGEST, LayerKind, NYDUS_BLOB_DIGEST, NYDUS_BLOB_SIZE,

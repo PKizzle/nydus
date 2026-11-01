@@ -3664,6 +3664,7 @@ dependencies = [
  "prost",
  "prost-types",
  "registry-client",
+ "ring",
  "rustls",
  "rustls-platform-verifier",
  "send_wrapper",

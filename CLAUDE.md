@@ -162,6 +162,14 @@ nydus/
     superblock) and the merge keeps a lower directory's metadata under it, while an explicit directory
     entry replaces it. Per-layer `create` and `merge` must be the same `nydus-image` build. Rules and
     accepted deviations: "Layer apply model" in [docs/nydus-image.md](docs/nydus-image.md).
+12. **A referrer bootstrap is untrusted input**: anyone with push access to a repository can attach
+    a referrer, and its bootstrap defines the whole file tree (setuid bits included), even over
+    verified data blobs. `referrer_detect` is off by default, and when on, a referrer is served only
+    if its `subject` is the prepared image, a `[[snapshotter.referrer_trust.rules]]` key verifies its
+    cosign key-based signature, and every blob in the bootstrap's blob table is listed in the signed
+    manifest (`snapshotter/src/source/trust.rs`). Never add a serving path that skips these checks.
+    A dual image's own-index nydus entry (`dual_index_detect`, default on) is covered by the image
+    digest and needs no signature. Digests become paths only as `sha256:<64 lowercase hex>`.
 
 ## Node-local acceleration (transparent, no tag change)
 
