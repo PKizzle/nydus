@@ -383,6 +383,23 @@ fn parent_chain_digest(parent: &str) -> Option<&str> {
     (hex.len() == 64 && hex.chars().all(|c| c.is_ascii_hexdigit())).then_some(suffix)
 }
 
+/// What a sidecar must match before `resolve_auto_accel_mount` serves it.
+/// An image ref is usually a tag, and the manifest it points at now may not
+/// be the content the snapshot was built from.
+#[derive(Clone, Copy, Debug)]
+enum AccelIdentity<'a> {
+    /// A new snapshot: the parent's chainID must be the image's topmost chainID.
+    Parent(&'a str),
+    /// A snapshot already routed to a daemon: the sidecar must stage this bootstrap.
+    Bootstrap(&'a Path),
+}
+
+/// Whether an image whose rootfs has topmost chainID `image_chain` is the
+/// content of `parent`. A parent without a chain digest matches nothing.
+fn image_is_parent(image_chain: &str, parent: &str) -> bool {
+    parent_chain_digest(parent) == Some(image_chain)
+}
+
 /// The main snapshotter implementation.
 ///
 /// Bridges containerd's gRPC proxy-plugin protocol to the overlay engine
@@ -494,8 +511,8 @@ impl NydusSnapshotter {
     /// spegel-mirrored). Returns the daemon mountpoint to substitute for the
     /// overlay mount plus the bootstrap it serves, or `Ok(None)` when no
     /// sidecar exists or auto-accel is disabled — the caller falls back to
-    /// overlay. With `expected_bootstrap`, a sidecar staging any other
-    /// bootstrap (the tag now points at other content) is also `Ok(None)`.
+    /// overlay. So is a sidecar of other content than `identity` names (the
+    /// tag now points at another image).
     ///
     /// Distinct from `resolve_nydus_mount` (which handles tag-of-image-was-
     /// converted nydus-meta layers) because the auto-accel path uses a
@@ -505,7 +522,7 @@ impl NydusSnapshotter {
         &self,
         image_ref: &str,
         holder: &str,
-        expected_bootstrap: Option<&Path>,
+        identity: AccelIdentity<'_>,
     ) -> Result<Option<(PathBuf, PathBuf)>, SnapshotterError> {
         let (Some(discovery), Some(lookup), Some(content_root)) = (
             self.auto_accel_discovery.as_ref(),
@@ -521,6 +538,22 @@ impl NydusSnapshotter {
                 return Ok(None);
             }
         };
+        if let AccelIdentity::Parent(parent) = identity
+            && !image_is_parent(&info.chain_id, parent)
+        {
+            debug!(
+                image_ref,
+                parent,
+                image_chain = %info.chain_id,
+                "auto-accel image ref points at other content than the parent; falling back to overlay"
+            );
+            // A cached chain → ref entry left behind by a repointed tag:
+            // drop it so the next prepare walks containerd again.
+            if let Some(chain) = parent_chain_digest(parent) {
+                lookup.forget(chain, image_ref);
+            }
+            return Ok(None);
+        }
         let staged = match discovery.resolve(&info.manifest_digest).await {
             Ok(Some(s)) => s,
             Ok(None) => {
@@ -541,7 +574,9 @@ impl NydusSnapshotter {
                 return Ok(None);
             }
         };
-        if expected_bootstrap.is_some_and(|b| b != staged.bootstrap) {
+        if let AccelIdentity::Bootstrap(b) = identity
+            && b != staged.bootstrap
+        {
             debug!(
                 image_ref,
                 staged = %staged.bootstrap.display(),
@@ -613,7 +648,7 @@ impl NydusSnapshotter {
             return Ok(Some(handle.mountpoint().to_path_buf()));
         }
         let restarted = self
-            .resolve_auto_accel_mount(image_ref, key, Some(bootstrap))
+            .resolve_auto_accel_mount(image_ref, key, AccelIdentity::Bootstrap(bootstrap))
             .await?
             .map(|(mountpoint, _)| mountpoint);
         if restarted.is_none() {
@@ -858,7 +893,7 @@ impl snapshots::Snapshotter for NydusSnapshotter {
                     // serves them on demand from the merged bootstrap.
                     if let Some(image_ref) = image_ref.as_deref()
                         && let Some((daemon_mnt, bootstrap)) =
-                            self.resolve_auto_accel_mount(image_ref, &key, None).await?
+                            self.resolve_auto_accel_mount(image_ref, &key, AccelIdentity::Parent(&parent)).await?
                     {
                         info!(key, parent, image_ref, mountpoint = %daemon_mnt.display(), "prepared auto-accel rootfs");
                         // No nydus meta layer exists in this chain for remove()
@@ -2157,6 +2192,18 @@ ead2bc6bac86c94fd0bfe3dda6bd9c1dc39bf2bd2446f8048aee82f437584bb5";
             parent_chain_digest(parent),
             Some("sha256:ead2bc6bac86c94fd0bfe3dda6bd9c1dc39bf2bd2446f8048aee82f437584bb5")
         );
+    }
+
+    #[test]
+    fn image_is_parent_rejects_a_repointed_tag() {
+        let x = format!("sha256:{}", "a".repeat(64));
+        let y = format!("sha256:{}", "b".repeat(64));
+        let parent_x = format!("k8s.io/18004/{x}");
+        assert!(image_is_parent(&x, &parent_x));
+        // The tag moved to Y: its sidecar must not serve X's container.
+        assert!(!image_is_parent(&y, &parent_x));
+        // No chain digest in the parent: nothing proves the content matches.
+        assert!(!image_is_parent(&x, "k8s.io/2/extract-12345-RC1f"));
     }
 
     #[test]
