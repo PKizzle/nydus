@@ -101,7 +101,14 @@ pub trait NydusDaemon: DaemonStateMachineSubscriber + Send + Sync {
     }
 
     /// Get daemon working state.
+    ///
+    /// A daemon may report a healthier-looking state machine position as unhealthy here (see
+    /// `ServiceController`); transitions are driven by [`machine_state`](Self::machine_state).
     fn get_state(&self) -> DaemonState;
+    /// State-machine position used to pick the events that drive a transition.
+    fn machine_state(&self) -> DaemonState {
+        self.get_state()
+    }
     /// Set daemon working state.
     fn set_state(&self, s: DaemonState);
     /// Start the daemon object to serve incoming requests.
@@ -112,7 +119,7 @@ pub trait NydusDaemon: DaemonStateMachineSubscriber + Send + Sync {
     fn stop(&self) {}
     /// Trigger `Stop` transition event to stop the daemon.
     fn trigger_stop(&self) -> Result<()> {
-        let s = self.get_state();
+        let s = self.machine_state();
 
         if s == DaemonState::STOPPED {
             return Ok(());
@@ -126,7 +133,7 @@ pub trait NydusDaemon: DaemonStateMachineSubscriber + Send + Sync {
     }
     /// Trigger transition events to move the state machine to `STOPPED` state.
     fn trigger_exit(&self) -> Result<()> {
-        let s = self.get_state();
+        let s = self.machine_state();
 
         if s == DaemonState::STOPPED {
             return Ok(());

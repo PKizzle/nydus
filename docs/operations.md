@@ -157,7 +157,7 @@ sudo perf script | stackcollapse-perf.pl | flamegraph.pl > containerd-nydus.svg
 Notes specific to this codebase:
 
 - Build with debug info for readable symbols. The workspace `[profile.release]` sets only
-  `panic = "abort"` — it does **not** enable `debug`, so a plain `cargo build --release` ships
+  `panic = "unwind"` — it does **not** enable `debug`, so a plain `cargo build --release` ships
   **without** DWARF debug info and `perf`/`samply` stacks will show raw addresses instead of
   function names. For symbolized stacks, build with `CARGO_PROFILE_RELEASE_DEBUG=true cargo build
   --release` (keeps release optimizations, adds debuginfo) or use a `dev` build (`[profile.dev]`

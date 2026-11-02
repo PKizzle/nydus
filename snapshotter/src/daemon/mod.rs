@@ -821,21 +821,32 @@ impl DaemonSupervisor {
             ),
         )?;
         let cfg_json = serde_json::json!({ "blobs": [entry] });
-        // The process-wide blob factory keys cache managers by config, which is
-        // the same for every start of this image, so it would hand back the
-        // previous daemon's cache entries; drop the idle ones, whose files the
-        // stale daemon-dir sweep may already have deleted.
-        nydus_storage::factory::BLOB_FACTORY.gc(None);
-
         // Only a mount of this staged bootstrap is healed in place. Any other
         // one, such as a mount without data devices that answers every read
         // with EIO, is replaced.
-        if let Some((source, _)) = mount_at(&mountpoint)
-            && Path::new(&source.replace("\\040", " ")) != staged_bootstrap
-        {
-            warn!(image_ref = %image_ref_str, source, "replacing a mount of another bootstrap");
-            detach_mount_stack(&mountpoint)
-                .with_context(|| format!("failed to detach {}", mountpoint.display()))?;
+        let heal_in_place = match mount_at(&mountpoint) {
+            Some((source, _)) if Path::new(&source.replace("\\040", " ")) == staged_bootstrap => {
+                true
+            }
+            Some((source, _)) => {
+                warn!(image_ref = %image_ref_str, source, "replacing a mount of another bootstrap");
+                detach_mount_stack(&mountpoint)
+                    .with_context(|| format!("failed to detach {}", mountpoint.display()))?;
+                false
+            }
+            None => false,
+        };
+        // The process-wide blob factory keys cache managers by config, which is
+        // the same for every start of this image, so it would hand back the
+        // previous daemon's cache entries. A fresh mount drops the idle ones,
+        // whose files the stale daemon-dir sweep may already have deleted.
+        // Healing in place must keep them: their cache files were opened before
+        // any pre-content mark existed, so the fills written through them raise
+        // no events. Reopened while the replaced daemon's group still marks the
+        // inode, every fill would raise an event of its own and block the
+        // worker that issued it.
+        if !heal_in_place {
+            nydus_storage::factory::BLOB_FACTORY.gc(None);
         }
 
         let supervisor_sock = supervisor_sock_path(&slug);
@@ -3906,6 +3917,137 @@ mod tests {
         assert!(
             matches!(&outcome, ProbeOutcome::Error(e) if e.contains("hello.txt")),
             "device-less EROFS mount: {outcome:?}"
+        );
+    }
+
+    /// A panic in one image's fanotify worker fails only that daemon: its reads get EIO and
+    /// it reports itself unhealthy, another image keeps serving, and the reconciler's
+    /// `recover()` restarts it over the live mount. Releasing both then leaves no cache file
+    /// open. `NYDUS_E2E_ROOT` is laid out as for
+    /// `auto_accel_daemon_serves_file_data_across_restarts`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "needs root, Linux >= 6.14 and an ext4 work dir; run misc/fanotify/auto-accel-restart-test.sh"]
+    fn auto_accel_worker_panic_fails_only_its_daemon_until_recovered() {
+        let root = PathBuf::from(std::env::var("NYDUS_E2E_ROOT").expect("NYDUS_E2E_ROOT unset"));
+        // Recovery restarts an auto-accel daemon from the production layout only:
+        // `<id>/stage/bootstrap` beside `<id>/backend`.
+        let accel = root.join("panic-accel");
+        fs::create_dir_all(accel.join("stage")).unwrap();
+        let bootstrap = accel.join("stage/bootstrap");
+        fs::copy(root.join("artifact/bootstrap"), &bootstrap).unwrap();
+        let backend = accel.join("backend");
+        std::os::unix::fs::symlink(root.join("artifact/backend"), &backend).unwrap();
+        let mut config = SnapshotterConfig::default();
+        config.snapshotter.root = root.join("snapshotter-panic");
+        let daemons = config.snapshotter.root.join("daemons");
+        let supervisor = DaemonSupervisor::new(config);
+        let runtime = compio::runtime::Runtime::new().unwrap();
+        let refs = ["e2e.invalid/panic/broken:1", "e2e.invalid/panic/healthy:1"];
+        let [broken, healthy] = refs.map(|image_ref| {
+            runtime
+                .block_on(
+                    supervisor.ensure_instance_local(image_ref, &bootstrap, &backend, "t", false),
+                )
+                .unwrap()
+        });
+
+        nydus_service::fanotify::inject_panic_on_next_event(broken.mountpoint());
+        let (total, failed) = read_every_file(broken.mountpoint());
+        assert!(!failed.is_empty(), "no read of {total} files hit the panic");
+        for failure in &failed {
+            assert!(failure.contains("os error 5"), "expected EIO: {failure}");
+        }
+        assert_eq!(broken.state(), DaemonState::UNKNOWN);
+        assert_eq!(healthy.state(), DaemonState::RUNNING);
+        let (_, failed) = read_every_file(healthy.mountpoint());
+        assert!(
+            failed.is_empty(),
+            "the other image stopped serving: {failed:#?}"
+        );
+
+        // The failed daemon's fanotify group, with its marks, lives as long as the daemon
+        // does (the upgrade manager keeps a copy of the fd for failover), and nothing answers
+        // its events once its workers are stopped. Recovery arms the replacement first and
+        // drops the old daemon after; a caller still holding the old handle would keep every
+        // read of the mount blocked.
+        let mountpoints = [&broken, &healthy].map(|h| h.mountpoint().to_path_buf());
+        drop((broken, healthy));
+        let report = runtime.block_on(supervisor.recover()).unwrap();
+        assert_eq!(report.restarted, 1, "{report:?}");
+        assert_eq!(report.outcomes[0].image_ref, refs[0]);
+        let (total, failed) = read_every_file(&mountpoints[0]);
+        assert!(total > 0);
+        assert!(failed.is_empty(), "not served after recovery: {failed:#?}");
+
+        for (image_ref, mountpoint) in refs.iter().zip(&mountpoints) {
+            runtime
+                .block_on(supervisor.release(image_ref, "t"))
+                .unwrap();
+            assert!(
+                !is_mounted_at(mountpoint),
+                "{image_ref}: mount outlived its daemon"
+            );
+        }
+        let open: Vec<PathBuf> = fs::read_dir("/proc/self/fd")
+            .unwrap()
+            .filter_map(|fd| fs::read_link(fd.unwrap().path()).ok())
+            .filter(|target| target.starts_with(&daemons))
+            .collect();
+        assert!(
+            open.is_empty(),
+            "released daemons left cache files open: {open:#?}"
+        );
+    }
+
+    /// A registration that fails after its workers started must stop them, or every supervisor
+    /// retry leaks a worker pool and a fanotify group.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "needs root (fanotify_init); run misc/fanotify/auto-accel-restart-test.sh"]
+    fn failed_fanotify_registration_stops_its_workers() {
+        let dir = tempfile::tempdir().unwrap();
+        let stage = dir.path().join("stage");
+        fs::create_dir_all(&stage).unwrap();
+        // All zeros: no data devices to open, and no EROFS magic, so the mount fails.
+        fs::write(stage.join("bootstrap"), vec![0u8; 4096]).unwrap();
+        let poll = Poll::new().unwrap();
+        let waker = Arc::new(Waker::new(poll.registry(), Token(1)).unwrap());
+        let daemon = create_daemon(
+            Some("registration".to_string()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            DaemonSupervisor::new(SnapshotterConfig::default()).build_info,
+            waker,
+            None::<&Path>,
+            false,
+        )
+        .unwrap();
+        let controller = daemon
+            .as_any()
+            .downcast_ref::<nydus_service::ServiceController>()
+            .unwrap();
+        let threads = || fs::read_dir("/proc/self/task").unwrap().count();
+        let before = threads();
+        controller
+            .register_fanotify_handler(
+                "registration",
+                stage.to_str().unwrap(),
+                dir.path().join("mnt").to_str().unwrap(),
+                4,
+            )
+            .expect_err("mounting a zeroed bootstrap must fail");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while threads() > before && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            threads(),
+            before,
+            "the failed registration left workers running"
         );
     }
 

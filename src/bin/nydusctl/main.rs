@@ -30,6 +30,7 @@ static BTI_STRING: LazyLock<String> = LazyLock::new(|| get_build_time_info().0);
 
 #[compio::main]
 async fn main() -> Result<()> {
+    nydus_utils::panic_policy::abort_on_uncontained_panic();
     let app = Command::new("A client to query and configure the nydusd daemon\n")
         .version(BTI_STRING.as_str())
         .author(crate_authors!())
