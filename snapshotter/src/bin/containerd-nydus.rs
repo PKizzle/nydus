@@ -22,8 +22,10 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 use anyhow::Result;
 use clap::Parser;
 use futures::FutureExt;
+use std::path::Path;
 use std::sync::Arc;
-use tracing::{info, warn};
+use std::time::{Duration, Instant};
+use tracing::{error, info, warn};
 
 use nydus_snapshotter::config::{Profile, SnapshotterConfig};
 use nydus_snapshotter::daemon::DaemonSupervisor;
@@ -271,18 +273,31 @@ async fn run(nofile: std::io::Result<(u64, u64)>) -> Result<()> {
         );
     }
 
-    // Fail fast with an actionable message if auto_zran is on but the resolved
-    // containerd socket is missing — otherwise this surfaces as a late,
-    // opaque gRPC connect error deep in the conversion path.
+    // auto_zran needs the containerd socket, but containerd may start after us: the shipped
+    // unit is `Type=notify` + `Before=containerd.service`, so containerd waits for our READY
+    // and blocking on its socket here would stall boot. Warn now and report an error only if
+    // the socket never appears, so a misconfigured path stays visible.
     if config.snapshotter.auto_zran.enable {
         let sock = config.snapshotter.containerd.address();
         if !sock.exists() {
-            anyhow::bail!(
-                "auto_zran is enabled but the containerd socket {} does not exist. \
-                 Start containerd/k3s, or fix [snapshotter.containerd].address / \
-                 [snapshotter].profile.",
-                sock.display()
+            warn!(
+                socket = %sock.display(),
+                "auto_zran is enabled but the containerd socket does not exist yet; waiting for containerd"
             );
+            compio::runtime::spawn(async move {
+                if wait_for_path(&sock, CONTAINERD_SOCKET_GRACE, Duration::from_secs(1)).await {
+                    info!(socket = %sock.display(), "containerd socket appeared");
+                } else {
+                    error!(
+                        socket = %sock.display(),
+                        grace_secs = CONTAINERD_SOCKET_GRACE.as_secs(),
+                        "auto_zran is enabled but the containerd socket still does not exist; \
+                         image conversions will fail. Start containerd/k3s, or fix \
+                         [snapshotter.containerd].address / [snapshotter].profile"
+                    );
+                }
+            })
+            .detach();
         }
     }
 
@@ -417,9 +432,46 @@ async fn run(nofile: std::io::Result<(u64, u64)>) -> Result<()> {
     Ok(())
 }
 
+/// How long containerd may take to create its socket before a missing socket is reported as an error.
+const CONTAINERD_SOCKET_GRACE: Duration = Duration::from_secs(60);
+
+/// Polls every `interval` until `path` exists; false if it is still missing after `timeout`.
+async fn wait_for_path(path: &Path, timeout: Duration, interval: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    while !path.exists() {
+        if Instant::now() >= deadline {
+            return false;
+        }
+        compio::time::sleep(interval).await;
+    }
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[compio::test]
+    async fn wait_for_path_sees_a_socket_created_later() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("containerd.sock");
+        let creator = {
+            let sock = sock.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(200));
+                std::os::unix::net::UnixListener::bind(&sock).unwrap()
+            })
+        };
+        assert!(wait_for_path(&sock, Duration::from_secs(10), Duration::from_millis(20)).await);
+        drop(creator.join().unwrap());
+    }
+
+    #[compio::test]
+    async fn wait_for_path_gives_up_on_a_socket_that_never_appears() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("containerd.sock");
+        assert!(!wait_for_path(&sock, Duration::from_millis(100), Duration::from_millis(20)).await);
+    }
 
     #[test]
     fn parse_profile_accepts_known_values_case_insensitively() {
