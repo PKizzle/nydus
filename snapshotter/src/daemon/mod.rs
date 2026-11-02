@@ -2629,8 +2629,15 @@ fn unix_now() -> i64 {
 fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
     use std::io::Write;
 
+    // A unique tmp name per call: concurrent persists of one record (several sandboxes of the
+    // same image starting at once) would otherwise truncate and rename each other's file.
+    static SEQ: AtomicU64 = AtomicU64::new(0);
     let mut tmp = path.as_os_str().to_os_string();
-    tmp.push(".tmp");
+    tmp.push(format!(
+        ".{}.{}.tmp",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
     let tmp = PathBuf::from(tmp);
 
     let mut file = fs::File::create(&tmp)?;
@@ -3516,6 +3523,31 @@ mod e2e_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn atomic_write_survives_concurrent_writers() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("record.json");
+        let threads: Vec<_> = (0..8)
+            .map(|t| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    for i in 0..50 {
+                        atomic_write(&path, format!("writer {t} round {i}").as_bytes()).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        assert!(fs::read_to_string(&path).unwrap().starts_with("writer "));
+        assert_eq!(
+            fs::read_dir(dir.path()).unwrap().count(),
+            1,
+            "no tmp residue"
+        );
+    }
 
     #[test]
     fn atomic_write_round_trip_and_overwrite() {
