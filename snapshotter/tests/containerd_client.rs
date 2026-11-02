@@ -106,6 +106,13 @@ fn content_and_images_round_trip_and_survive_a_containerd_restart() {
         assert_eq!(info.size, small.len() as u64);
         assert_eq!(info.labels["nydus.test/role"], "fixture");
         assert_eq!(client.fetch_bytes(&digest).await.unwrap(), small);
+        // containerd's startup GC runs 100 ms after it starts and collects committed content
+        // nothing references; the upload's lease must keep the blob through it.
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(
+            client.info(&digest).await.unwrap().is_some(),
+            "unreferenced blob survives a GC pass"
+        );
 
         // Root the small blob with its own image record right away. The image-record checks
         // below repoint and delete another record, and containerd's GC (triggered by deletes

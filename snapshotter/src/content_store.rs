@@ -37,12 +37,16 @@ use tracing::{debug, error, instrument};
 
 use crate::containerd_api::services::content::v1::{
     InfoRequest, ListContentRequest, ReadContentRequest, UpdateRequest, WriteAction,
-    WriteContentRequest, content_client::ContentClient,
+    WriteContentRequest, WriteContentResponse, content_client::ContentClient,
 };
 
 use crate::containerd_api::services::images::v1::{
     CreateImageRequest, DeleteImageRequest, GetImageRequest, Image, ListImagesRequest,
     UpdateImageRequest, images_client::ImagesClient,
+};
+
+use crate::containerd_api::services::leases::v1::{
+    CreateRequest as LeaseCreateRequest, leases_client::LeasesClient,
 };
 
 use crate::containerd_api::types as types_proto;
@@ -183,7 +187,8 @@ impl ContentStoreClient {
     }
 
     /// Stream `data` to containerd as a chunked `Write` session ending in a
-    /// commit, draining containerd's per-message responses.
+    /// commit, under a lease that keeps the blob from containerd's GC until
+    /// the caller roots it (see [`Self::ingest_lease`]).
     async fn commit(
         &self,
         ref_name: String,
@@ -191,20 +196,60 @@ impl ContentStoreClient {
         data: Vec<u8>,
         labels: HashMap<String, String>,
     ) -> Result<()> {
-        let requests = write_requests(ref_name, expected, data, labels);
+        let total = data.len() as i64;
+        let lease = self.ingest_lease(&ref_name).await?;
+        let mut request = tonic::Request::new(futures::stream::iter(write_requests(
+            ref_name, expected, data, labels,
+        )));
+        request.metadata_mut().insert(
+            "containerd-lease",
+            lease
+                .parse()
+                .context("lease id is not a valid header value")?,
+        );
         let mut responses = self
             .content()
-            .write(tonic::Request::new(futures::stream::iter(requests)))
+            .write(request)
             .await
             .map_err(|status| anyhow::anyhow!("containerd Write failed: {status}"))?
             .into_inner();
-        while responses
+        let mut last = None;
+        while let Some(response) = responses
             .message()
             .await
             .map_err(|status| anyhow::anyhow!("containerd Write response failed: {status}"))?
-            .is_some()
-        {}
-        Ok(())
+        {
+            last = Some(response);
+        }
+        check_committed(last, expected, total)
+    }
+
+    /// Create a lease for one upload and return its id. containerd's GC
+    /// collects committed content nothing references, and a sidecar blob is
+    /// only referenced once its manifest and image record exist; the lease
+    /// covers that gap. It is never deleted, because deleting it before the
+    /// image record roots the blob would reopen the gap; containerd removes it
+    /// once `containerd.io/gc.expire` passes, as for its own client's leases.
+    async fn ingest_lease(&self, ref_name: &str) -> Result<String> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default();
+        let expire = prost_types::Timestamp {
+            seconds: (now + INGEST_LEASE_TTL).as_secs() as i64,
+            nanos: 0,
+        };
+        let id = format!("{ref_name}-{}", now.as_nanos());
+        LeasesClient::new(self.channel.clone())
+            .create(LeaseCreateRequest {
+                id: id.clone(),
+                labels: HashMap::from([(
+                    "containerd.io/gc.expire".to_string(),
+                    expire.to_string(),
+                )]),
+            })
+            .await
+            .map_err(|status| anyhow::anyhow!("containerd Leases.Create({id}) failed: {status}"))?;
+        Ok(id)
     }
 
     /// Apply / overwrite labels on a content blob. Idempotent.
@@ -464,9 +509,31 @@ impl ContentStoreClient {
     }
 }
 
+/// How long an upload's lease protects its blob from containerd's GC; the
+/// same default containerd's own client gives its leases.
+const INGEST_LEASE_TTL: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+
 /// Payload bytes per `WriteContentRequest`, as containerd's own client sends.
 /// containerd's gRPC server rejects any message over 16 MiB.
 const WRITE_CHUNK_SIZE: usize = 1024 * 1024;
+
+/// containerd ends a `Write` session whose request stream closes before the
+/// commit without an error, so only a final commit response for the whole
+/// payload proves the blob was stored.
+fn check_committed(last: Option<WriteContentResponse>, expected: &str, total: i64) -> Result<()> {
+    match last {
+        Some(r)
+            if r.action == WriteAction::Commit as i32
+                && r.digest == expected
+                && r.offset == total =>
+        {
+            Ok(())
+        }
+        other => Err(anyhow::anyhow!(
+            "containerd Write of {expected} ended without committing it (last response: {other:?})"
+        )),
+    }
+}
 
 /// The messages of one content `Write` session for `data`: `Write` actions of
 /// at most [`WRITE_CHUNK_SIZE`] bytes, each at its running offset, the last
@@ -678,6 +745,26 @@ mod tests {
         }
         assert_eq!(joined, data);
         assert_eq!(reqs.last().unwrap().labels, labels);
+    }
+
+    /// Only a commit response covering the whole payload counts as stored.
+    #[test]
+    fn check_committed_requires_a_full_commit_response() {
+        let ok = |action: WriteAction, digest: &str, offset: i64| {
+            let response = WriteContentResponse {
+                action: action as i32,
+                digest: digest.to_string(),
+                offset,
+                ..Default::default()
+            };
+            check_committed(Some(response), "sha256:x", 5).is_ok()
+        };
+        assert!(ok(WriteAction::Commit, "sha256:x", 5));
+        // Request stream closed after a Write: containerd answers with that Write's status.
+        assert!(!ok(WriteAction::Write, "sha256:x", 5));
+        assert!(!ok(WriteAction::Commit, "sha256:y", 5));
+        assert!(!ok(WriteAction::Commit, "sha256:x", 4));
+        assert!(check_committed(None, "sha256:x", 5).is_err());
     }
 
     /// An empty payload is still committed, in a single message.
