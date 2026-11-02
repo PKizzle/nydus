@@ -25,6 +25,7 @@ pub mod crypt;
 pub mod digest;
 pub mod error_chain;
 pub mod exec;
+pub mod fd_limit;
 pub mod filemap;
 pub mod inode_bitmap;
 pub mod logger;

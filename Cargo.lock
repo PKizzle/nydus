@@ -3808,6 +3808,7 @@ dependencies = [
  "lz4-sys",
  "nix 0.31.3",
  "nydus-api",
+ "rlimit",
  "serde",
  "serde_json",
  "sha2",

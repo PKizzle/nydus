@@ -18,6 +18,8 @@ ExecStart=/usr/local/bin/containerd-nydus --config /etc/nydus/config.toml
 Restart=always
 RestartSec=1
 KillMode=process
+# Every mounted image holds blob, cache and content-store fds; the 1024 default soft limit runs out.
+LimitNOFILE=1048576
 OOMScoreAdjust=-999
 StandardOutput=journal
 StandardError=journal

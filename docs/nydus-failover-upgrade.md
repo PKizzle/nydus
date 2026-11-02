@@ -53,6 +53,8 @@ FileDescriptorStoreMax=128
 # FileDescriptorStorePreserve=restart
 Restart=always
 KillMode=process
+# Every mounted image holds blob, cache and content-store fds; the 1024 default soft limit runs out.
+LimitNOFILE=1048576
 ```
 
 Without a notify socket (`NOTIFY_SOCKET` unset — e.g. running by hand), the snapshotter logs
