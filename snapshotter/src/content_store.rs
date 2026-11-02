@@ -119,10 +119,8 @@ impl ContentStoreClient {
     /// discovery. Idempotent: if the digest already exists, we just (re-)apply
     /// labels via `Update`. Returns the canonical `sha256:...` digest.
     ///
-    /// The Write RPC is bidirectional streaming; for our use case (a single
-    /// already-on-disk file) we open the stream, send one `WriteContentRequest`
-    /// with `action=Commit` + the full bytes + the expected digest + labels,
-    /// and drain the response stream.
+    /// The payload goes over the bidirectional Write RPC in chunks; see
+    /// [`write_requests`].
     #[instrument(level = "debug", skip(self, labels), fields(path = %path.display()), err)]
     pub async fn write_blob(&self, path: &Path, labels: HashMap<String, String>) -> Result<String> {
         // Read + hash off the compio reactor: merged bootstraps scale with the
@@ -147,8 +145,6 @@ impl ContentStoreClient {
             return Ok(digest_with_prefix);
         }
 
-        // Larger artifacts (merged bootstraps for multi-layer images) can exceed
-        // tonic's default 4 MiB frame size.
         self.commit(
             format!("nydus-auto-accel-{digest}"),
             &digest_with_prefix,
@@ -175,9 +171,7 @@ impl ContentStoreClient {
             return Ok(digest_with_prefix);
         }
 
-        // Peers route bootstrap-sized blobs through this path too, so it gets
-        // write_blob's raised frame cap instead of relying on the payload
-        // staying small.
+        // Peers route bootstrap-sized blobs through this path too.
         self.commit(
             format!("nydus-auto-accel-{ref_hint}-{digest}"),
             &digest_with_prefix,
@@ -188,9 +182,8 @@ impl ContentStoreClient {
         Ok(digest_with_prefix)
     }
 
-    /// Single-shot `Write`: one frame carrying the whole payload, the expected
-    /// digest, the labels and `action=Commit`, then drain the response stream.
-    /// containerd accepts that as long as the payload fits the 64 MiB frame cap.
+    /// Stream `data` to containerd as a chunked `Write` session ending in a
+    /// commit, draining containerd's per-message responses.
     async fn commit(
         &self,
         ref_name: String,
@@ -198,20 +191,10 @@ impl ContentStoreClient {
         data: Vec<u8>,
         labels: HashMap<String, String>,
     ) -> Result<()> {
-        let request = WriteContentRequest {
-            action: WriteAction::Commit as i32,
-            r#ref: ref_name,
-            total: data.len() as i64,
-            expected: expected.to_string(),
-            offset: 0,
-            data,
-            labels,
-        };
-        let mut client = self.content().max_encoding_message_size(64 * 1024 * 1024);
-        let mut responses = client
-            .write(tonic::Request::new(futures::stream::once(async move {
-                request
-            })))
+        let requests = write_requests(ref_name, expected, data, labels);
+        let mut responses = self
+            .content()
+            .write(tonic::Request::new(futures::stream::iter(requests)))
             .await
             .map_err(|status| anyhow::anyhow!("containerd Write failed: {status}"))?
             .into_inner();
@@ -481,6 +464,50 @@ impl ContentStoreClient {
     }
 }
 
+/// Payload bytes per `WriteContentRequest`, as containerd's own client sends.
+/// containerd's gRPC server rejects any message over 16 MiB.
+const WRITE_CHUNK_SIZE: usize = 1024 * 1024;
+
+/// The messages of one content `Write` session for `data`: `Write` actions of
+/// at most [`WRITE_CHUNK_SIZE`] bytes, each at its running offset, the last
+/// one sent as `Commit` with the labels. The first message names the ref,
+/// size and digest (containerd opens the writer from it) and, at offset 0,
+/// truncates whatever an earlier aborted session left under the same ref.
+fn write_requests(
+    ref_name: String,
+    expected: &str,
+    data: Vec<u8>,
+    labels: HashMap<String, String>,
+) -> impl Iterator<Item = WriteContentRequest> + use<> {
+    let total = data.len();
+    let count = total.div_ceil(WRITE_CHUNK_SIZE).max(1);
+    let expected = expected.to_string();
+    let mut labels = Some(labels);
+    let mut ref_name = Some(ref_name);
+    (0..count).map(move |i| {
+        let start = i * WRITE_CHUNK_SIZE;
+        let end = total.min(start + WRITE_CHUNK_SIZE);
+        let last = i + 1 == count;
+        WriteContentRequest {
+            action: if last {
+                WriteAction::Commit
+            } else {
+                WriteAction::Write
+            } as i32,
+            r#ref: ref_name.take().unwrap_or_default(),
+            total: total as i64,
+            expected: expected.clone(),
+            offset: start as i64,
+            data: data[start..end].to_vec(),
+            labels: if last {
+                labels.take().unwrap_or_default()
+            } else {
+                HashMap::new()
+            },
+        }
+    })
+}
+
 /// An Image record named `name` whose target is the given descriptor.
 fn image_record(
     name: &str,
@@ -620,6 +647,47 @@ mod tests {
         assert!(!is_not_found(&e));
         assert!(is_rpc_failure(&e));
         assert!(!is_rpc_failure(&anyhow::anyhow!("connect failed")));
+    }
+
+    /// A payload over containerd's 16 MiB receive limit goes out as messages
+    /// that each stay under it, at contiguous offsets, ending in one commit
+    /// that carries the labels.
+    #[test]
+    fn write_requests_split_large_payload() {
+        let data: Vec<u8> = (0..33 * 1024 * 1024 + 7).map(|i| i as u8).collect();
+        let labels = HashMap::from([("k".to_string(), "v".to_string())]);
+        let reqs: Vec<_> =
+            write_requests("ref".into(), "sha256:x", data.clone(), labels.clone()).collect();
+        assert_eq!(reqs.len(), 34);
+        let mut joined = Vec::new();
+        for (i, req) in reqs.iter().enumerate() {
+            assert!(prost::Message::encoded_len(req) < 16 * 1024 * 1024);
+            assert_eq!(req.offset as usize, joined.len());
+            assert_eq!(req.total as usize, data.len());
+            assert_eq!(req.expected, "sha256:x");
+            assert_eq!(req.r#ref, if i == 0 { "ref" } else { "" });
+            let last = i + 1 == reqs.len();
+            let action = if last {
+                WriteAction::Commit
+            } else {
+                WriteAction::Write
+            };
+            assert_eq!(req.action, action as i32);
+            assert_eq!(req.labels.is_empty(), !last);
+            joined.extend_from_slice(&req.data);
+        }
+        assert_eq!(joined, data);
+        assert_eq!(reqs.last().unwrap().labels, labels);
+    }
+
+    /// An empty payload is still committed, in a single message.
+    #[test]
+    fn write_requests_empty_payload_commits() {
+        let reqs: Vec<_> =
+            write_requests("ref".into(), "sha256:x", Vec::new(), HashMap::new()).collect();
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(reqs[0].action, WriteAction::Commit as i32);
+        assert_eq!(reqs[0].r#ref, "ref");
     }
 
     #[test]
