@@ -786,7 +786,7 @@ impl DaemonSupervisor {
         // it under the expected `bootstrap` filename (see
         // `service/src/fanotify.rs::discover_blobs`).
         let staged_bootstrap = stage_dir.join("bootstrap");
-        fs::copy(bootstrap, &staged_bootstrap).with_context(|| {
+        stage_bootstrap(bootstrap, &staged_bootstrap).with_context(|| {
             format!(
                 "failed to stage bootstrap {} -> {}",
                 bootstrap.display(),
@@ -2651,6 +2651,24 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
     Ok(())
 }
 
+/// Copies `src` to `dst` and extends the copy with a sparse hole to a multiple of the host page
+/// size. Linux 7.3's file-backed EROFS reads metadata a whole folio at a time and fails a short
+/// read at end of file with `EIO`, so on a kernel whose page is larger than the EROFS block every
+/// inode in a last, partial page is unreadable (fixed upstream by 52dceb88082b, "erofs: fix
+/// metadata reads at the end of file-backed images"). The hole costs no disk blocks.
+fn stage_bootstrap(src: &Path, dst: &Path) -> io::Result<()> {
+    fs::copy(src, dst)?;
+    let file = fs::OpenOptions::new().write(true).open(dst)?;
+    let len = file.metadata()?.len();
+    file.set_len(len.next_multiple_of(host_page_size()))
+}
+
+fn host_page_size() -> u64 {
+    // SAFETY: sysconf reads a constant and has no preconditions.
+    let size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    u64::try_from(size).ok().filter(|&s| s > 0).unwrap_or(4096)
+}
+
 fn validate_spawn_request(image_ref: &str, bootstrap: &Path) -> Result<()> {
     if image_ref.trim().is_empty() {
         bail!("image reference must be non-empty to mount a Nydus image");
@@ -3516,6 +3534,33 @@ mod tests {
             .map(|e| e.unwrap().file_name())
             .collect();
         assert_eq!(names, vec![std::ffi::OsString::from("record.json")]);
+    }
+
+    #[test]
+    fn stage_bootstrap_extends_to_the_page_size_with_a_hole() {
+        use std::os::unix::fs::MetadataExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        let dst = dir.path().join("bootstrap");
+        let page = host_page_size();
+        // Never a page multiple, whatever the page size.
+        let body: Vec<u8> = (0..(page * 3 + 4096 - 512)).map(|i| i as u8).collect();
+        fs::write(&src, &body).unwrap();
+
+        stage_bootstrap(&src, &dst).unwrap();
+        let meta = fs::metadata(&dst).unwrap();
+        assert_eq!(meta.len(), page * 4);
+        let staged = fs::read(&dst).unwrap();
+        assert_eq!(&staged[..body.len()], &body[..]);
+        assert!(staged[body.len()..].iter().all(|&b| b == 0));
+        // The extension is a hole: no more blocks than the source needs.
+        assert!(meta.blocks() <= fs::metadata(&src).unwrap().blocks());
+
+        // Already a page multiple: unchanged.
+        fs::copy(&dst, &src).unwrap();
+        stage_bootstrap(&src, &dst).unwrap();
+        assert_eq!(fs::read(&dst).unwrap(), staged);
     }
 
     #[test]
