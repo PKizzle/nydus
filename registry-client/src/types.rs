@@ -42,7 +42,7 @@ pub const MEDIA_TYPE_OCTET_STREAM: &str = "application/octet-stream";
 /// blob's id equals the original OCI gzip layer digest.
 pub const MEDIA_TYPE_NYDUS_BLOB: &str = "application/vnd.oci.image.layer.nydus.blob.v1";
 /// Nydus bootstrap media type as used by nydus referrer artifacts
-/// (exercised by `misc/fanotify/b4b-referrer-serving-test.sh`).
+/// (see `B4B_ARTIFACT_JSON` in the tests below).
 pub const MEDIA_TYPE_NYDUS_BOOTSTRAP: &str = "application/vnd.oci.image.bootstrap.nydus.v1";
 /// Standard OCI gzip'd-tar layer media type. The nydus **bootstrap layer** is
 /// published under this — it is an ordinary tar holding `image/image.boot`,
@@ -426,8 +426,8 @@ pub fn verify_digest(bytes: &[u8], expected: &str) -> Result<()> {
 mod tests {
     use super::*;
 
-    /// The referrer artifact manifest shape pushed by
-    /// `misc/fanotify/b4b-referrer-serving-test.sh` (data blob listed BEFORE
+    /// The referrer artifact manifest shape nydusify pushes
+    /// (data blob listed BEFORE
     /// the annotated bootstrap layer), extended with the `subject` field used
     /// when publishing via the OCI 1.1 referrers API.
     const B4B_ARTIFACT_JSON: &str = r#"{

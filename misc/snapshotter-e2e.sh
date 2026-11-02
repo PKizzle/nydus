@@ -2,15 +2,18 @@
 # End-to-end correctness gate for the containerd -> gRPC -> containerd-nydus
 # mount loop. Assumes `misc/prepare.sh` has run: containerd with the nydus
 # proxy plugin registered, the Rust snapshotter as a systemd service
-# (config: misc/performance/snapshotter_config.toml — fusedev pinned, sysctl
+# (config: misc/performance/snapshotter_config.toml — one fs driver pinned, sysctl
 # socket /run/containerd-nydus/system.sock, plain-http registry backend), and
-# nerdctl 1.7.x + CNI installed.
+# nerdctl 1.7.x + CNI installed. FS_DRIVER names the one fs driver that config
+# lists (fusedev, blockdev or tarfs; default fusedev); step 4 checks the image
+# is served through it.
 #
 # Covered here:
 #   1. proxy-plugin dial + Stat/List           (ctr snapshot ls)
 #   2. readiness probe                         (containerd-nydus healthcheck --ready)
 #   3. plain-OCI image: Prepare -> Commit -> Mounts -> runc, no nydus daemon
-#   4. nydus image (fusedev): lazy mount through the in-process daemon
+#   4. nydus image: mounted through the in-process daemon with FS_DRIVER, and
+#      every file under /bin /lib /sbin /usr reads the same bytes as the OCI image
 #   5. teardown: image removal leaves no active snapshots, service stays up
 #
 # Out of scope (kernel >= 6.14 required, so lima or the k3s canary, not GH
@@ -25,6 +28,16 @@ readonly FIXTURE=localhost:${REGISTRY_PORT}/alpine:3.20
 readonly FIXTURE_NYDUS=localhost:${REGISTRY_PORT}/alpine:nydus-e2e
 readonly SYSCTL_SOCKET=/run/containerd-nydus/system.sock
 readonly WORK_DIR=$(mktemp -d /tmp/snapshotter-e2e.XXXXXX)
+readonly SNAPSHOTTER_ROOT=/var/lib/containerd/io.containerd.snapshotter.v1.nydus
+readonly FS_DRIVER=${FS_DRIVER:-fusedev}
+case "$FS_DRIVER" in
+    fusedev) FSTYPE='fuse(\.[^ ]+)?' ;;
+    blockdev | tarfs) FSTYPE=erofs ;;
+    *) echo "unknown FS_DRIVER $FS_DRIVER" >&2; exit 1 ;;
+esac
+# Checksums of every file the image ships outside /etc (which holds the
+# runtime's bind mounts).
+readonly CHECKSUMS='find /bin /lib /sbin /usr -type f | sort | xargs sha256sum'
 
 CTR="ctr --address /run/containerd/containerd.sock"
 NERDCTL="nerdctl --snapshotter nydus --insecure-registry"
@@ -73,16 +86,24 @@ docker push "$FIXTURE"
 output=$(timeout 300 $NERDCTL run --rm --net=none "$FIXTURE" sh -c 'echo E2E_OK && cat /etc/alpine-release')
 echo "$output" | grep -q "E2E_OK"
 echo "$output" | grep -q "^3\.20"
+timeout 300 $NERDCTL run --rm --net=none "$FIXTURE" sh -c "$CHECKSUMS" > "$WORK_DIR/oci.sha256"
+test "$(wc -l < "$WORK_DIR/oci.sha256")" -gt 10
 
-# --- 4. nydus image over the in-process fusedev daemon ---------------------
+# --- 4. nydus image over the in-process daemon -----------------------------
 timeout 300 nydusify convert \
     --source "$FIXTURE" \
     --target "$FIXTURE_NYDUS" \
     --plain-http \
     --nydus-image /usr/local/bin/nydus-image \
     --work-dir "$WORK_DIR"
-output=$(timeout 300 $NERDCTL run --rm --net=none "$FIXTURE_NYDUS" cat /etc/alpine-release)
+container=$(timeout 300 $NERDCTL run -d --net=none "$FIXTURE_NYDUS" sleep 600)
+# Served through the configured driver: a daemon mount of the expected type.
+grep -E " $SNAPSHOTTER_ROOT/daemons/[^/ ]+/mnt $FSTYPE " /proc/self/mounts
+output=$(timeout 60 $NERDCTL exec "$container" cat /etc/alpine-release)
 echo "$output" | grep -q "^3\.20"
+timeout 300 $NERDCTL exec "$container" sh -c "$CHECKSUMS" > "$WORK_DIR/nydus.sha256"
+diff "$WORK_DIR/oci.sha256" "$WORK_DIR/nydus.sha256"
+$NERDCTL rm -f "$container"
 
 # The nydus image must have gone through a daemon mount, not the plain
 # overlay path: the supervisor's records list it.

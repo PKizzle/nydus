@@ -760,13 +760,17 @@ jobs:
         make smoke-performance
 
   # Correctness gate for the containerd -> gRPC Prepare/Commit/Mounts loop:
-  # plain-OCI overlay path (no daemon) + nydus fusedev path + health probes +
-  # teardown. Runs the fusedev driver only — GH runner kernels are < 6.14, so
-  # the fanotify path stays covered by misc/fanotify/*.sh on a modern host.
+  # plain-OCI overlay path (no daemon) + nydus daemon path + health probes +
+  # teardown, once per fs driver that runs on a hosted runner. GH runner kernels
+  # are < 6.14, so the fanotify path is covered by fanotify-vm.yml instead.
   snapshotter-e2e:
     runs-on: ${{ vars.RUNNER_OS || 'ubuntu-latest' }}
     needs: [contrib-build, nydus-build]
     timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        fs_driver: [fusedev, blockdev, tarfs]
     steps:
     - name: Checkout
       uses: actions/checkout@v6
@@ -780,12 +784,24 @@ jobs:
       with:
         name: nydusify-artifact
         path: target/release
+    - name: Select the ${{ matrix.fs_driver }} fs driver
+      run: |
+        sed -i 's/^type = "fusedev"$/type = "${{ matrix.fs_driver }}"/' misc/performance/snapshotter_config.toml
+        grep -x 'type = "${{ matrix.fs_driver }}"' misc/performance/snapshotter_config.toml
+        if [ "${{ matrix.fs_driver }}" != fusedev ]; then
+          sudo modprobe erofs && sudo modprobe loop
+          grep -w erofs /proc/filesystems
+        fi
+        if [ "${{ matrix.fs_driver }}" = tarfs ]; then
+          sudo apt-get install -y -qq cryptsetup-bin
+          sudo modprobe dm-verity
+        fi
     - name: Prepare Nydus Container Environment
       run: |
         sudo bash misc/prepare.sh
     - name: Snapshotter E2E
       run: |
-        sudo bash misc/snapshotter-e2e.sh
+        sudo FS_DRIVER=${{ matrix.fs_driver }} bash misc/snapshotter-e2e.sh
     - name: Dump nydus-snapshotter logs
       if: always()
       run: |
@@ -793,6 +809,22 @@ jobs:
         sudo journalctl -u nydus-snapshotter --no-pager || true
         echo "=== nydus-snapshotter status ==="
         sudo systemctl status nydus-snapshotter --no-pager --full || true
+
+  # The ignored containerd gRPC tests: the content/images client across a containerd restart,
+  # and the layer backfill through the Transfer service against a registry with basic auth.
+  # Each script starts its own containerd inside a rust container.
+  containerd-grpc:
+    runs-on: ${{ vars.RUNNER_OS || 'ubuntu-latest' }}
+    timeout-minutes: 60
+    env:
+      NYDUS_TARGET_VOLUME: nydus-target-containerd-grpc
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v6
+    - name: ContentStoreClient against containerd
+      run: bash misc/containerd-grpc/client-test.sh
+    - name: Layer backfill through the Transfer service
+      run: bash misc/containerd-grpc/backfill-test.sh
 
   # The blob cache under disk pressure, on the fusedev path. Needs root, a loopback ext4 and
   # FUSE -- but NOT kernel >= 6.14, which is what keeps misc/fanotify/*.sh out of CI. Runs

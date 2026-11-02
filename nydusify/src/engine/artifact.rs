@@ -27,7 +27,7 @@
 //!
 //! The exact manifest shape mirrors what the snapshotter consumes
 //! (`snapshotter/src/source/referrer.rs::classify_descriptor` +
-//! `misc/fanotify/b4b-referrer-serving-test.sh`).
+//! `registry-client`'s `B4B_ARTIFACT_JSON` test fixture).
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};

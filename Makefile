@@ -162,7 +162,7 @@ build: .format .no-error-macros
 	# completely dead, and `unnecessary_cast` was hiding five redundant `addr as u64` casts
 	# in `block_uffd.rs` -- fixed rather than re-suppressed. Suppress at the item with
 	# #[allow]/#[expect] and a reason instead.
-	${CARGO} clippy --workspace $(EXCLUDE_PACKAGES) $(CARGO_COMMON) $(CARGO_BUILD_FLAGS) --bins --tests -- -Dwarnings
+	${CARGO} clippy --workspace $(EXCLUDE_PACKAGES) $(CARGO_COMMON) $(CARGO_BUILD_FLAGS) --all-targets -- -Dwarnings
 
 release: .format build
 
@@ -184,7 +184,7 @@ ut:
 
 # you need install cargo nextest first from: https://nexte.st/book/pre-built-binaries.html
 ut-nextest:
-	$(CARGO_COV_FLAGS) TEST_WORKDIR_PREFIX=$(TEST_WORKDIR_PREFIX) RUST_BACKTRACE=1 ${RUSTUP} run stable cargo nextest run --no-fail-fast --filter-expr 'test(test) - test(integration)' --workspace $(EXCLUDE_PACKAGES) $(CARGO_COMMON) $(CARGO_BUILD_FLAGS)
+	$(CARGO_COV_FLAGS) TEST_WORKDIR_PREFIX=$(TEST_WORKDIR_PREFIX) RUST_BACKTRACE=1 ${RUSTUP} run stable cargo nextest run --no-fail-fast --filter-expr 'not test(integration)' --workspace $(EXCLUDE_PACKAGES) $(CARGO_COMMON) $(CARGO_BUILD_FLAGS)
 
 # install miri first from https://github.com/rust-lang/miri/
 # nydus-snapshotter is excluded from Miri: it links compio (io_uring) + mimalloc

@@ -3466,6 +3466,9 @@ impl DaemonSupervisor {
     }
 }
 
+#[cfg(all(test, target_os = "linux"))]
+mod e2e_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;
