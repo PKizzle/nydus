@@ -447,7 +447,7 @@ async fn walk_manifest_via_grpc(
     }
     let manifest: OciManifest = serde_json::from_slice(&bytes)?;
     let bootstrap_indices = collect_bootstrap_layers(&manifest, image_ref, out);
-    let Some(cfg_desc) = manifest.config.as_ref() else {
+    let Some(cfg_desc) = image_config(&manifest) else {
         return Ok(());
     };
     let cfg_bytes = cs
@@ -458,6 +458,19 @@ async fn walk_manifest_via_grpc(
         .with_context(|| format!("parse image config for {image_ref}"))?;
     register_chain_ids(image_ref, &cfg.rootfs.diff_ids, &bootstrap_indices, out);
     Ok(())
+}
+
+/// The manifest's config descriptor when it is an image config. An OCI artifact stored under an
+/// image record (a cosign signature or SLSA attestation pulled by digest) has a manifest with an
+/// empty `{}` config and no rootfs, so it has no chainIDs to register.
+fn image_config(manifest: &OciManifest) -> Option<&OciDescriptor> {
+    manifest.config.as_ref().filter(|c| {
+        matches!(
+            c.media_type.as_str(),
+            "" | "application/vnd.oci.image.config.v1+json"
+                | "application/vnd.docker.container.image.v1+json"
+        )
+    })
 }
 
 /// Record bootstrap-annotated layers into the cache map (by layer digest)
@@ -901,7 +914,7 @@ fn walk_manifest_via_cli(
     }
     let manifest: OciManifest = serde_json::from_slice(&bytes)?;
     let bootstrap_indices = collect_bootstrap_layers(&manifest, image_ref, out);
-    let Some(cfg_desc) = manifest.config.as_ref() else {
+    let Some(cfg_desc) = image_config(&manifest) else {
         return Ok(());
     };
     let cfg_bytes = run_first_ok(&[
@@ -1310,6 +1323,37 @@ mod tests {
         let chains = chain_ids(&diff_ids);
         assert!(out.contains_key(&chains[1]));
         assert!(out.contains_key(chains.last().unwrap()));
+    }
+
+    /// An attestation manifest (empty `{}` config, DSSE layer) is skipped instead of failing the
+    /// walk with "parse image config"; image manifests of both spellings are walked.
+    #[test]
+    fn image_config_skips_artifact_manifests() {
+        let parse = |v: serde_json::Value| serde_json::from_value::<OciManifest>(v).unwrap();
+        let attestation = parse(serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "artifactType": "application/vnd.oci.image.config.v1+json",
+            "config": { "mediaType": "application/vnd.oci.empty.v1+json",
+                        "digest": "sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+                        "size": 2, "data": "e30=" },
+            "layers": [{ "mediaType": "application/vnd.dsse.envelope.v1+json",
+                         "digest": "sha256:dsse", "size": 9086 }]
+        }));
+        assert!(image_config(&attestation).is_none());
+        for media_type in [
+            "application/vnd.oci.image.config.v1+json",
+            "application/vnd.docker.container.image.v1+json",
+        ] {
+            let image = parse(serde_json::json!({
+                "config": { "mediaType": media_type, "digest": "sha256:cfg" },
+                "layers": []
+            }));
+            assert_eq!(
+                image_config(&image).map(|c| c.digest.as_str()),
+                Some("sha256:cfg")
+            );
+        }
     }
 
     #[test]
