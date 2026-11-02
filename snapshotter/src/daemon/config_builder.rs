@@ -21,8 +21,8 @@ use serde_json::json;
 use tracing::warn;
 
 use crate::config::{
-    HttpProxyBackendConfig, OssBackendConfig, RegistryBackendConfig, S3BackendConfig,
-    SnapshotterConfig,
+    ErofsInodeShare, HttpProxyBackendConfig, OssBackendConfig, RegistryBackendConfig,
+    S3BackendConfig, SnapshotterConfig,
 };
 use crate::daemon::image_ref::ImageRef;
 
@@ -337,6 +337,26 @@ fn resolve_credential_env(var_name: &str) -> anyhow::Result<String> {
     })
 }
 
+/// EROFS `domain_id` of the node-local page cache sharing domain.
+///
+/// The kernel shares pages between files of one domain whose fingerprint xattrs are equal, so a
+/// domain must only ever hold images whose fingerprints the node computed itself. Every artifact
+/// `local_accel` builds is fingerprinted by the same `nydus-image merge` from data it hashed, so
+/// one fixed domain lets all of them share with each other and with nothing else.
+pub const NODE_LOCAL_INODE_SHARE_DOMAIN: &str = "nydus-node-local";
+
+/// The `inode_share` domain to mount an auto-accel sidecar with, or `None` to mount without
+/// page cache sharing. Only a bootstrap built on this node qualifies: a peer's could carry a
+/// crafted fingerprint that aliases another image's file, so it never gets the option.
+pub fn auto_accel_inode_share_domain(
+    mode: ErofsInodeShare,
+    built_on_node: bool,
+    kernel_release: &str,
+) -> Option<String> {
+    (built_on_node && mode.enabled_for_kernel(kernel_release))
+        .then(|| NODE_LOCAL_INODE_SHARE_DOMAIN.to_string())
+}
+
 /// Build a `ConfigV2` for the **auto-accel sidecar** mount: a `localfs`
 /// backend pointed at the symlinked gzip-layer / zran-index directory + a
 /// `fanotify` pre-content cache pointed at the staging directory holding the
@@ -356,6 +376,7 @@ pub fn build_auto_accel_config(
     stage_dir: &Path,
     daemon_mountpoint: &Path,
     daemon_id: &str,
+    inode_share_domain: Option<String>,
 ) -> ConfigV2 {
     let backend = BackendConfigV2 {
         backend_type: "localfs".to_string(),
@@ -384,6 +405,7 @@ pub fn build_auto_accel_config(
         fanotify: Some(FanotifyConfig {
             work_dir: stage_dir.display().to_string(),
             mountpoint: daemon_mountpoint.display().to_string(),
+            erofs_inode_share_domain: inode_share_domain,
         }),
     };
 
@@ -419,8 +441,15 @@ pub fn build_auto_accel_blob_cache_entry(
     daemon_mountpoint: &Path,
     daemon_id: &str,
     bootstrap: &Path,
+    inode_share_domain: Option<String>,
 ) -> anyhow::Result<BlobCacheEntry> {
-    let cfg_v2 = build_auto_accel_config(backend_dir, stage_dir, daemon_mountpoint, daemon_id);
+    let cfg_v2 = build_auto_accel_config(
+        backend_dir,
+        stage_dir,
+        daemon_mountpoint,
+        daemon_id,
+        inode_share_domain,
+    );
     let entry_config = BlobCacheEntryConfigV2 {
         version: cfg_v2.version,
         id: cfg_v2.id,
@@ -972,5 +1001,49 @@ mod tests {
             resolve_endpoint_scheme("http://minio.local:9000/", false),
             ("http".to_string(), "minio.local:9000".to_string())
         );
+    }
+
+    #[test]
+    fn inode_share_only_for_node_built_auto_accel_bootstraps() {
+        let kernel = "7.4.0";
+        for mode in [
+            ErofsInodeShare::Auto,
+            ErofsInodeShare::On,
+            ErofsInodeShare::Off,
+        ] {
+            // A peer-fetched sidecar never gets the option, whatever the mode.
+            assert_eq!(auto_accel_inode_share_domain(mode, false, kernel), None);
+        }
+        assert_eq!(
+            auto_accel_inode_share_domain(ErofsInodeShare::Auto, true, kernel).as_deref(),
+            Some(NODE_LOCAL_INODE_SHARE_DOMAIN)
+        );
+        assert_eq!(
+            auto_accel_inode_share_domain(ErofsInodeShare::Off, true, kernel),
+            None
+        );
+
+        let fanotify_domain = |cfg: &ConfigV2| {
+            cfg.cache
+                .as_ref()
+                .and_then(|c| c.fanotify.as_ref())
+                .and_then(|f| f.erofs_inode_share_domain.clone())
+        };
+        let peer = auto_accel_inode_share_domain(ErofsInodeShare::On, false, kernel);
+        let local = auto_accel_inode_share_domain(ErofsInodeShare::On, true, kernel);
+        let dir = PathBuf::from("/tmp/x");
+        assert_eq!(
+            fanotify_domain(&build_auto_accel_config(&dir, &dir, &dir, "d", peer)),
+            None
+        );
+        assert_eq!(
+            fanotify_domain(&build_auto_accel_config(&dir, &dir, &dir, "d", local)).as_deref(),
+            Some(NODE_LOCAL_INODE_SHARE_DOMAIN)
+        );
+        // Registry-served images are configured without a fanotify section at all.
+        let mut cfg = SnapshotterConfig::default();
+        cfg.snapshotter.features.erofs_inode_share = ErofsInodeShare::On;
+        let registry = build_daemon_config(&cfg, &dummy_image(), &dir, None, "d").unwrap();
+        assert_eq!(fanotify_domain(&registry), None);
     }
 }

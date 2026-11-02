@@ -55,7 +55,6 @@ pub mod migrate;
 pub mod nri;
 pub mod nri_ttrpc;
 pub mod overlay;
-pub mod page_cache;
 pub mod peer_mirror;
 pub mod peer_mirror_selfcheck;
 pub mod prefetch_profile;

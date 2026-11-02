@@ -63,6 +63,13 @@ referrer_detect = false
 dual_index_detect = true
 prefetch = true
 metrics = true
+# EROFS page cache sharing (inode_share) between auto-accel images built on this node, so a
+# file present in many images is cached once. Registry and peer-fetched images never share.
+# "auto" enables it on kernel >= 7.4. "on" enables it on any kernel accepting the option
+# (7.0+); use it only on kernels that carry the fix "erofs: hold real inodes for shared files"
+# (mainline 7259fb011c14, via a stable release or a cherry-pick), since without it mmap'd shared
+# files can fault. "off" disables it.
+erofs_inode_share = "auto"
 
 # Who may publish a served referrer. The first rule whose scope glob matches
 # "<registry>/<repository>" decides ("*" stays within one path segment, "**"

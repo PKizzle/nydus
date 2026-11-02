@@ -45,6 +45,10 @@ use crate::peer_mirror::{
 const LABEL_ROLE: &str = "containerd.io/snapshot/nydus.auto-accel.role";
 const LABEL_SUBJECT: &str = "containerd.io/gc.ref.content.subject";
 const LABEL_DISTRIBUTION_SOURCE: &str = "containerd.io/distribution.source.nydus.auto-accel.local";
+/// Set only by this node's auto-zran worker on a bootstrap `local_accel` built here. A peer pull
+/// writes its own labels (`labels_for_role`) and never this one, so it tells the serving side
+/// whether the bootstrap's page cache sharing fingerprints can be trusted.
+pub const LABEL_BUILT_ON_NODE: &str = "containerd.io/snapshot/nydus.auto-accel.built-on-node";
 
 /// Accept header used on every manifest GET. We accept both the OCI media
 /// type our producer emits and the docker v2 manifest media type so a
@@ -68,6 +72,13 @@ pub struct StagedSidecar {
     /// Root of the per-image scratch (parent of `bootstrap` and
     /// `backend_dir`). Removed by the supervisor on instance teardown.
     pub work_dir: PathBuf,
+    /// The bootstrap was built on this node (see [`LABEL_BUILT_ON_NODE`]), not pulled from a peer.
+    pub built_on_node: bool,
+}
+
+/// Whether a bootstrap blob's content-store labels mark it as built on this node.
+pub fn is_built_on_node(labels: &HashMap<String, String>) -> bool {
+    labels.get(LABEL_BUILT_ON_NODE).is_some_and(|v| v == "true")
 }
 
 /// Sidecar lookup against containerd's content store. Cheap to clone.
@@ -310,11 +321,19 @@ impl SidecarLocator {
         ensure_present(&bootstrap_src, "bootstrap")?;
         let bootstrap_dst = stage_dir.join("bootstrap");
         copy_atomic(&bootstrap_src, &bootstrap_dst)?;
+        let built_on_node = match self.content_store.info(&manifest.bootstrap.digest).await {
+            Ok(info) => info.is_some_and(|i| is_built_on_node(&i.labels)),
+            Err(e) => {
+                debug!(error = %e, "auto-accel bootstrap labels unreadable; treating it as peer-built");
+                false
+            }
+        };
 
         Ok(StagedSidecar {
             bootstrap: bootstrap_dst,
             backend_dir,
             work_dir,
+            built_on_node,
         })
     }
 
@@ -876,6 +895,19 @@ mod tests {
     /// and layer blobs alive across containerd GC passes. A missing edge
     /// here resurfaces as a peer-mirror 404 for a referenced blob on every
     /// consumer node — pin the full shape.
+    /// A peer-pulled bootstrap is labelled by `labels_for_role`, which must never mark it as
+    /// built here: that label is what lets a bootstrap's fingerprints share page cache.
+    #[test]
+    fn peer_pulled_blobs_are_never_marked_built_on_node() {
+        for role in ["bootstrap", "index", "prefetch-blob", "config"] {
+            let labels = labels_for_role("sha256:s", role, "r:t", Some("sha256:l".into()));
+            assert!(!is_built_on_node(&labels), "{role}");
+        }
+        let mut local = HashMap::new();
+        local.insert(LABEL_BUILT_ON_NODE.to_string(), "true".to_string());
+        assert!(is_built_on_node(&local));
+    }
+
     #[test]
     fn manifest_blob_labels_carry_gc_edges_for_all_references() {
         let oci = OciImageManifest {

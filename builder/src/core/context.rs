@@ -1381,6 +1381,8 @@ pub struct BuildContext {
     pub fs_version: RafsVersion,
     /// Whether any directory/file has extended attributes.
     pub has_xattr: bool,
+    /// Write a page cache sharing fingerprint xattr on every non-empty regular file (RAFS v6).
+    pub inode_share_fingerprint: bool,
 
     /// Format conversion type.
     pub conversion_type: ConversionType,
@@ -1491,6 +1493,7 @@ impl BuildContext {
             blob_features,
             blob_inline_meta,
             has_xattr: false,
+            inode_share_fingerprint: false,
 
             features,
             configuration: Arc::new(ConfigV2::default()),
@@ -1607,6 +1610,7 @@ impl Default for BuildContext {
             blob_tar_reader: None,
             blob_features: BlobFeatures::empty(),
             has_xattr: true,
+            inode_share_fingerprint: false,
             blob_inline_meta: false,
             features: Features::new(),
             configuration: Arc::new(ConfigV2::default()),

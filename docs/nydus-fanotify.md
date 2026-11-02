@@ -143,6 +143,19 @@ sudo NYDUS_IMAGE=./target/release/nydus-image NYDUSD=./target/release/nydusd \
 > blob-cache `work_dir` is therefore the staging directory, and the producer must arrange the device
 > file and the cache file to be one inode.
 
+## Page cache sharing
+
+`cache_config.erofs_inode_share_domain` mounts the image with
+`inode_share,domain_id=<domain>`: on Linux 7.0+ files whose fingerprint xattrs are equal share
+one page cache across all mounts of the domain, so a library used by many images is cached once.
+The image needs fingerprints (`nydus-image merge --inode-share-fingerprint`); without them the
+kernel mounts normally. A kernel that rejects the options (`EINVAL`, before 7.0) is mounted
+without them. Shared mmaps need the 7.4 fix "erofs: hold real inodes for shared files" (or a
+stable kernel carrying it). `misc/fanotify/inode-share-test.sh` checks the sharing in the kernel.
+
+The snapshotter sets the domain only for auto-accel images this node built, under
+`[snapshotter.features] erofs_inode_share` (`auto`: kernel 7.4+, `on`, `off`).
+
 ## Troubleshooting
 
 - **Reads return `EIO`** — the daemon failed to fetch a range (backend/network error). Check

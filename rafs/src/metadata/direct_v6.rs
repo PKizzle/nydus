@@ -42,8 +42,8 @@ use crate::metadata::layout::v6::{
     EROFS_I_VERSION_BIT, EROFS_I_VERSION_BITS, EROFS_INODE_CHUNK_BASED, EROFS_INODE_FLAT_INLINE,
     EROFS_INODE_FLAT_PLAIN, EROFS_INODE_SLOT_SIZE, RafsV6BlobTable, RafsV6Dirent,
     RafsV6InodeChunkAddr, RafsV6InodeCompact, RafsV6InodeExtended, RafsV6OndiskInode,
-    RafsV6XattrEntry, RafsV6XattrIbodyHeader, block_size_from_bits, rafsv6_load_blob_extra_info,
-    recover_namespace,
+    RafsV6XattrEntry, RafsV6XattrIbodyHeader, block_size_from_bits, is_long_prefix_xattr,
+    rafsv6_load_blob_extra_info, recover_namespace,
 };
 use crate::metadata::layout::{MetaRange, XattrName, XattrValue, bytes_to_os_str};
 use crate::metadata::{
@@ -1046,13 +1046,16 @@ impl RafsInode for OndiskInodeWrapper {
                     e.name_len()
                 )));
             }
-            let mut xa_name = recover_namespace(e.name_index())?;
-            let suffix: &[u8] = state.map.get_slice(
-                offset + size_of::<RafsV6XattrEntry>(),
-                e.name_len() as usize,
-            )?;
-            xa_name.push(OsStr::from_bytes(suffix));
-            if xa_name == name {
+            let mut xa_name = OsString::new();
+            if !is_long_prefix_xattr(e.name_index()) {
+                xa_name = recover_namespace(e.name_index())?;
+                let suffix: &[u8] = state.map.get_slice(
+                    offset + size_of::<RafsV6XattrEntry>(),
+                    e.name_len() as usize,
+                )?;
+                xa_name.push(OsStr::from_bytes(suffix));
+            }
+            if !xa_name.is_empty() && xa_name == name {
                 let data: &[u8] = state.map.get_slice(
                     offset + size_of::<RafsV6XattrEntry>() + e.name_len() as usize,
                     e.value_size() as usize,
@@ -1092,14 +1095,16 @@ impl RafsInode for OndiskInodeWrapper {
                     e.name_len()
                 )));
             }
-            let name: &[u8] = state.map.get_slice(
-                offset + size_of::<RafsV6XattrEntry>(),
-                e.name_len() as usize,
-            )?;
-            let ns = recover_namespace(e.name_index())?;
-            let mut xa = ns.into_vec();
-            xa.extend_from_slice(name);
-            xattrs.push(xa);
+            if !is_long_prefix_xattr(e.name_index()) {
+                let name: &[u8] = state.map.get_slice(
+                    offset + size_of::<RafsV6XattrEntry>(),
+                    e.name_len() as usize,
+                )?;
+                let ns = recover_namespace(e.name_index())?;
+                let mut xa = ns.into_vec();
+                xa.extend_from_slice(name);
+                xattrs.push(xa);
+            }
 
             let mut s = e.name_len() + e.value_size() + size_of::<RafsV6XattrEntry>() as u32;
             s = round_up(s as u64, size_of::<RafsV6XattrEntry>() as u64) as u32;

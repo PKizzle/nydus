@@ -124,6 +124,22 @@ const EROFS_FEATURE_COMPAT_RAFS_V6: u32 = 0x4000_0000;
 const EROFS_FEATURE_INCOMPAT_CHUNKED_FILE: u32 = 0x0000_0004;
 /// Multi-devices, incompatible with EROFS versions prior to Linux kernel 5.16.
 const EROFS_FEATURE_INCOMPAT_DEVICE_TABLE: u32 = 0x0000_0008;
+/// Long xattr name prefixes are stored plainly on the primary device at `xattr_prefix_start * 4`.
+const EROFS_FEATURE_COMPAT_PLAIN_XATTR_PFX: u32 = 0x0000_0010;
+/// Regular files carry a content fingerprint xattr for page cache sharing (`inode_share`, 7.0+).
+const EROFS_FEATURE_COMPAT_ISHARE_XATTRS: u32 = 0x0000_0020;
+/// Xattr name index flag: the low 7 bits select an entry of the long prefix table.
+const EROFS_XATTR_LONG_PREFIX: u8 = 0x80;
+// Byte offsets inside `s_reserved` of the EROFS superblock fields that follow `devt_slotoff`.
+const SB_RESERVED_XATTR_PREFIX_COUNT: usize = 1;
+const SB_RESERVED_XATTR_PREFIX_START: usize = 2;
+const SB_RESERVED_ISHARE_XATTR_PREFIX_ID: usize = 15;
+
+/// In-memory name of the hidden xattr holding an inode's page cache sharing fingerprint.
+///
+/// It has no xattr namespace, so `RafsXAttrs::add` can never accept it from a source image, and on
+/// disk it is the long prefix with index 0 of the image's prefix table (`EROFS_XATTR_LONG_PREFIX`).
+pub const RAFSV6_ISHARE_XATTR_NAME: &str = "nydus.fingerprint.v1";
 
 /// Size of SHA256 digest string.
 const BLOB_SHA256_LEN: usize = 64;
@@ -391,6 +407,43 @@ impl RafsV6SuperBlock {
 
     impl_pub_getter_setter!(magic, set_magic, s_magic, u32);
     impl_pub_getter_setter!(extra_devices, set_extra_devices, s_extra_devices, u16);
+
+    /// Declare a one-entry long xattr prefix table at byte offset `table_offset` of the bootstrap
+    /// and make its entry the inode fingerprint xattr the kernel's `inode_share` mode reads.
+    pub fn set_ishare_xattr_prefix(&mut self, table_offset: u64) -> RafsResult<()> {
+        if !table_offset.is_multiple_of(4) || table_offset >> 2 > u32::MAX as u64 {
+            return Err(RafsError::InvalidMetadata(format!(
+                "invalid xattr prefix table offset 0x{table_offset:x}"
+            )));
+        }
+        let start = ((table_offset >> 2) as u32).to_le_bytes();
+        self.s_reserved[SB_RESERVED_XATTR_PREFIX_COUNT] = 1;
+        self.s_reserved[SB_RESERVED_XATTR_PREFIX_START..SB_RESERVED_XATTR_PREFIX_START + 4]
+            .copy_from_slice(&start);
+        self.s_reserved[SB_RESERVED_ISHARE_XATTR_PREFIX_ID] = 0;
+        let compat = u32::from_le(self.s_feature_compat)
+            | EROFS_FEATURE_COMPAT_PLAIN_XATTR_PFX
+            | EROFS_FEATURE_COMPAT_ISHARE_XATTRS;
+        self.s_feature_compat = compat.to_le();
+        Ok(())
+    }
+
+    /// Whether the image carries inode fingerprints for the kernel's `inode_share` mode.
+    pub fn has_ishare_xattrs(&self) -> bool {
+        u32::from_le(self.s_feature_compat) & EROFS_FEATURE_COMPAT_ISHARE_XATTRS != 0
+    }
+}
+
+/// Encode the long xattr prefix table holding [`RAFSV6_ISHARE_XATTR_NAME`]: one record of a
+/// `__le16` length, then `erofs_xattr_long_prefix { base_index = 0, infix }`. Base index 0 is no
+/// xattr namespace, so the kernel never lists the xattr to user space.
+pub fn ishare_xattr_prefix_table() -> Vec<u8> {
+    let infix = RAFSV6_ISHARE_XATTR_NAME.as_bytes();
+    let mut table = Vec::with_capacity(3 + infix.len());
+    table.extend_from_slice(&(1 + infix.len() as u16).to_le_bytes());
+    table.push(0);
+    table.extend_from_slice(infix);
+    table
 }
 
 impl RafsStore for RafsV6SuperBlock {
@@ -2185,6 +2238,12 @@ impl RafsV6XattrEntry {
     }
 }
 
+/// Whether an on-disk xattr entry names a long prefix. RAFS only ever writes the hidden inode
+/// fingerprint that way, so readers skip these entries: they are not user-visible xattrs.
+pub(crate) fn is_long_prefix_xattr(index: u8) -> bool {
+    index & EROFS_XATTR_LONG_PREFIX != 0
+}
+
 pub(crate) fn recover_namespace(index: u8) -> RafsResult<OsString> {
     let pos = RAFSV6_XATTR_TYPES
         .iter()
@@ -2265,7 +2324,16 @@ impl RafsXAttrs {
         Ok(0)
     }
 
+    /// Set the page cache sharing fingerprint stored under [`RAFSV6_ISHARE_XATTR_NAME`].
+    pub fn set_ishare_fingerprint(&mut self, value: Vec<u8>) {
+        self.pairs
+            .insert(OsString::from(RAFSV6_ISHARE_XATTR_NAME), value);
+    }
+
     fn match_prefix(key: &OsStr) -> RafsResult<(u8, usize)> {
+        if key == RAFSV6_ISHARE_XATTR_NAME {
+            return Ok((EROFS_XATTR_LONG_PREFIX, key.len()));
+        }
         let key_str = key.to_string_lossy();
         let pos = RAFSV6_XATTR_TYPES
             .iter()

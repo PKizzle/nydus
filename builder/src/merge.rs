@@ -319,6 +319,10 @@ impl Merger {
         // Safe to unwrap because there is at least one source bootstrap.
         let tree = tree.unwrap();
         ctx.fs_version = fs_version;
+        ensure!(
+            !ctx.inode_share_fingerprint || fs_version.is_v6(),
+            "inode share fingerprints need RAFS v6 sources"
+        );
         if let Some(chunk_size) = chunk_size {
             ctx.chunk_size = chunk_size;
         }
@@ -685,5 +689,142 @@ mod tests {
             RafsSuper::load_from_file(merged.as_path(), Arc::new(ConfigV2::new("cfg")), false)
                 .unwrap();
         assert_eq!(rs.meta.blkszbits, 14);
+    }
+
+    /// Build one RAFS v6 layer bootstrap from `files` (path, content) and return its path.
+    fn build_v6_layer(files: &[(&str, &[u8])], out: &std::path::Path) -> PathBuf {
+        use crate::{BlobManager, BootstrapManager, Builder, ConversionType, DirectoryBuilder};
+        use vmm_sys_util::tempdir::TempDir;
+
+        let source = TempDir::new().unwrap();
+        for (path, content) in files {
+            let p = source.as_path().join(path);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, content).unwrap();
+        }
+        let layer = out.join("cd".repeat(32));
+        let mut ctx = BuildContext {
+            fs_version: RafsVersion::V6,
+            conversion_type: ConversionType::DirectoryToRafs,
+            source_path: source.as_path().to_path_buf(),
+            aligned_chunk: true,
+            blob_storage: Some(ArtifactStorage::FileDir((out.to_path_buf(), String::new()))),
+            ..Default::default()
+        };
+        let mut bootstrap_mgr =
+            BootstrapManager::new(Some(ArtifactStorage::SingleFile(layer.clone())), None);
+        let mut blob_mgr = BlobManager::new(ctx.digester, false);
+        DirectoryBuilder::new()
+            .build(&mut ctx, &mut bootstrap_mgr, &mut blob_mgr)
+            .unwrap();
+        layer
+    }
+
+    /// The fingerprint `merge --inode-share-fingerprint` computes for `path` in a layer.
+    fn inode_share_fingerprint(layer: &std::path::Path, path: &str) -> Option<Vec<u8>> {
+        use crate::core::chunk_dict::HashChunkDict;
+        use nydus_rafs::metadata::layout::v6::RAFSV6_ISHARE_XATTR_NAME;
+
+        let (rs, _) =
+            RafsSuper::load_from_file(layer, Arc::new(ConfigV2::new("cfg")), false).unwrap();
+        let mut dict = HashChunkDict::new(digest::Algorithm::Sha256);
+        let tree = Tree::from_bootstrap(&rs, &mut dict).unwrap();
+        let node = tree.get_node(std::path::Path::new(path)).unwrap();
+        let mut node = node.borrow_mut_node();
+        node.v6_set_inode_share_fingerprint().unwrap();
+        node.info
+            .xattrs
+            .get(std::ffi::OsStr::new(RAFSV6_ISHARE_XATTR_NAME))
+            .cloned()
+    }
+
+    #[test]
+    fn test_inode_share_fingerprint_identifies_content() {
+        use vmm_sys_util::tempdir::TempDir;
+
+        let lib: Vec<u8> = (0..20000u32).map(|i| (i * 7 % 251) as u8).collect();
+        let mut patched = lib.clone();
+        patched[15000] ^= 1;
+        let dir_a = TempDir::new().unwrap();
+        let dir_b = TempDir::new().unwrap();
+        let a = build_v6_layer(
+            &[
+                ("usr/lib/libx.so", &lib),
+                ("a", b"only in a"),
+                ("empty", b""),
+            ],
+            dir_a.as_path(),
+        );
+        let b = build_v6_layer(
+            &[("opt/libx.so", &lib), ("patched.so", &patched)],
+            dir_b.as_path(),
+        );
+
+        let fp = inode_share_fingerprint(&a, "/usr/lib/libx.so").expect("fingerprint");
+        assert_eq!(fp.len(), 32);
+        assert_eq!(
+            inode_share_fingerprint(&b, "/opt/libx.so"),
+            Some(fp.clone())
+        );
+        assert_ne!(inode_share_fingerprint(&b, "/patched.so"), Some(fp.clone()));
+        assert_ne!(inode_share_fingerprint(&a, "/a"), Some(fp));
+        assert_eq!(inode_share_fingerprint(&a, "/empty"), None);
+    }
+
+    /// The merged bootstrap declares the fingerprint prefix for the kernel, and RAFS readers skip
+    /// the hidden xattr, so the result is still a valid merge source.
+    #[test]
+    fn test_merge_writes_inode_share_fingerprints() {
+        use nydus_rafs::metadata::layout::v6::{EROFS_SUPER_OFFSET, RafsV6SuperBlock};
+        use std::os::unix::fs::FileExt;
+        use vmm_sys_util::tempdir::TempDir;
+
+        let dir = TempDir::new().unwrap();
+        let layer = build_v6_layer(&[("f", &[3u8; 9000]), ("g", b"g")], dir.as_path());
+        let merge = |source: PathBuf, fingerprint: bool| {
+            let mut ctx = BuildContext {
+                inode_share_fingerprint: fingerprint,
+                ..Default::default()
+            };
+            let (target, merged) = make_tmp_target();
+            Merger::merge(
+                &mut ctx,
+                None,
+                vec![source],
+                None,
+                Some(vec!["cd".repeat(32)]),
+                None,
+                None,
+                None,
+                target,
+                None,
+                Arc::new(ConfigV2::new("cfg")),
+            )
+            .unwrap();
+            merged
+        };
+        let has_ishare = |path: &std::path::Path| {
+            let mut sb = RafsV6SuperBlock::new();
+            std::fs::File::open(path)
+                .unwrap()
+                .read_exact_at(sb.as_mut(), EROFS_SUPER_OFFSET as u64)
+                .unwrap();
+            sb.has_ishare_xattrs()
+        };
+
+        let plain = merge(layer.clone(), false);
+        assert!(!has_ishare(plain.as_path()));
+        let shared = merge(layer, true);
+        assert!(has_ishare(shared.as_path()));
+        let (rs, _) =
+            RafsSuper::load_from_file(shared.as_path(), Arc::new(ConfigV2::new("cfg")), false)
+                .unwrap();
+        let ino = rs.get_inode(rs.superblock.root_ino(), false).unwrap();
+        let f = ino.get_child_by_name(std::ffi::OsStr::new("f")).unwrap();
+        assert!(f.get_xattrs().unwrap().is_empty());
+        let shared_copy = shared.as_path().with_extension("src");
+        std::fs::copy(shared.as_path(), &shared_copy).unwrap();
+        assert!(has_ishare(merge(shared_copy.clone(), true).as_path()));
+        std::fs::remove_file(shared_copy).unwrap();
     }
 }
