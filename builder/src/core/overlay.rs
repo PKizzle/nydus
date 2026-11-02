@@ -173,12 +173,11 @@ impl Node {
 
         match spec {
             WhiteoutSpec::Oci => {
-                if let Some(name) = self.name().to_str() {
-                    if name == OCISPEC_WHITEOUT_OPAQUE {
-                        return Some(WhiteoutType::OciOpaque);
-                    } else if name.starts_with(OCISPEC_WHITEOUT_PREFIX) {
-                        return Some(WhiteoutType::OciRemoval);
-                    }
+                let name = self.name().as_bytes();
+                if name == OCISPEC_WHITEOUT_OPAQUE.as_bytes() {
+                    return Some(WhiteoutType::OciOpaque);
+                } else if name.starts_with(OCISPEC_WHITEOUT_PREFIX.as_bytes()) {
+                    return Some(WhiteoutType::OciRemoval);
                 }
             }
             WhiteoutSpec::Overlayfs => {
@@ -198,19 +197,16 @@ impl Node {
 
     /// Get original filename from a whiteout filename.
     pub fn origin_name(&self, t: WhiteoutType) -> Option<&OsStr> {
-        if let Some(name) = self.name().to_str() {
-            if t == WhiteoutType::OciRemoval {
-                // the whiteout filename prefixes the basename of the path to be deleted with ".wh.".
-                return Some(OsStr::from_bytes(
-                    &name.as_bytes()[OCISPEC_WHITEOUT_PREFIX.len()..],
-                ));
-            } else if t == WhiteoutType::OverlayFsRemoval {
-                // the whiteout file has the same name as the file to be deleted.
-                return Some(name.as_ref());
-            }
+        let name = self.name();
+        match t {
+            // the whiteout filename prefixes the basename of the path to be deleted with ".wh.".
+            WhiteoutType::OciRemoval => Some(OsStr::from_bytes(
+                &name.as_bytes()[OCISPEC_WHITEOUT_PREFIX.len()..],
+            )),
+            // the whiteout file has the same name as the file to be deleted.
+            WhiteoutType::OverlayFsRemoval => Some(name),
+            _ => None,
         }
-
-        None
     }
 }
 

@@ -2249,4 +2249,143 @@ mod tests {
     fn test_merge_keeps_lower_metadata_under_implicit_parent_v6() {
         test_merge_keeps_lower_metadata_under_implicit_parent(RafsVersion::V6);
     }
+
+    // Accepts at most one byte per call, as a writer on a nearly full disk may.
+    struct OneByteWriter(std::io::Cursor<Vec<u8>>);
+
+    impl std::io::Write for OneByteWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.write(&buf[..buf.len().min(1)])
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Seek for OneByteWriter {
+        fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+            self.0.seek(pos)
+        }
+    }
+
+    impl nydus_rafs::RafsIoWrite for OneByteWriter {
+        fn as_any(&self) -> &dyn std::any::Any {
+            &self.0
+        }
+    }
+
+    // A short write must be retried, not leave the rest of a directory or symlink unwritten.
+    #[test]
+    fn test_v6_dump_retries_short_writes() {
+        let mut tar = RawTar::default().sym("s", &"t".repeat(100)).dir("d/");
+        // Enough entries to spill the directory past one block.
+        for i in 0..300 {
+            tar = tar.reg(&format!("d/entry-with-a-long-name-{i:04}"), b"");
+        }
+        let tar = tar.finish();
+        let dump = |short: bool| -> Vec<u8> {
+            let (_tmp, mut ctx) = layer_ctx(&tar);
+            let tree = build_tree(&mut ctx).unwrap();
+            let mut bootstrap_ctx =
+                BootstrapContext::new(None, false, EROFS_BLOCK_SIZE_4096).unwrap();
+            if short {
+                bootstrap_ctx.writer = Box::new(OneByteWriter(std::io::Cursor::new(Vec::new())));
+            }
+            let mut bootstrap = Bootstrap::new(tree).unwrap();
+            bootstrap.build(&mut ctx, &mut bootstrap_ctx).unwrap();
+            bootstrap
+                .v6_dump(
+                    &mut ctx,
+                    &mut bootstrap_ctx,
+                    &nydus_rafs::metadata::layout::v6::RafsV6BlobTable::new(),
+                )
+                .unwrap();
+            let out = bootstrap_ctx.writer.as_any();
+            out.downcast_ref::<std::io::Cursor<Vec<u8>>>()
+                .unwrap()
+                .get_ref()
+                .clone()
+        };
+        assert!(dump(true) == dump(false));
+    }
+
+    // Merges the layer bootstraps without a parent bootstrap and renders the result.
+    fn merge_layers(version: RafsVersion, layers: &[Vec<u8>]) -> Vec<String> {
+        let tmp_dir = vmm_sys_util::tempdir::TempDir::new().unwrap();
+        let dir = tmp_dir.as_path();
+        let mut sources = Vec::new();
+        for (idx, tar) in layers.iter().enumerate() {
+            let path = dir.join(format!("b{idx}"));
+            build_layer_file(version, tar, &path, None, false);
+            sources.push(path);
+        }
+        let out = dir.join("merged");
+        let mut ctx = BuildContext {
+            fs_version: version,
+            ..Default::default()
+        };
+        crate::Merger::merge(
+            &mut ctx,
+            None,
+            sources,
+            None,
+            None,
+            None,
+            None,
+            None,
+            ArtifactStorage::SingleFile(out.clone()),
+            None,
+            Arc::new(nydus_api::ConfigV2::new("cfg")),
+        )
+        .unwrap();
+        render(&load_tree(&out))
+    }
+
+    // containerd applies the bottom layer into an empty directory: its whiteouts and opaque
+    // markers hide nothing and never show up.
+    fn test_merge_strips_whiteouts_of_first_layer(version: RafsVersion) {
+        let layer0 = RawTar::default()
+            .reg("a/f", b"")
+            .reg("a/.wh.gone", b"")
+            .reg(".wh.top", b"")
+            .reg("b/.wh..wh..opq", b"")
+            .reg("b/keep", b"")
+            .member(REG, b".wh.\xff", b"", 0o644, b"")
+            .finish();
+        assert_eq!(
+            merge_layers(version, &[layer0]),
+            [
+                "/ dir 755",
+                "/a dir 755",
+                "/a/f file 644",
+                "/b dir 755",
+                "/b/keep file 644",
+            ]
+        );
+    }
+
+    #[test]
+    fn test_merge_strips_whiteouts_of_first_layer_v5() {
+        test_merge_strips_whiteouts_of_first_layer(RafsVersion::V5);
+    }
+
+    #[test]
+    fn test_merge_strips_whiteouts_of_first_layer_v6() {
+        test_merge_strips_whiteouts_of_first_layer(RafsVersion::V6);
+    }
+
+    #[test]
+    fn test_merge_applies_non_utf8_whiteout() {
+        let layer0 = RawTar::default()
+            .member(REG, b"n\xff", b"", 0o644, b"")
+            .reg("kept", b"")
+            .finish();
+        let layer1 = RawTar::default()
+            .member(REG, b".wh.n\xff", b"", 0o644, b"")
+            .finish();
+        assert_eq!(
+            merge_layers(RafsVersion::V6, &[layer0, layer1]),
+            ["/ dir 755", "/kept file 644"]
+        );
+    }
 }
