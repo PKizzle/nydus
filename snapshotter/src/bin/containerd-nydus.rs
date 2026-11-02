@@ -138,8 +138,15 @@ fn run_healthcheck(socket: &std::path::Path, ready: bool, timeout_secs: u64) -> 
     }
 }
 
-#[compio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    // Raised before the compio runtime exists: every runtime, daemon and cached blob holds
+    // fds, and the inherited soft limit (1024 under systemd) is far below what a node with
+    // many accelerated images needs. Logged once tracing is up.
+    let nofile = nydus_utils::fd_limit::raise_nofile_soft_limit();
+    compio::runtime::Runtime::new()?.block_on(run(nofile))
+}
+
+async fn run(nofile: std::io::Result<(u64, u64)>) -> Result<()> {
     let args = Args::parse();
 
     // Probe subcommand: dispatch before config load / tracing setup so it
@@ -184,6 +191,12 @@ async fn main() -> Result<()> {
         version = nydus_snapshotter::VERSION,
         "starting containerd-nydus snapshotter"
     );
+    match nofile {
+        Ok((old, new)) => info!(old, new, "soft RLIMIT_NOFILE"),
+        Err(e) => {
+            warn!(error = %e, "failed to raise the soft RLIMIT_NOFILE; keeping the inherited limit")
+        }
+    }
 
     // Load configuration.
     let config = if let Some(path) = &args.config {

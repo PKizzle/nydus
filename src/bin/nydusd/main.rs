@@ -31,6 +31,7 @@ use std::sync::LazyLock;
 
 use clap::{Arg, ArgAction, ArgMatches, Command};
 use nix::sys::signal;
+use nydus_utils::fd_limit::{RLIMIT_NOFILE_MAX, RLIMIT_NOFILE_RESERVED, system_file_max};
 use rlimit::Resource;
 
 use nydus::{SubCmdArgs, dump_program_info, get_build_time_info, setup_logging};
@@ -49,11 +50,6 @@ use crate::api_server_glue::ApiServerController;
 mod virtiofs;
 
 mod api_server_glue;
-
-/// Minimal number of file descriptors reserved for system.
-const RLIMIT_NOFILE_RESERVED: u64 = 16384;
-/// Default number of file descriptors.
-const RLIMIT_NOFILE_MAX: u64 = 1_000_000;
 
 static DAEMON_CONTROLLER: LazyLock<DaemonController> = LazyLock::new(DaemonController::new);
 static BTI_STRING: LazyLock<String> = LazyLock::new(|| get_build_time_info().0);
@@ -316,35 +312,6 @@ fn prepare_commandline_options() -> Command {
     append_singleton_subcmd_options(cmdline)
 }
 
-#[cfg(target_os = "macos")]
-fn get_max_rlimit_nofile() -> Result<u64> {
-    let mut mib = [nix::libc::CTL_KERN, nix::libc::KERN_MAXFILES];
-    let mut file_max: u64 = 0;
-    let mut size = std::mem::size_of::<u64>();
-    // Safe because the arguments are valid and we have checked the result.
-    let res = unsafe {
-        nix::libc::sysctl(
-            mib.as_mut_ptr(),
-            2,
-            (&mut file_max) as *mut u64 as *mut nix::libc::c_void,
-            &mut size,
-            std::ptr::null_mut(),
-            0,
-        )
-    };
-    nix::errno::Errno::result(res)?;
-    Ok(file_max)
-}
-
-#[cfg(target_os = "linux")]
-fn get_max_rlimit_nofile() -> Result<u64> {
-    let file_max = std::fs::read_to_string("/proc/sys/fs/file-max")?;
-    file_max
-        .trim()
-        .parse::<u64>()
-        .with_context(|| format!("invalid content from fs.file-max: {:?}", file_max.trim()))
-}
-
 /// Handle command line option to tune rlimit for maximum file descriptor number.
 fn handle_rlimit_nofile_option(args: &ArgMatches, option_name: &str) -> Result<()> {
     // `rlimit-nofile` has a default value, so safe to unwrap().
@@ -356,7 +323,8 @@ fn handle_rlimit_nofile_option(args: &ArgMatches, option_name: &str) -> Result<(
 
     if rlimit_nofile != 0 {
         // Ensures there are fds available for other processes so we don't cause resource exhaustion.
-        let rlimit_nofile_max = get_max_rlimit_nofile()?;
+        let rlimit_nofile_max =
+            system_file_max().context("read the system-wide open-file limit")?;
         if rlimit_nofile_max < 2 * RLIMIT_NOFILE_RESERVED {
             bail!("The fs.file-max sysctl is too low to allow a reasonable number of open files.");
         }
