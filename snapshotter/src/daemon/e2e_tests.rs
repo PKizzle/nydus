@@ -239,6 +239,7 @@ fn auto_accel_sidecar_serves_converted_layers() {
             work_dir: root.join("convert"),
             sched: SchedClass::Normal,
             nice: 0,
+            sandbox: true,
         },
         &layers,
     )
@@ -310,6 +311,7 @@ fn auto_accel_sidecar_serves_converted_layers() {
             &staged.bootstrap,
             &staged.backend_dir,
             "k1",
+            true,
         ))
         .unwrap_or_else(|e| panic!("auto-accel daemon start: {e:#}"));
     let mountpoint = handle.mountpoint().to_path_buf();
