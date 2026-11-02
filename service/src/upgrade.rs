@@ -174,6 +174,19 @@ impl UpgradeManager {
             .insert(blob_state_id, entry.clone_without_secrets());
     }
 
+    /// The blob entries a takeover successor would re-add, after the same serialize/restore
+    /// round trip as the hot-upgrade state blob.
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn fanotify_state_for_test(&self) -> HashMap<String, BlobCacheEntry> {
+        use nydus_upgrade::persist::Snapshotter;
+
+        let backend_stat =
+            fanotify_upgrade::FanotifyBackendState::try_from(&self.fanotify_deamon_stat).unwrap();
+        let mut bytes = backend_stat.save().unwrap();
+        let restored = fanotify_upgrade::FanotifyBackendState::restore(&mut bytes).unwrap();
+        FanotifyState::try_from(&restored).unwrap().blob_entry_map
+    }
+
     pub fn remove_blob_entry_state(&mut self, domain_id: &str, blob_id: &str) {
         let mut blob_state_id = domain_id.to_string();
         blob_state_id.push('/');
