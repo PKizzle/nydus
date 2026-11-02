@@ -76,6 +76,9 @@ pub struct Reconciler {
     /// Overlay engine for resolving which daemon a snapshot would release on
     /// `remove()`; `None` disables refcount reconciliation.
     refcount_recon: Option<Arc<crate::overlay::OverlayEngine>>,
+    /// Slugs the last mount-health pass found dead, so each one is logged
+    /// when it dies and when it recovers rather than on every tick.
+    dead_mounts: std::sync::Mutex<HashSet<String>>,
 }
 
 impl Reconciler {
@@ -97,6 +100,7 @@ impl Reconciler {
             last_slow_pass: std::sync::Mutex::new(None),
             mount_probe_timeout: None,
             refcount_recon: None,
+            dead_mounts: std::sync::Mutex::new(HashSet::new()),
         }
     }
 
@@ -266,15 +270,27 @@ impl Reconciler {
         }
     }
 
-    /// Run the mount-health probe pass and warn once per dead mount. Purely
-    /// observational — remediation is deliberately left to operators/alerts
-    /// consuming the metrics and `GET /api/v1/mounts/health`.
+    /// Run the mount-health probe pass and log each mount once when it turns
+    /// dead and once when it recovers. Purely observational — remediation is
+    /// deliberately left to operators/alerts consuming the metrics and
+    /// `GET /api/v1/mounts/health`, which report every pass: a mount that
+    /// answers reads with EIO (a kernel bug, say) is not fixed by remounting
+    /// it, so a recovery loop would only churn.
     async fn check_mount_health(&self) {
         let Some(timeout) = self.mount_probe_timeout else {
             return;
         };
         let report = self.supervisor.probe_mount_health(timeout).await;
-        for result in report.results.iter().filter(|r| !r.healthy) {
+        let (newly_dead, recovered) =
+            dead_mount_transitions(&mut self.dead_mounts.lock().unwrap(), &report.results);
+        for result in recovered {
+            info!(
+                slug = %result.slug,
+                image_ref = %result.image_ref,
+                "nydus mount healthy again"
+            );
+        }
+        for result in newly_dead {
             warn!(
                 slug = %result.slug,
                 image_ref = %result.image_ref,
@@ -871,9 +887,78 @@ fn unescape_mount_field(s: &str) -> String {
     out
 }
 
+/// Fold one probe pass into `dead` (the slugs found dead last pass) and
+/// return the results that just turned dead and those that just recovered.
+/// A slug absent from the pass (its daemon stopped) is dropped silently.
+fn dead_mount_transitions<'a>(
+    dead: &mut HashSet<String>,
+    results: &'a [crate::daemon::MountProbeResult],
+) -> (
+    Vec<&'a crate::daemon::MountProbeResult>,
+    Vec<&'a crate::daemon::MountProbeResult>,
+) {
+    let newly_dead = results
+        .iter()
+        .filter(|r| !r.healthy && !dead.contains(&r.slug))
+        .collect();
+    let recovered = results
+        .iter()
+        .filter(|r| r.healthy && dead.contains(&r.slug))
+        .collect();
+    *dead = results
+        .iter()
+        .filter(|r| !r.healthy)
+        .map(|r| r.slug.clone())
+        .collect();
+    (newly_dead, recovered)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dead_mount_is_reported_once_per_transition() {
+        let probe = |slug: &str, healthy: bool| crate::daemon::MountProbeResult {
+            slug: slug.to_string(),
+            image_ref: format!("img-{slug}"),
+            mountpoint: PathBuf::from("/mnt"),
+            fstype: Some("erofs".to_string()),
+            healthy,
+            error: (!healthy).then(|| "Input/output error".to_string()),
+            latency_ms: 0,
+            affected_overlays: 0,
+            probed_at: 0,
+        };
+        let slugs = |v: Vec<&crate::daemon::MountProbeResult>| {
+            v.iter().map(|r| r.slug.clone()).collect::<Vec<_>>()
+        };
+        let mut dead = HashSet::new();
+
+        let pass = [probe("a", false), probe("b", true)];
+        let (died, healed) = dead_mount_transitions(&mut dead, &pass);
+        assert_eq!(
+            (slugs(died), slugs(healed)),
+            (vec!["a".to_string()], vec![])
+        );
+
+        // Still dead on the following passes: nothing new to report.
+        for _ in 0..3 {
+            let (died, healed) = dead_mount_transitions(&mut dead, &pass);
+            assert!(died.is_empty() && healed.is_empty());
+        }
+
+        let pass = [probe("a", true), probe("b", false)];
+        let (died, healed) = dead_mount_transitions(&mut dead, &pass);
+        assert_eq!(
+            (slugs(died), slugs(healed)),
+            (vec!["b".to_string()], vec!["a".to_string()])
+        );
+
+        // "b" stopped while dead: forgotten, so a later daemon reusing the slug reports again.
+        let (died, healed) = dead_mount_transitions(&mut dead, &[]);
+        assert!(died.is_empty() && healed.is_empty() && dead.is_empty());
+    }
 
     #[test]
     fn parse_mounts_extracts_target_and_fs_type() {
