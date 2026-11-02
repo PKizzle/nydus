@@ -882,6 +882,13 @@ pub struct AutoZranConfig {
     /// dirs are removed after the artifacts are committed to the content store.
     #[serde(default = "default_auto_zran_work_dir")]
     pub work_dir: PathBuf,
+    /// Confine each conversion subprocess with `no_new_privs` and Landlock (Linux): it may read
+    /// only its input layers, `nydus_image` and the system library dirs, write only its
+    /// per-image dir under `work_dir`, and not open TCP connections. Enforced as far as the
+    /// kernel's Landlock ABI allows; without Landlock only `no_new_privs` applies. Set to `false`
+    /// only when `nydus_image` is a wrapper that needs other paths.
+    #[serde(default = "default_true")]
+    pub sandbox: bool,
     /// Re-drive the OPTIMIZE stage from persisted prefetch profiles on the
     /// reconciler's slow pass, to recover images stuck at the Base sidecar
     /// (first pod died before settle, or the settle-driven upload failed).
@@ -909,6 +916,7 @@ impl Default for AutoZranConfig {
             nice: default_auto_zran_nice(),
             sched_class: SchedClass::default(),
             work_dir: default_auto_zran_work_dir(),
+            sandbox: true,
             reoptimize_stuck_base: true,
             capture: AccessCaptureConfig::default(),
         }
@@ -1847,6 +1855,7 @@ skip_verify = true
         // The Base-recovery sweep is on by default (the worker's re-optimize
         // gate makes it safe for non-candidate profiles).
         assert!(config.snapshotter.auto_zran.reoptimize_stuck_base);
+        assert!(config.snapshotter.auto_zran.sandbox);
         assert_eq!(config.snapshotter.containerd.namespace, "k8s.io");
         // The TCP metrics endpoint is opt-in: with no `[snapshotter.metrics]`
         // section the listener is unset, so behavior is UDS-only as before.

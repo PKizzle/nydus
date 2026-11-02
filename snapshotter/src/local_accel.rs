@@ -103,6 +103,9 @@ pub struct LocalAccelConfig {
     pub sched: SchedClass,
     /// `nice` level when `sched` is `Idle`.
     pub nice: i32,
+    /// Confine each `nydus-image` subprocess with `no_new_privs` and Landlock (Linux only; see
+    /// [`sandbox`]).
+    pub sandbox: bool,
 }
 
 /// Result of a node-local conversion, ready to feed a fanotify `BlobCacheEntry`
@@ -196,8 +199,19 @@ fn build_command(prog: &Path, args: &[OsString], sched: SchedClass, nice: i32) -
     }
 }
 
-fn run(prog: &Path, args: &[OsString], sched: SchedClass, nice: i32, what: &str) -> Result<()> {
-    let output = build_command(prog, args, sched, nice)
+/// Run `nydus-image` with `args`. `reads` are the input files it may read besides the ones under
+/// `config.work_dir`, which is the only place it may write.
+fn run(config: &LocalAccelConfig, args: &[OsString], reads: &[&Path], what: &str) -> Result<()> {
+    let mut cmd = build_command(&config.nydus_image, args, config.sched, config.nice);
+    #[cfg(target_os = "linux")]
+    if config.sandbox {
+        let mut ro = vec![config.nydus_image.as_path()];
+        ro.extend_from_slice(reads);
+        sandbox::confine(&mut cmd, &ro, &config.work_dir)?;
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = reads;
+    let output = cmd
         .output()
         .with_context(|| format!("failed to spawn nydus-image for {what}"))?;
     if !output.status.success() {
@@ -297,13 +311,7 @@ pub fn convert(config: &LocalAccelConfig, layers: &[SourceLayer]) -> Result<Node
         fresh_dir(&out_dir)?;
         let bootstrap = out_dir.join("bootstrap");
         let args = targz_ref_args(&layer.path, &bootstrap, &out_dir);
-        run(
-            &config.nydus_image,
-            &args,
-            config.sched,
-            config.nice,
-            "targz-ref convert",
-        )?;
+        run(config, &args, &[&layer.path], "targz-ref convert")?;
         let index = expect_at_most_one_output(&out_dir, Some(&bootstrap))
             .context("locating zran index blob")?;
 
@@ -342,13 +350,7 @@ pub fn convert(config: &LocalAccelConfig, layers: &[SourceLayer]) -> Result<Node
 
     let bootstrap = stage.join("bootstrap");
     let margs = merge_args(&bootstrap, &blob_ids, &layer_bootstraps);
-    run(
-        &config.nydus_image,
-        &margs,
-        config.sched,
-        config.nice,
-        "merge",
-    )?;
+    run(config, &margs, &[], "merge")?;
 
     Ok(NodeLocalArtifact {
         bootstrap,
@@ -391,6 +393,117 @@ fn symlink_force(target: &Path, link: &Path) -> Result<()> {
         std::fs::copy(target, link)
             .map(|_| ())
             .with_context(|| format!("copying {} -> {}", target.display(), link.display()))
+    }
+}
+
+/// Confinement for the converter subprocesses. They parse untrusted gzip, zstd and tar layers as
+/// root, so each one gets `no_new_privs` and a Landlock domain that allows reading its inputs and
+/// the system directories the `SchedClass` wrappers and the dynamic loader need, and writing only
+/// the per-image work dir. TCP bind/connect (ABI 4) and signals and abstract unix sockets leaving
+/// the domain (ABI 6) are denied too. Enforcement is best-effort by kernel ABI: rights the running
+/// kernel does not know are dropped, never an error. A Landlock call failing on a kernel that has
+/// Landlock is an error, and that conversion fails.
+#[cfg(target_os = "linux")]
+mod sandbox {
+    use std::io;
+    use std::os::unix::process::CommandExt;
+    use std::path::Path;
+    use std::process::Command;
+    use std::sync::Once;
+
+    use landlock::{
+        ABI, Access, AccessFs, AccessNet, Ruleset, RulesetAttr, RulesetCreatedAttr, RulesetError,
+        Scope, path_beneath_rules,
+    };
+
+    /// Newest ABI whose rights the ruleset handles; older kernels enforce the subset they know.
+    const TARGET_ABI: ABI = ABI::V9;
+
+    /// Read and execute: `ionice`, `nice`, and the loader and libraries of dynamically linked
+    /// binaries (the release `nydus-image` is static musl and needs none of it).
+    const SYSTEM_PATHS: &[&str] = &[
+        "/usr",
+        "/lib",
+        "/lib64",
+        "/bin",
+        "/sbin",
+        "/etc/ld.so.cache",
+    ];
+
+    #[derive(Debug, thiserror::Error)]
+    #[error("building the Landlock ruleset for nydus-image")]
+    pub struct SandboxError(#[from] RulesetError);
+
+    /// Landlock ABI of the running kernel (`ABI::Unsupported` without Landlock).
+    pub(super) fn kernel_abi() -> ABI {
+        // SAFETY: LANDLOCK_CREATE_RULESET_VERSION with a null attr only returns the ABI version.
+        let v = unsafe {
+            libc::syscall(
+                libc::SYS_landlock_create_ruleset,
+                std::ptr::null::<libc::c_void>(),
+                0usize,
+                1u32,
+            )
+        };
+        ABI::from(v as i32)
+    }
+
+    fn log_enforcement_once() {
+        static ONCE: Once = Once::new();
+        ONCE.call_once(|| {
+            let abi = kernel_abi();
+            if abi == ABI::Unsupported {
+                tracing::info!(
+                    "nydus-image sandbox: Landlock unavailable on this kernel, enforcing no_new_privs only"
+                );
+            } else {
+                tracing::info!(
+                    landlock_abi = ?abi,
+                    tcp_denied = abi >= ABI::V4,
+                    signals_and_abstract_sockets_scoped = abi >= ABI::V6,
+                    "nydus-image sandbox: no_new_privs + Landlock filesystem confinement"
+                );
+            }
+        });
+    }
+
+    /// Make `cmd` confine itself before exec: read-only (plus execute) on `read` and
+    /// [`SYSTEM_PATHS`], full access under `write_dir`, nothing else.
+    ///
+    /// The ruleset and its path fds are built here, in the parent; the child only calls
+    /// `landlock_restrict_self`, because nothing between fork and exec may allocate.
+    pub(super) fn confine(
+        cmd: &mut Command,
+        read: &[&Path],
+        write_dir: &Path,
+    ) -> Result<(), SandboxError> {
+        log_enforcement_once();
+        let ro = AccessFs::from_read(TARGET_ABI);
+        let mut ruleset = Some(
+            Ruleset::default()
+                .handle_access(AccessFs::from_all(TARGET_ABI))?
+                .handle_access(AccessNet::from_all(TARGET_ABI))?
+                .scope(Scope::from_all(TARGET_ABI))?
+                .create()?
+                .add_rules(path_beneath_rules(SYSTEM_PATHS, ro))?
+                .add_rules(path_beneath_rules(read, ro))?
+                .add_rules(path_beneath_rules(
+                    [write_dir],
+                    AccessFs::from_all(TARGET_ABI),
+                ))?,
+        );
+        // SAFETY: `restrict_self` makes the prctl and landlock_restrict_self syscalls and closes
+        // the ruleset fd; neither it nor the errno recovery allocates.
+        unsafe {
+            cmd.pre_exec(move || match ruleset.take() {
+                Some(r) => r.restrict_self().map(drop).map_err(|e| {
+                    nydus_utils::source_errno(&e)
+                        .map_or_else(io::Error::last_os_error, io::Error::from_raw_os_error)
+                }),
+                None => Ok(()),
+            });
+        }
+        Ok(())
     }
 }
 
@@ -550,5 +663,101 @@ mod tests {
         std::fs::write(tmp.path().join("blob-b"), b"b").unwrap();
         let err = expect_at_most_one_output(tmp.path(), None).unwrap_err();
         assert!(err.to_string().contains("more than one"));
+    }
+
+    /// A converter-like child under the sandbox reads its input and writes its work dir, and a
+    /// write anywhere else fails with EACCES.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sandbox_denies_writes_outside_the_work_dir() {
+        if sandbox::kernel_abi() == landlock::ABI::Unsupported {
+            eprintln!("skip: kernel has no Landlock");
+            return;
+        }
+        let input = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(input.path(), "layer bytes").unwrap();
+        let work = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let script = format!(
+            "cat {} > {}/out && echo x > {}/escaped",
+            input.path().display(),
+            work.path().display(),
+            outside.path().display()
+        );
+        let mut cmd = Command::new("/bin/sh");
+        cmd.args(["-c", &script]);
+        sandbox::confine(&mut cmd, &[input.path()], work.path()).unwrap();
+        let out = cmd.output().unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(work.path().join("out")).unwrap(),
+            "layer bytes"
+        );
+        assert!(!outside.path().join("escaped").exists(), "write escaped");
+        assert!(!out.status.success());
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains("Permission denied"), "stderr: {stderr}");
+    }
+
+    /// The real conversion of a gzip layer succeeds under the sandbox, through the `Idle`
+    /// `ionice`/`nice` wrappers, while the `nydus-image` it runs cannot write outside its work
+    /// dir. `nydus_image` is a wrapper script that tries such a write before exec'ing the real
+    /// binary (copied into the work dir, the one place the sandbox lets it execute from besides
+    /// the system dirs). Needs a nydus-image binary (NYDUS_IMAGE).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn convert_runs_under_the_sandbox() {
+        use sha2::Digest;
+        use std::os::unix::fs::PermissionsExt;
+
+        let Ok(real) = std::env::var("NYDUS_IMAGE") else {
+            eprintln!("skip: set NYDUS_IMAGE");
+            return;
+        };
+        if sandbox::kernel_abi() == landlock::ABI::Unsupported {
+            eprintln!("skip: kernel has no Landlock");
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let work = tmp.path().join("work");
+        let bin = work.join("bin/nydus-image");
+        std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
+        std::fs::copy(&real, &bin).unwrap();
+        let wrapper = tmp.path().join("nydus-image");
+        std::fs::write(
+            &wrapper,
+            format!(
+                "#!/bin/sh\necho x > {}/escaped\nexec {} \"$@\"\n",
+                outside.path().display(),
+                bin.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let layer = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../tests/texture/zran/zran-two-streams.tar.gz");
+        let digest = hex::encode(sha2::Sha256::digest(std::fs::read(&layer).unwrap()));
+        let config = LocalAccelConfig {
+            nydus_image: wrapper,
+            work_dir: work,
+            sched: SchedClass::Idle,
+            nice: 19,
+            sandbox: true,
+        };
+        let artifact = convert(
+            &config,
+            &[SourceLayer {
+                digest: format!("sha256:{digest}"),
+                path: layer,
+            }],
+        )
+        .unwrap();
+
+        assert!(artifact.bootstrap.is_file());
+        assert_eq!(artifact.zran_index_blob_ids.len(), 1);
+        assert!(artifact.zran_index_blob_ids[0].is_some());
+        assert!(!outside.path().join("escaped").exists(), "write escaped");
     }
 }

@@ -112,6 +112,9 @@ queue_depth = 4
 # Background conversion runs at idle priority (SchedClass, OS-portable).
 sched_class = "idle"
 work_dir = "/var/lib/containerd-nydus/auto-zran"
+# Confine the nydus-image subprocesses (untrusted layers, run as root) with
+# no_new_privs + Landlock, as far as the kernel supports. On by default.
+sandbox = true
 
 # Access-order capture driving the stage-2 prefetch optimization.
 [snapshotter.auto_zran.capture]
