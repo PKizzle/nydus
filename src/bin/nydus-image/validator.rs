@@ -95,6 +95,10 @@ impl Validator {
                 }
                 continue;
             }
+            // Only regular files carry chunks; a symlink's size would read as a chunk count.
+            if !inode.is_reg() {
+                continue;
+            }
             let Some(ondisk) = inode.as_any().downcast_ref::<OndiskInodeWrapper>() else {
                 continue;
             };
@@ -206,8 +210,12 @@ mod tests {
         assert_eq!(rafs_version, RafsVersion::V6);
     }
 
-    // Builds a two-file RAFS v6 image at `block_size`; returns (blob dir, bootstrap path).
-    fn build_image(block_size: u64) -> (vmm_sys_util::tempdir::TempDir, PathBuf) {
+    // Builds a RAFS v6 image of two files and a symlink at `block_size`; returns (blob dir,
+    // bootstrap path).
+    fn build_image(
+        block_size: u64,
+        compressor: compress::Algorithm,
+    ) -> (vmm_sys_util::tempdir::TempDir, PathBuf) {
         use nydus_builder::{
             ArtifactStorage, BlobManager, BootstrapManager, BuildContext, Builder, ConversionType,
             DirectoryBuilder,
@@ -218,12 +226,14 @@ mod tests {
         fs::create_dir(&source).unwrap();
         fs::write(source.join("a"), vec![1u8; 5000]).unwrap();
         fs::write(source.join("b"), vec![2u8; 20000]).unwrap();
+        std::os::unix::fs::symlink("a", source.join("link")).unwrap();
         let bootstrap = dir.as_path().join("bootstrap");
         let mut ctx = BuildContext {
             fs_version: RafsVersion::V6,
             conversion_type: ConversionType::DirectoryToRafs,
             source_path: source,
             aligned_chunk: true,
+            compressor,
             blob_storage: Some(ArtifactStorage::FileDir((
                 dir.as_path().to_path_buf(),
                 String::new(),
@@ -262,10 +272,19 @@ mod tests {
         fs::write(path, data).unwrap();
     }
 
+    // The layout `nydusify convert` produces by default: compressed chunks and a symlink.
+    #[test]
+    fn test_validator_accepts_compressed_image() {
+        for block_size in [4096u64, 16384] {
+            let (dir, bootstrap) = build_image(block_size, compress::Algorithm::Zstd);
+            check_image(&dir, &bootstrap).unwrap();
+        }
+    }
+
     #[test]
     fn test_validator_checks_v6_block_addresses() {
         for block_size in [4096u64, 16384] {
-            let (dir, bootstrap) = build_image(block_size);
+            let (dir, bootstrap) = build_image(block_size, compress::Algorithm::None);
             check_image(&dir, &bootstrap).unwrap();
 
             // "b" follows the 5000-byte "a", padded to a block. The kernel still reads it at
@@ -278,7 +297,7 @@ mod tests {
             );
 
             // A device slot too short for the chunks it holds.
-            let (dir, bootstrap) = build_image(block_size);
+            let (dir, bootstrap) = build_image(block_size, compress::Algorithm::None);
             let (sb, _) = RafsSuper::load_from_file(
                 &bootstrap,
                 create_test_config(dir.as_path().to_str().unwrap()),
