@@ -21,7 +21,9 @@ use url::{ParseError, Url};
 use nydus_api::RegistryConfig;
 use nydus_utils::metrics::BackendMetrics;
 
-use crate::backend::connection::{Connection, ConnectionConfig, ConnectionError, ReqBody};
+use crate::backend::connection::{
+    Connection, ConnectionConfig, ConnectionError, ReqBody, check_range_status,
+};
 use crate::backend::request;
 use crate::backend::request::is_success_status;
 use crate::backend::{BackendContext, BackendError, BackendResult, BlobBackend, BlobReader};
@@ -220,51 +222,6 @@ fn parse_challenges(source: &str) -> Vec<(String, HashMap<String, String>)> {
         challenge.1.insert(key.trim().to_ascii_lowercase(), value);
     }
     challenges
-}
-
-/// Check a blob GET that carried `Range: <range>` starting at `offset`.
-///
-/// `Content-Range` decides which bytes the body carries: a `206` or `200` whose
-/// `Content-Range` starts at `offset` is the requested range (dfdaemon < 1.4.0 serves a
-/// Range it satisfied itself as `200 OK` with a correct `Content-Range`). A `206` without
-/// the header is trusted as the requested range; a `200` without it is the whole blob,
-/// which is the requested data only at offset 0. Anything else would put bytes from the
-/// wrong offset into the cache. A 3xx here is a redirect that was not followed and
-/// carries no blob data.
-fn check_range_status(
-    status: StatusCode,
-    content_range: Option<&HeaderValue>,
-    offset: u64,
-    range: &str,
-) -> RegistryResult<()> {
-    // `bytes <start>-<end>/<total>`; `bytes */<total>` has no start and never matches.
-    let start = content_range
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.trim().strip_prefix("bytes "))
-        .and_then(|v| v.split_once('-'))
-        .and_then(|(start, _)| start.trim().parse::<u64>().ok());
-    let ok = match (status, start) {
-        (StatusCode::PARTIAL_CONTENT | StatusCode::OK, Some(start)) => start == offset,
-        (StatusCode::PARTIAL_CONTENT, None) => content_range.is_none(),
-        (StatusCode::OK, None) => content_range.is_none() && offset == 0,
-        _ => false,
-    };
-    if ok {
-        return Ok(());
-    }
-    let content_range = content_range
-        .map(|v| {
-            format!(
-                " (Content-Range: {})",
-                String::from_utf8_lossy(v.as_bytes())
-            )
-        })
-        .unwrap_or_default();
-    Err(RegistryBackendError::Request(
-        ConnectionError::ErrorWithMsg(format!(
-            "unexpected HTTP {status} response to Range {range}{content_range}"
-        )),
-    ))
 }
 
 #[derive(Default)]
@@ -1045,7 +1002,8 @@ impl RegistryReader {
                 // Try read again only once
                 return self._try_read(buf, offset, false, context);
             }
-            check_range_status(status, content_range.as_ref(), offset, &range)?;
+            check_range_status(status, content_range.as_ref(), offset, &range)
+                .map_err(RegistryBackendError::Request)?;
             return Ok(written);
         }
 
@@ -1147,7 +1105,8 @@ impl RegistryReader {
                         buf,
                     )
                     .map_err(request_err_to_registry)?;
-                check_range_status(rstatus, content_range.as_ref(), offset, &range)?;
+                check_range_status(rstatus, content_range.as_ref(), offset, &range)
+                    .map_err(RegistryBackendError::Request)?;
                 trace!(
                     "redirect cache for blob={}, status={}",
                     self.blob_id, status
@@ -1163,7 +1122,8 @@ impl RegistryReader {
         }
 
         let status = resp.status();
-        check_range_status(status, resp.headers().get(CONTENT_RANGE), offset, &range)?;
+        check_range_status(status, resp.headers().get(CONTENT_RANGE), offset, &range)
+            .map_err(RegistryBackendError::Request)?;
         resp.copy_to(buf)
             .map_err(|e| {
                 RegistryBackendError::Transport(std::io::Error::other(format!(
@@ -1212,7 +1172,8 @@ impl RegistryReader {
             resp.headers().get(CONTENT_RANGE),
             offset,
             &range,
-        )?;
+        )
+        .map_err(RegistryBackendError::Request)?;
 
         Ok(resp.reader())
     }

@@ -1143,7 +1143,7 @@ pub struct BlobCompressionContext {
     pub(crate) batch_info_array: MappedOrOwned<BatchInflateContext>,
     pub(crate) zran_info_array: MappedOrOwned<ZranInflateContext>,
     pub(crate) zran_dict_table: MappedOrOwned<u8>,
-    chunk_digest_default: RafsDigest,
+    pub(crate) chunk_digest_default: RafsDigest,
     /// EROFS block size the blob's chunk starts are aligned to (see [BlobInfo::block_size]).
     pub(crate) block_size: u64,
 }

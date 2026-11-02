@@ -1251,20 +1251,14 @@ impl FileCacheEntry {
             // if we are in on-demand path, retry for the timeout chunks
             for chunk in chunks {
                 match self.chunk_map.check_ready_and_mark_pending(chunk.as_ref()) {
-                    Err(e) => {
-                        return Err(StorageError::InvalidData(format!(
-                            "do_fetch_chunks failed, {:?}",
-                            e
-                        )));
-                    }
+                    Err(e) => return Err(e),
                     Ok(true) => {}
                     Ok(false) => {
                         info!("retry for timeout chunk, {}", chunk.id());
                         let mut buf = alloc_buf(chunk.uncompressed_size() as usize);
                         self.read_chunk_from_backend(chunk.as_ref(), &mut buf)
-                            .map_err(|e| {
-                                self.update_chunk_pending_status(chunk.as_ref(), false);
-                                StorageError::InvalidData(format!("read_raw_chunk failed, {:?}", e))
+                            .inspect_err(|_| {
+                                self.update_chunk_pending_status(chunk.as_ref(), false)
                             })?;
                         if self.dio_enabled {
                             self.adjust_buffer_for_dio(&mut buf)
@@ -2434,16 +2428,18 @@ mod tests {
 
         let batch_ctxes = vec![batch_ctx0];
 
-        let mut state = BlobCompressionContext::default();
-        state.chunk_info_array = chunk_infos;
-        state.batch_info_array = batch_ctxes.into();
-        state.compressed_size = 0x2000;
-        state.uncompressed_size = 0x3000;
-        state.blob_features = (BlobFeatures::BATCH
-            | BlobFeatures::ALIGNED
-            | BlobFeatures::INLINED_FS_META
-            | BlobFeatures::CHUNK_INFO_V2)
-            .bits();
+        let state = BlobCompressionContext {
+            chunk_info_array: chunk_infos,
+            batch_info_array: batch_ctxes.into(),
+            compressed_size: 0x2000,
+            uncompressed_size: 0x3000,
+            blob_features: (BlobFeatures::BATCH
+                | BlobFeatures::ALIGNED
+                | BlobFeatures::INLINED_FS_META
+                | BlobFeatures::CHUNK_INFO_V2)
+                .bits(),
+            ..Default::default()
+        };
 
         let state = Arc::new(state);
         let meta = BlobCompressionContextInfo { state };

@@ -120,6 +120,12 @@ pub enum StorageError {
     /// Data read back from the cache or a blob is not what it claimed to be.
     #[error("{0}")]
     InvalidData(String),
+    /// Chunk data could not be decoded from the blob.
+    ///
+    /// `source` is the decoder's error. A backend read the decoder issued itself fails inside
+    /// it, so the backend's errno stays on the chain for `source_errno` to recover.
+    #[error("failed to decompress chunk data: {0}")]
+    Decompress(#[source] std::io::Error),
     /// A cache write completed with fewer bytes than asked for.
     ///
     /// Carries no errno, so the fanotify deny path falls back to `EIO` -- which is what the
@@ -201,7 +207,9 @@ impl From<StorageError> for std::io::Error {
             StorageError::InvalidArgument(_) | StorageError::InvalidState(_) => {
                 std::io::ErrorKind::InvalidInput
             }
-            StorageError::InvalidData(_) => std::io::ErrorKind::InvalidData,
+            StorageError::InvalidData(_) | StorageError::Decompress(_) => {
+                std::io::ErrorKind::InvalidData
+            }
             _ => std::io::ErrorKind::Other,
         };
         std::io::Error::new(kind, e)
