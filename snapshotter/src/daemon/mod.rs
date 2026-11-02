@@ -821,23 +821,32 @@ impl DaemonSupervisor {
             ),
         )?;
         let cfg_json = serde_json::json!({ "blobs": [entry] });
-        // The process-wide blob factory keys cache managers by config, which is
-        // the same for every start of this image, so it would hand back the
-        // previous daemon's cache entries; drop the idle ones. Unregistering a
-        // handler collects them too, but an in-place restart after a failed
-        // handler never unregisters, and that daemon's cache state is not to be
-        // trusted.
-        nydus_storage::factory::BLOB_FACTORY.gc(None);
-
         // Only a mount of this staged bootstrap is healed in place. Any other
         // one, such as a mount without data devices that answers every read
         // with EIO, is replaced.
-        if let Some((source, _)) = mount_at(&mountpoint)
-            && Path::new(&source.replace("\\040", " ")) != staged_bootstrap
-        {
-            warn!(image_ref = %image_ref_str, source, "replacing a mount of another bootstrap");
-            detach_mount_stack(&mountpoint)
-                .with_context(|| format!("failed to detach {}", mountpoint.display()))?;
+        let heal_in_place = match mount_at(&mountpoint) {
+            Some((source, _)) if Path::new(&source.replace("\\040", " ")) == staged_bootstrap => {
+                true
+            }
+            Some((source, _)) => {
+                warn!(image_ref = %image_ref_str, source, "replacing a mount of another bootstrap");
+                detach_mount_stack(&mountpoint)
+                    .with_context(|| format!("failed to detach {}", mountpoint.display()))?;
+                false
+            }
+            None => false,
+        };
+        // The process-wide blob factory keys cache managers by config, which is
+        // the same for every start of this image, so it would hand back the
+        // previous daemon's cache entries. A fresh mount drops the idle ones,
+        // whose files the stale daemon-dir sweep may already have deleted.
+        // Healing in place must keep them: their cache files were opened before
+        // any pre-content mark existed, so the fills written through them raise
+        // no events. Reopened while the replaced daemon's group still marks the
+        // inode, every fill would raise an event of its own and block the
+        // worker that issued it.
+        if !heal_in_place {
+            nydus_storage::factory::BLOB_FACTORY.gc(None);
         }
 
         let supervisor_sock = supervisor_sock_path(&slug);
@@ -3957,15 +3966,20 @@ mod tests {
             "the other image stopped serving: {failed:#?}"
         );
 
+        // The failed daemon's fanotify group, with its marks, lives as long as the daemon
+        // does (the upgrade manager keeps a copy of the fd for failover), and nothing answers
+        // its events once its workers are stopped. Recovery arms the replacement first and
+        // drops the old daemon after; a caller still holding the old handle would keep every
+        // read of the mount blocked.
+        let mountpoints = [&broken, &healthy].map(|h| h.mountpoint().to_path_buf());
+        drop((broken, healthy));
         let report = runtime.block_on(supervisor.recover()).unwrap();
         assert_eq!(report.restarted, 1, "{report:?}");
         assert_eq!(report.outcomes[0].image_ref, refs[0]);
-        let (total, failed) = read_every_file(broken.mountpoint());
+        let (total, failed) = read_every_file(&mountpoints[0]);
         assert!(total > 0);
         assert!(failed.is_empty(), "not served after recovery: {failed:#?}");
 
-        let mountpoints = [&broken, &healthy].map(|h| h.mountpoint().to_path_buf());
-        drop((broken, healthy));
         for (image_ref, mountpoint) in refs.iter().zip(&mountpoints) {
             runtime
                 .block_on(supervisor.release(image_ref, "t"))
