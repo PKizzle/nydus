@@ -52,6 +52,7 @@ echo "src hello=$SRC_HELLO rand=$SRC_RAND small=$SRC_SMALL"
 step "nydus-image create (RAFS v6, compressor none, block-size $BLOCK_SIZE)"
 "$NI" create --fs-version 6 --compressor none --block-size "$BLOCK_SIZE" \
   -B "$ROOT/out/bootstrap" -D "$ROOT/out" "$ROOT/src" || fail "nydus-image create"
+"$NI" check -B "$ROOT/out/bootstrap" --blob-dir "$ROOT/out" >/dev/null || fail "nydus-image check"
 ls -la "$ROOT/out"
 
 BLOB=$(ls "$ROOT/out" | grep -vE '^bootstrap' | head -1)   # exclude bootstrap AND bootstrap.external

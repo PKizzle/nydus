@@ -5,6 +5,8 @@ set -u
 NI="${NYDUS_IMAGE:-./target/release/nydus-image}"
 ND="${NYDUSD:-./target/release/nydusd}"
 R="${ROOT:-/var/tmp/zran-ml}"
+# EROFS block size; the kernel mounts block sizes up to its page size.
+BLOCK_SIZE="${BLOCK_SIZE:-4096}"
 umount -l "$R/mnt" 2>/dev/null; pkill -9 -f "nydusd singleton" 2>/dev/null; sleep 1
 rm -rf "$R"; mkdir -p "$R"/{l1,l2,o1,o2,backend,stage,mnt}
 
@@ -30,8 +32,8 @@ tail -c +50001 "$R/L2.tar" | gzip -c >> "$R/L2.tar.gz"
 echo "layer2 gzip members: 2 (multi-member; tar size $(stat -c%s "$R/L2.tar") split at 50000)"
 D1=$(sha256sum "$R/L1.tar.gz"|awk '{print $1}'); D2=$(sha256sum "$R/L2.tar.gz"|awk '{print $1}')
 
-B1=$("$NI" create --type targz-ref --fs-version 6 -D "$R/o1" "$R/L1.tar.gz" 2>&1 | sed -n 's/^meta blob path: //p')
-B2=$("$NI" create --type targz-ref --fs-version 6 -D "$R/o2" "$R/L2.tar.gz" 2>&1 | sed -n 's/^meta blob path: //p')
+B1=$("$NI" create --type targz-ref --fs-version 6 --block-size "$BLOCK_SIZE" -D "$R/o1" "$R/L1.tar.gz" 2>&1 | sed -n 's/^meta blob path: //p')
+B2=$("$NI" create --type targz-ref --fs-version 6 --block-size "$BLOCK_SIZE" -D "$R/o2" "$R/L2.tar.gz" 2>&1 | sed -n 's/^meta blob path: //p')
 M1=$(ls "$R/o1" | grep -v "$(basename "$B1")"); M2=$(ls "$R/o2" | grep -v "$(basename "$B2")")
 echo "layer1=$D1 layer2=$D2"; echo "meta1=$M1 meta2=$M2"
 
@@ -40,6 +42,7 @@ cp "$R/L1.tar.gz" "$R/backend/$D1"; cp "$R/L2.tar.gz" "$R/backend/$D2"
 cp "$R/o1/$M1" "$R/backend/$M1"; cp "$R/o2/$M2" "$R/backend/$M2"
 # merged bootstrap (lower L1 -> upper L2) into the staging dir
 "$NI" merge -B "$R/stage/bootstrap" --original-blob-ids "$D1,$D2" "$B1" "$B2" >/dev/null 2>&1
+"$NI" check -B "$R/stage/bootstrap" --blob-dir "$R/backend" >/dev/null || { echo "check failed for the merged bootstrap"; exit 1; }
 echo "merged bootstrap: $(stat -c%s "$R/stage/bootstrap" 2>/dev/null) bytes; backend files: $(ls "$R/backend"|wc -l)"
 
 cat > "$R/cfg.json" <<EOF

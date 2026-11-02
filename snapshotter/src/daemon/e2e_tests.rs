@@ -243,6 +243,19 @@ fn auto_accel_sidecar_serves_converted_layers() {
         &layers,
     )
     .unwrap_or_else(|e| panic!("convert: {e:#}"));
+    // The kernel follows only block addresses, so validate the merged layout before serving it.
+    let check = std::process::Command::new(std::env::var("NYDUS_IMAGE").unwrap())
+        .args(["check", "-B"])
+        .arg(&artifact.bootstrap)
+        .arg("--blob-dir")
+        .arg(&artifact.backend_dir)
+        .output()
+        .unwrap();
+    assert!(
+        check.status.success(),
+        "nydus-image check failed for the merged bootstrap: {}",
+        String::from_utf8_lossy(&check.stderr)
+    );
     let zran_indexes = artifact
         .zran_index_blob_ids
         .iter()
