@@ -83,10 +83,18 @@ impl ServiceController {
             && let Some(config1) = config.as_object()
             && config1.contains_key("blobs")
             && let Ok(v) = serde_json::from_value::<BlobCacheList>(config.clone())
-            && let Err(e) = self.blob_cache_mgr.add_blob_list(&v)
         {
-            error!("Failed to add blob list: {}", e);
-            return Err(e);
+            if let Err(e) = self.blob_cache_mgr.add_blob_list(&v) {
+                error!("Failed to add blob list: {}", e);
+                return Err(e);
+            }
+            // A takeover successor starts without a config and re-adds blob entries only from
+            // the saved upgrade state; without them its handlers find no backed data blobs.
+            if let Some(mut mgr) = self.upgrade_mgr() {
+                for entry in v.blobs {
+                    mgr.add_blob_entry_state(entry);
+                }
+            }
         }
 
         Ok(())
@@ -752,6 +760,39 @@ mod tests {
 
         controller.fanotify.lock().unwrap().clear();
         worker.stop();
+    }
+
+    #[test]
+    fn test_blob_list_is_saved_for_takeover() {
+        let tmpdir = vmm_sys_util::tempdir::TempDir::new().unwrap();
+        let bootstrap = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../tests/texture/bootstrap/rafs-v6-2.2.boot");
+        let config = serde_json::json!({ "blobs": [{
+            "type": "bootstrap",
+            "id": "rafs-v6",
+            "domain_id": "domain1",
+            "config_v2": {
+                "version": 2,
+                "id": "factory1",
+                "backend": { "type": "localfs", "localfs": { "dir": tmpdir.as_path() } },
+                "cache": { "type": "fanotify", "fanotify": { "work_dir": tmpdir.as_path() } },
+                "metadata_path": bootstrap,
+            },
+        }]});
+
+        let mut predecessor = create_service_controller();
+        predecessor.upgrade_mgr = Some(Mutex::new(UpgradeManager::new("dummy_socket".into())));
+        predecessor.initialize_blob_cache(&Some(config)).unwrap();
+        let served = predecessor.blob_cache_mgr.get_all_data_blobs().len();
+        assert!(served > 0);
+
+        // The successor sees only what survives the serialized upgrade state.
+        let state = predecessor.upgrade_mgr().unwrap().fanotify_state_for_test();
+        let successor = BlobCacheMgr::new();
+        for entry in state.values() {
+            successor.add_blob_entry(entry).unwrap();
+        }
+        assert_eq!(successor.get_all_data_blobs().len(), served);
     }
 
     #[test]

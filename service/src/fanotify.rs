@@ -59,6 +59,94 @@ struct fanotify_response {
     response: u32,
 }
 
+/// Open the inode behind `fd` again, read-write, through a `FAN_OPEN_PERM` event of a private
+/// fanotify group. The kernel opens event descriptors with `FMODE_NONOTIFY`, so I/O through the
+/// returned descriptor raises no fanotify events even while the inode carries pre-content marks.
+fn open_without_events(fd: RawFd) -> Result<OwnedFd> {
+    let raw = unsafe {
+        libc::fanotify_init(
+            libc::FAN_CLASS_CONTENT | libc::FAN_CLOEXEC,
+            libc::O_RDWR as u32,
+        )
+    };
+    if raw < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // Dropping the group on any return answers whatever is still queued, so the opener below
+    // cannot be left blocked.
+    let group = unsafe { OwnedFd::from_raw_fd(raw) };
+    if unsafe {
+        libc::fanotify_mark(
+            raw,
+            libc::FAN_MARK_ADD,
+            libc::FAN_OPEN_PERM,
+            fd,
+            std::ptr::null(),
+        )
+    } != 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    let identity = fd_identity(fd)?;
+    let path = format!("/proc/self/fd/{fd}");
+    let opener = std::thread::spawn(move || File::open(path));
+
+    let mut buf = vec![0u8; 4096];
+    let found = loop {
+        let n = unsafe { libc::read(raw, buf.as_mut_ptr().cast(), buf.len()) };
+        if n < 0 {
+            let e = std::io::Error::last_os_error();
+            if e.kind() == ErrorKind::Interrupted {
+                continue;
+            }
+            break Err(e);
+        }
+        let mut found = None;
+        let mut offset = 0usize;
+        let len = n as usize;
+        while offset + std::mem::size_of::<libc::fanotify_event_metadata>() <= len {
+            // SAFETY: bounds checked above; the record is copied out unaligned.
+            let meta = unsafe {
+                std::ptr::read_unaligned(
+                    buf.as_ptr().add(offset) as *const libc::fanotify_event_metadata
+                )
+            };
+            if meta.event_len == 0 {
+                break;
+            }
+            offset += meta.event_len as usize;
+            if meta.fd < 0 {
+                continue;
+            }
+            // Every opener of the inode is allowed; only our own open's descriptor is kept.
+            let response = fanotify_response {
+                fd: meta.fd,
+                response: FAN_ALLOW,
+            };
+            unsafe {
+                libc::write(
+                    raw,
+                    &response as *const _ as *const libc::c_void,
+                    std::mem::size_of::<fanotify_response>(),
+                )
+            };
+            let event_fd = unsafe { OwnedFd::from_raw_fd(meta.fd) };
+            if found.is_none()
+                && meta.pid as u32 == std::process::id()
+                && fd_identity(event_fd.as_raw_fd()).ok() == Some(identity)
+            {
+                found = Some(event_fd);
+            }
+        }
+        if let Some(f) = found {
+            break Ok(f);
+        }
+    };
+    drop(group);
+    let _ = opener.join();
+    found
+}
+
 /// Get the `(st_dev, st_ino)` identity of an open file descriptor.
 ///
 /// Used to map a `FAN_PRE_ACCESS` event fd back to the [`DataBlob`] whose sparse backing file
@@ -618,6 +706,32 @@ impl FanotifyHandler {
             threads,
             OwnedFd::from(fan_file),
         )?;
+
+        // `assemble` opened the cache files while the inherited marks were live, and a file
+        // opened under a pre-content mark raises pre-content events for its own I/O: a fill
+        // write would wait on an event that only the writing worker could answer, and every
+        // reader of the mount would hang. Replace those descriptors, by number, with ones that
+        // raise no events, before any worker runs.
+        for backing in &handler.blob_backings {
+            let file_fd = backing.blob.file().as_raw_fd();
+            let cache_fd = backing
+                .blob
+                .blob()
+                .get_blob_object()
+                .ok_or_else(|| {
+                    std::io::Error::other(format!(
+                        "fanotify: blob object unavailable for {}",
+                        backing.blob.blob_info().blob_id()
+                    ))
+                })?
+                .as_raw_fd();
+            let quiet = open_without_events(file_fd)?;
+            for target in [cache_fd, file_fd] {
+                if unsafe { libc::dup3(quiet.as_raw_fd(), target, libc::O_CLOEXEC) } < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
+        }
 
         // `assemble` starts every backing at `armed == false`, which is right for a fresh group
         // whose marks `arm()` has yet to place. Here the marks came across with the fd, and this

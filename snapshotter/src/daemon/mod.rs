@@ -3847,6 +3847,163 @@ mod tests {
         }
     }
 
+    /// A restarted snapshotter takes over a running auto-accel daemon from the
+    /// fanotify group fd parked in systemd's fd store and serves file data the
+    /// predecessor never fetched. The predecessor and the successor run as child
+    /// processes of this test, which stands in for systemd's fd store and kills
+    /// the predecessor with SIGKILL while its marks are live. `NYDUS_E2E_ROOT`
+    /// is an ext4 dir holding `artifact/bootstrap` and the localfs
+    /// `artifact/backend/` of a zran image.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "needs root, Linux >= 6.14 and an ext4 work dir; run misc/fanotify/takeover-test.sh"]
+    fn fanotify_takeover_serves_uncached_file_data() {
+        use std::io::{BufRead, BufReader};
+        use std::os::fd::{AsRawFd, FromRawFd};
+        use std::os::unix::net::UnixDatagram;
+        use std::os::unix::process::CommandExt;
+        use std::process::{Command, Stdio};
+
+        const NAME: &str = "daemon::tests::fanotify_takeover_serves_uncached_file_data";
+        let root = PathBuf::from(std::env::var("NYDUS_E2E_ROOT").expect("NYDUS_E2E_ROOT unset"));
+        let image_ref = "e2e.invalid/takeover/app:1";
+        let supervisor = || {
+            let mut config = SnapshotterConfig::default();
+            config.snapshotter.root = root.join("snapshotter");
+            DaemonSupervisor::new(config)
+        };
+        let runtime = compio::runtime::Runtime::new().unwrap();
+
+        match std::env::var("NYDUS_TAKEOVER_ROLE").as_deref() {
+            Ok("predecessor") => {
+                let handle = runtime
+                    .block_on(supervisor().ensure_instance_local(
+                        image_ref,
+                        &root.join("artifact/bootstrap"),
+                        &root.join("artifact/backend"),
+                        "k1",
+                        false,
+                    ))
+                    .unwrap();
+                println!("PREDECESSOR_READY {}", handle.mountpoint().display());
+                loop {
+                    std::thread::sleep(Duration::from_secs(60));
+                }
+            }
+            Ok("successor") => {
+                // SAFETY: set before anything else in this process reads the environment.
+                unsafe { std::env::set_var("LISTEN_PID", std::process::id().to_string()) };
+                let supervisor = supervisor();
+                assert_eq!(runtime.block_on(supervisor.restore_from_store()), 1);
+                let mountpoint = PathBuf::from(std::env::var("NYDUS_TAKEOVER_MNT").unwrap());
+                for file in ["bin/tool", "passwd"] {
+                    assert!(
+                        fs::read(mountpoint.join(file)).unwrap()
+                            == fs::read(root.join("src").join(file)).unwrap(),
+                        "{file} differs from its source"
+                    );
+                }
+                println!("SUCCESSOR_READ_OK");
+                return;
+            }
+            _ => {}
+        }
+
+        let notify_path = root.join("notify.sock");
+        let _ = fs::remove_file(&notify_path);
+        let notify = UnixDatagram::bind(&notify_path).unwrap();
+        notify
+            .set_read_timeout(Some(Duration::from_secs(120)))
+            .unwrap();
+        let mut predecessor = Command::new(std::env::current_exe().unwrap())
+            .args([NAME, "--exact", "--ignored", "--nocapture"])
+            .env("NYDUS_TAKEOVER_ROLE", "predecessor")
+            .env("NOTIFY_SOCKET", &notify_path)
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+
+        // The FDSTORE message carrying the group fd, as systemd would keep it.
+        let (fd_name, group_fd) = loop {
+            let mut buf = [0u8; 256];
+            let mut fds = [-1; 1];
+            let (len, nfds) = match sendfd::RecvWithFd::recv_with_fd(&notify, &mut buf, &mut fds) {
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                r => r.expect("the predecessor parked no fd"),
+            };
+            let msg = String::from_utf8_lossy(&buf[..len]).into_owned();
+            if nfds == 1 && msg.contains("FDSTORE=1") {
+                let name = msg
+                    .lines()
+                    .find_map(|l| l.strip_prefix("FDNAME="))
+                    .unwrap()
+                    .to_string();
+                break (name, unsafe { std::os::fd::OwnedFd::from_raw_fd(fds[0]) });
+            }
+        };
+        let mountpoint = BufReader::new(predecessor.stdout.take().unwrap())
+            .lines()
+            .find_map(|l| {
+                l.unwrap()
+                    .strip_prefix("PREDECESSOR_READY ")
+                    .map(PathBuf::from)
+            })
+            .expect("the predecessor never mounted");
+        predecessor.kill().unwrap();
+        predecessor.wait().unwrap();
+        assert_eq!(mount_fstype_at(&mountpoint).as_deref(), Some("erofs"));
+
+        let raw = group_fd.as_raw_fd();
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args([NAME, "--exact", "--ignored", "--nocapture"])
+            .env("NYDUS_TAKEOVER_ROLE", "successor")
+            .env("NYDUS_TAKEOVER_MNT", &mountpoint)
+            .env("LISTEN_FDS", "1")
+            .env("LISTEN_FDNAMES", &fd_name);
+        // SAFETY: dup2 is async-signal-safe; it hands the fd over as LISTEN_FDS fd 3.
+        unsafe {
+            command.pre_exec(move || {
+                if libc::dup2(raw, 3) < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut successor = command.spawn().unwrap();
+        drop(group_fd);
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        let status = loop {
+            if let Some(status) = successor.try_wait().unwrap() {
+                break status;
+            }
+            if std::time::Instant::now() > deadline {
+                let pid = successor.id();
+                let mut stuck = Vec::new();
+                for task in fs::read_dir(format!("/proc/{pid}/task")).unwrap() {
+                    let task = task.unwrap().path();
+                    let stat = fs::read_to_string(task.join("stat")).unwrap_or_default();
+                    let wchan = fs::read_to_string(task.join("wchan")).unwrap_or_default();
+                    let state = stat.rsplit(')').next().unwrap_or("").trim();
+                    stuck.push(format!(
+                        "{} {} wchan={wchan}",
+                        task.display(),
+                        state.split(' ').next().unwrap_or("?")
+                    ));
+                }
+                successor.kill().unwrap();
+                successor.wait().unwrap();
+                panic!(
+                    "reads through the taken-over mount hung for 60s:\n{}",
+                    stuck.join("\n")
+                );
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        };
+        assert!(status.success(), "the successor failed: {status}");
+    }
+
     /// A mount that lists its directories but cannot serve file data is dead:
     /// a FUSE daemon whose registry is unreachable (through
     /// `probe_mount_health`), and an EROFS mount of a v6 bootstrap without its
