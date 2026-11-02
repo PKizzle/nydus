@@ -149,7 +149,7 @@ libp2p peer routing works once Spegel is healthy (bootstrap 0.3–6s, cross-node
 Setting `peer_discovery = "kubernetes"` re-enables the snapshotter's own Kubernetes-API node
 fan-out as an explicit, **deprecated** opt-in resilience fallback (a startup `warn!` fires when
 it's set) — kept only because a misconfigured or unhealthy Spegel instance (e.g. a
-`registries.yaml` typo, or a Cilium XDP path degrading etcd) can silently stop advertising a node's
+`registries.yaml` typo, or a CNI datapath fault degrading etcd) can silently stop advertising a node's
 content, and the fan-out routed around that class of failure during the same testing. It is
 scheduled for removal after a production soak of default-off.
 
