@@ -2,7 +2,7 @@
 //
 // SPDX-License-Identifier: (Apache-2.0 AND BSD-3-Clause)
 
-//! Compile vendored containerd service protos (Content, Images, Transfer, Streaming) into
+//! Compile vendored containerd service protos (Content, Images, Leases, Transfer, Streaming) into
 //! tonic 0.14 clients.
 //!
 //! containerd-client on crates.io still targets tonic 0.12, which doesn't
@@ -19,6 +19,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let services = [
         "containerd/api/services/content/v1/content.proto",
         "containerd/api/services/images/v1/images.proto",
+        "containerd/api/services/leases/v1/leases.proto",
         "containerd/api/services/transfer/v1/transfer.proto",
         "containerd/api/services/streaming/v1/streaming.proto",
         // Transfer payloads travel as `google.protobuf.Any`, so nothing imports these.
