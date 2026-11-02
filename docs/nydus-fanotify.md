@@ -107,6 +107,12 @@ each device table entry to cover its whole blob, since the kernel locates data o
 addresses. `runtime-test.sh` and `export-block-test.sh` take `BLOCK_SIZE=` to verify a block size
 in the kernel.
 
+Linux 7.3 fails every metadata read of a file-backed EROFS mount whose page runs past end of file
+with `EIO`, so on a 16K/64K-page host the inodes in a bootstrap's last, partial page cannot be read
+(fixed upstream by `52dceb88082b`, "erofs: fix metadata reads at the end of file-backed images",
+in 7.4-rc1 and marked for stable). The snapshotter therefore extends each bootstrap it stages to a
+multiple of the host page size with a sparse hole; the artifact itself stays a block multiple.
+
 ## Cache eviction
 
 `FanotifyHandler::cull_cache(blob_id)` punches holes
