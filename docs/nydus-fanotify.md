@@ -19,11 +19,12 @@ EROFS + `fscache` (`cachefiles`) on-demand path, which has been removed.
    longer need the daemon. Marks are placed on the cache file's own descriptor rather than on
    the `blob_<i>` device path; the two are hardlinks to one inode.
 2. It mounts the image with the in-kernel EROFS driver. The **bootstrap is the mount source**; the
-   data blobs are `device=` options in device-table order:
-   `mount("<bootstrap>", <mountpoint>, "erofs", MS_RDONLY|MS_NODEV|MS_NOSUID,
-   "device=<blob0>,device=<blob1>,…")`. A `NULL`/`"none"` source fails with `EINVAL`, and the
-   bootstrap is not itself a `device=` entry. The option string is capped at one page, so a deep
-   cache directory with many blobs is rejected up front rather than silently truncated.
+   data blobs are `device=` options in device-table order, each set with its own `fsconfig(2)`
+   call (`source=<bootstrap>`, `ro`, `device=<blob0>`, `device=<blob1>`, …), then `fsmount(2)`
+   with `MOUNT_ATTR_RDONLY|NODEV|NOSUID` and `move_mount(2)`. A missing source fails with
+   `EINVAL`, and the bootstrap is not itself a `device=` entry. `mount(2)` would silently
+   truncate the joined option string at one page, which an image with ~45 layers under a deep
+   cache directory exceeds; per-option `fsconfig` has no total limit, only 255 bytes per path.
 3. When a process reads a region of the rootfs that is not yet present, the kernel raises a
    `FAN_PRE_ACCESS` event carrying the **byte range** (`offset`, `count`) and an fd to the backing
    blob file.
