@@ -20,8 +20,8 @@ One image may mix all three. Each layer picks its route from its media type.
 
 - zran gives random access into gzip because a deflate stream can be resumed at a block
   boundary from a 32 KiB window. A zstd frame can only be resumed from its start: inside a
-  frame the decoder needs up to the full window (8 MiB in the reference image measured below)
-  plus entropy state, which libzstd cannot save. No container project indexes inside a frame:
+  frame the decoder needs up to the full window (8 MiB in Home Assistant's layers) plus
+  entropy state, which libzstd cannot save. No container project indexes inside a frame:
   SOCI declined it (awslabs/soci-snapshotter#519), and stargz, overlaybd TurboOCI and
   containers/storage fall back to a full unpack. nydus zran is gzip-only
   (dragonflyoss/nydus#1562).
@@ -29,9 +29,8 @@ One image may mix all three. Each layer picks its route from its media type.
   content as separate frames; the zstd seekable format writes fixed-size frames. Concatenated
   frames decode as one stream, so a range starting at a frame start is a self-contained decode
   unit.
-- Most zstd layers in practice are one frame (all 22 layers of the reference image, a large
-  public arm64 application image). Decode throughput, single-threaded, measured with its
-  largest layer (376 MiB compressed,
+- Most zstd layers in practice are one frame (Home Assistant: 22 of 22). Decode throughput,
+  single-threaded, measured with Home Assistant's largest layer (376 MiB compressed,
   1394 MiB decompressed): 330 MiB/s on a Raspberry Pi 5 (4.2 s for the whole layer) and
   100–130 MiB/s on a Raspberry Pi 4 (10.5–13.8 s).
 
@@ -71,7 +70,7 @@ with an empty dictionary whose `in_offset` is a frame start.
   requested chunks are returned and cached, exactly as for zran. Reads of one blob through the
   cursor are serialized.
 - Worst case: the first read near the end of a large single-frame layer decodes the layer once
-  (about 4 s on a Pi 5, 11–14 s on a Pi 4 for the reference image's largest layer). The existing
+  (about 4 s on a Pi 5, 11–14 s on a Pi 4 for Home Assistant's largest layer). The existing
   optimize stage packs the startup working set into the prefetch blob after the first run, so
   later starts do not reach the cursor for startup reads.
 
@@ -105,4 +104,4 @@ with an empty dictionary whose `in_offset` is a frame start.
   gzip, uncompressed, multi-frame zstd and single-frame zstd layers is converted, merged,
   mounted through fanotify/EROFS and compared file by file with the unpacked tars.
 - **snapshotter unit tests:** media-type selection.
-- **Deployment:** an image with single-frame zstd layers converts and starts from the accelerated mount on a Raspberry Pi 5.
+- **Deployment:** Home Assistant converts and starts from the accelerated mount on a Raspberry Pi 5.
