@@ -483,4 +483,52 @@ mod tests {
             );
         }
     }
+
+    /// A dirent's `e_nameoff` is relative to its directory block, so with 16 K and 64 K blocks a
+    /// name can start well past 4096 and every name must still be found.
+    #[test]
+    fn test_v6_large_directory_at_every_block_size() {
+        use nydus_rafs::metadata::RafsSuper;
+
+        use crate::{ArtifactStorage, BlobManager, BootstrapManager, Builder, ConversionType};
+
+        let source = TempDir::new().unwrap();
+        // 1400 entries of 12 + 40 bytes span several blocks at every block size, 64 KiB too.
+        let names: Vec<String> = (0..1400).map(|i| format!("{i:0>40}")).collect();
+        for name in &names {
+            fs::File::create(source.as_path().join(name)).unwrap();
+        }
+
+        for block_size in [4096u64, 16384, 65536] {
+            let bootstrap = vmm_sys_util::tempfile::TempFile::new().unwrap();
+            let mut ctx = BuildContext {
+                fs_version: RafsVersion::V6,
+                conversion_type: ConversionType::DirectoryToRafs,
+                source_path: source.as_path().to_path_buf(),
+                ..Default::default()
+            };
+            ctx.set_blob_block_size(block_size);
+            let mut bootstrap_mgr = BootstrapManager::new(
+                Some(ArtifactStorage::SingleFile(
+                    bootstrap.as_path().to_path_buf(),
+                )),
+                None,
+            );
+            let mut blob_mgr = BlobManager::new(ctx.digester, false);
+            DirectoryBuilder::new()
+                .build(&mut ctx, &mut bootstrap_mgr, &mut blob_mgr)
+                .unwrap();
+
+            let (rs, _) =
+                RafsSuper::load_from_file(bootstrap.as_path(), ctx.configuration.clone(), false)
+                    .unwrap();
+            let root = rs.get_inode(rs.superblock.root_ino(), false).unwrap();
+            assert!(root.size() > block_size, "block size {block_size}");
+            assert_eq!(root.get_child_count() as usize, names.len());
+            for name in &names {
+                let child = root.get_child_by_name(name.as_ref()).unwrap();
+                assert_eq!(child.name(), name.as_str(), "block size {block_size}");
+            }
+        }
+    }
 }
