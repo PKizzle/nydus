@@ -1475,6 +1475,7 @@ pub async fn serve_with_supervisor(
             // enqueue into the conversion worker.
             if let Some(ref manager) = auto_zran {
                 access_tracer.set_auto_zran(manager.clone());
+                metrics.set_auto_zran(manager.clone());
             }
             // Peer-mirror local self-check: turns the silent "local mirror not
             // advertising local content" misconfiguration (e.g. a broken

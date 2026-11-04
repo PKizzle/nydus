@@ -11,7 +11,9 @@
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
+
+use crate::auto_zran::AutoZranManager;
 use std::time::{Duration, Instant};
 
 const SNAPSHOT_DURATION_BUCKETS_MS: [f64; 14] = [
@@ -39,6 +41,9 @@ pub struct SnapshotterMetrics {
     /// release that never happened. The reconciler's clamp pass repairs the
     /// count; this counter says how often that repair is being relied on.
     daemon_release_missing_total: AtomicU64,
+    /// The conversion worker, once it exists (auto_zran enabled); its status is rendered as
+    /// the `snapshotter_auto_zran_*` families.
+    auto_zran: OnceLock<Arc<AutoZranManager>>,
 }
 
 #[derive(Clone, Debug)]
@@ -88,7 +93,13 @@ impl SnapshotterMetrics {
             snapshot_operations: Mutex::new(BTreeMap::new()),
             peer_mirror_selfcheck_ok: Mutex::new(None),
             daemon_release_missing_total: AtomicU64::new(0),
+            auto_zran: OnceLock::new(),
         }
+    }
+
+    /// Export `manager`'s job status with these metrics. Only the first call takes effect.
+    pub fn set_auto_zran(&self, manager: Arc<AutoZranManager>) {
+        let _ = self.auto_zran.set(manager);
     }
 
     /// Count a snapshot removal whose daemon release was skipped because the
@@ -193,7 +204,51 @@ impl SnapshotterMetrics {
         self.render_cache_metrics(&mut out, cache);
         self.render_peer_mirror_selfcheck(&mut out);
         self.render_release_missing(&mut out);
+        self.render_auto_zran(&mut out);
+        render_containerd_reachable(&mut out, crate::containerd_grpc::containerd_reachable());
         out
+    }
+
+    fn render_auto_zran(&self, out: &mut String) {
+        let Some(manager) = self.auto_zran.get() else {
+            return;
+        };
+        let status = manager.status();
+        out.push_str("# HELP snapshotter_auto_zran_jobs_total Auto-zran conversion jobs by event: queued, dropped (queue full), skipped (deduplicated, suppressed or deferred by the sweep gate), started, succeeded, failed (a failure strike), deferred (containerd unreachable, retried without a strike).\n");
+        out.push_str("# TYPE snapshotter_auto_zran_jobs_total counter\n");
+        for (event, value) in [
+            ("queued", status.queued_total),
+            ("dropped", status.dropped_total),
+            ("skipped", status.skipped_total),
+            ("started", status.started_total),
+            ("succeeded", status.succeeded_total),
+            ("failed", status.failed_total),
+            ("deferred", status.deferred_total),
+        ] {
+            push_labeled_metric(
+                out,
+                "snapshotter_auto_zran_jobs_total",
+                &[(event, "event")],
+                value,
+            );
+        }
+        push_help_gauge(
+            out,
+            "snapshotter_auto_zran_jobs",
+            "Auto-zran conversion jobs by state: queued (waiting for the worker), running, waiting (for containerd to become reachable).",
+        );
+        for (state, value) in [
+            ("queued", status.pending_jobs as u64),
+            ("running", status.running_jobs),
+            ("waiting", status.waiting_jobs as u64),
+        ] {
+            push_labeled_metric(
+                out,
+                "snapshotter_auto_zran_jobs",
+                &[(state, "state")],
+                value,
+            );
+        }
     }
 
     fn render_release_missing(&self, out: &mut String) {
@@ -519,6 +574,19 @@ fn bucket_label(bucket: f64) -> &'static str {
     }
 }
 
+/// `snapshotter_containerd_reachable`: whether the latest call to containerd reached it. Absent
+/// before the first call, so a node that has not needed containerd yet does not read as down.
+fn render_containerd_reachable(out: &mut String, reachable: Option<bool>) {
+    if let Some(reachable) = reachable {
+        push_help_gauge(
+            out,
+            "snapshotter_containerd_reachable",
+            "Whether the latest call to containerd reached it (1) or could not connect (0).",
+        );
+        push_metric(out, "snapshotter_containerd_reachable", reachable as u64);
+    }
+}
+
 fn push_help_gauge(out: &mut String, name: &str, help: &str) {
     let _ = writeln!(out, "# HELP {name} {help}");
     let _ = writeln!(out, "# TYPE {name} gauge");
@@ -734,6 +802,35 @@ mod tests {
         metrics.set_peer_mirror_selfcheck(true);
         let body = metrics.render_prometheus(CacheMetricSnapshot::default());
         assert!(body.contains("snapshotter_peer_mirror_selfcheck_ok 1"));
+    }
+
+    #[test]
+    fn containerd_reachable_gauge_absent_until_called_then_reflects_result() {
+        let mut out = String::new();
+        render_containerd_reachable(&mut out, None);
+        assert!(out.is_empty());
+        render_containerd_reachable(&mut out, Some(false));
+        assert!(out.contains("# TYPE snapshotter_containerd_reachable gauge"));
+        assert!(out.ends_with("snapshotter_containerd_reachable 0\n"));
+        let mut out = String::new();
+        render_containerd_reachable(&mut out, Some(true));
+        assert!(out.ends_with("snapshotter_containerd_reachable 1\n"));
+    }
+
+    #[test]
+    fn auto_zran_status_is_rendered_once_the_manager_is_set() {
+        let metrics = SnapshotterMetrics::new();
+        let body = metrics.render_prometheus(CacheMetricSnapshot::default());
+        assert!(!body.contains("snapshotter_auto_zran"));
+
+        let (manager, _queue) = crate::auto_zran::AutoZranManager::without_worker(4);
+        manager.try_enqueue_base("registry.local/app:1");
+        metrics.set_auto_zran(manager);
+        let body = metrics.render_prometheus(CacheMetricSnapshot::default());
+        assert!(body.contains("snapshotter_auto_zran_jobs_total{event=\"queued\"} 1"));
+        assert!(body.contains("snapshotter_auto_zran_jobs_total{event=\"deferred\"} 0"));
+        assert!(body.contains("snapshotter_auto_zran_jobs{state=\"queued\"} 1"));
+        assert!(body.contains("snapshotter_auto_zran_jobs{state=\"waiting\"} 0"));
     }
 
     #[test]

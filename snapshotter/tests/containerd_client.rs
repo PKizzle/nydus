@@ -12,7 +12,11 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use nydus_snapshotter::config::ContainerdConfig;
-use nydus_snapshotter::content_store::ContentStoreClient;
+use nydus_snapshotter::containerd_api::services::leases::v1::{
+    CreateRequest, DeleteRequest, ListRequest, leases_client::LeasesClient,
+};
+use nydus_snapshotter::containerd_grpc::ContainerdChannel;
+use nydus_snapshotter::content_store::{ContentStoreClient, is_containerd_unavailable};
 use sha2::{Digest, Sha256};
 
 const OCI_MANIFEST: &str = "application/vnd.oci.image.manifest.v1+json";
@@ -82,6 +86,41 @@ fn labels() -> HashMap<String, String> {
     HashMap::from([("nydus.test/role".to_string(), "fixture".to_string())])
 }
 
+/// Delete lease `id` and wait for the GC pass that deletion triggers (`sync`).
+async fn delete_lease_and_collect(channel: &ContainerdChannel, id: &str) {
+    LeasesClient::new(channel.clone())
+        .delete(DeleteRequest {
+            id: id.to_string(),
+            sync: true,
+        })
+        .await
+        .unwrap();
+}
+
+/// Run one GC pass to completion, through a throwaway lease.
+async fn collect_garbage(channel: &ContainerdChannel) {
+    LeasesClient::new(channel.clone())
+        .create(CreateRequest {
+            id: "nydus-test-gc".to_string(),
+            labels: HashMap::new(),
+        })
+        .await
+        .unwrap();
+    delete_lease_and_collect(channel, "nydus-test-gc").await;
+}
+
+async fn lease_ids(channel: &ContainerdChannel) -> Vec<String> {
+    LeasesClient::new(channel.clone())
+        .list(ListRequest { filters: vec![] })
+        .await
+        .unwrap()
+        .into_inner()
+        .leases
+        .into_iter()
+        .map(|lease| lease.id)
+        .collect()
+}
+
 fn digest_of(bytes: &[u8]) -> String {
     let hex: String = Sha256::digest(bytes)
         .iter()
@@ -99,8 +138,12 @@ fn content_and_images_round_trip_and_survive_a_containerd_restart() {
     let small = b"hello containerd";
 
     compio::runtime::Runtime::new().unwrap().block_on(async {
+        let lease = client.create_lease("test").await.unwrap();
         // Small blob: write, info with labels, read back.
-        let digest = client.write_bytes(small, "small", labels()).await.unwrap();
+        let digest = client
+            .write_bytes(small, "small", labels(), &lease)
+            .await
+            .unwrap();
         assert_eq!(digest, digest_of(small));
         let info = client.info(&digest).await.unwrap().expect("blob present");
         assert_eq!(info.size, small.len() as u64);
@@ -133,7 +176,10 @@ fn content_and_images_round_trip_and_survive_a_containerd_restart() {
         let big: Vec<u8> = (0..6 * 1024 * 1024u32).map(|i| (i % 251) as u8).collect();
         let big_path = dir.path().join("big.bin");
         std::fs::write(&big_path, &big).unwrap();
-        let big_digest = client.write_blob(&big_path, labels()).await.unwrap();
+        let big_digest = client
+            .write_blob(&big_path, labels(), &lease)
+            .await
+            .unwrap();
         assert_eq!(big_digest, digest_of(&big));
         assert_eq!(client.fetch_bytes(&big_digest).await.unwrap(), big);
 
@@ -190,6 +236,104 @@ fn content_and_images_round_trip_and_survive_a_containerd_restart() {
         assert!(
             started.elapsed() < Duration::from_secs(5),
             "call against a stopped containerd hung: {err:#}"
+        );
+        assert!(
+            is_containerd_unavailable(&err),
+            "a stopped containerd reads as unavailable: {err:#}"
+        );
+    });
+}
+
+/// The upload protocol of auto-zran: every blob goes in under one lease, which keeps it from
+/// GC until the Image record roots it, and is deleted afterwards. A blob that is already
+/// present (left by an earlier, failed upload) is taken into the new lease rather than
+/// trusted to survive on its own.
+#[test]
+#[ignore = "needs root and containerd; run misc/containerd-grpc/client-test.sh"]
+fn an_upload_lease_holds_content_until_the_image_record_roots_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let containerd = Containerd::start(dir.path());
+    let config = containerd.config();
+    let client = ContentStoreClient::new(&config).unwrap();
+    let channel = ContainerdChannel::new(config.address(), &config.namespace);
+    let leftover = b"left behind by a failed upload";
+    let manifest = b"sidecar manifest";
+    let name = "nydus.test/sidecar:1";
+
+    compio::runtime::Runtime::new().unwrap().block_on(async {
+        // Let containerd's startup GC pass (100 ms after start) go by; the passes below are
+        // the test's own.
+        compio::time::sleep(Duration::from_millis(500)).await;
+
+        let failed_upload = client.create_lease("test-upload").await.unwrap();
+        let leftover_digest = client
+            .write_bytes(leftover, "leftover", labels(), &failed_upload)
+            .await
+            .unwrap();
+
+        let upload = client.create_lease("test-upload").await.unwrap();
+        let again = client
+            .write_bytes(leftover, "leftover", labels(), &upload)
+            .await
+            .unwrap();
+        assert_eq!(again, leftover_digest);
+        let manifest_digest = client
+            .write_bytes(manifest, "manifest", labels(), &upload)
+            .await
+            .unwrap();
+
+        // The failed upload's lease goes, with a GC pass: the leftover blob now has only the
+        // new upload's lease, and that must be enough.
+        delete_lease_and_collect(&channel, &failed_upload).await;
+        assert!(client.info(&leftover_digest).await.unwrap().is_some());
+        assert!(client.info(&manifest_digest).await.unwrap().is_some());
+        collect_garbage(&channel).await;
+        assert!(
+            client.info(&manifest_digest).await.unwrap().is_some(),
+            "content under a live lease survives GC until the image record exists"
+        );
+
+        client
+            .images_upsert(
+                name,
+                &manifest_digest,
+                manifest.len() as u64,
+                OCI_MANIFEST,
+                labels(),
+            )
+            .await
+            .unwrap();
+        client.delete_lease(&upload).await.unwrap();
+        assert!(
+            !lease_ids(&channel).await.contains(&upload),
+            "the upload lease is gone after success"
+        );
+        // Deleting it again (an already expired lease) is not an error.
+        client.delete_lease(&upload).await.unwrap();
+
+        collect_garbage(&channel).await;
+        assert!(
+            client.info(&manifest_digest).await.unwrap().is_some(),
+            "the image record roots the manifest once the lease is gone"
+        );
+        assert!(
+            client.info(&leftover_digest).await.unwrap().is_none(),
+            "nothing but the deleted lease held the leftover blob"
+        );
+
+        // Two uploads of one blob racing each other: one commits, the other finds it
+        // committed (AlreadyExists, or present already) and both succeed.
+        let lease = client.create_lease("test-race").await.unwrap();
+        let shared: Vec<u8> = (0..3 * 1024 * 1024u32).map(|i| (i % 253) as u8).collect();
+        let (a, b) = futures::join!(
+            client.write_bytes(&shared, "race-a", labels(), &lease),
+            client.write_bytes(&shared, "race-b", labels(), &lease)
+        );
+        assert_eq!(a.unwrap(), digest_of(&shared));
+        assert_eq!(b.unwrap(), digest_of(&shared));
+        assert_eq!(
+            client.fetch_bytes(&digest_of(&shared)).await.unwrap(),
+            shared
         );
     });
 }
