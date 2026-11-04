@@ -270,7 +270,7 @@ containerd; every call connects lazily (`snapshotter/src/containerd_grpc.rs`). E
 reached" (socket missing or refusing, connection broken, `Unavailable`, `DeadlineExceeded`) from a
 real failure. The auto-zran worker re-queues a job that hit an unreachable containerd after a
 capped exponential delay (5 s doubling to 2 min) with no failure strike, so an outage never marks
-an image non-convertible; a retry of the base stage reuses the converted work dir. If containerd
+an image non-convertible; a retry of either stage reuses the converted work dir. If containerd
 is still unreachable five minutes after startup, one error names the configured socket.
 
 An upload writes every sidecar blob under **one lease** (`ContentStoreClient::create_lease`, 2 h

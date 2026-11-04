@@ -1098,9 +1098,15 @@ async fn run_optimize_stage(
     } else {
         // No reusable base (settle beat base, or the dir was swept): convert now.
         info!(image = %job.image, "auto-zran optimize: no reusable base work dir; running the conversion");
-        blocking::unblock(move || local_accel::convert(&local_cfg, &layers))
+        let artifact = blocking::unblock(move || local_accel::convert(&local_cfg, &layers))
             .await
-            .context("local_accel::convert failed")?
+            .context("local_accel::convert failed")?;
+        // Persist it so a retry after a failed upload (e.g. containerd was down) skips the
+        // conversion. Non-fatal: a retry converts again when it can't reload it.
+        if let Err(e) = write_base_artifact(&work_dir, &artifact) {
+            warn!(image = %job.image, error = ?e, "auto-zran failed to persist the converted artifact; a retry re-runs the conversion");
+        }
+        artifact
     };
 
     upload_artifact(deps, job, manifest_digest, image_name, &artifact, None).await?;
