@@ -246,7 +246,7 @@ pub struct AutoZranStatus {
     pub deferred_total: u64,
     /// Jobs on the queue, not yet picked up by the worker.
     pub pending_jobs: usize,
-    /// Jobs whose latest attempt found containerd unreachable and that are waiting to retry.
+    /// Jobs whose latest attempt found containerd unreachable, sleeping until they are re-queued.
     pub waiting_jobs: usize,
     pub active_image: Option<String>,
 }
@@ -309,6 +309,8 @@ struct AutoZranMetrics {
     failed_total: AtomicU64,
     deferred_total: AtomicU64,
     running_jobs: AtomicU64,
+    /// Deferred jobs whose retry delay has not run out yet (see [`AutoZranState::retry_due`]).
+    waiting_jobs: AtomicU64,
 }
 
 struct AutoZranState {
@@ -392,6 +394,7 @@ impl AutoZranState {
     fn mark_waiting(&self, job: &AutoZranJob) -> Duration {
         self.metrics.running_jobs.fetch_sub(1, Ordering::Relaxed);
         self.metrics.deferred_total.fetch_add(1, Ordering::Relaxed);
+        self.metrics.waiting_jobs.fetch_add(1, Ordering::Relaxed);
         self.clear_active(job);
         let attempt = match self.waiting.lock() {
             Ok(mut waiting) => {
@@ -404,6 +407,12 @@ impl AutoZranState {
             Err(_) => 1,
         };
         unavailable_retry_delay(attempt)
+    }
+
+    /// The retry delay of a job [`Self::mark_waiting`] returned ran out; it goes back on the
+    /// queue, where it counts as queued, not waiting.
+    fn retry_due(&self) {
+        self.metrics.waiting_jobs.fetch_sub(1, Ordering::Relaxed);
     }
 
     fn stop_waiting(&self, job: &AutoZranJob) {
@@ -479,11 +488,7 @@ impl AutoZranState {
             deferred_total: self.metrics.deferred_total.load(Ordering::Relaxed),
             // Filled in by the manager, which owns the queue.
             pending_jobs: 0,
-            waiting_jobs: self
-                .waiting
-                .lock()
-                .map(|waiting| waiting.len())
-                .unwrap_or_default(),
+            waiting_jobs: self.metrics.waiting_jobs.load(Ordering::Relaxed) as usize,
             active_image: self
                 .active_image
                 .lock()
@@ -796,8 +801,10 @@ async fn worker_loop(
                     "auto-zran conversion waiting: containerd is unreachable"
                 );
                 let retry = retry.clone();
+                let state = state.clone();
                 compio::runtime::spawn(async move {
                     compio::time::sleep(delay).await;
+                    state.retry_due();
                     if let Some(sender) = retry.upgrade() {
                         let _ = sender.send(job).await;
                     }
@@ -2320,7 +2327,15 @@ mod tests {
         state.queued_or_done.lock().unwrap().insert(key.clone());
 
         let mut delays = Vec::new();
-        for _ in 0..MAX_CONVERSION_FAILURES + 5 {
+        for attempt in 0..MAX_CONVERSION_FAILURES + 5 {
+            if attempt > 0 {
+                state.retry_due();
+                assert_eq!(
+                    state.status().waiting_jobs,
+                    0,
+                    "a re-queued job is not waiting"
+                );
+            }
             state.mark_started(&job);
             delays.push(state.mark_waiting(&job));
         }
@@ -2338,9 +2353,11 @@ mod tests {
         assert!(!state.enqueue_suppressed(&job.image, Instant::now()));
         assert!(state.queued_or_done.lock().unwrap().contains(&key));
 
+        state.retry_due();
         state.mark_started(&job);
         state.mark_finished(&job, true);
         assert_eq!(state.status().waiting_jobs, 0);
+        assert!(state.waiting.lock().unwrap().is_empty());
         assert_eq!(state.status().succeeded_total, 1);
     }
 
