@@ -422,9 +422,9 @@ fn probe_erofs_partial_folio(work_dir: &Path) {
             upstream_fix = erofs_folio::UPSTREAM_FIX,
             detail = %detail,
             "kernel has the file-backed EROFS partial-folio metadata bug: metadata in a page that \
-             extends past the end of an image fails with EIO. nydus pads the EROFS images it \
-             mounts to the page size, so its own mounts are not affected; other file-backed \
-             EROFS mounts on this host are. Use a kernel with the upstream fix"
+             extends past the end of an image fails with EIO. nydus pads every EROFS image it \
+             mounts from now on to the page size; mounts adopted from before and file-backed \
+             EROFS mounts by other tools are not covered. Use a kernel with the upstream fix"
         ),
         PartialFolioStatus::Unaffected => {
             info!(

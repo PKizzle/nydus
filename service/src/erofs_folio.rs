@@ -16,9 +16,10 @@
 //! on 16K/64K-page kernels, and 512-byte-block (tarfs) images on any page size. Data reads are not
 //! affected: they are clamped to the inode size and never read past the extent they map.
 //!
-//! The mitigation is [`pad_to_page_size`]: a sparse tail that ends the image on a page boundary
-//! costs no disk blocks and reads back as zeros, exactly what a fixed kernel substitutes for the
-//! missing bytes. [`self_test`] tells whether the running kernel needs it, by mounting a tiny
+//! The mitigation is [`pad_to_page_size`] (or [`page_aligned_source`] for a file nydus does not
+//! own): a sparse tail that ends the image on a page boundary costs no disk blocks and reads back
+//! as zeros, exactly what a fixed kernel substitutes for the missing bytes. It is applied on every
+//! kernel. [`self_test`] tells whether the running kernel needs it, by mounting a tiny
 //! crafted image once unpadded and once padded. A distro may backport the fix, so the kernel
 //! version alone does not decide it.
 
@@ -51,26 +52,8 @@ impl PartialFolioStatus {
     }
 }
 
-/// A mount refused because its source ends inside a page on a kernel with the bug.
-#[derive(Debug, thiserror::Error)]
-#[error(
-    "{} is {len} bytes, not a multiple of the {page_size}-byte page, and this kernel fails \
-     file-backed EROFS metadata reads at the end of such an image with EIO (fixed upstream by \
-     {UPSTREAM_FIX}); extend it with `truncate -s %{page_size}` or use a kernel with the fix",
-    path.display()
-)]
-pub struct UnpaddedImageError {
-    pub path: PathBuf,
-    pub len: u64,
-    pub page_size: u64,
-}
-
 /// The host page size in bytes.
-pub fn host_page_size() -> u64 {
-    // SAFETY: sysconf reads a constant and has no preconditions.
-    let size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
-    u64::try_from(size).ok().filter(|&s| s > 0).unwrap_or(4096)
-}
+pub use nydus_utils::host_page_size;
 
 /// Extends `path` with a sparse hole to a multiple of the host page size. A no-op when it
 /// already is one.
@@ -82,6 +65,32 @@ pub fn pad_to_page_size(path: &Path) -> io::Result<()> {
         file.set_len(padded)?;
     }
     Ok(())
+}
+
+/// The path to mount `image` from: `image` itself when it is a page multiple, otherwise a padded
+/// copy beside it (`<name>.page-padded`). The caller's file is never modified.
+pub fn page_aligned_source(image: &Path) -> io::Result<PathBuf> {
+    if fs::metadata(image)?.len().is_multiple_of(host_page_size()) {
+        return Ok(image.to_path_buf());
+    }
+    let mut name = image.file_name().unwrap_or_default().to_os_string();
+    name.push(".page-padded");
+    let padded = image.with_file_name(&name);
+    name.push(".tmp");
+    let tmp = image.with_file_name(name);
+    // A fresh file (never through a planted symlink), since nydusd may run as root.
+    let _ = fs::remove_file(&tmp);
+    let mut out = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)?;
+    let staged = io::copy(&mut fs::File::open(image)?, &mut out)
+        .and_then(|_| pad_to_page_size(&tmp))
+        .and_then(|()| fs::rename(&tmp, &padded));
+    if staged.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    staged.map(|()| padded)
 }
 
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
@@ -205,7 +214,10 @@ mod linux {
     /// should be on the filesystem nydus mounts its images from. A probe that does not finish
     /// within `timeout` is inconclusive and leaves its scratch directory behind.
     pub fn self_test(dir: &Path, timeout: Duration) -> PartialFolioStatus {
-        let work = dir.join(format!(".erofs-folio-probe-{}", std::process::id()));
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.subsec_nanos());
+        let work = dir.join(format!(".erofs-folio-probe-{}-{nanos}", std::process::id()));
         let (tx, rx) = mpsc::channel();
         let thread_work = work.clone();
         let spawned = std::thread::Builder::new()
@@ -304,32 +316,6 @@ mod linux {
         }
         Ok(())
     }
-
-    /// Refuses `image` as a file-backed EROFS mount source when it ends inside a page and the
-    /// kernel has the bug. The first call for such an image runs the self-test next to it.
-    pub fn check_mount_source(image: &Path) -> io::Result<()> {
-        let len = fs::metadata(image)?.len();
-        let page_size = host_page_size();
-        let dir = image.parent().unwrap_or(Path::new("."));
-        if refuses(len, page_size, || detect_once(dir)) {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                UnpaddedImageError {
-                    path: image.to_path_buf(),
-                    len,
-                    page_size,
-                },
-            ));
-        }
-        Ok(())
-    }
-}
-
-/// Whether a mount source of `len` bytes must be refused. `status` runs only for a source that
-/// ends inside a page.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-fn refuses<'a>(len: u64, page_size: u64, status: impl FnOnce() -> &'a PartialFolioStatus) -> bool {
-    !len.is_multiple_of(page_size) && matches!(status(), PartialFolioStatus::Affected(_))
 }
 
 #[cfg(test)]
@@ -356,19 +342,6 @@ mod tests {
         let status = classify(&eperm(), &eperm());
         assert!(matches!(status, PartialFolioStatus::Inconclusive(_)));
         assert_eq!(status.label(), "inconclusive");
-    }
-
-    #[test]
-    fn only_unpadded_sources_on_affected_kernels_are_refused() {
-        let affected = PartialFolioStatus::Affected(String::new());
-        let page = 16384;
-        // A page multiple never needs the self-test.
-        assert!(!refuses(2 * page, page, || unreachable!()));
-        assert!(refuses(5 * 4096, page, || &affected));
-        assert!(!refuses(5 * 4096, page, || &PartialFolioStatus::Unaffected));
-        // An undecided probe must not block mounts that work on most kernels.
-        let unknown = PartialFolioStatus::Inconclusive(String::new());
-        assert!(!refuses(5 * 4096, page, || &unknown));
     }
 
     #[test]
@@ -415,15 +388,32 @@ mod tests {
         fs::remove_dir_all(&dir).unwrap();
     }
 
-    #[cfg(target_os = "linux")]
     #[test]
-    fn page_aligned_sources_skip_the_self_test() {
+    fn page_aligned_source_copies_only_unaligned_images() {
         let dir = std::env::temp_dir().join(format!("erofs-folio-src-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("bootstrap");
-        fs::write(&path, vec![0u8; host_page_size() as usize]).unwrap();
-        check_mount_source(&path).unwrap();
-        assert!(detected().is_none());
+        let page = host_page_size() as usize;
+
+        let aligned = dir.join("aligned");
+        fs::write(&aligned, vec![1u8; page]).unwrap();
+        assert_eq!(page_aligned_source(&aligned).unwrap(), aligned);
+
+        let bootstrap = dir.join("bootstrap");
+        fs::write(&bootstrap, vec![7u8; page + 512]).unwrap();
+        let source = page_aligned_source(&bootstrap).unwrap();
+        assert_eq!(source, dir.join("bootstrap.page-padded"));
+        assert_eq!(fs::metadata(&bootstrap).unwrap().len(), page as u64 + 512);
+        let padded = fs::read(&source).unwrap();
+        assert_eq!(padded.len(), 2 * page);
+        assert_eq!(&padded[..page + 512], &vec![7u8; page + 512][..]);
+        assert!(!dir.join("bootstrap.page-padded.tmp").exists());
+
+        // A changed bootstrap replaces the stale copy.
+        fs::write(&bootstrap, vec![9u8; 512]).unwrap();
+        assert_eq!(
+            fs::read(page_aligned_source(&bootstrap).unwrap()).unwrap()[0],
+            9
+        );
         fs::remove_dir_all(&dir).unwrap();
     }
 }

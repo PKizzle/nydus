@@ -3543,7 +3543,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let src = dir.path().join("src");
         let dst = dir.path().join("bootstrap");
-        let page = nydus_service::erofs_folio::host_page_size();
+        let page = nydus_utils::host_page_size();
         // Never a page multiple, whatever the page size.
         let body: Vec<u8> = (0..(page * 3 + 4096 - 512)).map(|i| i as u8).collect();
         fs::write(&src, &body).unwrap();
