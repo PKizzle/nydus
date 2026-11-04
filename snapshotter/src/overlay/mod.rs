@@ -348,11 +348,6 @@ impl OverlayEngine {
         Ok(None)
     }
 
-    /// Return the parent key recorded for an existing snapshot, if any.
-    pub fn parent_of(&self, store: &SnapshotStore, key: &str) -> Result<Option<String>> {
-        Ok(store.stat(key)?.parent)
-    }
-
     /// Build a mount that uses the RAFS daemon mountpoint as the single
     /// readonly lower directory.
     ///

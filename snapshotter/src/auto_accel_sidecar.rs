@@ -580,7 +580,7 @@ fn ensure_present(path: &Path, kind: &str) -> Result<()> {
 /// the symlink is created under a temp name and `rename(2)`d over the final
 /// one. A remove+create pair would briefly leave the blob name dangling for a
 /// daemon that is already serving out of this backend dir.
-fn symlink_force(target: &Path, link: &Path) -> Result<()> {
+pub(crate) fn symlink_force(target: &Path, link: &Path) -> Result<()> {
     #[cfg(unix)]
     {
         let tmp = link.with_extension("tmp-link");
@@ -780,15 +780,6 @@ impl AutoAccelDiscovery {
         let staged = self.locator.stage(manifest_digest, &manifest).await?;
         Ok(Some(staged))
     }
-}
-
-/// Convenience: the canonical label set the auto-zran worker stamps on each
-/// uploaded artifact. Re-exported so callers can verify in tests or logs.
-pub fn auto_accel_labels(subject: &str, role: &str) -> HashMap<String, String> {
-    let mut m = HashMap::new();
-    m.insert(LABEL_SUBJECT.to_string(), subject.to_string());
-    m.insert(LABEL_ROLE.to_string(), role.to_string());
-    m
 }
 
 #[cfg(test)]
