@@ -754,7 +754,7 @@ fn image_record(
 
 /// A failed containerd call, its `tonic::Status` kept downcastable under the message so
 /// [`is_not_found`], [`is_rpc_failure`] and [`is_containerd_unavailable`] see the code.
-fn rpc_error(call: impl std::fmt::Display, status: tonic::Status) -> anyhow::Error {
+pub(crate) fn rpc_error(call: impl std::fmt::Display, status: tonic::Status) -> anyhow::Error {
     let msg = format!("containerd {call} failed: {status}");
     anyhow::Error::new(status).context(msg)
 }

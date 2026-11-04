@@ -12,9 +12,9 @@ use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use crate::auto_zran::AutoZranManager;
-use std::time::{Duration, Instant};
 
 const SNAPSHOT_DURATION_BUCKETS_MS: [f64; 14] = [
     0.5, 1.0, 5.0, 10.0, 50.0, 100.0, 150.0, 200.0, 250.0, 300.0, 350.0, 400.0, 600.0, 1000.0,

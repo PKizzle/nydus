@@ -37,6 +37,7 @@ use crate::containerd_api::types::transfer::{
 use crate::containerd_grpc::ContainerdChannel;
 use crate::containerd_lookup::MissingLayers;
 use crate::content_store::ContentStoreClient;
+use crate::content_store::rpc_error;
 use crate::daemon::image_ref::{ImageRef, parse_image_ref};
 use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine as _;
@@ -189,7 +190,9 @@ impl LayerBackfill {
         // Dropping the transfer call on a stall resets its HTTP/2 stream, which cancels the
         // fetch inside containerd.
         match select(transfer, stalled).await {
-            Either::Left((result, _)) => result.map(drop).map_err(anyhow::Error::new),
+            Either::Left((result, _)) => result
+                .map(drop)
+                .map_err(|status| rpc_error("Transfer", status)),
             Either::Right((stall, _)) => Err(stall),
         }
     }
@@ -206,14 +209,14 @@ impl LayerBackfill {
         let mut inbound = StreamingClient::new(self.channel.clone())
             .stream(requests)
             .await
-            .map_err(|status| anyhow::Error::new(status).context(format!("open stream {id}")))?
+            .map_err(|status| rpc_error(format_args!("Streaming.Stream({id})"), status))?
             .into_inner();
         // containerd acknowledges once the stream is registered under its ID; the transfer
         // must not reference it before that.
         inbound
             .message()
             .await
-            .map_err(|status| anyhow::Error::new(status).context(format!("stream {id} handshake")))?
+            .map_err(|status| rpc_error(format_args!("Streaming.Stream({id}) handshake"), status))?
             .with_context(|| format!("stream {id} closed during handshake"))?;
         Ok((outbound, inbound))
     }
