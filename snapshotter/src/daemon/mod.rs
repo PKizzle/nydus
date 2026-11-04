@@ -2652,21 +2652,11 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
 }
 
 /// Copies `src` to `dst` and extends the copy with a sparse hole to a multiple of the host page
-/// size. Linux 7.3's file-backed EROFS reads metadata a whole folio at a time and fails a short
-/// read at end of file with `EIO`, so on a kernel whose page is larger than the EROFS block every
-/// inode in a last, partial page is unreadable (fixed upstream by 52dceb88082b, "erofs: fix
-/// metadata reads at the end of file-backed images"). The hole costs no disk blocks.
+/// size, so kernels with the file-backed EROFS partial-folio bug can read all of its metadata
+/// (see `nydus_service::erofs_folio`).
 fn stage_bootstrap(src: &Path, dst: &Path) -> io::Result<()> {
     fs::copy(src, dst)?;
-    let file = fs::OpenOptions::new().write(true).open(dst)?;
-    let len = file.metadata()?.len();
-    file.set_len(len.next_multiple_of(host_page_size()))
-}
-
-fn host_page_size() -> u64 {
-    // SAFETY: sysconf reads a constant and has no preconditions.
-    let size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
-    u64::try_from(size).ok().filter(|&s| s > 0).unwrap_or(4096)
+    nydus_service::erofs_folio::pad_to_page_size(dst)
 }
 
 fn validate_spawn_request(image_ref: &str, bootstrap: &Path) -> Result<()> {
@@ -2751,6 +2741,16 @@ fn mount_blockdev_erofs(disk_image: PathBuf, mountpoint: PathBuf) -> Result<()> 
     })?;
     if is_mounted_at(&mountpoint) {
         return Ok(());
+    }
+    // A regular file is mounted file-backed: pad it like a staged bootstrap. A block device
+    // (the dm-verity path) reads through the block layer and needs nothing.
+    if disk_image.is_file() {
+        nydus_service::erofs_folio::pad_to_page_size(&disk_image).with_context(|| {
+            format!(
+                "failed to pad EROFS image {} to the page size",
+                disk_image.display()
+            )
+        })?;
     }
     // Use the nix wrapper around `mount(2)` directly instead of shelling
     // out to `/sbin/mount`. Avoids arg-escaping foot-guns and lifts a
@@ -3543,7 +3543,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let src = dir.path().join("src");
         let dst = dir.path().join("bootstrap");
-        let page = host_page_size();
+        let page = nydus_service::erofs_folio::host_page_size();
         // Never a page multiple, whatever the page size.
         let body: Vec<u8> = (0..(page * 3 + 4096 - 512)).map(|i| i as u8).collect();
         fs::write(&src, &body).unwrap();

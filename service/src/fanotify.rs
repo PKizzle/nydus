@@ -567,6 +567,7 @@ fn mount_erofs(
     mountpoint: &Path,
     inode_share_domain: Option<&str>,
 ) -> Result<()> {
+    crate::erofs_folio::check_mount_source(bootstrap)?;
     let options = build_erofs_device_options(blobs)?;
     if let Some(domain) = inode_share_domain {
         match erofs_inode_share_options(&options, domain)

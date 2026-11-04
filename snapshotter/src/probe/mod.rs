@@ -73,6 +73,12 @@ pub fn probe_and_promote_driver(
 ) -> (Vec<ProbeResult>, Option<FsDriverType>) {
     apply_driver_selection_policy(drivers, policy);
     let results = probe_drivers(drivers, work_dir);
+    #[cfg(target_os = "linux")]
+    if let Some(dir) = work_dir
+        && has_filesystem("erofs")
+    {
+        probe_erofs_partial_folio(dir);
+    }
     let selected = promote_selected_driver(drivers, &results);
     (results, selected)
 }
@@ -396,6 +402,44 @@ fn check_kernel_version(min_version: &str) -> Result<()> {
     }
     debug!(current = %release_base, required = %min_version, "kernel version check passed");
     Ok(())
+}
+
+/// Runs the file-backed EROFS partial-folio self-test once and reports the result. Every EROFS
+/// image the snapshotter mounts file-backed is padded to the page size whatever the outcome; the
+/// result is for operators (log, `nydus_snapshotter_erofs_partial_folio_bug` metric), because
+/// other file-backed EROFS mounts on an affected host fail the same way.
+#[cfg(target_os = "linux")]
+fn probe_erofs_partial_folio(work_dir: &Path) {
+    use nydus_service::erofs_folio::{self, PartialFolioStatus};
+
+    let kernel = fs::read_to_string("/proc/sys/kernel/osrelease").unwrap_or_default();
+    let kernel = kernel.trim();
+    let page_size = erofs_folio::host_page_size();
+    match erofs_folio::detect_once(work_dir) {
+        PartialFolioStatus::Affected(detail) => warn!(
+            kernel,
+            page_size,
+            upstream_fix = erofs_folio::UPSTREAM_FIX,
+            detail = %detail,
+            "kernel has the file-backed EROFS partial-folio metadata bug: metadata in a page that \
+             extends past the end of an image fails with EIO. nydus pads the EROFS images it \
+             mounts to the page size, so its own mounts are not affected; other file-backed \
+             EROFS mounts on this host are. Use a kernel with the upstream fix"
+        ),
+        PartialFolioStatus::Unaffected => {
+            info!(
+                kernel,
+                page_size, "file-backed EROFS partial-folio self-test passed"
+            )
+        }
+        PartialFolioStatus::Inconclusive(reason) => info!(
+            kernel,
+            page_size,
+            reason = %reason,
+            "file-backed EROFS partial-folio self-test inconclusive; EROFS images are padded to \
+             the page size regardless"
+        ),
+    }
 }
 
 /// On non-Linux, kernel version checks always fail (fanotify/fusedev are Linux-only).
