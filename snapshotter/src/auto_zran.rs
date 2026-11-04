@@ -2309,9 +2309,6 @@ mod tests {
         }
     }
 
-    /// A deferred sweep job (`mark_skipped`) records NO failure strike and
-    /// releases the `(image, stage)` dedupe key, so the image can be re-swept
-    /// (or optimized for real once its base lands) instead of being wedged.
     /// A containerd outage is not the image's fault: however long it lasts, the job takes no
     /// strike, keeps its dedupe key (it is still pending), and retries at a growing but capped
     /// interval; finishing clears the wait.
@@ -2347,6 +2344,9 @@ mod tests {
         assert_eq!(state.status().succeeded_total, 1);
     }
 
+    /// A deferred sweep job (`mark_skipped`) records NO failure strike and
+    /// releases the `(image, stage)` dedupe key, so the image can be re-swept
+    /// (or optimized for real once its base lands) instead of being wedged.
     #[test]
     fn mark_skipped_releases_dedupe_without_a_failure_strike() {
         let state = AutoZranState::new(8);
