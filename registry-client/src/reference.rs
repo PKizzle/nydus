@@ -150,9 +150,9 @@ mod tests {
 
     #[test]
     fn parse_full_docker_ref() {
-        let r = ImageReference::parse("docker.io/thegrandpkizzle/acme-dns:v2.0.0-nydus").unwrap();
+        let r = ImageReference::parse("docker.io/example/app:v2.0.0-nydus").unwrap();
         assert_eq!(r.api_host, "registry-1.docker.io");
-        assert_eq!(r.repo, "thegrandpkizzle/acme-dns");
+        assert_eq!(r.repo, "example/app");
         assert_eq!(r.tag.as_deref(), Some("v2.0.0-nydus"));
     }
 

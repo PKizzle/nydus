@@ -1388,7 +1388,7 @@ mod tests {
                     target_digest: "sha256:tgt".to_string(),
                 },
                 ImageRecord {
-                    name: "docker.io/thegrandpkizzle/mirrors@sha256:2a25".to_string(),
+                    name: "docker.io/example/app@sha256:2a25".to_string(),
                     target_digest: "sha256:tgt".to_string(),
                 },
             ];
@@ -1398,7 +1398,7 @@ mod tests {
             let groups = group_records_by_target(&records);
             assert_eq!(groups.len(), 1);
             assert_eq!(
-                groups[0].display_ref, "docker.io/thegrandpkizzle/mirrors@sha256:2a25",
+                groups[0].display_ref, "docker.io/example/app@sha256:2a25",
                 "repo@digest ref must beat the image-ID record (order={order})"
             );
         }
