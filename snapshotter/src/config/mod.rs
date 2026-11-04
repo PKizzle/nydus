@@ -654,6 +654,7 @@ pub struct MetricsConfig {
 
 /// Feature flags.
 #[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(from = "FeaturesConfigToml")]
 pub struct FeaturesConfig {
     /// Serve *published* nydus images found as OCI referrers of the image
     /// (the nydusify `--with-referrer` / Go-snapshotter distribution model).
@@ -684,6 +685,60 @@ pub struct FeaturesConfig {
     /// itself; see [`ErofsInodeShare`].
     #[serde(default)]
     pub erofs_inode_share: ErofsInodeShare,
+}
+
+/// [`FeaturesConfig`] as written, plus the deprecated keys it still reads.
+#[derive(Deserialize)]
+struct FeaturesConfigToml {
+    #[serde(default)]
+    referrer_detect: bool,
+    #[serde(default = "default_true")]
+    dual_index_detect: bool,
+    #[serde(default)]
+    encryption: bool,
+    #[serde(default = "default_true")]
+    prefetch: bool,
+    #[serde(default = "default_true")]
+    metrics: bool,
+    erofs_inode_share: Option<ErofsInodeShare>,
+    /// Deprecated boolean form of `erofs_inode_share`: `false` is `off`, `true` is `auto`.
+    erofs_page_cache_sharing: Option<bool>,
+}
+
+impl From<FeaturesConfigToml> for FeaturesConfig {
+    fn from(raw: FeaturesConfigToml) -> Self {
+        let erofs_inode_share = match (raw.erofs_inode_share, raw.erofs_page_cache_sharing) {
+            (Some(mode), legacy) => {
+                if legacy.is_some() {
+                    tracing::warn!(
+                        "[snapshotter.features] ignoring the deprecated erofs_page_cache_sharing; \
+                         erofs_inode_share is set"
+                    );
+                }
+                mode
+            }
+            (None, Some(enabled)) => {
+                tracing::warn!(
+                    "[snapshotter.features] erofs_page_cache_sharing is deprecated; use \
+                     erofs_inode_share (false is \"off\", true is \"auto\")"
+                );
+                if enabled {
+                    ErofsInodeShare::Auto
+                } else {
+                    ErofsInodeShare::Off
+                }
+            }
+            (None, None) => ErofsInodeShare::default(),
+        };
+        Self {
+            referrer_detect: raw.referrer_detect,
+            dual_index_detect: raw.dual_index_detect,
+            encryption: raw.encryption,
+            prefetch: raw.prefetch,
+            metrics: raw.metrics,
+            erofs_inode_share,
+        }
+    }
 }
 
 /// When auto-accel mounts use the EROFS `inode_share` option, which lets files with identical
@@ -1826,6 +1881,22 @@ mod tests {
         let empty: FeaturesConfig = toml::from_str("").unwrap();
         assert_eq!(empty.erofs_inode_share, ErofsInodeShare::Auto);
         assert!(toml::from_str::<FeaturesConfig>("erofs_inode_share = \"yes\"").is_err());
+        // The deprecated boolean key still decides.
+        for (value, want) in [
+            ("false", ErofsInodeShare::Off),
+            ("true", ErofsInodeShare::Auto),
+        ] {
+            let parsed: FeaturesConfig =
+                toml::from_str(&format!("erofs_page_cache_sharing = {value}")).unwrap();
+            assert_eq!(parsed.erofs_inode_share, want, "{value}");
+        }
+        // The new key wins over the deprecated one, and bad values name the valid ones.
+        let both: FeaturesConfig =
+            toml::from_str("erofs_inode_share = \"on\"\nerofs_page_cache_sharing = false").unwrap();
+        assert_eq!(both.erofs_inode_share, ErofsInodeShare::On);
+        let err = toml::from_str::<FeaturesConfig>("erofs_inode_share = \"yes\"").unwrap_err();
+        assert!(err.to_string().contains("auto"), "{err}");
+        assert!(toml::from_str::<FeaturesConfig>("erofs_inode_share = true").is_err());
 
         let auto = ErofsInodeShare::Auto;
         assert!(!auto.enabled_for_kernel("6.18.55-061855-generic"));

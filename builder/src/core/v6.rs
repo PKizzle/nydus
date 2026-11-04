@@ -108,10 +108,12 @@ impl Node {
     /// It is a SHA-256 over the file size and each chunk's digest, which the builder computed
     /// from the chunk's uncompressed data; the chunks must cover the file end to end. Nothing is
     /// read from the source image's own metadata. Empty files carry no data to share and get none.
-    pub fn v6_set_inode_share_fingerprint(&mut self) -> Result<()> {
+    /// Nor does a file whose chunks cannot identify it: it only misses out on sharing, so it is
+    /// logged and skipped rather than failing the build.
+    pub fn v6_set_inode_share_fingerprint(&mut self) {
         let size = self.inode.size();
         if !self.is_reg() || size == 0 {
-            return Ok(());
+            return;
         }
         let mut hasher = RafsDigest::hasher(digest::Algorithm::Sha256);
         hasher.digest_update(b"nydus-rafs-chunks-v1\0");
@@ -119,24 +121,27 @@ impl Node {
         let mut covered = 0u64;
         for chunk in &self.chunks {
             let id = chunk.inner.id();
-            ensure!(
-                id.data != [0u8; 32],
-                "{}: chunk has no content digest, cannot fingerprint it",
-                self.path().display()
-            );
+            if id.data == [0u8; 32] {
+                warn!(
+                    "{}: chunk has no content digest, not fingerprinting it",
+                    self.path().display()
+                );
+                return;
+            }
             covered += chunk.inner.uncompressed_size() as u64;
             hasher.digest_update(&chunk.inner.uncompressed_size().to_le_bytes());
             hasher.digest_update(&id.data);
         }
-        ensure!(
-            covered == size,
-            "{}: chunks cover {covered} of {size} bytes, cannot fingerprint it",
-            self.path().display()
-        );
+        if covered != size {
+            warn!(
+                "{}: chunks cover {covered} of {size} bytes, not fingerprinting it",
+                self.path().display()
+            );
+            return;
+        }
         Arc::make_mut(&mut self.info)
             .xattrs
             .set_ishare_fingerprint(hasher.digest_finalize().data.to_vec());
-        Ok(())
     }
 
     /// Update whether compact mode can be used for this inode or not.
