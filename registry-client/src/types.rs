@@ -79,7 +79,8 @@ pub const MANIFEST_ACCEPT: &str = concat!(
 pub struct Descriptor {
     /// Media type of the referenced content.
     pub media_type: String,
-    /// Content digest (`sha256:<hex>`).
+    /// Content digest (`sha256:<hex>`). Not validated on deserialization;
+    /// check with [`validate_digest`] before using it as a path or URL.
     pub digest: String,
     /// Size of the referenced content in bytes.
     #[serde(default)]
@@ -357,6 +358,25 @@ pub fn sha256_digest(bytes: &[u8]) -> String {
     format!("sha256:{}", hex::encode(Sha256::digest(bytes)))
 }
 
+/// Bare hex of a `sha256:<64 lowercase hex>` digest, the only form this crate
+/// produces and verifies. Anything else is rejected, so the result is safe to
+/// use as a file name or URL path segment.
+pub fn digest_hex(digest: &str) -> Result<&str> {
+    match digest.strip_prefix("sha256:") {
+        Some(hex)
+            if hex.len() == 64 && hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) =>
+        {
+            Ok(hex)
+        }
+        _ => bail!("invalid digest {digest:?}: expected sha256:<64 lowercase hex>"),
+    }
+}
+
+/// Check that `digest` is a well-formed `sha256:<64 lowercase hex>` digest.
+pub fn validate_digest(digest: &str) -> Result<()> {
+    digest_hex(digest).map(drop)
+}
+
 /// Verify that `bytes` hash to `expected` (a `sha256:<hex>` digest string).
 /// Only sha256 is supported; other algorithms are rejected.
 pub fn verify_digest(bytes: &[u8], expected: &str) -> Result<()> {
@@ -593,6 +613,22 @@ mod tests {
         let mut empty_version = platform("amd64", None);
         empty_version.os_version = Some(String::new());
         assert!(empty_version.matches(&platform("amd64", None)));
+    }
+
+    #[test]
+    fn digest_hex_accepts_only_canonical_sha256() {
+        let hex = "a".repeat(64);
+        assert_eq!(digest_hex(&format!("sha256:{hex}")).unwrap(), hex);
+        for bad in [
+            String::new(),
+            hex.clone(),
+            format!("sha256:{}", "a".repeat(63)),
+            format!("sha256:{}", "A".repeat(64)),
+            format!("sha256:{}/../x", "a".repeat(58)),
+            format!("sha512:{}", "a".repeat(128)),
+        ] {
+            assert!(validate_digest(&bad).is_err(), "{bad}");
+        }
     }
 
     #[test]

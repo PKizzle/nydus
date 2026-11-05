@@ -72,6 +72,6 @@ pub use error::RegistryError;
 pub use reference::ImageReference;
 pub use types::{
     Descriptor, History, ImageConfig, Index, Manifest, NYDUS_MANIFEST_ARTIFACT_TYPE,
-    NYDUS_OS_FEATURE, Platform, RootFs, go_arch, host_go_arch, is_nydus_entry, normalize_variant,
-    sha256_digest, verify_digest,
+    NYDUS_OS_FEATURE, Platform, RootFs, digest_hex, go_arch, host_go_arch, is_nydus_entry,
+    normalize_variant, sha256_digest, validate_digest, verify_digest,
 };

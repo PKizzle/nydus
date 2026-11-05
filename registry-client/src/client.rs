@@ -30,6 +30,7 @@ use crate::auth::{
 use crate::error::RegistryError;
 use crate::types::{
     Index, MANIFEST_ACCEPT, MEDIA_TYPE_OCI_INDEX, MEDIA_TYPE_OCTET_STREAM, sha256_digest,
+    validate_digest,
 };
 use anyhow::{Context, Result, anyhow, bail};
 use compio::BufResult;
@@ -644,6 +645,10 @@ impl RegistryClient {
             read_bounded(response, &url, MAX_REGISTRY_BODY_BYTES, self.body_timeout).await?;
         let mut index: Index = serde_json::from_slice(&bytes)
             .with_context(|| format!("parse referrers index for {subject_digest}"))?;
+        for desc in &index.manifests {
+            validate_digest(&desc.digest)
+                .with_context(|| format!("referrers index for {subject_digest}"))?;
+        }
         if let Some(filter) = artifact_type {
             filter_referrers(&mut index, filter);
         }
@@ -652,7 +657,11 @@ impl RegistryClient {
 
     /// GET the blob endpoint and ensure a success status (shared by the
     /// in-memory and to-file downloads).
+    ///
+    /// The digest is validated first, so an invalid one fails before any
+    /// request is sent and before callers touch the filesystem.
     async fn get_blob_response(&self, repo: &str, digest: &str) -> Result<Response, RegistryError> {
+        validate_digest(digest)?;
         let url = self.blob_url(repo, digest);
         let response = self
             .request_with_auth(
@@ -1860,6 +1869,43 @@ mod tests {
             .await
             .unwrap();
         assert!(fetched.digest.starts_with("sha256:"), "{}", fetched.digest);
+    }
+
+    #[compio::test]
+    async fn blob_to_file_rejects_invalid_digest_before_touching_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("blobs/out");
+        // No server: a digest that reached the network would fail differently.
+        let client = loopback_client(9);
+        for digest in [
+            "sha256:../../etc",
+            "sha256:ABC",
+            "md5:00",
+            &format!("sha256:{}", "A".repeat(64)),
+        ] {
+            let err = client
+                .get_blob_to_file("app", digest, &dest)
+                .await
+                .unwrap_err();
+            assert!(
+                err.to_string().contains("invalid digest"),
+                "{digest}: {err}"
+            );
+        }
+        assert!(!dir.path().join("blobs").exists());
+    }
+
+    #[compio::test]
+    async fn referrers_index_with_invalid_digest_is_rejected() {
+        let index = r#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"sha256:../x","size":1}]}"#;
+        let (port, server) = serve_raw(vec![raw_response("200 OK", index)]);
+        let subject = format!("sha256:{}", "a".repeat(64));
+        let err = loopback_client(port)
+            .get_referrers("app", &subject, None)
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("invalid digest"), "{err:#}");
+        server.join().unwrap();
     }
 
     #[test]
