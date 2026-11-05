@@ -203,7 +203,8 @@ fn build_nydusd_config(
             }
         },
         "mode": "direct",
-        "digest_validate": false,
+        // Chunks come from a registry; check each against the bootstrap's digest.
+        "digest_validate": true,
         "iostats_files": false,
         "enable_xattr": true,
         "fs_prefetch": {
@@ -408,6 +409,7 @@ mod tests {
         assert_eq!(config["device"]["cache"]["type"], "blobcache");
         assert_eq!(config["fs_prefetch"]["enable"], true);
         assert_eq!(config["mode"], "direct");
+        assert_eq!(config["digest_validate"], true);
     }
 
     #[test]
