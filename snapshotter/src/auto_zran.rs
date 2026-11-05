@@ -344,8 +344,9 @@ struct AutoZranState {
     /// [`AutoZranManager::note_sidecar_missing`] uses this map to detect the
     /// repoint and clear the stale state.
     last_manifest: Mutex<HashMap<String, String>>,
-    /// Dedupe key → outage record of a job waiting to retry (see
-    /// [`AutoZranState::mark_waiting`]). Cleared when the job finishes or is abandoned.
+    /// Dedupe key → outage record of a job whose latest attempts found containerd unreachable
+    /// (see [`AutoZranState::mark_waiting`]), through its retry delays and re-runs alike.
+    /// Cleared when the job finishes or is abandoned.
     waiting: Mutex<HashMap<String, OutageWait>>,
     metrics: AutoZranMetrics,
 }
@@ -1083,26 +1084,7 @@ async fn run_base_stage(
         return Ok(());
     }
 
-    let work_dir = job_work_dir(config, &job.image);
-    std::fs::create_dir_all(&work_dir)
-        .with_context(|| format!("create work dir {}", work_dir.display()))?;
-    let artifact = if let Some(base) = load_reusable_base_artifact(&work_dir, &layers) {
-        // An earlier attempt converted but could not upload (e.g. containerd was down).
-        info!(image = %job.image, "auto-zran base: reusing converted work dir (create/merge skipped)");
-        base
-    } else {
-        let local_cfg = local_accel_config(config, &work_dir);
-        let artifact = blocking::unblock(move || local_accel::convert(&local_cfg, &layers))
-            .await
-            .context("local_accel::convert (base) failed")?;
-        // Persist the base artifact so a retry and stage 2 can reuse it. Non-fatal on
-        // failure: they fall back to the full pipeline when they can't reload it.
-        if let Err(e) = write_base_artifact(&work_dir, &artifact) {
-            warn!(image = %job.image, error = ?e, "auto-zran failed to persist base artifact; optimize will re-run the full pipeline");
-        }
-        artifact
-    };
-
+    let artifact = load_or_convert(config, job, layers).await?;
     upload_artifact(deps, job, manifest_digest, image_name, &artifact, None).await?;
 
     // IMPORTANT: do NOT mark accelerated and do NOT remove work_dir — the
@@ -1145,34 +1127,42 @@ async fn run_optimize_stage(
         return Ok(());
     }
 
-    let work_dir = job_work_dir(config, &job.image);
-    std::fs::create_dir_all(&work_dir)
-        .with_context(|| format!("create work dir {}", work_dir.display()))?;
-    let local_cfg = local_accel_config(config, &work_dir);
-
-    let artifact = if let Some(base) = load_reusable_base_artifact(&work_dir, &layers) {
-        // Stage 1 output is on disk but its sidecar is gone: upload it again.
-        info!(image = %job.image, "auto-zran optimize: reusing base work dir (create/merge skipped)");
-        base
-    } else {
-        // No reusable base (settle beat base, or the dir was swept): convert now.
-        info!(image = %job.image, "auto-zran optimize: no reusable base work dir; running the conversion");
-        let artifact = blocking::unblock(move || local_accel::convert(&local_cfg, &layers))
-            .await
-            .context("local_accel::convert failed")?;
-        // Persist it so a retry after a failed upload (e.g. containerd was down) skips the
-        // conversion. Non-fatal: a retry converts again when it can't reload it.
-        if let Err(e) = write_base_artifact(&work_dir, &artifact) {
-            warn!(image = %job.image, error = ?e, "auto-zran failed to persist the converted artifact; a retry re-runs the conversion");
-        }
-        artifact
-    };
-
+    // Reuses stage 1's output (its sidecar is gone) or an earlier attempt's; otherwise the
+    // settle beat the base job, or the dir was swept, and this converts now.
+    let artifact = load_or_convert(config, job, layers).await?;
     upload_artifact(deps, job, manifest_digest, image_name, &artifact, None).await?;
 
     deps.access_tracer.mark_image_accelerated(&job.image);
     cleanup_work_dir(config, &job.image);
     Ok(())
+}
+
+/// The converted artifact of `layers` in the job's work dir: reloaded when an earlier
+/// attempt or stage left a reusable one (see [`load_reusable_base_artifact`]), else
+/// converted now and persisted, so a retry after a failed upload (e.g. containerd was
+/// down) and the optimize stage skip the conversion. Persisting is non-fatal: they
+/// convert again when they can't reload it.
+async fn load_or_convert(
+    config: &AutoZranConfig,
+    job: &AutoZranJob,
+    layers: Vec<local_accel::SourceLayer>,
+) -> Result<NodeLocalArtifact> {
+    let work_dir = job_work_dir(config, &job.image);
+    std::fs::create_dir_all(&work_dir)
+        .with_context(|| format!("create work dir {}", work_dir.display()))?;
+    if let Some(artifact) = load_reusable_base_artifact(&work_dir, &layers) {
+        info!(image = %job.image, stage = job.stage.tag(), "auto-zran: reusing converted work dir (create/merge skipped)");
+        return Ok(artifact);
+    }
+    info!(image = %job.image, stage = job.stage.tag(), "auto-zran: no reusable work dir; running the conversion");
+    let local_cfg = local_accel_config(config, &work_dir);
+    let artifact = blocking::unblock(move || local_accel::convert(&local_cfg, &layers))
+        .await
+        .with_context(|| format!("local_accel::convert ({}) failed", job.stage.tag()))?;
+    if let Err(e) = write_base_artifact(&work_dir, &artifact) {
+        warn!(image = %job.image, error = ?e, "auto-zran failed to persist the converted artifact; a retry or the optimize stage re-runs the conversion");
+    }
+    Ok(artifact)
 }
 
 /// Build a `LocalAccelConfig` for a job's per-image `work_dir`.
