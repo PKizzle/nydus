@@ -22,6 +22,7 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -41,6 +42,23 @@ const KEEP_ALIVE_TIMEOUT: Duration = Duration::from_secs(10);
 const AUTHORITY: &str = "containerd";
 
 type Sender = SendRequest<tonic::body::Body>;
+
+/// Outcome of the latest request to containerd from any channel: [`UNKNOWN`] before the first,
+/// then [`REACHED`] if containerd answered (whatever the gRPC status) or [`UNREACHED`] if the
+/// connection could not be made or broke. Read by [`containerd_reachable`].
+static REACHABLE: AtomicU8 = AtomicU8::new(UNKNOWN);
+const UNKNOWN: u8 = 0;
+const UNREACHED: u8 = 1;
+const REACHED: u8 = 2;
+
+/// Whether the latest request to containerd reached it; `None` before the first request.
+pub fn containerd_reachable() -> Option<bool> {
+    match REACHABLE.load(Ordering::Relaxed) {
+        REACHED => Some(true),
+        UNREACHED => Some(false),
+        _ => None,
+    }
+}
 
 thread_local! {
     /// Live connections of this thread, keyed by socket path.
@@ -103,13 +121,25 @@ impl ContainerdChannel {
         request: http::Request<tonic::body::Body>,
     ) -> Result<http::Response<Incoming>, ChannelError> {
         let request = prepare(request, &namespace)?;
-        let mut sender = sender(&socket).await?;
+        let result = Self::exchange(&socket, request).await;
+        REACHABLE.store(
+            if result.is_ok() { REACHED } else { UNREACHED },
+            Ordering::Relaxed,
+        );
+        result
+    }
+
+    async fn exchange(
+        socket: &Path,
+        request: http::Request<tonic::body::Body>,
+    ) -> Result<http::Response<Incoming>, ChannelError> {
+        let mut sender = sender(socket).await?;
         let result = match sender.ready().await {
             Ok(()) => sender.send_request(request).await,
             Err(source) => Err(source),
         };
         if result.is_err() && sender.is_closed() {
-            forget(&socket);
+            forget(socket);
         }
         result.map_err(|source| ChannelError::Request {
             socket: socket.to_path_buf(),

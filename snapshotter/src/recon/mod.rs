@@ -12,7 +12,7 @@
 use crate::cache::{CacheGcPolicy, CacheManager};
 use crate::daemon::DaemonSupervisor;
 use crate::store::SnapshotStore;
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use compio::time;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -76,6 +76,9 @@ pub struct Reconciler {
     /// Overlay engine for resolving which daemon a snapshot would release on
     /// `remove()`; `None` disables refcount reconciliation.
     refcount_recon: Option<Arc<crate::overlay::OverlayEngine>>,
+    /// Slugs the last mount-health pass found dead, so each one is logged
+    /// when it dies and when it recovers rather than on every tick.
+    dead_mounts: std::sync::Mutex<HashSet<String>>,
 }
 
 impl Reconciler {
@@ -97,6 +100,7 @@ impl Reconciler {
             last_slow_pass: std::sync::Mutex::new(None),
             mount_probe_timeout: None,
             refcount_recon: None,
+            dead_mounts: std::sync::Mutex::new(HashSet::new()),
         }
     }
 
@@ -200,15 +204,24 @@ impl Reconciler {
     /// since their last run.
     async fn reconcile(&self) -> Result<()> {
         debug!("starting reconciliation pass");
+        // A failing step must not starve the steps after it, so every step
+        // runs and the failures are reported together at the end.
+        let mut failed = Vec::new();
+        let mut note = |step: &'static str, result: Result<()>| {
+            if let Err(e) = result {
+                warn!(step, error = %format!("{e:#}"), "reconcile step failed");
+                failed.push(format!("{step}: {e:#}"));
+            }
+        };
 
         // 1. Recover failed daemon instances.
-        self.supervisor.recover().await?;
+        note("recover daemons", self.supervisor.recover().await.map(drop));
 
         // 2. Check for orphan overlay mounts under the snapshots root.
-        self.check_orphan_mounts().await?;
+        note("orphan mounts", self.check_orphan_mounts().await);
 
         // 3. Check for stale per-daemon state directories.
-        self.check_stale_daemon_dirs().await?;
+        note("stale daemon dirs", self.check_stale_daemon_dirs().await);
 
         // 4. Probe live daemon mountpoints for consumer-visible health.
         self.check_mount_health().await;
@@ -223,16 +236,16 @@ impl Reconciler {
         };
         if run_slow {
             // 5. Account for and optionally garbage-collect blob-cache artifacts.
-            self.check_cache_gc().await?;
+            note("cache gc", self.check_cache_gc().await);
 
             // 6. Sweep orphaned auto-zran per-job scratch dirs left by a crash.
-            self.check_stale_autozran_dirs().await?;
+            note("auto-zran job dirs", self.check_stale_autozran_dirs().await);
 
             // 7. Sweep sidecar Image records whose subject image is gone.
-            self.check_orphan_sidecars().await?;
+            note("orphan sidecars", self.check_orphan_sidecars().await);
 
             // 7b. Sweep short links whose snapshot directory is gone.
-            self.check_orphan_short_links().await?;
+            note("orphan short links", self.check_orphan_short_links().await);
 
             // 8. Clamp leaked daemon refcounts to the observed holder set.
             self.check_refcounts().await;
@@ -241,6 +254,9 @@ impl Reconciler {
             self.check_stuck_optimizes().await;
         }
 
+        if !failed.is_empty() {
+            bail!("reconcile steps failed: {}", failed.join("; "));
+        }
         debug!("reconciliation pass complete");
         Ok(())
     }
@@ -266,15 +282,27 @@ impl Reconciler {
         }
     }
 
-    /// Run the mount-health probe pass and warn once per dead mount. Purely
-    /// observational — remediation is deliberately left to operators/alerts
-    /// consuming the metrics and `GET /api/v1/mounts/health`.
+    /// Run the mount-health probe pass and log each mount once when it turns
+    /// dead and once when it recovers. Purely observational — remediation is
+    /// deliberately left to operators/alerts consuming the metrics and
+    /// `GET /api/v1/mounts/health`, which report every pass: a mount that
+    /// answers reads with EIO (a kernel bug, say) is not fixed by remounting
+    /// it, so a recovery loop would only churn.
     async fn check_mount_health(&self) {
         let Some(timeout) = self.mount_probe_timeout else {
             return;
         };
         let report = self.supervisor.probe_mount_health(timeout).await;
-        for result in report.results.iter().filter(|r| !r.healthy) {
+        let (newly_dead, recovered) =
+            dead_mount_transitions(&mut self.dead_mounts.lock().unwrap(), &report.results);
+        for result in recovered {
+            info!(
+                slug = %result.slug,
+                image_ref = %result.image_ref,
+                "nydus mount healthy again"
+            );
+        }
+        for result in newly_dead {
             warn!(
                 slug = %result.slug,
                 image_ref = %result.image_ref,
@@ -871,9 +899,78 @@ fn unescape_mount_field(s: &str) -> String {
     out
 }
 
+/// Fold one probe pass into `dead` (the slugs found dead last pass) and
+/// return the results that just turned dead and those that just recovered.
+/// A slug absent from the pass (its daemon stopped) is dropped silently.
+fn dead_mount_transitions<'a>(
+    dead: &mut HashSet<String>,
+    results: &'a [crate::daemon::MountProbeResult],
+) -> (
+    Vec<&'a crate::daemon::MountProbeResult>,
+    Vec<&'a crate::daemon::MountProbeResult>,
+) {
+    let newly_dead = results
+        .iter()
+        .filter(|r| !r.healthy && !dead.contains(&r.slug))
+        .collect();
+    let recovered = results
+        .iter()
+        .filter(|r| r.healthy && dead.contains(&r.slug))
+        .collect();
+    *dead = results
+        .iter()
+        .filter(|r| !r.healthy)
+        .map(|r| r.slug.clone())
+        .collect();
+    (newly_dead, recovered)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dead_mount_is_reported_once_per_transition() {
+        let probe = |slug: &str, healthy: bool| crate::daemon::MountProbeResult {
+            slug: slug.to_string(),
+            image_ref: format!("img-{slug}"),
+            mountpoint: PathBuf::from("/mnt"),
+            fstype: Some("erofs".to_string()),
+            healthy,
+            error: (!healthy).then(|| "Input/output error".to_string()),
+            latency_ms: 0,
+            affected_overlays: 0,
+            probed_at: 0,
+        };
+        let slugs = |v: Vec<&crate::daemon::MountProbeResult>| {
+            v.iter().map(|r| r.slug.clone()).collect::<Vec<_>>()
+        };
+        let mut dead = HashSet::new();
+
+        let pass = [probe("a", false), probe("b", true)];
+        let (died, healed) = dead_mount_transitions(&mut dead, &pass);
+        assert_eq!(
+            (slugs(died), slugs(healed)),
+            (vec!["a".to_string()], vec![])
+        );
+
+        // Still dead on the following passes: nothing new to report.
+        for _ in 0..3 {
+            let (died, healed) = dead_mount_transitions(&mut dead, &pass);
+            assert!(died.is_empty() && healed.is_empty());
+        }
+
+        let pass = [probe("a", true), probe("b", false)];
+        let (died, healed) = dead_mount_transitions(&mut dead, &pass);
+        assert_eq!(
+            (slugs(died), slugs(healed)),
+            (vec!["b".to_string()], vec!["a".to_string()])
+        );
+
+        // "b" stopped while dead: forgotten, so a later daemon reusing the slug reports again.
+        let (died, healed) = dead_mount_transitions(&mut dead, &[]);
+        assert!(died.is_empty() && healed.is_empty() && dead.is_empty());
+    }
 
     #[test]
     fn parse_mounts_extracts_target_and_fs_type() {
@@ -903,6 +1000,29 @@ proc /proc proc rw,nosuid 0 0
     fn parse_mounts_ignores_malformed_lines() {
         let parsed = parse_mounts("garbage\n\n");
         assert!(parsed.is_empty());
+    }
+
+    /// One failing step must not skip the rest of the pass.
+    #[compio::test]
+    async fn a_failing_step_does_not_skip_the_later_ones() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = crate::config::SnapshotterConfig::default();
+        config.snapshotter.root = tmp.path().to_path_buf();
+        // The stale-daemon-dir sweep fails: its root is not a directory.
+        std::fs::write(tmp.path().join("daemons"), b"").unwrap();
+        // The short-link sweep, which runs later, has a dangling link to remove.
+        let link = tmp.path().join("l/0123456789abcdef");
+        std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(tmp.path().join("gone"), &link).unwrap();
+        let reconciler = Reconciler::new(
+            Arc::new(DaemonSupervisor::new(config)),
+            Arc::new(SnapshotStore::open(&tmp.path().join("metadata.fjall")).unwrap()),
+            Duration::from_secs(3600),
+        );
+
+        let err = reconciler.run_once().await.unwrap_err();
+        assert!(format!("{err:#}").contains("stale daemon dirs"), "{err:#}");
+        assert!(!link.is_symlink(), "the short-link sweep must still run");
     }
 
     fn touch_dir_with_age(root: &Path, name: &str, age: Duration) -> PathBuf {

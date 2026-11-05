@@ -135,7 +135,7 @@ impl BlobCacheMgr for FileCacheMgr {
             self.closed.store(true, Ordering::Release);
             self.worker_mgr.stop();
             self.backend().shutdown();
-            self.metrics.release().unwrap_or_else(|e| error!("{:?}", e));
+            self.metrics.release();
         }
     }
 

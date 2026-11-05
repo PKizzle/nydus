@@ -20,6 +20,15 @@ use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::instrument;
 
+/// The store outcomes containerd tells apart by gRPC status code.
+#[derive(Debug, thiserror::Error)]
+pub enum StoreError {
+    #[error("snapshot {0} does not exist")]
+    NotFound(String),
+    #[error("snapshot {0} already exists")]
+    AlreadyExists(String),
+}
+
 const SNAPSHOTS_KEYSPACE: &str = "snapshots";
 
 /// Handle to the fjall snapshot store.
@@ -108,7 +117,7 @@ impl SnapshotStore {
             .snapshots
             .get(key.as_bytes())
             .with_context(|| format!("failed to read snapshot {key}"))?
-            .with_context(|| format!("snapshot {key} does not exist"))?;
+            .ok_or_else(|| StoreError::NotFound(key.to_string()))?;
         decode_snapshot(&value).with_context(|| format!("failed to decode snapshot {key}"))
     }
 
@@ -159,7 +168,7 @@ impl SnapshotStore {
             .with_context(|| format!("failed to check whether snapshot {key} exists"))?
             .is_some()
         {
-            bail!("snapshot {key} already exists");
+            return Err(StoreError::AlreadyExists(key.to_string()).into());
         }
         tx.insert(&self.snapshots, key.as_bytes().to_vec(), encoded);
         tx.commit()
@@ -176,7 +185,7 @@ impl SnapshotStore {
         let active_value = tx
             .get(&self.snapshots, key.as_bytes())
             .with_context(|| format!("failed to read active snapshot {key}"))?
-            .with_context(|| format!("snapshot {key} does not exist"))?;
+            .ok_or_else(|| StoreError::NotFound(key.to_string()))?;
         let active = decode_snapshot(&active_value)
             .with_context(|| format!("failed to decode active snapshot {key}"))?;
         if active.kind != SnapshotKind::Active.as_str() {
@@ -187,7 +196,7 @@ impl SnapshotStore {
             .with_context(|| format!("failed to check committed snapshot {name}"))?
             .is_some()
         {
-            bail!("target committed snapshot {name} already exists");
+            return Err(StoreError::AlreadyExists(name.to_string()).into());
         }
 
         let now = now_unix();
@@ -228,7 +237,7 @@ impl SnapshotStore {
             .with_context(|| format!("failed to read snapshot {key}"))?
             .is_none()
         {
-            bail!("snapshot {key} does not exist");
+            return Err(StoreError::NotFound(key.to_string()).into());
         }
         tx.remove(&self.snapshots, key.as_bytes().to_vec());
         tx.commit()
@@ -284,7 +293,7 @@ impl SnapshotStore {
         let value = tx
             .get(&self.snapshots, key.as_bytes())
             .with_context(|| format!("failed to read snapshot {key}"))?
-            .with_context(|| format!("snapshot {key} does not exist"))?;
+            .ok_or_else(|| StoreError::NotFound(key.to_string()))?;
         let mut info =
             decode_snapshot(&value).with_context(|| format!("failed to decode snapshot {key}"))?;
         info.labels = labels.iter().cloned().collect();
@@ -308,7 +317,7 @@ impl SnapshotStore {
         let value = tx
             .get(&self.snapshots, key.as_bytes())
             .with_context(|| format!("failed to read snapshot {key}"))?
-            .with_context(|| format!("snapshot {key} does not exist"))?;
+            .ok_or_else(|| StoreError::NotFound(key.to_string()))?;
         let mut info =
             decode_snapshot(&value).with_context(|| format!("failed to decode snapshot {key}"))?;
         info.image_ref = Some(image_ref.to_string());
@@ -333,7 +342,7 @@ impl SnapshotStore {
         let value = tx
             .get(&self.snapshots, key.as_bytes())
             .with_context(|| format!("failed to read snapshot {key}"))?
-            .with_context(|| format!("snapshot {key} does not exist"))?;
+            .ok_or_else(|| StoreError::NotFound(key.to_string()))?;
         let mut info =
             decode_snapshot(&value).with_context(|| format!("failed to decode snapshot {key}"))?;
         if info.kind != SnapshotKind::Committed.as_str() {
@@ -365,7 +374,7 @@ impl SnapshotStore {
             .with_context(|| format!("failed to check imported snapshot {}", info.key))?
             .is_some()
         {
-            bail!("snapshot {} already exists", info.key);
+            return Err(StoreError::AlreadyExists(info.key.clone()).into());
         }
         tx.insert(
             &self.snapshots,
@@ -470,6 +479,16 @@ fn now_unix() -> i64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs() as i64
+}
+
+#[cfg(test)]
+impl SnapshotStore {
+    /// Write `value` under `key` as is, bypassing encoding.
+    pub(crate) fn insert_raw(&self, key: &str, value: &[u8]) {
+        let mut tx = self.db.write_tx();
+        tx.insert(&self.snapshots, key.as_bytes().to_vec(), value.to_vec());
+        tx.commit().unwrap();
+    }
 }
 
 #[cfg(test)]

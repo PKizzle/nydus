@@ -2786,7 +2786,8 @@ fn unix_now() -> i64 {
         .as_secs() as i64
 }
 
-/// Crash-safe small-file write: write `<path>.tmp`, fsync, rename over `path`,
+/// Crash-safe small-file write: write a unique `<name><random>.tmp` beside `path`, fsync, rename
+/// over `path`,
 /// then fsync the parent directory. The records written through here (daemon
 /// status records, `upgrade.state`, the tarfs verity sidecar) gate mount
 /// takeover after a crash, so a torn write is worse than no file at all —
@@ -2798,19 +2799,17 @@ fn unix_now() -> i64 {
 fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
     use std::io::Write;
 
-    let mut tmp = path.as_os_str().to_os_string();
-    tmp.push(".tmp");
-    let tmp = PathBuf::from(tmp);
-
-    let mut file = fs::File::create(&tmp)?;
-    file.write_all(bytes)?;
-    file.sync_all()?;
-    drop(file);
-
-    if let Err(e) = fs::rename(&tmp, path) {
-        let _ = fs::remove_file(&tmp);
-        return Err(e);
-    }
+    // A unique, exclusively created tmp file per call: concurrent persists of one record
+    // (several sandboxes of the same image starting at once) must not truncate or rename each
+    // other's file. A failed write's tmp file is removed when `tmp` drops.
+    let parent = path.parent().unwrap_or(Path::new("."));
+    let mut tmp = tempfile::Builder::new()
+        .prefix(path.file_name().unwrap_or_default())
+        .suffix(".tmp")
+        .tempfile_in(parent)?;
+    tmp.write_all(bytes)?;
+    tmp.as_file().sync_all()?;
+    tmp.persist(path).map_err(|e| e.error)?;
 
     // Persist the rename itself: without the directory fsync a crash can
     // still lose the new entry (or resurrect the old one).
@@ -3708,6 +3707,31 @@ mod tests {
         StdMutex::new(None);
 
     #[test]
+    fn atomic_write_survives_concurrent_writers() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("record.json");
+        let threads: Vec<_> = (0..8)
+            .map(|t| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    for i in 0..50 {
+                        atomic_write(&path, format!("writer {t} round {i}").as_bytes()).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        assert!(fs::read_to_string(&path).unwrap().starts_with("writer "));
+        assert_eq!(
+            fs::read_dir(dir.path()).unwrap().count(),
+            1,
+            "no tmp residue"
+        );
+    }
+
+    #[test]
     fn atomic_write_round_trip_and_overwrite() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("record.json");
@@ -3903,7 +3927,7 @@ mod tests {
         // A crash inside atomic_write leaves a partial tmp file behind; the
         // reader must ignore it rather than warn on (or worse, decode) it.
         fs::write(
-            supervisor.record_dir().join("other-app.json.tmp"),
+            supervisor.record_dir().join("other-app.json.1234.0.tmp"),
             b"{\"image_ref\":\"tru",
         )
         .unwrap();

@@ -18,7 +18,7 @@ use crate::access_tracer::AccessTracer;
 use crate::config::{AutoZranConfig, ContainerdConfig, SchedClass as ConfigSchedClass};
 use crate::containerd_lookup::{ContainerdLookup, ManifestInfo, MissingLayers};
 use crate::containerd_transfer::{BackfillReport, LayerBackfill};
-use crate::content_store::ContentStoreClient;
+use crate::content_store::{ContentStoreClient, is_containerd_unavailable};
 use crate::local_accel::{
     self, LocalAccelConfig, NodeLocalArtifact, SchedClass as AccelSchedClass,
 };
@@ -32,8 +32,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use async_channel::{Receiver, Sender};
-use tracing::{debug, info, warn};
+use async_channel::{Receiver, Sender, WeakSender};
+use tracing::{debug, error, info, warn};
 
 /// Version of `AutoAccelManifest`. A sidecar whose manifest carries another version is treated as
 /// absent and reconverted; bump it when the artifact's content changes for every image (such as
@@ -242,6 +242,12 @@ pub struct AutoZranStatus {
     pub started_total: u64,
     pub succeeded_total: u64,
     pub failed_total: u64,
+    /// Attempts put off because containerd was unreachable (no failure strike).
+    pub deferred_total: u64,
+    /// Jobs on the queue, not yet picked up by the worker.
+    pub pending_jobs: usize,
+    /// Jobs whose latest attempt found containerd unreachable and that are waiting to retry.
+    pub waiting_jobs: usize,
     pub active_image: Option<String>,
 }
 
@@ -267,6 +273,25 @@ const MAX_CONVERSION_FAILURES: u32 = 3;
 /// soon-ish while a hard-failing image doesn't burn CPU on every pod start.
 const FAILURE_BACKOFF_BASE: Duration = Duration::from_secs(5 * 60);
 
+/// First retry delay of a job put off because containerd was unreachable; doubles per attempt
+/// up to [`UNAVAILABLE_RETRY_MAX`]. Such a job takes no failure strike and is retried until
+/// containerd answers, at most [`UNAVAILABLE_RETRY_MAX`] after it is back.
+const UNAVAILABLE_RETRY_BASE: Duration = Duration::from_secs(5);
+const UNAVAILABLE_RETRY_MAX: Duration = Duration::from_secs(2 * 60);
+
+/// How long after startup containerd may stay unreachable before that is logged as an error
+/// naming the configured socket. The snapshotter starts before containerd (containerd waits
+/// for its READY), so a short outage at boot is expected; one this long is a misconfiguration
+/// or a containerd that does not come up.
+const CONTAINERD_STARTUP_GRACE: Duration = Duration::from_secs(5 * 60);
+
+/// The delay before retry number `attempt` (1-based) of a job put off by a containerd outage.
+fn unavailable_retry_delay(attempt: u32) -> Duration {
+    UNAVAILABLE_RETRY_BASE
+        .saturating_mul(2u32.saturating_pow(attempt.saturating_sub(1)))
+        .min(UNAVAILABLE_RETRY_MAX)
+}
+
 /// Per-image record of consecutive conversion failures (both stages share it:
 /// a base failure and an optimize failure both count against the image).
 struct ImageFailures {
@@ -282,6 +307,7 @@ struct AutoZranMetrics {
     started_total: AtomicU64,
     succeeded_total: AtomicU64,
     failed_total: AtomicU64,
+    deferred_total: AtomicU64,
     running_jobs: AtomicU64,
 }
 
@@ -298,6 +324,9 @@ struct AutoZranState {
     /// [`AutoZranManager::note_sidecar_missing`] uses this map to detect the
     /// repoint and clear the stale state.
     last_manifest: Mutex<HashMap<String, String>>,
+    /// Dedupe key → consecutive attempts that found containerd unreachable, for jobs waiting to
+    /// retry (see [`AutoZranState::mark_waiting`]). Cleared when the job finishes either way.
+    waiting: Mutex<HashMap<String, u32>>,
     metrics: AutoZranMetrics,
 }
 
@@ -309,6 +338,7 @@ impl AutoZranState {
             active_image: Mutex::new(None),
             failures: Mutex::new(HashMap::new()),
             last_manifest: Mutex::new(HashMap::new()),
+            waiting: Mutex::new(HashMap::new()),
             metrics: AutoZranMetrics::default(),
         }
     }
@@ -323,6 +353,7 @@ impl AutoZranState {
 
     fn mark_finished(&self, job: &AutoZranJob, success: bool) {
         self.metrics.running_jobs.fetch_sub(1, Ordering::Relaxed);
+        self.stop_waiting(job);
         if success {
             self.metrics.succeeded_total.fetch_add(1, Ordering::Relaxed);
             // Any successful stage resets the negative cache for the image.
@@ -336,11 +367,7 @@ impl AutoZranState {
             }
             self.record_failure(&job.image);
         }
-        if let Ok(mut active) = self.active_image.lock()
-            && active.as_deref() == Some(job.image.as_str())
-        {
-            *active = None;
-        }
+        self.clear_active(job);
     }
 
     /// A job the worker chose not to run (the re-optimize gate deferred it: no
@@ -351,9 +378,41 @@ impl AutoZranState {
     fn mark_skipped(&self, job: &AutoZranJob) {
         self.metrics.running_jobs.fetch_sub(1, Ordering::Relaxed);
         self.metrics.skipped_total.fetch_add(1, Ordering::Relaxed);
+        self.stop_waiting(job);
         if let Ok(mut seen) = self.queued_or_done.lock() {
             seen.remove(&dedupe_key(&job.image, job.stage));
         }
+        self.clear_active(job);
+    }
+
+    /// A job whose attempt found containerd unreachable. That says nothing about the image, so
+    /// it records NO strike, and the job keeps its dedupe key: it is still pending, and the
+    /// worker re-sends it after the returned delay ([`unavailable_retry_delay`] of its
+    /// consecutive outage attempts).
+    fn mark_waiting(&self, job: &AutoZranJob) -> Duration {
+        self.metrics.running_jobs.fetch_sub(1, Ordering::Relaxed);
+        self.metrics.deferred_total.fetch_add(1, Ordering::Relaxed);
+        self.clear_active(job);
+        let attempt = match self.waiting.lock() {
+            Ok(mut waiting) => {
+                let attempt = waiting
+                    .entry(dedupe_key(&job.image, job.stage))
+                    .or_insert(0);
+                *attempt = attempt.saturating_add(1);
+                *attempt
+            }
+            Err(_) => 1,
+        };
+        unavailable_retry_delay(attempt)
+    }
+
+    fn stop_waiting(&self, job: &AutoZranJob) {
+        if let Ok(mut waiting) = self.waiting.lock() {
+            waiting.remove(&dedupe_key(&job.image, job.stage));
+        }
+    }
+
+    fn clear_active(&self, job: &AutoZranJob) {
         if let Ok(mut active) = self.active_image.lock()
             && active.as_deref() == Some(job.image.as_str())
         {
@@ -417,6 +476,14 @@ impl AutoZranState {
             started_total: self.metrics.started_total.load(Ordering::Relaxed),
             succeeded_total: self.metrics.succeeded_total.load(Ordering::Relaxed),
             failed_total: self.metrics.failed_total.load(Ordering::Relaxed),
+            deferred_total: self.metrics.deferred_total.load(Ordering::Relaxed),
+            // Filled in by the manager, which owns the queue.
+            pending_jobs: 0,
+            waiting_jobs: self
+                .waiting
+                .lock()
+                .map(|waiting| waiting.len())
+                .unwrap_or_default(),
             active_image: self
                 .active_image
                 .lock()
@@ -432,7 +499,24 @@ pub struct AutoZranManager {
     state: Arc<AutoZranState>,
 }
 
+impl std::fmt::Debug for AutoZranManager {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AutoZranManager").finish_non_exhaustive()
+    }
+}
+
 impl AutoZranManager {
+    /// A manager with no worker; the receiver stands in for it.
+    #[cfg(test)]
+    pub(crate) fn without_worker(depth: usize) -> (Arc<Self>, Receiver<AutoZranJob>) {
+        let (sender, receiver) = async_channel::bounded(depth);
+        let manager = Arc::new(Self {
+            sender,
+            state: Arc::new(AutoZranState::new(depth)),
+        });
+        (manager, receiver)
+    }
+
     /// Start the manager when configured. Returns `None` when auto-zran is
     /// disabled so callers can keep the fast path branch-free.
     pub fn start(config: &AutoZranConfig, deps: ConversionDeps) -> Option<Arc<Self>> {
@@ -448,9 +532,10 @@ impl AutoZranManager {
             state: state.clone(),
         });
         let worker_config = config.clone();
-        let worker_deps = deps;
+        let retry = manager.sender.downgrade();
+        compio::runtime::spawn(report_unreachable_containerd(deps.content_store.clone())).detach();
         compio::runtime::spawn(async move {
-            worker_loop(worker_config, worker_deps, receiver, state).await
+            worker_loop(worker_config, deps, receiver, retry, state).await
         })
         .detach();
         info!(queue_depth = depth, "auto-zran worker started");
@@ -458,7 +543,10 @@ impl AutoZranManager {
     }
 
     pub fn status(&self) -> AutoZranStatus {
-        self.state.status()
+        AutoZranStatus {
+            pending_jobs: self.sender.len(),
+            ..self.state.status()
+        }
     }
 
     /// Directory-safe key of the job the (single) worker is currently converting,
@@ -655,10 +743,34 @@ impl AutoZranManager {
     }
 }
 
+/// Log one error if containerd is still unreachable [`CONTAINERD_STARTUP_GRACE`] after startup,
+/// naming the configured socket, so a wrong path does not hide behind jobs that keep waiting.
+async fn report_unreachable_containerd(content_store: ContentStoreClient) {
+    compio::time::sleep(CONTAINERD_STARTUP_GRACE).await;
+    // Any digest will do: an answer, NotFound included, proves containerd is reachable.
+    let probe = format!("sha256:{}", "0".repeat(64));
+    if let Err(e) = content_store.info(&probe).await
+        && is_containerd_unavailable(&e)
+    {
+        error!(
+            socket = %content_store.socket().display(),
+            after_secs = CONTAINERD_STARTUP_GRACE.as_secs(),
+            error = %format!("{e:#}"),
+            "containerd is still unreachable; auto-zran conversions wait for it. Start \
+             containerd/k3s, or fix [snapshotter.containerd].address / [snapshotter].profile"
+        );
+    }
+}
+
+/// Runs queued jobs one at a time. A job that finds containerd unreachable is re-sent through
+/// `retry` after a capped exponential delay instead of failing (see
+/// [`AutoZranState::mark_waiting`]); `retry` is weak so the loop still ends once the manager
+/// and its sender are gone.
 async fn worker_loop(
     config: AutoZranConfig,
     deps: ConversionDeps,
     receiver: Receiver<AutoZranJob>,
+    retry: WeakSender<AutoZranJob>,
     state: Arc<AutoZranState>,
 ) {
     match deps.layer_backfill.remove_stale_records().await {
@@ -674,6 +786,24 @@ async fn worker_loop(
         match run_conversion(&config, &deps, &job).await {
             Ok(ConversionOutcome::Completed) => state.mark_finished(&job, true),
             Ok(ConversionOutcome::Deferred) => state.mark_skipped(&job),
+            Err(e) if is_containerd_unavailable(&e) => {
+                let delay = state.mark_waiting(&job);
+                warn!(
+                    image = %job.image,
+                    stage = job.stage.tag(),
+                    retry_in_secs = delay.as_secs(),
+                    error = %format!("{e:#}"),
+                    "auto-zran conversion waiting: containerd is unreachable"
+                );
+                let retry = retry.clone();
+                compio::runtime::spawn(async move {
+                    compio::time::sleep(delay).await;
+                    if let Some(sender) = retry.upgrade() {
+                        let _ = sender.send(job).await;
+                    }
+                })
+                .detach();
+            }
             Err(e) => {
                 state.mark_finished(&job, false);
                 warn!(image = %job.image, error = ?e, "auto-zran conversion failed");
@@ -890,16 +1020,22 @@ async fn run_base_stage(
     let work_dir = job_work_dir(config, &job.image);
     std::fs::create_dir_all(&work_dir)
         .with_context(|| format!("create work dir {}", work_dir.display()))?;
-    let local_cfg = local_accel_config(config, &work_dir);
-    let artifact = blocking::unblock(move || local_accel::convert(&local_cfg, &layers))
-        .await
-        .context("local_accel::convert (base) failed")?;
-
-    // Persist the base artifact so stage 2 can reuse it. Non-fatal on failure:
-    // stage 2 falls back to the full pipeline when it can't reload the base.
-    if let Err(e) = write_base_artifact(&work_dir, &artifact) {
-        warn!(image = %job.image, error = ?e, "auto-zran failed to persist base artifact; optimize will re-run the full pipeline");
-    }
+    let artifact = if let Some(base) = load_reusable_base_artifact(&work_dir, &layers) {
+        // An earlier attempt converted but could not upload (e.g. containerd was down).
+        info!(image = %job.image, "auto-zran base: reusing converted work dir (create/merge skipped)");
+        base
+    } else {
+        let local_cfg = local_accel_config(config, &work_dir);
+        let artifact = blocking::unblock(move || local_accel::convert(&local_cfg, &layers))
+            .await
+            .context("local_accel::convert (base) failed")?;
+        // Persist the base artifact so a retry and stage 2 can reuse it. Non-fatal on
+        // failure: they fall back to the full pipeline when they can't reload it.
+        if let Err(e) = write_base_artifact(&work_dir, &artifact) {
+            warn!(image = %job.image, error = ?e, "auto-zran failed to persist base artifact; optimize will re-run the full pipeline");
+        }
+        artifact
+    };
 
     upload_artifact(deps, job, manifest_digest, image_name, &artifact, None).await?;
 
@@ -960,16 +1096,9 @@ async fn run_optimize_stage(
             .context("local_accel::convert failed")?
     };
 
-    let image_record_ok =
-        upload_artifact(deps, job, manifest_digest, image_name, &artifact, None).await?;
+    upload_artifact(deps, job, manifest_digest, image_name, &artifact, None).await?;
 
-    // Tell the tracer to stop capturing ONLY when the cross-node advertisement
-    // is also wired (mirrors the original single-stage invariant): with
-    // image_record_ok=false peers can never discover the sidecar, so keep
-    // capture alive to retry the registration on a later cycle.
-    if image_record_ok {
-        deps.access_tracer.mark_image_accelerated(&job.image);
-    }
+    deps.access_tracer.mark_image_accelerated(&job.image);
     cleanup_work_dir(config, &job.image);
     Ok(())
 }
@@ -1119,8 +1248,14 @@ fn sidecar_state_of(manifest: &AutoAccelManifest) -> SidecarState {
 
 /// Upload a converted artifact as a content-store sidecar (bootstrap + zran
 /// indexes + optional prefetch blob + config + OCI manifest) and create-or-
-/// update the sidecar Image record. Shared by both stages. Returns whether the
-/// Image record registration succeeded (`image_record_ok`).
+/// update the sidecar Image record. Shared by both stages.
+///
+/// Every blob is written under one lease, which keeps them from containerd's GC
+/// until the Image record roots them and is deleted once it does. An upload that
+/// fails before that leaves the lease to expire (`UPLOAD_LEASE_TTL`), so a retry
+/// finds the blobs still there. The Image record is what makes the sidecar
+/// reachable at all (peers discover it, GC keeps it), so failing to write it
+/// fails the upload.
 ///
 /// The `images_upsert` at the end is what lets stage 2 PROMOTE the record from
 /// the base manifest to the optimized one — `Images.Create` alone swallows
@@ -1138,9 +1273,14 @@ async fn upload_artifact(
     image_name: &str,
     artifact: &NodeLocalArtifact,
     base_manifest_digest: Option<&str>,
-) -> Result<bool> {
+) -> Result<()> {
     // Own the digest so the step-4/5 label helpers below can `.clone()` it.
     let manifest_digest = manifest_digest.to_string();
+    let lease = deps
+        .content_store
+        .create_lease("auto-accel-upload")
+        .await
+        .context("create upload lease")?;
 
     // (4) Upload artifacts. Labels:
     //   - gc.ref.content.subject  is an OUTGOING GC edge (blob → referenced
@@ -1192,7 +1332,7 @@ async fn upload_artifact(
     );
     let bootstrap_digest = deps
         .content_store
-        .write_blob(&artifact.bootstrap, bootstrap_labels)
+        .write_blob(&artifact.bootstrap, bootstrap_labels, &lease)
         .await
         .context("upload bootstrap")?;
 
@@ -1223,7 +1363,7 @@ async fn upload_artifact(
         );
         let digest = deps
             .content_store
-            .write_blob(&path, labels)
+            .write_blob(&path, labels, &lease)
             .await
             .with_context(|| format!("upload zran index for layer {layer_digest}"))?;
         zran_descriptors.push(AutoAccelLayerDescriptor {
@@ -1240,7 +1380,7 @@ async fn upload_artifact(
             .len();
         let digest = deps
             .content_store
-            .write_blob(&path, base_labels("prefetch-blob"))
+            .write_blob(&path, base_labels("prefetch-blob"), &lease)
             .await
             .context("upload prefetch blob")?;
         Some(AutoAccelDescriptor { digest, size })
@@ -1271,7 +1411,12 @@ async fn upload_artifact(
     let config_ingest_ref = format!("nydus-auto-accel-config:v1:{manifest_digest}");
     let config_digest = deps
         .content_store
-        .write_bytes(&config_bytes, &config_ingest_ref, base_labels("config"))
+        .write_bytes(
+            &config_bytes,
+            &config_ingest_ref,
+            base_labels("config"),
+            &lease,
+        )
         .await
         .context("upload auto-accel config")?;
 
@@ -1306,7 +1451,7 @@ async fn upload_artifact(
     );
     let manifest_digest_in_store = deps
         .content_store
-        .write_bytes(&manifest_bytes, &manifest_oci_ref, manifest_labels)
+        .write_bytes(&manifest_bytes, &manifest_oci_ref, manifest_labels, &lease)
         .await
         .context("upload auto-accel oci manifest")?;
 
@@ -1322,8 +1467,7 @@ async fn upload_artifact(
         "containerd.io/snapshot/nydus.auto-accel.subject-image".to_string(),
         job.image.clone(),
     );
-    let image_record_ok = match deps
-        .content_store
+    deps.content_store
         .images_upsert(
             image_name,
             &manifest_digest_in_store,
@@ -1332,31 +1476,25 @@ async fn upload_artifact(
             image_labels,
         )
         .await
-    {
-        Ok(_) => true,
-        Err(e) => {
-            warn!(
-                image = %job.image,
-                image_name = %image_name,
-                error = ?e,
-                "auto-zran image-record registration failed (cross-node spegel mirror disabled for this manifest)"
-            );
-            false
-        }
-    };
+        .with_context(|| format!("register sidecar image record {image_name}"))?;
+
+    // The record roots the blobs now. A lease that cannot be deleted only lingers until it
+    // expires, so that is no reason to fail the upload.
+    if let Err(e) = deps.content_store.delete_lease(&lease).await {
+        warn!(lease = %lease, error = %format!("{e:#}"), "auto-zran could not delete its upload lease; it expires on its own");
+    }
 
     info!(
         image = %job.image,
         subject = %manifest_digest,
         auto_accel_manifest = %manifest_digest_in_store,
         image_name = %image_name,
-        image_record = image_record_ok,
         "auto-zran sidecar uploaded"
     );
 
     // The stage caller decides whether to mark the image accelerated and clean
     // up the work dir (base retains it for stage 2; optimize tears it down).
-    Ok(image_record_ok)
+    Ok(())
 }
 
 /// GC labels stamped onto the sidecar OCI manifest blob.
@@ -2174,6 +2312,41 @@ mod tests {
     /// A deferred sweep job (`mark_skipped`) records NO failure strike and
     /// releases the `(image, stage)` dedupe key, so the image can be re-swept
     /// (or optimized for real once its base lands) instead of being wedged.
+    /// A containerd outage is not the image's fault: however long it lasts, the job takes no
+    /// strike, keeps its dedupe key (it is still pending), and retries at a growing but capped
+    /// interval; finishing clears the wait.
+    #[test]
+    fn containerd_outage_defers_without_a_strike_and_backs_off_to_a_cap() {
+        let state = AutoZranState::new(8);
+        let job = AutoZranJob::base("registry.local/app:1".to_string());
+        let key = dedupe_key(&job.image, job.stage);
+        state.queued_or_done.lock().unwrap().insert(key.clone());
+
+        let mut delays = Vec::new();
+        for _ in 0..MAX_CONVERSION_FAILURES + 5 {
+            state.mark_started(&job);
+            delays.push(state.mark_waiting(&job));
+        }
+        assert_eq!(delays[0], UNAVAILABLE_RETRY_BASE);
+        assert_eq!(delays[1], UNAVAILABLE_RETRY_BASE * 2);
+        assert!(delays.windows(2).all(|w| w[0] <= w[1]));
+        assert_eq!(*delays.last().unwrap(), UNAVAILABLE_RETRY_MAX);
+
+        let status = state.status();
+        assert_eq!(status.failed_total, 0);
+        assert_eq!(status.deferred_total, delays.len() as u64);
+        assert_eq!(status.waiting_jobs, 1);
+        assert_eq!(status.running_jobs, 0);
+        assert!(status.active_image.is_none());
+        assert!(!state.enqueue_suppressed(&job.image, Instant::now()));
+        assert!(state.queued_or_done.lock().unwrap().contains(&key));
+
+        state.mark_started(&job);
+        state.mark_finished(&job, true);
+        assert_eq!(state.status().waiting_jobs, 0);
+        assert_eq!(state.status().succeeded_total, 1);
+    }
+
     #[test]
     fn mark_skipped_releases_dedupe_without_a_failure_strike() {
         let state = AutoZranState::new(8);

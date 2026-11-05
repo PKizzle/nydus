@@ -22,10 +22,8 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 use anyhow::Result;
 use clap::Parser;
 use futures::FutureExt;
-use std::path::Path;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 
 use nydus_snapshotter::config::{Profile, SnapshotterConfig};
 use nydus_snapshotter::daemon::DaemonSupervisor;
@@ -244,6 +242,10 @@ async fn run(nofile: std::io::Result<(u64, u64)>) -> Result<()> {
         "resolved deployment profile"
     );
 
+    // Containerd is not contacted here, even with auto_zran on: the shipped unit is
+    // `Type=notify` + `Before=containerd.service`, so containerd waits for our READY. Calls to
+    // it connect lazily, and auto-zran jobs wait out an unreachable containerd (auto_zran.rs).
+
     // Reject backend configurations the in-process daemon cannot honour (e.g.
     // an orphan [backends.localfs], or more than one pull backend) instead of
     // silently ignoring them.
@@ -271,34 +273,6 @@ async fn run(nofile: std::io::Result<(u64, u64)>) -> Result<()> {
             cgroup_control = %target.display(),
             "applied snapshotter cgroup memory.max"
         );
-    }
-
-    // auto_zran needs the containerd socket, but containerd may start after us: the shipped
-    // unit is `Type=notify` + `Before=containerd.service`, so containerd waits for our READY
-    // and blocking on its socket here would stall boot. Warn now and report an error only if
-    // the socket never appears, so a misconfigured path stays visible.
-    if config.snapshotter.auto_zran.enable {
-        let sock = config.snapshotter.containerd.address();
-        if !sock.exists() {
-            warn!(
-                socket = %sock.display(),
-                "auto_zran is enabled but the containerd socket does not exist yet; waiting for containerd"
-            );
-            compio::runtime::spawn(async move {
-                if wait_for_path(&sock, CONTAINERD_SOCKET_GRACE, Duration::from_secs(1)).await {
-                    info!(socket = %sock.display(), "containerd socket appeared");
-                } else {
-                    error!(
-                        socket = %sock.display(),
-                        grace_secs = CONTAINERD_SOCKET_GRACE.as_secs(),
-                        "auto_zran is enabled but the containerd socket still does not exist; \
-                         image conversions will fail. Start containerd/k3s, or fix \
-                         [snapshotter.containerd].address / [snapshotter].profile"
-                    );
-                }
-            })
-            .detach();
-        }
     }
 
     // Probe filesystem drivers and promote the selected one to the front of
@@ -432,46 +406,9 @@ async fn run(nofile: std::io::Result<(u64, u64)>) -> Result<()> {
     Ok(())
 }
 
-/// How long containerd may take to create its socket before a missing socket is reported as an error.
-const CONTAINERD_SOCKET_GRACE: Duration = Duration::from_secs(60);
-
-/// Polls every `interval` until `path` exists; false if it is still missing after `timeout`.
-async fn wait_for_path(path: &Path, timeout: Duration, interval: Duration) -> bool {
-    let deadline = Instant::now() + timeout;
-    while !path.exists() {
-        if Instant::now() >= deadline {
-            return false;
-        }
-        compio::time::sleep(interval).await;
-    }
-    true
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[compio::test]
-    async fn wait_for_path_sees_a_socket_created_later() {
-        let dir = tempfile::tempdir().unwrap();
-        let sock = dir.path().join("containerd.sock");
-        let creator = {
-            let sock = sock.clone();
-            std::thread::spawn(move || {
-                std::thread::sleep(Duration::from_millis(200));
-                std::os::unix::net::UnixListener::bind(&sock).unwrap()
-            })
-        };
-        assert!(wait_for_path(&sock, Duration::from_secs(10), Duration::from_millis(20)).await);
-        drop(creator.join().unwrap());
-    }
-
-    #[compio::test]
-    async fn wait_for_path_gives_up_on_a_socket_that_never_appears() {
-        let dir = tempfile::tempdir().unwrap();
-        let sock = dir.path().join("containerd.sock");
-        assert!(!wait_for_path(&sock, Duration::from_millis(100), Duration::from_millis(20)).await);
-    }
 
     #[test]
     fn parse_profile_accepts_known_values_case_insensitively() {

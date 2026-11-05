@@ -361,6 +361,20 @@ impl SidecarLocator {
         // mirrors the same pattern; consumer must match so the second pod on
         // this node doesn't refetch.
         let subject_labels = manifest_blob_labels(manifest_digest, synthetic_ref, &sidecar.oci);
+        // One lease keeps every blob from containerd's GC until the Image record roots them.
+        let lease = match self
+            .content_store
+            .create_lease("auto-accel-peer-pull")
+            .await
+        {
+            Ok(lease) => lease,
+            Err(e) => {
+                return PullOutcome::RegistryError {
+                    status: 0,
+                    body: format!("create content store lease failed: {e:#}"),
+                };
+            }
+        };
         // `write_bytes` keys the manifest by the digest of its own bytes; the
         // tag is synthetic, so no digest was known before the fetch.
         let manifest_digest_in_store = match self
@@ -372,6 +386,7 @@ impl SidecarLocator {
                     strip_sha256(manifest_digest)
                 ),
                 subject_labels,
+                &lease,
             )
             .await
         {
@@ -401,6 +416,7 @@ impl SidecarLocator {
                         strip_sha256(&blob.digest)
                     ),
                     labels,
+                    &lease,
                 )
                 .await
             {
@@ -413,7 +429,7 @@ impl SidecarLocator {
 
         // Register the Image record locally so the next pod hits
         // `images_get` straight away.
-        if let Err(e) = self
+        match self
             .content_store
             .images_create(
                 synthetic_ref,
@@ -424,14 +440,19 @@ impl SidecarLocator {
             )
             .await
         {
-            // Non-fatal: blobs are written + GC-anchored. images_get
-            // would miss but the label-scan fallback in `resolve_or_pull`
+            Ok(()) => {
+                if let Err(e) = self.content_store.delete_lease(&lease).await {
+                    warn!(lease = %lease, error = %format!("{e:#}"), "could not delete the peer-pull lease; it expires on its own");
+                }
+            }
+            // Non-fatal for this pull: the blobs are written and the lease keeps them until it
+            // expires. images_get would miss but the label-scan fallback in `resolve_or_pull`
             // still finds the manifest. Log loud so operators see it.
-            warn!(
+            Err(e) => warn!(
                 image_name = %synthetic_ref,
                 error = ?e,
                 "peer mirror pull wrote blobs but Image record registration failed"
-            );
+            ),
         }
 
         PullOutcome::Ok
@@ -1132,7 +1153,7 @@ mod tests {
         }
 
         /// `peer_pull` gets past verification to the content-store write
-        /// (here a containerd socket that does not exist).
+        /// (here a containerd socket that does not exist, so the upload lease fails first).
         #[test]
         fn peer_pull_of_a_valid_sidecar_reaches_the_content_store() {
             let dir = tempfile::tempdir().unwrap();
@@ -1154,7 +1175,7 @@ mod tests {
                 .block_on(locator.peer_pull(SUBJECT, &name));
             match outcome {
                 PullOutcome::RegistryError { body, .. } => {
-                    assert!(body.contains("write manifest"), "unexpected error: {body}")
+                    assert!(body.contains("content store"), "unexpected error: {body}")
                 }
                 o => panic!("unexpected outcome {o:?}"),
             }

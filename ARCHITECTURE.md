@@ -263,6 +263,24 @@ roughly one conversion, not one conversion *plus* a settle timer:
    daemon-mounted, accelerated path only benefits the *next* pod (and peers), never the pod whose
    own access pattern produced the profile.
 
+**Talking to containerd.** The snapshotter starts before containerd (the unit is
+`Before=containerd.service` and containerd waits for its READY), so nothing at startup contacts
+containerd; every call connects lazily (`snapshotter/src/containerd_grpc.rs`). Errors keep their
+`tonic::Status`, and `content_store::is_containerd_unavailable` tells "containerd could not be
+reached" (socket missing or refusing, connection broken, `Unavailable`, `DeadlineExceeded`) from a
+real failure. The auto-zran worker re-queues a job that hit an unreachable containerd after a
+capped exponential delay (5 s doubling to 2 min) with no failure strike, so an outage never marks
+an image non-convertible; a retry of the base stage reuses the converted work dir. If containerd
+is still unreachable five minutes after startup, one error names the configured socket.
+
+An upload writes every sidecar blob under **one lease** (`ContentStoreClient::create_lease`, 2 h
+`containerd.io/gc.expire`), including blobs that are already present (added to the lease with
+`Leases.AddResource`), and deletes the lease once `images_upsert` has rooted them. An upload that
+fails leaves its lease to expire, so a retry finds the blobs still there; a failed Image-record
+write fails the job. A `Write` that ends in `AlreadyExists` counts as stored once `Info` confirms
+the blob, as in containerd's own client. Files stream to containerd in 1 MiB reads after one
+hashing pass, never held in memory whole.
+
 The two-stage split means the fragile wiring point is the `AccessTracer` ↔ `AutoZranManager` link:
 `AutoZranManager`'s `ConversionDeps` borrow the tracer, so the tracer is constructed first with an
 empty `OnceLock`, and `AccessTracer::set_auto_zran` back-fills it once the manager exists
@@ -275,6 +293,10 @@ profiles still capture and persist to disk, but nothing enqueues a conversion jo
 - **Prometheus metrics**: always served over the sysctl UDS at `GET /metrics`; `[snapshotter.metrics].listen`
   (e.g. `"127.0.0.1:9110"`) additionally binds a TCP `GET /metrics` endpoint reusing the same
   renderer (`snapshotter/src/metrics.rs`, `grpc/mod.rs`), restoring parity with the Go snapshotter.
+- **Auto-zran and containerd**: `snapshotter_auto_zran_jobs_total{event}` (queued, dropped,
+  skipped, started, succeeded, failed, deferred), `snapshotter_auto_zran_jobs{state}` (queued,
+  running, waiting for containerd), and `snapshotter_containerd_reachable` (0/1, outcome of the
+  latest call; absent until the first one).
 - **gRPC health**: the standard `grpc.health.v1.Health` service rides the same cyper-axum server as
   the `Snapshots` service, so containerd's proxy-plugin dialer and `grpc_health_probe` can check
   readiness (`snapshotter/src/grpc/mod.rs`).

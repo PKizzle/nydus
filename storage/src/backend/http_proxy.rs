@@ -375,7 +375,7 @@ impl Drop for HttpProxy {
     fn drop(&mut self) {
         self.shutdown();
         if let Some(metrics) = self.metrics.as_ref() {
-            metrics.release().unwrap_or_else(|e| error!("{:?}", e));
+            metrics.release();
         }
     }
 }

@@ -17,7 +17,7 @@ use crate::containerd_lookup::ContainerdLookup;
 use crate::source::{
     CRI_IMAGE_REF, LayerKind, NYDUS_META_LAYER, classify_layer, target_snapshot_ref,
 };
-use crate::store::{SnapshotKind, SnapshotStore};
+use crate::store::{SnapshotKind, SnapshotStore, StoreError};
 use anyhow::{Context, Result, bail};
 use containerd_snapshots::api::types::Mount;
 use labels::{bootstrap_digest_from_key, image_ref, is_image_ref_like, normalize_parent};
@@ -182,6 +182,10 @@ impl OverlayEngine {
 
         let src = self.snapshot_dir(key);
         let dst = self.snapshot_dir(name);
+        if store.exists(name)? {
+            return Err(StoreError::AlreadyExists(name.to_string()).into());
+        }
+        // A directory without a row is debris, not an existing snapshot.
         if dst.exists() {
             bail!(
                 "snapshot directory for {name} already exists: {}",
