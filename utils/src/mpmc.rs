@@ -46,6 +46,11 @@ impl<T> Channel<T> {
         self.notifier.notify(usize::MAX);
     }
 
+    /// Whether [`Channel::close`] has been called.
+    pub fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Acquire)
+    }
+
     /// Send a message to the channel.
     ///
     /// The message object will be returned on error, to ease the lifecycle management.

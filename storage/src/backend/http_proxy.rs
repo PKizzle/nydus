@@ -13,8 +13,7 @@ use nydus_api::HttpProxyConfig;
 use nydus_utils::metrics::BackendMetrics;
 
 use super::connection::{
-    Connection, ConnectionConfig, ConnectionError, block_on_http, check_range_status,
-    is_success_status,
+    Connection, ConnectionConfig, ConnectionError, check_range_status, is_success_status,
 };
 use super::{BackendContext, BackendError, BackendResult, BlobBackend, BlobReader};
 use crate::backend::request;
@@ -183,7 +182,8 @@ impl LocalClient {
     }
 
     fn get_headers(&self) -> BackendResult<HeaderMap<HeaderValue>> {
-        let (status, headers, _) = block_on_http(self.do_req(true, 0, None))?;
+        let (status, headers, _) = crate::compio_rt::block_on(self.do_req(true, 0, None))
+            .map_err(|e| HttpProxyError::Response(e.into()))??;
         if !is_success_status(status) {
             return Err(
                 HttpProxyError::Response(ConnectionError::ErrorWithMsg(format!(
@@ -196,7 +196,9 @@ impl LocalClient {
     }
 
     fn try_read(&self, offset: u64, len: usize) -> BackendResult<Vec<u8>> {
-        let (status, headers, body) = block_on_http(self.do_req(false, offset, Some(len)))?;
+        let (status, headers, body) =
+            crate::compio_rt::block_on(self.do_req(false, offset, Some(len)))
+                .map_err(|e| HttpProxyError::Response(e.into()))??;
         let range = range_str_for_header(offset, Some(len));
         check_range_status(
             status,
