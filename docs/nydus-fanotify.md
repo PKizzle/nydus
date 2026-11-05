@@ -153,6 +153,7 @@ with `EIO` for any other reason is reported as dead rather than passing.
 [`misc/erofs-folio/qemu-test.sh`](../misc/erofs-folio/qemu-test.sh) boots an arm64 kernel in QEMU
 and runs the self-test (`service/examples/erofs_folio_probe.rs`) in it, optionally walking an
 EROFS image as is and padded, to check how a kernel build classifies.
+
 ## Cache eviction
 
 `FanotifyHandler::cull_cache(blob_id)` punches holes
