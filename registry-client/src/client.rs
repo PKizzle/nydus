@@ -1617,25 +1617,35 @@ mod tests {
 
     /// Serve `responses` in order on a loopback port, one connection each,
     /// and return the port plus a handle yielding the request lines seen.
+    /// Serve `responses` one per connection; returns each request's head
+    /// (request line plus headers, CRLF-joined).
     fn serve_raw(responses: Vec<String>) -> (u16, std::thread::JoinHandle<Vec<String>>) {
+        serve_raw_with(|_| responses)
+    }
+
+    /// [`serve_raw`] for responses that must name the server's own port.
+    fn serve_raw_with(
+        responses: impl FnOnce(u16) -> Vec<String>,
+    ) -> (u16, std::thread::JoinHandle<Vec<String>>) {
         use std::io::{BufRead, BufReader, Write};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
+        let responses = responses(port);
         let handle = std::thread::spawn(move || {
             let mut seen = Vec::new();
             for response in responses {
                 let (stream, _) = listener.accept().unwrap();
                 let mut reader = BufReader::new(stream);
-                let mut line = String::new();
-                reader.read_line(&mut line).unwrap();
-                seen.push(line.trim().to_string());
+                let mut head = String::new();
                 loop {
-                    let mut header = String::new();
-                    reader.read_line(&mut header).unwrap();
-                    if header == "\r\n" || header.is_empty() {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" || line.is_empty() {
                         break;
                     }
+                    head.push_str(&line);
                 }
+                seen.push(head.trim_end().to_string());
                 reader.get_mut().write_all(response.as_bytes()).unwrap();
             }
             seen
@@ -1729,6 +1739,43 @@ mod tests {
         let err = client.get_manifest("app", "v1").await.unwrap_err();
         assert!(matches!(err, RegistryError::Other(_)), "{err}");
         assert!(started.elapsed() < IDEMPOTENT_RETRY_DELAY, "{err}");
+    }
+
+    #[compio::test]
+    async fn bearer_challenge_fetches_token_retries_and_caches_it() {
+        let manifest = r#"{"schemaVersion":2}"#;
+        let (port, server) = serve_raw_with(|port| {
+            let challenge = format!(
+                "HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Bearer \
+                 realm=\"http://127.0.0.1:{port}/token\",service=\"reg\",\
+                 scope=\"repository:app:pull\"\r\nContent-Length: 0\r\n\
+                 Connection: close\r\n\r\n"
+            );
+            vec![
+                challenge,
+                raw_response("200 OK", r#"{"token":"tok-1","expires_in":300}"#),
+                raw_response("200 OK", manifest),
+                raw_response("200 OK", manifest),
+            ]
+        });
+        let client = loopback_client(port);
+        for _ in 0..2 {
+            let fetched = client.get_manifest("app", "v1").await.unwrap();
+            assert_eq!(fetched.bytes, manifest.as_bytes());
+        }
+        let seen = server.join().unwrap();
+        assert_eq!(seen.len(), 4, "{seen:#?}");
+        assert!(!seen[0].to_ascii_lowercase().contains("authorization:"));
+        assert!(
+            seen[1].starts_with("GET /token?service=reg&scope=repository%3Aapp%3Apull "),
+            "{}",
+            seen[1]
+        );
+        // The retry and the next call (served from the cache, no second
+        // challenge) both carry the minted token.
+        for head in &seen[2..] {
+            assert!(head.contains("authorization: Bearer tok-1"), "{head}");
+        }
     }
 
     #[test]
