@@ -32,7 +32,9 @@ use crate::engine::manifest::{
     ANNOTATION_NYDUS_BOOTSTRAP, assemble_manifest, bootstrap_descriptor, config_media_type,
     data_blob_descriptor, manifest_media_type, rebuild_image_config, validate_nydus_manifest,
 };
-use crate::engine::oci::{client_options, fetch_nydus_platform_manifest};
+use crate::engine::oci::{
+    BlobSource, client_options, ensure_blob_in_repo, fetch_nydus_platform_manifest,
+};
 use crate::engine::retry::RetryPolicy;
 
 use super::common::{resolve_platform, validate_existing_file};
@@ -147,14 +149,16 @@ pub async fn run(args: OptimizeArgs) -> Result<()> {
     std::fs::create_dir_all(&staging).with_context(|| format!("create {}", staging.display()))?;
     let mut data_blobs = Vec::with_capacity(original_data_layers.len() + 1);
     for layer in &original_data_layers {
-        copy_blob(
-            &source_client,
-            &source_ref.repo,
+        ensure_blob_in_repo(
             &target_client,
             &target_ref.repo,
+            Some(&source_ref.repo),
             same_registry,
             &layer.digest,
-            &staging,
+            BlobSource::Download {
+                client: &source_client,
+                staging: &staging,
+            },
             &retry,
         )
         .await?;
@@ -361,34 +365,6 @@ fn single_file(dir: &Path) -> Result<Option<PathBuf>> {
         found = Some(entry.path());
     }
     Ok(found)
-}
-
-/// Move one blob from the source repo to the target repo: skip when the target already has it,
-/// cross-repo mount within one registry, else download and re-push.
-#[allow(clippy::too_many_arguments)]
-async fn copy_blob(
-    source_client: &RegistryClient,
-    source_repo: &str,
-    target_client: &RegistryClient,
-    target_repo: &str,
-    same_registry: bool,
-    digest: &str,
-    staging: &Path,
-    retry: &RetryPolicy,
-) -> Result<()> {
-    crate::engine::oci::ensure_blob_in_repo(
-        target_client,
-        target_repo,
-        Some(source_repo),
-        same_registry,
-        digest,
-        crate::engine::oci::BlobSource::Download {
-            client: source_client,
-            staging,
-        },
-        retry,
-    )
-    .await
 }
 
 fn ensure_work_dir(dir: &Path) -> Result<&Path> {

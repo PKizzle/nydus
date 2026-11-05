@@ -27,7 +27,6 @@
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use anyhow::{Context, Result, anyhow, bail};
 use registry_client::types::Manifest;
@@ -52,6 +51,7 @@ use crate::engine::oci::{
 };
 use crate::engine::oci_archive::{self, ArchiveBlob};
 use crate::engine::retry::RetryPolicy;
+use crate::engine::util::{file_len, fresh_dir, run_nydus_image};
 
 /// A source rootfs layer pulled to disk.
 #[derive(Clone, Debug)]
@@ -1929,39 +1929,6 @@ fn write_output_json(
 // ---------------------------------------------------------------------------
 // Subprocess + fs helpers (mirrors local_accel.rs)
 // ---------------------------------------------------------------------------
-
-fn file_len(path: &Path) -> Result<u64> {
-    Ok(std::fs::metadata(path)
-        .with_context(|| format!("stat {}", path.display()))?
-        .len())
-}
-
-/// Run `nydus-image <args>`, capturing stderr on failure.
-fn run_nydus_image(nydus_image: &Path, args: &[OsString], what: &str) -> Result<()> {
-    let output = Command::new(nydus_image)
-        .args(args)
-        .output()
-        .with_context(|| format!("spawn `{}` for {what}", nydus_image.display()))?;
-    if !output.status.success() {
-        bail!(
-            "nydus-image {what} failed ({}): {}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-    Ok(())
-}
-
-/// (Re)create `dir` empty so each `nydus-image` invocation owns a private dir
-/// and "exactly one output file" is a structural guarantee.
-fn fresh_dir(dir: &Path) -> Result<()> {
-    match std::fs::remove_dir_all(dir) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(e).with_context(|| format!("clearing stale dir {}", dir.display())),
-    }
-    std::fs::create_dir_all(dir).with_context(|| format!("creating dir {}", dir.display()))
-}
 
 /// Where a layer's bootstrap must live so that `merge` derives the right blob id
 /// for it, or `None` when the current name is already fine.

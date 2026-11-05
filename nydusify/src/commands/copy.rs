@@ -12,7 +12,9 @@ use serde::Serialize;
 use tracing::{debug, info, warn};
 
 use crate::cli::CopyArgs;
-use crate::engine::oci::{blob_hex, client_options, is_index, select_platform};
+use crate::engine::oci::{
+    BlobSource, blob_hex, client_options, ensure_blob_in_repo, is_index, select_platform,
+};
 use crate::engine::oci_archive::{self, ArchiveBlob};
 use crate::engine::retry::RetryPolicy;
 
@@ -202,27 +204,31 @@ pub async fn run(args: CopyArgs) -> Result<()> {
         registry_target.expect("an archive target returned via export_from_registry above");
 
     // Copy the config blob and every layer.
-    copy_blob(
-        &source_client,
-        &source_ref.repo,
+    ensure_blob_in_repo(
         &target_client,
         &target_ref.repo,
+        Some(&source_ref.repo),
         same_registry,
         &manifest.config.digest,
-        staging.path(),
+        BlobSource::Download {
+            client: &source_client,
+            staging: staging.path(),
+        },
         &retry,
     )
     .await
     .with_context(|| format!("copy image config {}", manifest.config.digest))?;
     for layer in &manifest.layers {
-        copy_blob(
-            &source_client,
-            &source_ref.repo,
+        ensure_blob_in_repo(
             &target_client,
             &target_ref.repo,
+            Some(&source_ref.repo),
             same_registry,
             &layer.digest,
-            staging.path(),
+            BlobSource::Download {
+                client: &source_client,
+                staging: staging.path(),
+            },
             &retry,
         )
         .await
@@ -369,14 +375,16 @@ async fn copy_index_all_platforms(
     // instead of paying the sum of every round-trip: a 4-platform index of
     // 50-layer images is ~200 of them.
     let copies = stream::iter(blob_digests.iter().map(|digest| {
-        copy_blob(
-            source_client,
-            &source_ref.repo,
+        ensure_blob_in_repo(
             target_client,
             &target_ref.repo,
+            Some(&source_ref.repo),
             same_registry,
             digest,
-            staging,
+            BlobSource::Download {
+                client: source_client,
+                staging,
+            },
             retry,
         )
     }))
@@ -584,35 +592,6 @@ async fn copy_from_archive(
         "copy complete"
     );
     Ok(())
-}
-
-/// Copy one blob from the source repo to the target repo. Order of preference:
-/// skip if the target already has it (HEAD-dedup), cross-repo mount when both
-/// repos are on the same registry, else download to `staging` and re-push.
-#[allow(clippy::too_many_arguments)]
-async fn copy_blob(
-    source_client: &RegistryClient,
-    source_repo: &str,
-    target_client: &RegistryClient,
-    target_repo: &str,
-    same_registry: bool,
-    digest: &str,
-    staging: &Path,
-    retry: &RetryPolicy,
-) -> Result<()> {
-    crate::engine::oci::ensure_blob_in_repo(
-        target_client,
-        target_repo,
-        Some(source_repo),
-        same_registry,
-        digest,
-        crate::engine::oci::BlobSource::Download {
-            client: source_client,
-            staging,
-        },
-        retry,
-    )
-    .await
 }
 
 fn ensure_dir(path: &Path) -> Result<()> {

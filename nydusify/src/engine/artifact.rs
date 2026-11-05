@@ -43,6 +43,7 @@ use tracing::info;
 
 use crate::engine::oci::is_index;
 use crate::engine::retry::RetryPolicy;
+use crate::engine::util::file_len;
 
 /// The referrer artifact's `artifactType`: the nydus data-blob media type. This
 /// is the value the snapshotter matches on ("nydus" substring) when classifying
@@ -243,12 +244,6 @@ pub fn build_referrer_manifest(
         subject: Some(subject),
         annotations: None,
     }
-}
-
-fn file_len(path: &Path) -> Result<u64> {
-    Ok(std::fs::metadata(path)
-        .with_context(|| format!("stat {}", path.display()))?
-        .len())
 }
 
 #[cfg(test)]

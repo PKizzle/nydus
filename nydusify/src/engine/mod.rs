@@ -14,3 +14,4 @@ pub mod oci;
 pub mod oci_archive;
 pub mod overlay_diff;
 pub mod retry;
+pub mod util;

@@ -41,7 +41,6 @@
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use anyhow::{Context, Result, bail};
 use registry_client::types::{Descriptor, Manifest, sha256_digest};
@@ -56,9 +55,12 @@ use crate::engine::manifest::{
     ANNOTATION_NYDUS_BOOTSTRAP, assemble_manifest, bootstrap_descriptor, config_media_type,
     data_blob_descriptor, manifest_media_type, rebuild_image_config, validate_nydus_manifest,
 };
-use crate::engine::oci::{blob_hex, client_options, fetch_nydus_platform_manifest};
+use crate::engine::oci::{
+    BlobSource, blob_hex, client_options, ensure_blob_in_repo, fetch_nydus_platform_manifest,
+};
 use crate::engine::overlay_diff::write_upper_layer_tar;
 use crate::engine::retry::RetryPolicy;
+use crate::engine::util::{file_len, fresh_dir, run_nydus_image};
 
 /// Annotation on the bootstrap layer listing the blobs every commit so far has
 /// contributed, comma separated. `--maximum-times` is enforced against its
@@ -378,17 +380,23 @@ async fn push_committed_image(
         .filter(|l| !is_bootstrap_layer(l))
         .cloned()
         .collect();
+    // Mounted when both repositories share a registry, else copied through
+    // `work_dir` so a multi-gigabyte base layer need not fit in memory.
     for layer in &layers {
-        copy_blob_to_target(
+        ensure_blob_in_repo(
             target_client,
-            source_client,
-            target_ref,
-            source_ref,
-            layer,
-            work_dir,
+            repo,
+            Some(&source_ref.repo),
+            source_ref.api_host == target_ref.api_host,
+            &layer.digest,
+            BlobSource::Download {
+                client: source_client,
+                staging: work_dir,
+            },
             retry,
         )
-        .await?;
+        .await
+        .with_context(|| format!("make base blob {} available in {target_ref}", layer.digest))?;
     }
 
     let mut commit_blobs: Vec<String> = already_committed.to_vec();
@@ -496,57 +504,6 @@ async fn push_committed_image(
         size: manifest_bytes.len() as u64,
         ..Descriptor::default()
     })
-}
-
-/// Make sure one of the base image's data blobs is readable from the target
-/// repository — mounted, or copied when the registries differ.
-async fn copy_blob_to_target(
-    target_client: &RegistryClient,
-    source_client: &RegistryClient,
-    target_ref: &ImageReference,
-    source_ref: &ImageReference,
-    layer: &Descriptor,
-    work_dir: &Path,
-    retry: &RetryPolicy,
-) -> Result<()> {
-    let repo = &target_ref.repo;
-    if target_client
-        .head_blob(repo, &layer.digest)
-        .await
-        .unwrap_or(false)
-    {
-        debug!(digest = %layer.digest, "base blob already in the target repository");
-        return Ok(());
-    }
-
-    if source_ref.api_host == target_ref.api_host
-        && target_client
-            .mount_blob(repo, &layer.digest, &source_ref.repo)
-            .await
-            .unwrap_or(false)
-    {
-        debug!(digest = %layer.digest, from = %source_ref.repo, "mounted base blob");
-        return Ok(());
-    }
-
-    // Different registry (or a registry without cross-repo mount): the bytes
-    // have to travel. Stage through a file so a multi-gigabyte base layer does
-    // not have to fit in memory.
-    let staged = work_dir.join(format!("base-{}", blob_hex(&layer.digest)?));
-    source_client
-        .get_blob_to_file(&source_ref.repo, &layer.digest, &staged)
-        .await
-        .with_context(|| format!("fetch base blob {} from {source_ref}", layer.digest))?;
-    let result = retry
-        .run("copy base blob", || {
-            target_client.push_blob_file(repo, &staged)
-        })
-        .await
-        .with_context(|| format!("push base blob {} to {target_ref}", layer.digest));
-    let _ = std::fs::remove_file(&staged);
-    result?;
-    debug!(digest = %layer.digest, "copied base blob to the target registry");
-    Ok(())
 }
 
 /// One RAFS layer built for this commit: its data blob (absent when the layer
@@ -787,36 +744,6 @@ fn read_output_json(path: &Path) -> Result<NydusImageOutput> {
         .with_context(|| format!("read nydus-image output {}", path.display()))?;
     serde_json::from_slice(&bytes)
         .with_context(|| format!("parse nydus-image output {}", path.display()))
-}
-
-fn run_nydus_image(nydus_image: &Path, args: &[OsString], what: &str) -> Result<()> {
-    debug!(binary = %nydus_image.display(), ?args, what, "running nydus-image");
-    let output = Command::new(nydus_image)
-        .args(args)
-        .output()
-        .with_context(|| format!("spawn `{}` to {what}", nydus_image.display()))?;
-    if !output.status.success() {
-        bail!(
-            "nydus-image failed to {what} ({}): {}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr).trim(),
-        );
-    }
-    Ok(())
-}
-
-fn fresh_dir(dir: &Path) -> Result<()> {
-    if dir.exists() {
-        std::fs::remove_dir_all(dir)
-            .with_context(|| format!("clear directory {}", dir.display()))?;
-    }
-    std::fs::create_dir_all(dir).with_context(|| format!("create directory {}", dir.display()))
-}
-
-fn file_len(path: &Path) -> Result<u64> {
-    Ok(std::fs::metadata(path)
-        .with_context(|| format!("stat {}", path.display()))?
-        .len())
 }
 
 /// Validate the flags and describe the commit, without contacting anything.
