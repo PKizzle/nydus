@@ -138,12 +138,9 @@ fn content_and_images_round_trip_and_survive_a_containerd_restart() {
     let small = b"hello containerd";
 
     compio::runtime::Runtime::new().unwrap().block_on(async {
-        let lease = client.create_lease("test").await.unwrap();
+        let upload = client.begin_upload("test").await.unwrap();
         // Small blob: write, info with labels, read back.
-        let digest = client
-            .write_bytes(small, "small", labels(), &lease)
-            .await
-            .unwrap();
+        let digest = upload.write_bytes(small, "small", labels()).await.unwrap();
         assert_eq!(digest, digest_of(small));
         let info = client.info(&digest).await.unwrap().expect("blob present");
         assert_eq!(info.size, small.len() as u64);
@@ -176,10 +173,7 @@ fn content_and_images_round_trip_and_survive_a_containerd_restart() {
         let big: Vec<u8> = (0..6 * 1024 * 1024u32).map(|i| (i % 251) as u8).collect();
         let big_path = dir.path().join("big.bin");
         std::fs::write(&big_path, &big).unwrap();
-        let big_digest = client
-            .write_blob(&big_path, labels(), &lease)
-            .await
-            .unwrap();
+        let big_digest = upload.write_blob(&big_path, labels()).await.unwrap();
         assert_eq!(big_digest, digest_of(&big));
         assert_eq!(client.fetch_bytes(&big_digest).await.unwrap(), big);
 
@@ -265,26 +259,27 @@ fn an_upload_lease_holds_content_until_the_image_record_roots_it() {
         // the test's own.
         compio::time::sleep(Duration::from_millis(500)).await;
 
-        let failed_upload = client.create_lease("test-upload").await.unwrap();
-        let leftover_digest = client
-            .write_bytes(leftover, "leftover", labels(), &failed_upload)
+        let failed_upload = client.begin_upload("test-upload").await.unwrap();
+        let leftover_digest = failed_upload
+            .write_bytes(leftover, "leftover", labels())
             .await
             .unwrap();
 
-        let upload = client.create_lease("test-upload").await.unwrap();
-        let again = client
-            .write_bytes(leftover, "leftover", labels(), &upload)
+        let upload = client.begin_upload("test-upload").await.unwrap();
+        let upload_lease = upload.lease().to_string();
+        let again = upload
+            .write_bytes(leftover, "leftover", labels())
             .await
             .unwrap();
         assert_eq!(again, leftover_digest);
-        let manifest_digest = client
-            .write_bytes(manifest, "manifest", labels(), &upload)
+        let manifest_digest = upload
+            .write_bytes(manifest, "manifest", labels())
             .await
             .unwrap();
 
         // The failed upload's lease goes, with a GC pass: the leftover blob now has only the
         // new upload's lease, and that must be enough.
-        delete_lease_and_collect(&channel, &failed_upload).await;
+        delete_lease_and_collect(&channel, failed_upload.lease()).await;
         assert!(client.info(&leftover_digest).await.unwrap().is_some());
         assert!(client.info(&manifest_digest).await.unwrap().is_some());
         collect_garbage(&channel).await;
@@ -293,8 +288,8 @@ fn an_upload_lease_holds_content_until_the_image_record_roots_it() {
             "content under a live lease survives GC until the image record exists"
         );
 
-        client
-            .images_upsert(
+        upload
+            .finish_upsert(
                 name,
                 &manifest_digest,
                 manifest.len() as u64,
@@ -303,13 +298,10 @@ fn an_upload_lease_holds_content_until_the_image_record_roots_it() {
             )
             .await
             .unwrap();
-        client.delete_lease(&upload).await.unwrap();
         assert!(
-            !lease_ids(&channel).await.contains(&upload),
+            !lease_ids(&channel).await.contains(&upload_lease),
             "the upload lease is gone after success"
         );
-        // Deleting it again (an already expired lease) is not an error.
-        client.delete_lease(&upload).await.unwrap();
 
         collect_garbage(&channel).await;
         assert!(
@@ -323,11 +315,11 @@ fn an_upload_lease_holds_content_until_the_image_record_roots_it() {
 
         // Two uploads of one blob racing each other: one commits, the other finds it
         // committed (AlreadyExists, or present already) and both succeed.
-        let lease = client.create_lease("test-race").await.unwrap();
+        let race = client.begin_upload("test-race").await.unwrap();
         let shared: Vec<u8> = (0..3 * 1024 * 1024u32).map(|i| (i % 253) as u8).collect();
         let (a, b) = futures::join!(
-            client.write_bytes(&shared, "race-a", labels(), &lease),
-            client.write_bytes(&shared, "race-b", labels(), &lease)
+            race.write_bytes(&shared, "race-a", labels()),
+            race.write_bytes(&shared, "race-b", labels())
         );
         assert_eq!(a.unwrap(), digest_of(&shared));
         assert_eq!(b.unwrap(), digest_of(&shared));
@@ -335,5 +327,51 @@ fn an_upload_lease_holds_content_until_the_image_record_roots_it() {
             client.fetch_bytes(&digest_of(&shared)).await.unwrap(),
             shared
         );
+
+        // finish_create never overwrites a record. One that already points at another
+        // manifest does not root this upload, so its lease stays and finishing fails.
+        let other = client.begin_upload("test-conflict").await.unwrap();
+        let other_lease = other.lease().to_string();
+        let other_manifest = b"another sidecar manifest";
+        let other_digest = other
+            .write_bytes(other_manifest, "other", labels())
+            .await
+            .unwrap();
+        let err = other
+            .finish_create(
+                name,
+                &other_digest,
+                other_manifest.len() as u64,
+                OCI_MANIFEST,
+                labels(),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains(&manifest_digest), "{err:#}");
+        assert!(
+            lease_ids(&channel).await.contains(&other_lease),
+            "a lease whose blobs no record roots is kept"
+        );
+        assert_eq!(
+            client.images_get(name).await.unwrap().unwrap().digest,
+            manifest_digest
+        );
+
+        // A record that already points at this upload's manifest roots it: the lease goes.
+        let same = client.begin_upload("test-same").await.unwrap();
+        let same_lease = same.lease().to_string();
+        same.write_bytes(manifest, "manifest", labels())
+            .await
+            .unwrap();
+        same.finish_create(
+            name,
+            &manifest_digest,
+            manifest.len() as u64,
+            OCI_MANIFEST,
+            labels(),
+        )
+        .await
+        .unwrap();
+        assert!(!lease_ids(&channel).await.contains(&same_lease));
     });
 }

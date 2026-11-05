@@ -25,7 +25,7 @@
 //! `containerd-namespace` header, so no method here handles it.
 
 use crate::config::ContainerdConfig;
-use crate::containerd_grpc::{ChannelError, ContainerdChannel};
+use crate::containerd_grpc::{ContainerdChannel, ContainerdFault, containerd_fault};
 use anyhow::{Context, Result};
 use futures::{Stream, StreamExt};
 use sha2::{Digest, Sha256};
@@ -34,7 +34,7 @@ use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tonic::Code;
-use tracing::{debug, error, instrument};
+use tracing::{debug, error, instrument, warn};
 
 use crate::containerd_api::services::content::v1::{
     InfoRequest, ListContentRequest, ReadContentRequest, UpdateRequest, WriteAction,
@@ -131,10 +131,10 @@ impl ContentStoreClient {
     /// Create a lease that keeps the content written under it from containerd's GC, and return
     /// its id. containerd collects committed content nothing references, and an upload's blobs
     /// are only referenced once the Image record that roots them exists; the lease covers that
-    /// gap. Delete it with [`Self::delete_lease`] once the record exists. A lease left behind
-    /// by a failed upload expires after [`UPLOAD_LEASE_TTL`] (`containerd.io/gc.expire`), long
-    /// enough for a retry to find the blobs still there.
-    pub async fn create_lease(&self, purpose: &str) -> Result<String> {
+    /// gap. [`Upload::finish_upsert`] / [`Upload::finish_create`] delete it once the record
+    /// exists. A lease left behind by a failed upload expires after [`UPLOAD_LEASE_TTL`]
+    /// (`containerd.io/gc.expire`), long enough for a retry to find the blobs still there.
+    async fn create_lease(&self, purpose: &str) -> Result<String> {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default();
@@ -156,8 +156,17 @@ impl ContentStoreClient {
         Ok(id)
     }
 
+    /// Start an upload: every blob written through the returned [`Upload`] goes under one new
+    /// lease, which its `finish_*` method deletes once an Image record roots them.
+    pub async fn begin_upload(&self, purpose: &str) -> Result<Upload> {
+        Ok(Upload {
+            lease: self.create_lease(purpose).await?,
+            client: self.clone(),
+        })
+    }
+
     /// Delete a lease. Idempotent: an already expired lease is success.
-    pub async fn delete_lease(&self, id: &str) -> Result<()> {
+    async fn delete_lease(&self, id: &str) -> Result<()> {
         let request = LeaseDeleteRequest {
             id: id.to_string(),
             sync: false,
@@ -177,7 +186,7 @@ impl ContentStoreClient {
     /// [`WRITE_CHUNK_SIZE`] reads (see [`write_requests`]), so it is never held in memory whole.
     /// Both passes run off the compio reactor.
     #[instrument(level = "debug", skip(self, labels), fields(path = %path.display()), err)]
-    pub async fn write_blob(
+    async fn write_blob(
         &self,
         path: &Path,
         labels: HashMap<String, String>,
@@ -203,7 +212,7 @@ impl ContentStoreClient {
 
     /// Write an in-memory byte slice as a content blob under `lease`. Used for the small
     /// auto-accel manifest JSON. Idempotent like [`Self::write_blob`].
-    pub async fn write_bytes(
+    async fn write_bytes(
         &self,
         data: &[u8],
         ref_hint: &str,
@@ -593,6 +602,95 @@ impl ContentStoreClient {
     }
 }
 
+/// One upload: blobs written under a single containerd lease that keeps them from GC until an
+/// Image record roots them. Finishing creates that record and deletes the lease; an upload
+/// dropped without finishing leaves its lease to expire ([`UPLOAD_LEASE_TTL`]), so a retry
+/// still finds the blobs.
+#[derive(Debug)]
+#[must_use = "an upload's lease is deleted only by finishing it"]
+pub struct Upload {
+    client: ContentStoreClient,
+    lease: String,
+}
+
+impl Upload {
+    /// The id of this upload's lease.
+    pub fn lease(&self) -> &str {
+        &self.lease
+    }
+
+    /// See [`ContentStoreClient::write_blob`].
+    pub async fn write_blob(&self, path: &Path, labels: HashMap<String, String>) -> Result<String> {
+        self.client.write_blob(path, labels, &self.lease).await
+    }
+
+    /// See [`ContentStoreClient::write_bytes`].
+    pub async fn write_bytes(
+        &self,
+        data: &[u8],
+        ref_hint: &str,
+        labels: HashMap<String, String>,
+    ) -> Result<String> {
+        self.client
+            .write_bytes(data, ref_hint, labels, &self.lease)
+            .await
+    }
+
+    /// Point Image record `name` at `digest`, creating or overwriting it
+    /// ([`ContentStoreClient::images_upsert`]), then delete the lease.
+    pub async fn finish_upsert(
+        self,
+        name: &str,
+        digest: &str,
+        size: u64,
+        media_type: &str,
+        labels: HashMap<String, String>,
+    ) -> Result<()> {
+        self.client
+            .images_upsert(name, digest, size, media_type, labels)
+            .await?;
+        self.release().await;
+        Ok(())
+    }
+
+    /// Create Image record `name` for `digest` unless one exists
+    /// ([`ContentStoreClient::images_create`]), and delete the lease only once the record
+    /// verifiably points at `digest`. A record that already pointed elsewhere does not root
+    /// these blobs, so the lease stays until it expires and this is an error.
+    pub async fn finish_create(
+        self,
+        name: &str,
+        digest: &str,
+        size: u64,
+        media_type: &str,
+        labels: HashMap<String, String>,
+    ) -> Result<()> {
+        self.client
+            .images_create(name, digest, size, media_type, labels)
+            .await?;
+        match self.client.images_get(name).await? {
+            Some(record) if record.digest == digest => {
+                self.release().await;
+                Ok(())
+            }
+            other => Err(anyhow::anyhow!(
+                "image record {name} points at {}, not {digest}; lease {} keeps the upload until \
+                 it expires",
+                other.map_or_else(|| "nothing".to_string(), |record| record.digest),
+                self.lease
+            )),
+        }
+    }
+
+    /// Delete the lease. One that cannot be deleted only lingers until it expires, so that is
+    /// logged, not returned.
+    async fn release(self) {
+        if let Err(e) = self.client.delete_lease(&self.lease).await {
+            warn!(lease = %self.lease, error = %format!("{e:#}"), "could not delete an upload lease; it expires on its own");
+        }
+    }
+}
+
 /// Lifetime of an upload lease that is never deleted because its upload failed: long enough
 /// for the retries of the failed job to reuse its blobs, short enough that superseded blobs do
 /// not linger. A successful upload deletes its lease as soon as the Image record roots the blobs.
@@ -778,37 +876,16 @@ pub(crate) fn is_rpc_failure(e: &anyhow::Error) -> bool {
     status_code(e).is_some_and(|code| code != Code::NotFound)
 }
 
-/// Whether `e` says containerd could not be reached, rather than that it refused the request:
-/// its socket is missing or refuses connections, the connection broke, or containerd answered
-/// `Unavailable` or `DeadlineExceeded`. Such a failure says nothing about the request and is
-/// worth retrying once containerd is back.
+/// What `e` says about containerd itself (see [`containerd_fault`]); `None` when containerd
+/// answered, whatever the gRPC status, or the error is local.
+pub fn containerd_fault_of(e: &anyhow::Error) -> Option<ContainerdFault> {
+    containerd_fault(e.as_ref())
+}
+
+/// Whether `e` is containerd being unreachable for now ([`ContainerdFault::Unreachable`]): no
+/// answer, so nothing about the request, and worth retrying once containerd is back.
 pub fn is_containerd_unavailable(e: &anyhow::Error) -> bool {
-    e.chain().any(|cause| {
-        if let Some(status) = cause.downcast_ref::<tonic::Status>() {
-            matches!(status.code(), Code::Unavailable | Code::DeadlineExceeded)
-        } else if let Some(channel) = cause.downcast_ref::<ChannelError>() {
-            matches!(
-                channel,
-                ChannelError::Connect { .. }
-                    | ChannelError::Handshake { .. }
-                    | ChannelError::Request { .. }
-            )
-        } else if let Some(io) = cause.downcast_ref::<io::Error>() {
-            // A connection that broke mid-call reaches tonic as an h2/hyper error over these.
-            matches!(
-                io.kind(),
-                io::ErrorKind::ConnectionRefused
-                    | io::ErrorKind::ConnectionReset
-                    | io::ErrorKind::ConnectionAborted
-                    | io::ErrorKind::BrokenPipe
-                    | io::ErrorKind::NotConnected
-            )
-        } else {
-            cause.downcast_ref::<hyper::Error>().is_some_and(|e| {
-                e.is_closed() || e.is_canceled() || e.is_incomplete_message() || e.is_timeout()
-            })
-        }
-    })
+    containerd_fault_of(e) == Some(ContainerdFault::Unreachable)
 }
 
 fn sha256_of_bytes(bytes: &[u8]) -> String {
@@ -850,6 +927,7 @@ fn strip_sha256_prefix(digest: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::containerd_grpc::ChannelError;
 
     #[test]
     fn blob_path_strips_sha256_prefix() {
@@ -900,48 +978,49 @@ mod tests {
         let e = rpc_error("Images.Get(x)", tonic::Status::unavailable("down"));
         assert!(!is_not_found(&e));
         assert!(is_rpc_failure(&e));
-        assert!(is_containerd_unavailable(&e.context("resolve manifest")));
         assert!(!is_rpc_failure(&anyhow::anyhow!("connect failed")));
     }
 
-    /// Unreachable means the request never got an answer: a socket that is missing or refuses
-    /// connections, a dropped connection, or containerd's own Unavailable/DeadlineExceeded.
-    /// An answer about the request itself, or a local error, is not.
+    /// Unreachable means the request never got an answer: a socket that is missing in its
+    /// directory or refuses connections. A status containerd sent is an answer about the
+    /// request, whatever its code; a socket path that cannot work is misconfiguration; a local
+    /// error is neither.
     #[test]
     fn containerd_unavailable_is_told_apart_from_real_failures() {
-        let channel = |kind: io::ErrorKind| {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("containerd.sock");
+        let channel = |socket: &Path, errno: i32| {
             let status = tonic::Status::from_error(Box::new(ChannelError::Connect {
-                socket: PathBuf::from("/run/containerd/containerd.sock"),
-                source: io::Error::from(kind),
+                socket: socket.to_path_buf(),
+                source: io::Error::from_raw_os_error(errno),
             }));
             anyhow::Error::new(status).context("containerd Write(sha256:x) failed")
         };
-        assert!(is_containerd_unavailable(&channel(io::ErrorKind::NotFound)));
+        assert!(is_containerd_unavailable(&channel(&socket, libc::ENOENT)));
         assert!(is_containerd_unavailable(&channel(
-            io::ErrorKind::ConnectionRefused
+            &socket,
+            libc::ECONNREFUSED
         )));
-        let status = |status: tonic::Status| rpc_error("Info(sha256:x)", status);
-        assert!(is_containerd_unavailable(&status(
-            tonic::Status::deadline_exceeded("slow")
-        )));
-        assert!(is_containerd_unavailable(&status(
-            tonic::Status::unavailable("down")
-        )));
-        let reset =
-            tonic::Status::from_error(Box::new(io::Error::from(io::ErrorKind::ConnectionReset)));
-        assert!(is_containerd_unavailable(&anyhow::Error::new(reset)));
 
-        assert!(!is_containerd_unavailable(&status(
-            tonic::Status::not_found("gone")
-        )));
-        assert!(!is_containerd_unavailable(&status(
-            tonic::Status::failed_precondition("digest mismatch")
-        )));
-        assert!(!is_containerd_unavailable(&status(
-            tonic::Status::already_exists("present")
-        )));
+        let misconfigured = channel(&socket, libc::EACCES);
+        assert!(!is_containerd_unavailable(&misconfigured));
+        assert_eq!(
+            containerd_fault_of(&misconfigured),
+            Some(ContainerdFault::Misconfigured(socket.clone()))
+        );
+
+        let status = |status: tonic::Status| rpc_error("Transfer", status);
+        for answered in [
+            tonic::Status::deadline_exceeded("registry fetch timed out"),
+            tonic::Status::unavailable("ref locked"),
+            tonic::Status::not_found("gone"),
+            tonic::Status::already_exists("present"),
+        ] {
+            let e = status(answered);
+            assert_eq!(containerd_fault_of(&e), None, "{e:#}");
+        }
         assert!(!is_containerd_unavailable(&anyhow::Error::new(
-            io::Error::from(io::ErrorKind::NotFound)
+            io::Error::from(io::ErrorKind::ConnectionReset)
         )));
         assert!(!is_containerd_unavailable(&anyhow::anyhow!(
             "convert failed"
@@ -1114,7 +1193,7 @@ mod tests {
 
         let unavailable = rpc_error("Write(sha256:x)", tonic::Status::unavailable("down"));
         let (result, adopted) = settle(Err(unavailable), true);
-        assert!(!adopted && is_containerd_unavailable(&result.unwrap_err()));
+        assert!(!adopted && status_code(&result.unwrap_err()) == Some(Code::Unavailable));
     }
 
     #[test]

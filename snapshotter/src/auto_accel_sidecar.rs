@@ -198,6 +198,13 @@ impl SidecarLocator {
                         "auto-accel pull failed: registry/mirror error (peer mirror mTLS, auth, daemon down?). Cross-node discovery degraded until fixed."
                     );
                 }
+                PullOutcome::ContentStoreError(error) => {
+                    warn!(
+                        image_name = %image_name,
+                        error = %error,
+                        "auto-accel peer pull fetched the sidecar but could not store it in containerd's content store"
+                    );
+                }
                 PullOutcome::Disabled => {
                     debug!(image_name = %image_name, "peer mirror disabled or unconfigured; cross-node discovery skipped");
                 }
@@ -362,23 +369,21 @@ impl SidecarLocator {
         // this node doesn't refetch.
         let subject_labels = manifest_blob_labels(manifest_digest, synthetic_ref, &sidecar.oci);
         // One lease keeps every blob from containerd's GC until the Image record roots them.
-        let lease = match self
+        let upload = match self
             .content_store
-            .create_lease("auto-accel-peer-pull")
+            .begin_upload("auto-accel-peer-pull")
             .await
         {
-            Ok(lease) => lease,
+            Ok(upload) => upload,
             Err(e) => {
-                return PullOutcome::RegistryError {
-                    status: 0,
-                    body: format!("create content store lease failed: {e:#}"),
-                };
+                return PullOutcome::ContentStoreError(format!(
+                    "create content store lease: {e:#}"
+                ));
             }
         };
         // `write_bytes` keys the manifest by the digest of its own bytes; the
         // tag is synthetic, so no digest was known before the fetch.
-        let manifest_digest_in_store = match self
-            .content_store
+        let manifest_digest_in_store = match upload
             .write_bytes(
                 &sidecar.manifest,
                 &format!(
@@ -386,16 +391,14 @@ impl SidecarLocator {
                     strip_sha256(manifest_digest)
                 ),
                 subject_labels,
-                &lease,
             )
             .await
         {
             Ok(d) => d,
             Err(e) => {
-                return PullOutcome::RegistryError {
-                    status: 0,
-                    body: format!("write manifest to content store failed: {e}"),
-                };
+                return PullOutcome::ContentStoreError(format!(
+                    "write manifest to content store: {e:#}"
+                ));
             }
         };
 
@@ -406,8 +409,7 @@ impl SidecarLocator {
                 synthetic_ref,
                 blob.layer_digest.clone(),
             );
-            if let Err(e) = self
-                .content_store
+            if let Err(e) = upload
                 .write_bytes(
                     &blob.bytes,
                     &format!(
@@ -416,22 +418,25 @@ impl SidecarLocator {
                         strip_sha256(&blob.digest)
                     ),
                     labels,
-                    &lease,
                 )
                 .await
             {
-                return PullOutcome::RegistryError {
-                    status: 0,
-                    body: format!("write blob {} to content store failed: {e}", blob.digest),
-                };
+                return PullOutcome::ContentStoreError(format!(
+                    "write blob {} to content store: {e:#}",
+                    blob.digest
+                ));
             }
         }
 
         // Register the Image record locally so the next pod hits
         // `images_get` straight away.
-        match self
-            .content_store
-            .images_create(
+        // The lease is deleted only once the record verifiably points at this manifest.
+        // Otherwise (a record for another manifest already existed, or registration failed)
+        // the lease keeps the blobs until it expires; non-fatal for this pull, since the
+        // label-scan fallback in `resolve_or_pull` still finds the manifest. Log loud so
+        // operators see it.
+        if let Err(e) = upload
+            .finish_create(
                 synthetic_ref,
                 &manifest_digest_in_store,
                 sidecar.manifest.len() as u64,
@@ -440,19 +445,11 @@ impl SidecarLocator {
             )
             .await
         {
-            Ok(()) => {
-                if let Err(e) = self.content_store.delete_lease(&lease).await {
-                    warn!(lease = %lease, error = %format!("{e:#}"), "could not delete the peer-pull lease; it expires on its own");
-                }
-            }
-            // Non-fatal for this pull: the blobs are written and the lease keeps them until it
-            // expires. images_get would miss but the label-scan fallback in `resolve_or_pull`
-            // still finds the manifest. Log loud so operators see it.
-            Err(e) => warn!(
+            warn!(
                 image_name = %synthetic_ref,
-                error = ?e,
-                "peer mirror pull wrote blobs but Image record registration failed"
-            ),
+                error = %format!("{e:#}"),
+                "peer mirror pull wrote blobs but the Image record does not root them"
+            );
         }
 
         PullOutcome::Ok
@@ -1164,9 +1161,10 @@ mod tests {
             let outcome = compio::runtime::Runtime::new()
                 .unwrap()
                 .block_on(locator.peer_pull(SUBJECT, &name));
+            // A containerd that cannot be reached is not reported as a mirror error.
             match outcome {
-                PullOutcome::RegistryError { body, .. } => {
-                    assert!(body.contains("content store"), "unexpected error: {body}")
+                PullOutcome::ContentStoreError(error) => {
+                    assert!(error.contains("lease"), "unexpected error: {error}")
                 }
                 o => panic!("unexpected outcome {o:?}"),
             }
