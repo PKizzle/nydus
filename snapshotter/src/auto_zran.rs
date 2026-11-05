@@ -19,7 +19,7 @@ use crate::config::{AutoZranConfig, ContainerdConfig, SchedClass as ConfigSchedC
 use crate::containerd_grpc::ContainerdFault;
 use crate::containerd_lookup::{ContainerdLookup, ManifestInfo, MissingLayers};
 use crate::containerd_transfer::{BackfillReport, LayerBackfill};
-use crate::content_store::{ContentStoreClient, containerd_fault_of, is_containerd_unavailable};
+use crate::content_store::{ContentStoreClient, containerd_fault_of};
 use crate::local_accel::{
     self, LocalAccelConfig, NodeLocalArtifact, SchedClass as AccelSchedClass,
 };
@@ -611,10 +611,9 @@ impl AutoZranManager {
     pub fn work_dir_in_use(&self, key: &str) -> bool {
         self.active_job_key().as_deref() == Some(key)
             || self.state.waiting.lock().is_ok_and(|waiting| {
-                // Dedupe keys are `<stage>:<job_key>`.
-                waiting
-                    .keys()
-                    .any(|k| k.split_once(':').is_some_and(|(_, dir)| dir == key))
+                [AutoZranStage::Base, AutoZranStage::Optimize]
+                    .into_iter()
+                    .any(|stage| waiting.contains_key(&stage_key(stage, key)))
             })
     }
 
@@ -853,54 +852,56 @@ async fn worker_loop(
         match run_conversion(&config, &deps, &job).await {
             Ok(ConversionOutcome::Completed) => state.mark_finished(&job, true),
             Ok(ConversionOutcome::Deferred) => state.mark_skipped(&job),
-            Err(e) if is_containerd_unavailable(&e) => {
-                let Some(delay) = state.mark_waiting(&job) else {
+            Err(e) => match containerd_fault_of(&e) {
+                Some(ContainerdFault::Unreachable) => {
+                    let Some(delay) = state.mark_waiting(&job) else {
+                        warn!(
+                            image = %job.image,
+                            stage = job.stage.tag(),
+                            waited_secs = OUTAGE_WAIT_BUDGET.as_secs(),
+                            error = %format!("{e:#}"),
+                            "auto-zran conversion abandoned: containerd stayed unreachable; the \
+                             image's next prepare enqueues a base job again, and the recon sweep an \
+                             optimize job from its saved profile"
+                        );
+                        continue;
+                    };
                     warn!(
                         image = %job.image,
                         stage = job.stage.tag(),
-                        waited_secs = OUTAGE_WAIT_BUDGET.as_secs(),
+                        retry_in_secs = delay.as_secs(),
                         error = %format!("{e:#}"),
-                        "auto-zran conversion abandoned: containerd stayed unreachable; the \
-                         image's next prepare enqueues a base job again, and the recon sweep an \
-                         optimize job from its saved profile"
+                        "auto-zran conversion waiting: containerd is unreachable"
                     );
-                    continue;
-                };
-                warn!(
-                    image = %job.image,
-                    stage = job.stage.tag(),
-                    retry_in_secs = delay.as_secs(),
-                    error = %format!("{e:#}"),
-                    "auto-zran conversion waiting: containerd is unreachable"
-                );
-                let retry = retry.clone();
-                let state = state.clone();
-                compio::runtime::spawn(async move {
-                    compio::time::sleep(delay).await;
-                    // Counted as waiting until it is on the queue, also while a full queue
-                    // blocks the send.
-                    if let Some(sender) = retry.upgrade() {
-                        let _ = sender.send(job).await;
-                    }
-                    state.retry_due();
-                })
-                .detach();
-            }
-            Err(e) => {
-                state.mark_finished(&job, false);
-                if let Some(ContainerdFault::Misconfigured(socket)) = containerd_fault_of(&e)
-                    && !MISCONFIGURED_SOCKET_REPORTED.swap(true, Ordering::Relaxed)
-                {
-                    error!(
-                        socket = %socket.display(),
-                        error = %format!("{e:#}"),
-                        "the containerd socket path cannot work (no permission, not a socket, or \
-                         its directory is missing); auto-zran conversions fail until \
-                         [snapshotter.containerd].address / [snapshotter].profile is fixed"
-                    );
+                    let retry = retry.clone();
+                    let state = state.clone();
+                    compio::runtime::spawn(async move {
+                        compio::time::sleep(delay).await;
+                        // Counted as waiting until it is on the queue, also while a full queue
+                        // blocks the send.
+                        if let Some(sender) = retry.upgrade() {
+                            let _ = sender.send(job).await;
+                        }
+                        state.retry_due();
+                    })
+                    .detach();
                 }
-                warn!(image = %job.image, error = ?e, "auto-zran conversion failed");
-            }
+                fault => {
+                    state.mark_finished(&job, false);
+                    if let Some(ContainerdFault::Misconfigured(socket)) = fault
+                        && !MISCONFIGURED_SOCKET_REPORTED.swap(true, Ordering::Relaxed)
+                    {
+                        error!(
+                            socket = %socket.display(),
+                            error = %format!("{e:#}"),
+                            "the containerd socket path cannot work (no permission, not a socket, or \
+                             its directory is missing); auto-zran conversions fail until \
+                             [snapshotter.containerd].address / [snapshotter].profile is fixed"
+                        );
+                    }
+                    warn!(image = %job.image, error = ?e, "auto-zran conversion failed");
+                }
+            },
         }
     }
 }
@@ -1718,7 +1719,12 @@ fn job_key(image: &str) -> String {
 /// same stage collapse. Distinct from `job_key` (which names the shared,
 /// stage-agnostic on-disk work dir the recon sweep watches).
 fn dedupe_key(image: &str, stage: AutoZranStage) -> String {
-    format!("{}:{}", stage.tag(), job_key(image))
+    stage_key(stage, &job_key(image))
+}
+
+/// The dedupe key of `stage` for the job whose work dir key ([`job_key`]) is `job_key`.
+fn stage_key(stage: AutoZranStage, job_key: &str) -> String {
+    format!("{}:{job_key}", stage.tag())
 }
 
 #[cfg(test)]

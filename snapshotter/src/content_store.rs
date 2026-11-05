@@ -876,7 +876,8 @@ fn image_record(
 }
 
 /// A failed containerd call, its `tonic::Status` kept downcastable under the message so
-/// [`is_not_found`], [`is_rpc_failure`] and [`is_containerd_unavailable`] see the code.
+/// [`is_not_found`] and [`is_rpc_failure`] see the code, and with it any transport error
+/// tonic keeps as its source, which [`containerd_fault_of`] classifies.
 pub(crate) fn rpc_error(call: impl std::fmt::Display, status: tonic::Status) -> anyhow::Error {
     let msg = format!("containerd {call} failed: {status}");
     anyhow::Error::new(status).context(msg)
