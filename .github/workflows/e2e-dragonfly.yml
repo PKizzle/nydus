@@ -45,7 +45,7 @@ jobs:
         with:
           cache-on-failure: true
           shared-key: Linux-cargo-amd64
-          save-if: ${{ github.ref == 'refs/heads/master' }}
+          save-if: ${{ github.ref == 'refs/heads/production' }}
 
       - name: Setup Rust toolchain
         uses: dsherret/rust-toolchain-file@v1

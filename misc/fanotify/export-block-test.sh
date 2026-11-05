@@ -32,6 +32,10 @@ head -c 5000 /dev/urandom > "$ROOT/src/a-small.bin"
 head -c 200000 /dev/urandom > "$ROOT/src/b-large.bin"
 perl -e 'print "EXPORT_BLOCK_OK_0123456789ABCDEF" x 4096' > "$ROOT/src/hello.txt"
 echo "subdir-small-file-marker" > "$ROOT/src/sub/small.txt"
+# Enough dirents to fill several directory blocks at every block size, so name offsets reach
+# past 4096 within a block.
+mkdir -p "$ROOT/src/many"
+for i in $(seq 1 1400); do : > "$ROOT/src/many/$(printf '%040d' "$i")"; done
 
 step "nydus-image create (RAFS v6, compressor none, block-size $BLOCK_SIZE)"
 "$NI" create --fs-version 6 --compressor none --block-size "$BLOCK_SIZE" \

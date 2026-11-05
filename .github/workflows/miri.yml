@@ -28,7 +28,7 @@ jobs:
       with:
         cache-on-failure: true
         shared-key: Linux-cargo-amd64
-        save-if: ${{ github.ref == 'refs/heads/master' }}
+        save-if: ${{ github.ref == 'refs/heads/production' }}
     - name: Install cargo nextest
       uses: taiki-e/install-action@nextest
     - name: Install protoc

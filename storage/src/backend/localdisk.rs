@@ -377,7 +377,7 @@ impl BlobBackend for LocalDisk {
 
 impl Drop for LocalDisk {
     fn drop(&mut self) {
-        self.metrics.release().unwrap_or_else(|e| error!("{:?}", e));
+        self.metrics.release();
     }
 }
 

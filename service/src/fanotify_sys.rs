@@ -127,6 +127,26 @@ pub struct fanotify_event_info_range {
     pub count: u64,
 }
 
+// ---------------------------------------------------------------------------
+// New mount API (`<linux/mount.h>`; libc lacks these on musl)
+// ---------------------------------------------------------------------------
+
+/// `fsopen(2)` flag: close the filesystem context fd on exec.
+pub const FSOPEN_CLOEXEC: libc::c_uint = 0x0000_0001;
+/// `fsconfig(2)` command: set a flag parameter (no value).
+pub const FSCONFIG_SET_FLAG: libc::c_uint = 0;
+/// `fsconfig(2)` command: set a string parameter.
+pub const FSCONFIG_SET_STRING: libc::c_uint = 1;
+/// `fsconfig(2)` command: create the superblock from the configured context.
+pub const FSCONFIG_CMD_CREATE: libc::c_uint = 6;
+/// `fsmount(2)` flag: close the mount fd on exec.
+pub const FSMOUNT_CLOEXEC: libc::c_uint = 0x0000_0001;
+/// `move_mount(2)` flag: the source is the fd itself (empty path).
+pub const MOVE_MOUNT_F_EMPTY_PATH: libc::c_uint = 0x0000_0004;
+/// Longest `fsconfig(2)` string value: the kernel copies it with `strndup_user(value, 256)`,
+/// which counts the terminating NUL.
+pub const FSCONFIG_VALUE_MAX: usize = 255;
+
 // ---- safety assertions ---------------------------------------------------
 
 const _: () = assert!(mem::size_of::<fanotify_event_info_header>() == 4);

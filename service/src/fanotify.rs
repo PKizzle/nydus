@@ -13,9 +13,9 @@
 //!    again once its cache fills, so warm reads bypass the daemon and regain kernel
 //!    readahead — see [`FanotifyHandler::disarm_if_complete`].
 //! 3. Issuing a file-backed EROFS mount with the **bootstrap as the mount source**
-//!    and the data blobs as `device=` options:
-//!    `mount("<bootstrap>", mountpoint, "erofs", MS_RDONLY|MS_NODEV|MS_NOSUID,
-//!    "device=blob_0,device=blob_1,...")` (a NULL/`none` source fails with `EINVAL`).
+//!    and the data blobs as `device=` options, one `fsconfig(2)` call each:
+//!    `source=<bootstrap>`, `ro`, `device=blob_0`, `device=blob_1`, ..., then `fsmount(2)`
+//!    with `MOUNT_ATTR_RDONLY|NODEV|NOSUID` and `move_mount(2)` onto the mountpoint.
 //! 4. Polling the fanotify fd; when a `FAN_PRE_ACCESS` event arrives, the handler
 //!    fetches the missing chunk data from the [`BlobCacheMgr`], writes it into the
 //!    sparse blob via `pwrite(2)`, and responds `FAN_ALLOW`.
@@ -37,7 +37,9 @@ use nydus_rafs::metadata::layout::v6::{EROFS_SUPER_OFFSET, RafsV6Device, RafsV6S
 use crate::blob_cache::{BlobCacheMgr, DataBlob};
 use crate::fanotify_sys::{
     FAN_CLASS_PRE_CONTENT, FAN_EVENT_INFO_TYPE_RANGE, FAN_NOFD, FAN_PRE_ACCESS, FAN_Q_OVERFLOW,
-    fan_deny_errno, fanotify_event_info_header, fanotify_event_info_range,
+    FSCONFIG_CMD_CREATE, FSCONFIG_SET_FLAG, FSCONFIG_SET_STRING, FSCONFIG_VALUE_MAX,
+    FSMOUNT_CLOEXEC, FSOPEN_CLOEXEC, MOVE_MOUNT_F_EMPTY_PATH, fan_deny_errno,
+    fanotify_event_info_header, fanotify_event_info_range,
 };
 
 const TOKEN_EVENT_WAKER: usize = 1;
@@ -472,24 +474,35 @@ fn order_by_device_table<T>(
         .collect()
 }
 
-/// Maximum size of the `mount(2)` data argument.
-///
-/// The kernel copies the options string with `copy_mount_options()`, which is bounded by one
-/// page and NUL-terminates at the end — anything longer is **silently truncated**, so a deep
-/// cache directory multiplied by a large device table turns into a baffling EROFS mount error
-/// rather than an obvious "options too long". 4095 leaves room for the terminator on the
-/// smallest supported page size.
-const MOUNT_DATA_MAX: usize = 4095;
+/// Reject a mount parameter value `fsconfig(2)` would refuse with a bare `EINVAL`.
+fn check_fsconfig_value(what: &str, value: &[u8]) -> Result<()> {
+    if value.len() > FSCONFIG_VALUE_MAX {
+        return Err(std::io::Error::new(
+            ErrorKind::InvalidInput,
+            format!(
+                "{what} {:?} is {} bytes, over the {FSCONFIG_VALUE_MAX}-byte kernel limit for \
+                 one mount option; use a shorter blob cache directory path",
+                String::from_utf8_lossy(value),
+                value.len()
+            ),
+        ));
+    }
+    Ok(())
+}
 
-/// Build the `device=<path>,device=<path>,…` option string for a file-backed EROFS mount.
+/// Build the `device=<path>,device=<path>,…` option list for a file-backed EROFS mount.
 ///
 /// Split out from [`mount_erofs`] so the validation is unit-testable without root or a
-/// 6.14 kernel. The option list is comma-separated and NUL-terminated by the kernel, so a
-/// path containing either byte would silently change the meaning of the mount rather than
-/// fail — both are rejected up front.
+/// 6.14 kernel. [`mount_erofs_with`] issues each comma-separated entry as its own
+/// `fsconfig(2)` call, so the list has no total length limit (`mount(2)` silently truncates
+/// its data at one page, which an image with ~45 layers under a deep cache directory
+/// exceeds); each path is bounded by [`FSCONFIG_VALUE_MAX`] instead. A path containing a
+/// comma or NUL would silently change the meaning of the mount rather than fail — both are
+/// rejected up front.
 fn build_erofs_device_options(blobs: &[PathBuf]) -> Result<String> {
     for blob in blobs {
         let bytes = blob.as_os_str().as_encoded_bytes();
+        check_fsconfig_value("device path", bytes)?;
         if bytes.contains(&b',') {
             return Err(std::io::Error::new(
                 ErrorKind::InvalidInput,
@@ -508,26 +521,11 @@ fn build_erofs_device_options(blobs: &[PathBuf]) -> Result<String> {
         }
     }
 
-    let options = blobs
+    Ok(blobs
         .iter()
         .map(|blob| format!("device={}", blob.display()))
         .collect::<Vec<_>>()
-        .join(",");
-
-    if options.len() > MOUNT_DATA_MAX {
-        return Err(std::io::Error::new(
-            ErrorKind::InvalidInput,
-            format!(
-                "EROFS mount options are {} bytes for {} device(s), over the {}-byte kernel \
-                 limit; use a shorter blob cache directory path",
-                options.len(),
-                blobs.len(),
-                MOUNT_DATA_MAX
-            ),
-        ));
-    }
-
-    Ok(options)
+        .join(","))
 }
 
 /// Whether anything is mounted exactly at `mountpoint`.
@@ -551,11 +549,11 @@ fn is_mounted_at(mountpoint: &Path) -> bool {
         .unwrap_or(false)
 }
 
-// Issue a file-backed EROFS mount via `mount(2)` (kernel ≥ 6.12).
+// Issue a file-backed EROFS mount through the new mount API (kernel ≥ 6.12).
 //
 // The **bootstrap** is the mount source: it holds the EROFS superblock, inode metadata and the
 // device table. The **data blobs** are the extra block devices that back file content; they are
-// passed as `device=<path>` mount options in device-table order. The bootstrap itself is NOT a
+// passed as `device=<path>` parameters in device-table order. The bootstrap itself is NOT a
 // `device=` entry, and the source must be the bootstrap path — passing a NULL/`none` source fails
 // with `EINVAL` ("special device none does not exist").
 //
@@ -576,6 +574,7 @@ fn mount_erofs(
         );
         bootstrap.to_path_buf()
     });
+    check_fsconfig_value("bootstrap path", bootstrap.as_os_str().as_encoded_bytes())?;
     let options = build_erofs_device_options(blobs)?;
     if let Some(domain) = inode_share_domain {
         match erofs_inode_share_options(&options, domain)
@@ -600,55 +599,104 @@ fn erofs_inode_share_options(device_options: &str, domain: &str) -> Result<Strin
             format!("invalid EROFS domain_id {domain:?}"),
         ));
     }
+    check_fsconfig_value("EROFS domain_id", domain.as_bytes())?;
     let share = format!("inode_share,domain_id={domain}");
-    let options = if device_options.is_empty() {
+    Ok(if device_options.is_empty() {
         share
     } else {
         format!("{device_options},{share}")
-    };
-    if options.len() > MOUNT_DATA_MAX {
-        return Err(std::io::Error::new(
-            ErrorKind::InvalidInput,
-            "EROFS mount options with inode_share exceed the kernel limit",
-        ));
-    }
-    Ok(options)
+    })
 }
 
+/// Mount EROFS from `bootstrap` at `mountpoint`, setting each comma-separated `key[=value]`
+/// entry of `options` with its own `fsconfig(2)` call. `mount(2)` would take the same list as
+/// one string, and silently truncate it at one page.
 pub(crate) fn mount_erofs_with(bootstrap: &Path, mountpoint: &Path, options: &str) -> Result<()> {
-    let source_c = std::ffi::CString::new(bootstrap.as_os_str().as_encoded_bytes())
-        .map_err(|e| std::io::Error::new(ErrorKind::InvalidInput, e))?;
-    let mountpoint_c = std::ffi::CString::new(mountpoint.as_os_str().as_encoded_bytes())
-        .map_err(|e| std::io::Error::new(ErrorKind::InvalidInput, e))?;
-    let fstype = std::ffi::CString::new("erofs").unwrap();
-    let opts = std::ffi::CString::new(options.as_bytes())
-        .map_err(|e| std::io::Error::new(ErrorKind::InvalidInput, e))?;
-    // An empty options string would still be a valid C string (""); pass NULL in that case.
-    let opts_ptr = if options.is_empty() {
-        std::ptr::null()
-    } else {
-        opts.as_ptr() as *const libc::c_void
+    fn cstr(bytes: &[u8]) -> Result<std::ffi::CString> {
+        std::ffi::CString::new(bytes).map_err(|e| std::io::Error::new(ErrorKind::InvalidInput, e))
+    }
+    fn cvt(ret: libc::c_long) -> Result<libc::c_long> {
+        if ret < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(ret)
+    }
+    fn fd(ret: libc::c_long) -> Result<OwnedFd> {
+        // SAFETY: on success the syscall returned a fresh descriptor that nothing else owns.
+        cvt(ret).map(|fd| unsafe { OwnedFd::from_raw_fd(fd as RawFd) })
+    }
+
+    let fs = fd(unsafe { libc::syscall(libc::SYS_fsopen, c"erofs".as_ptr(), FSOPEN_CLOEXEC) })?;
+    let config = |cmd: libc::c_uint, key: Option<&str>, value: Option<&[u8]>| -> Result<()> {
+        let key = key.map(|k| cstr(k.as_bytes())).transpose()?;
+        let value = value.map(cstr).transpose()?;
+        let ret = unsafe {
+            libc::syscall(
+                libc::SYS_fsconfig,
+                fs.as_raw_fd(),
+                cmd,
+                key.as_ref().map_or(std::ptr::null(), |k| k.as_ptr()),
+                value.as_ref().map_or(std::ptr::null(), |v| v.as_ptr()),
+                0,
+            )
+        };
+        cvt(ret).map(drop)
     };
+
+    let configured = (|| {
+        config(
+            FSCONFIG_SET_STRING,
+            Some("source"),
+            Some(bootstrap.as_os_str().as_encoded_bytes()),
+        )?;
+        config(FSCONFIG_SET_FLAG, Some("ro"), None)?;
+        for option in options.split(',').filter(|o| !o.is_empty()) {
+            match option.split_once('=') {
+                Some((key, value)) => {
+                    config(FSCONFIG_SET_STRING, Some(key), Some(value.as_bytes()))?
+                }
+                None => config(FSCONFIG_SET_FLAG, Some(option), None)?,
+            }
+        }
+        config(FSCONFIG_CMD_CREATE, None, None)
+    })();
+    if configured.is_err() {
+        // With the new mount API the kernel logs the reason for a refused parameter into the
+        // context fd rather than dmesg; surface it, leaving the returned errno untouched.
+        let mut buf = [0u8; 512];
+        loop {
+            let n = unsafe { libc::read(fs.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
+            if n <= 0 {
+                break;
+            }
+            warn!(
+                "fanotify: EROFS mount of {}: {}",
+                mountpoint.display(),
+                String::from_utf8_lossy(&buf[..n as usize]).trim_end()
+            );
+        }
+    }
+    configured?;
 
     // The mounted tree is an untrusted container image. EROFS is read-only anyway, but
-    // `MS_RDONLY` states it rather than relying on the driver, and `MS_NODEV`/`MS_NOSUID`
+    // `MOUNT_ATTR_RDONLY` states it rather than relying on the driver, and `NODEV`/`NOSUID`
     // stop a device node or setuid bit baked into the image from being honoured through
     // this mount.
-    let flags = libc::MS_RDONLY | libc::MS_NODEV | libc::MS_NOSUID;
-
+    let attrs = libc::MOUNT_ATTR_RDONLY | libc::MOUNT_ATTR_NODEV | libc::MOUNT_ATTR_NOSUID;
+    let mnt =
+        fd(unsafe { libc::syscall(libc::SYS_fsmount, fs.as_raw_fd(), FSMOUNT_CLOEXEC, attrs) })?;
+    let mountpoint_c = cstr(mountpoint.as_os_str().as_encoded_bytes())?;
     let ret = unsafe {
-        libc::mount(
-            source_c.as_ptr(),
+        libc::syscall(
+            libc::SYS_move_mount,
+            mnt.as_raw_fd(),
+            c"".as_ptr(),
+            libc::AT_FDCWD,
             mountpoint_c.as_ptr(),
-            fstype.as_ptr(),
-            flags,
-            opts_ptr,
+            MOVE_MOUNT_F_EMPTY_PATH,
         )
     };
-    if ret != 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    Ok(())
+    cvt(ret).map(drop)
 }
 
 impl FanotifyHandler {
@@ -2284,28 +2332,29 @@ mod tests {
     }
 
     #[test]
-    fn test_device_options_reject_length_over_kernel_limit() {
-        // The kernel truncates the mount data at one page instead of erroring, so a
-        // deep cache dir + a large device table must be caught here.
-        let deep = PathBuf::from(format!("/{}", "d".repeat(400)));
-        let blobs = vec![deep; 12];
-        let err =
-            build_erofs_device_options(&blobs).expect_err("over-long options must be rejected");
-        assert_eq!(err.kind(), ErrorKind::InvalidInput);
-        let msg = err.to_string();
-        assert!(
-            msg.contains("shorter blob cache directory"),
-            "error should say how to fix it: {msg}"
-        );
+    fn test_device_options_have_no_total_length_limit() {
+        // Each device is its own fsconfig(2) call, so a large device table under a deep cache
+        // dir mounts even though the joined list is far past mount(2)'s one-page data limit.
+        let blobs: Vec<_> = (0..128)
+            .map(|i| PathBuf::from(format!("/{}/blob_{i}", "d".repeat(140))))
+            .collect();
+        let opts = build_erofs_device_options(&blobs).expect("128 deep devices are valid");
+        assert!(opts.len() > 4 * 4096);
+        assert_eq!(opts.split(',').count(), 128);
     }
 
     #[test]
-    fn test_device_options_accept_up_to_the_limit() {
-        // Exactly at the boundary must still mount: "device=" (7) + path length.
-        let path = PathBuf::from(format!("/{}", "d".repeat(MOUNT_DATA_MAX - 8)));
-        let opts = build_erofs_device_options(std::slice::from_ref(&path))
-            .expect("a single device at exactly the limit is valid");
-        assert_eq!(opts.len(), MOUNT_DATA_MAX);
+    fn test_device_options_bound_each_path() {
+        let at_limit = PathBuf::from(format!("/{}", "d".repeat(FSCONFIG_VALUE_MAX - 1)));
+        build_erofs_device_options(std::slice::from_ref(&at_limit))
+            .expect("a path of exactly the fsconfig value limit is valid");
+        let over = PathBuf::from(format!("/{}", "d".repeat(FSCONFIG_VALUE_MAX)));
+        let err = build_erofs_device_options(&[over]).expect_err("an over-long path is rejected");
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(
+            err.to_string().contains("shorter blob cache directory"),
+            "error should say how to fix it: {err}"
+        );
     }
 
     #[test]
@@ -2318,13 +2367,11 @@ mod tests {
             erofs_inode_share_options("", "d").unwrap(),
             "inode_share,domain_id=d"
         );
-        for bad in ["", "a,b"] {
+        let long = "d".repeat(FSCONFIG_VALUE_MAX + 1);
+        for bad in ["", "a,b", long.as_str()] {
             let err = erofs_inode_share_options("device=/x", bad).unwrap_err();
             assert_eq!(err.kind(), ErrorKind::InvalidInput);
         }
-        let full = "d".repeat(MOUNT_DATA_MAX - 10);
-        let err = erofs_inode_share_options(&full, "domain").unwrap_err();
-        assert_eq!(err.kind(), ErrorKind::InvalidInput);
     }
 
     // ---- event buffer walking (Parts 2a / 2b) ----------------------------
