@@ -594,7 +594,9 @@ impl DaemonSupervisor {
     /// different content (its mount is live — replacing would leak its FUSE
     /// threads and stack a new mount over the held one), and stop + remove an
     /// unhealthy one before the caller starts a replacement. Mirrors
-    /// `spawn_instance`.
+    /// `spawn_instance`. An unhealthy fanotify daemon of the same bootstrap is
+    /// healed in place instead (see `heal_fanotify_in_place`), so the caller
+    /// finds a healthy instance to reuse.
     async fn evict_replaceable_instance(&self, image_ref: &str, bootstrap: &Path) -> Result<()> {
         let mut instances = self.instances.write().await;
         if let Some(inst) = instances.get(image_ref) {
@@ -605,6 +607,26 @@ impl DaemonSupervisor {
                     inst.bootstrap.display(),
                     bootstrap.display()
                 );
+            }
+            if inst.bootstrap == bootstrap
+                && Self::accel_backend_for(bootstrap).is_some()
+                && mount_fstype_at(&inst.mountpoint).as_deref() == Some("erofs")
+                && let Some(old) = instances.remove(image_ref)
+            {
+                warn!(image_ref, "healing unhealthy fanotify daemon in place");
+                match self.heal_fanotify_in_place(&old).await {
+                    Ok(healed) => {
+                        instances.insert(image_ref.to_string(), healed);
+                    }
+                    Err(e) => {
+                        warn!(
+                            image_ref,
+                            error = format!("{e:#}"),
+                            "failed to heal fanotify daemon; starting a fresh one"
+                        );
+                    }
+                }
+                return Ok(());
             }
             if let Some(old) = instances.remove(image_ref) {
                 warn!(image_ref, "replacing unhealthy daemon");
@@ -734,6 +756,9 @@ impl DaemonSupervisor {
         }
         self.evict_replaceable_instance(image_ref, bootstrap)
             .await?;
+        if let Some(handle) = self.try_reuse_instance(image_ref, bootstrap, holder).await {
+            return Ok(handle);
+        }
 
         let instance = self
             .start_local_instance(image_ref, bootstrap, backend_dir, built_on_node)
@@ -792,13 +817,28 @@ impl DaemonSupervisor {
         // it under the expected `bootstrap` filename (see
         // `service/src/fanotify.rs::discover_blobs`).
         let staged_bootstrap = stage_dir.join("bootstrap");
-        stage_bootstrap(bootstrap, &staged_bootstrap).with_context(|| {
-            format!(
-                "failed to stage bootstrap {} -> {}",
-                bootstrap.display(),
-                staged_bootstrap.display()
-            )
-        })?;
+        // Only a mount of this staged bootstrap, still holding the same content, is healed in
+        // place: that file is its live source, so it is left as it is. Any other mount, such as
+        // one without data devices that answers every read with EIO, is replaced, and only then
+        // is the bootstrap staged again.
+        if let Some((source, _)) = mount_at(&mountpoint) {
+            let heal = Path::new(&source.replace("\\040", " ")) == staged_bootstrap
+                && is_staged_copy(bootstrap, &staged_bootstrap);
+            if !heal {
+                warn!(image_ref = %image_ref_str, source, "replacing a mount of another bootstrap");
+                detach_mount_stack(&mountpoint)
+                    .with_context(|| format!("failed to detach {}", mountpoint.display()))?;
+            }
+        }
+        if !is_mounted_at(&mountpoint) {
+            stage_bootstrap(bootstrap, &staged_bootstrap).with_context(|| {
+                format!(
+                    "failed to stage bootstrap {} -> {}",
+                    bootstrap.display(),
+                    staged_bootstrap.display()
+                )
+            })?;
+        }
 
         let threads = self.config.snapshotter.daemon.threads.max(1) as u32;
         let bti = self.build_info.clone();
@@ -827,33 +867,11 @@ impl DaemonSupervisor {
             ),
         )?;
         let cfg_json = serde_json::json!({ "blobs": [entry] });
-        // Only a mount of this staged bootstrap is healed in place. Any other
-        // one, such as a mount without data devices that answers every read
-        // with EIO, is replaced.
-        let heal_in_place = match mount_at(&mountpoint) {
-            Some((source, _)) if Path::new(&source.replace("\\040", " ")) == staged_bootstrap => {
-                true
-            }
-            Some((source, _)) => {
-                warn!(image_ref = %image_ref_str, source, "replacing a mount of another bootstrap");
-                detach_mount_stack(&mountpoint)
-                    .with_context(|| format!("failed to detach {}", mountpoint.display()))?;
-                false
-            }
-            None => false,
-        };
         // The process-wide blob factory keys cache managers by config, which is
         // the same for every start of this image, so it would hand back the
-        // previous daemon's cache entries. A fresh mount drops the idle ones,
-        // whose files the stale daemon-dir sweep may already have deleted.
-        // Healing in place must keep them: their cache files were opened before
-        // any pre-content mark existed, so the fills written through them raise
-        // no events. Reopened while the replaced daemon's group still marks the
-        // inode, every fill would raise an event of its own and block the
-        // worker that issued it.
-        if !heal_in_place {
-            nydus_storage::factory::BLOB_FACTORY.gc(None);
-        }
+        // previous daemon's cache entries; drop the idle ones, whose files the
+        // stale daemon-dir sweep may already have deleted.
+        nydus_storage::factory::BLOB_FACTORY.gc(None);
 
         let supervisor_sock = supervisor_sock_path(&slug);
         let stage_dir_str = stage_dir.display().to_string();
@@ -903,7 +921,7 @@ impl DaemonSupervisor {
             holders: StdMutex::new(HashSet::new()),
             restored_holders: StdMutex::new(HashSet::new()),
             failover_armed: AtomicBool::new(armed),
-            built_on_node,
+            built_on_node: built_on_node,
             _poll: poll,
         }))
     }
@@ -1370,37 +1388,41 @@ impl DaemonSupervisor {
             warn!(image_ref, state = %before_state, "recovering unhealthy nydus daemon");
 
             // Consumer preservation depends on what is mounted:
-            // - EROFS: the kernel mount is fine — only the handler died. Stop
-            //   the service threads WITHOUT unmounting; the restart reuses the
-            //   live mountpoint and re-arms marks on the same inodes, so
-            //   existing container overlays never notice.
+            // - EROFS: the kernel mount is fine — only the handler died. A
+            //   fanotify daemon is replaced on its own group (see
+            //   `heal_fanotify_in_place`); any other one is stopped WITHOUT
+            //   unmounting and restarted over the live mountpoint, so existing
+            //   container overlays never notice.
             // - FUSE: an unhealthy daemon means the connection is already
             //   dead for consumers. Tear down fully (pop any stacked corpse
             //   layers) so the restart mounts fresh.
             let fstype = mount_fstype_at(&old.mountpoint);
             let is_erofs = fstype.as_deref() == Some("erofs");
-            if is_erofs {
-                stop_daemon_keep_mount(&old);
+            let started = if is_erofs && Self::accel_backend_for(&bootstrap).is_some() {
+                self.heal_fanotify_in_place(&old).await
             } else {
-                if let Err(e) = stop_instance(&old) {
-                    warn!(image_ref, error = %e, "failed to stop unhealthy daemon during recovery");
-                }
-                while mount_fstype_at(&old.mountpoint).is_some_and(|t| t.contains("fuse")) {
-                    if let Err(e) = detach_mount_lazy(&old.mountpoint) {
-                        warn!(image_ref, error = %e, "failed to detach dead fuse mount during recovery");
-                        break;
+                if is_erofs {
+                    stop_daemon_keep_mount(&old);
+                } else {
+                    if let Err(e) = stop_instance(&old) {
+                        warn!(image_ref, error = %e, "failed to stop unhealthy daemon during recovery");
                     }
+                    while mount_fstype_at(&old.mountpoint).is_some_and(|t| t.contains("fuse")) {
+                        if let Err(e) = detach_mount_lazy(&old.mountpoint) {
+                            warn!(image_ref, error = %e, "failed to detach dead fuse mount during recovery");
+                            break;
+                        }
+                    }
+                    self.clear_failover_state(&slug);
                 }
-                self.clear_failover_state(&slug);
-            }
-            if let Err(e) = self.persist_instance_record(&old, false).await {
-                warn!(image_ref, error = %e, "failed to persist stopped daemon record");
-            }
+                if let Err(e) = self.persist_instance_record(&old, false).await {
+                    warn!(image_ref, error = %e, "failed to persist stopped daemon record");
+                }
+                self.start_instance_for_record(&image_ref, &bootstrap, old.built_on_node)
+                    .await
+            };
 
-            match self
-                .start_instance_for_record(&image_ref, &bootstrap, old.built_on_node)
-                .await
-            {
+            match started {
                 Ok(instance) => {
                     instance.refcount.store(refcount, Ordering::SeqCst);
                     // Carry the holder set over: dropping it would turn every
@@ -1849,6 +1871,8 @@ impl DaemonSupervisor {
     /// mount can be taken over later); `false` means failover is not armed for
     /// this image and the caller must unmount it on shutdown rather than leave a
     /// kernel mount no successor can recover.
+    /// On `false` nothing stays parked for the slug: an fd left from an earlier
+    /// generation would hand a successor a group nobody serves.
     async fn park_failover_state(
         &self,
         slug: &str,
@@ -1860,6 +1884,7 @@ impl DaemonSupervisor {
             && let Err(e) = fs::create_dir_all(parent)
         {
             warn!(slug, error = %e, dir = %parent.display(), "failed to create failover socket dir; failover disabled for this image");
+            self.clear_failover_state(slug);
             return false;
         }
 
@@ -1878,6 +1903,7 @@ impl DaemonSupervisor {
             Ok(parts) => parts,
             Err(e) => {
                 warn!(slug, error = %e, "failed to snapshot daemon state; failover disabled for this image");
+                self.clear_failover_state(slug);
                 return false;
             }
         };
@@ -1885,6 +1911,7 @@ impl DaemonSupervisor {
         let state_path = daemon_root.join("upgrade.state");
         if let Err(e) = atomic_write(&state_path, &state) {
             warn!(slug, error = %e, "failed to persist failover state blob; failover disabled for this image");
+            self.clear_failover_state(slug);
             return false;
         }
         match crate::fdstore::replace_fd(slug, fuse_fd.as_raw_fd()) {
@@ -1903,6 +1930,7 @@ impl DaemonSupervisor {
             }
             Err(e) => {
                 warn!(slug, error = %e, "failed to store fuse fd in systemd fd store");
+                self.clear_failover_state(slug);
                 false
             }
         }
@@ -2312,13 +2340,7 @@ impl DaemonSupervisor {
     /// handler's workers start draining. This is why adoption is strictly
     /// better than the record rebuild for fanotify: the rebuild re-arms
     /// fresh marks, leaving a brief window where a cold read could slip
-    /// through unmarked.
-    ///
-    /// The daemon-side counterpart is `fanotify_upgrade::restore`
-    /// (`service/src/upgrade.rs`): blob-cache entries are re-added from the
-    /// state blob (no backend config has to be reconstructed here) and the
-    /// handler is rebuilt around the inherited fd without re-arming marks or
-    /// re-mounting.
+    /// through unmarked. See `adopt_fanotify_group`.
     async fn restore_fanotify_instance(
         &self,
         record: &DaemonStatusRecord,
@@ -2337,57 +2359,9 @@ impl DaemonSupervisor {
         let state_path = self.failover_state_path(slug);
         let state = fs::read(&state_path)
             .with_context(|| format!("read failover state {}", state_path.display()))?;
-
-        let bti = self.build_info.clone();
-        let poll = Poll::new().context("failed to create mio Poll for daemon waker")?;
-        let waker =
-            Arc::new(Waker::new(poll.registry(), Token(1)).context("failed to create mio Waker")?);
-        let poll = Arc::new(Mutex::new(poll));
-
-        let supervisor_sock = supervisor_sock_path(slug);
-        // `upgrade=true` + `Some(api_sock)` skips handler registration and the
-        // Mount/Start events, leaving the daemon in INIT ready for takeover.
-        // No fanotify blob_dir/mountpoint and no blob config are passed: the
-        // handler geometry and the blob-cache entries all come from the state
-        // blob captured at save time.
-        let api_sock = daemon_root.join("api.sock");
-        let daemon = create_daemon(
-            Some(slug.to_string()),
-            Some(supervisor_sock.display().to_string()),
-            None,
-            None,
-            None,
-            None,
-            bti,
-            waker,
-            Some(api_sock.as_path()),
-            true,
-        )
-        .map_err(|e| anyhow::anyhow!("create upgrade fanotify daemon for {image_ref_str}: {e}"))?;
-
-        // Replay (fd, state) into the daemon's restore() over the supervisor
-        // socket, then start it serving on the existing kernel mount.
-        let daemon_for_takeover = daemon.clone();
-        let state_owned = state;
-        let sock_for_restore = supervisor_sock.clone();
-        blocking::unblock(move || {
-            crate::failover::serve_on_restore(&sock_for_restore, fan_fd, state_owned, || {
-                daemon_for_takeover
-                    .trigger_takeover()
-                    .map_err(|e| anyhow::anyhow!("trigger_takeover: {e}"))
-            })
-        })
-        .await
-        .context("replay preserved fanotify fd into daemon")?;
-
-        daemon
-            .trigger_start()
-            .map_err(|e| anyhow::anyhow!("trigger_start: {e}"))?;
-        wait_for_running_off_reactor(daemon.clone(), self.startup_timeout)
-            .await
-            .with_context(|| {
-                format!("restored fanotify daemon for {image_ref_str} never reached RUNNING")
-            })?;
+        let (daemon, poll) = self
+            .adopt_fanotify_group(image_ref_str, slug, fan_fd, state)
+            .await?;
 
         let (refcount, holders) = restored_holder_state(record);
         let instance = Arc::new(DaemonInstance {
@@ -2410,6 +2384,182 @@ impl DaemonSupervisor {
             .await
             .insert(image_ref_str.to_string(), instance);
         Ok(())
+    }
+
+    /// Start a fanotify daemon around the group `fan_fd` and the state blob `state` captured by
+    /// a predecessor's `save()`, through `Takeover -> Restore -> Start`.
+    ///
+    /// The daemon-side counterpart is `fanotify_upgrade::restore`
+    /// (`service/src/upgrade.rs`): blob-cache entries are re-added from the state blob (no
+    /// backend config has to be reconstructed here) and the handler is rebuilt around the
+    /// group without re-arming marks or re-mounting. Its workers answer every event already
+    /// queued on the group.
+    async fn adopt_fanotify_group(
+        &self,
+        image_ref_str: &str,
+        slug: &str,
+        fan_fd: std::os::fd::RawFd,
+        state: Vec<u8>,
+    ) -> Result<(Arc<dyn NydusDaemon>, Arc<Mutex<Poll>>)> {
+        let bti = self.build_info.clone();
+        let poll = Poll::new().context("failed to create mio Poll for daemon waker")?;
+        let waker =
+            Arc::new(Waker::new(poll.registry(), Token(1)).context("failed to create mio Waker")?);
+        let poll = Arc::new(Mutex::new(poll));
+
+        let supervisor_sock = supervisor_sock_path(slug);
+        // `upgrade=true` + `Some(api_sock)` skips handler registration and the
+        // Mount/Start events, leaving the daemon in INIT ready for takeover.
+        // No fanotify blob_dir/mountpoint and no blob config are passed: the
+        // handler geometry and the blob-cache entries all come from the state
+        // blob captured at save time.
+        let api_sock = self.daemons_root().join(slug).join("api.sock");
+        let daemon = create_daemon(
+            Some(slug.to_string()),
+            Some(supervisor_sock.display().to_string()),
+            None,
+            None,
+            None,
+            None,
+            bti,
+            waker,
+            Some(api_sock.as_path()),
+            true,
+        )
+        .map_err(|e| anyhow::anyhow!("create upgrade fanotify daemon for {image_ref_str}: {e}"))?;
+
+        // Replay (fd, state) into the daemon's restore() over the supervisor
+        // socket, then start it serving on the existing kernel mount.
+        let daemon_for_takeover = daemon.clone();
+        blocking::unblock(move || {
+            crate::failover::serve_on_restore(&supervisor_sock, fan_fd, state, || {
+                daemon_for_takeover
+                    .trigger_takeover()
+                    .map_err(|e| anyhow::anyhow!("trigger_takeover: {e}"))
+            })
+        })
+        .await
+        .context("replay preserved fanotify fd into daemon")?;
+
+        daemon
+            .trigger_start()
+            .map_err(|e| anyhow::anyhow!("trigger_start: {e}"))?;
+        wait_for_running_off_reactor(daemon.clone(), self.startup_timeout)
+            .await
+            .with_context(|| {
+                format!("restored fanotify daemon for {image_ref_str} never reached RUNNING")
+            })?;
+        Ok((daemon, poll))
+    }
+
+    /// Replace the failed handler of `old`, a fanotify daemon over a live EROFS mount, with a
+    /// new daemon on the SAME fanotify group.
+    ///
+    /// The group carries the mount's marks and every event raised while no handler serves it.
+    /// So it never closes while the mount is live: closing it would allow (`fanotify_release()`)
+    /// whatever is queued, serving unfilled holes as zeros, and a fresh group would leave the
+    /// mount unmarked until it is armed. The failed handler's workers stop first, without
+    /// answering what is queued; reads meanwhile wait, and the new workers answer them. The
+    /// systemd fd store keeps holding the same group, so it stays current.
+    ///
+    /// Nothing of the failed daemon's state is reused: the new daemon rebuilds its blob cache
+    /// managers from the saved blob entries and reopens the cache files without events.
+    ///
+    /// On failure the mount is torn down for good (unmounted before the group closes) and its
+    /// failover state cleared, so no daemonless mount is left serving zeros.
+    async fn heal_fanotify_in_place(
+        &self,
+        old: &Arc<DaemonInstance>,
+    ) -> Result<Arc<DaemonInstance>> {
+        let slug = slug_for(&old.image_ref);
+        let healed = self.take_over_fanotify_group(old, &slug).await;
+        if healed.is_err() {
+            let stopping = old.clone();
+            if let Err(e) = blocking::unblock(move || stop_unreferenced_instance(&stopping)).await {
+                warn!(image_ref = %old.image_ref, error = %e, "failed to stop daemon after a failed takeover");
+            }
+            if is_mounted_at(&old.mountpoint)
+                && let Err(e) = detach_mount_stack(&old.mountpoint)
+            {
+                warn!(image_ref = %old.image_ref, error = %e, "failed to detach mount after a failed takeover");
+            }
+            self.clear_failover_state(&slug);
+            if let Err(e) = self.persist_instance_record(old, false).await {
+                warn!(image_ref = %old.image_ref, error = %e, "failed to persist stopped daemon record");
+            }
+        }
+        healed
+    }
+
+    async fn take_over_fanotify_group(
+        &self,
+        old: &Arc<DaemonInstance>,
+        slug: &str,
+    ) -> Result<Arc<DaemonInstance>> {
+        #[cfg(not(target_os = "linux"))]
+        bail!(
+            "fanotify is Linux-only; cannot take over {} ({slug})",
+            old.image_ref
+        );
+
+        #[cfg(target_os = "linux")]
+        {
+            let daemon = old.daemon.clone();
+            let sock = supervisor_sock_path(slug);
+            let (group, state, suspended) = blocking::unblock(move || {
+                let controller = daemon
+                    .as_any()
+                    .downcast_ref::<nydus_service::ServiceController>()
+                    .context("not a fanotify daemon")?;
+                // A dup of the group and the state rebuilding its handler, taken before
+                // the workers stop.
+                let (group, state) = crate::failover::capture_on_save(&sock, || {
+                    daemon
+                        .save()
+                        .map_err(|e| anyhow::anyhow!("daemon save(): {e}"))
+                })?;
+                Ok::<_, anyhow::Error>((group, state, controller.suspend_fanotify_handlers()))
+            })
+            .await?;
+            #[cfg(test)]
+            if let Some(hook) = tests::TAKEOVER_GAP_HOOK.lock().unwrap().take() {
+                hook();
+            }
+            // Lets the old daemon's state machine thread, which holds the daemon, exit. With
+            // its handlers taken out, stopping it answers none of the queued events.
+            stop_daemon_keep_mount(old);
+            // A panic may have left the old managers' state half-updated.
+            nydus_storage::factory::BLOB_FACTORY.forget(slug);
+            let (daemon, poll) = match self
+                .adopt_fanotify_group(&old.image_ref, slug, group.as_raw_fd(), state)
+                .await
+            {
+                Ok(adopted) => adopted,
+                Err(e) => {
+                    if let Some(controller) = old
+                        .daemon
+                        .as_any()
+                        .downcast_ref::<nydus_service::ServiceController>()
+                    {
+                        controller.reinstate_fanotify_handlers(suspended);
+                    }
+                    return Err(e);
+                }
+            };
+            drop(suspended);
+            Ok(Arc::new(DaemonInstance {
+                image_ref: old.image_ref.clone(),
+                mountpoint: old.mountpoint.clone(),
+                bootstrap: old.bootstrap.clone(),
+                daemon,
+                refcount: AtomicUsize::new(old.refcount.load(Ordering::SeqCst)),
+                holders: StdMutex::new(old.holders.lock().unwrap().clone()),
+                restored_holders: StdMutex::new(old.restored_holders.lock().unwrap().clone()),
+                failover_armed: AtomicBool::new(old.failover_armed.load(Ordering::SeqCst)),
+                built_on_node: old.built_on_node,
+                _poll: poll,
+            }))
+        }
     }
 
     fn active_fs_driver(&self) -> FsDriverType {
@@ -2680,6 +2830,16 @@ fn stage_bootstrap(src: &Path, dst: &Path) -> io::Result<()> {
     let file = fs::OpenOptions::new().write(true).open(dst)?;
     let len = file.metadata()?.len();
     file.set_len(len.next_multiple_of(host_page_size()))
+}
+
+/// Whether `staged` holds exactly what [`stage_bootstrap`] makes of `src`.
+fn is_staged_copy(src: &Path, staged: &Path) -> bool {
+    let (Ok(src), Ok(staged)) = (fs::read(src), fs::read(staged)) else {
+        return false;
+    };
+    staged.len() as u64 == (src.len() as u64).next_multiple_of(host_page_size())
+        && staged.starts_with(&src)
+        && staged[src.len()..].iter().all(|&b| b == 0)
 }
 
 fn host_page_size() -> u64 {
@@ -3537,6 +3697,12 @@ mod e2e_tests;
 mod tests {
     use super::*;
 
+    /// Run by the in-place fanotify takeover after the failed handler's workers stopped and
+    /// before the new daemon starts: the window in which reads must wait, not fail.
+    #[cfg(target_os = "linux")]
+    pub(super) static TAKEOVER_GAP_HOOK: StdMutex<Option<Box<dyn FnOnce() + Send>>> =
+        StdMutex::new(None);
+
     #[test]
     fn atomic_write_round_trip_and_overwrite() {
         let dir = tempfile::tempdir().unwrap();
@@ -3581,6 +3747,22 @@ mod tests {
         fs::copy(&dst, &src).unwrap();
         stage_bootstrap(&src, &dst).unwrap();
         assert_eq!(fs::read(&dst).unwrap(), staged);
+    }
+
+    /// A live mount's staged bootstrap is kept only when it is exactly what staging writes.
+    #[test]
+    fn is_staged_copy_matches_only_the_padded_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        let dst = dir.path().join("bootstrap");
+        fs::write(&src, vec![7u8; 5000]).unwrap();
+        assert!(!is_staged_copy(&src, &dst), "nothing staged yet");
+        stage_bootstrap(&src, &dst).unwrap();
+        assert!(is_staged_copy(&src, &dst));
+        fs::write(&src, vec![8u8; 5000]).unwrap();
+        assert!(!is_staged_copy(&src, &dst), "different content");
+        fs::write(&src, vec![7u8; 5001]).unwrap();
+        assert!(!is_staged_copy(&src, &dst), "different length");
     }
 
     #[test]
@@ -4161,13 +4343,75 @@ mod tests {
 
     /// A panic in one image's fanotify worker fails only that daemon: its reads get EIO and
     /// it reports itself unhealthy, another image keeps serving, and the reconciler's
-    /// `recover()` restarts it over the live mount. Releasing both then leaves no cache file
-    /// open. `NYDUS_E2E_ROOT` is laid out as for
+    /// `recover()` replaces it over the live mount on the same fanotify group, while a caller
+    /// still holds the failed daemon's handle and its failover state cannot be written: a read
+    /// issued while no handler serves the group waits and gets the right bytes, every file
+    /// then reads the same as through the healthy image, and the (fake) systemd fd store still
+    /// holds exactly one fd for the image, the group now serving it. Releasing both then leaves no
+    /// cache file open and nothing parked. `NYDUS_E2E_ROOT` is laid out as for
     /// `auto_accel_daemon_serves_file_data_across_restarts`.
     #[cfg(target_os = "linux")]
     #[test]
     #[ignore = "needs root, Linux >= 6.14 and an ext4 work dir; run misc/fanotify/auto-accel-restart-test.sh"]
     fn auto_accel_worker_panic_fails_only_its_daemon_until_recovered() {
+        use std::os::fd::FromRawFd;
+        use std::os::unix::net::UnixDatagram;
+        use std::sync::mpsc;
+
+        // A regression here hangs reads in the kernel, not the test's own code.
+        let done = Arc::new(AtomicBool::new(false));
+        let watchdog_done = done.clone();
+        std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(240);
+            while !watchdog_done.load(Ordering::Acquire) {
+                if Instant::now() > deadline {
+                    eprintln!("worker-panic recovery test hung for 240s");
+                    std::process::exit(101);
+                }
+                std::thread::sleep(Duration::from_millis(200));
+            }
+        });
+
+        // Stand in for systemd's fd store: keep every FDSTORE fd by name until FDSTOREREMOVE.
+        let notify_dir = tempfile::tempdir().unwrap();
+        let notify_path = notify_dir.path().join("notify");
+        let notify = UnixDatagram::bind(&notify_path).unwrap();
+        notify
+            .set_read_timeout(Some(Duration::from_millis(100)))
+            .unwrap();
+        let store: Arc<StdMutex<HashMap<String, Vec<std::os::fd::OwnedFd>>>> = Arc::default();
+        let store_writer = store.clone();
+        let store_done = done.clone();
+        std::thread::spawn(move || {
+            while !store_done.load(Ordering::Acquire) {
+                let mut buf = [0u8; 256];
+                let mut fds = [-1; 1];
+                let Ok((len, nfds)) = sendfd::RecvWithFd::recv_with_fd(&notify, &mut buf, &mut fds)
+                else {
+                    continue;
+                };
+                let msg = String::from_utf8_lossy(&buf[..len]).into_owned();
+                let name = msg
+                    .lines()
+                    .find_map(|l| l.strip_prefix("FDNAME="))
+                    .unwrap_or_default()
+                    .to_string();
+                let mut store = store_writer.lock().unwrap();
+                if msg.contains("FDSTOREREMOVE=1") {
+                    store.remove(&name);
+                } else if msg.contains("FDSTORE=1") && nfds == 1 {
+                    let fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(fds[0]) };
+                    store.entry(name).or_default().push(fd);
+                }
+            }
+        });
+        // SAFETY: this ignored test runs alone (`--exact`), so nothing reads the environment
+        // concurrently.
+        unsafe { std::env::set_var("NOTIFY_SOCKET", &notify_path) };
+        // Messages are datagrams on one socket, so a later one cannot overtake an earlier one;
+        // this waits for the receiver to have handled everything sent so far.
+        let settle = || std::thread::sleep(Duration::from_millis(300));
+
         let root = PathBuf::from(std::env::var("NYDUS_E2E_ROOT").expect("NYDUS_E2E_ROOT unset"));
         // Recovery restarts an auto-accel daemon from the production layout only:
         // `<id>/stage/bootstrap` beside `<id>/backend`.
@@ -4190,6 +4434,13 @@ mod tests {
                 )
                 .unwrap()
         });
+        let broken_slug = slug_for(refs[0]);
+        settle();
+        assert_eq!(
+            store.lock().unwrap().get(&broken_slug).map(Vec::len),
+            Some(1),
+            "the broken image's group was not parked"
+        );
 
         nydus_service::fanotify::inject_panic_on_next_event(broken.mountpoint());
         let (total, failed) = read_every_file(broken.mountpoint());
@@ -4204,20 +4455,117 @@ mod tests {
             failed.is_empty(),
             "the other image stopped serving: {failed:#?}"
         );
-
-        // The failed daemon's fanotify group, with its marks, lives as long as the daemon
-        // does (the upgrade manager keeps a copy of the fd for failover), and nothing answers
-        // its events once its workers are stopped. Recovery arms the replacement first and
-        // drops the old daemon after; a caller still holding the old handle would keep every
-        // read of the mount blocked.
         let mountpoints = [&broken, &healthy].map(|h| h.mountpoint().to_path_buf());
-        drop((broken, healthy));
+        drop(healthy);
+        // The failed daemon's handle stays held across the recovery, as a caller's could be,
+        // so the old daemon outlives it. And its failover state can no longer be written:
+        // nothing may need it, and the fd store must not be left holding the old group.
+        let state_path = daemons.join(&broken_slug).join("upgrade.state");
+        fs::remove_file(&state_path).unwrap();
+        fs::create_dir(&state_path).unwrap();
+
+        // Every file's bytes as the healthy image serves them; the broken image denied its
+        // reads, so none of its data has been fetched.
+        let mut expected = Vec::new();
+        let mut stack = vec![PathBuf::new()];
+        while let Some(rel) = stack.pop() {
+            for entry in fs::read_dir(mountpoints[1].join(&rel)).unwrap() {
+                let entry = entry.unwrap();
+                let rel = rel.join(entry.file_name());
+                let ft = entry.file_type().unwrap();
+                if ft.is_dir() {
+                    stack.push(rel);
+                } else if ft.is_file() {
+                    let bytes = fs::read(entry.path()).unwrap();
+                    expected.push((rel, bytes));
+                }
+            }
+        }
+        expected.sort_by_key(|(_, bytes)| std::cmp::Reverse(bytes.len()));
+        assert!(
+            expected[0].1.iter().any(|&b| b != 0),
+            "the largest file is all zeros, so zeros could not be told from data"
+        );
+
+        // Read the largest file while the takeover has no handler serving the group.
+        let (gap_tx, gap_rx) = mpsc::channel();
+        let gap_file = mountpoints[0].join(&expected[0].0);
+        // Whether the reader was still waiting when the takeover went on; checked after the
+        // takeover, so a failed check cannot leave the group unserved.
+        let gap_waited = Arc::new(AtomicBool::new(false));
+        let gap_waited_by_hook = gap_waited.clone();
+        *TAKEOVER_GAP_HOOK.lock().unwrap() = Some(Box::new(move || {
+            let reader = std::thread::spawn(move || {
+                let _ = gap_tx.send(fs::read(&gap_file));
+            });
+            std::thread::sleep(Duration::from_millis(500));
+            gap_waited_by_hook.store(!reader.is_finished(), Ordering::Release);
+        }));
         let report = runtime.block_on(supervisor.recover()).unwrap();
         assert_eq!(report.restarted, 1, "{report:?}");
         assert_eq!(report.outcomes[0].image_ref, refs[0]);
-        let (total, failed) = read_every_file(&mountpoints[0]);
-        assert!(total > 0);
-        assert!(failed.is_empty(), "not served after recovery: {failed:#?}");
+        assert!(
+            gap_waited.load(Ordering::Acquire),
+            "the read issued during the takeover did not wait for the new handler"
+        );
+        assert!(
+            TAKEOVER_GAP_HOOK.lock().unwrap().is_none(),
+            "recovery did not take over the group"
+        );
+        let gap_read = gap_rx
+            .recv_timeout(Duration::from_secs(60))
+            .expect("the read issued during the takeover never completed");
+        assert!(
+            gap_read.as_ref().ok() == Some(&expected[0].1),
+            "the read issued during the takeover did not return the file's bytes: {}",
+            match &gap_read {
+                Ok(bytes) if bytes.iter().all(|&b| b == 0) => "all zeros".to_string(),
+                Ok(_) => "wrong bytes".to_string(),
+                Err(e) => e.to_string(),
+            }
+        );
+        drop(broken);
+        fs::remove_dir(&state_path).unwrap();
+        for (rel, bytes) in &expected {
+            let got = fs::read(mountpoints[0].join(rel))
+                .unwrap_or_else(|e| panic!("{} after recovery: {e}", rel.display()));
+            assert!(
+                &got == bytes,
+                "{} reads differently after recovery",
+                rel.display()
+            );
+        }
+
+        settle();
+        {
+            let store = store.lock().unwrap();
+            let parked = store
+                .get(&broken_slug)
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            assert_eq!(parked.len(), 1, "fd store entries for the broken image");
+            let instances = runtime.block_on(supervisor.instances.read());
+            let controller = instances[refs[0]]
+                .daemon
+                .as_any()
+                .downcast_ref::<nydus_service::ServiceController>()
+                .unwrap();
+            let groups = controller.collect_fanotify_upgrade_state().unwrap();
+            assert_eq!(groups.len(), 1);
+            const KCMP_FILE: libc::c_long = 0;
+            let pid = std::process::id() as libc::c_long;
+            let same = unsafe {
+                libc::syscall(
+                    libc::SYS_kcmp,
+                    pid,
+                    pid,
+                    KCMP_FILE,
+                    parked[0].as_raw_fd() as libc::c_long,
+                    groups[0].4.as_raw_fd() as libc::c_long,
+                )
+            };
+            assert_eq!(same, 0, "the parked fd is not the group serving the mount");
+        }
 
         for (image_ref, mountpoint) in refs.iter().zip(&mountpoints) {
             runtime
@@ -4228,6 +4576,11 @@ mod tests {
                 "{image_ref}: mount outlived its daemon"
             );
         }
+        settle();
+        assert!(
+            store.lock().unwrap().is_empty(),
+            "released daemons left fds parked"
+        );
         let open: Vec<PathBuf> = fs::read_dir("/proc/self/fd")
             .unwrap()
             .filter_map(|fd| fs::read_link(fd.unwrap().path()).ok())
@@ -4237,6 +4590,9 @@ mod tests {
             open.is_empty(),
             "released daemons left cache files open: {open:#?}"
         );
+        done.store(true, Ordering::Release);
+        // SAFETY: as above.
+        unsafe { std::env::remove_var("NOTIFY_SOCKET") };
     }
 
     /// A registration that fails after its workers started must stop them, or every supervisor
