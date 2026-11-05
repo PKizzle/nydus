@@ -1456,7 +1456,7 @@ impl BlobBackend for Registry {
 
 impl Drop for Registry {
     fn drop(&mut self) {
-        self.metrics.release().unwrap_or_else(|e| error!("{:?}", e));
+        self.metrics.release();
     }
 }
 

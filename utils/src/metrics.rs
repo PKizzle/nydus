@@ -443,6 +443,17 @@ impl<'a> FopRecorder<'a> {
     }
 }
 
+/// Remove `id` from `map` only if it still points at `owner`.
+fn release_owned<T>(map: &RwLock<HashMap<String, Arc<T>>>, id: &str, owner: &T) {
+    let mut map = map.write().unwrap();
+    if map
+        .get(id)
+        .is_some_and(|v| std::ptr::eq(Arc::as_ptr(v), owner))
+    {
+        map.remove(id);
+    }
+}
+
 /// Export file metrics of a filesystem.
 pub fn export_files_stats(
     name: &Option<String>,
@@ -640,13 +651,11 @@ impl BackendMetrics {
     }
 
     /// Release a [`BackendMetrics`] object for a storage backend.
-    pub fn release(&self) -> IoStatsResult<()> {
-        BACKEND_METRICS
-            .write()
-            .unwrap()
-            .remove(&self.id)
-            .map(|_| ())
-            .ok_or(MetricsError::NoCounter)
+    ///
+    /// Backend ids are not unique (every RAFS instance mounted at the same path shares one), so a
+    /// newer backend may have replaced this entry; only the registered owner removes it.
+    pub fn release(&self) {
+        release_owned(&BACKEND_METRICS, &self.id, self);
     }
 
     /// Mark starting of an IO operations.
@@ -768,14 +777,10 @@ impl BlobcacheMetrics {
         metrics
     }
 
-    /// Release a [`BlobcacheMetrics`] object for a blob cache manager.
-    pub fn release(&self) -> IoStatsResult<()> {
-        BLOBCACHE_METRICS
-            .write()
-            .unwrap()
-            .remove(&self.id)
-            .map(|_| ())
-            .ok_or(MetricsError::NoCounter)
+    /// Release a [`BlobcacheMetrics`] object for a blob cache manager; see
+    /// [`BackendMetrics::release`] for why only the registered owner removes the entry.
+    pub fn release(&self) {
+        release_owned(&BLOBCACHE_METRICS, &self.id, self);
     }
 
     /// Export blobcache metric information.
@@ -1041,7 +1046,7 @@ mod tests {
             assert_eq!(metrics.len(), 1);
         }
         assert!(m1.export_metrics().is_ok());
-        assert!(m1.release().is_ok());
+        m1.release();
         {
             let metrics = BLOBCACHE_METRICS.read().unwrap();
             assert_eq!(metrics.len(), 0);
@@ -1092,8 +1097,22 @@ mod tests {
         assert!(export_backend_metrics(&id0).is_ok());
         assert!(export_backend_metrics(&id1).is_ok());
         assert!(export_backend_metrics(&none).is_err());
-        assert!(b0.release().is_ok());
-        assert!(b1.release().is_ok());
+        b0.release();
+        b1.release();
+    }
+
+    #[test]
+    fn test_backend_metric_release_keeps_newer_owner() {
+        let _guard = BACKEND_METRICS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let id: Option<String> = Some("shared-id".to_string());
+        let old = BackendMetrics::new("shared-id", "t0");
+        let new = BackendMetrics::new("shared-id", "t1");
+        old.release();
+        assert!(export_backend_metrics(&id).is_ok());
+        new.release();
+        assert!(export_backend_metrics(&id).is_err());
     }
 
     #[test]
@@ -1174,6 +1193,6 @@ mod tests {
         backend.end(&begin2, 0, true);
         assert_eq!(backend.read_count.count(), 2);
         assert_eq!(backend.read_errors.count(), 1);
-        assert!(backend.release().is_ok());
+        backend.release();
     }
 }
