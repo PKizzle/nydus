@@ -34,14 +34,6 @@ const RATE_LIMITED_LOG_TIME: u8 = 2;
 static CONNECTION_ID: AtomicU64 = AtomicU64::new(0);
 
 thread_local! {
-    /// Per-thread compio runtime to drive cyper's async HTTP on the synchronous
-    /// backend read path. `Connection::call` is always invoked from a blocking
-    /// pool thread (cache prefetch via `blocking::unblock`, on-demand reads via
-    /// compio `spawn_blocking`), so this thread-local `block_on` never nests
-    /// inside another compio runtime.
-    static HTTP_RUNTIME: compio::runtime::Runtime =
-        compio::runtime::Runtime::new().expect("storage: failed to create compio HTTP runtime");
-
     /// Per-thread cyper clients, keyed by `(connection id, is_proxy)`. cyper's
     /// `Client` is `!Send` (thread-per-core, `Rc`-based), so it cannot live in
     /// the `Arc`-shared `Connection`. Each worker/blocking thread instead builds
@@ -49,12 +41,17 @@ thread_local! {
     static HTTP_CLIENTS: RefCell<HashMap<(u64, bool), Client>> = RefCell::new(HashMap::new());
 }
 
-/// Drive a cyper future to completion on the thread-local HTTP runtime.
+/// Drive a cyper future to completion on the thread's compio runtime
+/// ([`crate::compio_rt`]).
 ///
-/// Also reused by the http-proxy backend so all backends share one compio HTTP
-/// runtime per thread.
-pub(crate) fn block_on_http<F: std::future::Future>(fut: F) -> F::Output {
-    HTTP_RUNTIME.with(|rt| rt.block_on(fut))
+/// `Connection::call` is always invoked from a blocking pool thread (cache
+/// prefetch via `blocking::unblock`, on-demand reads via compio
+/// `spawn_blocking`), so this `block_on` never nests inside another compio
+/// runtime. Also used by the http-proxy backend.
+pub(crate) fn block_on_http<T>(
+    fut: impl std::future::Future<Output = ConnectionResult<T>>,
+) -> ConnectionResult<T> {
+    crate::compio_rt::block_on(fut)?
 }
 
 thread_local! {
@@ -82,6 +79,9 @@ pub enum ConnectionError {
     /// The TLS trust store or client configuration could not be built.
     #[error("TLS configuration error, {0}")]
     Tls(String),
+    /// The calling thread could not create the compio runtime that drives the request.
+    #[error("{0}")]
+    Runtime(#[from] crate::compio_rt::RuntimeUnavailable),
 }
 
 /// Specialized `Result` for network communication.
@@ -552,6 +552,10 @@ impl Connection {
                                 }
                                 last_success = success;
                                 proxy.health.set(success);
+                            }
+                            // A local runtime failure (EMFILE) says nothing about the proxy.
+                            Err(ConnectionError::Runtime(e)) => {
+                                warn!("Skipped proxy health check, {}", e);
                             }
                             Err(e) => {
                                 if last_success {

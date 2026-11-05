@@ -44,6 +44,7 @@ extern crate bitflags;
 
 pub mod backend;
 pub mod cache;
+pub mod compio_rt;
 pub mod device;
 pub mod factory;
 pub mod meta;

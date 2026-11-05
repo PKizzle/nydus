@@ -46,10 +46,10 @@
 //! Threading: cyper's `Client` is `!Send + !Sync` (Rc-based, targets the
 //! compio current_thread runtime), but the snapshotter trait requires
 //! `Send` futures. All HTTP therefore runs inside `blocking::unblock`
-//! on a thread-local compio runtime ([`block_on_http`]) — the same
-//! pattern `storage/src/backend/connection.rs` uses for the registry
-//! backend. Only `Send + Sync` state (rustls config, endpoint strings,
-//! cooldown map) is held across await points.
+//! on the thread-local compio runtime from `nydus_storage::compio_rt`
+//! ([`block_on_http`]), shared with the storage backends. Only `Send + Sync`
+//! state (rustls config, endpoint strings, cooldown map) is held across
+//! await points.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -139,13 +139,6 @@ enum StatusOutcome {
 }
 
 thread_local! {
-    /// Per-thread compio runtime used by [`block_on_http`] to drive cyper
-    /// from inside `blocking::unblock`. cyper's HTTPS plumbing needs
-    /// `Runtime::current()` at client-build time and a `block_on` to run
-    /// requests, so each blocking thread gets its own.
-    static HTTP_RUNTIME: compio::runtime::Runtime = compio::runtime::Runtime::new()
-        .expect("peer mirror: failed to create compio HTTP runtime");
-
     /// Per-thread cyper client cache, keyed by [`ClientKey`]. A fresh
     /// `cyper::Client` builds a rustls TLS config *and* a connection
     /// pool; a multi-blob sidecar pull calls [`PeerMirror::fetch`]
@@ -166,8 +159,16 @@ thread_local! {
     static CLIENT_BUILD_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-fn block_on_http<F: std::future::Future>(fut: F) -> F::Output {
-    HTTP_RUNTIME.with(|rt| rt.block_on(fut))
+/// Drive `fut` on this blocking thread's compio runtime. A thread that cannot
+/// create one (e.g. `EMFILE`) fails this fetch with a transport-level
+/// `RegistryError`, which callers treat as a peer miss.
+fn block_on_http(fut: impl std::future::Future<Output = FetchResult>) -> FetchResult {
+    nydus_storage::compio_rt::block_on(fut).unwrap_or_else(|e| {
+        FetchResult::Outcome(PullOutcome::RegistryError {
+            status: 0,
+            body: e.to_string(),
+        })
+    })
 }
 
 /// Identity key for the per-thread [`HTTP_CLIENT`] cache: which rustls
@@ -1362,7 +1363,7 @@ mod tests {
     /// perf bug this cache fixes.
     #[test]
     fn cached_client_reused_for_same_tls_key() {
-        block_on_http(async {
+        nydus_storage::compio_rt::block_on(async {
             CLIENT_BUILD_COUNT.with(|c| c.set(0));
             let tls = dummy_tls_config();
             for _ in 0..5 {
@@ -1373,20 +1374,22 @@ mod tests {
                 1,
                 "client should only be built once for a stable TLS identity"
             );
-        });
+        })
+        .unwrap();
     }
 
     /// A `None` (plain-HTTP) key is likewise cached and distinct from
     /// any TLS-backed client.
     #[test]
     fn cached_client_reused_for_plain_http() {
-        block_on_http(async {
+        nydus_storage::compio_rt::block_on(async {
             CLIENT_BUILD_COUNT.with(|c| c.set(0));
             for _ in 0..3 {
                 cached_client(None).expect("build cached plain client");
             }
             assert_eq!(CLIENT_BUILD_COUNT.with(|c| c.get()), 1);
-        });
+        })
+        .unwrap();
     }
 
     /// A change in TLS config identity (e.g. a test/caller building a
@@ -1395,7 +1398,7 @@ mod tests {
     /// silently reusing a client built for a different config.
     #[test]
     fn cached_client_rebuilds_when_tls_key_changes() {
-        block_on_http(async {
+        nydus_storage::compio_rt::block_on(async {
             CLIENT_BUILD_COUNT.with(|c| c.set(0));
             let tls_a = dummy_tls_config();
             let tls_b = dummy_tls_config();
@@ -1407,7 +1410,8 @@ mod tests {
                 2,
                 "distinct TLS identities must each build exactly one client"
             );
-        });
+        })
+        .unwrap();
     }
 
     // ---- build_tls_config: PEM identity loading ----

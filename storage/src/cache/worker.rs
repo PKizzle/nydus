@@ -18,15 +18,6 @@ use nydus_utils::mpmc::Channel;
 
 use crate::cache::{BlobCache, BlobIoRange};
 
-thread_local! {
-    /// Per-worker-thread compio runtime. compio is thread-per-core (its
-    /// `Runtime` is `!Send`), so each prefetch worker thread owns its own
-    /// runtime and drives its event loop with `block_on`. This replaces the
-    /// shared tokio runtime (`with_runtime` + `ASYNC_RUNTIME`).
-    static WORKER_RUNTIME: compio::runtime::Runtime =
-        compio::runtime::Runtime::new().expect("storage: failed to create compio worker runtime");
-}
-
 /// Prefetch bandwidth limiter: a governor token bucket (byte-cells) plus its
 /// burst capacity. governor rejects `until_n_ready(n)` when `n` exceeds the
 /// burst, so callers clamp the requested amount to `burst`.
@@ -224,9 +215,24 @@ impl AsyncWorkerMgr {
                         .prefetch_workers
                         .fetch_add(1, Ordering::Relaxed);
 
-                    WORKER_RUNTIME.with(|rt| {
-                        rt.block_on(Self::handle_prefetch_requests(mgr2.clone()));
-                    });
+                    // Runtime creation can fail transiently (EMFILE); keep retrying until
+                    // the manager stops so queued prefetch requests are still drained.
+                    let mut logged = false;
+                    while let Err(e) =
+                        crate::compio_rt::block_on(Self::handle_prefetch_requests(mgr2.clone()))
+                    {
+                        if mgr2.prefetch_channel.is_closed() {
+                            break;
+                        }
+                        if !logged {
+                            error!(
+                                "storage: prefetch worker thread {} waiting for a runtime, {:?}",
+                                num, e
+                            );
+                            logged = true;
+                        }
+                        thread::sleep(Duration::from_secs(1));
+                    }
 
                     mgr2.metrics
                         .prefetch_workers

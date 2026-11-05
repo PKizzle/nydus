@@ -141,21 +141,13 @@ struct OciDescriptor {
 
 static REFERRER_CACHE: OnceLock<Mutex<ReferrerCache>> = OnceLock::new();
 
-thread_local! {
-    /// Per-thread compio runtime used by [`detect_referrer_blocking`] to drive
-    /// cyper from inside `blocking::unblock`. cyper's `Client` is `!Send`
-    /// (Rc-based, targets the compio current-thread runtime) and its HTTPS
-    /// plumbing needs `Runtime::current()` at build time plus a `block_on` to
-    /// run requests — the same threading model `peer_mirror.rs` uses.
-    static REFERRER_HTTP_RUNTIME: compio::runtime::Runtime = compio::runtime::Runtime::new()
-        .expect("referrer: failed to create compio HTTP runtime");
-}
-
 /// Run referrer detection off the caller's (gRPC) runtime.
 ///
 /// cyper's `Client` is `!Send`, but the snapshotter trait requires `Send`
 /// futures, so all referrer HTTP runs inside `blocking::unblock` on a
-/// thread-local compio runtime (mirroring `peer_mirror.rs`). Only `Send`
+/// thread-local compio runtime (`nydus_storage::compio_rt`). If that thread
+/// cannot create a runtime (e.g. `EMFILE`), the error is returned uncached and
+/// the caller falls back to overlay for this Prepare. Only `Send`
 /// state (the owned `image_ref` + cloned `config`) crosses the boundary; the
 /// returned [`ReferrerInfo`] is owned and `Send`. Detection results are cached
 /// in the module-global LRU (both Nydus hits and StandardOci), so a given image
@@ -167,8 +159,7 @@ pub async fn detect_referrer_blocking(
     let image_ref = image_ref.to_string();
     let config = config.clone();
     blocking::unblock(move || {
-        REFERRER_HTTP_RUNTIME
-            .with(|rt| rt.block_on(detect_referrer_with_config(&image_ref, &config)))
+        nydus_storage::compio_rt::block_on(detect_referrer_with_config(&image_ref, &config))?
     })
     .await
 }
@@ -262,7 +253,7 @@ fn client_options_from_config(
 /// The returned [`RegistryClient`] is `!Send` (cyper/compio) and its TLS
 /// plumbing needs `Runtime::current()` at build time, so this must run on a
 /// thread that owns a compio runtime — in production, inside the
-/// `REFERRER_HTTP_RUNTIME.block_on` of the `*_blocking` wrappers.
+/// `nydus_storage::compio_rt::block_on` of the `*_blocking` wrappers.
 fn build_registry_client(image: &ImageRef, config: &SnapshotterConfig) -> Result<RegistryClient> {
     let auth = resolve_auth(config, image);
     RegistryClient::new(&image.api_host, client_options_from_config(config, auth))
@@ -743,8 +734,7 @@ pub fn materialize_bootstrap_blocking(
     config: &SnapshotterConfig,
     cache_dir: &Path,
 ) -> Result<PathBuf> {
-    REFERRER_HTTP_RUNTIME
-        .with(|rt| rt.block_on(materialize_bootstrap(image_ref, info, config, cache_dir)))
+    nydus_storage::compio_rt::block_on(materialize_bootstrap(image_ref, info, config, cache_dir))?
 }
 
 /// The referrers-API fallback tag for a subject digest: `sha256:<hex>`
