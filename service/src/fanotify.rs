@@ -1132,6 +1132,11 @@ impl FanotifyHandler {
         }
     }
 
+    /// Undo [`stop_workers`](Self::stop_workers), so newly spawned workers run again.
+    pub(crate) fn reactivate(&self) {
+        self.active.store(true, Ordering::Release);
+    }
+
     /// Keep the worker threads running [`run_loop`](Self::run_loop), for `stop_workers` to join.
     pub(crate) fn add_workers(
         &self,
@@ -1300,6 +1305,9 @@ impl FanotifyHandler {
     fn run_loop_inner(&self) -> Result<()> {
         let mut events = Events::with_capacity(MAX_EVENTS_PER_POLL);
         let mut buf = vec![0u8; EVENT_BUF_SIZE];
+        // The registration is edge-triggered, and events queued while no worker ran (before a
+        // takeover, or while suspended) may have had their edge consumed already.
+        self.drain_events(&mut buf)?;
 
         loop {
             // Only a panic inside `Poll::poll` itself can poison this lock; the poller holds no

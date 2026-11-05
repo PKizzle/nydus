@@ -596,7 +596,8 @@ impl DaemonSupervisor {
     /// unhealthy one before the caller starts a replacement. Mirrors
     /// `spawn_instance`. An unhealthy fanotify daemon of the same bootstrap is
     /// healed in place instead (see `heal_fanotify_in_place`), so the caller
-    /// finds a healthy instance to reuse.
+    /// finds a healthy instance to reuse; if that fails, it stays and this
+    /// fails, since a second daemon must not be started over its mount.
     async fn evict_replaceable_instance(&self, image_ref: &str, bootstrap: &Path) -> Result<()> {
         let mut instances = self.instances.write().await;
         if let Some(inst) = instances.get(image_ref) {
@@ -613,20 +614,22 @@ impl DaemonSupervisor {
                 && mount_fstype_at(&inst.mountpoint).as_deref() == Some("erofs")
                 && let Some(old) = instances.remove(image_ref)
             {
+                // The caller's per-image start lock keeps this image's other starts out; other
+                // images need not wait for the heal.
+                drop(instances);
                 warn!(image_ref, "healing unhealthy fanotify daemon in place");
-                match self.heal_fanotify_in_place(&old).await {
+                let healed = self.heal_fanotify_in_place(&old).await;
+                let mut instances = self.instances.write().await;
+                return match healed {
                     Ok(healed) => {
                         instances.insert(image_ref.to_string(), healed);
+                        Ok(())
                     }
                     Err(e) => {
-                        warn!(
-                            image_ref,
-                            error = format!("{e:#}"),
-                            "failed to heal fanotify daemon; starting a fresh one"
-                        );
+                        instances.insert(image_ref.to_string(), old);
+                        Err(e.context(format!("failed to heal the fanotify daemon of {image_ref}")))
                     }
-                }
-                return Ok(());
+                };
             }
             if let Some(old) = instances.remove(image_ref) {
                 warn!(image_ref, "replacing unhealthy daemon");
@@ -921,7 +924,7 @@ impl DaemonSupervisor {
             holders: StdMutex::new(HashSet::new()),
             restored_holders: StdMutex::new(HashSet::new()),
             failover_armed: AtomicBool::new(armed),
-            built_on_node: built_on_node,
+            built_on_node,
             _poll: poll,
         }))
     }
@@ -1398,7 +1401,8 @@ impl DaemonSupervisor {
             //   layers) so the restart mounts fresh.
             let fstype = mount_fstype_at(&old.mountpoint);
             let is_erofs = fstype.as_deref() == Some("erofs");
-            let started = if is_erofs && Self::accel_backend_for(&bootstrap).is_some() {
+            let heal = is_erofs && Self::accel_backend_for(&bootstrap).is_some();
+            let started = if heal {
                 self.heal_fanotify_in_place(&old).await
             } else {
                 if is_erofs {
@@ -1450,10 +1454,15 @@ impl DaemonSupervisor {
                     });
                 }
                 Err(e) => {
+                    // A failed heal leaves the old daemon serving its group,
+                    // denying reads, for the next pass to try again.
+                    if heal {
+                        instances.insert(image_ref.clone(), old.clone());
+                    }
                     // Terminal for this pass: never leave a daemonless kernel
                     // mount serving unmarked sparse data — detach so consumers
                     // fail loudly and kubelet remounts via a fresh Prepare.
-                    if is_erofs && is_mounted_at(&old.mountpoint) {
+                    if is_erofs && !heal && is_mounted_at(&old.mountpoint) {
                         match detach_mount_stack(&old.mountpoint) {
                             Ok(layers) => {
                                 info!(image_ref, layers, "detached mount after failed recovery")
@@ -2360,7 +2369,7 @@ impl DaemonSupervisor {
         let state = fs::read(&state_path)
             .with_context(|| format!("read failover state {}", state_path.display()))?;
         let (daemon, poll) = self
-            .adopt_fanotify_group(image_ref_str, slug, fan_fd, state)
+            .adopt_fanotify_group(image_ref_str, slug, fan_fd, state, |_| ())
             .await?;
 
         let (refcount, holders) = restored_holder_state(record);
@@ -2400,6 +2409,7 @@ impl DaemonSupervisor {
         slug: &str,
         fan_fd: std::os::fd::RawFd,
         state: Vec<u8>,
+        on_error: impl FnOnce(&Arc<dyn NydusDaemon>),
     ) -> Result<(Arc<dyn NydusDaemon>, Arc<Mutex<Poll>>)> {
         let bti = self.build_info.clone();
         let poll = Poll::new().context("failed to create mio Poll for daemon waker")?;
@@ -2431,24 +2441,35 @@ impl DaemonSupervisor {
         // Replay (fd, state) into the daemon's restore() over the supervisor
         // socket, then start it serving on the existing kernel mount.
         let daemon_for_takeover = daemon.clone();
-        blocking::unblock(move || {
-            crate::failover::serve_on_restore(&supervisor_sock, fan_fd, state, || {
-                daemon_for_takeover
-                    .trigger_takeover()
-                    .map_err(|e| anyhow::anyhow!("trigger_takeover: {e}"))
+        let started = async {
+            blocking::unblock(move || {
+                crate::failover::serve_on_restore(&supervisor_sock, fan_fd, state, || {
+                    daemon_for_takeover
+                        .trigger_takeover()
+                        .map_err(|e| anyhow::anyhow!("trigger_takeover: {e}"))
+                })
             })
-        })
-        .await
-        .context("replay preserved fanotify fd into daemon")?;
-
-        daemon
-            .trigger_start()
-            .map_err(|e| anyhow::anyhow!("trigger_start: {e}"))?;
-        wait_for_running_off_reactor(daemon.clone(), self.startup_timeout)
             .await
-            .with_context(|| {
-                format!("restored fanotify daemon for {image_ref_str} never reached RUNNING")
-            })?;
+            .context("replay preserved fanotify fd into daemon")?;
+            daemon
+                .trigger_start()
+                .map_err(|e| anyhow::anyhow!("trigger_start: {e}"))?;
+            wait_for_running_off_reactor(daemon.clone(), self.startup_timeout)
+                .await
+                .with_context(|| {
+                    format!("restored fanotify daemon for {image_ref_str} never reached RUNNING")
+                })?;
+            #[cfg(all(test, target_os = "linux"))]
+            if tests::FAIL_NEXT_ADOPTION.swap(false, Ordering::AcqRel) {
+                bail!("injected adoption failure");
+            }
+            Ok(())
+        }
+        .await;
+        if let Err(e) = started {
+            on_error(&daemon);
+            return Err(e);
+        }
         Ok((daemon, poll))
     }
 
@@ -2465,52 +2486,30 @@ impl DaemonSupervisor {
     /// Nothing of the failed daemon's state is reused: the new daemon rebuilds its blob cache
     /// managers from the saved blob entries and reopens the cache files without events.
     ///
-    /// On failure the mount is torn down for good (unmounted before the group closes) and its
-    /// failover state cleared, so no daemonless mount is left serving zeros.
+    /// On failure `old` is left as it was: its failed handlers serve the group again, denying
+    /// every read with EIO, and the caller keeps it for a later attempt.
     async fn heal_fanotify_in_place(
         &self,
         old: &Arc<DaemonInstance>,
     ) -> Result<Arc<DaemonInstance>> {
-        let slug = slug_for(&old.image_ref);
-        let healed = self.take_over_fanotify_group(old, &slug).await;
-        if healed.is_err() {
-            let stopping = old.clone();
-            if let Err(e) = blocking::unblock(move || stop_unreferenced_instance(&stopping)).await {
-                warn!(image_ref = %old.image_ref, error = %e, "failed to stop daemon after a failed takeover");
-            }
-            if is_mounted_at(&old.mountpoint)
-                && let Err(e) = detach_mount_stack(&old.mountpoint)
-            {
-                warn!(image_ref = %old.image_ref, error = %e, "failed to detach mount after a failed takeover");
-            }
-            self.clear_failover_state(&slug);
-            if let Err(e) = self.persist_instance_record(old, false).await {
-                warn!(image_ref = %old.image_ref, error = %e, "failed to persist stopped daemon record");
-            }
-        }
-        healed
-    }
-
-    async fn take_over_fanotify_group(
-        &self,
-        old: &Arc<DaemonInstance>,
-        slug: &str,
-    ) -> Result<Arc<DaemonInstance>> {
         #[cfg(not(target_os = "linux"))]
-        bail!(
-            "fanotify is Linux-only; cannot take over {} ({slug})",
-            old.image_ref
-        );
+        bail!("fanotify is Linux-only; cannot heal {}", old.image_ref);
 
         #[cfg(target_os = "linux")]
         {
-            let daemon = old.daemon.clone();
-            let sock = supervisor_sock_path(slug);
-            let (group, state, suspended) = blocking::unblock(move || {
-                let controller = daemon
+            use nydus_service::ServiceController;
+            fn controller(daemon: &Arc<dyn NydusDaemon>) -> Result<&ServiceController> {
+                daemon
                     .as_any()
-                    .downcast_ref::<nydus_service::ServiceController>()
-                    .context("not a fanotify daemon")?;
+                    .downcast_ref::<ServiceController>()
+                    .context("not a fanotify daemon")
+            }
+
+            let slug = slug_for(&old.image_ref);
+            let daemon = old.daemon.clone();
+            let sock = supervisor_sock_path(&slug);
+            let (group, state, suspended) = blocking::unblock(move || {
+                let controller = controller(&daemon)?;
                 // A dup of the group and the state rebuilding its handler, taken before
                 // the workers stop.
                 let (group, state) = crate::failover::capture_on_save(&sock, || {
@@ -2525,28 +2524,29 @@ impl DaemonSupervisor {
             if let Some(hook) = tests::TAKEOVER_GAP_HOOK.lock().unwrap().take() {
                 hook();
             }
-            // Lets the old daemon's state machine thread, which holds the daemon, exit. With
-            // its handlers taken out, stopping it answers none of the queued events.
-            stop_daemon_keep_mount(old);
             // A panic may have left the old managers' state half-updated.
-            nydus_storage::factory::BLOB_FACTORY.forget(slug);
-            let (daemon, poll) = match self
-                .adopt_fanotify_group(&old.image_ref, slug, group.as_raw_fd(), state)
-                .await
-            {
+            nydus_storage::factory::BLOB_FACTORY.forget(&slug);
+            let adopted = self
+                .adopt_fanotify_group(&old.image_ref, &slug, group.as_raw_fd(), state, |new| {
+                    // Its workers stop without answering; the old ones take the queue back.
+                    if let Ok(controller) = controller(new) {
+                        drop(controller.suspend_fanotify_handlers());
+                    }
+                    let _ = new.trigger_stop();
+                    let _ = new.wait();
+                })
+                .await;
+            let (daemon, poll) = match adopted {
                 Ok(adopted) => adopted,
                 Err(e) => {
-                    if let Some(controller) = old
-                        .daemon
-                        .as_any()
-                        .downcast_ref::<nydus_service::ServiceController>()
-                    {
-                        controller.reinstate_fanotify_handlers(suspended);
-                    }
+                    controller(&old.daemon)?.resume_fanotify_handlers(suspended);
                     return Err(e);
                 }
             };
             drop(suspended);
+            // Lets the old daemon's state machine thread, which holds the daemon, exit. With
+            // its handlers taken out, stopping it answers none of the queued events.
+            stop_daemon_keep_mount(old);
             Ok(Arc::new(DaemonInstance {
                 image_ref: old.image_ref.clone(),
                 mountpoint: old.mountpoint.clone(),
@@ -3699,6 +3699,10 @@ mod tests {
 
     /// Run by the in-place fanotify takeover after the failed handler's workers stopped and
     /// before the new daemon starts: the window in which reads must wait, not fail.
+    /// Makes the next fanotify group adoption fail once its daemon is already serving.
+    #[cfg(target_os = "linux")]
+    pub(super) static FAIL_NEXT_ADOPTION: AtomicBool = AtomicBool::new(false);
+
     #[cfg(target_os = "linux")]
     pub(super) static TAKEOVER_GAP_HOOK: StdMutex<Option<Box<dyn FnOnce() + Send>>> =
         StdMutex::new(None);
@@ -4486,6 +4490,35 @@ mod tests {
             expected[0].1.iter().any(|&b| b != 0),
             "the largest file is all zeros, so zeros could not be told from data"
         );
+
+        // A takeover that fails after the new daemon started serving leaves the old daemon in
+        // place: its failed handlers serve the group again and deny, so a read fails (or, had
+        // the new daemon filled it, succeeds) instead of hanging or reading zeros.
+        FAIL_NEXT_ADOPTION.store(true, Ordering::Release);
+        let report = runtime.block_on(supervisor.recover()).unwrap();
+        assert_eq!(report.failed, 1, "{report:?}");
+        assert_eq!(
+            runtime.block_on(supervisor.instances.read())[refs[0]]
+                .daemon
+                .get_state(),
+            DaemonState::UNKNOWN
+        );
+        let (read_tx, read_rx) = mpsc::channel();
+        let probe = mountpoints[0].join(&expected[1].0);
+        std::thread::spawn(move || {
+            let _ = read_tx.send(fs::read(probe));
+        });
+        match read_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("a read after the failed takeover hung")
+        {
+            Ok(bytes) => assert!(
+                bytes == expected[1].1,
+                "a read after the failed takeover returned wrong bytes"
+            ),
+            Err(e) => assert_eq!(e.raw_os_error(), Some(libc::EIO), "{e}"),
+        }
+        supervisor.recent_recoveries.lock().unwrap().clear();
 
         // Read the largest file while the takeover has no handler serving the group.
         let (gap_tx, gap_rx) = mpsc::channel();

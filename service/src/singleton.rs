@@ -256,8 +256,7 @@ impl ServiceController {
     ///
     /// Call it after [`save`](NydusDaemon::save) has captured the group fds. Each returned
     /// handler keeps its group open until dropped; if the takeover fails, hand them back with
-    /// [`reinstate_fanotify_handlers`](Self::reinstate_fanotify_handlers) so the usual
-    /// unregister path drains them and unmounts before the groups close.
+    /// [`resume_fanotify_handlers`](Self::resume_fanotify_handlers).
     pub fn suspend_fanotify_handlers(
         &self,
     ) -> Vec<(String, Arc<crate::fanotify::FanotifyHandler>)> {
@@ -273,11 +272,16 @@ impl ServiceController {
     }
 
     /// Register handlers [`suspend_fanotify_handlers`](Self::suspend_fanotify_handlers) took out
-    /// again, without restarting their workers.
-    pub fn reinstate_fanotify_handlers(
+    /// again and restart their workers, which answer what queued meanwhile.
+    pub fn resume_fanotify_handlers(
         &self,
         handlers: Vec<(String, Arc<crate::fanotify::FanotifyHandler>)>,
     ) {
+        for (image_id, fanotify) in &handlers {
+            info!("Resuming fanotify handler for {}", image_id);
+            fanotify.reactivate();
+            self.spawn_fanotify_workers(image_id, fanotify);
+        }
         self.fanotify.lock().unwrap().extend(handlers);
     }
 

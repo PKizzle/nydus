@@ -1202,14 +1202,20 @@ impl FileCacheEntry {
                             blob_offset,
                             bufs.compressed_buf(),
                         );
-                        for idx in start_idx..=end_idx {
-                            if status.pending[idx] {
-                                self.update_chunk_persist_status(chunks[idx].as_ref(), &res);
-                                status.pending[idx] = false;
+                        for (chunk, pending) in chunks[start_idx..=end_idx]
+                            .iter()
+                            .zip(&mut status.pending[start_idx..=end_idx])
+                        {
+                            if *pending {
+                                self.update_chunk_persist_status(chunk.as_ref(), &res);
+                                *pending = false;
                             }
                         }
                     } else {
-                        for idx in start_idx..=end_idx {
+                        for (chunk, pending) in chunks[start_idx..=end_idx]
+                            .iter()
+                            .zip(&mut status.pending[start_idx..=end_idx])
+                        {
                             let mut buf = match bufs.next() {
                                 None => {
                                     return Err(StorageError::InvalidData(
@@ -1222,12 +1228,12 @@ impl FileCacheEntry {
                                 Some(Ok(v)) => v,
                             };
 
-                            if status.pending[idx] {
+                            if *pending {
                                 if self.dio_enabled {
                                     self.adjust_buffer_for_dio(&mut buf)
                                 }
-                                let _ = self.persist_chunk_data(chunks[idx].as_ref(), buf.as_ref());
-                                status.pending[idx] = false;
+                                let _ = self.persist_chunk_data(chunk.as_ref(), buf.as_ref());
+                                *pending = false;
                             }
                         }
                     }
