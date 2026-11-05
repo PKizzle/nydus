@@ -41,7 +41,7 @@ use tracing::{debug, info, warn};
 
 use crate::config::{FsDriverType, SnapshotterConfig};
 use crate::daemon::config_builder::{
-    build_auto_accel_config, build_blob_cache_entry, build_daemon_config,
+    build_auto_accel_config, build_blob_cache_entry, build_daemon_config, localfs_backend,
 };
 use crate::daemon::image_ref::{ImageRef, parse_image_ref};
 use crate::prefetch_profile::runtime_prefetch_for_image;
@@ -1257,11 +1257,29 @@ impl DaemonSupervisor {
         bootstrap: &Path,
     ) -> Result<Arc<DaemonInstance>> {
         match Self::accel_backend_for(bootstrap) {
-            Some(backend_dir) => {
+            Some(backend_dir) if self.local_serving_driver(bootstrap) == FsDriverType::Fanotify => {
                 self.start_local_instance(image_ref, bootstrap, &backend_dir)
                     .await
             }
+            // FUSE reads the same localfs backend dir (see `start_instance`).
+            Some(_) => {
+                self.start_instance(image_ref, bootstrap, Some(FsDriverType::Fusedev))
+                    .await
+            }
             None => self.start_instance(image_ref, bootstrap, None).await,
+        }
+    }
+
+    /// The driver that serves a localfs-backed (content-store) bootstrap:
+    /// fanotify when it is the node's driver and the bootstrap is a 4 KiB RAFS
+    /// v6 image, FUSE otherwise. Other block sizes stay on FUSE, which reads
+    /// through the chunk table: images built before v6 chunk starts were padded
+    /// to the block size are misread by the kernel without any error.
+    pub fn local_serving_driver(&self, bootstrap: &Path) -> FsDriverType {
+        if self.active_fs_driver() == FsDriverType::Fanotify && is_4k_rafs_v6(bootstrap) {
+            FsDriverType::Fanotify
+        } else {
+            FsDriverType::Fusedev
         }
     }
 
@@ -1706,7 +1724,10 @@ impl DaemonSupervisor {
             }));
         }
 
-        let cfg_v2 = build_daemon_config(&self.config, &parsed, &cache_dir, auth, &slug)?;
+        let mut cfg_v2 = build_daemon_config(&self.config, &parsed, &cache_dir, auth, &slug)?;
+        if let Some(backend_dir) = Self::accel_backend_for(bootstrap) {
+            cfg_v2.backend = Some(localfs_backend(&backend_dir));
+        }
         let cfg_json =
             serde_json::to_string(&cfg_v2).context("failed to serialise ConfigV2 for nydusd")?;
 
@@ -2627,6 +2648,23 @@ fn restored_holder_state(record: &DaemonStatusRecord) -> (usize, HashSet<String>
     (record.refcount.max(holders.len()), holders)
 }
 
+/// Whether `bootstrap` is a RAFS v6 (EROFS) image with 4 KiB blocks.
+fn is_4k_rafs_v6(bootstrap: &Path) -> bool {
+    use std::io::Read as _;
+    let mut header = [0u8; EROFS_HEADER_LEN];
+    fs::File::open(bootstrap)
+        .and_then(|mut f| f.read_exact(&mut header))
+        .is_ok()
+        && erofs_block_bits(&header) == Some(12)
+}
+
+/// EROFS superblock: magic at byte 1024, `s_blkszbits` at byte 1036.
+const EROFS_HEADER_LEN: usize = 1037;
+
+fn erofs_block_bits(header: &[u8; EROFS_HEADER_LEN]) -> Option<u8> {
+    (header[1024..1028] == 0xE0F5_E1E2u32.to_le_bytes()).then_some(header[1036])
+}
+
 fn is_healthy_state(state: DaemonState) -> bool {
     matches!(state, DaemonState::RUNNING | DaemonState::READY)
 }
@@ -3493,6 +3531,46 @@ mod tests {
         let supervisor = DaemonSupervisor::new(config);
 
         assert_eq!(supervisor.active_fs_driver(), FsDriverType::Blockdev);
+    }
+
+    #[test]
+    fn local_bootstraps_use_fanotify_only_for_4k_rafs_v6() {
+        let dir = tempfile::tempdir().unwrap();
+        let bootstrap = |name: &str, magic: u32, blkszbits: u8| {
+            let mut header = vec![0u8; EROFS_HEADER_LEN];
+            header[1024..1028].copy_from_slice(&magic.to_le_bytes());
+            header[1036] = blkszbits;
+            let path = dir.path().join(name);
+            fs::write(&path, header).unwrap();
+            path
+        };
+        let v6_4k = bootstrap("v6-4k", 0xE0F5_E1E2, 12);
+        let v6_16k = bootstrap("v6-16k", 0xE0F5_E1E2, 14);
+        let v5 = bootstrap("v5", 0x5241_4653, 12);
+        let short = dir.path().join("short");
+        fs::write(&short, [0u8; 16]).unwrap();
+
+        let mut config = SnapshotterConfig::default();
+        config
+            .snapshotter
+            .fs_drivers
+            .retain(|d| d.driver_type == FsDriverType::Fanotify);
+        let fanotify = DaemonSupervisor::new(config);
+        assert_eq!(
+            fanotify.local_serving_driver(&v6_4k),
+            FsDriverType::Fanotify
+        );
+        for other in [&v6_16k, &v5, &short, &dir.path().join("missing")] {
+            assert_eq!(fanotify.local_serving_driver(other), FsDriverType::Fusedev);
+        }
+
+        let mut config = SnapshotterConfig::default();
+        config
+            .snapshotter
+            .fs_drivers
+            .retain(|d| d.driver_type == FsDriverType::Fusedev);
+        let fusedev = DaemonSupervisor::new(config);
+        assert_eq!(fusedev.local_serving_driver(&v6_4k), FsDriverType::Fusedev);
     }
 
     #[test]

@@ -357,19 +357,7 @@ pub fn build_auto_accel_config(
     daemon_mountpoint: &Path,
     daemon_id: &str,
 ) -> ConfigV2 {
-    let backend = BackendConfigV2 {
-        backend_type: "localfs".to_string(),
-        localdisk: None,
-        localfs: Some(LocalFsConfig {
-            blob_file: String::new(),
-            dir: backend_dir.display().to_string(),
-            alt_dirs: Vec::new(),
-        }),
-        oss: None,
-        s3: None,
-        registry: None,
-        http_proxy: None,
-    };
+    let backend = localfs_backend(backend_dir);
 
     let cache = CacheConfigV2 {
         cache_type: "fanotify".to_string(),
@@ -403,6 +391,23 @@ pub fn build_auto_accel_config(
         rafs: Some(rafs),
         overlay: None,
         internal: Default::default(),
+    }
+}
+
+/// A `localfs` backend reading blobs named by their bare hex digest from `dir`.
+pub fn localfs_backend(dir: &Path) -> BackendConfigV2 {
+    BackendConfigV2 {
+        backend_type: "localfs".to_string(),
+        localdisk: None,
+        localfs: Some(LocalFsConfig {
+            blob_file: String::new(),
+            dir: dir.display().to_string(),
+            alt_dirs: Vec::new(),
+        }),
+        oss: None,
+        s3: None,
+        registry: None,
+        http_proxy: None,
     }
 }
 
