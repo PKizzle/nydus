@@ -610,14 +610,17 @@ fn mount_erofs(
     inode_share_domain: Option<&str>,
 ) -> Result<()> {
     // The caller's bootstrap may end inside a page: see `erofs_folio`. A blob dir that cannot
-    // hold the padded copy keeps the old behaviour, which only an affected kernel fails.
-    let bootstrap = &crate::erofs_folio::page_aligned_source(bootstrap).unwrap_or_else(|e| {
-        warn!(
-            "fanotify: cannot stage a page-padded copy of {}: {e}; mounting it as is",
-            bootstrap.display()
-        );
-        bootstrap.to_path_buf()
-    });
+    // hold the padded copy keeps the old behaviour, which only an affected kernel fails. The
+    // copy lives until this function returns, by which time the mount holds its own reference.
+    let source = crate::erofs_folio::page_aligned_source(bootstrap)
+        .inspect_err(|e| {
+            warn!(
+                "fanotify: cannot stage a page-padded copy of {}: {e}; mounting it as is",
+                bootstrap.display()
+            )
+        })
+        .ok();
+    let bootstrap = source.as_ref().map_or(bootstrap, |s| s.path());
     check_fsconfig_value("bootstrap path", bootstrap.as_os_str().as_encoded_bytes())?;
     let options = build_erofs_device_options(blobs)?;
     if let Some(domain) = inode_share_domain {
