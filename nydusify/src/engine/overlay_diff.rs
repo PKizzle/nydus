@@ -196,7 +196,16 @@ fn append_entry<W: io::Write>(builder: &mut Builder<W>, abs: &Path, rel: &Path) 
 /// apply to the record that follows, so this must be written immediately before
 /// the entry itself.
 fn append_pax_xattrs<W: io::Write>(builder: &mut Builder<W>, abs: &Path, rel: &Path) -> Result<()> {
-    let xattrs = collect_xattrs(abs)?;
+    append_xattr_records(builder, &collect_xattrs(abs)?, rel)
+}
+
+/// Write `xattrs` (from [`collect_xattrs`] or [`collect_file_xattrs`]) as the
+/// PAX header of the entry that follows.
+pub(crate) fn append_xattr_records<W: io::Write>(
+    builder: &mut Builder<W>,
+    xattrs: &BTreeMap<String, Vec<u8>>,
+    rel: &Path,
+) -> Result<()> {
     if xattrs.is_empty() {
         return Ok(());
     }
@@ -209,8 +218,23 @@ fn append_pax_xattrs<W: io::Write>(builder: &mut Builder<W>, abs: &Path, rel: &P
 /// Read every xattr of `path` that belongs in the published layer, keyed by its
 /// PAX record name. Symlinks are not dereferenced.
 fn collect_xattrs(path: &Path) -> Result<BTreeMap<String, Vec<u8>>> {
+    filter_xattrs(path, xattr::list(path), |name| xattr::get(path, name))
+}
+
+/// [`collect_xattrs`] for an open file; `path` only names it in messages.
+#[cfg(target_os = "linux")]
+pub(crate) fn collect_file_xattrs(file: &File, path: &Path) -> Result<BTreeMap<String, Vec<u8>>> {
+    use xattr::FileExt as _;
+    filter_xattrs(path, file.list_xattr(), |name| file.get_xattr(name))
+}
+
+fn filter_xattrs(
+    path: &Path,
+    names: io::Result<xattr::XAttrs>,
+    get: impl Fn(&std::ffi::OsStr) -> io::Result<Option<Vec<u8>>>,
+) -> Result<BTreeMap<String, Vec<u8>>> {
     let mut out = BTreeMap::new();
-    let names = match xattr::list(path) {
+    let names = match names {
         Ok(names) => names,
         Err(e) if is_absent_or_unsupported(&e) => return Ok(out),
         Err(e) => return Err(e).with_context(|| format!("list xattrs of {}", path.display())),
@@ -231,7 +255,7 @@ fn collect_xattrs(path: &Path) -> Result<BTreeMap<String, Vec<u8>>> {
             );
             continue;
         }
-        match xattr::get(path, &name) {
+        match get(&name) {
             Ok(Some(value)) => {
                 out.insert(format!("{PAX_XATTR_PREFIX}{key}"), value);
             }

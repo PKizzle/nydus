@@ -4,6 +4,8 @@
 
 pub mod artifact;
 pub mod bootstrap_layer;
+#[cfg(target_os = "linux")]
+pub mod container_tar;
 pub mod containerd_converter;
 pub mod containerd_inspect;
 pub mod converter;

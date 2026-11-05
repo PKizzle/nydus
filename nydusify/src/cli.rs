@@ -70,9 +70,15 @@ pub struct CommitArgs {
     /// layers, so a commit loop cannot grow a manifest without bound.
     #[arg(long = "maximum-times", default_value_t = 400)]
     pub maximum_times: usize,
-    /// `nsenter` binary used to enter the container's mount namespace for
-    /// `--with-path`.
-    #[arg(long = "nsenter", env = "NSENTER", default_value = "nsenter")]
+    /// Ignored, and accepted only so existing invocations keep working:
+    /// `--with-path` reads the container through `/proc/<pid>/root` in-process
+    /// and runs no `nsenter`.
+    #[arg(
+        long = "nsenter",
+        env = "NSENTER",
+        default_value = "nsenter",
+        hide = true
+    )]
     pub nsenter: PathBuf,
     /// containerd CLI used to inspect the container.
     #[arg(long = "containerd-cli", env = "CONTAINERD_CLI", default_value = "ctr")]
