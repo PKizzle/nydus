@@ -69,7 +69,7 @@ jobs:
       with:
         cache-on-failure: true
         shared-key: ${{ runner.os }}-cargo-${{ matrix.arch }}
-        save-if: ${{ github.ref == 'refs/heads/master' }}
+        save-if: ${{ github.ref == 'refs/heads/production' }}
     - uses: dsherret/rust-toolchain-file@v1
     - name: Read Rust toolchain version
       id: set_toolchain_version
@@ -127,10 +127,16 @@ jobs:
           containerd-nydus
 
   nydusd-build-macos:
-    runs-on: macos-15
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
     strategy:
       matrix:
-        arch: [amd64, arm64]
+        include:
+          # Native runner per arch: macos-15 is arm64-only.
+          - arch: amd64
+            runner: macos-15-intel
+          - arch: arm64
+            runner: macos-15
     steps:
     - uses: actions/checkout@v6
     - name: Cache cargo
@@ -138,7 +144,7 @@ jobs:
       with:
         cache-on-failure: true
         shared-key: ${{ runner.os }}-cargo-${{ matrix.arch }}
-        save-if: ${{ github.ref == 'refs/heads/master' }}
+        save-if: ${{ github.ref == 'refs/heads/production' }}
     - uses: dsherret/rust-toolchain-file@v1
     - name: Install protoc
       run: bash misc/install-protoc.sh ${{matrix.arch}} osx
@@ -253,7 +259,7 @@ jobs:
       with:
         cache-on-failure: true
         shared-key: Linux-cargo-amd64
-        save-if: ${{ github.ref == 'refs/heads/master' }}
+        save-if: ${{ github.ref == 'refs/heads/production' }}
     - name: Install cargo nextest
       uses: taiki-e/install-action@nextest
     - name: Install protoc
@@ -303,7 +309,7 @@ jobs:
         with:
           cache-on-failure: true
           shared-key: Linux-cargo-amd64
-          save-if: ${{ github.ref == 'refs/heads/master' }}
+          save-if: ${{ github.ref == 'refs/heads/production' }}
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
       - name: Install protoc
@@ -333,7 +339,7 @@ jobs:
       with:
         cache-on-failure: true
         shared-key: Linux-cargo-amd64-coverage
-        save-if: ${{ github.ref == 'refs/heads/master' }}
+        save-if: ${{ github.ref == 'refs/heads/production' }}
     - name: Install cargo-llvm-cov
       uses: taiki-e/install-action@cargo-llvm-cov
     - name: Install protoc
