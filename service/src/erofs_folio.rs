@@ -23,6 +23,9 @@
 //! crafted image once unpadded and once padded. A distro may backport the fix, so the kernel
 //! version alone does not decide it.
 
+// The probe image and classification are used by the Linux-only self-test and the tests.
+#![cfg_attr(not(target_os = "linux"), allow(dead_code))]
+
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -52,8 +55,7 @@ impl PartialFolioStatus {
     }
 }
 
-/// The host page size in bytes.
-pub use nydus_utils::host_page_size;
+use nydus_utils::host_page_size;
 
 /// Extends `path` with a sparse hole to a multiple of the host page size. A no-op when it
 /// already is one.
@@ -76,6 +78,9 @@ pub fn page_aligned_source(image: &Path) -> io::Result<PathBuf> {
     let mut name = image.file_name().unwrap_or_default().to_os_string();
     name.push(".page-padded");
     let padded = image.with_file_name(&name);
+    if is_current_copy(image, &padded) {
+        return Ok(padded);
+    }
     name.push(".tmp");
     let tmp = image.with_file_name(name);
     // A fresh file (never through a planted symlink), since nydusd may run as root.
@@ -93,38 +98,45 @@ pub fn page_aligned_source(image: &Path) -> io::Result<PathBuf> {
     staged.map(|()| padded)
 }
 
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-/// Decides the status from the unpadded and padded probe mounts.
-fn classify(unpadded: &io::Result<()>, padded: &io::Result<()>) -> PartialFolioStatus {
-    match (unpadded, padded) {
-        (Ok(()), _) => PartialFolioStatus::Unaffected,
-        (Err(e), Ok(())) => PartialFolioStatus::Affected(format!(
+/// Whether `padded` is a padded copy of `image` written after `image` last changed.
+fn is_current_copy(image: &Path, padded: &Path) -> bool {
+    let (Ok(src), Ok(dst)) = (fs::metadata(image), fs::symlink_metadata(padded)) else {
+        return false;
+    };
+    dst.is_file()
+        && dst.len() == src.len().next_multiple_of(host_page_size())
+        && matches!((src.modified(), dst.modified()), (Ok(s), Ok(d)) if d >= s)
+}
+
+/// Decides the status from the unpadded probe mount, and the padded one only when that failed.
+fn classify(
+    unpadded: io::Result<()>,
+    padded: impl FnOnce() -> io::Result<()>,
+) -> PartialFolioStatus {
+    let Err(e) = unpadded else {
+        return PartialFolioStatus::Unaffected;
+    };
+    match (e, padded()) {
+        (e, Ok(())) => PartialFolioStatus::Affected(format!(
             "an image ending inside a page failed ({e}) while the same image padded to the page \
              size read cleanly"
         )),
-        (Err(_), Err(e)) => {
+        (_, Err(e)) => {
             PartialFolioStatus::Inconclusive(format!("file-backed EROFS probe mount failed: {e}"))
         }
     }
 }
 
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 const PROBE_FILES: usize = 8;
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 const PROBE_BLOCK: usize = 512;
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 const PROBE_LEN: usize = 4 * PROBE_BLOCK;
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 const ROOT_NID: u64 = 36;
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 const FILE_NID0: u64 = 48;
 
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn probe_content(i: usize) -> Vec<u8> {
     format!("nydus erofs probe {i}\n").into_bytes()
 }
 
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 /// A 2 KiB EROFS image with 512-byte blocks, smaller than any page: a superblock, a root
 /// directory and [`PROBE_FILES`] small files, all inline. On a kernel with the bug the
 /// superblock read itself is short, so the mount fails.
@@ -190,9 +202,6 @@ mod linux {
     use std::sync::mpsc;
     use std::time::Duration;
 
-    use std::ffi::CString;
-    use std::os::unix::ffi::OsStrExt;
-
     /// Upper bound for [`self_test`]: two tiny mounts normally take milliseconds.
     pub const SELF_TEST_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -223,69 +232,49 @@ mod linux {
         let spawned = std::thread::Builder::new()
             .name("erofs-folio-probe".into())
             .spawn(move || {
-                let result = run_trials(&thread_work);
+                let status = run_trials(&thread_work);
                 let _ = fs::remove_dir_all(&thread_work);
-                let _ = tx.send(result);
+                let _ = tx.send(status);
             });
         if let Err(e) = spawned {
             return PartialFolioStatus::Inconclusive(format!("failed to spawn probe thread: {e}"));
         }
-        match rx.recv_timeout(timeout) {
-            Ok(Ok((unpadded, padded))) => classify(&unpadded, &padded),
-            Ok(Err(e)) => PartialFolioStatus::Inconclusive(format!(
-                "failed to stage probe image in {}: {e}",
-                work.display()
-            )),
-            Err(_) => {
-                PartialFolioStatus::Inconclusive(format!("probe did not finish within {timeout:?}"))
+        rx.recv_timeout(timeout).unwrap_or_else(|_| {
+            PartialFolioStatus::Inconclusive(format!("probe did not finish within {timeout:?}"))
+        })
+    }
+
+    fn run_trials(work: &Path) -> PartialFolioStatus {
+        let staged = (|| {
+            fs::create_dir_all(work)?;
+            let unpadded = work.join("unpadded.erofs");
+            fs::write(&unpadded, probe_image())?;
+            io::Result::Ok(unpadded)
+        })();
+        let unpadded = match staged {
+            Ok(path) => path,
+            Err(e) => {
+                return PartialFolioStatus::Inconclusive(format!(
+                    "failed to stage probe image in {}: {e}",
+                    work.display()
+                ));
             }
-        }
+        };
+        classify(trial(&unpadded, &work.join("m0")), || {
+            let padded = work.join("padded.erofs");
+            fs::write(&padded, probe_image())?;
+            pad_to_page_size(&padded)?;
+            trial(&padded, &work.join("m1"))
+        })
     }
 
-    type Trials = (io::Result<()>, io::Result<()>);
-
-    fn run_trials(work: &Path) -> io::Result<Trials> {
-        fs::create_dir_all(work)?;
-        let image = probe_image();
-        let unpadded = work.join("unpadded.erofs");
-        let padded = work.join("padded.erofs");
-        fs::write(&unpadded, &image)?;
-        fs::write(&padded, &image)?;
-        pad_to_page_size(&padded)?;
-        Ok((
-            trial(&unpadded, &work.join("m0"))?,
-            trial(&padded, &work.join("m1"))?,
-        ))
-    }
-
-    /// The outer result is a staging failure; the inner one is the mount-and-read outcome.
-    fn trial(image: &Path, mountpoint: &Path) -> io::Result<io::Result<()>> {
+    /// Mounts `image` the way nydus mounts its own images, reads it all and unmounts.
+    fn trial(image: &Path, mountpoint: &Path) -> io::Result<()> {
         fs::create_dir_all(mountpoint)?;
-        let cstr = |p: &Path| {
-            CString::new(p.as_os_str().as_bytes())
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))
-        };
-        let (source, target) = (cstr(image)?, cstr(mountpoint)?);
-        // SAFETY: every pointer is a valid NUL-terminated string that outlives the call.
-        let ret = unsafe {
-            libc::mount(
-                source.as_ptr(),
-                target.as_ptr(),
-                c"erofs".as_ptr(),
-                libc::MS_RDONLY | libc::MS_NODEV | libc::MS_NOSUID,
-                std::ptr::null(),
-            )
-        };
-        if ret != 0 {
-            return Ok(Err(io::Error::last_os_error()));
-        }
+        crate::fanotify::mount_erofs_with(image, mountpoint, "")?;
         let read = read_all(mountpoint);
-        // SAFETY: as above.
-        if unsafe { libc::umount2(target.as_ptr(), 0) } != 0 {
-            // SAFETY: as above.
-            unsafe { libc::umount2(target.as_ptr(), libc::MNT_DETACH) };
-        }
-        Ok(read)
+        let _ = nix::mount::umount2(mountpoint, nix::mount::MntFlags::MNT_DETACH);
+        read
     }
 
     /// Lists the root, stats every entry and reads every file in full, checking the contents.
@@ -325,21 +314,21 @@ mod tests {
     #[test]
     fn classification() {
         let eio = || Err(io::Error::from_raw_os_error(libc::EIO));
-        assert_eq!(classify(&Ok(()), &Ok(())), PartialFolioStatus::Unaffected);
-        assert_eq!(classify(&Ok(()), &eio()), PartialFolioStatus::Unaffected);
+        let unused = || -> io::Result<()> { unreachable!("padded probe runs only on failure") };
+        assert_eq!(classify(Ok(()), unused), PartialFolioStatus::Unaffected);
         assert!(matches!(
-            classify(&eio(), &Ok(())),
+            classify(eio(), || Ok(())),
             PartialFolioStatus::Affected(_)
         ));
         // Wrong data from the unpadded image is just as unsafe as EIO.
         let zeros = Err(io::Error::new(io::ErrorKind::InvalidData, "zeros"));
         assert!(matches!(
-            classify(&zeros, &Ok(())),
+            classify(zeros, || Ok(())),
             PartialFolioStatus::Affected(_)
         ));
         // Both failing says nothing about this bug: no privilege, no file-backed EROFS, ...
         let eperm = || Err(io::Error::from_raw_os_error(libc::EPERM));
-        let status = classify(&eperm(), &eperm());
+        let status = classify(eperm(), eperm);
         assert!(matches!(status, PartialFolioStatus::Inconclusive(_)));
         assert_eq!(status.label(), "inconclusive");
     }
@@ -408,7 +397,8 @@ mod tests {
         assert_eq!(&padded[..page + 512], &vec![7u8; page + 512][..]);
         assert!(!dir.join("bootstrap.page-padded.tmp").exists());
 
-        // A changed bootstrap replaces the stale copy.
+        // A current copy is reused; a changed bootstrap replaces it.
+        assert_eq!(page_aligned_source(&bootstrap).unwrap(), source);
         fs::write(&bootstrap, vec![9u8; 512]).unwrap();
         assert_eq!(
             fs::read(page_aligned_source(&bootstrap).unwrap()).unwrap()[0],

@@ -21,7 +21,7 @@ fn main() {
     let status = erofs_folio::self_test(dir, erofs_folio::SELF_TEST_TIMEOUT);
     println!(
         "erofs-folio-probe: page_size={} status={} {:?}",
-        erofs_folio::host_page_size(),
+        nydus_utils::host_page_size(),
         status.label(),
         status
     );

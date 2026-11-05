@@ -73,11 +73,18 @@ pub fn probe_and_promote_driver(
 ) -> (Vec<ProbeResult>, Option<FsDriverType>) {
     apply_driver_selection_policy(drivers, policy);
     let results = probe_drivers(drivers, work_dir);
+    // Report-only, so startup does not wait for its mounts.
     #[cfg(target_os = "linux")]
     if let Some(dir) = work_dir
         && has_filesystem("erofs")
     {
-        probe_erofs_partial_folio(dir);
+        let dir = dir.to_path_buf();
+        if let Err(e) = std::thread::Builder::new()
+            .name("erofs-folio-probe".into())
+            .spawn(move || probe_erofs_partial_folio(&dir))
+        {
+            warn!(error = %e, "failed to start the file-backed EROFS partial-folio self-test");
+        }
     }
     let selected = promote_selected_driver(drivers, &results);
     (results, selected)
@@ -414,7 +421,7 @@ fn probe_erofs_partial_folio(work_dir: &Path) {
 
     let kernel = fs::read_to_string("/proc/sys/kernel/osrelease").unwrap_or_default();
     let kernel = kernel.trim();
-    let page_size = erofs_folio::host_page_size();
+    let page_size = nydus_utils::host_page_size();
     match erofs_folio::detect_once(work_dir) {
         PartialFolioStatus::Affected(detail) => warn!(
             kernel,

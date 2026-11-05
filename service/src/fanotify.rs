@@ -615,7 +615,7 @@ fn erofs_inode_share_options(device_options: &str, domain: &str) -> Result<Strin
     Ok(options)
 }
 
-fn mount_erofs_with(bootstrap: &Path, mountpoint: &Path, options: &str) -> Result<()> {
+pub(crate) fn mount_erofs_with(bootstrap: &Path, mountpoint: &Path, options: &str) -> Result<()> {
     let source_c = std::ffi::CString::new(bootstrap.as_os_str().as_encoded_bytes())
         .map_err(|e| std::io::Error::new(ErrorKind::InvalidInput, e))?;
     let mountpoint_c = std::ffi::CString::new(mountpoint.as_os_str().as_encoded_bytes())
