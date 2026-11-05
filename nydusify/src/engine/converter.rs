@@ -1479,9 +1479,9 @@ async fn attach_oci_manifest_and_push_index(
                      into another repository"
                 );
             }
-            vec![converted_entry]
+            vec![converted_entry.clone()]
         }
-        None => vec![converted_entry],
+        None => vec![converted_entry.clone()],
     };
     // Merge into what the tag holds RIGHT NOW, not into the index captured when
     // the pull started. Conversion takes minutes, and the tag is a shared
@@ -1492,7 +1492,9 @@ async fn attach_oci_manifest_and_push_index(
     // portable compare-and-swap, so this re-reads late and keeps the window to
     // the round-trip below rather than the whole run.
     let base_entries = match current_tag_entries(target_client, target_ref).await {
-        Ok(Some(current)) => current,
+        // The nydus manifest is converted from `converted_entry`, so that is the
+        // OCI half it is published beside, whatever the tag held for this platform.
+        Ok(Some(current)) => with_converted_entry(current, converted_entry),
         Ok(None) => base_entries,
         Err(e) => {
             warn!(
@@ -1526,6 +1528,23 @@ async fn attach_oci_manifest_and_push_index(
         "published dual-manifest index: OCI + nydus under one tag"
     );
     Ok(())
+}
+
+/// `entries` with `converted` as this platform's OCI image: it takes the place
+/// of the first non-nydus entry for the same platform, and any further ones are
+/// dropped. Nydus entries are left to [`dual_manifest_index`].
+fn with_converted_entry(mut entries: Vec<Descriptor>, converted: Descriptor) -> Vec<Descriptor> {
+    let platform = converted.platform.clone().unwrap_or_default();
+    let same_platform = |d: &Descriptor| {
+        !is_nydus_entry(d) && d.platform.as_ref().is_some_and(|p| p.matches(&platform))
+    };
+    let at = entries
+        .iter()
+        .position(same_platform)
+        .unwrap_or(entries.len());
+    entries.retain(|d| !same_platform(d));
+    entries.insert(at, converted);
+    entries
 }
 
 /// Assemble the dual-manifest index: the base entries first, the nydus manifest last,
@@ -2251,6 +2270,49 @@ mod tests {
         assert!(index.manifests[0].artifact_type.is_none());
         assert!(index.manifests[1].artifact_type.is_none());
         assert!(index.manifests[2].artifact_type.is_some());
+    }
+
+    #[test]
+    fn the_converted_image_replaces_what_the_tag_held_for_its_platform() {
+        // The tag already pairs an older OCI image with its nydus manifest; the new nydus
+        // manifest must be published beside the image it was converted from.
+        let plat = |arch: &str| registry_client::types::Platform {
+            architecture: arch.into(),
+            os: "linux".into(),
+            ..Default::default()
+        };
+        let oci = |digest: &str, arch: &str| Descriptor {
+            digest: digest.into(),
+            platform: Some(plat(arch)),
+            ..Descriptor::default()
+        };
+        let current = vec![
+            oci("sha256:old-arm64", "arm64"),
+            oci("sha256:amd64", "amd64"),
+            nydus_entry("sha256:old-nydus", "arm64", true, true),
+        ];
+        let entries = with_converted_entry(current, oci("sha256:new-arm64", "arm64"));
+        let nydus = Descriptor {
+            digest: "sha256:new-nydus".into(),
+            ..Descriptor::default()
+        };
+        let index = dual_manifest_index(entries, &nydus, &plat("arm64"));
+        assert_eq!(
+            index
+                .manifests
+                .iter()
+                .map(|m| m.digest.as_str())
+                .collect::<Vec<_>>(),
+            ["sha256:new-arm64", "sha256:amd64", "sha256:new-nydus"]
+        );
+
+        // A tag without this platform gains it.
+        let entries = with_converted_entry(
+            vec![oci("sha256:amd64", "amd64")],
+            oci("sha256:new-arm64", "arm64"),
+        );
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[1].digest, "sha256:new-arm64");
     }
 
     /// A descriptor shaped like a nydus entry this tool would have written.
