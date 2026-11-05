@@ -271,9 +271,9 @@ reached" (socket missing or refusing, connection broken, `Unavailable`, `Deadlin
 real failure. The auto-zran worker re-queues a job that hit an unreachable containerd after a
 capped exponential delay (5 s doubling to 2 min) with no failure strike, so an outage never marks
 an image non-convertible; a retry of either stage reuses the converted work dir, which the recon
-stale-dir sweep leaves alone while the job waits. A job still waiting an hour after its first
-outage attempt is abandoned, again without a strike, and its dedupe key released, so the next
-prepare or recon sweep enqueues it afresh. If containerd is still unreachable five minutes after
+stale-dir sweep leaves alone while the job waits. A job whose retry delays add up to an hour
+is abandoned, again without a strike, and its dedupe key released, so the next prepare of the
+image enqueues it afresh. If containerd is still unreachable five minutes after
 startup, one error names the configured socket.
 
 An upload writes every sidecar blob under **one lease** (`ContentStoreClient::create_lease`, 2 h

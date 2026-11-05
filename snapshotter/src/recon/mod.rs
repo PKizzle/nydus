@@ -621,25 +621,6 @@ impl Reconciler {
     }
 }
 
-/// Remove immediate subdirectories of `work_dir` whose mtime is at least `max_age`
-/// old, skipping any dir `is_active` claims (the running job's, or a job's waiting
-/// out a containerd outage) no matter how old it looks. Returns the number of directories removed. Pulled out of
-/// `Reconciler::check_stale_autozran_dirs` as a pure(-ish) function of its inputs
-/// (plus `now`, so tests don't depend on wall-clock timing) so the sweep logic is
-/// unit-testable without constructing a full `Reconciler` / `AutoZranManager`.
-///
-/// `is_active` is re-evaluated immediately before each `remove_dir_all`, NOT
-/// snapshotted once up front. Job keys are deterministic (`job_key(image)`), so a
-/// same-image conversion that starts mid-sweep reuses the exact dir we may have
-/// already decided is stale by mtime. Re-checking at delete time closes that TOCTOU:
-/// `mark_started()` (which flips `active_job_key()`) runs before the worker
-/// (re)creates the dir, so the delete-time check either sees the now-live job and
-/// skips, or the dir is still pure debris and is safe to remove (the worker will
-/// recreate a fresh one via `fresh_dir`).
-///
-/// The whole sweep is best-effort/non-fatal: an unreadable `work_dir` and per-dir
-/// removal failures are logged and skipped rather than propagated, so a transient
-/// filesystem hiccup never aborts a reconciliation pass.
 /// Remove `l/<hash>` symlinks whose target no longer resolves.
 ///
 /// The link points at `../snapshots/<dir>/fs`, so "the snapshot is gone" is
@@ -691,6 +672,26 @@ fn sweep_orphan_short_links(link_dir: &Path) -> usize {
     removed
 }
 
+/// Remove immediate subdirectories of `work_dir` whose mtime is at least `max_age`
+/// old, skipping any dir `is_active` claims (the running job's, or a job's waiting
+/// out a containerd outage) no matter how old it looks. Returns the number of
+/// directories removed. Pulled out of
+/// `Reconciler::check_stale_autozran_dirs` as a pure(-ish) function of its inputs
+/// (plus `now`, so tests don't depend on wall-clock timing) so the sweep logic is
+/// unit-testable without constructing a full `Reconciler` / `AutoZranManager`.
+///
+/// `is_active` is re-evaluated immediately before each `remove_dir_all`, NOT
+/// snapshotted once up front. Job keys are deterministic (`job_key(image)`), so a
+/// same-image conversion that starts mid-sweep reuses the exact dir we may have
+/// already decided is stale by mtime. Re-checking at delete time closes that TOCTOU:
+/// `mark_started()` (which flips `active_job_key()`) runs before the worker
+/// (re)creates the dir, so the delete-time check either sees the now-live job and
+/// skips, or the dir is still pure debris and is safe to remove (the worker will
+/// recreate a fresh one via `fresh_dir`).
+///
+/// The whole sweep is best-effort/non-fatal: an unreadable `work_dir` and per-dir
+/// removal failures are logged and skipped rather than propagated, so a transient
+/// filesystem hiccup never aborts a reconciliation pass.
 fn sweep_stale_job_dirs(
     work_dir: &Path,
     max_age: Duration,
