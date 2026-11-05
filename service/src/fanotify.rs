@@ -61,13 +61,31 @@ struct fanotify_response {
     response: u32,
 }
 
-/// Open the inode behind `fd` again, read-write, through a `FAN_OPEN_PERM` event of a private
-/// fanotify group. The kernel opens event descriptors with `FMODE_NONOTIFY`, so I/O through the
-/// returned descriptor raises no fanotify events even while the inode carries pre-content marks.
-fn open_without_events(fd: RawFd) -> Result<OwnedFd> {
+/// How long [`open_without_events`] waits for its own opens to arrive as events.
+const OPEN_WITHOUT_EVENTS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Open the inodes behind `fds` again, read-write, through `FAN_OPEN_PERM` events of one
+/// private fanotify group, returning one descriptor per input, in order. The kernel opens
+/// event descriptors with `FMODE_NONOTIFY`, so I/O through them raises no fanotify events even
+/// while the inodes carry pre-content marks.
+fn open_without_events(fds: &[RawFd]) -> Result<Vec<OwnedFd>> {
+    open_without_events_via(fds, |path| File::open(path))
+}
+
+/// [`open_without_events`] with the opener supplied, so a failing open can be tested.
+///
+/// A failed open raises no event, so the opener reports each result and the group is polled
+/// with a deadline: either failure ends the wait with an error instead of blocking forever.
+fn open_without_events_via(
+    fds: &[RawFd],
+    open: impl Fn(&str) -> Result<File> + Send + 'static,
+) -> Result<Vec<OwnedFd>> {
+    if fds.is_empty() {
+        return Ok(Vec::new());
+    }
     let raw = unsafe {
         libc::fanotify_init(
-            libc::FAN_CLASS_CONTENT | libc::FAN_CLOEXEC,
+            libc::FAN_CLASS_CONTENT | libc::FAN_CLOEXEC | libc::FAN_NONBLOCK,
             libc::O_RDWR as u32,
         )
     };
@@ -77,76 +95,97 @@ fn open_without_events(fd: RawFd) -> Result<OwnedFd> {
     // Dropping the group on any return answers whatever is still queued, so the opener below
     // cannot be left blocked.
     let group = unsafe { OwnedFd::from_raw_fd(raw) };
-    if unsafe {
-        libc::fanotify_mark(
-            raw,
-            libc::FAN_MARK_ADD,
-            libc::FAN_OPEN_PERM,
-            fd,
-            std::ptr::null(),
-        )
-    } != 0
-    {
-        return Err(std::io::Error::last_os_error());
+    for &fd in fds {
+        if unsafe {
+            libc::fanotify_mark(
+                raw,
+                libc::FAN_MARK_ADD,
+                libc::FAN_OPEN_PERM,
+                fd,
+                std::ptr::null(),
+            )
+        } != 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
     }
-    let identity = fd_identity(fd)?;
-    let path = format!("/proc/self/fd/{fd}");
-    let opener = std::thread::spawn(move || File::open(path));
+    let identities = fds
+        .iter()
+        .map(|&fd| fd_identity(fd))
+        .collect::<Result<Vec<_>>>()?;
+    let paths: Vec<String> = fds.iter().map(|fd| format!("/proc/self/fd/{fd}")).collect();
+    let (opened_tx, opened) = std::sync::mpsc::channel();
+    let opener = std::thread::spawn(move || {
+        for path in paths {
+            let failed = opened_tx.send(open(&path).map(drop)).is_err();
+            if failed {
+                return;
+            }
+        }
+    });
 
+    let deadline = std::time::Instant::now() + OPEN_WITHOUT_EVENTS_TIMEOUT;
     let mut buf = vec![0u8; 4096];
-    let found = loop {
-        let n = unsafe { libc::read(raw, buf.as_mut_ptr().cast(), buf.len()) };
-        if n < 0 {
+    let mut found: Vec<Option<OwnedFd>> = fds.iter().map(|_| None).collect();
+    let result = loop {
+        if found.iter().all(Option::is_some) {
+            break Ok(found.into_iter().flatten().collect());
+        }
+        // An open returns only once its event is answered, so only a failed one is news.
+        if let Ok(Err(e)) = opened.try_recv() {
+            break Err(e);
+        }
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            break Err(std::io::Error::from_raw_os_error(libc::ETIMEDOUT));
+        }
+        let mut pfd = libc::pollfd {
+            fd: raw,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // Short slices, so an opener failure is noticed without waiting out the deadline.
+        let slice = left.min(std::time::Duration::from_millis(20)).as_millis() as libc::c_int;
+        if unsafe { libc::poll(&mut pfd, 1, slice) } < 0 {
             let e = std::io::Error::last_os_error();
             if e.kind() == ErrorKind::Interrupted {
                 continue;
             }
             break Err(e);
         }
-        let mut found = None;
-        let mut offset = 0usize;
-        let len = n as usize;
-        while offset + std::mem::size_of::<libc::fanotify_event_metadata>() <= len {
-            // SAFETY: bounds checked above; the record is copied out unaligned.
-            let meta = unsafe {
-                std::ptr::read_unaligned(
-                    buf.as_ptr().add(offset) as *const libc::fanotify_event_metadata
-                )
-            };
-            if meta.event_len == 0 {
-                break;
-            }
-            offset += meta.event_len as usize;
-            if meta.fd < 0 {
+        let n = unsafe { libc::read(raw, buf.as_mut_ptr().cast(), buf.len()) };
+        if n < 0 {
+            let e = std::io::Error::last_os_error();
+            if matches!(e.raw_os_error(), Some(libc::EAGAIN) | Some(libc::EINTR)) {
                 continue;
             }
-            // Every opener of the inode is allowed; only our own open's descriptor is kept.
-            let response = fanotify_response {
-                fd: meta.fd,
-                response: FAN_ALLOW,
-            };
-            unsafe {
-                libc::write(
-                    raw,
-                    &response as *const _ as *const libc::c_void,
-                    std::mem::size_of::<fanotify_response>(),
-                )
-            };
-            let event_fd = unsafe { OwnedFd::from_raw_fd(meta.fd) };
-            if found.is_none()
-                && meta.pid as u32 == std::process::id()
-                && fd_identity(event_fd.as_raw_fd()).ok() == Some(identity)
-            {
-                found = Some(event_fd);
+            break Err(e);
+        }
+        for_each_parsable_event(&buf[..n as usize], |meta| {
+            if meta.fd < 0 {
+                return;
             }
-        }
-        if let Some(f) = found {
-            break Ok(f);
-        }
+            // Every opener of the inodes is allowed; only our own opens' descriptors are kept.
+            write_response(raw, meta.fd, FAN_ALLOW);
+            let event_fd = unsafe { OwnedFd::from_raw_fd(meta.fd) };
+            if meta.pid as u32 != std::process::id() {
+                return;
+            }
+            let Ok(identity) = fd_identity(event_fd.as_raw_fd()) else {
+                return;
+            };
+            if let Some(slot) = identities
+                .iter()
+                .zip(found.iter_mut())
+                .find_map(|(id, slot)| (*id == identity && slot.is_none()).then_some(slot))
+            {
+                *slot = Some(event_fd);
+            }
+        });
     };
     drop(group);
     let _ = opener.join();
-    found
+    result
 }
 
 /// Get the `(st_dev, st_ino)` identity of an open file descriptor.
@@ -361,6 +400,9 @@ pub struct FanotifyHandler {
     failed: AtomicBool,
     /// Barrier that workers must reach before `stop()` returns.
     barrier: Barrier,
+    /// The worker threads, joined once they pass the barrier, so a stopped handler is held
+    /// by nobody else.
+    workers: Mutex<Vec<std::thread::JoinHandle<()>>>,
     /// Number of worker threads.
     threads: usize,
     /// Fanotify notification fd (owned — `close(2)` on drop).
@@ -375,6 +417,8 @@ pub struct FanotifyHandler {
     mountpoint: PathBuf,
     /// Reference to the blob cache manager (kept alive for the lifetime of the handler).
     _blob_cache_mgr: Arc<BlobCacheMgr>,
+    /// Configuration and blob id of each device's cache, to collect them once released.
+    cache_keys: Vec<(Arc<nydus_api::ConfigV2>, String)>,
     /// Data blobs serviced on demand, indexed by their backing-file identity.
     blob_backings: Vec<BlobBacking>,
 
@@ -764,32 +808,6 @@ impl FanotifyHandler {
             OwnedFd::from(fan_file),
         )?;
 
-        // `assemble` opened the cache files while the inherited marks were live, and a file
-        // opened under a pre-content mark raises pre-content events for its own I/O: a fill
-        // write would wait on an event that only the writing worker could answer, and every
-        // reader of the mount would hang. Replace those descriptors, by number, with ones that
-        // raise no events, before any worker runs.
-        for backing in &handler.blob_backings {
-            let file_fd = backing.blob.file().as_raw_fd();
-            let cache_fd = backing
-                .blob
-                .blob()
-                .get_blob_object()
-                .ok_or_else(|| {
-                    std::io::Error::other(format!(
-                        "fanotify: blob object unavailable for {}",
-                        backing.blob.blob_info().blob_id()
-                    ))
-                })?
-                .as_raw_fd();
-            let quiet = open_without_events(file_fd)?;
-            for target in [cache_fd, file_fd] {
-                if unsafe { libc::dup3(quiet.as_raw_fd(), target, libc::O_CLOEXEC) } < 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-            }
-        }
-
         // `assemble` starts every backing at `armed == false`, which is right for a fresh group
         // whose marks `arm()` has yet to place. Here the marks came across with the fd, and this
         // path deliberately never calls `arm()` -- so leaving the hint at `false` would make
@@ -834,12 +852,8 @@ impl FanotifyHandler {
             std::fs::create_dir_all(mp)?;
         }
 
-        // NOTE: marks are *not* placed here. Arming the marks before the daemon has opened its own
-        // backing files — and before the worker threads are draining events — would deadlock: the
-        // `DataBlob::new` calls below open each blob's `.blob.data` file, which is the *same inode*
-        // as the marked `blob_*` device file, so the daemon's own open would raise a pre-content
-        // event that nothing can answer yet. Marks are armed later via `arm()`, after the workers
-        // are running and after this constructor has finished opening every backing file.
+        // NOTE: marks are *not* placed here. They go on only once the workers are draining
+        // events (`arm()`), or a read raised before then would wait on a queue nobody reads.
 
         // mio poll setup.
         let poller = Poll::new().map_err(|e| std::io::Error::other(format!("mio poll: {}", e)))?;
@@ -875,6 +889,26 @@ impl FanotifyHandler {
         // Each `DataBlob` owns a handle to its sparse backing file; we record that file's
         // identity so an incoming event fd can be resolved back to the blob without relying on
         // path names.
+        let cache_keys = configs
+            .iter()
+            .map(|cfg| (cfg.config_v2().clone(), cfg.blob_info().blob_id()))
+            .collect();
+        // The mount shares page cache only when every one of its own devices names the same
+        // domain; the manager may hold other bootstraps' blobs with other domains.
+        let domains: Vec<Option<String>> = configs
+            .iter()
+            .map(|cfg| {
+                cfg.config_v2()
+                    .cache
+                    .as_ref()?
+                    .fanotify
+                    .as_ref()?
+                    .erofs_inode_share_domain
+                    .clone()
+            })
+            .collect();
+        let inode_share_domain = common_domain(&domains);
+
         let runtime = compio::runtime::Runtime::new()
             .map_err(|e| std::io::Error::other(format!("fanotify: compio runtime: {}", e)))?;
         let mut blob_backings = Vec::with_capacity(configs.len());
@@ -895,6 +929,36 @@ impl FanotifyHandler {
                 io_lock: RwLock::new(()),
                 armed: AtomicBool::new(false),
             });
+        }
+
+        // A file opened under a pre-content mark raises pre-content events for its own I/O: a
+        // fill write would wait on an event that only the writing worker could answer, and
+        // every reader of the mount would hang. The marks may already be live here (an
+        // inherited group, or another group still marking the inode), so the descriptors just
+        // opened are replaced, by number, with ones that raise no events, before any worker
+        // runs.
+        let file_fds: Vec<RawFd> = blob_backings
+            .iter()
+            .map(|backing| backing.blob.file().as_raw_fd())
+            .collect();
+        let quiet_fds = open_without_events(&file_fds)?;
+        for (backing, quiet) in blob_backings.iter().zip(&quiet_fds) {
+            let cache_fd = backing
+                .blob
+                .blob()
+                .get_blob_object()
+                .ok_or_else(|| {
+                    std::io::Error::other(format!(
+                        "fanotify: blob object unavailable for {}",
+                        backing.blob.blob_info().blob_id()
+                    ))
+                })?
+                .as_raw_fd();
+            for target in [cache_fd, backing.blob.file().as_raw_fd()] {
+                if unsafe { libc::dup3(quiet.as_raw_fd(), target, libc::O_CLOEXEC) } < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
         }
 
         // Materialise the EROFS device files from the cache. Each data blob's cache file
@@ -927,20 +991,11 @@ impl FanotifyHandler {
             device_blobs.push(device_path);
         }
 
-        let inode_share_domain = blob_cache_mgr.get_all_data_blobs().iter().find_map(|cfg| {
-            cfg.config_v2()
-                .cache
-                .as_ref()?
-                .fanotify
-                .as_ref()?
-                .erofs_inode_share_domain
-                .clone()
-        });
-
         Ok(FanotifyHandler {
             active: AtomicBool::new(true),
             failed: AtomicBool::new(false),
             barrier: Barrier::new(threads + 1),
+            workers: Mutex::new(Vec::new()),
             threads,
             fan_fd,
             poller: Mutex::new(poller),
@@ -948,6 +1003,7 @@ impl FanotifyHandler {
             blob_dir: blob_dir_path.to_path_buf(),
             mountpoint: mp.to_path_buf(),
             _blob_cache_mgr: blob_cache_mgr,
+            cache_keys,
             blob_backings,
             bootstrap_path,
             device_blobs,
@@ -1116,10 +1172,40 @@ impl FanotifyHandler {
     /// the drain fails open when the fd finally closes, which is the kernel's
     /// own fallback semantic.
     pub fn stop(&self) {
-        self.active.store(false, Ordering::Release);
-        let _ = self.waker.wake();
-        self.barrier.wait();
+        self.stop_workers();
         self.drain_deny_pending();
+    }
+
+    /// Signal all workers to stop and wait until they have exited, leaving queued events for a
+    /// successor handler on the same group. Every event a worker read has been answered by then:
+    /// a worker answers its whole batch before it looks at the stop signal. Idempotent.
+    pub fn stop_workers(&self) {
+        if self.active.swap(false, Ordering::AcqRel) {
+            let _ = self.waker.wake();
+            self.barrier.wait();
+        }
+        for worker in std::mem::take(&mut *self.workers.lock().unwrap()) {
+            let _ = worker.join();
+        }
+    }
+
+    /// Undo [`stop_workers`](Self::stop_workers), so newly spawned workers run again.
+    pub(crate) fn reactivate(&self) {
+        self.active.store(true, Ordering::Release);
+    }
+
+    /// Keep the worker threads running [`run_loop`](Self::run_loop), for `stop_workers` to join.
+    pub(crate) fn add_workers(
+        &self,
+        workers: impl IntoIterator<Item = std::thread::JoinHandle<()>>,
+    ) {
+        self.workers.lock().unwrap().extend(workers);
+    }
+
+    /// Configuration and blob id of each device's cache, for collecting them with
+    /// `BLOB_FACTORY.gc` once this handler is dropped.
+    pub(crate) fn cache_keys(&self) -> &[(Arc<nydus_api::ConfigV2>, String)] {
+        &self.cache_keys
     }
 
     /// Answer every event still readable on the (non-blocking) group fd with
@@ -1276,6 +1362,9 @@ impl FanotifyHandler {
     fn run_loop_inner(&self) -> Result<()> {
         let mut events = Events::with_capacity(MAX_EVENTS_PER_POLL);
         let mut buf = vec![0u8; EVENT_BUF_SIZE];
+        // The registration is edge-triggered, and events queued while no worker ran (before a
+        // takeover, or while suspended) may have had their edge consumed already.
+        self.drain_events(&mut buf)?;
 
         loop {
             // Only a panic inside `Poll::poll` itself can poison this lock; the poller holds no
@@ -1478,60 +1567,9 @@ impl FanotifyHandler {
         Ok(())
     }
 
-    /// Write a permission response (`FAN_ALLOW` / `FAN_DENY_ERRNO`) for `event_fd`.
-    ///
-    /// A response that never reaches the kernel leaves the accessing task blocked in
-    /// `D` state indefinitely, so `EINTR` is retried rather than dropped; any other
-    /// failure is logged loudly (there is no recovery — the fd is closed either way).
+    /// Answer `event_fd` on this handler's group; see [`write_response`].
     fn write_response(&self, event_fd: RawFd, response: u32) {
-        let resp = fanotify_response {
-            fd: event_fd,
-            response,
-        };
-        let resp_buf = unsafe {
-            std::slice::from_raw_parts(
-                &resp as *const fanotify_response as *const u8,
-                std::mem::size_of::<fanotify_response>(),
-            )
-        };
-        loop {
-            let ret = unsafe {
-                libc::write(
-                    self.fan_fd.as_raw_fd(),
-                    resp_buf.as_ptr() as *const libc::c_void,
-                    resp_buf.len(),
-                )
-            };
-            if ret >= 0 {
-                return;
-            }
-            let err = std::io::Error::last_os_error();
-            if err.raw_os_error() == Some(libc::EINTR) {
-                continue;
-            }
-            // A kernel that rejects a specific DENY errno payload (EINVAL)
-            // must still get *a* response, or the reader stalls in D-state
-            // forever. Retry once with the always-valid EIO form. The guard
-            // excludes FAN_ALLOW: a rejected allow must not be flipped into a
-            // spurious read error.
-            if err.raw_os_error() == Some(libc::EINVAL)
-                && response != FAN_ALLOW
-                && response != fan_deny_errno(libc::EIO)
-            {
-                warn!(
-                    "fanotify: kernel rejected deny response {:#x} for fd {}; retrying with EIO",
-                    response, event_fd
-                );
-                self.write_response(event_fd, fan_deny_errno(libc::EIO));
-                return;
-            }
-            error!(
-                "fanotify: failed to write permission response for fd {}: {}; \
-                 the blocked reader will stall until the group closes",
-                event_fd, err
-            );
-            return;
-        }
+        write_response(self.fan_fd.as_raw_fd(), event_fd, response);
     }
 
     /// Extract the trailing `FAN_EVENT_INFO_TYPE_RANGE` record from a raw event buffer, if present.
@@ -1804,6 +1842,72 @@ fn invalidate_in_order(
     rearm_mark()?;
     revoke_ready()?;
     discard_bytes()
+}
+
+/// The domain every entry names, or `None` if one names none or they disagree.
+fn common_domain(domains: &[Option<String>]) -> Option<String> {
+    match domains.first() {
+        Some(Some(domain)) if domains.iter().all(|d| d.as_ref() == Some(domain)) => {
+            Some(domain.clone())
+        }
+        _ => None,
+    }
+}
+
+/// Write a permission response (`FAN_ALLOW` / `FAN_DENY_ERRNO`) for `event_fd` to `group`.
+///
+/// A response that never reaches the kernel leaves the accessing task blocked in
+/// `D` state indefinitely, so `EINTR` is retried rather than dropped; any other
+/// failure is logged loudly (there is no recovery — the fd is closed either way).
+fn write_response(group: RawFd, event_fd: RawFd, response: u32) {
+    let resp = fanotify_response {
+        fd: event_fd,
+        response,
+    };
+    let resp_buf = unsafe {
+        std::slice::from_raw_parts(
+            &resp as *const fanotify_response as *const u8,
+            std::mem::size_of::<fanotify_response>(),
+        )
+    };
+    loop {
+        let ret = unsafe {
+            libc::write(
+                group,
+                resp_buf.as_ptr() as *const libc::c_void,
+                resp_buf.len(),
+            )
+        };
+        if ret >= 0 {
+            return;
+        }
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() == Some(libc::EINTR) {
+            continue;
+        }
+        // A kernel that rejects a specific DENY errno payload (EINVAL)
+        // must still get *a* response, or the reader stalls in D-state
+        // forever. Retry once with the always-valid EIO form. The guard
+        // excludes FAN_ALLOW: a rejected allow must not be flipped into a
+        // spurious read error.
+        if err.raw_os_error() == Some(libc::EINVAL)
+            && response != FAN_ALLOW
+            && response != fan_deny_errno(libc::EIO)
+        {
+            warn!(
+                "fanotify: kernel rejected deny response {:#x} for fd {}; retrying with EIO",
+                response, event_fd
+            );
+            write_response(group, event_fd, fan_deny_errno(libc::EIO));
+            return;
+        }
+        error!(
+            "fanotify: failed to write permission response for fd {}: {}; \
+             the blocked reader will stall until the group closes",
+            event_fd, err
+        );
+        return;
+    }
 }
 
 /// Walk a raw fanotify event buffer, invoking `f` for every record that can be trusted.
@@ -2563,6 +2667,55 @@ mod tests {
             "bytes were discarded despite a failed revoke"
         );
         assert!(err.to_string().contains("read-only"), "unexpected: {err}");
+    }
+
+    /// A reopen that fails raises no open event; waiting for one would block forever, and with
+    /// it a takeover at startup. The opener's own error, errno intact, comes back instead.
+    #[test]
+    #[ignore = "needs CAP_SYS_ADMIN for fanotify_init"]
+    fn open_without_events_reports_a_failed_open() {
+        let files = [(); 2].map(|_| vmm_sys_util::tempfile::TempFile::new().unwrap());
+        let fds = files.each_ref().map(|f| f.as_file().as_raw_fd());
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(super::open_without_events_via(&fds, |_| {
+                Err(std::io::Error::from_raw_os_error(libc::EMFILE))
+            }));
+        });
+        let result = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("open_without_events hung on a failed open");
+        assert_eq!(
+            result.err().and_then(|e| e.raw_os_error()),
+            Some(libc::EMFILE)
+        );
+    }
+
+    /// One group reopens every inode, and each descriptor comes back in its input's place.
+    #[test]
+    #[ignore = "needs CAP_SYS_ADMIN for fanotify_init"]
+    fn open_without_events_reopens_each_inode_in_order() {
+        let files = [(); 3].map(|_| vmm_sys_util::tempfile::TempFile::new().unwrap());
+        let fds = files.each_ref().map(|f| f.as_file().as_raw_fd());
+        let reopened = super::open_without_events(&fds).unwrap();
+        assert_eq!(reopened.len(), fds.len());
+        for (fd, quiet) in fds.iter().zip(&reopened) {
+            assert_eq!(
+                super::fd_identity(quiet.as_raw_fd()).unwrap(),
+                super::fd_identity(*fd).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn inode_share_domain_needs_every_device_to_agree() {
+        use super::common_domain;
+        let d = |s: &str| Some(s.to_string());
+        assert_eq!(common_domain(&[d("a"), d("a")]), d("a"));
+        assert_eq!(common_domain(&[d("a"), d("b")]), None);
+        assert_eq!(common_domain(&[d("a"), None]), None);
+        assert_eq!(common_domain(&[None, d("a")]), None);
+        assert_eq!(common_domain(&[]), None);
     }
 
     #[test]

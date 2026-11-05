@@ -731,7 +731,7 @@ mod tests {
         let tree = Tree::from_bootstrap(&rs, &mut dict).unwrap();
         let node = tree.get_node(std::path::Path::new(path)).unwrap();
         let mut node = node.borrow_mut_node();
-        node.v6_set_inode_share_fingerprint().unwrap();
+        node.v6_set_inode_share_fingerprint();
         node.info
             .xattrs
             .get(std::ffi::OsStr::new(RAFSV6_ISHARE_XATTR_NAME))
@@ -769,6 +769,33 @@ mod tests {
         assert_ne!(inode_share_fingerprint(&b, "/patched.so"), Some(fp.clone()));
         assert_ne!(inode_share_fingerprint(&a, "/a"), Some(fp));
         assert_eq!(inode_share_fingerprint(&a, "/empty"), None);
+    }
+
+    /// A file whose chunks do not cover it gets no fingerprint, and the build goes on.
+    #[test]
+    fn test_inode_share_fingerprint_skips_a_file_it_cannot_identify() {
+        use crate::core::chunk_dict::HashChunkDict;
+        use nydus_rafs::metadata::layout::v6::RAFSV6_ISHARE_XATTR_NAME;
+        use vmm_sys_util::tempdir::TempDir;
+
+        let dir = TempDir::new().unwrap();
+        let layer = build_v6_layer(&[("f", &[3u8; 9000])], dir.as_path());
+        let (rs, _) =
+            RafsSuper::load_from_file(&layer, Arc::new(ConfigV2::new("cfg")), false).unwrap();
+        let tree =
+            Tree::from_bootstrap(&rs, &mut HashChunkDict::new(digest::Algorithm::Sha256)).unwrap();
+        let mut node = tree
+            .get_node(std::path::Path::new("/f"))
+            .unwrap()
+            .borrow_mut_node();
+        node.inode.set_size(20000);
+        node.v6_set_inode_share_fingerprint();
+        assert!(
+            node.info
+                .xattrs
+                .get(std::ffi::OsStr::new(RAFSV6_ISHARE_XATTR_NAME))
+                .is_none()
+        );
     }
 
     /// The merged bootstrap declares the fingerprint prefix for the kernel, and RAFS readers skip

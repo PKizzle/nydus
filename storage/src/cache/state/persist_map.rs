@@ -301,25 +301,17 @@ impl PersistMap {
             }
 
             if self.write_u8(index, current) {
-                if self.not_ready_count.fetch_sub(1, Ordering::AcqRel) == 1 {
-                    self.mark_all_ready();
+                // Flush the map once its last chunk is ready.
+                if self.not_ready_count.fetch_sub(1, Ordering::AcqRel) == 1
+                    && let Err(e) = self.filemap.sync_data()
+                {
+                    warn!("failed to flush the completed chunk map: {e}");
                 }
                 break;
             }
         }
 
         Ok(())
-    }
-
-    fn mark_all_ready(&self) {
-        if self.filemap.sync_data().is_ok() {
-            /*
-            if let Ok(header) = self.filemap.get_mut::<Header>(0) {
-                header.all_ready = MAGIC_ALL_READY;
-                let _ = self.filemap.sync_data();
-            }
-             */
-        }
     }
 
     #[inline]

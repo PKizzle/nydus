@@ -31,7 +31,7 @@ use std::sync::LazyLock;
 
 use clap::{Arg, ArgAction, ArgMatches, Command};
 use nix::sys::signal;
-use nydus_utils::fd_limit::{RLIMIT_NOFILE_MAX, RLIMIT_NOFILE_RESERVED, system_file_max};
+use nydus_utils::fd_limit::{RLIMIT_NOFILE_RESERVED, nofile_soft_target, system_file_max};
 use rlimit::Resource;
 
 use nydus::{SubCmdArgs, dump_program_info, get_build_time_info, setup_logging};
@@ -323,24 +323,12 @@ fn handle_rlimit_nofile_option(args: &ArgMatches, option_name: &str) -> Result<(
 
     if rlimit_nofile != 0 {
         // Ensures there are fds available for other processes so we don't cause resource exhaustion.
-        let rlimit_nofile_max =
-            system_file_max().context("read the system-wide open-file limit")?;
-        if rlimit_nofile_max < 2 * RLIMIT_NOFILE_RESERVED {
+        let file_max = system_file_max().context("read the system-wide open-file limit")?;
+        if file_max < 2 * RLIMIT_NOFILE_RESERVED {
             bail!("The fs.file-max sysctl is too low to allow a reasonable number of open files.");
         }
-
-        // Reduce max_fds below the system-wide maximum, if necessary.
-        let rlimit_nofile_max = std::cmp::min(
-            rlimit_nofile_max - RLIMIT_NOFILE_RESERVED,
-            RLIMIT_NOFILE_MAX,
-        );
-        let rlimit_nofile_max = Resource::NOFILE.get().map(|(curr, _)| {
-            if curr >= rlimit_nofile_max {
-                curr
-            } else {
-                rlimit_nofile_max
-            }
-        })?;
+        let (curr, _) = Resource::NOFILE.get()?;
+        let rlimit_nofile_max = nofile_soft_target(curr, u64::MAX, file_max);
         let rlimit_nofile = std::cmp::min(rlimit_nofile, rlimit_nofile_max);
         info!(
             "Set rlimit-nofile to {}, maximum {}",
