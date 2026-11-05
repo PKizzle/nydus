@@ -824,8 +824,9 @@ impl DaemonSupervisor {
         // place: that file is its live source, so it is left as it is. Any other mount, such as
         // one without data devices that answers every read with EIO, is replaced, and only then
         // is the bootstrap staged again.
+        let mut heal = false;
         if let Some((source, _)) = mount_at(&mountpoint) {
-            let heal = Path::new(&source.replace("\\040", " ")) == staged_bootstrap
+            heal = Path::new(&source.replace("\\040", " ")) == staged_bootstrap
                 && is_staged_copy(bootstrap, &staged_bootstrap);
             if !heal {
                 warn!(image_ref = %image_ref_str, source, "replacing a mount of another bootstrap");
@@ -833,7 +834,7 @@ impl DaemonSupervisor {
                     .with_context(|| format!("failed to detach {}", mountpoint.display()))?;
             }
         }
-        if !is_mounted_at(&mountpoint) {
+        if !heal {
             stage_bootstrap(bootstrap, &staged_bootstrap).with_context(|| {
                 format!(
                     "failed to stage bootstrap {} -> {}",
@@ -2409,7 +2410,7 @@ impl DaemonSupervisor {
         slug: &str,
         fan_fd: std::os::fd::RawFd,
         state: Vec<u8>,
-        on_error: impl FnOnce(&Arc<dyn NydusDaemon>),
+        on_error: impl FnOnce(&Arc<dyn NydusDaemon>) + Send + 'static,
     ) -> Result<(Arc<dyn NydusDaemon>, Arc<Mutex<Poll>>)> {
         let bti = self.build_info.clone();
         let poll = Poll::new().context("failed to create mio Poll for daemon waker")?;
@@ -2467,7 +2468,8 @@ impl DaemonSupervisor {
         }
         .await;
         if let Err(e) = started {
-            on_error(&daemon);
+            let stopping = daemon.clone();
+            blocking::unblock(move || on_error(&stopping)).await;
             return Err(e);
         }
         Ok((daemon, poll))
@@ -2546,7 +2548,8 @@ impl DaemonSupervisor {
             drop(suspended);
             // Lets the old daemon's state machine thread, which holds the daemon, exit. With
             // its handlers taken out, stopping it answers none of the queued events.
-            stop_daemon_keep_mount(old);
+            let stopping = old.clone();
+            blocking::unblock(move || stop_daemon_keep_mount(&stopping)).await;
             Ok(Arc::new(DaemonInstance {
                 image_ref: old.image_ref.clone(),
                 mountpoint: old.mountpoint.clone(),
@@ -2833,6 +2836,12 @@ fn stage_bootstrap(src: &Path, dst: &Path) -> io::Result<()> {
 
 /// Whether `staged` holds exactly what [`stage_bootstrap`] makes of `src`.
 fn is_staged_copy(src: &Path, staged: &Path) -> bool {
+    let (Ok(src_meta), Ok(staged_meta)) = (fs::metadata(src), fs::metadata(staged)) else {
+        return false;
+    };
+    if staged_meta.len() != src_meta.len().next_multiple_of(host_page_size()) {
+        return false;
+    }
     let (Ok(src), Ok(staged)) = (fs::read(src), fs::read(staged)) else {
         return false;
     };
@@ -3696,12 +3705,12 @@ mod e2e_tests;
 mod tests {
     use super::*;
 
-    /// Run by the in-place fanotify takeover after the failed handler's workers stopped and
-    /// before the new daemon starts: the window in which reads must wait, not fail.
     /// Makes the next fanotify group adoption fail once its daemon is already serving.
     #[cfg(target_os = "linux")]
     pub(super) static FAIL_NEXT_ADOPTION: AtomicBool = AtomicBool::new(false);
 
+    /// Run by the in-place fanotify takeover after the failed handler's workers stopped and
+    /// before the new daemon starts: the window in which reads must wait, not fail.
     #[cfg(target_os = "linux")]
     pub(super) static TAKEOVER_GAP_HOOK: StdMutex<Option<Box<dyn FnOnce() + Send>>> =
         StdMutex::new(None);
