@@ -645,9 +645,9 @@ async fn settle_commit(
 /// `Write` actions at their running offsets, the chunk that completes the payload sent as
 /// `Commit` with the labels. The first message names the ref, size and digest (containerd
 /// opens the writer from it) and, at offset 0, truncates whatever an earlier aborted session
-/// left under the same ref. Only the first carries the digest, as in containerd's own client:
-/// containerd keeps it for the commit, and looks it up in its metadata store for every message
-/// that carries one. A source that ends early ends the session without a commit, which
+/// left under the same ref. The digest goes only on the first message and the commit, as in
+/// containerd's own client: containerd looks it up in its metadata store for every message
+/// that carries one, so repeating it on each data message costs one lookup per chunk. A source that ends early ends the session without a commit, which
 /// [`check_committed`] reports.
 fn write_requests<C: Stream<Item = Vec<u8>>>(
     mut ref_name: String,
@@ -656,7 +656,7 @@ fn write_requests<C: Stream<Item = Vec<u8>>>(
     mut labels: HashMap<String, String>,
     chunks: C,
 ) -> impl Stream<Item = WriteContentRequest> + use<C> {
-    let mut expected = expected.to_string();
+    let expected = expected.to_string();
     let mut offset = 0u64;
     chunks.map(move |data| {
         let start = offset;
@@ -670,7 +670,11 @@ fn write_requests<C: Stream<Item = Vec<u8>>>(
             } as i32,
             r#ref: std::mem::take(&mut ref_name),
             total: total as i64,
-            expected: std::mem::take(&mut expected),
+            expected: if start == 0 || last {
+                expected.clone()
+            } else {
+                String::new()
+            },
             offset: start as i64,
             data,
             labels: if last {
@@ -964,7 +968,8 @@ mod tests {
             assert!(req.data.len() <= WRITE_CHUNK_SIZE);
             assert_eq!(req.offset as usize, joined.len());
             assert_eq!(req.total as usize, data.len());
-            assert_eq!(req.expected, if i == 0 { "sha256:x" } else { "" });
+            let carries_digest = i == 0 || i + 1 == reqs.len();
+            assert_eq!(req.expected, if carries_digest { "sha256:x" } else { "" });
             assert_eq!(req.r#ref, if i == 0 { "ref" } else { "" });
             let last = i + 1 == reqs.len();
             let action = if last {
