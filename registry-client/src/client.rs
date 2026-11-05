@@ -34,7 +34,7 @@ use crate::types::{
 use anyhow::{Context, Result, anyhow, bail};
 use compio::BufResult;
 use compio::io::{AsyncReadAt, AsyncWriteAtExt};
-use cyper::{Client, Response};
+use cyper::{Client, RequestBuilder, Response};
 use futures::StreamExt;
 use http::header::{
     ACCEPT, AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, HeaderName, HeaderValue, LOCATION,
@@ -886,8 +886,11 @@ impl RegistryClient {
     }
 
     /// Send one logical request. `GET`/`HEAD` are retried with exponential
-    /// backoff on a `5xx` or transport error (up to [`IDEMPOTENT_ATTEMPTS`]);
-    /// other methods, timeouts and non-`5xx` statuses are returned as-is.
+    /// backoff on a transport error or a `5xx` other than `501` (up to
+    /// [`IDEMPOTENT_ATTEMPTS`]). `501` is a definitive "unsupported" that
+    /// callers interpret (see [`Self::get_referrers`]). Other methods,
+    /// timeouts, other statuses and request-build failures (invalid URL or
+    /// header, unreadable upload file) are returned as-is.
     async fn send_once(
         &self,
         method: Method,
@@ -901,11 +904,15 @@ impl RegistryClient {
         let mut delay = IDEMPOTENT_RETRY_DELAY;
         let mut attempt = 1;
         loop {
-            let result = self
-                .send_attempt(method.clone(), url, headers, body, auth.clone(), timeout)
-                .await;
+            let request = self
+                .build_request(method.clone(), url, headers, body, auth.clone())
+                .await?;
+            let result = send_request(request, url, timeout).await;
             let failure = match &result {
-                Ok(response) if response.status().is_server_error() => {
+                Ok(response)
+                    if response.status().is_server_error()
+                        && response.status() != StatusCode::NOT_IMPLEMENTED =>
+                {
                     format!("HTTP {}", response.status())
                 }
                 Err(RegistryError::Other(err)) => format!("{err:#}"),
@@ -921,17 +928,15 @@ impl RegistryClient {
         }
     }
 
-    /// One attempt: build the request (headers, optional auth, body) and send
-    /// it with the per-request timeout.
-    async fn send_attempt(
+    /// Build one attempt's request: headers, optional auth, body.
+    async fn build_request(
         &self,
         method: Method,
         url: &str,
         headers: &[(HeaderName, HeaderValue)],
         body: &BodySource<'_>,
         auth: Option<HeaderValue>,
-        timeout: Option<Duration>,
-    ) -> Result<Response, RegistryError> {
+    ) -> Result<RequestBuilder, RegistryError> {
         let mut request = self
             .client
             .request(method, url)
@@ -978,15 +983,7 @@ impl RegistryClient {
                     .body(file)
             }
         };
-        let send = request.send();
-        match timeout {
-            Some(duration) => compio::time::timeout(duration, send)
-                .await
-                .map_err(|_| RegistryError::Timeout(format!("registry request to {url}")))?,
-            None => send.await,
-        }
-        .with_context(|| format!("registry request failed for {url}"))
-        .map_err(RegistryError::from)
+        Ok(request)
     }
 
     /// Best available `Authorization` header for the first attempt: cached
@@ -1063,6 +1060,24 @@ fn same_origin(base: &str, url: &str) -> bool {
         (Some(a), Some(b)) => a == b,
         _ => false,
     }
+}
+
+/// Send a built request under the per-request timeout. Any error other than
+/// the timeout is a transport failure, mapped to [`RegistryError::Other`].
+async fn send_request(
+    request: RequestBuilder,
+    url: &str,
+    timeout: Option<Duration>,
+) -> Result<Response, RegistryError> {
+    let send = request.send();
+    match timeout {
+        Some(duration) => compio::time::timeout(duration, send)
+            .await
+            .map_err(|_| RegistryError::Timeout(format!("registry request to {url}")))?,
+        None => send.await,
+    }
+    .with_context(|| format!("registry request failed for {url}"))
+    .map_err(RegistryError::from)
 }
 
 /// Resolve an upload `Location` header against the registry base URL
@@ -1682,6 +1697,38 @@ mod tests {
             "{err}"
         );
         assert_eq!(server.join().unwrap().len(), 1);
+    }
+
+    #[compio::test]
+    async fn manifest_get_does_not_retry_not_implemented() {
+        let (port, server) = serve_raw(vec![raw_response("501 Not Implemented", "")]);
+        let err = loopback_client(port)
+            .get_manifest("app", "v1")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, RegistryError::Http { status: 501, .. }),
+            "{err}"
+        );
+        assert_eq!(server.join().unwrap().len(), 1);
+    }
+
+    #[compio::test]
+    async fn request_build_failures_are_not_retried() {
+        // A space makes the URL unparseable: the request is never sent, so
+        // backing off and retrying could not change the outcome.
+        let client = RegistryClient::new(
+            "bad host",
+            RegistryClientOptions {
+                use_docker_config: false,
+                ..RegistryClientOptions::default()
+            },
+        )
+        .unwrap();
+        let started = std::time::Instant::now();
+        let err = client.get_manifest("app", "v1").await.unwrap_err();
+        assert!(matches!(err, RegistryError::Other(_)), "{err}");
+        assert!(started.elapsed() < IDEMPOTENT_RETRY_DELAY, "{err}");
     }
 
     #[test]
