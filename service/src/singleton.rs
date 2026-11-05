@@ -178,7 +178,7 @@ impl ServiceController {
         image_id: &str,
         fanotify: &Arc<crate::fanotify::FanotifyHandler>,
     ) {
-        for _ in 0..fanotify.working_threads() {
+        let workers = (0..fanotify.working_threads()).map(|_| {
             let f2 = fanotify.clone();
             let waker = self.waker.clone();
             let id = image_id.to_string();
@@ -189,8 +189,9 @@ impl ServiceController {
                 if let Err(err) = waker.wake() {
                     error!("fanotify: fail to exit daemon, error: {:?}", err);
                 }
-            });
-        }
+            })
+        });
+        fanotify.add_workers(workers.collect::<Vec<_>>());
     }
 
     /// Rebuild a fanotify handler from a fanotify group fd preserved across a hot upgrade.
@@ -249,6 +250,41 @@ impl ServiceController {
         Ok(out)
     }
 
+    /// Take every fanotify handler out of this daemon and stop its workers, for a takeover of
+    /// their groups by another daemon in this process. Queued events stay unanswered for the
+    /// successor's workers: stopping this daemon afterwards finds no handler to drain.
+    ///
+    /// Call it after [`save`](NydusDaemon::save) has captured the group fds. Each returned
+    /// handler keeps its group open until dropped; if the takeover fails, hand them back with
+    /// [`resume_fanotify_handlers`](Self::resume_fanotify_handlers).
+    pub fn suspend_fanotify_handlers(
+        &self,
+    ) -> Vec<(String, Arc<crate::fanotify::FanotifyHandler>)> {
+        let handlers: Vec<_> = self.fanotify.lock().unwrap().drain().collect();
+        for (image_id, fanotify) in &handlers {
+            info!(
+                "Suspending fanotify handler for {} for a takeover",
+                image_id
+            );
+            fanotify.stop_workers();
+        }
+        handlers
+    }
+
+    /// Register handlers [`suspend_fanotify_handlers`](Self::suspend_fanotify_handlers) took out
+    /// again and restart their workers, which answer what queued meanwhile.
+    pub fn resume_fanotify_handlers(
+        &self,
+        handlers: Vec<(String, Arc<crate::fanotify::FanotifyHandler>)>,
+    ) {
+        for (image_id, fanotify) in &handlers {
+            info!("Resuming fanotify handler for {}", image_id);
+            fanotify.reactivate();
+            self.spawn_fanotify_workers(image_id, fanotify);
+        }
+        self.fanotify.lock().unwrap().extend(handlers);
+    }
+
     /// Unregister a fanotify handler for an image.
     ///
     /// This stops the worker threads and unmounts the EROFS filesystem.
@@ -274,20 +310,15 @@ impl ServiceController {
             let mountpoint = fanotify.mountpoint().to_path_buf();
             drop(handlers); // Release lock before unmounting
             result = Self::umount_fanotify_erofs(&fanotify, &mountpoint);
-            // Only now may the handler — and the group fd it owns — drop. The workers release
-            // their references just after the barrier `stop()` waited on; wait for that, so
-            // the cache managers are idle for the gc below.
-            for _ in 0..1000 {
-                if Arc::strong_count(&fanotify) == 1 {
-                    break;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(1));
-            }
-            drop(fanotify);
-            // Release the cache managers the handler held. The blob factory keys them by
+            // Only now may the handler — and the group fd it owns — drop; `stop()` joined its
+            // workers. Then release its cache managers: the blob factory keys them by
             // config, so an idle one would otherwise keep its cache files open after the
             // daemon's directory is removed, and be handed to the next daemon for this image.
-            nydus_storage::factory::BLOB_FACTORY.gc(None);
+            let cache_keys = fanotify.cache_keys().to_vec();
+            drop(fanotify);
+            for (config, blob_id) in &cache_keys {
+                nydus_storage::factory::BLOB_FACTORY.gc(Some((config, blob_id)));
+            }
         }
         if is_empty {
             self.fanotify_enabled.store(false, Ordering::Release);

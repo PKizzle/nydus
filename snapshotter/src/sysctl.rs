@@ -1824,6 +1824,7 @@ mod tests {
             live: false,
             updated_at: 1,
             pid: 0,
+            built_on_node: false,
         };
         let records_dir = controller.supervisor.daemons_root().join("records");
         std::fs::create_dir_all(&records_dir).unwrap();

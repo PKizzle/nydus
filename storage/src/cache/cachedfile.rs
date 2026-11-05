@@ -29,7 +29,7 @@ use nydus_utils::metrics::{BlobcacheMetrics, Metric};
 use nydus_utils::{DelayType, Delayer, FileRangeReader, compress, digest, round_up_usize};
 
 use crate::backend::BlobReader;
-use crate::cache::state::ChunkMap;
+use crate::cache::state::{ChunkMap, RangeMap};
 use crate::cache::worker::{AsyncPrefetchConfig, AsyncPrefetchMessage, AsyncWorkerMgr};
 use crate::cache::{BlobCache, BlobIoMergeState, CasMgr};
 use crate::device::{
@@ -1157,12 +1157,18 @@ impl FileCacheEntry {
             Some(v) => v,
         };
 
-        let mut status = vec![false; count as usize];
+        // Whichever way this returns or unwinds, the chunks it marked and did not resolve are
+        // cleared, or every later read of them waits out the in-flight timeout and fails.
+        let mut status = PendingChunks {
+            bitmap,
+            chunks,
+            pending: vec![false; count as usize],
+        };
         let (start_idx, end_idx) = {
             let mut start = u32::MAX;
             let mut end = 0;
             for chunk_id in pending.iter() {
-                status[(*chunk_id - chunk_index) as usize] = true;
+                status.pending[(*chunk_id - chunk_index) as usize] = true;
                 start = std::cmp::min(*chunk_id - chunk_index, start);
                 end = std::cmp::max(*chunk_id - chunk_index, end);
             }
@@ -1196,13 +1202,20 @@ impl FileCacheEntry {
                             blob_offset,
                             bufs.compressed_buf(),
                         );
-                        for idx in start_idx..=end_idx {
-                            if status[idx] {
-                                self.update_chunk_persist_status(chunks[idx].as_ref(), &res);
+                        for (chunk, pending) in chunks[start_idx..=end_idx]
+                            .iter()
+                            .zip(&mut status.pending[start_idx..=end_idx])
+                        {
+                            if *pending {
+                                self.update_chunk_persist_status(chunk.as_ref(), &res);
+                                *pending = false;
                             }
                         }
                     } else {
-                        for idx in start_idx..=end_idx {
+                        for (chunk, pending) in chunks[start_idx..=end_idx]
+                            .iter()
+                            .zip(&mut status.pending[start_idx..=end_idx])
+                        {
                             let mut buf = match bufs.next() {
                                 None => {
                                     return Err(StorageError::InvalidData(
@@ -1210,33 +1223,22 @@ impl FileCacheEntry {
                                     ));
                                 }
                                 Some(Err(e)) => {
-                                    for idx in idx..=end_idx {
-                                        if status[idx] {
-                                            bitmap.clear_range_pending(chunks[idx].id(), 1)
-                                        }
-                                    }
                                     return Err(StorageError::cache_io("decompress a chunk", e));
                                 }
                                 Some(Ok(v)) => v,
                             };
 
-                            if status[idx] {
+                            if *pending {
                                 if self.dio_enabled {
                                     self.adjust_buffer_for_dio(&mut buf)
                                 }
-                                let _ = self.persist_chunk_data(chunks[idx].as_ref(), buf.as_ref());
+                                let _ = self.persist_chunk_data(chunk.as_ref(), buf.as_ref());
+                                *pending = false;
                             }
                         }
                     }
                 }
-                Err(e) => {
-                    for idx in 0..chunks.len() {
-                        if status[idx] {
-                            bitmap.clear_range_pending(chunks[idx].id(), 1)
-                        }
-                    }
-                    return Err(e);
-                }
+                Err(e) => return Err(e),
             }
         }
 
@@ -2069,8 +2071,65 @@ impl FileIoMergeState {
     }
 }
 
+/// The chunks one `do_fetch_chunks` call marked in flight, until it resolves each one.
+///
+/// Dropping it clears the marks still standing: an early return or a panic would otherwise
+/// leave them for every later read of those chunks to wait on until the in-flight timeout.
+struct PendingChunks<'a> {
+    bitmap: &'a dyn RangeMap<I = u32>,
+    chunks: &'a [Arc<dyn BlobChunkInfo>],
+    pending: Vec<bool>,
+}
+
+impl Drop for PendingChunks<'_> {
+    fn drop(&mut self) {
+        for (chunk, pending) in self.chunks.iter().zip(&self.pending) {
+            if *pending {
+                self.bitmap.clear_range_pending(chunk.id(), 1);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn pending_chunks_clears_only_unresolved_marks_on_unwind() {
+        use super::{BlobChunkInfo, PendingChunks, RangeMap};
+        use crate::test::MockChunkInfo;
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Default)]
+        struct Cleared(Mutex<Vec<u32>>);
+        impl RangeMap for Cleared {
+            type I = u32;
+            fn clear_range_pending(&self, start: u32, _count: u32) {
+                self.0.lock().unwrap().push(start);
+            }
+        }
+
+        let cleared = Cleared::default();
+        let chunks: Vec<Arc<dyn BlobChunkInfo>> = (10..13)
+            .map(|index| {
+                Arc::new(MockChunkInfo {
+                    index,
+                    ..Default::default()
+                }) as Arc<dyn BlobChunkInfo>
+            })
+            .collect();
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut status = PendingChunks {
+                bitmap: &cleared,
+                chunks: &chunks,
+                pending: vec![true, true, false],
+            };
+            status.pending[0] = false; // resolved before the failure
+            panic!("fill failed");
+        }));
+        assert!(unwound.is_err());
+        assert_eq!(*cleared.0.lock().unwrap(), vec![11]);
+    }
+
     #[test]
     fn persist_cached_data_preserves_write_errno() {
         use std::sync::Arc;
