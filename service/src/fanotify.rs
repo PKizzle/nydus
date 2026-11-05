@@ -606,12 +606,15 @@ fn mount_erofs_with(bootstrap: &Path, mountpoint: &Path, options: &str) -> Resul
     fn cstr(bytes: &[u8]) -> Result<std::ffi::CString> {
         std::ffi::CString::new(bytes).map_err(|e| std::io::Error::new(ErrorKind::InvalidInput, e))
     }
-    fn fd(ret: libc::c_long) -> Result<OwnedFd> {
+    fn cvt(ret: libc::c_long) -> Result<libc::c_long> {
         if ret < 0 {
             return Err(std::io::Error::last_os_error());
         }
-        // SAFETY: the syscall returned a fresh descriptor that nothing else owns.
-        Ok(unsafe { OwnedFd::from_raw_fd(ret as RawFd) })
+        Ok(ret)
+    }
+    fn fd(ret: libc::c_long) -> Result<OwnedFd> {
+        // SAFETY: on success the syscall returned a fresh descriptor that nothing else owns.
+        cvt(ret).map(|fd| unsafe { OwnedFd::from_raw_fd(fd as RawFd) })
     }
 
     let fs = fd(unsafe { libc::syscall(libc::SYS_fsopen, c"erofs".as_ptr(), FSOPEN_CLOEXEC) })?;
@@ -628,10 +631,7 @@ fn mount_erofs_with(bootstrap: &Path, mountpoint: &Path, options: &str) -> Resul
                 0,
             )
         };
-        if ret < 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        Ok(())
+        cvt(ret).map(drop)
     };
 
     let configured = (|| {
@@ -687,10 +687,7 @@ fn mount_erofs_with(bootstrap: &Path, mountpoint: &Path, options: &str) -> Resul
             MOVE_MOUNT_F_EMPTY_PATH,
         )
     };
-    if ret < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    Ok(())
+    cvt(ret).map(drop)
 }
 
 impl FanotifyHandler {

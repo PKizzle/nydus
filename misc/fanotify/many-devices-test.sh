@@ -26,7 +26,7 @@ done
 "$NI" merge -B "$STAGE/bootstrap" --original-blob-ids "$(IFS=,; echo "${IDS[*]}")" "${BOOTSTRAPS[@]}" >/dev/null 2>&1 || { echo "merge failed"; exit 1; }
 "$NI" check -B "$STAGE/bootstrap" --blob-dir "$R/backend" >/dev/null || { echo "check failed"; exit 1; }
 BLOBS=$(ls "$R/backend" | wc -l)
-OPTS=0; for i in $(seq 0 $((BLOBS - 1))); do OPTS=$((OPTS + ${#STAGE} + 14 + ${#i})); done  # "device=<stage>/blob_<i>,"
+OPTS=$(for i in $(seq 0 $((BLOBS - 1))); do printf 'device=%s/blob_%s,' "$STAGE" "$i"; done | wc -c)
 echo "layers=$LAYERS blobs=$BLOBS joined device options $OPTS bytes"
 [ "$BLOBS" = "$LAYERS" ] && [ "$OPTS" -gt 4096 ] || { echo "image too small to exercise the one-page limit"; exit 1; }
 
