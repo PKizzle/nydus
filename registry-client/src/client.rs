@@ -878,7 +878,8 @@ impl RegistryClient {
     }
 
     /// Fetch and cache a bearer token for `challenge`, preferring the
-    /// challenge's scope over the caller-requested one. Failures map to
+    /// challenge's scope over the caller-requested one. `requested_scope`
+    /// only fills in when the challenge names no scope. Failures map to
     /// [`RegistryError::Auth`] — a broken token dance is an auth failure,
     /// whatever its underlying transport shape.
     async fn acquire_bearer(
@@ -899,13 +900,12 @@ impl RegistryClient {
         )
         .await
         .map_err(|e| RegistryError::Auth(format!("bearer token fetch failed: {e:#}")))?;
-        {
-            let mut cache = self.tokens.borrow_mut();
-            cache.insert(requested_scope, &bearer.token, bearer.expires_in);
-            if token_scope != requested_scope {
-                cache.insert(&token_scope, &bearer.token, bearer.expires_in);
-            }
-        }
+        // Cache only under the scope the token was minted for: when the
+        // challenge named a narrower scope (pull for a push), serving it for
+        // `requested_scope` would send a token known not to grant it.
+        self.tokens
+            .borrow_mut()
+            .insert(&token_scope, &bearer.token, bearer.expires_in);
         HeaderValue::from_str(&format!("Bearer {}", bearer.token)).map_err(|_| {
             RegistryError::Auth("registry bearer token contained invalid header characters".into())
         })
@@ -1809,6 +1809,30 @@ mod tests {
         for head in &seen[2..] {
             assert!(head.contains("authorization: Bearer tok-1"), "{head}");
         }
+    }
+
+    #[compio::test]
+    async fn token_is_cached_only_under_the_granted_scope() {
+        let manifest = r#"{"schemaVersion":2}"#;
+        let (port, server) = serve_raw_with(|port| {
+            // The challenge names a scope other than the client's pull scope.
+            let challenge = format!(
+                "HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Bearer \
+                 realm=\"http://127.0.0.1:{port}/token\",scope=\"repository:other:pull\"\r\n\
+                 Content-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            vec![
+                challenge,
+                raw_response("200 OK", r#"{"token":"tok-other"}"#),
+                raw_response("200 OK", manifest),
+            ]
+        });
+        let client = loopback_client(port);
+        client.get_manifest("app", "v1").await.unwrap();
+        server.join().unwrap();
+        let cache = client.tokens.borrow();
+        assert_eq!(cache.get("repository:other:pull"), Some("tok-other"));
+        assert_eq!(cache.get(&pull_scope("app")), None);
     }
 
     #[compio::test]
