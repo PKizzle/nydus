@@ -168,7 +168,7 @@ impl Bootstrap {
             }
 
             if ctx.inode_share_fingerprint && ctx.fs_version.is_v6() {
-                child_node.v6_set_inode_share_fingerprint()?;
+                child_node.v6_set_inode_share_fingerprint();
             }
             // update bootstrap_ctx.offset for rafs v6 non-dir nodes.
             if !child_node.is_dir() && ctx.fs_version.is_v6() {
