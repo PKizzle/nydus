@@ -21,9 +21,10 @@
 //! there; `HEAD`-dedup makes it free when the source and target repos coincide,
 //! and for `--oci-ref` the reused gzip layers are already present). It is
 //! published both by digest (registries with native referrers-API support build
-//! the referrers index from the `subject`) and under the `sha256-<subject-hex>`
-//! **fallback tag** (the referrers-API fallback for registries such as Zot /
-//! older Harbor that lack native support).
+//! the referrers index from the `subject`) and listed in the image index at the
+//! `sha256-<subject-hex>` **fallback tag** (the referrers-API fallback for
+//! registries such as Zot / older Harbor that lack native support), which the
+//! OCI 1.1 distribution spec defines as the index of every referrer.
 //!
 //! The exact manifest shape mirrors what the snapshotter consumes
 //! (`snapshotter/src/source/referrer.rs::classify_descriptor` +
@@ -35,11 +36,12 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use registry_client::types::{
     ANNOTATION_NYDUS_BOOTSTRAP, MEDIA_TYPE_NYDUS_BLOB, MEDIA_TYPE_NYDUS_BOOTSTRAP,
-    MEDIA_TYPE_OCI_CONFIG, MEDIA_TYPE_OCI_MANIFEST, Manifest,
+    MEDIA_TYPE_OCI_CONFIG, MEDIA_TYPE_OCI_INDEX, MEDIA_TYPE_OCI_MANIFEST, Manifest,
 };
-use registry_client::{Descriptor, RegistryClient};
+use registry_client::{Descriptor, Index, RegistryClient, RegistryError};
 use tracing::info;
 
+use crate::engine::oci::is_index;
 use crate::engine::retry::RetryPolicy;
 
 /// The referrer artifact's `artifactType`: the nydus data-blob media type. This
@@ -134,10 +136,27 @@ pub async fn maybe_push_referrer(
         .context("push referrer artifact manifest by digest")?;
     // (2) Fallback tag: the referrers-API fallback for registries without native
     // support — the snapshotter GETs `sha256-<subject-hex>` when /referrers 404s.
+    // Its content is the index of the subject's referrers, so the other ones
+    // already listed there are kept.
     let fallback = fallback_referrers_tag(&subject.digest);
+    let existing = match source_client.get_manifest(source_repo, &fallback).await {
+        Ok(fetched) if is_index(fetched.content_type.as_deref(), &fetched.bytes) => Some(
+            serde_json::from_slice::<Index>(&fetched.bytes)
+                .with_context(|| format!("parse referrers fallback index {fallback}"))?,
+        ),
+        // Absent, or a bare artifact manifest written before the tag held an index.
+        Ok(_) | Err(RegistryError::NotFound { .. }) => None,
+        Err(e) => {
+            return Err(e).with_context(|| format!("read referrers fallback tag {fallback}"));
+        }
+    };
+    let mut entry = artifact.clone();
+    entry.artifact_type = Some(REFERRER_ARTIFACT_TYPE.to_string());
+    let index_bytes = serde_json::to_vec(&referrers_fallback_index(existing, entry))
+        .context("serialize referrers fallback index")?;
     retry
         .run("push referrer fallback tag", || {
-            source_client.push_manifest(source_repo, &fallback, MEDIA_TYPE_OCI_MANIFEST, &bytes)
+            source_client.push_manifest(source_repo, &fallback, MEDIA_TYPE_OCI_INDEX, &index_bytes)
         })
         .await
         .with_context(|| format!("push referrer fallback tag {fallback}"))?;
@@ -150,6 +169,25 @@ pub async fn maybe_push_referrer(
         "pushed nydus referrer artifact"
     );
     Ok(Some(artifact))
+}
+
+/// The fallback-tag index after publishing `entry`: every existing referrer is
+/// kept except earlier nydus artifacts, which `entry` supersedes — consumers take
+/// the first nydus entry, and the subject has one current conversion.
+pub fn referrers_fallback_index(existing: Option<Index>, entry: Descriptor) -> Index {
+    let mut manifests: Vec<Descriptor> = existing
+        .map(|index| index.manifests)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|d| d.digest != entry.digest && d.artifact_type != entry.artifact_type)
+        .collect();
+    manifests.push(entry);
+    Index {
+        schema_version: 2,
+        media_type: Some(MEDIA_TYPE_OCI_INDEX.to_string()),
+        manifests,
+        annotations: None,
+    }
 }
 
 /// The referrers-API fallback tag for a subject digest: `sha256:<hex>` becomes
@@ -236,6 +274,32 @@ mod tests {
             fallback_referrers_tag(&subject_desc().digest),
             "sha256-a94a8fe5ccb19ba61c4c0873d391e987982fbbd3a94a8fe5ccb19ba61c4c0873"
         );
+    }
+
+    #[test]
+    fn fallback_tag_holds_an_index_of_every_referrer() {
+        let artifact = |digest: &str, artifact_type: &str| Descriptor {
+            media_type: MEDIA_TYPE_OCI_MANIFEST.to_string(),
+            digest: digest.to_string(),
+            artifact_type: Some(artifact_type.to_string()),
+            ..Descriptor::default()
+        };
+        let sbom = artifact("sha256:sbom", "application/spdx+json");
+        let old = artifact("sha256:old", REFERRER_ARTIFACT_TYPE);
+        let new = artifact("sha256:new", REFERRER_ARTIFACT_TYPE);
+
+        let first = referrers_fallback_index(None, old.clone());
+        assert_eq!(first.media_type.as_deref(), Some(MEDIA_TYPE_OCI_INDEX));
+        assert_eq!(first.schema_version, 2);
+        assert_eq!(first.manifests, std::slice::from_ref(&old));
+
+        // Another tool's referrer stays; the earlier nydus artifact is replaced.
+        let existing = Index {
+            manifests: vec![sbom.clone(), old],
+            ..Index::default()
+        };
+        let index = referrers_fallback_index(Some(existing), new.clone());
+        assert_eq!(index.manifests, [sbom, new]);
     }
 
     #[test]
