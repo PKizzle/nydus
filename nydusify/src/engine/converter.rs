@@ -706,9 +706,9 @@ fn pull_source_from_archive(
 /// runtime sees, and its repo is where reused blobs are mounted from. `plan()` guarantees
 /// at least one image source exists.
 ///
-/// Every image source is pulled with the same client, so the source-side flags
-/// (`--source-insecure`, `--source-plain-http`, credentials) apply to all of them; sources
-/// spread across registries with differing settings are not supported.
+/// Each image source is pulled from its own registry: sources on the anchor's host share
+/// its client, any other host gets a client of its own. The source-side flags
+/// (`--source-insecure`, `--source-plain-http`, `--ca-cert`) apply to all of them.
 async fn gather_sources(
     request: &ConvertRequest,
     client: Option<&RegistryClient>,
@@ -738,6 +738,21 @@ async fn gather_sources(
                 } else {
                     ImageReference::parse(reference)
                         .with_context(|| format!("parse --source {reference}"))?
+                };
+                let own_client;
+                let client = if image_ref.api_host == anchor_ref.api_host {
+                    client
+                } else {
+                    own_client = RegistryClient::new(
+                        &image_ref.api_host,
+                        client_options(
+                            request.source_insecure,
+                            request.source_plain_http,
+                            &request.ca_cert_files,
+                        ),
+                    )
+                    .with_context(|| format!("build registry client for --source {reference}"))?;
+                    &own_client
                 };
                 let pulled = pull_source(request, client, &image_ref, platform, workspace).await?;
                 inputs.extend(pulled.layers.iter().cloned().map(BuildInput::Layer));
@@ -2019,6 +2034,57 @@ fn link_or_copy(target: &Path, link: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A request parsed and planned from `nydusify convert` plus `args`.
+    fn convert_request(args: &[&str]) -> ConvertRequest {
+        use clap::Parser as _;
+        let mut argv = vec!["nydusify", "convert"];
+        argv.extend_from_slice(args);
+        let crate::cli::Commands::Convert(args) = crate::cli::Cli::parse_from(argv).command else {
+            panic!("expected convert command");
+        };
+        let plan = crate::commands::convert::plan(&args).unwrap();
+        ConvertRequest::from_convert_args(&args, &plan, String::new()).unwrap()
+    }
+
+    #[compio::test]
+    async fn each_source_is_pulled_from_its_own_registry() {
+        // Nothing listens on either port; the point is which one is dialled first.
+        let lower = "127.0.0.1:9/lower:1";
+        let anchor = "127.0.0.1:10/upper:1";
+        let work = tempfile::tempdir().unwrap();
+        let request = convert_request(&[
+            "--source",
+            lower,
+            "--source",
+            anchor,
+            "--target",
+            "127.0.0.1:11/out:1",
+            "--plain-http",
+            "--platform",
+            "linux/amd64",
+        ]);
+        let anchor_ref = ImageReference::parse(anchor).unwrap();
+        let client = RegistryClient::new(
+            &anchor_ref.api_host,
+            client_options(false, true, &[] as &[PathBuf]),
+        )
+        .unwrap();
+        let err = match gather_sources(
+            &request,
+            Some(&client),
+            Some(&anchor_ref),
+            "linux/amd64",
+            work.path(),
+        )
+        .await
+        {
+            Ok(_) => panic!("nothing listens on the test ports"),
+            Err(e) => format!("{e:#}"),
+        };
+        assert!(err.contains("http://127.0.0.1:9/"), "{err}");
+        assert!(!err.contains("127.0.0.1:10"), "{err}");
+    }
 
     fn to_strings(args: &[OsString]) -> Vec<String> {
         args.iter()
