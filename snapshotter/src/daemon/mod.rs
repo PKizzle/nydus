@@ -1952,6 +1952,21 @@ impl DaemonSupervisor {
     /// number of daemons restored. Best-effort per daemon; call once at startup
     /// before serving gRPC.
     pub async fn restore_from_store(&self) -> usize {
+        // Before anything adopts or heals a mount, so both see padded sources.
+        let daemons = self.config.snapshotter.root.join("daemons");
+        let padded = blocking::unblock(move || {
+            pad_live_erofs_sources(
+                &fs::read_to_string("/proc/self/mounts").unwrap_or_default(),
+                &daemons,
+            )
+        })
+        .await;
+        if padded > 0 {
+            info!(
+                padded,
+                "extended the sources of live EROFS mounts to the page size"
+            );
+        }
         let stored = crate::fdstore::take_stored_fds();
         if stored.is_empty() {
             return 0;
@@ -2828,6 +2843,36 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
 fn stage_bootstrap(src: &Path, dst: &Path) -> io::Result<()> {
     fs::copy(src, dst)?;
     nydus_service::erofs_folio::pad_to_page_size(dst)
+}
+
+/// Pads the source of every file-backed EROFS mount whose source is a regular file under
+/// `daemons` (one of ours) to the page size, in place, and returns how many it changed. Such a
+/// mount may predate the padding in [`stage_bootstrap`] and [`mount_blockdev_erofs`]. Growing
+/// the backing file with zeros fixes the live mount: a kernel with the partial-folio bug only
+/// fails the read of a page that runs past the end of the file, and retries it on the next
+/// access, so containers already running on the mount need no remount.
+fn pad_live_erofs_sources(mounts: &str, daemons: &Path) -> usize {
+    let page = nydus_utils::host_page_size();
+    mounts
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let source = fields.next()?;
+            (fields.nth(1)? == "erofs").then(|| PathBuf::from(source.replace("\\040", " ")))
+        })
+        .filter(|source| source.starts_with(daemons))
+        .filter(|source| {
+            fs::symlink_metadata(source)
+                .is_ok_and(|m| m.is_file() && !m.len().is_multiple_of(page))
+        })
+        .filter(|source| match nydus_service::erofs_folio::pad_to_page_size(source) {
+            Ok(()) => true,
+            Err(e) => {
+                warn!(source = %source.display(), error = %e, "failed to pad a live EROFS source");
+                false
+            }
+        })
+        .count()
 }
 
 /// Whether `staged` holds exactly what [`stage_bootstrap`] makes of `src`.
@@ -3791,6 +3836,51 @@ mod tests {
     }
 
     /// A live mount's staged bootstrap is kept only when it is exactly what staging writes.
+    #[test]
+    fn pad_live_erofs_sources_pads_only_our_unaligned_erofs_sources() {
+        let dir = tempfile::tempdir().unwrap();
+        let daemons = dir.path().join("my daemons");
+        let page = nydus_utils::host_page_size();
+        let stage = daemons.join("slug/stage");
+        fs::create_dir_all(&stage).unwrap();
+        let ours = stage.join("bootstrap");
+        let aligned = stage.join("aligned");
+        let foreign = dir.path().join("foreign.erofs");
+        let not_erofs = stage.join("ext4.img");
+        for path in [&ours, &foreign, &not_erofs] {
+            fs::write(path, vec![1u8; 4096 + 512]).unwrap();
+        }
+        fs::write(&aligned, vec![1u8; page as usize]).unwrap();
+        let line = |source: &Path, fstype: &str| {
+            format!(
+                "{} /mnt/x {fstype} ro,relatime 0 0\n",
+                source.display().to_string().replace(' ', "\\040")
+            )
+        };
+        let mounts = [
+            line(&ours, "erofs"),
+            line(&aligned, "erofs"),
+            line(&foreign, "erofs"),
+            line(&not_erofs, "ext4"),
+            line(Path::new("/dev/mapper/verity"), "erofs"),
+        ]
+        .concat();
+
+        assert_eq!(pad_live_erofs_sources(&mounts, &daemons), 1);
+        assert_eq!(
+            fs::metadata(&ours).unwrap().len(),
+            (4096u64 + 512).next_multiple_of(page)
+        );
+        assert_eq!(fs::metadata(&aligned).unwrap().len(), page);
+        assert_eq!(fs::metadata(&foreign).unwrap().len(), 4096 + 512);
+        assert_eq!(fs::metadata(&not_erofs).unwrap().len(), 4096 + 512);
+        assert_eq!(
+            pad_live_erofs_sources(&mounts, &daemons),
+            0,
+            "already padded"
+        );
+    }
+
     #[test]
     fn is_staged_copy_matches_only_the_padded_copy() {
         let dir = tempfile::tempdir().unwrap();
