@@ -868,7 +868,7 @@ fn parse_mounts(contents: &str) -> Vec<MountEntry> {
 }
 
 /// `/proc/mounts` escapes spaces, tabs and backslashes as octal sequences.
-fn unescape_mount_field(s: &str) -> String {
+pub(crate) fn unescape_mount_field(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut chars = s.chars();
     while let Some(c) = chars.next() {

@@ -749,8 +749,11 @@ impl BlockDevice {
         // tail to the largest page size makes the file mountable everywhere; EROFS and
         // dm-verity read only the blocks the superblock and the verity parameters name.
         let file = OpenOptions::new().write(true).open(&path)?;
-        let len = file.metadata()?.len();
-        file.set_len(len.next_multiple_of(EXPORT_ALIGNMENT))?;
+        let meta = file.metadata()?;
+        // A block device output keeps its size; only a file can be mounted file-backed.
+        if meta.is_file() {
+            file.set_len(meta.len().next_multiple_of(EXPORT_ALIGNMENT))?;
+        }
 
         Ok(info)
     }

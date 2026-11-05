@@ -161,6 +161,7 @@ mod linux {
     use super::*;
     use std::path::PathBuf;
     use std::sync::OnceLock;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::mpsc;
     use std::time::Duration;
 
@@ -189,9 +190,9 @@ mod linux {
 
     /// The source to mount `image` from: `image` itself when it is a page multiple, otherwise a
     /// padded copy in the same directory. The copy is an `O_TMPFILE` named by its
-    /// `/proc/self/fd` link, so nothing is left behind; where the filesystem has no `O_TMPFILE`,
-    /// it is a named file removed when the source is dropped. The caller's file is never
-    /// modified.
+    /// `/proc/self/fd` link, so nothing is left behind, and the mount table shows that link as
+    /// the source; where `O_TMPFILE` or that link is unavailable, it is a named file removed when
+    /// the source is dropped. The caller's file is never modified.
     pub fn page_aligned_source(image: &Path) -> io::Result<MountSource> {
         use std::os::unix::fs::OpenOptionsExt;
         use std::os::unix::io::AsRawFd;
@@ -203,7 +204,10 @@ mod linux {
                 remove: false,
             });
         }
-        let dir = image.parent().unwrap_or(Path::new("."));
+        let dir = image
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
         let padded_copy = |mut out: fs::File| -> io::Result<fs::File> {
             let len = io::copy(&mut fs::File::open(image)?, &mut out)?;
             out.set_len(len.next_multiple_of(host_page_size()))?;
@@ -216,7 +220,8 @@ mod linux {
             .custom_flags(libc::O_TMPFILE)
             .open(dir)
         {
-            Ok(tmp) => {
+            // The link must resolve here: /proc can be missing or another PID namespace's.
+            Ok(tmp) if fs::metadata(format!("/proc/self/fd/{}", tmp.as_raw_fd())).is_ok() => {
                 let copy = padded_copy(tmp)?;
                 Ok(MountSource {
                     path: PathBuf::from(format!("/proc/self/fd/{}", copy.as_raw_fd())),
@@ -224,9 +229,14 @@ mod linux {
                     remove: false,
                 })
             }
-            Err(e) if e.raw_os_error() == Some(libc::EOPNOTSUPP) => {
+            _ => {
+                static COPIES: AtomicU64 = AtomicU64::new(0);
                 let mut name = image.file_name().unwrap_or_default().to_os_string();
-                name.push(format!(".page-padded.{}", std::process::id()));
+                name.push(format!(
+                    ".page-padded.{}.{}",
+                    std::process::id(),
+                    COPIES.fetch_add(1, Ordering::Relaxed)
+                ));
                 let path = image.with_file_name(name);
                 // A fresh file (never through a planted symlink), since nydusd may run as root.
                 let _ = fs::remove_file(&path);
@@ -243,7 +253,6 @@ mod linux {
                 padded_copy(out)?;
                 Ok(source)
             }
-            Err(e) => Err(e),
         }
     }
 
@@ -379,7 +388,7 @@ mod tests {
     }
 
     /// The kernel must accept the padded copy's `/proc/self/fd` link as a mount source. Needs
-    /// root and file-backed EROFS; skipped otherwise.
+    /// root, and file-backed EROFS shown by a named padded copy mounting; skipped otherwise.
     #[cfg(target_os = "linux")]
     #[test]
     fn page_aligned_source_mounts_and_reads() {
@@ -390,27 +399,24 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("erofs-folio-mnt-{}", std::process::id()));
         let mnt = dir.join("mnt");
         fs::create_dir_all(&mnt).unwrap();
+        let mount_and_read = |source: &Path| {
+            crate::fanotify::mount_erofs_with(source, &mnt, "")?;
+            let read = linux::read_all(&mnt);
+            let _ = nix::mount::umount2(&mnt, nix::mount::MntFlags::MNT_DETACH);
+            read
+        };
+        let control = dir.join("control");
+        fs::write(&control, probe_image()).unwrap();
+        pad_to_page_size(&control).unwrap();
+        if mount_and_read(&control).is_err() {
+            fs::remove_dir_all(&dir).unwrap();
+            return;
+        }
         let image = dir.join("bootstrap");
         fs::write(&image, probe_image()).unwrap();
         let source = page_aligned_source(&image).unwrap();
-        assert!(
-            source.path().starts_with("/proc/self/fd"),
-            "{:?}",
-            source.path()
-        );
-        let mounted = crate::fanotify::mount_erofs_with(source.path(), &mnt, "");
+        let read = mount_and_read(source.path());
         drop(source);
-        if let Err(e) = mounted {
-            fs::remove_dir_all(&dir).unwrap();
-            // No file-backed EROFS on this kernel: nothing to check.
-            assert!(
-                matches!(e.raw_os_error(), Some(libc::ENODEV | libc::ENOTBLK)),
-                "{e}"
-            );
-            return;
-        }
-        let read = linux::read_all(&mnt);
-        let _ = nix::mount::umount2(&mnt, nix::mount::MntFlags::MNT_DETACH);
         fs::remove_dir_all(&dir).unwrap();
         read.unwrap();
     }

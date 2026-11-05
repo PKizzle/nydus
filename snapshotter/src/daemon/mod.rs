@@ -2846,8 +2846,9 @@ fn stage_bootstrap(src: &Path, dst: &Path) -> io::Result<()> {
 }
 
 /// Pads the source of every file-backed EROFS mount whose source is a regular file under
-/// `daemons` (one of ours) to the page size, in place, and returns how many it changed. Such a
-/// mount may predate the padding in [`stage_bootstrap`] and [`mount_blockdev_erofs`]. Growing
+/// `daemons` (one of ours) to the page size, in place, and returns how many it changed. A live
+/// mount can hold a source that is not a page multiple, which [`stage_bootstrap`] and
+/// [`mount_blockdev_erofs`] only rule out for the mounts they make themselves. Growing
 /// the backing file with zeros fixes the live mount: a kernel with the partial-folio bug only
 /// fails the read of a page that runs past the end of the file, and retries it on the next
 /// access, so containers already running on the mount need no remount.
@@ -2858,7 +2859,8 @@ fn pad_live_erofs_sources(mounts: &str, daemons: &Path) -> usize {
         .filter_map(|line| {
             let mut fields = line.split_whitespace();
             let source = fields.next()?;
-            (fields.nth(1)? == "erofs").then(|| PathBuf::from(source.replace("\\040", " ")))
+            (fields.nth(1)? == "erofs")
+                .then(|| PathBuf::from(crate::recon::unescape_mount_field(source)))
         })
         .filter(|source| source.starts_with(daemons))
         .filter(|source| {
@@ -3835,7 +3837,6 @@ mod tests {
         assert_eq!(fs::read(&dst).unwrap(), staged);
     }
 
-    /// A live mount's staged bootstrap is kept only when it is exactly what staging writes.
     #[test]
     fn pad_live_erofs_sources_pads_only_our_unaligned_erofs_sources() {
         let dir = tempfile::tempdir().unwrap();
@@ -3881,6 +3882,7 @@ mod tests {
         );
     }
 
+    /// A live mount's staged bootstrap is kept only when it is exactly what staging writes.
     #[test]
     fn is_staged_copy_matches_only_the_padded_copy() {
         let dir = tempfile::tempdir().unwrap();
