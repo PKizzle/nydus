@@ -413,7 +413,7 @@ async fn walk_manifest_via_grpc(
     digest: &str,
     image_ref: &str,
     out: &mut HashMap<String, String>,
-) -> Result<()> {
+) -> Result<bool> {
     let bytes = cs
         .fetch_bytes(digest)
         .await
@@ -426,7 +426,9 @@ async fn walk_manifest_via_grpc(
         let (host, rest) = walkable_children(&index);
         let mut host_results = Vec::with_capacity(host.len());
         for child in host {
-            let result = Box::pin(walk_manifest_via_grpc(cs, child, image_ref, out)).await;
+            let result = Box::pin(walk_manifest_via_grpc(cs, child, image_ref, out))
+                .await
+                .map(|_| ());
             if let Err(e) = &result {
                 debug!(child = %child, error = %format_args!("{e:#}"), "host-platform child walk failed");
             }
@@ -436,19 +438,19 @@ async fn walk_manifest_via_grpc(
         if walk_rest_children(&host_results, is_not_found) {
             for child in rest {
                 match Box::pin(walk_manifest_via_grpc(cs, child, image_ref, out)).await {
-                    Ok(()) => rest_resolved = true,
+                    Ok(registered) => rest_resolved |= registered,
                     Err(e) => {
                         debug!(child = %child, error = %format_args!("{e:#}"), "child walk failed")
                     }
                 }
             }
         }
-        return index_walk_result(digest, host_results, rest_resolved);
+        return index_walk_result(digest, host_results, rest_resolved).map(|()| true);
     }
     let manifest: OciManifest = serde_json::from_slice(&bytes)?;
     let bootstrap_indices = collect_bootstrap_layers(&manifest, image_ref, out);
     let Some(cfg_desc) = image_config(&manifest) else {
-        return Ok(());
+        return Ok(false);
     };
     let cfg_bytes = cs
         .fetch_bytes(&cfg_desc.digest)
@@ -457,20 +459,18 @@ async fn walk_manifest_via_grpc(
     let cfg: OciImageConfig = serde_json::from_slice(&cfg_bytes)
         .with_context(|| format!("parse image config for {image_ref}"))?;
     register_chain_ids(image_ref, &cfg.rootfs.diff_ids, &bootstrap_indices, out);
-    Ok(())
+    Ok(true)
 }
 
-/// The manifest's config descriptor when it is an image config. An OCI artifact stored under an
-/// image record (a cosign signature or SLSA attestation pulled by digest) has a manifest with an
-/// empty `{}` config and no rootfs, so it has no chainIDs to register.
+/// The manifest's config descriptor unless the manifest is an OCI artifact. An artifact stored
+/// under an image record (an SLSA attestation pulled by digest, say) carries the spec's empty
+/// `{}` config and no rootfs, so it has no chainIDs to register. A walk that reaches one returns
+/// `Ok(false)`, which an index does not count as a resolved child.
 fn image_config(manifest: &OciManifest) -> Option<&OciDescriptor> {
-    manifest.config.as_ref().filter(|c| {
-        matches!(
-            c.media_type.as_str(),
-            "" | "application/vnd.oci.image.config.v1+json"
-                | "application/vnd.docker.container.image.v1+json"
-        )
-    })
+    manifest
+        .config
+        .as_ref()
+        .filter(|c| c.media_type != "application/vnd.oci.empty.v1+json")
 }
 
 /// Record bootstrap-annotated layers into the cache map (by layer digest)
@@ -880,7 +880,7 @@ fn walk_manifest_via_cli(
     digest: &str,
     image_ref: &str,
     out: &mut HashMap<String, String>,
-) -> Result<()> {
+) -> Result<bool> {
     let bytes = run_first_ok(&[
         &["ctr", "-n", "k8s.io", "content", "get", digest],
         &["k3s", "ctr", "-n", "k8s.io", "content", "get", digest],
@@ -891,7 +891,7 @@ fn walk_manifest_via_cli(
         let (host, rest) = walkable_children(&index);
         let mut host_results = Vec::with_capacity(host.len());
         for child in host {
-            let result = walk_manifest_via_cli(child, image_ref, out);
+            let result = walk_manifest_via_cli(child, image_ref, out).map(|_| ());
             if let Err(e) = &result {
                 debug!(child = %child, error = %format_args!("{e:#}"), "host-platform child walk failed");
             }
@@ -903,19 +903,19 @@ fn walk_manifest_via_cli(
         if walk_rest_children(&host_results, |_| true) {
             for child in rest {
                 match walk_manifest_via_cli(child, image_ref, out) {
-                    Ok(()) => rest_resolved = true,
+                    Ok(registered) => rest_resolved |= registered,
                     Err(e) => {
                         debug!(child = %child, error = %format_args!("{e:#}"), "child walk failed")
                     }
                 }
             }
         }
-        return index_walk_result(digest, host_results, rest_resolved);
+        return index_walk_result(digest, host_results, rest_resolved).map(|()| true);
     }
     let manifest: OciManifest = serde_json::from_slice(&bytes)?;
     let bootstrap_indices = collect_bootstrap_layers(&manifest, image_ref, out);
     let Some(cfg_desc) = image_config(&manifest) else {
-        return Ok(());
+        return Ok(false);
     };
     let cfg_bytes = run_first_ok(&[
         &["ctr", "-n", "k8s.io", "content", "get", &cfg_desc.digest],
@@ -933,7 +933,7 @@ fn walk_manifest_via_cli(
     let cfg: OciImageConfig = serde_json::from_slice(&cfg_bytes)
         .with_context(|| format!("parse image config for {image_ref}"))?;
     register_chain_ids(image_ref, &cfg.rootfs.diff_ids, &bootstrap_indices, out);
-    Ok(())
+    Ok(true)
 }
 
 fn manifest_info_via_cli(image_ref: &str, content_root: &std::path::Path) -> Result<ManifestInfo> {
@@ -1326,7 +1326,7 @@ mod tests {
     }
 
     /// An attestation manifest (empty `{}` config, DSSE layer) is skipped instead of failing the
-    /// walk with "parse image config"; image manifests of both spellings are walked.
+    /// walk with "parse image config"; any other config, whatever its media type, is walked.
     #[test]
     fn image_config_skips_artifact_manifests() {
         let parse = |v: serde_json::Value| serde_json::from_value::<OciManifest>(v).unwrap();
@@ -1344,6 +1344,8 @@ mod tests {
         for media_type in [
             "application/vnd.oci.image.config.v1+json",
             "application/vnd.docker.container.image.v1+json",
+            "application/octet-stream",
+            "",
         ] {
             let image = parse(serde_json::json!({
                 "config": { "mediaType": media_type, "digest": "sha256:cfg" },

@@ -2617,7 +2617,7 @@ fn unix_now() -> i64 {
         .as_secs() as i64
 }
 
-/// Crash-safe small-file write: write `<path>.tmp`, fsync, rename over `path`,
+/// Crash-safe small-file write: write `<path>.<pid>.<seq>.tmp`, fsync, rename over `path`,
 /// then fsync the parent directory. The records written through here (daemon
 /// status records, `upgrade.state`, the tarfs verity sidecar) gate mount
 /// takeover after a crash, so a torn write is worse than no file at all —
@@ -2640,12 +2640,12 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
     ));
     let tmp = PathBuf::from(tmp);
 
-    let mut file = fs::File::create(&tmp)?;
-    file.write_all(bytes)?;
-    file.sync_all()?;
-    drop(file);
-
-    if let Err(e) = fs::rename(&tmp, path) {
+    let staged = fs::File::create(&tmp).and_then(|mut file| {
+        file.write_all(bytes)?;
+        file.sync_all()
+    });
+    // Each call has its own tmp name, so a failed one is never overwritten by the next: remove it.
+    if let Err(e) = staged.and_then(|()| fs::rename(&tmp, path)) {
         let _ = fs::remove_file(&tmp);
         return Err(e);
     }
@@ -3712,7 +3712,7 @@ mod tests {
         // A crash inside atomic_write leaves a partial tmp file behind; the
         // reader must ignore it rather than warn on (or worse, decode) it.
         fs::write(
-            supervisor.record_dir().join("other-app.json.tmp"),
+            supervisor.record_dir().join("other-app.json.1234.0.tmp"),
             b"{\"image_ref\":\"tru",
         )
         .unwrap();
