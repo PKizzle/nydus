@@ -193,6 +193,7 @@ impl BlobFactory {
 
     /// Garbage-collect unused blob cache managers and blob caches.
     pub fn gc(&self, victim: Option<(&Arc<ConfigV2>, &str)>) {
+        let mut reclaimed = Vec::new();
         let mut guard = self.mgrs.lock().unwrap();
         if let Some((config, id)) = victim {
             let key = BlobCacheMgrKey {
@@ -202,7 +203,7 @@ impl BlobFactory {
                 && entry.active_users() == 0
                 && entry.mgr.gc(Some(id))
             {
-                guard.remove(&key);
+                reclaimed.extend(guard.remove(&key));
             }
         } else {
             let mut reclaim = Vec::new();
@@ -214,9 +215,26 @@ impl BlobFactory {
                 }
             }
             for key in reclaim {
-                guard.remove(&key);
+                reclaimed.extend(guard.remove(&key));
             }
         }
+        drop(guard);
+        // Reclaimed managers are destroyed here, outside the factory lock.
+        drop(reclaimed);
+    }
+
+    /// Stop handing out the cache managers of configuration `id`, in use or not, so the next
+    /// blob cache created for it gets a new manager. Current holders keep theirs until they drop
+    /// it.
+    pub fn forget(&self, id: &str) {
+        let forgotten: Vec<_> = self
+            .mgrs
+            .lock()
+            .unwrap()
+            .extract_if(|key, _| key.config.id == id)
+            .collect();
+        // A manager nobody else holds is destroyed here, outside the factory lock.
+        drop(forgotten);
     }
 
     pub fn supported_backends() -> Vec<String> {
@@ -480,6 +498,41 @@ mod tests {
             "unexpected error: {err}"
         );
         assert_eq!(std::io::Error::from(err).kind(), ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn test_forget_drops_only_that_configs_managers_even_in_use() {
+        let factory = BlobFactory::default();
+        let backend: Arc<dyn BlobBackend> = Arc::new(MockBackend {
+            metrics: BackendMetrics::new("factory-forget-test", "mock"),
+        });
+        let mgr: Arc<dyn BlobCacheMgr> = Arc::new(BlockingMgr {
+            backend,
+            entered: Arc::new(Barrier::new(1)),
+            release: Arc::new(Barrier::new(1)),
+        });
+        for id in ["forgotten", "kept"] {
+            let entry = Arc::new(BlobCacheMgrEntry::new(mgr.clone()));
+            // In use: `gc` would keep it.
+            std::mem::forget(entry.pin());
+            factory.mgrs.lock().unwrap().insert(
+                BlobCacheMgrKey {
+                    config: test_factory_config(id),
+                },
+                entry,
+            );
+        }
+
+        factory.forget("forgotten");
+
+        let ids: Vec<String> = factory
+            .mgrs
+            .lock()
+            .unwrap()
+            .keys()
+            .map(|k| k.config.id.clone())
+            .collect();
+        assert_eq!(ids, vec!["kept".to_string()]);
     }
 
     #[test]
