@@ -1293,9 +1293,8 @@ impl RafsV6Dirent {
         val as u8
     }
 
-    /// Set name offset of the dirent.
+    /// Set name offset of the dirent, relative to the start of its directory block.
     pub fn set_name_offset(&mut self, offset: u16) {
-        assert!(offset < EROFS_BLOCK_SIZE_4096 as u16);
         self.e_nameoff = u16::to_le(offset);
     }
 
@@ -2957,6 +2956,9 @@ mod tests {
         let mut dir = RafsV6Dirent::new(0, 1024, EROFS_FILE_TYPE::EROFS_FT_BLKDEV as u8);
         dir.set_name_offset(2048);
         assert_eq!(dir.e_nameoff, 2048);
+        // Offsets are relative to a directory block of up to 64 KiB.
+        dir.set_name_offset(65000);
+        assert_eq!(u16::from_le(dir.e_nameoff), 65000);
 
         assert_eq!(
             RafsV6Dirent::file_type(crate::metadata::mode_bits(libc::S_IFREG)),

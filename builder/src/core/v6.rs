@@ -44,6 +44,21 @@ pub enum V6LayoutError {
     /// Chunks address their blob by a `u8` device index, so the device table is capped.
     #[error("{count} data blobs exceed the RAFS v6 limit of {max}")]
     TooManyBlobs { count: usize, max: usize },
+    /// A dirent's name offset is relative to its directory block and must stay inside it.
+    #[error("dirent name offset {offset} is outside its {block_size}-byte directory block")]
+    NameOffsetPastBlock { offset: u64, block_size: u64 },
+}
+
+/// `nameoff` as the on-disk `u16`; it always fits, as blocks are at most 64 KiB.
+fn dirent_name_offset(nameoff: u64, block_size: u64) -> Result<u16> {
+    if nameoff >= block_size {
+        return Err(V6LayoutError::NameOffsetPastBlock {
+            offset: nameoff,
+            block_size,
+        }
+        .into());
+    }
+    Ok(nameoff as u16)
 }
 
 // Rafs v6 dedicated methods
@@ -426,7 +441,7 @@ impl Node {
             if used + len as u64 > block_size {
                 for (entry, name) in dirents.iter_mut() {
                     trace!("{:?} nameoff {}", name, nameoff);
-                    entry.set_name_offset(nameoff as u16);
+                    entry.set_name_offset(dirent_name_offset(nameoff, block_size)?);
                     dir_data.extend(entry.as_ref());
                     entry_names.push(*name);
                     // Use length in byte, instead of length in character.
@@ -480,7 +495,7 @@ impl Node {
         if used > 0 {
             for (entry, name) in dirents.iter_mut() {
                 trace!("{:?} tail nameoff {}", name, nameoff);
-                entry.set_name_offset(nameoff as u16);
+                entry.set_name_offset(dirent_name_offset(nameoff, block_size)?);
                 dir_data.extend(entry.as_ref());
                 entry_names.push(*name);
                 nameoff += name.as_bytes().len() as u64;
