@@ -525,6 +525,20 @@ impl RegistryClient {
         Ok(digest)
     }
 
+    /// Push a file as a blob whose `digest` the caller already knows and has
+    /// checked for presence (e.g. after its own HEAD or mount attempt): no
+    /// re-hash, no HEAD. The registry still verifies the `?digest=` on PUT.
+    pub async fn push_blob_file_with_digest(
+        &self,
+        repo: &str,
+        path: &Path,
+        digest: &str,
+    ) -> Result<(), RegistryError> {
+        validate_digest(digest)?;
+        self.monolithic_upload(repo, digest, BodySource::File(path))
+            .await
+    }
+
     /// PUT a manifest (`/v2/<repo>/manifests/<reference>`) with the given
     /// `Content-Type`. `reference` may be a tag or a digest.
     ///
@@ -1833,6 +1847,41 @@ mod tests {
         let cache = client.tokens.borrow();
         assert_eq!(cache.get("repository:other:pull"), Some("tok-other"));
         assert_eq!(cache.get(&pull_scope("app")), None);
+    }
+
+    #[compio::test]
+    async fn push_blob_file_with_digest_uploads_without_hash_or_head() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("blob");
+        std::fs::write(&path, b"data").unwrap();
+        let digest = sha256_digest(b"data");
+        let (port, server) = serve_raw(vec![
+            "HTTP/1.1 202 Accepted\r\nLocation: /v2/app/blobs/uploads/u1\r\n\
+             Content-Length: 0\r\nConnection: close\r\n\r\n"
+                .to_string(),
+            raw_response("201 Created", ""),
+        ]);
+        let client = loopback_client(port);
+        client
+            .push_blob_file_with_digest("app", &path, &digest)
+            .await
+            .unwrap();
+        let seen = server.join().unwrap();
+        assert!(
+            seen[0].starts_with("POST /v2/app/blobs/uploads/ "),
+            "{}",
+            seen[0]
+        );
+        assert!(
+            seen[1].starts_with("PUT /v2/app/blobs/uploads/u1?digest=sha256%3A"),
+            "{}",
+            seen[1]
+        );
+        let err = client
+            .push_blob_file_with_digest("app", &path, "sha256:bad")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("invalid digest"), "{err}");
     }
 
     #[compio::test]
