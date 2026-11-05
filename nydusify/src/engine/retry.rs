@@ -15,6 +15,7 @@ use std::fmt::Display;
 use std::future::Future;
 use std::time::Duration;
 
+use registry_client::RegistryError;
 use tracing::warn;
 
 /// Default delay applied when `--push-retry-delay` cannot be parsed.
@@ -54,13 +55,14 @@ impl RetryPolicy {
     /// Run `op` up to [`attempts`](Self::attempts) times, sleeping
     /// [`delay`](Self::delay) between failures. `what` labels the operation in
     /// the retry warning. The last error is returned when all attempts fail.
+    /// An error that no retry can fix (see [`is_permanent`]) is returned at once.
     ///
     /// Generic over the error type (anything `Display`), so it wraps both
     /// `anyhow::Result` closures and `registry-client` calls returning the
     /// typed `RegistryError` without erasing the error the caller gets back.
     pub async fn run<T, E, F, Fut>(&self, what: &str, mut op: F) -> Result<T, E>
     where
-        E: Display,
+        E: Display + 'static,
         F: FnMut() -> Fut,
         Fut: Future<Output = Result<T, E>>,
     {
@@ -68,7 +70,7 @@ impl RetryPolicy {
         loop {
             match op().await {
                 Ok(value) => return Ok(value),
-                Err(err) if attempt < self.attempts => {
+                Err(err) if attempt < self.attempts && !is_permanent(&err) => {
                     warn!(
                         operation = what,
                         attempt,
@@ -83,6 +85,25 @@ impl RetryPolicy {
                 Err(err) => return Err(err),
             }
         }
+    }
+}
+
+/// Whether `err` is a registry answer that the same request will get again:
+/// failed auth, a missing resource, a digest mismatch, or any 4xx except
+/// 408 (timeout) and 429 (rate limited). Works for a bare [`RegistryError`] and
+/// for one anywhere in an `anyhow` chain.
+fn is_permanent(err: &dyn std::any::Any) -> bool {
+    let registry = err.downcast_ref::<RegistryError>().or_else(|| {
+        err.downcast_ref::<anyhow::Error>()
+            .and_then(|e| e.chain().find_map(|c| c.downcast_ref::<RegistryError>()))
+    });
+    match registry {
+        Some(RegistryError::Auth(_) | RegistryError::NotFound { .. }) => true,
+        Some(RegistryError::DigestMismatch { .. }) => true,
+        Some(RegistryError::Http { status, .. }) => {
+            (400..500).contains(status) && *status != 408 && *status != 429
+        }
+        _ => false,
     }
 }
 
@@ -162,6 +183,57 @@ mod tests {
             .await;
         assert_eq!(result.unwrap(), 3);
         assert_eq!(calls.get(), 3);
+    }
+
+    #[compio::test]
+    async fn run_does_not_retry_what_a_retry_cannot_fix() {
+        let policy = RetryPolicy {
+            attempts: 3,
+            delay: Duration::from_millis(0),
+        };
+        let http = |status| RegistryError::Http {
+            status,
+            body: String::new(),
+            resource: "blob".into(),
+        };
+        for (err, calls_expected) in [
+            (RegistryError::Auth("denied".into()), 1),
+            (http(400), 1),
+            (http(403), 1),
+            (http(408), 3),
+            (http(429), 3),
+            (http(503), 3),
+        ] {
+            let calls = Cell::new(0u32);
+            let err = std::cell::RefCell::new(Some(err));
+            let result: Result<(), RegistryError> = policy
+                .run("test", || {
+                    calls.set(calls.get() + 1);
+                    let e = err.borrow_mut().take();
+                    async move {
+                        Err(e.unwrap_or_else(|| {
+                            RegistryError::Timeout("retried".into())
+                        }))
+                    }
+                })
+                .await;
+            assert!(result.is_err());
+            assert_eq!(calls.get(), calls_expected);
+        }
+
+        // Wrapped in anyhow context, a registry error is still recognised.
+        let calls = Cell::new(0u32);
+        let result: Result<()> = policy
+            .run("test", || async {
+                calls.set(calls.get() + 1);
+                Err(anyhow::Error::new(RegistryError::NotFound {
+                    resource: "blob".into(),
+                })
+                .context("push blob"))
+            })
+            .await;
+        assert!(result.is_err());
+        assert_eq!(calls.get(), 1);
     }
 
     #[compio::test]
