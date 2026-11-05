@@ -106,6 +106,9 @@ enum BlockRange {
     DataBlob(Rc<DataBlob>),
 }
 
+/// Exported block images are padded to this size, the largest Linux page size.
+pub const EXPORT_ALIGNMENT: u64 = 0x10000;
+
 /// dm-verity parameters for a block image exported with `verity = true`.
 ///
 /// These are exactly the values needed for the standard `veritysetup open`
@@ -725,6 +728,7 @@ impl BlockDevice {
             }
         }
 
+        let mut info = None;
         if let Some(generator) = generator.as_ref() {
             let mut guard = generator.lock().unwrap();
             let root_digest = guard.generate_all_digests()?;
@@ -732,15 +736,23 @@ impl BlockDevice {
                 .data
                 .iter()
                 .fold(String::new(), |acc, v| acc + &format!("{:02x}", v));
-            return Ok(Some(BlockDeviceVerityInfo {
+            info = Some(BlockDeviceVerityInfo {
                 data_block_size: block_device.block_size(),
                 data_blocks: blocks,
                 hash_offset: verity_offset,
                 root_digest,
-            }));
+            });
         }
 
-        Ok(None)
+        // A file-backed EROFS mount of an image that ends inside a page fails metadata reads on
+        // kernels without upstream fix 52dceb88082b (see `crate::erofs_folio`). A sparse zero
+        // tail to the largest page size makes the file mountable everywhere; EROFS and
+        // dm-verity read only the blocks the superblock and the verity parameters name.
+        let file = OpenOptions::new().write(true).open(&path)?;
+        let len = file.metadata()?.len();
+        file.set_len(len.next_multiple_of(EXPORT_ALIGNMENT))?;
+
+        Ok(info)
     }
 
     async fn do_export(
@@ -1159,6 +1171,8 @@ mod tests {
 
         let mut disk_path = PathBuf::from(tmp_dir.as_path());
         disk_path.push("rafs-v6-2.2.boot.disk");
+        let len = std::fs::metadata(&disk_path)?.len();
+        assert_eq!(len % EXPORT_ALIGNMENT, 0, "{len} is not padded");
         let input = File::open(disk_path)?;
         let reader = BufReader::new(input);
         let sha256 = sha256_digest(reader)?;
