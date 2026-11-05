@@ -36,8 +36,7 @@ use crate::containerd_api::types::transfer::{
 };
 use crate::containerd_grpc::ContainerdChannel;
 use crate::containerd_lookup::MissingLayers;
-use crate::content_store::ContentStoreClient;
-use crate::content_store::rpc_error;
+use crate::content_store::{ContentStoreClient, rpc_error};
 use crate::daemon::image_ref::{ImageRef, parse_image_ref};
 use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine as _;
