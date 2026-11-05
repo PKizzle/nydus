@@ -270,8 +270,11 @@ containerd; every call connects lazily (`snapshotter/src/containerd_grpc.rs`). E
 reached" (socket missing or refusing, connection broken, `Unavailable`, `DeadlineExceeded`) from a
 real failure. The auto-zran worker re-queues a job that hit an unreachable containerd after a
 capped exponential delay (5 s doubling to 2 min) with no failure strike, so an outage never marks
-an image non-convertible; a retry of either stage reuses the converted work dir. If containerd
-is still unreachable five minutes after startup, one error names the configured socket.
+an image non-convertible; a retry of either stage reuses the converted work dir, which the recon
+stale-dir sweep leaves alone while the job waits. A job still waiting an hour after its first
+outage attempt is abandoned, again without a strike, and its dedupe key released, so the next
+prepare or recon sweep enqueues it afresh. If containerd is still unreachable five minutes after
+startup, one error names the configured socket.
 
 An upload writes every sidecar blob under **one lease** (`ContentStoreClient::create_lease`, 2 h
 `containerd.io/gc.expire`), including blobs that are already present (added to the lease with
@@ -294,7 +297,7 @@ profiles still capture and persist to disk, but nothing enqueues a conversion jo
   (e.g. `"127.0.0.1:9110"`) additionally binds a TCP `GET /metrics` endpoint reusing the same
   renderer (`snapshotter/src/metrics.rs`, `grpc/mod.rs`), restoring parity with the Go snapshotter.
 - **Auto-zran and containerd**: `snapshotter_auto_zran_jobs_total{event}` (queued, dropped,
-  skipped, started, succeeded, failed, deferred), `snapshotter_auto_zran_jobs{state}` (queued,
+  skipped, started, succeeded, failed, deferred, abandoned), `snapshotter_auto_zran_jobs{state}` (queued,
   running, waiting for containerd), and `snapshotter_containerd_reachable` (0/1, outcome of the
   latest call; absent until the first one).
 - **gRPC health**: the standard `grpc.health.v1.Health` service rides the same cyper-axum server as

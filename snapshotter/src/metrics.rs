@@ -214,7 +214,7 @@ impl SnapshotterMetrics {
             return;
         };
         let status = manager.status();
-        out.push_str("# HELP snapshotter_auto_zran_jobs_total Auto-zran conversion jobs by event: queued, dropped (queue full), skipped (deduplicated, suppressed or deferred by the sweep gate), started, succeeded, failed (a failure strike), deferred (containerd unreachable, retried without a strike).\n");
+        out.push_str("# HELP snapshotter_auto_zran_jobs_total Auto-zran conversion jobs by event: queued, dropped (queue full), skipped (deduplicated, suppressed or deferred by the sweep gate), started, succeeded, failed (a failure strike), deferred (containerd unreachable, retried without a strike), abandoned (containerd still unreachable after the wait budget, dropped without a strike).\n");
         out.push_str("# TYPE snapshotter_auto_zran_jobs_total counter\n");
         for (event, value) in [
             ("queued", status.queued_total),
@@ -224,6 +224,7 @@ impl SnapshotterMetrics {
             ("succeeded", status.succeeded_total),
             ("failed", status.failed_total),
             ("deferred", status.deferred_total),
+            ("abandoned", status.abandoned_total),
         ] {
             push_labeled_metric(
                 out,

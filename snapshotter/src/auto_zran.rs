@@ -244,6 +244,8 @@ pub struct AutoZranStatus {
     pub failed_total: u64,
     /// Attempts put off because containerd was unreachable (no failure strike).
     pub deferred_total: u64,
+    /// Jobs given up after waiting [`OUTAGE_WAIT_BUDGET`] for containerd (no failure strike).
+    pub abandoned_total: u64,
     /// Jobs on the queue, not yet picked up by the worker.
     pub pending_jobs: usize,
     /// Jobs whose latest attempt found containerd unreachable, sleeping until they are re-queued.
@@ -279,6 +281,11 @@ const FAILURE_BACKOFF_BASE: Duration = Duration::from_secs(5 * 60);
 const UNAVAILABLE_RETRY_BASE: Duration = Duration::from_secs(5);
 const UNAVAILABLE_RETRY_MAX: Duration = Duration::from_secs(2 * 60);
 
+/// How long a job may keep waiting for containerd, counted from its first outage attempt.
+/// Past it the job is dropped without a strike and its dedupe key released, so the next
+/// prepare or recon sweep enqueues it afresh instead of one job waiting forever.
+const OUTAGE_WAIT_BUDGET: Duration = Duration::from_secs(60 * 60);
+
 /// How long after startup containerd may stay unreachable before that is logged as an error
 /// naming the configured socket. The snapshotter starts before containerd (containerd waits
 /// for its READY), so a short outage at boot is expected; one this long is a misconfiguration
@@ -290,6 +297,16 @@ fn unavailable_retry_delay(attempt: u32) -> Duration {
     UNAVAILABLE_RETRY_BASE
         .saturating_mul(2u32.saturating_pow(attempt.saturating_sub(1)))
         .min(UNAVAILABLE_RETRY_MAX)
+}
+
+/// A job waiting out a containerd outage.
+struct OutageWait {
+    /// Consecutive attempts that found containerd unreachable.
+    attempts: u32,
+    /// When the first of them ended.
+    since: Instant,
+    /// The job's work dir key ([`job_key`]), which the recon sweep must leave alone.
+    work_dir_key: String,
 }
 
 /// Per-image record of consecutive conversion failures (both stages share it:
@@ -308,6 +325,7 @@ struct AutoZranMetrics {
     succeeded_total: AtomicU64,
     failed_total: AtomicU64,
     deferred_total: AtomicU64,
+    abandoned_total: AtomicU64,
     running_jobs: AtomicU64,
     /// Deferred jobs whose retry delay has not run out yet (see [`AutoZranState::retry_due`]).
     waiting_jobs: AtomicU64,
@@ -326,9 +344,9 @@ struct AutoZranState {
     /// [`AutoZranManager::note_sidecar_missing`] uses this map to detect the
     /// repoint and clear the stale state.
     last_manifest: Mutex<HashMap<String, String>>,
-    /// Dedupe key → consecutive attempts that found containerd unreachable, for jobs waiting to
-    /// retry (see [`AutoZranState::mark_waiting`]). Cleared when the job finishes either way.
-    waiting: Mutex<HashMap<String, u32>>,
+    /// Dedupe key → outage record of a job waiting to retry (see
+    /// [`AutoZranState::mark_waiting`]). Cleared when the job finishes or is abandoned.
+    waiting: Mutex<HashMap<String, OutageWait>>,
     metrics: AutoZranMetrics,
 }
 
@@ -387,26 +405,42 @@ impl AutoZranState {
         self.clear_active(job);
     }
 
-    /// A job whose attempt found containerd unreachable. That says nothing about the image, so
-    /// it records NO strike, and the job keeps its dedupe key: it is still pending, and the
-    /// worker re-sends it after the returned delay ([`unavailable_retry_delay`] of its
-    /// consecutive outage attempts).
-    fn mark_waiting(&self, job: &AutoZranJob) -> Duration {
+    /// A job whose attempt (ending at `now`) found containerd unreachable. That says nothing
+    /// about the image, so it records NO strike. Returns the delay after which the worker
+    /// re-sends the job ([`unavailable_retry_delay`] of its consecutive outage attempts); the
+    /// job keeps its dedupe key meanwhile, as it is still pending. Returns `None` once the job
+    /// has waited [`OUTAGE_WAIT_BUDGET`]: it is abandoned and its dedupe key released.
+    fn mark_waiting(&self, job: &AutoZranJob, now: Instant) -> Option<Duration> {
         self.metrics.running_jobs.fetch_sub(1, Ordering::Relaxed);
-        self.metrics.deferred_total.fetch_add(1, Ordering::Relaxed);
-        self.metrics.waiting_jobs.fetch_add(1, Ordering::Relaxed);
         self.clear_active(job);
+        let key = dedupe_key(&job.image, job.stage);
         let attempt = match self.waiting.lock() {
             Ok(mut waiting) => {
-                let attempt = waiting
-                    .entry(dedupe_key(&job.image, job.stage))
-                    .or_insert(0);
-                *attempt = attempt.saturating_add(1);
-                *attempt
+                let wait = waiting.entry(key.clone()).or_insert_with(|| OutageWait {
+                    attempts: 0,
+                    since: now,
+                    work_dir_key: job_key(&job.image),
+                });
+                if now.saturating_duration_since(wait.since) >= OUTAGE_WAIT_BUDGET {
+                    waiting.remove(&key);
+                    None
+                } else {
+                    wait.attempts = wait.attempts.saturating_add(1);
+                    Some(wait.attempts)
+                }
             }
-            Err(_) => 1,
+            Err(_) => Some(1),
         };
-        unavailable_retry_delay(attempt)
+        let Some(attempt) = attempt else {
+            self.metrics.abandoned_total.fetch_add(1, Ordering::Relaxed);
+            if let Ok(mut seen) = self.queued_or_done.lock() {
+                seen.remove(&key);
+            }
+            return None;
+        };
+        self.metrics.deferred_total.fetch_add(1, Ordering::Relaxed);
+        self.metrics.waiting_jobs.fetch_add(1, Ordering::Relaxed);
+        Some(unavailable_retry_delay(attempt))
     }
 
     /// The retry delay of a job [`Self::mark_waiting`] returned ran out; it goes back on the
@@ -486,6 +520,7 @@ impl AutoZranState {
             succeeded_total: self.metrics.succeeded_total.load(Ordering::Relaxed),
             failed_total: self.metrics.failed_total.load(Ordering::Relaxed),
             deferred_total: self.metrics.deferred_total.load(Ordering::Relaxed),
+            abandoned_total: self.metrics.abandoned_total.load(Ordering::Relaxed),
             // Filled in by the manager, which owns the queue.
             pending_jobs: 0,
             waiting_jobs: self.metrics.waiting_jobs.load(Ordering::Relaxed) as usize,
@@ -567,6 +602,18 @@ impl AutoZranManager {
             .ok()
             .and_then(|active| active.clone())
             .map(|image| job_key(&image))
+    }
+
+    /// Whether the work dir named `key` belongs to the running job or to a job waiting out a
+    /// containerd outage, whose retry reuses the conversion in it. The recon stale-dir sweep
+    /// leaves such a dir alone however old it is.
+    pub fn work_dir_in_use(&self, key: &str) -> bool {
+        self.active_job_key().as_deref() == Some(key)
+            || self
+                .state
+                .waiting
+                .lock()
+                .is_ok_and(|waiting| waiting.values().any(|wait| wait.work_dir_key == key))
     }
 
     /// Enqueue the stage-1 BASE conversion for `image` without blocking the
@@ -792,7 +839,17 @@ async fn worker_loop(
             Ok(ConversionOutcome::Completed) => state.mark_finished(&job, true),
             Ok(ConversionOutcome::Deferred) => state.mark_skipped(&job),
             Err(e) if is_containerd_unavailable(&e) => {
-                let delay = state.mark_waiting(&job);
+                let Some(delay) = state.mark_waiting(&job, Instant::now()) else {
+                    warn!(
+                        image = %job.image,
+                        stage = job.stage.tag(),
+                        waited_secs = OUTAGE_WAIT_BUDGET.as_secs(),
+                        error = %format!("{e:#}"),
+                        "auto-zran conversion abandoned: containerd stayed unreachable; the next \
+                         prepare or recon sweep enqueues it again"
+                    );
+                    continue;
+                };
                 warn!(
                     image = %job.image,
                     stage = job.stage.tag(),
@@ -2343,7 +2400,11 @@ mod tests {
                 );
             }
             state.mark_started(&job);
-            delays.push(state.mark_waiting(&job));
+            delays.push(
+                state
+                    .mark_waiting(&job, Instant::now())
+                    .expect("within the budget"),
+            );
         }
         assert_eq!(delays[0], UNAVAILABLE_RETRY_BASE);
         assert_eq!(delays[1], UNAVAILABLE_RETRY_BASE * 2);
@@ -2365,6 +2426,51 @@ mod tests {
         assert_eq!(state.status().waiting_jobs, 0);
         assert!(state.waiting.lock().unwrap().is_empty());
         assert_eq!(state.status().succeeded_total, 1);
+    }
+
+    /// A job that waits out [`OUTAGE_WAIT_BUDGET`] is abandoned, still without a strike: its
+    /// dedupe key is released so the image can be enqueued afresh, and it stops holding its
+    /// work dir against the recon sweep.
+    #[test]
+    fn containerd_outage_past_the_budget_abandons_the_job_without_a_strike() {
+        let (manager, _queue) = AutoZranManager::without_worker(4);
+        let state = &manager.state;
+        let job = AutoZranJob::base("registry.local/app:1".to_string());
+        let key = dedupe_key(&job.image, job.stage);
+        let dir = job_key(&job.image);
+        state.queued_or_done.lock().unwrap().insert(key.clone());
+        let t0 = Instant::now();
+
+        state.mark_started(&job);
+        assert!(state.mark_waiting(&job, t0).is_some());
+        assert!(
+            manager.work_dir_in_use(&dir),
+            "a waiting job keeps its work dir"
+        );
+        assert!(!manager.work_dir_in_use(&job_key("registry.local/other:1")));
+        state.retry_due();
+        state.mark_started(&job);
+        assert!(
+            state
+                .mark_waiting(&job, t0 + OUTAGE_WAIT_BUDGET - Duration::from_secs(1))
+                .is_some()
+        );
+        state.retry_due();
+        state.mark_started(&job);
+        assert_eq!(state.mark_waiting(&job, t0 + OUTAGE_WAIT_BUDGET), None);
+
+        let status = state.status();
+        assert_eq!(status.abandoned_total, 1);
+        assert_eq!(status.deferred_total, 2);
+        assert_eq!(status.failed_total, 0);
+        assert_eq!(status.waiting_jobs, 0);
+        assert_eq!(status.running_jobs, 0);
+        assert!(!state.queued_or_done.lock().unwrap().contains(&key));
+        assert!(!manager.work_dir_in_use(&dir));
+        assert!(
+            manager.enqueue(job.clone()),
+            "the image can be enqueued afresh"
+        );
     }
 
     /// A deferred sweep job (`mark_skipped`) records NO failure strike and
