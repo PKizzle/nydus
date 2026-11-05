@@ -105,6 +105,7 @@ jobs:
         sudo udevadm control --reload-rules && sudo udevadm trigger --name-match=kvm
         ls -l /dev/kvm
     - name: Fetch kernel
+      id: fetch
       run: |
         K="$RUNNER_TEMP/kernel"; mkdir -p "$K"; cd "$K"
         curl -fsSLO --retry 5 --retry-all-errors "$KERNEL_URL/$KERNEL_IMAGE_DEB"
@@ -128,7 +129,7 @@ jobs:
         " | tee "$D/probe.log"
         bash misc/erofs-folio/expect.sh "$D/probe.log" "$EROFS_FOLIO" image
     - name: Run misc/fanotify in the VM
-      if: ${{ !cancelled() }}
+      if: ${{ !cancelled() && steps.fetch.outcome == 'success' }}
       run: |
         echo "runner kernel: $(uname -r)"
         vng --run "$VMLINUZ" --user root --cpus 4 --memory 6G --rwdir "$RUNNER_TEMP" --exec "
