@@ -578,6 +578,83 @@ impl NydusSnapshotter {
         Ok(Some((handle.mountpoint().to_path_buf(), staged.bootstrap)))
     }
 
+    /// Serve the nydus sibling of a dual-index image from containerd's content
+    /// store. The sibling's zran data blobs are the OCI half's layers, which
+    /// containerd has already pulled, so only the bootstrap and the small
+    /// sibling blobs come from the registry. `None` (logged) keeps the
+    /// registry-backed path: a layer is missing locally, or staging or the
+    /// daemon failed.
+    async fn serve_dual_index_locally(
+        &self,
+        image_ref: &str,
+        manifest_digest: &str,
+        key: &str,
+    ) -> Option<PathBuf> {
+        let staged = {
+            let image_ref = image_ref.to_string();
+            let manifest_digest = manifest_digest.to_string();
+            let config = self.config.clone();
+            let stage_root = self
+                .supervisor
+                .daemons_root()
+                .join(crate::daemon::slug_for(&image_ref))
+                .join("dual-index");
+            blocking::unblock(move || {
+                crate::source::referrer::stage_dual_index_blocking(
+                    &image_ref,
+                    &manifest_digest,
+                    &config,
+                    &stage_root,
+                )
+            })
+            .await
+        };
+        let staged = match staged {
+            Ok(Some(staged)) => staged,
+            Ok(None) => {
+                info!(
+                    image_ref,
+                    "dual-index layer missing from the content store; serving from the registry"
+                );
+                return None;
+            }
+            Err(e) => {
+                warn!(
+                    image_ref,
+                    error = format!("{e:#}"),
+                    "failed to stage dual-index image locally; serving from the registry"
+                );
+                return None;
+            }
+        };
+        let driver = self.supervisor.local_serving_driver(&staged.bootstrap);
+        let started = if driver == crate::config::FsDriverType::Fanotify {
+            self.supervisor
+                .ensure_instance_local(image_ref, &staged.bootstrap, &staged.backend_dir, key)
+                .await
+        } else {
+            self.supervisor
+                .ensure_instance(image_ref, &staged.bootstrap, key, Some(driver))
+                .await
+        };
+        match started {
+            Ok(handle) => {
+                info!(
+                    image = %image_ref,
+                    driver = driver.as_str(),
+                    mountpoint = %handle.mountpoint().display(),
+                    "serving dual-index image from the content store"
+                );
+                self.stamp_daemon_ref_label(key, image_ref, &staged.bootstrap);
+                Some(handle.mountpoint().to_path_buf())
+            }
+            Err(e) => {
+                warn!(image = %image_ref, error = format!("{e:#}"), "local dual-index daemon failed to start; serving from the registry");
+                None
+            }
+        }
+    }
+
     /// Daemon mountpoint for a snapshot `prepare()` routed to a daemon without
     /// a nydus meta layer in its chain (auto-accel or referrer serving), which
     /// recorded the serving image in the [`labels::NYDUS_DAEMON_IMAGE_REF`]
@@ -903,6 +980,14 @@ impl snapshots::Snapshotter for NydusSnapshotter {
                         {
                             Ok(info) => match info.image_type {
                                 ImageType::NydusRafs => {
+                                    if info.dual_index
+                                        && let Some(manifest_digest) = info.bootstrap_digest.as_deref()
+                                        && let Some(mountpoint) = self
+                                            .serve_dual_index_locally(image_ref, manifest_digest, &key)
+                                            .await
+                                    {
+                                        return Ok(self.rewrite_mounts_with_daemon(&key, &mountpoint, false));
+                                    }
                                     if let Some(bootstrap_digest) = info.bootstrap_digest.as_deref() {
                                         // `materialize_bootstrap_blocking` is
                                         // synchronous and blocks its thread on

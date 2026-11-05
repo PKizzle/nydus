@@ -57,6 +57,10 @@ pub struct ReferrerInfo {
     pub image_type: ImageType,
     pub bootstrap_digest: Option<String>,
     pub fs_driver_hint: Option<String>,
+    /// The nydus manifest is a sibling entry of the image's own index (the
+    /// `bootstrap_digest` is that manifest's digest). Its zran data blobs are
+    /// the OCI half's layers, which containerd has already pulled.
+    pub dual_index: bool,
 }
 
 /// Small bounded LRU cache for referrer detection results.
@@ -122,6 +126,8 @@ struct OciDescriptor {
     media_type: String,
     #[serde(default, rename = "artifactType")]
     artifact_type: String,
+    #[serde(default)]
+    size: u64,
     #[serde(default)]
     annotations: HashMap<String, String>,
 }
@@ -433,6 +439,7 @@ fn classify_dual_index(index_bytes: &[u8]) -> Option<ReferrerInfo> {
         image_type: ImageType::NydusRafs,
         bootstrap_digest: Some(entry.digest.clone()),
         fs_driver_hint: None,
+        dual_index: true,
     })
 }
 
@@ -465,6 +472,7 @@ pub fn detect_from_oci_json(payload: &[u8]) -> Result<ReferrerInfo> {
                 image_type: ImageType::NydusRafs,
                 bootstrap_digest: Some(boot.digest.clone()),
                 fs_driver_hint: boot.annotations.get(NYDUS_FS_DRIVER_HINT).cloned(),
+                dual_index: false,
             });
         }
         // EROFS/blockdev artifacts have no bootstrap layer; they are still
@@ -525,6 +533,7 @@ fn classify_descriptor(desc: &OciDescriptor) -> Option<ReferrerInfo> {
             image_type: ImageType::NydusRafs,
             bootstrap_digest: Some(desc.digest.clone()),
             fs_driver_hint: desc.annotations.get(NYDUS_FS_DRIVER_HINT).cloned(),
+            dual_index: false,
         });
     }
     if media_or_artifact.contains("erofs") || media_or_artifact.contains("blockdev") {
@@ -536,6 +545,7 @@ fn classify_descriptor(desc: &OciDescriptor) -> Option<ReferrerInfo> {
                 .get(NYDUS_FS_DRIVER_HINT)
                 .cloned()
                 .or_else(|| Some("blockdev".to_string())),
+            dual_index: false,
         });
     }
     None
@@ -546,6 +556,7 @@ fn standard_oci() -> ReferrerInfo {
         image_type: ImageType::StandardOci,
         bootstrap_digest: None,
         fs_driver_hint: None,
+        dual_index: false,
     }
 }
 
@@ -673,37 +684,36 @@ pub async fn materialize_bootstrap(
         }
     };
 
-    let (final_digest, bytes) = match layer_digest {
-        Some(layer_digest) => {
-            // Artifact-manifest path: the bootstrap is the nydus layer blob.
-            if let Some(path) = cached_bootstrap(&dir, &layer_digest) {
-                debug!(image = %image_ref, bootstrap = %layer_digest, "reusing cached referrer bootstrap layer");
-                return Ok(path);
-            }
-            let bytes = client
-                .get_blob(repo, &layer_digest)
-                .await
-                .with_context(|| format!("fetch nydus bootstrap layer {layer_digest}"))?;
-            (layer_digest, bytes)
-        }
-        None => {
-            // Direct-blob path: bootstrap_digest is the bootstrap blob.
-            let bytes = client
-                .get_blob(repo, bootstrap_digest)
-                .await
-                .with_context(|| format!("fetch referrer bootstrap blob {bootstrap_digest}"))?;
-            (bootstrap_digest.to_string(), bytes)
-        }
-    };
+    // Artifact-manifest path: the bootstrap is the nydus layer blob.
+    // Direct-blob path: bootstrap_digest is the bootstrap blob itself.
+    let digest = layer_digest.as_deref().unwrap_or(bootstrap_digest);
+    fetch_bootstrap_blob(&client, repo, digest, &dir).await
+}
 
+/// Fetch the bootstrap blob `digest` into `dir`, unless already cached there.
+/// The blob is sha256-verified before it touches disk.
+async fn fetch_bootstrap_blob(
+    client: &RegistryClient,
+    repo: &str,
+    digest: &str,
+    dir: &Path,
+) -> Result<PathBuf> {
+    if let Some(path) = cached_bootstrap(dir, digest) {
+        debug!(bootstrap = %digest, "reusing cached referrer bootstrap layer");
+        return Ok(path);
+    }
+    let bytes = client
+        .get_blob(repo, digest)
+        .await
+        .with_context(|| format!("fetch nydus bootstrap blob {digest}"))?;
     // Never write or mount an unverified bootstrap.
-    verify_bootstrap_digest(&bytes, &final_digest)?;
+    verify_bootstrap_digest(&bytes, digest)?;
     // A referrer artifact ships the bootstrap raw; a nydus image manifest (the dual-index
     // path) ships it as a gzip tar holding image/image.boot. Unwrap AFTER digest
     // verification -- the declared digest is of the layer blob, not its contents.
     let bytes = maybe_unwrap_bootstrap_layer(bytes)?;
-    let path = write_bootstrap(&dir, &final_digest, &bytes)?;
-    info!(image = %image_ref, bootstrap = %final_digest, path = %path.display(), "materialized referrer bootstrap");
+    let path = write_bootstrap(dir, digest, &bytes)?;
+    info!(repo, bootstrap = %digest, path = %path.display(), "materialized referrer bootstrap");
     Ok(path)
 }
 
@@ -733,6 +743,180 @@ pub fn materialize_bootstrap_blocking(
             cache_dir,
         ))
     })
+}
+
+/// Largest data blob of a dual-index nydus sibling that local staging downloads
+/// up front. The sibling's own blobs (zran indexes, an optional prefetch blob)
+/// are a few percent of the image; a larger absent blob is an OCI layer
+/// containerd no longer holds, and fetching it eagerly would cost more than
+/// serving it lazily from the registry.
+const MAX_EAGER_BLOB_BYTES: u64 = 64 * 1024 * 1024;
+
+/// A dual-index nydus sibling staged for the localfs backend.
+#[derive(Clone, Debug)]
+pub struct LocalStage {
+    /// `<work>/stage/bootstrap`, the path the daemon is keyed by.
+    pub bootstrap: PathBuf,
+    /// `<work>/backend`: one entry per data blob, named by its bare hex digest.
+    pub backend_dir: PathBuf,
+}
+
+/// Where a sibling data blob is read from.
+#[derive(Debug, PartialEq, Eq)]
+enum BlobSource {
+    /// Already in containerd's content store (an OCI layer of the image).
+    ContentStore(PathBuf),
+    /// Downloaded once from the registry (a zran index or prefetch blob).
+    Registry,
+}
+
+/// Bare lowercase hex of a well-formed `sha256:` digest. Manifest digests are
+/// untrusted and become file names, so anything else is rejected.
+fn sha256_hex(digest: &str) -> Option<String> {
+    let hex = digest.strip_prefix("sha256:")?;
+    (hex.len() == 64 && hex.bytes().all(|b| b.is_ascii_hexdigit()))
+        .then(|| hex.to_ascii_lowercase())
+}
+
+/// Plan where each data blob of a nydus sibling manifest comes from. `None`
+/// when a blob is neither in the content store nor small enough to fetch up
+/// front, or carries a malformed digest; the caller then keeps the registry path.
+fn plan_blob_sources(
+    layers: &[OciDescriptor],
+    bootstrap_digest: &str,
+    content_root: &Path,
+) -> Option<Vec<(String, BlobSource)>> {
+    let mut plan = Vec::with_capacity(layers.len());
+    for layer in layers.iter().filter(|l| l.digest != bootstrap_digest) {
+        let hex = sha256_hex(&layer.digest)?;
+        let local = content_root.join("blobs").join("sha256").join(&hex);
+        let source = if local.is_file() {
+            BlobSource::ContentStore(local)
+        } else if layer.size <= MAX_EAGER_BLOB_BYTES {
+            BlobSource::Registry
+        } else {
+            debug!(layer = %layer.digest, size = layer.size, "dual-index layer is not in the content store");
+            return None;
+        };
+        plan.push((hex, source));
+    }
+    Some(plan)
+}
+
+/// Stage the nydus sibling `manifest_digest` of a dual-index image under
+/// `stage_root` for the localfs backend: layers already in containerd's content
+/// store are symlinked, and only the bootstrap and the small sibling blobs are
+/// downloaded. `Ok(None)` means a large layer is missing locally.
+///
+/// The work dir is keyed by the manifest digest, so a tag that moves to new
+/// content never restages a directory a running daemon serves.
+pub async fn stage_dual_index(
+    image_ref: &str,
+    manifest_digest: &str,
+    config: &SnapshotterConfig,
+    stage_root: &Path,
+) -> Result<Option<LocalStage>> {
+    let manifest_hex = sha256_hex(manifest_digest)
+        .ok_or_else(|| anyhow!("unsupported nydus manifest digest {manifest_digest}"))?;
+    let parsed = parse_image_ref(image_ref).context("invalid image reference")?;
+    let client = build_registry_client(&parsed, config)?;
+    let repo = parsed.repo.as_str();
+    let fetched = client
+        .get_manifest(repo, manifest_digest)
+        .await
+        .with_context(|| format!("fetch nydus manifest {manifest_digest}"))?;
+    let manifest: OciManifest =
+        serde_json::from_slice(&fetched.bytes).context("parse nydus manifest")?;
+    let boot = bootstrap_layer_of(&manifest.layers)
+        .ok_or_else(|| anyhow!("nydus manifest {manifest_digest} has no bootstrap layer"))?;
+    let content_root = config.snapshotter.containerd.content_root();
+    let Some(plan) = plan_blob_sources(&manifest.layers, &boot.digest, &content_root) else {
+        return Ok(None);
+    };
+
+    // Concurrent prepares of one image stage the same dir, and the link/copy
+    // helpers use fixed temp names.
+    let lock = {
+        let mut locks = stage_locks().lock().unwrap();
+        locks.entry(manifest_hex.clone()).or_default().clone()
+    };
+    let _guard = lock.lock().await;
+
+    let work = stage_root.join(&manifest_hex[..16]);
+    let backend_dir = work.join("backend");
+    let stage_dir = work.join("stage");
+    for dir in [&backend_dir, &stage_dir] {
+        std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
+    }
+    let mut fetched_blobs = 0usize;
+    for (hex, source) in plan {
+        let link = backend_dir.join(&hex);
+        match source {
+            BlobSource::ContentStore(path) => {
+                crate::auto_accel_sidecar::symlink_force(&path, &link)?
+            }
+            // Content-addressed and verified on write, so a present file is complete.
+            BlobSource::Registry if link.is_file() => {}
+            BlobSource::Registry => {
+                let digest = format!("sha256:{hex}");
+                // `get_blob` verifies the bytes against the digest.
+                let bytes = client
+                    .get_blob(repo, &digest)
+                    .await
+                    .with_context(|| format!("fetch nydus blob {digest}"))?;
+                let mut tmp = tempfile::Builder::new()
+                    .prefix(".blob.tmp.")
+                    .tempfile_in(&backend_dir)
+                    .with_context(|| format!("create temp blob in {}", backend_dir.display()))?;
+                std::io::Write::write_all(&mut tmp, &bytes)
+                    .with_context(|| format!("write nydus blob {digest}"))?;
+                tmp.persist(&link)
+                    .with_context(|| format!("move nydus blob into place at {}", link.display()))?;
+                fetched_blobs += 1;
+            }
+        }
+    }
+
+    let bootstrap_src = fetch_bootstrap_blob(
+        &client,
+        repo,
+        &boot.digest,
+        &config.snapshotter.root.join("referrer-bootstraps"),
+    )
+    .await?;
+    let bootstrap = stage_dir.join("bootstrap");
+    crate::auto_accel_sidecar::copy_atomic(&bootstrap_src, &bootstrap)?;
+    // The fanotify service discovers its bootstrap inside the blob dir.
+    crate::auto_accel_sidecar::copy_atomic(&bootstrap_src, &backend_dir.join("bootstrap"))?;
+    debug!(image = %image_ref, nydus_manifest = %manifest_digest, fetched_blobs, "staged dual-index nydus manifest");
+    Ok(Some(LocalStage {
+        bootstrap,
+        backend_dir,
+    }))
+}
+
+/// Blocking entry point for [`stage_dual_index`]; same threading model as
+/// [`materialize_bootstrap_blocking`].
+pub fn stage_dual_index_blocking(
+    image_ref: &str,
+    manifest_digest: &str,
+    config: &SnapshotterConfig,
+    stage_root: &Path,
+) -> Result<Option<LocalStage>> {
+    REFERRER_HTTP_RUNTIME.with(|rt| {
+        rt.block_on(stage_dual_index(
+            image_ref,
+            manifest_digest,
+            config,
+            stage_root,
+        ))
+    })
+}
+
+fn stage_locks() -> &'static Mutex<HashMap<String, std::sync::Arc<async_lock::Mutex<()>>>> {
+    static LOCKS: OnceLock<Mutex<HashMap<String, std::sync::Arc<async_lock::Mutex<()>>>>> =
+        OnceLock::new();
+    LOCKS.get_or_init(Default::default)
 }
 
 /// The referrers-API fallback tag for a subject digest: `sha256:<hex>`
@@ -1008,7 +1192,49 @@ mod tests {
                 .expect("marked sibling must be detected");
             assert_eq!(info.image_type, ImageType::NydusRafs);
             assert_eq!(info.bootstrap_digest.as_deref(), Some("sha256:nydus"));
+            assert!(info.dual_index);
         }
+    }
+
+    #[test]
+    fn dual_index_blobs_come_from_the_content_store_or_a_small_fetch() {
+        let root = tempfile::tempdir().unwrap();
+        let blobs = root.path().join("blobs").join("sha256");
+        std::fs::create_dir_all(&blobs).unwrap();
+        let digest = |c: char| format!("sha256:{}", c.to_string().repeat(64));
+        std::fs::write(blobs.join("a".repeat(64)), b"gzip layer").unwrap();
+        let layer = |d: String, size: u64| OciDescriptor {
+            digest: d,
+            media_type: String::new(),
+            artifact_type: String::new(),
+            size,
+            annotations: HashMap::new(),
+        };
+        let boot = digest('c');
+        let mut layers = vec![
+            layer(digest('a'), 1 << 30), // OCI layer, pulled by containerd
+            layer(digest('b'), 4096),    // zran index, registry only
+            layer(boot.clone(), MAX_EAGER_BLOB_BYTES + 1), // bootstrap, fetched separately
+        ];
+        let plan = super::plan_blob_sources(&layers, &boot, root.path()).unwrap();
+        assert_eq!(
+            plan,
+            vec![
+                (
+                    "a".repeat(64),
+                    BlobSource::ContentStore(blobs.join("a".repeat(64)))
+                ),
+                ("b".repeat(64), BlobSource::Registry),
+            ]
+        );
+
+        // A large layer containerd no longer holds keeps the registry path.
+        layers.push(layer(digest('d'), MAX_EAGER_BLOB_BYTES + 1));
+        assert!(super::plan_blob_sources(&layers, &boot, root.path()).is_none());
+
+        // Manifest digests become file names; anything but sha256 hex is refused.
+        let traversal = [layer("sha256:../../etc/passwd".into(), 1)];
+        assert!(super::plan_blob_sources(&traversal, &boot, root.path()).is_none());
     }
 
     #[test]
@@ -1250,6 +1476,7 @@ mod tests {
             image_type: ImageType::NydusRafs,
             bootstrap_digest: Some("sha256:cachedboot".to_string()),
             fs_driver_hint: Some("fanotify".to_string()),
+            dual_index: false,
         };
         global_cache()
             .lock()

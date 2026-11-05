@@ -196,6 +196,16 @@ mistaken for the bootstrap; a manifest with nydus blobs but no identifiable boot
 as standard OCI and falls through safely), downloads and digest-verifies the bootstrap, then
 mounts it via `DaemonSupervisor::ensure_instance` — including full registry-backend serving of the
 data blobs.
+A **dual-index** image (`nydusify convert --oci-ref --attach-oci-manifest`: one index holding the
+OCI manifests and a zran nydus sibling) is served from the content store instead: containerd has
+already pulled the OCI half, whose layer digests are the sibling's data-blob ids.
+`referrer::stage_dual_index` symlinks those layers into a localfs backend dir
+(`daemons/<slug>/dual-index/<manifest>/backend`) and downloads only the bootstrap and the small
+sibling blobs (zran indexes, prefetch blob). The daemon runs on fanotify when that is the node's
+driver and the bootstrap is a 4 KiB RAFS v6 image, otherwise on FUSE over the same backend dir
+(`DaemonSupervisor::local_serving_driver`; other block sizes stay on FUSE because the kernel
+silently misreads images whose chunk starts were not padded to the block size). A large layer
+missing from the content store keeps the registry-backend path above.
 Every failure in that path falls through to a plain overlay mount, so referrer resolution never
 blocks a pod. Note this is orthogonal to *transparent* node-local acceleration (Decision 7), which
 never consults referrers. The push side of the loop is the Rust `nydusify convert --with-referrer`

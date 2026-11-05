@@ -573,7 +573,7 @@ fn ensure_present(path: &Path, kind: &str) -> Result<()> {
 /// the symlink is created under a temp name and `rename(2)`d over the final
 /// one. A remove+create pair would briefly leave the blob name dangling for a
 /// daemon that is already serving out of this backend dir.
-fn symlink_force(target: &Path, link: &Path) -> Result<()> {
+pub(crate) fn symlink_force(target: &Path, link: &Path) -> Result<()> {
     #[cfg(unix)]
     {
         let tmp = link.with_extension("tmp-link");
@@ -598,7 +598,7 @@ fn symlink_force(target: &Path, link: &Path) -> Result<()> {
 /// directory, then `rename(2)`), so a reader never observes a half-written
 /// `dst`. Callers serialize per destination via the stage lock, so the fixed
 /// temp suffix cannot collide.
-fn copy_atomic(src: &Path, dst: &Path) -> Result<()> {
+pub(crate) fn copy_atomic(src: &Path, dst: &Path) -> Result<()> {
     let tmp = dst.with_extension("tmp-copy");
     std::fs::copy(src, &tmp)
         .with_context(|| format!("copy {} -> {}", src.display(), tmp.display()))?;
