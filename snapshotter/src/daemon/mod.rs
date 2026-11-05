@@ -126,6 +126,10 @@ pub struct DaemonStatusRecord {
     /// (written before this field existed) loadable.
     #[serde(default)]
     pub pid: u32,
+    /// Whether this node's `local_accel` built the bootstrap, which alone makes an auto-accel
+    /// mount eligible for EROFS page cache sharing. Restarts keep the mount's eligibility.
+    #[serde(default)]
+    pub built_on_node: bool,
 }
 
 /// Outcome for one daemon recovery attempt.
@@ -233,6 +237,8 @@ struct DaemonInstance {
     /// a successor can take its mount over. When false, the mount must be
     /// unmounted on shutdown rather than left held (which would wedge in D-state).
     failover_armed: AtomicBool,
+    /// See `DaemonStatusRecord::built_on_node`.
+    built_on_node: bool,
 }
 
 impl DaemonInstance {
@@ -897,6 +903,7 @@ impl DaemonSupervisor {
             holders: StdMutex::new(HashSet::new()),
             restored_holders: StdMutex::new(HashSet::new()),
             failover_armed: AtomicBool::new(armed),
+            built_on_node,
             _poll: poll,
         }))
     }
@@ -1299,12 +1306,11 @@ impl DaemonSupervisor {
         &self,
         image_ref: &str,
         bootstrap: &Path,
+        built_on_node: bool,
     ) -> Result<Arc<DaemonInstance>> {
         match Self::accel_backend_for(bootstrap) {
             Some(backend_dir) => {
-                // A persisted record does not say who built the bootstrap, so a restarted
-                // instance mounts without page cache sharing.
-                self.start_local_instance(image_ref, bootstrap, &backend_dir, false)
+                self.start_local_instance(image_ref, bootstrap, &backend_dir, built_on_node)
                     .await
             }
             None => self.start_instance(image_ref, bootstrap, None).await,
@@ -1391,7 +1397,10 @@ impl DaemonSupervisor {
                 warn!(image_ref, error = %e, "failed to persist stopped daemon record");
             }
 
-            match self.start_instance_for_record(&image_ref, &bootstrap).await {
+            match self
+                .start_instance_for_record(&image_ref, &bootstrap, old.built_on_node)
+                .await
+            {
                 Ok(instance) => {
                     instance.refcount.store(refcount, Ordering::SeqCst);
                     // Carry the holder set over: dropping it would turn every
@@ -1673,6 +1682,7 @@ impl DaemonSupervisor {
                 _poll: poll,
                 // Blockdev/EROFS export has no fuse fd to preserve.
                 failover_armed: AtomicBool::new(false),
+                built_on_node: false,
             }));
         }
 
@@ -1749,6 +1759,7 @@ impl DaemonSupervisor {
                 _poll: poll,
                 // Tarfs is a kernel mount; there is no fuse fd to preserve.
                 failover_armed: AtomicBool::new(false),
+                built_on_node: false,
             }));
         }
 
@@ -1820,6 +1831,7 @@ impl DaemonSupervisor {
             holders: StdMutex::new(HashSet::new()),
             restored_holders: StdMutex::new(HashSet::new()),
             failover_armed: AtomicBool::new(armed),
+            built_on_node: false,
             _poll: poll,
         }))
     }
@@ -2027,7 +2039,11 @@ impl DaemonSupervisor {
             // fetches at an upstream that may not even have the blobs (k3s
             // preloads images like pause from its airgap bundle).
             let started = self
-                .start_instance_for_record(&record.image_ref, &record.bootstrap)
+                .start_instance_for_record(
+                    &record.image_ref,
+                    &record.bootstrap,
+                    record.built_on_node,
+                )
                 .await;
             match started {
                 Ok(instance) => {
@@ -2274,6 +2290,7 @@ impl DaemonSupervisor {
             // The fd stays in systemd's store across restarts, so this daemon is
             // still recoverable by the next successor.
             failover_armed: AtomicBool::new(true),
+            built_on_node: record.built_on_node,
         });
         self.note_parked_slug(slug);
         self.instances
@@ -2385,6 +2402,7 @@ impl DaemonSupervisor {
             // The fd stays in systemd's store (it holds its own dup), so this
             // daemon remains recoverable by the next successor too.
             failover_armed: AtomicBool::new(true),
+            built_on_node: record.built_on_node,
         });
         self.note_parked_slug(slug);
         self.instances
@@ -2558,6 +2576,7 @@ impl DaemonSupervisor {
             // In-process daemon: failover targets the snapshotter process itself,
             // so `kill -9` restarts it and the successor takes the mount over.
             pid: if live { std::process::id() } else { 0 },
+            built_on_node: inst.built_on_node,
         }
     }
 
@@ -3496,6 +3515,7 @@ fn test_instance_with_daemon(
         restored_holders: StdMutex::new(HashSet::new()),
         _poll: Arc::new(Mutex::new(Poll::new().unwrap())),
         failover_armed: AtomicBool::new(false),
+        built_on_node: false,
     }
 }
 
@@ -3660,7 +3680,24 @@ mod tests {
             live: true,
             updated_at: 0,
             pid: 0,
+            built_on_node: false,
         }
+    }
+
+    /// A restart must start an auto-accel mount with the page cache sharing it had, so the
+    /// record carries who built the bootstrap; older records load as not built here.
+    #[test]
+    fn record_keeps_built_on_node_and_older_records_default_it() {
+        let mut record = sample_record(PathBuf::from("/tmp/bootstrap"));
+        record.built_on_node = true;
+        let json = serde_json::to_value(&record).unwrap();
+        let back: DaemonStatusRecord = serde_json::from_value(json.clone()).unwrap();
+        assert!(back.built_on_node);
+
+        let mut older = json;
+        older.as_object_mut().unwrap().remove("built_on_node");
+        let back: DaemonStatusRecord = serde_json::from_value(older).unwrap();
+        assert!(!back.built_on_node);
     }
 
     #[test]
