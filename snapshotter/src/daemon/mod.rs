@@ -865,9 +865,7 @@ impl DaemonSupervisor {
             auto_accel_inode_share_domain(
                 self.config.snapshotter.features.erofs_inode_share,
                 built_on_node,
-                fs::read_to_string("/proc/sys/kernel/osrelease")
-                    .unwrap_or_default()
-                    .trim(),
+                crate::probe::erofs_inode_share_fix_detected,
             ),
         )?;
         let cfg_json = serde_json::json!({ "blobs": [entry] });

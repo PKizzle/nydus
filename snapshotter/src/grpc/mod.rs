@@ -1314,6 +1314,10 @@ pub async fn serve(mut config: SnapshotterConfig) -> Result<()> {
         config.snapshotter.fs_driver_policy,
         Some(&work_dir),
     );
+    crate::probe::spawn_erofs_inode_share_self_test(
+        &work_dir,
+        config.snapshotter.features.erofs_inode_share,
+    );
     for result in &probe_results {
         info!(
             driver = ?result.driver_type,

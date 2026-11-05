@@ -288,6 +288,10 @@ async fn run(nofile: std::io::Result<(u64, u64)>) -> Result<()> {
         config.snapshotter.fs_driver_policy,
         Some(&work_dir),
     );
+    nydus_snapshotter::probe::spawn_erofs_inode_share_self_test(
+        &work_dir,
+        config.snapshotter.features.erofs_inode_share,
+    );
     for result in &probe_results {
         info!(
             driver = ?result.driver_type,

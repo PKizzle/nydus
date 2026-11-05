@@ -196,11 +196,27 @@ sudo NYDUS_IMAGE=./target/release/nydus-image NYDUSD=./target/release/nydusd \
 one page cache across all mounts of the domain, so a library used by many images is cached once.
 The image needs fingerprints (`nydus-image merge --inode-share-fingerprint`); without them the
 kernel mounts normally. A kernel that rejects the options (`EINVAL`, before 7.0) is mounted
-without them. Shared mmaps need the 7.4 fix "erofs: hold real inodes for shared files" (or a
-stable kernel carrying it). `misc/fanotify/inode-share-test.sh` checks the sharing in the kernel.
+without them. Shared mmaps need the fix "erofs: hold real inodes for shared files" (mainline
+`7259fb011c14`, 7.4; or a backport): without it, a page fault on a mapping whose file was closed
+and whose real inode was evicted dereferences a NULL inode, a kernel oops.
+`misc/fanotify/inode-share-test.sh` checks the sharing in the kernel.
 
 The snapshotter sets the domain only for auto-accel images this node built, under
-`[snapshotter.features] erofs_inode_share` (`auto`: kernel 7.4+, `on`, `off`).
+`[snapshotter.features] erofs_inode_share` (`auto`, `on`, `off`). `auto` enables it when the
+startup self-test (`nydus_service::erofs_ishare`) finds both:
+
+- **support**: a tiny file-backed probe image mounts with `inode_share,domain_id=…`, and
+  `inode_share` without `domain_id` fails `EINVAL` (a kernel built without
+  `CONFIG_EROFS_FS_PAGE_CACHE_SHARE` ignores both options; one before 7.0 rejects both);
+- **the fix**: `/proc/kallsyms` lists `erofs_ishare_backing_release`, the `release` hook the fix
+  adds. Triggering the bug itself would oops the kernel, so the probe never does.
+
+It does not compare kernel versions, so a backport counts as fixed. Without kallsyms the result is
+`inconclusive` and `auto` stays off; `on` enables sharing regardless, and `off` skips the self-test.
+The self-test runs in the background at startup; auto-accel mounts made before it finishes go
+without sharing. The startup log and the `nydus_snapshotter_erofs_inode_share{status,mode,enabled}`
+gauge report the outcome (`status` is `fix_present`, `fix_absent`, `unsupported` or
+`inconclusive`).
 
 ## Troubleshooting
 

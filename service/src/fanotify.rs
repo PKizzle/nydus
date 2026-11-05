@@ -636,7 +636,7 @@ fn mount_erofs(
 }
 
 /// Append `inode_share,domain_id=<domain>` to the device options.
-fn erofs_inode_share_options(device_options: &str, domain: &str) -> Result<String> {
+pub(crate) fn erofs_inode_share_options(device_options: &str, domain: &str) -> Result<String> {
     if domain.is_empty() || domain.contains(',') {
         return Err(std::io::Error::new(
             ErrorKind::InvalidInput,
