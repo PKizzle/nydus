@@ -25,13 +25,14 @@
 //! `containerd-namespace` header, so no method here handles it.
 
 use crate::config::ContainerdConfig;
-use crate::containerd_grpc::ContainerdChannel;
+use crate::containerd_grpc::{ChannelError, ContainerdChannel};
 use anyhow::{Context, Result};
+use futures::{Stream, StreamExt};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use std::io::Read;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tonic::Code;
 use tracing::{debug, error, instrument};
 
@@ -46,7 +47,8 @@ use crate::containerd_api::services::images::v1::{
 };
 
 use crate::containerd_api::services::leases::v1::{
-    CreateRequest as LeaseCreateRequest, leases_client::LeasesClient,
+    AddResourceRequest, CreateRequest as LeaseCreateRequest, DeleteRequest as LeaseDeleteRequest,
+    Resource as LeaseResource, leases_client::LeasesClient,
 };
 
 use crate::containerd_api::types as types_proto;
@@ -84,6 +86,15 @@ impl ContentStoreClient {
         ImagesClient::new(self.channel.clone())
     }
 
+    fn leases(&self) -> LeasesClient<ContainerdChannel> {
+        LeasesClient::new(self.channel.clone())
+    }
+
+    /// The containerd socket this client talks to.
+    pub fn socket(&self) -> &Path {
+        self.channel.socket()
+    }
+
     /// Resolve a digest to its on-disk path in the content store. Used by the
     /// fanotify backend dir to symlink to already-committed gzip-layer blobs
     /// without re-copying them. The well-known layout is stable across
@@ -113,133 +124,26 @@ impl ContentStoreClient {
                 }))
             }
             Err(status) if status.code() == Code::NotFound => Ok(None),
-            Err(status) => Err(anyhow::anyhow!(
-                "containerd Info({digest}) failed: {status}"
-            )),
+            Err(status) => Err(rpc_error(format_args!("Info({digest})"), status)),
         }
     }
 
-    /// Upload a local file as a content blob, applying labels for GC + auto-accel
-    /// discovery. Idempotent: if the digest already exists, we just (re-)apply
-    /// labels via `Update`. Returns the canonical `sha256:...` digest.
-    ///
-    /// The payload goes over the bidirectional Write RPC in chunks; see
-    /// [`write_requests`].
-    #[instrument(level = "debug", skip(self, labels), fields(path = %path.display()), err)]
-    pub async fn write_blob(&self, path: &Path, labels: HashMap<String, String>) -> Result<String> {
-        // Read + hash off the compio reactor: merged bootstraps scale with the
-        // image's file count, and a multi-MiB synchronous read would stall the
-        // event loop for its duration.
-        let path_buf = path.to_path_buf();
-        let (bytes, digest) = blocking::unblock(move || {
-            let bytes = std::fs::read(&path_buf)
-                .with_context(|| format!("failed to read {} for upload", path_buf.display()))?;
-            let digest = sha256_of_bytes(&bytes);
-            Ok::<_, anyhow::Error>((bytes, digest))
-        })
-        .await?;
-        let digest_with_prefix = format!("sha256:{digest}");
-
-        if self.info(&digest_with_prefix).await?.is_some() {
-            debug!(
-                digest = %digest_with_prefix,
-                "blob already present in content store; only applying labels"
-            );
-            self.apply_labels(&digest_with_prefix, &labels).await?;
-            return Ok(digest_with_prefix);
-        }
-
-        self.commit(
-            format!("nydus-auto-accel-{digest}"),
-            &digest_with_prefix,
-            bytes,
-            labels,
-        )
-        .await?;
-        Ok(digest_with_prefix)
-    }
-
-    /// Write an in-memory byte slice as a content blob. Used for the small
-    /// auto-accel manifest JSON.
-    pub async fn write_bytes(
-        &self,
-        data: &[u8],
-        ref_hint: &str,
-        labels: HashMap<String, String>,
-    ) -> Result<String> {
-        let digest = sha256_of_bytes(data);
-        let digest_with_prefix = format!("sha256:{digest}");
-
-        if self.info(&digest_with_prefix).await?.is_some() {
-            self.apply_labels(&digest_with_prefix, &labels).await?;
-            return Ok(digest_with_prefix);
-        }
-
-        // Peers route bootstrap-sized blobs through this path too.
-        self.commit(
-            format!("nydus-auto-accel-{ref_hint}-{digest}"),
-            &digest_with_prefix,
-            data.to_vec(),
-            labels,
-        )
-        .await?;
-        Ok(digest_with_prefix)
-    }
-
-    /// Stream `data` to containerd as a chunked `Write` session ending in a
-    /// commit, under a lease that keeps the blob from containerd's GC until
-    /// the caller roots it (see [`Self::ingest_lease`]).
-    async fn commit(
-        &self,
-        ref_name: String,
-        expected: &str,
-        data: Vec<u8>,
-        labels: HashMap<String, String>,
-    ) -> Result<()> {
-        let total = data.len() as i64;
-        let lease = self.ingest_lease(&ref_name).await?;
-        let mut request = tonic::Request::new(futures::stream::iter(write_requests(
-            ref_name, expected, data, labels,
-        )));
-        request.metadata_mut().insert(
-            "containerd-lease",
-            lease
-                .parse()
-                .context("lease id is not a valid header value")?,
-        );
-        let mut responses = self
-            .content()
-            .write(request)
-            .await
-            .map_err(|status| anyhow::anyhow!("containerd Write failed: {status}"))?
-            .into_inner();
-        let mut last = None;
-        while let Some(response) = responses
-            .message()
-            .await
-            .map_err(|status| anyhow::anyhow!("containerd Write response failed: {status}"))?
-        {
-            last = Some(response);
-        }
-        check_committed(last, expected, total)
-    }
-
-    /// Create a lease for one upload and return its id. containerd's GC
-    /// collects committed content nothing references, and a sidecar blob is
-    /// only referenced once its manifest and image record exist; the lease
-    /// covers that gap. It is never deleted, because deleting it before the
-    /// image record roots the blob would reopen the gap; containerd removes it
-    /// once `containerd.io/gc.expire` passes, as for its own client's leases.
-    async fn ingest_lease(&self, ref_name: &str) -> Result<String> {
+    /// Create a lease that keeps the content written under it from containerd's GC, and return
+    /// its id. containerd collects committed content nothing references, and an upload's blobs
+    /// are only referenced once the Image record that roots them exists; the lease covers that
+    /// gap. Delete it with [`Self::delete_lease`] once the record exists. A lease left behind
+    /// by a failed upload expires after [`UPLOAD_LEASE_TTL`] (`containerd.io/gc.expire`), long
+    /// enough for a retry to find the blobs still there.
+    pub async fn create_lease(&self, purpose: &str) -> Result<String> {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default();
         let expire = prost_types::Timestamp {
-            seconds: (now + INGEST_LEASE_TTL).as_secs() as i64,
+            seconds: (now + UPLOAD_LEASE_TTL).as_secs() as i64,
             nanos: 0,
         };
-        let id = format!("{ref_name}-{}", now.as_nanos());
-        LeasesClient::new(self.channel.clone())
+        let id = format!("nydus-{purpose}-{}", now.as_nanos());
+        self.leases()
             .create(LeaseCreateRequest {
                 id: id.clone(),
                 labels: HashMap::from([(
@@ -248,8 +152,194 @@ impl ContentStoreClient {
                 )]),
             })
             .await
-            .map_err(|status| anyhow::anyhow!("containerd Leases.Create({id}) failed: {status}"))?;
+            .map_err(|status| rpc_error(format_args!("Leases.Create({id})"), status))?;
         Ok(id)
+    }
+
+    /// Delete a lease. Idempotent: an already expired lease is success.
+    pub async fn delete_lease(&self, id: &str) -> Result<()> {
+        let request = LeaseDeleteRequest {
+            id: id.to_string(),
+            sync: false,
+        };
+        match self.leases().delete(request).await {
+            Ok(_) => Ok(()),
+            Err(status) if status.code() == Code::NotFound => Ok(()),
+            Err(status) => Err(rpc_error(format_args!("Leases.Delete({id})"), status)),
+        }
+    }
+
+    /// Upload a local file as a content blob under `lease`, applying labels for GC + auto-accel
+    /// discovery. Idempotent: if the digest already exists, it is added to the lease and its
+    /// labels are (re-)applied. Returns the canonical `sha256:...` digest.
+    ///
+    /// The file is hashed in one pass, then streamed over the bidirectional Write RPC in
+    /// [`WRITE_CHUNK_SIZE`] reads (see [`write_requests`]), so it is never held in memory whole.
+    /// Both passes run off the compio reactor.
+    #[instrument(level = "debug", skip(self, labels), fields(path = %path.display()), err)]
+    pub async fn write_blob(
+        &self,
+        path: &Path,
+        labels: HashMap<String, String>,
+        lease: &str,
+    ) -> Result<String> {
+        let path = path.to_path_buf();
+        let hash_path = path.clone();
+        let (digest, total) = blocking::unblock(move || sha256_of_file(&hash_path))
+            .await
+            .with_context(|| format!("failed to hash {} for upload", path.display()))?;
+        let digest_with_prefix = format!("sha256:{digest}");
+        self.store(
+            lease,
+            format!("nydus-auto-accel-{digest}"),
+            &digest_with_prefix,
+            total,
+            labels,
+            file_chunks(path, total),
+        )
+        .await?;
+        Ok(digest_with_prefix)
+    }
+
+    /// Write an in-memory byte slice as a content blob under `lease`. Used for the small
+    /// auto-accel manifest JSON. Idempotent like [`Self::write_blob`].
+    pub async fn write_bytes(
+        &self,
+        data: &[u8],
+        ref_hint: &str,
+        labels: HashMap<String, String>,
+        lease: &str,
+    ) -> Result<String> {
+        let digest = sha256_of_bytes(data);
+        let digest_with_prefix = format!("sha256:{digest}");
+        // Peers route bootstrap-sized blobs through this path too.
+        self.store(
+            lease,
+            format!("nydus-auto-accel-{ref_hint}-{digest}"),
+            &digest_with_prefix,
+            data.len() as u64,
+            labels,
+            futures::stream::iter(memory_chunks(data).map(Ok)),
+        )
+        .await?;
+        Ok(digest_with_prefix)
+    }
+
+    /// Store `total` bytes from `chunks` as blob `expected` under `lease`, unless it is already
+    /// present, in which case it is only adopted (see [`Self::adopt`]).
+    async fn store<S>(
+        &self,
+        lease: &str,
+        ref_name: String,
+        expected: &str,
+        total: u64,
+        labels: HashMap<String, String>,
+        chunks: S,
+    ) -> Result<()>
+    where
+        S: Stream<Item = io::Result<Vec<u8>>> + Send + 'static,
+    {
+        if self.info(expected).await?.is_some() {
+            debug!(
+                digest = %expected,
+                "blob already present in content store; only adding it to the lease and applying labels"
+            );
+            return self.adopt(lease, expected, &labels).await;
+        }
+        let committed = self
+            .commit(lease, ref_name, expected, total, labels.clone(), chunks)
+            .await;
+        settle_commit(
+            committed,
+            async || Ok(self.info(expected).await?.is_some()),
+            async || self.adopt(lease, expected, &labels).await,
+        )
+        .await
+    }
+
+    /// Stream `chunks` to containerd as a chunked `Write` session ending in a commit, under
+    /// `lease`. A chunk that fails to read ends the session and is reported as the error.
+    async fn commit<S>(
+        &self,
+        lease: &str,
+        ref_name: String,
+        expected: &str,
+        total: u64,
+        labels: HashMap<String, String>,
+        chunks: S,
+    ) -> Result<()>
+    where
+        S: Stream<Item = io::Result<Vec<u8>>> + Send + 'static,
+    {
+        let read_failure = Arc::new(Mutex::new(None::<io::Error>));
+        let slot = read_failure.clone();
+        let chunks = chunks.scan((), move |_, chunk| {
+            futures::future::ready(match chunk {
+                Ok(data) => Some(data),
+                Err(e) => {
+                    if let Ok(mut slot) = slot.lock() {
+                        *slot = Some(e);
+                    }
+                    None
+                }
+            })
+        });
+        let mut request =
+            tonic::Request::new(write_requests(ref_name, expected, total, labels, chunks));
+        request.metadata_mut().insert(
+            "containerd-lease",
+            lease
+                .parse()
+                .context("lease id is not a valid header value")?,
+        );
+        let written =
+            async {
+                let mut responses = self
+                    .content()
+                    .write(request)
+                    .await
+                    .map_err(|status| rpc_error(format_args!("Write({expected})"), status))?
+                    .into_inner();
+                let mut last = None;
+                while let Some(response) = responses.message().await.map_err(|status| {
+                    rpc_error(format_args!("Write({expected}) response"), status)
+                })? {
+                    last = Some(response);
+                }
+                check_committed(last, expected, total)
+            }
+            .await;
+        if let Some(e) = read_failure.lock().ok().and_then(|mut slot| slot.take()) {
+            return Err(anyhow::Error::new(e).context(format!("read payload of {expected}")));
+        }
+        written
+    }
+
+    /// Take an already-present blob into `lease` and (re-)apply its labels. The blob may be
+    /// unreferenced (left by an earlier, failed upload), so without the lease containerd's GC
+    /// could collect it before the Image record that roots it exists.
+    async fn adopt(
+        &self,
+        lease: &str,
+        digest: &str,
+        labels: &HashMap<String, String>,
+    ) -> Result<()> {
+        self.leases()
+            .add_resource(AddResourceRequest {
+                id: lease.to_string(),
+                resource: Some(LeaseResource {
+                    id: digest.to_string(),
+                    r#type: "content".to_string(),
+                }),
+            })
+            .await
+            .map_err(|status| {
+                rpc_error(
+                    format_args!("Leases.AddResource({lease}, {digest})"),
+                    status,
+                )
+            })?;
+        self.apply_labels(digest, labels).await
     }
 
     /// Apply / overwrite labels on a content blob. Idempotent.
@@ -274,7 +364,7 @@ impl ContentStoreClient {
         self.content()
             .update(request)
             .await
-            .map_err(|status| anyhow::anyhow!("containerd Update({digest}) failed: {status}"))?;
+            .map_err(|status| rpc_error(format_args!("Update({digest})"), status))?;
         Ok(())
     }
 
@@ -293,13 +383,13 @@ impl ContentStoreClient {
             .content()
             .list(tonic::Request::new(ListContentRequest { filters }))
             .await
-            .map_err(|status| anyhow::anyhow!("containerd List failed: {status}"))?
+            .map_err(|status| rpc_error("List", status))?
             .into_inner();
         let mut out = Vec::new();
         while let Some(chunk) = stream
             .message()
             .await
-            .map_err(|status| anyhow::anyhow!("containerd List stream failed: {status}"))?
+            .map_err(|status| rpc_error("List stream", status))?
         {
             for info in chunk.info {
                 out.push(ContentInfo {
@@ -348,13 +438,13 @@ impl ContentStoreClient {
             .content()
             .read(request)
             .await
-            .map_err(|status| read_error(digest, "failed", status))?
+            .map_err(|status| rpc_error(format_args!("Read({digest})"), status))?
             .into_inner();
         let mut out = Vec::new();
         while let Some(chunk) = response
             .message()
             .await
-            .map_err(|status| read_error(digest, "stream failed", status))?
+            .map_err(|status| rpc_error(format_args!("Read({digest}) stream"), status))?
         {
             out.extend_from_slice(&chunk.data);
         }
@@ -387,9 +477,7 @@ impl ContentStoreClient {
         match self.images().create(request).await {
             Ok(_) => Ok(()),
             Err(status) if status.code() == Code::AlreadyExists => Ok(()),
-            Err(status) => Err(anyhow::anyhow!(
-                "containerd Images.Create({name}) failed: {status}"
-            )),
+            Err(status) => Err(rpc_error(format_args!("Images.Create({name})"), status)),
         }
     }
 
@@ -425,13 +513,13 @@ impl ContentStoreClient {
                     }),
                     source_date_epoch: None,
                 });
-                client.update(update).await.map(|_| ()).map_err(|status| {
-                    anyhow::anyhow!("containerd Images.Update({name}) failed: {status}")
-                })
+                client
+                    .update(update)
+                    .await
+                    .map(|_| ())
+                    .map_err(|status| rpc_error(format_args!("Images.Update({name})"), status))
             }
-            Err(status) => Err(anyhow::anyhow!(
-                "containerd Images.Create({name}) failed: {status}"
-            )),
+            Err(status) => Err(rpc_error(format_args!("Images.Create({name})"), status)),
         }
     }
 
@@ -458,9 +546,7 @@ impl ContentStoreClient {
                 }))
             }
             Err(status) if status.code() == Code::NotFound => Ok(None),
-            Err(status) => Err(anyhow::anyhow!(
-                "containerd Images.Get({name}) failed: {status}"
-            )),
+            Err(status) => Err(rpc_error(format_args!("Images.Get({name})"), status)),
         }
     }
 
@@ -473,7 +559,7 @@ impl ContentStoreClient {
             .images()
             .list(tonic::Request::new(ListImagesRequest { filters: vec![] }))
             .await
-            .map_err(|status| anyhow::anyhow!("containerd Images.List failed: {status}"))?;
+            .map_err(|status| rpc_error("Images.List", status))?;
         Ok(response
             .into_inner()
             .images
@@ -502,16 +588,15 @@ impl ContentStoreClient {
         match self.images().delete(request).await {
             Ok(_) => Ok(()),
             Err(status) if status.code() == Code::NotFound => Ok(()),
-            Err(status) => Err(anyhow::anyhow!(
-                "containerd Images.Delete({name}) failed: {status}"
-            )),
+            Err(status) => Err(rpc_error(format_args!("Images.Delete({name})"), status)),
         }
     }
 }
 
-/// How long an upload's lease protects its blob from containerd's GC; the
-/// same default containerd's own client gives its leases.
-const INGEST_LEASE_TTL: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+/// Lifetime of an upload lease that is never deleted because its upload failed: long enough
+/// for the retries of the failed job to reuse its blobs, short enough that superseded blobs do
+/// not linger. A successful upload deletes its lease as soon as the Image record roots the blobs.
+pub const UPLOAD_LEASE_TTL: std::time::Duration = std::time::Duration::from_secs(2 * 60 * 60);
 
 /// Payload bytes per `WriteContentRequest`, as containerd's own client sends.
 /// containerd's gRPC server rejects any message over 16 MiB.
@@ -520,12 +605,12 @@ const WRITE_CHUNK_SIZE: usize = 1024 * 1024;
 /// containerd ends a `Write` session whose request stream closes before the
 /// commit without an error, so only a final commit response for the whole
 /// payload proves the blob was stored.
-fn check_committed(last: Option<WriteContentResponse>, expected: &str, total: i64) -> Result<()> {
+fn check_committed(last: Option<WriteContentResponse>, expected: &str, total: u64) -> Result<()> {
     match last {
         Some(r)
             if r.action == WriteAction::Commit as i32
                 && r.digest == expected
-                && r.offset == total =>
+                && r.offset == total as i64 =>
         {
             Ok(())
         }
@@ -535,26 +620,48 @@ fn check_committed(last: Option<WriteContentResponse>, expected: &str, total: i6
     }
 }
 
-/// The messages of one content `Write` session for `data`: `Write` actions of
-/// at most [`WRITE_CHUNK_SIZE`] bytes, each at its running offset, the last
-/// one sent as `Commit` with the labels. The first message names the ref,
-/// size and digest (containerd opens the writer from it) and, at offset 0,
-/// truncates whatever an earlier aborted session left under the same ref.
-fn write_requests(
+/// The outcome of a `Write` session. `AlreadyExists` means another writer committed the same
+/// digest first; like containerd's own client, that counts as stored once `exists` confirms
+/// the blob is there, and the blob is then `adopt`ed (lease + labels) as a present one is.
+async fn settle_commit(
+    committed: Result<()>,
+    exists: impl AsyncFnOnce() -> Result<bool>,
+    adopt: impl AsyncFnOnce() -> Result<()>,
+) -> Result<()> {
+    match committed {
+        Err(e) if status_code(&e) == Some(Code::AlreadyExists) => {
+            if !exists().await? {
+                return Err(
+                    e.context("containerd reported the blob as existing, but Info cannot find it")
+                );
+            }
+            adopt().await
+        }
+        other => other,
+    }
+}
+
+/// The messages of one content `Write` session for a `total`-byte payload read as `chunks`:
+/// `Write` actions at their running offsets, the chunk that completes the payload sent as
+/// `Commit` with the labels. The first message names the ref, size and digest (containerd
+/// opens the writer from it) and, at offset 0, truncates whatever an earlier aborted session
+/// left under the same ref. A source that ends early ends the session without a commit, which
+/// [`check_committed`] reports.
+fn write_requests<C: Stream<Item = Vec<u8>>>(
     ref_name: String,
     expected: &str,
-    data: Vec<u8>,
+    total: u64,
     labels: HashMap<String, String>,
-) -> impl Iterator<Item = WriteContentRequest> + use<> {
-    let total = data.len();
-    let count = total.div_ceil(WRITE_CHUNK_SIZE).max(1);
+    chunks: C,
+) -> impl Stream<Item = WriteContentRequest> + use<C> {
     let expected = expected.to_string();
     let mut labels = Some(labels);
     let mut ref_name = Some(ref_name);
-    (0..count).map(move |i| {
-        let start = i * WRITE_CHUNK_SIZE;
-        let end = total.min(start + WRITE_CHUNK_SIZE);
-        let last = i + 1 == count;
+    let mut offset = 0u64;
+    chunks.map(move |data| {
+        let start = offset;
+        offset += data.len() as u64;
+        let last = offset >= total;
         WriteContentRequest {
             action: if last {
                 WriteAction::Commit
@@ -565,12 +672,60 @@ fn write_requests(
             total: total as i64,
             expected: expected.clone(),
             offset: start as i64,
-            data: data[start..end].to_vec(),
+            data,
             labels: if last {
                 labels.take().unwrap_or_default()
             } else {
                 HashMap::new()
             },
+        }
+    })
+}
+
+/// `data` in [`WRITE_CHUNK_SIZE`] pieces; one empty piece for an empty payload, so that it is
+/// still committed.
+fn memory_chunks(data: &[u8]) -> impl Iterator<Item = Vec<u8>> + Send + 'static {
+    let pieces: Vec<Vec<u8>> = if data.is_empty() {
+        vec![Vec::new()]
+    } else {
+        data.chunks(WRITE_CHUNK_SIZE).map(<[u8]>::to_vec).collect()
+    };
+    pieces.into_iter()
+}
+
+/// The first `total` bytes of the file at `path` in [`WRITE_CHUNK_SIZE`] reads, each run off the
+/// compio reactor. The file is opened on the first poll. A file shorter than `total` yields an
+/// `UnexpectedEof` error, after which the stream ends.
+fn file_chunks(
+    path: PathBuf,
+    total: u64,
+) -> impl Stream<Item = io::Result<Vec<u8>>> + Send + 'static {
+    // State: the open file (after the first read), the next offset, whether a chunk was sent.
+    futures::stream::unfold(Some((None::<std::fs::File>, 0u64, false)), move |state| {
+        let path = path.clone();
+        async move {
+            let (file, offset, started) = state?;
+            if started && offset >= total {
+                return None;
+            }
+            let len = (total - offset).min(WRITE_CHUNK_SIZE as u64);
+            let read = blocking::unblock(move || {
+                let mut file = match file {
+                    Some(file) => file,
+                    None => std::fs::File::open(&path)?,
+                };
+                let mut buf = Vec::with_capacity(len as usize);
+                (&mut file).take(len).read_to_end(&mut buf)?;
+                if (buf.len() as u64) < len {
+                    return Err(io::Error::from(io::ErrorKind::UnexpectedEof));
+                }
+                Ok((file, buf))
+            })
+            .await;
+            Some(match read {
+                Ok((file, buf)) => (Ok(buf), Some((Some(file), offset + len, true))),
+                Err(e) => (Err(e), None),
+            })
         }
     })
 }
@@ -597,24 +752,59 @@ fn image_record(
     }
 }
 
-/// A Read RPC error that keeps the `tonic::Status` downcastable under its
-/// message, so `is_not_found`/`is_rpc_failure` see the code.
-fn read_error(digest: &str, what: &str, status: tonic::Status) -> anyhow::Error {
-    let msg = format!("containerd Read({digest}) {what}: {status}");
+/// A failed containerd call, its `tonic::Status` kept downcastable under the message so
+/// [`is_not_found`], [`is_rpc_failure`] and [`is_containerd_unavailable`] see the code.
+fn rpc_error(call: impl std::fmt::Display, status: tonic::Status) -> anyhow::Error {
+    let msg = format!("containerd {call} failed: {status}");
     anyhow::Error::new(status).context(msg)
+}
+
+fn status_code(e: &anyhow::Error) -> Option<Code> {
+    e.downcast_ref::<tonic::Status>().map(tonic::Status::code)
 }
 
 /// The content-store read of this error's digest answered NotFound.
 pub(crate) fn is_not_found(e: &anyhow::Error) -> bool {
-    e.downcast_ref::<tonic::Status>()
-        .is_some_and(|s| s.code() == Code::NotFound)
+    status_code(e) == Some(Code::NotFound)
 }
 
-/// A gRPC failure other than NotFound, which `fetch_bytes` has already
-/// logged at error; callers that log fetch failures skip these.
+/// A gRPC failure other than NotFound. For `fetch_bytes` errors, which it has already logged
+/// at error; callers that log fetch failures skip these.
 pub(crate) fn is_rpc_failure(e: &anyhow::Error) -> bool {
-    e.downcast_ref::<tonic::Status>()
-        .is_some_and(|s| s.code() != Code::NotFound)
+    status_code(e).is_some_and(|code| code != Code::NotFound)
+}
+
+/// Whether `e` says containerd could not be reached, rather than that it refused the request:
+/// its socket is missing or refuses connections, the connection broke, or containerd answered
+/// `Unavailable` or `DeadlineExceeded`. Such a failure says nothing about the request and is
+/// worth retrying once containerd is back.
+pub fn is_containerd_unavailable(e: &anyhow::Error) -> bool {
+    e.chain().any(|cause| {
+        if let Some(status) = cause.downcast_ref::<tonic::Status>() {
+            matches!(status.code(), Code::Unavailable | Code::DeadlineExceeded)
+        } else if let Some(channel) = cause.downcast_ref::<ChannelError>() {
+            matches!(
+                channel,
+                ChannelError::Connect { .. }
+                    | ChannelError::Handshake { .. }
+                    | ChannelError::Request { .. }
+            )
+        } else if let Some(io) = cause.downcast_ref::<io::Error>() {
+            // A connection that broke mid-call reaches tonic as an h2/hyper error over these.
+            matches!(
+                io.kind(),
+                io::ErrorKind::ConnectionRefused
+                    | io::ErrorKind::ConnectionReset
+                    | io::ErrorKind::ConnectionAborted
+                    | io::ErrorKind::BrokenPipe
+                    | io::ErrorKind::NotConnected
+            )
+        } else {
+            cause.downcast_ref::<hyper::Error>().is_some_and(|e| {
+                e.is_closed() || e.is_canceled() || e.is_incomplete_message() || e.is_timeout()
+            })
+        }
+    })
 }
 
 fn sha256_of_bytes(bytes: &[u8]) -> String {
@@ -632,23 +822,21 @@ fn hex_encode(bytes: &[u8]) -> String {
     out
 }
 
-/// Hash a file with a streaming reader so we don't load it into memory.
-/// Kept for future direct-streaming uploads of multi-GiB layers; current
-/// `write_blob` reads the whole file (the artifacts we upload are small
-/// merged bootstraps + KB-scale zran indexes).
-#[allow(dead_code)]
-fn sha256_of_file(path: &Path) -> Result<String> {
+/// The sha256 hex digest and size of the file at `path`, read in one streaming pass.
+fn sha256_of_file(path: &Path) -> io::Result<(String, u64)> {
     let mut file = std::fs::File::open(path)?;
     let mut hasher = Sha256::new();
-    let mut buf = [0u8; 64 * 1024];
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut size = 0u64;
     loop {
         let n = file.read(&mut buf)?;
         if n == 0 {
             break;
         }
         hasher.update(&buf[..n]);
+        size += n as u64;
     }
-    Ok(hex_encode(&hasher.finalize()))
+    Ok((hex_encode(&hasher.finalize()), size))
 }
 
 fn strip_sha256_prefix(digest: &str) -> &str {
@@ -697,38 +885,83 @@ mod tests {
         assert!(!is_not_found(&anyhow::anyhow!("connect failed")));
     }
 
-    /// The error `read_bytes` builds is the one `fetch_bytes` classifies:
-    /// if it stops carrying the `tonic::Status`, every NotFound is logged
-    /// at error again.
+    /// The error every containerd call builds is the one callers classify: if it stops carrying
+    /// the `tonic::Status`, NotFound is logged at error again and an outage counts as a failure.
     #[test]
-    fn read_error_keeps_status_downcastable() {
-        let e = read_error("sha256:x", "failed", tonic::Status::not_found("gone"));
+    fn rpc_error_keeps_status_downcastable() {
+        let e = rpc_error("Read(sha256:x)", tonic::Status::not_found("gone"));
         assert!(is_not_found(&e));
         assert!(!is_rpc_failure(&e));
         assert!(e.to_string().contains("containerd Read(sha256:x)"), "{e}");
-        let e = read_error(
-            "sha256:x",
-            "stream failed",
-            tonic::Status::unavailable("down"),
-        );
+        let e = rpc_error("Images.Get(x)", tonic::Status::unavailable("down"));
         assert!(!is_not_found(&e));
         assert!(is_rpc_failure(&e));
+        assert!(is_containerd_unavailable(&e.context("resolve manifest")));
         assert!(!is_rpc_failure(&anyhow::anyhow!("connect failed")));
     }
 
-    /// A payload over containerd's 16 MiB receive limit goes out as messages
-    /// that each stay under it, at contiguous offsets, ending in one commit
-    /// that carries the labels.
+    /// Unreachable means the request never got an answer: a socket that is missing or refuses
+    /// connections, a dropped connection, or containerd's own Unavailable/DeadlineExceeded.
+    /// An answer about the request itself, or a local error, is not.
     #[test]
-    fn write_requests_split_large_payload() {
-        let data: Vec<u8> = (0..33 * 1024 * 1024 + 7).map(|i| i as u8).collect();
-        let labels = HashMap::from([("k".to_string(), "v".to_string())]);
-        let reqs: Vec<_> =
-            write_requests("ref".into(), "sha256:x", data.clone(), labels.clone()).collect();
-        assert_eq!(reqs.len(), 34);
+    fn containerd_unavailable_is_told_apart_from_real_failures() {
+        let channel = |kind: io::ErrorKind| {
+            let status = tonic::Status::from_error(Box::new(ChannelError::Connect {
+                socket: PathBuf::from("/run/containerd/containerd.sock"),
+                source: io::Error::from(kind),
+            }));
+            anyhow::Error::new(status).context("containerd Write(sha256:x) failed")
+        };
+        assert!(is_containerd_unavailable(&channel(io::ErrorKind::NotFound)));
+        assert!(is_containerd_unavailable(&channel(
+            io::ErrorKind::ConnectionRefused
+        )));
+        let status = |status: tonic::Status| rpc_error("Info(sha256:x)", status);
+        assert!(is_containerd_unavailable(&status(
+            tonic::Status::deadline_exceeded("slow")
+        )));
+        assert!(is_containerd_unavailable(&status(
+            tonic::Status::unavailable("down")
+        )));
+        let reset =
+            tonic::Status::from_error(Box::new(io::Error::from(io::ErrorKind::ConnectionReset)));
+        assert!(is_containerd_unavailable(&anyhow::Error::new(reset)));
+
+        assert!(!is_containerd_unavailable(&status(
+            tonic::Status::not_found("gone")
+        )));
+        assert!(!is_containerd_unavailable(&status(
+            tonic::Status::failed_precondition("digest mismatch")
+        )));
+        assert!(!is_containerd_unavailable(&status(
+            tonic::Status::already_exists("present")
+        )));
+        assert!(!is_containerd_unavailable(&anyhow::Error::new(
+            io::Error::from(io::ErrorKind::NotFound)
+        )));
+        assert!(!is_containerd_unavailable(&anyhow::anyhow!(
+            "convert failed"
+        )));
+    }
+
+    fn collect_requests(
+        total: u64,
+        chunks: impl Stream<Item = Vec<u8>>,
+        labels: HashMap<String, String>,
+    ) -> Vec<WriteContentRequest> {
+        futures::executor::block_on(
+            write_requests("ref".into(), "sha256:x", total, labels, chunks).collect(),
+        )
+    }
+
+    /// Asserts `reqs` is one well-formed session for `data`: messages under containerd's
+    /// 16 MiB limit at contiguous offsets, ref only on the first, one commit at the end that
+    /// carries `labels`.
+    fn assert_session(reqs: &[WriteContentRequest], data: &[u8], labels: &HashMap<String, String>) {
         let mut joined = Vec::new();
         for (i, req) in reqs.iter().enumerate() {
             assert!(prost::Message::encoded_len(req) < 16 * 1024 * 1024);
+            assert!(req.data.len() <= WRITE_CHUNK_SIZE);
             assert_eq!(req.offset as usize, joined.len());
             assert_eq!(req.total as usize, data.len());
             assert_eq!(req.expected, "sha256:x");
@@ -740,11 +973,81 @@ mod tests {
                 WriteAction::Write
             };
             assert_eq!(req.action, action as i32);
-            assert_eq!(req.labels.is_empty(), !last);
+            assert_eq!(req.labels.is_empty(), !last || labels.is_empty());
             joined.extend_from_slice(&req.data);
         }
         assert_eq!(joined, data);
-        assert_eq!(reqs.last().unwrap().labels, labels);
+        assert_eq!(&reqs.last().unwrap().labels, labels);
+    }
+
+    /// A payload over containerd's 16 MiB receive limit goes out as messages that each stay
+    /// under it.
+    #[test]
+    fn write_requests_split_large_payload() {
+        let data: Vec<u8> = (0..33 * 1024 * 1024 + 7).map(|i| i as u8).collect();
+        let labels = HashMap::from([("k".to_string(), "v".to_string())]);
+        let reqs = collect_requests(
+            data.len() as u64,
+            futures::stream::iter(memory_chunks(&data)),
+            labels.clone(),
+        );
+        assert_eq!(reqs.len(), 34);
+        assert_session(&reqs, &data, &labels);
+    }
+
+    /// A file streams as the same session its bytes would, one `WRITE_CHUNK_SIZE` read at a
+    /// time, without being read into memory first.
+    #[test]
+    fn file_chunks_stream_a_file_as_one_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("blob");
+        let data: Vec<u8> = (0..3 * WRITE_CHUNK_SIZE + 5)
+            .map(|i| (i % 251) as u8)
+            .collect();
+        std::fs::write(&path, &data).unwrap();
+        let labels = HashMap::from([("k".to_string(), "v".to_string())]);
+        let chunks = file_chunks(path, data.len() as u64).map(Result::unwrap);
+        let reqs = collect_requests(data.len() as u64, chunks, labels.clone());
+        assert_eq!(reqs.len(), 4);
+        assert_session(&reqs, &data, &labels);
+    }
+
+    /// An empty file is still committed, in a single message.
+    #[test]
+    fn file_chunks_commit_an_empty_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("empty");
+        std::fs::write(&path, b"").unwrap();
+        let chunks = file_chunks(path, 0).map(Result::unwrap);
+        let reqs = collect_requests(0, chunks, HashMap::new());
+        assert_eq!(reqs.len(), 1);
+        assert_session(&reqs, &[], &HashMap::new());
+    }
+
+    /// A file that shrank after it was hashed yields a raw `UnexpectedEof` and ends the stream,
+    /// so the session cannot commit a short payload.
+    #[test]
+    fn file_chunks_report_a_file_shorter_than_its_hash() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("blob");
+        std::fs::write(&path, vec![7u8; WRITE_CHUNK_SIZE + 10]).unwrap();
+        let items: Vec<_> = futures::executor::block_on(
+            file_chunks(path.clone(), (2 * WRITE_CHUNK_SIZE) as u64).collect(),
+        );
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].as_ref().unwrap().len(), WRITE_CHUNK_SIZE);
+        assert_eq!(
+            items[1].as_ref().unwrap_err().kind(),
+            io::ErrorKind::UnexpectedEof
+        );
+
+        let missing: Vec<_> =
+            futures::executor::block_on(file_chunks(dir.path().join("absent"), 1).collect());
+        assert_eq!(missing.len(), 1);
+        assert_eq!(
+            missing[0].as_ref().unwrap_err().raw_os_error(),
+            Some(libc::ENOENT)
+        );
     }
 
     /// Only a commit response covering the whole payload counts as stored.
@@ -770,11 +1073,43 @@ mod tests {
     /// An empty payload is still committed, in a single message.
     #[test]
     fn write_requests_empty_payload_commits() {
-        let reqs: Vec<_> =
-            write_requests("ref".into(), "sha256:x", Vec::new(), HashMap::new()).collect();
+        let reqs = collect_requests(0, futures::stream::iter(memory_chunks(&[])), HashMap::new());
         assert_eq!(reqs.len(), 1);
         assert_eq!(reqs[0].action, WriteAction::Commit as i32);
         assert_eq!(reqs[0].r#ref, "ref");
+    }
+
+    /// `AlreadyExists` from a commit is success once Info confirms the blob, which is then
+    /// adopted; it is an error if Info cannot find it. Other outcomes pass through untouched.
+    #[test]
+    fn settle_commit_treats_already_exists_as_stored() {
+        let exists = tonic::Status::already_exists("content sha256:x: already exists");
+        let settle = |committed: Result<()>, present: bool| {
+            let adopted = std::cell::Cell::new(false);
+            let result = futures::executor::block_on(settle_commit(
+                committed,
+                async || Ok(present),
+                async || {
+                    adopted.set(true);
+                    Ok(())
+                },
+            ));
+            (result, adopted.get())
+        };
+
+        let (result, adopted) = settle(Err(rpc_error("Write(sha256:x)", exists.clone())), true);
+        assert!(result.is_ok() && adopted);
+
+        let (result, adopted) = settle(Err(rpc_error("Write(sha256:x)", exists)), false);
+        assert!(!adopted);
+        assert_eq!(status_code(&result.unwrap_err()), Some(Code::AlreadyExists));
+
+        let (result, adopted) = settle(Ok(()), true);
+        assert!(result.is_ok() && !adopted);
+
+        let unavailable = rpc_error("Write(sha256:x)", tonic::Status::unavailable("down"));
+        let (result, adopted) = settle(Err(unavailable), true);
+        assert!(!adopted && is_containerd_unavailable(&result.unwrap_err()));
     }
 
     #[test]
@@ -793,7 +1128,10 @@ mod tests {
         std::fs::write(&path, b"hello\n").unwrap();
         assert_eq!(
             sha256_of_file(&path).unwrap(),
-            "5891b5b522d5df086d0ff0b110fbd9d21bb4fc7163af34d08286a2e846f6be03"
+            (
+                "5891b5b522d5df086d0ff0b110fbd9d21bb4fc7163af34d08286a2e846f6be03".to_string(),
+                6
+            )
         );
     }
 }

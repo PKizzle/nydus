@@ -183,7 +183,7 @@ impl LayerBackfill {
         // Dropping the transfer call on a stall resets its HTTP/2 stream, which cancels the
         // fetch inside containerd.
         match select(transfer, stalled).await {
-            Either::Left((result, _)) => result.map(drop).map_err(|status| anyhow!("{status}")),
+            Either::Left((result, _)) => result.map(drop).map_err(anyhow::Error::new),
             Either::Right((stall, _)) => Err(stall),
         }
     }
@@ -200,14 +200,14 @@ impl LayerBackfill {
         let mut inbound = StreamingClient::new(self.channel.clone())
             .stream(requests)
             .await
-            .map_err(|status| anyhow!("open stream {id}: {status}"))?
+            .map_err(|status| anyhow::Error::new(status).context(format!("open stream {id}")))?
             .into_inner();
         // containerd acknowledges once the stream is registered under its ID; the transfer
         // must not reference it before that.
         inbound
             .message()
             .await
-            .map_err(|status| anyhow!("stream {id} handshake: {status}"))?
+            .map_err(|status| anyhow::Error::new(status).context(format!("stream {id} handshake")))?
             .with_context(|| format!("stream {id} closed during handshake"))?;
         Ok((outbound, inbound))
     }
