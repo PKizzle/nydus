@@ -2460,6 +2460,43 @@ mod tests {
         assert!(err.to_string().contains("invalid arguments"));
     }
 
+    /// `--block-size` and `--exclude` exist only in this tree's `create`, and
+    /// nydusify and the fanotify tests pass them; an upstream resync of this
+    /// file must keep both.
+    #[test]
+    fn test_create_accepts_block_size_and_exclude() {
+        let cmd = super::prepare_cmd_args(super::BTI_STRING.as_str())
+            .try_get_matches_from([
+                "nydus-image",
+                "create",
+                "--block-size",
+                "16384",
+                "--exclude",
+                "/etc/app.conf",
+                "--exclude",
+                "/var/cache",
+                "--bootstrap",
+                "/tmp/bootstrap",
+                "--blob-dir",
+                "/tmp/blobs",
+                "/src",
+            ])
+            .unwrap();
+        let create = cmd.subcommand_matches("create").unwrap();
+        assert_eq!(
+            create.get_one::<String>("block-size").map(String::as_str),
+            Some("16384")
+        );
+        let excludes: Vec<&PathBuf> = create.get_many::<PathBuf>("exclude").unwrap().collect();
+        assert_eq!(
+            excludes,
+            ["/etc/app.conf", "/var/cache"]
+                .map(PathBuf::from)
+                .iter()
+                .collect::<Vec<_>>()
+        );
+    }
+
     fn create_tarfs(extra: &[&str]) -> anyhow::Result<()> {
         let dir = vmm_sys_util::tempdir::TempDir::new().unwrap();
         let tar = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
