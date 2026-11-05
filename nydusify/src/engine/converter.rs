@@ -678,6 +678,9 @@ fn pull_source_from_archive(
     );
     let config_bytes = std::fs::read(imported.blob_path(&manifest.config)?)
         .context("read image config from the source archive")?;
+    // An archive holds one image without an index; like a single-manifest
+    // registry source, it is what its config says.
+    let plat = single_manifest_platform(plat, platform, &config_bytes);
 
     let mut layers = Vec::with_capacity(manifest.layers.len());
     for layer in &manifest.layers {
@@ -869,19 +872,9 @@ async fn pull_source(
     // published an index claiming, say, linux/amd64 for an arm64-only image:
     // amd64 nodes then pull an arm64 rootfs and arm64 nodes match nothing, so
     // the tag breaks for every architecture, silently, at publish time.
-    let plat = match (index_entries.as_ref(), platform_from_config(&config_bytes)) {
-        (None, Some(from_config)) => {
-            if !from_config.matches(&plat) {
-                warn!(
-                    requested = platform,
-                    actual = %format_platform(&from_config),
-                    "the source image is not the requested platform; labeling it with what its \
-                     config says it is"
-                );
-            }
-            from_config
-        }
-        _ => plat,
+    let plat = match index_entries {
+        Some(_) => plat,
+        None => single_manifest_platform(plat, platform, &config_bytes),
     };
 
     let layers_dir = workspace.join("layers");
@@ -954,6 +947,27 @@ fn real_image_entries(entries: &[Descriptor]) -> Vec<&Descriptor> {
                 .is_none_or(|p| !(p.os == "unknown" && p.architecture == "unknown"))
         })
         .collect()
+}
+
+/// The platform of an image that came without an index: what its config says,
+/// falling back to the `requested` selector only when the config names none.
+fn single_manifest_platform(
+    requested: registry_client::types::Platform,
+    selector: &str,
+    config_bytes: &[u8],
+) -> registry_client::types::Platform {
+    let Some(from_config) = platform_from_config(config_bytes) else {
+        return requested;
+    };
+    if !from_config.matches(&requested) {
+        warn!(
+            requested = selector,
+            actual = %format_platform(&from_config),
+            "the source image is not the requested platform; labeling it with what its \
+             config says it is"
+        );
+    }
+    from_config
 }
 
 /// The platform an image config declares for itself.
@@ -2379,6 +2393,50 @@ mod tests {
         );
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[1].digest, "sha256:new-arm64");
+    }
+
+    #[test]
+    fn an_archive_source_is_labeled_with_its_config_platform() {
+        let dir = tempfile::tempdir().unwrap();
+        let stage = |name: &str, bytes: &[u8]| {
+            let path = dir.path().join(name);
+            std::fs::write(&path, bytes).unwrap();
+            ArchiveBlob {
+                digest: registry_client::types::sha256_digest(bytes),
+                size: bytes.len() as u64,
+                path,
+            }
+        };
+        let config = stage("config", br#"{"architecture":"arm64","os":"linux"}"#);
+        let layer = stage("layer", b"layer");
+        let manifest = serde_json::to_vec(&serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": registry_client::types::MEDIA_TYPE_OCI_MANIFEST,
+            "config": {"mediaType": "application/vnd.oci.image.config.v1+json",
+                       "digest": config.digest, "size": config.size},
+            "layers": [{"mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+                        "digest": layer.digest, "size": layer.size}],
+        }))
+        .unwrap();
+        let archive = dir.path().join("image.tar");
+        oci_archive::export(
+            &archive,
+            &manifest,
+            registry_client::types::MEDIA_TYPE_OCI_MANIFEST,
+            "app:v1",
+            &[config, layer],
+        )
+        .unwrap();
+        let request = convert_request(&[
+            "--source",
+            "example.com/app:v1",
+            "--target",
+            "example.com/app:nydus",
+        ]);
+
+        let source =
+            pull_source_from_archive(&request, &archive, "linux/amd64", dir.path()).unwrap();
+        assert_eq!(source.platform.architecture, "arm64");
     }
 
     /// A descriptor shaped like a nydus entry this tool would have written.
