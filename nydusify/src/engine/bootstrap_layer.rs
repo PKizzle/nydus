@@ -15,10 +15,10 @@
 //!   `<snapshot>/fs/image/image.boot` (`snapshotter::overlay`), which only exists
 //!   because containerd expanded the tar.
 //!
-//! Publishing the raw bootstrap under a bespoke
-//! `application/vnd.oci.image.layer.nydus.bootstrap.v1` media type — as this
-//! crate used to — produces an image that no standard nydus deployment can
-//! consume: containerd fails the pull with "no processor for media-type".
+//! The bootstrap layer must not be published raw under the bespoke
+//! `application/vnd.oci.image.layer.nydus.bootstrap.v1` media type: no standard
+//! nydus deployment can consume that image, because containerd fails the pull
+//! with "no processor for media-type".
 //!
 //! Referrer artifacts are a separate matter: there the bootstrap legitimately
 //! travels raw under `MEDIA_TYPE_NYDUS_BOOTSTRAP`, because the snapshotter

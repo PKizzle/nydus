@@ -680,8 +680,8 @@ mod tests {
         assert_eq!(plan.platform, default_platform());
     }
 
-    /// Planning must accept `--all-platforms`; this is the regression guard
-    /// against `run` rejecting it outright again.
+    /// Planning accepts `--all-platforms`: `run` copies every platform of an
+    /// index.
     #[test]
     fn accepts_all_platforms() {
         let mut args = base_args();

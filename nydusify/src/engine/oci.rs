@@ -272,10 +272,9 @@ pub enum BlobSource<'a> {
 /// the target already has it, a cross-repo mount when both repos live on one
 /// registry, and only failing that an upload.
 ///
-/// This is the one place that cascade is written. It used to exist four times —
-/// in `copy`, in `optimize`, and twice in the converter — with subtly different
-/// semantics each time, so a fix to the mount fallback or the retry behaviour
-/// had to be rediscovered for each copy.
+/// Every command that moves blobs between repositories goes through this one
+/// function, so the mount fallback and the retry behaviour stay identical
+/// across them.
 pub async fn ensure_blob_in_repo(
     target_client: &RegistryClient,
     target_repo: &str,
