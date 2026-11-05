@@ -12,7 +12,7 @@
 #                    --target aarch64-unknown-linux-musl
 #   MODULES_TAR  optional tarball holding .../kernel/fs/erofs/erofs.ko[.xz|.zst] (modular EROFS),
 #                e.g. `dpkg-deb --fsys-tarfile linux-modules-*.deb`
-#   DEMO_IMAGE   optional EROFS image to mount as is and padded, e.g. `mkfs.erofs -b4096` output
+#   DEMO_IMAGE   optional EROFS image to mount as is and padded, e.g. from `demo-image.sh`
 #   EXPECT       optional affected|unaffected; the script fails unless the probe says so and,
 #                with DEMO_IMAGE, the image reads as `expect.sh` requires
 #   BUSYBOX      static busybox (default: the one on PATH)
@@ -43,10 +43,11 @@ if [ -n "${MODULES_TAR:-}" ]; then
 fi
 # QEMU's -kernel loader does not unpack zboot payloads compressed with zstd.
 if [ "$(dd if="$KERNEL" bs=1 skip=4 count=4 2>/dev/null)" = zimg ]; then
-  off=$(od -An -tu4 -j8 -N4 "$KERNEL"); size=$(od -An -tu4 -j12 -N4 "$KERNEL")
+  off=$(($(od -An -tu4 -j8 -N4 "$KERNEL"))) size=$(($(od -An -tu4 -j12 -N4 "$KERNEL")))
   comp=$(dd if="$KERNEL" bs=1 skip=24 count=32 2>/dev/null | tr -d '\0')
   case "$comp" in gzip | zstd) ;; *) echo "unsupported zboot compression: $comp" >&2; exit 1 ;; esac
-  tail -c +$((off + 1)) "$KERNEL" | head -c "$size" | "$comp" -dc > "$WORK/Image"
+  dd if="$KERNEL" iflag=skip_bytes,count_bytes skip="$off" count="$size" status=none |
+    "$comp" -dc > "$WORK/Image"
   KERNEL="$WORK/Image"
 fi
 [ -n "${DEMO_IMAGE:-}" ] && cp "$DEMO_IMAGE" "$ROOT/demo.erofs"
@@ -74,4 +75,4 @@ timeout 300 qemu-system-aarch64 -machine virt -cpu max -m 1024 -nographic -no-re
   -kernel "$KERNEL" -initrd "$WORK/initrd.gz" \
   -append "console=ttyAMA0 rdinit=/init panic=-1 quiet" </dev/null | tee "$WORK/console.log"
 
-bash "$(dirname "$0")/expect.sh" "$WORK/console.log" "${EXPECT:-}"
+bash "$(dirname "$0")/expect.sh" "$WORK/console.log" "${EXPECT:-}" "${DEMO_IMAGE:+image}"

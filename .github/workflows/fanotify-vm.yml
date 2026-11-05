@@ -42,9 +42,9 @@ jobs:
       cancel-in-progress: true
     strategy:
       fail-fast: false
-      # Ubuntu mainline builds: 6.18.y is the supported floor, 7.3.y the newest kernel features,
-      # 7.4-rc the first with the EROFS partial-folio fix (52dceb88082b). `erofs_folio` is the
-      # self-test verdict on 4K pages: 7.3.y without the fix is affected by 512-byte-block images.
+      # Ubuntu mainline builds: 6.18.y is the supported floor, 7.3.y the newest release, 7.4-rc the
+      # first with the EROFS partial-folio fix (52dceb88082b), which 7.3.1 lacks. `erofs_folio` is
+      # the self-test verdict on 4K pages, where 512-byte-block images trigger the bug.
       # Per entry, bump all five together (sha256 from the release's CHECKSUMS file).
       matrix:
         include:
@@ -117,11 +117,8 @@ jobs:
         echo "VMLINUZ=$(ls "$K"/root/boot/vmlinuz-*)" >> "$GITHUB_ENV"
     - name: EROFS partial-folio self-test in the VM
       run: |
-        # A 512-byte-block image with its metadata at the end, ending inside a 4K page.
-        D="$RUNNER_TEMP/folio"; mkdir -p "$D/src/d"
-        for i in $(seq 40); do echo "file $i" > "$D/src/d/f$i"; done
-        head -c 300000 /dev/zero > "$D/src/big"
-        mkfs.erofs -b512 "$D/demo.erofs" "$D/src"
+        D="$RUNNER_TEMP/folio"; mkdir -p "$D"
+        bash misc/erofs-folio/demo-image.sh "$D/demo.erofs" 512 4096
         truncate -s 64M "$D/ext4.img"; mkfs.ext4 -q -F "$D/ext4.img"
         vng --run "$VMLINUZ" --user root --cpus 2 --memory 1G --rwdir "$RUNNER_TEMP" --exec "
           set -e
@@ -129,8 +126,9 @@ jobs:
           mkdir -p /var/tmp/folio && mount -o loop '$D/ext4.img' /var/tmp/folio
           '$GITHUB_WORKSPACE/target/release/examples/erofs_folio_probe' /var/tmp/folio '$D/demo.erofs' || true
         " | tee "$D/probe.log"
-        bash misc/erofs-folio/expect.sh "$D/probe.log" "$EROFS_FOLIO"
+        bash misc/erofs-folio/expect.sh "$D/probe.log" "$EROFS_FOLIO" image
     - name: Run misc/fanotify in the VM
+      if: ${{ !cancelled() }}
       run: |
         echo "runner kernel: $(uname -r)"
         vng --run "$VMLINUZ" --user root --cpus 4 --memory 6G --rwdir "$RUNNER_TEMP" --exec "
@@ -217,11 +215,8 @@ jobs:
         echo "VMLINUZ=$(ls "$K"/root/boot/vmlinuz-*)" >> "$GITHUB_ENV"
     - name: EROFS partial-folio self-test under QEMU
       run: |
-        # A 4K-block image (the nydus default) with its metadata at the end, ending inside a 64K page.
-        D="$RUNNER_TEMP/folio"; mkdir -p "$D/src/d"
-        for i in $(seq 40); do echo "file $i" > "$D/src/d/f$i"; done
-        head -c 300000 /dev/zero > "$D/src/big"
-        mkfs.erofs -b4096 "$D/demo.erofs" "$D/src"
+        # 4K blocks, the nydus default.
+        bash misc/erofs-folio/demo-image.sh "$RUNNER_TEMP/demo.erofs" 4096 65536
         KERNEL="$VMLINUZ" PROBE=target/aarch64-unknown-linux-musl/release/examples/erofs_folio_probe \
-        MODULES_TAR="$RUNNER_TEMP/kernel/modules.tar" DEMO_IMAGE="$D/demo.erofs" EXPECT="$EROFS_FOLIO" \
+        MODULES_TAR="$RUNNER_TEMP/kernel/modules.tar" DEMO_IMAGE="$RUNNER_TEMP/demo.erofs" EXPECT="$EROFS_FOLIO" \
           bash misc/erofs-folio/qemu-test.sh

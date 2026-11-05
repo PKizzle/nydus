@@ -154,11 +154,12 @@ with `EIO` for any other reason is reported as dead rather than passing.
 and runs the self-test (`service/examples/erofs_folio_probe.rs`) in it, optionally walking an
 EROFS image as is and padded, to check how a kernel build classifies.
 
-CI (`.github/workflows/fanotify-vm.yml`) runs the self-test and an image walk on every kernel it
-boots, and `misc/erofs-folio/expect.sh` fails the job unless the verdict matches the kernel: on
-4K pages, 6.18.55 and 7.4-rc1 are unaffected and 7.3.1 is affected (the probe and walked image use
-512-byte blocks); on arm64 64K pages under QEMU, with a 4K-block image, 7.3.1 is affected and
-7.4-rc1 is unaffected. An affected verdict requires the padded copy to read cleanly.
+CI (`.github/workflows/fanotify-vm.yml`) runs the self-test and walks an image from
+`misc/erofs-folio/demo-image.sh` on every kernel it boots: the 4K-page amd64 matrix with a
+512-byte-block image, and Ubuntu's 64K-page arm64 builds of 7.3.1 and 7.4-rc1 under QEMU with a
+4K-block image. `misc/erofs-folio/expect.sh` fails the job unless the verdict is the one the matrix
+lists for that kernel (affected for 7.3.1, unaffected for the others), the padded copy reads
+cleanly, and the unpadded one fails exactly on an affected kernel.
 
 ## Cache eviction
 
