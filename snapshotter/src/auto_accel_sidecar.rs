@@ -347,7 +347,8 @@ impl SidecarLocator {
     /// Pull the auto-accel sidecar manifest + every referenced blob from
     /// the peer mirrors. Returns `PullOutcome::Disabled` when the
     /// mirror isn't configured (silent fallback to overlay), otherwise
-    /// maps the HTTP responses into one of the four outcomes.
+    /// maps the HTTP responses to `Ok`, `NotFound` or `RegistryError`, and a
+    /// failure to store the fetched sidecar locally to `ContentStoreError`.
     ///
     /// The whole sidecar is fetched and verified before anything is written,
     /// so a peer that fails any check leaves no trace in the content store.

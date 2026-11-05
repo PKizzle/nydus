@@ -278,8 +278,8 @@ classification. The auto-zran worker re-queues a job that hit an unreachable con
 capped exponential delay (5 s doubling to 2 min) with no failure strike, so an outage never marks
 an image non-convertible; a retry of either stage reuses the converted work dir, which the recon
 stale-dir sweep leaves alone while the job waits. A job whose retry delays add up to an hour
-is abandoned, again without a strike, and its dedupe key released, so the next prepare of the
-image enqueues it afresh. A misconfigured socket fails the job with a strike instead, and the
+is abandoned, again without a strike, and its dedupe key released, so it is enqueued afresh (a base job by
+the image's next prepare, an optimize job by the recon sweep from its saved profile). A misconfigured socket fails the job with a strike instead, and the
 first such failure is logged as one error naming the socket. If containerd is still unreachable
 five minutes after startup, one error names the configured socket.
 

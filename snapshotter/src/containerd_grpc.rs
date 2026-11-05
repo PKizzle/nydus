@@ -147,6 +147,8 @@ impl ChannelError {
 fn connect_is_permanent(socket: &Path, error: &std::io::Error) -> bool {
     match error.kind() {
         std::io::ErrorKind::NotFound => !socket.parent().is_some_and(Path::is_dir),
+        // Also a path longer than `sun_path`, rejected before connect(2) with no errno.
+        std::io::ErrorKind::InvalidInput => true,
         // connect(2) on a path that is not a socket fails ECONNREFUSED on Linux.
         std::io::ErrorKind::ConnectionRefused => {
             use std::os::unix::fs::FileTypeExt;
@@ -359,6 +361,13 @@ mod tests {
         for errno in [libc::EACCES, libc::ENOTSOCK, libc::EINVAL] {
             misconfigured(&socket, std::io::Error::from_raw_os_error(errno));
         }
+        misconfigured(
+            &socket,
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "path must be shorter than SUN_LEN",
+            ),
+        );
         let file = dir.path().join("not-a-socket");
         std::fs::write(&file, b"").unwrap();
         misconfigured(&file, refused());

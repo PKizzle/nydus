@@ -284,8 +284,8 @@ const UNAVAILABLE_RETRY_MAX: Duration = Duration::from_secs(2 * 60);
 
 /// How long a job may spend in retry delays for one containerd outage (time spent running
 /// attempts does not count). Past it the job is dropped without a strike and its dedupe key
-/// released, so the next prepare of the image enqueues it afresh instead of one job waiting
-/// forever.
+/// released, so it is enqueued afresh (a base job by the image's next prepare, an optimize job
+/// by the recon sweep from its saved profile) instead of one job waiting forever.
 const OUTAGE_WAIT_BUDGET: Duration = Duration::from_secs(60 * 60);
 
 /// How long after startup containerd may stay unreachable before that is logged as an error
@@ -860,8 +860,9 @@ async fn worker_loop(
                         stage = job.stage.tag(),
                         waited_secs = OUTAGE_WAIT_BUDGET.as_secs(),
                         error = %format!("{e:#}"),
-                        "auto-zran conversion abandoned: containerd stayed unreachable; the next \
-                         prepare of the image enqueues it again"
+                        "auto-zran conversion abandoned: containerd stayed unreachable; the \
+                         image's next prepare enqueues a base job again, and the recon sweep an \
+                         optimize job from its saved profile"
                     );
                     continue;
                 };
@@ -2428,7 +2429,7 @@ mod tests {
 
     /// A tag repoint while a job sleeps between outage retries does not enqueue a second job
     /// for the same image and stage: the retry resolves the tag afresh. A stage with no job
-    /// pending is released as before.
+    /// pending is released.
     #[test]
     fn tag_repoint_during_an_outage_retry_does_not_duplicate_the_job() {
         let (manager, queue) = AutoZranManager::without_worker(4);

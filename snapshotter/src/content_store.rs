@@ -479,13 +479,28 @@ impl ContentStoreClient {
         media_type: &str,
         labels: HashMap<String, String>,
     ) -> Result<()> {
+        self.create_image(name, digest, size, media_type, labels)
+            .await
+            .map(drop)
+    }
+
+    /// [`Self::images_create`], returning whether it created the record (`false`: one by that
+    /// name already existed and was left as it is).
+    async fn create_image(
+        &self,
+        name: &str,
+        digest: &str,
+        size: u64,
+        media_type: &str,
+        labels: HashMap<String, String>,
+    ) -> Result<bool> {
         let request = tonic::Request::new(CreateImageRequest {
             image: Some(image_record(name, digest, size, media_type, labels)),
             source_date_epoch: None,
         });
         match self.images().create(request).await {
-            Ok(_) => Ok(()),
-            Err(status) if status.code() == Code::AlreadyExists => Ok(()),
+            Ok(_) => Ok(true),
+            Err(status) if status.code() == Code::AlreadyExists => Ok(false),
             Err(status) => Err(rpc_error(format_args!("Images.Create({name})"), status)),
         }
     }
@@ -655,8 +670,9 @@ impl Upload {
 
     /// Create Image record `name` for `digest` unless one exists
     /// ([`ContentStoreClient::images_create`]), and delete the lease only once the record
-    /// verifiably points at `digest`. A record that already pointed elsewhere does not root
-    /// these blobs, so the lease stays until it expires and this is an error.
+    /// verifiably points at `digest`: it created the record, or the one that already existed
+    /// reads back with that target. A record pointing elsewhere does not root these blobs, so
+    /// the lease stays until it expires and this is an error.
     pub async fn finish_create(
         self,
         name: &str,
@@ -665,9 +681,14 @@ impl Upload {
         media_type: &str,
         labels: HashMap<String, String>,
     ) -> Result<()> {
-        self.client
-            .images_create(name, digest, size, media_type, labels)
+        let created = self
+            .client
+            .create_image(name, digest, size, media_type, labels)
             .await?;
+        if created {
+            self.release().await;
+            return Ok(());
+        }
         match self.client.images_get(name).await? {
             Some(record) if record.digest == digest => {
                 self.release().await;
@@ -1025,6 +1046,35 @@ mod tests {
         assert!(!is_containerd_unavailable(&anyhow::anyhow!(
             "convert failed"
         )));
+    }
+
+    /// The classification holds through tonic's real error path, not only for hand-built
+    /// errors: a call to a socket missing from an existing directory reads as an outage, one
+    /// whose directory is missing as misconfiguration. Fails if tonic stops keeping the
+    /// transport error as the status's source.
+    #[test]
+    fn a_real_call_to_a_missing_socket_is_classified_through_tonic() {
+        let dir = tempfile::tempdir().unwrap();
+        let call = |socket: PathBuf| {
+            let client = ContentStoreClient::new(&ContainerdConfig {
+                address: Some(socket),
+                ..Default::default()
+            })
+            .unwrap();
+            compio::runtime::Runtime::new()
+                .unwrap()
+                .block_on(client.info(&format!("sha256:{}", "0".repeat(64))))
+                .unwrap_err()
+        };
+        let e = call(dir.path().join("containerd.sock"));
+        assert!(is_containerd_unavailable(&e), "{e:#}");
+        let socket = dir.path().join("missing/containerd.sock");
+        let e = call(socket.clone());
+        assert_eq!(
+            containerd_fault_of(&e),
+            Some(ContainerdFault::Misconfigured(socket)),
+            "{e:#}"
+        );
     }
 
     fn collect_requests(
