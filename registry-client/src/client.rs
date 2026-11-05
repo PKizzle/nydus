@@ -69,6 +69,10 @@ const MAX_ERROR_BODY_BYTES: u64 = 4 * 1024;
 /// returns `500 UNKNOWN`).
 const IDEMPOTENT_ATTEMPTS: u32 = 4;
 
+/// Slowest upload throughput the derived blob-PUT deadline tolerates (see
+/// [`RegistryClientOptions::upload_timeout`]).
+const MIN_UPLOAD_BYTES_PER_SEC: u64 = 64 * 1024;
+
 /// Delay before the first idempotent retry; doubled for each further one.
 const IDEMPOTENT_RETRY_DELAY: Duration = Duration::from_millis(250);
 
@@ -105,9 +109,11 @@ pub struct RegistryClientOptions {
     /// `compio::time::timeout`. `None` disables it.
     pub timeout: Option<Duration>,
     /// Timeout for the blob-upload `PUT` (which transmits the entire body
-    /// before resolving, so it must scale with blob size). Defaults to `None`
-    /// (unbounded) because a fixed value would break large pushes on slow
-    /// links.
+    /// before resolving, so it must scale with blob size). `None` (the
+    /// default) derives it per blob: the larger of [`timeout`](Self::timeout)
+    /// and the time to send the blob at 64 KiB/s, so slow
+    /// links still finish large pushes while a stalled PUT cannot hang
+    /// forever. Unbounded only when `timeout` is `None` as well.
     pub upload_timeout: Option<Duration>,
     /// Wall-clock deadline for reading a whole in-memory response body
     /// (manifests, [`RegistryClient::get_blob`]). The byte cap bounds size,
@@ -746,6 +752,17 @@ impl RegistryClient {
             .ok_or_else(|| anyhow!("registry returned no Location for blob upload session"))?;
         let put_url =
             append_query_param(&resolve_location(&self.base, &location), "digest", digest);
+        let len = match body {
+            BodySource::Empty => 0,
+            BodySource::Bytes(bytes) => bytes.len() as u64,
+            BodySource::File(path) => compio::fs::metadata(path)
+                .await
+                .with_context(|| format!("stat upload file {}", path.display()))?
+                .len(),
+        };
+        let put_timeout = self
+            .upload_timeout
+            .or_else(|| upload_deadline(self.timeout, len));
         let response = self
             .request_with_auth(
                 Method::PUT,
@@ -756,7 +773,7 @@ impl RegistryClient {
                     HeaderValue::from_static(MEDIA_TYPE_OCTET_STREAM),
                 )],
                 body,
-                self.upload_timeout,
+                put_timeout,
             )
             .await?;
         if !response.status().is_success() {
@@ -1060,6 +1077,13 @@ fn same_origin(base: &str, url: &str) -> bool {
         (Some(a), Some(b)) => a == b,
         _ => false,
     }
+}
+
+/// Derived blob-PUT deadline: the larger of the per-request `timeout` and the
+/// time to send `len` bytes at [`MIN_UPLOAD_BYTES_PER_SEC`]. `None` when
+/// `timeout` is `None` (the caller asked for no deadlines).
+fn upload_deadline(timeout: Option<Duration>, len: u64) -> Option<Duration> {
+    timeout.map(|base| base.max(Duration::from_secs(len.div_ceil(MIN_UPLOAD_BYTES_PER_SEC))))
 }
 
 /// Send a built request under the per-request timeout. Any error other than
@@ -1836,6 +1860,20 @@ mod tests {
             .await
             .unwrap();
         assert!(fetched.digest.starts_with("sha256:"), "{}", fetched.digest);
+    }
+
+    #[test]
+    fn upload_deadline_scales_with_blob_size() {
+        let base = Some(Duration::from_secs(30));
+        // Small blobs get the base timeout.
+        assert_eq!(upload_deadline(base, 0), base);
+        assert_eq!(upload_deadline(base, 1024 * 1024), base);
+        // 1 GiB at 64 KiB/s.
+        assert_eq!(
+            upload_deadline(base, 1 << 30),
+            Some(Duration::from_secs(16384))
+        );
+        assert_eq!(upload_deadline(None, 1 << 30), None);
     }
 
     #[test]
