@@ -466,7 +466,7 @@ async fn export_from_registry(
 ) -> Result<()> {
     let mut blobs = Vec::with_capacity(manifest.layers.len() + 1);
     for desc in std::iter::once(&manifest.config).chain(manifest.layers.iter()) {
-        let path = staging.join(blob_hex(&desc.digest));
+        let path = staging.join(blob_hex(&desc.digest)?);
         source_client
             .get_blob_to_file(&source_ref.repo, &desc.digest, &path)
             .await

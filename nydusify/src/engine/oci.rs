@@ -33,13 +33,22 @@ pub fn client_options(
     }
 }
 
-/// Bare lowercase hex of an OCI digest (strips an `algo:` prefix). This is how
+/// Bare lowercase hex of a `sha256:<64 lowercase hex>` digest. This is how
 /// nydus names data blobs and keys the localfs/registry backend.
-pub fn blob_hex(digest: &str) -> &str {
-    match digest.split_once(':') {
-        Some((_algo, hex)) => hex,
-        None => digest,
-    }
+///
+/// Digests come from manifests, indexes and archives, all untrusted, and the
+/// hex is joined onto local paths, so anything else is refused: an absolute or
+/// `..` value would let `Path::join` escape the work directory.
+pub fn blob_hex(digest: &str) -> Result<&str> {
+    digest
+        .strip_prefix("sha256:")
+        .filter(|hex| {
+            hex.len() == 64
+                && hex
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        })
+        .ok_or_else(|| anyhow!("invalid digest {digest:?}: want sha256: and 64 lowercase hex"))
 }
 
 /// Whether a fetched manifest is an image index / manifest list. Uses the
@@ -294,7 +303,7 @@ pub async fn ensure_blob_in_repo(
         }
         BlobSource::Download { client, staging } => {
             let from = source_repo.context("downloading a blob needs a source repository")?;
-            let tmp = staging.join(blob_hex(digest));
+            let tmp = staging.join(blob_hex(digest)?);
             client
                 .get_blob_to_file(from, digest, &tmp)
                 .await
@@ -362,8 +371,21 @@ mod tests {
 
     #[test]
     fn blob_hex_strips_algorithm() {
-        assert_eq!(blob_hex("sha256:deadbeef"), "deadbeef");
-        assert_eq!(blob_hex("cafef00d"), "cafef00d");
+        let hex = "a".repeat(64);
+        assert_eq!(blob_hex(&format!("sha256:{hex}")).unwrap(), hex);
+    }
+
+    #[test]
+    fn blob_hex_refuses_anything_that_could_name_another_path() {
+        let short = "sha256:deadbeef".to_string();
+        let upper = format!("sha256:{}", "A".repeat(64));
+        let bare = "a".repeat(64);
+        let sha512 = format!("sha512:{}", "a".repeat(128));
+        let traversal = format!("sha256:../../{}", "a".repeat(58));
+        let absolute = format!("sha256:/{}", "a".repeat(63));
+        for bad in [short, upper, bare, sha512, traversal, absolute] {
+            assert!(blob_hex(&bad).is_err(), "{bad} must be refused");
+        }
     }
 
     #[test]

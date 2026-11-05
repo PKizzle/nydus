@@ -405,7 +405,10 @@ async fn push_committed_image(
     // Every blob the merged bootstrap references has to be fetchable from the
     // committed image, or it mounts to a filesystem with holes in it. Checking
     // here turns that into a push-time error rather than a runtime one.
-    let published: Vec<&str> = layers.iter().map(|l| blob_hex(&l.digest)).collect();
+    let published: Vec<&str> = layers
+        .iter()
+        .map(|l| blob_hex(&l.digest))
+        .collect::<Result<_>>()?;
     for blob_id in merged_blob_ids {
         if !published.contains(&blob_id.as_str()) {
             bail!(
@@ -528,7 +531,7 @@ async fn copy_blob_to_target(
     // Different registry (or a registry without cross-repo mount): the bytes
     // have to travel. Stage through a file so a multi-gigabyte base layer does
     // not have to fit in memory.
-    let staged = work_dir.join(format!("base-{}", blob_hex(&layer.digest)));
+    let staged = work_dir.join(format!("base-{}", blob_hex(&layer.digest)?));
     source_client
         .get_blob_to_file(&source_ref.repo, &layer.digest, &staged)
         .await

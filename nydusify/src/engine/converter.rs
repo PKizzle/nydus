@@ -81,9 +81,9 @@ impl BuildInput {
     /// Only has to be unique among the inputs, and the index prefixed by the caller
     /// already guarantees that; this exists to keep the workspace readable when a
     /// conversion is being debugged.
-    fn slug(&self) -> String {
-        match self {
-            BuildInput::Layer(layer) => blob_hex(&layer.digest).to_string(),
+    fn slug(&self) -> Result<String> {
+        Ok(match self {
+            BuildInput::Layer(layer) => blob_hex(&layer.digest)?.to_string(),
             BuildInput::Directory(dir) => dir
                 .file_name()
                 .map(|n| {
@@ -91,7 +91,7 @@ impl BuildInput {
                         .replace(|c: char| !c.is_alphanumeric(), "_")
                 })
                 .unwrap_or_else(|| "dir".to_string()),
-        }
+        })
     }
 
     /// How this input is named in an error, so a failed build says which source it was.
@@ -874,7 +874,7 @@ async fn pull_source(
         .with_context(|| format!("create layers dir {}", layers_dir.display()))?;
     let mut layers = Vec::with_capacity(manifest.layers.len());
     for layer in &manifest.layers {
-        let path = layers_dir.join(blob_hex(&layer.digest));
+        let path = layers_dir.join(blob_hex(&layer.digest)?);
         client
             .get_blob_to_file(repo, &layer.digest, &path)
             .await
@@ -1027,7 +1027,7 @@ fn build_artifact(
     let mut original_blob_ids = Vec::with_capacity(inputs.len());
 
     for (i, input) in inputs.iter().enumerate() {
-        let out_dir = convert_root.join(format!("l{i}-{}", input.slug()));
+        let out_dir = convert_root.join(format!("l{i}-{}", input.slug()?));
         fresh_dir(&out_dir)?;
         let bootstrap_i = out_dir.join("bootstrap");
         let args = match input {
@@ -1096,7 +1096,7 @@ fn build_artifact(
         }
         // Only consumed on the `--oci-ref` path, which never sees a directory input.
         if let BuildInput::Layer(layer) = input {
-            original_blob_ids.push(blob_hex(&layer.digest).to_string());
+            original_blob_ids.push(blob_hex(&layer.digest)?.to_string());
         }
     }
 
@@ -1279,7 +1279,7 @@ fn run_optimize(
     let blob_dir = workspace.join("optimize-blobs");
     fresh_dir(&blob_dir)?;
     for layer in reused_layers {
-        link_or_copy(&layer.path, &blob_dir.join(blob_hex(&layer.digest)))?;
+        link_or_copy(&layer.path, &blob_dir.join(blob_hex(&layer.digest)?))?;
     }
     for blob in new_blobs {
         let name = blob
