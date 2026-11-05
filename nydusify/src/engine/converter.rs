@@ -48,7 +48,7 @@ use crate::engine::manifest::{
 };
 use crate::engine::oci::{
     all_platform_selectors, blob_hex, client_options, is_index, parse_platform_list,
-    select_platform,
+    select_source_platform,
 };
 use crate::engine::oci_archive::{self, ArchiveBlob};
 use crate::engine::retry::RetryPolicy;
@@ -427,7 +427,7 @@ async fn resolve_platform_plan(
         // Validate every requested selector resolves in the index up front.
         let requested = parse_platform_list(&request.platforms)?;
         for sel in &requested {
-            select_platform(&index, sel)?;
+            select_source_platform(&index, sel)?;
         }
         requested
     };
@@ -819,13 +819,9 @@ async fn pull_source(
             let index: Index =
                 serde_json::from_slice(&fetched.bytes).context("parse source image index")?;
             let entries = index.manifests.clone();
-            let selected = select_platform(&index, platform)?;
-            if registry_client::is_nydus_entry(selected) {
-                bail!(
-                    "the entry selected for platform {platform:?} in {source_ref} is the tag's \
-                     nydus manifest, not an OCI image; a nydus image cannot be a conversion source"
-                );
-            }
+            // A nydus manifest cannot be a conversion source, wherever the index lists it.
+            let selected = select_source_platform(&index, platform)
+                .with_context(|| format!("select the OCI image to convert from {source_ref}"))?;
             let plat = selected.platform.clone().unwrap_or_default();
             let img = client
                 .get_manifest(repo, &selected.digest)

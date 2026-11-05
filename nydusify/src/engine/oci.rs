@@ -194,6 +194,17 @@ pub fn select_nydus_platform<'a>(
     }
 }
 
+/// Select the OCI image (never the nydus half of a dual-manifest index) for
+/// `platform_selector`: the entry a conversion can start from.
+pub fn select_source_platform<'a>(
+    index: &'a Index,
+    platform_selector: &str,
+) -> Result<&'a Descriptor> {
+    select_matching_platform(index, platform_selector, |d| {
+        !registry_client::is_nydus_entry(d)
+    })
+}
+
 fn select_matching_platform<'a>(
     index: &'a Index,
     platform_selector: &str,
@@ -232,6 +243,7 @@ fn select_matching_platform<'a>(
     let available: Vec<String> = index
         .manifests
         .iter()
+        .filter(|d| keep(d))
         .filter_map(|d| d.platform.as_ref())
         .map(|p| match &p.variant {
             Some(v) => format!("{}/{}/{}", p.os, p.architecture, v),
@@ -555,6 +567,22 @@ mod tests {
             select_nydus_platform(&index, "linux/amd64").unwrap().digest,
             "sha256:oci-amd"
         );
+    }
+
+    #[test]
+    fn select_source_platform_skips_a_nydus_entry_listed_first() {
+        let index = index_of(vec![
+            nydus_desc("linux", "arm64", "sha256:nydus-arm"),
+            platform_desc("linux", "arm64", None, "sha256:oci-arm"),
+        ]);
+        assert_eq!(
+            select_source_platform(&index, "linux/arm64")
+                .unwrap()
+                .digest,
+            "sha256:oci-arm"
+        );
+        let nydus_only = index_of(vec![nydus_desc("linux", "arm64", "sha256:nydus-arm")]);
+        assert!(select_source_platform(&nydus_only, "linux/arm64").is_err());
     }
 
     #[test]
