@@ -26,9 +26,9 @@ done
 "$NI" merge -B "$STAGE/bootstrap" --original-blob-ids "$(IFS=,; echo "${IDS[*]}")" "${BOOTSTRAPS[@]}" >/dev/null 2>&1 || { echo "merge failed"; exit 1; }
 "$NI" check -B "$STAGE/bootstrap" --blob-dir "$R/backend" >/dev/null || { echo "check failed"; exit 1; }
 BLOBS=$(ls "$R/backend" | wc -l)
-OPTS=$(( BLOBS * (${#STAGE} + ${#BLOBS} + 15) ))
-echo "layers=$LAYERS blobs=$BLOBS device path ~$(( ${#STAGE} + 8 )) bytes, joined options ~$OPTS bytes"
-[ "$BLOBS" -ge 64 ] && [ "$OPTS" -gt 4096 ] || { echo "image too small to exercise the one-page limit"; exit 1; }
+OPTS=0; for i in $(seq 0 $((BLOBS - 1))); do OPTS=$((OPTS + ${#STAGE} + 14 + ${#i})); done  # "device=<stage>/blob_<i>,"
+echo "layers=$LAYERS blobs=$BLOBS joined device options $OPTS bytes"
+[ "$BLOBS" = "$LAYERS" ] && [ "$OPTS" -gt 4096 ] || { echo "image too small to exercise the one-page limit"; exit 1; }
 
 cat > "$R/cfg.json" <<EOF
 { "blobs": [ { "type":"bootstrap","id":"b1","domain_id":"d1","config":{
@@ -41,7 +41,9 @@ EOF
 for _ in $(seq 30); do mount | grep -qF "$R/mnt type erofs" && break; sleep 1; done
 P=1
 mount | grep -qF "$R/mnt type erofs" || { echo "NOT MOUNTED"; tail -15 "$R/log"; P=0; }
-echo "self-staged devices: $(ls "$STAGE" | grep -c '^blob_')"
+STAGED=$(ls "$STAGE" | grep -c '^blob_')
+echo "self-staged devices: $STAGED"
+[ "$STAGED" = "$BLOBS" ] || { echo "MISMATCH staged devices"; P=0; }
 BAD=0
 for i in $(seq 0 $((LAYERS - 1))); do
   S=$(sha256sum "$R/l$i/layer$i/data.bin" | awk '{print $1}')

@@ -474,6 +474,22 @@ fn order_by_device_table<T>(
         .collect()
 }
 
+/// Reject a mount parameter value `fsconfig(2)` would refuse with a bare `EINVAL`.
+fn check_fsconfig_value(what: &str, value: &[u8]) -> Result<()> {
+    if value.len() > FSCONFIG_VALUE_MAX {
+        return Err(std::io::Error::new(
+            ErrorKind::InvalidInput,
+            format!(
+                "{what} {:?} is {} bytes, over the {FSCONFIG_VALUE_MAX}-byte kernel limit for \
+                 one mount option; use a shorter blob cache directory path",
+                String::from_utf8_lossy(value),
+                value.len()
+            ),
+        ));
+    }
+    Ok(())
+}
+
 /// Build the `device=<path>,device=<path>,…` option list for a file-backed EROFS mount.
 ///
 /// Split out from [`mount_erofs`] so the validation is unit-testable without root or a
@@ -486,17 +502,7 @@ fn order_by_device_table<T>(
 fn build_erofs_device_options(blobs: &[PathBuf]) -> Result<String> {
     for blob in blobs {
         let bytes = blob.as_os_str().as_encoded_bytes();
-        if bytes.len() > FSCONFIG_VALUE_MAX {
-            return Err(std::io::Error::new(
-                ErrorKind::InvalidInput,
-                format!(
-                    "device path {:?} is {} bytes, over the {FSCONFIG_VALUE_MAX}-byte kernel \
-                     limit for one mount option; use a shorter blob cache directory path",
-                    blob,
-                    bytes.len()
-                ),
-            ));
-        }
+        check_fsconfig_value("device path", bytes)?;
         if bytes.contains(&b',') {
             return Err(std::io::Error::new(
                 ErrorKind::InvalidInput,
@@ -559,6 +565,7 @@ fn mount_erofs(
     mountpoint: &Path,
     inode_share_domain: Option<&str>,
 ) -> Result<()> {
+    check_fsconfig_value("bootstrap path", bootstrap.as_os_str().as_encoded_bytes())?;
     let options = build_erofs_device_options(blobs)?;
     if let Some(domain) = inode_share_domain {
         match erofs_inode_share_options(&options, domain)
@@ -583,6 +590,7 @@ fn erofs_inode_share_options(device_options: &str, domain: &str) -> Result<Strin
             format!("invalid EROFS domain_id {domain:?}"),
         ));
     }
+    check_fsconfig_value("EROFS domain_id", domain.as_bytes())?;
     let share = format!("inode_share,domain_id={domain}");
     Ok(if device_options.is_empty() {
         share
@@ -626,19 +634,40 @@ fn mount_erofs_with(bootstrap: &Path, mountpoint: &Path, options: &str) -> Resul
         Ok(())
     };
 
-    config(
-        FSCONFIG_SET_STRING,
-        Some("source"),
-        Some(bootstrap.as_os_str().as_encoded_bytes()),
-    )?;
-    config(FSCONFIG_SET_FLAG, Some("ro"), None)?;
-    for option in options.split(',').filter(|o| !o.is_empty()) {
-        match option.split_once('=') {
-            Some((key, value)) => config(FSCONFIG_SET_STRING, Some(key), Some(value.as_bytes()))?,
-            None => config(FSCONFIG_SET_FLAG, Some(option), None)?,
+    let configured = (|| {
+        config(
+            FSCONFIG_SET_STRING,
+            Some("source"),
+            Some(bootstrap.as_os_str().as_encoded_bytes()),
+        )?;
+        config(FSCONFIG_SET_FLAG, Some("ro"), None)?;
+        for option in options.split(',').filter(|o| !o.is_empty()) {
+            match option.split_once('=') {
+                Some((key, value)) => {
+                    config(FSCONFIG_SET_STRING, Some(key), Some(value.as_bytes()))?
+                }
+                None => config(FSCONFIG_SET_FLAG, Some(option), None)?,
+            }
+        }
+        config(FSCONFIG_CMD_CREATE, None, None)
+    })();
+    if configured.is_err() {
+        // With the new mount API the kernel logs the reason for a refused parameter into the
+        // context fd rather than dmesg; surface it, leaving the returned errno untouched.
+        let mut buf = [0u8; 512];
+        loop {
+            let n = unsafe { libc::read(fs.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
+            if n <= 0 {
+                break;
+            }
+            warn!(
+                "fanotify: EROFS mount of {}: {}",
+                mountpoint.display(),
+                String::from_utf8_lossy(&buf[..n as usize]).trim_end()
+            );
         }
     }
-    config(FSCONFIG_CMD_CREATE, None, None)?;
+    configured?;
 
     // The mounted tree is an untrusted container image. EROFS is read-only anyway, but
     // `MOUNT_ATTR_RDONLY` states it rather than relying on the driver, and `NODEV`/`NOSUID`
@@ -2332,7 +2361,8 @@ mod tests {
             erofs_inode_share_options("", "d").unwrap(),
             "inode_share,domain_id=d"
         );
-        for bad in ["", "a,b"] {
+        let long = "d".repeat(FSCONFIG_VALUE_MAX + 1);
+        for bad in ["", "a,b", long.as_str()] {
             let err = erofs_inode_share_options("device=/x", bad).unwrap_err();
             assert_eq!(err.kind(), ErrorKind::InvalidInput);
         }
