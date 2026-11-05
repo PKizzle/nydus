@@ -324,14 +324,17 @@ impl RegistryTokenResponse {
     }
 }
 
+/// Upper bound on a token response body; real ones are a few KiB of JWT.
+const MAX_TOKEN_RESPONSE_BYTES: u64 = 1024 * 1024;
+
 /// Fetch a bearer token from `challenge.realm` for `scope`.
 ///
 /// `basic_auth` is the base64 `user:password` payload (or a full
 /// `Basic ...` / `Bearer ...` header value) forwarded to the token service so
 /// it can mint an authenticated token; without it the token service issues an
-/// anonymous token where allowed. `timeout` bounds the whole token request
-/// (cyper has no client-level timeout, so it is applied per request via
-/// `compio::time::timeout`).
+/// anonymous token where allowed. `timeout` bounds the whole token request,
+/// response body included (cyper has no client-level timeout, so it is
+/// applied per request via `compio::time::timeout`).
 pub async fn fetch_bearer_token(
     client: &cyper::Client,
     challenge: &BearerChallenge,
@@ -360,26 +363,33 @@ pub async fn fetch_bearer_token(
             .header(AUTHORIZATION, auth)
             .context("invalid Authorization header")?;
     }
-    let send = request.send();
-    let response = match timeout {
-        Some(duration) => compio::time::timeout(duration, send)
+    let fetch = async {
+        let response = request
+            .send()
+            .await
+            .context("registry token request failed")?;
+        if !response.status().is_success() {
+            bail!(
+                "registry token request failed with HTTP {}",
+                response.status()
+            );
+        }
+        // Body read under the same deadline as the send; the cap keeps a
+        // hostile token service from streaming an unbounded body.
+        let body =
+            crate::client::read_bounded(response, &challenge.realm, MAX_TOKEN_RESPONSE_BYTES, None)
+                .await?;
+        serde_json::from_slice::<RegistryTokenResponse>(&body)
+            .context("failed to decode registry token response")
+    };
+    match timeout {
+        Some(duration) => compio::time::timeout(duration, fetch)
             .await
             .map_err(|_| anyhow!("registry token request timed out"))?,
-        None => send.await,
-    }
-    .context("registry token request failed")?;
-    if !response.status().is_success() {
-        bail!(
-            "registry token request failed with HTTP {}",
-            response.status()
-        );
-    }
-    response
-        .json::<RegistryTokenResponse>()
-        .await
-        .context("failed to decode registry token response")?
-        .into_bearer()
-        .context("registry token response did not include a token")
+        None => fetch.await,
+    }?
+    .into_bearer()
+    .context("registry token response did not include a token")
 }
 
 #[derive(Debug, Deserialize)]

@@ -1116,7 +1116,7 @@ pub fn append_query_param(url: &str, key: &str, value: &str) -> String {
 /// The `Content-Length` check is a cheap fast-path rejection (skip opening
 /// the stream at all when the registry honestly advertises an oversized body
 /// up front); it is not load-bearing for the guarantee above.
-async fn read_bounded(
+pub(crate) async fn read_bounded(
     response: Response,
     url: &str,
     max_bytes: u64,
@@ -1776,6 +1776,30 @@ mod tests {
         for head in &seen[2..] {
             assert!(head.contains("authorization: Bearer tok-1"), "{head}");
         }
+    }
+
+    #[compio::test]
+    async fn token_response_body_is_capped() {
+        let (port, server) = serve_raw_with(|port| {
+            let challenge = format!(
+                "HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Bearer \
+                 realm=\"http://127.0.0.1:{port}/token\"\r\nContent-Length: 0\r\n\
+                 Connection: close\r\n\r\n"
+            );
+            // Advertises a body over the cap; the client must refuse it
+            // without waiting for (or the server sending) the bytes.
+            let oversized = "HTTP/1.1 200 OK\r\nContent-Length: 4194304\r\n\
+                             Connection: close\r\n\r\n"
+                .to_string();
+            vec![challenge, oversized]
+        });
+        let err = loopback_client(port)
+            .get_manifest("app", "v1")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, RegistryError::Auth(_)), "{err}");
+        assert!(err.to_string().contains("exceeds cap"), "{err}");
+        server.join().unwrap();
     }
 
     #[test]
