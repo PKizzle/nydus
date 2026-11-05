@@ -56,7 +56,7 @@ use crate::engine::manifest::{
     data_blob_descriptor, manifest_media_type, rebuild_image_config, validate_nydus_manifest,
 };
 use crate::engine::oci::{
-    BlobSource, blob_hex, client_options, ensure_blob_in_repo, fetch_nydus_platform_manifest,
+    BlobSource, client_options, ensure_blob_in_repo, fetch_nydus_platform_manifest,
 };
 use crate::engine::overlay_diff::write_upper_layer_tar;
 use crate::engine::retry::RetryPolicy;
@@ -416,7 +416,7 @@ async fn push_committed_image(
     // here turns that into a push-time error rather than a runtime one.
     let published: Vec<&str> = layers
         .iter()
-        .map(|l| blob_hex(&l.digest))
+        .map(|l| registry_client::digest_hex(&l.digest))
         .collect::<Result<_>>()?;
     for blob_id in merged_blob_ids {
         if !published.contains(&blob_id.as_str()) {

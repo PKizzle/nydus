@@ -28,8 +28,6 @@ use registry_client::Descriptor;
 use registry_client::types::{Index, Manifest, verify_digest};
 use tracing::debug;
 
-use crate::engine::oci::blob_hex;
-
 /// Marker file every OCI layout carries, and the only version we emit.
 const OCI_LAYOUT_FILE: &str = "oci-layout";
 const OCI_LAYOUT_VERSION: &str = "1.0.0";
@@ -81,7 +79,10 @@ impl ImportedImage {
     /// pushed under the descriptor's digest.
     pub fn blob_path(&self, desc: &Descriptor) -> Result<PathBuf> {
         let digest = &desc.digest;
-        let path = self.blobs_dir.join("sha256").join(blob_hex(digest)?);
+        let path = self
+            .blobs_dir
+            .join("sha256")
+            .join(registry_client::digest_hex(digest)?);
         let len = std::fs::symlink_metadata(&path)
             .ok()
             .filter(|md| md.is_file())
@@ -161,7 +162,9 @@ pub fn import(archive: &Path, dest: &Path) -> Result<ImportedImage> {
     }
 
     let blobs_dir = dest.join("blobs");
-    let manifest_path = blobs_dir.join("sha256").join(blob_hex(&descriptor.digest)?);
+    let manifest_path = blobs_dir
+        .join("sha256")
+        .join(registry_client::digest_hex(&descriptor.digest)?);
     let manifest_bytes = std::fs::read(&manifest_path)
         .with_context(|| format!("read manifest blob {}", manifest_path.display()))?;
     verify_digest(&manifest_bytes, &descriptor.digest)
@@ -295,7 +298,10 @@ pub fn export(
 
 /// `blobs/sha256/<hex>` path for a digest.
 fn blob_entry_path(digest: &str) -> Result<String> {
-    Ok(format!("blobs/sha256/{}", blob_hex(digest)?))
+    Ok(format!(
+        "blobs/sha256/{}",
+        registry_client::digest_hex(digest)?
+    ))
 }
 
 fn append_bytes<W: Write>(builder: &mut tar::Builder<W>, name: &str, bytes: &[u8]) -> Result<()> {

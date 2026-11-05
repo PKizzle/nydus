@@ -46,8 +46,7 @@ use crate::engine::manifest::{
     synthesize_image_config,
 };
 use crate::engine::oci::{
-    all_platform_selectors, blob_hex, client_options, is_index, parse_platform_list,
-    select_source_platform,
+    all_platform_selectors, client_options, is_index, parse_platform_list, select_source_platform,
 };
 use crate::engine::oci_archive::{self, ArchiveBlob};
 use crate::engine::retry::RetryPolicy;
@@ -83,7 +82,7 @@ impl BuildInput {
     /// conversion is being debugged.
     fn slug(&self) -> Result<String> {
         Ok(match self {
-            BuildInput::Layer(layer) => blob_hex(&layer.digest)?.to_string(),
+            BuildInput::Layer(layer) => registry_client::digest_hex(&layer.digest)?.to_string(),
             BuildInput::Directory(dir) => dir
                 .file_name()
                 .map(|n| {
@@ -878,7 +877,7 @@ async fn pull_source(
         .with_context(|| format!("create layers dir {}", layers_dir.display()))?;
     let mut layers = Vec::with_capacity(manifest.layers.len());
     for layer in &manifest.layers {
-        let path = layers_dir.join(blob_hex(&layer.digest)?);
+        let path = layers_dir.join(registry_client::digest_hex(&layer.digest)?);
         client
             .get_blob_to_file(repo, &layer.digest, &path)
             .await
@@ -1121,7 +1120,7 @@ fn build_artifact(
         }
         // Only consumed on the `--oci-ref` path, which never sees a directory input.
         if let BuildInput::Layer(layer) = input {
-            original_blob_ids.push(blob_hex(&layer.digest)?.to_string());
+            original_blob_ids.push(registry_client::digest_hex(&layer.digest)?.to_string());
         }
     }
 
@@ -1304,7 +1303,10 @@ fn run_optimize(
     let blob_dir = workspace.join("optimize-blobs");
     fresh_dir(&blob_dir)?;
     for layer in reused_layers {
-        link_or_copy(&layer.path, &blob_dir.join(blob_hex(&layer.digest)?))?;
+        link_or_copy(
+            &layer.path,
+            &blob_dir.join(registry_client::digest_hex(&layer.digest)?),
+        )?;
     }
     for blob in new_blobs {
         let name = blob

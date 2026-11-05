@@ -13,7 +13,7 @@ use tracing::{debug, info, warn};
 
 use crate::cli::CopyArgs;
 use crate::engine::oci::{
-    BlobSource, blob_hex, client_options, ensure_blob_in_repo, is_index, select_platform,
+    BlobSource, client_options, ensure_blob_in_repo, is_index, select_platform,
 };
 use crate::engine::oci_archive::{self, ArchiveBlob};
 use crate::engine::retry::RetryPolicy;
@@ -474,7 +474,7 @@ async fn export_from_registry(
 ) -> Result<()> {
     let mut blobs = Vec::with_capacity(manifest.layers.len() + 1);
     for desc in std::iter::once(&manifest.config).chain(manifest.layers.iter()) {
-        let path = staging.join(blob_hex(&desc.digest)?);
+        let path = staging.join(registry_client::digest_hex(&desc.digest)?);
         source_client
             .get_blob_to_file(&source_ref.repo, &desc.digest, &path)
             .await
@@ -562,7 +562,7 @@ async fn copy_from_archive(
         let path = imported.blob_path(desc)?;
         retry
             .run("push archived blob", || {
-                client.push_blob_file(&target_ref.repo, &path)
+                client.push_blob_file_with_digest(&target_ref.repo, &path, &desc.digest)
             })
             .await
             .with_context(|| format!("push blob {}", desc.digest))?;
