@@ -153,6 +153,13 @@ with `EIO` for any other reason is reported as dead rather than passing.
 [`misc/erofs-folio/qemu-test.sh`](../misc/erofs-folio/qemu-test.sh) boots an arm64 kernel in QEMU
 and runs the self-test (`service/examples/erofs_folio_probe.rs`) in it, optionally walking an
 EROFS image as is and padded, to check how a kernel build classifies.
+
+CI (`.github/workflows/fanotify-vm.yml`) runs the self-test and an image walk on every kernel it
+boots, and `misc/erofs-folio/expect.sh` fails the job unless the verdict matches the kernel: on
+4K pages, 6.18.55 and 7.4-rc1 are unaffected and 7.3.1 is affected (the probe and walked image use
+512-byte blocks); on arm64 64K pages under QEMU, with a 4K-block image, 7.3.1 is affected and
+7.4-rc1 is unaffected. An affected verdict requires the padded copy to read cleanly.
+
 ## Cache eviction
 
 `FanotifyHandler::cull_cache(blob_id)` punches holes
