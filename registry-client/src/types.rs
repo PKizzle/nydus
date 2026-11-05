@@ -51,13 +51,11 @@ pub const MEDIA_TYPE_NYDUS_BOOTSTRAP: &str = "application/vnd.oci.image.bootstra
 /// unpacks it with no stream processor registered.
 pub const MEDIA_TYPE_OCI_LAYER_GZIP: &str = "application/vnd.oci.image.layer.v1.tar+gzip";
 
-/// A bespoke bootstrap-*layer* media type that this crate used to publish.
-///
-/// NOTE: no nydus implementation actually emits this — the Go nydusify uses
-/// [`MEDIA_TYPE_OCI_LAYER_GZIP`] for the bootstrap layer, and a bare
-/// `git grep` of it across the Go tree finds nothing. It is retained only so
-/// existing images written by older builds of this crate can still be
-/// recognised on the read path; never emit it.
+/// Non-standard bootstrap-*layer* media type, recognised on the read path
+/// only. Never emit it: the Go nydusify and upstream's converter publish the
+/// bootstrap layer as [`MEDIA_TYPE_OCI_LAYER_GZIP`] plus
+/// [`ANNOTATION_NYDUS_BOOTSTRAP`], and no other implementation reads this
+/// type. Recognising it keeps images that carry it convertible and mountable.
 pub const MEDIA_TYPE_NYDUS_BOOTSTRAP_LAYER: &str =
     "application/vnd.oci.image.layer.nydus.bootstrap.v1";
 
