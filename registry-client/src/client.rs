@@ -1041,34 +1041,34 @@ fn header_str(response: &Response, name: &HeaderName) -> Option<String> {
         .map(str::to_string)
 }
 
-/// Resolve an upload `Location` header against the registry base URL
-/// (`scheme://host[:port]`, no trailing slash). Absolute locations pass
-/// through untouched; relative ones (with or without a leading `/`) are
-/// joined onto the base, preserving any query string they carry.
 /// Whether `url` targets the same origin (`scheme://host[:port]`) as `base`.
 ///
-/// `base` is already a bare origin with no trailing slash (see
-/// [`RegistryClient`] construction), so this reduces to extracting `url`'s
-/// origin — everything up to the first `/` after the scheme separator — and
-/// comparing case-insensitively. Ports are compared literally: a registry
-/// that names its own origin differently than `base` was configured (implicit
-/// vs explicit default port) fails closed, which only means credentials are
-/// withheld from a URL we cannot prove is the registry itself.
+/// Scheme and host compare case-insensitively and an omitted port counts as
+/// the scheme's default, so `https://r.example` and `https://r.example:443`
+/// match. Anything that does not parse as an absolute http(s) URL fails
+/// closed: credentials are withheld from a URL not provably the registry.
 fn same_origin(base: &str, url: &str) -> bool {
-    fn origin_of(u: &str) -> Option<&str> {
-        let scheme_end = u.find("://")? + 3;
-        let path_start = u[scheme_end..]
-            .find('/')
-            .map(|i| scheme_end + i)
-            .unwrap_or(u.len());
-        Some(&u[..path_start])
+    fn origin_of(u: &str) -> Option<(String, String, u16)> {
+        let uri: http::Uri = u.parse().ok()?;
+        let scheme = uri.scheme_str()?.to_ascii_lowercase();
+        let default_port = match scheme.as_str() {
+            "https" => 443,
+            "http" => 80,
+            _ => return None,
+        };
+        let host = uri.host()?.to_ascii_lowercase();
+        Some((scheme, host, uri.port_u16().unwrap_or(default_port)))
     }
     match (origin_of(base), origin_of(url)) {
-        (Some(a), Some(b)) => a.eq_ignore_ascii_case(b),
+        (Some(a), Some(b)) => a == b,
         _ => false,
     }
 }
 
+/// Resolve an upload `Location` header against the registry base URL
+/// (`scheme://host[:port]`, no trailing slash). Absolute locations pass
+/// through untouched; relative ones (with or without a leading `/`) are
+/// joined onto the base, preserving any query string they carry.
 pub fn resolve_location(base: &str, location: &str) -> String {
     if location.starts_with("http://") || location.starts_with("https://") {
         location.to_string()
@@ -1423,6 +1423,24 @@ mod tests {
         assert!(!same_origin(
             "https://registry.local",
             "http://registry.local/v2/"
+        ));
+        // An explicit default port is the same origin; another port is not.
+        assert!(same_origin(
+            "https://registry.local",
+            "https://registry.local:443/v2/foo/blobs/uploads/x"
+        ));
+        assert!(same_origin(
+            "http://registry.local:80",
+            "http://registry.local/v2/"
+        ));
+        assert!(!same_origin(
+            "https://registry.local",
+            "https://registry.local:8443/v2/"
+        ));
+        // Userinfo cannot smuggle a different host past the comparison.
+        assert!(!same_origin(
+            "https://registry.local",
+            "https://registry.local@evil.example/v2/"
         ));
     }
 
