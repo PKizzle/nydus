@@ -250,12 +250,15 @@ impl RegistryClient {
         } else {
             Client::builder().use_rustls_default()
         };
-        // Use Cyper's portable resolver instead of relying on the OS resolver
-        // implementation. In particular, macOS's dynamic resolver configuration
-        // is not consistently available through the libc lookup path used by
-        // Hyper, while Hickory reads the configured DNS servers directly.
+        // Resolve through the OS (getaddrinfo on a blocking thread), not
+        // Hickory: Hickory reads /etc/resolv.conf, which macOS does not use
+        // for lookups, and so bypasses mDNSResponder's cache, scoped/VPN
+        // resolvers and nameserver failover. One stalled nameserver then costs
+        // every lookup Hickory's 5 s query timeouts, enough to exhaust the
+        // per-request deadline. Explicit, because cyper defaults to Hickory
+        // whenever anything in the graph enables its `hickory-dns` feature.
         let client = builder
-            .hickory_dns(true)
+            .no_hickory_dns()
             .build()
             .context("failed to build registry HTTP client")?;
         let basic_auth = match (opts.credentials.as_ref(), opts.raw_auth.as_ref()) {
@@ -1661,6 +1664,42 @@ mod tests {
             "{err}"
         );
         assert_eq!(server.join().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn client_builds_outside_a_runtime_so_it_uses_the_os_resolver() {
+        // cyper's Hickory resolver needs `Runtime::current()` at build time;
+        // building on a plain thread proves the client resolves through the OS.
+        RegistryClient::new(
+            "registry.invalid",
+            RegistryClientOptions {
+                use_docker_config: false,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    }
+
+    /// Anonymous token flow against Docker Hub. Set `REGISTRY_CLIENT_NET=1`.
+    #[compio::test]
+    async fn fetches_public_manifest_from_docker_hub() {
+        if std::env::var("REGISTRY_CLIENT_NET").as_deref() != Ok("1") {
+            eprintln!("skip: set REGISTRY_CLIENT_NET=1 to reach registry-1.docker.io");
+            return;
+        }
+        let client = RegistryClient::new(
+            "registry-1.docker.io",
+            RegistryClientOptions {
+                use_docker_config: false,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let fetched = client
+            .get_manifest("library/alpine", "latest")
+            .await
+            .unwrap();
+        assert!(fetched.digest.starts_with("sha256:"), "{}", fetched.digest);
     }
 
     #[test]
