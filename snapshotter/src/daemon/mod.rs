@@ -2617,7 +2617,8 @@ fn unix_now() -> i64 {
         .as_secs() as i64
 }
 
-/// Crash-safe small-file write: write `<path>.<pid>.<seq>.tmp`, fsync, rename over `path`,
+/// Crash-safe small-file write: write a unique `<name><random>.tmp` beside `path`, fsync, rename
+/// over `path`,
 /// then fsync the parent directory. The records written through here (daemon
 /// status records, `upgrade.state`, the tarfs verity sidecar) gate mount
 /// takeover after a crash, so a torn write is worse than no file at all —
@@ -2629,26 +2630,17 @@ fn unix_now() -> i64 {
 fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
     use std::io::Write;
 
-    // A unique tmp name per call: concurrent persists of one record (several sandboxes of the
-    // same image starting at once) would otherwise truncate and rename each other's file.
-    static SEQ: AtomicU64 = AtomicU64::new(0);
-    let mut tmp = path.as_os_str().to_os_string();
-    tmp.push(format!(
-        ".{}.{}.tmp",
-        std::process::id(),
-        SEQ.fetch_add(1, Ordering::Relaxed)
-    ));
-    let tmp = PathBuf::from(tmp);
-
-    let staged = fs::File::create(&tmp).and_then(|mut file| {
-        file.write_all(bytes)?;
-        file.sync_all()
-    });
-    // Each call has its own tmp name, so a failed one is never overwritten by the next: remove it.
-    if let Err(e) = staged.and_then(|()| fs::rename(&tmp, path)) {
-        let _ = fs::remove_file(&tmp);
-        return Err(e);
-    }
+    // A unique, exclusively created tmp file per call: concurrent persists of one record
+    // (several sandboxes of the same image starting at once) must not truncate or rename each
+    // other's file. A failed write's tmp file is removed when `tmp` drops.
+    let parent = path.parent().unwrap_or(Path::new("."));
+    let mut tmp = tempfile::Builder::new()
+        .prefix(path.file_name().unwrap_or_default())
+        .suffix(".tmp")
+        .tempfile_in(parent)?;
+    tmp.write_all(bytes)?;
+    tmp.as_file().sync_all()?;
+    tmp.persist(path).map_err(|e| e.error)?;
 
     // Persist the rename itself: without the directory fsync a crash can
     // still lose the new entry (or resurrect the old one).
