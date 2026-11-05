@@ -76,14 +76,49 @@ pub struct ImportedImage {
 }
 
 impl ImportedImage {
-    /// On-disk path of a blob named by `digest`.
-    pub fn blob_path(&self, digest: &str) -> Result<PathBuf> {
+    /// On-disk path of the blob `desc` names, once its size and sha256 match
+    /// the descriptor. The archive is untrusted, and its blobs are built from or
+    /// pushed under the descriptor's digest.
+    pub fn blob_path(&self, desc: &Descriptor) -> Result<PathBuf> {
+        let digest = &desc.digest;
         let path = self.blobs_dir.join("sha256").join(blob_hex(digest)?);
-        if !path.is_file() {
-            bail!("archive is missing blob {digest}");
+        let len = std::fs::symlink_metadata(&path)
+            .ok()
+            .filter(|md| md.is_file())
+            .with_context(|| format!("archive is missing blob {digest}"))?
+            .len();
+        if len != desc.size {
+            bail!(
+                "archive blob {digest} is {len} bytes, but its descriptor says {}",
+                desc.size
+            );
+        }
+        let actual = file_digest(&path)?;
+        if actual != *digest {
+            bail!("archive blob {digest} does not match its digest (computed {actual})");
         }
         Ok(path)
     }
+}
+
+/// `sha256:<hex>` of a file, streamed.
+fn file_digest(path: &Path) -> Result<String> {
+    use sha2::Digest as _;
+    use std::io::Read as _;
+    let mut file =
+        std::fs::File::open(path).with_context(|| format!("open blob {}", path.display()))?;
+    let mut hasher = sha2::Sha256::new();
+    let mut buf = vec![0u8; 1 << 20];
+    loop {
+        let n = file
+            .read(&mut buf)
+            .with_context(|| format!("hash {}", path.display()))?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(format!("sha256:{}", hex::encode(hasher.finalize())))
 }
 
 /// Unpack an OCI layout tarball into `dest` and resolve its single image.
@@ -152,7 +187,11 @@ pub fn import(archive: &Path, dest: &Path) -> Result<ImportedImage> {
 /// Unpack `archive` into `dest`, refusing entries that escape it.
 ///
 /// A tarball is untrusted input; without this a `../` entry would let it write
-/// anywhere the process can (the classic Zip-Slip).
+/// anywhere the process can (the classic Zip-Slip). Only regular files and
+/// directories are unpacked: a symlink or hard link named like a blob would make
+/// the import read (and push) a host file. Links are skipped rather than
+/// refused because `docker save` emits legacy-layout symlinks beside the OCI
+/// layout, and nothing the import reads is one.
 fn unpack_sanitized<R: std::io::Read>(archive: &mut tar::Archive<R>, dest: &Path) -> Result<()> {
     std::fs::create_dir_all(dest)
         .with_context(|| format!("create archive staging dir {}", dest.display()))?;
@@ -166,6 +205,11 @@ fn unpack_sanitized<R: std::io::Read>(archive: &mut tar::Archive<R>, dest: &Path
             )
         }) {
             bail!("archive entry {:?} escapes the extraction directory", path);
+        }
+        let kind = entry.header().entry_type();
+        if !(kind.is_file() || kind.is_dir()) {
+            debug!(?path, ?kind, "skipping non-regular archive entry");
+            continue;
         }
         entry
             .unpack_in(dest)
@@ -343,16 +387,12 @@ mod tests {
         );
         assert_eq!(imported.manifest.layers.len(), 1);
         // Every blob the manifest names is present and intact.
-        let cfg = imported
-            .blob_path(&imported.manifest.config.digest)
-            .unwrap();
+        let cfg = imported.blob_path(&imported.manifest.config).unwrap();
         assert_eq!(
             std::fs::read(cfg).unwrap(),
             b"{\"architecture\":\"amd64\"}".to_vec()
         );
-        let lyr = imported
-            .blob_path(&imported.manifest.layers[0].digest)
-            .unwrap();
+        let lyr = imported.blob_path(&imported.manifest.layers[0]).unwrap();
         assert_eq!(std::fs::read(lyr).unwrap(), b"layer-bytes-here".to_vec());
     }
 
@@ -535,11 +575,9 @@ mod tests {
     }
 
     #[test]
-    fn unpack_does_not_follow_a_symlink_out_of_the_destination() {
-        // The traversal guard is per-entry-name, so it cannot see this one: a
-        // legal-looking symlink is planted first, then a legal-looking file is
-        // written "through" it. `unpack_in` is what refuses; this pins that we
-        // still rely on an implementation that does.
+    fn unpack_skips_links_so_nothing_is_written_or_read_through_them() {
+        // A legal-looking symlink followed by a file written "through" it: the
+        // link is never created, so the file lands inside the destination.
         let dir = tempfile::tempdir().unwrap();
         let outside = dir.path().join("outside");
         std::fs::create_dir_all(&outside).unwrap();
@@ -564,16 +602,81 @@ mod tests {
         let bytes = builder.into_inner().unwrap();
 
         let dest = dir.path().join("dest");
-        // `unpack_in` refuses the second entry with "trying to unpack outside of
-        // destination path" — the symlink itself is legal and does get created.
-        let err = unpack_bytes(&bytes, &dest).unwrap_err();
+        unpack_bytes(&bytes, &dest).unwrap();
+        assert!(!outside.join("planted").exists());
         assert!(
-            format!("{err:#}").contains("outside of destination"),
-            "expected unpack_in to refuse the symlinked entry, got: {err:#}"
+            std::fs::symlink_metadata(dest.join("escape"))
+                .unwrap()
+                .is_dir()
         );
-        assert!(
-            !outside.join("planted").exists(),
-            "a symlinked entry must not write outside the destination"
-        );
+    }
+
+    /// Export a one-layer image, then rebuild the archive with `edit` applied
+    /// to the unpacked layout, and import that.
+    fn import_edited(edit: impl FnOnce(&Path, &ArchiveBlob)) -> Result<()> {
+        let dir = tempfile::tempdir().unwrap();
+        let config = staged(dir.path(), "config", b"{}");
+        let layer = staged(dir.path(), "layer", b"layer-bytes");
+        let manifest_bytes = sample_manifest(&config, &layer);
+        let archive = dir.path().join("saved.tar");
+        let layer_desc = ArchiveBlob {
+            digest: layer.digest.clone(),
+            size: layer.size,
+            path: layer.path.clone(),
+        };
+        export(
+            &archive,
+            &manifest_bytes,
+            MEDIA_TYPE_OCI_MANIFEST,
+            "app:v1",
+            &[config, layer],
+        )
+        .unwrap();
+        let dest = dir.path().join("unpacked");
+        import(&archive, &dest).unwrap();
+        edit(&dest, &layer_desc);
+        let repacked = dir.path().join("edited.tar");
+        {
+            let mut b = tar::Builder::new(std::fs::File::create(&repacked).unwrap());
+            b.follow_symlinks(false);
+            b.append_dir_all(".", &dest).unwrap();
+            b.into_inner().unwrap();
+        }
+        let imported = import(&repacked, &dir.path().join("unpacked2"))?;
+        imported.blob_path(&imported.manifest.layers[0]).map(drop)
+    }
+
+    fn layer_blob(dest: &Path, layer: &ArchiveBlob) -> PathBuf {
+        dest.join("blobs/sha256")
+            .join(layer.digest.strip_prefix("sha256:").unwrap())
+    }
+
+    #[test]
+    fn a_blob_that_does_not_hash_to_its_digest_is_refused() {
+        let err = import_edited(|dest, layer| {
+            std::fs::write(layer_blob(dest, layer), b"layer-bytez").unwrap();
+        })
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("does not match"), "{err:#}");
+    }
+
+    #[test]
+    fn a_blob_of_the_wrong_size_is_refused() {
+        let err = import_edited(|dest, layer| {
+            std::fs::write(layer_blob(dest, layer), b"short").unwrap();
+        })
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("bytes"), "{err:#}");
+    }
+
+    #[test]
+    fn a_blob_symlinked_to_a_host_file_is_never_read() {
+        let err = import_edited(|dest, layer| {
+            let blob = layer_blob(dest, layer);
+            std::fs::remove_file(&blob).unwrap();
+            std::os::unix::fs::symlink("/etc/passwd", &blob).unwrap();
+        })
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("missing blob"), "{err:#}");
     }
 }

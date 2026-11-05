@@ -676,14 +676,14 @@ fn pull_source_from_archive(
         imported.manifest_bytes.len() as u64,
         request.driver.docker2oci,
     );
-    let config_bytes = std::fs::read(imported.blob_path(&manifest.config.digest)?)
+    let config_bytes = std::fs::read(imported.blob_path(&manifest.config)?)
         .context("read image config from the source archive")?;
 
     let mut layers = Vec::with_capacity(manifest.layers.len());
     for layer in &manifest.layers {
         layers.push(PulledLayer {
             digest: layer.digest.clone(),
-            path: imported.blob_path(&layer.digest)?,
+            path: imported.blob_path(layer)?,
         });
     }
 

@@ -551,7 +551,7 @@ async fn copy_from_archive(
             debug!(digest = %desc.digest, "blob already present in target; skipping");
             continue;
         }
-        let path = imported.blob_path(&desc.digest)?;
+        let path = imported.blob_path(desc)?;
         retry
             .run("push archived blob", || {
                 client.push_blob_file(&target_ref.repo, &path)
