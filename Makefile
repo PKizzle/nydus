@@ -133,11 +133,10 @@ endef
 # telling you not to write.
 #
 # `grep -P`, not `-E`: `\b` is undefined in POSIX ERE and git grep matches *nothing* for the
-# whole pattern, which makes the check silently pass. `storage/src/remote/` is excluded
-# because that module is disabled (see its header) and takes no part in the migration.
+# whole pattern, which makes the check silently pass.
 .no-error-macros:
 	@! git grep -nP '\b(einval|eio|eother|enoent|enosys|eacces|ebadf|enotdir|eisdir|ealready|epipe|last_error|bail_einval|bail_eio|make_error)!' \
-		-- '*.rs' ':(exclude)third_party' ':(exclude)storage/src/remote' \
+		-- '*.rs' ':(exclude)third_party' \
 		|| { echo 'error: the deleted error macros are back; use a thiserror variant or anyhow instead'; exit 1; }
 
 .musl_target:

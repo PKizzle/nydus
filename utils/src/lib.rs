@@ -11,7 +11,6 @@ use std::convert::{Into, TryFrom, TryInto};
 use std::time::Duration;
 
 pub use self::error_chain::{source_errno, with_context};
-pub use self::exec::*;
 pub use self::inode_bitmap::InodeBitmap;
 pub use self::reader::*;
 pub use self::types::*;
@@ -24,7 +23,6 @@ pub mod crc32;
 pub mod crypt;
 pub mod digest;
 pub mod error_chain;
-pub mod exec;
 pub mod fd_limit;
 pub mod filemap;
 pub mod inode_bitmap;

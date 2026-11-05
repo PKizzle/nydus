@@ -324,7 +324,7 @@ pub fn convert(config: &LocalAccelConfig, layers: &[SourceLayer]) -> Result<Node
             Some(index) => {
                 // Stage the backend: symlink the gzip layer in place (no copy), and move the
                 // small zran index blob in, both keyed by their nydus blob ids.
-                symlink_force(&layer.path, &backend.join(&blob_id))?;
+                crate::auto_accel_sidecar::symlink_force(&layer.path, &backend.join(&blob_id))?;
                 let index_name = index
                     .file_name()
                     .context("zran index blob has no file name")?
@@ -382,21 +382,6 @@ fn stage_blob(src: &Path, dst: &Path, what: &str) -> Result<()> {
             Ok(())
         }
         Err(e) => Err(e).with_context(|| format!("staging {} into backend", what)),
-    }
-}
-
-fn symlink_force(target: &Path, link: &Path) -> Result<()> {
-    let _ = std::fs::remove_file(link);
-    #[cfg(unix)]
-    {
-        std::os::unix::fs::symlink(target, link)
-            .with_context(|| format!("symlinking {} -> {}", link.display(), target.display()))
-    }
-    #[cfg(not(unix))]
-    {
-        std::fs::copy(target, link)
-            .map(|_| ())
-            .with_context(|| format!("copying {} -> {}", target.display(), link.display()))
     }
 }
 
