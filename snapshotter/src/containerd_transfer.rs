@@ -164,7 +164,13 @@ impl LayerBackfill {
             anyhow::Ok(())
         });
         let watchdog = pin!(watch_progress(
-            async || progress_in.message().await.ok().flatten(),
+            async || match progress_in.message().await {
+                Ok(update) => update,
+                Err(status) => {
+                    warn!(%status, "layer backfill progress stream failed");
+                    None
+                }
+            },
             STALL_TIMEOUT,
         ));
         // Resolves only with a stall; an auth stream that ends early is logged and the
@@ -214,8 +220,8 @@ impl LayerBackfill {
 }
 
 /// Resolves with an error once `stall` passes without any blob advancing in the progress
-/// reported by `next`; never resolves while progress keeps coming. A progress stream that ends
-/// stops the watch rather than counting as a stall.
+/// reported by `next`; never resolves while progress keeps coming. Once the progress stream
+/// ends nothing can advance, so the transfer gets one more `stall` window to finish.
 async fn watch_progress(
     mut next: impl AsyncFnMut() -> Option<Any>,
     stall: Duration,
@@ -233,7 +239,12 @@ async fn watch_progress(
                     deadline = Instant::now() + stall;
                 }
             }
-            Ok(None) => std::future::pending::<()>().await,
+            Ok(None) => {
+                compio::time::sleep(stall).await;
+                return anyhow!(
+                    "transfer did not finish within {stall:?} after its progress ended"
+                );
+            }
         }
     }
 }
@@ -600,6 +611,26 @@ mod tests {
         let started = Instant::now();
         runtime.block_on(watch);
         assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn an_ended_progress_stream_still_times_out() {
+        let runtime = compio::runtime::Runtime::new().unwrap();
+        let watch = watch_progress(async || None, Duration::from_millis(100));
+        let started = Instant::now();
+        let err = runtime.block_on(async {
+            match select(
+                pin!(watch),
+                pin!(compio::time::sleep(Duration::from_secs(5))),
+            )
+            .await
+            {
+                Either::Left((err, _)) => err,
+                Either::Right(_) => panic!("the watch never resolved"),
+            }
+        });
+        assert!(started.elapsed() >= Duration::from_millis(100));
+        assert!(format!("{err:#}").contains("did not finish"), "{err:#}");
     }
 
     #[test]

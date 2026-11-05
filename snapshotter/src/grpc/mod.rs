@@ -14,7 +14,7 @@ use crate::daemon::DaemonSupervisor;
 use crate::metrics::SnapshotterMetrics;
 use crate::overlay::{NydusMetaInfo, OverlayEngine, PrepareOutcome};
 use crate::recon::Reconciler;
-use crate::store::{SnapshotInfo, SnapshotStore};
+use crate::store::{SnapshotInfo, SnapshotStore, StoreError};
 use crate::sysctl::serve_unix as serve_sysctl_unix;
 use anyhow::{Context as _, Result};
 use containerd_snapshots::{self as snapshots, Info, Kind, Usage};
@@ -121,6 +121,12 @@ impl From<SnapshotterError> for snapshots::tonic::Status {
 fn grpc_error(e: &anyhow::Error) -> SnapshotterError {
     let message = format!("{:#}", e);
     for cause in e.chain() {
+        if let Some(store) = cause.downcast_ref::<StoreError>() {
+            return match store {
+                StoreError::NotFound(_) => SnapshotterError::not_found(message),
+                StoreError::AlreadyExists(_) => SnapshotterError::already_exists(message),
+            };
+        }
         if let Some(svc) = cause.downcast_ref::<nydus_service::Error>() {
             return match svc {
                 nydus_service::Error::NotFound => SnapshotterError::not_found(message),
@@ -454,7 +460,8 @@ impl NydusSnapshotter {
         let meta = self
             .overlay
             .nydus_meta_info(store, parent, call_labels)
-            .map_err(|e| grpc_error(&e))?;
+            // A missing ancestor is a broken chain, not a missing `holder`.
+            .map_err(|e| SnapshotterError::internal(format!("{e:#}")))?;
         let Some(meta) = meta else {
             return Ok(None);
         };
@@ -471,6 +478,55 @@ impl NydusSnapshotter {
             })?;
         let mountpoint = handle.mountpoint().to_path_buf();
         Ok(Some((meta, mountpoint)))
+    }
+
+    /// The daemons snapshot `key` holds a reference on: the nydus meta layer in
+    /// its parent chain, and the image prepare() stamped on it for auto-accel
+    /// and referrer mounts, which have no meta layer.
+    fn daemon_holds(&self, key: &str) -> Vec<String> {
+        let store = self.store.as_ref();
+        let info = match store.stat(key) {
+            Ok(info) => info,
+            // No row, nothing held.
+            Err(e) if matches!(e.downcast_ref(), Some(StoreError::NotFound(_))) => {
+                return Vec::new();
+            }
+            Err(e) => {
+                warn!(key, error = %e, "snapshot stat failed; a daemon release may be missed");
+                self.metrics.record_daemon_release_missing();
+                return Vec::new();
+            }
+        };
+        let mut holds = Vec::new();
+        if let Some(parent) = info.parent.as_deref() {
+            match self.overlay.nydus_meta_info(store, parent, &info.labels) {
+                Ok(meta) => holds.extend(meta.map(|meta| meta.image_ref)),
+                Err(e) => {
+                    warn!(key, error = %e, "daemon resolution failed; a daemon release may be missed");
+                    self.metrics.record_daemon_release_missing();
+                }
+            }
+        }
+        if let Some(stamped) = info
+            .labels
+            .get(crate::source::labels::NYDUS_DAEMON_IMAGE_REF)
+            && !holds.contains(stamped)
+        {
+            holds.push(stamped.clone());
+        }
+        holds
+    }
+
+    /// Release the references `key` held, once its row is gone from the store.
+    async fn release_daemon_holds(&self, key: &str, holds: &[String]) {
+        for image_ref in holds {
+            if let Err(e) = self.supervisor.release(image_ref, key).await {
+                warn!(image_ref, error = %e, "failed to release nydus daemon refcount");
+            }
+        }
+        // Shrink tracer state with the snapshot that attached it (no-op for
+        // keys that never attached).
+        self.access_tracer.detach_holder(key);
     }
 
     /// Stamp `image_ref` into the [`labels::NYDUS_DAEMON_IMAGE_REF`] label of
@@ -693,7 +749,7 @@ impl snapshots::Snapshotter for NydusSnapshotter {
             let store = self.store.as_ref();
             store.stat(&key).map(info_to_snapshots).map_err(|e| {
                 debug!(key, error = %e, "stat snapshot failed");
-                SnapshotterError::not_found(e.to_string())
+                grpc_error(&e)
             })
         }
         .await;
@@ -735,8 +791,8 @@ impl snapshots::Snapshotter for NydusSnapshotter {
             // is safe only because containerd serializes RPCs per snapshot key,
             // so no concurrent update can race between the two calls.
             let existing = store.stat(&info.name).map_err(|e| {
-                warn!(name = %info.name, error = %e, "update snapshot: not found");
-                SnapshotterError::not_found(e.to_string())
+                warn!(name = %info.name, error = %e, "update snapshot: stat failed");
+                grpc_error(&e)
             })?;
 
             let new_labels = match mask {
@@ -787,9 +843,7 @@ impl snapshots::Snapshotter for NydusSnapshotter {
         let result = async {
             debug!(key, "mounts snapshot");
             let store = self.store.as_ref();
-            let info = store
-                .stat(&key)
-                .map_err(|e| SnapshotterError::not_found(e.to_string()))?;
+            let info = store.stat(&key).map_err(|e| grpc_error(&e))?;
             let readonly = info.kind == "kind_view";
             let parent = info.parent.clone().unwrap_or_default();
             let labels = info.labels.clone();
@@ -1081,8 +1135,7 @@ impl snapshots::Snapshotter for NydusSnapshotter {
                         "nydus blob layer; committing target and returning AlreadyExists"
                     );
                     if let Err(e) = self.overlay.commit(store, &target, &key, &commit_labels) {
-                        let msg = e.to_string();
-                        if msg.contains("already exists") {
+                        if matches!(e.downcast_ref(), Some(StoreError::AlreadyExists(_))) {
                             // Re-prepare of an already-committed target. Drop the
                             // active row we just created so it doesn't leak.
                             if let Err(cleanup) = self.overlay.remove(store, &key) {
@@ -1090,7 +1143,7 @@ impl snapshots::Snapshotter for NydusSnapshotter {
                             }
                         } else {
                             warn!(%key, %target, error = %e, "commit of nydus blob target failed");
-                            return Err(SnapshotterError::internal(msg));
+                            return Err(grpc_error(&e));
                         }
                     }
                     Err(SnapshotterError::already_exists(format!(
@@ -1145,13 +1198,18 @@ impl snapshots::Snapshotter for NydusSnapshotter {
         let result = async {
             info!(name, key, ?labels, "commit snapshot");
             let store = self.store.as_ref();
+            // Commit consumes the active key, so no remove(key) will ever
+            // release what it held.
+            let holds = self.daemon_holds(&key);
             self.overlay
                 .commit(store, &name, &key, &labels)
-                .inspect(|_| debug!(name, key, "committed snapshot"))
                 .map_err(|e| {
                     warn!(name, key, error = %e, "commit snapshot failed");
                     grpc_error(&e)
-                })
+                })?;
+            debug!(name, key, "committed snapshot");
+            self.release_daemon_holds(&key, &holds).await;
+            Ok(())
         }
         .await;
         timer.finish(snapshot_status_label(&result));
@@ -1162,37 +1220,7 @@ impl snapshots::Snapshotter for NydusSnapshotter {
         let timer = self.metrics.start_snapshot_operation("remove");
         let result = async {
             debug!(key, "remove snapshot");
-            let store = self.store.as_ref();
-            let stat = match store.stat(&key) {
-                Ok(info) => Some(info),
-                Err(e) => {
-                    warn!(key, error = %e, "snapshot stat failed during remove; a daemon release may be missed");
-                    self.metrics.record_daemon_release_missing();
-                    None
-                }
-            };
-            let parent = stat.as_ref().and_then(|info| info.parent.clone());
-            let labels = stat
-                .as_ref()
-                .map(|info| info.labels.clone())
-                .unwrap_or_default();
-            let release_target = if let Some(parent) = parent.as_deref() {
-                match self.overlay.nydus_meta_info(store, parent, &labels) {
-                    Ok(meta) => meta.map(|meta| meta.image_ref),
-                    Err(e) => {
-                        warn!(key, error = %e, "daemon resolution failed during remove; a daemon release may be missed");
-                        self.metrics.record_daemon_release_missing();
-                        None
-                    }
-                }
-            } else {
-                None
-            };
-            // Auto-accel / referrer mounts have no nydus meta layer in their
-            // chain; prepare() stamped the serving image on the snapshot.
-            let stamped_target = labels
-                .get(crate::source::labels::NYDUS_DAEMON_IMAGE_REF)
-                .cloned();
+            let holds = self.daemon_holds(&key);
             {
                 // remove_dir_all over an arbitrarily large snapshot tree —
                 // never inline on the shared gRPC reactor thread.
@@ -1207,18 +1235,7 @@ impl snapshots::Snapshotter for NydusSnapshotter {
                         grpc_error(&e)
                     })?;
             }
-            for image_ref in release_target.iter().chain(
-                stamped_target
-                    .iter()
-                    .filter(|s| release_target.as_ref() != Some(s)),
-            ) {
-                if let Err(e) = self.supervisor.release(image_ref, &key).await {
-                    warn!(image_ref, error = %e, "failed to release nydus daemon refcount");
-                }
-            }
-            // Shrink tracer state with the snapshot that attached it (no-op
-            // for keys that never attached).
-            self.access_tracer.detach_holder(&key);
+            self.release_daemon_holds(&key, &holds).await;
             Ok(())
         }
         .await;
@@ -1817,6 +1834,53 @@ mod tests {
             "repeated Mounts must hold the daemon once"
         );
         assert_eq!(record.holders, 1);
+    }
+
+    /// Commit consumes the active key, so it must drop the daemon reference
+    /// the key took; no remove(key) will ever come for it.
+    #[compio::test]
+    async fn commit_releases_the_daemon_held_by_the_active_key() {
+        let dir = tempdir().unwrap();
+        let snapshotter = plain_prepare_snapshotter(dir.path());
+        let image_ref = "registry.invalid.test/team/app:1";
+        let key = "accel-rootfs";
+        snapshotter
+            .prepare(key.to_string(), String::new(), HashMap::new())
+            .await
+            .unwrap();
+        stamp(&snapshotter, key, image_ref, "/tmp/bootstrap");
+        snapshotter
+            .supervisor
+            .insert_test_instance(image_ref, dir.path().join("daemons/app/mnt"))
+            .await;
+        snapshotter.mounts(key.to_string()).await.unwrap();
+
+        snapshotter
+            .commit("committed".to_string(), key.to_string(), HashMap::new())
+            .await
+            .unwrap();
+        let holders = snapshotter
+            .supervisor
+            .daemon_record(image_ref)
+            .await
+            .map_or(0, |record| record.holders);
+        assert_eq!(holders, 0);
+    }
+
+    /// Only a missing row is NotFound. Any other store failure must not tell
+    /// containerd the snapshot is gone, or its GC acts on it.
+    #[compio::test]
+    async fn stat_of_an_unreadable_record_is_internal() {
+        let dir = tempdir().unwrap();
+        let snapshotter = test_snapshotter(dir.path());
+        let missing = snapshotter.stat("missing".to_string()).await.unwrap_err();
+        assert_eq!(status_code(missing), snapshots::tonic::Code::NotFound);
+
+        snapshotter.store.insert_raw("corrupt", b"not json");
+        let corrupt = snapshotter.stat("corrupt".to_string()).await.unwrap_err();
+        assert_eq!(status_code(corrupt), snapshots::tonic::Code::Internal);
+        let corrupt = snapshotter.mounts("corrupt".to_string()).await.unwrap_err();
+        assert_eq!(status_code(corrupt), snapshots::tonic::Code::Internal);
     }
 
     /// With the stamped daemon gone and no way to restart it, `mounts()` falls
