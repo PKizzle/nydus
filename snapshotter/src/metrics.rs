@@ -515,11 +515,7 @@ fn linux_rss_kib() -> u64 {
     else {
         return 0;
     };
-    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
-    if page_size <= 0 {
-        return 0;
-    }
-    resident_pages.saturating_mul(page_size as u64) / 1024
+    resident_pages.saturating_mul(nydus_utils::host_page_size()) / 1024
 }
 
 #[cfg(target_os = "linux")]

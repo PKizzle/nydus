@@ -609,6 +609,18 @@ fn mount_erofs(
     mountpoint: &Path,
     inode_share_domain: Option<&str>,
 ) -> Result<()> {
+    // The caller's bootstrap may end inside a page: see `erofs_folio`. A blob dir that cannot
+    // hold the padded copy keeps the old behaviour, which only an affected kernel fails. The
+    // copy lives until this function returns, by which time the mount holds its own reference.
+    let source = crate::erofs_folio::page_aligned_source(bootstrap)
+        .inspect_err(|e| {
+            warn!(
+                "fanotify: cannot stage a page-padded copy of {}: {e}; mounting it as is",
+                bootstrap.display()
+            )
+        })
+        .ok();
+    let bootstrap = source.as_ref().map_or(bootstrap, |s| s.path());
     check_fsconfig_value("bootstrap path", bootstrap.as_os_str().as_encoded_bytes())?;
     let options = build_erofs_device_options(blobs)?;
     if let Some(domain) = inode_share_domain {
@@ -646,7 +658,7 @@ fn erofs_inode_share_options(device_options: &str, domain: &str) -> Result<Strin
 /// Mount EROFS from `bootstrap` at `mountpoint`, setting each comma-separated `key[=value]`
 /// entry of `options` with its own `fsconfig(2)` call. `mount(2)` would take the same list as
 /// one string, and silently truncate it at one page.
-fn mount_erofs_with(bootstrap: &Path, mountpoint: &Path, options: &str) -> Result<()> {
+pub(crate) fn mount_erofs_with(bootstrap: &Path, mountpoint: &Path, options: &str) -> Result<()> {
     fn cstr(bytes: &[u8]) -> Result<std::ffi::CString> {
         std::ffi::CString::new(bytes).map_err(|e| std::io::Error::new(ErrorKind::InvalidInput, e))
     }

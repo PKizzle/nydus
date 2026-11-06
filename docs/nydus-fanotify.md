@@ -108,14 +108,51 @@ each device table entry to cover its whole blob, since the kernel locates data o
 addresses. `runtime-test.sh` and `export-block-test.sh` take `BLOCK_SIZE=` to verify a block size
 in the kernel.
 
-**Kernel workaround (16K/64K-page hosts).** Linux 7.3's file-backed EROFS fails a metadata read
-with `EIO` when its page runs past end of file, so on a 16K/64K-page kernel the inodes in a
-bootstrap's last, partial page cannot be read. The snapshotter works around this by extending each
-auto-accel bootstrap it stages to a multiple of the host page size with a sparse hole; the artifact
-itself stays a block multiple. Standalone nydusd fanotify mounts are not covered: build those at
-the host page size (`--block-size`). The upstream fix is `52dceb88082b` ("erofs: fix metadata
-reads at the end of file-backed images", 7.4-rc1, Cc stable); remove the workaround once the
-minimum supported large-page kernel includes it.
+### File-backed EROFS partial-folio metadata bug
+
+Linux 7.3 (from e587a984d332) reads the metadata of a file-backed EROFS mount one page-cache folio
+at a time and fails the read with `EIO` ("failed to read inode meta block") when that folio runs
+past the end of the image file. Fixed upstream by `52dceb88082b` ("erofs: fix metadata reads at the
+end of file-backed images", 7.4-rc1, marked for stable); 7.3.1 does not carry it. The metadata
+folio is always one page, so the trigger is any image whose length is not a multiple of the host
+page size:
+
+- 4 KiB-block images on 16K-page (arm64, LoongArch) and 64K-page (arm64, ppc64le) kernels;
+- 512-byte-block (tarfs) images on every page size, 4K included.
+
+An image whose block size equals the page size is safe, because its length is a block multiple.
+Inodes in the last, partial page return `EIO` (a container then fails with errors like
+`mkdir /etc: Input/output error`); an image smaller than one page does not mount at all. Data
+reads are not affected: they are clamped to the inode size and never read past the extent they
+map, and the data blobs (`device=`) carry no metadata, so the `.blob.data` cache files need nothing.
+
+Mitigation, in `nydus_service::erofs_folio`:
+
+| File-backed EROFS mount | Source | Handling |
+| --- | --- | --- |
+| Auto-accel / fanotify (snapshotter) | staged bootstrap copy | padded to a page multiple with a sparse hole (`stage_bootstrap`) |
+| Blockdev and tarfs without dm-verity (snapshotter) | exported `image.erofs` | padded at export (`BlockDevice::export`) and before the mount (`mount_blockdev_erofs`), so a cached image that is not a page multiple is covered too |
+| `nydus-image export --block` | the exported `.disk` | padded to a 64 KiB multiple (`EXPORT_ALIGNMENT`, the largest page size) at export, with or without `--verity`: EROFS reads only the blocks the superblock names, dm-verity only `--data-blocks` and the tree at `--hash-offset` |
+| Tarfs with dm-verity | dm block device | not file-backed: unaffected |
+| Regular nydus images (snapshotter) | FUSE | not EROFS: unaffected |
+| `nydusd --fanotify` (standalone) | the caller's `bootstrap` | left untouched; when it is not a page multiple, `mount_erofs` mounts an anonymous padded copy (`O_TMPFILE` in the bootstrap's directory, named by its `/proc/self/fd` link), or, where `O_TMPFILE` or that link is unavailable, a named copy it removes once mounted. Nothing is left behind; the mount table shows `/proc/self/fd/<n>` as the source. |
+| Live mounts adopted on restart | staged bootstrap or `image.erofs` | at startup, before adoption, the snapshotter pads every unaligned regular-file source of a live EROFS mount under its `daemons/` dir in place. The kernel retries a failed metadata read on the next access, so the live mount reads cleanly without a remount, and running containers keep working. |
+
+The hole costs no disk blocks and reads back as zeros, which is what a fixed kernel substitutes for
+the missing bytes, so padding is applied on every kernel. To tell whether a kernel is affected
+(distros backport, so the version alone does not decide it), the snapshotter runs a self-test once
+at startup in the cache `work_dir`: it mounts a crafted 2 KiB image (512-byte blocks, smaller than
+any page) file-backed, once as is and once padded, and reads every inode. The unpadded image failing
+while the padded one reads cleanly means affected. The result is logged (a `WARN` naming the
+kernel, the page size and the fix when affected) and exported as
+`nydus_snapshotter_erofs_partial_folio_bug{status="affected|unaffected|inconclusive"} 1`.
+`inconclusive` means the probe could not mount at all (no privilege, no file-backed EROFS, or a
+10 s timeout). The mount health probe reads both metadata and file data, so a mount that answers
+with `EIO` for any other reason is reported as dead rather than passing.
+
+[`misc/erofs-folio/qemu-test.sh`](../misc/erofs-folio/qemu-test.sh) boots an arm64 kernel in QEMU
+and runs the self-test (`service/examples/erofs_folio_probe.rs`) in it, optionally walking an
+EROFS image as is and padded, to check how a kernel build classifies.
 
 ## Cache eviction
 

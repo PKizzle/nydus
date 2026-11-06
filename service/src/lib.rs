@@ -31,6 +31,7 @@ use versionize::{VersionMap, Versionize, VersionizeError, VersionizeResult};
 use versionize_derive::Versionize;
 
 pub mod daemon;
+pub mod erofs_folio;
 mod fs_service;
 mod fusedev;
 mod singleton;

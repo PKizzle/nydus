@@ -1019,6 +1019,21 @@ async fn metrics_response(controller: &SystemController) -> HttpResponse {
         controller.supervisor.mount_probe_timeouts_total(),
     );
 
+    #[cfg(target_os = "linux")]
+    if let Some(status) = nydus_service::erofs_folio::detected() {
+        body.push_str(&format!(
+            "# HELP nydus_snapshotter_erofs_partial_folio_bug File-backed EROFS partial-folio metadata bug (fixed upstream by {}), from the startup self-test: affected, unaffected or inconclusive.\n",
+            nydus_service::erofs_folio::UPSTREAM_FIX
+        ));
+        body.push_str("# TYPE nydus_snapshotter_erofs_partial_folio_bug gauge\n");
+        push_labeled_metric(
+            &mut body,
+            "nydus_snapshotter_erofs_partial_folio_bug",
+            &[("status", status.label())],
+            1u64,
+        );
+    }
+
     body.push_str("# HELP nydusd_counts The counts of nydus daemon.\n");
     body.push_str("# TYPE nydusd_counts gauge\n");
     push_labeled_metric(
