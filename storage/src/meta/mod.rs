@@ -512,6 +512,17 @@ impl BlobCompressionContextInfo {
                 "invalid chunk count in blob meta header".to_string(),
             ));
         }
+        // Both sizes come from the bootstrap and are rounded up to 4 KiB (plus the header) below.
+        let size_limit = u64::MAX - BLOB_CCT_HEADER_SIZE - 0xfff;
+        if blob_info.uncompressed_size() > size_limit
+            || blob_info.meta_ci_uncompressed_size() > size_limit
+        {
+            return Err(MetaError::InvalidMetadata(format!(
+                "invalid blob size {} / blob meta size {}",
+                blob_info.uncompressed_size(),
+                blob_info.meta_ci_uncompressed_size()
+            )));
+        }
 
         let uncompressed_size = blob_info.meta_ci_uncompressed_size() as usize;
         let meta_path = format!("{}.{}", blob_path, BLOB_CCT_FILE_SUFFIX);
@@ -1247,9 +1258,7 @@ impl BlobCompressionContext {
     /// Capable of handling both batch and non-batch chunks.
     pub fn get_compressed_size(&self, chunk_index: usize) -> MetaResult<u32> {
         if self.is_batch_chunk(chunk_index) {
-            let ctx = self
-                .get_batch_context(self.get_batch_index(chunk_index)? as usize)
-                .unwrap();
+            let ctx = self.get_batch_context(self.get_batch_index(chunk_index)? as usize)?;
             Ok(ctx.compressed_size())
         } else {
             Ok(self.chunk_info_array.compressed_size(chunk_index))

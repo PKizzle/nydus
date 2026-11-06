@@ -37,6 +37,7 @@ extern crate nydus_storage as storage;
 
 use std::any::Any;
 use std::borrow::Cow;
+use std::collections::HashSet;
 use std::fmt::Debug;
 use std::fs::File;
 use std::io::{BufWriter, Error, Read, Result, Seek, SeekFrom, Write};
@@ -348,6 +349,9 @@ impl dyn RafsIoRead {
 pub struct RafsIterator<'a> {
     _rs: &'a RafsSuper,
     cursor_stack: Vec<(Arc<dyn RafsInodeExt>, PathBuf)>,
+    /// Directories already expanded. A directory has exactly one parent, so meeting one again
+    /// means the tree has a cycle, which would otherwise be walked forever.
+    visited_dirs: HashSet<u64>,
 }
 
 impl<'a> RafsIterator<'a> {
@@ -370,6 +374,7 @@ impl<'a> RafsIterator<'a> {
         RafsIterator {
             _rs: rs,
             cursor_stack,
+            visited_dirs: HashSet::new(),
         }
     }
 }
@@ -378,7 +383,16 @@ impl Iterator for RafsIterator<'_> {
     type Item = (Arc<dyn RafsInodeExt>, PathBuf);
 
     fn next(&mut self) -> Option<Self::Item> {
-        let (node, path) = self.cursor_stack.pop()?;
+        let (node, path) = loop {
+            let (node, path) = self.cursor_stack.pop()?;
+            if !node.is_dir() || self.visited_dirs.insert(node.ino()) {
+                break (node, path);
+            }
+            error!(
+                "directory inode {} is reachable twice from the root, damaged or malicious file?",
+                node.ino()
+            );
+        };
         if node.is_dir() {
             let children = 0..node.get_child_count();
             for idx in children.rev() {

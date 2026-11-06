@@ -364,9 +364,19 @@ impl ZstdStreamCursor {
     const READ_SIZE: usize = 1024 * 1024;
 
     fn new(ctx: &ZranContext) -> io::Result<Self> {
+        // The context comes from blob metadata, which is not validated before it gets here.
+        let ctx_in_end = ctx
+            .in_offset
+            .checked_add(ctx.in_len as u64)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "zstd context range overflows the blob offset space",
+                )
+            })?;
         Ok(Self {
             ctx_in_offset: ctx.in_offset,
-            ctx_in_end: ctx.in_offset + ctx.in_len as u64,
+            ctx_in_end,
             dctx: new_dctx()?,
             in_pos: ctx.in_offset,
             out_pos: 0,
@@ -620,5 +630,22 @@ mod tests {
         let end = plain.len() as u64 - 100;
         assert!(ZstdStreamCursor::read(&mut cursor, &ctx, end, &mut past_end, read_at).is_err());
         assert!(cursor.is_none(), "a failed read drops the decoder state");
+    }
+
+    #[test]
+    fn stream_cursor_rejects_a_context_past_the_offset_space() {
+        let ctx = ZranContext {
+            in_offset: u64::MAX,
+            out_offset: 0,
+            in_len: 1,
+            out_len: 1,
+            ctx_byte: 0,
+            ctx_bits: 0,
+            dict: Vec::new(),
+        };
+        let mut cursor = None;
+        let mut out = [0u8; 1];
+        let err = ZstdStreamCursor::read(&mut cursor, &ctx, 0, &mut out, |_, _| Ok(0)).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 }

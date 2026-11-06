@@ -1088,8 +1088,18 @@ impl RafsSuper {
         let mut path = PathBuf::new();
         let mut cur_ino = ino;
         let mut inode;
+        // A path of PATH_MAX bytes has at most PATH_MAX / 2 components; a longer parent chain is
+        // a cycle in the parent pointers.
+        let mut depth = 0;
 
         loop {
+            depth += 1;
+            if depth > libc::PATH_MAX / 2 {
+                return Err(RafsError::InvalidMetadata(format!(
+                    "parent chain of inode {} does not reach the root",
+                    ino
+                )));
+            }
             inode = self.get_extended_inode(cur_ino, false)?;
             let e: PathBuf = inode.name().into();
             path = e.join(path);

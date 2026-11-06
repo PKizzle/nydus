@@ -337,7 +337,9 @@ impl BlobInfo {
                 // For RAFS v6
                 if self.has_feature(BlobFeatures::HAS_TAR_HEADER) {
                     // There's a tar header between chunk data and compression information.
-                    self.meta_ci_offset - 0x200
+                    // Saturating: the offset comes from the bootstrap, and a corrupt one
+                    // must not underflow.
+                    self.meta_ci_offset.saturating_sub(0x200)
                 } else {
                     self.meta_ci_offset
                 }
