@@ -1,2 +1,5 @@
 # LeakSanitizer suppressions for `make asan-ut-nextest`. Each entry names the
 # leaked allocation's frame and says why the leak is intended.
+
+# The test pins each cache manager with `mem::forget(entry.pin())` so `gc` sees it in use.
+leak:test_forget_drops_only_that_configs_managers_even_in_use

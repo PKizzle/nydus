@@ -49,8 +49,18 @@ jobs:
         tool: cargo-careful
     - name: Install protoc
       run: bash misc/install-protoc.sh
+    - name: Install llvm-symbolizer
+      # Without it, LeakSanitizer reports raw addresses and lsan.supp cannot match frames.
+      if: matrix.tool == 'asan'
+      run: |
+        sym=$(command -v llvm-symbolizer || ls /usr/bin/llvm-symbolizer-* 2>/dev/null | sort -V | tail -1)
+        if [ -z "$sym" ]; then
+          sudo apt-get update -qq && sudo apt-get install -y -qq llvm
+          sym=$(command -v llvm-symbolizer)
+        fi
+        echo "ASAN_SYMBOLIZER_PATH=$sym" >> "$GITHUB_ENV"
     - name: Unit Test with ${{ matrix.tool }}
       run: |
         export RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}" CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
-        bash misc/sudo-env.sh PATH RUSTUP_HOME 'CARGO_*' -- \
+        bash misc/sudo-env.sh PATH RUSTUP_HOME 'CARGO_*' 'ASAN_*' -- \
           make ${{ matrix.tool }}-ut-nextest SANITIZER_TOOLCHAIN="$SANITIZER_TOOLCHAIN" RUSTUP="$(command -v rustup)"
