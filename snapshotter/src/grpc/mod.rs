@@ -37,8 +37,8 @@ use tracing::{debug, info, warn};
 /// `None`) and degrades to the full pipeline. Six hours is deliberately
 /// generous: conversions run at idle scheduling priority and a large
 /// multi-layer image can legitimately churn for a long time, so the sweep must
-/// never race a slow-but-healthy job (the live job is additionally excluded
-/// via `active_job_key()`).
+/// never race a slow-but-healthy job (the live job, and any job waiting out a
+/// containerd outage, are additionally excluded via `work_dir_in_use()`).
 const AUTO_ZRAN_STALE_JOB_MAX_AGE: std::time::Duration =
     std::time::Duration::from_secs(6 * 60 * 60);
 
@@ -1313,6 +1313,10 @@ pub async fn serve(mut config: SnapshotterConfig) -> Result<()> {
         &mut config.snapshotter.fs_drivers,
         config.snapshotter.fs_driver_policy,
         Some(&work_dir),
+    );
+    crate::probe::spawn_erofs_inode_share_self_test(
+        &work_dir,
+        config.snapshotter.features.erofs_inode_share,
     );
     for result in &probe_results {
         info!(

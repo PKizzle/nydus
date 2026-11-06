@@ -12,9 +12,9 @@ use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use crate::auto_zran::AutoZranManager;
-use std::time::{Duration, Instant};
 
 const SNAPSHOT_DURATION_BUCKETS_MS: [f64; 14] = [
     0.5, 1.0, 5.0, 10.0, 50.0, 100.0, 150.0, 200.0, 250.0, 300.0, 350.0, 400.0, 600.0, 1000.0,
@@ -214,7 +214,7 @@ impl SnapshotterMetrics {
             return;
         };
         let status = manager.status();
-        out.push_str("# HELP snapshotter_auto_zran_jobs_total Auto-zran conversion jobs by event: queued, dropped (queue full), skipped (deduplicated, suppressed or deferred by the sweep gate), started, succeeded, failed (a failure strike), deferred (containerd unreachable, retried without a strike).\n");
+        out.push_str("# HELP snapshotter_auto_zran_jobs_total Auto-zran conversion jobs by event: queued, dropped (queue full), skipped (deduplicated, suppressed or deferred by the sweep gate), started, succeeded, failed (a failure strike), deferred (containerd unreachable, retried without a strike), abandoned (containerd still unreachable after the wait budget, dropped without a strike).\n");
         out.push_str("# TYPE snapshotter_auto_zran_jobs_total counter\n");
         for (event, value) in [
             ("queued", status.queued_total),
@@ -224,6 +224,7 @@ impl SnapshotterMetrics {
             ("succeeded", status.succeeded_total),
             ("failed", status.failed_total),
             ("deferred", status.deferred_total),
+            ("abandoned", status.abandoned_total),
         ] {
             push_labeled_metric(
                 out,

@@ -366,6 +366,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support O_PATH")]
     fn a_symlink_out_of_the_volume_is_archived_not_followed() {
         let root = fake_root();
         symlink("/etc", root.path().join("vol/escape")).unwrap();
@@ -383,6 +384,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support O_PATH")]
     fn a_path_through_a_symlink_resolves_inside_the_root() {
         let root = fake_root();
         symlink("/etc", root.path().join("vol/escape")).unwrap();
@@ -394,6 +396,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support O_PATH")]
     fn an_absolute_symlink_on_the_requested_path_resolves_inside_the_root() {
         let root = fake_root();
         fs::write(root.path().join("vol/file"), b"in the volume").unwrap();
@@ -410,6 +413,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support O_PATH")]
     fn magic_links_are_refused() {
         // A container's own /proc is a real procfs, whose `root` and `fd/*`
         // links lead anywhere. With the host's / as the root, the path below
@@ -429,6 +433,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support O_PATH")]
     fn hardlinks_within_the_volume_are_kept() {
         let root = fake_root();
         fs::write(root.path().join("vol/a"), b"shared").unwrap();
@@ -443,6 +448,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support mkfifo")]
     fn devices_fifos_and_metadata_are_carried() {
         let root = fake_root();
         let fifo = CString::new(root.path().join("vol/pipe").as_os_str().as_bytes()).unwrap();
@@ -489,6 +495,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support xattrs")]
     fn xattrs_round_trip() {
         let root = fake_root();
         let file = root.path().join("vol/labelled");
@@ -510,6 +517,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support Unix sockets")]
     fn whiteout_names_and_sockets_are_skipped() {
         let root = fake_root();
         fs::write(root.path().join("vol/.wh.passwd"), b"").unwrap();
@@ -523,6 +531,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support setfsuid")]
     fn an_unreadable_file_is_skipped_with_a_warning() {
         let root = fake_root();
         fs::write(root.path().join("vol/locked"), b"secret").unwrap();

@@ -1252,6 +1252,7 @@ mod tests {
     }
 
     #[compio::test]
+    #[cfg_attr(miri, ignore = "Miri does not support io_uring")]
     async fn urls_follow_the_distribution_spec() {
         let client = test_client(false);
         assert_eq!(
@@ -1354,12 +1355,14 @@ mod tests {
     }
 
     #[compio::test]
+    #[cfg_attr(miri, ignore = "Miri does not support io_uring")]
     async fn plain_http_switches_scheme() {
         let client = test_client(true);
         assert!(client.manifest_url("a/b", "1").starts_with("http://"));
     }
 
     #[compio::test]
+    #[cfg_attr(miri, ignore = "Miri does not support io_uring")]
     async fn explicit_credentials_take_precedence_and_become_basic_auth() {
         let client = RegistryClient::new(
             "registry.local:5000",
@@ -1384,6 +1387,7 @@ mod tests {
     }
 
     #[compio::test]
+    #[cfg_attr(miri, ignore = "Miri does not support io_uring")]
     async fn raw_auth_payload_is_used_and_loses_to_explicit_credentials() {
         // A pre-encoded base64 payload (the snapshotter's runtime-auth shape)
         // becomes the Basic header as-is.
@@ -1445,6 +1449,7 @@ mod tests {
     }
 
     #[compio::test]
+    #[cfg_attr(miri, ignore = "Miri does not support io_uring")]
     async fn cached_token_wins_over_basic_auth() {
         let client = test_client(false);
         assert!(
@@ -1580,6 +1585,7 @@ mod tests {
     }
 
     #[compio::test]
+    #[cfg_attr(miri, ignore = "Miri does not support io_uring")]
     async fn file_digest_matches_bytes_digest() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("blob.bin");
@@ -1594,6 +1600,7 @@ mod tests {
     }
 
     #[compio::test]
+    #[cfg_attr(miri, ignore = "Miri does not support io_uring")]
     async fn read_deadline_bounds_a_stalled_body() {
         // A stream that never yields models a slow-drip/stalled body; the
         // wall-clock deadline must fire instead of waiting forever.
@@ -1604,6 +1611,7 @@ mod tests {
     }
 
     #[compio::test]
+    #[cfg_attr(miri, ignore = "Miri does not support io_uring")]
     async fn collect_bounded_bails_as_soon_as_running_total_exceeds_cap() {
         // Three 10-byte chunks against a 25-byte cap: the running total
         // crosses the cap on the third chunk (30 > 25), so the call must
@@ -1623,6 +1631,7 @@ mod tests {
     }
 
     #[compio::test]
+    #[cfg_attr(miri, ignore = "Miri does not support io_uring")]
     async fn collect_bounded_accepts_a_body_exactly_at_the_cap() {
         let chunks: Vec<std::result::Result<Vec<u8>, std::io::Error>> =
             vec![Ok(vec![1u8; 10]), Ok(vec![2u8; 10])];
@@ -1634,6 +1643,7 @@ mod tests {
     }
 
     #[compio::test]
+    #[cfg_attr(miri, ignore = "Miri does not support io_uring")]
     async fn collect_bounded_never_had_content_length_to_lean_on() {
         // With no Content-Length header at all (chunked transfer-encoding),
         // the cap must be enforced purely from the running total of streamed
@@ -1697,6 +1707,7 @@ mod tests {
     }
 
     #[compio::test]
+    #[cfg_attr(miri, ignore = "Miri does not support io_uring")]
     async fn manifest_get_retries_a_transient_server_error() {
         let manifest = r#"{"schemaVersion":2}"#;
         let (port, server) = serve_raw(vec![
@@ -1715,6 +1726,7 @@ mod tests {
     }
 
     #[compio::test]
+    #[cfg_attr(miri, ignore = "Miri does not support io_uring")]
     async fn manifest_put_is_not_retried_on_server_error() {
         let (port, server) = serve_raw(vec![raw_response("500 Internal Server Error", "")]);
         let err = loopback_client(port)
@@ -1734,6 +1746,7 @@ mod tests {
     }
 
     #[compio::test]
+    #[cfg_attr(miri, ignore = "Miri does not support io_uring")]
     async fn blob_download_restarts_a_body_that_breaks_off() {
         let body = "the whole blob";
         let digest = sha256_digest(body.as_bytes());
@@ -1757,6 +1770,7 @@ mod tests {
     }
 
     #[compio::test]
+    #[cfg_attr(miri, ignore = "Miri does not support io_uring")]
     async fn blob_download_stops_at_the_descriptor_size() {
         let body = "x".repeat(4096);
         let digest = sha256_digest(body.as_bytes());
@@ -1779,6 +1793,7 @@ mod tests {
     }
 
     #[compio::test]
+    #[cfg_attr(miri, ignore = "Miri does not support io_uring")]
     async fn blob_download_refuses_a_path_like_digest_before_touching_disk() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("nested").join("blob");
@@ -1792,6 +1807,7 @@ mod tests {
     }
 
     #[compio::test]
+    #[cfg_attr(miri, ignore = "Miri does not support io_uring")]
     async fn credentials_never_go_to_a_cleartext_token_realm() {
         let client = RegistryClient::new(
             "registry.local:5000",
@@ -1816,6 +1832,7 @@ mod tests {
     }
 
     #[compio::test]
+    #[cfg_attr(miri, ignore = "Miri does not support io_uring")]
     async fn token_response_body_is_bounded() {
         let huge = format!("{{\"token\":\"{}\"}}", "a".repeat(2 * 1024 * 1024));
         let (port, server) = serve_raw(vec![raw_response("200 OK", &huge)]);

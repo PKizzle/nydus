@@ -330,6 +330,7 @@ mod tests {
     use std::path::PathBuf;
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support file-backed mmap")]
     fn mapped_slice_checks_range_and_alignment() {
         let temp = TempFile::new().unwrap();
         temp.as_file()
@@ -355,6 +356,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support file-backed mmap")]
     fn mapped_or_owned_copies_before_mutation() {
         let temp = TempFile::new().unwrap();
         temp.as_file().write_all(&[7u8; 8]).unwrap();
@@ -369,6 +371,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support file-backed mmap")]
     fn create_file_map_object() {
         let root_dir = &std::env::var("CARGO_MANIFEST_DIR").expect("$CARGO_MANIFEST_DIR");
         let path = PathBuf::from(root_dir).join("../tests/texture/bootstrap/rafs-v5.boot");
@@ -398,6 +401,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support file-backed mmap")]
     fn test_file_map_error() {
         let temp = TempFile::new().unwrap();
         temp.as_file().set_len(4096).unwrap();
@@ -430,6 +434,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support file-backed mmap")]
     fn typed_mapping_checks_alignment_permissions_and_empty_state() {
         let temp = TempFile::new().unwrap();
         temp.as_file().set_len(4096).unwrap();

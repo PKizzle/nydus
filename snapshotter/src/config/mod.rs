@@ -750,35 +750,34 @@ impl From<FeaturesConfigToml> for FeaturesConfig {
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ErofsInodeShare {
-    /// On kernels >= 7.4, the first release whose shared mmaps keep their real inode alive.
+    /// When the kernel supports `inode_share` and carries the fix "erofs: hold real inodes for
+    /// shared files" (mainline 7259fb011c14), as detected at startup by
+    /// `nydus_service::erofs_ishare`; a backport counts the same as a release that has it.
+    /// Without the fix, mmap'd shared files can oops the kernel once their real inode is evicted.
     #[default]
     Auto,
-    /// On any kernel that accepts the option (7.0+). Meant for kernels below 7.4 that carry
-    /// the fix "erofs: hold real inodes for shared files" (mainline 7259fb011c14, a stable
-    /// backport or a cherry-pick), which `uname` cannot reveal; without it, mmap'd shared files
-    /// can fault once their real inode is evicted.
+    /// On any kernel that accepts the option (7.0+), whatever the startup self-test found.
     On,
     /// Never.
     Off,
 }
 
 impl ErofsInodeShare {
-    /// Kernel release from which `Auto` enables sharing.
-    pub const AUTO_MIN_KERNEL: (u32, u32) = (7, 4);
+    /// The lowercase mode name (matches the serde representation).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::On => "on",
+            Self::Off => "off",
+        }
+    }
 
-    /// Whether to request `inode_share` on a kernel reporting `release` (`uname -r`).
-    pub fn enabled_for_kernel(self, release: &str) -> bool {
+    /// Whether to request `inode_share`. `fix_detected` runs only for `Auto`.
+    pub fn enabled(self, fix_detected: impl FnOnce() -> bool) -> bool {
         match self {
             Self::On => true,
             Self::Off => false,
-            Self::Auto => {
-                let mut parts = release
-                    .split(|c: char| !c.is_ascii_digit())
-                    .map(|p| p.parse::<u32>().unwrap_or(0));
-                let major = parts.next().unwrap_or(0);
-                let minor = parts.next().unwrap_or(0);
-                (major, minor) >= Self::AUTO_MIN_KERNEL
-            }
+            Self::Auto => fix_detected(),
         }
     }
 }
@@ -1868,7 +1867,7 @@ mod tests {
     }
 
     #[test]
-    fn erofs_inode_share_parses_and_gates_on_the_kernel() {
+    fn erofs_inode_share_parses_and_gates_on_the_fix() {
         for (value, want) in [
             ("auto", ErofsInodeShare::Auto),
             ("on", ErofsInodeShare::On),
@@ -1877,6 +1876,7 @@ mod tests {
             let parsed: FeaturesConfig =
                 toml::from_str(&format!("erofs_inode_share = \"{value}\"")).unwrap();
             assert_eq!(parsed.erofs_inode_share, want, "{value}");
+            assert_eq!(want.as_str(), value);
         }
         let empty: FeaturesConfig = toml::from_str("").unwrap();
         assert_eq!(empty.erofs_inode_share, ErofsInodeShare::Auto);
@@ -1898,15 +1898,11 @@ mod tests {
         assert!(err.to_string().contains("auto"), "{err}");
         assert!(toml::from_str::<FeaturesConfig>("erofs_inode_share = true").is_err());
 
-        let auto = ErofsInodeShare::Auto;
-        assert!(!auto.enabled_for_kernel("6.18.55-061855-generic"));
-        assert!(!auto.enabled_for_kernel("7.3.1-070301-generic"));
-        assert!(auto.enabled_for_kernel("7.4.0-rc1"));
-        assert!(auto.enabled_for_kernel("7.10.2"));
-        assert!(auto.enabled_for_kernel("8.0.0"));
-        assert!(!auto.enabled_for_kernel("garbage"));
-        assert!(ErofsInodeShare::On.enabled_for_kernel("7.3.1"));
-        assert!(!ErofsInodeShare::Off.enabled_for_kernel("7.4.0"));
+        let unused = || -> bool { unreachable!("only auto consults the kernel") };
+        assert!(ErofsInodeShare::Auto.enabled(|| true));
+        assert!(!ErofsInodeShare::Auto.enabled(|| false));
+        assert!(ErofsInodeShare::On.enabled(unused));
+        assert!(!ErofsInodeShare::Off.enabled(unused));
     }
 
     #[test]

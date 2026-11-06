@@ -193,6 +193,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
     fn test_validator_check_returns_blob_metadata() {
         let (tmp_dir, bootstrap) = prepare_fixture_root();
         let config = create_test_config(tmp_dir.as_path().to_str().unwrap());
@@ -274,6 +275,7 @@ mod tests {
 
     // The layout `nydusify convert` produces by default: compressed chunks and a symlink.
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
     fn test_validator_accepts_compressed_image() {
         for block_size in [4096u64, 16384] {
             let (dir, bootstrap) = build_image(block_size, compress::Algorithm::Zstd);
@@ -282,6 +284,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
     fn test_validator_checks_v6_block_addresses() {
         for block_size in [4096u64, 16384] {
             let (dir, bootstrap) = build_image(block_size, compress::Algorithm::None);

@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Boots an arm64 kernel in QEMU and runs the file-backed EROFS partial-folio self-test
-# (`nydus_service::erofs_folio`) in it, on a loop-mounted ext4 like the snapshotter's work dir.
+# (`nydus_service::erofs_folio`) and the page-cache-sharing self-test (`nydus_service::erofs_ishare`)
+# in it, on a loop-mounted ext4 like the snapshotter's work dir.
 # Use it to check how a kernel build classifies, e.g. an unpatched 7.3 against one carrying the
 # upstream fix 52dceb88082b. Needs qemu-system-aarch64, a static busybox, mkfs.ext4 and cpio;
 # no root on the host.
@@ -15,9 +16,11 @@
 #   DEMO_IMAGE   optional EROFS image to mount as is and padded, e.g. from `demo-image.sh`
 #   EXPECT       optional affected|unaffected; the script fails unless the probe says so and,
 #                with DEMO_IMAGE, the image reads as `expect.sh` requires
+#   EXPECT_ISHARE  optional unsupported|fix_absent|fix_present|inconclusive, likewise
 #   BUSYBOX      static busybox (default: the one on PATH)
 #
-# Prints the guest console and ends with "==== EROFS FOLIO PROBE: <status> ====".
+# Prints the guest console and ends with "==== EROFS FOLIO PROBE: <status> ====" and
+# "==== EROFS ISHARE PROBE: <status> ====".
 set -euo pipefail
 : "${KERNEL:?}" "${PROBE:?}"
 BUSYBOX="${BUSYBOX:-$(command -v busybox)}"
@@ -77,4 +80,9 @@ timeout 300 qemu-system-aarch64 -machine virt -cpu neoverse-n1 -m 1024 -nographi
   -kernel "$KERNEL" -initrd "$WORK/initrd.gz" \
   -append "console=ttyAMA0 rdinit=/init panic=-1 quiet" </dev/null | tee "$WORK/console.log"
 
-bash "$(dirname "$0")/expect.sh" "$WORK/console.log" "${EXPECT:-}" "${DEMO_IMAGE:+image}"
+ishare=$(sed -n 's/.*erofs-ishare-probe: status=\([a-z_]*\).*/\1/p' "$WORK/console.log" | tr -d '\r')
+rc=0
+bash "$(dirname "$0")/expect.sh" "$WORK/console.log" "${EXPECT:-}" "${DEMO_IMAGE:+image}" || rc=$?
+echo "==== EROFS ISHARE PROBE: ${ishare:-none} ===="
+[ "$rc" = 0 ]
+[ -z "${EXPECT_ISHARE:-}" ] || [ "$ishare" = "$EXPECT_ISHARE" ]

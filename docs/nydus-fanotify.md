@@ -131,10 +131,12 @@ Mitigation, in `nydus_service::erofs_folio`:
 | File-backed EROFS mount | Source | Handling |
 | --- | --- | --- |
 | Auto-accel / fanotify (snapshotter) | staged bootstrap copy | padded to a page multiple with a sparse hole (`stage_bootstrap`) |
-| Blockdev and tarfs without dm-verity (snapshotter) | exported `image.erofs` | padded before the mount (`mount_blockdev_erofs`) |
+| Blockdev and tarfs without dm-verity (snapshotter) | exported `image.erofs` | padded at export (`BlockDevice::export`) and before the mount (`mount_blockdev_erofs`), so a cached image that is not a page multiple is covered too |
+| `nydus-image export --block` | the exported `.disk` | padded to a 64 KiB multiple (`EXPORT_ALIGNMENT`, the largest page size) at export, with or without `--verity`: EROFS reads only the blocks the superblock names, dm-verity only `--data-blocks` and the tree at `--hash-offset` |
 | Tarfs with dm-verity | dm block device | not file-backed: unaffected |
 | Regular nydus images (snapshotter) | FUSE | not EROFS: unaffected |
-| `nydusd --fanotify` (standalone) | the caller's `bootstrap` | left untouched; when it is not a page multiple, `mount_erofs` mounts a padded copy, `bootstrap.page-padded`, beside it |
+| `nydusd --fanotify` (standalone) | the caller's `bootstrap` | left untouched; when it is not a page multiple, `mount_erofs` mounts an anonymous padded copy (`O_TMPFILE` in the bootstrap's directory, named by its `/proc/self/fd` link), or, where `O_TMPFILE` or that link is unavailable, a named copy it removes once mounted. Nothing is left behind; the mount table shows `/proc/self/fd/<n>` as the source. |
+| Live mounts adopted on restart | staged bootstrap or `image.erofs` | at startup, before adoption, the snapshotter pads every unaligned regular-file source of a live EROFS mount under its `daemons/` dir in place. The kernel retries a failed metadata read on the next access, so the live mount reads cleanly without a remount, and running containers keep working. |
 
 The hole costs no disk blocks and reads back as zeros, which is what a fixed kernel substitutes for
 the missing bytes, so padding is applied on every kernel. To tell whether a kernel is affected
@@ -145,9 +147,7 @@ while the padded one reads cleanly means affected. The result is logged (a `WARN
 kernel, the page size and the fix when affected) and exported as
 `nydus_snapshotter_erofs_partial_folio_bug{status="affected|unaffected|inconclusive"} 1`.
 `inconclusive` means the probe could not mount at all (no privilege, no file-backed EROFS, or a
-10 s timeout). Padding happens at mount time, so an EROFS mount that already existed
-before the snapshotter started (adopted on restart) keeps its unpadded source until it is
-remounted. The mount health probe reads both metadata and file data, so a mount that answers
+10 s timeout). The mount health probe reads both metadata and file data, so a mount that answers
 with `EIO` for any other reason is reported as dead rather than passing.
 
 [`misc/erofs-folio/qemu-test.sh`](../misc/erofs-folio/qemu-test.sh) boots an arm64 kernel in QEMU
@@ -204,11 +204,27 @@ sudo NYDUS_IMAGE=./target/release/nydus-image NYDUSD=./target/release/nydusd \
 one page cache across all mounts of the domain, so a library used by many images is cached once.
 The image needs fingerprints (`nydus-image merge --inode-share-fingerprint`); without them the
 kernel mounts normally. A kernel that rejects the options (`EINVAL`, before 7.0) is mounted
-without them. Shared mmaps need the 7.4 fix "erofs: hold real inodes for shared files" (or a
-stable kernel carrying it). `misc/fanotify/inode-share-test.sh` checks the sharing in the kernel.
+without them. Shared mmaps need the fix "erofs: hold real inodes for shared files" (mainline
+`7259fb011c14`, 7.4; or a backport): without it, a page fault on a mapping whose file was closed
+and whose real inode was evicted dereferences a NULL inode, a kernel oops.
+`misc/fanotify/inode-share-test.sh` checks the sharing in the kernel.
 
 The snapshotter sets the domain only for auto-accel images this node built, under
-`[snapshotter.features] erofs_inode_share` (`auto`: kernel 7.4+, `on`, `off`).
+`[snapshotter.features] erofs_inode_share` (`auto`, `on`, `off`). `auto` enables it when the
+startup self-test (`nydus_service::erofs_ishare`) finds both:
+
+- **support**: a tiny file-backed probe image mounts with `inode_share,domain_id=…`, and
+  `inode_share` without `domain_id` fails `EINVAL` (a kernel built without
+  `CONFIG_EROFS_FS_PAGE_CACHE_SHARE` ignores both options; one before 7.0 rejects both);
+- **the fix**: `/proc/kallsyms` lists `erofs_ishare_backing_release`, the `release` hook the fix
+  adds. Triggering the bug itself would oops the kernel, so the probe never does.
+
+It does not compare kernel versions, so a backport counts as fixed. Without kallsyms the result is
+`inconclusive` and `auto` stays off; `on` enables sharing regardless, and `off` skips the self-test.
+The self-test runs in the background at startup; auto-accel mounts made before it finishes go
+without sharing. The startup log and the `nydus_snapshotter_erofs_inode_share{status,mode,enabled}`
+gauge report the outcome (`status` is `fix_present`, `fix_absent`, `unsupported` or
+`inconclusive`).
 
 ## Troubleshooting
 
