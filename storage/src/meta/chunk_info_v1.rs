@@ -428,6 +428,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "calls the C lz4 library")]
     fn test_read_metadata_compressor_lz4() {
         let temp = TempFile::new().unwrap();
         let mut w = OpenOptions::new()
@@ -499,6 +500,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "calls the C lz4 library")]
     fn test_read_metadata_rejects_short_decompression() {
         // Enough repetitive entries that every algorithm actually compresses them.
         let chunks = vec![

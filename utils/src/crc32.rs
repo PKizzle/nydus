@@ -259,6 +259,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support memfd_create")]
     fn test_crc32_from_raw_fd() {
         let content = b"hello nydus world";
         let fd = make_memfd(content);
@@ -275,6 +276,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support memfd_create")]
     fn test_crc32_from_raw_fd_with_offset() {
         let content = b"prefixdata";
         let offset = 6u64; // skip "prefix", checksum "data"
@@ -292,6 +294,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support memfd_create")]
     fn test_crc32_from_raw_fd_zero_size() {
         let content = b"some content";
         let fd = make_memfd(content);

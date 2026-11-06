@@ -766,6 +766,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
     fn test_blob_cache_entry() {
         let tmpdir = TempDir::new().unwrap();
         let path = tmpdir.as_path().join("bootstrap1");
@@ -810,6 +811,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
     fn test_invalid_blob_id() {
         let tmpdir = TempDir::new().unwrap();
         let path = tmpdir.as_path().join("bootstrap1");
@@ -879,6 +881,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
     fn test_add_bootstrap() {
         let tmpdir = TempDir::new().unwrap();
         let root_dir = &std::env::var("CARGO_MANIFEST_DIR").expect("$CARGO_MANIFEST_DIR");
@@ -958,6 +961,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
     fn test_get_meta_info_rejects_invalid_metadata_path() {
         let tmpdir = TempDir::new().unwrap();
         let config = create_factory_config();
@@ -986,6 +990,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
     fn test_remove_blob_entry_by_domain() {
         let tmpdir = TempDir::new().unwrap();
         let root_dir = &std::env::var("CARGO_MANIFEST_DIR").expect("$CARGO_MANIFEST_DIR");
@@ -1058,6 +1063,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support io_uring")]
     fn test_meta_blob() {
         let root_dir = &std::env::var("CARGO_MANIFEST_DIR").expect("$CARGO_MANIFEST_DIR");
         let mut source_path = PathBuf::from(root_dir);
@@ -1084,6 +1090,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support io_uring")]
     fn test_meta_blob_file() {
         use std::os::fd::AsRawFd;
 
@@ -1168,6 +1175,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
     fn test_data_blob_getters() {
         use std::os::fd::AsRawFd;
 
@@ -1180,6 +1188,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
     fn test_data_blob_async_fetch_zero_len() {
         let (data_blob, _tmp_dir) = create_data_blob();
         compio::runtime::Runtime::new()
@@ -1192,6 +1201,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
     fn test_data_blob_async_fetch_and_read() {
         let (data_blob, _tmp_dir) = create_data_blob();
         compio::runtime::Runtime::new()

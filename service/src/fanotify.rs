@@ -2196,6 +2196,7 @@ mod tests {
     /// A bootstrap with data devices and no registered data blob would mount as one flat
     /// device and answer every file read with EIO, so the handler must refuse it.
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
     fn test_refuses_bootstrap_whose_devices_have_no_data_blob() {
         let dir = vmm_sys_util::tempdir::TempDir::new().unwrap();
         let root = std::env::var("CARGO_MANIFEST_DIR").unwrap();
@@ -2224,6 +2225,7 @@ mod tests {
     /// linked: the blob cache manager may hold other bootstraps' blobs, so only the bootstrap's
     /// own device table says which blob backs which device.
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
     fn refuses_data_blobs_that_do_not_match_the_device_table() {
         const BLOB: &str = "be7d77eeb719f70884758d1aa800ed0fb09d701aaec469964e9d54325f0d5fef";
         let root = std::env::var("CARGO_MANIFEST_DIR").unwrap();
@@ -2293,6 +2295,7 @@ mod tests {
     /// A panic while serving one event answers that event and the rest of its batch with
     /// `EIO`, fails the handler, and leaves every worker able to reach the shutdown barrier.
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
     fn worker_panic_denies_the_batch_and_fails_the_handler() {
         let h = SocketHandler::start(2);
         inject_panic_on_next_event(h.handler.mountpoint());
@@ -2314,6 +2317,7 @@ mod tests {
 
     /// `FAN_Q_OVERFLOW` fails the whole handler: no worker serves the stream afterwards.
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
     fn queue_overflow_stops_every_worker_from_serving() {
         let h = SocketHandler::start(2);
         // Sanity: a healthy handler allows an event that maps to no blob.
@@ -2722,6 +2726,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
     fn is_mounted_at_recognises_a_real_mountpoint_and_rejects_a_plain_directory() {
         use super::is_mounted_at;
         use std::path::Path;

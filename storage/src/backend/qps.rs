@@ -215,6 +215,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "timing-sensitive; Miri runs too slowly")]
     fn test_token_refill() {
         let limiter = QpsLimiter::new(100.0);
 
@@ -234,6 +235,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "timing-sensitive; Miri runs too slowly")]
     fn test_blocking_acquire() {
         let limiter = QpsLimiter::new(100.0);
 
@@ -300,6 +302,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "timing-sensitive; Miri runs too slowly")]
     fn test_concurrent_acquisition() {
         use std::sync::Arc;
         use std::thread;

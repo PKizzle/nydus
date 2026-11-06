@@ -56,6 +56,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support io_uring")]
     fn creation_failure_keeps_errno_and_is_retried() {
         std::thread::spawn(|| {
             let err = block_on_with(|| Err(io::Error::from_raw_os_error(libc::EMFILE)), async {})

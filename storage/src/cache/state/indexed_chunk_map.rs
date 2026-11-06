@@ -152,6 +152,7 @@ mod tests {
     use crate::test::MockChunkInfo;
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
     fn test_indexed_new_invalid_file_size() {
         let dir = TempDir::new().unwrap();
         let blob_path = dir.as_path().join("blob-1");
@@ -182,6 +183,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
     fn test_indexed_new_zero_file_size() {
         let dir = TempDir::new().unwrap();
         let blob_path = dir.as_path().join("blob-1");
@@ -218,6 +220,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
     fn test_indexed_new_header_not_ready() {
         let dir = TempDir::new().unwrap();
         let blob_path = dir.as_path().join("blob-1");
@@ -255,6 +258,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
     fn test_indexed_new_all_ready() {
         let dir = TempDir::new().unwrap();
         let blob_path = dir.as_path().join("blob-1");
@@ -301,6 +305,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
     fn test_indexed_new_load_v0() {
         let dir = TempDir::new().unwrap();
         let blob_path = dir.as_path().join("blob-1");
@@ -348,6 +353,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
     fn test_reset_revokes_every_chunk() {
         let dir = TempDir::new().unwrap();
         let blob_path = dir.as_path().join("blob-reset");
@@ -392,6 +398,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
     fn test_reset_survives_reopen() {
         let dir = TempDir::new().unwrap();
         let blob_path = dir.as_path().join("blob-reset-persist");

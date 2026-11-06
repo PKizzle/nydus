@@ -907,6 +907,7 @@ mod tests {
 
     #[test]
     #[cfg(feature = "backend-localfs")]
+    #[cfg_attr(miri, ignore = "calls the C zstd library")]
     fn test_read_from_cache_file() {
         let root_dir = &std::env::var("CARGO_MANIFEST_DIR").expect("$CARGO_MANIFEST_DIR");
         let path = Path::new(root_dir).join("../tests/texture/toc");
@@ -1019,6 +1020,10 @@ mod tests {
             String::from("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
         );
 
+        // The rest decompresses with the C zstd library, which Miri cannot call.
+        if cfg!(miri) {
+            return;
+        }
         let root_dir = &std::env::var("CARGO_MANIFEST_DIR").expect("$CARGO_MANIFEST_DIR");
         let path = Path::new(root_dir)
             .join("../tests/texture/zstd")

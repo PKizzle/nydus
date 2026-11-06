@@ -93,6 +93,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support Unix sockets")]
     fn test_save_invalid_socket_path_returns_create_unix_stream_error() {
         let mut backend = UdsStorageBackend::new(PathBuf::from("/nonexistent/dir/test.sock"));
         // Provide a non-empty fds slice so the empty-fds guard does not fire;
@@ -105,6 +106,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support Unix sockets")]
     fn test_restore_invalid_socket_path_returns_create_unix_stream_error() {
         let mut backend = UdsStorageBackend::new(PathBuf::from("/nonexistent/dir/test.sock"));
         let result = backend.restore();

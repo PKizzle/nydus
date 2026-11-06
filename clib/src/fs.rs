@@ -309,12 +309,14 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support readahead")]
     fn test_open_rafs() {
         let fs = open_file_system();
         unsafe { nydus_close_rafs(fs) };
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support readahead")]
     fn test_open_rafs_default() {
         init_logging();
         let root_dir = &std::env::var("CARGO_MANIFEST_DIR").expect("$CARGO_MANIFEST_DIR");
