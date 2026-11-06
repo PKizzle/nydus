@@ -219,7 +219,7 @@ impl DirectSuperBlockV6 {
             meta.flags,
             old_state.block_size(),
         )?;
-        let blob_extra_infos = rafsv6_load_blob_extra_info(meta, r)?;
+        let blob_extra_infos = rafsv6_load_blob_extra_info(meta, &blob_table, r)?;
 
         // SAFETY: nydus only reads the bootstrap, which must not change while it's mounted.
         let file_map = unsafe { FileMapState::new(file, 0, len as usize, false) }?;

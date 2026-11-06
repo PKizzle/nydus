@@ -29,7 +29,7 @@ impl RafsSuper {
         if !sb.is_rafs_v6() {
             return Ok(false);
         }
-        sb.validate(end)?;
+        let block_size = sb.validate(end)?;
         self.meta.version = RAFS_SUPER_VERSION_V6;
         self.meta.magic = sb.magic();
         self.meta.meta_blkaddr = sb.meta_addr();
@@ -40,7 +40,7 @@ impl RafsSuper {
 
         let mut ext_sb = RafsV6SuperBlockExt::new();
         ext_sb.load(r)?;
-        ext_sb.validate(end, &sb)?;
+        ext_sb.validate(end, &sb, block_size)?;
         self.meta.chunk_size = ext_sb.chunk_size();
         self.meta.blob_table_offset = ext_sb.blob_table_offset();
         self.meta.blob_table_size = ext_sb.blob_table_size();
@@ -246,8 +246,8 @@ mod tests {
 
     #[test]
     fn test_v6_load_rejects_blob_table_in_devslots() {
+        use crate::metadata::layout::v6::test_util::{DEVSLOT_TEST_END, test_ext_sb, test_sb};
         use crate::metadata::layout::v6::{EROFS_SUPER_BLOCK_SIZE, EROFS_SUPER_OFFSET};
-        use nydus_utils::{compress, digest};
 
         let t_file = TempFile::new().unwrap();
         let file = OpenOptions::new()
@@ -255,17 +255,9 @@ mod tests {
             .write(true)
             .open(t_file.as_path())
             .unwrap();
-        let mut sb = RafsV6SuperBlock::new();
-        sb.set_inos(1);
         // 54 device slots run 128 bytes past the 8 KiB boundary the blob table starts at.
-        sb.set_extra_devices(54);
-        sb.set_meta_addr(24 * EROFS_BLOCK_SIZE_4096);
-        let mut ext = RafsV6SuperBlockExt::new();
-        ext.set_compressor(compress::Algorithm::None);
-        ext.set_digester(digest::Algorithm::Sha256);
-        ext.set_chunk_size(0x10_0000);
-        ext.set_blob_table_offset(2 * EROFS_BLOCK_SIZE_4096);
-        ext.set_blob_table_size(54 * 256); // 54 blob table entries
+        let sb = test_sb(54, 24 * EROFS_BLOCK_SIZE_4096);
+        let ext = test_ext_sb(2 * EROFS_BLOCK_SIZE_4096, 54);
         let mut writer = BufWriter::new(file.try_clone().unwrap());
         sb.store(&mut writer).unwrap();
         writer
@@ -273,7 +265,7 @@ mod tests {
             .unwrap();
         ext.store(&mut writer).unwrap();
         writer.flush().unwrap();
-        file.set_len(32 * EROFS_BLOCK_SIZE_4096).unwrap();
+        file.set_len(DEVSLOT_TEST_END).unwrap();
 
         let mut reader = Box::new(file) as RafsIoReader;
         let mut rs = RafsSuper {
