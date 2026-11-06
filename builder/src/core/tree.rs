@@ -477,7 +477,7 @@ mod tests {
 
     #[test]
     #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
-    fn test_merge_overlay_releases_upper_on_caller_thread() {
+    fn test_merge_overlay_releases_upper_before_return() {
         let tmpdir = TempDir::new().unwrap();
         let tmpfile = TempFile::new_in(tmpdir.as_path()).unwrap();
         let fs_node = |path: &std::path::Path| {
@@ -501,9 +501,9 @@ mod tests {
             .merge_overaly(&BuildContext::default(), upper)
             .unwrap();
 
-        // The merged tree shares the upper root and child nodes. `TreeNode` is a non-atomic `Rc`,
-        // so the consumed upper tree must be gone before `merge_overaly` returns: a handle kept
-        // alive anywhere else (another thread in particular) would show up here.
+        // The merged tree shares the upper root and child nodes, so every handle the consumed upper
+        // tree held must be released by the time `merge_overaly` returns: the merged tree is then
+        // the only owner of each node. A handle kept alive past the call raises a count above 1.
         assert_eq!(Rc::strong_count(&lower.node), 1);
         assert_eq!(lower.children.len(), 1);
         assert_eq!(Rc::strong_count(&lower.children[0].node), 1);
