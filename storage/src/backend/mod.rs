@@ -506,6 +506,9 @@ pub trait BlobReader: Send + Sync {
         max_size: usize,
     ) -> BackendResult<usize> {
         if bufs.len() == 1 && max_size >= bufs[0].len() {
+            // SAFETY: `bufs[0]` is a `FileVolatileSlice` whose creator guarantees `len()` writable
+            // bytes for its lifetime; the caller hands it over to be filled by this read and does
+            // not access it concurrently.
             let buf = unsafe { std::slice::from_raw_parts_mut(bufs[0].as_ptr(), bufs[0].len()) };
             self.read(buf, offset)
         } else {

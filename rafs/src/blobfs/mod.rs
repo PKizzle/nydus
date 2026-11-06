@@ -275,11 +275,13 @@ impl BlobFs {
     }
 
     fn stat(f: &File) -> io::Result<libc::stat64> {
-        // Safe because this is a constant value and a valid C string.
+        // SAFETY: `EMPTY_CSTR` is the constant `b"\0"`, a valid C string with exactly one trailing
+        // NUL.
         let pathname = unsafe { CStr::from_bytes_with_nul_unchecked(EMPTY_CSTR) };
         let mut st = MaybeUninit::<libc::stat64>::zeroed();
 
-        // Safe because the kernel will only write data in `st` and we check the return value.
+        // SAFETY: `st` is writable storage for a `stat64` that outlives the call, `pathname` is a
+        // valid C string, and the return value is checked below.
         let res = unsafe {
             libc::fstatat64(
                 f.as_raw_fd(),
@@ -289,7 +291,8 @@ impl BlobFs {
             )
         };
         if res >= 0 {
-            // Safe because the kernel guarantees that the struct is now fully initialized.
+            // SAFETY: `fstatat64` succeeded, so the kernel filled the whole struct (which was also
+            // zeroed).
             Ok(unsafe { st.assume_init() })
         } else {
             Err(io::Error::last_os_error())
@@ -300,8 +303,12 @@ impl BlobFs {
         let pathname = CString::new(pathname.as_os_str().as_bytes())
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         let fd = if flags & libc::O_CREAT == libc::O_CREAT {
+            // SAFETY: `pathname` is a NUL-terminated path that outlives the call; the result is
+            // checked below.
             unsafe { libc::openat(dfd, pathname.as_ptr(), flags, mode) }
         } else {
+            // SAFETY: `pathname` is a NUL-terminated path that outlives the call; the result is
+            // checked below.
             unsafe { libc::openat(dfd, pathname.as_ptr(), flags) }
         };
 
@@ -309,7 +316,8 @@ impl BlobFs {
             return Err(io::Error::last_os_error());
         }
 
-        // Safe because we just opened this fd.
+        // SAFETY: `openat` just returned this descriptor (checked non-negative above) and nothing
+        // else owns it.
         Ok(unsafe { File::from_raw_fd(fd) })
     }
 }

@@ -36,7 +36,6 @@ pub mod types;
 pub mod verity;
 pub mod xxh3;
 
-/// Round up and divide the value `n` by `d`.
 /// The host page size in bytes, or 4096 when it cannot be read.
 pub fn host_page_size() -> u64 {
     // SAFETY: sysconf reads a constant and has no preconditions.
@@ -44,6 +43,7 @@ pub fn host_page_size() -> u64 {
     u64::try_from(size).ok().filter(|&s| s > 0).unwrap_or(4096)
 }
 
+/// Round up and divide the value `n` by `d`.
 pub fn div_round_up(n: u64, d: u64) -> u64 {
     debug_assert!(d != 0);
     debug_assert!(d.is_power_of_two());
@@ -122,6 +122,11 @@ struct LazyDrop<T> {
     v: T,
 }
 
+// SAFETY: NOT established for every `T`. The value is only moved to and dropped on the spawned
+// thread, which is sound when `T: Send` or when the caller hands over the last handle to every `Rc`
+// inside it. Callers pass `!Send` builder trees (`Rc<RefCell<Node>>`), and `Tree::merge_overaly`
+// keeps a clone of the root `Rc` it lazily drops, so this needs a `T: Send` bound or an `unsafe`
+// contract on `lazy_drop`.
 unsafe impl<T> Send for LazyDrop<T> {}
 
 /// Lazy drop of object.

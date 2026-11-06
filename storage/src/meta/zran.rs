@@ -62,6 +62,8 @@ impl ZranInflateContext {
     }
 }
 
+// SAFETY: `#[repr(C, packed)]` with only integer fields: no padding, alignment 1, no interior
+// mutability, and every bit pattern is valid.
 unsafe impl FromMapped for ZranInflateContext {}
 
 impl ZranInflateContext {
@@ -107,6 +109,8 @@ impl ZranInflateContext {
 
     /// Convert to an immutable u8 slice.
     pub fn as_slice(&self) -> &[u8] {
+        // SAFETY: the packed struct has no padding, so all its bytes are initialized; the slice
+        // borrows `self`.
         unsafe {
             slice::from_raw_parts(
                 self as *const ZranInflateContext as *const u8,
@@ -409,6 +413,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "calls the C zlib library")]
     fn test_generate_chunk_info() {
         let root_dir = &std::env::var("CARGO_MANIFEST_DIR").expect("$CARGO_MANIFEST_DIR");
         let path = PathBuf::from(root_dir).join("../tests/texture/zran/zran-two-streams.tar.gz");
@@ -446,6 +451,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "calls the C zlib library")]
     fn test_zran_context_generator_to_vec() {
         let root_dir = &std::env::var("CARGO_MANIFEST_DIR").expect("$CARGO_MANIFEST_DIR");
         let path = PathBuf::from(root_dir).join("../tests/texture/zran/zran-two-streams.tar.gz");

@@ -467,6 +467,7 @@ pub mod blob_cache_tests {
     use vmm_sys_util::tempfile::TempFile;
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
     fn test_blob_cache_config() {
         // new blob cache
         let tmp_dir = TempDir::new().unwrap();
@@ -556,6 +557,9 @@ pub mod blob_cache_tests {
            );
 
            // read from cache
+           // SAFETY: `alloc_zeroed` returns a 50-byte, initialized allocation (the test would fault
+           // on the impossible NULL), which the volatile slice covers exactly and which is only
+           // read back after `read` returns. It is leaked, never freed.
            let r1 = unsafe {
                let layout = Layout::from_size_align(50, 1).unwrap();
                let ptr = alloc_zeroed(layout);
@@ -564,6 +568,7 @@ pub mod blob_cache_tests {
                Vec::from(from_raw_parts(ptr, 50))
            };
 
+           // SAFETY: as for `r1` above.
            let r2 = unsafe {
                let layout = Layout::from_size_align(50, 1).unwrap();
                let ptr = alloc_zeroed(layout);
@@ -937,6 +942,7 @@ mod tests {
     /// So this invariant is the whole of what stops a running filesystem having its backend
     /// shut down underneath it, and it lives here rather than in the factory.
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
     fn gc_keeps_the_manager_while_a_blob_cache_is_live() {
         use crate::device::BlobFeatures;
         use crate::test::MockBackend;
@@ -987,6 +993,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
     fn test_stale_chunk_map_is_dropped_with_its_data_file() {
         use crate::cache::state::IndexedChunkMap;
         use crate::test::MockChunkInfo;

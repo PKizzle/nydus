@@ -224,6 +224,8 @@ fn validate_vma_regions(regions: &[VmaRegion], block_size: u64) -> Result<()> {
 /// Returns `Ok(Some(msg))` on successful read.
 pub fn read_uffd_msg(uffd_fd: RawFd) -> Result<Option<UffdMsg>> {
     let mut msg = std::mem::MaybeUninit::<UffdMsg>::uninit();
+    // SAFETY: `msg` is writable storage of exactly the size passed, and `uffd_fd` is the caller's
+    // open descriptor; a bad fd only makes `read` fail.
     let n = unsafe {
         libc::read(
             uffd_fd,
@@ -243,6 +245,8 @@ pub fn read_uffd_msg(uffd_fd: RawFd) -> Result<Option<UffdMsg>> {
         return Err(Error::Uffd(format!("uffd short read: {n} bytes")));
     }
 
+    // SAFETY: the read filled all `size_of::<UffdMsg>()` bytes (short reads return above), and
+    // `UffdMsg` is plain integers, for which any bytes are valid.
     Ok(Some(unsafe { msg.assume_init() }))
 }
 
@@ -255,6 +259,9 @@ pub async fn uffdio_zeropage(uffd_fd: RawFd, start_addr: u64, len: u64) -> Resul
             mode: 0,
             zeropage: 0,
         };
+        // SAFETY: `ioctl_arg` is a live, initialized `UffdioZeropage` matching the
+        // `UFFDIO_ZEROPAGE` ABI, which the kernel reads and updates in place; the kernel validates
+        // the range itself.
         let ret = unsafe { libc::ioctl(uffd_fd, UFFDIO_ZEROPAGE, &mut ioctl_arg) };
         if ret < 0 {
             let err = std::io::Error::last_os_error();
@@ -295,6 +302,9 @@ pub async fn uffdio_copy<B: AsRef<[u8]> + Send + 'static>(
             mode: 0,
             copy: 0,
         };
+        // SAFETY: `src` points into `buf`, which the closure owns for the whole call and which
+        // holds at least `len` bytes (checked above); `ioctl_arg` matches the `UFFDIO_COPY` ABI and
+        // the kernel validates the destination range itself.
         let ret = unsafe { libc::ioctl(uffd_fd, UFFDIO_COPY, &mut ioctl_arg) };
         if ret < 0 {
             return Err(Error::Uffd(format!(
@@ -322,6 +332,8 @@ pub async fn uffdio_wake(uffd_fd: RawFd, start_addr: u64, len: u64) -> Result<()
             start: start_addr,
             len,
         };
+        // SAFETY: `range` is a `#[repr(C)]` `{start, len}` pair matching the `UFFDIO_WAKE` ABI and
+        // outlives the call.
         let ret = unsafe { libc::ioctl(uffd_fd, UFFDIO_WAKE, &mut range) };
         if ret < 0 {
             let err = std::io::Error::last_os_error();
@@ -389,6 +401,9 @@ impl UffdCore {
                     // than leak it.
                     let child_fd = msg.pagefault.flags as u32 as RawFd;
                     warn!("uffd_core: ignoring UFFD_EVENT_FORK, closing child uffd fd {child_fd}");
+                    // SAFETY: a `UFFD_EVENT_FORK` message carries a new descriptor the kernel
+                    // installed in this process for the child, which nothing else owns; it is
+                    // closed exactly once here.
                     unsafe { libc::close(child_fd) };
                     return Ok(PageFaultResult::Noop);
                 }
@@ -942,17 +957,26 @@ impl UffdWorker {
         Self::close_fds(&fds);
 
         // Set uffd fd to non-blocking mode
+        // SAFETY: `F_GETFL` only takes integers; `fd` is the uffd just received and owned by this
+        // function.
         let flags = unsafe { libc::fcntl(fd, libc::F_GETFL, 0) };
         if flags < 0 {
+            // SAFETY: `fd` is owned by this function and not yet wrapped, so it is closed exactly
+            // once.
             unsafe { libc::close(fd) };
             return Err(std::io::Error::last_os_error().into());
         }
+        // SAFETY: `F_SETFL` only takes integers; `fd` is owned by this function.
         if unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
             let err = std::io::Error::last_os_error();
+            // SAFETY: `fd` is owned by this function and not yet wrapped, so it is closed exactly
+            // once.
             unsafe { libc::close(fd) };
             return Err(err.into());
         }
 
+        // SAFETY: `fd` was received over `SCM_RIGHTS` and is owned only by this function; it is
+        // wrapped exactly once.
         let owned_fd = unsafe { OwnedFd::from_raw_fd(fd) };
         let uffd_poll = PollFd::new(owned_fd)
             .map_err(|e| Error::Uffd(format!("Failed to create PollFd for uffd: {}", e)))?;
@@ -1035,6 +1059,8 @@ impl UffdWorker {
 
     fn close_fds(fds: &[i32]) {
         for &fd in fds {
+            // SAFETY: the caller passes descriptors received over `SCM_RIGHTS` that it owns and
+            // hands over, so each is closed exactly once.
             unsafe {
                 libc::close(fd);
             }
@@ -1308,6 +1334,10 @@ impl UffdService {
         // Shutdown all active client sockets so handle_conn tasks exit.
         let conns = self.active_conns.lock().unwrap();
         for &fd in conns.iter() {
+            // SAFETY: `shutdown` takes integers only and cannot corrupt memory. Each fd is
+            // registered by `handle_conn` while its stream is alive and removed before the stream
+            // closes on the normal exit path; an early error return leaves the number registered,
+            // so a later `stop` could shut down an unrelated socket that reused it.
             unsafe {
                 libc::shutdown(fd, libc::SHUT_RDWR);
             }
@@ -1575,6 +1605,7 @@ mod tests {
     use vmm_sys_util::tempdir::TempDir;
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support io_uring")]
     fn uffdio_copy_rejects_a_short_source_buffer() {
         let error = compio::runtime::Runtime::new()
             .unwrap()
@@ -1589,6 +1620,8 @@ mod tests {
         let uffd_fd = create_userfaultfd_for_test()?;
         let align = 2 * 1024 * 1024; // 2MB
         let mmap_size = size.div_ceil(align) * align;
+        // SAFETY: an anonymous private mapping with a NULL hint has no preconditions; the result is
+        // checked below.
         let addr = unsafe {
             libc::mmap(
                 std::ptr::null_mut(),
@@ -1600,10 +1633,14 @@ mod tests {
             )
         };
         if addr == libc::MAP_FAILED {
+            // SAFETY: `uffd_fd` was created by `create_userfaultfd_for_test` and is owned by this
+            // function.
             unsafe { libc::close(uffd_fd) };
             return Err(std::io::Error::last_os_error().into());
         }
         if let Err(e) = uffd_register_for_test(uffd_fd, addr as u64, mmap_size as u64) {
+            // SAFETY: `addr`/`mmap_size` are the mapping created above and `uffd_fd` is owned by
+            // this function; each is released exactly once on this error path.
             unsafe {
                 libc::munmap(addr, mmap_size);
                 libc::close(uffd_fd);
@@ -1614,6 +1651,8 @@ mod tests {
     }
 
     fn cleanup_uffd_region(uffd_fd: i32, addr: u64, size: usize) {
+        // SAFETY: the caller passes the mapping and uffd returned by `setup_uffd_region`, which it
+        // owns and no longer uses.
         unsafe {
             libc::munmap(addr as *mut _, size);
             libc::close(uffd_fd);
@@ -1621,6 +1660,7 @@ mod tests {
     }
 
     fn create_userfaultfd_for_test() -> Result<i32> {
+        // SAFETY: `userfaultfd` only takes integer flags; the result is checked below.
         let fd = unsafe { libc::syscall(libc::SYS_userfaultfd, libc::O_CLOEXEC | libc::O_NONBLOCK) }
             as i32;
         if fd < 0 {
@@ -1638,8 +1678,11 @@ mod tests {
             ioctls: 0,
         };
         const UFFDIO_API_IOCTL: libc::Ioctl = 0xc018aa3fu32 as libc::Ioctl;
+        // SAFETY: `api` is a live `#[repr(C)]` struct matching the `UFFDIO_API` ABI and `fd` is the
+        // uffd created above.
         let ret = unsafe { libc::ioctl(fd, UFFDIO_API_IOCTL, &mut api) };
         if ret < 0 {
+            // SAFETY: `fd` is owned by this function and closed exactly once on this error path.
             unsafe { libc::close(fd) };
             return Err(std::io::Error::last_os_error().into());
         }
@@ -1662,6 +1705,8 @@ mod tests {
             mode: UFFDIO_REGISTER_MODE_MISSING,
             ioctls: 0,
         };
+        // SAFETY: `reg` is a live `#[repr(C)]` struct matching the `UFFDIO_REGISTER` ABI; the
+        // kernel validates the range.
         let ret = unsafe { libc::ioctl(fd, UFFDIO_REGISTER_IOCTL, &mut reg) };
         if ret < 0 {
             return Err(std::io::Error::last_os_error().into());
@@ -1731,6 +1776,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
     fn test_uffd_daemon_lifecycle() {
         let tmpdir = TempDir::new().unwrap();
         let device = create_block_device(tmpdir.as_path().to_path_buf()).unwrap();
@@ -1822,6 +1868,7 @@ mod tests {
     // --- UffdService basic tests ---
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
     fn test_uffd_service_stop_flag() {
         let tmpdir = TempDir::new().unwrap();
         let device = create_block_device(tmpdir.as_path().to_path_buf()).unwrap();
@@ -1845,6 +1892,7 @@ mod tests {
     // on: a new receiver is *Empty* (pending), not *Closed*, and a stop signal
     // still reaches it.
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
     fn test_uffd_service_shutdown_channel_stays_open() {
         let tmpdir = TempDir::new().unwrap();
         let device = create_block_device(tmpdir.as_path().to_path_buf()).unwrap();
@@ -1869,6 +1917,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
     fn test_uffd_service_save_restore() {
         let tmpdir = TempDir::new().unwrap();
         let device = create_block_device(tmpdir.as_path().to_path_buf()).unwrap();
@@ -1881,6 +1930,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
     fn test_uffd_service_get_blob_cache_mgr() {
         let tmpdir = TempDir::new().unwrap();
         let device = create_block_device(tmpdir.as_path().to_path_buf()).unwrap();
@@ -1907,6 +1957,7 @@ mod tests {
     // --- try_recv_from_sock tests ---
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support sendmsg/recvmsg")]
     fn test_try_recv_from_sock_eof() {
         // Create a pair of unix stream sockets, close the sender side
         let (sock1, sock2) = std::os::unix::net::UnixStream::pair().unwrap();
@@ -1923,6 +1974,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support sendmsg/recvmsg")]
     fn test_try_recv_from_sock_would_block() {
         // Create a pair and set non-blocking, read without writing -> WouldBlock -> Ok(None)
         let (sock1, _sock2) = std::os::unix::net::UnixStream::pair().unwrap();
@@ -1934,6 +1986,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support sendmsg/recvmsg")]
     fn test_try_recv_from_sock_valid_handshake() {
         let (sock1, sock2) = std::os::unix::net::UnixStream::pair().unwrap();
 
@@ -1956,6 +2009,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support sendmsg/recvmsg")]
     fn test_try_recv_from_sock_stat_request() {
         let (sock1, sock2) = std::os::unix::net::UnixStream::pair().unwrap();
 
@@ -1970,6 +2024,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support sendmsg/recvmsg")]
     fn test_try_recv_from_sock_invalid_utf8() {
         let (sock1, sock2) = std::os::unix::net::UnixStream::pair().unwrap();
 
@@ -1982,6 +2037,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support sendmsg/recvmsg")]
     fn test_try_recv_from_sock_invalid_json() {
         let (sock1, sock2) = std::os::unix::net::UnixStream::pair().unwrap();
 
@@ -1996,6 +2052,7 @@ mod tests {
     // --- handle_handshake Firecracker compatibility test ---
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support sendmsg/recvmsg")]
     fn test_handle_handshake_firecracker_format() {
         let (sock1, sock2) = std::os::unix::net::UnixStream::pair().unwrap();
 
@@ -2037,6 +2094,7 @@ mod tests {
     // --- do_prefault test ---
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support io_uring")]
     fn test_do_prefault() {
         compio::runtime::Runtime::new().unwrap().block_on(async {
             let tmpdir = TempDir::new().unwrap();
@@ -2084,6 +2142,7 @@ mod tests {
     // --- send_batch_response test ---
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support io_uring")]
     fn test_send_batch_response() {
         compio::runtime::Runtime::new().unwrap().block_on(async {
             let (sock1, sock2) = std::os::unix::net::UnixStream::pair().unwrap();
@@ -2118,6 +2177,7 @@ mod tests {
     // --- dispatch_message tests ---
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support io_uring")]
     fn test_dispatch_message_stat() {
         compio::runtime::Runtime::new().unwrap().block_on(async {
             let (sock1, sock2) = std::os::unix::net::UnixStream::pair().unwrap();
@@ -2147,6 +2207,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support io_uring")]
     fn test_dispatch_message_unexpected_type() {
         compio::runtime::Runtime::new().unwrap().block_on(async {
             let (sock1, _sock2) = std::os::unix::net::UnixStream::pair().unwrap();
@@ -2175,6 +2236,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support io_uring")]
     fn test_dispatch_message_handshake_already_handshaked() {
         compio::runtime::Runtime::new().unwrap().block_on(async {
             let (sock1, _sock2) = std::os::unix::net::UnixStream::pair().unwrap();
@@ -2188,6 +2250,8 @@ mod tests {
             // Pre-set conn_state to simulate already handshaked
             let (uffd_sock, _) = std::os::unix::net::UnixStream::pair().unwrap();
             uffd_sock.set_nonblocking(true).unwrap();
+            // SAFETY: the `OwnedFd` takes over `uffd_sock`'s descriptor, and `uffd_sock` is
+            // forgotten below so the descriptor is closed only once.
             let uffd_fd = unsafe { OwnedFd::from_raw_fd(uffd_sock.as_raw_fd()) };
             let uffd_poll = PollFd::new(uffd_fd).unwrap();
             let mut conn_state: Option<ConnState> = Some(ConnState {
@@ -2225,6 +2289,7 @@ mod tests {
     // --- handle_stat_request test ---
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support io_uring")]
     fn test_handle_stat_request() {
         compio::runtime::Runtime::new().unwrap().block_on(async {
             let (sock1, sock2) = std::os::unix::net::UnixStream::pair().unwrap();
@@ -2254,6 +2319,7 @@ mod tests {
     // --- handle_handshake with real uffd fd ---
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support io_uring")]
     fn test_handle_handshake_with_uffd_fd() {
         compio::runtime::Runtime::new().unwrap().block_on(async {
             let tmpdir = TempDir::new().unwrap();
@@ -2283,6 +2349,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support io_uring")]
     fn test_handle_handshake_no_uffd_fd() {
         compio::runtime::Runtime::new().unwrap().block_on(async {
             let tmpdir = TempDir::new().unwrap();
@@ -2308,6 +2375,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support io_uring")]
     fn test_handle_handshake_copy_policy() {
         compio::runtime::Runtime::new().unwrap().block_on(async {
             let tmpdir = TempDir::new().unwrap();
@@ -2336,6 +2404,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support io_uring")]
     fn test_handle_handshake_rejects_invalid_vma() {
         compio::runtime::Runtime::new().unwrap().block_on(async {
             let tmpdir = TempDir::new().unwrap();
@@ -2361,6 +2430,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support io_uring")]
     fn test_dispatch_message_closes_unexpected_fds() {
         // A message that carries fds the handler does not expect must have them
         // closed rather than leaked.
@@ -2385,6 +2455,7 @@ mod tests {
             let mut conn_state: Option<ConnState> = None;
 
             let mut sock_fds = [-1_i32; 2];
+            // SAFETY: `sock_fds` is a writable array of two descriptors, as `socketpair` requires.
             let rc = unsafe {
                 libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, sock_fds.as_mut_ptr())
             };
@@ -2412,8 +2483,11 @@ mod tests {
             assert!(res.is_ok());
 
             let n =
+                // SAFETY: `peer_fd` is the test's own socket end and the buffer is one readable
+                // byte.
                 unsafe { libc::send(peer_fd, b"x".as_ptr() as *const _, 1, libc::MSG_NOSIGNAL) };
             let errno = std::io::Error::last_os_error().raw_os_error();
+            // SAFETY: `peer_fd` is owned by the test and closed exactly once.
             unsafe { libc::close(peer_fd) };
 
             assert_eq!(n, -1, "unexpected fd was leaked: send to peer succeeded");
@@ -2424,6 +2498,7 @@ mod tests {
     // --- UffdService create_worker test ---
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
     fn test_uffd_service_create_worker() {
         let tmpdir = TempDir::new().unwrap();
         let device = create_block_device(tmpdir.as_path().to_path_buf()).unwrap();
@@ -2443,6 +2518,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
     fn test_uffd_service_run_without_workers_fails() {
         let tmpdir = TempDir::new().unwrap();
         let device = create_block_device(tmpdir.as_path().to_path_buf()).unwrap();
@@ -2456,6 +2532,7 @@ mod tests {
     // --- async_send_with_fd test ---
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support io_uring")]
     fn test_async_send_with_fd() {
         compio::runtime::Runtime::new().unwrap().block_on(async {
             let (sock1, sock2) = std::os::unix::net::UnixStream::pair().unwrap();
@@ -2481,6 +2558,7 @@ mod tests {
     // --- stop() shutdown socket test ---
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
     fn test_service_stop_shutdown_sockets() {
         let tmpdir = TempDir::new().unwrap();
         let device = create_block_device(tmpdir.as_path().to_path_buf()).unwrap();
@@ -2535,6 +2613,7 @@ mod tests {
     // --- handle_conn graceful shutdown test ---
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support io_uring")]
     fn test_handle_conn_graceful_shutdown() {
         compio::runtime::Runtime::new().unwrap().block_on(async {
             let tmpdir = TempDir::new().unwrap();
@@ -2593,6 +2672,8 @@ mod tests {
 
             // Only unmap the memory region; do NOT close uffd_fd since
             // ownership was transferred to handle_conn via SCM_RIGHTS.
+            // SAFETY: the region was mapped by `setup_uffd_region` and is not touched after this
+            // unmap.
             unsafe {
                 libc::munmap(addr as *mut _, mmap_size);
             }
@@ -2605,6 +2686,7 @@ mod tests {
     // --- handle_uffd_event test ---
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support io_uring")]
     fn test_handle_uffd_event_no_event() {
         compio::runtime::Runtime::new().unwrap().block_on(async {
             let tmpdir = TempDir::new().unwrap();
@@ -2622,6 +2704,8 @@ mod tests {
             let state = ConnState {
                 vma_regions,
                 policy: FaultPolicy::Zerocopy,
+                // SAFETY: `uffd_fd` from `setup_uffd_region` is owned by the test and wrapped
+                // exactly once.
                 uffd_poll: PollFd::new(unsafe { OwnedFd::from_raw_fd(uffd_fd) }).unwrap(),
             };
 
@@ -2632,6 +2716,8 @@ mod tests {
             assert!(result.is_ok());
 
             // Only unmap; OwnedFd owns uffd_fd and will close it on drop.
+            // SAFETY: the region was mapped by `setup_uffd_region` and is not touched after this
+            // unmap.
             unsafe {
                 libc::munmap(addr as *mut _, mmap_size);
             }
@@ -2688,19 +2774,23 @@ mod tests {
 
     #[test]
     fn test_read_uffd_msg_would_block() {
+        // SAFETY: `fds` is a writable array of two descriptors, as `pipe` requires.
         let (read_fd, write_fd) = unsafe {
             let mut fds: [libc::c_int; 2] = [-1, -1];
             let ret = libc::pipe(fds.as_mut_ptr());
             assert_eq!(ret, 0);
             (fds[0], fds[1])
         };
+        // SAFETY: `F_GETFL` only takes integers; `read_fd` is the pipe end created above.
         let flags = unsafe { libc::fcntl(read_fd, libc::F_GETFL, 0) };
         assert!(flags >= 0);
+        // SAFETY: `F_SETFL` only takes integers; `read_fd` is the pipe end created above.
         unsafe { libc::fcntl(read_fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
 
         let result = read_uffd_msg(read_fd);
         assert!(result.unwrap().is_none());
 
+        // SAFETY: both pipe ends are owned by the test and closed exactly once.
         unsafe {
             libc::close(read_fd);
             libc::close(write_fd);
@@ -2708,6 +2798,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
     fn test_uffd_core_new_and_device() {
         let tmpdir = TempDir::new().unwrap();
         let device = create_block_device(tmpdir.as_path().to_path_buf()).unwrap();
@@ -2721,6 +2812,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
     fn test_handle_page_fault_not_pagefault_event() {
         let tmpdir = TempDir::new().unwrap();
         let device = create_block_device(tmpdir.as_path().to_path_buf()).unwrap();
@@ -2748,6 +2840,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
     fn test_handle_page_fault_vma_invalidating_event_errors() {
         // REMAP/REMOVE/UNMAP invalidate the cached VMA layout; the handler must surface an error
         // so the connection tears down rather than resolving faults against stale addresses.
@@ -2780,6 +2873,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
     fn test_handle_page_fault_fork_closes_child_fd() {
         // A FORK event carries a brand-new child uffd fd in the first u64 of the union; the handler
         // must close it (returning Noop) instead of leaking it.
@@ -2800,6 +2894,7 @@ mod tests {
 
         let mut sock_fds = [-1_i32; 2];
         let rc =
+            // SAFETY: `sock_fds` is a writable array of two descriptors, as `socketpair` requires.
             unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, sock_fds.as_mut_ptr()) };
         assert_eq!(
             rc,
@@ -2832,8 +2927,10 @@ mod tests {
         // If the handler closed `child_fd`, the socket peer has no remaining endpoint,
         // and `send(peer_fd, MSG_NOSIGNAL)` returns -1 with EPIPE. If the handler
         // leaked the fd, the send succeeds (data queues into the still-open peer).
+        // SAFETY: `peer_fd` is the test's own socket end and the buffer is one readable byte.
         let n = unsafe { libc::send(peer_fd, b"x".as_ptr() as *const _, 1, libc::MSG_NOSIGNAL) };
         let errno = std::io::Error::last_os_error().raw_os_error();
+        // SAFETY: `peer_fd` is owned by the test and closed exactly once.
         unsafe { libc::close(peer_fd) };
 
         assert_eq!(n, -1, "FORK child fd was leaked: send to peer succeeded");
@@ -2841,6 +2938,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
     fn test_handle_page_fault_addr_not_in_vma() {
         let tmpdir = TempDir::new().unwrap();
         let device = create_block_device(tmpdir.as_path().to_path_buf()).unwrap();
@@ -2868,6 +2966,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
     fn test_handle_page_fault_copy_mode() {
         let tmpdir = TempDir::new().unwrap();
         let device = create_block_device(tmpdir.as_path().to_path_buf()).unwrap();
@@ -2896,6 +2995,9 @@ mod tests {
             assert!(matches!(result, PageFaultResult::Copy));
 
             let magic_ptr = (addr + 1024) as *const u8;
+            // SAFETY: `magic_ptr..magic_ptr + 4` lies inside the region mapped by
+            // `setup_uffd_region`, which `UFFDIO_COPY` has just populated, so the reads do not
+            // fault.
             let magic = unsafe {
                 (*magic_ptr) as u32
                     | (*magic_ptr.add(1) as u32) << 8
@@ -2909,6 +3011,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
     fn test_handle_page_fault_zerocopy_mode() {
         let tmpdir = TempDir::new().unwrap();
         let device = create_block_device(tmpdir.as_path().to_path_buf()).unwrap();
@@ -2946,6 +3049,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
     fn test_resolve_copy() {
         let tmpdir = TempDir::new().unwrap();
         let device = create_block_device(tmpdir.as_path().to_path_buf()).unwrap();
@@ -2957,6 +3061,9 @@ mod tests {
         compio::runtime::Runtime::new().unwrap().block_on(async {
             core.resolve_copy(0, 4096, addr, uffd_fd).await.unwrap();
             let magic_ptr = (addr + 1024) as *const u8;
+            // SAFETY: `magic_ptr..magic_ptr + 4` lies inside the region mapped by
+            // `setup_uffd_region`, which `resolve_copy` has just populated, so the reads do not
+            // fault.
             let magic = unsafe {
                 (*magic_ptr) as u32
                     | (*magic_ptr.add(1) as u32) << 8
@@ -2970,6 +3077,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
     fn test_resolve_zerocopy_ranges() {
         let tmpdir = TempDir::new().unwrap();
         let device = create_block_device(tmpdir.as_path().to_path_buf()).unwrap();
@@ -2991,6 +3099,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
     fn test_prefault_ranges() {
         let tmpdir = TempDir::new().unwrap();
         let device = create_block_device(tmpdir.as_path().to_path_buf()).unwrap();
@@ -3005,6 +3114,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
     fn test_handle_page_fault_beyond_device_zerocopy() {
         let tmpdir = TempDir::new().unwrap();
         let device = create_block_device(tmpdir.as_path().to_path_buf()).unwrap();
@@ -3048,6 +3158,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
     fn test_handle_page_fault_beyond_device_copy() {
         let tmpdir = TempDir::new().unwrap();
         let device = create_block_device(tmpdir.as_path().to_path_buf()).unwrap();
@@ -3083,6 +3194,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support io_uring")]
     fn test_uffdio_wake() {
         compio::runtime::Runtime::new().unwrap().block_on(async {
             let (uffd_fd, addr, mmap_size) = setup_uffd_region(4096).unwrap();
@@ -3113,6 +3225,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support io_uring")]
     fn test_uffdio_wake_invalid_fd() {
         compio::runtime::Runtime::new().unwrap().block_on(async {
             let result = uffdio_wake(-1, 0x1000, 4096).await;

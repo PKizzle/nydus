@@ -1849,6 +1849,11 @@ impl DataBuffer {
 
     #[allow(dead_code)]
     unsafe fn from_mut_slice(buf: &mut [u8]) -> Self {
+        // SAFETY: NOT a sound general-purpose constructor: `Vec::from_raw_parts` requires a pointer
+        // from a global-allocator allocation of exactly `buf.len()` capacity, and the result does
+        // not borrow `buf`. `ManuallyDrop` keeps it from being freed, so it is only usable, as in
+        // its single test, on a whole `Vec` whose length equals its capacity and which outlives the
+        // `DataBuffer`, and only if the buffer is never grown.
         unsafe {
             DataBuffer::Reuse(ManuallyDrop::new(Vec::from_raw_parts(
                 buf.as_mut_ptr(),
@@ -2131,6 +2136,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
     fn persist_cached_data_preserves_write_errno() {
         use std::sync::Arc;
         use vmm_sys_util::tempdir::TempDir;
@@ -2183,6 +2189,8 @@ mod tests {
     #[test]
     fn test_data_buffer() {
         let mut buf1 = vec![0x1u8; 8];
+        // SAFETY: `buf1` is a whole `Vec` with length equal to capacity that outlives `buf2`, and
+        // `buf2` is only read and copied, never grown.
         let buf2 = unsafe { DataBuffer::from_mut_slice(buf1.as_mut_slice()) };
 
         assert_eq!(buf2.slice()[1], 0x1);
@@ -2545,6 +2553,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
     fn test_entries_count_metric_increment() {
         use crate::cache::state::{BlobStateMap, IndexedChunkMap};
         use std::sync::Arc;
@@ -2619,6 +2628,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
     fn test_file_cache_meta_reloads_after_background_load_failed() {
         use vmm_sys_util::tempdir::TempDir;
 
@@ -2682,6 +2692,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
     fn test_file_cache_meta_reload_under_contention_waits_for_the_in_flight_reload() {
         use vmm_sys_util::tempdir::TempDir;
 

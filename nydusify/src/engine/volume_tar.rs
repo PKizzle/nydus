@@ -366,6 +366,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support O_PATH")]
     fn a_symlink_out_of_the_volume_is_archived_not_followed() {
         let root = fake_root();
         symlink("/etc", root.path().join("vol/escape")).unwrap();
@@ -383,6 +384,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support O_PATH")]
     fn a_path_through_a_symlink_resolves_inside_the_root() {
         let root = fake_root();
         symlink("/etc", root.path().join("vol/escape")).unwrap();
@@ -394,6 +396,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support O_PATH")]
     fn an_absolute_symlink_on_the_requested_path_resolves_inside_the_root() {
         let root = fake_root();
         fs::write(root.path().join("vol/file"), b"in the volume").unwrap();
@@ -410,6 +413,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support O_PATH")]
     fn magic_links_are_refused() {
         // A container's own /proc is a real procfs, whose `root` and `fd/*`
         // links lead anywhere. With the host's / as the root, the path below
@@ -429,6 +433,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support O_PATH")]
     fn hardlinks_within_the_volume_are_kept() {
         let root = fake_root();
         fs::write(root.path().join("vol/a"), b"shared").unwrap();
@@ -443,13 +448,17 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support mkfifo")]
     fn devices_fifos_and_metadata_are_carried() {
         let root = fake_root();
         let fifo = CString::new(root.path().join("vol/pipe").as_os_str().as_bytes()).unwrap();
+        // SAFETY: `fifo` is a NUL-terminated path that outlives the call.
         assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o640) }, 0);
         // A device node needs CAP_MKNOD; without it only the fifo is checked.
         let dev = CString::new(root.path().join("vol/null").as_os_str().as_bytes()).unwrap();
         let have_dev =
+            // SAFETY: `dev` is a NUL-terminated path that outlives the call; the mode and device
+            // number are integers.
             unsafe { libc::mknod(dev.as_ptr(), libc::S_IFCHR | 0o600, libc::makedev(1, 3)) } == 0;
         let file = root.path().join("vol/script");
         fs::write(&file, b"#!/bin/sh\n").unwrap();
@@ -489,6 +498,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support xattrs")]
     fn xattrs_round_trip() {
         let root = fake_root();
         let file = root.path().join("vol/labelled");
@@ -510,6 +520,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support Unix sockets")]
     fn whiteout_names_and_sockets_are_skipped() {
         let root = fake_root();
         fs::write(root.path().join("vol/.wh.passwd"), b"").unwrap();
@@ -523,6 +534,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support setfsuid")]
     fn an_unreadable_file_is_skipped_with_a_warning() {
         let root = fake_root();
         fs::write(root.path().join("vol/locked"), b"secret").unwrap();
@@ -543,6 +555,7 @@ mod tests {
 
         let mut out = Vec::new();
         let result = write_volume_tar_to(root.path(), Path::new("/vol"), &mut out);
+        // SAFETY: `setfsuid` only takes an integer; this restores the thread's previous fsuid.
         unsafe { libc::setfsuid(old as libc::uid_t) };
 
         let stats = result.unwrap();
@@ -586,12 +599,16 @@ mod tests {
         let c = |p: &Path| CString::new(p.as_os_str().as_bytes()).unwrap();
         let (c_root, c_data, c_volume) = (c(&rootfs), c(&rootfs.join("data")), c(&volume));
         let mut fds = [0; 2];
+        // SAFETY: `fds` is a writable array of two descriptors, as `pipe` requires.
         assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
         // SAFETY: the child only makes async-signal-safe syscalls on memory
         // prepared before the fork, then waits to be killed.
         let pid = unsafe { libc::fork() };
         assert!(pid >= 0);
         if pid == 0 {
+            // SAFETY: the forked child only makes async-signal-safe syscalls on `CString`s and
+            // descriptors prepared before the fork, never returns into Rust code, and waits in
+            // `pause` until it is killed.
             unsafe {
                 let ok = libc::unshare(libc::CLONE_NEWNS) == 0
                     && libc::mount(
@@ -616,6 +633,8 @@ mod tests {
             }
         }
         let mut ready = [0u8; 1];
+        // SAFETY: `ready` is one writable byte and `fds[0]` is the pipe's read end owned by this
+        // test.
         unsafe { libc::read(fds[0], ready.as_mut_ptr().cast(), 1) };
         let proc_root = PathBuf::from(format!("/proc/{pid}/root"));
         let result = std::panic::catch_unwind(|| {
@@ -633,6 +652,8 @@ mod tests {
             let (_, entries) = archive(&proc_root, "/data/escape/passwd");
             assert_eq!(find(&entries, "data/escape/passwd").data, b"inside");
         });
+        // SAFETY: `pid` is the child forked above (checked non-negative), which this test owns and
+        // reaps once.
         unsafe {
             libc::kill(pid, libc::SIGKILL);
             libc::waitpid(pid, std::ptr::null_mut(), 0);

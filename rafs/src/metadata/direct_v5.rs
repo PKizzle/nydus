@@ -223,8 +223,8 @@ impl DirectSuperBlockV5 {
         // Prefetch the bootstrap file
         readahead(file.as_raw_fd(), 0, len);
 
-        // Mmap the bootstrap file into current process for direct access. Safe because nydus only
-        // reads the bootstrap, which must not change while it's mounted.
+        // Mmap the bootstrap file into current process for direct access.
+        // SAFETY: nydus only reads the bootstrap, which must not change while it's mounted.
         let file_map = Arc::new(unsafe { FileMapState::new(file, 0, size, false) }?);
 
         // Load blob table. Safe because we have validated the blob table layout.

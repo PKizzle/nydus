@@ -66,6 +66,8 @@ fn nbd_ioctl(fd: RawFd, cmd: u32, arg: u64) -> Result<libc::c_int> {
     // `c_int` on linux-musl/android — `as _` lets the compiler pick the right
     // width per target so the musl static-release builds stop tripping E0308.
     let code = (0xab_u32 << 8) | cmd;
+    // SAFETY: every NBD ioctl this helper issues takes an integer argument (or none), so `arg` is
+    // never dereferenced as a pointer; `fd` is the caller's open NBD device.
     nix::errno::Errno::result(unsafe { libc::ioctl(fd, code as _, arg) })
         .map_err(|e| Error::Nbd(format!("block_nbd: ioctl 0x{:x} failed, {}", cmd, e)))
 }
@@ -705,6 +707,7 @@ mod tests {
     // socket). Construct a worker directly over a socketpair so no `/dev/nbd*`
     // device is needed.
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support io_uring")]
     fn test_nbd_worker_exits_on_shutdown_broadcast() {
         compio::runtime::Runtime::new().unwrap().block_on(async {
             let tmpdir = TempDir::new().unwrap();

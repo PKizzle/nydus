@@ -13,8 +13,13 @@ static ALLOC_ALIGN: AtomicUsize = AtomicUsize::new(0);
 static FREE_SIZE: AtomicUsize = AtomicUsize::new(0);
 static FREE_ALIGN: AtomicUsize = AtomicUsize::new(0);
 
+// SAFETY: every method forwards to `System` with the caller's layout and pointer unchanged, so this
+// allocator upholds exactly the `GlobalAlloc` contract `System` does; the bookkeeping only touches
+// atomics and never allocates.
 unsafe impl GlobalAlloc for Checked {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        // SAFETY: the caller upholds `GlobalAlloc::alloc`'s contract (non-zero size), which is
+        // forwarded as is.
         let ptr = unsafe { System.alloc(layout) };
         if WATCH.load(Ordering::SeqCst) && layout.align() == 4096 {
             PTR.store(ptr as usize, Ordering::SeqCst);
@@ -28,6 +33,8 @@ unsafe impl GlobalAlloc for Checked {
             FREE_SIZE.store(layout.size(), Ordering::SeqCst);
             FREE_ALIGN.store(layout.align(), Ordering::SeqCst);
         }
+        // SAFETY: `ptr` was returned by `alloc` above, which got it from `System` with this
+        // `layout`.
         unsafe { System.dealloc(ptr, layout) };
     }
 }

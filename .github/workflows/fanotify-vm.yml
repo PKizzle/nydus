@@ -3,13 +3,16 @@ name: Fanotify VM
 # The fanotify/EROFS on-demand path needs Linux >= 6.14 (FAN_PRE_ACCESS). Hosted runners move
 # kernels without notice, so this job does not test against theirs: it builds on the runner and
 # runs misc/fanotify/run-all.sh as root inside virtme-ng VMs booting pinned Ubuntu mainline
-# kernels, with the runner's filesystem shared in.
+# kernels, with the runner's filesystem shared in. Each kernel also runs the file-backed EROFS
+# partial-folio self-test (service/src/erofs_folio.rs) and must give the verdict listed for it.
 on:
   # `push` covers long-lived branches only; a feature branch runs through its pull request.
   push:
     branches: [master, production, "stable/**"]
     paths: &paths
       - 'service/src/fanotify*'
+      - 'service/src/erofs_folio.rs'
+      - 'service/examples/erofs_folio_probe.rs'
       - 'storage/**'
       - 'rafs/**'
       - 'builder/**'
@@ -18,6 +21,7 @@ on:
       - 'snapshotter/src/local_accel.rs'
       - 'snapshotter/src/auto_accel_sidecar.rs'
       - 'misc/fanotify/**'
+      - 'misc/erofs-folio/**'
       - '.github/workflows/fanotify-vm.yml'
   pull_request:
     paths: *paths
@@ -38,27 +42,39 @@ jobs:
       cancel-in-progress: true
     strategy:
       fail-fast: false
-      # Ubuntu mainline builds: 6.18.y is the supported floor, 7.3.y the newest kernel features.
-      # Per entry, bump all four together (sha256 from the release's CHECKSUMS file).
+      # Ubuntu mainline builds: 6.18.y is the supported floor, 7.3.y the newest release, 7.4-rc the
+      # first with the EROFS partial-folio fix (52dceb88082b), which 7.3.1 lacks. `erofs_folio` is
+      # the self-test verdict on 4K pages, where 512-byte-block images trigger the bug.
+      # Per entry, bump all five together (sha256 from the release's CHECKSUMS file).
       matrix:
         include:
         - kernel: 6.18.55
+          erofs_folio: unaffected
           image_deb: linux-image-unsigned-6.18.55-061855-generic_6.18.55-061855.202610031245_amd64.deb
           modules_deb: linux-modules-6.18.55-061855-generic_6.18.55-061855.202610031245_amd64.deb
           sha256: |
             510c01027df618ed21f2ab7027f946e7e8d64e4c88702722577470dca03ee30f  linux-image-unsigned-6.18.55-061855-generic_6.18.55-061855.202610031245_amd64.deb
             0f532598e00ba37515288eda4b53426ee7ce53abb99d949c911873c679d6aaf5  linux-modules-6.18.55-061855-generic_6.18.55-061855.202610031245_amd64.deb
         - kernel: 7.3.1
+          erofs_folio: affected
           image_deb: linux-image-unsigned-7.3.1-070301-generic_7.3.1-070301.202610301300_amd64.deb
           modules_deb: linux-modules-7.3.1-070301-generic_7.3.1-070301.202610301300_amd64.deb
           sha256: |
             93c7c059e51cd81d7aa817f0cb0d2a7e94c5b04642a8e20de8b4ab4628b6a357  linux-image-unsigned-7.3.1-070301-generic_7.3.1-070301.202610301300_amd64.deb
             7f9a44175036fd63b01ec317ccace29e184261a794d39046902439458fb18c2f  linux-modules-7.3.1-070301-generic_7.3.1-070301.202610301300_amd64.deb
+        - kernel: 7.4-rc1
+          erofs_folio: unaffected
+          image_deb: linux-image-unsigned-7.4.0-070400rc1-generic_7.4.0-070400rc1.202611012313_amd64.deb
+          modules_deb: linux-modules-7.4.0-070400rc1-generic_7.4.0-070400rc1.202611012313_amd64.deb
+          sha256: |
+            5cba6ee87fbd2e326256fadadfd70048245d33cc244dca9daecd7e8b3e8ea29b  linux-image-unsigned-7.4.0-070400rc1-generic_7.4.0-070400rc1.202611012313_amd64.deb
+            8febb36deb72ced896b98c7991ddcff6046622f7575fed54370b95a1f9bf6dba  linux-modules-7.4.0-070400rc1-generic_7.4.0-070400rc1.202611012313_amd64.deb
     env:
       KERNEL_URL: https://kernel.ubuntu.com/mainline/v${{ matrix.kernel }}/amd64
       KERNEL_IMAGE_DEB: ${{ matrix.image_deb }}
       KERNEL_MODULES_DEB: ${{ matrix.modules_deb }}
       KERNEL_SHA256: ${{ matrix.sha256 }}
+      EROFS_FOLIO: ${{ matrix.erofs_folio }}
     steps:
     - name: Checkout
       uses: actions/checkout@v6
@@ -73,6 +89,7 @@ jobs:
     - name: Build nydusd, nydus-image and the snapshotter test binary
       run: |
         cargo build --release --bin nydusd --bin nydus-image
+        cargo build --release -p nydus-service --example erofs_folio_probe
         BIN=$(cargo test -p nydus-snapshotter --lib --no-run --message-format=json \
           | jq -r 'select(.profile.test and .executable != null and (.target.kind | index("lib"))) | .executable' | tail -1)
         test -x "$BIN"
@@ -80,7 +97,7 @@ jobs:
     - name: Install VM tooling
       run: |
         sudo apt-get update -qq
-        sudo apt-get install -y -qq qemu-system-x86 virtiofsd zstd e2fsprogs strace
+        sudo apt-get install -y -qq qemu-system-x86 virtiofsd zstd e2fsprogs strace erofs-utils
         pipx install "virtme-ng==$VIRTME_NG_VERSION"
         # Let the runner user open /dev/kvm.
         echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
@@ -88,17 +105,31 @@ jobs:
         sudo udevadm control --reload-rules && sudo udevadm trigger --name-match=kvm
         ls -l /dev/kvm
     - name: Fetch kernel
+      id: fetch
       run: |
         K="$RUNNER_TEMP/kernel"; mkdir -p "$K"; cd "$K"
-        curl -fsSLO "$KERNEL_URL/$KERNEL_IMAGE_DEB"
-        curl -fsSLO "$KERNEL_URL/$KERNEL_MODULES_DEB"
+        curl -fsSLO --retry 5 --retry-all-errors "$KERNEL_URL/$KERNEL_IMAGE_DEB"
+        curl -fsSLO --retry 5 --retry-all-errors "$KERNEL_URL/$KERNEL_MODULES_DEB"
         echo "$KERNEL_SHA256" | sha256sum -c
         dpkg-deb -x "$KERNEL_IMAGE_DEB" root; dpkg-deb -x "$KERNEL_MODULES_DEB" root
         CONFIG=$(ls root/boot/config-*)
         grep -E '^CONFIG_FANOTIFY_ACCESS_PERMISSIONS=y|^CONFIG_EROFS_FS=' "$CONFIG"
         grep -q '^CONFIG_FANOTIFY_ACCESS_PERMISSIONS=y' "$CONFIG"
         echo "VMLINUZ=$(ls "$K"/root/boot/vmlinuz-*)" >> "$GITHUB_ENV"
+    - name: EROFS partial-folio self-test in the VM
+      run: |
+        D="$RUNNER_TEMP/folio"; mkdir -p "$D"
+        bash misc/erofs-folio/demo-image.sh "$D/demo.erofs" 512 4096
+        truncate -s 64M "$D/ext4.img"; mkfs.ext4 -q -F "$D/ext4.img"
+        vng --run "$VMLINUZ" --user root --cpus 2 --memory 1G --rwdir "$RUNNER_TEMP" --exec "
+          set -e
+          modprobe erofs
+          mkdir -p /var/tmp/folio && mount -o loop '$D/ext4.img' /var/tmp/folio
+          '$GITHUB_WORKSPACE/target/release/examples/erofs_folio_probe' /var/tmp/folio '$D/demo.erofs' || true
+        " | tee "$D/probe.log"
+        bash misc/erofs-folio/expect.sh "$D/probe.log" "$EROFS_FOLIO" image
     - name: Run misc/fanotify in the VM
+      if: ${{ !cancelled() && steps.fetch.outcome == 'success' }}
       run: |
         echo "runner kernel: $(uname -r)"
         vng --run "$VMLINUZ" --user root --cpus 4 --memory 6G --rwdir "$RUNNER_TEMP" --exec "
@@ -118,3 +149,76 @@ jobs:
           SNAPSHOTTER_TEST_BIN='$SNAPSHOTTER_TEST_BIN' \
           IMG='$RUNNER_TEMP/fanotify-ci.img' \
           bash misc/fanotify/run-all.sh"
+
+  # The partial-folio bug's common trigger: 4K-block images on a large-page kernel. Hosted runners
+  # have no 16K/64K-page kernel and no KVM, so misc/erofs-folio/qemu-test.sh boots Ubuntu's arm64
+  # 64K-page builds under QEMU TCG with a busybox initrd (seconds per boot).
+  erofs-folio-arm64:
+    name: erofs-folio (arm64 64K pages, ${{ matrix.kernel }})
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+    concurrency:
+      group: ${{ github.workflow }}-${{ github.head_ref || github.ref_name }}-arm64-${{ matrix.kernel }}
+      cancel-in-progress: true
+    strategy:
+      fail-fast: false
+      # Per entry, bump all five together (sha256 from the release's CHECKSUMS file).
+      matrix:
+        include:
+        - kernel: 7.3.1
+          erofs_folio: affected
+          image_deb: linux-image-unsigned-7.3.1-070301-generic-64k_7.3.1-070301.202610301300_arm64.deb
+          modules_deb: linux-modules-7.3.1-070301-generic-64k_7.3.1-070301.202610301300_arm64.deb
+          sha256: |
+            be9788ec21f71180cd139860e5c96afc34ba0c157b7d6381c661683aba24e702  linux-image-unsigned-7.3.1-070301-generic-64k_7.3.1-070301.202610301300_arm64.deb
+            0620b23fccb968d6276ef49ca276af2dd3c86a6278fdf603dab587763538647d  linux-modules-7.3.1-070301-generic-64k_7.3.1-070301.202610301300_arm64.deb
+        - kernel: 7.4-rc1
+          erofs_folio: unaffected
+          image_deb: linux-image-unsigned-7.4.0-070400rc1-generic-64k_7.4.0-070400rc1.202611012313_arm64.deb
+          modules_deb: linux-modules-7.4.0-070400rc1-generic-64k_7.4.0-070400rc1.202611012313_arm64.deb
+          sha256: |
+            e5189da36f8c93ea7afab451095eb9d167a2b16b307867387a6d24ac0828946c  linux-image-unsigned-7.4.0-070400rc1-generic-64k_7.4.0-070400rc1.202611012313_arm64.deb
+            27846332665980ddaf169ead8671d259a8f2fe93a244139ba165236637788ea9  linux-modules-7.4.0-070400rc1-generic-64k_7.4.0-070400rc1.202611012313_arm64.deb
+    env:
+      KERNEL_URL: https://kernel.ubuntu.com/mainline/v${{ matrix.kernel }}/arm64
+      KERNEL_IMAGE_DEB: ${{ matrix.image_deb }}
+      KERNEL_MODULES_DEB: ${{ matrix.modules_deb }}
+      KERNEL_SHA256: ${{ matrix.sha256 }}
+      EROFS_FOLIO: ${{ matrix.erofs_folio }}
+      CC_aarch64_unknown_linux_musl: musl-gcc
+      CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v6
+    - name: Install tooling
+      run: |
+        sudo apt-get update -qq
+        sudo apt-get install -y -qq musl-tools qemu-system-arm busybox-static cpio zstd e2fsprogs erofs-utils
+    - uses: dsherret/rust-toolchain-file@v1
+    - name: Add musl target
+      run: rustup target add aarch64-unknown-linux-musl
+    - name: Rust Cache
+      uses: Swatinem/rust-cache@v2
+      with:
+        cache-on-failure: true
+        shared-key: erofs-folio-arm64
+    - name: Build the static probe
+      run: cargo build --release -p nydus-service --example erofs_folio_probe --target aarch64-unknown-linux-musl
+    - name: Fetch kernel
+      run: |
+        K="$RUNNER_TEMP/kernel"; mkdir -p "$K"; cd "$K"
+        curl -fsSLO --retry 5 --retry-all-errors "$KERNEL_URL/$KERNEL_IMAGE_DEB"
+        curl -fsSLO --retry 5 --retry-all-errors "$KERNEL_URL/$KERNEL_MODULES_DEB"
+        echo "$KERNEL_SHA256" | sha256sum -c
+        dpkg-deb -x "$KERNEL_IMAGE_DEB" root
+        dpkg-deb --fsys-tarfile "$KERNEL_MODULES_DEB" > modules.tar
+        # The config ships in the modules package.
+        tar xOf modules.tar --wildcards '*/boot/config-*' | grep -E '^CONFIG_ARM64_64K_PAGES=y'
+        echo "VMLINUZ=$(ls "$K"/root/boot/vmlinuz-*)" >> "$GITHUB_ENV"
+    - name: EROFS partial-folio self-test under QEMU
+      run: |
+        # 4K blocks, the nydus default.
+        bash misc/erofs-folio/demo-image.sh "$RUNNER_TEMP/demo.erofs" 4096 65536
+        KERNEL="$VMLINUZ" PROBE=target/aarch64-unknown-linux-musl/release/examples/erofs_folio_probe \
+        MODULES_TAR="$RUNNER_TEMP/kernel/modules.tar" DEMO_IMAGE="$RUNNER_TEMP/demo.erofs" EXPECT="$EROFS_FOLIO" \
+          bash misc/erofs-folio/qemu-test.sh

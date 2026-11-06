@@ -83,6 +83,7 @@ fn open_without_events_via(
     if fds.is_empty() {
         return Ok(Vec::new());
     }
+    // SAFETY: `fanotify_init` only takes integer flags; the result is checked below.
     let raw = unsafe {
         libc::fanotify_init(
             libc::FAN_CLASS_CONTENT | libc::FAN_CLOEXEC | libc::FAN_NONBLOCK,
@@ -92,10 +93,13 @@ fn open_without_events_via(
     if raw < 0 {
         return Err(std::io::Error::last_os_error());
     }
-    // Dropping the group on any return answers whatever is still queued, so the opener below
+    // SAFETY: `raw` is the new group descriptor (checked non-negative above) and nothing else owns
+    // it. Dropping the group on any return answers whatever is still queued, so the opener below
     // cannot be left blocked.
     let group = unsafe { OwnedFd::from_raw_fd(raw) };
     for &fd in fds {
+        // SAFETY: `raw` is the live group fd owned by `group`, `fd` is a descriptor the caller
+        // keeps open for this call, and a NULL path marks `fd` itself.
         if unsafe {
             libc::fanotify_mark(
                 raw,
@@ -146,6 +150,7 @@ fn open_without_events_via(
         };
         // Short slices, so an opener failure is noticed without waiting out the deadline.
         let slice = left.min(std::time::Duration::from_millis(20)).as_millis() as libc::c_int;
+        // SAFETY: `pfd` is a live, initialized `pollfd` and the count is 1.
         if unsafe { libc::poll(&mut pfd, 1, slice) } < 0 {
             let e = std::io::Error::last_os_error();
             if e.kind() == ErrorKind::Interrupted {
@@ -153,6 +158,7 @@ fn open_without_events_via(
             }
             break Err(e);
         }
+        // SAFETY: `buf` is writable for `buf.len()` bytes and `raw` is the live group fd.
         let n = unsafe { libc::read(raw, buf.as_mut_ptr().cast(), buf.len()) };
         if n < 0 {
             let e = std::io::Error::last_os_error();
@@ -167,6 +173,8 @@ fn open_without_events_via(
             }
             // Every opener of the inodes is allowed; only our own opens' descriptors are kept.
             write_response(raw, meta.fd, FAN_ALLOW);
+            // SAFETY: every event with `fd >= 0` carries a fresh descriptor the kernel installed
+            // for this process, owned by whoever reads the event; it is wrapped exactly once.
             let event_fd = unsafe { OwnedFd::from_raw_fd(meta.fd) };
             if meta.pid as u32 != std::process::id() {
                 return;
@@ -195,6 +203,7 @@ fn open_without_events_via(
 fn fd_identity(fd: RawFd) -> Result<(u64, u64)> {
     // SAFETY: `stat` is plain-old-data; `fstat` only writes into it.
     let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: `st` is a writable `stat` that outlives the call; a bad fd only makes `fstat` fail.
     let ret = unsafe { libc::fstat(fd, &mut st) };
     if ret != 0 {
         return Err(std::io::Error::last_os_error());
@@ -220,6 +229,8 @@ struct AssertBlobThreadSafe(DataBlob);
 // SAFETY: see the type-level comment — raw-fd-only access from worker threads; the inner
 // compio fd's refcount is never mutated concurrently.
 unsafe impl Send for AssertBlobThreadSafe {}
+// SAFETY: shared access to the inner `DataBlob` only reads its raw fd (see the type-level comment),
+// so no `Rc` refcount or other unsynchronized state is touched concurrently.
 unsafe impl Sync for AssertBlobThreadSafe {}
 
 impl std::ops::Deref for AssertBlobThreadSafe {
@@ -271,6 +282,8 @@ impl BlobBacking {
     /// the whole path rests on -- so they are the same object to fanotify, and a descriptor we
     /// already hold cannot be raced by a rename the way a path lookup can.
     fn set_mark(&self, fan_fd: RawFd, flags: u32) -> Result<()> {
+        // SAFETY: `fan_fd` is the caller's live group fd and the blob file's descriptor stays open
+        // for the call; a NULL path marks that descriptor itself.
         let ret = unsafe {
             libc::fanotify_mark(
                 fan_fd,
@@ -366,6 +379,8 @@ impl<'a> EventFdGuard<'a> {
     fn finish(mut self, response: u32) {
         if !self.answered {
             self.handler.write_response(self.fd, response);
+            // SAFETY: `self.fd` is the event's descriptor, owned by this guard, and `answered`
+            // ensures it is closed exactly once.
             unsafe {
                 libc::close(self.fd);
             }
@@ -379,6 +394,8 @@ impl Drop for EventFdGuard<'_> {
         if !self.answered {
             self.handler
                 .write_response(self.fd, fan_deny_errno(libc::EIO));
+            // SAFETY: `self.fd` is the event's descriptor, owned by this guard, and `answered`
+            // ensures it is closed exactly once.
             unsafe {
                 libc::close(self.fd);
             }
@@ -673,10 +690,14 @@ pub(crate) fn mount_erofs_with(bootstrap: &Path, mountpoint: &Path, options: &st
         cvt(ret).map(|fd| unsafe { OwnedFd::from_raw_fd(fd as RawFd) })
     }
 
+    // SAFETY: `fsopen` takes a NUL-terminated string literal and integer flags; the result is
+    // checked by `fd`.
     let fs = fd(unsafe { libc::syscall(libc::SYS_fsopen, c"erofs".as_ptr(), FSOPEN_CLOEXEC) })?;
     let config = |cmd: libc::c_uint, key: Option<&str>, value: Option<&[u8]>| -> Result<()> {
         let key = key.map(|k| cstr(k.as_bytes())).transpose()?;
         let value = value.map(cstr).transpose()?;
+        // SAFETY: `fs` is the live fs-context fd, and the key and value are NUL-terminated
+        // `CString`s (or NULL where the command takes none) that outlive the call.
         let ret = unsafe {
             libc::syscall(
                 libc::SYS_fsconfig,
@@ -712,6 +733,7 @@ pub(crate) fn mount_erofs_with(bootstrap: &Path, mountpoint: &Path, options: &st
         // context fd rather than dmesg; surface it, leaving the returned errno untouched.
         let mut buf = [0u8; 512];
         loop {
+            // SAFETY: `buf` is writable for `buf.len()` bytes and `fs` is the live fs-context fd.
             let n = unsafe { libc::read(fs.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
             if n <= 0 {
                 break;
@@ -731,8 +753,12 @@ pub(crate) fn mount_erofs_with(bootstrap: &Path, mountpoint: &Path, options: &st
     // this mount.
     let attrs = libc::MOUNT_ATTR_RDONLY | libc::MOUNT_ATTR_NODEV | libc::MOUNT_ATTR_NOSUID;
     let mnt =
+        // SAFETY: `fsmount` takes the live fs-context fd and integer flags; the result is checked
+        // by `fd`.
         fd(unsafe { libc::syscall(libc::SYS_fsmount, fs.as_raw_fd(), FSMOUNT_CLOEXEC, attrs) })?;
     let mountpoint_c = cstr(mountpoint.as_os_str().as_encoded_bytes())?;
+    // SAFETY: `mnt` is the live detached-mount fd, and both paths are NUL-terminated strings that
+    // outlive the call.
     let ret = unsafe {
         libc::syscall(
             libc::SYS_move_mount,
@@ -780,10 +806,13 @@ impl FanotifyHandler {
         // observable difference of leaving it off is that fanotify_init
         // succeeds where it previously failed. Same fix mirrored in
         // `snapshotter/src/probe/mod.rs::try_fanotify_init`.
+        // SAFETY: `fanotify_init` only takes integer flags; the result is checked below.
         let raw_fd = unsafe { libc::fanotify_init(init_flags, libc::O_RDONLY as u32) };
         if raw_fd < 0 {
             return Err(std::io::Error::last_os_error());
         }
+        // SAFETY: `raw_fd` is the new group descriptor (checked non-negative above) and nothing
+        // else owns it.
         let fan_fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
 
         Self::assemble(blob_dir, mountpoint, blob_cache_mgr, threads, fan_fd)
@@ -958,6 +987,10 @@ impl FanotifyHandler {
                 })?
                 .as_raw_fd();
             for target in [cache_fd, backing.blob.file().as_raw_fd()] {
+                // SAFETY: `quiet` and `target` are both open descriptors held for the duration of
+                // the call. `dup3` atomically re-points the existing `target` number at the
+                // event-free open file; ownership of the number stays with the blob objects, and
+                // `quiet` keeps its own.
                 if unsafe { libc::dup3(quiet.as_raw_fd(), target, libc::O_CLOEXEC) } < 0 {
                     return Err(std::io::Error::last_os_error());
                 }
@@ -1221,6 +1254,7 @@ impl FanotifyHandler {
         let mut buf = vec![0u8; EVENT_BUF_SIZE];
         let mut denied = 0usize;
         loop {
+            // SAFETY: `buf` is writable for `buf.len()` bytes and the group fd is owned by `self`.
             let n = unsafe {
                 libc::read(
                     self.fan_fd.as_raw_fd(),
@@ -1247,6 +1281,8 @@ impl FanotifyHandler {
             return;
         }
         self.write_response(event_fd, fan_deny_errno(libc::EIO));
+        // SAFETY: `event_fd` is an event descriptor (checked non-negative above) owned by the
+        // caller, who hands it over to be answered and closed exactly once here.
         unsafe {
             libc::close(event_fd);
         }
@@ -1275,10 +1311,14 @@ impl FanotifyHandler {
     /// the upgrade path passes it explicitly via `SCM_RIGHTS` instead.
     pub fn get_file(&self) -> Result<File> {
         let raw = self.fan_fd.as_raw_fd();
+        // SAFETY: `F_DUPFD_CLOEXEC` duplicates the live group fd owned by `self`; the result is
+        // checked below.
         let fd = unsafe { libc::fcntl(raw, libc::F_DUPFD_CLOEXEC, 0) };
         if fd < 0 {
             return Err(std::io::Error::last_os_error());
         }
+        // SAFETY: `fcntl` returned a new descriptor (checked non-negative above) that nothing else
+        // owns.
         Ok(unsafe { File::from_raw_fd(fd) })
     }
 
@@ -1412,6 +1452,7 @@ impl FanotifyHandler {
     /// an unrelated new event re-arms the readiness edge.
     fn drain_events(&self, buf: &mut [u8]) -> Result<()> {
         loop {
+            // SAFETY: `buf` is writable for `buf.len()` bytes and the group fd is owned by `self`.
             let n = unsafe {
                 libc::read(
                     self.fan_fd.as_raw_fd(),
@@ -1806,6 +1847,8 @@ impl FanotifyHandler {
                 if len == 0 {
                     return Ok(());
                 }
+                // SAFETY: `fallocate` only takes integers; `fd` is the blob's open cache file
+                // descriptor.
                 let ret = unsafe {
                     libc::fallocate(
                         fd,
@@ -1867,6 +1910,8 @@ fn write_response(group: RawFd, event_fd: RawFd, response: u32) {
         fd: event_fd,
         response,
     };
+    // SAFETY: `fanotify_response` is a `#[repr(C)]` pair of 32-bit integers with no padding, so all
+    // its bytes are initialized; the slice borrows the local `resp`.
     let resp_buf = unsafe {
         std::slice::from_raw_parts(
             &resp as *const fanotify_response as *const u8,
@@ -1874,6 +1919,7 @@ fn write_response(group: RawFd, event_fd: RawFd, response: u32) {
         )
     };
     loop {
+        // SAFETY: `resp_buf` is readable for its length and outlives the call.
         let ret = unsafe {
             libc::write(
                 group,
@@ -1948,6 +1994,7 @@ fn for_each_parsable_event(buf: &[u8], mut f: impl FnMut(&libc::fanotify_event_m
 fn fd_file_size(fd: RawFd) -> Result<u64> {
     // SAFETY: `stat` is plain-old-data; `fstat` only writes into it.
     let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: `st` is a writable `stat` that outlives the call; a bad fd only makes `fstat` fail.
     let ret = unsafe { libc::fstat(fd, &mut st) };
     if ret != 0 {
         return Err(std::io::Error::last_os_error());
@@ -2011,6 +2058,7 @@ pub(crate) mod testing {
             let dir = TempDir::new().unwrap();
             stage_bootstrap(dir.as_path(), |sb, _| sb.set_extra_devices(0));
             let mut fds = [0; 2];
+            // SAFETY: `fds` is a writable array of two descriptors, as `socketpair` requires.
             let ret = unsafe {
                 libc::socketpair(
                     libc::AF_UNIX,
@@ -2022,14 +2070,18 @@ pub(crate) mod testing {
             assert_eq!(ret, 0);
             // Like a real group fd, the handler's end never blocks a read.
             assert_eq!(
+                // SAFETY: `fds[0]` is the socket just created above.
                 unsafe { libc::fcntl(fds[0], libc::F_SETFL, libc::O_NONBLOCK) },
                 0
             );
+            // SAFETY: `fds[1]` is the socket just created above and is wrapped exactly once.
             let peer = unsafe { OwnedFd::from_raw_fd(fds[1]) };
             let timeout = libc::timeval {
                 tv_sec: 5,
                 tv_usec: 0,
             };
+            // SAFETY: `fds[1]` is a live socket and `timeout` is a `timeval` that outlives the
+            // call, with its exact size passed.
             let ret = unsafe {
                 libc::setsockopt(
                     fds[1],
@@ -2046,6 +2098,8 @@ pub(crate) mod testing {
                     dir.as_path().join("mnt").to_str().unwrap(),
                     Arc::new(BlobCacheMgr::new()),
                     threads,
+                    // SAFETY: `fds[0]` is the socket just created above and is wrapped exactly
+                    // once.
                     unsafe { File::from_raw_fd(fds[0]) },
                 )
                 .unwrap(),
@@ -2065,6 +2119,8 @@ pub(crate) mod testing {
         }
 
         pub(crate) fn send(&self, buf: &[u8]) {
+            // SAFETY: `buf` is readable for `buf.len()` bytes and the peer socket is owned by
+            // `self`.
             let n = unsafe {
                 libc::write(
                     self.peer.as_raw_fd(),
@@ -2081,6 +2137,8 @@ pub(crate) mod testing {
             // A socket read with SO_RCVTIMEO is not restarted after a signal, even with
             // SA_RESTART, so retry EINTR here.
             let n = loop {
+                // SAFETY: `resp` is a writable `fanotify_response` of exactly the size passed,
+                // and any bytes are a valid value for its two integers.
                 let n = unsafe {
                     libc::read(
                         self.peer.as_raw_fd(),
@@ -2137,6 +2195,8 @@ pub(crate) mod testing {
             std::slice::from_raw_parts(&meta as *const _ as *const u8, std::mem::size_of_val(&meta))
         }
         .to_vec();
+        // SAFETY: `fanotify_event_info_range` is a `#[repr(C)]` struct laid out without padding
+        // (header, `u32`, two `u64`s), so all its bytes are initialized; the slice borrows `range`.
         buf.extend_from_slice(unsafe {
             std::slice::from_raw_parts(
                 &range as *const _ as *const u8,
@@ -2203,6 +2263,7 @@ mod tests {
     /// A bootstrap with data devices and no registered data blob would mount as one flat
     /// device and answer every file read with EIO, so the handler must refuse it.
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
     fn test_refuses_bootstrap_whose_devices_have_no_data_blob() {
         let dir = vmm_sys_util::tempdir::TempDir::new().unwrap();
         let root = std::env::var("CARGO_MANIFEST_DIR").unwrap();
@@ -2213,6 +2274,7 @@ mod tests {
         )
         .unwrap();
         // Any pollable fd stands in for a group fd: the check runs before it is used.
+        // SAFETY: `eventfd` only takes integers; the result is checked below.
         let group = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC) };
         assert!(group >= 0);
         let err = FanotifyHandler::from_restored_fd(
@@ -2220,6 +2282,8 @@ mod tests {
             dir.as_path().join("mnt").to_str().unwrap(),
             Arc::new(BlobCacheMgr::new()),
             1,
+            // SAFETY: `group` is the eventfd just created (checked above) and is wrapped exactly
+            // once.
             unsafe { File::from_raw_fd(group) },
         )
         .err()
@@ -2231,6 +2295,7 @@ mod tests {
     /// linked: the blob cache manager may hold other bootstraps' blobs, so only the bootstrap's
     /// own device table says which blob backs which device.
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
     fn refuses_data_blobs_that_do_not_match_the_device_table() {
         const BLOB: &str = "be7d77eeb719f70884758d1aa800ed0fb09d701aaec469964e9d54325f0d5fef";
         let root = std::env::var("CARGO_MANIFEST_DIR").unwrap();
@@ -2259,12 +2324,16 @@ mod tests {
         let open = |device_id: &[u8; 64]| {
             let dir = vmm_sys_util::tempdir::TempDir::new().unwrap();
             stage_bootstrap(dir.as_path(), |_, slot| slot.set_blob_id(device_id));
+            // SAFETY: `eventfd` only takes integers; the result is checked below.
             let group = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC) };
+            assert!(group >= 0);
             let result = FanotifyHandler::from_restored_fd(
                 dir.as_path().to_str().unwrap(),
                 dir.as_path().join("mnt").to_str().unwrap(),
                 mgr.clone(),
                 1,
+                // SAFETY: `group` is the eventfd just created (checked above) and is wrapped
+                // exactly once.
                 unsafe { File::from_raw_fd(group) },
             );
             (result.map(|_| ()), dir)
@@ -2300,6 +2369,7 @@ mod tests {
     /// A panic while serving one event answers that event and the rest of its batch with
     /// `EIO`, fails the handler, and leaves every worker able to reach the shutdown barrier.
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
     fn worker_panic_denies_the_batch_and_fails_the_handler() {
         let h = SocketHandler::start(2);
         inject_panic_on_next_event(h.handler.mountpoint());
@@ -2321,6 +2391,7 @@ mod tests {
 
     /// `FAN_Q_OVERFLOW` fails the whole handler: no worker serves the stream afterwards.
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
     fn queue_overflow_stops_every_worker_from_serving() {
         let h = SocketHandler::start(2);
         // Sanity: a healthy handler allows an event that maps to no blob.
@@ -2521,6 +2592,8 @@ mod tests {
         // The FAN_Q_OVERFLOW record is what `process_event_buffer` keys on to fail
         // closed. Guard the two properties that make it detectable.
         let buf = event_header(FAN_NOFD, FAN_Q_OVERFLOW, 0);
+        // SAFETY: `buf` holds a full event header (`event_header` builds one), and `read_unaligned`
+        // imposes no alignment requirement.
         let meta = unsafe {
             std::ptr::read_unaligned(buf.as_ptr() as *const libc::fanotify_event_metadata)
         };
@@ -2729,6 +2802,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
     fn is_mounted_at_recognises_a_real_mountpoint_and_rejects_a_plain_directory() {
         use super::is_mounted_at;
         use std::path::Path;

@@ -554,6 +554,7 @@ mod tests {
     }
 
     #[compio::test]
+    #[cfg_attr(miri, ignore = "Miri does not support io_uring")]
     async fn blob_source_prefers_a_carrier_on_the_target_registry() {
         let sources = [
             source_with_layers("other.example/a:1", &[("sha256:aa", 7)]),
@@ -565,6 +566,7 @@ mod tests {
     }
 
     #[compio::test]
+    #[cfg_attr(miri, ignore = "Miri does not support io_uring")]
     async fn blob_source_falls_back_to_a_carrier_on_another_registry() {
         let sources = [
             source_with_layers("target.example/b:1", &[("sha256:bb", 3)]),

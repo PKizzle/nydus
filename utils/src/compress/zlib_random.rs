@@ -483,6 +483,10 @@ impl<R: Read> Read for ZranReaderState<R> {
             // Reload the input buffer when needed.
             if self.stream.avail_in() == 0 {
                 if self.stream.stream.next_in > self.input.as_mut_ptr() {
+                    // SAFETY: `next_in` only ever points into `self.input` (set in `new` and
+                    // below), and zlib advances it at most to the end of the slice it was given;
+                    // being strictly past the start, `next_in - 1` is a byte of `self.input`, which
+                    // `read` does not reallocate.
                     self.stream.last_byte = unsafe { *self.stream.stream.next_in.sub(1) };
                 }
                 let sz = self.reader.read(self.input.as_mut_slice())?;
@@ -565,6 +569,9 @@ impl ZranStream {
         // or add 16 to decode only the gzip format (the zlib format will return a Z_DATA_ERROR).
         // -15 means raw mode.
         let mode = if decode { -15 } else { 31 };
+        // SAFETY: `stream` is a boxed, fully initialized `z_stream` with our `zalloc`/`zfree`,
+        // whose address stays stable for the life of `ZranStream`; the version string and struct
+        // size are the ones zlib checks for ABI compatibility.
         let ret = unsafe {
             inflateInit2_(
                 stream.deref_mut() as *mut z_stream,
@@ -604,10 +611,15 @@ impl ZranStream {
     }
 
     fn raw_inflate(&mut self, mode: i32) -> i32 {
+        // SAFETY: the stream was initialized by `inflateInit2_`, and callers point
+        // `next_in`/`next_out` at buffers of at least `avail_in`/`avail_out` bytes that live across
+        // this call.
         unsafe { inflate(self.stream.deref_mut() as *mut z_stream, mode) }
     }
 
     fn reset(&mut self) -> io::Result<()> {
+        // SAFETY: the stream was initialized by `inflateInit2_`, and `&mut self` guarantees it is
+        // not in use elsewhere.
         let ret = unsafe { inflateReset(self.stream.deref_mut() as *mut z_stream) };
         if ret != Z_OK {
             return Err(io::Error::new(
@@ -620,6 +632,8 @@ impl ZranStream {
 
     fn reset2(&mut self, is_gzip: bool) -> io::Result<()> {
         let winodw_bits = if is_gzip { 31 } else { -15 };
+        // SAFETY: the stream was initialized by `inflateInit2_`, and `&mut self` guarantees it is
+        // not in use elsewhere.
         let ret = unsafe { inflateReset2(self.stream.deref_mut() as *mut z_stream, winodw_bits) };
         if ret != Z_OK {
             return Err(io::Error::new(
@@ -636,6 +650,9 @@ impl ZranStream {
             if std::ptr::eq(self.stream.next_in, buf.as_ptr()) {
                 self.last_byte
             } else {
+                // SAFETY: the assert and the `ptr::eq` check above give `next_in > buf.as_ptr()`,
+                // and zlib only advanced `next_in` within `buf`, so `next_in - 1` is a byte of
+                // `buf`.
                 unsafe { *self.stream.next_in.sub(1) }
             }
         } else {
@@ -655,6 +672,8 @@ impl ZranStream {
         let mut len: uInt = 0;
         assert_eq!(buf.len(), ZRAN_DICT_WIN_SIZE);
 
+        // SAFETY: the stream was initialized, `buf` is exactly `ZRAN_DICT_WIN_SIZE` (32 KiB, the
+        // maximum window zlib writes) as asserted above, and `len` is a valid out-pointer.
         let ret = unsafe {
             inflateGetDictionary(
                 self.stream.deref_mut() as *mut z_stream,
@@ -674,6 +693,8 @@ impl ZranStream {
     }
 
     fn set_dict(&mut self, dict: &[u8]) -> io::Result<()> {
+        // SAFETY: the stream was initialized and `dict` is readable for `dict.len()` bytes during
+        // the call.
         let ret = unsafe {
             inflateSetDictionary(self.stream.deref_mut(), dict.as_ptr(), dict.len() as uInt)
         };
@@ -687,6 +708,8 @@ impl ZranStream {
     }
 
     fn set_prime(&mut self, bits: u8, prime: u8) -> io::Result<()> {
+        // SAFETY: the stream was initialized by `inflateInit2_`, and `&mut self` guarantees it is
+        // not in use elsewhere.
         let ret = unsafe {
             inflatePrime(
                 self.stream.deref_mut(),
@@ -739,6 +762,8 @@ impl ZranStream {
 
 impl Drop for ZranStream {
     fn drop(&mut self) {
+        // SAFETY: the stream was initialized in `new` (a failed init returns before a `ZranStream`
+        // exists) and is ended exactly once here.
         unsafe { inflateEnd(self.stream.deref_mut() as *mut z_stream) };
     }
 }
@@ -769,6 +794,9 @@ extern "C" fn zalloc(_ptr: *mut c_void, items: uInt, item_size: uInt) -> *mut c_
         Err(_) => return ptr::null_mut(),
     };
 
+    // SAFETY: `layout` has a non-zero size (at least one `usize` header) and `usize` alignment; a
+    // non-null result is valid for `size` bytes, so the header write and the `add(1)` stay inside
+    // it.
     unsafe {
         // Allocate the data, and if successful store the size we allocated
         // at the beginning and then return an offset pointer.
@@ -782,6 +810,8 @@ extern "C" fn zalloc(_ptr: *mut c_void, items: uInt, item_size: uInt) -> *mut c_
 }
 
 extern "C" fn zfree(_ptr: *mut c_void, address: *mut c_void) {
+    // SAFETY: zlib only passes `zfree` addresses returned by `zalloc`, which sit one `usize` header
+    // past the start of an allocation made with exactly `Layout(size, ZLIB_ALIGN)`.
     unsafe {
         // Move our address being freed back one pointer, read the size we
         // stored in `zalloc`, and then free it using the standard Rust
@@ -810,6 +840,7 @@ mod tests {
     use tar::{Archive, EntryType};
 
     #[test]
+    #[cfg_attr(miri, ignore = "calls the C zlib library")]
     fn test_parse_single_gzip_object() {
         let root_dir = &std::env::var("CARGO_MANIFEST_DIR").expect("$CARGO_MANIFEST_DIR");
         let path = PathBuf::from(root_dir).join("../tests/texture/zran/zran-single-stream.tar.gz");
@@ -833,6 +864,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "calls the C zlib library")]
     fn test_parse_first_gzip_object() {
         let root_dir = &std::env::var("CARGO_MANIFEST_DIR").expect("$CARGO_MANIFEST_DIR");
         let path = PathBuf::from(root_dir).join("../tests/texture/zran/zran-two-streams.tar.gz");
@@ -857,6 +889,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "calls the C zlib library")]
     fn test_parse_two_gzip_objects() {
         let root_dir = &std::env::var("CARGO_MANIFEST_DIR").expect("$CARGO_MANIFEST_DIR");
         let path = PathBuf::from(root_dir).join("../tests/texture/zran/zran-two-streams.tar.gz");
@@ -882,6 +915,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "calls the C zlib library")]
     fn test_parse_gzip_with_big_zero() {
         let root_dir = &std::env::var("CARGO_MANIFEST_DIR").expect("$CARGO_MANIFEST_DIR");
         let path = PathBuf::from(root_dir).join("../tests/texture/zran/zran-zero-file.tar.gz");
@@ -911,6 +945,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "calls the C zlib library")]
     fn test_generate_comp_info() {
         let root_dir = &std::env::var("CARGO_MANIFEST_DIR").expect("$CARGO_MANIFEST_DIR");
         let path = PathBuf::from(root_dir).join("../tests/texture/zran/zran-two-streams.tar.gz");
@@ -945,6 +980,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "calls the C zlib library")]
     fn test_zran_bgzip() {
         let root_dir = &std::env::var("CARGO_MANIFEST_DIR").expect("$CARGO_MANIFEST_DIR");
         let path = PathBuf::from(root_dir).join("../tests/texture/zran/bgzip.tar.gz");
@@ -987,6 +1023,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "calls the C zlib library")]
     fn test_zran_decoder() {
         let root_dir = &std::env::var("CARGO_MANIFEST_DIR").expect("$CARGO_MANIFEST_DIR");
         let path = PathBuf::from(root_dir).join("../tests/texture/zran/zran-two-streams.tar.gz");
@@ -1031,6 +1068,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "calls the C zlib library")]
     fn test_zran_reader() {
         let root_dir = &std::env::var("CARGO_MANIFEST_DIR").expect("$CARGO_MANIFEST_DIR");
         let path = PathBuf::from(root_dir).join("../tests/texture/zran/zran-two-streams.tar.gz");

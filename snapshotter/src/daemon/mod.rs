@@ -4332,6 +4332,8 @@ mod tests {
                     .find_map(|l| l.strip_prefix("FDNAME="))
                     .unwrap()
                     .to_string();
+                // SAFETY: `nfds == 1`, so `fds[0]` is a descriptor just received over `SCM_RIGHTS`,
+                // owned only by this test, and wrapped exactly once.
                 break (name, unsafe { std::os::fd::OwnedFd::from_raw_fd(fds[0]) });
             }
         };
@@ -4532,6 +4534,8 @@ mod tests {
                 if msg.contains("FDSTOREREMOVE=1") {
                     store.remove(&name);
                 } else if msg.contains("FDSTORE=1") && nfds == 1 {
+                    // SAFETY: `nfds == 1`, so `fds[0]` is a descriptor just received over
+                    // `SCM_RIGHTS`, owned only by this thread, and wrapped exactly once.
                     let fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(fds[0]) };
                     store.entry(name).or_default().push(fd);
                 }
@@ -4715,6 +4719,8 @@ mod tests {
             assert_eq!(groups.len(), 1);
             const KCMP_FILE: libc::c_long = 0;
             let pid = std::process::id() as libc::c_long;
+            // SAFETY: `kcmp` only takes integers (pids, a type, and two descriptor numbers) and
+            // dereferences nothing.
             let same = unsafe {
                 libc::syscall(
                     libc::SYS_kcmp,

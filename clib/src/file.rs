@@ -48,6 +48,8 @@ pub unsafe extern "C" fn nydus_fopen(
     fs_handle: NydusFsHandle,
     path: *const c_char,
 ) -> NydusFileHandle {
+    // SAFETY: the caller guarantees `fs_handle` came from `nydus_open_rafs*` and is still open, and
+    // that a non-null `path` points to a NUL-terminated string that stays valid for this call.
     unsafe {
         if path.is_null() {
             set_errno(libc::EINVAL);
@@ -184,6 +186,9 @@ fn errno_of(e: &std::io::Error) -> i32 {
 /// Caller needs to ensure `fs_handle` is valid, otherwise it may cause memory access violation.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn nydus_fclose(handle: NydusFileHandle) {
+    // SAFETY: the caller guarantees a non-invalid `handle` came from `nydus_fopen` and has not been
+    // closed, so it is the `Box<FileState>` leaked there and is reclaimed exactly once; its
+    // filesystem handle is still open per the `nydus_close_rafs` contract.
     unsafe {
         if handle == NYDUS_INVALID_FILE_HANDLE as NydusFileHandle {
             set_errno(libc::EINVAL);
@@ -208,6 +213,7 @@ mod tests {
 
     fn fopen(fs: NydusFsHandle, path: &str) -> NydusFileHandle {
         let c = CString::new(path).unwrap();
+        // SAFETY: `c` is a NUL-terminated string that outlives the call and `fs` is an open handle.
         unsafe { nydus_fopen(fs, c.as_ptr()) }
     }
 
@@ -222,8 +228,11 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support readahead")]
     fn fopen_resolves_the_requested_path() {
         let fs = open_file_system();
+        // SAFETY: `fs` is the open handle returned by `open_file_system` and is closed only at the
+        // end of the test.
         let root = unsafe { FileSystemState::from_handle(fs) }.root_ino;
 
         // A nested regular file from the fixture image. Before `nydus_fopen` walked the
@@ -231,12 +240,14 @@ mod tests {
         // inode, so this is the assertion that actually pins the fix.
         let handle = fopen(fs, "/hardlink-test/foo");
         assert_ne!(handle, NYDUS_INVALID_FILE_HANDLE as NydusFileHandle);
+        // SAFETY: `handle` is a live `FileState` box returned by `nydus_fopen` and not yet closed.
         let ino = unsafe { &*(handle as *const FileState) }.ino;
         assert_ne!(ino, root, "handle still points at the root inode");
 
         // A path in a different subtree must resolve somewhere else.
         let other = fopen(fs, "/normal-file-test");
         assert_ne!(other, NYDUS_INVALID_FILE_HANDLE as NydusFileHandle);
+        // SAFETY: `other` is a live `FileState` box returned by `nydus_fopen` and not yet closed.
         let other_ino = unsafe { &*(other as *const FileState) }.ino;
         assert_ne!(ino, other_ino);
 
@@ -245,9 +256,13 @@ mod tests {
         // correct, not a path-resolution bug.
         let link = fopen(fs, "/hardlink-test/test.sh");
         assert_ne!(link, NYDUS_INVALID_FILE_HANDLE as NydusFileHandle);
+        // SAFETY: `link` is a live `FileState` box returned by `nydus_fopen` and not yet closed.
         assert_eq!(unsafe { &*(link as *const FileState) }.ino, ino);
+        // SAFETY: `link` came from `nydus_fopen` and is closed exactly once.
         unsafe { nydus_fclose(link) };
 
+        // SAFETY: each file handle came from `nydus_fopen` and is closed exactly once, before its
+        // filesystem.
         unsafe {
             nydus_fclose(handle);
             nydus_fclose(other);
@@ -256,6 +271,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support readahead")]
     fn fopen_accepts_leading_and_duplicate_separators() {
         let fs = open_file_system();
         let a = fopen(fs, "/hardlink-test/foo");
@@ -264,9 +280,13 @@ mod tests {
         for h in [a, b, c] {
             assert_ne!(h, NYDUS_INVALID_FILE_HANDLE as NydusFileHandle);
         }
+        // SAFETY: every handle passed in is a live `FileState` box returned by `nydus_fopen` and
+        // not yet closed.
         let ino = |h: NydusFileHandle| unsafe { &*(h as *const FileState) }.ino;
         assert_eq!(ino(a), ino(b));
         assert_eq!(ino(a), ino(c));
+        // SAFETY: each file handle came from `nydus_fopen` and is closed exactly once, before its
+        // filesystem.
         unsafe {
             nydus_fclose(a);
             nydus_fclose(b);
@@ -276,6 +296,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support readahead")]
     fn fopen_reports_enoent_for_a_missing_path() {
         let fs = open_file_system();
         let handle = fopen(fs, "/no/such/file");
@@ -298,6 +319,7 @@ mod tests {
         let handle = fopen(fs, "");
         assert_eq!(handle, NYDUS_INVALID_FILE_HANDLE as NydusFileHandle);
 
+        // SAFETY: `fs` came from `open_file_system` and is closed exactly once.
         unsafe { nydus_close_rafs(fs) };
     }
 
@@ -305,6 +327,7 @@ mod tests {
     fn closing_an_invalid_file_handle_is_rejected_not_fatal() {
         // Mirrors `nydus_close_rafs`: `nydus_fopen` returns NYDUS_INVALID_FILE_HANDLE on
         // failure, and closing it must not fault.
+        // SAFETY: the invalid handle is rejected before anything is dereferenced.
         unsafe { nydus_fclose(NYDUS_INVALID_FILE_HANDLE as NydusFileHandle) };
         assert_eq!(
             std::io::Error::last_os_error().raw_os_error(),
@@ -313,14 +336,20 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support readahead")]
     fn fopen_on_root_returns_the_root_inode() {
         let fs = open_file_system();
+        // SAFETY: `fs` is the open handle returned by `open_file_system` and is closed only at the
+        // end of the test.
         let root = unsafe { FileSystemState::from_handle(fs) }.root_ino;
         let handle = fopen(fs, "/");
         assert_ne!(handle, NYDUS_INVALID_FILE_HANDLE as NydusFileHandle);
+        // SAFETY: `handle` is a live `FileState` box returned by `nydus_fopen` and not yet closed.
         assert_eq!(unsafe { &*(handle as *const FileState) }.ino, root);
         // `nydus_fclose` forgets unconditionally, so the root open must have taken a
         // reference of its own; if it did not, this drops the superblock's.
+        // SAFETY: the file handle came from `nydus_fopen` and is closed exactly once, before its
+        // filesystem.
         unsafe {
             nydus_fclose(handle);
             nydus_close_rafs(fs);

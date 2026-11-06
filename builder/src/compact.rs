@@ -793,9 +793,6 @@ mod tests {
         }
     }
 
-    unsafe impl Send for MockBackend {}
-    unsafe impl Sync for MockBackend {}
-
     impl BlobBackend for MockBackend {
         fn shutdown(&self) {}
 
@@ -1024,6 +1021,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support readahead")]
     fn test_blob_compactor_new() {
         let compactor = create_blob_compactor();
         assert!(compactor.is_ok());
@@ -1031,6 +1029,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support readahead")]
     fn test_blob_compactor_load_chunk_dict_blobs() {
         let mut compactor = create_blob_compactor().unwrap();
         let chunk_dict = compactor.get_chunk_dict();
@@ -1138,11 +1137,13 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support readahead")]
     fn test_blob_compactor_load_and_dedup_chunks() {
         assert!(blob_compactor_load_and_dedup_chunks().is_ok());
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
     fn test_blob_compactor_dump_new_blobs() {
         let tmp_dir = TempDir::new().unwrap();
         let build_ctx = BuildContext::new(
@@ -1245,6 +1246,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support readahead")]
     fn test_blob_compactor_do_compact() {
         let mut compactor = blob_compactor_load_and_dedup_chunks().unwrap();
 

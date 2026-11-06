@@ -143,6 +143,7 @@ mod tests {
     }
 
     #[compio::test]
+    #[cfg_attr(miri, ignore = "Miri does not support io_uring")]
     async fn run_retries_until_success() {
         let policy = RetryPolicy {
             attempts: 3,
@@ -165,6 +166,7 @@ mod tests {
     }
 
     #[compio::test]
+    #[cfg_attr(miri, ignore = "Miri does not support io_uring")]
     async fn run_gives_up_after_attempts_exhausted() {
         let policy = RetryPolicy {
             attempts: 2,

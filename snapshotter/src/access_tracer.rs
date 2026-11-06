@@ -335,6 +335,9 @@ impl AccessTracer {
             // `mark()` wants an `AsFd` for the directory in which the path is
             // looked up. Pass AT_FDCWD (the kernel sentinel) so the path is
             // resolved as-is.
+            // SAFETY: `AT_FDCWD` is not a real descriptor but the kernel's "current directory"
+            // sentinel; it is never -1 and nix only passes it on as the `dirfd` argument of
+            // `fanotify_mark`, which accepts it, so nothing treats it as an open file.
             let at_cwd = unsafe { std::os::fd::BorrowedFd::borrow_raw(libc::AT_FDCWD) };
             if let Err(err) = fanotify
                 .mark(
@@ -655,6 +658,8 @@ impl AccessTracer {
     #[cfg(target_os = "linux")]
     fn try_remove_mark(&self, mount_root: &Path) {
         if let Some(fanotify) = self.inner.fanotify.as_ref() {
+            // SAFETY: as in `attach`: `AT_FDCWD` is only passed on as the `fanotify_mark` `dirfd`
+            // sentinel.
             let at_cwd = unsafe { std::os::fd::BorrowedFd::borrow_raw(libc::AT_FDCWD) };
             let _ = fanotify.mark(
                 MarkFlags::FAN_MARK_REMOVE | MarkFlags::FAN_MARK_MOUNT,

@@ -218,12 +218,14 @@ fn connect_dgram(addr: &[u8]) -> Result<UnixDatagram> {
         base + addr.len() + 1
     } as libc::socklen_t;
 
-    // SAFETY: standard libc socket(2)/connect(2) with a well-formed sockaddr_un.
+    // SAFETY: socket(2) only takes integer arguments.
     let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_DGRAM, 0) };
     if fd < 0 {
         return Err(std::io::Error::last_os_error()).context("socket(AF_UNIX, SOCK_DGRAM)");
     }
     set_cloexec(fd);
+    // SAFETY: `fd` is the socket created above; `sun` is a fully initialized `sockaddr_un` that
+    // outlives the call and `addr_len` does not exceed its size.
     let rc = unsafe {
         libc::connect(
             fd,

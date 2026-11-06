@@ -297,6 +297,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support io_uring")]
     fn no_op_when_flag_unset() {
         // With the flag unset the call must not touch the network; a client
         // pointed at an unroutable host proves nothing is sent.
