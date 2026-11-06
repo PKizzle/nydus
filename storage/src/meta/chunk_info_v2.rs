@@ -591,10 +591,16 @@ mod verification {
         }
     }
 
+    /// Error messages are not under test, and formatting them dominates the solver's time.
+    fn no_format(_args: std::fmt::Arguments<'_>) -> String {
+        String::new()
+    }
+
     /// `validate` is the gate between an untrusted on-disk chunk record (plus the ZRan or batch
     /// context it points at) and the offset arithmetic of the read path: it decides every
     /// record without panicking, and an accepted ZRan or batch chunk lies inside its context.
     #[kani::proof]
+    #[kani::stub(std::fmt::format, no_format)]
     fn validate_decides_every_record() {
         let chunk = any_chunk();
         let state = BlobCompressionContext {

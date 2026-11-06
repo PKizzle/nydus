@@ -2417,9 +2417,15 @@ mod verification {
     use super::*;
     use crate::metadata::RafsSuperMeta;
 
+    /// Error messages are not under test, and formatting them dominates the solver's time.
+    fn no_format(_args: std::fmt::Arguments<'_>) -> String {
+        String::new()
+    }
+
     /// Validating an untrusted superblock pair the way `try_load_v6` does never panics, and an
     /// accepted pair places the metadata area and every table inside the bootstrap.
     #[kani::proof]
+    #[kani::stub(std::fmt::format, no_format)]
     fn superblocks_decide_every_image() {
         let meta_size: u64 = kani::any();
         let mut sb = RafsV6SuperBlock::new();

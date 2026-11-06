@@ -37,11 +37,11 @@ Linux (or a Linux container).
 cargo install --locked kani-verifier
 cargo kani setup
 
-cargo kani -p nydus-storage
-cargo kani -p nydus-rafs
-cargo kani -p nydus-service
+cargo kani -p nydus-storage -Z stubbing
+cargo kani -p nydus-rafs -Z stubbing
+cargo kani -p nydus-service -Z stubbing
 # One harness:
-cargo kani -p nydus-storage --harness validate_decides_every_record
+cargo kani -p nydus-storage --harness validate_decides_every_record -Z stubbing
 ```
 
 A failing proof prints the failed check with its file and line. Add `--concrete-playback=print`

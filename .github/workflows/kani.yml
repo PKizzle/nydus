@@ -27,6 +27,7 @@ jobs:
   kani:
     name: Kani (${{ matrix.crate }})
     runs-on: ubuntu-latest
+    timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
@@ -38,7 +39,8 @@ jobs:
         uses: model-checking/kani-github-action@f838096619a707b0f6b2118cf435eaccfa33e51f # v1.1
         with:
           kani-version: '0.68.0'
-          args: -p ${{ matrix.crate }}
+          # Stubbing replaces error-message formatting, which is not under test (`kani::stub`).
+          args: -p ${{ matrix.crate }} -Z stubbing
 
   loom:
     runs-on: ubuntu-latest
