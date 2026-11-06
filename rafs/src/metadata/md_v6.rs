@@ -40,7 +40,7 @@ impl RafsSuper {
 
         let mut ext_sb = RafsV6SuperBlockExt::new();
         ext_sb.load(r)?;
-        ext_sb.validate(end, &self.meta)?;
+        ext_sb.validate(end, &sb)?;
         self.meta.chunk_size = ext_sb.chunk_size();
         self.meta.blob_table_offset = ext_sb.blob_table_offset();
         self.meta.blob_table_size = ext_sb.blob_table_size();
@@ -259,11 +259,13 @@ mod tests {
         sb.set_inos(1);
         // 54 device slots run 128 bytes past the 8 KiB boundary the blob table starts at.
         sb.set_extra_devices(54);
+        sb.set_meta_addr(24 * EROFS_BLOCK_SIZE_4096);
         let mut ext = RafsV6SuperBlockExt::new();
         ext.set_compressor(compress::Algorithm::None);
         ext.set_digester(digest::Algorithm::Sha256);
         ext.set_chunk_size(0x10_0000);
         ext.set_blob_table_offset(2 * EROFS_BLOCK_SIZE_4096);
+        ext.set_blob_table_size(54 * 256); // 54 blob table entries
         let mut writer = BufWriter::new(file.try_clone().unwrap());
         sb.store(&mut writer).unwrap();
         writer
@@ -271,7 +273,7 @@ mod tests {
             .unwrap();
         ext.store(&mut writer).unwrap();
         writer.flush().unwrap();
-        file.set_len(4 * EROFS_BLOCK_SIZE_4096).unwrap();
+        file.set_len(32 * EROFS_BLOCK_SIZE_4096).unwrap();
 
         let mut reader = Box::new(file) as RafsIoReader;
         let mut rs = RafsSuper {
