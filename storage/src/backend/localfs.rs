@@ -415,7 +415,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "asserts preadv fills the buffers; Miri injects short reads")]
+    #[cfg_attr(miri, ignore = "asserts full preadv reads; Miri injects short reads")]
     fn test_localfs_get_reader() {
         let tempfile = TempFile::new().unwrap();
         let path = tempfile.as_path();
