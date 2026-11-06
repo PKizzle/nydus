@@ -232,6 +232,8 @@ impl UpgradeManager {
             .map_err(UpgradeMgrError::StorageBackendError)?;
         let files = fds
             .into_iter()
+            // SAFETY: the backend received these descriptors over `SCM_RIGHTS`, so each is a fresh
+            // fd owned only by this call, and each is wrapped exactly once.
             .map(|fd| unsafe { File::from_raw_fd(fd) })
             .collect();
         Ok((files, state_data))
@@ -312,6 +314,8 @@ impl UpgradeManager {
         if fds.len() != 1 {
             warn!("Too many fds {}, we may not correctly handle it", fds.len());
         }
+        // SAFETY: the backend received this descriptor over `SCM_RIGHTS` (it returns at least one),
+        // so it is a fresh fd owned only by this call.
         self.file = Some(unsafe { File::from_raw_fd(fds[0]) });
         Ok(state_data)
     }

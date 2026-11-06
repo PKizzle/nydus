@@ -831,7 +831,8 @@ impl FileSystem for Rafs {
     }
 
     fn statfs(&self, _ctx: &Context, _inode: u64) -> Result<statvfs64> {
-        // Safe because we are zero-initializing a struct with only POD fields.
+        // SAFETY: `statvfs64` is a C struct of integer fields, for which all-zero bytes are a valid
+        // value.
         let mut st: statvfs64 = unsafe { std::mem::zeroed() };
 
         // This matches the behavior of libfuse as it returns these values if the

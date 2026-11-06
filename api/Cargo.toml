@@ -9,6 +9,9 @@ repository = "https://github.com/dragonflyoss/nydus"
 edition = "2024"
 rust-version.workspace = true
 
+[lints]
+workspace = true
+
 [dependencies]
 libc = "0.2"
 log = "0.4.8"

@@ -61,6 +61,11 @@ macro_rules! impl_bootstrap_converter {
                     ));
                 }
 
+                // SAFETY: the length equals `size_of::<$T>()` and the pointer is aligned for `$T`,
+                // both checked above. Every type this macro is used on is a
+                // `#[repr(C)]`/`#[repr(transparent)]` on-disk struct of integers and byte arrays
+                // without padding, so any bytes are a valid `$T`; the reference keeps the borrow of
+                // `buf`.
                 Ok(unsafe { &*(ptr as *const $T) })
             }
         }
@@ -79,6 +84,8 @@ macro_rules! impl_bootstrap_converter {
                     ));
                 }
 
+                // SAFETY: as for the shared conversion above; the exclusive borrow of `buf` makes
+                // the `&mut` unique.
                 Ok(unsafe { &mut *(ptr as *mut $T) })
             }
         }
@@ -87,6 +94,8 @@ macro_rules! impl_bootstrap_converter {
             #[inline]
             fn as_ref(&self) -> &[u8] {
                 let ptr = self as *const $T as *const u8;
+                // SAFETY: `self` is a valid `$T`, readable as `size_of::<$T>()` bytes because the
+                // types this macro is used on have no padding.
                 unsafe { std::slice::from_raw_parts(ptr, size_of::<$T>()) }
             }
         }
@@ -95,11 +104,14 @@ macro_rules! impl_bootstrap_converter {
             #[inline]
             fn as_mut(&mut self) -> &mut [u8] {
                 let ptr = self as *mut $T as *mut u8;
+                // SAFETY: as for `as_ref`; any bytes written are a valid `$T` (see `try_from`), and
+                // the borrow of `self` is exclusive.
                 unsafe { std::slice::from_raw_parts_mut(ptr, size_of::<$T>()) }
             }
         }
 
-        // Safe because the conversions above already treat any bytes as a valid `$T`.
+        // SAFETY: the conversions above already require any bytes to be a valid `$T`, and the
+        // on-disk types this macro is used on have no interior mutability.
         unsafe impl nydus_utils::filemap::FromMapped for $T {}
     };
 }

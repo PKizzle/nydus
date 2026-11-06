@@ -58,6 +58,8 @@
 //! failures; it implements `std::error::Error`, so `?` into `anyhow::Result`
 //! keeps working for application callers.
 
+#![forbid(unsafe_code)]
+
 pub mod auth;
 pub mod client;
 pub mod error;

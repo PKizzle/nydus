@@ -38,6 +38,8 @@ pub struct BlobChunkInfoV2Ondisk {
     pub(crate) data: u64,
 }
 
+// SAFETY: `#[repr(C, packed)]` with only `u64` fields: no padding, alignment 1, no interior
+// mutability, and every bit pattern is valid.
 unsafe impl FromMapped for BlobChunkInfoV2Ondisk {}
 
 impl BlobChunkInfoV2Ondisk {

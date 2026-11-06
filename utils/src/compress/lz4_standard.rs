@@ -8,6 +8,8 @@ use lz4_sys::{LZ4_compress_default, LZ4_compressBound, LZ4_decompress_safe};
 
 pub(super) fn lz4_compress(src: &[u8]) -> io::Result<Vec<u8>> {
     // 0 iff src too large
+    // SAFETY: `LZ4_compressBound` is pure arithmetic on its argument and returns 0 for out-of-range
+    // sizes.
     let compress_bound: i32 = unsafe { LZ4_compressBound(src.len() as i32) };
 
     if src.len() > (i32::MAX as usize) || compress_bound <= 0 {
@@ -18,6 +20,9 @@ pub(super) fn lz4_compress(src: &[u8]) -> io::Result<Vec<u8>> {
     }
 
     let mut dst_buf = Vec::with_capacity(compress_bound as usize);
+    // SAFETY: `src` is readable for `src.len()` bytes (checked to fit `i32` above) and `dst_buf`
+    // has `compress_bound` bytes of capacity; `LZ4_compress_default` writes at most `dstCapacity`
+    // bytes.
     let cmp_size = unsafe {
         LZ4_compress_default(
             src.as_ptr() as *const c_char,
@@ -31,6 +36,8 @@ pub(super) fn lz4_compress(src: &[u8]) -> io::Result<Vec<u8>> {
     }
 
     assert!(cmp_size as usize <= dst_buf.capacity());
+    // SAFETY: LZ4 initialized the first `cmp_size` bytes, which the assert keeps within the
+    // capacity.
     unsafe { dst_buf.set_len(cmp_size as usize) };
 
     Ok(dst_buf)
@@ -45,6 +52,7 @@ pub(super) fn lz4_decompress(src: &[u8], dst: &mut [u8]) -> io::Result<usize> {
     }
     let size = dst.len() as i32;
 
+    // SAFETY: `LZ4_compressBound` is pure arithmetic on its argument.
     if unsafe { LZ4_compressBound(size) } <= 0 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -52,6 +60,9 @@ pub(super) fn lz4_decompress(src: &[u8], dst: &mut [u8]) -> io::Result<usize> {
         ));
     }
 
+    // SAFETY: both lengths were checked to fit `i32` above, and `LZ4_decompress_safe` reads at most
+    // `compressedSize` bytes from `src` and writes at most `dstCapacity` bytes into `dst`, even on
+    // malformed input.
     let dec_bytes = unsafe {
         LZ4_decompress_safe(
             src.as_ptr() as *const c_char,

@@ -139,6 +139,9 @@ impl BlobCache for DummyCache {
             if !bios[0].user_io {
                 return Ok(0);
             }
+            // SAFETY: `bufs[0]` is a `FileVolatileSlice` whose creator guarantees `len()` writable
+            // bytes for its lifetime, and `d_size <= bufs[0].len()` was checked above. The caller
+            // hands the buffer over to be filled by this read and does not access it concurrently.
             let buf = unsafe { std::slice::from_raw_parts_mut(bufs[0].as_ptr(), d_size) };
             self.read_chunk_from_backend(&bios[0].chunkinfo, buf)?;
             return Ok(buf.len());
@@ -491,6 +494,8 @@ mod tests {
 
         let mut dst_buf1 = vec![0x0u8; 800];
         let volatile_slice_1 =
+            // SAFETY: `dst_buf1` outlives the volatile slice and is not accessed directly while the
+            // cache reads into it.
             unsafe { FileVolatileSlice::from_raw_ptr(dst_buf1.as_mut_ptr(), dst_buf1.len()) };
         let bufs: &[FileVolatileSlice] = &[volatile_slice_1];
         assert_eq!(cache.read(&mut iovec, bufs).unwrap(), 800);
@@ -544,9 +549,13 @@ mod tests {
         let mut dst_buf2 = vec![0x0u8; 100];
         let mut dst_buf3 = vec![0x0u8; 100];
         let volatile_slice_2 =
+            // SAFETY: `dst_buf2` outlives the volatile slice and is not accessed directly while the
+            // cache reads into it.
             unsafe { FileVolatileSlice::from_raw_ptr(dst_buf2.as_mut_ptr(), dst_buf2.len()) };
 
         let volatile_slice_3 =
+            // SAFETY: `dst_buf3` outlives the volatile slice and is not accessed directly while the
+            // cache reads into it.
             unsafe { FileVolatileSlice::from_raw_ptr(dst_buf3.as_mut_ptr(), dst_buf3.len()) };
         let bufs: &[FileVolatileSlice] = &[volatile_slice_2, volatile_slice_3];
         assert_eq!(cache.read(&mut iovec, bufs).unwrap(), 200);

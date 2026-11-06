@@ -31,10 +31,14 @@ pub(crate) struct Header {
     pub reserved: [u8; HEADER_RESERVED_SIZE],
 }
 
+// SAFETY: `Header` is `#[repr(C)]` with four `u32`s followed by a byte array, so it has no padding,
+// no interior mutability, and every bit pattern is valid.
 unsafe impl FromMapped for Header {}
 
 impl Header {
     pub fn as_slice(&self) -> &[u8] {
+        // SAFETY: `Header` has no padding (see the `FromMapped` impl), so all `size_of::<Header>()`
+        // bytes of `self` are initialized; the slice borrows `self`.
         unsafe {
             std::slice::from_raw_parts(
                 self as *const Header as *const u8,
@@ -47,8 +51,8 @@ impl Header {
 /// Get the byte at `offset` in a chunk map mapping as an atomic.
 fn atomic_byte(filemap: &FileMapState, offset: usize) -> io::Result<&AtomicU8> {
     let ptr = filemap.validate_range(offset, 1)?;
-    // Safe because the byte is in the writable mapping, which outlives the reference. The bitmap
-    // is only ever accessed atomically, and the header is only read this way before it's written.
+    // SAFETY: the byte is in the writable mapping, which outlives the reference. The bitmap is only
+    // ever accessed atomically, and the header is only read this way before it's written.
     Ok(unsafe { AtomicU8::from_ptr(ptr.cast_mut()) })
 }
 
@@ -63,8 +67,8 @@ fn atomic_all_ready(filemap: &FileMapState) -> io::Result<&AtomicU32> {
             "unaligned chunk map header",
         ));
     }
-    // Safe because the word is aligned and in the writable mapping, which outlives the reference,
-    // and once the map is open the word is only accessed atomically.
+    // SAFETY: the word is aligned and in the writable mapping, which outlives the reference, and
+    // once the map is open the word is only accessed atomically.
     Ok(unsafe { AtomicU32::from_ptr(ptr.cast_mut()) })
 }
 
@@ -133,11 +137,14 @@ impl PersistMap {
 
         let file2 = clone_file(file.as_raw_fd())
             .map_err(|e| StorageError::cache_io("dup the chunk map fd", e))?;
-        // Safe because the header is written through `file` only under the exclusive file lock,
-        // while no reference into the mapping is alive, and the bitmap is accessed only through
-        // atomic operations.
+        // SAFETY: the header is written through `file` only under the exclusive file lock, while no
+        // reference into the mapping is alive, and the bitmap is accessed only through atomic
+        // operations.
         let mut filemap = unsafe { FileMapState::new(file2, 0, expected_size as usize, true) }
             .map_err(|e| StorageError::cache_io("mmap the chunk map file", e))?;
+        // SAFETY: the reference ends before `write_header` writes the file below. Another opener
+        // holding the shared lock may read the header concurrently, but nothing writes it while
+        // this process holds the file lock and the reference.
         let header = unsafe { filemap.get_mut::<Header>(0) }
             .map_err(|e| StorageError::cache_io("reach the chunk map contents", e))?;
         if header.magic != MAGIC1 {
@@ -164,6 +171,8 @@ impl PersistMap {
             Self::write_header(&mut file, expected_size)?;
         }
 
+        // SAFETY: as above: the previous header reference is dead, and the header is not written by
+        // anyone else while this process holds the file lock.
         let header = unsafe { filemap.get_mut::<Header>(0) }
             .map_err(|e| StorageError::cache_io("reach the chunk map contents", e))?;
         let mut not_ready_count = chunk_count;
@@ -188,6 +197,11 @@ impl PersistMap {
                 }
 
                 if ready_count >= chunk_count {
+                    // SAFETY: NOT fully established. The file lock keeps other openers out of this
+                    // function, but a process that already opened the map may `store` to
+                    // `all_ready` atomically (see `invalidate`) while this plain `&mut` write runs;
+                    // it relies on `all_ready` being set only once every chunk is ready, after
+                    // which nothing clears it except invalidation.
                     let header = unsafe { filemap.get_mut::<Header>(0) }
                         .map_err(|e| StorageError::cache_io("reach the chunk map contents", e))?;
                     header.all_ready = MAGIC_ALL_READY;

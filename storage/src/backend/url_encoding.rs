@@ -80,10 +80,9 @@ pub fn encode_binary(data: &[u8]) -> Cow<'_, str> {
     // let _ = escaped.try_reserve(data.len() | 15);
     let unmodified = append_string(data, &mut escaped, true);
     if unmodified {
-        return Cow::Borrowed(unsafe {
-            // encode_into has checked it's ASCII
-            str::from_utf8_unchecked(data)
-        });
+        // SAFETY: `append_string` returns `true` only when every byte of `data` is in the
+        // unreserved ASCII set, so `data` is valid UTF-8.
+        return Cow::Borrowed(unsafe { str::from_utf8_unchecked(data) });
     }
     Cow::Owned(escaped)
 }
@@ -117,6 +116,8 @@ fn encode_into<E>(
         };
         pushed = true;
         if !safe.is_empty() {
+            // SAFETY: `safe` is the prefix that matched the unreserved ASCII set above, so it is
+            // valid UTF-8.
             push_str(unsafe { str::from_utf8_unchecked(safe) })?;
         }
         if rest.is_empty() {
@@ -126,6 +127,7 @@ fn encode_into<E>(
         match rest.split_first() {
             Some((byte, rest)) => {
                 let enc = &[b'%', to_hex_digit(byte >> 4), to_hex_digit(byte & 15)];
+                // SAFETY: `enc` is `%` followed by two ASCII hex digits, so it is valid UTF-8.
                 push_str(unsafe { str::from_utf8_unchecked(enc) })?;
                 data = rest;
             }

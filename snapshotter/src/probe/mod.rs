@@ -379,11 +379,15 @@ fn probe_tarfs_platform(_entry: &FsDriverEntry) -> ProbeResult {
 /// Check that the current kernel version is at least `min_version` (semver "major.minor.patch").
 #[cfg(target_os = "linux")]
 fn check_kernel_version(min_version: &str) -> Result<()> {
+    // SAFETY: `utsname` is a C struct of byte arrays, for which all-zero bytes are a valid value.
     let mut buf: libc::utsname = unsafe { std::mem::zeroed() };
+    // SAFETY: `buf` is a writable `utsname` that outlives the call.
     let ret = unsafe { libc::uname(&mut buf) };
     if ret < 0 {
         bail!("failed to call uname: {}", std::io::Error::last_os_error());
     }
+    // SAFETY: `uname` succeeded, so `release` holds a NUL-terminated string inside `buf`, which
+    // outlives the `CStr`.
     let release = unsafe { std::ffi::CStr::from_ptr(buf.release.as_ptr()) }
         .to_string_lossy()
         .to_string();
@@ -755,6 +759,7 @@ fn try_fanotify_init() -> Result<()> {
     // Same fix mirrored in `service/src/fanotify.rs::FanotifyHandler::new`.
     const O_RDONLY: i32 = 0;
 
+    // SAFETY: `fanotify_init` only takes integer flags; the result is checked below.
     let fd = unsafe { libc::fanotify_init(FAN_CLASS_PRE_CONTENT, O_RDONLY as u32) };
 
     if fd < 0 {
@@ -763,6 +768,8 @@ fn try_fanotify_init() -> Result<()> {
     }
 
     // Close the fd immediately; we only needed to verify the kernel supports it.
+    // SAFETY: `fd` is the group just created (checked non-negative above), owned only by this
+    // function and closed exactly once.
     unsafe {
         libc::close(fd);
     }
@@ -792,6 +799,7 @@ fn try_fanotify_pre_content_mark(work_dir: &Path) -> Result<()> {
         .tempfile_in(work_dir)
         .with_context(|| format!("create probe file in {}", work_dir.display()))?;
 
+    // SAFETY: `fanotify_init` only takes integer flags; the result is checked below.
     let fd = unsafe { libc::fanotify_init(FAN_CLASS_PRE_CONTENT, 0) };
     if fd < 0 {
         bail!(
@@ -803,6 +811,8 @@ fn try_fanotify_pre_content_mark(work_dir: &Path) -> Result<()> {
     struct FdGuard(i32);
     impl Drop for FdGuard {
         fn drop(&mut self) {
+            // SAFETY: the guard is built only from the group created above (checked non-negative),
+            // which nothing else owns, and closes it exactly once.
             unsafe { libc::close(self.0) };
         }
     }
@@ -810,6 +820,8 @@ fn try_fanotify_pre_content_mark(work_dir: &Path) -> Result<()> {
 
     let path_c = std::ffi::CString::new(probe_file.path().as_os_str().as_encoded_bytes())
         .context("probe file path contains NUL")?;
+    // SAFETY: `fd` is the live group fd and `path_c` is a NUL-terminated path that outlives the
+    // call.
     let ret = unsafe {
         libc::fanotify_mark(
             fd,

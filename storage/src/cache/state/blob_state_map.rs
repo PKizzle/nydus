@@ -407,6 +407,8 @@ pub(crate) mod tests {
             Arc::new(Self {
                 index,
                 digest: RafsDigest::from_buf(
+                    // SAFETY: `index` is a live `u32`, so its 4 bytes are initialized and readable
+                    // for this call.
                     unsafe { std::slice::from_raw_parts(&index as *const u32 as *const u8, 4) },
                     Algorithm::Blake3,
                 ),

@@ -363,6 +363,7 @@ impl ServiceController {
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
 
         for attempt in 1..=UMOUNT_MAX_ATTEMPTS {
+            // SAFETY: `mnt_cstr` is a NUL-terminated path that outlives the call.
             let ret = unsafe { libc::umount(mnt_cstr.as_ptr()) };
             if ret == 0 {
                 if attempt > 1 {

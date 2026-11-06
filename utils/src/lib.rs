@@ -122,6 +122,11 @@ struct LazyDrop<T> {
     v: T,
 }
 
+// SAFETY: NOT established for every `T`. The value is only moved to and dropped on the spawned
+// thread, which is sound when `T: Send` or when the caller hands over the last handle to every `Rc`
+// inside it. Callers pass `!Send` builder trees (`Rc<RefCell<Node>>`), and `Tree::merge_overaly`
+// keeps a clone of the root `Rc` it lazily drops, so this needs a `T: Send` bound or an `unsafe`
+// contract on `lazy_drop`.
 unsafe impl<T> Send for LazyDrop<T> {}
 
 /// Lazy drop of object.

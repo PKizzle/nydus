@@ -2382,6 +2382,8 @@ impl RafsV6PrefetchTable {
 
     /// Store the inode prefetch table to a writer.
     pub fn store(&mut self, w: &mut dyn RafsIoWrite) -> RafsResult<usize> {
+        // SAFETY: `u32` has no padding, so its bytes are initialized; `u8` has alignment 1, so the
+        // middle slice covers the whole table.
         let (_, data, _) = unsafe { self.inodes.align_to::<u8>() };
         w.write_all(data.as_ref())?;
 
@@ -2404,6 +2406,8 @@ impl RafsV6PrefetchTable {
     ) -> RafsResult<usize> {
         self.inodes = vec![0u32; entries];
 
+        // SAFETY: `u32` has no padding and every byte pattern is a valid `u32`, so the table can be
+        // filled as bytes; `u8` has alignment 1, so the middle slice covers the whole table.
         let (_, data, _) = unsafe { self.inodes.align_to_mut::<u8>() };
         r.seek_to_offset(offset)?;
         r.read_exact(data)?;

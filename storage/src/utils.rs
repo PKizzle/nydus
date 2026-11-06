@@ -203,8 +203,11 @@ pub fn get_path_from_file(file: &impl AsRawFd) -> Option<String> {
 #[cfg(target_os = "macos")]
 pub fn get_path_from_file(file: &impl AsRawFd) -> Option<String> {
     let fd = file.as_raw_fd();
+    // SAFETY: `c_char` is an integer type, so an all-zero array is a valid value.
     let mut buf: [c_char; 1024] = unsafe { mem::zeroed() };
 
+    // SAFETY: `F_GETPATH` writes at most `MAXPATHLEN` (1024) bytes into `buf`, which is exactly
+    // that size; an invalid `fd` only makes the call fail.
     let result = unsafe { fcntl(fd, libc::F_GETPATH, buf.as_mut_ptr()) };
 
     if result == -1 {
@@ -212,6 +215,8 @@ pub fn get_path_from_file(file: &impl AsRawFd) -> Option<String> {
         return None;
     }
 
+    // SAFETY: `F_GETPATH` succeeded, so it wrote a NUL-terminated path into `buf`, which outlives
+    // `cstr`.
     let cstr = unsafe { CStr::from_ptr(buf.as_ptr()) };
     cstr.to_str().ok().map(|s| s.to_string())
 }
@@ -269,16 +274,24 @@ impl<'a> MemSliceCursor<'a> {
 
             match this_left.cmp(&size) {
                 cmp::Ordering::Greater => {
-                    // Safe because self.offset is valid and we have checked `size`.
+                    // SAFETY: `self.offset < slice.len()` (the cursor invariant, `this_left > 0`),
+                    // so the pointer stays inside the slice.
                     let p = unsafe { slice.as_ptr().add(self.offset) };
+                    // SAFETY: `size < this_left`, so `[p, p + size)` lies inside the slice. The
+                    // slice's creator owns that memory for its lifetime `'a`; callers must not
+                    // access it through another `FileVolatileSlice` copy while the returned
+                    // `IoSliceMut`s are alive.
                     let s = unsafe { from_raw_parts_mut(p, size) };
                     vectors.push(IoSliceMut::new(s));
                     self.offset += size;
                     break;
                 }
                 cmp::Ordering::Equal => {
-                    // Safe because self.offset is valid and we have checked `size`.
+                    // SAFETY: `self.offset < slice.len()` (the cursor invariant, `this_left > 0`),
+                    // so the pointer stays inside the slice.
                     let p = unsafe { slice.as_ptr().add(self.offset) };
+                    // SAFETY: `size == this_left`, so `[p, p + size)` ends exactly at the end of
+                    // the slice; aliasing as in the `Greater` arm.
                     let s = unsafe { from_raw_parts_mut(p, size) };
                     vectors.push(IoSliceMut::new(s));
                     self.index += 1;
@@ -286,7 +299,11 @@ impl<'a> MemSliceCursor<'a> {
                     break;
                 }
                 cmp::Ordering::Less => {
+                    // SAFETY: `self.offset < slice.len()` (the cursor invariant, `this_left > 0`),
+                    // so the pointer stays inside the slice.
                     let p = unsafe { slice.as_ptr().add(self.offset) };
+                    // SAFETY: `[p, p + this_left)` ends exactly at the end of the slice; aliasing
+                    // as in the `Greater` arm.
                     let s = unsafe { from_raw_parts_mut(p, this_left) };
                     vectors.push(IoSliceMut::new(s));
                     self.index += 1;
@@ -315,6 +332,8 @@ pub fn readahead(fd: libc::c_int, mut offset: u64, end: u64) {
     while offset < end {
         // Kernel default 128KB readahead size
         let count = std::cmp::min(128 << 10, end - offset);
+        // SAFETY: `readahead` only takes integers and has no memory-safety preconditions; a bad fd
+        // makes it fail.
         unsafe { libc::readahead(fd, offset as i64, count as usize) };
         offset += count;
     }
@@ -330,6 +349,8 @@ pub fn readahead(fd: libc::c_int, mut offset: u64, end: u64) {
             ra_offset: offset as i64,
             ra_count: count as i32,
         };
+        // SAFETY: `F_RDADVISE` reads a `radvisory` through the pointer, which refers to a local
+        // that outlives the call; a bad fd makes it fail.
         unsafe { fcntl(fd, libc::F_RDADVISE, &advice as *const radvisory) };
         offset += count;
     }
@@ -482,8 +503,12 @@ mod tests {
         let mut dst_buf1 = vec![0x0u8; 4];
         let mut dst_buf2 = vec![0x0u8; 4];
         let volatile_slice_1 =
+            // SAFETY: `dst_buf1` outlives the volatile slice and is not accessed directly until
+            // `copyv` returns.
             unsafe { FileVolatileSlice::from_raw_ptr(dst_buf1.as_mut_ptr(), dst_buf1.len()) };
         let volatile_slice_2 =
+            // SAFETY: `dst_buf2` outlives the volatile slice and is not accessed directly until
+            // `copyv` returns.
             unsafe { FileVolatileSlice::from_raw_ptr(dst_buf2.as_mut_ptr(), dst_buf2.len()) };
         let dst_bufs = [volatile_slice_1, volatile_slice_2];
 
@@ -599,8 +624,12 @@ mod tests {
         let mut dst_buf1 = vec![0x0u8; 2];
         let mut dst_buf2 = vec![0x0u8; 2];
         let volatile_slice_1 =
+            // SAFETY: `dst_buf1` outlives the volatile slice and is not accessed directly until
+            // `copyv` returns.
             unsafe { FileVolatileSlice::from_raw_ptr(dst_buf1.as_mut_ptr(), dst_buf1.len()) };
         let volatile_slice_2 =
+            // SAFETY: `dst_buf2` outlives the volatile slice and is not accessed directly until
+            // `copyv` returns.
             unsafe { FileVolatileSlice::from_raw_ptr(dst_buf2.as_mut_ptr(), dst_buf2.len()) };
         let dst_bufs = [volatile_slice_1, volatile_slice_2];
 
@@ -620,6 +649,8 @@ mod tests {
     fn test_copyv_overflow_after_partial_copy() {
         let mut dst_buf = vec![0x0u8; 3];
         let volatile_slice =
+            // SAFETY: `dst_buf` outlives the volatile slice and is not accessed directly until
+            // `copyv` returns.
             unsafe { FileVolatileSlice::from_raw_ptr(dst_buf.as_mut_ptr(), dst_buf.len()) };
         let dst_bufs = [volatile_slice];
 
@@ -677,8 +708,12 @@ mod tests {
     #[test]
     fn test_mem_slice_cursor_move() {
         let mut buf1 = vec![0x0u8; 2];
+        // SAFETY: `buf1` outlives the volatile slice and is not accessed directly while the cursor
+        // uses it.
         let vs1 = unsafe { FileVolatileSlice::from_raw_ptr(buf1.as_mut_ptr(), buf1.len()) };
         let mut buf2 = vec![0x0u8; 2];
+        // SAFETY: `buf2` outlives the volatile slice and is not accessed directly while the cursor
+        // uses it.
         let vs2 = unsafe { FileVolatileSlice::from_raw_ptr(buf2.as_mut_ptr(), buf2.len()) };
         let vs = [vs1, vs2];
 
@@ -714,8 +749,12 @@ mod tests {
     #[test]
     fn test_mem_slice_cursor_consume() {
         let mut buf1 = vec![0x0u8; 2];
+        // SAFETY: `buf1` outlives the volatile slice and is not accessed directly while the cursor
+        // uses it.
         let vs1 = unsafe { FileVolatileSlice::from_raw_ptr(buf1.as_mut_ptr(), buf1.len()) };
         let mut buf2 = vec![0x0u8; 2];
+        // SAFETY: `buf2` outlives the volatile slice and is not accessed directly while the cursor
+        // uses it.
         let vs2 = unsafe { FileVolatileSlice::from_raw_ptr(buf2.as_mut_ptr(), buf2.len()) };
         let vs = [vs1, vs2];
 
@@ -747,8 +786,12 @@ mod tests {
     #[test]
     fn test_mem_slice_cursor_consume_from_middle_across_slices() {
         let mut buf1 = vec![1u8, 2u8, 3u8];
+        // SAFETY: `buf1` outlives the volatile slice and is only read after the consumed slices are
+        // dropped.
         let vs1 = unsafe { FileVolatileSlice::from_raw_ptr(buf1.as_mut_ptr(), buf1.len()) };
         let mut buf2 = vec![4u8, 5u8];
+        // SAFETY: `buf2` outlives the volatile slice and is only read after the consumed slices are
+        // dropped.
         let vs2 = unsafe { FileVolatileSlice::from_raw_ptr(buf2.as_mut_ptr(), buf2.len()) };
         let vs = [vs1, vs2];
 

@@ -531,6 +531,9 @@ mod tests {
 
     #[test]
     fn test_parse_custom_headers_from_env() {
+        // SAFETY: NOT enforced: `set_var` races with any other thread reading the environment, and
+        // test threads run in parallel; it relies on no concurrently running test touching the
+        // environment.
         unsafe {
             std::env::set_var("NYDUS_HEADER_X-TEST-PROXY-1", "value1");
             std::env::set_var("NYDUS_HEADER_X-TEST-PROXY-2", "value2");
@@ -551,6 +554,7 @@ mod tests {
             &HeaderValue::from_str("value2").unwrap()
         );
 
+        // SAFETY: NOT enforced: as for `set_var` above.
         unsafe {
             std::env::remove_var("NYDUS_HEADER_X-TEST-PROXY-1");
             std::env::remove_var("NYDUS_HEADER_X-TEST-PROXY-2");
@@ -685,6 +689,9 @@ mod tests {
 
     #[test]
     fn test_call_injects_custom_headers() {
+        // SAFETY: NOT enforced: `set_var` races with any other thread reading the environment, and
+        // test threads run in parallel; it relies on no concurrently running test touching the
+        // environment.
         unsafe { std::env::set_var("NYDUS_HEADER_X-TEST-INJECT", "injected") };
         let req = make_request("", "");
         let mut headers = HeaderMap::new();
@@ -706,6 +713,7 @@ mod tests {
         assert_eq!(headers.get("X-TEST-INJECT").unwrap(), "injected");
         assert_eq!(headers.get("User-Agent").unwrap(), "nydusd/1.0.0");
 
+        // SAFETY: NOT enforced: as for `set_var` above.
         unsafe { std::env::remove_var("NYDUS_HEADER_X-TEST-INJECT") };
     }
 

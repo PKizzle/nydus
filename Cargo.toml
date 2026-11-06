@@ -14,6 +14,9 @@ edition = "2024"
 rust-version.workspace = true
 build = "build.rs"
 
+[lints]
+workspace = true
+
 [profile.release]
 # Unwinding lets a panic in one fanotify worker be contained to that image's daemon (see
 # `nydus_utils::panic_policy`). Every binary installs `abort_on_uncontained_panic`, so a panic
@@ -172,6 +175,18 @@ members = [
 # package alone is what makes clippy's MSRV-aware lints work for every member;
 # without it they run unconstrained and have to be silenced in the Makefile.
 rust-version = "1.96"
+
+# Every first-party member opts in with `[lints] workspace = true`.
+[workspace.lints.clippy]
+# Each `unsafe` block and `unsafe impl` states the invariant that makes it sound.
+undocumented_unsafe_blocks = "deny"
+
+[workspace.lints.rust]
+# An `unsafe fn` body is not an implicit unsafe block: each unsafe operation inside it is
+# wrapped and documented like any other.
+unsafe_op_in_unsafe_fn = "deny"
+# Custom cfgs used by verification tooling (Kani proofs, loom models, cargo-fuzz builds).
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)', 'cfg(loom)', 'cfg(fuzzing)'] }
 
 [workspace.dependencies]
 # rust-vmm crates

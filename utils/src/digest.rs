@@ -207,6 +207,8 @@ impl From<DigestData> for RafsDigest {
 
 impl From<&DigestData> for &RafsDigest {
     fn from(data: &DigestData) -> Self {
+        // SAFETY: `RafsDigest` is `#[repr(C)]` with `DigestData` as its only field, so both have
+        // the same size, alignment and layout, and the reference keeps the borrow of `data`.
         unsafe { &*(data as *const DigestData as *const u8 as *const RafsDigest) }
     }
 }
