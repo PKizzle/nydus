@@ -156,7 +156,7 @@ impl VerityGenerator {
             if md.len() < total_size as u64 + offset {
                 file.set_len(total_size as u64 + offset)?;
             }
-            // Safe because only this mapping writes the verity data from `offset` on, and the block
+            // SAFETY: only this mapping writes the verity data from `offset` on, and the block
             // device that uses it writes only the data below `offset`.
             unsafe { FileMapState::new(file, offset as libc::off_t, total_size, true) }?
         } else {
@@ -177,6 +177,8 @@ impl VerityGenerator {
         let mut map = self.file_map.lock().unwrap();
 
         while offset < total_size {
+            // SAFETY: the mapping is private to this generator and only accessed under the
+            // `file_map` mutex, so the mutable reference is exclusive while it lives.
             let digest = unsafe { map.get_mut::<DigestData>(offset) }?;
             digest.copy_from_slice(&NON_EXIST_ENTRY_DIGEST.data);
             offset += size_of::<DigestData>();
@@ -227,6 +229,8 @@ impl VerityGenerator {
         let base = self.mkl_tree.level_base(level) as usize;
         let offset = base + index as usize * digest_size;
         let mut guard = self.file_map.lock().unwrap();
+        // SAFETY: the mapping is private to this generator and only accessed under the `file_map`
+        // mutex, so the mutable reference is exclusive while it lives.
         let buf = unsafe { guard.get_mut::<DigestData>(offset) }?;
         buf.copy_from_slice(digest);
 
@@ -245,6 +249,9 @@ impl VerityGenerator {
         for _ in 0..count {
             let data = guard.get_slice::<u8>(data_base, page_size)?;
             let digest = RafsDigest::from_buf(data, self.mkl_tree.digest_algo);
+            // SAFETY: the mapping is only accessed under the `file_map` mutex; the digest slot at
+            // `digest_base` (level `level`) does not overlap the `data` slice read from level
+            // `level - 1`, which is no longer borrowed.
             let buf = unsafe { guard.get_mut::<DigestData>(digest_base) }?;
             buf.copy_from_slice(digest.as_ref());
             data_base += page_size;

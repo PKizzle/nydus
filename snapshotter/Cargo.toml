@@ -13,6 +13,9 @@ repository = "https://github.com/dragonflyoss/nydus"
 edition = "2024"
 rust-version.workspace = true
 
+[lints]
+workspace = true
+
 [[bin]]
 name = "containerd-nydus"
 path = "src/bin/containerd-nydus.rs"

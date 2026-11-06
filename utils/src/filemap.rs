@@ -20,10 +20,16 @@ use crate::with_context;
 /// structs without gaps whose fields are plain integers, arrays, or structs of them.
 pub unsafe trait FromMapped {}
 
+// SAFETY: every bit pattern of a `u8` is valid and it has no padding or interior mutability.
 unsafe impl FromMapped for u8 {}
+// SAFETY: every bit pattern of a `u16` is valid and it has no padding or interior mutability.
 unsafe impl FromMapped for u16 {}
+// SAFETY: every bit pattern of a `u32` is valid and it has no padding or interior mutability.
 unsafe impl FromMapped for u32 {}
+// SAFETY: every bit pattern of a `u64` is valid and it has no padding or interior mutability.
 unsafe impl FromMapped for u64 {}
+// SAFETY: an array has no padding between elements, so it inherits the all-bit-patterns-valid,
+// no-padding, no-interior-mutability guarantee from `T: FromMapped`.
 unsafe impl<T: FromMapped, const N: usize> FromMapped for [T; N] {}
 
 /// Struct to manage memory range mapped from file objects.
@@ -36,9 +42,12 @@ pub struct FileMapState {
     writable: bool,
 }
 
-// Safe because `new` requires that nothing writes the mapped file under live references, and
-// mutable access is unsafe.
+// SAFETY: the mapping is process-wide memory and `fd` is owned, so neither is tied to the creating
+// thread. Shared access only reads, `new` requires that nothing writes the mapped range under live
+// references, and mutable access needs `&mut self` plus the caller's `unsafe` contract.
 unsafe impl Send for FileMapState {}
+// SAFETY: `&FileMapState` only hands out shared references into a mapping that `new` requires to be
+// unchanging while borrowed; see the `Send` impl above.
 unsafe impl Sync for FileMapState {}
 
 impl Default for FileMapState {
@@ -55,6 +64,9 @@ impl Default for FileMapState {
 impl Drop for FileMapState {
     fn drop(&mut self) {
         if !self.base.is_null() {
+            // SAFETY: `base`/`size` describe the mapping created by a successful `mmap` in `new`,
+            // which is unmapped only here. Every reference handed out borrows `self` (or holds an
+            // `Arc` to it), so none outlive this call.
             unsafe { libc::munmap(self.base as *mut u8 as *mut libc::c_void, self.size) };
             self.base = std::ptr::null();
             self.size = 0;
@@ -93,6 +105,9 @@ impl FileMapState {
         } else {
             libc::PROT_READ
         };
+        // SAFETY: a NULL hint lets the kernel choose the address; `file` is an open fd that
+        // outlives the call, and `size` was checked to be non-zero. The result is checked for
+        // `MAP_FAILED` below.
         let base = unsafe {
             libc::mmap(
                 std::ptr::null_mut(),
@@ -128,8 +143,9 @@ impl FileMapState {
     /// Cast a subregion of the mapped area to an object reference.
     pub fn get_ref<T: FromMapped>(&self, offset: usize) -> io::Result<&T> {
         let start = self.typed_range::<T>(offset, 1)?;
-        // Safe because any bytes are a valid `T`, and `new` requires them not to change while
-        // borrowed.
+        // SAFETY: `typed_range` checked that the range lies inside the live mapping and is aligned
+        // for `T`; `T: FromMapped` makes any bytes a valid `T`, and `new` requires them not to
+        // change while borrowed. The reference borrows `self`, so the mapping outlives it.
         Ok(unsafe { &*start })
     }
 
@@ -142,13 +158,18 @@ impl FileMapState {
             return Err(invalid_input("mapping is read-only"));
         }
         let start = self.typed_range::<T>(offset, 1)?;
+        // SAFETY: `typed_range` checked bounds and alignment and the mapping is writable; the
+        // caller guarantees exclusive access to the range, and the reference borrows `self`
+        // mutably.
         Ok(unsafe { &mut *start.cast_mut() })
     }
 
     /// Get an immutable slice of `T` at `offset` with `count` entries.
     pub fn get_slice<T: FromMapped>(&self, offset: usize, count: usize) -> io::Result<&[T]> {
         let start = self.typed_range::<T>(offset, count)?;
-        // Safe for the same reasons as `get_ref`.
+        // SAFETY: `typed_range` checked that `count` entries of `T` fit inside the live mapping (or
+        // returned a dangling aligned pointer for an empty slice) and are aligned; validity follows
+        // from `T: FromMapped` and the `new` contract as in `get_ref`.
         Ok(unsafe { std::slice::from_raw_parts(start, count) })
     }
 
@@ -165,6 +186,8 @@ impl FileMapState {
             return Err(invalid_input("mapping is read-only"));
         }
         let start = self.typed_range::<T>(offset, count)?;
+        // SAFETY: bounds and alignment as in `get_slice`, the mapping is writable, and the caller
+        // guarantees exclusive access to the range for the borrow of `self`.
         Ok(unsafe { std::slice::from_raw_parts_mut(start.cast_mut(), count) })
     }
 
@@ -212,6 +235,8 @@ impl FileMapState {
         if self.fd < 0 {
             return Err(invalid_input("mapping has no file"));
         }
+        // SAFETY: `fd` is the open descriptor owned by `self`; the temporary `File` is forgotten
+        // instead of dropped, so it never closes the descriptor.
         let file = unsafe { File::from_raw_fd(self.fd) };
         let result = file.sync_data();
         std::mem::forget(file);
@@ -221,6 +246,8 @@ impl FileMapState {
 
 /// Duplicate a file object by `libc::dup()`.
 pub fn clone_file(fd: RawFd) -> io::Result<File> {
+    // SAFETY: `dup` has no memory-safety preconditions; on success it returns a fresh descriptor
+    // that nothing else owns, so `File` may take ownership of it.
     unsafe {
         let fd = libc::dup(fd);
         if fd < 0 {
@@ -267,14 +294,16 @@ impl<T> Deref for MappedSlice<T> {
     type Target = [T];
 
     fn deref(&self) -> &[T] {
-        // Safe because `new` checked range and alignment against the mapping, which `_map`
-        // keeps alive.
+        // SAFETY: `MappedSlice::new` checked range and alignment against the mapping, which `_map`
+        // keeps alive for as long as this view, and `T: FromMapped` makes the bytes valid `T`s.
         unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
     }
 }
 
-// Sharing the view is as safe as sharing a `&[T]`.
+// SAFETY: the view is a `&[T]` into a mapping kept alive by an `Arc`, so sending it is as sound as
+// sending a `&[T]`, which requires `T: Sync`.
 unsafe impl<T: Sync> Send for MappedSlice<T> {}
+// SAFETY: sharing the view is as sound as sharing a `&[T]`, which requires `T: Sync`.
 unsafe impl<T: Sync> Sync for MappedSlice<T> {}
 
 /// A table of entries that is either built in memory or viewed in a mapped file.
@@ -337,6 +366,8 @@ mod tests {
             .write_all(&[1u8, 0, 0, 0, 2, 0, 0, 0])
             .unwrap();
         let map = Arc::new(
+            // SAFETY: the temp file is private to this test and is neither written nor truncated
+            // while mapped.
             unsafe { FileMapState::new(temp.as_file().try_clone().unwrap(), 0, 8, false) }.unwrap(),
         );
         let view = MappedSlice::<u32>::new(map.clone(), 0, 2).unwrap();
@@ -361,6 +392,8 @@ mod tests {
         let temp = TempFile::new().unwrap();
         temp.as_file().write_all(&[7u8; 8]).unwrap();
         let map = Arc::new(
+            // SAFETY: the temp file is private to this test and is neither written nor truncated
+            // while mapped.
             unsafe { FileMapState::new(temp.as_file().try_clone().unwrap(), 0, 8, false) }.unwrap(),
         );
         let mut table = MappedOrOwned::Mapped(MappedSlice::<u8>::new(map, 0, 8).unwrap());
@@ -380,6 +413,8 @@ mod tests {
             .write(false)
             .open(path)
             .unwrap();
+        // SAFETY: the fixture bootstrap is read-only test data that nothing writes while it is
+        // mapped.
         let map = unsafe { FileMapState::new(file, 0, 4096, false) }.unwrap();
 
         let magic = map.get_ref::<u32>(0).unwrap();
@@ -410,6 +445,8 @@ mod tests {
             .write(false)
             .open(temp.as_path())
             .unwrap();
+        // SAFETY: the temp file is private to this test; the mapping attempt fails before any
+        // access.
         assert!(unsafe { FileMapState::new(file, 0, 4096, true) }.is_err());
 
         let temp = TempFile::new().unwrap();
@@ -419,6 +456,8 @@ mod tests {
             .write(false)
             .open(temp.as_path())
             .unwrap();
+        // SAFETY: the temp file is private to this test and is neither written nor truncated while
+        // mapped.
         let mut map = unsafe { FileMapState::new(file, 0, 4096, false) }.unwrap();
         assert!(map.get_slice::<u64>(0, usize::MAX).is_err());
         assert!(map.get_slice::<u64>(usize::MAX, 1).is_err());
@@ -426,10 +465,18 @@ mod tests {
         assert!(map.get_slice::<u64>(0, 128).is_ok());
         assert!(map.get_slice::<u64>(0, 0).is_ok());
 
+        // SAFETY: the mapping is read-only, so every call returns an error before creating a
+        // reference.
         assert!(unsafe { map.get_slice_mut::<u64>(0, usize::MAX) }.is_err());
+        // SAFETY: the mapping is read-only, so every call returns an error before creating a
+        // reference.
         assert!(unsafe { map.get_slice_mut::<u64>(usize::MAX, 1) }.is_err());
+        // SAFETY: the mapping is read-only, so every call returns an error before creating a
+        // reference.
         assert!(unsafe { map.get_slice_mut::<u64>(4096, 4096) }.is_err());
         // Read-only mapping: mutable access is refused even for an in-range request.
+        // SAFETY: the mapping is read-only, so every call returns an error before creating a
+        // reference.
         assert!(unsafe { map.get_slice_mut::<u64>(0, 128) }.is_err());
     }
 
@@ -439,8 +486,12 @@ mod tests {
         let temp = TempFile::new().unwrap();
         temp.as_file().set_len(4096).unwrap();
         let mut map =
+            // SAFETY: the temp file is private to this test and is only written through this
+            // mapping.
             unsafe { FileMapState::new(temp.as_file().try_clone().unwrap(), 0, 4096, true) }
                 .unwrap();
+        // SAFETY: the test holds the only handle that accesses the mapping, so the mutable
+        // reference is exclusive and is dropped before the shared read.
         unsafe {
             assert!(map.get_ref::<u32>(1).is_err());
             assert!(map.get_mut::<u32>(1).is_err());
@@ -453,14 +504,20 @@ mod tests {
         map.sync_data().unwrap();
         drop(map);
         let mut map =
+            // SAFETY: the temp file is private to this test and is neither written nor truncated
+            // while mapped.
             unsafe { FileMapState::new(temp.as_file().try_clone().unwrap(), 0, 4096, false) }
                 .unwrap();
+        // SAFETY: the mapping is read-only, so the mutable accessors fail before creating
+        // references.
         unsafe {
             assert_eq!(*map.get_ref::<u32>(4).unwrap(), 42);
             assert!(map.get_mut::<u32>(4).is_err());
             assert!(map.get_slice_mut::<u8>(0, 1).is_err());
         }
         let mut empty = FileMapState::default();
+        // SAFETY: the empty map has no memory, so only zero-sized requests succeed and none
+        // dereferences memory.
         unsafe {
             assert!(empty.get_ref::<[u8; 0]>(0).is_ok());
             assert!(empty.get_slice::<u8>(0, 0).is_ok());
@@ -471,6 +528,7 @@ mod tests {
         assert!(empty.sync_data().is_err());
         assert!(empty.validate_range(0, 0).is_err());
         assert!(
+            // SAFETY: the size check rejects 0 before any mapping is created.
             unsafe { FileMapState::new(temp.as_file().try_clone().unwrap(), 0, 0, false) }.is_err()
         );
     }

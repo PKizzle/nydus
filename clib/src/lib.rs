@@ -32,12 +32,14 @@ pub type Inode = u64;
 /// Helper to set libc::errno
 #[cfg(target_os = "linux")]
 fn set_errno(errno: i32) {
+    // SAFETY: `__errno_location` returns a valid pointer to the calling thread's `errno`.
     unsafe { *libc::__errno_location() = errno };
 }
 
 /// Helper to set libc::errno
 #[cfg(target_os = "macos")]
 fn set_errno(errno: i32) {
+    // SAFETY: `__error` returns a valid pointer to the calling thread's `errno`.
     unsafe { *libc::__error() = errno };
 }
 

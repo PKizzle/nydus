@@ -557,6 +557,9 @@ pub mod blob_cache_tests {
            );
 
            // read from cache
+           // SAFETY: `alloc_zeroed` returns a 50-byte, initialized allocation (the test would fault
+           // on the impossible NULL), which the volatile slice covers exactly and which is only
+           // read back after `read` returns. It is leaked, never freed.
            let r1 = unsafe {
                let layout = Layout::from_size_align(50, 1).unwrap();
                let ptr = alloc_zeroed(layout);
@@ -565,6 +568,7 @@ pub mod blob_cache_tests {
                Vec::from(from_raw_parts(ptr, 50))
            };
 
+           // SAFETY: as for `r1` above.
            let r2 = unsafe {
                let layout = Layout::from_size_align(50, 1).unwrap();
                let ptr = alloc_zeroed(layout);

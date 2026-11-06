@@ -793,9 +793,6 @@ mod tests {
         }
     }
 
-    unsafe impl Send for MockBackend {}
-    unsafe impl Sync for MockBackend {}
-
     impl BlobBackend for MockBackend {
         fn shutdown(&self) {}
 

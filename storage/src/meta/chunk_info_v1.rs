@@ -24,6 +24,8 @@ pub struct BlobChunkInfoV1Ondisk {
     pub(crate) comp_info: u64,
 }
 
+// SAFETY: `#[repr(C, packed)]` with only `u64` fields: no padding, alignment 1, no interior
+// mutability, and every bit pattern is valid.
 unsafe impl FromMapped for BlobChunkInfoV1Ondisk {}
 
 impl BlobMetaChunkInfo for BlobChunkInfoV1Ondisk {
@@ -374,6 +376,8 @@ mod tests {
             },
         ];
 
+        // SAFETY: `BlobChunkInfoV1Ondisk` is packed integers, so the vector's bytes are initialized
+        // and the length is its exact byte size; `data` borrows `chunks`.
         let data = unsafe {
             std::slice::from_raw_parts(
                 chunks.as_ptr() as *const u8,
@@ -453,6 +457,8 @@ mod tests {
             },
         ];
 
+        // SAFETY: `BlobChunkInfoV1Ondisk` is packed integers, so the vector's bytes are initialized
+        // and the length is its exact byte size; `data` borrows `chunks`.
         let data = unsafe {
             std::slice::from_raw_parts(
                 chunks.as_ptr() as *const u8,
@@ -510,6 +516,8 @@ mod tests {
             };
             64
         ];
+        // SAFETY: `BlobChunkInfoV1Ondisk` is packed integers, so the vector's bytes are initialized
+        // and the length is its exact byte size; `data` borrows `chunks`.
         let data = unsafe {
             std::slice::from_raw_parts(
                 chunks.as_ptr() as *const u8,

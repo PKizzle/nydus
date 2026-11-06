@@ -422,6 +422,8 @@ mod tests {
         let filename = path.file_name().unwrap().to_str().unwrap();
 
         {
+            // SAFETY: the `File` borrows the tempfile's descriptor and gives it back with
+            // `into_raw_fd` before leaving the scope, so the descriptor is never closed twice.
             let mut file = unsafe { File::from_raw_fd(tempfile.as_file().as_raw_fd()) };
             file.write_all(&[0x1u8, 0x2, 0x3, 0x4]).unwrap();
             let _ = file.into_raw_fd();
@@ -444,7 +446,9 @@ mod tests {
         let mut buf2 = [0x0u8];
         let mut buf3 = [0x0u8];
         let bufs = [
+            // SAFETY: `buf2` outlives the volatile slice and is only read after `readv` returns.
             unsafe { FileVolatileSlice::from_raw_ptr(buf2.as_mut_ptr(), buf2.len()) },
+            // SAFETY: `buf3` outlives the volatile slice and is only read after `readv` returns.
             unsafe { FileVolatileSlice::from_raw_ptr(buf3.as_mut_ptr(), buf3.len()) },
         ];
 
@@ -481,6 +485,8 @@ mod tests {
 
         let mut readv_buf = [0xabu8; 2];
         let bufs =
+            // SAFETY: `readv_buf` outlives the volatile slice and is only read after `readv`
+            // returns.
             [unsafe { FileVolatileSlice::from_raw_ptr(readv_buf.as_mut_ptr(), readv_buf.len()) }];
         assert_eq!(blob.readv(&bufs, 0, 0).unwrap(), 0);
         assert_eq!(readv_buf, [0xab, 0xab]);

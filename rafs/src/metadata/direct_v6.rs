@@ -221,7 +221,7 @@ impl DirectSuperBlockV6 {
         )?;
         let blob_extra_infos = rafsv6_load_blob_extra_info(meta, r)?;
 
-        // Safe because nydus only reads the bootstrap, which must not change while it's mounted.
+        // SAFETY: nydus only reads the bootstrap, which must not change while it's mounted.
         let file_map = unsafe { FileMapState::new(file, 0, len as usize, false) }?;
         let state = DirectMappingState {
             meta: old_state.meta.clone(),

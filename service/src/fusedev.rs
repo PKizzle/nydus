@@ -623,14 +623,19 @@ fn is_mounted(mp: impl AsRef<Path>) -> Result<bool> {
     let mp = CString::new(String::from(mp))
         .map_err(|_| NydusError::InvalidArguments("mountpoint contains a NUL byte".to_string()))?;
     let mut mntbuf: *mut libc::statfs = std::ptr::null_mut();
+    // SAFETY: `mntbuf` is a valid out-pointer; on success `getmntinfo` stores a pointer to `count`
+    // entries it owns.
     let count = unsafe { libc::getmntinfo(&mut mntbuf, libc::MNT_NOWAIT) };
     if count == 0 {
         return Err(NydusError::ReadMountTable(std::io::Error::last_os_error()));
     }
-    // getmntinfo owns this array, so it must not be freed here.
+    // SAFETY: `getmntinfo` returned `count > 0` entries at `mntbuf`, which it owns and which stay
+    // valid until the next `getmntinfo` call on this thread; they must not be freed here.
     let mounts = unsafe { std::slice::from_raw_parts(mntbuf, count as usize) };
     Ok(mounts
         .iter()
+        // SAFETY: `f_mntonname` is a NUL-terminated fixed-size array inside the entry borrowed from
+        // `mounts`.
         .any(|m| unsafe { CStr::from_ptr(m.f_mntonname.as_ptr()) } == mp.as_c_str()))
 }
 
@@ -639,36 +644,38 @@ fn is_mounted(mp: impl AsRef<Path>) -> Result<bool> {
 fn is_mounted(mp: impl AsRef<Path>) -> Result<bool> {
     let mounts = CString::new("/proc/self/mounts").unwrap();
     let ty = CString::new("r").unwrap();
+    let mp = CString::new(mp.as_ref().as_os_str().as_bytes())
+        .map_err(|_| NydusError::InvalidArguments("mountpoint contains a NUL byte".to_string()))?;
 
-    let mounts_stream = unsafe {
-        libc::setmntent(
-            mounts.as_ptr() as *const libc::c_char,
-            ty.as_ptr() as *const libc::c_char,
-        )
-    };
+    // SAFETY: both arguments are NUL-terminated strings that outlive the call.
+    let mounts_stream = unsafe { libc::setmntent(mounts.as_ptr(), ty.as_ptr()) };
+    if mounts_stream.is_null() {
+        return Err(NydusError::ReadMountTable(std::io::Error::last_os_error()));
+    }
 
+    let mut found = false;
     loop {
+        // SAFETY: `mounts_stream` is the non-null stream opened above and not yet closed. The
+        // returned entry lives in a static buffer, so this relies on no other thread calling
+        // `getmntent` concurrently.
         let mnt = unsafe { libc::getmntent(mounts_stream) };
-        if mnt as u32 == libc::PT_NULL {
+        if mnt.is_null() {
             break;
         }
 
         // Mount point path
-        if unsafe { CStr::from_ptr((*mnt).mnt_dir) }
-            == CString::new(mp.as_ref().as_os_str().as_bytes())
-                .map_err(|_| {
-                    NydusError::InvalidArguments("mountpoint contains a NUL byte".to_string())
-                })?
-                .as_c_str()
-        {
-            unsafe { libc::endmntent(mounts_stream) };
-            return Ok(true);
+        // SAFETY: a non-null `getmntent` result points to an entry whose `mnt_dir` is a
+        // NUL-terminated string, valid until the next `getmntent` call on this stream.
+        if unsafe { CStr::from_ptr((*mnt).mnt_dir) } == mp.as_c_str() {
+            found = true;
+            break;
         }
     }
 
+    // SAFETY: `mounts_stream` was opened by `setmntent` above and is closed exactly once.
     unsafe { libc::endmntent(mounts_stream) };
 
-    Ok(false)
+    Ok(found)
 }
 
 fn is_sock_residual(sock: impl AsRef<Path>) -> bool {

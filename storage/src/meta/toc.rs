@@ -357,6 +357,9 @@ impl TocEntryList {
 
     /// Convert object to a byte slice.
     pub fn as_bytes(&self) -> &[u8] {
+        // SAFETY: `TocEntry` is `#[repr(C)]` integers and byte arrays laid out to 128 bytes without
+        // padding, so its bytes are initialized; `u8` has alignment 1, so the middle slice covers
+        // all entries.
         let (_, data, _) = unsafe { self.entries.align_to::<u8>() };
         data
     }
@@ -532,6 +535,9 @@ impl TocEntryList {
 
         while pos < size {
             let mut entry = TocEntry::default();
+            // SAFETY: `entry` is a live local of exactly `size_of::<TocEntry>()` bytes, which has
+            // no padding and accepts any bit pattern; the slice is the only access to it until it
+            // ends.
             let s = unsafe {
                 slice::from_raw_parts_mut(&mut entry as *mut _ as *mut u8, size_of::<TocEntry>())
             };

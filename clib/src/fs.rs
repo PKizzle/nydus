@@ -33,21 +33,25 @@ pub(crate) struct FileSystemState {
 
 impl FileSystemState {
     /// Caller needs to ensure the lifetime of returned reference.
-    pub(crate) unsafe fn from_handle(hdl: NydusFsHandle) -> &'static mut Self {
+    pub(crate) unsafe fn from_handle(hdl: NydusFsHandle) -> &'static Self {
+        // SAFETY: the caller guarantees `hdl` came from `nydus_open_rafs*` and has not been closed,
+        // so it points to the live, leaked `Box<FileSystemState>`; the reference is only used while
+        // that holds.
         unsafe {
-            let fs = &mut *(hdl as *const FileSystemState as *mut FileSystemState);
+            let fs = &*(hdl as *const FileSystemState);
             assert_eq!(fs.magic, NYDUS_FS_HANDLE_MAGIC);
             fs
         }
     }
 
     /// Caller needs to ensure the lifetime of returned reference.
-    pub(crate) unsafe fn try_from_handle(hdl: NydusFsHandle) -> Result<&'static mut Self, i32> {
+    pub(crate) unsafe fn try_from_handle(hdl: NydusFsHandle) -> Result<&'static Self, i32> {
+        // SAFETY: as in `from_handle`, for a non-null `hdl`.
         unsafe {
             if hdl == null::<FileSystemState>() as usize {
                 return Err(libc::EINVAL);
             }
-            let fs = &mut *(hdl as *const FileSystemState as *mut FileSystemState);
+            let fs = &*(hdl as *const FileSystemState);
             assert_eq!(fs.magic, NYDUS_FS_HANDLE_MAGIC);
             Ok(fs)
         }
@@ -132,6 +136,8 @@ pub unsafe extern "C" fn nydus_open_rafs(
     bootstrap: *const c_char,
     config: *const c_char,
 ) -> NydusFsHandle {
+    // SAFETY: the caller guarantees non-null `bootstrap` and `config` point to NUL-terminated
+    // strings that stay valid for this call.
     unsafe {
         if bootstrap.is_null() || config.is_null() {
             return fs_error_einval();
@@ -156,6 +162,8 @@ pub unsafe extern "C" fn nydus_open_rafs_default(
     bootstrap: *const c_char,
     dir_path: *const c_char,
 ) -> NydusFsHandle {
+    // SAFETY: the caller guarantees non-null `bootstrap` and `dir_path` point to NUL-terminated
+    // strings that stay valid for this call.
     unsafe {
         if bootstrap.is_null() || dir_path.is_null() {
             return fs_error_einval();
@@ -194,6 +202,9 @@ pub unsafe extern "C" fn nydus_open_rafs_default(
 /// Caller needs to ensure `handle` is valid, otherwise it may cause memory access violation.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn nydus_close_rafs(handle: NydusFsHandle) {
+    // SAFETY: the caller guarantees a non-invalid `handle` came from `nydus_open_rafs*`, has not
+    // been closed, and has no file handle left open, so it is the leaked `Box<FileSystemState>` and
+    // is reclaimed exactly once.
     unsafe {
         // An open that failed returns `NYDUS_INVALID_FS_HANDLE`, and every caller which does not
         // check before closing used to reach `Box::from_raw(null)` and read `magic` through it --
@@ -267,6 +278,7 @@ pub(crate) mod tests {
 
     pub(crate) fn open_file_system() -> NydusFsHandle {
         init_logging();
+        // SAFETY: null pointers are rejected before anything is dereferenced.
         let ret = unsafe { nydus_open_rafs(null(), null()) };
         assert_eq!(ret, NYDUS_INVALID_FS_HANDLE);
         assert_eq!(
@@ -297,6 +309,7 @@ pub(crate) mod tests {
             blob_dir.display()
         );
         let config = CString::new(config).unwrap();
+        // SAFETY: both pointers come from `CString`s that outlive the call.
         let fs = unsafe {
             nydus_open_rafs(
                 bootstrap.as_ptr() as *const c_char,
@@ -312,6 +325,7 @@ pub(crate) mod tests {
     #[cfg_attr(miri, ignore = "Miri does not support readahead")]
     fn test_open_rafs() {
         let fs = open_file_system();
+        // SAFETY: `fs` came from `open_file_system` and is closed exactly once.
         unsafe { nydus_close_rafs(fs) };
     }
 
@@ -334,11 +348,13 @@ pub(crate) mod tests {
         // this test failed with a bare "left: 0, right: 0" naming neither the cause nor the
         // step. About 1-3% of `--test-threads=8` runs, i.e. only ever in CI.
         let blob_dir = CString::new(blob_dir.to_str().unwrap()).unwrap();
+        // SAFETY: both pointers come from `CString`s that outlive the call.
         let fs = unsafe { nydus_open_rafs_default(bootstrap.as_ptr(), blob_dir.as_ptr()) };
         // Assert before closing. Without this, an open that failed for any reason handed a
         // null handle straight to `nydus_close_rafs`, and the test died with a bare SIGSEGV
         // that said nothing about which step had actually gone wrong.
         assert_ne!(fs, NYDUS_INVALID_FS_HANDLE);
+        // SAFETY: `fs` was checked to be a valid handle and is closed exactly once.
         unsafe { nydus_close_rafs(fs) };
     }
 
@@ -346,6 +362,7 @@ pub(crate) mod tests {
     fn closing_an_invalid_handle_is_rejected_not_fatal() {
         // The C idiom is to close whatever open returned. When open failed that handle is
         // `NYDUS_INVALID_FS_HANDLE`, and dereferencing it used to fault inside the library.
+        // SAFETY: the invalid handle is rejected before anything is dereferenced.
         unsafe { nydus_close_rafs(NYDUS_INVALID_FS_HANDLE) };
         assert_eq!(
             Error::raw_os_error(&Error::last_os_error()),

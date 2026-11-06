@@ -207,6 +207,9 @@ pub struct BlobCompressionContextHeader {
     s_magic2: u32,
 }
 
+// SAFETY: `BlobCompressionContextHeader` is `#[repr(C)]` integers and a byte array laid out to
+// exactly 4096 bytes with no padding, so every bit pattern is valid and it has no interior
+// mutability.
 unsafe impl FromMapped for BlobCompressionContextHeader {}
 
 impl Default for BlobCompressionContextHeader {
@@ -451,6 +454,8 @@ impl BlobCompressionContextHeader {
 
     /// Convert the header as an `&[u8]`.
     pub fn as_bytes(&self) -> &[u8] {
+        // SAFETY: the header has no padding (see the `FromMapped` impl), so all its bytes are
+        // initialized; the slice borrows `self`.
         unsafe {
             std::slice::from_raw_parts(
                 self as *const BlobCompressionContextHeader as *const u8,
@@ -565,6 +570,9 @@ impl BlobCompressionContextInfo {
             .try_clone()
             .map_err(|e| MetaError::io("failed to dup the blob meta file", e))?;
         let filemap = Arc::new(
+            // SAFETY: the mapping is read-only, and the header references taken from it end with
+            // each `validate_header` call; the file is written only through `file` while none is
+            // alive (see the comment above).
             unsafe { FileMapState::new(map_file, 0, expected_size, false) }.map_err(|e| {
                 MetaError::io(format!("failed to mmap blob meta file {}", meta_path), e)
             })?,
@@ -691,8 +699,8 @@ impl BlobCompressionContextInfo {
                 )));
             }
 
-            // Safe because the digest file isn't written once it exists.
             let file_map = Arc::new(
+                // SAFETY: the digest file isn't written once it exists.
                 unsafe { FileMapState::new(file, 0, size, false) }
                     .map_err(|e| MetaError::io("failed to mmap the chunk digest file", e))?,
             );
@@ -1350,12 +1358,18 @@ impl BlobMetaChunkArray {
     /// Convert the chunk compression information array as a u8 slice.
     pub fn as_byte_slice(&self) -> &[u8] {
         match self {
+            // SAFETY: `BlobChunkInfoV1Ondisk` is `#[repr(C, packed)]` integers, so the array's
+            // bytes are initialized and the length is the array's exact byte size; the slice
+            // borrows `v`.
             BlobMetaChunkArray::V1(v) => unsafe {
                 std::slice::from_raw_parts(
                     v.as_ptr() as *const u8,
                     v.len() * size_of::<BlobChunkInfoV1Ondisk>(),
                 )
             },
+            // SAFETY: `BlobChunkInfoV2Ondisk` is `#[repr(C, packed)]` integers, so the array's
+            // bytes are initialized and the length is the array's exact byte size; the slice
+            // borrows `v`.
             BlobMetaChunkArray::V2(v) => unsafe {
                 std::slice::from_raw_parts(
                     v.as_ptr() as *const u8,
@@ -2345,6 +2359,7 @@ pub(crate) mod tests {
             let bytes = vec![0x12; 2 * entry_size];
             std::fs::write(file.as_path(), &bytes).unwrap();
             let mapping = Arc::new(
+                // SAFETY: the temp file is private to this test and is not written while mapped.
                 unsafe {
                     FileMapState::new(file.as_file().try_clone().unwrap(), 0, bytes.len(), false)
                 }

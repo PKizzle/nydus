@@ -109,6 +109,8 @@ fn recv_fd_state(stream: &UnixStream) -> Result<(OwnedFd, Vec<u8>)> {
     // SAFETY: each fd in [0, n_fds) was just created by recvmsg and is owned by us.
     let fuse_fd = unsafe { OwnedFd::from_raw_fd(fds[0]) };
     for &extra in &fds[1..n_fds] {
+        // SAFETY: each extra fd was just received by `recvmsg` and is owned only by this function,
+        // so closing it cannot affect another owner.
         unsafe { libc::close(extra) };
     }
     data.truncate(n_data);
@@ -133,6 +135,8 @@ fn dup_cloexec(fd: RawFd) -> Result<OwnedFd> {
     if new < 0 {
         return Err(std::io::Error::last_os_error()).context("fcntl(F_DUPFD_CLOEXEC)");
     }
+    // SAFETY: `fcntl` returned a new descriptor (checked non-negative above) that nothing else
+    // owns.
     Ok(unsafe { OwnedFd::from_raw_fd(new) })
 }
 
@@ -190,6 +194,8 @@ mod tests {
             *recv_clone.lock().unwrap() = buf;
             *recv_fds_clone.lock().unwrap() = nf;
             for &fd in &fds[..nf] {
+                // SAFETY: each fd was just received by `recv_with_fd` and is owned only by this
+                // thread.
                 unsafe { libc::close(fd) };
             }
             Ok(())
