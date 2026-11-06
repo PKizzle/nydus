@@ -580,6 +580,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "zstd is C code; the 3 MiB input alone takes minutes")]
     fn stream_cursor_reads_forward_and_restarts_behind_its_position() {
         let plain = pattern(3 * 1024 * 1024, 5);
         let stream = frame(&plain);
