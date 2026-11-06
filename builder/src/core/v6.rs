@@ -15,12 +15,12 @@ use nydus_rafs::RafsIoWrite;
 use nydus_rafs::metadata::RafsStore;
 use nydus_rafs::metadata::chunk::ChunkWrapper;
 use nydus_rafs::metadata::layout::v6::{
-    EROFS_BLOCK_BITS_9, EROFS_BLOCK_SIZE_512, EROFS_BLOCK_SIZE_4096, EROFS_DEVTABLE_OFFSET,
-    EROFS_INODE_CHUNK_BASED, EROFS_INODE_FLAT_INLINE, EROFS_INODE_FLAT_PLAIN,
-    EROFS_INODE_SLOT_SIZE, EROFS_SUPER_BLOCK_SIZE, EROFS_SUPER_OFFSET, RafsV6BlobTable,
-    RafsV6Device, RafsV6Dirent, RafsV6InodeChunkAddr, RafsV6InodeChunkHeader, RafsV6OndiskInode,
-    RafsV6PrefetchTable, RafsV6SuperBlock, RafsV6SuperBlockExt, align_offset, block_bits_from_size,
-    calculate_nid, ishare_xattr_prefix_table, new_v6_inode,
+    EROFS_BLOCK_BITS_9, EROFS_BLOCK_SIZE_512, EROFS_DEVTABLE_OFFSET, EROFS_INODE_CHUNK_BASED,
+    EROFS_INODE_FLAT_INLINE, EROFS_INODE_FLAT_PLAIN, EROFS_INODE_SLOT_SIZE, EROFS_SUPER_BLOCK_SIZE,
+    EROFS_SUPER_OFFSET, RafsV6BlobTable, RafsV6Device, RafsV6Dirent, RafsV6InodeChunkAddr,
+    RafsV6InodeChunkHeader, RafsV6OndiskInode, RafsV6PrefetchTable, RafsV6SuperBlock,
+    RafsV6SuperBlockExt, align_offset, block_bits_from_size, calculate_nid,
+    ishare_xattr_prefix_table, new_v6_inode,
 };
 use nydus_storage::device::{BlobFeatures, BlobInfo};
 use nydus_utils::digest::{self, DigestHasher, RafsDigest};
@@ -731,9 +731,7 @@ impl Bootstrap {
         // +---+---------+------------+-------------+-----------------+-----------+---------+------------------+
 
         let block_size = ctx.v6_block_size();
-        // The superblocks own the first 4 KiB however small the block size (`RafsV6SuperBlock`
-        // stores a whole 4 KiB block), so the layout is aligned to at least 4 KiB.
-        let layout_block = block_size.max(EROFS_BLOCK_SIZE_4096);
+        let layout_block = super::context::v6_meta_start(block_size);
         let blobs = blob_table.get_all();
         let devtable_len = blobs.len() * size_of::<RafsV6Device>();
         let blob_table_size = blob_table.size() as u64;

@@ -2481,6 +2481,59 @@ mod tests {
         bootstrap
     }
 
+    /// A dirent naming a nid whose inode would overlap the superblocks or lie past the bootstrap
+    /// is refused when looked up, not parsed.
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
+    fn test_v6_dirent_nid_outside_the_inode_area_is_refused() {
+        let root = vmm_sys_util::tempdir::TempDir::new().unwrap();
+        // Without file data the inode area starts at block 0, so small nids reach the superblock.
+        let tar = RawTar::default().reg("empty", b"").finish();
+        let path = build_v6_variant(
+            root.as_path(),
+            ConversionType::TarToRafs,
+            &tar,
+            4096,
+            false,
+            false,
+            None,
+        );
+        let load = |path: &Path| {
+            nydus_rafs::metadata::RafsSuper::load_from_file(
+                path,
+                Arc::new(nydus_api::ConfigV2::default()),
+                false,
+            )
+            .unwrap()
+            .0
+        };
+        let rs = load(&path);
+        assert_eq!(rs.meta.meta_blkaddr, 0);
+        let lookup = |rs: &nydus_rafs::metadata::RafsSuper| {
+            rs.get_inode(rs.superblock.root_ino(), false)
+                .unwrap()
+                .get_child_by_name(OsStr::new("empty"))
+                .map(|child| child.ino())
+        };
+        let nid = lookup(&rs).unwrap();
+
+        let data = std::fs::read(&path).unwrap();
+        let at: Vec<usize> = data
+            .windows(8)
+            .enumerate()
+            .filter(|(_, w)| *w == nid.to_le_bytes())
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(at.len(), 1, "the child's dirent names nid {nid} once");
+        for bad in [32u64, 36, 1 << 40] {
+            let mut patched = data.clone();
+            patched[at[0]..at[0] + 8].copy_from_slice(&bad.to_le_bytes());
+            let path = root.as_path().join(format!("nid-{bad}"));
+            std::fs::write(&path, &patched).unwrap();
+            assert!(lookup(&load(&path)).is_err(), "nid {bad}");
+        }
+    }
+
     /// Every v6 layout variant the builder writes passes `RafsSuper` validation and loads back:
     /// each block size, with and without a prefetch table, implicit directories and the inode
     /// sharing xattr prefix table, without blobs, as tarfs, and over a chunk dictionary.

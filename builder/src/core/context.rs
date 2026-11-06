@@ -1252,7 +1252,7 @@ impl BootstrapContext {
             inode_map: HashMap::new(),
             inode_count: 0,
             next_ino: 1,
-            offset: block_size.max(EROFS_BLOCK_SIZE_4096),
+            offset: v6_meta_start(block_size),
             writer,
             // Sized for the largest supported block size (64 KiB) so the per-tail-size slot index
             // used by `allocate_available_block`/`append_available_block` (up to block_size /
@@ -1344,6 +1344,13 @@ impl BootstrapManager {
             block_size,
         )
     }
+}
+
+/// Offset the RAFS v6 metadata starts at, and the unit it is aligned to before the inodes. The
+/// superblocks own the first 4 KiB however small the block size (`RafsV6SuperBlock` stores a
+/// whole 4 KiB block), so this is the block size but at least 4 KiB.
+pub(crate) fn v6_meta_start(block_size: u64) -> u64 {
+    block_size.max(EROFS_BLOCK_SIZE_4096)
 }
 
 pub struct BuildContext {

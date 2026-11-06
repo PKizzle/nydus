@@ -22,8 +22,8 @@ use nydus_utils::crypt::{self, Cipher, CipherContext};
 use nydus_utils::{ByteSize, compress, digest, round_up};
 
 use crate::metadata::inode::InodeWrapper;
-use crate::metadata::layout::RafsXAttrs;
 use crate::metadata::layout::v5::RafsV5ChunkInfo;
+use crate::metadata::layout::{MetaRange, RafsXAttrs};
 use crate::metadata::{Inode, RafsBlobExtraInfo, RafsStore, RafsSuperFlags, RafsSuperMeta};
 use crate::{
     RafsError, RafsIoReader, RafsIoWrite, RafsResult, impl_bootstrap_converter,
@@ -309,11 +309,10 @@ impl RafsV6SuperBlock {
         }
         // Inodes live at `meta_addr + 32 * nid`, so a metadata area starting inside the
         // superblocks or device slots would parse them as inodes. The builder puts the area at
-        // block 0 only in images without devices or metadata tables, with the root inode at
-        // the first block past the superblocks.
+        // block 0 only in images without devices or metadata tables.
         let root_offset = meta_addr + self.root_nid() as u64 * EROFS_INODE_SLOT_SIZE as u64;
         if (meta_addr < devtable_end && !(meta_addr == 0 && self.s_extra_devices == 0))
-            || root_offset < devtable_end
+            || root_offset < rafsv6_inode_area_start(meta_addr, devtable_end)
         {
             return Err(RafsError::InvalidMetadata(format!(
                 "Rafs v6 meta block address 0x{:x} / root inode 0x{:x} overlap the device table ending at 0x{:x}",
@@ -464,11 +463,21 @@ impl RafsV6SuperBlock {
     }
 
     /// Size of the long xattr prefix table as the kernel reads it: its single entry's stored
-    /// `__le16` length plus the length field itself, 0 without a table.
-    pub fn load_xattr_prefix_table_size(&self, r: &mut RafsIoReader) -> RafsResult<u64> {
+    /// `__le16` length plus the length field itself, 0 without a table. `meta_size` is the size
+    /// of the bootstrap `r` reads.
+    pub fn load_xattr_prefix_table_size(
+        &self,
+        r: &mut RafsIoReader,
+        meta_size: u64,
+    ) -> RafsResult<u64> {
         let Some(offset) = self.xattr_prefix_table_offset() else {
             return Ok(0);
         };
+        if offset.checked_add(2).is_none_or(|end| end > meta_size) {
+            return Err(RafsError::InvalidMetadata(format!(
+                "Rafs v6 xattr prefix table offset 0x{offset:x} lies past the bootstrap end 0x{meta_size:x}"
+            )));
+        }
         let mut len = [0u8; 2];
         r.seek_to_offset(offset)?;
         r.read_exact(&mut len)?;
@@ -570,6 +579,20 @@ pub struct RafsV6SuperBlockExt {
 
 impl_bootstrap_converter!(RafsV6SuperBlockExt);
 
+/// A metadata table referenced by the extended superblock, as `RafsV6SuperBlockExt::validate`
+/// checks it.
+struct MetaTable {
+    name: &'static str,
+    offset: u64,
+    size: u64,
+    /// Alignment of `offset`.
+    align: u64,
+    /// `size` is a multiple of this record size.
+    unit: u64,
+    /// Whether the builder writes the table before the inode area rather than after it.
+    before_inodes: bool,
+}
+
 impl RafsV6SuperBlockExt {
     /// Create a new instance `RafsV6SuperBlockExt`.
     pub fn new() -> Self {
@@ -653,86 +676,86 @@ impl RafsV6SuperBlockExt {
         let meta_addr = sb.meta_addr() as u64 * block_size;
         let root_end = meta_addr + (sb.root_nid() as u64 + 1) * EROFS_INODE_SLOT_SIZE as u64;
         let (prefetch_offset, prefetch_size) = self.prefetch_table();
-        let xattr_prefix_offset = sb.xattr_prefix_table_offset().unwrap_or(0);
-        // (name, offset, size, offset alignment, size unit, precedes the inode area)
+        // `MetaRange` keeps every table 8-byte aligned. The builder places the xattr prefix
+        // table right after chunk records of 80 bytes from a block boundary, so it is too.
         let tables = [
-            (
-                "blob",
-                self.blob_table_offset(),
-                blob_size,
-                block_size,
-                size_of::<RafsV6Blob>() as u64,
-                true,
-            ),
-            (
-                "prefetch",
-                prefetch_offset,
-                prefetch_size as u64,
-                8,
-                4,
-                true,
-            ),
-            (
-                "implicit directory",
-                self.implicit_dir_table_offset(),
-                self.implicit_dir_table_size() as u64,
-                8,
-                4,
-                true,
-            ),
-            (
-                "chunk",
-                self.chunk_table_offset(),
-                self.chunk_table_size(),
-                block_size,
-                size_of::<RafsV5ChunkInfo>() as u64,
-                false,
-            ),
-            (
-                "xattr prefix",
-                xattr_prefix_offset,
-                xattr_prefix_size,
-                4,
-                1,
-                false,
-            ),
+            MetaTable {
+                name: "blob",
+                offset: self.blob_table_offset(),
+                size: blob_size,
+                align: block_size,
+                unit: size_of::<RafsV6Blob>() as u64,
+                before_inodes: true,
+            },
+            MetaTable {
+                name: "prefetch",
+                offset: prefetch_offset,
+                size: prefetch_size as u64,
+                align: 8,
+                unit: size_of::<u32>() as u64,
+                before_inodes: true,
+            },
+            MetaTable {
+                name: "implicit directory",
+                offset: self.implicit_dir_table_offset(),
+                size: self.implicit_dir_table_size() as u64,
+                align: 8,
+                unit: size_of::<u32>() as u64,
+                before_inodes: true,
+            },
+            MetaTable {
+                name: "chunk",
+                offset: self.chunk_table_offset(),
+                size: self.chunk_table_size(),
+                align: block_size,
+                unit: size_of::<RafsV5ChunkInfo>() as u64,
+                before_inodes: false,
+            },
+            MetaTable {
+                name: "xattr prefix",
+                offset: sb.xattr_prefix_table_offset().unwrap_or(0),
+                size: xattr_prefix_size,
+                align: 8,
+                unit: 1,
+                before_inodes: false,
+            },
         ];
 
-        let mut ranges = Vec::with_capacity(tables.len());
-        for (name, offset, size, align, unit, before_inodes) in tables {
-            if offset == 0 && size == 0 {
+        let invalid = |t: &MetaTable| {
+            RafsError::InvalidMetadata(format!(
+                "invalid {} table offset 0x{:x}/size 0x{:x} in Rafs v6 extended superblock, device table end 0x{devslot_end:x}, inode area 0x{meta_addr:x}",
+                t.name, t.offset, t.size
+            ))
+        };
+        // sb.validate() keeps the device table inside the bootstrap.
+        let after_devslots = MetaRange::new(devslot_end, meta_size - devslot_end, false)?;
+        let mut ranges: Vec<(&str, MetaRange)> = Vec::with_capacity(tables.len());
+        for t in &tables {
+            if t.offset == 0 && t.size == 0 {
                 continue;
             }
-            let end = offset.checked_add(size);
+            let range = MetaRange::new(t.offset, t.size, false).map_err(|_| invalid(t))?;
             // An empty table placed before the inodes may point anywhere past the device table:
             // without blobs the builder leaves the blob table offset after a `meta_addr` of 0.
-            let placed = if before_inodes {
-                size == 0 || end.is_some_and(|end| end <= meta_addr)
+            let placed = if t.before_inodes {
+                t.size == 0 || range.end() <= meta_addr
             } else {
-                offset >= root_end
+                t.offset >= root_end
             };
-            if !offset.is_multiple_of(align)
-                || !size.is_multiple_of(unit)
-                || offset < devslot_end
-                || end.is_none_or(|end| end > meta_size)
+            if !t.offset.is_multiple_of(t.align)
+                || !t.size.is_multiple_of(t.unit)
+                || !range.is_subrange_of(&after_devslots)
                 || !placed
             {
+                return Err(invalid(t));
+            }
+            if let Some((other, _)) = ranges.iter().find(|(_, r)| r.intersect_with(&range)) {
                 return Err(RafsError::InvalidMetadata(format!(
-                    "invalid {name} table offset 0x{offset:x}/size 0x{size:x} in Rafs v6 extended superblock, device table end 0x{devslot_end:x}, inode area 0x{meta_addr:x}"
+                    "{} table intersects with {other} table in Rafs v6 extended superblock",
+                    t.name
                 )));
             }
-            if size > 0 {
-                ranges.push((name, offset, offset + size));
-            }
-        }
-        for (i, &(name, start, end)) in ranges.iter().enumerate() {
-            for &(other, other_start, other_end) in &ranges[i + 1..] {
-                if start < other_end && other_start < end {
-                    return Err(RafsError::InvalidMetadata(format!(
-                        "{name} table intersects with {other} table in Rafs v6 extended superblock"
-                    )));
-                }
-            }
+            ranges.push((t.name, range));
         }
 
         Ok(())
@@ -1586,6 +1609,18 @@ impl RafsStore for RafsV6Device {
     }
 }
 
+/// Lowest byte offset any RAFS v6 inode may occupy: past the superblocks and the device table
+/// ending at `device_table_end`, and past `meta_addr`. With a `meta_addr` of 0 every builder puts
+/// the first inode at 4 KiB or later.
+pub fn rafsv6_inode_area_start(meta_addr: u64, device_table_end: u64) -> u64 {
+    let start = if meta_addr == 0 {
+        EROFS_BLOCK_SIZE_4096
+    } else {
+        meta_addr
+    };
+    start.max(device_table_end)
+}
+
 /// Load blob information table from a reader.
 ///
 /// Slot `i` must name the blob of blob table entry `i`: EROFS selects a device by slot position
@@ -1595,13 +1630,11 @@ pub fn rafsv6_load_blob_extra_info(
     blob_table: &RafsV6BlobTable,
     r: &mut RafsIoReader,
 ) -> RafsResult<HashMap<String, RafsBlobExtraInfo>> {
-    if blob_table.entries.len() != meta.blob_device_table_count as usize {
-        return Err(RafsError::InvalidMetadata(format!(
-            "RAFS v6 blob table has {} entries but the device table has {} slots",
-            blob_table.entries.len(),
-            meta.blob_device_table_count
-        )));
-    }
+    // `RafsV6SuperBlockExt::validate` made the slot count equal the blob table entry count.
+    debug_assert_eq!(
+        blob_table.entries.len(),
+        meta.blob_device_table_count as usize
+    );
     let mut infos = HashMap::new();
     if blob_table.entries.is_empty() {
         return Ok(infos);
@@ -3069,11 +3102,14 @@ mod tests {
         test_sb(0, 0).validate(end).unwrap();
         assert!(test_sb(2, 0).validate(end).is_err());
 
-        // At block 0 the root inode itself must lie past the superblocks.
+        // At block 0 the root inode itself must start at 4 KiB or later.
         let mut sb = test_sb(0, 0);
         sb.set_root_nid((EROFS_SUPER_OFFSET as usize / EROFS_INODE_SLOT_SIZE) as u16);
         assert!(sb.validate(end).is_err());
-        sb.set_root_nid((EROFS_DEVTABLE_OFFSET as usize / EROFS_INODE_SLOT_SIZE) as u16);
+        let first = (EROFS_BLOCK_SIZE_4096 as usize / EROFS_INODE_SLOT_SIZE) as u16;
+        sb.set_root_nid(first - 1);
+        assert!(sb.validate(end).is_err());
+        sb.set_root_nid(first);
         sb.validate(end).unwrap();
 
         // Without devices the area may sit at block 0 or past the device table offset, but not
@@ -3214,14 +3250,28 @@ mod tests {
     #[test]
     fn test_rafs_v6_load_xattr_prefix_table_size_reads_stored_length() {
         let (mut reader, mut writer) = get_streams();
+        let end = 3 * EROFS_BLOCK_SIZE_4096;
         let mut sb = test_sb(0, 0);
-        assert_eq!(sb.load_xattr_prefix_table_size(&mut reader).unwrap(), 0);
+        assert_eq!(
+            sb.load_xattr_prefix_table_size(&mut reader, end).unwrap(),
+            0
+        );
         let offset = 2 * EROFS_BLOCK_SIZE_4096;
         sb.set_ishare_xattr_prefix(offset).unwrap();
         writer.seek_offset(offset).unwrap();
         writer.write_all(&300u16.to_le_bytes()).unwrap();
         writer.flush().unwrap();
-        assert_eq!(sb.load_xattr_prefix_table_size(&mut reader).unwrap(), 302);
+        assert_eq!(
+            sb.load_xattr_prefix_table_size(&mut reader, end).unwrap(),
+            302
+        );
+
+        // An offset past the bootstrap is invalid metadata, not a short read.
+        sb.set_ishare_xattr_prefix(end).unwrap();
+        assert!(matches!(
+            sb.load_xattr_prefix_table_size(&mut reader, end),
+            Err(RafsError::InvalidMetadata(_))
+        ));
     }
 
     #[test]
@@ -3274,7 +3324,6 @@ mod tests {
         assert_eq!(load(&['a', 'b']).unwrap().len(), 2);
         assert!(load(&['b', 'a']).is_err());
         assert!(load(&['a', 'c']).is_err());
-        assert!(load(&['a']).is_err());
     }
 
     #[test]

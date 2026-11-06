@@ -17,19 +17,32 @@ use super::{RafsMode, RafsSuper, RafsSuperBlock, RafsSuperFlags};
 use crate::RafsIoReader;
 use crate::{RafsError, RafsResult};
 
+/// Load and validate the superblocks of the bootstrap `r`: the superblock, the extended
+/// superblock and the block size, or `None` if `r` is not a RAFS v6 bootstrap.
+pub(crate) fn load_v6_superblocks(
+    r: &mut RafsIoReader,
+) -> RafsResult<Option<(RafsV6SuperBlock, RafsV6SuperBlockExt, u64)>> {
+    let end = r.seek_to_end(0)?;
+    r.seek_to_offset(0)?;
+
+    let mut sb = RafsV6SuperBlock::new();
+    if sb.load(r).is_err() || !sb.is_rafs_v6() {
+        return Ok(None);
+    }
+    let block_size = sb.validate(end)?;
+    let mut ext_sb = RafsV6SuperBlockExt::new();
+    ext_sb.load(r)?;
+    let xattr_prefix_size = sb.load_xattr_prefix_table_size(r, end)?;
+    r.seek_to_offset(EROFS_BLOCK_SIZE_4096)?;
+    ext_sb.validate(end, &sb, block_size, xattr_prefix_size)?;
+    Ok(Some((sb, ext_sb, block_size)))
+}
+
 impl RafsSuper {
     pub(crate) fn try_load_v6(&mut self, r: &mut RafsIoReader) -> RafsResult<bool> {
-        let end = r.seek_to_end(0)?;
-        r.seek_to_offset(0)?;
-
-        let mut sb = RafsV6SuperBlock::new();
-        if sb.load(r).is_err() {
+        let Some((sb, ext_sb, _)) = load_v6_superblocks(r)? else {
             return Ok(false);
-        }
-        if !sb.is_rafs_v6() {
-            return Ok(false);
-        }
-        let block_size = sb.validate(end)?;
+        };
         self.meta.version = RAFS_SUPER_VERSION_V6;
         self.meta.magic = sb.magic();
         self.meta.meta_blkaddr = sb.meta_addr();
@@ -38,11 +51,6 @@ impl RafsSuper {
         self.meta.blob_device_table_count = sb.extra_devices() as u32;
         self.meta.blob_device_table_offset = sb.device_table_offset();
 
-        let mut ext_sb = RafsV6SuperBlockExt::new();
-        ext_sb.load(r)?;
-        let xattr_prefix_size = sb.load_xattr_prefix_table_size(r)?;
-        r.seek_to_offset(EROFS_BLOCK_SIZE_4096)?;
-        ext_sb.validate(end, &sb, block_size, xattr_prefix_size)?;
         self.meta.chunk_size = ext_sb.chunk_size();
         self.meta.blob_table_offset = ext_sb.blob_table_offset();
         self.meta.blob_table_size = ext_sb.blob_table_size();

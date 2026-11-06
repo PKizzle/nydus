@@ -40,12 +40,13 @@ use crate::metadata::layout::v5::RafsV5ChunkInfo;
 use crate::metadata::layout::v6::{
     EROFS_BLOCK_BITS_9, EROFS_BLOCK_SIZE_512, EROFS_BLOCK_SIZE_4096, EROFS_I_DATALAYOUT_BITS,
     EROFS_I_VERSION_BIT, EROFS_I_VERSION_BITS, EROFS_INODE_CHUNK_BASED, EROFS_INODE_FLAT_INLINE,
-    EROFS_INODE_FLAT_PLAIN, EROFS_INODE_SLOT_SIZE, RafsV6BlobTable, RafsV6Dirent,
+    EROFS_INODE_FLAT_PLAIN, EROFS_INODE_SLOT_SIZE, RafsV6BlobTable, RafsV6Device, RafsV6Dirent,
     RafsV6InodeChunkAddr, RafsV6InodeCompact, RafsV6InodeExtended, RafsV6OndiskInode,
     RafsV6XattrEntry, RafsV6XattrIbodyHeader, block_size_from_bits, is_long_prefix_xattr,
-    rafsv6_load_blob_extra_info, recover_namespace,
+    rafsv6_inode_area_start, rafsv6_load_blob_extra_info, recover_namespace,
 };
 use crate::metadata::layout::{XattrName, XattrValue, bytes_to_os_str};
+use crate::metadata::md_v6::load_v6_superblocks;
 use crate::metadata::{
     Attr, Entry, Inode, RAFS_ATTR_BLOCK_SIZE, RAFS_MAX_NAME, RafsBlobExtraInfo, RafsInode,
     RafsInodeWalkAction, RafsInodeWalkHandler, RafsSuperBlock, RafsSuperFlags, RafsSuperInodes,
@@ -97,6 +98,8 @@ impl DirectMappingState {
 
 struct DirectCachedInfo {
     meta_offset: usize,
+    /// Lowest offset an inode may occupy, see `rafsv6_inode_area_start`.
+    inode_area_start: usize,
     root_ino: Inode,
     chunk_size: u32,
     chunk_map: Mutex<Option<HashMap<RafsV6InodeChunkAddr, usize>>>,
@@ -118,8 +121,12 @@ impl DirectSuperBlockV6 {
         let state = DirectMappingState::new(meta);
         let block_size = state.block_size();
         let meta_offset = meta.meta_blkaddr as usize * block_size as usize;
+        let device_table_end = meta.blob_device_table_offset
+            + meta.blob_device_table_count as u64 * size_of::<RafsV6Device>() as u64;
         let info = DirectCachedInfo {
             meta_offset,
+            inode_area_start: rafsv6_inode_area_start(meta_offset as u64, device_table_end)
+                as usize,
             root_ino: meta.root_nid as Inode,
             chunk_size: meta.chunk_size,
             chunk_map: Mutex::new(None),
@@ -162,6 +169,7 @@ impl DirectSuperBlockV6 {
             .info
             .meta_offset
             .checked_add(nid as usize * EROFS_INODE_SLOT_SIZE)
+            .filter(|offset| *offset >= self.info.inode_area_start)
         {
             OndiskInodeWrapper::new(state, self.clone(), offset)
         } else {
@@ -189,12 +197,41 @@ impl DirectSuperBlockV6 {
         })
     }
 
+    /// Validate the bootstrap `r` a remount swaps in and require the layout the mounted state
+    /// was built from: inodes and tables keep being read at the offsets validated at load.
+    fn check_same_layout(&self, r: &mut RafsIoReader) -> RafsResult<()> {
+        let (sb, ext, _) = load_v6_superblocks(r)?.ok_or_else(|| {
+            RafsError::InvalidMetadata("the new bootstrap is not a RAFS v6 image".to_string())
+        })?;
+        let meta = &self.state.load().meta;
+        if sb.blkszbits() != meta.blkszbits
+            || sb.meta_addr() != meta.meta_blkaddr
+            || sb.root_nid() != meta.root_nid
+            || sb.extra_devices() as u32 != meta.blob_device_table_count
+            || ext.blob_table_offset() != meta.blob_table_offset
+            || ext.blob_table_size() != meta.blob_table_size
+            || ext.chunk_table_offset() != meta.chunk_table_offset
+            || ext.chunk_table_size() != meta.chunk_table_size
+            || ext.prefetch_table()
+                != (
+                    meta.prefetch_table_offset,
+                    meta.prefetch_table_entries * size_of::<u32>() as u32,
+                )
+        {
+            return Err(RafsError::InvalidMetadata(
+                "the new bootstrap's layout differs from the mounted RAFS v6 image".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
     fn update_state(&self, r: &mut RafsIoReader) -> RafsResult<()> {
         // Validate file size
         let file = clone_file(r.as_raw_fd())?;
         let md = file.metadata()?;
         let len = md.len();
-        // `try_load_v6` validated the blob table position against the bootstrap.
+        // `try_load_v6`, or `check_same_layout` on a remount, validated the table positions
+        // against this bootstrap.
         let old_state = self.state.load();
 
         // Prefetch the bootstrap file
@@ -312,7 +349,8 @@ impl RafsSuperBlock for DirectSuperBlockV6 {
     }
 
     fn update(&self, r: &mut RafsIoReader) -> RafsResult<()> {
-        self.update_state(r)
+        self.check_same_layout(r)
+            .and_then(|_| self.update_state(r))
             .map_err(|e| RafsError::SwapBackend(e.into()))
     }
 
@@ -1754,6 +1792,49 @@ mod tests {
         let info = TarfsChunkInfoV6::new(1, 2, 3, 4);
         assert!(!info.has_crc32());
         assert_eq!(info.crc32(), 0);
+    }
+
+    /// A remount swaps in a newly opened bootstrap under the validated layout of the mounted
+    /// one, so the new bootstrap is validated again and must keep that layout.
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
+    fn test_update_revalidates_the_new_bootstrap() {
+        use crate::metadata::layout::v6::{EROFS_SUPER_BLOCK_SIZE, EROFS_SUPER_OFFSET};
+        use std::io::{Seek, SeekFrom, Write};
+
+        let root_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap();
+        let fixture =
+            std::path::PathBuf::from(root_dir).join("../tests/texture/bootstrap/rafs-v6-2.2.boot");
+        let (rs, _) = crate::metadata::RafsSuper::load_from_file(
+            &fixture,
+            Arc::new(nydus_api::ConfigV2::default()),
+            false,
+        )
+        .unwrap();
+        let open =
+            |path: &std::path::Path| Box::new(std::fs::File::open(path).unwrap()) as RafsIoReader;
+        rs.update(&mut open(&fixture)).unwrap();
+
+        let data = std::fs::read(&fixture).unwrap();
+        let dir = vmm_sys_util::tempdir::TempDir::new().unwrap();
+        // Shorter: the tables and inodes past the cut are gone.
+        let short = dir.as_path().join("short");
+        std::fs::write(&short, &data[..data.len() - EROFS_BLOCK_SIZE_4096 as usize]).unwrap();
+        assert!(rs.update(&mut open(&short)).is_err());
+        // Laid out differently: the blob table moves one block further.
+        let moved = dir.as_path().join("moved");
+        std::fs::write(&moved, &data).unwrap();
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&moved)
+            .unwrap();
+        let ext_offset = (EROFS_SUPER_OFFSET + EROFS_SUPER_BLOCK_SIZE) as u64 + 8;
+        let blob_table_offset = rs.meta.blob_table_offset + EROFS_BLOCK_SIZE_4096;
+        file.seek(SeekFrom::Start(ext_offset)).unwrap();
+        file.write_all(&blob_table_offset.to_le_bytes()).unwrap();
+        drop(file);
+        assert!(rs.update(&mut open(&moved)).is_err());
+        rs.update(&mut open(&fixture)).unwrap();
     }
 
     #[test]
