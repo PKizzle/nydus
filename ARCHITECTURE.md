@@ -268,8 +268,9 @@ roughly one conversion, not one conversion *plus* a settle timer:
 containerd; every call connects lazily (`snapshotter/src/containerd_grpc.rs`). Errors keep their
 `tonic::Status` and its source, and `containerd_grpc::containerd_fault` classifies a failure by
 that chain: **unreachable** when containerd never answered (its socket refuses connections or is
-missing from an existing directory, or the connection broke), **misconfigured** when the socket
-path cannot work (no permission, not a socket, missing directory), and otherwise an answer about
+missing, or the connection broke; a missing socket directory counts too, since k3s's embedded
+containerd creates it only once it starts), **misconfigured** when the socket path cannot work (no permission, not
+a socket), and otherwise an answer about
 the request. A status containerd itself returned is always the latter, whatever its code
 (`Unavailable` from a locked ingest ref, `DeadlineExceeded` from a Transfer's registry fetch): a
 status tonic builds from a transport error keeps that error as its source, one decoded from

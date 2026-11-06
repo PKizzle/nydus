@@ -70,11 +70,11 @@ thread_local! {
 /// What a failed containerd call says about containerd itself, as opposed to about the request.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ContainerdFault {
-    /// No answer: containerd's socket refuses connections or does not exist yet (its directory
-    /// does), or the connection broke. Worth retrying once containerd is back.
+    /// No answer: containerd's socket refuses connections or does not exist yet, or the
+    /// connection broke. Worth retrying once containerd is back.
     Unreachable,
-    /// The configured socket path cannot work however long we wait: no permission, not a
-    /// socket, or its directory does not exist.
+    /// The configured socket path cannot work however long we wait: no permission, or not a
+    /// socket.
     Misconfigured(PathBuf),
 }
 
@@ -141,12 +141,15 @@ impl ChannelError {
     }
 }
 
-/// Whether connecting to `socket` failed in a way waiting cannot fix. A missing socket in an
-/// existing directory, or one that refuses connections, is containerd not (yet) running; a
-/// missing directory, a path that is not a socket, or no permission is configuration.
+/// Whether connecting to `socket` failed in a way waiting cannot fix. A missing socket, or one
+/// that refuses connections, is containerd not (yet) running; a path that is not a socket, or
+/// no permission, is configuration. A missing socket counts as not running even when its
+/// directory is missing too: k3s's embedded containerd creates `/run/k3s/containerd/` only
+/// once it starts, after the snapshotter. A path that never appears is reported by the
+/// auto-zran outage budget and its startup check instead.
 fn connect_is_permanent(socket: &Path, error: &std::io::Error) -> bool {
     match error.kind() {
-        std::io::ErrorKind::NotFound => !socket.parent().is_some_and(Path::is_dir),
+        std::io::ErrorKind::NotFound => false,
         // Also a path longer than `sun_path`, rejected before connect(2) with no errno.
         std::io::ErrorKind::InvalidInput => true,
         // connect(2) on a path that is not a socket fails ECONNREFUSED on Linux.
@@ -334,7 +337,7 @@ mod tests {
         }
     }
 
-    /// containerd not running yet (socket missing in its existing dir, or refusing) is an
+    /// containerd not running yet (socket missing, even with its directory, or refusing) is an
     /// outage; a path that cannot work is configuration, and names the socket.
     #[test]
     fn connect_failures_split_into_outage_and_misconfiguration() {
@@ -357,7 +360,11 @@ mod tests {
                 Some(ContainerdFault::Misconfigured(socket.to_path_buf()))
             )
         };
-        misconfigured(&dir.path().join("missing/containerd.sock"), enoent());
+        assert_eq!(
+            connect_error(&dir.path().join("missing/containerd.sock"), enoent()).fault(),
+            Some(ContainerdFault::Unreachable),
+            "k3s creates the socket's directory only once it starts"
+        );
         for errno in [libc::EACCES, libc::ENOTSOCK, libc::EINVAL] {
             misconfigured(&socket, std::io::Error::from_raw_os_error(errno));
         }

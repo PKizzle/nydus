@@ -824,7 +824,9 @@ async fn report_unreachable_containerd(content_store: ContentStoreClient) {
 }
 
 /// Set once a misconfigured containerd socket has been logged as an error, so a node full of
-/// images reports it once rather than once per job.
+/// images reports it once rather than once per job. Once per process is enough: the socket
+/// path comes from the config read at startup, so fixing it means a restart, which resets
+/// this; and every failed job still logs its full error at warn.
 static MISCONFIGURED_SOCKET_REPORTED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
@@ -894,8 +896,8 @@ async fn worker_loop(
                         error!(
                             socket = %socket.display(),
                             error = %format!("{e:#}"),
-                            "the containerd socket path cannot work (no permission, not a socket, or \
-                             its directory is missing); auto-zran conversions fail until \
+                            "the containerd socket path cannot work (no permission, or not a socket); \
+                             auto-zran conversions fail until \
                              [snapshotter.containerd].address / [snapshotter].profile is fixed"
                         );
                     }

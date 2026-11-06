@@ -1050,9 +1050,9 @@ mod tests {
     }
 
     /// The classification holds through tonic's real error path, not only for hand-built
-    /// errors: a call to a socket missing from an existing directory reads as an outage, one
-    /// whose directory is missing as misconfiguration. Fails if tonic stops keeping the
-    /// transport error as the status's source.
+    /// errors: a call to a missing socket reads as an outage, one to a path that is not a
+    /// socket as misconfiguration. Fails if tonic stops keeping the transport error as the
+    /// status's source.
     #[test]
     fn a_real_call_to_a_missing_socket_is_classified_through_tonic() {
         let dir = tempfile::tempdir().unwrap();
@@ -1069,7 +1069,10 @@ mod tests {
         };
         let e = call(dir.path().join("containerd.sock"));
         assert!(is_containerd_unavailable(&e), "{e:#}");
-        let socket = dir.path().join("missing/containerd.sock");
+        let e = call(dir.path().join("missing/containerd.sock"));
+        assert!(is_containerd_unavailable(&e), "{e:#}");
+        let socket = dir.path().join("not-a-socket");
+        std::fs::write(&socket, b"").unwrap();
         let e = call(socket.clone());
         assert_eq!(
             containerd_fault_of(&e),
