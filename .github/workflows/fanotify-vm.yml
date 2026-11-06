@@ -212,7 +212,8 @@ jobs:
         echo "$KERNEL_SHA256" | sha256sum -c
         dpkg-deb -x "$KERNEL_IMAGE_DEB" root
         dpkg-deb --fsys-tarfile "$KERNEL_MODULES_DEB" > modules.tar
-        grep -E '^CONFIG_ARM64_64K_PAGES=y' root/boot/config-*
+        # The config ships in the modules package.
+        tar xOf modules.tar --wildcards '*/boot/config-*' | grep -E '^CONFIG_ARM64_64K_PAGES=y'
         echo "VMLINUZ=$(ls "$K"/root/boot/vmlinuz-*)" >> "$GITHUB_ENV"
     - name: EROFS partial-folio self-test under QEMU
       run: |
