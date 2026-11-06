@@ -16,6 +16,7 @@ use crate::meta::{BlobMetaChunkInfo, round_up_4k};
 
 /// Context information to support random access to zlib/gzip stream .
 #[repr(C, packed)]
+#[cfg_attr(kani, derive(kani::Arbitrary))]
 pub struct ZranInflateContext {
     /// Offset in the original compression data stream.
     in_offset: u64,

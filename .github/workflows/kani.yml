@@ -1,0 +1,60 @@
+name: Kani and loom
+
+# Model checking: Kani proofs over untrusted-input parsers and offset math, and loom
+# interleavings of the chunk single-flight protocol. See docs/verification.md.
+on:
+  pull_request:
+    paths:
+      - 'storage/src/meta/**'
+      - 'storage/src/cache/state/**'
+      - 'rafs/src/metadata/layout/**'
+      - 'service/src/fanotify.rs'
+      - 'service/src/fanotify_sys.rs'
+      - 'storage/Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/kani.yml'
+  schedule:
+    - cron: "17 4 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  kani:
+    name: Kani (${{ matrix.crate }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        crate: [nydus-storage, nydus-rafs, nydus-service]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+      - name: Kani
+        uses: model-checking/kani-github-action@f838096619a707b0f6b2118cf435eaccfa33e51f # v1.1
+        with:
+          kani-version: '0.68.0'
+          args: -p ${{ matrix.crate }}
+
+  loom:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: loom
+          save-if: ${{ github.ref == 'refs/heads/production' }}
+      - name: loom
+        shell: bash
+        env:
+          RUSTFLAGS: --cfg nydus_loom
+        run: |
+          cargo test -p nydus-storage --release --lib loom_ 2>&1 | tee loom.log
+          # A filter that matches nothing passes too; require that the loom tests ran.
+          grep -q 'test result: ok\. [1-9]' loom.log

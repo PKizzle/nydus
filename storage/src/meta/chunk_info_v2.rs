@@ -577,3 +577,79 @@ mod tests {
         assert!(chunk.validate(&ctx).is_ok());
     }
 }
+
+#[cfg(kani)]
+mod verification {
+    use super::*;
+    use crate::meta::{BatchInflateContext, ZranInflateContext};
+
+    fn any_chunk() -> BlobChunkInfoV2Ondisk {
+        BlobChunkInfoV2Ondisk {
+            uncomp_info: kani::any(),
+            comp_info: kani::any(),
+            data: kani::any(),
+        }
+    }
+
+    /// `validate` is the gate between an untrusted on-disk chunk record (plus the ZRan or batch
+    /// context it points at) and the offset arithmetic of the read path: it decides every
+    /// record without panicking, and an accepted ZRan or batch chunk lies inside its context.
+    #[kani::proof]
+    fn validate_decides_every_record() {
+        let chunk = any_chunk();
+        let state = BlobCompressionContext {
+            blob_features: kani::any(),
+            compressed_size: kani::any(),
+            uncompressed_size: kani::any(),
+            zran_info_array: vec![kani::any::<ZranInflateContext>()].into(),
+            batch_info_array: vec![kani::any::<BatchInflateContext>()].into(),
+            ..Default::default()
+        };
+        if chunk.validate(&state).is_err() {
+            return;
+        }
+        let size = chunk.uncompressed_size() as u64;
+        if chunk.is_zran() {
+            let offset = chunk.get_zran_offset().unwrap() as u64;
+            assert!(offset + size <= state.zran_info_array[0].out_size() as u64);
+        }
+        if chunk.is_batch() {
+            let offset = chunk.get_uncompressed_offset_in_batch_buf().unwrap() as u64;
+            let batch = &state.batch_info_array[0];
+            assert!(offset + size <= batch.uncompressed_batch_size() as u64);
+        }
+    }
+
+    /// The packed fields of a chunk record do not overlap: writing each one leaves the others
+    /// readable unchanged.
+    #[kani::proof]
+    fn packed_fields_round_trip() {
+        let comp_offset: u64 = kani::any();
+        let comp_size: u32 = kani::any();
+        let uncomp_offset: u64 = kani::any();
+        let uncomp_size: u32 = kani::any();
+        let (compressed, encrypted, zran): (bool, bool, bool) = kani::any();
+        kani::assume(comp_offset <= CHUNK_V2_COMP_OFFSET_MASK);
+        kani::assume(comp_size as u64 <= BLOB_CCT_CHUNK_SIZE_MASK);
+        kani::assume(uncomp_offset >> CHUNK_V2_UNCOMP_OFFSET_SHIFT <= CHUNK_V2_UNCOMP_OFFSET_MASK);
+        kani::assume(uncomp_offset & ((1 << CHUNK_V2_UNCOMP_OFFSET_SHIFT) - 1) == 0);
+        kani::assume(uncomp_size != 0 && uncomp_size as u64 - 1 <= BLOB_CCT_CHUNK_SIZE_MASK);
+
+        let mut chunk = any_chunk();
+        chunk.set_compressed_offset(comp_offset);
+        chunk.set_compressed_size(comp_size);
+        chunk.set_uncompressed_offset(uncomp_offset);
+        chunk.set_uncompressed_size(uncomp_size);
+        chunk.set_compressed(compressed);
+        chunk.set_encrypted(encrypted);
+        chunk.set_zran(zran);
+
+        assert_eq!(chunk.compressed_offset(), comp_offset);
+        assert_eq!(chunk.compressed_size(), comp_size);
+        assert_eq!(chunk.uncompressed_offset(), uncomp_offset);
+        assert_eq!(chunk.uncompressed_size(), uncomp_size);
+        assert_eq!(chunk.is_compressed(), compressed);
+        assert_eq!(chunk.is_encrypted(), encrypted);
+        assert_eq!(chunk.is_zran(), zran);
+    }
+}

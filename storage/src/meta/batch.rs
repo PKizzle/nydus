@@ -14,6 +14,7 @@ use crate::meta::chunk_info_v2::BlobChunkInfoV2Ondisk;
 /// Each one corresponds to a whole batch chunk containing multiple small chunks.
 #[repr(C, packed)]
 #[derive(Default)]
+#[cfg_attr(kani, derive(kani::Arbitrary))]
 pub struct BatchInflateContext {
     /// Compressed size of the whole batch chunk data.
     compressed_size: u32,
