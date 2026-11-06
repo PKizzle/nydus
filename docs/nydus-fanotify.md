@@ -131,10 +131,12 @@ Mitigation, in `nydus_service::erofs_folio`:
 | File-backed EROFS mount | Source | Handling |
 | --- | --- | --- |
 | Auto-accel / fanotify (snapshotter) | staged bootstrap copy | padded to a page multiple with a sparse hole (`stage_bootstrap`) |
-| Blockdev and tarfs without dm-verity (snapshotter) | exported `image.erofs` | padded before the mount (`mount_blockdev_erofs`) |
+| Blockdev and tarfs without dm-verity (snapshotter) | exported `image.erofs` | padded at export (`BlockDevice::export`) and before the mount (`mount_blockdev_erofs`), so a cached image that is not a page multiple is covered too |
+| `nydus-image export --block` | the exported `.disk` | padded to a 64 KiB multiple (`EXPORT_ALIGNMENT`, the largest page size) at export, with or without `--verity`: EROFS reads only the blocks the superblock names, dm-verity only `--data-blocks` and the tree at `--hash-offset` |
 | Tarfs with dm-verity | dm block device | not file-backed: unaffected |
 | Regular nydus images (snapshotter) | FUSE | not EROFS: unaffected |
-| `nydusd --fanotify` (standalone) | the caller's `bootstrap` | left untouched; when it is not a page multiple, `mount_erofs` mounts a padded copy, `bootstrap.page-padded`, beside it |
+| `nydusd --fanotify` (standalone) | the caller's `bootstrap` | left untouched; when it is not a page multiple, `mount_erofs` mounts an anonymous padded copy (`O_TMPFILE` in the bootstrap's directory, named by its `/proc/self/fd` link), or, where `O_TMPFILE` or that link is unavailable, a named copy it removes once mounted. Nothing is left behind; the mount table shows `/proc/self/fd/<n>` as the source. |
+| Live mounts adopted on restart | staged bootstrap or `image.erofs` | at startup, before adoption, the snapshotter pads every unaligned regular-file source of a live EROFS mount under its `daemons/` dir in place. The kernel retries a failed metadata read on the next access, so the live mount reads cleanly without a remount, and running containers keep working. |
 
 The hole costs no disk blocks and reads back as zeros, which is what a fixed kernel substitutes for
 the missing bytes, so padding is applied on every kernel. To tell whether a kernel is affected
@@ -145,14 +147,13 @@ while the padded one reads cleanly means affected. The result is logged (a `WARN
 kernel, the page size and the fix when affected) and exported as
 `nydus_snapshotter_erofs_partial_folio_bug{status="affected|unaffected|inconclusive"} 1`.
 `inconclusive` means the probe could not mount at all (no privilege, no file-backed EROFS, or a
-10 s timeout). Padding happens at mount time, so an EROFS mount that already existed
-before the snapshotter started (adopted on restart) keeps its unpadded source until it is
-remounted. The mount health probe reads both metadata and file data, so a mount that answers
+10 s timeout). The mount health probe reads both metadata and file data, so a mount that answers
 with `EIO` for any other reason is reported as dead rather than passing.
 
 [`misc/erofs-folio/qemu-test.sh`](../misc/erofs-folio/qemu-test.sh) boots an arm64 kernel in QEMU
 and runs the self-test (`service/examples/erofs_folio_probe.rs`) in it, optionally walking an
 EROFS image as is and padded, to check how a kernel build classifies.
+
 ## Cache eviction
 
 `FanotifyHandler::cull_cache(blob_id)` punches holes

@@ -17,7 +17,7 @@
 //! affected: they are clamped to the inode size and never read past the extent they map.
 //!
 //! The mitigation is [`pad_to_page_size`] (or [`page_aligned_source`] for a file nydus does not
-//! own): a sparse tail that ends the image on a page boundary costs no disk blocks and reads back
+//! own, which mounts an anonymous padded copy and leaves no file behind): a sparse tail that ends the image on a page boundary costs no disk blocks and reads back
 //! as zeros, exactly what a fixed kernel substitutes for the missing bytes. It is applied on every
 //! kernel. [`self_test`] tells whether the running kernel needs it, by mounting a tiny
 //! crafted image once unpadded and once padded. A distro may backport the fix, so the kernel
@@ -28,7 +28,7 @@
 
 use std::fs;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 /// The upstream commit that fixes the bug.
 pub const UPSTREAM_FIX: &str = "52dceb88082b";
@@ -60,52 +60,21 @@ use nydus_utils::host_page_size;
 /// Extends `path` with a sparse hole to a multiple of the host page size. A no-op when it
 /// already is one.
 pub fn pad_to_page_size(path: &Path) -> io::Result<()> {
-    let file = fs::OpenOptions::new().write(true).open(path)?;
-    let len = file.metadata()?.len();
-    let padded = len.next_multiple_of(host_page_size());
-    if padded != len {
+    pad_file(
+        &fs::OpenOptions::new().write(true).open(path)?,
+        host_page_size(),
+    )
+}
+
+/// Extends a regular `file` with a sparse hole to a multiple of `align`. Anything else, such as
+/// a block device, keeps its size.
+pub fn pad_file(file: &fs::File, align: u64) -> io::Result<()> {
+    let meta = file.metadata()?;
+    let padded = meta.len().next_multiple_of(align);
+    if meta.is_file() && padded != meta.len() {
         file.set_len(padded)?;
     }
     Ok(())
-}
-
-/// The path to mount `image` from: `image` itself when it is a page multiple, otherwise a padded
-/// copy beside it (`<name>.page-padded`). The caller's file is never modified.
-pub fn page_aligned_source(image: &Path) -> io::Result<PathBuf> {
-    if fs::metadata(image)?.len().is_multiple_of(host_page_size()) {
-        return Ok(image.to_path_buf());
-    }
-    let mut name = image.file_name().unwrap_or_default().to_os_string();
-    name.push(".page-padded");
-    let padded = image.with_file_name(&name);
-    if is_current_copy(image, &padded) {
-        return Ok(padded);
-    }
-    name.push(".tmp");
-    let tmp = image.with_file_name(name);
-    // A fresh file (never through a planted symlink), since nydusd may run as root.
-    let _ = fs::remove_file(&tmp);
-    let mut out = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&tmp)?;
-    let staged = io::copy(&mut fs::File::open(image)?, &mut out)
-        .and_then(|_| pad_to_page_size(&tmp))
-        .and_then(|()| fs::rename(&tmp, &padded));
-    if staged.is_err() {
-        let _ = fs::remove_file(&tmp);
-    }
-    staged.map(|()| padded)
-}
-
-/// Whether `padded` is a padded copy of `image` written after `image` last changed.
-fn is_current_copy(image: &Path, padded: &Path) -> bool {
-    let (Ok(src), Ok(dst)) = (fs::metadata(image), fs::symlink_metadata(padded)) else {
-        return false;
-    };
-    dst.is_file()
-        && dst.len() == src.len().next_multiple_of(host_page_size())
-        && matches!((src.modified(), dst.modified()), (Ok(s), Ok(d)) if d >= s)
 }
 
 /// Decides the status from the unpadded probe mount, and the padded one only when that failed.
@@ -198,9 +167,102 @@ pub use linux::*;
 #[cfg(target_os = "linux")]
 mod linux {
     use super::*;
+    use std::path::PathBuf;
     use std::sync::OnceLock;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::mpsc;
     use std::time::Duration;
+
+    /// A mount source that ends on a page boundary. Keep it alive until the mount is done.
+    pub struct MountSource {
+        path: PathBuf,
+        // The anonymous copy `path` names through `/proc/self/fd`.
+        _copy: Option<fs::File>,
+        // A named fallback copy, removed on drop: the mount holds its own reference.
+        remove: bool,
+    }
+
+    impl MountSource {
+        pub fn path(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    impl Drop for MountSource {
+        fn drop(&mut self) {
+            if self.remove {
+                let _ = fs::remove_file(&self.path);
+            }
+        }
+    }
+
+    /// The source to mount `image` from: `image` itself when it is a page multiple, otherwise a
+    /// padded copy in the same directory. The copy is an `O_TMPFILE` named by its
+    /// `/proc/self/fd` link, so nothing is left behind, and the mount table shows that link as
+    /// the source; where `O_TMPFILE` or that link is unavailable, it is a named file removed when
+    /// the source is dropped. The caller's file is never modified.
+    pub fn page_aligned_source(image: &Path) -> io::Result<MountSource> {
+        use std::os::unix::fs::OpenOptionsExt;
+        use std::os::unix::io::AsRawFd;
+
+        if fs::metadata(image)?.len().is_multiple_of(host_page_size()) {
+            return Ok(MountSource {
+                path: image.to_path_buf(),
+                _copy: None,
+                remove: false,
+            });
+        }
+        let dir = image
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        let padded_copy = |mut out: fs::File| -> io::Result<fs::File> {
+            io::copy(&mut fs::File::open(image)?, &mut out)?;
+            pad_file(&out, host_page_size())?;
+            Ok(out)
+        };
+        match fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .mode(0o600)
+            .custom_flags(libc::O_TMPFILE)
+            .open(dir)
+        {
+            // The link must resolve here: /proc can be missing or another PID namespace's.
+            Ok(tmp) if fs::metadata(format!("/proc/self/fd/{}", tmp.as_raw_fd())).is_ok() => {
+                let copy = padded_copy(tmp)?;
+                Ok(MountSource {
+                    path: PathBuf::from(format!("/proc/self/fd/{}", copy.as_raw_fd())),
+                    _copy: Some(copy),
+                    remove: false,
+                })
+            }
+            _ => {
+                static COPIES: AtomicU64 = AtomicU64::new(0);
+                let mut name = image.file_name().unwrap_or_default().to_os_string();
+                name.push(format!(
+                    ".page-padded.{}.{}",
+                    std::process::id(),
+                    COPIES.fetch_add(1, Ordering::Relaxed)
+                ));
+                let path = image.with_file_name(name);
+                // A fresh file (never through a planted symlink), since nydusd may run as root.
+                let _ = fs::remove_file(&path);
+                let out = fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .open(&path)?;
+                let source = MountSource {
+                    path,
+                    _copy: None,
+                    remove: true,
+                };
+                padded_copy(out)?;
+                Ok(source)
+            }
+        }
+    }
 
     /// Upper bound for [`self_test`]: two tiny mounts normally take milliseconds.
     pub const SELF_TEST_TIMEOUT: Duration = Duration::from_secs(10);
@@ -286,7 +348,7 @@ mod linux {
     }
 
     /// Lists the root, stats every entry and reads every file in full, checking the contents.
-    fn read_all(root: &Path) -> io::Result<()> {
+    pub(super) fn read_all(root: &Path) -> io::Result<()> {
         let mut seen = 0;
         for entry in fs::read_dir(root)? {
             let path = entry?.path();
@@ -341,6 +403,40 @@ mod tests {
         assert_eq!(status.label(), "inconclusive");
     }
 
+    /// The kernel must accept the padded copy's `/proc/self/fd` link as a mount source. Needs
+    /// root, and file-backed EROFS shown by a named padded copy mounting; skipped otherwise.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn page_aligned_source_mounts_and_reads() {
+        // SAFETY: geteuid has no preconditions.
+        if unsafe { libc::geteuid() } != 0 {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("erofs-folio-mnt-{}", std::process::id()));
+        let mnt = dir.join("mnt");
+        fs::create_dir_all(&mnt).unwrap();
+        let mount_and_read = |source: &Path| {
+            crate::fanotify::mount_erofs_with(source, &mnt, "")?;
+            let read = linux::read_all(&mnt);
+            let _ = nix::mount::umount2(&mnt, nix::mount::MntFlags::MNT_DETACH);
+            read
+        };
+        let control = dir.join("control");
+        fs::write(&control, probe_image()).unwrap();
+        pad_to_page_size(&control).unwrap();
+        if mount_and_read(&control).is_err() {
+            fs::remove_dir_all(&dir).unwrap();
+            return;
+        }
+        let image = dir.join("bootstrap");
+        fs::write(&image, probe_image()).unwrap();
+        let source = page_aligned_source(&image).unwrap();
+        let read = mount_and_read(source.path());
+        drop(source);
+        fs::remove_dir_all(&dir).unwrap();
+        read.unwrap();
+    }
+
     #[test]
     fn probe_image_ends_inside_every_page() {
         let img = probe_image();
@@ -385,33 +481,34 @@ mod tests {
         fs::remove_dir_all(&dir).unwrap();
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
-    fn page_aligned_source_copies_only_unaligned_images() {
+    fn page_aligned_source_leaves_no_file_behind() {
         let dir = std::env::temp_dir().join(format!("erofs-folio-src-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         let page = host_page_size() as usize;
 
         let aligned = dir.join("aligned");
         fs::write(&aligned, vec![1u8; page]).unwrap();
-        assert_eq!(page_aligned_source(&aligned).unwrap(), aligned);
+        assert_eq!(page_aligned_source(&aligned).unwrap().path(), aligned);
 
         let bootstrap = dir.join("bootstrap");
         fs::write(&bootstrap, vec![7u8; page + 512]).unwrap();
         let source = page_aligned_source(&bootstrap).unwrap();
-        assert_eq!(source, dir.join("bootstrap.page-padded"));
+        assert_ne!(source.path(), bootstrap);
         assert_eq!(fs::metadata(&bootstrap).unwrap().len(), page as u64 + 512);
-        let padded = fs::read(&source).unwrap();
+        let padded = fs::read(source.path()).unwrap();
         assert_eq!(padded.len(), 2 * page);
         assert_eq!(&padded[..page + 512], &vec![7u8; page + 512][..]);
-        assert!(!dir.join("bootstrap.page-padded.tmp").exists());
+        assert!(padded[page + 512..].iter().all(|&b| b == 0));
+        drop(source);
 
-        // A current copy is reused; a changed bootstrap replaces it.
-        assert_eq!(page_aligned_source(&bootstrap).unwrap(), source);
-        fs::write(&bootstrap, vec![9u8; 512]).unwrap();
-        assert_eq!(
-            fs::read(page_aligned_source(&bootstrap).unwrap()).unwrap()[0],
-            9
-        );
+        let mut left: Vec<_> = fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        left.sort();
+        assert_eq!(left, ["aligned", "bootstrap"]);
         fs::remove_dir_all(&dir).unwrap();
     }
 }
