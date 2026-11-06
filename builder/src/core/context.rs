@@ -1237,8 +1237,9 @@ pub struct BootstrapContext {
 impl BootstrapContext {
     /// Create a new instance of [BootstrapContext].
     ///
-    /// `block_size` is the RAFS v6 logical block size (4 K / 16 K / 64 K). The first logical
-    /// block is reserved for the superblock, so metadata starts at `block_size`.
+    /// `block_size` is the RAFS v6 logical block size (512 for tarfs, else 4 K / 16 K / 64 K).
+    /// The first logical block, and at least the first 4 KiB, is reserved for the superblocks,
+    /// so metadata starts there.
     pub fn new(storage: Option<ArtifactStorage>, layered: bool, block_size: u64) -> Result<Self> {
         let writer = if let Some(storage) = storage {
             Box::new(ArtifactFileWriter(ArtifactWriter::new(storage)?)) as Box<dyn RafsIoWrite>
@@ -1251,7 +1252,7 @@ impl BootstrapContext {
             inode_map: HashMap::new(),
             inode_count: 0,
             next_ino: 1,
-            offset: block_size,
+            offset: block_size.max(EROFS_BLOCK_SIZE_4096),
             writer,
             // Sized for the largest supported block size (64 KiB) so the per-tail-size slot index
             // used by `allocate_available_block`/`append_available_block` (up to block_size /

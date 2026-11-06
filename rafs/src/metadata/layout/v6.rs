@@ -309,11 +309,15 @@ impl RafsV6SuperBlock {
         }
         // Inodes live at `meta_addr + 32 * nid`, so a metadata area starting inside the
         // superblocks or device slots would parse them as inodes. The builder puts the area at
-        // block 0 only in images without devices or metadata tables.
-        if meta_addr < devtable_end && !(meta_addr == 0 && self.s_extra_devices == 0) {
+        // block 0 only in images without devices or metadata tables, with the root inode at
+        // the first block past the superblocks.
+        let root_offset = meta_addr + self.root_nid() as u64 * EROFS_INODE_SLOT_SIZE as u64;
+        if (meta_addr < devtable_end && !(meta_addr == 0 && self.s_extra_devices == 0))
+            || root_offset < devtable_end
+        {
             return Err(RafsError::InvalidMetadata(format!(
-                "Rafs v6 meta block address 0x{:x} overlaps the device table ending at 0x{:x}",
-                meta_addr, devtable_end
+                "Rafs v6 meta block address 0x{:x} / root inode 0x{:x} overlap the device table ending at 0x{:x}",
+                meta_addr, root_offset, devtable_end
             )));
         }
 
@@ -446,20 +450,29 @@ impl RafsV6SuperBlock {
         Ok(())
     }
 
-    /// Offset and size of the long xattr prefix table, `(0, 0)` without one. The builder writes
-    /// at most the single entry of [`ishare_xattr_prefix_table`].
-    pub fn xattr_prefix_table(&self) -> (u64, u64) {
+    /// Offset of the long xattr prefix table, if the image has one. `validate` admits at most
+    /// one entry, as the builder writes.
+    pub fn xattr_prefix_table_offset(&self) -> Option<u64> {
         if self.s_reserved[SB_RESERVED_XATTR_PREFIX_COUNT] == 0 {
-            return (0, 0);
+            return None;
         }
         let mut start = [0u8; 4];
         start.copy_from_slice(
             &self.s_reserved[SB_RESERVED_XATTR_PREFIX_START..SB_RESERVED_XATTR_PREFIX_START + 4],
         );
-        (
-            u32::from_le_bytes(start) as u64 * 4,
-            ishare_xattr_prefix_table().len() as u64,
-        )
+        Some(u32::from_le_bytes(start) as u64 * 4)
+    }
+
+    /// Size of the long xattr prefix table as the kernel reads it: its single entry's stored
+    /// `__le16` length plus the length field itself, 0 without a table.
+    pub fn load_xattr_prefix_table_size(&self, r: &mut RafsIoReader) -> RafsResult<u64> {
+        let Some(offset) = self.xattr_prefix_table_offset() else {
+            return Ok(0);
+        };
+        let mut len = [0u8; 2];
+        r.seek_to_offset(offset)?;
+        r.read_exact(&mut len)?;
+        Ok(2 + u16::from_le_bytes(len) as u64)
     }
 
     /// Whether the image carries inode fingerprints for the kernel's `inode_share` mode.
@@ -573,13 +586,24 @@ impl RafsV6SuperBlockExt {
         Ok(())
     }
 
-    /// Validate the Rafs v6 extended super block against the primary super block `sb` and the
-    /// `block_size` its [`RafsV6SuperBlock::validate`] returned.
+    /// Offset and size of the prefetch table. Legacy builders left the offset 0 with a non-zero
+    /// size in empty filesystems; such a table is absent and reported as `(0, 0)`.
+    pub fn prefetch_table(&self) -> (u64, u32) {
+        match self.prefetch_table_offset() {
+            0 => (0, 0),
+            offset => (offset, self.prefetch_table_size()),
+        }
+    }
+
+    /// Validate the Rafs v6 extended super block against the primary super block `sb`, the
+    /// `block_size` its [`RafsV6SuperBlock::validate`] returned, and the size of its long xattr
+    /// prefix table from [`RafsV6SuperBlock::load_xattr_prefix_table_size`].
     pub fn validate(
         &self,
         meta_size: u64,
         sb: &RafsV6SuperBlock,
         block_size: u64,
+        xattr_prefix_size: u64,
     ) -> RafsResult<()> {
         let mut flags = self.flags();
         flags &= RafsSuperFlags::COMPRESSION_NONE.bits()
@@ -628,15 +652,8 @@ impl RafsV6SuperBlockExt {
         let devslot_end = sb.device_table_end();
         let meta_addr = sb.meta_addr() as u64 * block_size;
         let root_end = meta_addr + (sb.root_nid() as u64 + 1) * EROFS_INODE_SLOT_SIZE as u64;
-        // Legacy builders left the prefetch offset 0 with a non-zero size in empty filesystems;
-        // such a table is absent, and `try_load_v6` reads no entries from it.
-        let prefetch_offset = self.prefetch_table_offset();
-        let prefetch_size = if prefetch_offset == 0 {
-            0
-        } else {
-            self.prefetch_table_size() as u64
-        };
-        let (xattr_prefix_offset, xattr_prefix_size) = sb.xattr_prefix_table();
+        let (prefetch_offset, prefetch_size) = self.prefetch_table();
+        let xattr_prefix_offset = sb.xattr_prefix_table_offset().unwrap_or(0);
         // (name, offset, size, offset alignment, size unit, precedes the inode area)
         let tables = [
             (
@@ -647,7 +664,14 @@ impl RafsV6SuperBlockExt {
                 size_of::<RafsV6Blob>() as u64,
                 true,
             ),
-            ("prefetch", prefetch_offset, prefetch_size, 8, 4, true),
+            (
+                "prefetch",
+                prefetch_offset,
+                prefetch_size as u64,
+                8,
+                4,
+                true,
+            ),
             (
                 "implicit directory",
                 self.implicit_dir_table_offset(),
@@ -1571,11 +1595,6 @@ pub fn rafsv6_load_blob_extra_info(
     blob_table: &RafsV6BlobTable,
     r: &mut RafsIoReader,
 ) -> RafsResult<HashMap<String, RafsBlobExtraInfo>> {
-    let mut infos = HashMap::new();
-    if meta.blob_device_table_count == 0 {
-        return Ok(infos);
-    }
-    r.seek_to_offset(meta.blob_device_table_offset)?;
     if blob_table.entries.len() != meta.blob_device_table_count as usize {
         return Err(RafsError::InvalidMetadata(format!(
             "RAFS v6 blob table has {} entries but the device table has {} slots",
@@ -1583,6 +1602,11 @@ pub fn rafsv6_load_blob_extra_info(
             meta.blob_device_table_count
         )));
     }
+    let mut infos = HashMap::new();
+    if blob_table.entries.is_empty() {
+        return Ok(infos);
+    }
+    r.seek_to_offset(meta.blob_device_table_offset)?;
     for (idx, blob) in blob_table.entries.iter().enumerate() {
         let mut devslot = RafsV6Device::new();
         r.read_exact(devslot.as_mut())?;
@@ -2500,6 +2524,10 @@ pub(crate) mod test_util {
             sb.set_blocks(0);
         }
         sb.set_meta_addr(meta_addr);
+        if meta_addr == 0 {
+            // The builder puts the root inode at the first block past the superblocks.
+            sb.set_root_nid((EROFS_BLOCK_SIZE_4096 / EROFS_INODE_SLOT_SIZE as u64) as u16);
+        }
         sb
     }
 }
@@ -2950,7 +2978,7 @@ mod tests {
         let sb = test_sb(0, 2 * EROFS_BLOCK_SIZE_4096);
         let end = 3 * EROFS_BLOCK_SIZE_4096;
         let bs = sb.validate(end).unwrap();
-        ext.validate(end, &sb, bs).unwrap();
+        ext.validate(end, &sb, bs, 0).unwrap();
 
         let (mut reader, mut writer) = get_streams();
         writer
@@ -2968,12 +2996,15 @@ mod tests {
 
         // Misaligned size, table past the end, and table inside the superblocks are rejected.
         ext.set_implicit_dir_table_size(6);
-        assert!(ext.validate(end, &sb, bs).is_err());
+        assert!(ext.validate(end, &sb, bs, 0).is_err());
         ext.set_implicit_dir_table_size(8);
         ext.set_implicit_dir_table_offset(end - 8);
-        assert!(ext.validate(end, &sb, bs).is_err());
+        assert!(ext.validate(end, &sb, bs, 0).is_err());
+        let past_end = 2 * EROFS_BLOCK_SIZE_4096;
+        ext.set_implicit_dir_table_offset(past_end - 4);
+        assert!(ext.validate(past_end, &sb, bs, 0).is_err());
         ext.set_implicit_dir_table_offset(EROFS_DEVTABLE_OFFSET as u64 - 8);
-        assert!(ext.validate(end, &sb, bs).is_err());
+        assert!(ext.validate(end, &sb, bs, 0).is_err());
     }
 
     #[test]
@@ -3009,9 +3040,9 @@ mod tests {
             ("implicit dir", &implicit_dir_table),
         ];
         for (name, ext) in cases {
-            ext(53).validate(end, &fits, bs).unwrap();
+            ext(53).validate(end, &fits, bs, 0).unwrap();
             assert!(
-                ext(54).validate(end, &overlaps, bs).is_err(),
+                ext(54).validate(end, &overlaps, bs, 0).is_err(),
                 "{name} table"
             );
         }
@@ -3019,7 +3050,7 @@ mod tests {
         // A prefetch table need not be block aligned: 4 bytes into the slots is rejected.
         let mut ext = prefetch_table(53);
         ext.set_prefetch_table_offset(at - 4);
-        assert!(ext.validate(end, &fits, bs).is_err());
+        assert!(ext.validate(end, &fits, bs, 0).is_err());
     }
 
     #[test]
@@ -3038,6 +3069,13 @@ mod tests {
         test_sb(0, 0).validate(end).unwrap();
         assert!(test_sb(2, 0).validate(end).is_err());
 
+        // At block 0 the root inode itself must lie past the superblocks.
+        let mut sb = test_sb(0, 0);
+        sb.set_root_nid((EROFS_SUPER_OFFSET as usize / EROFS_INODE_SLOT_SIZE) as u16);
+        assert!(sb.validate(end).is_err());
+        sb.set_root_nid((EROFS_DEVTABLE_OFFSET as usize / EROFS_INODE_SLOT_SIZE) as u16);
+        sb.validate(end).unwrap();
+
         // Without devices the area may sit at block 0 or past the device table offset, but not
         // inside the superblocks: with 512-byte blocks, block 1 starts inside the superblock.
         let small = |meta_addr| {
@@ -3054,14 +3092,14 @@ mod tests {
 
     #[test]
     fn test_rafs_v6_super_block_ext_rejects_tables_in_inode_area() {
-        // 2 slots end at 0x1508; the blob table fills 0x2000..0x2200.
+        // 2 slots end at 0x680; the blob table fills 0x2000..0x2200.
         let end = DEVSLOT_TEST_END;
         let bs = EROFS_BLOCK_SIZE_4096;
         let blob_end = 2 * bs + 2 * size_of::<RafsV6Blob>() as u64;
         let at_meta = |meta_addr: u64, ext: &RafsV6SuperBlockExt| {
             let sb = test_sb(2, meta_addr);
             sb.validate(end).unwrap();
-            ext.validate(end, &sb, bs)
+            ext.validate(end, &sb, bs, 0)
         };
 
         let mut ext = test_ext_sb(2 * bs, 2);
@@ -3095,17 +3133,22 @@ mod tests {
         assert!(at_meta(3 * bs, &ext).is_err());
         ext.set_chunk_table(4 * bs, chunk);
 
-        let with_prefix = |prefix: u64| {
+        let prefix_size = ishare_xattr_prefix_table().len() as u64;
+        let with_prefix = |prefix: u64, size: u64| {
             let mut sb = test_sb(2, 3 * bs);
             sb.set_ishare_xattr_prefix(prefix).unwrap();
             sb.validate(end).unwrap();
-            ext.validate(end, &sb, bs)
+            ext.validate(end, &sb, bs, size)
         };
-        with_prefix(3 * bs + 32).unwrap();
-        with_prefix(4 * bs + chunk).unwrap();
-        assert!(with_prefix(3 * bs + 28).is_err());
-        assert!(with_prefix(4 * bs + 8).is_err());
-        assert!(with_prefix(end - 4).is_err());
+        with_prefix(3 * bs + 32, prefix_size).unwrap();
+        with_prefix(4 * bs + chunk, prefix_size).unwrap();
+        assert!(with_prefix(3 * bs + 28, prefix_size).is_err());
+        assert!(with_prefix(4 * bs + 8, prefix_size).is_err());
+        // The kernel reads the stored entry length, so a longer entry can reach the chunk table.
+        let tight = (4 * bs - prefix_size) & !3;
+        with_prefix(tight, prefix_size).unwrap();
+        assert!(with_prefix(tight, prefix_size + 8).is_err());
+        assert!(with_prefix(end - 4, prefix_size).is_err());
     }
 
     #[test]
@@ -3115,19 +3158,19 @@ mod tests {
         let sb = test_sb(2, 4 * bs);
         sb.validate(end).unwrap();
         let ext = || test_ext_sb(2 * bs, 2);
-        ext().validate(end, &sb, bs).unwrap();
+        ext().validate(end, &sb, bs, 0).unwrap();
 
         // A table with a size but offset 0 is not absent: it would be read from the superblock.
         let mut e = ext();
         e.set_chunk_table(0, size_of::<RafsV5ChunkInfo>() as u64);
-        assert!(e.validate(end, &sb, bs).is_err());
+        assert!(e.validate(end, &sb, bs, 0).is_err());
         let mut e = ext();
         e.set_implicit_dir_table_size(4);
-        assert!(e.validate(end, &sb, bs).is_err());
+        assert!(e.validate(end, &sb, bs, 0).is_err());
         // Except the legacy prefetch table, which is treated as absent.
         let mut e = ext();
         e.set_prefetch_table_size(4);
-        e.validate(end, &sb, bs).unwrap();
+        e.validate(end, &sb, bs, 0).unwrap();
 
         // Tables before the inodes must not overlap each other.
         let blob_end = 2 * bs + 2 * size_of::<RafsV6Blob>() as u64;
@@ -3136,21 +3179,25 @@ mod tests {
         e.set_prefetch_table_size(16);
         e.set_implicit_dir_table_offset(blob_end + 16);
         e.set_implicit_dir_table_size(8);
-        e.validate(end, &sb, bs).unwrap();
+        e.validate(end, &sb, bs, 0).unwrap();
         e.set_implicit_dir_table_offset(blob_end + 8);
-        assert!(e.validate(end, &sb, bs).is_err());
+        assert!(e.validate(end, &sb, bs, 0).is_err());
         e.set_implicit_dir_table_offset(blob_end - 8);
-        assert!(e.validate(end, &sb, bs).is_err());
+        assert!(e.validate(end, &sb, bs, 0).is_err());
 
         // Tables are aligned as the builder aligns them.
-        assert!(test_ext_sb(2 * bs + 512, 2).validate(end, &sb, bs).is_err());
+        assert!(
+            test_ext_sb(2 * bs + 512, 2)
+                .validate(end, &sb, bs, 0)
+                .is_err()
+        );
         let mut e = ext();
         e.set_chunk_table(5 * bs + 8, size_of::<RafsV5ChunkInfo>() as u64);
-        assert!(e.validate(end, &sb, bs).is_err());
+        assert!(e.validate(end, &sb, bs, 0).is_err());
         let mut e = ext();
         e.set_prefetch_table_offset(blob_end + 4);
         e.set_prefetch_table_size(4);
-        assert!(e.validate(end, &sb, bs).is_err());
+        assert!(e.validate(end, &sb, bs, 0).is_err());
 
         // Without devices or blobs, the empty blob table may lie past a `meta_addr` of 0, but
         // an empty table with an offset is still placed: aligned and past the device table.
@@ -3158,10 +3205,23 @@ mod tests {
         none.validate(end).unwrap();
         let mut e = test_ext_sb(bs, 0);
         e.set_chunk_table(2 * bs, 0);
-        e.validate(end, &none, bs).unwrap();
-        assert!(test_ext_sb(512, 0).validate(end, &none, bs).is_err());
+        e.validate(end, &none, bs, 0).unwrap();
+        assert!(test_ext_sb(512, 0).validate(end, &none, bs, 0).is_err());
         e.set_chunk_table(2 * bs + 8, 0);
-        assert!(e.validate(end, &none, bs).is_err());
+        assert!(e.validate(end, &none, bs, 0).is_err());
+    }
+
+    #[test]
+    fn test_rafs_v6_load_xattr_prefix_table_size_reads_stored_length() {
+        let (mut reader, mut writer) = get_streams();
+        let mut sb = test_sb(0, 0);
+        assert_eq!(sb.load_xattr_prefix_table_size(&mut reader).unwrap(), 0);
+        let offset = 2 * EROFS_BLOCK_SIZE_4096;
+        sb.set_ishare_xattr_prefix(offset).unwrap();
+        writer.seek_offset(offset).unwrap();
+        writer.write_all(&300u16.to_le_bytes()).unwrap();
+        writer.flush().unwrap();
+        assert_eq!(sb.load_xattr_prefix_table_size(&mut reader).unwrap(), 302);
     }
 
     #[test]
@@ -3223,18 +3283,18 @@ mod tests {
         let sb = test_sb(2, 8 * EROFS_BLOCK_SIZE_4096);
         let bs = sb.validate(end).unwrap();
         test_ext_sb(EROFS_BLOCK_SIZE_4096, 2)
-            .validate(end, &sb, bs)
+            .validate(end, &sb, bs, 0)
             .unwrap();
         for blobs in [0, 1, 3] {
             assert!(
                 test_ext_sb(EROFS_BLOCK_SIZE_4096, blobs)
-                    .validate(end, &sb, bs)
+                    .validate(end, &sb, bs, 0)
                     .is_err()
             );
         }
         assert!(
             test_ext_sb(EROFS_BLOCK_SIZE_4096, 2)
-                .validate(end, &test_sb(0, 8 * EROFS_BLOCK_SIZE_4096), bs)
+                .validate(end, &test_sb(0, 8 * EROFS_BLOCK_SIZE_4096), bs, 0)
                 .is_err()
         );
     }

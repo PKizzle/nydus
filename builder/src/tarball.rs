@@ -2431,4 +2431,157 @@ mod tests {
             ["/ dir 755", "/kept file 644"]
         );
     }
+
+    /// Builds a v6 layer from `tar` into a fresh directory under `root` and returns its bootstrap.
+    fn build_v6_variant(
+        root: &Path,
+        conversion: ConversionType,
+        tar: &[u8],
+        block_size: u64,
+        prefetch: bool,
+        ishare: bool,
+        chunk_dict: Option<&Path>,
+    ) -> PathBuf {
+        let dir = root.join(format!("{}", root.read_dir().unwrap().count()));
+        std::fs::create_dir(&dir).unwrap();
+        let source = dir.join("layer.tar");
+        std::fs::write(&source, tar).unwrap();
+        let mut ctx = create_context(source, RafsVersion::V6);
+        ctx.conversion_type = conversion;
+        ctx.blob_storage = Some(ArtifactStorage::FileDir((dir.clone(), String::new())));
+        if conversion != ConversionType::TarToTarfs {
+            ctx.set_blob_block_size(block_size);
+        }
+        if prefetch {
+            ctx.prefetch = Prefetch::with_paths(&["/a/file"]);
+        }
+        ctx.inode_share_fingerprint = ishare;
+        let bootstrap = dir.join("bootstrap");
+        let mut bootstrap_mgr =
+            BootstrapManager::new(Some(ArtifactStorage::SingleFile(bootstrap.clone())), None);
+        let mut blob_mgr = BlobManager::new(digest::Algorithm::Sha256, false);
+        if let Some(dict) = chunk_dict {
+            let config = nydus_rafs::metadata::RafsSuperConfig {
+                version: RafsVersion::V6,
+                compressor: ctx.compressor,
+                digester: ctx.digester,
+                chunk_size: ctx.chunk_size,
+                batch_size: 0,
+                explicit_uidgid: ctx.explicit_uidgid,
+                is_tarfs_mode: false,
+            };
+            let dict =
+                crate::HashChunkDict::from_bootstrap_file(dict, ctx.configuration.clone(), &config)
+                    .unwrap();
+            blob_mgr.set_chunk_dict(Arc::new(dict));
+        }
+        TarballBuilder::new(conversion)
+            .build(&mut ctx, &mut bootstrap_mgr, &mut blob_mgr)
+            .unwrap();
+        bootstrap
+    }
+
+    /// Every v6 layout variant the builder writes passes `RafsSuper` validation and loads back:
+    /// each block size, with and without a prefetch table, implicit directories and the inode
+    /// sharing xattr prefix table, without blobs, as tarfs, and over a chunk dictionary.
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
+    fn test_v6_layout_variants_load_back() {
+        let root = vmm_sys_util::tempdir::TempDir::new().unwrap();
+        let root = root.as_path();
+        // `a/` has no entry of its own, so it becomes an implicit directory.
+        let tar = RawTar::default()
+            .reg("a/file", b"data")
+            .reg("empty", b"")
+            .finish();
+        let load = |path: &Path| {
+            let (rs, _) = nydus_rafs::metadata::RafsSuper::load_from_file(
+                path,
+                Arc::new(nydus_api::ConfigV2::default()),
+                false,
+            )
+            .unwrap();
+            let tree = Tree::from_bootstrap(&rs, &mut ()).unwrap();
+            (rs, tree)
+        };
+
+        for block_size in [4096u64, 16384, 65536] {
+            for prefetch in [false, true] {
+                for ishare in [false, true] {
+                    let case = format!("bs {block_size} prefetch {prefetch} ishare {ishare}");
+                    let path = build_v6_variant(
+                        root,
+                        ConversionType::TarToRafs,
+                        &tar,
+                        block_size,
+                        prefetch,
+                        ishare,
+                        None,
+                    );
+                    let (rs, tree) = load(&path);
+                    assert_eq!(rs.meta.blob_device_table_count, 1, "{case}");
+                    assert_eq!(rs.meta.prefetch_table_entries > 0, prefetch, "{case}");
+                    assert_eq!(implicit_dirs(&tree), ["/a"], "{case}");
+                }
+            }
+        }
+
+        // Without file data there are no blobs and the inode area starts at block 0.
+        let no_data = RawTar::default().reg("empty", b"").dir("d/").finish();
+        let path = build_v6_variant(
+            root,
+            ConversionType::TarToRafs,
+            &no_data,
+            4096,
+            false,
+            false,
+            None,
+        );
+        let (rs, _) = load(&path);
+        assert_eq!(rs.meta.blob_device_table_count, 0);
+        assert_eq!(rs.meta.meta_blkaddr, 0);
+
+        let path = build_v6_variant(
+            root,
+            ConversionType::TarToTarfs,
+            &tar,
+            512,
+            false,
+            false,
+            None,
+        );
+        let (rs, tree) = load(&path);
+        assert_eq!(rs.meta.blkszbits, 9);
+        assert_eq!(get_tree_node(&tree, "/a/file").inode.size(), 4);
+
+        // The second layer reuses the first layer's chunk, so its blob table names that blob.
+        let base = build_v6_variant(
+            root,
+            ConversionType::TarToRafs,
+            &tar,
+            4096,
+            false,
+            false,
+            None,
+        );
+        let other = RawTar::default().reg("b/file", b"data").finish();
+        let path = build_v6_variant(
+            root,
+            ConversionType::TarToRafs,
+            &other,
+            4096,
+            false,
+            false,
+            Some(&base),
+        );
+        let (rs, _) = load(&path);
+        let (base_rs, _) = load(&base);
+        let base_id = base_rs.superblock.get_blob_infos()[0].blob_id();
+        assert!(
+            rs.superblock
+                .get_blob_infos()
+                .iter()
+                .any(|b| b.blob_id() == base_id)
+        );
+    }
 }

@@ -45,7 +45,7 @@ use crate::metadata::layout::v6::{
     RafsV6XattrEntry, RafsV6XattrIbodyHeader, block_size_from_bits, is_long_prefix_xattr,
     rafsv6_load_blob_extra_info, recover_namespace,
 };
-use crate::metadata::layout::{MetaRange, XattrName, XattrValue, bytes_to_os_str};
+use crate::metadata::layout::{XattrName, XattrValue, bytes_to_os_str};
 use crate::metadata::{
     Attr, Entry, Inode, RAFS_ATTR_BLOCK_SIZE, RAFS_MAX_NAME, RafsBlobExtraInfo, RafsInode,
     RafsInodeWalkAction, RafsInodeWalkHandler, RafsSuperBlock, RafsSuperFlags, RafsSuperInodes,
@@ -194,19 +194,8 @@ impl DirectSuperBlockV6 {
         let file = clone_file(r.as_raw_fd())?;
         let md = file.metadata()?;
         let len = md.len();
+        // `try_load_v6` validated the blob table position against the bootstrap.
         let old_state = self.state.load();
-        // Metadata tables start past the first block of the image's own block size; tarfs
-        // images use 512-byte blocks.
-        let block_size = old_state.block_size();
-        let md_range = MetaRange::new(block_size, len.saturating_sub(block_size), true)?;
-
-        // Validate blob table layout as blob_table_start and blob_table_offset is read from bootstrap.
-        let blob_table_size = old_state.meta.blob_table_size as u64;
-        let blob_table_start = old_state.meta.blob_table_offset;
-        let blob_table_range = MetaRange::new(blob_table_start, blob_table_size, false)?;
-        if !blob_table_range.is_subrange_of(&md_range) {
-            return Err(RafsError::BadDescriptor("invalid blob table".to_string()));
-        }
 
         // Prefetch the bootstrap file
         readahead(file.as_raw_fd(), 0, len);

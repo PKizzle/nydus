@@ -40,7 +40,9 @@ impl RafsSuper {
 
         let mut ext_sb = RafsV6SuperBlockExt::new();
         ext_sb.load(r)?;
-        ext_sb.validate(end, &sb, block_size)?;
+        let xattr_prefix_size = sb.load_xattr_prefix_table_size(r)?;
+        r.seek_to_offset(EROFS_BLOCK_SIZE_4096)?;
+        ext_sb.validate(end, &sb, block_size, xattr_prefix_size)?;
         self.meta.chunk_size = ext_sb.chunk_size();
         self.meta.blob_table_offset = ext_sb.blob_table_offset();
         self.meta.blob_table_size = ext_sb.blob_table_size();
@@ -53,13 +55,9 @@ impl RafsSuper {
         })?;
         info!("RAFS features: {}", self.meta.flags);
 
-        // `validate` accepts a legacy prefetch table at offset 0 only as an absent one.
-        self.meta.prefetch_table_entries = if ext_sb.prefetch_table_offset() == 0 {
-            0
-        } else {
-            ext_sb.prefetch_table_size() / size_of::<u32>() as u32
-        };
-        self.meta.prefetch_table_offset = ext_sb.prefetch_table_offset();
+        let (prefetch_offset, prefetch_size) = ext_sb.prefetch_table();
+        self.meta.prefetch_table_entries = prefetch_size / size_of::<u32>() as u32;
+        self.meta.prefetch_table_offset = prefetch_offset;
         trace!(
             "prefetch table offset {} entries {} ",
             self.meta.prefetch_table_offset, self.meta.prefetch_table_entries
