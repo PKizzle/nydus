@@ -619,6 +619,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support io_uring")]
     fn test_call_direct_no_proxy() {
         let req = make_request("", "");
         let mut headers = HeaderMap::new();
@@ -640,6 +641,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support io_uring")]
     fn test_call_temp_disable_proxy_bypasses_proxy() {
         let req = make_request("http://proxy:8080", "http://scheduler:8002");
         let mut headers = HeaderMap::new();
@@ -661,6 +663,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support io_uring")]
     fn test_call_context_disable_proxy_bypasses_proxy() {
         let req = make_request("http://proxy:8080", "http://scheduler:8002");
         let mut headers = HeaderMap::new();
@@ -684,6 +687,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support io_uring")]
     fn test_call_injects_custom_headers() {
         unsafe { std::env::set_var("NYDUS_HEADER_X-TEST-INJECT", "injected") };
         let req = make_request("", "");
@@ -710,6 +714,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support io_uring")]
     fn test_call_empty_proxy_url_goes_direct() {
         // Even with scheduler configured, empty proxy URL → direct
         let req = make_request("", "http://scheduler:8002");

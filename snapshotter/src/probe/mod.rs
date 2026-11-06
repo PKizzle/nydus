@@ -13,7 +13,7 @@
 //! - Linux capabilities (`CAP_SYS_ADMIN`, etc.)
 //! - cgroup v2 delegation
 
-use crate::config::{FsDriverEntry, FsDriverSelectionPolicy, FsDriverType};
+use crate::config::{ErofsInodeShare, FsDriverEntry, FsDriverSelectionPolicy, FsDriverType};
 #[cfg(target_os = "linux")]
 use anyhow::Context;
 use anyhow::{Result, bail};
@@ -447,6 +447,83 @@ fn probe_erofs_partial_folio(work_dir: &Path) {
              the page size regardless"
         ),
     }
+}
+
+/// Starts the EROFS page cache sharing self-test in the background, unless `mode` is `Off`.
+/// Not gated on erofs being listed yet: the probe mount loads the module. Auto-accel mounts made
+/// before it finishes go without sharing.
+pub fn spawn_erofs_inode_share_self_test(work_dir: &Path, mode: ErofsInodeShare) {
+    #[cfg(target_os = "linux")]
+    if mode != ErofsInodeShare::Off {
+        let dir = work_dir.to_path_buf();
+        if let Err(e) = std::thread::Builder::new()
+            .name("erofs-ishare-probe".into())
+            .spawn(move || probe_erofs_inode_share(&dir, mode))
+        {
+            warn!(error = %e, "failed to start the EROFS page cache sharing self-test");
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = (work_dir, mode);
+}
+
+/// The `erofs_inode_share` mode the startup self-test ran under, for the metric.
+#[cfg(target_os = "linux")]
+static INODE_SHARE_MODE: std::sync::OnceLock<ErofsInodeShare> = std::sync::OnceLock::new();
+
+/// Whether the startup self-test found the kernel supports EROFS page cache sharing and carries
+/// the fix for shared mmaps, which `erofs_inode_share = "auto"` requires. `false` until it has
+/// finished: callers run on the async runtime and must not wait for the probe mounts.
+pub fn erofs_inode_share_fix_detected() -> bool {
+    #[cfg(target_os = "linux")]
+    return nydus_service::erofs_ishare::detected().is_some_and(|s| s.safe_to_share());
+    #[cfg(not(target_os = "linux"))]
+    false
+}
+
+/// The startup EROFS page cache sharing decision: self-test status, configured mode and whether
+/// node-built auto-accel images are mounted with `inode_share`. `None` until the self-test ran,
+/// and with `erofs_inode_share = "off"`, which skips it.
+#[cfg(target_os = "linux")]
+pub fn erofs_inode_share_decision() -> Option<(
+    &'static nydus_service::erofs_ishare::InodeShareStatus,
+    ErofsInodeShare,
+    bool,
+)> {
+    let status = nydus_service::erofs_ishare::detected()?;
+    let mode = *INODE_SHARE_MODE.get()?;
+    Some((status, mode, mode.enabled(|| status.safe_to_share())))
+}
+
+/// Runs the EROFS page cache sharing self-test once and logs what `mode` makes of it.
+#[cfg(target_os = "linux")]
+fn probe_erofs_inode_share(work_dir: &Path, mode: ErofsInodeShare) {
+    use nydus_service::erofs_ishare::{self, InodeShareStatus};
+
+    let _ = INODE_SHARE_MODE.set(mode);
+    let status = erofs_ishare::detect_once(work_dir);
+    let enabled = mode.enabled(|| status.safe_to_share());
+    let detail = match status {
+        InodeShareStatus::Unsupported(d) | InodeShareStatus::Inconclusive(d) => d.as_str(),
+        InodeShareStatus::FixAbsent => "kernel lacks the fix for mmaps of shared files",
+        InodeShareStatus::FixPresent => "",
+    };
+    if mode == ErofsInodeShare::On && *status == InodeShareStatus::FixAbsent {
+        warn!(
+            upstream_fix = erofs_ishare::UPSTREAM_FIX,
+            "erofs_inode_share = \"on\" on a kernel without the fix \"erofs: hold real inodes for \
+             shared files\": a page fault on an mmap of a shared file whose real inode was \
+             evicted oopses the kernel. Use \"auto\" or a kernel with the fix"
+        );
+    }
+    info!(
+        mode = mode.as_str(),
+        status = status.label(),
+        enabled,
+        upstream_fix = erofs_ishare::UPSTREAM_FIX,
+        detail,
+        "EROFS page cache sharing (inode_share) for node-built auto-accel images"
+    );
 }
 
 /// On non-Linux, kernel version checks always fail (fanotify/fusedev are Linux-only).

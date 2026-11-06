@@ -2617,6 +2617,7 @@ mod tests {
     /// note on that function.
     #[cfg(feature = "backend-registry")]
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support io_uring")]
     fn test_relative_redirect_is_resolved_against_the_request_url() {
         use std::io::{Read, Write};
         use std::net::TcpListener;
@@ -2724,6 +2725,7 @@ mod tests {
 
     #[cfg(feature = "backend-registry")]
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support io_uring")]
     fn test_range_read_rejects_responses_that_ignore_the_range() {
         const BLOB: &[u8] = b"0123456789abcdefghij";
         let read_at = |response: String, offset: u64, len: usize| {

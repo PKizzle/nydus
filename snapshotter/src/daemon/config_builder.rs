@@ -348,13 +348,13 @@ pub const NODE_LOCAL_INODE_SHARE_DOMAIN: &str = "nydus-node-local";
 /// The `inode_share` domain to mount an auto-accel sidecar with, or `None` to mount without
 /// page cache sharing. Only a bootstrap built on this node qualifies: a peer's could carry a
 /// crafted fingerprint that aliases another image's file, so it never gets the option.
+/// `fix_detected` is consulted only for a node-built bootstrap in `auto` mode.
 pub fn auto_accel_inode_share_domain(
     mode: ErofsInodeShare,
     built_on_node: bool,
-    kernel_release: &str,
+    fix_detected: impl FnOnce() -> bool,
 ) -> Option<String> {
-    (built_on_node && mode.enabled_for_kernel(kernel_release))
-        .then(|| NODE_LOCAL_INODE_SHARE_DOMAIN.to_string())
+    (built_on_node && mode.enabled(fix_detected)).then(|| NODE_LOCAL_INODE_SHARE_DOMAIN.to_string())
 }
 
 /// Build a `ConfigV2` for the **auto-accel sidecar** mount: a `localfs`
@@ -1005,21 +1005,28 @@ mod tests {
 
     #[test]
     fn inode_share_only_for_node_built_auto_accel_bootstraps() {
-        let kernel = "7.4.0";
+        let fixed = || true;
         for mode in [
             ErofsInodeShare::Auto,
             ErofsInodeShare::On,
             ErofsInodeShare::Off,
         ] {
             // A peer-fetched sidecar never gets the option, whatever the mode.
-            assert_eq!(auto_accel_inode_share_domain(mode, false, kernel), None);
+            assert_eq!(
+                auto_accel_inode_share_domain(mode, false, || unreachable!()),
+                None
+            );
         }
         assert_eq!(
-            auto_accel_inode_share_domain(ErofsInodeShare::Auto, true, kernel).as_deref(),
+            auto_accel_inode_share_domain(ErofsInodeShare::Auto, true, fixed).as_deref(),
             Some(NODE_LOCAL_INODE_SHARE_DOMAIN)
         );
         assert_eq!(
-            auto_accel_inode_share_domain(ErofsInodeShare::Off, true, kernel),
+            auto_accel_inode_share_domain(ErofsInodeShare::Auto, true, || false),
+            None
+        );
+        assert_eq!(
+            auto_accel_inode_share_domain(ErofsInodeShare::Off, true, fixed),
             None
         );
 
@@ -1029,8 +1036,8 @@ mod tests {
                 .and_then(|c| c.fanotify.as_ref())
                 .and_then(|f| f.erofs_inode_share_domain.clone())
         };
-        let peer = auto_accel_inode_share_domain(ErofsInodeShare::On, false, kernel);
-        let local = auto_accel_inode_share_domain(ErofsInodeShare::On, true, kernel);
+        let peer = auto_accel_inode_share_domain(ErofsInodeShare::On, false, fixed);
+        let local = auto_accel_inode_share_domain(ErofsInodeShare::On, true, fixed);
         let dir = PathBuf::from("/tmp/x");
         assert_eq!(
             fanotify_domain(&build_auto_accel_config(&dir, &dir, &dir, "d", peer)),

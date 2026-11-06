@@ -222,6 +222,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support readahead")]
     fn fopen_resolves_the_requested_path() {
         let fs = open_file_system();
         let root = unsafe { FileSystemState::from_handle(fs) }.root_ino;
@@ -256,6 +257,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support readahead")]
     fn fopen_accepts_leading_and_duplicate_separators() {
         let fs = open_file_system();
         let a = fopen(fs, "/hardlink-test/foo");
@@ -276,6 +278,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support readahead")]
     fn fopen_reports_enoent_for_a_missing_path() {
         let fs = open_file_system();
         let handle = fopen(fs, "/no/such/file");
@@ -313,6 +316,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support readahead")]
     fn fopen_on_root_returns_the_root_inode() {
         let fs = open_file_system();
         let root = unsafe { FileSystemState::from_handle(fs) }.root_ino;

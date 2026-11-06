@@ -97,8 +97,11 @@ pub enum PullOutcome {
     /// A non-success, non-404 status (401/403/5xx etc), or a
     /// transport-layer failure prevented the request from completing.
     /// `status: 0` means the request never reached Spegel (transport,
-    /// TLS, malformed ref, write-to-content-store failure, etc.).
+    /// TLS, malformed ref, etc.).
     RegistryError { status: u16, body: String },
+    /// The sidecar was fetched and verified, but storing it in the local containerd content
+    /// store failed (containerd down or refusing the write). Not a mirror problem.
+    ContentStoreError(String),
     /// Mirror is disabled by config, or the TLS material doesn't exist
     /// on disk. Quiet fallback — the locator falls through to its
     /// label-filter scan and the node runs without the mirror-pull path.

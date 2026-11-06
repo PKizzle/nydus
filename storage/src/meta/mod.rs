@@ -2330,6 +2330,7 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support file-backed mmap")]
     fn chunk_tables_keep_their_mapping_alive() {
         use vmm_sys_util::tempfile::TempFile;
 
@@ -2423,6 +2424,7 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
     fn test_load_meta_ci_zran_from_reader() {
         let root_dir = &std::env::var("CARGO_MANIFEST_DIR").expect("$CARGO_MANIFEST_DIR");
         let id = "233c72f2b6b698c07021c4da367cfe2dff4f049efbaa885ca0ff760ea297865a";
@@ -2492,6 +2494,7 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
     fn test_load_meta_waits_for_initializing_process() {
         let root_dir = &std::env::var("CARGO_MANIFEST_DIR").expect("$CARGO_MANIFEST_DIR");
         let id = "233c72f2b6b698c07021c4da367cfe2dff4f049efbaa885ca0ff760ea297865a";
@@ -2555,6 +2558,7 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support file-backed mmap")]
     fn test_load_meta_ci_zran_add_more_chunks() {
         let root_dir = &std::env::var("CARGO_MANIFEST_DIR").expect("$CARGO_MANIFEST_DIR");
         let path = PathBuf::from(root_dir).join("../tests/texture/zran/233c72f2b6b698c07021c4da367cfe2dff4f049efbaa885ca0ff760ea297865a");
@@ -2610,6 +2614,7 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support file-backed mmap")]
     fn test_load_meta_ci_zran_get_chunks_uncompressed() {
         let root_dir = &std::env::var("CARGO_MANIFEST_DIR").expect("$CARGO_MANIFEST_DIR");
         let path = PathBuf::from(root_dir).join("../tests/texture/zran/233c72f2b6b698c07021c4da367cfe2dff4f049efbaa885ca0ff760ea297865a");
@@ -2670,6 +2675,7 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support file-backed mmap")]
     fn test_load_meta_ci_zran_get_chunks_compressed() {
         let root_dir = &std::env::var("CARGO_MANIFEST_DIR").expect("$CARGO_MANIFEST_DIR");
         let path = PathBuf::from(root_dir).join("../tests/texture/zran/233c72f2b6b698c07021c4da367cfe2dff4f049efbaa885ca0ff760ea297865a");

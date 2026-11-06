@@ -517,6 +517,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "calls the C zstd library")]
     fn detects_frame_and_skippable_magics() {
         assert!(is_zstd_magic(&frame(b"x")));
         assert!(is_zstd_magic(&skippable(b"meta")));
@@ -526,6 +527,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "calls the C zstd library")]
     fn contexts_start_at_frame_boundaries_and_extend_within_a_frame() {
         let (a, b, c) = (pattern(3000, 1), pattern(5000, 2), pattern(2000, 3));
         let (fa, fb) = (frame(&a), frame(&b));
@@ -556,6 +558,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "calls the C zstd library")]
     fn reader_digest_and_size_cover_the_consumed_input() {
         let stream = frame(&pattern(10_000, 7));
         let mut reader =
@@ -571,6 +574,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "calls the C zstd library")]
     fn truncated_frames_fail() {
         let stream = frame(&pattern(100_000, 9));
         let mut reader =

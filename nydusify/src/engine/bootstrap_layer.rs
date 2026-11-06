@@ -241,6 +241,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "calls the C zlib library")]
     fn packs_the_bootstrap_at_the_path_the_snapshotter_reads() {
         let (_dir, path) = write_temp(b"RAFS-BOOTSTRAP-BYTES");
         let layer = pack(&path, &[]).unwrap();
@@ -289,6 +290,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "calls the C zlib library")]
     fn appended_files_ride_beside_the_bootstrap_under_their_base_names() {
         let (dir, path) = write_temp(b"RAFS-BOOTSTRAP-BYTES");
         let extra = dir.path().join("model-card.json");
@@ -312,6 +314,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "calls the C zlib library")]
     fn packing_the_same_inputs_twice_yields_the_same_digest() {
         // Ownership and mtime are pinned so a converted image is reproducible; an appended
         // file's own mtime must not leak into the layer digest.
@@ -328,6 +331,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "calls the C zlib library")]
     fn extract_still_finds_the_bootstrap_past_appended_entries() {
         // `extract` scans for image/image.boot; appended entries must not shadow it.
         let (dir, path) = write_temp(b"THE-BOOTSTRAP");
@@ -343,6 +347,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "calls the C zlib library")]
     fn diff_id_is_the_tar_digest_not_the_gzip_digest() {
         // containerd recomputes the diff id from the uncompressed tar while
         // unpacking; returning the gzip digest here fails the pull with a
@@ -361,6 +366,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "calls the C zlib library")]
     fn pack_then_extract_round_trips() {
         let (dir, path) = write_temp(b"BOOTSTRAP-CONTENT-42");
         let layer = pack(&path, &[]).unwrap();
@@ -395,6 +401,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "calls the C zlib library")]
     fn extract_refuses_a_decompression_bomb() {
         use std::io::Write as _;
 
@@ -422,6 +429,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "calls the C zlib library")]
     fn extract_accepts_a_layer_that_fits_the_ceiling() {
         // The bound must not be so eager that it rejects a legitimate layer
         // sitting just under it.
@@ -453,6 +461,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "calls the C zlib library")]
     fn packing_is_deterministic() {
         // Same bootstrap in, same layer digest out: a re-convert must not churn
         // the manifest, so the tar header carries no timestamps or ownership.

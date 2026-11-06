@@ -705,6 +705,7 @@ mod tests {
     // socket). Construct a worker directly over a socketpair so no `/dev/nbd*`
     // device is needed.
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support io_uring")]
     fn test_nbd_worker_exits_on_shutdown_broadcast() {
         compio::runtime::Runtime::new().unwrap().block_on(async {
             let tmpdir = TempDir::new().unwrap();

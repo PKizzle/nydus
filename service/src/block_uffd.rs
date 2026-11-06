@@ -1575,6 +1575,7 @@ mod tests {
     use vmm_sys_util::tempdir::TempDir;
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support io_uring")]
     fn uffdio_copy_rejects_a_short_source_buffer() {
         let error = compio::runtime::Runtime::new()
             .unwrap()
@@ -1731,6 +1732,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
     fn test_uffd_daemon_lifecycle() {
         let tmpdir = TempDir::new().unwrap();
         let device = create_block_device(tmpdir.as_path().to_path_buf()).unwrap();
@@ -1822,6 +1824,7 @@ mod tests {
     // --- UffdService basic tests ---
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
     fn test_uffd_service_stop_flag() {
         let tmpdir = TempDir::new().unwrap();
         let device = create_block_device(tmpdir.as_path().to_path_buf()).unwrap();
@@ -1845,6 +1848,7 @@ mod tests {
     // on: a new receiver is *Empty* (pending), not *Closed*, and a stop signal
     // still reaches it.
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
     fn test_uffd_service_shutdown_channel_stays_open() {
         let tmpdir = TempDir::new().unwrap();
         let device = create_block_device(tmpdir.as_path().to_path_buf()).unwrap();
@@ -1869,6 +1873,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
     fn test_uffd_service_save_restore() {
         let tmpdir = TempDir::new().unwrap();
         let device = create_block_device(tmpdir.as_path().to_path_buf()).unwrap();
@@ -1881,6 +1886,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
     fn test_uffd_service_get_blob_cache_mgr() {
         let tmpdir = TempDir::new().unwrap();
         let device = create_block_device(tmpdir.as_path().to_path_buf()).unwrap();
@@ -1907,6 +1913,7 @@ mod tests {
     // --- try_recv_from_sock tests ---
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support sendmsg/recvmsg")]
     fn test_try_recv_from_sock_eof() {
         // Create a pair of unix stream sockets, close the sender side
         let (sock1, sock2) = std::os::unix::net::UnixStream::pair().unwrap();
@@ -1923,6 +1930,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support sendmsg/recvmsg")]
     fn test_try_recv_from_sock_would_block() {
         // Create a pair and set non-blocking, read without writing -> WouldBlock -> Ok(None)
         let (sock1, _sock2) = std::os::unix::net::UnixStream::pair().unwrap();
@@ -1934,6 +1942,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support sendmsg/recvmsg")]
     fn test_try_recv_from_sock_valid_handshake() {
         let (sock1, sock2) = std::os::unix::net::UnixStream::pair().unwrap();
 
@@ -1956,6 +1965,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support sendmsg/recvmsg")]
     fn test_try_recv_from_sock_stat_request() {
         let (sock1, sock2) = std::os::unix::net::UnixStream::pair().unwrap();
 
@@ -1970,6 +1980,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support sendmsg/recvmsg")]
     fn test_try_recv_from_sock_invalid_utf8() {
         let (sock1, sock2) = std::os::unix::net::UnixStream::pair().unwrap();
 
@@ -1982,6 +1993,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support sendmsg/recvmsg")]
     fn test_try_recv_from_sock_invalid_json() {
         let (sock1, sock2) = std::os::unix::net::UnixStream::pair().unwrap();
 
@@ -1996,6 +2008,7 @@ mod tests {
     // --- handle_handshake Firecracker compatibility test ---
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support sendmsg/recvmsg")]
     fn test_handle_handshake_firecracker_format() {
         let (sock1, sock2) = std::os::unix::net::UnixStream::pair().unwrap();
 
@@ -2037,6 +2050,7 @@ mod tests {
     // --- do_prefault test ---
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support io_uring")]
     fn test_do_prefault() {
         compio::runtime::Runtime::new().unwrap().block_on(async {
             let tmpdir = TempDir::new().unwrap();
@@ -2084,6 +2098,7 @@ mod tests {
     // --- send_batch_response test ---
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support io_uring")]
     fn test_send_batch_response() {
         compio::runtime::Runtime::new().unwrap().block_on(async {
             let (sock1, sock2) = std::os::unix::net::UnixStream::pair().unwrap();
@@ -2118,6 +2133,7 @@ mod tests {
     // --- dispatch_message tests ---
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support io_uring")]
     fn test_dispatch_message_stat() {
         compio::runtime::Runtime::new().unwrap().block_on(async {
             let (sock1, sock2) = std::os::unix::net::UnixStream::pair().unwrap();
@@ -2147,6 +2163,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support io_uring")]
     fn test_dispatch_message_unexpected_type() {
         compio::runtime::Runtime::new().unwrap().block_on(async {
             let (sock1, _sock2) = std::os::unix::net::UnixStream::pair().unwrap();
@@ -2175,6 +2192,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support io_uring")]
     fn test_dispatch_message_handshake_already_handshaked() {
         compio::runtime::Runtime::new().unwrap().block_on(async {
             let (sock1, _sock2) = std::os::unix::net::UnixStream::pair().unwrap();
@@ -2225,6 +2243,7 @@ mod tests {
     // --- handle_stat_request test ---
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support io_uring")]
     fn test_handle_stat_request() {
         compio::runtime::Runtime::new().unwrap().block_on(async {
             let (sock1, sock2) = std::os::unix::net::UnixStream::pair().unwrap();
@@ -2254,6 +2273,7 @@ mod tests {
     // --- handle_handshake with real uffd fd ---
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support io_uring")]
     fn test_handle_handshake_with_uffd_fd() {
         compio::runtime::Runtime::new().unwrap().block_on(async {
             let tmpdir = TempDir::new().unwrap();
@@ -2283,6 +2303,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support io_uring")]
     fn test_handle_handshake_no_uffd_fd() {
         compio::runtime::Runtime::new().unwrap().block_on(async {
             let tmpdir = TempDir::new().unwrap();
@@ -2308,6 +2329,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support io_uring")]
     fn test_handle_handshake_copy_policy() {
         compio::runtime::Runtime::new().unwrap().block_on(async {
             let tmpdir = TempDir::new().unwrap();
@@ -2336,6 +2358,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support io_uring")]
     fn test_handle_handshake_rejects_invalid_vma() {
         compio::runtime::Runtime::new().unwrap().block_on(async {
             let tmpdir = TempDir::new().unwrap();
@@ -2361,6 +2384,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support io_uring")]
     fn test_dispatch_message_closes_unexpected_fds() {
         // A message that carries fds the handler does not expect must have them
         // closed rather than leaked.
@@ -2424,6 +2448,7 @@ mod tests {
     // --- UffdService create_worker test ---
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
     fn test_uffd_service_create_worker() {
         let tmpdir = TempDir::new().unwrap();
         let device = create_block_device(tmpdir.as_path().to_path_buf()).unwrap();
@@ -2443,6 +2468,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
     fn test_uffd_service_run_without_workers_fails() {
         let tmpdir = TempDir::new().unwrap();
         let device = create_block_device(tmpdir.as_path().to_path_buf()).unwrap();
@@ -2456,6 +2482,7 @@ mod tests {
     // --- async_send_with_fd test ---
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support io_uring")]
     fn test_async_send_with_fd() {
         compio::runtime::Runtime::new().unwrap().block_on(async {
             let (sock1, sock2) = std::os::unix::net::UnixStream::pair().unwrap();
@@ -2481,6 +2508,7 @@ mod tests {
     // --- stop() shutdown socket test ---
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
     fn test_service_stop_shutdown_sockets() {
         let tmpdir = TempDir::new().unwrap();
         let device = create_block_device(tmpdir.as_path().to_path_buf()).unwrap();
@@ -2535,6 +2563,7 @@ mod tests {
     // --- handle_conn graceful shutdown test ---
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support io_uring")]
     fn test_handle_conn_graceful_shutdown() {
         compio::runtime::Runtime::new().unwrap().block_on(async {
             let tmpdir = TempDir::new().unwrap();
@@ -2605,6 +2634,7 @@ mod tests {
     // --- handle_uffd_event test ---
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support io_uring")]
     fn test_handle_uffd_event_no_event() {
         compio::runtime::Runtime::new().unwrap().block_on(async {
             let tmpdir = TempDir::new().unwrap();
@@ -2708,6 +2738,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
     fn test_uffd_core_new_and_device() {
         let tmpdir = TempDir::new().unwrap();
         let device = create_block_device(tmpdir.as_path().to_path_buf()).unwrap();
@@ -2721,6 +2752,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
     fn test_handle_page_fault_not_pagefault_event() {
         let tmpdir = TempDir::new().unwrap();
         let device = create_block_device(tmpdir.as_path().to_path_buf()).unwrap();
@@ -2748,6 +2780,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
     fn test_handle_page_fault_vma_invalidating_event_errors() {
         // REMAP/REMOVE/UNMAP invalidate the cached VMA layout; the handler must surface an error
         // so the connection tears down rather than resolving faults against stale addresses.
@@ -2780,6 +2813,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
     fn test_handle_page_fault_fork_closes_child_fd() {
         // A FORK event carries a brand-new child uffd fd in the first u64 of the union; the handler
         // must close it (returning Noop) instead of leaking it.
@@ -2841,6 +2875,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
     fn test_handle_page_fault_addr_not_in_vma() {
         let tmpdir = TempDir::new().unwrap();
         let device = create_block_device(tmpdir.as_path().to_path_buf()).unwrap();
@@ -2868,6 +2903,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
     fn test_handle_page_fault_copy_mode() {
         let tmpdir = TempDir::new().unwrap();
         let device = create_block_device(tmpdir.as_path().to_path_buf()).unwrap();
@@ -2909,6 +2945,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
     fn test_handle_page_fault_zerocopy_mode() {
         let tmpdir = TempDir::new().unwrap();
         let device = create_block_device(tmpdir.as_path().to_path_buf()).unwrap();
@@ -2946,6 +2983,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
     fn test_resolve_copy() {
         let tmpdir = TempDir::new().unwrap();
         let device = create_block_device(tmpdir.as_path().to_path_buf()).unwrap();
@@ -2970,6 +3008,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
     fn test_resolve_zerocopy_ranges() {
         let tmpdir = TempDir::new().unwrap();
         let device = create_block_device(tmpdir.as_path().to_path_buf()).unwrap();
@@ -2991,6 +3030,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
     fn test_prefault_ranges() {
         let tmpdir = TempDir::new().unwrap();
         let device = create_block_device(tmpdir.as_path().to_path_buf()).unwrap();
@@ -3005,6 +3045,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
     fn test_handle_page_fault_beyond_device_zerocopy() {
         let tmpdir = TempDir::new().unwrap();
         let device = create_block_device(tmpdir.as_path().to_path_buf()).unwrap();
@@ -3048,6 +3089,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
     fn test_handle_page_fault_beyond_device_copy() {
         let tmpdir = TempDir::new().unwrap();
         let device = create_block_device(tmpdir.as_path().to_path_buf()).unwrap();
@@ -3083,6 +3125,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support io_uring")]
     fn test_uffdio_wake() {
         compio::runtime::Runtime::new().unwrap().block_on(async {
             let (uffd_fd, addr, mmap_size) = setup_uffd_region(4096).unwrap();
@@ -3113,6 +3156,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support io_uring")]
     fn test_uffdio_wake_invalid_fd() {
         compio::runtime::Runtime::new().unwrap().block_on(async {
             let result = uffdio_wake(-1, 0x1000, 4096).await;

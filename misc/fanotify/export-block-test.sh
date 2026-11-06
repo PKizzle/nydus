@@ -46,6 +46,8 @@ step "nydus-image export --block"
 "$NI" export --block --bootstrap "$ROOT/out/bootstrap" --localfs-dir "$ROOT/out" \
   --output "$ROOT/disk.img" || fail "nydus-image export --block"
 ls -la "$ROOT/disk.img"
+# Padded so a file-backed mount of it never ends inside a page (partial-folio EROFS bug).
+[ $(( $(stat -c %s "$ROOT/disk.img") % 65536 )) -eq 0 ] || fail "export is not a 64 KiB multiple"
 
 step "loop-mount the exported image"
 sudo mount -t erofs -o loop,ro "$ROOT/disk.img" "$ROOT/mnt" || fail "EROFS loop mount"
