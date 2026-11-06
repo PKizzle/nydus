@@ -312,7 +312,9 @@ impl BlobMetaChunkInfo for BlobChunkInfoV2Ondisk {
             let ctx = &state.zran_info_array[index];
             let zran_offset = self.get_zran_offset()?;
             if zran_offset >= ctx.out_size()
-                || zran_offset + self.uncompressed_size() > ctx.out_size()
+                || zran_offset
+                    .checked_add(self.uncompressed_size())
+                    .is_none_or(|end| end > ctx.out_size())
             {
                 return Err(MetaError::Corrupted(format!(
                     "ZRan range 0x{:x}/0x{:x} is invalid, should be with in 0/0x{:x}",

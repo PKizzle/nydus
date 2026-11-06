@@ -167,7 +167,7 @@ fn open_without_events_via(
             }
             break Err(e);
         }
-        for_each_parsable_event(&buf[..n as usize], |meta| {
+        for_each_parsable_event(&buf[..n as usize], |meta, _| {
             if meta.fd < 0 {
                 return;
             }
@@ -1294,7 +1294,7 @@ impl FanotifyHandler {
     /// structural-failure path.
     fn deny_events_in_buffer(&self, buf: &[u8]) -> usize {
         let mut denied = 0usize;
-        for_each_parsable_event(buf, |meta| {
+        for_each_parsable_event(buf, |meta, _| {
             let event_fd = meta.fd as RawFd;
             if event_fd >= 0 {
                 self.deny_event_fd(event_fd);
@@ -1968,7 +1968,7 @@ fn write_response(group: RawFd, event_fd: RawFd, response: u32) {
 /// Only used off the hot path (shutdown drain, structural-failure recovery); the serving loop
 /// in [`FanotifyHandler::process_event_buffer`] needs per-record error handling and does its
 /// own walk.
-fn for_each_parsable_event(buf: &[u8], mut f: impl FnMut(&libc::fanotify_event_metadata)) {
+fn for_each_parsable_event(buf: &[u8], mut f: impl FnMut(&libc::fanotify_event_metadata, &[u8])) {
     let mut offset = 0usize;
     while offset + std::mem::size_of::<libc::fanotify_event_metadata>() <= buf.len() {
         // SAFETY: we verified the buffer has enough bytes; the event buffer is a `Vec<u8>` with no
@@ -1985,9 +1985,23 @@ fn for_each_parsable_event(buf: &[u8], mut f: impl FnMut(&libc::fanotify_event_m
         {
             break;
         }
-        f(&meta);
+        f(&meta, &buf[offset..offset + meta_len]);
         offset += meta_len;
     }
+}
+
+/// Walk an untrusted event buffer the way the worker does, extracting each record's range, and
+/// return how many records carried one. Entry point for the `fanotify_events` fuzz target.
+#[cfg(feature = "fuzzing")]
+#[doc(hidden)]
+pub fn fuzz_event_buffer(buf: &[u8]) -> usize {
+    let mut ranges = 0;
+    for_each_parsable_event(buf, |_, raw| {
+        if FanotifyHandler::parse_range(raw).is_some() {
+            ranges += 1;
+        }
+    });
+    ranges
 }
 
 /// Get the current size of an open file descriptor.
@@ -2660,7 +2674,7 @@ mod tests {
     /// itself is covered by `misc/fanotify/*.sh`.
     fn walk_deniable_events(buf: &[u8]) -> Vec<RawFd> {
         let mut fds = Vec::new();
-        for_each_parsable_event(buf, |meta| {
+        for_each_parsable_event(buf, |meta, _| {
             if meta.fd >= 0 {
                 fds.push(meta.fd as RawFd);
             }
