@@ -38,9 +38,7 @@ use nydus_utils::compress::ZlibDecoder;
 use nydus_utils::compress::zlib_random::{ZRAN_READER_BUF_SIZE, ZranReader};
 use nydus_utils::compress::zstd_frames::{ZstdFrameReader, is_zstd_magic};
 use nydus_utils::digest::RafsDigest;
-use nydus_utils::{
-    BufReaderInfo, ByteSize, compress, div_round_up, lazy_drop, root_tracer, timing_tracer,
-};
+use nydus_utils::{BufReaderInfo, ByteSize, compress, div_round_up, root_tracer, timing_tracer};
 
 use crate::core::context::{Artifact, NoopArtifactWriter, RefContextGenerator};
 
@@ -795,8 +793,6 @@ impl Builder for TarballBuilder {
                 "dump_bootstrap"
             )?;
         }
-
-        lazy_drop(bootstrap_ctx);
 
         BuildOutput::new(blob_mgr, None, &bootstrap_mgr.bootstrap_storage, &None)
     }
