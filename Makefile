@@ -18,6 +18,10 @@ CARGO ?= $(shell which cargo)
 RUSTUP ?= $(shell which rustup)
 MIRI_TOOLCHAIN ?= nightly
 MIRI_NEXTEST = $(CARGO_COV_FLAGS) MIRIFLAGS=-Zmiri-disable-isolation TEST_WORKDIR_PREFIX=$(TEST_WORKDIR_PREFIX) RUST_BACKTRACE=1 ${RUSTUP} run $(MIRI_TOOLCHAIN) cargo miri nextest run --filter-expr 'test(test) - test(integration) - test(deduplicate::tests) - test(cache::dedup::) - test(inode_bitmap::tests::test_inode_bitmap)' --workspace $(EXCLUDE_PACKAGES) --exclude nydus-snapshotter $(CARGO_COMMON) $(CARGO_BUILD_FLAGS)
+# Sanitizer runs (`make asan-ut-nextest`, `make careful-ut-nextest`): see docs/sanitizers.md.
+SANITIZER_TOOLCHAIN ?= nightly
+SANITIZER_TARGET ?= $(UNAME_M)-unknown-linux-gnu
+SANITIZER_NEXTEST_ARGS = --no-fail-fast --filter-expr 'not test(integration)' --workspace $(EXCLUDE_PACKAGES) $(CARGO_COMMON) --target $(SANITIZER_TARGET)
 CARGO_BUILD_GEARS = -v ~/.ssh/id_rsa:/root/.ssh/id_rsa -v ~/.cargo/git:/root/.cargo/git -v ~/.cargo/registry:/root/.cargo/registry
 SUDO = $(shell which sudo)
 CARGO_COMMON ?=
@@ -184,6 +188,19 @@ ut:
 # you need install cargo nextest first from: https://nexte.st/book/pre-built-binaries.html
 ut-nextest:
 	$(CARGO_COV_FLAGS) TEST_WORKDIR_PREFIX=$(TEST_WORKDIR_PREFIX) RUST_BACKTRACE=1 ${RUSTUP} run stable cargo nextest run --no-fail-fast --filter-expr 'not test(integration)' --workspace $(EXCLUDE_PACKAGES) $(CARGO_COMMON) $(CARGO_BUILD_FLAGS)
+
+# AddressSanitizer needs an explicit --target so build scripts and proc macros, which run
+# on the host, are built without the sanitizer runtime.
+asan-ut-nextest:
+	RUSTFLAGS="-Zsanitizer=address" RUSTDOCFLAGS="-Zsanitizer=address" \
+	ASAN_OPTIONS="$${ASAN_OPTIONS:-detect_leaks=1}" \
+	LSAN_OPTIONS="$${LSAN_OPTIONS:-suppressions=$(CURDIR)/misc/sanitizers/lsan.supp:print_suppressions=0}" \
+	TEST_WORKDIR_PREFIX=$(TEST_WORKDIR_PREFIX) RUST_BACKTRACE=1 ${RUSTUP} run $(SANITIZER_TOOLCHAIN) cargo nextest run $(SANITIZER_NEXTEST_ARGS)
+
+# cargo-careful rebuilds std with debug assertions, so std's precondition checks
+# (slice::from_raw_parts, ptr::copy_nonoverlapping, ...) fire inside the tests.
+careful-ut-nextest:
+	TEST_WORKDIR_PREFIX=$(TEST_WORKDIR_PREFIX) RUST_BACKTRACE=1 ${RUSTUP} run $(SANITIZER_TOOLCHAIN) cargo careful nextest run $(SANITIZER_NEXTEST_ARGS)
 
 # install miri first from https://github.com/rust-lang/miri/
 # nydus-snapshotter is excluded from Miri: it links compio (io_uring) + mimalloc

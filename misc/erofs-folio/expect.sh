@@ -13,11 +13,12 @@ echo "==== EROFS FOLIO PROBE: ${status:-none} ===="
 fail() { echo "::error::erofs-folio: $*"; exit 1; }
 [ "$status" = "$expect" ] || fail "probe says '${status:-none}', expected '$expect'"
 [ -n "$image" ] || exit 0
-grep -q '/padded\.erofs: .*, 0 failed' "$log" || fail "the padded image did not read cleanly"
+grep -qE '\(padded, mounted from [^)]*\): [0-9]+ bytes, .*, 0 failed' "$log" ||
+  fail "the padded image did not read cleanly"
 case "$expect" in
-  affected) grep -q '/unpadded\.erofs: .* entries walked, [1-9][0-9]* failed' "$log" ||
+  affected) grep -qE '/unpadded\.erofs: [0-9]+ bytes, [0-9]+ entries walked, [1-9][0-9]* failed' "$log" ||
     fail "the unpadded image did not mount and fail inside, so it does not reproduce the bug" ;;
-  *) grep -q '/unpadded\.erofs: .*, 0 failed' "$log" ||
+  *) grep -qE '/unpadded\.erofs: [0-9]+ bytes, .*, 0 failed' "$log" ||
     fail "the unpadded image failed on a kernel the probe calls unaffected" ;;
 esac
 echo "==== EROFS FOLIO IMAGE: padded reads cleanly, unpadded as expected ===="

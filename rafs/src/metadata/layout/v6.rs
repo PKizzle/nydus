@@ -2404,6 +2404,18 @@ impl RafsV6PrefetchTable {
         offset: u64,
         entries: usize,
     ) -> RafsResult<usize> {
+        // `entries` comes from the superblock: check it against the file before allocating.
+        let end = r.seek_to_end(0)?;
+        if (entries as u64)
+            .checked_mul(size_of::<u32>() as u64)
+            .and_then(|size| offset.checked_add(size))
+            .is_none_or(|table_end| table_end > end)
+        {
+            return Err(RafsError::InvalidMetadata(format!(
+                "prefetch table at offset {} with {} entries exceeds the bootstrap size {}",
+                offset, entries, end
+            )));
+        }
         self.inodes = vec![0u32; entries];
 
         // SAFETY: `u32` has no padding and every byte pattern is a valid `u32`, so the table can be
@@ -3186,5 +3198,14 @@ mod tests {
         assert_eq!(table.len(), 0);
         assert!(table.load_prefetch_table_from(&mut reader, 0, 2).is_ok());
         assert_eq!(table.len(), 2);
+        // An entry count from a corrupt superblock is refused before anything is allocated.
+        assert!(matches!(
+            table.load_prefetch_table_from(&mut reader, 0, 1 << 30),
+            Err(RafsError::InvalidMetadata(_))
+        ));
+        assert!(matches!(
+            table.load_prefetch_table_from(&mut reader, u64::MAX, 1),
+            Err(RafsError::InvalidMetadata(_))
+        ));
     }
 }

@@ -258,6 +258,15 @@ impl DirectSuperBlockV6 {
 
         for idx in 0..(size / unit_size) {
             let chunk = DirectChunkInfoV6::new(&state, self.clone(), idx)?;
+            // The chunk address packs these into 8 and 24 bits; its setters assert the ranges.
+            if chunk.blob_index() >= u8::MAX as u32 || chunk.id() > 0x00ff_ffff {
+                return Err(RafsError::InvalidMetadata(format!(
+                    "v6: chunk {} has blob index {} / compression index {} out of range",
+                    idx,
+                    chunk.blob_index(),
+                    chunk.id()
+                )));
+            }
             let mut v6_chunk = RafsV6InodeChunkAddr::new();
             v6_chunk.set_blob_index(chunk.blob_index());
             v6_chunk.set_blob_ci_index(chunk.id());
@@ -359,6 +368,18 @@ impl OndiskInodeWrapper {
         offset: usize,
     ) -> RafsResult<Self> {
         let inode = DirectSuperBlockV6::disk_inode(state, offset)?;
+        // Dirent blocks live in the bootstrap, so a larger directory is corrupt; the directory
+        // operations walk every block, and an unbounded size would make them spin.
+        if crate::metadata::file_type_bits(inode.mode() as u32)
+            == crate::metadata::mode_bits(libc::S_IFDIR)
+            && inode.size() > state.map.size() as u64
+        {
+            return Err(RafsError::InvalidMetadata(format!(
+                "v6: directory size {} exceeds the bootstrap size {}",
+                inode.size(),
+                state.map.size()
+            )));
+        }
         let blocks_count = div_round_up(inode.size(), state.block_size());
 
         Ok(OndiskInodeWrapper {
@@ -1822,6 +1843,36 @@ mod tests {
         ));
         assert!(matches!(
             root.walk_children_inodes(0, &mut |_, _, _, _| Ok(RafsInodeWalkAction::Continue)),
+            Err(RafsError::InvalidMetadata(_))
+        ));
+    }
+
+    /// A directory claiming more dirent blocks than the bootstrap holds is rejected when its
+    /// inode is resolved, instead of every directory operation walking all the claimed blocks.
+    #[test]
+    fn test_reject_directory_larger_than_bootstrap() {
+        let (path, mut data) = v6_fixture();
+        let sb = load_v6(&data).unwrap();
+        let mut dsb = DirectSuperBlockV6::new(&sb.meta);
+        let mut reader = Box::new(std::fs::File::open(&path).unwrap()) as RafsIoReader;
+        dsb.load(&mut reader).unwrap();
+        let state = dsb.state.load();
+        let offset = dsb
+            .inode_wrapper(&state, sb.meta.root_nid as u64)
+            .unwrap()
+            .offset;
+        drop(state);
+
+        // `i_size` sits at byte 8 of both inode layouts; bit 0 of `i_format` selects the layout.
+        let size = offset + 8;
+        if data[offset] & 1 == 0 {
+            data[size..size + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+        } else {
+            data[size..size + 8].copy_from_slice(&u64::MAX.to_le_bytes());
+        }
+        let sb = load_v6(&data).unwrap();
+        assert!(matches!(
+            sb.superblock.get_inode(sb.superblock.root_ino(), false),
             Err(RafsError::InvalidMetadata(_))
         ));
     }

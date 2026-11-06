@@ -14,9 +14,10 @@ extern crate serde_json;
 
 // mimalloc global allocator: image conversion churns many small buffers
 // (chunking, compression, zran); thread-local pools cut allocator overhead.
-// Disabled under Miri, which cannot call mimalloc's FFI (mi_malloc_aligned) and
-// aborts even when just listing tests; fall back to Miri's own allocator.
-#[cfg(not(miri))]
+// Disabled in test builds: Miri cannot call mimalloc's FFI (mi_malloc_aligned) and
+// aborts even when just listing tests, and AddressSanitizer only tracks heap blocks
+// from the system allocator. Tests fall back to the system (or Miri's) allocator.
+#[cfg(not(any(miri, test)))]
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 

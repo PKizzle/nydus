@@ -308,6 +308,7 @@ mod tests {
         use std::thread;
 
         let limiter = Arc::new(QpsLimiter::new(100.0));
+        let start = Instant::now();
 
         // Create multiple threads trying to acquire tokens
         let mut handles = vec![];
@@ -329,11 +330,13 @@ mod tests {
             total_acquired += handle.join().unwrap();
         }
 
-        // Should acquire all 100 initial tokens
-        assert_eq!(total_acquired, 100);
-
-        // Should have no tokens left
-        assert!(!limiter.try_acquire());
+        // All 100 initial tokens, plus whatever refilled while the threads ran: a slow
+        // (sanitized or loaded) run takes longer than the 10 ms one token needs.
+        let refilled = (start.elapsed().as_secs_f64() * 100.0).ceil() as i32;
+        assert!(
+            (100..=100 + refilled).contains(&total_acquired),
+            "acquired {total_acquired}, refilled at most {refilled}"
+        );
     }
 
     #[test]

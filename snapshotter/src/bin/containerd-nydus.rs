@@ -13,9 +13,10 @@
 // mimalloc global allocator: compio's completion I/O (gRPC + in-process daemon
 // blob reads) is owned-buffer-per-op; mimalloc's thread-local pools cut the
 // small-buffer allocation overhead.
-// Disabled under Miri, which cannot call mimalloc's FFI (mi_malloc_aligned) and
-// aborts even when just listing tests; fall back to Miri's own allocator.
-#[cfg(not(miri))]
+// Disabled in test builds: Miri cannot call mimalloc's FFI (mi_malloc_aligned) and
+// aborts even when just listing tests, and AddressSanitizer only tracks heap blocks
+// from the system allocator. Tests fall back to the system (or Miri's) allocator.
+#[cfg(not(any(miri, test)))]
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
