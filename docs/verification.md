@@ -18,6 +18,7 @@ the checked modules.
 | --- | --- | --- |
 | Kani | `storage/src/meta/chunk_info_v2.rs` `validate_decides_every_record` | `validate` decides every on-disk chunk record without panicking; an accepted ZRan or batch chunk lies inside its context |
 | Kani | `storage/src/meta/chunk_info_v2.rs` `packed_fields_round_trip` | the packed offset/size/flag fields of a chunk record do not overlap |
+| Kani | `rafs/src/metadata/layout/v6.rs` `superblocks_decide_every_image` | RAFS v6 superblock validation never panics, and an accepted image keeps its metadata area and tables inside the bootstrap |
 | Kani | `service/src/fanotify.rs` `parse_range_stays_in_bounds` | `parse_range` never reads past the event buffer, whatever the info-record lengths say |
 | Kani | `service/src/fanotify.rs` `event_walk_stays_in_bounds` | `for_each_parsable_event` never walks past the buffer, whatever `event_len` says |
 | loom | `storage/src/cache/state/blob_state_map.rs` `loom_racing_readers_fetch_once` | of two readers racing for a chunk, exactly one fetches it, and the other waits for that fetch |
@@ -37,6 +38,7 @@ cargo install --locked kani-verifier
 cargo kani setup
 
 cargo kani -p nydus-storage -Z stubbing
+cargo kani -p nydus-rafs -Z stubbing
 cargo kani -p nydus-service -Z stubbing
 # One harness:
 cargo kani -p nydus-storage --harness validate_decides_every_record -Z stubbing

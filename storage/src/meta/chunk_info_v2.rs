@@ -613,7 +613,12 @@ mod verification {
             batch_info_array: vec![kani::any::<BatchInflateContext>()].into(),
             ..Default::default()
         };
-        if chunk.validate(&state).is_err() {
+        // Leak the error: `MetaError` can hold an `io::Error`, whose boxed `dyn Error` the
+        // solver cannot bound, so dropping one unwinds forever.
+        let result = chunk.validate(&state);
+        let accepted = result.is_ok();
+        std::mem::forget(result);
+        if !accepted {
             return;
         }
         let size = chunk.uncompressed_size() as u64;
