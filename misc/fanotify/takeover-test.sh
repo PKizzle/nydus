@@ -3,7 +3,8 @@
 # auto-accel daemon from the fanotify group fd parked in systemd's fd store, then reads file
 # data the predecessor never fetched. Builds a zran artifact (gzip layer + zran index +
 # bootstrap) and runs the root-only `fanotify_takeover_serves_uncached_file_data` test, which
-# plays systemd's fd store and kills the predecessor while its marks are live.
+# plays systemd's fd store and kills the predecessor while its marks are live, once on all CPUs
+# and once pinned to one.
 #
 # Needs root, Linux >= 6.14, cargo, and ROOT on ext4 (tmpfs has no pre-content marks).
 set -u
@@ -28,9 +29,14 @@ cp "$ROOT/layer.tar.gz" "$ROOT/artifact/backend/$DATA"
 cp "$ROOT/out/$META" "$ROOT/artifact/backend/$META"
 cp "$BOOTSTRAP" "$ROOT/artifact/bootstrap"
 
-NYDUS_E2E_ROOT="$ROOT" "$CARGO" test -p nydus-snapshotter --lib \
-  daemon::tests::fanotify_takeover_serves_uncached_file_data -- --ignored --exact --nocapture
-rc=$?
-grep " $ROOT/" /proc/self/mounts | awk '{print $2}' | xargs -r -n1 umount -l
-[ $rc = 0 ] || fail "the successor did not serve the taken-over mount"
+# Once as is and once on a single CPU: with one CPU, libtest runs tests serially and its
+# output differs, and the daemon's threads compete for that CPU.
+for pin in "" "taskset -c 0"; do
+  rm -rf "$ROOT/snapshotter"
+  NYDUS_E2E_ROOT="$ROOT" timeout 600 $pin "$CARGO" test -p nydus-snapshotter --lib \
+    daemon::tests::fanotify_takeover_serves_uncached_file_data -- --ignored --exact --nocapture
+  rc=$?
+  grep " $ROOT/" /proc/self/mounts | awk '{print $2}' | xargs -r -n1 umount -l
+  [ $rc = 0 ] || fail "the successor did not serve the taken-over mount${pin:+ ($pin)}"
+done
 echo "==== FANOTIFY TAKEOVER: PASS ===="

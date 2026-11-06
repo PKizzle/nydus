@@ -4242,12 +4242,14 @@ mod tests {
                 break (name, unsafe { std::os::fd::OwnedFd::from_raw_fd(fds[0]) });
             }
         };
+        // Not a line prefix: with one CPU available, libtest runs tests serially and writes
+        // "test <name> ... " before the test runs, on the same line as the marker.
         let mountpoint = BufReader::new(predecessor.stdout.take().unwrap())
             .lines()
             .find_map(|l| {
                 l.unwrap()
-                    .strip_prefix("PREDECESSOR_READY ")
-                    .map(PathBuf::from)
+                    .split_once("PREDECESSOR_READY ")
+                    .map(|(_, path)| PathBuf::from(path))
             })
             .expect("the predecessor never mounted");
         predecessor.kill().unwrap();
