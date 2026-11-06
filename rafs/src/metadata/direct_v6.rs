@@ -1850,6 +1850,7 @@ mod tests {
     /// A directory claiming more dirent blocks than the bootstrap holds is rejected when its
     /// inode is resolved, instead of every directory operation walking all the claimed blocks.
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support readahead")]
     fn test_reject_directory_larger_than_bootstrap() {
         let (path, mut data) = v6_fixture();
         let sb = load_v6(&data).unwrap();
