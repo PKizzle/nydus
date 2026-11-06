@@ -1602,7 +1602,7 @@ mod tests {
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     use std::path::PathBuf;
     use std::time::Duration;
-    use vmm_sys_util::tempdir::TempDir;
+    use tempfile::TempDir;
 
     #[test]
     #[cfg_attr(miri, ignore = "Miri does not support io_uring")]

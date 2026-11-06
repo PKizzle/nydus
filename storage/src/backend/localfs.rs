@@ -221,7 +221,8 @@ mod tests {
     use std::fs;
     use std::io::Write;
     use std::os::unix::io::{FromRawFd, IntoRawFd};
-    use vmm_sys_util::{tempdir::TempDir, tempfile::TempFile};
+    use tempfile::TempDir;
+    use vmm_sys_util::tempfile::TempFile;
 
     fn new_localfs(
         dir: &Path,
@@ -310,13 +311,13 @@ mod tests {
     #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
     fn test_localfs_get_blob_path_stays_in_dir() {
         let root = TempDir::new().unwrap();
-        let dir = root.as_path().join("blobs");
+        let dir = root.path().join("blobs");
         std::fs::create_dir(&dir).unwrap();
-        write_blob(&root.as_path().join("secret"), b"nydus");
+        write_blob(&root.path().join("secret"), b"nydus");
         let fs = new_localfs(&dir, None, Vec::new(), "secret");
 
         assert!(fs.get_blob_path("../secret").is_err());
-        let absolute = root.as_path().join("secret");
+        let absolute = root.path().join("secret");
         assert!(fs.get_blob_path(absolute.to_str().unwrap()).is_err());
     }
 
@@ -328,24 +329,20 @@ mod tests {
         let valid_alt_dir = TempDir::new().unwrap();
         let blob_id = "blob-alt-skip";
 
-        write_blob(&main_dir.as_path().join(blob_id), &[]);
-        write_blob(&zero_alt_dir.as_path().join(blob_id), &[]);
-        write_blob(&valid_alt_dir.as_path().join(blob_id), b"nydus");
+        write_blob(&main_dir.path().join(blob_id), &[]);
+        write_blob(&zero_alt_dir.path().join(blob_id), &[]);
+        write_blob(&valid_alt_dir.path().join(blob_id), b"nydus");
 
         let fs = new_localfs(
-            main_dir.as_path(),
+            main_dir.path(),
             None,
-            vec![zero_alt_dir.as_path(), valid_alt_dir.as_path()],
+            vec![zero_alt_dir.path(), valid_alt_dir.path()],
             blob_id,
         );
 
         assert_eq!(
             fs.get_blob_path(blob_id).unwrap(),
-            valid_alt_dir
-                .as_path()
-                .join(blob_id)
-                .canonicalize()
-                .unwrap()
+            valid_alt_dir.path().join(blob_id).canonicalize().unwrap()
         );
     }
 
@@ -355,17 +352,12 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let blob_file = TempFile::new().unwrap();
         let blob_id = "blob-priority";
-        let dir_blob = dir.as_path().join(blob_id);
+        let dir_blob = dir.path().join(blob_id);
 
         write_blob(blob_file.as_path(), b"blob-file");
         write_blob(&dir_blob, b"dir-file");
 
-        let fs = new_localfs(
-            dir.as_path(),
-            Some(blob_file.as_path()),
-            Vec::new(),
-            blob_id,
-        );
+        let fs = new_localfs(dir.path(), Some(blob_file.as_path()), Vec::new(), blob_id);
 
         assert_eq!(
             fs.get_blob_path(blob_id).unwrap(),
@@ -387,9 +379,9 @@ mod tests {
         let blob_id = "blob-miss";
 
         let fs = new_localfs(
-            main_dir.as_path(),
+            main_dir.path(),
             None,
-            vec![alt_dir_1.as_path(), alt_dir_2.as_path()],
+            vec![alt_dir_1.path(), alt_dir_2.path()],
             blob_id,
         );
 

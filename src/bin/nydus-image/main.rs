@@ -2472,14 +2472,14 @@ mod tests {
     }
 
     fn create_tarfs(extra: &[&str]) -> anyhow::Result<()> {
-        let dir = vmm_sys_util::tempdir::TempDir::new().unwrap();
+        let dir = tempfile::TempDir::new().unwrap();
         let tar = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("tests/texture/tar/all-entry-type.tar")
             .display()
             .to_string();
-        std::fs::create_dir(dir.as_path().join("blobs")).unwrap();
-        let blob_dir = dir.as_path().join("blobs").display().to_string();
-        let bootstrap = dir.as_path().join("bootstrap").display().to_string();
+        std::fs::create_dir(dir.path().join("blobs")).unwrap();
+        let blob_dir = dir.path().join("blobs").display().to_string();
+        let bootstrap = dir.path().join("bootstrap").display().to_string();
         let mut args = vec![
             "nydus-image",
             "create",

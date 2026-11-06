@@ -35,6 +35,9 @@ nydus-storage = { version = "0.8.0", path = "../storage", features = ["backend-l
 nydus-utils = { version = "0.6.0", path = "../utils" }
 gix-attributes = "0.33.1"
 
+[dev-dependencies]
+tempfile = "3"
+
 [package.metadata.docs.rs]
 all-features = true
 targets = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu", "aarch64-apple-darwin"]

@@ -230,7 +230,7 @@ impl Bootstrap {
 mod tests {
     use nydus_rafs::metadata::RafsVersion;
     use nydus_utils::compress;
-    use vmm_sys_util::tempdir::TempDir;
+    use tempfile::TempDir;
 
     use super::*;
     use crate::attributes::Attributes;
@@ -238,7 +238,7 @@ mod tests {
 
     fn build_tar_with_name(version: RafsVersion, name: &str) -> Result<()> {
         let tmp = TempDir::new().unwrap();
-        let tar_path = tmp.as_path().join("layer.tar");
+        let tar_path = tmp.path().join("layer.tar");
         let mut tar = tar::Builder::new(std::fs::File::create(&tar_path).unwrap());
         let mut header = tar::Header::new_gnu();
         header.set_size(0);
@@ -267,7 +267,7 @@ mod tests {
             Attributes::default(),
         );
         ctx.fs_version = version;
-        let bootstrap = tmp.as_path().join("bootstrap");
+        let bootstrap = tmp.path().join("bootstrap");
         let mut bootstrap_mgr =
             BootstrapManager::new(Some(ArtifactStorage::SingleFile(bootstrap)), None);
         let mut blob_mgr = BlobManager::new(digest::Algorithm::Sha256, false);

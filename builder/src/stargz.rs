@@ -945,8 +945,8 @@ mod tests {
     #[test]
     #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
     fn test_build_stargz_toc() {
-        let tmp_dir = vmm_sys_util::tempdir::TempDir::new().unwrap();
-        let mut tmp_dir = tmp_dir.as_path().to_path_buf();
+        let tmp_dir = tempfile::TempDir::new().unwrap();
+        let mut tmp_dir = tmp_dir.path().to_path_buf();
         let root_dir = &std::env::var("CARGO_MANIFEST_DIR").expect("$CARGO_MANIFEST_DIR");
         let source_path =
             PathBuf::from(root_dir).join("../tests/texture/stargz/estargz_sample.json");
@@ -979,8 +979,8 @@ mod tests {
     #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
     fn test_hardlink_under_a_replaced_directory_is_dropped_with_it() {
         // A file entry over a directory replaces the whole subtree, hardlinks included.
-        let tmp_dir = vmm_sys_util::tempdir::TempDir::new().unwrap();
-        let tmp_dir = tmp_dir.as_path();
+        let tmp_dir = tempfile::TempDir::new().unwrap();
+        let tmp_dir = tmp_dir.path();
         let toc = tmp_dir.join("toc.json");
         std::fs::write(
             &toc,

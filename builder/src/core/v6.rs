@@ -1091,17 +1091,18 @@ mod tests {
     };
     use nydus_rafs::metadata::{RAFS_DEFAULT_CHUNK_SIZE, RafsVersion};
     use std::fs::File;
-    use vmm_sys_util::{tempdir::TempDir, tempfile::TempFile};
+    use tempfile::TempDir;
+    use vmm_sys_util::tempfile::TempFile;
 
     #[test]
     #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
     fn test_set_v6_offset() {
         let pa = TempDir::new().unwrap();
-        let pa_aa = TempFile::new_in(pa.as_path()).unwrap();
+        let pa_aa = TempFile::new_in(pa.path()).unwrap();
         pa_aa.as_file().set_modified(std::time::UNIX_EPOCH).unwrap();
         let mut node = Node::from_fs_object(
             RafsVersion::V6,
-            pa.as_path().to_path_buf(),
+            pa.path().to_path_buf(),
             pa_aa.as_path().to_path_buf(),
             Overlay::UpperAddition,
             RAFS_DEFAULT_CHUNK_SIZE as u32,
@@ -1130,8 +1131,8 @@ mod tests {
         // symlink and dir are handled in the same way.
         let mut dir_node = Node::from_fs_object(
             RafsVersion::V6,
-            pa.as_path().to_path_buf(),
-            pa.as_path().to_path_buf(),
+            pa.path().to_path_buf(),
+            pa.path().to_path_buf(),
             Overlay::UpperAddition,
             RAFS_DEFAULT_CHUNK_SIZE as u32,
             0,
@@ -1232,11 +1233,11 @@ mod tests {
             ("epoch.pyc", UNIX_EPOCH, true),
         ];
         for (name, mtime, compact) in cases {
-            let path = pa.as_path().join(name);
+            let path = pa.path().join(name);
             File::create(&path).unwrap().set_modified(mtime).unwrap();
             let node = Node::from_fs_object(
                 RafsVersion::V6,
-                pa.as_path().to_path_buf(),
+                pa.path().to_path_buf(),
                 path,
                 Overlay::UpperAddition,
                 RAFS_DEFAULT_CHUNK_SIZE as u32,
@@ -1282,8 +1283,8 @@ mod tests {
         let root = TempDir::new().unwrap();
         let node = Node::from_fs_object(
             RafsVersion::V6,
-            root.as_path().to_path_buf(),
-            root.as_path().to_path_buf(),
+            root.path().to_path_buf(),
+            root.path().to_path_buf(),
             Overlay::UpperAddition,
             RAFS_DEFAULT_CHUNK_SIZE as u32,
             0,

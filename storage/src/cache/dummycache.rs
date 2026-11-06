@@ -265,7 +265,7 @@ mod tests {
     use nydus_utils::crc32::{self, Crc32};
     use nydus_utils::digest::RafsDigest;
     use nydus_utils::metrics::BackendMetrics;
-    use vmm_sys_util::tempdir::TempDir;
+    use tempfile::TempDir;
 
     use crate::{
         cache::state::IndexedChunkMap,
@@ -391,7 +391,7 @@ mod tests {
         );
         let dir = TempDir::new().unwrap();
         let blob_path = dir
-            .as_path()
+            .path()
             .join("blob-0")
             .as_os_str()
             .to_str()
