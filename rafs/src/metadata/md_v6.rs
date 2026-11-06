@@ -244,6 +244,47 @@ mod tests {
         assert!(rs.try_load_v6(&mut reader).is_err());
     }
 
+    #[test]
+    fn test_v6_load_rejects_blob_table_in_devslots() {
+        use crate::metadata::layout::v6::{EROFS_SUPER_BLOCK_SIZE, EROFS_SUPER_OFFSET};
+        use nydus_utils::{compress, digest};
+
+        let t_file = TempFile::new().unwrap();
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(t_file.as_path())
+            .unwrap();
+        let mut sb = RafsV6SuperBlock::new();
+        sb.set_inos(1);
+        // 54 device slots run 128 bytes past the 8 KiB boundary the blob table starts at.
+        sb.set_extra_devices(54);
+        let mut ext = RafsV6SuperBlockExt::new();
+        ext.set_compressor(compress::Algorithm::None);
+        ext.set_digester(digest::Algorithm::Sha256);
+        ext.set_chunk_size(0x10_0000);
+        ext.set_blob_table_offset(2 * EROFS_BLOCK_SIZE_4096);
+        let mut writer = BufWriter::new(file.try_clone().unwrap());
+        sb.store(&mut writer).unwrap();
+        writer
+            .seek_offset((EROFS_SUPER_OFFSET + EROFS_SUPER_BLOCK_SIZE) as u64)
+            .unwrap();
+        ext.store(&mut writer).unwrap();
+        writer.flush().unwrap();
+        file.set_len(4 * EROFS_BLOCK_SIZE_4096).unwrap();
+
+        let mut reader = Box::new(file) as RafsIoReader;
+        let mut rs = RafsSuper {
+            mode: RafsMode::Direct,
+            ..Default::default()
+        };
+        let err = rs.try_load_v6(&mut reader).unwrap_err();
+        assert!(
+            matches!(&err, RafsError::InvalidMetadata(msg) if msg.contains("blob table offset")),
+            "{err:?}"
+        );
+    }
+
     /*
     #[test]
     fn test_try_load_v6() {

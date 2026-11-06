@@ -296,7 +296,8 @@ impl RafsV6SuperBlock {
                 u16::from_le(self.s_devt_slotoff)
             )));
         }
-        let devtable_end = devtable_off + u16::from_le(self.s_extra_devices) as u64;
+        let devtable_end = devtable_off
+            + u16::from_le(self.s_extra_devices) as u64 * size_of::<RafsV6Device>() as u64;
         if devtable_end > meta_size {
             return Err(RafsError::InvalidMetadata(format!(
                 "invalid device table slot count {} in Rafsv6 superblock",
@@ -576,7 +577,9 @@ impl RafsV6SuperBlockExt {
             ));
         }
 
-        let devslot_end = meta.blob_device_table_offset + meta.blob_table_size as u64;
+        // Only fields `try_load_v6` fills from the primary superblock before this call are usable.
+        let devslot_end = meta.blob_device_table_offset
+            + meta.blob_device_table_count as u64 * size_of::<RafsV6Device>() as u64;
 
         let blob_offset = self.blob_table_offset();
         let blob_size = self.blob_table_size() as u64;
@@ -2903,6 +2906,69 @@ mod tests {
         assert!(ext.validate(end, &meta).is_err());
         ext.set_implicit_dir_table_offset(EROFS_BLOCK_SIZE_4096 - 8);
         assert!(ext.validate(end, &meta).is_err());
+    }
+
+    #[test]
+    fn test_rafs_v6_super_block_ext_rejects_tables_in_devslots() {
+        // 53 device slots end exactly at 8 KiB, the second 4 KiB block boundary.
+        let devslot_meta = |devices: u16| {
+            let mut sb = RafsV6SuperBlock::new();
+            sb.set_inos(1);
+            sb.set_extra_devices(devices);
+            sb.validate(4 * EROFS_BLOCK_SIZE_4096).unwrap();
+            // Populated the way `try_load_v6` does before validating the extended superblock.
+            RafsSuperMeta {
+                blkszbits: sb.blkszbits(),
+                blob_device_table_offset: sb.device_table_offset(),
+                blob_device_table_count: sb.extra_devices() as u32,
+                ..RafsSuperMeta::default()
+            }
+        };
+        let fits = devslot_meta(53);
+        let overlaps = devslot_meta(54);
+        assert_eq!(
+            fits.blob_device_table_offset + 53 * size_of::<RafsV6Device>() as u64,
+            2 * EROFS_BLOCK_SIZE_4096
+        );
+
+        let end = 4 * EROFS_BLOCK_SIZE_4096;
+        let mut ext = RafsV6SuperBlockExt::new();
+        ext.set_compressor(compress::Algorithm::None);
+        ext.set_digester(digest::Algorithm::Sha256);
+        ext.set_chunk_size(0x10_0000);
+        ext.set_blob_table_offset(2 * EROFS_BLOCK_SIZE_4096);
+        ext.set_blob_table_size(size_of::<RafsV6Blob>() as u32);
+        ext.validate(end, &fits).unwrap();
+        assert!(ext.validate(end, &overlaps).is_err());
+
+        ext.set_blob_table_offset(3 * EROFS_BLOCK_SIZE_4096);
+        ext.set_chunk_table(
+            2 * EROFS_BLOCK_SIZE_4096,
+            size_of::<RafsV5ChunkInfo>() as u64,
+        );
+        ext.validate(end, &fits).unwrap();
+        assert!(ext.validate(end, &overlaps).is_err());
+
+        ext.set_chunk_table(0, 0);
+        ext.set_prefetch_table_size(4);
+        ext.set_prefetch_table_offset(2 * EROFS_BLOCK_SIZE_4096);
+        ext.validate(end, &fits).unwrap();
+        ext.set_prefetch_table_offset(2 * EROFS_BLOCK_SIZE_4096 - 4);
+        assert!(ext.validate(end, &fits).is_err());
+
+        ext.set_prefetch_table_size(0);
+        ext.set_implicit_dir_table_size(4);
+        ext.set_implicit_dir_table_offset(2 * EROFS_BLOCK_SIZE_4096);
+        ext.validate(end, &fits).unwrap();
+        assert!(ext.validate(end, &overlaps).is_err());
+
+        // The device table itself must fit in the bootstrap.
+        let mut sb = RafsV6SuperBlock::new();
+        sb.set_inos(1);
+        sb.set_extra_devices(21);
+        sb.validate(EROFS_BLOCK_SIZE_4096).unwrap();
+        sb.set_extra_devices(22);
+        assert!(sb.validate(EROFS_BLOCK_SIZE_4096).is_err());
     }
 
     #[test]
