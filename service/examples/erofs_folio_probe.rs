@@ -2,8 +2,9 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-//! Runs the file-backed EROFS partial-folio self-test (`nydus_service::erofs_folio`) in a
-//! directory and prints the result. Needs root. Exit status: 0 unaffected, 1 affected,
+//! Runs the file-backed EROFS partial-folio self-test (`nydus_service::erofs_folio`) and the
+//! page-cache-sharing self-test (`nydus_service::erofs_ishare`) in a directory and prints the
+//! results. Needs root. Exit status, from the first: 0 unaffected, 1 affected,
 //! 2 inconclusive.
 //!
 //! With an EROFS image as well, mounts it file-backed through `page_aligned_source` and as is,
@@ -26,6 +27,8 @@ fn main() {
         status.label(),
         status
     );
+    let ishare = nydus_service::erofs_ishare::self_test(dir, erofs_folio::SELF_TEST_TIMEOUT);
+    println!("erofs-ishare-probe: status={} {ishare:?}", ishare.label());
     if let Some(image) = args.get(2) {
         let copy = dir.join("unpadded.erofs");
         std::fs::copy(image, &copy).expect("copy image");

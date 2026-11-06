@@ -32,6 +32,7 @@ use versionize_derive::Versionize;
 
 pub mod daemon;
 pub mod erofs_folio;
+pub mod erofs_ishare;
 mod fs_service;
 mod fusedev;
 mod singleton;

@@ -285,55 +285,63 @@ mod linux {
     /// should be on the filesystem nydus mounts its images from. A probe that does not finish
     /// within `timeout` is inconclusive and leaves its scratch directory behind.
     pub fn self_test(dir: &Path, timeout: Duration) -> PartialFolioStatus {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.subsec_nanos());
-        let work = dir.join(format!(".erofs-folio-probe-{}-{nanos}", std::process::id()));
-        let (tx, rx) = mpsc::channel();
-        let thread_work = work.clone();
-        let spawned = std::thread::Builder::new()
-            .name("erofs-folio-probe".into())
-            .spawn(move || {
-                let status = run_trials(&thread_work);
-                let _ = fs::remove_dir_all(&thread_work);
-                let _ = tx.send(status);
-            });
-        if let Err(e) = spawned {
-            return PartialFolioStatus::Inconclusive(format!("failed to spawn probe thread: {e}"));
-        }
-        rx.recv_timeout(timeout).unwrap_or_else(|_| {
-            PartialFolioStatus::Inconclusive(format!("probe did not finish within {timeout:?}"))
-        })
-    }
-
-    fn run_trials(work: &Path) -> PartialFolioStatus {
-        let staged = (|| {
-            fs::create_dir_all(work)?;
+        run_probe(dir, "erofs-folio-probe", timeout, |work, padded| {
             let unpadded = work.join("unpadded.erofs");
-            fs::write(&unpadded, probe_image())?;
-            io::Result::Ok(unpadded)
-        })();
-        let unpadded = match staged {
-            Ok(path) => path,
-            Err(e) => {
+            if let Err(e) = fs::write(&unpadded, probe_image()) {
                 return PartialFolioStatus::Inconclusive(format!(
                     "failed to stage probe image in {}: {e}",
                     work.display()
                 ));
             }
-        };
-        classify(trial(&unpadded, &work.join("m0")), || {
-            let padded = work.join("padded.erofs");
-            fs::write(&padded, probe_image())?;
-            pad_to_page_size(&padded)?;
-            trial(&padded, &work.join("m1"))
+            classify(trial(&unpadded, &work.join("m0"), ""), || {
+                trial(padded, &work.join("m1"), "")
+            })
         })
+        .unwrap_or_else(PartialFolioStatus::Inconclusive)
     }
 
-    /// Mounts `image` the way nydus mounts its own images, reads it all and unmounts.
-    fn trial(image: &Path, mountpoint: &Path) -> io::Result<()> {
+    /// Runs `probe` on its own thread in a fresh scratch directory under `dir` that holds the
+    /// probe image padded to the page size (so the partial-folio bug cannot fail it), and removes
+    /// the directory afterwards. `Err` describes a probe that could not run or did not finish
+    /// within `timeout`; a probe that hangs in the kernel leaves its scratch directory behind.
+    pub(crate) fn run_probe<T: Send + 'static>(
+        dir: &Path,
+        name: &str,
+        timeout: Duration,
+        probe: impl FnOnce(&Path, &Path) -> T + Send + 'static,
+    ) -> Result<T, String> {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.subsec_nanos());
+        let work = dir.join(format!(".{name}-{}-{nanos}", std::process::id()));
+        let (tx, rx) = mpsc::channel();
+        std::thread::Builder::new()
+            .name(name.into())
+            .spawn(move || {
+                let image = work.join("probe.erofs");
+                let staged = fs::create_dir_all(&work)
+                    .and_then(|()| fs::write(&image, probe_image()))
+                    .and_then(|()| pad_to_page_size(&image));
+                let result = match staged {
+                    Ok(()) => Ok(probe(&work, &image)),
+                    Err(e) => Err(format!(
+                        "failed to stage probe image in {}: {e}",
+                        work.display()
+                    )),
+                };
+                let _ = fs::remove_dir_all(&work);
+                let _ = tx.send(result);
+            })
+            .map_err(|e| format!("failed to spawn probe thread: {e}"))?;
+        rx.recv_timeout(timeout)
+            .unwrap_or_else(|_| Err(format!("probe did not finish within {timeout:?}")))
+    }
+
+    /// Mounts the probe image `image` at `mountpoint` with `options`, the way nydus mounts its
+    /// own images, reads it all and unmounts it.
+    pub(crate) fn trial(image: &Path, mountpoint: &Path, options: &str) -> io::Result<()> {
         fs::create_dir_all(mountpoint)?;
-        crate::fanotify::mount_erofs_with(image, mountpoint, "")?;
+        crate::fanotify::mount_erofs_with(image, mountpoint, options)?;
         let read = read_all(mountpoint);
         let _ = nix::mount::umount2(mountpoint, nix::mount::MntFlags::MNT_DETACH);
         read
