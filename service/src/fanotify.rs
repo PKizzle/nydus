@@ -2253,6 +2253,7 @@ mod tests {
             let dir = vmm_sys_util::tempdir::TempDir::new().unwrap();
             stage_bootstrap(dir.as_path(), |_, slot| slot.set_blob_id(device_id));
             let group = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC) };
+            assert!(group >= 0);
             let result = FanotifyHandler::from_restored_fd(
                 dir.as_path().to_str().unwrap(),
                 dir.as_path().join("mnt").to_str().unwrap(),

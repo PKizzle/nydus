@@ -639,36 +639,31 @@ fn is_mounted(mp: impl AsRef<Path>) -> Result<bool> {
 fn is_mounted(mp: impl AsRef<Path>) -> Result<bool> {
     let mounts = CString::new("/proc/self/mounts").unwrap();
     let ty = CString::new("r").unwrap();
+    let mp = CString::new(mp.as_ref().as_os_str().as_bytes())
+        .map_err(|_| NydusError::InvalidArguments("mountpoint contains a NUL byte".to_string()))?;
 
-    let mounts_stream = unsafe {
-        libc::setmntent(
-            mounts.as_ptr() as *const libc::c_char,
-            ty.as_ptr() as *const libc::c_char,
-        )
-    };
+    let mounts_stream = unsafe { libc::setmntent(mounts.as_ptr(), ty.as_ptr()) };
+    if mounts_stream.is_null() {
+        return Err(NydusError::ReadMountTable(std::io::Error::last_os_error()));
+    }
 
+    let mut found = false;
     loop {
         let mnt = unsafe { libc::getmntent(mounts_stream) };
-        if mnt as u32 == libc::PT_NULL {
+        if mnt.is_null() {
             break;
         }
 
         // Mount point path
-        if unsafe { CStr::from_ptr((*mnt).mnt_dir) }
-            == CString::new(mp.as_ref().as_os_str().as_bytes())
-                .map_err(|_| {
-                    NydusError::InvalidArguments("mountpoint contains a NUL byte".to_string())
-                })?
-                .as_c_str()
-        {
-            unsafe { libc::endmntent(mounts_stream) };
-            return Ok(true);
+        if unsafe { CStr::from_ptr((*mnt).mnt_dir) } == mp.as_c_str() {
+            found = true;
+            break;
         }
     }
 
     unsafe { libc::endmntent(mounts_stream) };
 
-    Ok(false)
+    Ok(found)
 }
 
 fn is_sock_residual(sock: impl AsRef<Path>) -> bool {

@@ -326,16 +326,11 @@ pub fn readahead(fd: libc::c_int, mut offset: u64, end: u64) {
     while offset < end {
         // Kernel default 128KB readahead size
         let count = std::cmp::min(128 << 10, end - offset);
-        unsafe {
-            fcntl(
-                fd,
-                libc::F_RDADVISE,
-                radvisory {
-                    ra_offset: offset as i64,
-                    ra_count: count as i32,
-                },
-            );
-        }
+        let advice = radvisory {
+            ra_offset: offset as i64,
+            ra_count: count as i32,
+        };
+        unsafe { fcntl(fd, libc::F_RDADVISE, &advice as *const radvisory) };
         offset += count;
     }
 }

@@ -33,21 +33,21 @@ pub(crate) struct FileSystemState {
 
 impl FileSystemState {
     /// Caller needs to ensure the lifetime of returned reference.
-    pub(crate) unsafe fn from_handle(hdl: NydusFsHandle) -> &'static mut Self {
+    pub(crate) unsafe fn from_handle(hdl: NydusFsHandle) -> &'static Self {
         unsafe {
-            let fs = &mut *(hdl as *const FileSystemState as *mut FileSystemState);
+            let fs = &*(hdl as *const FileSystemState);
             assert_eq!(fs.magic, NYDUS_FS_HANDLE_MAGIC);
             fs
         }
     }
 
     /// Caller needs to ensure the lifetime of returned reference.
-    pub(crate) unsafe fn try_from_handle(hdl: NydusFsHandle) -> Result<&'static mut Self, i32> {
+    pub(crate) unsafe fn try_from_handle(hdl: NydusFsHandle) -> Result<&'static Self, i32> {
         unsafe {
             if hdl == null::<FileSystemState>() as usize {
                 return Err(libc::EINVAL);
             }
-            let fs = &mut *(hdl as *const FileSystemState as *mut FileSystemState);
+            let fs = &*(hdl as *const FileSystemState);
             assert_eq!(fs.magic, NYDUS_FS_HANDLE_MAGIC);
             Ok(fs)
         }

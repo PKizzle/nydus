@@ -886,12 +886,8 @@ impl RafsV5ExtBlobTable {
 
     /// Load extended blob information table from a reader.
     pub fn load(&mut self, r: &mut RafsIoReader, count: usize) -> RafsResult<()> {
-        let mut entries = Vec::<RafsV5ExtBlobEntry>::with_capacity(count);
-        // Safe because it is already reserved enough space
-        let (_, data, _) = unsafe {
-            entries.set_len(count);
-            entries.align_to_mut::<u8>()
-        };
+        let mut entries = vec![RafsV5ExtBlobEntry::default(); count];
+        let (_, data, _) = unsafe { entries.align_to_mut::<u8>() };
 
         r.read_exact(data)?;
         self.entries = entries.iter().cloned().map(Arc::new).collect();

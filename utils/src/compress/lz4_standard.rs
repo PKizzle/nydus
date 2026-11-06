@@ -37,10 +37,10 @@ pub(super) fn lz4_compress(src: &[u8]) -> io::Result<Vec<u8>> {
 }
 
 pub(super) fn lz4_decompress(src: &[u8], dst: &mut [u8]) -> io::Result<usize> {
-    if dst.len() >= i32::MAX as usize {
+    if dst.len() >= i32::MAX as usize || src.len() > i32::MAX as usize {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "the destination buffer is big than i32::MAX",
+            "the source or destination buffer is bigger than i32::MAX",
         ));
     }
     let size = dst.len() as i32;
