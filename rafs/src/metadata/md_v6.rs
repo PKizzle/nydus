@@ -53,7 +53,12 @@ impl RafsSuper {
         })?;
         info!("RAFS features: {}", self.meta.flags);
 
-        self.meta.prefetch_table_entries = ext_sb.prefetch_table_size() / size_of::<u32>() as u32;
+        // `validate` accepts a legacy prefetch table at offset 0 only as an absent one.
+        self.meta.prefetch_table_entries = if ext_sb.prefetch_table_offset() == 0 {
+            0
+        } else {
+            ext_sb.prefetch_table_size() / size_of::<u32>() as u32
+        };
         self.meta.prefetch_table_offset = ext_sb.prefetch_table_offset();
         trace!(
             "prefetch table offset {} entries {} ",
@@ -244,9 +249,12 @@ mod tests {
         assert!(rs.try_load_v6(&mut reader).is_err());
     }
 
-    #[test]
-    fn test_v6_load_rejects_blob_table_in_devslots() {
-        use crate::metadata::layout::v6::test_util::{DEVSLOT_TEST_END, test_ext_sb, test_sb};
+    /// Run `try_load_v6` over a bootstrap holding only `sb` and `ext`.
+    fn load_crafted(
+        sb: &RafsV6SuperBlock,
+        ext: &RafsV6SuperBlockExt,
+    ) -> (RafsSuper, RafsResult<bool>) {
+        use crate::metadata::layout::v6::test_util::DEVSLOT_TEST_END;
         use crate::metadata::layout::v6::{EROFS_SUPER_BLOCK_SIZE, EROFS_SUPER_OFFSET};
 
         let t_file = TempFile::new().unwrap();
@@ -255,9 +263,6 @@ mod tests {
             .write(true)
             .open(t_file.as_path())
             .unwrap();
-        // 54 device slots run 128 bytes past the 8 KiB boundary the blob table starts at.
-        let sb = test_sb(54, 24 * EROFS_BLOCK_SIZE_4096);
-        let ext = test_ext_sb(2 * EROFS_BLOCK_SIZE_4096, 54);
         let mut writer = BufWriter::new(file.try_clone().unwrap());
         sb.store(&mut writer).unwrap();
         writer
@@ -272,11 +277,37 @@ mod tests {
             mode: RafsMode::Direct,
             ..Default::default()
         };
-        let err = rs.try_load_v6(&mut reader).unwrap_err();
+        let result = rs.try_load_v6(&mut reader);
+        (rs, result)
+    }
+
+    #[test]
+    fn test_v6_load_rejects_blob_table_in_devslots() {
+        use crate::metadata::layout::v6::test_util::{test_ext_sb, test_sb};
+
+        // 54 device slots run 128 bytes past the 8 KiB boundary the blob table starts at.
+        let sb = test_sb(54, 24 * EROFS_BLOCK_SIZE_4096);
+        let ext = test_ext_sb(2 * EROFS_BLOCK_SIZE_4096, 54);
+        let err = load_crafted(&sb, &ext).1.unwrap_err();
         assert!(
             matches!(&err, RafsError::InvalidMetadata(msg) if msg.contains("blob table offset")),
             "{err:?}"
         );
+    }
+
+    #[test]
+    fn test_v6_load_ignores_legacy_prefetch_table_at_offset_0() {
+        use crate::metadata::layout::v6::test_util::{test_ext_sb, test_sb};
+
+        let sb = test_sb(0, 2 * EROFS_BLOCK_SIZE_4096);
+        let mut ext = test_ext_sb(EROFS_BLOCK_SIZE_4096, 0);
+        ext.set_prefetch_table_size(4);
+        // Loading fails later on the empty inode area; the prefetch entries are set before.
+        let (rs, _) = load_crafted(&sb, &ext);
+        assert_eq!(rs.meta.prefetch_table_entries, 0);
+        ext.set_prefetch_table_offset(EROFS_BLOCK_SIZE_4096);
+        let (rs, _) = load_crafted(&sb, &ext);
+        assert_eq!(rs.meta.prefetch_table_entries, 1);
     }
 
     /*

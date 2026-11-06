@@ -194,10 +194,13 @@ impl DirectSuperBlockV6 {
         let file = clone_file(r.as_raw_fd())?;
         let md = file.metadata()?;
         let len = md.len();
-        let md_range = MetaRange::new(EROFS_BLOCK_SIZE_4096, len - EROFS_BLOCK_SIZE_4096, true)?;
+        let old_state = self.state.load();
+        // Metadata tables start past the first block of the image's own block size; tarfs
+        // images use 512-byte blocks.
+        let block_size = old_state.block_size();
+        let md_range = MetaRange::new(block_size, len.saturating_sub(block_size), true)?;
 
         // Validate blob table layout as blob_table_start and blob_table_offset is read from bootstrap.
-        let old_state = self.state.load();
         let blob_table_size = old_state.meta.blob_table_size as u64;
         let blob_table_start = old_state.meta.blob_table_offset;
         let blob_table_range = MetaRange::new(blob_table_start, blob_table_size, false)?;
