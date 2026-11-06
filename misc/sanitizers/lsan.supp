@@ -1,0 +1,15 @@
+# LeakSanitizer suppressions for `make asan-ut-nextest`. Each entry names the
+# leaked allocation's frame and says why the leak is intended.
+
+# The test pins each cache manager with `mem::forget(entry.pin())` so `gc` sees it in use.
+leak:test_forget_drops_only_that_configs_managers_even_in_use
+
+# The test forgets its TempDir because the detached server thread keeps serving from it.
+leak:grpc_transport_round_trips_a_real_client_over_compio
+
+# Known leak, not test-only: the thread-local runtime in storage/src/compio_rt.rs is leaked
+# as a reference cycle (executor, proactor, io_uring driver, a pending hickory
+# DnsExchangeBackground task) when its thread exits. compio-runtime's `Runtime::drop` skips
+# `Executor::clear` while another `Rc<Executor>` is alive, so a task that keeps the runtime
+# alive is never dropped. See docs/sanitizers.md.
+leak:test_call_context_disable_proxy_bypasses_proxy

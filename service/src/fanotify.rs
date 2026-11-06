@@ -2134,14 +2134,21 @@ pub(crate) mod testing {
         /// Next `(event fd, response)`; panics after the 5 s receive timeout.
         pub(crate) fn response(&self) -> (i32, u32) {
             let mut resp = fanotify_response { fd: 0, response: 0 };
-            // SAFETY: `resp` is a writable `fanotify_response` of exactly the size passed, and any
-            // bytes are a valid value for its two integers.
-            let n = unsafe {
-                libc::read(
-                    self.peer.as_raw_fd(),
-                    &mut resp as *mut _ as *mut libc::c_void,
-                    std::mem::size_of::<fanotify_response>(),
-                )
+            // A socket read with SO_RCVTIMEO is not restarted after a signal, even with
+            // SA_RESTART, so retry EINTR here.
+            let n = loop {
+                // SAFETY: `resp` is a writable `fanotify_response` of exactly the size passed,
+                // and any bytes are a valid value for its two integers.
+                let n = unsafe {
+                    libc::read(
+                        self.peer.as_raw_fd(),
+                        &mut resp as *mut _ as *mut libc::c_void,
+                        std::mem::size_of::<fanotify_response>(),
+                    )
+                };
+                if n >= 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+                    break n;
+                }
             };
             assert_eq!(
                 n,
