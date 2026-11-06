@@ -312,7 +312,7 @@ impl BlobMetaChunkInfo for BlobChunkInfoV2Ondisk {
             let ctx = &state.zran_info_array[index];
             let zran_offset = self.get_zran_offset()?;
             if zran_offset >= ctx.out_size()
-                || zran_offset + self.uncompressed_size() > ctx.out_size()
+                || zran_offset as u64 + self.uncompressed_size() as u64 > ctx.out_size() as u64
             {
                 return Err(MetaError::Corrupted(format!(
                     "ZRan range 0x{:x}/0x{:x} is invalid, should be with in 0/0x{:x}",
@@ -339,8 +339,9 @@ impl BlobMetaChunkInfo for BlobChunkInfoV2Ondisk {
                 }
                 let ctx = &state.batch_info_array[index];
                 if ctx.compressed_size() > ctx.uncompressed_batch_size()
-                    || self.get_uncompressed_offset_in_batch_buf()? + self.uncompressed_size()
-                        > ctx.uncompressed_batch_size()
+                    || self.get_uncompressed_offset_in_batch_buf()? as u64
+                        + self.uncompressed_size() as u64
+                        > ctx.uncompressed_batch_size() as u64
                     || u64::MAX - self.compressed_offset() < ctx.compressed_size() as u64
                 {
                     return Err(MetaError::Corrupted(format!(
@@ -555,6 +556,29 @@ mod tests {
 
         chunk.set_zran(false);
         assert!(chunk.validate(&ctx).is_ok());
+    }
+
+    /// A ZRan offset near `u32::MAX` must be rejected when the chunk runs past its context,
+    /// not wrap around the 32-bit sum and pass.
+    #[test]
+    fn test_zran_range_past_u32_is_rejected() {
+        use crate::meta::ZranInflateContext;
+
+        let ctx = BlobCompressionContext {
+            compressed_size: 0x1000,
+            uncompressed_size: 0x1000,
+            blob_features: BlobFeatures::ZRAN.bits(),
+            zran_info_array: vec![ZranInflateContext::with_out_len(u32::MAX)].into(),
+            ..Default::default()
+        };
+        let mut chunk = BlobChunkInfoV2Ondisk::default();
+        chunk.set_compressed_size(0x20);
+        chunk.set_uncompressed_size(0x20);
+        chunk.set_compressed(true);
+        chunk.set_zran(true);
+        chunk.set_zran_index(0);
+        chunk.set_zran_offset(u32::MAX - 0x10);
+        assert!(chunk.validate(&ctx).is_err());
     }
 
     #[test]
