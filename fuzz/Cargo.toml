@@ -1,0 +1,66 @@
+[package]
+name = "nydus-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+nydus-api = { path = "../api" }
+nydus-rafs = { path = "../rafs" }
+nydus-storage = { path = "../storage", features = ["backend-localfs"] }
+nydus-utils = { path = "../utils", features = ["zran"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+nydus-service = { path = "../service", features = ["fuzzing"] }
+
+# A workspace of its own: cargo-fuzz builds on nightly with sanitizer flags, which must stay out
+# of the main workspace's lockfile and build cache.
+[workspace]
+members = ["."]
+
+# The root workspace's patch for a crate in this graph; a patch does not cross workspace
+# boundaries. Cargo.lock started as a copy of the root lockfile to pin the same versions.
+[patch.crates-io]
+compio-executor = { path = "../third_party/compio-executor" }
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "rafs_bootstrap"
+path = "fuzz_targets/rafs_bootstrap.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "erofs_metadata"
+path = "fuzz_targets/erofs_metadata.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "zran_meta"
+path = "fuzz_targets/zran_meta.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "zstd_cursor"
+path = "fuzz_targets/zstd_cursor.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fanotify_events"
+path = "fuzz_targets/fanotify_events.rs"
+test = false
+doc = false
+bench = false

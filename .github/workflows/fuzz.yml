@@ -1,0 +1,91 @@
+name: Fuzz
+
+on:
+  pull_request:
+    paths:
+      - "fuzz/**"
+      - "rafs/**"
+      - "storage/src/meta/**"
+      - "utils/src/compress/**"
+      - "service/src/fanotify*.rs"
+      - ".github/workflows/fuzz.yml"
+  schedule:
+    # Nightly, clear of the 03:00 UTC batch of scheduled workflows.
+    - cron: "40 1 * * *"
+  workflow_dispatch:
+    inputs:
+      seconds:
+        description: "Run time per target, in seconds"
+        default: "600"
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Pull requests only build the targets, so an API change that breaks a harness fails review
+  # instead of the next nightly run.
+  build:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install nightly
+        run: rustup toolchain install nightly --profile minimal
+      - uses: taiki-e/install-action@cargo-fuzz
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz
+          shared-key: fuzz
+      - name: Build fuzz targets
+        working-directory: fuzz
+        run: cargo +nightly fuzz build
+
+  fuzz:
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [rafs_bootstrap, erofs_metadata, zran_meta, zstd_cursor, fanotify_events]
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install nightly
+        run: rustup toolchain install nightly --profile minimal
+      - uses: taiki-e/install-action@cargo-fuzz
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz
+          shared-key: fuzz
+      # The corpus grows across runs: restore the newest one for this target, save a new one
+      # under a run-specific key.
+      - name: Restore corpus
+        uses: actions/cache/restore@v5
+        with:
+          path: fuzz/corpus-cache/${{ matrix.target }}
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
+          restore-keys: fuzz-corpus-${{ matrix.target }}-
+      - name: Fuzz
+        working-directory: fuzz
+        run: |
+          mkdir -p corpus-cache/${{ matrix.target }}
+          # Inputs land in the first corpus dir; the committed seeds are read-only extra input.
+          cargo +nightly fuzz run ${{ matrix.target }} \
+            corpus-cache/${{ matrix.target }} corpus/${{ matrix.target }} \
+            -- -max_total_time=${{ inputs.seconds || '600' }} -rss_limit_mb=4096 -timeout=30
+      - name: Minimize corpus
+        if: success()
+        working-directory: fuzz
+        run: cargo +nightly fuzz cmin ${{ matrix.target }} corpus-cache/${{ matrix.target }}
+      - name: Save corpus
+        if: always()
+        uses: actions/cache/save@v5
+        with:
+          path: fuzz/corpus-cache/${{ matrix.target }}
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v6
+        with:
+          name: fuzz-artifacts-${{ matrix.target }}
+          path: fuzz/artifacts/${{ matrix.target }}
+          if-no-files-found: ignore
