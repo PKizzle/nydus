@@ -45,7 +45,9 @@ type Sender = SendRequest<tonic::body::Body>;
 
 /// Outcome of the latest request to containerd from any channel: [`UNKNOWN`] before the first,
 /// then [`REACHED`] if containerd answered (whatever the gRPC status) or [`UNREACHED`] if the
-/// connection could not be made or broke. Read by [`containerd_reachable`].
+/// request failed with a [`ContainerdFault`], the same classification
+/// [`containerd_fault`] gives callers. A stream that breaks after containerd's response
+/// headers is seen only by the caller. Read by [`containerd_reachable`].
 static REACHABLE: AtomicU8 = AtomicU8::new(UNKNOWN);
 const UNKNOWN: u8 = 0;
 const UNREACHED: u8 = 1;
@@ -63,6 +65,37 @@ pub fn containerd_reachable() -> Option<bool> {
 thread_local! {
     /// Live connections of this thread, keyed by socket path.
     static CONNECTIONS: RefCell<HashMap<PathBuf, Sender>> = RefCell::new(HashMap::new());
+}
+
+/// What a failed containerd call says about containerd itself, as opposed to about the request.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ContainerdFault {
+    /// No answer: containerd's socket refuses connections or does not exist yet, or the
+    /// connection broke. Worth retrying once containerd is back.
+    Unreachable,
+    /// The configured socket path cannot work however long we wait: no permission, or not a
+    /// socket.
+    Misconfigured(PathBuf),
+}
+
+/// Classify a failed containerd call by its error chain. Only failures that never got an answer
+/// from containerd count; a gRPC status containerd itself sent (decoded from its headers or
+/// trailers, so with no source in the chain) is about the request, whatever its code, including
+/// `Unavailable` and `DeadlineExceeded`. A status tonic builds from a transport error keeps that
+/// error as its source, which is what this finds: a [`ChannelError`], or a `hyper::Error` other
+/// than one about our own request body.
+pub fn containerd_fault(error: &(dyn std::error::Error + 'static)) -> Option<ContainerdFault> {
+    let mut cause = Some(error);
+    while let Some(e) = cause {
+        if let Some(channel) = e.downcast_ref::<ChannelError>() {
+            return channel.fault();
+        }
+        if let Some(hyper) = e.downcast_ref::<hyper::Error>() {
+            return (!hyper.is_user()).then_some(ContainerdFault::Unreachable);
+        }
+        cause = e.source();
+    }
+    None
 }
 
 /// Why a request to containerd failed before a gRPC status was received.
@@ -90,6 +123,62 @@ pub enum ChannelError {
     Namespace(String),
     #[error("invalid gRPC request URI")]
     Uri(#[source] http::Error),
+}
+
+impl ChannelError {
+    /// What this failure says about containerd; `None` for a local error about the request.
+    pub fn fault(&self) -> Option<ContainerdFault> {
+        match self {
+            Self::Connect { socket, source } if connect_is_permanent(socket, source) => {
+                Some(ContainerdFault::Misconfigured(socket.clone()))
+            }
+            Self::Connect { .. } => Some(ContainerdFault::Unreachable),
+            Self::Handshake { source, .. } | Self::Request { source, .. } => {
+                (!source.is_user()).then_some(ContainerdFault::Unreachable)
+            }
+            Self::Namespace(_) | Self::Uri(_) => None,
+        }
+    }
+}
+
+/// Whether connecting to `socket` failed in a way waiting cannot fix. A missing socket, or one
+/// that refuses connections, is containerd not (yet) running; a path that is not a socket, or
+/// no permission, is configuration. A missing socket counts as not running even when its
+/// directory is missing too: k3s's embedded containerd creates `/run/k3s/containerd/` only
+/// once it starts, after the snapshotter. A path that never appears is reported by the
+/// auto-zran outage budget and its startup check instead.
+fn connect_is_permanent(socket: &Path, error: &std::io::Error) -> bool {
+    match error.kind() {
+        std::io::ErrorKind::NotFound => false,
+        // Also a path longer than `sun_path`, rejected before connect(2) with no errno.
+        std::io::ErrorKind::InvalidInput => true,
+        // connect(2) on a path that is not a socket fails ECONNREFUSED on Linux.
+        std::io::ErrorKind::ConnectionRefused => {
+            use std::os::unix::fs::FileTypeExt;
+            std::fs::metadata(socket).is_ok_and(|m| !m.file_type().is_socket())
+        }
+        _ => matches!(
+            error.raw_os_error(),
+            Some(
+                libc::EACCES
+                    | libc::EPERM
+                    | libc::ENOTSOCK
+                    | libc::ENOTDIR
+                    | libc::EINVAL
+                    | libc::ENAMETOOLONG
+                    | libc::ELOOP
+                    | libc::EPROTOTYPE
+            )
+        ),
+    }
+}
+
+/// The [`REACHABLE`] value a request's outcome sets; `None` leaves it, for a local error.
+fn reachability<T>(result: &Result<T, ChannelError>) -> Option<u8> {
+    match result {
+        Ok(_) => Some(REACHED),
+        Err(e) => e.fault().map(|_| UNREACHED),
+    }
 }
 
 /// A tower service that sends tonic requests to containerd over a cached HTTP/2 connection.
@@ -122,10 +211,9 @@ impl ContainerdChannel {
     ) -> Result<http::Response<Incoming>, ChannelError> {
         let request = prepare(request, &namespace)?;
         let result = Self::exchange(&socket, request).await;
-        REACHABLE.store(
-            if result.is_ok() { REACHED } else { UNREACHED },
-            Ordering::Relaxed,
-        );
+        if let Some(reachable) = reachability(&result) {
+            REACHABLE.store(reachable, Ordering::Relaxed);
+        }
         result
     }
 
@@ -241,6 +329,77 @@ async fn connect(socket: &Path) -> Result<Sender, ChannelError> {
 mod tests {
     use super::*;
     use std::sync::mpsc;
+
+    fn connect_error(socket: &Path, error: std::io::Error) -> ChannelError {
+        ChannelError::Connect {
+            socket: socket.to_path_buf(),
+            source: error,
+        }
+    }
+
+    /// containerd not running yet (socket missing, even with its directory, or refusing) is an
+    /// outage; a path that cannot work is configuration, and names the socket.
+    #[test]
+    fn connect_failures_split_into_outage_and_misconfiguration() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("containerd.sock");
+        let enoent = || std::io::Error::from_raw_os_error(libc::ENOENT);
+        let refused = || std::io::Error::from_raw_os_error(libc::ECONNREFUSED);
+        assert_eq!(
+            connect_error(&socket, enoent()).fault(),
+            Some(ContainerdFault::Unreachable)
+        );
+        assert_eq!(
+            connect_error(&socket, refused()).fault(),
+            Some(ContainerdFault::Unreachable)
+        );
+
+        let misconfigured = |socket: &Path, error| {
+            assert_eq!(
+                connect_error(socket, error).fault(),
+                Some(ContainerdFault::Misconfigured(socket.to_path_buf()))
+            )
+        };
+        assert_eq!(
+            connect_error(&dir.path().join("missing/containerd.sock"), enoent()).fault(),
+            Some(ContainerdFault::Unreachable),
+            "k3s creates the socket's directory only once it starts"
+        );
+        for errno in [libc::EACCES, libc::ENOTSOCK, libc::EINVAL] {
+            misconfigured(&socket, std::io::Error::from_raw_os_error(errno));
+        }
+        misconfigured(
+            &socket,
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "path must be shorter than SUN_LEN",
+            ),
+        );
+        let file = dir.path().join("not-a-socket");
+        std::fs::write(&file, b"").unwrap();
+        misconfigured(&file, refused());
+
+        assert_eq!(ChannelError::Namespace("bad".into()).fault(), None);
+    }
+
+    /// The gauge follows the same classification: a local error says nothing about containerd.
+    #[test]
+    fn reachability_follows_the_fault_classification() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("containerd.sock");
+        assert_eq!(reachability::<()>(&Ok(())), Some(REACHED));
+        let refused = connect_error(
+            &socket,
+            std::io::Error::from_raw_os_error(libc::ECONNREFUSED),
+        );
+        assert_eq!(reachability::<()>(&Err(refused)), Some(UNREACHED));
+        let eacces = connect_error(&socket, std::io::Error::from_raw_os_error(libc::EACCES));
+        assert_eq!(reachability::<()>(&Err(eacces)), Some(UNREACHED));
+        assert_eq!(
+            reachability::<()>(&Err(ChannelError::Namespace("bad".into()))),
+            None
+        );
+    }
     use std::thread::JoinHandle;
     use tonic_health::pb::health_check_response::ServingStatus;
     use tonic_health::pb::{HealthCheckRequest, health_client::HealthClient};
