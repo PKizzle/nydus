@@ -1,0 +1,2 @@
+# LeakSanitizer suppressions for `make asan-ut-nextest`. Each entry names the
+# leaked allocation's frame and says why the leak is intended.
