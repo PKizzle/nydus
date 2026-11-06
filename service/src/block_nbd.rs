@@ -711,7 +711,7 @@ mod tests {
     fn test_nbd_worker_exits_on_shutdown_broadcast() {
         compio::runtime::Runtime::new().unwrap().block_on(async {
             let tmpdir = TempDir::new().unwrap();
-            let device = create_block_device(tmpdir.as_path().to_path_buf()).unwrap();
+            let device = create_block_device(tmpdir.path().to_path_buf()).unwrap();
             let (sock_kern, sock_user) = std::os::unix::net::UnixStream::pair().unwrap();
 
             let (mut sender, receiver) = broadcast::<u32>(4);
@@ -746,7 +746,7 @@ mod tests {
     fn test_nbd_device() {
         compio::runtime::Runtime::new().unwrap().block_on(async {
             let tmpdir = TempDir::new().unwrap();
-            let device = create_block_device(tmpdir.as_path().to_path_buf()).unwrap();
+            let device = create_block_device(tmpdir.path().to_path_buf()).unwrap();
             let nbd = NbdService::new(device, "/dev/nbd15".to_string(), 60).unwrap();
             let nbd = Arc::new(nbd);
             let nbd2 = nbd.clone();
