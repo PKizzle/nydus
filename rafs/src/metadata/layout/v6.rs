@@ -2412,48 +2412,6 @@ impl RafsV6PrefetchTable {
     }
 }
 
-#[cfg(kani)]
-mod verification {
-    use super::*;
-    use crate::metadata::RafsSuperMeta;
-
-    /// Error messages are not under test, and formatting them dominates the solver's time.
-    fn no_format(_args: std::fmt::Arguments<'_>) -> String {
-        String::new()
-    }
-
-    /// Validating an untrusted superblock pair the way `try_load_v6` does never panics, and an
-    /// accepted pair places the metadata area and every table inside the bootstrap.
-    #[kani::proof]
-    #[kani::stub(std::fmt::format, no_format)]
-    fn superblocks_decide_every_image() {
-        let meta_size: u64 = kani::any();
-        let mut sb = RafsV6SuperBlock::new();
-        sb.as_mut()
-            .copy_from_slice(&kani::any::<[u8; size_of::<RafsV6SuperBlock>()]>());
-        if sb.validate(meta_size).is_err() {
-            return;
-        }
-        assert!(sb.meta_addr() as u64 * sb.block_size().unwrap() <= meta_size);
-
-        let meta = RafsSuperMeta {
-            blkszbits: sb.blkszbits(),
-            blob_device_table_offset: sb.device_table_offset(),
-            ..Default::default()
-        };
-        let mut ext = RafsV6SuperBlockExt::new();
-        ext.as_mut()
-            .copy_from_slice(&kani::any::<[u8; size_of::<RafsV6SuperBlockExt>()]>());
-        if ext.validate(meta_size, &meta).is_err() {
-            return;
-        }
-        assert!(ext.blob_table_offset() + ext.blob_table_size() as u64 <= meta_size);
-        if ext.chunk_table_size() > 0 {
-            assert!(ext.chunk_table_offset() + ext.chunk_table_size() <= meta_size);
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

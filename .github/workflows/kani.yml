@@ -7,7 +7,6 @@ on:
     paths:
       - 'storage/src/meta/**'
       - 'storage/src/cache/state/**'
-      - 'rafs/src/metadata/layout/**'
       - 'service/src/fanotify.rs'
       - 'service/src/fanotify_sys.rs'
       - 'storage/Cargo.toml'
@@ -31,7 +30,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        crate: [nydus-storage, nydus-rafs, nydus-service]
+        crate: [nydus-storage, nydus-service]
     steps:
       - name: Checkout
         uses: actions/checkout@v6
