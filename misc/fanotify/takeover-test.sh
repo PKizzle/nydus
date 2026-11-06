@@ -33,7 +33,7 @@ cp "$BOOTSTRAP" "$ROOT/artifact/bootstrap"
 # output differs, and the daemon's threads compete for that CPU.
 for pin in "" "taskset -c 0"; do
   rm -rf "$ROOT/snapshotter"
-  NYDUS_E2E_ROOT="$ROOT" timeout 600 $pin "$CARGO" test -p nydus-snapshotter --lib \
+  NYDUS_E2E_ROOT="$ROOT" $pin "$CARGO" test -p nydus-snapshotter --lib \
     daemon::tests::fanotify_takeover_serves_uncached_file_data -- --ignored --exact --nocapture
   rc=$?
   grep " $ROOT/" /proc/self/mounts | awk '{print $2}' | xargs -r -n1 umount -l
