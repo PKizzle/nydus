@@ -1045,11 +1045,13 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
     fn test_v5_hardlink_to_non_regular_file() {
         test_hardlink_to_non_regular_file(RafsVersion::V5);
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
     fn test_v6_hardlink_to_non_regular_file() {
         test_hardlink_to_non_regular_file(RafsVersion::V6);
     }
@@ -1091,11 +1093,13 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
     fn test_v5_fifo_without_device_numbers() {
         test_fifo_without_device_numbers(RafsVersion::V5);
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
     fn test_v6_fifo_without_device_numbers() {
         test_fifo_without_device_numbers(RafsVersion::V6);
     }
@@ -1129,16 +1133,19 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
     fn test_v5_device_files_keep_rdev() {
         test_device_files_keep_rdev(RafsVersion::V5);
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
     fn test_v6_device_files_keep_rdev() {
         test_device_files_keep_rdev(RafsVersion::V6);
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
     fn test_hardlink_to_directory_is_rejected() {
         let tmp_dir = vmm_sys_util::tempdir::TempDir::new().unwrap();
         let source_path = tmp_dir.as_path().join("hardlink-dir.tar");
@@ -1153,6 +1160,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
     fn test_hardlink_to_unknown_target_is_rejected() {
         // A tar entry may only be hardlinked to an entry which appeared earlier in the stream,
         // because the tarball is parsed in a single pass.
@@ -1169,6 +1177,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
     fn test_malformed_pax_extension_is_rejected() {
         let tmp_dir = vmm_sys_util::tempdir::TempDir::new().unwrap();
         let source_path = tmp_dir.as_path().join("bad-pax.tar");
@@ -1191,6 +1200,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
     fn test_build_tarfs() {
         let tmp_dir = vmm_sys_util::tempdir::TempDir::new().unwrap();
         let tmp_dir = tmp_dir.as_path().to_path_buf();
@@ -1227,6 +1237,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
     fn test_build_encrypted_tarfs() {
         let tmp_dir = vmm_sys_util::tempdir::TempDir::new().unwrap();
         let tmp_dir = tmp_dir.as_path().to_path_buf();
@@ -1263,6 +1274,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
     fn test_zran_metadata_after_chunk_deduplication() {
         use nydus_storage::backend::{BlobBackend, localfs::LocalFs};
         use nydus_storage::meta::BlobCompressionContextInfo;
@@ -1472,6 +1484,7 @@ mod tests {
     // the xattr table itself is written whenever the node has xattrs. If the two disagree, every
     // inode after the hardlink is written at the wrong offset and the bootstrap can't be loaded.
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
     fn test_v5_hardlink_inherits_xattr_flag_from_target() {
         let sb = build_and_load_xattr_hardlink_tar(RafsVersion::V5, "foo");
         // Both names of the hardlink resolve to the inode of the target, which carries the xattr.
@@ -1487,6 +1500,7 @@ mod tests {
     // write past that region, leaking them onto the target and corrupting the inodes stored after
     // it, so the xattrs of the target win even when only the hardlink entry recorded any.
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
     fn test_v6_hardlink_xattrs_stay_identical_to_target() {
         let sb = build_and_load_xattr_hardlink_tar(RafsVersion::V6, "foo-link");
         assert_eq!(xattr_count(&sb, "foo"), 0);
@@ -1625,6 +1639,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
     fn test_ustar_prefix_applies_to_any_ustar_version() {
         let tar = prefixed_member(|h| h[263..265].copy_from_slice(b"  "));
         let bootstrap = build_layer(&tar);
@@ -1638,6 +1653,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
     fn test_ustar_prefix_applies_with_version_00() {
         let bootstrap = build_layer(&prefixed_member(|_| {}));
         assert!(get_node(&bootstrap, "/usr/share/doc/x/etc/ld.so.preload").is_reg());
@@ -1645,6 +1661,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
     fn test_star_trailer_shortens_the_prefix_to_131_bytes() {
         let tar = RawTar::default()
             .member_with(REG, b"f", b"", 0o644, b"x", |h| {
@@ -1659,6 +1676,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
     fn test_gnu_header_with_unparsable_atime_falls_back_to_the_prefix() {
         // The prefix field overlays GNU atime/ctime; a prefix that is not a number is
         // how a pre-Go1.8 writer's output looks, and Go reads it as the prefix.
@@ -1669,6 +1687,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
     fn test_gnu_header_with_valid_atime_has_no_prefix() {
         let tar = RawTar::default()
             .member_with(REG, b"etc/ld.so.preload", b"", 0o644, b"x", |h| {
@@ -1682,6 +1701,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
     fn test_pax_path_and_linkpath_may_hold_newlines() {
         // PAX records are length-prefixed, so a value may contain '\n'.
         let tar = RawTar::default()
@@ -1698,6 +1718,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
     fn test_pax_xattr_may_hold_newlines() {
         let tar = RawTar::default()
             .pax(
@@ -1728,6 +1749,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
     fn test_pax_sparse_1_0_is_rejected() {
         // GNU sparse 1.0: the map is stored in front of the data, the real name in a record.
         let data = b"1\n0\n4\n".to_vec();
@@ -1751,6 +1773,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
     fn test_pax_sparse_0_1_is_rejected() {
         let tar = RawTar::default()
             .pax(
@@ -1768,6 +1791,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
     fn test_member_names_resolve_lexically_within_root() {
         let tar = RawTar::default()
             .reg("./a//b/../c", b"c")
@@ -1791,6 +1815,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
     fn test_member_names_resolve_through_earlier_symlinks() {
         let tar = RawTar::default()
             .sym("a", "/")
@@ -1822,6 +1847,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
     fn test_symlink_loop_is_rejected() {
         let tar = RawTar::default().sym("l", "l/x").reg("l/f", b"").finish();
         let err = build_layer_err(&tar);
@@ -1829,6 +1855,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
     fn test_parent_regular_file_is_rejected() {
         let tar = RawTar::default().reg("x", b"").reg("x/y", b"").finish();
         let err = build_layer_err(&tar);
@@ -1836,6 +1863,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
     fn test_hardlink_target_resolves_through_symlink() {
         let tar = RawTar::default()
             .dir("etc/")
@@ -1851,6 +1879,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
     fn test_later_duplicate_member_wins() {
         let tar = RawTar::default()
             .reg("f", b"AAAA")
@@ -1871,6 +1900,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
     fn test_hardlink_keeps_inode_of_overwritten_target() {
         // The link names the inode holding "AAAA"; replacing `f` afterwards unlinks only `f`.
         let tar = RawTar::default()
@@ -1889,6 +1919,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
     fn test_root_member_is_ignored() {
         // Apply skips a member resolving to the root, so its metadata never lands.
         let tar = RawTar::default()
@@ -1901,6 +1932,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
     fn test_pax_global_header_is_ignored() {
         // `git archive` writes one of these in front of every archive.
         let tar = RawTar::default()
@@ -1918,6 +1950,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
     fn test_header_only_members_have_no_data() {
         // Go reads no data for link, device, directory and fifo members whatever their size
         // field says, so the next header follows right after theirs.
@@ -1931,6 +1964,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
     fn test_legacy_trailing_slash_member_is_directory() {
         // A type '\0' member whose name ends in '/' is a directory, as Go reads it.
         let tar = RawTar::default()
@@ -1943,6 +1977,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
     fn test_members_after_end_of_archive_are_ignored() {
         let mut tar = RawTar::default().reg("f", b"").finish();
         tar.extend_from_slice(&RawTar::default().reg("hidden", b"").finish());
@@ -1951,6 +1986,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
     fn test_tar_ref_chunk_offsets_follow_pax_headers() {
         // In tar-ref (and zran) mode chunks address the original stream, so a member read
         // through PAX headers must report the offset its data really has in the tar.
@@ -1989,6 +2025,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "calls the C zlib library")]
     fn test_targz_ref_reads_members_through_pax_headers() {
         let tar = pax_payload_tar();
         let gz = compress::compress(&tar, compress::Algorithm::GZip)
@@ -2009,6 +2046,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
     fn test_missing_parent_sorting_before_a_sibling_holds_its_children() {
         // `root/` is synthesized after `tmp/` exists and sorts before it.
         let tar = RawTar::default()
@@ -2047,6 +2085,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
     fn test_missing_parents_are_implicit_until_declared() {
         let tar = RawTar::default().reg("a/b/c", b"").dir("a/").finish();
         let bootstrap = build_layer(&tar);
@@ -2098,6 +2137,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
     fn test_implicit_dir_flag_round_trips_v5() {
         let tar = RawTar::default().reg("a/b/c", b"").dir("a/").finish();
         let tree = round_trip_layer(RafsVersion::V5, &tar, false);
@@ -2105,6 +2145,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
     fn test_implicit_dir_flag_round_trips_v6() {
         let tar = RawTar::default().reg("a/b/c", b"").dir("a/").finish();
         let tree = round_trip_layer(RafsVersion::V6, &tar, false);
@@ -2241,11 +2282,13 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
     fn test_merge_keeps_lower_metadata_under_implicit_parent_v5() {
         test_merge_keeps_lower_metadata_under_implicit_parent(RafsVersion::V5);
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
     fn test_merge_keeps_lower_metadata_under_implicit_parent_v6() {
         test_merge_keeps_lower_metadata_under_implicit_parent(RafsVersion::V6);
     }
@@ -2276,6 +2319,7 @@ mod tests {
 
     // A short write must be retried, not leave the rest of a directory or symlink unwritten.
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
     fn test_v6_dump_retries_short_writes() {
         let mut tar = RawTar::default().sym("s", &"t".repeat(100)).dir("d/");
         // Enough entries to spill the directory past one block.
@@ -2365,16 +2409,19 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
     fn test_merge_strips_whiteouts_of_first_layer_v5() {
         test_merge_strips_whiteouts_of_first_layer(RafsVersion::V5);
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
     fn test_merge_strips_whiteouts_of_first_layer_v6() {
         test_merge_strips_whiteouts_of_first_layer(RafsVersion::V6);
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
     fn test_merge_applies_non_utf8_whiteout() {
         let layer0 = RawTar::default()
             .member(REG, b"n\xff", b"", 0o644, b"")

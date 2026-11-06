@@ -430,6 +430,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support xattrs")]
     fn copies_files_and_directories_parent_first_in_sorted_order() {
         let upper = tempfile::tempdir().unwrap();
         fs::create_dir_all(upper.path().join("root/sub")).unwrap();
@@ -468,6 +469,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support xattrs")]
     fn symlinks_are_recorded_not_followed() {
         let upper = tempfile::tempdir().unwrap();
         fs::write(upper.path().join("target.txt"), b"payload").unwrap();
@@ -488,6 +490,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support xattrs")]
     fn opaque_directories_get_an_opq_marker_before_their_contents() {
         let upper = tempfile::tempdir().unwrap();
         let opaque = upper.path().join("etc");
@@ -515,6 +518,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support xattrs")]
     fn xattr_whiteouts_become_oci_whiteouts() {
         let upper = tempfile::tempdir().unwrap();
         let gone = upper.path().join("gone");
@@ -537,6 +541,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support xattrs")]
     fn files_named_like_whiteouts_are_not_published() {
         // Published as is, `.wh.passwd` would delete /etc/passwd from the image.
         let upper = tempfile::tempdir().unwrap();
@@ -554,6 +559,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support xattrs")]
     fn overlay_bookkeeping_xattrs_are_stripped_and_the_rest_carried_over() {
         let upper = tempfile::tempdir().unwrap();
         let file = upper.path().join("payload");
@@ -594,6 +600,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support xattrs")]
     fn a_redirect_marker_fails_the_commit_instead_of_producing_a_wrong_layer() {
         let upper = tempfile::tempdir().unwrap();
         let renamed = upper.path().join("newname");
@@ -634,6 +641,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri reports st_rdev as 0")]
     fn whiteout_detection_keys_on_a_zero_device_number() {
         let dir = tempfile::tempdir().unwrap();
         let plain = dir.path().join("plain");

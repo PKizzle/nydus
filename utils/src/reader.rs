@@ -223,6 +223,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "asserts full reads; Miri injects short reads")]
     fn test_file_range_reader_partial_read() {
         let file = TempFile::new().unwrap();
         std::fs::write(file.as_path(), b"ABCDEFGHIJ").unwrap();

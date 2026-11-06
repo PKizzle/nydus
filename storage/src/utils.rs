@@ -50,6 +50,20 @@ pub fn readv(fd: RawFd, iovec: &mut [IoSliceMut], offset: u64) -> io::Result<usi
     }
 }
 
+/// `pread` until `buf` is full or EOF: a single `pread` may return fewer bytes than asked for.
+pub fn pread_full(file: &std::fs::File, buf: &mut [u8], offset: u64) -> nix::Result<usize> {
+    let mut done = 0;
+    while done < buf.len() {
+        match nix::sys::uio::pread(file, &mut buf[done..], (offset + done as u64) as i64) {
+            Ok(0) => break,
+            Ok(n) => done += n,
+            Err(nix::errno::Errno::EINTR) => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(done)
+}
+
 /// Copy from buffer slice to another buffer slice.
 ///
 /// `offset` is where to start copy in the first buffer of source slice.
@@ -778,6 +792,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support copy_file_range")]
     fn test_copy_file_range() {
         let mut src = TempFile::new().unwrap().into_file();
         let dst = TempFile::new().unwrap();
@@ -797,6 +812,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri file descriptors are not in /proc/self/fd")]
     fn test_get_path_from_file() {
         let temp_file = TempFile::new().unwrap();
         let file = temp_file.as_file();

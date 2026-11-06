@@ -511,10 +511,11 @@ mod tests {
             entered: Arc::new(Barrier::new(1)),
             release: Arc::new(Barrier::new(1)),
         });
+        let mut pins = Vec::new();
         for id in ["forgotten", "kept"] {
             let entry = Arc::new(BlobCacheMgrEntry::new(mgr.clone()));
             // In use: `gc` would keep it.
-            std::mem::forget(entry.pin());
+            pins.push(entry.pin());
             factory.mgrs.lock().unwrap().insert(
                 BlobCacheMgrKey {
                     config: test_factory_config(id),

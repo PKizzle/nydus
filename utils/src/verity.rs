@@ -415,6 +415,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support file-backed mmap")]
     fn test_generate_mkl_tree_two_entries() {
         let file = TempFile::new().unwrap();
         let mut generator = VerityGenerator::new(file.into_file(), 0, 2).unwrap();
@@ -431,6 +432,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support file-backed mmap")]
     fn test_generate_mkl_tree_4097_entries() {
         let file = TempFile::new().unwrap();
         let mut generator = VerityGenerator::new(file.into_file(), 0, 4097).unwrap();
@@ -454,6 +456,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support file-backed mmap")]
     fn test_verity_generator_error() {
         let file = TempFile::new().unwrap();
         assert!(VerityGenerator::new(file.into_file(), u64::MAX, u32::MAX).is_err());
@@ -464,6 +467,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support file-backed mmap")]
     fn test_verity_initialize() {
         let file = TempFile::new().unwrap();
         let mut generator = VerityGenerator::new(file.into_file(), 0, 4097).unwrap();

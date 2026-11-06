@@ -11,12 +11,11 @@ use std::path::Path;
 use std::sync::{Arc, RwLock};
 
 use fuse_backend_rs::file_buf::FileVolatileSlice;
-use nix::sys::uio;
 use nydus_api::LocalDiskConfig;
 use nydus_utils::metrics::BackendMetrics;
 
 use crate::backend::{BackendError, BackendResult, BlobBackend, BlobReader};
-use crate::utils::{MemSliceCursor, readv};
+use crate::utils::{MemSliceCursor, pread_full, readv};
 
 type LocalDiskResult<T> = std::result::Result<T, LocalDiskError>;
 
@@ -77,7 +76,7 @@ impl BlobReader for LocalDiskBlob {
             .ok_or(LocalDiskError::ReadBlob(msg))?;
         let len = std::cmp::min(self.blob_length - offset, buf.len() as u64) as usize;
 
-        uio::pread(&self.device_file, &mut buf[..len], actual_offset as i64).map_err(|e| {
+        pread_full(&self.device_file, &mut buf[..len], actual_offset).map_err(|e| {
             let msg = format!(
                 "localdisk: failed to read data from blob {}, {}",
                 self.blob_id, e

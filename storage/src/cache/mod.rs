@@ -1055,6 +1055,7 @@ mod tests {
         /// `cache.validate = true` must check the digest of zran chunks, both those decoded in
         /// memory and those decoded by the zstd stream cursor.
         #[test]
+        #[cfg_attr(miri, ignore = "calls the C zstd library")]
         fn test_zran_chunks_are_validated() {
             for ctx_len in [0x2000, STREAMED] {
                 let genuine = ZstdBlob::new(b'a', ctx_len, None);
@@ -1074,6 +1075,7 @@ mod tests {
         /// A backend read failure keeps its errno, whether the read fetched the compressed range
         /// up front or was issued by the zstd stream decoder.
         #[test]
+        #[cfg_attr(miri, ignore = "calls the C zstd library")]
         fn test_backend_errno_survives_zran_reads() {
             let blob = ZstdBlob::new(b'a', 0x2000, Some(libc::ENOSPC));
             let Err(err) = blob.read_chunk() else {

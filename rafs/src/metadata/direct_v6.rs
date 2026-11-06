@@ -1775,6 +1775,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support readahead")]
     fn test_reject_blob_id_with_path_components() {
         let (_, mut data) = v6_fixture();
         let sb = load_v6(&data).unwrap();
@@ -1794,6 +1795,7 @@ mod tests {
     /// A directory block whose first dirent claims `e_nameoff == 0` holds zero entries; a lookup
     /// in it must fail as corrupt metadata, neither panicking nor answering ENOENT.
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support readahead")]
     fn test_lookup_in_dir_block_without_entries() {
         let (path, mut data) = v6_fixture();
         let sb = load_v6(&data).unwrap();

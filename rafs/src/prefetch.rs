@@ -829,6 +829,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "timing-sensitive; Miri runs too slowly")]
     fn test_rate_limiter_exact_capacity_no_wait() {
         let mut limiter = RateLimiter::new(1024); // capacity = 2048
         assert!(limiter.consume(2048).is_none());

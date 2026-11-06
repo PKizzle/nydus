@@ -774,6 +774,7 @@ mod tests {
     /// A failed handler makes the daemon unhealthy for the supervisor, while state-machine
     /// transitions still see where the machine is (so `trigger_stop` sends both `Stop`s).
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
     fn failed_fanotify_handler_reports_the_daemon_unhealthy() {
         let controller = create_service_controller();
         controller.set_state(DaemonState::RUNNING);
@@ -794,6 +795,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
     fn test_blob_list_is_saved_for_takeover() {
         let tmpdir = vmm_sys_util::tempdir::TempDir::new().unwrap();
         let bootstrap = Path::new(env!("CARGO_MANIFEST_DIR"))
