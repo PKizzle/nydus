@@ -71,7 +71,9 @@ INIT
 chmod +x "$ROOT/init"
 (cd "$ROOT" && find . | cpio -o -H newc --quiet) | gzip > "$WORK/initrd.gz"
 
-timeout 300 qemu-system-aarch64 -machine virt -cpu max -m 1024 -nographic -no-reboot \
+# Neoverse-N1 has the 4K, 16K and 64K granules; QEMU 8.2 (Ubuntu 24.04) hangs booting Ubuntu's
+# 7.3/7.4 arm64 kernels with `-cpu max`.
+timeout 300 qemu-system-aarch64 -machine virt -cpu neoverse-n1 -m 1024 -nographic -no-reboot \
   -kernel "$KERNEL" -initrd "$WORK/initrd.gz" \
   -append "console=ttyAMA0 rdinit=/init panic=-1 quiet" </dev/null | tee "$WORK/console.log"
 
