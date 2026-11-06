@@ -44,5 +44,17 @@ Pass nextest arguments through `SANITIZER_NEXTEST_ARGS` to narrow a run, for exa
   runs on the system allocator that ASan intercepts.
 - **C dependencies** (lz4, zstd, zlib, sqlite, mimalloc) are not instrumented. ASan reports no
   false positives for them; it simply does not check accesses made inside them.
-- **Leaks.** LeakSanitizer is on (`detect_leaks=1`). Intended leaks are listed with a reason in
-  `misc/sanitizers/lsan.supp`; override with `LSAN_OPTIONS=...` when investigating.
+- **Leaks.** LeakSanitizer is on (`detect_leaks=1`). Suppressed leaks are listed with a reason in
+  `misc/sanitizers/lsan.supp`; override with `LSAN_OPTIONS=...` when investigating. CI installs
+  `llvm-symbolizer` (`ASAN_SYMBOLIZER_PATH`); without it reports carry raw addresses and the
+  suppressions, which match on function names, do not apply.
+
+## Known findings
+
+- **compio runtime leaked at thread exit.** `backend::request::tests::test_call_context_disable_proxy_bypasses_proxy`
+  leaks the per-thread compio runtime from `storage/src/compio_rt.rs` together with a pending
+  hickory DNS task: every allocation is an *indirect* leak, i.e. a reference cycle. compio-runtime
+  0.12's `Runtime::drop` only clears the executor's tasks when it holds the last `Rc<Executor>`,
+  so a queued task that keeps the runtime alive is never dropped, and the io_uring driver goes
+  with it. In production this costs one runtime per exiting `blocking` pool thread that left
+  such a task behind. Suppressed by test name until the runtime clears its tasks on thread exit.
