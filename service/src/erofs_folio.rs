@@ -60,10 +60,18 @@ use nydus_utils::host_page_size;
 /// Extends `path` with a sparse hole to a multiple of the host page size. A no-op when it
 /// already is one.
 pub fn pad_to_page_size(path: &Path) -> io::Result<()> {
-    let file = fs::OpenOptions::new().write(true).open(path)?;
-    let len = file.metadata()?.len();
-    let padded = len.next_multiple_of(host_page_size());
-    if padded != len {
+    pad_file(
+        &fs::OpenOptions::new().write(true).open(path)?,
+        host_page_size(),
+    )
+}
+
+/// Extends a regular `file` with a sparse hole to a multiple of `align`. Anything else, such as
+/// a block device, keeps its size.
+pub fn pad_file(file: &fs::File, align: u64) -> io::Result<()> {
+    let meta = file.metadata()?;
+    let padded = meta.len().next_multiple_of(align);
+    if meta.is_file() && padded != meta.len() {
         file.set_len(padded)?;
     }
     Ok(())
@@ -209,8 +217,8 @@ mod linux {
             .filter(|p| !p.as_os_str().is_empty())
             .unwrap_or(Path::new("."));
         let padded_copy = |mut out: fs::File| -> io::Result<fs::File> {
-            let len = io::copy(&mut fs::File::open(image)?, &mut out)?;
-            out.set_len(len.next_multiple_of(host_page_size()))?;
+            io::copy(&mut fs::File::open(image)?, &mut out)?;
+            pad_file(&out, host_page_size())?;
             Ok(out)
         };
         match fs::OpenOptions::new()

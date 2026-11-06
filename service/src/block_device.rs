@@ -748,12 +748,10 @@ impl BlockDevice {
         // kernels without upstream fix 52dceb88082b (see `crate::erofs_folio`). A sparse zero
         // tail to the largest page size makes the file mountable everywhere; EROFS and
         // dm-verity read only the blocks the superblock and the verity parameters name.
-        let file = OpenOptions::new().write(true).open(&path)?;
-        let meta = file.metadata()?;
-        // A block device output keeps its size; only a file can be mounted file-backed.
-        if meta.is_file() {
-            file.set_len(meta.len().next_multiple_of(EXPORT_ALIGNMENT))?;
-        }
+        crate::erofs_folio::pad_file(
+            &OpenOptions::new().write(true).open(&path)?,
+            EXPORT_ALIGNMENT,
+        )?;
 
         Ok(info)
     }
@@ -1181,7 +1179,7 @@ mod tests {
         let sha256 = sha256_digest(reader)?;
         assert_eq!(
             sha256,
-            String::from("5684c330c622350c12d633d0773201f862b9955375d806670e1aaf36ef038b31")
+            String::from("86ca2d61371251edf1794a30557b5138fc005d71d474016a1080a93c8db5e0fd")
         );
 
         Ok(())

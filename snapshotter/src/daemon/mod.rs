@@ -2854,27 +2854,26 @@ fn stage_bootstrap(src: &Path, dst: &Path) -> io::Result<()> {
 /// access, so containers already running on the mount need no remount.
 fn pad_live_erofs_sources(mounts: &str, daemons: &Path) -> usize {
     let page = nydus_utils::host_page_size();
-    mounts
-        .lines()
-        .filter_map(|line| {
-            let mut fields = line.split_whitespace();
-            let source = fields.next()?;
-            (fields.nth(1)? == "erofs")
-                .then(|| PathBuf::from(crate::recon::unescape_mount_field(source)))
-        })
-        .filter(|source| source.starts_with(daemons))
-        .filter(|source| {
-            fs::symlink_metadata(source)
-                .is_ok_and(|m| m.is_file() && !m.len().is_multiple_of(page))
-        })
-        .filter(|source| match nydus_service::erofs_folio::pad_to_page_size(source) {
-            Ok(()) => true,
+    let mut padded = 0;
+    for line in mounts.lines() {
+        let mut fields = line.split_whitespace();
+        let (Some(source), Some("erofs")) = (fields.next(), fields.nth(1)) else {
+            continue;
+        };
+        let source = PathBuf::from(crate::recon::unescape_mount_field(source));
+        let unaligned = fs::symlink_metadata(&source)
+            .is_ok_and(|m| m.is_file() && !m.len().is_multiple_of(page));
+        if !source.starts_with(daemons) || !unaligned {
+            continue;
+        }
+        match nydus_service::erofs_folio::pad_to_page_size(&source) {
+            Ok(()) => padded += 1,
             Err(e) => {
-                warn!(source = %source.display(), error = %e, "failed to pad a live EROFS source");
-                false
+                warn!(source = %source.display(), error = %e, "failed to pad a live EROFS source")
             }
-        })
-        .count()
+        }
+    }
+    padded
 }
 
 /// Whether `staged` holds exactly what [`stage_bootstrap`] makes of `src`.
