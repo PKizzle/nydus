@@ -439,6 +439,7 @@ mod tests {
     use vmm_sys_util::tempfile::TempFile;
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
     fn test_set_lock_node() {
         let tmpdir = TempDir::new().unwrap();
         let tmpfile = TempFile::new_in(tmpdir.as_path()).unwrap();
@@ -476,6 +477,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
     fn test_walk_tree() {
         let tmpdir = TempDir::new().unwrap();
         let tmpfile = TempFile::new_in(tmpdir.as_path()).unwrap();
@@ -559,6 +561,7 @@ mod tests {
     /// A bootstrap whose root directory lists itself as a child must fail to load instead of
     /// recursing until the stack overflows.
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support readahead")]
     fn test_from_bootstrap_rejects_directory_cycle() {
         use nydus_api::ConfigV2;
         use std::sync::Arc;

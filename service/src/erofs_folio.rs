@@ -483,6 +483,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    #[cfg_attr(miri, ignore = "needs copy_file_range and O_TMPFILE, which Miri lacks")]
     fn page_aligned_source_leaves_no_file_behind() {
         let dir = std::env::temp_dir().join(format!("erofs-folio-src-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();

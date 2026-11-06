@@ -207,6 +207,9 @@ pub struct BlobCompressionContextHeader {
     s_magic2: u32,
 }
 
+// SAFETY: `BlobCompressionContextHeader` is `#[repr(C)]` integers and a byte array laid out to
+// exactly 4096 bytes with no padding, so every bit pattern is valid and it has no interior
+// mutability.
 unsafe impl FromMapped for BlobCompressionContextHeader {}
 
 impl Default for BlobCompressionContextHeader {
@@ -451,6 +454,8 @@ impl BlobCompressionContextHeader {
 
     /// Convert the header as an `&[u8]`.
     pub fn as_bytes(&self) -> &[u8] {
+        // SAFETY: the header has no padding (see the `FromMapped` impl), so all its bytes are
+        // initialized; the slice borrows `self`.
         unsafe {
             std::slice::from_raw_parts(
                 self as *const BlobCompressionContextHeader as *const u8,
@@ -565,6 +570,9 @@ impl BlobCompressionContextInfo {
             .try_clone()
             .map_err(|e| MetaError::io("failed to dup the blob meta file", e))?;
         let filemap = Arc::new(
+            // SAFETY: the mapping is read-only, and the header references taken from it end with
+            // each `validate_header` call; the file is written only through `file` while none is
+            // alive (see the comment above).
             unsafe { FileMapState::new(map_file, 0, expected_size, false) }.map_err(|e| {
                 MetaError::io(format!("failed to mmap blob meta file {}", meta_path), e)
             })?,
@@ -691,8 +699,8 @@ impl BlobCompressionContextInfo {
                 )));
             }
 
-            // Safe because the digest file isn't written once it exists.
             let file_map = Arc::new(
+                // SAFETY: the digest file isn't written once it exists.
                 unsafe { FileMapState::new(file, 0, size, false) }
                     .map_err(|e| MetaError::io("failed to mmap the chunk digest file", e))?,
             );
@@ -1350,12 +1358,18 @@ impl BlobMetaChunkArray {
     /// Convert the chunk compression information array as a u8 slice.
     pub fn as_byte_slice(&self) -> &[u8] {
         match self {
+            // SAFETY: `BlobChunkInfoV1Ondisk` is `#[repr(C, packed)]` integers, so the array's
+            // bytes are initialized and the length is the array's exact byte size; the slice
+            // borrows `v`.
             BlobMetaChunkArray::V1(v) => unsafe {
                 std::slice::from_raw_parts(
                     v.as_ptr() as *const u8,
                     v.len() * size_of::<BlobChunkInfoV1Ondisk>(),
                 )
             },
+            // SAFETY: `BlobChunkInfoV2Ondisk` is `#[repr(C, packed)]` integers, so the array's
+            // bytes are initialized and the length is the array's exact byte size; the slice
+            // borrows `v`.
             BlobMetaChunkArray::V2(v) => unsafe {
                 std::slice::from_raw_parts(
                     v.as_ptr() as *const u8,
@@ -2330,6 +2344,7 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support file-backed mmap")]
     fn chunk_tables_keep_their_mapping_alive() {
         use vmm_sys_util::tempfile::TempFile;
 
@@ -2344,6 +2359,7 @@ pub(crate) mod tests {
             let bytes = vec![0x12; 2 * entry_size];
             std::fs::write(file.as_path(), &bytes).unwrap();
             let mapping = Arc::new(
+                // SAFETY: the temp file is private to this test and is not written while mapped.
                 unsafe {
                     FileMapState::new(file.as_file().try_clone().unwrap(), 0, bytes.len(), false)
                 }
@@ -2423,6 +2439,7 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
     fn test_load_meta_ci_zran_from_reader() {
         let root_dir = &std::env::var("CARGO_MANIFEST_DIR").expect("$CARGO_MANIFEST_DIR");
         let id = "233c72f2b6b698c07021c4da367cfe2dff4f049efbaa885ca0ff760ea297865a";
@@ -2492,6 +2509,7 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
     fn test_load_meta_waits_for_initializing_process() {
         let root_dir = &std::env::var("CARGO_MANIFEST_DIR").expect("$CARGO_MANIFEST_DIR");
         let id = "233c72f2b6b698c07021c4da367cfe2dff4f049efbaa885ca0ff760ea297865a";
@@ -2555,6 +2573,7 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support file-backed mmap")]
     fn test_load_meta_ci_zran_add_more_chunks() {
         let root_dir = &std::env::var("CARGO_MANIFEST_DIR").expect("$CARGO_MANIFEST_DIR");
         let path = PathBuf::from(root_dir).join("../tests/texture/zran/233c72f2b6b698c07021c4da367cfe2dff4f049efbaa885ca0ff760ea297865a");
@@ -2610,6 +2629,7 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support file-backed mmap")]
     fn test_load_meta_ci_zran_get_chunks_uncompressed() {
         let root_dir = &std::env::var("CARGO_MANIFEST_DIR").expect("$CARGO_MANIFEST_DIR");
         let path = PathBuf::from(root_dir).join("../tests/texture/zran/233c72f2b6b698c07021c4da367cfe2dff4f049efbaa885ca0ff760ea297865a");
@@ -2670,6 +2690,7 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support file-backed mmap")]
     fn test_load_meta_ci_zran_get_chunks_compressed() {
         let root_dir = &std::env::var("CARGO_MANIFEST_DIR").expect("$CARGO_MANIFEST_DIR");
         let path = PathBuf::from(root_dir).join("../tests/texture/zran/233c72f2b6b698c07021c4da367cfe2dff4f049efbaa885ca0ff760ea297865a");

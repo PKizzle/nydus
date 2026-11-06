@@ -11,13 +11,12 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
 use fuse_backend_rs::file_buf::FileVolatileSlice;
-use nix::sys::uio;
 
 use nydus_api::LocalFsConfig;
 use nydus_utils::metrics::BackendMetrics;
 
 use crate::backend::{BackendError, BackendResult, BlobBackend, BlobReader};
-use crate::utils::{MemSliceCursor, readv};
+use crate::utils::{MemSliceCursor, pread_full, readv};
 
 type LocalFsResult<T> = std::result::Result<T, LocalFsError>;
 
@@ -60,7 +59,7 @@ impl BlobReader for LocalFsEntry {
     }
 
     fn try_read(&self, buf: &mut [u8], offset: u64) -> BackendResult<usize> {
-        uio::pread(&self.file, buf, offset as i64).map_err(|e| {
+        pread_full(&self.file, buf, offset).map_err(|e| {
             let msg = format!("failed to read data from blob {}, {}", self.id, e);
             LocalFsError::ReadBlob(msg).into()
         })
@@ -308,6 +307,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
     fn test_localfs_get_blob_path_stays_in_dir() {
         let root = TempDir::new().unwrap();
         let dir = root.as_path().join("blobs");
@@ -321,6 +321,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
     fn test_localfs_get_blob_path_skips_zero_byte_alt_dirs() {
         let main_dir = TempDir::new().unwrap();
         let zero_alt_dir = TempDir::new().unwrap();
@@ -349,6 +350,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
     fn test_localfs_get_blob_path_prefers_blob_file_over_dirs() {
         let dir = TempDir::new().unwrap();
         let blob_file = TempFile::new().unwrap();
@@ -377,6 +379,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
     fn test_localfs_get_blob_path_errors_when_all_dirs_miss() {
         let main_dir = TempDir::new().unwrap();
         let alt_dir_1 = TempDir::new().unwrap();
@@ -412,12 +415,15 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "asserts full preadv reads; Miri injects short reads")]
     fn test_localfs_get_reader() {
         let tempfile = TempFile::new().unwrap();
         let path = tempfile.as_path();
         let filename = path.file_name().unwrap().to_str().unwrap();
 
         {
+            // SAFETY: the `File` borrows the tempfile's descriptor and gives it back with
+            // `into_raw_fd` before leaving the scope, so the descriptor is never closed twice.
             let mut file = unsafe { File::from_raw_fd(tempfile.as_file().as_raw_fd()) };
             file.write_all(&[0x1u8, 0x2, 0x3, 0x4]).unwrap();
             let _ = file.into_raw_fd();
@@ -440,7 +446,9 @@ mod tests {
         let mut buf2 = [0x0u8];
         let mut buf3 = [0x0u8];
         let bufs = [
+            // SAFETY: `buf2` outlives the volatile slice and is only read after `readv` returns.
             unsafe { FileVolatileSlice::from_raw_ptr(buf2.as_mut_ptr(), buf2.len()) },
+            // SAFETY: `buf3` outlives the volatile slice and is only read after `readv` returns.
             unsafe { FileVolatileSlice::from_raw_ptr(buf3.as_mut_ptr(), buf3.len()) },
         ];
 
@@ -477,6 +485,8 @@ mod tests {
 
         let mut readv_buf = [0xabu8; 2];
         let bufs =
+            // SAFETY: `readv_buf` outlives the volatile slice and is only read after `readv`
+            // returns.
             [unsafe { FileVolatileSlice::from_raw_ptr(readv_buf.as_mut_ptr(), readv_buf.len()) }];
         assert_eq!(blob.readv(&bufs, 0, 0).unwrap(), 0);
         assert_eq!(readv_buf, [0xab, 0xab]);

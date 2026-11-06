@@ -960,6 +960,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "timing-sensitive; Miri runs too slowly")]
     fn test_latecny() {
         let f = FsIoStats::default();
         assert_eq!(f.latency_start(), None);
@@ -1039,6 +1040,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "timing-sensitive; Miri runs too slowly")]
     fn test_blob_cache_metric() {
         let m1: Arc<BlobcacheMetrics> = BlobcacheMetrics::new("id", "path");
         {

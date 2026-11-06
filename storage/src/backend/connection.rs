@@ -1196,6 +1196,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support io_uring")]
     fn test_unhealthy_proxy_with_fallback_attempts_origin() {
         // When proxy is unhealthy but fallback IS enabled, call() should
         // fall through to the origin server (which will fail with a connection
@@ -1227,6 +1228,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support io_uring")]
     fn test_healthy_proxy_no_fallback_returns_proxy_error() {
         // When proxy is healthy and fallback is disabled, a failed proxy request
         // should return the proxy error directly without falling back.

@@ -13,6 +13,9 @@ pub fn register_signal_handler(sig: signal::Signal, handler: extern "C" fn(libc:
         signal::SigSet::empty(),
     );
 
+    // SAFETY: `handler` is an `extern "C" fn` supplied by the caller for use as a signal handler,
+    // which must only perform async-signal-safe operations; installing it does not touch any Rust
+    // state.
     unsafe {
         // Signal registration fails, just panic since nydusd won't work properly.
         signal::sigaction(sig, &sa).unwrap();

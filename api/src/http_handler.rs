@@ -444,6 +444,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support Unix sockets")]
     fn test_start_http_thread() {
         let tmpdir = TempFile::new().unwrap();
         let path = tmpdir.as_path().to_str().unwrap();

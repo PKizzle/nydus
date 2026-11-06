@@ -234,8 +234,12 @@ mod tests {
     /// return its raw file descriptor.  The caller is responsible for closing it.
     #[cfg(target_os = "linux")]
     fn make_memfd(content: &[u8]) -> i32 {
+        // SAFETY: the name is a NUL-terminated literal and the flags are integers; the result is
+        // checked below.
         let fd = unsafe { libc::memfd_create(c"crc32_test".as_ptr(), 0) };
         assert!(fd >= 0, "memfd_create failed");
+        // SAFETY: `fd` is the memfd just created (checked above), owned by nothing else; the `File`
+        // is forgotten below, handing ownership to the caller.
         let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
         file.write_all(content).unwrap();
         // Leak the File wrapper so the fd stays open
@@ -259,6 +263,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support memfd_create")]
     fn test_crc32_from_raw_fd() {
         let content = b"hello nydus world";
         let fd = make_memfd(content);
@@ -270,11 +275,13 @@ mod tests {
 
         assert_eq!(result, crc32.from_buf(content));
 
+        // SAFETY: `fd` came from `make_memfd`, whose caller owns it, and is closed exactly once.
         unsafe { libc::close(fd) };
     }
 
     #[cfg(target_os = "linux")]
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support memfd_create")]
     fn test_crc32_from_raw_fd_with_offset() {
         let content = b"prefixdata";
         let offset = 6u64; // skip "prefix", checksum "data"
@@ -287,11 +294,13 @@ mod tests {
 
         assert_eq!(result, crc32.from_buf(&content[offset as usize..]));
 
+        // SAFETY: `fd` came from `make_memfd`, whose caller owns it, and is closed exactly once.
         unsafe { libc::close(fd) };
     }
 
     #[cfg(target_os = "linux")]
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support memfd_create")]
     fn test_crc32_from_raw_fd_zero_size() {
         let content = b"some content";
         let fd = make_memfd(content);
@@ -304,6 +313,7 @@ mod tests {
         // CRC of zero bytes must equal CRC of an empty slice.
         assert_eq!(result, crc32.from_buf(b""));
 
+        // SAFETY: `fd` came from `make_memfd`, whose caller owns it, and is closed exactly once.
         unsafe { libc::close(fd) };
     }
 }

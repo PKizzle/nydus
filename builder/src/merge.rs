@@ -599,6 +599,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support readahead")]
     fn test_merger_merge() {
         let mut ctx = BuildContext::default();
         ctx.configuration.internal.set_blob_accessible(false);
@@ -640,6 +641,7 @@ mod tests {
     /// Chunks of a 16 KiB layer start on 16 KiB boundaries, so the merged bootstrap must keep that
     /// block size: storage holds each blob's padding to the filesystem's block size.
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
     fn test_merger_merge_keeps_source_block_size() {
         use crate::{BlobManager, BootstrapManager, Builder, ConversionType, DirectoryBuilder};
         use vmm_sys_util::tempdir::TempDir;
@@ -739,6 +741,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
     fn test_inode_share_fingerprint_identifies_content() {
         use vmm_sys_util::tempdir::TempDir;
 
@@ -773,6 +776,7 @@ mod tests {
 
     /// A file whose chunks do not cover it gets no fingerprint, and the build goes on.
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
     fn test_inode_share_fingerprint_skips_a_file_it_cannot_identify() {
         use crate::core::chunk_dict::HashChunkDict;
         use nydus_rafs::metadata::layout::v6::RAFSV6_ISHARE_XATTR_NAME;
@@ -801,6 +805,7 @@ mod tests {
     /// The merged bootstrap declares the fingerprint prefix for the kernel, and RAFS readers skip
     /// the hidden xattr, so the result is still a valid merge source.
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
     fn test_merge_writes_inode_share_fingerprints() {
         use nydus_rafs::metadata::layout::v6::{EROFS_SUPER_OFFSET, RafsV6SuperBlock};
         use std::os::unix::fs::FileExt;

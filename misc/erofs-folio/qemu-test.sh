@@ -6,13 +6,16 @@
 # upstream fix 52dceb88082b. Needs qemu-system-aarch64, a static busybox, mkfs.ext4 and cpio;
 # no root on the host.
 #
-#   KERNEL       arm64 kernel Image
+#   KERNEL       arm64 kernel Image, or an EFI zboot vmlinuz (gzip or zstd payload, as in Ubuntu's
+#                kernel packages)
 #   PROBE        static aarch64 build of the probe:
 #                  cargo build --release -p nydus-service --example erofs_folio_probe \
 #                    --target aarch64-unknown-linux-musl
-#   MODULES_TAR  optional tarball holding .../kernel/fs/erofs/erofs.ko[.xz] (modular EROFS)
-#   DEMO_IMAGE   optional EROFS image to mount as is and padded, e.g. `mkfs.erofs -b4096` output
-#   EXPECT       optional affected|unaffected; the script fails unless the probe says so
+#   MODULES_TAR  optional tarball holding .../kernel/fs/erofs/erofs.ko[.xz|.zst] (modular EROFS),
+#                e.g. `dpkg-deb --fsys-tarfile linux-modules-*.deb`
+#   DEMO_IMAGE   optional EROFS image to mount as is and padded, e.g. from `demo-image.sh`
+#   EXPECT       optional affected|unaffected; the script fails unless the probe says so and,
+#                with DEMO_IMAGE, the image reads as `expect.sh` requires
 #   EXPECT_ISHARE  optional unsupported|fix_absent|fix_present|inconclusive, likewise
 #   BUSYBOX      static busybox (default: the one on PATH)
 #
@@ -37,8 +40,18 @@ if [ -n "${MODULES_TAR:-}" ]; then
   tar xOf "$MODULES_TAR" "$ko" > "$WORK/erofs.ko.raw"
   case "$ko" in
     *.xz) xz -dc "$WORK/erofs.ko.raw" > "$ROOT/erofs.ko" ;;
+    *.zst) zstd -dc "$WORK/erofs.ko.raw" > "$ROOT/erofs.ko" ;;
     *) cp "$WORK/erofs.ko.raw" "$ROOT/erofs.ko" ;;
   esac
+fi
+# QEMU's -kernel loader does not unpack zboot payloads compressed with zstd.
+if [ "$(dd if="$KERNEL" bs=1 skip=4 count=4 2>/dev/null)" = zimg ]; then
+  off=$(($(od -An -tu4 -j8 -N4 "$KERNEL"))) size=$(($(od -An -tu4 -j12 -N4 "$KERNEL")))
+  comp=$(dd if="$KERNEL" bs=1 skip=24 count=32 2>/dev/null | tr -d '\0')
+  case "$comp" in gzip | zstd) ;; *) echo "unsupported zboot compression: $comp" >&2; exit 1 ;; esac
+  dd if="$KERNEL" iflag=skip_bytes,count_bytes skip="$off" count="$size" status=none |
+    "$comp" -dc > "$WORK/Image"
+  KERNEL="$WORK/Image"
 fi
 [ -n "${DEMO_IMAGE:-}" ] && cp "$DEMO_IMAGE" "$ROOT/demo.erofs"
 truncate -s 16M "$ROOT/ext4.img"
@@ -61,13 +74,15 @@ INIT
 chmod +x "$ROOT/init"
 (cd "$ROOT" && find . | cpio -o -H newc --quiet) | gzip > "$WORK/initrd.gz"
 
-timeout 300 qemu-system-aarch64 -machine virt -cpu max -m 1024 -nographic -no-reboot \
+# Neoverse-N1 has the 4K, 16K and 64K granules; QEMU 8.2 (Ubuntu 24.04) hangs booting Ubuntu's
+# 7.3/7.4 arm64 kernels with `-cpu max`.
+timeout 300 qemu-system-aarch64 -machine virt -cpu neoverse-n1 -m 1024 -nographic -no-reboot \
   -kernel "$KERNEL" -initrd "$WORK/initrd.gz" \
-  -append "console=ttyAMA0 rdinit=/init panic=-1 quiet" | tee "$WORK/console.log"
+  -append "console=ttyAMA0 rdinit=/init panic=-1 quiet" </dev/null | tee "$WORK/console.log"
 
-status=$(sed -n 's/.*erofs-folio-probe: .* status=\([a-z]*\).*/\1/p' "$WORK/console.log" | tr -d '\r')
 ishare=$(sed -n 's/.*erofs-ishare-probe: status=\([a-z_]*\).*/\1/p' "$WORK/console.log" | tr -d '\r')
-echo "==== EROFS FOLIO PROBE: ${status:-none} ===="
+rc=0
+bash "$(dirname "$0")/expect.sh" "$WORK/console.log" "${EXPECT:-}" "${DEMO_IMAGE:+image}" || rc=$?
 echo "==== EROFS ISHARE PROBE: ${ishare:-none} ===="
-[ -z "${EXPECT:-}" ] || [ "$status" = "$EXPECT" ]
+[ "$rc" = 0 ]
 [ -z "${EXPECT_ISHARE:-}" ] || [ "$ishare" = "$EXPECT_ISHARE" ]

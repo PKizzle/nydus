@@ -288,6 +288,8 @@ impl Blob {
                 header_size as u64,
             )?;
 
+            // SAFETY: `blob_chunk_digest` is a `Vec<[u8; 32]>`, so its storage is `len() * 32`
+            // initialized bytes; the slice borrows it and nothing mutates it while `buf` lives.
             let buf = unsafe {
                 slice::from_raw_parts(
                     blob_ctx.blob_chunk_digest.as_ptr() as *const u8,

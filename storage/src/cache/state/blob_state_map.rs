@@ -412,6 +412,8 @@ pub(crate) mod tests {
             Arc::new(Self {
                 index,
                 digest: RafsDigest::from_buf(
+                    // SAFETY: `index` is a live `u32`, so its 4 bytes are initialized and readable
+                    // for this call.
                     unsafe { std::slice::from_raw_parts(&index as *const u32 as *const u8, 4) },
                     Algorithm::Blake3,
                 ),
@@ -474,6 +476,7 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
     fn test_chunk_map() {
         let dir = TempDir::new().unwrap();
         let blob_path = dir.as_path().join("blob-1");
@@ -565,6 +568,7 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
     fn test_chunk_map_perf() {
         let dir = TempDir::new().unwrap();
         let blob_path = dir.as_path().join("blob-1");
@@ -594,6 +598,7 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support file-backed mmap")]
     fn test_inflight_tracer() {
         let chunk_1: Arc<dyn BlobChunkInfo> = Arc::new({
             let mut c = MockChunkInfo::new();
@@ -693,6 +698,7 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support file-backed mmap")]
     fn test_inflight_tracer_race() {
         let tmp_file = TempFile::new().unwrap();
         let map = Arc::new(BlobStateMap::from(
@@ -760,6 +766,7 @@ pub(crate) mod tests {
     ///     The chunk of index 4 is never marked as ready/downloaded.
     ///     Each caller of `has_ready` can escape from where it is blocked.
     ///     After timeout, no slot is left in inflight tracer.
+    #[cfg_attr(miri, ignore = "Miri does not support file-backed mmap")]
     fn test_inflight_tracer_timeout() {
         let tmp_file = TempFile::new().unwrap();
         let map = Arc::new(BlobStateMap::from(
@@ -804,6 +811,7 @@ pub(crate) mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support file-backed mmap")]
     fn test_inflight_tracer_race_range() {
         let tmp_file = TempFile::new().unwrap();
         let map = Arc::new(BlobStateMap::from(

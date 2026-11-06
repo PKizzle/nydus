@@ -60,6 +60,7 @@ mod tests {
     /// The hook aborts on a panic outside `contain` and lets one inside it unwind. Runs in a
     /// child process, because the abort would take the test harness down with it.
     #[test]
+    #[cfg_attr(miri, ignore = "Miri cannot spawn processes")]
     fn hook_aborts_only_uncontained_panics() {
         const CHILD: &str = "NYDUS_PANIC_POLICY_CHILD";
         if let Ok(mode) = std::env::var(CHILD) {

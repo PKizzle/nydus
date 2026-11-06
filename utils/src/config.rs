@@ -362,8 +362,10 @@ mod tests {
         let _guard = test_sync::TEST_LOCK.lock().unwrap();
         clear();
 
-        const WRITERS: usize = 8;
-        const KEYS_PER_WRITER: usize = 50;
+        // Every write clones the whole map, so Miri needs minutes per hundred keys; a few
+        // racing writers still exercise the lost-update window.
+        const WRITERS: usize = if cfg!(miri) { 4 } else { 8 };
+        const KEYS_PER_WRITER: usize = if cfg!(miri) { 8 } else { 50 };
         let barrier = std::sync::Barrier::new(WRITERS);
         std::thread::scope(|s| {
             for w in 0..WRITERS {

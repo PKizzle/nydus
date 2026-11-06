@@ -535,6 +535,7 @@ fn linux_cpu_seconds() -> (f64, f64) {
         .get(12)
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(0);
+    // SAFETY: `sysconf` only takes an integer and has no memory-safety preconditions.
     let ticks_per_second = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
     if ticks_per_second <= 0 {
         return (0.0, 0.0);

@@ -723,6 +723,9 @@ mod tests {
     #[test]
     fn s3_backend_maps_fields_and_resolves_env_credentials() {
         // Unique env var names to avoid cross-test interference.
+        // SAFETY: NOT enforced: `set_var` races with any other thread reading the environment, and
+        // test threads run in parallel; the unique variable names avoid logical interference but
+        // not that race.
         unsafe {
             std::env::set_var("B3_TEST_S3_AK", "AKIAEXAMPLE");
             std::env::set_var("B3_TEST_S3_SK", "s3cr3t");
@@ -759,6 +762,7 @@ mod tests {
             ..Default::default()
         };
         assert!(bc.validate());
+        // SAFETY: NOT enforced: as for `set_var` above.
         unsafe {
             std::env::remove_var("B3_TEST_S3_AK");
             std::env::remove_var("B3_TEST_S3_SK");

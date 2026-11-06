@@ -24,6 +24,8 @@ pub struct BlobChunkInfoV1Ondisk {
     pub(crate) comp_info: u64,
 }
 
+// SAFETY: `#[repr(C, packed)]` with only `u64` fields: no padding, alignment 1, no interior
+// mutability, and every bit pattern is valid.
 unsafe impl FromMapped for BlobChunkInfoV1Ondisk {}
 
 impl BlobMetaChunkInfo for BlobChunkInfoV1Ondisk {
@@ -374,6 +376,8 @@ mod tests {
             },
         ];
 
+        // SAFETY: `BlobChunkInfoV1Ondisk` is packed integers, so the vector's bytes are initialized
+        // and the length is its exact byte size; `data` borrows `chunks`.
         let data = unsafe {
             std::slice::from_raw_parts(
                 chunks.as_ptr() as *const u8,
@@ -428,6 +432,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "calls the C lz4 library")]
     fn test_read_metadata_compressor_lz4() {
         let temp = TempFile::new().unwrap();
         let mut w = OpenOptions::new()
@@ -452,6 +457,8 @@ mod tests {
             },
         ];
 
+        // SAFETY: `BlobChunkInfoV1Ondisk` is packed integers, so the vector's bytes are initialized
+        // and the length is its exact byte size; `data` borrows `chunks`.
         let data = unsafe {
             std::slice::from_raw_parts(
                 chunks.as_ptr() as *const u8,
@@ -499,6 +506,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "calls the C lz4 library")]
     fn test_read_metadata_rejects_short_decompression() {
         // Enough repetitive entries that every algorithm actually compresses them.
         let chunks = vec![
@@ -508,6 +516,8 @@ mod tests {
             };
             64
         ];
+        // SAFETY: `BlobChunkInfoV1Ondisk` is packed integers, so the vector's bytes are initialized
+        // and the length is its exact byte size; `data` borrows `chunks`.
         let data = unsafe {
             std::slice::from_raw_parts(
                 chunks.as_ptr() as *const u8,

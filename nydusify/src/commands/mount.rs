@@ -326,9 +326,9 @@ mod signal {
     }
 
     pub fn install() {
-        // SAFETY: `handle` only performs an atomic store, which is
-        // async-signal-safe.
         let handler = handle as *const () as libc::sighandler_t;
+        // SAFETY: `handler` is a valid `extern "C"` function pointer, and `handle` only performs
+        // an atomic store, which is async-signal-safe.
         unsafe {
             libc::signal(libc::SIGINT, handler);
             libc::signal(libc::SIGTERM, handler);

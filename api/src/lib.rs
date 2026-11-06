@@ -7,6 +7,8 @@
 //! The `nydus-api` crate defines API and related data structures for Nydus Image Service.
 //! All data structures used by the API are encoded in JSON format.
 
+#![forbid(unsafe_code)]
+
 #[cfg_attr(feature = "handler", macro_use)]
 extern crate log;
 #[macro_use]

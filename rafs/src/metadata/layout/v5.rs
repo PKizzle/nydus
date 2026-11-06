@@ -461,6 +461,8 @@ impl RafsV5InodeTable {
 
     /// Load inode offset table for a `RafsIoReader` object.
     pub fn load(&mut self, r: &mut RafsIoReader) -> RafsResult<()> {
+        // SAFETY: `u32` has no padding and every byte pattern is a valid `u32`, so the table can be
+        // filled as bytes; `u8` has alignment 1, so the middle slice covers the whole table.
         let (_, data, _) = unsafe { self.data.align_to_mut::<u8>() };
         r.read_exact(data)?;
         Ok(())
@@ -469,6 +471,8 @@ impl RafsV5InodeTable {
 
 impl RafsStore for RafsV5InodeTable {
     fn store(&self, w: &mut dyn RafsIoWrite) -> RafsResult<usize> {
+        // SAFETY: `u32` has no padding, so its bytes are initialized; `u8` has alignment 1, so the
+        // middle slice covers the whole table.
         let (_, data, _) = unsafe { self.data.align_to::<u8>() };
 
         w.write_all(data)?;
@@ -521,6 +525,8 @@ impl RafsV5PrefetchTable {
 
     /// Store the inode prefetch table to a writer.
     pub fn store(&mut self, w: &mut dyn RafsIoWrite) -> RafsResult<usize> {
+        // SAFETY: `u32` has no padding, so its bytes are initialized; `u8` has alignment 1, so the
+        // middle slice covers the whole table.
         let (_, data, _) = unsafe { self.inodes.align_to::<u8>() };
         w.write_all(data.as_ref())?;
 
@@ -545,6 +551,8 @@ impl RafsV5PrefetchTable {
     ) -> RafsResult<usize> {
         self.inodes = vec![0u32; entries];
 
+        // SAFETY: `u32` has no padding and every byte pattern is a valid `u32`, so the table can be
+        // filled as bytes; `u8` has alignment 1, so the middle slice covers the whole table.
         let (_, data, _) = unsafe { self.inodes.align_to_mut::<u8>() };
         r.seek_to_offset(offset)?;
         r.read_exact(data)?;
@@ -659,8 +667,12 @@ impl RafsV5BlobTable {
         let mut buf = data.as_mut_slice();
         while buf.len() > 2 * size_of::<u32>() {
             let readahead_offset =
+                // SAFETY: the loop condition guarantees more than 8 bytes, so `buf[0..4]` is 4
+                // readable bytes and `read_unaligned` imposes no alignment requirement.
                 unsafe { std::ptr::read_unaligned::<u32>(buf[0..4].as_ptr() as *const u32) };
             let readahead_size =
+                // SAFETY: the loop condition guarantees more than 8 bytes, so `buf[4..8]` is 4
+                // readable bytes and `read_unaligned` imposes no alignment requirement.
                 unsafe { std::ptr::read_unaligned::<u32>(buf[4..8].as_ptr() as *const u32) };
 
             let mut pos = 8;
@@ -886,12 +898,11 @@ impl RafsV5ExtBlobTable {
 
     /// Load extended blob information table from a reader.
     pub fn load(&mut self, r: &mut RafsIoReader, count: usize) -> RafsResult<()> {
-        let mut entries = Vec::<RafsV5ExtBlobEntry>::with_capacity(count);
-        // Safe because it is already reserved enough space
-        let (_, data, _) = unsafe {
-            entries.set_len(count);
-            entries.align_to_mut::<u8>()
-        };
+        let mut entries = vec![RafsV5ExtBlobEntry::default(); count];
+        // SAFETY: every element is initialized and `RafsV5ExtBlobEntry` is `#[repr(C)]` integers
+        // and byte arrays with no padding, so its bytes may be viewed and overwritten as `u8`s
+        // (alignment 1, so the prefix and suffix are empty).
+        let (_, data, _) = unsafe { entries.align_to_mut::<u8>() };
 
         r.read_exact(data)?;
         self.entries = entries.iter().cloned().map(Arc::new).collect();
@@ -1519,6 +1530,8 @@ pub mod tests {
     }
 
     unsafe fn any_as_u8_slice<T: Sized>(p: &T) -> &[u8] {
+        // SAFETY: the caller passes a type without padding, so all `size_of::<T>()` bytes of `*p`
+        // are initialized, and the slice borrows `p`.
         unsafe {
             ::std::slice::from_raw_parts((p as *const T) as *const u8, ::std::mem::size_of::<T>())
         }
@@ -1535,8 +1548,11 @@ pub mod tests {
         let second_id = "19ebb6e9bdcbbce3f24d694fe20e0e552ae705ce079e26023ad0ecd61d4b1300";
         let third_id = "be7d77eeb719f70884758d1aa800ed0fb09d701aaec469964e9d54325f0d5fef";
 
+        // SAFETY: `Entry` is two `u32`s and has no padding.
         let first_slice = unsafe { any_as_u8_slice(&first) };
+        // SAFETY: `Entry` is two `u32`s and has no padding.
         let second_slice = unsafe { any_as_u8_slice(&second) };
+        // SAFETY: `Entry` is two `u32`s and has no padding.
         let third_slice = unsafe { any_as_u8_slice(&third) };
 
         buffer.extend_from_slice(first_slice);

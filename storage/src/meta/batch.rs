@@ -26,6 +26,8 @@ pub struct BatchInflateContext {
     __reserved4: u64,
 }
 
+// SAFETY: `#[repr(C, packed)]` with only integer fields: no padding, alignment 1, no interior
+// mutability, and every bit pattern is valid.
 unsafe impl FromMapped for BatchInflateContext {}
 
 impl BatchInflateContext {
@@ -51,6 +53,8 @@ impl BatchInflateContext {
 
     /// Convert to an immutable u8 slice.
     pub fn as_slice(&self) -> &[u8] {
+        // SAFETY: the packed struct has no padding, so all its bytes are initialized; the slice
+        // borrows `self`.
         unsafe {
             slice::from_raw_parts(
                 self as *const BatchInflateContext as *const u8,
@@ -190,6 +194,9 @@ mod tests {
         assert_eq!(ctx_data.len(), size_of::<BatchInflateContext>());
         // `ctx_data` is a byte buffer with no alignment guarantee for the context.
         let ctx =
+            // SAFETY: the assert above checks that `ctx_data` holds exactly one context,
+            // `read_unaligned` imposes no alignment requirement, and any bytes are a valid
+            // packed-integer `BatchInflateContext`.
             unsafe { std::ptr::read_unaligned(ctx_data.as_ptr() as *const BatchInflateContext) };
         assert_eq!(ctx.compressed_size(), 4);
         assert_eq!(ctx.uncompressed_batch_size(), 4);
