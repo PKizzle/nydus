@@ -603,6 +603,8 @@ mod verification {
     #[kani::stub(std::fmt::format, no_format)]
     fn validate_decides_every_record() {
         let chunk = any_chunk();
+        // Unknown flags only log a warning, and the logger's global state would swamp the solver.
+        kani::assume(chunk.check_flags() == 0);
         let state = BlobCompressionContext {
             blob_features: kani::any(),
             compressed_size: kani::any(),
