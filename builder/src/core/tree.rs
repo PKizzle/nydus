@@ -29,7 +29,7 @@ use nydus_rafs::metadata::chunk::ChunkWrapper;
 use nydus_rafs::metadata::inode::InodeWrapper;
 use nydus_rafs::metadata::layout::{RafsXAttrs, bytes_to_os_str};
 use nydus_rafs::metadata::{Inode, RafsInodeExt, RafsSuper};
-use nydus_utils::{lazy_drop, root_tracer, timing_tracer};
+use nydus_utils::{root_tracer, timing_tracer};
 
 use super::node::{ChunkSource, Node, NodeChunk, NodeInfo};
 use super::overlay::{Overlay, WhiteoutType};
@@ -208,7 +208,6 @@ impl Tree {
         upper.borrow_mut_node().overlay = Overlay::UpperModification;
         self.node = upper.node.clone();
         self.merge_children(ctx, &upper)?;
-        lazy_drop(upper);
 
         Ok(())
     }
@@ -474,6 +473,40 @@ mod tests {
         tree.set_node(node);
         let node2 = tree.borrow_mut_node();
         assert_eq!(node2.name(), tmpfile.as_path().file_name().unwrap());
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
+    fn test_merge_overlay_releases_upper_before_return() {
+        let tmpdir = TempDir::new().unwrap();
+        let tmpfile = TempFile::new_in(tmpdir.as_path()).unwrap();
+        let fs_node = |path: &std::path::Path| {
+            Node::from_fs_object(
+                RafsVersion::V6,
+                tmpdir.as_path().to_path_buf(),
+                path.to_path_buf(),
+                Overlay::UpperAddition,
+                RAFS_DEFAULT_CHUNK_SIZE as u32,
+                0,
+                true,
+                false,
+            )
+            .unwrap()
+        };
+        let mut lower = Tree::new(fs_node(tmpdir.as_path()));
+        let mut upper = Tree::new(fs_node(tmpdir.as_path()));
+        upper.insert_child(Tree::new(fs_node(tmpfile.as_path())));
+
+        lower
+            .merge_overaly(&BuildContext::default(), upper)
+            .unwrap();
+
+        // The merged tree shares the upper root and child nodes, so every handle the consumed upper
+        // tree held must be released by the time `merge_overaly` returns: the merged tree is then
+        // the only owner of each node. A handle kept alive past the call raises a count above 1.
+        assert_eq!(Rc::strong_count(&lower.node), 1);
+        assert_eq!(lower.children.len(), 1);
+        assert_eq!(Rc::strong_count(&lower.children[0].node), 1);
     }
 
     #[test]

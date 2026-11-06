@@ -29,7 +29,7 @@ nydus-api = { version = "0.6.0", path = "../api" }
 nydus-storage = { version = "0.8.0", path = "../storage", features = [
     "backend-localfs",
 ] }
-nydus-utils = { version = "0.6.0", path = "../utils" }
+nydus-utils = { version = "0.7.0", path = "../utils" }
 
 [dev-dependencies]
 vmm-sys-util = { workspace = true }

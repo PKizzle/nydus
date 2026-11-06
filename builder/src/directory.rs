@@ -6,7 +6,7 @@ use std::fs;
 use std::fs::DirEntry;
 
 use anyhow::{Context, Result, anyhow};
-use nydus_utils::{event_tracer, lazy_drop, root_tracer, timing_tracer};
+use nydus_utils::{event_tracer, root_tracer, timing_tracer};
 
 use crate::core::context::{Artifact, NoopArtifactWriter};
 use crate::core::prefetch;
@@ -216,8 +216,6 @@ impl DirectoryBuilder {
                 "dump_bootstrap"
             )?;
         }
-
-        lazy_drop(bootstrap_ctx);
 
         BuildOutput::new(blob_mgr, None, &bootstrap_mgr.bootstrap_storage, &None)
     }
