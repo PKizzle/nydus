@@ -144,7 +144,7 @@ mod tests {
     use std::fs::OpenOptions;
     use std::io::Write;
     use std::sync::atomic::Ordering;
-    use vmm_sys_util::tempdir::TempDir;
+    use tempfile::TempDir;
 
     use super::super::persist_map::*;
     use super::*;
@@ -154,7 +154,7 @@ mod tests {
     #[test]
     fn test_indexed_new_invalid_file_size() {
         let dir = TempDir::new().unwrap();
-        let blob_path = dir.as_path().join("blob-1");
+        let blob_path = dir.path().join("blob-1");
         let blob_path = blob_path.as_os_str().to_str().unwrap().to_string();
 
         assert!(IndexedChunkMap::new(&blob_path, 0, false).is_err());
@@ -184,7 +184,7 @@ mod tests {
     #[test]
     fn test_indexed_new_zero_file_size() {
         let dir = TempDir::new().unwrap();
-        let blob_path = dir.as_path().join("blob-1");
+        let blob_path = dir.path().join("blob-1");
         let blob_path = blob_path.as_os_str().to_str().unwrap().to_string();
 
         assert!(IndexedChunkMap::new(&blob_path, 0, true).is_err());
@@ -220,7 +220,7 @@ mod tests {
     #[test]
     fn test_indexed_new_header_not_ready() {
         let dir = TempDir::new().unwrap();
-        let blob_path = dir.as_path().join("blob-1");
+        let blob_path = dir.path().join("blob-1");
         let blob_path = blob_path.as_os_str().to_str().unwrap().to_string();
 
         assert!(IndexedChunkMap::new(&blob_path, 0, true).is_err());
@@ -257,7 +257,7 @@ mod tests {
     #[test]
     fn test_indexed_new_all_ready() {
         let dir = TempDir::new().unwrap();
-        let blob_path = dir.as_path().join("blob-1");
+        let blob_path = dir.path().join("blob-1");
         let blob_path = blob_path.as_os_str().to_str().unwrap().to_string();
 
         assert!(IndexedChunkMap::new(&blob_path, 0, true).is_err());
@@ -303,7 +303,7 @@ mod tests {
     #[test]
     fn test_indexed_new_load_v0() {
         let dir = TempDir::new().unwrap();
-        let blob_path = dir.as_path().join("blob-1");
+        let blob_path = dir.path().join("blob-1");
         let blob_path = blob_path.as_os_str().to_str().unwrap().to_string();
 
         assert!(IndexedChunkMap::new(&blob_path, 0, true).is_err());
@@ -350,7 +350,7 @@ mod tests {
     #[test]
     fn test_reset_revokes_every_chunk() {
         let dir = TempDir::new().unwrap();
-        let blob_path = dir.as_path().join("blob-reset");
+        let blob_path = dir.path().join("blob-reset");
         let blob_path = blob_path.as_os_str().to_str().unwrap().to_string();
 
         let map = IndexedChunkMap::new(&blob_path, 16, true).unwrap();
@@ -394,7 +394,7 @@ mod tests {
     #[test]
     fn test_reset_survives_reopen() {
         let dir = TempDir::new().unwrap();
-        let blob_path = dir.as_path().join("blob-reset-persist");
+        let blob_path = dir.path().join("blob-reset-persist");
         let blob_path = blob_path.as_os_str().to_str().unwrap().to_string();
 
         {

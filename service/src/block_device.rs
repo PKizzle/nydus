@@ -828,7 +828,7 @@ mod tests {
     use std::fs::{self, File};
     use std::io::{BufReader, Read};
     use std::path::PathBuf;
-    use vmm_sys_util::tempdir::TempDir;
+    use tempfile::TempDir;
 
     #[test]
     fn aligned_io_buffer_preserves_its_allocation() {
@@ -929,7 +929,7 @@ mod tests {
         let root_dir = &std::env::var("CARGO_MANIFEST_DIR").expect("$CARGO_MANIFEST_DIR");
         let mut source_path = PathBuf::from(root_dir);
         source_path.push("../tests/texture/blobs/be7d77eeb719f70884758d1aa800ed0fb09d701aaec469964e9d54325f0d5fef");
-        let mut dest_path = tmp_dir.as_path().to_path_buf();
+        let mut dest_path = tmp_dir.path().to_path_buf();
         dest_path.push("be7d77eeb719f70884758d1aa800ed0fb09d701aaec469964e9d54325f0d5fef");
         fs::copy(&source_path, &dest_path).unwrap();
 
@@ -970,7 +970,7 @@ mod tests {
 
         // config with correct path
         let content = config
-            .replace("/tmp/nydus", tmp_dir.as_path().to_str().unwrap())
+            .replace("/tmp/nydus", tmp_dir.path().to_str().unwrap())
             .replace("RAFS_V5", &source_path.display().to_string());
         let mut entry: BlobCacheEntry = serde_json::from_str(&content).unwrap();
         assert!(entry.prepare_configuration_info());
@@ -1062,15 +1062,15 @@ mod tests {
         };
         use nydus_rafs::metadata::RafsVersion;
 
-        let source = dir.as_path().join("source");
-        let blobs = dir.as_path().join("blobs");
-        let cache = dir.as_path().join("cache");
+        let source = dir.path().join("source");
+        let blobs = dir.path().join("blobs");
+        let cache = dir.path().join("cache");
         for d in [&source, &blobs, &cache] {
             fs::create_dir(d).unwrap();
         }
         let content: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8 + 1).collect();
         fs::write(source.join("data"), &content).unwrap();
-        let bootstrap = dir.as_path().join("bootstrap");
+        let bootstrap = dir.path().join("bootstrap");
 
         let mut ctx = BuildContext {
             fs_version: RafsVersion::V6,
@@ -1162,7 +1162,7 @@ mod tests {
         let entry = create_bootstrap_entry(&entry_tmp_dir);
 
         let tmp_dir = TempDir::new().unwrap();
-        let data_dir = Some(String::from(tmp_dir.as_path().to_str().unwrap()));
+        let data_dir = Some(String::from(tmp_dir.path().to_str().unwrap()));
 
         // verity = true must return the dm-verity parameters.
         let verity = BlockDevice::export(entry, None, data_dir, thread, true)?;
@@ -1170,7 +1170,7 @@ mod tests {
         assert_eq!(verity.data_block_size, 4096);
         assert_eq!(verity.root_digest.len(), 64);
 
-        let mut disk_path = PathBuf::from(tmp_dir.as_path());
+        let mut disk_path = PathBuf::from(tmp_dir.path());
         disk_path.push("rafs-v6-2.2.boot.disk");
         let len = std::fs::metadata(&disk_path)?.len();
         assert_eq!(len % EXPORT_ALIGNMENT, 0, "{len} is not padded");

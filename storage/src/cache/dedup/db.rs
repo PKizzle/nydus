@@ -251,18 +251,18 @@ impl CasDb {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use vmm_sys_util::tempdir::TempDir;
+    use tempfile::TempDir;
 
     #[test]
     fn test_cas_blob() {
         let tmpdir = TempDir::new().unwrap();
 
-        let mut cas_mgr = CasDb::new(tmpdir.as_path()).unwrap();
+        let mut cas_mgr = CasDb::new(tmpdir.path()).unwrap();
         cas_mgr
             .add_blobs(&["/tmp/blob1".to_string(), "/tmp/blob2".to_string()])
             .unwrap();
 
-        let mut mgr2 = CasDb::new(tmpdir.as_path()).unwrap();
+        let mut mgr2 = CasDb::new(tmpdir.path()).unwrap();
         assert_eq!(mgr2.add_blob("/tmp/blob3").unwrap(), 3);
 
         drop(cas_mgr);
@@ -305,7 +305,7 @@ mod tests {
     #[test]
     fn test_cas_chunk() {
         let tmpdir = TempDir::new().unwrap();
-        let mut cas_mgr = CasDb::new(tmpdir.as_path()).unwrap();
+        let mut cas_mgr = CasDb::new(tmpdir.path()).unwrap();
         cas_mgr
             .add_blobs(&["/tmp/blob1".to_string(), "/tmp/blob2".to_string()])
             .unwrap();

@@ -435,16 +435,16 @@ mod tests {
     use super::*;
     use nydus_rafs::metadata::RafsVersion;
     use nydus_storage::RAFS_DEFAULT_CHUNK_SIZE;
-    use vmm_sys_util::tempdir::TempDir;
+    use tempfile::TempDir;
     use vmm_sys_util::tempfile::TempFile;
 
     #[test]
     fn test_set_lock_node() {
         let tmpdir = TempDir::new().unwrap();
-        let tmpfile = TempFile::new_in(tmpdir.as_path()).unwrap();
+        let tmpfile = TempFile::new_in(tmpdir.path()).unwrap();
         let node = Node::from_fs_object(
             RafsVersion::V6,
-            tmpdir.as_path().to_path_buf(),
+            tmpdir.path().to_path_buf(),
             tmpfile.as_path().to_path_buf(),
             Overlay::UpperAddition,
             RAFS_DEFAULT_CHUNK_SIZE as u32,
@@ -458,10 +458,10 @@ mod tests {
         let node1 = tree.borrow_mut_node();
         drop(node1);
 
-        let tmpfile = TempFile::new_in(tmpdir.as_path()).unwrap();
+        let tmpfile = TempFile::new_in(tmpdir.path()).unwrap();
         let node = Node::from_fs_object(
             RafsVersion::V6,
-            tmpdir.as_path().to_path_buf(),
+            tmpdir.path().to_path_buf(),
             tmpfile.as_path().to_path_buf(),
             Overlay::UpperAddition,
             RAFS_DEFAULT_CHUNK_SIZE as u32,
@@ -478,10 +478,10 @@ mod tests {
     #[test]
     fn test_walk_tree() {
         let tmpdir = TempDir::new().unwrap();
-        let tmpfile = TempFile::new_in(tmpdir.as_path()).unwrap();
+        let tmpfile = TempFile::new_in(tmpdir.path()).unwrap();
         let node = Node::from_fs_object(
             RafsVersion::V6,
-            tmpdir.as_path().to_path_buf(),
+            tmpdir.path().to_path_buf(),
             tmpfile.as_path().to_path_buf(),
             Overlay::UpperAddition,
             RAFS_DEFAULT_CHUNK_SIZE as u32,
@@ -492,10 +492,10 @@ mod tests {
         .unwrap();
         let mut tree = Tree::new(node);
 
-        let tmpfile2 = TempFile::new_in(tmpdir.as_path()).unwrap();
+        let tmpfile2 = TempFile::new_in(tmpdir.path()).unwrap();
         let node = Node::from_fs_object(
             RafsVersion::V6,
-            tmpdir.as_path().to_path_buf(),
+            tmpdir.path().to_path_buf(),
             tmpfile2.as_path().to_path_buf(),
             Overlay::UpperAddition,
             RAFS_DEFAULT_CHUNK_SIZE as u32,
@@ -507,10 +507,10 @@ mod tests {
         let tree2 = Tree::new(node);
         tree.insert_child(tree2);
 
-        let tmpfile3 = TempFile::new_in(tmpdir.as_path()).unwrap();
+        let tmpfile3 = TempFile::new_in(tmpdir.path()).unwrap();
         let node = Node::from_fs_object(
             RafsVersion::V6,
-            tmpdir.as_path().to_path_buf(),
+            tmpdir.path().to_path_buf(),
             tmpfile3.as_path().to_path_buf(),
             Overlay::UpperAddition,
             RAFS_DEFAULT_CHUNK_SIZE as u32,

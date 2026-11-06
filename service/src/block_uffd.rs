@@ -1572,7 +1572,7 @@ mod tests {
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     use std::path::PathBuf;
     use std::time::Duration;
-    use vmm_sys_util::tempdir::TempDir;
+    use tempfile::TempDir;
 
     #[test]
     fn uffdio_copy_rejects_a_short_source_buffer() {

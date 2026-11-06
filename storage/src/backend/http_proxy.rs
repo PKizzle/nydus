@@ -396,8 +396,8 @@ mod tests {
     use hyper_util::server::conn::auto::Builder;
     use nydus_api::HttpProxyConfig;
     use std::{cmp, thread};
+    use tempfile::TempDir;
     use tokio::net::{TcpListener, UnixListener};
-    use vmm_sys_util::tempdir::TempDir;
 
     use super::Bytes;
 
@@ -476,7 +476,7 @@ mod tests {
     /// Start a local (unix socket) and a remote (TCP) mock proxy answering in `mode`, and return
     /// a backend for each. The servers run on a tokio runtime; only the test harness uses tokio.
     fn proxies(mode: Mode, dir: &TempDir) -> Vec<HttpProxy> {
-        let socket = dir.as_path().join("proxy.sock");
+        let socket = dir.path().join("proxy.sock");
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(1)
             .enable_all()

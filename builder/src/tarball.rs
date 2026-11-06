@@ -976,8 +976,8 @@ mod tests {
     }
 
     fn test_hardlink_to_non_regular_file(version: RafsVersion) {
-        let tmp_dir = vmm_sys_util::tempdir::TempDir::new().unwrap();
-        let tmp_dir = tmp_dir.as_path().to_path_buf();
+        let tmp_dir = tempfile::TempDir::new().unwrap();
+        let tmp_dir = tmp_dir.path().to_path_buf();
         let source_path = tmp_dir.join("hardlink.tar");
         create_hardlink_tar(&source_path);
         let mut ctx = create_context(source_path.clone(), version);
@@ -1073,8 +1073,8 @@ mod tests {
     }
 
     fn test_fifo_without_device_numbers(version: RafsVersion) {
-        let tmp_dir = vmm_sys_util::tempdir::TempDir::new().unwrap();
-        let source_path = tmp_dir.as_path().join("fifo.tar");
+        let tmp_dir = tempfile::TempDir::new().unwrap();
+        let source_path = tmp_dir.path().join("fifo.tar");
         let mut tar = tar::Builder::new(File::create(&source_path).unwrap());
         append_entry_without_device_numbers(&mut tar, "fifo-entry", EntryType::Fifo);
         tar.finish().unwrap();
@@ -1103,8 +1103,8 @@ mod tests {
     // Character and block special files are the two types POSIX defines `devmajor`/`devminor`
     // for, so they must keep round-tripping their device number.
     fn test_device_files_keep_rdev(version: RafsVersion) {
-        let tmp_dir = vmm_sys_util::tempdir::TempDir::new().unwrap();
-        let source_path = tmp_dir.as_path().join("devices.tar");
+        let tmp_dir = tempfile::TempDir::new().unwrap();
+        let source_path = tmp_dir.path().join("devices.tar");
         let mut tar = tar::Builder::new(File::create(&source_path).unwrap());
         for (name, entry_type) in [("chr", EntryType::Char), ("blk", EntryType::Block)] {
             let mut header = Header::new_ustar();
@@ -1140,8 +1140,8 @@ mod tests {
 
     #[test]
     fn test_hardlink_to_directory_is_rejected() {
-        let tmp_dir = vmm_sys_util::tempdir::TempDir::new().unwrap();
-        let source_path = tmp_dir.as_path().join("hardlink-dir.tar");
+        let tmp_dir = tempfile::TempDir::new().unwrap();
+        let source_path = tmp_dir.path().join("hardlink-dir.tar");
         let mut tar = tar::Builder::new(File::create(&source_path).unwrap());
         append_entry(&mut tar, "dir/", EntryType::Directory, None, b"");
         append_entry(&mut tar, "dir-link", EntryType::Link, Some("dir"), b"");
@@ -1156,8 +1156,8 @@ mod tests {
     fn test_hardlink_to_unknown_target_is_rejected() {
         // A tar entry may only be hardlinked to an entry which appeared earlier in the stream,
         // because the tarball is parsed in a single pass.
-        let tmp_dir = vmm_sys_util::tempdir::TempDir::new().unwrap();
-        let source_path = tmp_dir.as_path().join("hardlink-unknown.tar");
+        let tmp_dir = tempfile::TempDir::new().unwrap();
+        let source_path = tmp_dir.path().join("hardlink-unknown.tar");
         let mut tar = tar::Builder::new(File::create(&source_path).unwrap());
         append_entry(&mut tar, "sym-link", EntryType::Link, Some("sym"), b"");
         append_entry(&mut tar, "sym", EntryType::Symlink, Some("foo"), b"");
@@ -1170,8 +1170,8 @@ mod tests {
 
     #[test]
     fn test_malformed_pax_extension_is_rejected() {
-        let tmp_dir = vmm_sys_util::tempdir::TempDir::new().unwrap();
-        let source_path = tmp_dir.as_path().join("bad-pax.tar");
+        let tmp_dir = tempfile::TempDir::new().unwrap();
+        let source_path = tmp_dir.path().join("bad-pax.tar");
         let mut tar = tar::Builder::new(File::create(&source_path).unwrap());
         // A PAX record starts with its own length in decimal, here reported too long.
         let pax = "99 SCHILY.xattr.user.key=value\n";
@@ -1192,8 +1192,8 @@ mod tests {
 
     #[test]
     fn test_build_tarfs() {
-        let tmp_dir = vmm_sys_util::tempdir::TempDir::new().unwrap();
-        let tmp_dir = tmp_dir.as_path().to_path_buf();
+        let tmp_dir = tempfile::TempDir::new().unwrap();
+        let tmp_dir = tmp_dir.path().to_path_buf();
         let root_dir = &std::env::var("CARGO_MANIFEST_DIR").expect("$CARGO_MANIFEST_DIR");
         let source_path = PathBuf::from(root_dir).join("../tests/texture/tar/all-entry-type.tar");
         let prefetch = Prefetch::default();
@@ -1228,8 +1228,8 @@ mod tests {
 
     #[test]
     fn test_build_encrypted_tarfs() {
-        let tmp_dir = vmm_sys_util::tempdir::TempDir::new().unwrap();
-        let tmp_dir = tmp_dir.as_path().to_path_buf();
+        let tmp_dir = tempfile::TempDir::new().unwrap();
+        let tmp_dir = tmp_dir.path().to_path_buf();
         let root_dir = &std::env::var("CARGO_MANIFEST_DIR").expect("$CARGO_MANIFEST_DIR");
         let source_path = PathBuf::from(root_dir).join("../tests/texture/tar/all-entry-type.tar");
         let prefetch = Prefetch::default();
@@ -1268,12 +1268,12 @@ mod tests {
         use nydus_storage::meta::BlobCompressionContextInfo;
         use nydus_utils::compress::zlib_random::ZranDecoder;
 
-        let tmp_dir = vmm_sys_util::tempdir::TempDir::new().unwrap();
-        let tar_path = tmp_dir.as_path().join("source.tar");
-        let source_path = tmp_dir.as_path().join("source.tar.gz");
-        let bootstrap_path = tmp_dir.as_path().join("bootstrap");
-        let meta_blob_path = tmp_dir.as_path().join("meta-blob");
-        let cache_path = tmp_dir.as_path().join("cached-blob");
+        let tmp_dir = tempfile::TempDir::new().unwrap();
+        let tar_path = tmp_dir.path().join("source.tar");
+        let source_path = tmp_dir.path().join("source.tar.gz");
+        let bootstrap_path = tmp_dir.path().join("bootstrap");
+        let meta_blob_path = tmp_dir.path().join("meta-blob");
+        let cache_path = tmp_dir.path().join("cached-blob");
 
         // Keep the compressed file large enough to start a new inflate context for each
         // entry, while allowing the builder to deduplicate three identical file chunks.
@@ -1416,8 +1416,8 @@ mod tests {
         version: RafsVersion,
         xattr_on: &str,
     ) -> nydus_rafs::metadata::RafsSuper {
-        let tmp_dir = vmm_sys_util::tempdir::TempDir::new().unwrap();
-        let tmp_dir = tmp_dir.as_path().to_path_buf();
+        let tmp_dir = tempfile::TempDir::new().unwrap();
+        let tmp_dir = tmp_dir.path().to_path_buf();
         let source_path = tmp_dir.join("xattr-hardlink.tar");
         let bootstrap_path = tmp_dir.join("bootstrap");
         create_xattr_hardlink_tar(&source_path, xattr_on);
@@ -1578,9 +1578,9 @@ mod tests {
         }
     }
 
-    fn layer_ctx(tar: &[u8]) -> (vmm_sys_util::tempdir::TempDir, BuildContext) {
-        let tmp_dir = vmm_sys_util::tempdir::TempDir::new().unwrap();
-        let source_path = tmp_dir.as_path().join("layer.tar");
+    fn layer_ctx(tar: &[u8]) -> (tempfile::TempDir, BuildContext) {
+        let tmp_dir = tempfile::TempDir::new().unwrap();
+        let source_path = tmp_dir.path().join("layer.tar");
         std::fs::write(&source_path, tar).unwrap();
         let ctx = create_context(source_path, RafsVersion::V6);
         (tmp_dir, ctx)
@@ -2091,8 +2091,8 @@ mod tests {
 
     // Builds the layer into a bootstrap file and loads the tree back from it.
     fn round_trip_layer(version: RafsVersion, tar: &[u8], with_blob: bool) -> Tree {
-        let tmp_dir = vmm_sys_util::tempdir::TempDir::new().unwrap();
-        let path = tmp_dir.as_path().join("bootstrap");
+        let tmp_dir = tempfile::TempDir::new().unwrap();
+        let path = tmp_dir.path().join("bootstrap");
         build_layer_file(version, tar, &path, None, with_blob);
         load_tree(&path)
     }
@@ -2179,8 +2179,8 @@ mod tests {
     ];
 
     fn test_merge_keeps_lower_metadata_under_implicit_parent(version: RafsVersion) {
-        let tmp_dir = vmm_sys_util::tempdir::TempDir::new().unwrap();
-        let dir = tmp_dir.as_path();
+        let tmp_dir = tempfile::TempDir::new().unwrap();
+        let dir = tmp_dir.path();
         let b0 = dir.join("b0");
         let b1 = dir.join("b1");
         let b2 = dir.join("b2");
@@ -2311,8 +2311,8 @@ mod tests {
 
     // Merges the layer bootstraps without a parent bootstrap and renders the result.
     fn merge_layers(version: RafsVersion, layers: &[Vec<u8>]) -> Vec<String> {
-        let tmp_dir = vmm_sys_util::tempdir::TempDir::new().unwrap();
-        let dir = tmp_dir.as_path();
+        let tmp_dir = tempfile::TempDir::new().unwrap();
+        let dir = tmp_dir.path();
         let mut sources = Vec::new();
         for (idx, tar) in layers.iter().enumerate() {
             let path = dir.join(format!("b{idx}"));

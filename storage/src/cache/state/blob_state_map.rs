@@ -389,7 +389,7 @@ pub(crate) mod tests {
 
     use nydus_utils::digest::Algorithm::Blake3;
     use nydus_utils::digest::{Algorithm, RafsDigest};
-    use vmm_sys_util::tempdir::TempDir;
+    use tempfile::TempDir;
     use vmm_sys_util::tempfile::TempFile;
 
     use super::*;
@@ -471,7 +471,7 @@ pub(crate) mod tests {
     #[test]
     fn test_chunk_map() {
         let dir = TempDir::new().unwrap();
-        let blob_path = dir.as_path().join("blob-1");
+        let blob_path = dir.path().join("blob-1");
         let blob_path = blob_path.as_os_str().to_str().unwrap().to_string();
         let chunk_count = 1000000;
         let skip_index = 77;
@@ -562,7 +562,7 @@ pub(crate) mod tests {
     #[test]
     fn test_chunk_map_perf() {
         let dir = TempDir::new().unwrap();
-        let blob_path = dir.as_path().join("blob-1");
+        let blob_path = dir.path().join("blob-1");
         let blob_path = blob_path.as_os_str().to_str().unwrap().to_string();
         let chunk_count = 1000000;
 

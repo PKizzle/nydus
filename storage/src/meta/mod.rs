@@ -2435,8 +2435,8 @@ pub(crate) mod tests {
         blob_data.extend_from_slice(
             &meta_data[header_offset..header_offset + BLOB_CCT_HEADER_SIZE as usize],
         );
-        let dir = vmm_sys_util::tempdir::TempDir::new().unwrap();
-        let blob_path = dir.as_path().join(id);
+        let dir = tempfile::TempDir::new().unwrap();
+        let blob_path = dir.path().join(id);
         std::fs::write(&blob_path, &blob_data).unwrap();
         let reader: Arc<dyn BlobReader> = Arc::new(DummyBlobReader {
             metrics: BackendMetrics::new(id, "localfs"),
@@ -2499,8 +2499,8 @@ pub(crate) mod tests {
             PathBuf::from(root_dir).join(format!("../tests/texture/zran/{}.blob.meta", id)),
         )
         .unwrap();
-        let dir = vmm_sys_util::tempdir::TempDir::new().unwrap();
-        let blob_path = dir.as_path().join(id).display().to_string();
+        let dir = tempfile::TempDir::new().unwrap();
+        let blob_path = dir.path().join(id).display().to_string();
         let meta_path = format!("{}.{}", blob_path, BLOB_CCT_FILE_SUFFIX);
 
         // Act as another process that has created the meta file and is still downloading it.
