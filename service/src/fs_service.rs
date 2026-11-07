@@ -133,7 +133,8 @@ pub trait FsService: Send + Sync {
         Ok(())
     }
 
-    /// Remount a filesystem instance.
+    /// Remount a filesystem instance with a new configuration. The bootstrap must be the
+    /// mounted one, byte for byte; use umount and mount to switch images.
     fn remount(&self, cmd: FsBackendMountCmd) -> Result<()> {
         let (rootfs, _) = self
             .backend_from_mountpoint(&cmd.mountpoint)?

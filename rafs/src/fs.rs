@@ -185,6 +185,9 @@ impl Rafs {
     }
 
     /// Update storage backend for blobs.
+    ///
+    /// The bootstrap `r` must be the mounted one: a RAFS v6 filesystem refuses any other with
+    /// `RafsError::SwapBackend`. Use umount and mount to switch images.
     pub fn update(
         &self,
         r: &mut RafsIoReader,

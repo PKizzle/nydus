@@ -625,10 +625,8 @@ impl RafsV6SuperBlockExt {
     pub fn inode_area(&self, sb: &RafsV6SuperBlock, block_size: u64, meta_size: u64) -> Range<u64> {
         let meta_addr = sb.meta_addr() as u64 * block_size;
         let start = rafsv6_inode_area_start(meta_addr, sb.device_table_end());
-        let chunk_table = match (self.chunk_table_offset(), self.chunk_table_size()) {
-            (0, 0) => None,
-            (offset, _) => Some(offset),
-        };
+        // `validate` rejects a chunk table at offset 0 that has records.
+        let chunk_table = (self.chunk_table_offset() != 0).then_some(self.chunk_table_offset());
         let end = [chunk_table, sb.xattr_prefix_table_offset()]
             .into_iter()
             .flatten()

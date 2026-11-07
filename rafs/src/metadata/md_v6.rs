@@ -18,6 +18,7 @@ use crate::RafsIoReader;
 use crate::{RafsError, RafsResult};
 
 /// The validated superblocks of a RAFS v6 bootstrap.
+#[derive(Clone, Copy)]
 pub(crate) struct V6Superblocks {
     pub sb: RafsV6SuperBlock,
     pub ext: RafsV6SuperBlockExt,
@@ -44,9 +45,10 @@ pub(crate) fn load_v6_superblocks(r: &mut RafsIoReader) -> RafsResult<Option<V6S
 
 impl RafsSuper {
     pub(crate) fn try_load_v6(&mut self, r: &mut RafsIoReader) -> RafsResult<bool> {
-        let Some(V6Superblocks { sb, ext: ext_sb }) = load_v6_superblocks(r)? else {
+        let Some(superblocks) = load_v6_superblocks(r)? else {
             return Ok(false);
         };
+        let V6Superblocks { sb, ext: ext_sb } = superblocks;
         self.meta.version = RAFS_SUPER_VERSION_V6;
         self.meta.magic = sb.magic();
         self.meta.meta_blkaddr = sb.meta_addr();
@@ -89,7 +91,7 @@ impl RafsSuper {
 
         match self.mode {
             RafsMode::Direct => {
-                let mut sb_v6 = DirectSuperBlockV6::new(&self.meta);
+                let mut sb_v6 = DirectSuperBlockV6::new(&self.meta, superblocks);
                 sb_v6.load(r)?;
                 self.superblock = Arc::new(sb_v6);
                 Ok(true)
