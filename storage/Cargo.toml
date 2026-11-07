@@ -139,6 +139,12 @@ tokio = { version = "1.52.3", features = [
     "time",
 ] }
 
+# Model-checks the chunk state single-flight protocol; see docs/verification.md. The cfg is not
+# the conventional `loom`: that one switches event-listener and friends in the dependency graph
+# to loom primitives, which they only build with their own `loom` features.
+[target.'cfg(nydus_loom)'.dev-dependencies]
+loom = "0.7.2"
+
 [[bench]]
 name = "backend_read"
 harness = false

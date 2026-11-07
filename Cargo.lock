@@ -3751,6 +3751,7 @@ dependencies = [
  "hyper-util",
  "libc",
  "log",
+ "loom",
  "nix 0.31.3",
  "nydus-api",
  "nydus-utils",

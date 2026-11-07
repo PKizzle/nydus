@@ -186,7 +186,7 @@ undocumented_unsafe_blocks = "deny"
 # wrapped and documented like any other.
 unsafe_op_in_unsafe_fn = "deny"
 # Custom cfgs used by verification tooling (Kani proofs, loom models, cargo-fuzz builds).
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)', 'cfg(loom)', 'cfg(fuzzing)'] }
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)', 'cfg(loom)', 'cfg(nydus_loom)', 'cfg(fuzzing)'] }
 
 [workspace.dependencies]
 # rust-vmm crates
