@@ -330,6 +330,12 @@ impl MetaRange {
         }
     }
 
+    /// A range without alignment requirements, `None` if it overflows; the caller checks the
+    /// alignment its format needs.
+    pub fn new_unaligned(start: u64, size: u64) -> Option<Self> {
+        start.checked_add(size).map(|_| MetaRange { start, size })
+    }
+
     #[allow(dead_code)]
     pub fn start(&self) -> u64 {
         self.start

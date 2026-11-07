@@ -14,6 +14,10 @@ use super::*;
 impl RafsSuper {
     pub(crate) fn try_load_v5(&mut self, r: &mut RafsIoReader) -> RafsResult<bool> {
         let end = r.seek_to_end(0)?;
+        // A bootstrap shorter than the v5 superblock (a small 512-byte-block v6 image) is not v5.
+        if end < size_of::<RafsV5SuperBlock>() as u64 {
+            return Ok(false);
+        }
         r.seek_to_offset(0)?;
         let mut sb = RafsV5SuperBlock::new();
         r.read_exact(sb.as_mut())?;
@@ -274,6 +278,15 @@ impl BlobChunkInfo for V5IoChunk {
 mod tests {
     use super::*;
     // TODO: add unit test cases for RafsSuper::{try_load_v5, amplify_io}
+
+    #[test]
+    fn test_v5_load_short_file_is_not_v5() {
+        let t_file = vmm_sys_util::tempfile::TempFile::new().unwrap();
+        t_file.as_file().set_len(4096).unwrap();
+        let mut reader = Box::new(t_file.into_file()) as RafsIoReader;
+        let mut rs = RafsSuper::default();
+        assert!(!rs.try_load_v5(&mut reader).unwrap());
+    }
 
     #[test]
     fn test_v5_io_chunk_basic() {
