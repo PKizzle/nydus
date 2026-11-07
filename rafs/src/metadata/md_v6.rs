@@ -17,11 +17,15 @@ use super::{RafsMode, RafsSuper, RafsSuperBlock, RafsSuperFlags};
 use crate::RafsIoReader;
 use crate::{RafsError, RafsResult};
 
-/// Load and validate the superblocks of the bootstrap `r`: the superblock, the extended
-/// superblock and the block size, or `None` if `r` is not a RAFS v6 bootstrap.
-pub(crate) fn load_v6_superblocks(
-    r: &mut RafsIoReader,
-) -> RafsResult<Option<(RafsV6SuperBlock, RafsV6SuperBlockExt, u64)>> {
+/// The validated superblocks of a RAFS v6 bootstrap.
+pub(crate) struct V6Superblocks {
+    pub sb: RafsV6SuperBlock,
+    pub ext: RafsV6SuperBlockExt,
+}
+
+/// Load and validate the superblocks of the bootstrap `r`, or `None` if `r` is not a RAFS v6
+/// bootstrap.
+pub(crate) fn load_v6_superblocks(r: &mut RafsIoReader) -> RafsResult<Option<V6Superblocks>> {
     let end = r.seek_to_end(0)?;
     r.seek_to_offset(0)?;
 
@@ -35,12 +39,12 @@ pub(crate) fn load_v6_superblocks(
     let xattr_prefix_size = sb.load_xattr_prefix_table_size(r, end)?;
     r.seek_to_offset(EROFS_BLOCK_SIZE_4096)?;
     ext_sb.validate(end, &sb, block_size, xattr_prefix_size)?;
-    Ok(Some((sb, ext_sb, block_size)))
+    Ok(Some(V6Superblocks { sb, ext: ext_sb }))
 }
 
 impl RafsSuper {
     pub(crate) fn try_load_v6(&mut self, r: &mut RafsIoReader) -> RafsResult<bool> {
-        let Some((sb, ext_sb, _)) = load_v6_superblocks(r)? else {
+        let Some(V6Superblocks { sb, ext: ext_sb }) = load_v6_superblocks(r)? else {
             return Ok(false);
         };
         self.meta.version = RAFS_SUPER_VERSION_V6;

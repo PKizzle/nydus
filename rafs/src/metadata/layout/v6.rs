@@ -9,6 +9,7 @@ use std::ffi::{OsStr, OsString};
 use std::fmt::Debug;
 use std::io::Read;
 use std::mem::size_of;
+use std::ops::Range;
 use std::os::unix::ffi::OsStrExt;
 use std::str::FromStr;
 use std::sync::{Arc, LazyLock};
@@ -618,6 +619,23 @@ impl RafsV6SuperBlockExt {
         }
     }
 
+    /// Byte range the inodes of a validated image may occupy: from
+    /// [`rafsv6_inode_area_start`] up to the first table the builder writes after the inodes,
+    /// or the end of the `meta_size` bytes long bootstrap.
+    pub fn inode_area(&self, sb: &RafsV6SuperBlock, block_size: u64, meta_size: u64) -> Range<u64> {
+        let meta_addr = sb.meta_addr() as u64 * block_size;
+        let start = rafsv6_inode_area_start(meta_addr, sb.device_table_end());
+        let chunk_table = match (self.chunk_table_offset(), self.chunk_table_size()) {
+            (0, 0) => None,
+            (offset, _) => Some(offset),
+        };
+        let end = [chunk_table, sb.xattr_prefix_table_offset()]
+            .into_iter()
+            .flatten()
+            .fold(meta_size, u64::min);
+        start..end
+    }
+
     /// Validate the Rafs v6 extended super block against the primary super block `sb`, the
     /// `block_size` its [`RafsV6SuperBlock::validate`] returned, and the size of its long xattr
     /// prefix table from [`RafsV6SuperBlock::load_xattr_prefix_table_size`].
@@ -676,8 +694,6 @@ impl RafsV6SuperBlockExt {
         let meta_addr = sb.meta_addr() as u64 * block_size;
         let root_end = meta_addr + (sb.root_nid() as u64 + 1) * EROFS_INODE_SLOT_SIZE as u64;
         let (prefetch_offset, prefetch_size) = self.prefetch_table();
-        // `MetaRange` keeps every table 8-byte aligned. The builder places the xattr prefix
-        // table right after chunk records of 80 bytes from a block boundary, so it is too.
         let tables = [
             MetaTable {
                 name: "blob",
@@ -715,7 +731,8 @@ impl RafsV6SuperBlockExt {
                 name: "xattr prefix",
                 offset: sb.xattr_prefix_table_offset().unwrap_or(0),
                 size: xattr_prefix_size,
-                align: 8,
+                // The kernel reads it at `xattr_prefix_start * 4`.
+                align: 4,
                 unit: 1,
                 before_inodes: false,
             },
@@ -727,14 +744,20 @@ impl RafsV6SuperBlockExt {
                 t.name, t.offset, t.size
             ))
         };
-        // sb.validate() keeps the device table inside the bootstrap.
-        let after_devslots = MetaRange::new(devslot_end, meta_size - devslot_end, false)?;
+        let after_devslots = meta_size
+            .checked_sub(devslot_end)
+            .and_then(|size| MetaRange::new_unaligned(devslot_end, size))
+            .ok_or_else(|| {
+                RafsError::InvalidMetadata(format!(
+                    "Rafs v6 device table end 0x{devslot_end:x} lies past the bootstrap end 0x{meta_size:x}"
+                ))
+            })?;
         let mut ranges: Vec<(&str, MetaRange)> = Vec::with_capacity(tables.len());
         for t in &tables {
             if t.offset == 0 && t.size == 0 {
                 continue;
             }
-            let range = MetaRange::new(t.offset, t.size, false).map_err(|_| invalid(t))?;
+            let range = MetaRange::new_unaligned(t.offset, t.size).ok_or_else(|| invalid(t))?;
             // An empty table placed before the inodes may point anywhere past the device table:
             // without blobs the builder leaves the blob table offset after a `meta_addr` of 0.
             let placed = if t.before_inodes {
@@ -1623,18 +1646,14 @@ pub fn rafsv6_inode_area_start(meta_addr: u64, device_table_end: u64) -> u64 {
 
 /// Load blob information table from a reader.
 ///
-/// Slot `i` must name the blob of blob table entry `i`: EROFS selects a device by slot position
-/// while chunks name their blob by table index.
+/// The device table holds one slot per blob table entry, as `RafsV6SuperBlockExt::validate`
+/// requires, and slot `i` must name the blob of entry `i`: EROFS selects a device by slot
+/// position while chunks name their blob by table index.
 pub fn rafsv6_load_blob_extra_info(
     meta: &RafsSuperMeta,
     blob_table: &RafsV6BlobTable,
     r: &mut RafsIoReader,
 ) -> RafsResult<HashMap<String, RafsBlobExtraInfo>> {
-    // `RafsV6SuperBlockExt::validate` made the slot count equal the blob table entry count.
-    debug_assert_eq!(
-        blob_table.entries.len(),
-        meta.blob_device_table_count as usize
-    );
     let mut infos = HashMap::new();
     if blob_table.entries.is_empty() {
         return Ok(infos);
@@ -3177,6 +3196,8 @@ mod tests {
             ext.validate(end, &sb, bs, size)
         };
         with_prefix(3 * bs + 32, prefix_size).unwrap();
+        // 4-byte aligned is enough: the kernel reads it at `xattr_prefix_start * 4`.
+        with_prefix(3 * bs + 36, prefix_size).unwrap();
         with_prefix(4 * bs + chunk, prefix_size).unwrap();
         assert!(with_prefix(3 * bs + 28, prefix_size).is_err());
         assert!(with_prefix(4 * bs + 8, prefix_size).is_err());
@@ -3270,6 +3291,17 @@ mod tests {
         sb.set_ishare_xattr_prefix(end).unwrap();
         assert!(matches!(
             sb.load_xattr_prefix_table_size(&mut reader, end),
+            Err(RafsError::InvalidMetadata(_))
+        ));
+    }
+
+    #[test]
+    fn test_rafs_v6_super_block_ext_rejects_device_table_past_the_end() {
+        // A superblock that did not pass `validate` must not make the extended one underflow.
+        let sb = test_sb(54, 24 * EROFS_BLOCK_SIZE_4096);
+        let ext = test_ext_sb(EROFS_BLOCK_SIZE_4096, 54);
+        assert!(matches!(
+            ext.validate(EROFS_BLOCK_SIZE_4096, &sb, EROFS_BLOCK_SIZE_4096, 0),
             Err(RafsError::InvalidMetadata(_))
         ));
     }

@@ -2481,8 +2481,49 @@ mod tests {
         bootstrap
     }
 
-    /// A dirent naming a nid whose inode would overlap the superblocks or lie past the bootstrap
-    /// is refused when looked up, not parsed.
+    /// Rewrites the dirent of `name` in the root directory of the bootstrap at `path` to each nid
+    /// `bad(rs)` returns, and asserts every such lookup is refused rather than parsed.
+    fn assert_bad_dirent_nids_refused(
+        path: &Path,
+        name: &str,
+        bad: impl Fn(&nydus_rafs::metadata::RafsSuper) -> Vec<u64>,
+    ) {
+        let load = |path: &Path| {
+            nydus_rafs::metadata::RafsSuper::load_from_file(
+                path,
+                Arc::new(nydus_api::ConfigV2::default()),
+                false,
+            )
+            .unwrap()
+            .0
+        };
+        let lookup = |rs: &nydus_rafs::metadata::RafsSuper| {
+            rs.get_inode(rs.superblock.root_ino(), false)
+                .unwrap()
+                .get_child_by_name(OsStr::new(name))
+                .map(|child| child.ino())
+        };
+        let rs = load(path);
+        let nid = lookup(&rs).unwrap();
+        let data = std::fs::read(path).unwrap();
+        let at: Vec<usize> = data
+            .windows(8)
+            .enumerate()
+            .filter(|(_, w)| *w == nid.to_le_bytes())
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(at.len(), 1, "the dirent of {name} names nid {nid} once");
+        for bad in bad(&rs) {
+            let mut patched = data.clone();
+            patched[at[0]..at[0] + 8].copy_from_slice(&bad.to_le_bytes());
+            let patched_path = path.with_extension(format!("nid-{bad}"));
+            std::fs::write(&patched_path, &patched).unwrap();
+            assert!(lookup(&load(&patched_path)).is_err(), "nid {bad}");
+        }
+    }
+
+    /// A dirent naming a nid whose inode would overlap the superblocks, the chunk table or lie
+    /// past the bootstrap is refused when looked up, not parsed.
     #[test]
     #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
     fn test_v6_dirent_nid_outside_the_inode_area_is_refused() {
@@ -2498,40 +2539,29 @@ mod tests {
             false,
             None,
         );
-        let load = |path: &Path| {
-            nydus_rafs::metadata::RafsSuper::load_from_file(
-                path,
-                Arc::new(nydus_api::ConfigV2::default()),
-                false,
-            )
-            .unwrap()
-            .0
-        };
-        let rs = load(&path);
-        assert_eq!(rs.meta.meta_blkaddr, 0);
-        let lookup = |rs: &nydus_rafs::metadata::RafsSuper| {
-            rs.get_inode(rs.superblock.root_ino(), false)
-                .unwrap()
-                .get_child_by_name(OsStr::new("empty"))
-                .map(|child| child.ino())
-        };
-        let nid = lookup(&rs).unwrap();
+        assert_bad_dirent_nids_refused(&path, "empty", |rs| {
+            assert_eq!(rs.meta.meta_blkaddr, 0);
+            vec![32, 36, 1 << 40]
+        });
 
-        let data = std::fs::read(&path).unwrap();
-        let at: Vec<usize> = data
-            .windows(8)
-            .enumerate()
-            .filter(|(_, w)| *w == nid.to_le_bytes())
-            .map(|(i, _)| i)
-            .collect();
-        assert_eq!(at.len(), 1, "the child's dirent names nid {nid} once");
-        for bad in [32u64, 36, 1 << 40] {
-            let mut patched = data.clone();
-            patched[at[0]..at[0] + 8].copy_from_slice(&bad.to_le_bytes());
-            let path = root.as_path().join(format!("nid-{bad}"));
-            std::fs::write(&path, &patched).unwrap();
-            assert!(lookup(&load(&path)).is_err(), "nid {bad}");
-        }
+        // With file data the chunk table follows the inodes; a nid inside it is refused too.
+        let tar = RawTar::default().reg("file", b"data").finish();
+        let path = build_v6_variant(
+            root.as_path(),
+            ConversionType::TarToRafs,
+            &tar,
+            4096,
+            false,
+            false,
+            None,
+        );
+        assert_bad_dirent_nids_refused(&path, "file", |rs| {
+            assert!(rs.meta.chunk_table_size > 0);
+            let meta_addr = rs.meta.meta_blkaddr as u64 * 4096;
+            let first = (rs.meta.chunk_table_offset - meta_addr) / 32;
+            // The first two inode slots inside the chunk table.
+            vec![first, first + 1]
+        });
     }
 
     /// Every v6 layout variant the builder writes passes `RafsSuper` validation and loads back:

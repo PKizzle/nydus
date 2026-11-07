@@ -23,6 +23,7 @@ use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
 use std::io::SeekFrom;
 use std::mem::size_of;
+use std::ops::Range;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::io::AsRawFd;
 use std::sync::{Arc, Mutex};
@@ -40,10 +41,11 @@ use crate::metadata::layout::v5::RafsV5ChunkInfo;
 use crate::metadata::layout::v6::{
     EROFS_BLOCK_BITS_9, EROFS_BLOCK_SIZE_512, EROFS_BLOCK_SIZE_4096, EROFS_I_DATALAYOUT_BITS,
     EROFS_I_VERSION_BIT, EROFS_I_VERSION_BITS, EROFS_INODE_CHUNK_BASED, EROFS_INODE_FLAT_INLINE,
-    EROFS_INODE_FLAT_PLAIN, EROFS_INODE_SLOT_SIZE, RafsV6BlobTable, RafsV6Device, RafsV6Dirent,
-    RafsV6InodeChunkAddr, RafsV6InodeCompact, RafsV6InodeExtended, RafsV6OndiskInode,
-    RafsV6XattrEntry, RafsV6XattrIbodyHeader, block_size_from_bits, is_long_prefix_xattr,
-    rafsv6_inode_area_start, rafsv6_load_blob_extra_info, recover_namespace,
+    EROFS_INODE_FLAT_PLAIN, EROFS_INODE_SLOT_SIZE, EROFS_SUPER_BLOCK_SIZE, EROFS_SUPER_OFFSET,
+    RafsV6BlobTable, RafsV6Dirent, RafsV6InodeChunkAddr, RafsV6InodeCompact, RafsV6InodeExtended,
+    RafsV6OndiskInode, RafsV6SuperBlock, RafsV6SuperBlockExt, RafsV6XattrEntry,
+    RafsV6XattrIbodyHeader, block_size_from_bits, is_long_prefix_xattr,
+    rafsv6_load_blob_extra_info, recover_namespace,
 };
 use crate::metadata::layout::{XattrName, XattrValue, bytes_to_os_str};
 use crate::metadata::md_v6::load_v6_superblocks;
@@ -69,6 +71,10 @@ struct DirectMappingState {
     blob_table: RafsV6BlobTable,
     blob_extra_infos: HashMap<String, RafsBlobExtraInfo>,
     map: FileMapState,
+    /// Byte range of the mapped bootstrap that inodes may occupy.
+    inode_area: Range<usize>,
+    /// Chunk address to chunk table index, built from the mapped bootstrap on first use.
+    chunk_map: Mutex<Option<HashMap<RafsV6InodeChunkAddr, usize>>>,
 }
 
 impl DirectMappingState {
@@ -78,6 +84,8 @@ impl DirectMappingState {
             blob_table: RafsV6BlobTable::default(),
             blob_extra_infos: HashMap::new(),
             map: FileMapState::default(),
+            inode_area: 0..0,
+            chunk_map: Mutex::new(None),
         }
     }
 
@@ -98,11 +106,8 @@ impl DirectMappingState {
 
 struct DirectCachedInfo {
     meta_offset: usize,
-    /// Lowest offset an inode may occupy, see `rafsv6_inode_area_start`.
-    inode_area_start: usize,
     root_ino: Inode,
     chunk_size: u32,
-    chunk_map: Mutex<Option<HashMap<RafsV6InodeChunkAddr, usize>>>,
     attr_timeout: Duration,
     entry_timeout: Duration,
 }
@@ -121,15 +126,10 @@ impl DirectSuperBlockV6 {
         let state = DirectMappingState::new(meta);
         let block_size = state.block_size();
         let meta_offset = meta.meta_blkaddr as usize * block_size as usize;
-        let device_table_end = meta.blob_device_table_offset
-            + meta.blob_device_table_count as u64 * size_of::<RafsV6Device>() as u64;
         let info = DirectCachedInfo {
             meta_offset,
-            inode_area_start: rafsv6_inode_area_start(meta_offset as u64, device_table_end)
-                as usize,
             root_ino: meta.root_nid as Inode,
             chunk_size: meta.chunk_size,
-            chunk_map: Mutex::new(None),
             attr_timeout: meta.attr_timeout,
             entry_timeout: meta.entry_timeout,
         };
@@ -145,12 +145,29 @@ impl DirectSuperBlockV6 {
         state: &Guard<Arc<DirectMappingState>>,
         offset: usize,
     ) -> RafsResult<&dyn RafsV6OndiskInode> {
+        let inside = |size: usize| {
+            offset >= state.inode_area.start
+                && offset
+                    .checked_add(size)
+                    .is_some_and(|end| end <= state.inode_area.end)
+        };
+        let invalid = || {
+            RafsError::InvalidMetadata(format!(
+                "v6: inode at 0x{offset:x} lies outside the inode area 0x{:x}..0x{:x}",
+                state.inode_area.start, state.inode_area.end
+            ))
+        };
+        if !inside(size_of::<RafsV6InodeCompact>()) {
+            return Err(invalid());
+        }
         let i: &RafsV6InodeCompact = state.map.get_ref(offset)?;
         if i.format() & EROFS_I_VERSION_BITS == 0 {
             Ok(i)
-        } else {
+        } else if inside(size_of::<RafsV6InodeExtended>()) {
             let i = state.map.get_ref::<RafsV6InodeExtended>(offset)?;
             Ok(i)
+        } else {
+            Err(invalid())
         }
     }
 
@@ -169,7 +186,6 @@ impl DirectSuperBlockV6 {
             .info
             .meta_offset
             .checked_add(nid as usize * EROFS_INODE_SLOT_SIZE)
-            .filter(|offset| *offset >= self.info.inode_area_start)
         {
             OndiskInodeWrapper::new(state, self.clone(), offset)
         } else {
@@ -197,29 +213,22 @@ impl DirectSuperBlockV6 {
         })
     }
 
-    /// Validate the bootstrap `r` a remount swaps in and require the layout the mounted state
-    /// was built from: inodes and tables keep being read at the offsets validated at load.
+    /// Validate the bootstrap `r` a remount swaps in and require the superblocks of the mounted
+    /// one, byte for byte: the mounted state keeps the meta parsed from them, so every table
+    /// offset, size, flag and the chunk size must stay as they are. Only the records in the
+    /// tables may differ; `update_state` reloads those.
     fn check_same_layout(&self, r: &mut RafsIoReader) -> RafsResult<()> {
-        let (sb, ext, _) = load_v6_superblocks(r)?.ok_or_else(|| {
+        let new = load_v6_superblocks(r)?.ok_or_else(|| {
             RafsError::InvalidMetadata("the new bootstrap is not a RAFS v6 image".to_string())
         })?;
-        let meta = &self.state.load().meta;
-        if sb.blkszbits() != meta.blkszbits
-            || sb.meta_addr() != meta.meta_blkaddr
-            || sb.root_nid() != meta.root_nid
-            || sb.extra_devices() as u32 != meta.blob_device_table_count
-            || ext.blob_table_offset() != meta.blob_table_offset
-            || ext.blob_table_size() != meta.blob_table_size
-            || ext.chunk_table_offset() != meta.chunk_table_offset
-            || ext.chunk_table_size() != meta.chunk_table_size
-            || ext.prefetch_table()
-                != (
-                    meta.prefetch_table_offset,
-                    meta.prefetch_table_entries * size_of::<u32>() as u32,
-                )
-        {
+        let old = self.state.load();
+        let old_sb: &RafsV6SuperBlock = old.map.get_ref(EROFS_SUPER_OFFSET as usize)?;
+        let old_ext: &RafsV6SuperBlockExt = old
+            .map
+            .get_ref((EROFS_SUPER_OFFSET + EROFS_SUPER_BLOCK_SIZE) as usize)?;
+        if new.sb.as_ref() != old_sb.as_ref() || new.ext.as_ref() != old_ext.as_ref() {
             return Err(RafsError::InvalidMetadata(
-                "the new bootstrap's layout differs from the mounted RAFS v6 image".to_string(),
+                "the new bootstrap's superblocks differ from the mounted RAFS v6 image".to_string(),
             ));
         }
         Ok(())
@@ -252,11 +261,17 @@ impl DirectSuperBlockV6 {
 
         // SAFETY: nydus only reads the bootstrap, which must not change while it's mounted.
         let file_map = unsafe { FileMapState::new(file, 0, len as usize, false) }?;
+        let sb: &RafsV6SuperBlock = file_map.get_ref(EROFS_SUPER_OFFSET as usize)?;
+        let ext: &RafsV6SuperBlockExt =
+            file_map.get_ref((EROFS_SUPER_OFFSET + EROFS_SUPER_BLOCK_SIZE) as usize)?;
+        let inode_area = ext.inode_area(sb, old_state.block_size(), len);
         let state = DirectMappingState {
             meta: old_state.meta.clone(),
             blob_table,
             blob_extra_infos,
             map: file_map,
+            inode_area: inode_area.start as usize..inode_area.end as usize,
+            chunk_map: Mutex::new(None),
         };
 
         // Swap new and old DirectMappingState object,
@@ -268,9 +283,11 @@ impl DirectSuperBlockV6 {
 
     // For RafsV6, inode doesn't store detailed chunk info, only a simple RafsV6InodeChunkAddr
     // so we need to use the chunk table at the end of the bootstrap to restore the chunk info of an inode
-    fn load_chunk_map(&self) -> RafsResult<HashMap<RafsV6InodeChunkAddr, usize>> {
+    fn load_chunk_map(
+        &self,
+        state: &DirectMappingState,
+    ) -> RafsResult<HashMap<RafsV6InodeChunkAddr, usize>> {
         let mut chunk_map = HashMap::default();
-        let state = self.state.load();
         let size = state.meta.chunk_table_size as usize;
         if size == 0 {
             return Ok(chunk_map);
@@ -286,7 +303,7 @@ impl DirectSuperBlockV6 {
         }
 
         for idx in 0..(size / unit_size) {
-            let chunk = DirectChunkInfoV6::new(&state, self.clone(), idx)?;
+            let chunk = DirectChunkInfoV6::new(state, self.clone(), idx)?;
             // The chunk address packs these into 8 and 24 bits; its setters assert the ranges.
             if chunk.blob_index() >= u8::MAX as u32 || chunk.id() > 0x00ff_ffff {
                 return Err(RafsError::InvalidMetadata(format!(
@@ -1470,9 +1487,9 @@ impl RafsInodeExt for OndiskInodeWrapper {
             let chunk_info = TarfsChunkInfoV6::from_chunk_addr(chunk_addr, size)?;
             Ok(Arc::new(chunk_info))
         } else {
-            let mut chunk_map = self.mapping.info.chunk_map.lock().unwrap();
+            let mut chunk_map = state.chunk_map.lock().unwrap();
             if chunk_map.is_none() {
-                *chunk_map = Some(self.mapping.load_chunk_map()?);
+                *chunk_map = Some(self.mapping.load_chunk_map(&state)?);
             }
             match chunk_map.as_ref().unwrap().get(chunk_addr) {
                 None => Err(RafsError::NotFound(format!(
@@ -1794,47 +1811,129 @@ mod tests {
         assert_eq!(info.crc32(), 0);
     }
 
+    fn v6_fixture_path() -> std::path::PathBuf {
+        let root_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap();
+        std::path::PathBuf::from(root_dir).join("../tests/texture/bootstrap/rafs-v6-2.2.boot")
+    }
+
+    fn open_bootstrap(path: &std::path::Path) -> RafsIoReader {
+        Box::new(std::fs::File::open(path).unwrap()) as RafsIoReader
+    }
+
+    /// `(ino, chunk index, compressed offset, uncompressed offset)` of every chunk of every
+    /// regular file, looked up through the chunk table.
+    fn all_chunks(rs: &crate::metadata::RafsSuper) -> Vec<(u64, u32, u64, u64)> {
+        let mut out = Vec::new();
+        let mut dirs = vec![rs.get_inode(rs.superblock.root_ino(), false).unwrap()];
+        while let Some(dir) = dirs.pop() {
+            for idx in 0..dir.get_child_count() {
+                let child = dir.get_child_by_index(idx).unwrap();
+                if child.is_dir() {
+                    dirs.push(rs.get_inode(child.ino(), false).unwrap());
+                } else if child.is_reg() {
+                    for c in 0..child.get_chunk_count() {
+                        let chunk = child.get_chunk_info(c).unwrap();
+                        out.push((
+                            child.ino(),
+                            c,
+                            chunk.compressed_offset(),
+                            chunk.uncompressed_offset(),
+                        ));
+                    }
+                }
+            }
+        }
+        out
+    }
+
     /// A remount swaps in a newly opened bootstrap under the validated layout of the mounted
     /// one, so the new bootstrap is validated again and must keep that layout.
     #[test]
     #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
     fn test_update_revalidates_the_new_bootstrap() {
+        use crate::BufWriter;
+        use crate::RafsIoWrite;
+        use crate::metadata::RafsStore;
         use crate::metadata::layout::v6::{EROFS_SUPER_BLOCK_SIZE, EROFS_SUPER_OFFSET};
-        use std::io::{Seek, SeekFrom, Write};
+        use std::io::Write;
 
-        let root_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap();
-        let fixture =
-            std::path::PathBuf::from(root_dir).join("../tests/texture/bootstrap/rafs-v6-2.2.boot");
+        let fixture = v6_fixture_path();
         let (rs, _) = crate::metadata::RafsSuper::load_from_file(
             &fixture,
             Arc::new(nydus_api::ConfigV2::default()),
             false,
         )
         .unwrap();
-        let open =
-            |path: &std::path::Path| Box::new(std::fs::File::open(path).unwrap()) as RafsIoReader;
-        rs.update(&mut open(&fixture)).unwrap();
+        rs.update(&mut open_bootstrap(&fixture)).unwrap();
 
         let data = std::fs::read(&fixture).unwrap();
         let dir = vmm_sys_util::tempdir::TempDir::new().unwrap();
         // Shorter: the tables and inodes past the cut are gone.
         let short = dir.as_path().join("short");
         std::fs::write(&short, &data[..data.len() - EROFS_BLOCK_SIZE_4096 as usize]).unwrap();
-        assert!(rs.update(&mut open(&short)).is_err());
-        // Laid out differently: the blob table moves one block further.
-        let moved = dir.as_path().join("moved");
-        std::fs::write(&moved, &data).unwrap();
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .open(&moved)
-            .unwrap();
-        let ext_offset = (EROFS_SUPER_OFFSET + EROFS_SUPER_BLOCK_SIZE) as u64 + 8;
-        let blob_table_offset = rs.meta.blob_table_offset + EROFS_BLOCK_SIZE_4096;
-        file.seek(SeekFrom::Start(ext_offset)).unwrap();
-        file.write_all(&blob_table_offset.to_le_bytes()).unwrap();
-        drop(file);
-        assert!(rs.update(&mut open(&moved)).is_err());
-        rs.update(&mut open(&fixture)).unwrap();
+        assert!(rs.update(&mut open_bootstrap(&short)).is_err());
+        // Extended superblocks differing from the mounted one: a moved blob table fails
+        // validation, a doubled chunk size passes it but would change every chunk index.
+        let edit_ext = |name: &str, edit: &dyn Fn(&mut RafsV6SuperBlockExt)| {
+            let path = dir.as_path().join(name);
+            std::fs::write(&path, &data).unwrap();
+            let mut ext = RafsV6SuperBlockExt::new();
+            ext.load(&mut open_bootstrap(&path)).unwrap();
+            edit(&mut ext);
+            let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+            let mut writer = BufWriter::new(file);
+            writer
+                .seek_offset((EROFS_SUPER_OFFSET + EROFS_SUPER_BLOCK_SIZE) as u64)
+                .unwrap();
+            ext.store(&mut writer).unwrap();
+            writer.flush().unwrap();
+            path
+        };
+        let moved = edit_ext("moved", &|ext| {
+            ext.set_blob_table_offset(ext.blob_table_offset() + EROFS_BLOCK_SIZE_4096)
+        });
+        assert!(rs.update(&mut open_bootstrap(&moved)).is_err());
+        let chunk_size = edit_ext("chunk-size", &|ext| {
+            ext.set_chunk_size(ext.chunk_size() * 2)
+        });
+        let mut reader = open_bootstrap(&chunk_size);
+        assert!(
+            crate::metadata::md_v6::load_v6_superblocks(&mut reader)
+                .unwrap()
+                .is_some()
+        );
+        assert!(rs.update(&mut open_bootstrap(&chunk_size)).is_err());
+        rs.update(&mut open_bootstrap(&fixture)).unwrap();
+    }
+
+    /// A remount to a bootstrap with the same superblocks but reordered chunk records serves
+    /// the new records: the chunk lookup cache belongs to the mapped bootstrap.
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
+    fn test_update_rebuilds_the_chunk_lookup() {
+        let fixture = v6_fixture_path();
+        let (rs, _) = crate::metadata::RafsSuper::load_from_file(
+            &fixture,
+            Arc::new(nydus_api::ConfigV2::default()),
+            false,
+        )
+        .unwrap();
+        // Fills the chunk lookup cache of the mounted bootstrap.
+        let before = all_chunks(&rs);
+        assert!(!before.is_empty());
+
+        let mut data = std::fs::read(&fixture).unwrap();
+        let table = rs.meta.chunk_table_offset as usize;
+        let unit = size_of::<RafsV5ChunkInfo>();
+        assert!(rs.meta.chunk_table_size as usize >= 2 * unit);
+        let (first, second) = data[table..table + 2 * unit].split_at_mut(unit);
+        first.swap_with_slice(second);
+        let dir = vmm_sys_util::tempdir::TempDir::new().unwrap();
+        let swapped = dir.as_path().join("swapped");
+        std::fs::write(&swapped, &data).unwrap();
+
+        rs.update(&mut open_bootstrap(&swapped)).unwrap();
+        assert_eq!(all_chunks(&rs), before);
     }
 
     #[test]
