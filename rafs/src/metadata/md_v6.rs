@@ -308,6 +308,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support readahead")]
     fn test_v6_load_ignores_legacy_prefetch_table_at_offset_0() {
         use crate::metadata::layout::v6::test_util::{test_ext_sb, test_sb};
 
