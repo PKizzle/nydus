@@ -278,7 +278,7 @@ mod tests {
 
     use nydus_rafs::metadata::RafsVersion;
     use nydus_rafs::metadata::layout::v6::EROFS_BLOCK_SIZE_4096;
-    use vmm_sys_util::tempdir::TempDir;
+    use tempfile::TempDir;
 
     use super::*;
     use crate::{Bootstrap, BootstrapContext};
@@ -289,23 +289,23 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
+    #[cfg_attr(miri, ignore = "Miri does not support xattrs")]
     fn test_v5_hardlinked_symlink_is_not_coalesced() {
         let source = TempDir::new().unwrap();
-        let nested = source.as_path().join("b");
+        let nested = source.path().join("b");
         fs::create_dir(&nested).unwrap();
 
-        let symlink_path = source.as_path().join("a");
+        let symlink_path = source.path().join("a");
         symlink("target", &symlink_path).unwrap();
         fs::hard_link(&symlink_path, nested.join("a")).unwrap();
 
-        let regular_path = source.as_path().join("c");
+        let regular_path = source.path().join("c");
         fs::write(&regular_path, b"data").unwrap();
         fs::hard_link(&regular_path, nested.join("c")).unwrap();
 
         let mut ctx = BuildContext {
             fs_version: RafsVersion::V5,
-            source_path: source.as_path().to_path_buf(),
+            source_path: source.path().to_path_buf(),
             ..Default::default()
         };
         let (tree, _) = DirectoryBuilder::new().build_tree(&mut ctx, 0).unwrap();
@@ -331,7 +331,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
+    #[cfg_attr(miri, ignore = "Miri does not support xattrs")]
     fn test_v6_directory_build_preserves_mtime() {
         use std::time::{Duration, UNIX_EPOCH};
 
@@ -350,7 +350,7 @@ mod tests {
             ("only-nsecs", UNIX_EPOCH + Duration::new(0, 1)),
         ];
         for (name, mtime) in cases {
-            let file = fs::File::create(source.as_path().join(name)).unwrap();
+            let file = fs::File::create(source.path().join(name)).unwrap();
             file.set_modified(mtime).unwrap();
         }
 
@@ -358,7 +358,7 @@ mod tests {
         let mut ctx = BuildContext {
             fs_version: RafsVersion::V6,
             conversion_type: ConversionType::DirectoryToRafs,
-            source_path: source.as_path().to_path_buf(),
+            source_path: source.path().to_path_buf(),
             ..Default::default()
         };
         let mut bootstrap_mgr = BootstrapManager::new(
@@ -408,7 +408,7 @@ mod tests {
     /// The kernel locates chunk data only through `blkaddr * block_size` and the device table,
     /// so every chunk must start on a block boundary and each device must cover its whole blob.
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
+    #[cfg_attr(miri, ignore = "Miri does not support xattrs")]
     fn test_v6_chunk_layout_follows_block_size() {
         use nydus_rafs::RafsIoRead;
         use nydus_rafs::metadata::RafsSuper;
@@ -417,9 +417,9 @@ mod tests {
         use crate::{ArtifactStorage, BlobManager, BootstrapManager, Builder, ConversionType};
 
         let source = TempDir::new().unwrap();
-        fs::write(source.as_path().join("a-small"), vec![0x5au8; 5000]).unwrap();
+        fs::write(source.path().join("a-small"), vec![0x5au8; 5000]).unwrap();
         let big: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
-        fs::write(source.as_path().join("b-big"), big).unwrap();
+        fs::write(source.path().join("b-big"), big).unwrap();
 
         for block_size in [4096u64, 16384, 65536] {
             let blob_dir = TempDir::new().unwrap();
@@ -427,10 +427,10 @@ mod tests {
             let mut ctx = BuildContext {
                 fs_version: RafsVersion::V6,
                 conversion_type: ConversionType::DirectoryToRafs,
-                source_path: source.as_path().to_path_buf(),
+                source_path: source.path().to_path_buf(),
                 aligned_chunk: true,
                 blob_storage: Some(ArtifactStorage::FileDir((
-                    blob_dir.as_path().to_path_buf(),
+                    blob_dir.path().to_path_buf(),
                     String::new(),
                 ))),
                 ..Default::default()
@@ -488,7 +488,7 @@ mod tests {
     /// A dirent's `e_nameoff` is relative to its directory block, so with 16 K and 64 K blocks a
     /// name can start well past 4096 and every name must still be found.
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
+    #[cfg_attr(miri, ignore = "Miri does not support xattrs")]
     fn test_v6_large_directory_at_every_block_size() {
         use nydus_rafs::metadata::RafsSuper;
 
@@ -498,7 +498,7 @@ mod tests {
         // 1400 entries of 12 + 40 bytes span several blocks at every block size, 64 KiB too.
         let names: Vec<String> = (0..1400).map(|i| format!("{i:0>40}")).collect();
         for name in &names {
-            fs::File::create(source.as_path().join(name)).unwrap();
+            fs::File::create(source.path().join(name)).unwrap();
         }
 
         for block_size in [4096u64, 16384, 65536] {
@@ -506,7 +506,7 @@ mod tests {
             let mut ctx = BuildContext {
                 fs_version: RafsVersion::V6,
                 conversion_type: ConversionType::DirectoryToRafs,
-                source_path: source.as_path().to_path_buf(),
+                source_path: source.path().to_path_buf(),
                 ..Default::default()
             };
             ctx.set_blob_block_size(block_size);

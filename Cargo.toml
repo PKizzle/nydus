@@ -107,6 +107,7 @@ time = { version = "0.3.53", features = ["formatting"] }
 [dev-dependencies]
 xattr = "1.6.1"
 vmm-sys-util = { workspace = true }
+tempfile = "3"
 
 [features]
 default = [

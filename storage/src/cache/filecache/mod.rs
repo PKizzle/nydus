@@ -463,15 +463,14 @@ impl FileCacheEntry {
 #[cfg(test)]
 pub mod blob_cache_tests {
     use nydus_api::FileCacheConfig;
-    use vmm_sys_util::tempdir::TempDir;
+    use tempfile::TempDir;
     use vmm_sys_util::tempfile::TempFile;
 
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
     fn test_blob_cache_config() {
         // new blob cache
         let tmp_dir = TempDir::new().unwrap();
-        let dir = tmp_dir.as_path().to_path_buf();
+        let dir = tmp_dir.path().to_path_buf();
         let s = format!(
             r###"
         {{
@@ -942,19 +941,19 @@ mod tests {
     /// So this invariant is the whole of what stops a running filesystem having its backend
     /// shut down underneath it, and it lives here rather than in the factory.
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
+    #[cfg_attr(miri, ignore = "Miri does not support file-backed mmap")]
     fn gc_keeps_the_manager_while_a_blob_cache_is_live() {
         use crate::device::BlobFeatures;
         use crate::test::MockBackend;
         use nydus_api::CacheConfigV2;
         use nydus_utils::metrics::BackendMetrics;
-        use vmm_sys_util::tempdir::TempDir;
+        use tempfile::TempDir;
 
         let tmp_dir = TempDir::new().unwrap();
         let config = CacheConfigV2 {
             cache_type: "filecache".to_string(),
             file_cache: Some(nydus_api::FileCacheConfig {
-                work_dir: tmp_dir.as_path().to_str().unwrap().to_owned(),
+                work_dir: tmp_dir.path().to_str().unwrap().to_owned(),
                 ..Default::default()
             }),
             ..Default::default()
@@ -993,13 +992,13 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
+    #[cfg_attr(miri, ignore = "Miri does not support file-backed mmap")]
     fn test_stale_chunk_map_is_dropped_with_its_data_file() {
         use crate::cache::state::IndexedChunkMap;
         use crate::test::MockChunkInfo;
 
-        let dir = vmm_sys_util::tempdir::TempDir::new().unwrap();
-        let blob = dir.as_path().join("blob").display().to_string();
+        let dir = tempfile::TempDir::new().unwrap();
+        let blob = dir.path().join("blob").display().to_string();
         let data = format!("{blob}{BLOB_DATA_FILE_SUFFIX}");
         let chunk = MockChunkInfo {
             index: 1,

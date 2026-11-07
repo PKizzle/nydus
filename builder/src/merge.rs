@@ -641,24 +641,24 @@ mod tests {
     /// Chunks of a 16 KiB layer start on 16 KiB boundaries, so the merged bootstrap must keep that
     /// block size: storage holds each blob's padding to the filesystem's block size.
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
+    #[cfg_attr(miri, ignore = "Miri does not support xattrs")]
     fn test_merger_merge_keeps_source_block_size() {
         use crate::{BlobManager, BootstrapManager, Builder, ConversionType, DirectoryBuilder};
-        use vmm_sys_util::tempdir::TempDir;
+        use tempfile::TempDir;
 
         let source = TempDir::new().unwrap();
-        std::fs::write(source.as_path().join("a"), vec![1u8; 5000]).unwrap();
-        std::fs::write(source.as_path().join("b"), vec![2u8; 20000]).unwrap();
+        std::fs::write(source.path().join("a"), vec![1u8; 5000]).unwrap();
+        std::fs::write(source.path().join("b"), vec![2u8; 20000]).unwrap();
         let blob_dir = TempDir::new().unwrap();
         // Without `--original-blob-ids`, merge names the layer's blob after its bootstrap file.
-        let layer = blob_dir.as_path().join("ab".repeat(32));
+        let layer = blob_dir.path().join("ab".repeat(32));
         let mut ctx = BuildContext {
             fs_version: RafsVersion::V6,
             conversion_type: ConversionType::DirectoryToRafs,
-            source_path: source.as_path().to_path_buf(),
+            source_path: source.path().to_path_buf(),
             aligned_chunk: true,
             blob_storage: Some(ArtifactStorage::FileDir((
-                blob_dir.as_path().to_path_buf(),
+                blob_dir.path().to_path_buf(),
                 String::new(),
             ))),
             ..Default::default()
@@ -696,11 +696,11 @@ mod tests {
     /// Build one RAFS v6 layer bootstrap from `files` (path, content) and return its path.
     fn build_v6_layer(files: &[(&str, &[u8])], out: &std::path::Path) -> PathBuf {
         use crate::{BlobManager, BootstrapManager, Builder, ConversionType, DirectoryBuilder};
-        use vmm_sys_util::tempdir::TempDir;
+        use tempfile::TempDir;
 
         let source = TempDir::new().unwrap();
         for (path, content) in files {
-            let p = source.as_path().join(path);
+            let p = source.path().join(path);
             std::fs::create_dir_all(p.parent().unwrap()).unwrap();
             std::fs::write(p, content).unwrap();
         }
@@ -708,7 +708,7 @@ mod tests {
         let mut ctx = BuildContext {
             fs_version: RafsVersion::V6,
             conversion_type: ConversionType::DirectoryToRafs,
-            source_path: source.as_path().to_path_buf(),
+            source_path: source.path().to_path_buf(),
             aligned_chunk: true,
             blob_storage: Some(ArtifactStorage::FileDir((out.to_path_buf(), String::new()))),
             ..Default::default()
@@ -741,9 +741,9 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
+    #[cfg_attr(miri, ignore = "Miri does not support xattrs")]
     fn test_inode_share_fingerprint_identifies_content() {
-        use vmm_sys_util::tempdir::TempDir;
+        use tempfile::TempDir;
 
         let lib: Vec<u8> = (0..20000u32).map(|i| (i * 7 % 251) as u8).collect();
         let mut patched = lib.clone();
@@ -756,11 +756,11 @@ mod tests {
                 ("a", b"only in a"),
                 ("empty", b""),
             ],
-            dir_a.as_path(),
+            dir_a.path(),
         );
         let b = build_v6_layer(
             &[("opt/libx.so", &lib), ("patched.so", &patched)],
-            dir_b.as_path(),
+            dir_b.path(),
         );
 
         let fp = inode_share_fingerprint(&a, "/usr/lib/libx.so").expect("fingerprint");
@@ -776,14 +776,14 @@ mod tests {
 
     /// A file whose chunks do not cover it gets no fingerprint, and the build goes on.
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
+    #[cfg_attr(miri, ignore = "Miri does not support xattrs")]
     fn test_inode_share_fingerprint_skips_a_file_it_cannot_identify() {
         use crate::core::chunk_dict::HashChunkDict;
         use nydus_rafs::metadata::layout::v6::RAFSV6_ISHARE_XATTR_NAME;
-        use vmm_sys_util::tempdir::TempDir;
+        use tempfile::TempDir;
 
         let dir = TempDir::new().unwrap();
-        let layer = build_v6_layer(&[("f", &[3u8; 9000])], dir.as_path());
+        let layer = build_v6_layer(&[("f", &[3u8; 9000])], dir.path());
         let (rs, _) =
             RafsSuper::load_from_file(&layer, Arc::new(ConfigV2::new("cfg")), false).unwrap();
         let tree =
@@ -805,14 +805,14 @@ mod tests {
     /// The merged bootstrap declares the fingerprint prefix for the kernel, and RAFS readers skip
     /// the hidden xattr, so the result is still a valid merge source.
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
+    #[cfg_attr(miri, ignore = "Miri does not support xattrs")]
     fn test_merge_writes_inode_share_fingerprints() {
         use nydus_rafs::metadata::layout::v6::{EROFS_SUPER_OFFSET, RafsV6SuperBlock};
         use std::os::unix::fs::FileExt;
-        use vmm_sys_util::tempdir::TempDir;
+        use tempfile::TempDir;
 
         let dir = TempDir::new().unwrap();
-        let layer = build_v6_layer(&[("f", &[3u8; 9000]), ("g", b"g")], dir.as_path());
+        let layer = build_v6_layer(&[("f", &[3u8; 9000]), ("g", b"g")], dir.path());
         let merge = |source: PathBuf, fingerprint: bool| {
             let mut ctx = BuildContext {
                 inode_share_fingerprint: fingerprint,

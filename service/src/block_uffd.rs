@@ -1602,7 +1602,7 @@ mod tests {
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     use std::path::PathBuf;
     use std::time::Duration;
-    use vmm_sys_util::tempdir::TempDir;
+    use tempfile::TempDir;
 
     #[test]
     #[cfg_attr(miri, ignore = "Miri does not support io_uring")]
@@ -1776,11 +1776,11 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
+    #[cfg_attr(miri, ignore = "Miri does not support copy_file_range")]
     fn test_uffd_daemon_lifecycle() {
         let tmpdir = TempDir::new().unwrap();
-        let device = create_block_device(tmpdir.as_path().to_path_buf()).unwrap();
-        let sock_path = format!("{}/test_daemon.sock", tmpdir.as_path().display());
+        let device = create_block_device(tmpdir.path().to_path_buf()).unwrap();
+        let sock_path = format!("{}/test_daemon.sock", tmpdir.path().display());
         let service = Arc::new(UffdService::new(device, sock_path.clone()).unwrap());
 
         let (trigger, events_rx) = std::sync::mpsc::channel::<DaemonStateMachineInput>();
@@ -1839,8 +1839,8 @@ mod tests {
 
         // Also test create_uffd_daemon convenience function
         let tmpdir2 = TempDir::new().unwrap();
-        let entry = create_test_blob_entry(tmpdir2.as_path().to_path_buf());
-        let sock_path2 = format!("{}/test_daemon2.sock", tmpdir2.as_path().display());
+        let entry = create_test_blob_entry(tmpdir2.path().to_path_buf());
+        let sock_path2 = format!("{}/test_daemon2.sock", tmpdir2.path().display());
         let poll2 = mio::Poll::new().unwrap();
         let waker2 = Arc::new(Waker::new(poll2.registry(), mio::Token(0)).unwrap());
 
@@ -1868,11 +1868,11 @@ mod tests {
     // --- UffdService basic tests ---
 
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
+    #[cfg_attr(miri, ignore = "Miri does not support copy_file_range")]
     fn test_uffd_service_stop_flag() {
         let tmpdir = TempDir::new().unwrap();
-        let device = create_block_device(tmpdir.as_path().to_path_buf()).unwrap();
-        let sock_path = format!("{}/test.sock", tmpdir.as_path().display());
+        let device = create_block_device(tmpdir.path().to_path_buf()).unwrap();
+        let sock_path = format!("{}/test.sock", tmpdir.path().display());
         let service = UffdService::new(device, sock_path).unwrap();
 
         assert!(service.active.load(Ordering::Acquire));
@@ -1892,11 +1892,11 @@ mod tests {
     // on: a new receiver is *Empty* (pending), not *Closed*, and a stop signal
     // still reaches it.
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
+    #[cfg_attr(miri, ignore = "Miri does not support copy_file_range")]
     fn test_uffd_service_shutdown_channel_stays_open() {
         let tmpdir = TempDir::new().unwrap();
-        let device = create_block_device(tmpdir.as_path().to_path_buf()).unwrap();
-        let sock_path = format!("{}/test.sock", tmpdir.as_path().display());
+        let device = create_block_device(tmpdir.path().to_path_buf()).unwrap();
+        let sock_path = format!("{}/test.sock", tmpdir.path().display());
         let service = UffdService::new(device, sock_path).unwrap();
 
         let mut rx = service.sender.new_receiver();
@@ -1917,11 +1917,11 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
+    #[cfg_attr(miri, ignore = "Miri does not support copy_file_range")]
     fn test_uffd_service_save_restore() {
         let tmpdir = TempDir::new().unwrap();
-        let device = create_block_device(tmpdir.as_path().to_path_buf()).unwrap();
-        let sock_path = format!("{}/test.sock", tmpdir.as_path().display());
+        let device = create_block_device(tmpdir.path().to_path_buf()).unwrap();
+        let sock_path = format!("{}/test.sock", tmpdir.path().display());
         let service = UffdService::new(device, sock_path).unwrap();
 
         // save and restore are no-ops for stateless service
@@ -1930,11 +1930,11 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
+    #[cfg_attr(miri, ignore = "Miri does not support copy_file_range")]
     fn test_uffd_service_get_blob_cache_mgr() {
         let tmpdir = TempDir::new().unwrap();
-        let device = create_block_device(tmpdir.as_path().to_path_buf()).unwrap();
-        let sock_path = format!("{}/test.sock", tmpdir.as_path().display());
+        let device = create_block_device(tmpdir.path().to_path_buf()).unwrap();
+        let sock_path = format!("{}/test.sock", tmpdir.path().display());
         let service = UffdService::new(device, sock_path).unwrap();
 
         assert!(service.get_blob_cache_mgr().is_some());
@@ -2098,7 +2098,7 @@ mod tests {
     fn test_do_prefault() {
         compio::runtime::Runtime::new().unwrap().block_on(async {
             let tmpdir = TempDir::new().unwrap();
-            let device = create_block_device(tmpdir.as_path().to_path_buf()).unwrap();
+            let device = create_block_device(tmpdir.path().to_path_buf()).unwrap();
             let (sock1, sock2) = std::os::unix::net::UnixStream::pair().unwrap();
             sock2.set_nonblocking(true).unwrap();
 
@@ -2185,7 +2185,7 @@ mod tests {
             let sock_async = AsyncSock::new(sock1).unwrap();
 
             let tmpdir = TempDir::new().unwrap();
-            let device = create_block_device(tmpdir.as_path().to_path_buf()).unwrap();
+            let device = create_block_device(tmpdir.path().to_path_buf()).unwrap();
             let core = UffdCore::new(device);
             let mut conn_state: Option<ConnState> = None;
 
@@ -2215,7 +2215,7 @@ mod tests {
             let sock_async = AsyncSock::new(sock1).unwrap();
 
             let tmpdir = TempDir::new().unwrap();
-            let device = create_block_device(tmpdir.as_path().to_path_buf()).unwrap();
+            let device = create_block_device(tmpdir.path().to_path_buf()).unwrap();
             let core = UffdCore::new(device);
             let mut conn_state: Option<ConnState> = None;
 
@@ -2244,7 +2244,7 @@ mod tests {
             let sock_async = AsyncSock::new(sock1).unwrap();
 
             let tmpdir = TempDir::new().unwrap();
-            let device = create_block_device(tmpdir.as_path().to_path_buf()).unwrap();
+            let device = create_block_device(tmpdir.path().to_path_buf()).unwrap();
             let core = UffdCore::new(device);
 
             // Pre-set conn_state to simulate already handshaked
@@ -2323,7 +2323,7 @@ mod tests {
     fn test_handle_handshake_with_uffd_fd() {
         compio::runtime::Runtime::new().unwrap().block_on(async {
             let tmpdir = TempDir::new().unwrap();
-            let device = create_block_device(tmpdir.as_path().to_path_buf()).unwrap();
+            let device = create_block_device(tmpdir.path().to_path_buf()).unwrap();
             let core = UffdCore::new(device);
 
             let (sock1, _sock2) = std::os::unix::net::UnixStream::pair().unwrap();
@@ -2353,7 +2353,7 @@ mod tests {
     fn test_handle_handshake_no_uffd_fd() {
         compio::runtime::Runtime::new().unwrap().block_on(async {
             let tmpdir = TempDir::new().unwrap();
-            let device = create_block_device(tmpdir.as_path().to_path_buf()).unwrap();
+            let device = create_block_device(tmpdir.path().to_path_buf()).unwrap();
             let core = UffdCore::new(device);
 
             let (sock1, _sock2) = std::os::unix::net::UnixStream::pair().unwrap();
@@ -2379,7 +2379,7 @@ mod tests {
     fn test_handle_handshake_copy_policy() {
         compio::runtime::Runtime::new().unwrap().block_on(async {
             let tmpdir = TempDir::new().unwrap();
-            let device = create_block_device(tmpdir.as_path().to_path_buf()).unwrap();
+            let device = create_block_device(tmpdir.path().to_path_buf()).unwrap();
             let core = UffdCore::new(device);
 
             let (sock1, _sock2) = std::os::unix::net::UnixStream::pair().unwrap();
@@ -2408,7 +2408,7 @@ mod tests {
     fn test_handle_handshake_rejects_invalid_vma() {
         compio::runtime::Runtime::new().unwrap().block_on(async {
             let tmpdir = TempDir::new().unwrap();
-            let device = create_block_device(tmpdir.as_path().to_path_buf()).unwrap();
+            let device = create_block_device(tmpdir.path().to_path_buf()).unwrap();
             let core = UffdCore::new(device);
 
             let (sock1, _sock2) = std::os::unix::net::UnixStream::pair().unwrap();
@@ -2450,7 +2450,7 @@ mod tests {
             let sock_async = AsyncSock::new(sock1).unwrap();
 
             let tmpdir = TempDir::new().unwrap();
-            let device = create_block_device(tmpdir.as_path().to_path_buf()).unwrap();
+            let device = create_block_device(tmpdir.path().to_path_buf()).unwrap();
             let core = UffdCore::new(device);
             let mut conn_state: Option<ConnState> = None;
 
@@ -2498,11 +2498,11 @@ mod tests {
     // --- UffdService create_worker test ---
 
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
+    #[cfg_attr(miri, ignore = "Miri does not support copy_file_range")]
     fn test_uffd_service_create_worker() {
         let tmpdir = TempDir::new().unwrap();
-        let device = create_block_device(tmpdir.as_path().to_path_buf()).unwrap();
-        let sock_path = format!("{}/test_worker.sock", tmpdir.as_path().display());
+        let device = create_block_device(tmpdir.path().to_path_buf()).unwrap();
+        let sock_path = format!("{}/test_worker.sock", tmpdir.path().display());
         let service = UffdService::new(device, sock_path).unwrap();
         let service = Arc::new(service);
 
@@ -2518,11 +2518,11 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
+    #[cfg_attr(miri, ignore = "Miri does not support copy_file_range")]
     fn test_uffd_service_run_without_workers_fails() {
         let tmpdir = TempDir::new().unwrap();
-        let device = create_block_device(tmpdir.as_path().to_path_buf()).unwrap();
-        let sock_path = format!("{}/test_no_workers.sock", tmpdir.as_path().display());
+        let device = create_block_device(tmpdir.path().to_path_buf()).unwrap();
+        let sock_path = format!("{}/test_no_workers.sock", tmpdir.path().display());
         let service = UffdService::new(device, sock_path).unwrap();
 
         let result = service.run();
@@ -2558,11 +2558,11 @@ mod tests {
     // --- stop() shutdown socket test ---
 
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
+    #[cfg_attr(miri, ignore = "Miri does not support copy_file_range")]
     fn test_service_stop_shutdown_sockets() {
         let tmpdir = TempDir::new().unwrap();
-        let device = create_block_device(tmpdir.as_path().to_path_buf()).unwrap();
-        let sock_path = format!("{}/test_stop.sock", tmpdir.as_path().display());
+        let device = create_block_device(tmpdir.path().to_path_buf()).unwrap();
+        let sock_path = format!("{}/test_stop.sock", tmpdir.path().display());
 
         let service = Arc::new(UffdService::new(device, sock_path.clone()).unwrap());
 
@@ -2617,7 +2617,7 @@ mod tests {
     fn test_handle_conn_graceful_shutdown() {
         compio::runtime::Runtime::new().unwrap().block_on(async {
             let tmpdir = TempDir::new().unwrap();
-            let device = create_block_device(tmpdir.as_path().to_path_buf()).unwrap();
+            let device = create_block_device(tmpdir.path().to_path_buf()).unwrap();
 
             let (client_sock, server_sock) = std::os::unix::net::UnixStream::pair().unwrap();
             client_sock.set_nonblocking(true).unwrap();
@@ -2690,7 +2690,7 @@ mod tests {
     fn test_handle_uffd_event_no_event() {
         compio::runtime::Runtime::new().unwrap().block_on(async {
             let tmpdir = TempDir::new().unwrap();
-            let device = create_block_device(tmpdir.as_path().to_path_buf()).unwrap();
+            let device = create_block_device(tmpdir.path().to_path_buf()).unwrap();
             let core = UffdCore::new(device);
 
             // Create sockets for communication
@@ -2798,10 +2798,10 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
+    #[cfg_attr(miri, ignore = "Miri does not support copy_file_range")]
     fn test_uffd_core_new_and_device() {
         let tmpdir = TempDir::new().unwrap();
-        let device = create_block_device(tmpdir.as_path().to_path_buf()).unwrap();
+        let device = create_block_device(tmpdir.path().to_path_buf()).unwrap();
         let device_size = device.blocks_to_size(device.blocks());
         let block_size = device.block_size();
 
@@ -2812,10 +2812,10 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
+    #[cfg_attr(miri, ignore = "Miri does not support copy_file_range")]
     fn test_handle_page_fault_not_pagefault_event() {
         let tmpdir = TempDir::new().unwrap();
-        let device = create_block_device(tmpdir.as_path().to_path_buf()).unwrap();
+        let device = create_block_device(tmpdir.path().to_path_buf()).unwrap();
         let core = UffdCore::new(device);
         let vma_regions = vec![VmaRegion::new(0x1000, 0x2000, 0, 4096)];
 
@@ -2840,12 +2840,12 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
+    #[cfg_attr(miri, ignore = "Miri does not support copy_file_range")]
     fn test_handle_page_fault_vma_invalidating_event_errors() {
         // REMAP/REMOVE/UNMAP invalidate the cached VMA layout; the handler must surface an error
         // so the connection tears down rather than resolving faults against stale addresses.
         let tmpdir = TempDir::new().unwrap();
-        let device = create_block_device(tmpdir.as_path().to_path_buf()).unwrap();
+        let device = create_block_device(tmpdir.path().to_path_buf()).unwrap();
         let core = UffdCore::new(device);
         let vma_regions = vec![VmaRegion::new(0x1000, 0x2000, 0, 4096)];
 
@@ -2873,7 +2873,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
+    #[cfg_attr(miri, ignore = "Miri does not support copy_file_range")]
     fn test_handle_page_fault_fork_closes_child_fd() {
         // A FORK event carries a brand-new child uffd fd in the first u64 of the union; the handler
         // must close it (returning Noop) instead of leaking it.
@@ -2888,7 +2888,7 @@ mod tests {
         // returns EPIPE iff the OTHER end was genuinely closed — independent of whether some
         // unrelated open() later reused that fd number on a different thread.
         let tmpdir = TempDir::new().unwrap();
-        let device = create_block_device(tmpdir.as_path().to_path_buf()).unwrap();
+        let device = create_block_device(tmpdir.path().to_path_buf()).unwrap();
         let core = UffdCore::new(device);
         let vma_regions = vec![VmaRegion::new(0x1000, 0x2000, 0, 4096)];
 
@@ -2938,10 +2938,10 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
+    #[cfg_attr(miri, ignore = "Miri does not support copy_file_range")]
     fn test_handle_page_fault_addr_not_in_vma() {
         let tmpdir = TempDir::new().unwrap();
-        let device = create_block_device(tmpdir.as_path().to_path_buf()).unwrap();
+        let device = create_block_device(tmpdir.path().to_path_buf()).unwrap();
         let core = UffdCore::new(device);
         let vma_regions = vec![VmaRegion::new(0x1000, 0x2000, 0, 4096)];
 
@@ -2966,10 +2966,10 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
+    #[cfg_attr(miri, ignore = "Miri does not support copy_file_range")]
     fn test_handle_page_fault_copy_mode() {
         let tmpdir = TempDir::new().unwrap();
-        let device = create_block_device(tmpdir.as_path().to_path_buf()).unwrap();
+        let device = create_block_device(tmpdir.path().to_path_buf()).unwrap();
         let device_size = device.blocks_to_size(device.blocks()) as usize;
         let core = UffdCore::new(device);
 
@@ -3011,10 +3011,10 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
+    #[cfg_attr(miri, ignore = "Miri does not support copy_file_range")]
     fn test_handle_page_fault_zerocopy_mode() {
         let tmpdir = TempDir::new().unwrap();
-        let device = create_block_device(tmpdir.as_path().to_path_buf()).unwrap();
+        let device = create_block_device(tmpdir.path().to_path_buf()).unwrap();
         let device_size = device.blocks_to_size(device.blocks()) as usize;
         let core = UffdCore::new(device);
 
@@ -3049,10 +3049,10 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
+    #[cfg_attr(miri, ignore = "Miri does not support copy_file_range")]
     fn test_resolve_copy() {
         let tmpdir = TempDir::new().unwrap();
-        let device = create_block_device(tmpdir.as_path().to_path_buf()).unwrap();
+        let device = create_block_device(tmpdir.path().to_path_buf()).unwrap();
         let device_size = device.blocks_to_size(device.blocks()) as usize;
         let core = UffdCore::new(device);
 
@@ -3077,10 +3077,10 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
+    #[cfg_attr(miri, ignore = "Miri does not support copy_file_range")]
     fn test_resolve_zerocopy_ranges() {
         let tmpdir = TempDir::new().unwrap();
-        let device = create_block_device(tmpdir.as_path().to_path_buf()).unwrap();
+        let device = create_block_device(tmpdir.path().to_path_buf()).unwrap();
         let device_size = device.blocks_to_size(device.blocks()) as usize;
         let core = UffdCore::new(device);
 
@@ -3099,10 +3099,10 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
+    #[cfg_attr(miri, ignore = "Miri does not support copy_file_range")]
     fn test_prefault_ranges() {
         let tmpdir = TempDir::new().unwrap();
-        let device = create_block_device(tmpdir.as_path().to_path_buf()).unwrap();
+        let device = create_block_device(tmpdir.path().to_path_buf()).unwrap();
         let device_size = device.blocks_to_size(device.blocks()) as usize;
         let core = UffdCore::new(device);
 
@@ -3114,10 +3114,10 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
+    #[cfg_attr(miri, ignore = "Miri does not support copy_file_range")]
     fn test_handle_page_fault_beyond_device_zerocopy() {
         let tmpdir = TempDir::new().unwrap();
-        let device = create_block_device(tmpdir.as_path().to_path_buf()).unwrap();
+        let device = create_block_device(tmpdir.path().to_path_buf()).unwrap();
         let device_size = device.blocks_to_size(device.blocks());
 
         let vma_size = device_size as usize + 0x200000;
@@ -3158,10 +3158,10 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
+    #[cfg_attr(miri, ignore = "Miri does not support copy_file_range")]
     fn test_handle_page_fault_beyond_device_copy() {
         let tmpdir = TempDir::new().unwrap();
-        let device = create_block_device(tmpdir.as_path().to_path_buf()).unwrap();
+        let device = create_block_device(tmpdir.path().to_path_buf()).unwrap();
         let device_size = device.blocks_to_size(device.blocks());
 
         let vma_size = device_size as usize + 0x200000;

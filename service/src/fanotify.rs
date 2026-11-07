@@ -2026,7 +2026,7 @@ fn fd_file_size(fd: RawFd) -> Result<u64> {
 pub(crate) mod testing {
     use super::*;
     use std::os::unix::fs::FileExt;
-    use vmm_sys_util::tempdir::TempDir;
+    use tempfile::TempDir;
 
     pub(crate) struct SocketHandler {
         pub handler: Arc<FanotifyHandler>,
@@ -2070,7 +2070,7 @@ pub(crate) mod testing {
         /// Start `threads` workers over a bootstrap without data devices.
         pub(crate) fn start(threads: usize) -> Self {
             let dir = TempDir::new().unwrap();
-            stage_bootstrap(dir.as_path(), |sb, _| sb.set_extra_devices(0));
+            stage_bootstrap(dir.path(), |sb, _| sb.set_extra_devices(0));
             let mut fds = [0; 2];
             // SAFETY: `fds` is a writable array of two descriptors, as `socketpair` requires.
             let ret = unsafe {
@@ -2108,8 +2108,8 @@ pub(crate) mod testing {
             assert_eq!(ret, 0);
             let handler = Arc::new(
                 FanotifyHandler::from_restored_fd(
-                    dir.as_path().to_str().unwrap(),
-                    dir.as_path().join("mnt").to_str().unwrap(),
+                    dir.path().to_str().unwrap(),
+                    dir.path().join("mnt").to_str().unwrap(),
                     Arc::new(BlobCacheMgr::new()),
                     threads,
                     // SAFETY: `fds[0]` is the socket just created above and is wrapped exactly
@@ -2277,14 +2277,14 @@ mod tests {
     /// A bootstrap with data devices and no registered data blob would mount as one flat
     /// device and answer every file read with EIO, so the handler must refuse it.
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
+    #[cfg_attr(miri, ignore = "Miri does not support copy_file_range")]
     fn test_refuses_bootstrap_whose_devices_have_no_data_blob() {
-        let dir = vmm_sys_util::tempdir::TempDir::new().unwrap();
+        let dir = tempfile::TempDir::new().unwrap();
         let root = std::env::var("CARGO_MANIFEST_DIR").unwrap();
         // This bootstrap's device table holds one data blob.
         std::fs::copy(
             format!("{root}/../tests/texture/bootstrap/rafs-v6-2.2.boot"),
-            dir.as_path().join("bootstrap"),
+            dir.path().join("bootstrap"),
         )
         .unwrap();
         // Any pollable fd stands in for a group fd: the check runs before it is used.
@@ -2292,8 +2292,8 @@ mod tests {
         let group = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC) };
         assert!(group >= 0);
         let err = FanotifyHandler::from_restored_fd(
-            dir.as_path().to_str().unwrap(),
-            dir.as_path().join("mnt").to_str().unwrap(),
+            dir.path().to_str().unwrap(),
+            dir.path().join("mnt").to_str().unwrap(),
             Arc::new(BlobCacheMgr::new()),
             1,
             // SAFETY: `group` is the eventfd just created (checked above) and is wrapped exactly
@@ -2309,14 +2309,14 @@ mod tests {
     /// linked: the blob cache manager may hold other bootstraps' blobs, so only the bootstrap's
     /// own device table says which blob backs which device.
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
+    #[cfg_attr(miri, ignore = "Miri does not support copy_file_range")]
     fn refuses_data_blobs_that_do_not_match_the_device_table() {
         const BLOB: &str = "be7d77eeb719f70884758d1aa800ed0fb09d701aaec469964e9d54325f0d5fef";
         let root = std::env::var("CARGO_MANIFEST_DIR").unwrap();
-        let work = vmm_sys_util::tempdir::TempDir::new().unwrap();
+        let work = tempfile::TempDir::new().unwrap();
         std::fs::copy(
             format!("{root}/../tests/texture/blobs/{BLOB}"),
-            work.as_path().join(BLOB),
+            work.path().join(BLOB),
         )
         .unwrap();
         let config = r#"{
@@ -2328,7 +2328,7 @@ mod tests {
                 "metadata_path": "ROOT/../tests/texture/bootstrap/rafs-v6-2.2.boot"
             }
         }"#
-        .replace("WORK", work.as_path().to_str().unwrap())
+        .replace("WORK", work.path().to_str().unwrap())
         .replace("ROOT", &root);
         let mut entry: nydus_api::config::BlobCacheEntry = serde_json::from_str(&config).unwrap();
         assert!(entry.prepare_configuration_info());
@@ -2336,14 +2336,14 @@ mod tests {
         mgr.add_blob_entry(&entry).unwrap();
 
         let open = |device_id: &[u8; 64]| {
-            let dir = vmm_sys_util::tempdir::TempDir::new().unwrap();
-            stage_bootstrap(dir.as_path(), |_, slot| slot.set_blob_id(device_id));
+            let dir = tempfile::TempDir::new().unwrap();
+            stage_bootstrap(dir.path(), |_, slot| slot.set_blob_id(device_id));
             // SAFETY: `eventfd` only takes integers; the result is checked below.
             let group = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC) };
             assert!(group >= 0);
             let result = FanotifyHandler::from_restored_fd(
-                dir.as_path().to_str().unwrap(),
-                dir.as_path().join("mnt").to_str().unwrap(),
+                dir.path().to_str().unwrap(),
+                dir.path().join("mnt").to_str().unwrap(),
                 mgr.clone(),
                 1,
                 // SAFETY: `group` is the eventfd just created (checked above) and is wrapped
@@ -2358,14 +2358,14 @@ mod tests {
             .expect_err("another image's layer must be refused");
         assert_eq!(err.kind(), ErrorKind::InvalidInput, "{err}");
         assert!(
-            !work.as_path().join("blob_0").exists(),
+            !work.path().join("blob_0").exists(),
             "a refused bootstrap re-linked the device files"
         );
 
         open(BLOB.as_bytes().try_into().unwrap())
             .0
             .expect("the bootstrap's own layer is accepted");
-        assert!(work.as_path().join("blob_0").exists());
+        assert!(work.path().join("blob_0").exists());
     }
 
     #[test]
@@ -2383,7 +2383,7 @@ mod tests {
     /// A panic while serving one event answers that event and the rest of its batch with
     /// `EIO`, fails the handler, and leaves every worker able to reach the shutdown barrier.
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
+    #[cfg_attr(miri, ignore = "Miri does not support copy_file_range")]
     fn worker_panic_denies_the_batch_and_fails_the_handler() {
         let h = SocketHandler::start(2);
         inject_panic_on_next_event(h.handler.mountpoint());
@@ -2405,7 +2405,7 @@ mod tests {
 
     /// `FAN_Q_OVERFLOW` fails the whole handler: no worker serves the stream afterwards.
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
+    #[cfg_attr(miri, ignore = "Miri does not support copy_file_range")]
     fn queue_overflow_stops_every_worker_from_serving() {
         let h = SocketHandler::start(2);
         // Sanity: a healthy handler allows an event that maps to no blob.
@@ -2816,16 +2816,15 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
     fn is_mounted_at_recognises_a_real_mountpoint_and_rejects_a_plain_directory() {
         use super::is_mounted_at;
         use std::path::Path;
         // `/proc` is mounted on every host this code runs on; a temp dir under it is not.
         assert!(is_mounted_at(Path::new("/proc")));
 
-        let dir = vmm_sys_util::tempdir::TempDir::new().unwrap();
+        let dir = tempfile::TempDir::new().unwrap();
         assert!(
-            !is_mounted_at(dir.as_path()),
+            !is_mounted_at(dir.path()),
             "a plain directory must not look mounted, or mount() would skip and leave the \
              image unserved"
         );

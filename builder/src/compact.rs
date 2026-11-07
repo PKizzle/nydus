@@ -693,7 +693,7 @@ mod tests {
     use nydus_utils::metrics::BackendMetrics;
     use nydus_utils::{compress, crypt};
     use std::any::Any;
-    use vmm_sys_util::tempdir::TempDir;
+    use tempfile::TempDir;
     use vmm_sys_util::tempfile::TempFile;
 
     #[doc(hidden)]
@@ -997,10 +997,10 @@ mod tests {
         });
 
         let tmpdir = TempDir::new()?;
-        let tmpfile = TempFile::new_in(tmpdir.as_path())?;
+        let tmpfile = TempFile::new_in(tmpdir.path())?;
         let node = Node::from_fs_object(
             RafsVersion::V6,
-            tmpdir.as_path().to_path_buf(),
+            tmpdir.path().to_path_buf(),
             tmpfile.as_path().to_path_buf(),
             Overlay::UpperAddition,
             RAFS_DEFAULT_CHUNK_SIZE as u32,
@@ -1089,10 +1089,10 @@ mod tests {
         compactor.states = vec![State::ChunkDict; 5];
 
         let tmpdir = TempDir::new()?;
-        let tmpfile = TempFile::new_in(tmpdir.as_path())?;
+        let tmpfile = TempFile::new_in(tmpdir.path())?;
         let node = Node::from_fs_object(
             RafsVersion::V6,
-            tmpdir.as_path().to_path_buf(),
+            tmpdir.path().to_path_buf(),
             tmpfile.as_path().to_path_buf(),
             Overlay::UpperAddition,
             RAFS_DEFAULT_CHUNK_SIZE as u32,
@@ -1101,10 +1101,10 @@ mod tests {
             false,
         )?;
         let mut tree = Tree::new(node);
-        let tmpfile2 = TempFile::new_in(tmpdir.as_path())?;
+        let tmpfile2 = TempFile::new_in(tmpdir.path())?;
         let mut node = Node::from_fs_object(
             RafsVersion::V6,
-            tmpdir.as_path().to_path_buf(),
+            tmpdir.path().to_path_buf(),
             tmpfile2.as_path().to_path_buf(),
             Overlay::UpperAddition,
             RAFS_DEFAULT_CHUNK_SIZE as u32,
@@ -1143,7 +1143,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
+    #[cfg_attr(miri, ignore = "Miri does not support readahead")]
     fn test_blob_compactor_dump_new_blobs() {
         let tmp_dir = TempDir::new().unwrap();
         let build_ctx = BuildContext::new(
@@ -1155,7 +1155,7 @@ mod tests {
             true,
             WhiteoutSpec::None,
             ConversionType::DirectoryToRafs,
-            PathBuf::from(tmp_dir.as_path()),
+            PathBuf::from(tmp_dir.path()),
             Default::default(),
             None,
             None,
@@ -1231,7 +1231,7 @@ mod tests {
         compactor.states[0] = State::Invalid;
 
         let tmp_dir = TempDir::new().unwrap();
-        let dir = tmp_dir.as_path().to_str().unwrap();
+        let dir = tmp_dir.path().to_str().unwrap();
         assert!(compactor.dump_new_blobs(&build_ctx, dir, true).is_err());
 
         compactor.states = vec![
@@ -1260,7 +1260,7 @@ mod tests {
             true,
             WhiteoutSpec::None,
             ConversionType::DirectoryToRafs,
-            PathBuf::from(tmp_dir.as_path()),
+            PathBuf::from(tmp_dir.path()),
             Default::default(),
             None,
             None,

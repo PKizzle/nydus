@@ -396,7 +396,7 @@ impl TarBuilder {
 
 #[cfg(test)]
 mod tests {
-    use vmm_sys_util::tempdir::TempDir;
+    use tempfile::TempDir;
 
     use super::*;
 
@@ -420,10 +420,9 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
     fn test_tar_builder_create_directory() {
         let tmp_dir = TempDir::new().unwrap();
-        let target_paths = [OsString::from(tmp_dir.as_path())];
+        let target_paths = [OsString::from(tmp_dir.path())];
         let mut builder = TarBuilder::new(true, 0, RafsVersion::V6);
 
         let node = builder.create_directory(&target_paths);
@@ -431,7 +430,7 @@ mod tests {
         let node = node.unwrap();
         println!("Node: {}", node);
         assert_eq!(node.file_type(), "dir");
-        assert_eq!(node.target(), tmp_dir.as_path());
+        assert_eq!(node.target(), tmp_dir.path());
 
         assert_eq!(builder.next_ino, 1);
         assert_eq!(builder.next_ino(), 2);

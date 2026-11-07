@@ -2469,14 +2469,14 @@ mod tests {
     }
 
     fn create_tarfs(extra: &[&str]) -> anyhow::Result<()> {
-        let dir = vmm_sys_util::tempdir::TempDir::new().unwrap();
+        let dir = tempfile::TempDir::new().unwrap();
         let tar = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("tests/texture/tar/all-entry-type.tar")
             .display()
             .to_string();
-        std::fs::create_dir(dir.as_path().join("blobs")).unwrap();
-        let blob_dir = dir.as_path().join("blobs").display().to_string();
-        let bootstrap = dir.as_path().join("bootstrap").display().to_string();
+        std::fs::create_dir(dir.path().join("blobs")).unwrap();
+        let blob_dir = dir.path().join("blobs").display().to_string();
+        let bootstrap = dir.path().join("bootstrap").display().to_string();
         let mut args = vec![
             "nydus-image",
             "create",
@@ -2496,13 +2496,12 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
+    #[cfg_attr(miri, ignore = "Miri does not support getegid")]
     fn test_create_tarfs_with_default_block_size() {
         create_tarfs(&[]).unwrap();
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
     fn test_create_tarfs_rejects_explicit_block_size() {
         let err = create_tarfs(&["--block-size", "4096"]).unwrap_err();
         assert!(

@@ -734,7 +734,7 @@ impl DataBlob {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use vmm_sys_util::tempdir::TempDir;
+    use tempfile::TempDir;
 
     fn create_factory_config() -> String {
         let config = r#"
@@ -766,13 +766,12 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
     fn test_blob_cache_entry() {
         let tmpdir = TempDir::new().unwrap();
-        let path = tmpdir.as_path().join("bootstrap1");
+        let path = tmpdir.path().join("bootstrap1");
         std::fs::write(path, "metadata").unwrap();
         let cfg = create_factory_config();
-        let content = cfg.replace("/tmp/nydus", tmpdir.as_path().to_str().unwrap());
+        let content = cfg.replace("/tmp/nydus", tmpdir.path().to_str().unwrap());
         let mut entry: BlobCacheEntry = serde_json::from_str(&content).unwrap();
         assert!(entry.prepare_configuration_info());
         let blob_config = entry.blob_config.as_ref().unwrap();
@@ -791,7 +790,7 @@ mod tests {
         let (path, config) = mgr.get_meta_info(&entry).unwrap();
         let backend_cfg = config.get_backend_config().unwrap();
         let cache_cfg = config.get_cache_config().unwrap();
-        assert_eq!(path, tmpdir.as_path().join("bootstrap1"));
+        assert_eq!(path, tmpdir.path().join("bootstrap1"));
         assert_eq!(&config.id, "factory1");
         assert_eq!(&backend_cfg.backend_type, "localfs");
         assert_eq!(&cache_cfg.cache_type, "fanotify");
@@ -811,13 +810,12 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
     fn test_invalid_blob_id() {
         let tmpdir = TempDir::new().unwrap();
-        let path = tmpdir.as_path().join("bootstrap1");
+        let path = tmpdir.path().join("bootstrap1");
         std::fs::write(path, "metadata").unwrap();
         let config = create_factory_config();
-        let content = config.replace("/tmp/nydus", tmpdir.as_path().to_str().unwrap());
+        let content = config.replace("/tmp/nydus", tmpdir.path().to_str().unwrap());
         let mut entry: BlobCacheEntry = serde_json::from_str(&content).unwrap();
         let mgr = BlobCacheMgr::new();
 
@@ -881,7 +879,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
+    #[cfg_attr(miri, ignore = "Miri does not support readahead")]
     fn test_add_bootstrap() {
         let tmpdir = TempDir::new().unwrap();
         let root_dir = &std::env::var("CARGO_MANIFEST_DIR").expect("$CARGO_MANIFEST_DIR");
@@ -912,7 +910,7 @@ mod tests {
             }
           }"#;
         let content = config
-            .replace("/tmp/nydus", tmpdir.as_path().to_str().unwrap())
+            .replace("/tmp/nydus", tmpdir.path().to_str().unwrap())
             .replace("RAFS_V5", &source_path.display().to_string());
         let mut entry: BlobCacheEntry = serde_json::from_str(&content).unwrap();
         assert!(entry.prepare_configuration_info());
@@ -961,11 +959,10 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
     fn test_get_meta_info_rejects_invalid_metadata_path() {
         let tmpdir = TempDir::new().unwrap();
         let config = create_factory_config();
-        let content = config.replace("/tmp/nydus", tmpdir.as_path().to_str().unwrap());
+        let content = config.replace("/tmp/nydus", tmpdir.path().to_str().unwrap());
         let mgr = BlobCacheMgr::new();
 
         let mut empty_path_entry: BlobCacheEntry = serde_json::from_str(&content).unwrap();
@@ -976,7 +973,7 @@ mod tests {
         let mut dir_path_entry: BlobCacheEntry = serde_json::from_str(&content).unwrap();
         assert!(dir_path_entry.prepare_configuration_info());
         dir_path_entry.blob_config.as_mut().unwrap().metadata_path =
-            Some(tmpdir.as_path().to_str().unwrap().to_string());
+            Some(tmpdir.path().to_str().unwrap().to_string());
         assert!(mgr.get_meta_info(&dir_path_entry).is_err());
 
         let mut missing_path_entry: BlobCacheEntry = serde_json::from_str(&content).unwrap();
@@ -985,12 +982,12 @@ mod tests {
             .blob_config
             .as_mut()
             .unwrap()
-            .metadata_path = Some(tmpdir.as_path().join("missing.boot").display().to_string());
+            .metadata_path = Some(tmpdir.path().join("missing.boot").display().to_string());
         assert!(mgr.get_meta_info(&missing_path_entry).is_err());
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
+    #[cfg_attr(miri, ignore = "Miri does not support readahead")]
     fn test_remove_blob_entry_by_domain() {
         let tmpdir = TempDir::new().unwrap();
         let root_dir = &std::env::var("CARGO_MANIFEST_DIR").expect("$CARGO_MANIFEST_DIR");
@@ -1021,7 +1018,7 @@ mod tests {
             }
           }"#;
         let content = config
-            .replace("/tmp/nydus", tmpdir.as_path().to_str().unwrap())
+            .replace("/tmp/nydus", tmpdir.path().to_str().unwrap())
             .replace("RAFS_V5", &source_path.display().to_string());
         let mut entry: BlobCacheEntry = serde_json::from_str(&content).unwrap();
         assert!(entry.prepare_configuration_info());
@@ -1121,7 +1118,7 @@ mod tests {
         // Copy blob file to tmpdir
         let mut blob_src = PathBuf::from(root_dir);
         blob_src.push("../tests/texture/blobs/be7d77eeb719f70884758d1aa800ed0fb09d701aaec469964e9d54325f0d5fef");
-        let mut blob_dst = tmp_dir.as_path().to_path_buf();
+        let mut blob_dst = tmp_dir.path().to_path_buf();
         blob_dst.push("be7d77eeb719f70884758d1aa800ed0fb09d701aaec469964e9d54325f0d5fef");
         std::fs::copy(&blob_src, &blob_dst).unwrap();
 
@@ -1148,7 +1145,7 @@ mod tests {
             }
         }"#;
         let content = config
-            .replace("/tmp/nydus", tmp_dir.as_path().to_str().unwrap())
+            .replace("/tmp/nydus", tmp_dir.path().to_str().unwrap())
             .replace("BOOT_PATH", &boot_path.display().to_string());
         let mut entry: BlobCacheEntry = serde_json::from_str(&content).unwrap();
         assert!(entry.prepare_configuration_info());
@@ -1175,7 +1172,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
+    #[cfg_attr(miri, ignore = "Miri does not support copy_file_range")]
     fn test_data_blob_getters() {
         use std::os::fd::AsRawFd;
 
@@ -1188,7 +1185,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
+    #[cfg_attr(miri, ignore = "Miri does not support copy_file_range")]
     fn test_data_blob_async_fetch_zero_len() {
         let (data_blob, _tmp_dir) = create_data_blob();
         compio::runtime::Runtime::new()
@@ -1201,7 +1198,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
+    #[cfg_attr(miri, ignore = "Miri does not support copy_file_range")]
     fn test_data_blob_async_fetch_and_read() {
         let (data_blob, _tmp_dir) = create_data_blob();
         compio::runtime::Runtime::new()

@@ -265,7 +265,7 @@ mod tests {
     use nydus_utils::crc32::{self, Crc32};
     use nydus_utils::digest::RafsDigest;
     use nydus_utils::metrics::BackendMetrics;
-    use vmm_sys_util::tempdir::TempDir;
+    use tempfile::TempDir;
 
     use crate::{
         cache::state::IndexedChunkMap,
@@ -378,7 +378,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
+    #[cfg_attr(miri, ignore = "Miri does not support file-backed mmap")]
     fn test_dummy_cache() {
         let info = BlobInfo::new(
             0,
@@ -391,7 +391,7 @@ mod tests {
         );
         let dir = TempDir::new().unwrap();
         let blob_path = dir
-            .as_path()
+            .path()
             .join("blob-0")
             .as_os_str()
             .to_str()

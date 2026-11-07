@@ -775,7 +775,7 @@ mod tests {
     /// A failed handler makes the daemon unhealthy for the supervisor, while state-machine
     /// transitions still see where the machine is (so `trigger_stop` sends both `Stop`s).
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
+    #[cfg_attr(miri, ignore = "Miri does not support copy_file_range")]
     fn failed_fanotify_handler_reports_the_daemon_unhealthy() {
         let controller = create_service_controller();
         controller.set_state(DaemonState::RUNNING);
@@ -796,9 +796,9 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
+    #[cfg_attr(miri, ignore = "Miri does not support readahead")]
     fn test_blob_list_is_saved_for_takeover() {
-        let tmpdir = vmm_sys_util::tempdir::TempDir::new().unwrap();
+        let tmpdir = tempfile::TempDir::new().unwrap();
         let bootstrap = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../tests/texture/bootstrap/rafs-v6-2.2.boot");
         let config = serde_json::json!({ "blobs": [{
@@ -808,8 +808,8 @@ mod tests {
             "config_v2": {
                 "version": 2,
                 "id": "factory1",
-                "backend": { "type": "localfs", "localfs": { "dir": tmpdir.as_path() } },
-                "cache": { "type": "fanotify", "fanotify": { "work_dir": tmpdir.as_path() } },
+                "backend": { "type": "localfs", "localfs": { "dir": tmpdir.path() } },
+                "cache": { "type": "fanotify", "fanotify": { "work_dir": tmpdir.path() } },
                 "metadata_path": bootstrap,
             },
         }]});

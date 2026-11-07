@@ -171,14 +171,14 @@ mod tests {
         Arc::new(serde_json::from_str(&content).unwrap())
     }
 
-    fn prepare_fixture_root() -> (vmm_sys_util::tempdir::TempDir, PathBuf) {
-        let tmp_dir = vmm_sys_util::tempdir::TempDir::new().unwrap();
+    fn prepare_fixture_root() -> (tempfile::TempDir, PathBuf) {
+        let tmp_dir = tempfile::TempDir::new().unwrap();
         let root_dir = std::env::var("CARGO_MANIFEST_DIR").expect("$CARGO_MANIFEST_DIR");
         let fixture_blob = PathBuf::from(&root_dir).join(
             "tests/texture/blobs/be7d77eeb719f70884758d1aa800ed0fb09d701aaec469964e9d54325f0d5fef",
         );
         let target_blob = tmp_dir
-            .as_path()
+            .path()
             .join("be7d77eeb719f70884758d1aa800ed0fb09d701aaec469964e9d54325f0d5fef");
         fs::copy(fixture_blob, target_blob).unwrap();
 
@@ -193,10 +193,10 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
+    #[cfg_attr(miri, ignore = "Miri does not support copy_file_range")]
     fn test_validator_check_returns_blob_metadata() {
         let (tmp_dir, bootstrap) = prepare_fixture_root();
-        let config = create_test_config(tmp_dir.as_path().to_str().unwrap());
+        let config = create_test_config(tmp_dir.path().to_str().unwrap());
 
         let mut validator = Validator::new(&bootstrap, config).unwrap();
         let (blobs, compressor, rafs_version) = validator.check(false).unwrap();
@@ -216,19 +216,19 @@ mod tests {
     fn build_image(
         block_size: u64,
         compressor: compress::Algorithm,
-    ) -> (vmm_sys_util::tempdir::TempDir, PathBuf) {
+    ) -> (tempfile::TempDir, PathBuf) {
         use nydus_builder::{
             ArtifactStorage, BlobManager, BootstrapManager, BuildContext, Builder, ConversionType,
             DirectoryBuilder,
         };
 
-        let dir = vmm_sys_util::tempdir::TempDir::new().unwrap();
-        let source = dir.as_path().join("src");
+        let dir = tempfile::TempDir::new().unwrap();
+        let source = dir.path().join("src");
         fs::create_dir(&source).unwrap();
         fs::write(source.join("a"), vec![1u8; 5000]).unwrap();
         fs::write(source.join("b"), vec![2u8; 20000]).unwrap();
         std::os::unix::fs::symlink("a", source.join("link")).unwrap();
-        let bootstrap = dir.as_path().join("bootstrap");
+        let bootstrap = dir.path().join("bootstrap");
         let mut ctx = BuildContext {
             fs_version: RafsVersion::V6,
             conversion_type: ConversionType::DirectoryToRafs,
@@ -236,7 +236,7 @@ mod tests {
             aligned_chunk: true,
             compressor,
             blob_storage: Some(ArtifactStorage::FileDir((
-                dir.as_path().to_path_buf(),
+                dir.path().to_path_buf(),
                 String::new(),
             ))),
             ..Default::default()
@@ -251,8 +251,8 @@ mod tests {
         (dir, bootstrap)
     }
 
-    fn check_image(dir: &vmm_sys_util::tempdir::TempDir, bootstrap: &Path) -> Result<()> {
-        let config = create_test_config(dir.as_path().to_str().unwrap());
+    fn check_image(dir: &tempfile::TempDir, bootstrap: &Path) -> Result<()> {
+        let config = create_test_config(dir.path().to_str().unwrap());
         Validator::new(bootstrap, config)?.check(false).map(|_| ())
     }
 
@@ -275,7 +275,7 @@ mod tests {
 
     // The layout `nydusify convert` produces by default: compressed chunks and a symlink.
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
+    #[cfg_attr(miri, ignore = "Miri does not support xattrs")]
     fn test_validator_accepts_compressed_image() {
         for block_size in [4096u64, 16384] {
             let (dir, bootstrap) = build_image(block_size, compress::Algorithm::Zstd);
@@ -284,7 +284,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
+    #[cfg_attr(miri, ignore = "Miri does not support xattrs")]
     fn test_validator_checks_v6_block_addresses() {
         for block_size in [4096u64, 16384] {
             let (dir, bootstrap) = build_image(block_size, compress::Algorithm::None);
@@ -303,7 +303,7 @@ mod tests {
             let (dir, bootstrap) = build_image(block_size, compress::Algorithm::None);
             let (sb, _) = RafsSuper::load_from_file(
                 &bootstrap,
-                create_test_config(dir.as_path().to_str().unwrap()),
+                create_test_config(dir.path().to_str().unwrap()),
                 false,
             )
             .unwrap();

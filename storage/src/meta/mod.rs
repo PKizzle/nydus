@@ -2448,7 +2448,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
+    #[cfg_attr(miri, ignore = "Miri does not support file-backed mmap")]
     fn test_load_meta_ci_zran_from_reader() {
         let root_dir = &std::env::var("CARGO_MANIFEST_DIR").expect("$CARGO_MANIFEST_DIR");
         let id = "233c72f2b6b698c07021c4da367cfe2dff4f049efbaa885ca0ff760ea297865a";
@@ -2461,8 +2461,8 @@ pub(crate) mod tests {
         blob_data.extend_from_slice(
             &meta_data[header_offset..header_offset + BLOB_CCT_HEADER_SIZE as usize],
         );
-        let dir = vmm_sys_util::tempdir::TempDir::new().unwrap();
-        let blob_path = dir.as_path().join(id);
+        let dir = tempfile::TempDir::new().unwrap();
+        let blob_path = dir.path().join(id);
         std::fs::write(&blob_path, &blob_data).unwrap();
         let reader: Arc<dyn BlobReader> = Arc::new(DummyBlobReader {
             metrics: BackendMetrics::new(id, "localfs"),
@@ -2518,7 +2518,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
+    #[cfg_attr(miri, ignore = "Miri does not support blocking flock")]
     fn test_load_meta_waits_for_initializing_process() {
         let root_dir = &std::env::var("CARGO_MANIFEST_DIR").expect("$CARGO_MANIFEST_DIR");
         let id = "233c72f2b6b698c07021c4da367cfe2dff4f049efbaa885ca0ff760ea297865a";
@@ -2526,8 +2526,8 @@ pub(crate) mod tests {
             PathBuf::from(root_dir).join(format!("../tests/texture/zran/{}.blob.meta", id)),
         )
         .unwrap();
-        let dir = vmm_sys_util::tempdir::TempDir::new().unwrap();
-        let blob_path = dir.as_path().join(id).display().to_string();
+        let dir = tempfile::TempDir::new().unwrap();
+        let blob_path = dir.path().join(id).display().to_string();
         let meta_path = format!("{}.{}", blob_path, BLOB_CCT_FILE_SUFFIX);
 
         // Act as another process that has created the meta file and is still downloading it.

@@ -124,16 +124,16 @@ mod tests {
     use std::thread;
     use std::time::Instant;
 
-    use vmm_sys_util::tempdir::TempDir;
+    use tempfile::TempDir;
 
     use super::super::BlobStateMap;
     use super::*;
 
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
+    #[cfg_attr(miri, ignore = "Miri does not support file-backed mmap")]
     fn test_range_map() {
         let dir = TempDir::new().unwrap();
-        let blob_path = dir.as_path().join("blob-1");
+        let blob_path = dir.path().join("blob-1");
         let blob_path = blob_path.as_os_str().to_str().unwrap().to_string();
         let range_count = 1000000;
         let skip_index = 77;
@@ -198,10 +198,10 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
+    #[cfg_attr(miri, ignore = "Miri does not support file-backed mmap")]
     fn test_range_map_state() {
         let dir = TempDir::new().unwrap();
-        let blob_path = dir.as_path().join("blob-1");
+        let blob_path = dir.path().join("blob-1");
         let blob_path = blob_path.as_os_str().to_str().unwrap().to_string();
         let range_count = 100;
 
