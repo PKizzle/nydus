@@ -26,7 +26,7 @@ use nydus_storage::{RAFS_MAX_CHUNK_SIZE, RAFS_MAX_CHUNKS_PER_BLOB};
 use nydus_utils::compact::makedev;
 use nydus_utils::compress::{self, compute_compressed_gzip_size};
 use nydus_utils::digest::{self, DigestData, RafsDigest};
-use nydus_utils::{ByteSize, lazy_drop, root_tracer, round_up, timing_tracer};
+use nydus_utils::{ByteSize, root_tracer, round_up, timing_tracer};
 use serde::{Deserialize, Serialize};
 
 use crate::core::context::{Artifact, NoopArtifactWriter};
@@ -901,8 +901,6 @@ impl Builder for StargzBuilder {
                 "dump_bootstrap"
             )?;
         }
-
-        lazy_drop(bootstrap_ctx);
 
         BuildOutput::new(blob_mgr, None, &bootstrap_mgr.bootstrap_storage, &None)
     }

@@ -14,9 +14,10 @@ extern crate serde_json;
 
 // mimalloc global allocator: image conversion churns many small buffers
 // (chunking, compression, zran); thread-local pools cut allocator overhead.
-// Disabled under Miri, which cannot call mimalloc's FFI (mi_malloc_aligned) and
-// aborts even when just listing tests; fall back to Miri's own allocator.
-#[cfg(not(miri))]
+// Disabled in test builds: Miri cannot call mimalloc's FFI (mi_malloc_aligned) and
+// aborts even when just listing tests, and AddressSanitizer only tracks heap blocks
+// from the system allocator. Tests fall back to the system (or Miri's) allocator.
+#[cfg(not(any(miri, test)))]
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
@@ -54,9 +55,7 @@ use nydus_storage::factory::BlobFactory;
 use nydus_storage::meta::{BatchContextGenerator, format_blob_features};
 use nydus_storage::{RAFS_DEFAULT_CHUNK_SIZE, RAFS_MAX_CHUNK_SIZE};
 use nydus_utils::trace::{EventTracerClass, TimingTracerClass, TraceClass};
-use nydus_utils::{
-    compress, digest, event_tracer, lazy_drop, register_tracer, root_tracer, timing_tracer,
-};
+use nydus_utils::{compress, digest, event_tracer, register_tracer, root_tracer, timing_tracer};
 use serde::{Deserialize, Serialize};
 
 use crate::unpack::{OCIUnpacker, Unpacker};
@@ -1431,8 +1430,6 @@ impl Command {
             },
             "total_build"
         )?;
-
-        lazy_drop(build_ctx);
 
         // Some operations like listing xattr pairs of certain namespace need the process
         // to be privileged. Therefore, trace what euid and egid are.

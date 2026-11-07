@@ -109,7 +109,8 @@ pub trait RafsSuperBlock: RafsSuperInodes + Send + Sync {
     /// Load and validate the RAFS filesystem super block from the specified reader.
     fn load(&mut self, r: &mut RafsIoReader) -> RafsResult<()>;
 
-    /// Update/reload the RAFS filesystem super block from the specified reader.
+    /// Reload the RAFS filesystem super block from the specified reader, which must hold the
+    /// bootstrap the super block was loaded from.
     fn update(&self, r: &mut RafsIoReader) -> RafsResult<()>;
 
     /// Destroy the RAFS filesystem super block object.
@@ -886,7 +887,8 @@ impl RafsSuper {
         Ok(())
     }
 
-    /// Update the filesystem metadata and storage backend.
+    /// Update the filesystem metadata and storage backend from `r`, which must hold the bootstrap
+    /// this filesystem was loaded from.
     pub fn update(&self, r: &mut RafsIoReader) -> RafsResult<()> {
         if self.meta.is_v5() {
             self.skip_v5_superblock(r)
@@ -1088,8 +1090,18 @@ impl RafsSuper {
         let mut path = PathBuf::new();
         let mut cur_ino = ino;
         let mut inode;
+        // A path of PATH_MAX bytes has at most PATH_MAX / 2 components; a longer parent chain is
+        // a cycle in the parent pointers.
+        let mut depth = 0;
 
         loop {
+            depth += 1;
+            if depth > libc::PATH_MAX / 2 {
+                return Err(RafsError::InvalidMetadata(format!(
+                    "parent chain of inode {} does not reach the root",
+                    ino
+                )));
+            }
             inode = self.get_extended_inode(cur_ino, false)?;
             let e: PathBuf = inode.name().into();
             path = e.join(path);

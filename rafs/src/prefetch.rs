@@ -747,9 +747,6 @@ mod tests {
         }
     }
 
-    // SAFETY: used only in single-threaded tests.
-    unsafe impl Send for LimitedReader {}
-
     // ── helpers ───────────────────────────────────────────────────────────────
 
     fn make_state(stop: bool) -> Arc<State> {

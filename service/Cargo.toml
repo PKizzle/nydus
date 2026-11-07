@@ -35,7 +35,7 @@ nydus-api = { version = "0.6.0", path = "../api" }
 nydus-rafs = { version = "0.5.0", path = "../rafs" }
 nydus-storage = { version = "0.8.0", path = "../storage" }
 nydus-upgrade = { version = "0.3.0", path = "../upgrade" }
-nydus-utils = { version = "0.6.0", path = "../utils" }
+nydus-utils = { version = "0.7.0", path = "../utils" }
 
 vhost = { workspace = true, features = ["vhost-user"], optional = true }
 vhost-user-backend = { workspace = true, optional = true }
@@ -82,6 +82,8 @@ block-nbd = ["block-device", "bytes"]
 block-uffd = ["block-device"]
 
 coco = ["fuse-backend-rs/fusedev", "nydus-storage/backend-registry"]
+# Exposes parser entry points for the cargo-fuzz targets in `fuzz/`.
+fuzzing = []
 # Test-only fault hooks (`fanotify::inject_panic_on_next_event`); enabled by dev-dependencies,
 # never by a release build.
 fault-injection = []

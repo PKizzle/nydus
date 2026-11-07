@@ -1,0 +1,66 @@
+name: Sanitizers
+
+# AddressSanitizer and cargo-careful over the unit tests. Nightly-only and slow, so this
+# is not a required check: it runs on a schedule, on demand, and on pull requests that
+# carry the `sanitizers` label. See docs/sanitizers.md.
+on:
+  schedule:
+    - cron: "30 1 * * *"
+  workflow_dispatch:
+  pull_request:
+    types: [labeled, synchronize, opened, reopened]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref_name }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Pinned so a nightly regression shows up as a deliberate bump, not a red nightly run.
+  SANITIZER_TOOLCHAIN: nightly-2026-10-20
+
+jobs:
+  sanitizer:
+    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'sanitizers')
+    runs-on: ${{ vars.RUNNER_OS || 'ubuntu-latest' }}
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      matrix:
+        tool: [asan, careful]
+    name: ${{ matrix.tool }}
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v6
+    - name: Install nightly
+      run: rustup toolchain install "$SANITIZER_TOOLCHAIN" --profile minimal --component rust-src
+    - name: Rust Cache
+      uses: Swatinem/rust-cache@v2
+      with:
+        cache-on-failure: true
+        shared-key: Linux-cargo-amd64-${{ matrix.tool }}
+        save-if: ${{ github.ref == 'refs/heads/production' }}
+    - name: Install cargo nextest
+      uses: taiki-e/install-action@nextest
+    - name: Install cargo careful
+      if: matrix.tool == 'careful'
+      uses: taiki-e/install-action@v2
+      with:
+        tool: cargo-careful
+    - name: Install protoc
+      run: bash misc/install-protoc.sh
+    - name: Install llvm-symbolizer
+      # Without it, LeakSanitizer reports raw addresses and lsan.supp cannot match frames.
+      if: matrix.tool == 'asan'
+      run: |
+        sym=$(command -v llvm-symbolizer || ls /usr/bin/llvm-symbolizer-* 2>/dev/null | sort -V | tail -1)
+        if [ -z "$sym" ]; then
+          sudo apt-get update -qq && sudo apt-get install -y -qq llvm
+          sym=$(command -v llvm-symbolizer)
+        fi
+        echo "ASAN_SYMBOLIZER_PATH=$sym" >> "$GITHUB_ENV"
+    - name: Unit Test with ${{ matrix.tool }}
+      run: |
+        export RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}" CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
+        bash misc/sudo-env.sh PATH RUSTUP_HOME 'CARGO_*' 'ASAN_*' -- \
+          make ${{ matrix.tool }}-ut-nextest SANITIZER_TOOLCHAIN="$SANITIZER_TOOLCHAIN" RUSTUP="$(command -v rustup)"
