@@ -2868,7 +2868,10 @@ mod verification {
         let buf: [u8; BUF] = kani::any();
         let raw = any_prefix(&buf);
         let mut walked = 0usize;
-        for_each_parsable_event(raw, |meta| walked += meta.event_len as usize);
+        for_each_parsable_event(raw, |meta, record| {
+            assert_eq!(record.len(), meta.event_len as usize);
+            walked += record.len();
+        });
         assert!(walked <= raw.len());
     }
 }
