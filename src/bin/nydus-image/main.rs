@@ -55,9 +55,7 @@ use nydus_storage::factory::BlobFactory;
 use nydus_storage::meta::{BatchContextGenerator, format_blob_features};
 use nydus_storage::{RAFS_DEFAULT_CHUNK_SIZE, RAFS_MAX_CHUNK_SIZE};
 use nydus_utils::trace::{EventTracerClass, TimingTracerClass, TraceClass};
-use nydus_utils::{
-    compress, digest, event_tracer, lazy_drop, register_tracer, root_tracer, timing_tracer,
-};
+use nydus_utils::{compress, digest, event_tracer, register_tracer, root_tracer, timing_tracer};
 use serde::{Deserialize, Serialize};
 
 use crate::unpack::{OCIUnpacker, Unpacker};
@@ -1432,8 +1430,6 @@ impl Command {
             },
             "total_build"
         )?;
-
-        lazy_drop(build_ctx);
 
         // Some operations like listing xattr pairs of certain namespace need the process
         // to be privileged. Therefore, trace what euid and egid are.

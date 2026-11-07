@@ -146,6 +146,16 @@ impl Prefetch {
         })
     }
 
+    /// A filesystem prefetch policy over `paths`, without reading the list from stdin.
+    #[cfg(test)]
+    pub(crate) fn with_paths(paths: &[&str]) -> Self {
+        Self {
+            policy: PrefetchPolicy::Fs,
+            patterns: generate_patterns(paths.iter().map(|p| p.to_string()).collect()).unwrap(),
+            ..Default::default()
+        }
+    }
+
     /// Insert node into the prefetch Vector if it matches prefetch rules,
     /// while recording the index of matched prefetch pattern,
     /// or insert it into non-prefetch Vector.

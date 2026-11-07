@@ -731,12 +731,13 @@ impl Bootstrap {
         // +---+---------+------------+-------------+-----------------+-----------+---------+------------------+
 
         let block_size = ctx.v6_block_size();
+        let layout_block = super::context::v6_meta_start(block_size);
         let blobs = blob_table.get_all();
         let devtable_len = blobs.len() * size_of::<RafsV6Device>();
         let blob_table_size = blob_table.size() as u64;
         let blob_table_offset = align_offset(
             (EROFS_DEVTABLE_OFFSET as u64) + devtable_len as u64,
-            block_size,
+            layout_block,
         );
         let blob_table_entries = blobs.len();
         if blob_table_entries >= u8::MAX as usize {
@@ -772,7 +773,7 @@ impl Bootstrap {
         // the root directory will not be shown by glibc's getdents/readdir.
         // Because in some OS, ino == 0 represents corresponding file is deleted.
         let root_node_offset = self.tree.borrow_mut_node().v6_offset;
-        let orig_meta_addr = root_node_offset - block_size;
+        let orig_meta_addr = root_node_offset - layout_block;
         let mut implicit_dir_count = 0usize;
         self.tree.walk_bfs(true, &mut |n| {
             if n.borrow_mut_node().inode.is_implicit_dir() {
@@ -788,7 +789,7 @@ impl Bootstrap {
         let meta_addr = if blob_table_size > 0 || implicit_dir_table_size > 0 {
             align_offset(
                 implicit_dir_table_offset + implicit_dir_table_size,
-                block_size,
+                layout_block,
             )
         } else {
             orig_meta_addr

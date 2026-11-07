@@ -109,7 +109,8 @@ pub trait RafsSuperBlock: RafsSuperInodes + Send + Sync {
     /// Load and validate the RAFS filesystem super block from the specified reader.
     fn load(&mut self, r: &mut RafsIoReader) -> RafsResult<()>;
 
-    /// Update/reload the RAFS filesystem super block from the specified reader.
+    /// Reload the RAFS filesystem super block from the specified reader, which must hold the
+    /// bootstrap the super block was loaded from.
     fn update(&self, r: &mut RafsIoReader) -> RafsResult<()>;
 
     /// Destroy the RAFS filesystem super block object.
@@ -886,7 +887,8 @@ impl RafsSuper {
         Ok(())
     }
 
-    /// Update the filesystem metadata and storage backend.
+    /// Update the filesystem metadata and storage backend from `r`, which must hold the bootstrap
+    /// this filesystem was loaded from.
     pub fn update(&self, r: &mut RafsIoReader) -> RafsResult<()> {
         if self.meta.is_v5() {
             self.skip_v5_superblock(r)
