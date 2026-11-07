@@ -471,7 +471,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
+    #[cfg_attr(miri, ignore = "Miri does not support file-backed mmap")]
     fn test_chunk_map() {
         let dir = TempDir::new().unwrap();
         let blob_path = dir.path().join("blob-1");
@@ -563,7 +563,10 @@ pub(crate) mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
+    #[cfg_attr(
+        miri,
+        ignore = "runs millions of chunk-map operations; under Miri it does not finish"
+    )]
     fn test_chunk_map_perf() {
         let dir = TempDir::new().unwrap();
         let blob_path = dir.path().join("blob-1");

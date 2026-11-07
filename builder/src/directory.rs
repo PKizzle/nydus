@@ -291,7 +291,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
+    #[cfg_attr(miri, ignore = "Miri does not support xattrs")]
     fn test_v5_hardlinked_symlink_is_not_coalesced() {
         let source = TempDir::new().unwrap();
         let nested = source.path().join("b");
@@ -333,7 +333,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
+    #[cfg_attr(miri, ignore = "Miri does not support xattrs")]
     fn test_v6_directory_build_preserves_mtime() {
         use std::time::{Duration, UNIX_EPOCH};
 
@@ -410,7 +410,7 @@ mod tests {
     /// The kernel locates chunk data only through `blkaddr * block_size` and the device table,
     /// so every chunk must start on a block boundary and each device must cover its whole blob.
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
+    #[cfg_attr(miri, ignore = "Miri does not support xattrs")]
     fn test_v6_chunk_layout_follows_block_size() {
         use nydus_rafs::RafsIoRead;
         use nydus_rafs::metadata::RafsSuper;
@@ -490,7 +490,7 @@ mod tests {
     /// A dirent's `e_nameoff` is relative to its directory block, so with 16 K and 64 K blocks a
     /// name can start well past 4096 and every name must still be found.
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
+    #[cfg_attr(miri, ignore = "Miri does not support xattrs")]
     fn test_v6_large_directory_at_every_block_size() {
         use nydus_rafs::metadata::RafsSuper;
 

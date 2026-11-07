@@ -277,7 +277,10 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
+    #[cfg_attr(
+        miri,
+        ignore = "leaves a thread running at exit, which Miri reports as a leak"
+    )]
     fn test_reject_name_longer_than_255_bytes() {
         for version in [RafsVersion::V5, RafsVersion::V6] {
             build_tar_with_name(version, &"a".repeat(255)).unwrap();

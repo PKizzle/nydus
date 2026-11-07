@@ -943,7 +943,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
+    #[cfg_attr(miri, ignore = "calls the C zlib library")]
     fn test_build_stargz_toc() {
         let tmp_dir = tempfile::TempDir::new().unwrap();
         let mut tmp_dir = tmp_dir.path().to_path_buf();
@@ -976,7 +976,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
     fn test_hardlink_under_a_replaced_directory_is_dropped_with_it() {
         // A file entry over a directory replaces the whole subtree, hardlinks included.
         let tmp_dir = tempfile::TempDir::new().unwrap();

@@ -2499,13 +2499,12 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
+    #[cfg_attr(miri, ignore = "Miri does not support getegid")]
     fn test_create_tarfs_with_default_block_size() {
         create_tarfs(&[]).unwrap();
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
     fn test_create_tarfs_rejects_explicit_block_size() {
         let err = create_tarfs(&["--block-size", "4096"]).unwrap_err();
         assert!(

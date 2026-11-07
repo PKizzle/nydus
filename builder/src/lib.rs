@@ -420,7 +420,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
     fn test_tar_builder_create_directory() {
         let tmp_dir = TempDir::new().unwrap();
         let target_paths = [OsString::from(tmp_dir.path())];

@@ -439,7 +439,7 @@ mod tests {
     use vmm_sys_util::tempfile::TempFile;
 
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
+    #[cfg_attr(miri, ignore = "Miri does not support xattrs")]
     fn test_set_lock_node() {
         let tmpdir = TempDir::new().unwrap();
         let tmpfile = TempFile::new_in(tmpdir.path()).unwrap();
@@ -477,7 +477,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
+    #[cfg_attr(miri, ignore = "Miri does not support xattrs")]
     fn test_walk_tree() {
         let tmpdir = TempDir::new().unwrap();
         let tmpfile = TempFile::new_in(tmpdir.path()).unwrap();

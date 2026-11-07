@@ -847,7 +847,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
+    #[cfg_attr(miri, ignore = "Miri does not support copy_file_range")]
     fn test_block_device() {
         let tmp_dir = TempDir::new().unwrap();
         let entry = create_bootstrap_entry(&tmp_dir);
@@ -1008,7 +1008,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
+    #[cfg_attr(miri, ignore = "Miri does not support copy_file_range")]
     fn test_block_size() {
         let mut device = create_block_device();
 
@@ -1022,7 +1022,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
+    #[cfg_attr(miri, ignore = "Miri does not support copy_file_range")]
     fn test_size_to_blocks() {
         let mut device = create_block_device();
 
@@ -1040,7 +1040,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
+    #[cfg_attr(miri, ignore = "Miri does not support copy_file_range")]
     fn test_blocks_to_size() {
         let mut device = create_block_device();
 
@@ -1117,7 +1117,7 @@ mod tests {
     /// The exporter must address the device in the image's own block size: the builder stamps
     /// `mapped_blkaddr` and the chunk block addresses in those units.
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
+    #[cfg_attr(miri, ignore = "Miri does not support xattrs")]
     fn test_block_device_follows_image_block_size() {
         for block_size in [EROFS_BLOCK_SIZE_4096, 16384] {
             let tmp_dir = TempDir::new().unwrap();
@@ -1191,14 +1191,14 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
+    #[cfg_attr(miri, ignore = "Miri does not support copy_file_range")]
     fn test_export() {
         assert!(test_export_arg_thread(1).is_ok());
         assert!(test_export_arg_thread(2).is_ok());
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
+    #[cfg_attr(miri, ignore = "Miri does not support copy_file_range")]
     fn test_fetch_ranges_invalid() {
         let device = create_block_device();
         compio::runtime::Runtime::new()
@@ -1211,7 +1211,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
+    #[cfg_attr(miri, ignore = "Miri does not support copy_file_range")]
     fn test_fetch_ranges_out_of_range() {
         let device = create_block_device();
         compio::runtime::Runtime::new()
@@ -1224,7 +1224,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
+    #[cfg_attr(miri, ignore = "Miri does not support copy_file_range")]
     fn test_fetch_ranges_meta_blob() {
         let device = create_block_device();
         compio::runtime::Runtime::new()
@@ -1247,7 +1247,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
+    #[cfg_attr(miri, ignore = "Miri does not support copy_file_range")]
     fn test_fetch_ranges_meta_blob_probe() {
         let device = create_block_device();
         compio::runtime::Runtime::new()
@@ -1263,7 +1263,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
+    #[cfg_attr(miri, ignore = "Miri does not support copy_file_range")]
     fn test_fetch_ranges_data_blob() {
         let (device, _tmp_dir) = create_block_device_with_tmpdir();
         compio::runtime::Runtime::new()
@@ -1279,7 +1279,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
+    #[cfg_attr(miri, ignore = "Miri does not support copy_file_range")]
     fn test_fetch_ranges_data_blob_probe() {
         let (device, _tmp_dir) = create_block_device_with_tmpdir();
         compio::runtime::Runtime::new()
@@ -1297,7 +1297,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
+    #[cfg_attr(miri, ignore = "Miri does not support copy_file_range")]
     fn test_fetch_ranges_mixed() {
         let (device, _tmp_dir) = create_block_device_with_tmpdir();
         compio::runtime::Runtime::new()
@@ -1312,7 +1312,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
+    #[cfg_attr(miri, ignore = "Miri does not support copy_file_range")]
     fn test_fetch_ranges_hole() {
         let device = create_block_device();
         compio::runtime::Runtime::new()
@@ -1326,7 +1326,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
+    #[cfg_attr(miri, ignore = "Miri does not support copy_file_range")]
     fn test_fetch_ranges_zero_blocks() {
         let device = create_block_device();
         compio::runtime::Runtime::new()
@@ -1338,7 +1338,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
+    #[cfg_attr(miri, ignore = "Miri does not support copy_file_range")]
     fn test_fetch_ranges_meta_blob_offsets() {
         let device = create_block_device();
         compio::runtime::Runtime::new()
@@ -1356,7 +1356,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
+    #[cfg_attr(miri, ignore = "Miri does not support copy_file_range")]
     fn test_fetch_ranges_data_blob_offsets() {
         let (device, _tmp_dir) = create_block_device_with_tmpdir();
         compio::runtime::Runtime::new()
@@ -1374,7 +1374,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
+    #[cfg_attr(miri, ignore = "Miri does not support copy_file_range")]
     fn test_fetch_ranges_probe_after_fetch() {
         let (device, _tmp_dir) = create_block_device_with_tmpdir();
         compio::runtime::Runtime::new()
@@ -1397,7 +1397,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
+    #[cfg_attr(miri, ignore = "Miri does not support copy_file_range")]
     fn test_fetch_ranges_probe_cold() {
         let (device, _tmp_dir) = create_block_device_with_tmpdir();
         compio::runtime::Runtime::new()
@@ -1412,7 +1412,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
+    #[cfg_attr(miri, ignore = "Miri does not support copy_file_range")]
     fn test_fetch_ranges_probe_mixed_ready() {
         let (device, _tmp_dir) = create_block_device_with_tmpdir();
         compio::runtime::Runtime::new()
@@ -1433,7 +1433,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
+    #[cfg_attr(miri, ignore = "Miri does not support copy_file_range")]
     fn test_async_read_zero_buf() {
         let (device, _tmp_dir) = create_block_device_with_tmpdir();
         compio::runtime::Runtime::new()
@@ -1447,7 +1447,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
+    #[cfg_attr(miri, ignore = "Miri does not support copy_file_range")]
     fn test_async_read_data_blob() {
         let (device, _tmp_dir) = create_block_device_with_tmpdir();
         compio::runtime::Runtime::new()

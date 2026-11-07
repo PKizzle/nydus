@@ -2136,7 +2136,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
     fn persist_cached_data_preserves_write_errno() {
         use std::sync::Arc;
         use tempfile::TempDir;
@@ -2553,7 +2552,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
+    #[cfg_attr(miri, ignore = "Miri does not support file-backed mmap")]
     fn test_entries_count_metric_increment() {
         use crate::cache::state::{BlobStateMap, IndexedChunkMap};
         use std::sync::Arc;
@@ -2628,7 +2627,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
+    #[cfg_attr(miri, ignore = "Miri does not support copy_file_range")]
     fn test_file_cache_meta_reloads_after_background_load_failed() {
         use tempfile::TempDir;
 
@@ -2692,7 +2691,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
+    #[cfg_attr(miri, ignore = "Miri does not support copy_file_range")]
     fn test_file_cache_meta_reload_under_contention_waits_for_the_in_flight_reload() {
         use tempfile::TempDir;
 

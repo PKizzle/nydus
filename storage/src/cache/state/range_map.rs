@@ -130,7 +130,7 @@ mod tests {
     use super::*;
 
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
+    #[cfg_attr(miri, ignore = "Miri does not support file-backed mmap")]
     fn test_range_map() {
         let dir = TempDir::new().unwrap();
         let blob_path = dir.path().join("blob-1");
@@ -198,7 +198,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
+    #[cfg_attr(miri, ignore = "Miri does not support file-backed mmap")]
     fn test_range_map_state() {
         let dir = TempDir::new().unwrap();
         let blob_path = dir.path().join("blob-1");

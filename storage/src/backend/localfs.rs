@@ -308,7 +308,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
     fn test_localfs_get_blob_path_stays_in_dir() {
         let root = TempDir::new().unwrap();
         let dir = root.path().join("blobs");
@@ -322,7 +321,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
     fn test_localfs_get_blob_path_skips_zero_byte_alt_dirs() {
         let main_dir = TempDir::new().unwrap();
         let zero_alt_dir = TempDir::new().unwrap();
@@ -347,7 +345,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
+    #[cfg_attr(miri, ignore = "asserts full reads; Miri injects short reads")]
     fn test_localfs_get_blob_path_prefers_blob_file_over_dirs() {
         let dir = TempDir::new().unwrap();
         let blob_file = TempFile::new().unwrap();
@@ -371,7 +369,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
     fn test_localfs_get_blob_path_errors_when_all_dirs_miss() {
         let main_dir = TempDir::new().unwrap();
         let alt_dir_1 = TempDir::new().unwrap();

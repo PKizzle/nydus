@@ -1143,7 +1143,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
+    #[cfg_attr(miri, ignore = "Miri does not support readahead")]
     fn test_blob_compactor_dump_new_blobs() {
         let tmp_dir = TempDir::new().unwrap();
         let build_ctx = BuildContext::new(

@@ -467,7 +467,6 @@ pub mod blob_cache_tests {
     use vmm_sys_util::tempfile::TempFile;
 
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
     fn test_blob_cache_config() {
         // new blob cache
         let tmp_dir = TempDir::new().unwrap();
@@ -942,7 +941,7 @@ mod tests {
     /// So this invariant is the whole of what stops a running filesystem having its backend
     /// shut down underneath it, and it lives here rather than in the factory.
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
+    #[cfg_attr(miri, ignore = "Miri does not support file-backed mmap")]
     fn gc_keeps_the_manager_while_a_blob_cache_is_live() {
         use crate::device::BlobFeatures;
         use crate::test::MockBackend;
@@ -993,7 +992,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
+    #[cfg_attr(miri, ignore = "Miri does not support file-backed mmap")]
     fn test_stale_chunk_map_is_dropped_with_its_data_file() {
         use crate::cache::state::IndexedChunkMap;
         use crate::test::MockChunkInfo;

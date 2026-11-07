@@ -1095,7 +1095,7 @@ mod tests {
     use vmm_sys_util::tempfile::TempFile;
 
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
+    #[cfg_attr(miri, ignore = "Miri does not support xattrs")]
     fn test_set_v6_offset() {
         let pa = TempDir::new().unwrap();
         let pa_aa = TempFile::new_in(pa.path()).unwrap();
@@ -1220,7 +1220,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
+    #[cfg_attr(miri, ignore = "Miri does not support xattrs")]
     fn test_set_v6_inode_compact() {
         use std::time::{Duration, UNIX_EPOCH};
 
@@ -1278,7 +1278,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
+    #[cfg_attr(miri, ignore = "Miri does not support xattrs")]
     fn test_v6_dump_rejects_too_many_blobs() {
         let root = TempDir::new().unwrap();
         let node = Node::from_fs_object(

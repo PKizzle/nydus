@@ -458,7 +458,7 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
+    #[cfg_attr(miri, ignore = "Miri does not support inline assembly")]
     fn test_worker_mgr_new() {
         let tmpdir = TempDir::new().unwrap();
         let metrics = BlobcacheMetrics::new("test1", tmpdir.path().to_str().unwrap());
@@ -504,7 +504,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
     fn test_send_prefetch_message_disabled() {
         let tmpdir = TempDir::new().unwrap();
         let metrics = BlobcacheMetrics::new("test_disabled", tmpdir.path().to_str().unwrap());
@@ -524,7 +523,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
     fn test_send_prefetch_message_enabled_increments_inflight() {
         let tmpdir = TempDir::new().unwrap();
         let metrics = BlobcacheMetrics::new("test_enabled", tmpdir.path().to_str().unwrap());
@@ -545,7 +543,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
     fn test_consume_prefetch_budget() {
         let tmpdir = TempDir::new().unwrap();
         let metrics = BlobcacheMetrics::new("test_budget", tmpdir.path().to_str().unwrap());
@@ -569,7 +566,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
+    #[cfg_attr(miri, ignore = "Miri does not support inline assembly")]
     fn test_worker_mgr_rate_limiter() {
         let tmpdir = TempDir::new().unwrap();
         let metrics = BlobcacheMetrics::new("test1", tmpdir.path().to_str().unwrap());

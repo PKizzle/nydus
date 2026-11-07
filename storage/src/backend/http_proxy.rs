@@ -518,7 +518,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
+    #[cfg_attr(miri, ignore = "Miri does not support Unix sockets")]
     fn test_head_and_get() {
         let dir = TempDir::new().unwrap();
         for backend in proxies(Mode::Range, &dir) {
@@ -544,7 +544,7 @@ mod tests {
     /// A response that does not carry the requested range must fail the read instead of
     /// being copied into the cache as chunk data.
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
+    #[cfg_attr(miri, ignore = "Miri does not support Unix sockets")]
     fn test_get_rejects_responses_without_the_range() {
         for mode in [Mode::NotFound, Mode::FullBody] {
             let dir = TempDir::new().unwrap();

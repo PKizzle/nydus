@@ -1776,7 +1776,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
+    #[cfg_attr(miri, ignore = "Miri does not support copy_file_range")]
     fn test_uffd_daemon_lifecycle() {
         let tmpdir = TempDir::new().unwrap();
         let device = create_block_device(tmpdir.path().to_path_buf()).unwrap();
@@ -1868,7 +1868,7 @@ mod tests {
     // --- UffdService basic tests ---
 
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
+    #[cfg_attr(miri, ignore = "Miri does not support copy_file_range")]
     fn test_uffd_service_stop_flag() {
         let tmpdir = TempDir::new().unwrap();
         let device = create_block_device(tmpdir.path().to_path_buf()).unwrap();
@@ -1892,7 +1892,7 @@ mod tests {
     // on: a new receiver is *Empty* (pending), not *Closed*, and a stop signal
     // still reaches it.
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
+    #[cfg_attr(miri, ignore = "Miri does not support copy_file_range")]
     fn test_uffd_service_shutdown_channel_stays_open() {
         let tmpdir = TempDir::new().unwrap();
         let device = create_block_device(tmpdir.path().to_path_buf()).unwrap();
@@ -1917,7 +1917,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
+    #[cfg_attr(miri, ignore = "Miri does not support copy_file_range")]
     fn test_uffd_service_save_restore() {
         let tmpdir = TempDir::new().unwrap();
         let device = create_block_device(tmpdir.path().to_path_buf()).unwrap();
@@ -1930,7 +1930,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
+    #[cfg_attr(miri, ignore = "Miri does not support copy_file_range")]
     fn test_uffd_service_get_blob_cache_mgr() {
         let tmpdir = TempDir::new().unwrap();
         let device = create_block_device(tmpdir.path().to_path_buf()).unwrap();
@@ -2498,7 +2498,7 @@ mod tests {
     // --- UffdService create_worker test ---
 
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
+    #[cfg_attr(miri, ignore = "Miri does not support copy_file_range")]
     fn test_uffd_service_create_worker() {
         let tmpdir = TempDir::new().unwrap();
         let device = create_block_device(tmpdir.path().to_path_buf()).unwrap();
@@ -2518,7 +2518,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
+    #[cfg_attr(miri, ignore = "Miri does not support copy_file_range")]
     fn test_uffd_service_run_without_workers_fails() {
         let tmpdir = TempDir::new().unwrap();
         let device = create_block_device(tmpdir.path().to_path_buf()).unwrap();
@@ -2558,7 +2558,7 @@ mod tests {
     // --- stop() shutdown socket test ---
 
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
+    #[cfg_attr(miri, ignore = "Miri does not support copy_file_range")]
     fn test_service_stop_shutdown_sockets() {
         let tmpdir = TempDir::new().unwrap();
         let device = create_block_device(tmpdir.path().to_path_buf()).unwrap();
@@ -2798,7 +2798,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
+    #[cfg_attr(miri, ignore = "Miri does not support copy_file_range")]
     fn test_uffd_core_new_and_device() {
         let tmpdir = TempDir::new().unwrap();
         let device = create_block_device(tmpdir.path().to_path_buf()).unwrap();
@@ -2812,7 +2812,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
+    #[cfg_attr(miri, ignore = "Miri does not support copy_file_range")]
     fn test_handle_page_fault_not_pagefault_event() {
         let tmpdir = TempDir::new().unwrap();
         let device = create_block_device(tmpdir.path().to_path_buf()).unwrap();
@@ -2840,7 +2840,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
+    #[cfg_attr(miri, ignore = "Miri does not support copy_file_range")]
     fn test_handle_page_fault_vma_invalidating_event_errors() {
         // REMAP/REMOVE/UNMAP invalidate the cached VMA layout; the handler must surface an error
         // so the connection tears down rather than resolving faults against stale addresses.
@@ -2873,7 +2873,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
+    #[cfg_attr(miri, ignore = "Miri does not support copy_file_range")]
     fn test_handle_page_fault_fork_closes_child_fd() {
         // A FORK event carries a brand-new child uffd fd in the first u64 of the union; the handler
         // must close it (returning Noop) instead of leaking it.
@@ -2938,7 +2938,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
+    #[cfg_attr(miri, ignore = "Miri does not support copy_file_range")]
     fn test_handle_page_fault_addr_not_in_vma() {
         let tmpdir = TempDir::new().unwrap();
         let device = create_block_device(tmpdir.path().to_path_buf()).unwrap();
@@ -2966,7 +2966,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
+    #[cfg_attr(miri, ignore = "Miri does not support copy_file_range")]
     fn test_handle_page_fault_copy_mode() {
         let tmpdir = TempDir::new().unwrap();
         let device = create_block_device(tmpdir.path().to_path_buf()).unwrap();
@@ -3011,7 +3011,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
+    #[cfg_attr(miri, ignore = "Miri does not support copy_file_range")]
     fn test_handle_page_fault_zerocopy_mode() {
         let tmpdir = TempDir::new().unwrap();
         let device = create_block_device(tmpdir.path().to_path_buf()).unwrap();
@@ -3049,7 +3049,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
+    #[cfg_attr(miri, ignore = "Miri does not support copy_file_range")]
     fn test_resolve_copy() {
         let tmpdir = TempDir::new().unwrap();
         let device = create_block_device(tmpdir.path().to_path_buf()).unwrap();
@@ -3077,7 +3077,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
+    #[cfg_attr(miri, ignore = "Miri does not support copy_file_range")]
     fn test_resolve_zerocopy_ranges() {
         let tmpdir = TempDir::new().unwrap();
         let device = create_block_device(tmpdir.path().to_path_buf()).unwrap();
@@ -3099,7 +3099,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
+    #[cfg_attr(miri, ignore = "Miri does not support copy_file_range")]
     fn test_prefault_ranges() {
         let tmpdir = TempDir::new().unwrap();
         let device = create_block_device(tmpdir.path().to_path_buf()).unwrap();
@@ -3114,7 +3114,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
+    #[cfg_attr(miri, ignore = "Miri does not support copy_file_range")]
     fn test_handle_page_fault_beyond_device_zerocopy() {
         let tmpdir = TempDir::new().unwrap();
         let device = create_block_device(tmpdir.path().to_path_buf()).unwrap();
@@ -3158,7 +3158,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
+    #[cfg_attr(miri, ignore = "Miri does not support copy_file_range")]
     fn test_handle_page_fault_beyond_device_copy() {
         let tmpdir = TempDir::new().unwrap();
         let device = create_block_device(tmpdir.path().to_path_buf()).unwrap();
