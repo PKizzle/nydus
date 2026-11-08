@@ -506,11 +506,13 @@ pub struct DaemonSupervisor {
     /// I/O cannot be cancelled, so a slug is not re-probed while its last
     /// probe is still (presumed) in flight. Bounds thread leakage to one per
     /// dead mount per backoff window.
-    probes_in_flight: StdMutex<HashMap<String, Instant>>,
-    /// Set while a mount-health pass runs. Passes come from the reconciler
+    /// A marker is cleared by its probe thread when the read returns, so a
+    /// cancelled pass cannot leave one behind.
+    probes_in_flight: Arc<StdMutex<HashMap<String, Instant>>>,
+    /// Held while a mount-health pass runs. Passes come from the reconciler
     /// loop, the Cleanup RPC and the HTTP API; an overlapping pass would read
     /// the running pass's `probes_in_flight` markers as hung probes.
-    probe_pass_running: AtomicBool,
+    probe_pass: async_lock::Mutex<()>,
     probe_timeouts_total: AtomicU64,
     /// Flap guard for `recover()`: a daemon recovered within this window is
     /// skipped on the next pass instead of being restarted again and again.
@@ -537,8 +539,8 @@ impl DaemonSupervisor {
             startup_timeout: Duration::from_secs(30),
             parked_slugs: StdMutex::new(HashSet::new()),
             last_mount_health: StdMutex::new(None),
-            probes_in_flight: StdMutex::new(HashMap::new()),
-            probe_pass_running: AtomicBool::new(false),
+            probes_in_flight: Arc::new(StdMutex::new(HashMap::new())),
+            probe_pass: async_lock::Mutex::new(()),
             probe_timeouts_total: AtomicU64::new(0),
             recent_recoveries: StdMutex::new(HashMap::new()),
         }
@@ -1192,25 +1194,19 @@ impl DaemonSupervisor {
     ///
     /// The blocking waits run through `blocking::unblock`, never on the compio
     /// reactor. A probe that times out leaves its thread behind (a D-state
-    /// read cannot be cancelled); `probes_in_flight` prevents re-probing that
-    /// slug until a full backoff window (`5 * timeout`) has passed.
+    /// read cannot be cancelled); its `probes_in_flight` marker stays until
+    /// the read returns, and prevents re-probing that slug until then or until
+    /// a full backoff window (`5 * timeout`) has passed.
     ///
-    /// One pass runs at a time: a caller arriving while a pass runs gets the
-    /// most recent report instead of probing again. An instance torn down
-    /// while the pass runs is left out of the report, since its mount is gone
+    /// One pass runs at a time: a caller arriving while a pass runs waits for
+    /// it and returns its report instead of probing again. An instance torn
+    /// down while the pass runs is not reported dead, since its mount is gone
     /// on purpose.
     pub async fn probe_mount_health(&self, timeout: Duration) -> MountHealthReport {
-        if self.probe_pass_running.swap(true, Ordering::AcqRel) {
+        let Some(_pass) = self.probe_pass.try_lock() else {
+            drop(self.probe_pass.lock().await);
             return self.last_mount_health().unwrap_or_default();
-        }
-        // Cleared on every exit, including a dropped future.
-        struct PassGuard<'a>(&'a AtomicBool);
-        impl Drop for PassGuard<'_> {
-            fn drop(&mut self) {
-                self.0.store(false, Ordering::Release);
-            }
-        }
-        let _pass = PassGuard(&self.probe_pass_running);
+        };
 
         let instances: Vec<_> = {
             let map = self.instances.read().await;
@@ -1242,23 +1238,18 @@ impl DaemonSupervisor {
                     if self.probe_backoff_active(&slug, timeout) {
                         (false, Some("previous probe still hung".to_string()))
                     } else {
-                        self.probes_in_flight
-                            .lock()
-                            .unwrap()
-                            .insert(slug.clone(), Instant::now());
-                        match probe_with_timeout(mountpoint.clone(), timeout, read_data_probe).await
+                        let marker = InFlightMarker::insert(&self.probes_in_flight, &slug);
+                        match probe_with_timeout(
+                            mountpoint.clone(),
+                            timeout,
+                            read_data_probe,
+                            marker,
+                        )
+                        .await
                         {
-                            ProbeOutcome::Ok => {
-                                self.probes_in_flight.lock().unwrap().remove(&slug);
-                                (true, None)
-                            }
-                            ProbeOutcome::Error(e) => {
-                                self.probes_in_flight.lock().unwrap().remove(&slug);
-                                (false, Some(e))
-                            }
+                            ProbeOutcome::Ok => (true, None),
+                            ProbeOutcome::Error(e) => (false, Some(e)),
                             ProbeOutcome::TimedOut => {
-                                // Leave the in-flight marker: the thread is
-                                // still blocked and must not be duplicated.
                                 self.probe_timeouts_total.fetch_add(1, Ordering::Relaxed);
                                 (false, Some(format!("probe timed out after {timeout:?}")))
                             }
@@ -1267,13 +1258,7 @@ impl DaemonSupervisor {
                 }
             };
             if !healthy {
-                let still_live = self
-                    .instances
-                    .read()
-                    .await
-                    .get(&image_ref)
-                    .is_some_and(|inst| Arc::ptr_eq(&inst.daemon, &daemon));
-                if !still_live {
+                if !self.is_current_daemon(&image_ref, &daemon).await {
                     continue;
                 }
                 report.dead += 1;
@@ -1293,6 +1278,16 @@ impl DaemonSupervisor {
         report.probed = report.results.len();
         *self.last_mount_health.lock().unwrap() = Some(report.clone());
         report
+    }
+
+    /// Whether `daemon` is still the instance registered for `image_ref`, i.e.
+    /// it was neither released nor replaced since the caller looked it up.
+    async fn is_current_daemon(&self, image_ref: &str, daemon: &Arc<dyn NydusDaemon>) -> bool {
+        self.instances
+            .read()
+            .await
+            .get(image_ref)
+            .is_some_and(|inst| Arc::ptr_eq(&inst.daemon, daemon))
     }
 
     fn probe_backoff_active(&self, slug: &str, timeout: Duration) -> bool {
@@ -3453,17 +3448,52 @@ enum ProbeOutcome {
 /// `timeout`. The wait happens on the blocking pool, never the compio reactor.
 /// On timeout the probe thread is abandoned (it may be stuck in
 /// uninterruptible I/O and cannot be cancelled); callers bound re-probing.
-async fn probe_with_timeout(
+/// A slug's `probes_in_flight` entry, removed when this value drops: at the
+/// end of the probe thread, or with the thread's closure if it never started.
+/// Only the entry this marker inserted is removed, never a newer probe's.
+struct InFlightMarker {
+    map: Arc<StdMutex<HashMap<String, Instant>>>,
+    slug: String,
+    since: Instant,
+}
+
+impl InFlightMarker {
+    fn insert(map: &Arc<StdMutex<HashMap<String, Instant>>>, slug: &str) -> Self {
+        let since = Instant::now();
+        map.lock().unwrap().insert(slug.to_string(), since);
+        Self {
+            map: map.clone(),
+            slug: slug.to_string(),
+            since,
+        }
+    }
+}
+
+impl Drop for InFlightMarker {
+    fn drop(&mut self) {
+        let mut map = self.map.lock().unwrap_or_else(|e| e.into_inner());
+        if map.get(&self.slug) == Some(&self.since) {
+            map.remove(&self.slug);
+        }
+    }
+}
+
+/// Run `probe` on its own thread, waiting at most `timeout`. `done` is dropped
+/// by that thread once the probe returns, however long that takes.
+async fn probe_with_timeout<D: Send + 'static>(
     mountpoint: PathBuf,
     timeout: Duration,
     probe: fn(&Path) -> Result<(), String>,
+    done: D,
 ) -> ProbeOutcome {
     blocking::unblock(move || {
         let (tx, rx) = std::sync::mpsc::channel();
         let spawned = std::thread::Builder::new()
             .name("nydus-mount-probe".into())
             .spawn(move || {
-                let _ = tx.send(probe(&mountpoint));
+                let result = probe(&mountpoint);
+                drop(done);
+                let _ = tx.send(result);
             });
         if let Err(e) = spawned {
             return ProbeOutcome::Error(format!("failed to spawn probe thread: {e}"));
@@ -4497,7 +4527,12 @@ mod tests {
             "mounting the bootstrap without devices failed"
         );
         assert!(fs::read_dir(&mnt).unwrap().count() > 0);
-        let outcome = runtime.block_on(probe_with_timeout(mnt.clone(), timeout, read_data_probe));
+        let outcome = runtime.block_on(probe_with_timeout(
+            mnt.clone(),
+            timeout,
+            read_data_probe,
+            (),
+        ));
         let _ = std::process::Command::new("umount").arg(&mnt).status();
         assert!(
             matches!(&outcome, ProbeOutcome::Error(e) if e.contains("hello.txt")),
@@ -4872,6 +4907,7 @@ mod tests {
             dir.path().to_path_buf(),
             Duration::from_secs(2),
             read_data_probe,
+            (),
         ));
         assert!(matches!(outcome, ProbeOutcome::Ok), "got {outcome:?}");
         // Error: nonexistent path.
@@ -4879,6 +4915,7 @@ mod tests {
             dir.path().join("missing"),
             Duration::from_secs(2),
             read_data_probe,
+            (),
         ));
         assert!(matches!(outcome, ProbeOutcome::Error(_)), "got {outcome:?}");
         // A probe stuck in the filesystem is abandoned once the timeout passes.
@@ -4890,6 +4927,7 @@ mod tests {
                 std::thread::sleep(Duration::from_secs(5));
                 Ok(())
             },
+            (),
         ));
         assert!(matches!(outcome, ProbeOutcome::TimedOut), "got {outcome:?}");
         assert!(started.elapsed() < Duration::from_secs(2));
@@ -4923,23 +4961,91 @@ mod tests {
     }
 
     #[test]
-    fn overlapping_probe_pass_returns_last_report_without_probing() {
+    fn overlapping_probe_pass_waits_and_returns_that_pass_report() {
         let dir = tempfile::tempdir().unwrap();
         let supervisor = DaemonSupervisor::new(SnapshotterConfig::default());
         let rt = compio::runtime::Runtime::new().unwrap();
         rt.block_on(supervisor.insert_test_instance("app", dir.path().join("mnt")));
 
-        // Another pass is running: no probe, the (empty) last report comes back.
-        supervisor.probe_pass_running.store(true, Ordering::SeqCst);
-        let report = rt.block_on(supervisor.probe_mount_health(Duration::from_millis(100)));
-        assert_eq!((report.probed, report.dead), (0, 0));
-        assert!(supervisor.last_mount_health().is_none());
+        // Another pass holds the lock and stores its report when it ends: the
+        // overlapping caller waits for it and returns that report unprobed.
+        let running = MountHealthReport {
+            probed: 7,
+            ..MountHealthReport::default()
+        };
+        let report = rt.block_on(async {
+            let pass = supervisor.probe_pass.try_lock().unwrap();
+            let (report, ()) = futures::join!(
+                supervisor.probe_mount_health(Duration::from_millis(100)),
+                async {
+                    *supervisor.last_mount_health.lock().unwrap() = Some(running);
+                    drop(pass);
+                }
+            );
+            report
+        });
+        assert_eq!(report.probed, 7);
 
-        // Once it ends, the next pass probes and finds nothing mounted.
-        supervisor.probe_pass_running.store(false, Ordering::SeqCst);
+        // With no pass running, the caller probes and finds nothing mounted.
         let report = rt.block_on(supervisor.probe_mount_health(Duration::from_millis(100)));
         assert_eq!((report.probed, report.dead), (1, 1));
-        assert!(!supervisor.probe_pass_running.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn in_flight_marker_clears_only_its_own_entry() {
+        let map = Arc::new(StdMutex::new(HashMap::new()));
+        let old = InFlightMarker::insert(&map, "app");
+        drop(InFlightMarker::insert(&map, "other"));
+        assert!(!map.lock().unwrap().contains_key("other"));
+        // A newer probe of the same slug replaced the entry; the old marker
+        // dropping late must not clear it.
+        let newer = InFlightMarker::insert(&map, "app");
+        drop(old);
+        assert!(map.lock().unwrap().contains_key("app"));
+        drop(newer);
+        assert!(map.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn probe_thread_clears_its_marker_after_a_timeout() {
+        let map = Arc::new(StdMutex::new(HashMap::new()));
+        let marker = InFlightMarker::insert(&map, "app");
+        let outcome = compio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(probe_with_timeout(
+                PathBuf::from("/"),
+                Duration::from_millis(20),
+                |_| {
+                    std::thread::sleep(Duration::from_millis(200));
+                    Ok(())
+                },
+                marker,
+            ));
+        assert!(matches!(outcome, ProbeOutcome::TimedOut), "got {outcome:?}");
+        assert!(map.lock().unwrap().contains_key("app"), "still in flight");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while map.lock().unwrap().contains_key("app") {
+            assert!(Instant::now() < deadline, "marker never cleared");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn released_or_replaced_daemon_is_not_current() {
+        let dir = tempfile::tempdir().unwrap();
+        let supervisor = DaemonSupervisor::new(SnapshotterConfig::default());
+        let rt = compio::runtime::Runtime::new().unwrap();
+        rt.block_on(supervisor.insert_test_instance("app", dir.path().join("mnt")));
+        let daemon = rt.block_on(supervisor.instances.read())["app"]
+            .daemon
+            .clone();
+        assert!(rt.block_on(supervisor.is_current_daemon("app", &daemon)));
+
+        rt.block_on(supervisor.insert_test_instance("app", dir.path().join("mnt")));
+        assert!(!rt.block_on(supervisor.is_current_daemon("app", &daemon)));
+
+        rt.block_on(supervisor.instances.write()).remove("app");
+        assert!(!rt.block_on(supervisor.is_current_daemon("app", &daemon)));
     }
 
     #[test]
