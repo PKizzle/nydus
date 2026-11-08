@@ -105,4 +105,26 @@ mod tests {
         .unwrap();
         assert!(dropped.load(Ordering::SeqCst));
     }
+
+    /// Dropping a clone of the runtime while the built runtime lives leaves its tasks running.
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support io_uring")]
+    fn dropping_a_runtime_clone_keeps_tasks_alive() {
+        std::thread::spawn(|| {
+            let got = block_on(async {
+                let (tx, rx) = futures::channel::oneshot::channel();
+                let task = compio::runtime::spawn(async move {
+                    compio::runtime::time::sleep(std::time::Duration::from_millis(10)).await;
+                    tx.send(5).unwrap();
+                });
+                drop(Runtime::current());
+                task.detach();
+                rx.await.unwrap()
+            })
+            .expect("runtime");
+            assert_eq!(got, 5);
+        })
+        .join()
+        .unwrap();
+    }
 }

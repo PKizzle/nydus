@@ -357,7 +357,7 @@ impl Runtime {
 impl Drop for Runtime {
     fn drop(&mut self) {
         // NYDUS LOCAL PATCH: a clone that is not the last runtime reference leaves the tasks to
-        // the owner
+        // the owner.
         if !self.owner && Rc::strong_count(&self.executor) > 1 {
             return;
         }

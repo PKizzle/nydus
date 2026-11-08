@@ -37,8 +37,8 @@ unsafe impl<T: FromMapped, const N: usize> FromMapped for [T; N] {}
 /// The bytes of a region of a file, held in memory.
 ///
 /// The bytes either come from mapping the region with `mmap` ([`FileMapState::new`]) or from
-/// copying it into a page-aligned buffer ([`FileMapState::read`]). Readers see the same API, page
-/// alignment and bounds checks for both; which one to use is the caller's choice. A copy cannot
+/// copying it into a 4 KiB-aligned buffer ([`FileMapState::read`]). Readers see the same API,
+/// alignment checks and bounds checks for both; which one to use is the caller's choice. A copy cannot
 /// change underneath its readers, so it carries none of the mapping's safety contract, and it is
 /// the only form Miri can check.
 pub struct FileMapState {
@@ -98,8 +98,8 @@ fn invalid_input(msg: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, msg)
 }
 
-/// Copies are aligned like a mapping, so a type that is aligned in a mapped file is aligned in a
-/// copy of it.
+/// Alignment of a copy: at least that of any on-disk type and of the smallest page size, so an
+/// offset aligned in a mapping is aligned in a copy too.
 const COPY_ALIGN: usize = 4096;
 
 fn copy_layout(size: usize) -> std::alloc::Layout {
@@ -160,23 +160,28 @@ impl FileMapState {
         })
     }
 
-    /// Copy a region of the file into a page-aligned buffer, read-only.
+    /// Copy a region of the file into a 4 KiB-aligned buffer, read-only.
     ///
     /// It takes ownership of the file object and will close it when the returned object is
     /// dropped. Unlike a mapping, later writes to the file are not seen, and the region must lie
     /// inside the file: a short file fails with `UnexpectedEof`.
-    pub fn read(mut file: File, offset: u64, size: usize) -> io::Result<Self> {
-        use std::io::{Read, Seek, SeekFrom};
+    pub fn read(file: File, offset: u64, size: usize) -> io::Result<Self> {
+        use std::os::unix::fs::FileExt;
 
         if size == 0 || size > isize::MAX as usize - COPY_ALIGN {
             return Err(invalid_input("invalid read size"));
         }
-        file.seek(SeekFrom::Start(offset))?;
+        // Check the region fits before allocating it: the size can come from untrusted metadata.
+        let len = file.metadata()?.len();
+        if offset.checked_add(size as u64).is_none_or(|end| end > len) {
+            return Err(io::ErrorKind::UnexpectedEof.into());
+        }
         let layout = copy_layout(size);
         // SAFETY: `size` is non-zero, so the layout is not zero-sized.
         let base = unsafe { std::alloc::alloc_zeroed(layout) };
         if base.is_null() {
-            std::alloc::handle_alloc_error(layout);
+            // An error, as a failed mmap is, rather than aborting the daemon.
+            return Err(io::Error::from_raw_os_error(libc::ENOMEM));
         }
         // Owns `base` from here, so an error below frees it.
         let mut map = Self {
@@ -189,7 +194,8 @@ impl FileMapState {
         // SAFETY: `base` is a fresh, initialized (zeroed) allocation of `size` bytes that nothing
         // else references; the slice ends before `map` is returned.
         let buf = unsafe { std::slice::from_raw_parts_mut(base, size) };
-        file.read_exact(buf)?;
+        // Positional, so a dup's shared file offset is left alone.
+        file.read_exact_at(buf, offset)?;
         map.fd = file.into_raw_fd();
         Ok(map)
     }
@@ -515,7 +521,7 @@ mod tests {
         temp
     }
 
-    /// A copy hands out the same bytes as a mapping of the same region, page-aligned.
+    /// A copy hands out the same bytes as a mapping of the same region, 4 KiB-aligned.
     #[test]
     #[cfg_attr(miri, ignore = "Miri does not support file-backed mmap")]
     fn copy_matches_mapping() {
@@ -528,6 +534,27 @@ mod tests {
             copied.get_slice::<u8>(0, 8192).unwrap()
         );
         assert!((copied.get_slice::<u8>(0, 1).unwrap().as_ptr() as usize).is_multiple_of(4096));
+    }
+
+    /// `load` honours the source: a copy keeps the bytes it read, a mapping sees later writes.
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support file-backed mmap")]
+    fn load_copies_or_maps_as_asked() {
+        use std::os::unix::fs::FileExt;
+
+        let file = file_with(&[1; 64]);
+        // SAFETY: the test owns the file; the write below is the behaviour under test and goes
+        // through the kernel, so the mapping only observes it.
+        let mapped =
+            unsafe { FileMapState::load(MetadataSource::Mmap, file.try_clone().unwrap(), 0, 64) }
+                .unwrap();
+        // SAFETY: a copy has no contract.
+        let copied =
+            unsafe { FileMapState::load(MetadataSource::Read, file.try_clone().unwrap(), 0, 64) }
+                .unwrap();
+        file.write_all_at(&[2; 64], 0).unwrap();
+        assert_eq!(copied.get_slice::<u8>(0, 64).unwrap(), &[1; 64]);
+        assert_eq!(mapped.get_slice::<u8>(0, 64).unwrap(), &[2; 64]);
     }
 
     #[test]
@@ -549,6 +576,10 @@ mod tests {
     #[test]
     fn copy_rejects_a_short_file_and_an_empty_region() {
         let err = FileMapState::read(file_with(&[0; 16]), 8, 16)
+            .err()
+            .unwrap();
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+        let err = FileMapState::read(file_with(&[0; 16]), u64::MAX, 16)
             .err()
             .unwrap();
         assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);

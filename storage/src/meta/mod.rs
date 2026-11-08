@@ -604,7 +604,7 @@ impl BlobCompressionContextInfo {
         if !header_is_valid(&filemap)? {
             if let Some(reader) = reader {
                 Self::read_metadata(blob_info, reader, &file)?;
-                // A copy does not see the write, so bring the bytes in again.
+                // A copy taken before the download does not see it; for a mapping the reload is a harmless remap.
                 filemap = load()?;
                 if !header_is_valid(&filemap)? {
                     return Err(MetaError::NotFound(
@@ -2680,6 +2680,62 @@ pub(crate) mod tests {
         };
         assert_eq!(chunks(&mapped).len(), 116);
         assert_eq!(chunks(&mapped), chunks(&copied));
+    }
+
+    /// A local chunk digest file loads through either source, and one of the wrong size is refused.
+    #[test]
+    fn chunk_digest_file_loads_from_either_source() {
+        let root_dir = &std::env::var("CARGO_MANIFEST_DIR").expect("$CARGO_MANIFEST_DIR");
+        let id = "233c72f2b6b698c07021c4da367cfe2dff4f049efbaa885ca0ff760ea297865a";
+        let fixture =
+            PathBuf::from(root_dir).join(format!("../tests/texture/zran/{}.blob.meta", id));
+        let dir = tempfile::TempDir::new().unwrap();
+        let blob_path = dir.path().join(id).display().to_string();
+        std::fs::write(
+            format!("{}.{}", blob_path, BLOB_CCT_FILE_SUFFIX),
+            std::fs::read(fixture).unwrap(),
+        )
+        .unwrap();
+        let chunk_count = 0xa3usize;
+        let mut blob_info = BlobInfo::new(
+            0,
+            id.to_string(),
+            0x16c6000,
+            9839040,
+            RAFS_DEFAULT_CHUNK_SIZE as u32,
+            chunk_count as u32,
+            BlobFeatures::ALIGNED
+                | BlobFeatures::INLINED_FS_META
+                | BlobFeatures::CHUNK_INFO_V2
+                | BlobFeatures::ZRAN
+                | BlobFeatures::INLINED_CHUNK_DIGEST,
+        );
+        blob_info.set_blob_meta_info(0, 0xa1290, 0xa1290, compress::Algorithm::None as u32);
+        let digest_path = format!("{}.{}", blob_path, BLOB_DIGEST_FILE_SUFFIX);
+        let digests: Vec<u8> = (0..32 * chunk_count).map(|i| i as u8).collect();
+        std::fs::write(&digest_path, &digests).unwrap();
+
+        let sources = if cfg!(miri) {
+            vec![MetadataSource::Read]
+        } else {
+            vec![MetadataSource::Mmap, MetadataSource::Read]
+        };
+        for source in sources {
+            let meta = BlobCompressionContextInfo::new(&blob_path, &blob_info, None, true, source)
+                .unwrap();
+            for i in [0, chunk_count - 1] {
+                assert_eq!(
+                    meta.get_chunk_digest(i).unwrap(),
+                    &digests[32 * i..32 * (i + 1)]
+                );
+            }
+        }
+
+        std::fs::write(&digest_path, &digests[32..]).unwrap();
+        assert!(
+            BlobCompressionContextInfo::new(&blob_path, &blob_info, None, true, test_source())
+                .is_err()
+        );
     }
 
     #[test]

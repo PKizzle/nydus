@@ -54,20 +54,11 @@ Pass nextest arguments through `SANITIZER_NEXTEST_ARGS` to narrow a run, for exa
 Miri does not support file-backed `mmap` or `readahead`. Bootstraps and blob-meta files are
 therefore loaded through `nydus_utils::filemap::FileMapState::load`, which takes a
 `nydus_api::MetadataSource`: `Mmap` (the default, used in production) maps the region, and
-`Read` copies it into a page-aligned buffer. Both run the same parser over the same bytes.
+`Read` copies it into a 4 KiB-aligned buffer. Both run the same parser over the same bytes.
 The choice travels in `ConfigV2::internal.metadata_source` (not part of the config file
-format). Tests pick `Read` under `cfg(miri)` through their crate's test helper
-(`rafs::test_util::test_config`, `builder::test_config`, `storage::meta::tests::test_source`).
+format). Tests pick `Read` under `cfg(miri)` through a test helper in each crate
+(for example `rafs::test_util::test_config`, `builder::test_config`, `storage::meta::tests::test_source`).
 `cfg(miri)` never appears in production code. Native test runs keep Mmap, and
 `test_mmap_and_read_load_the_same_filesystem` (rafs) and
 `mapped_and_copied_meta_parse_identically` (storage) check that both sources give the same result.
 
-## Known findings
-
-- **compio runtime leaked at thread exit** (fixed). `backend::request::tests::test_call_context_disable_proxy_bypasses_proxy`
-  leaked the per-thread compio runtime from `storage/src/compio_rt.rs` together with a pending
-  hickory DNS task as a reference cycle: compio-runtime 0.12's `Runtime::drop` only clears the
-  executor's tasks when it holds the last `Rc<Executor>`, and the task held a clone. The vendored
-  `third_party/compio-runtime` clears them when the built runtime drops (see
-  [dependencies.md](dependencies.md)); `compio_rt::tests::thread_exit_drops_tasks_holding_the_runtime`
-  pins it.
