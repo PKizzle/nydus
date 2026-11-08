@@ -172,7 +172,13 @@ impl BlobFactory {
             // Without this it would fall through to `DummyCacheMgr` (no `get_blob_object`, no
             // backing file) and every pre-access event would read zeros.
             "blobcache" | "filecache" | "fanotify" => {
-                let mgr = FileCacheMgr::new(cache_cfg, backend, &config.id, user_io_batch_size)?;
+                let mgr = FileCacheMgr::new(
+                    cache_cfg,
+                    backend,
+                    &config.id,
+                    user_io_batch_size,
+                    config.internal.metadata_source,
+                )?;
                 mgr.init()?;
                 Arc::new(mgr) as Arc<dyn BlobCacheMgr>
             }

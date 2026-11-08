@@ -8,7 +8,7 @@ use std::fs::OpenOptions;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
-use nydus_api::CacheConfigV2;
+use nydus_api::{CacheConfigV2, MetadataSource};
 use nydus_utils::crypt;
 use nydus_utils::metrics::BlobcacheMetrics;
 
@@ -46,6 +46,7 @@ pub struct FileCacheMgr {
     cache_encryption_key: String,
     closed: Arc<AtomicBool>,
     user_io_batch_size: u32,
+    metadata_source: MetadataSource,
 }
 
 impl FileCacheMgr {
@@ -55,6 +56,7 @@ impl FileCacheMgr {
         backend: Arc<dyn BlobBackend>,
         id: &str,
         user_io_batch_size: u32,
+        metadata_source: MetadataSource,
     ) -> StorageResult<FileCacheMgr> {
         let blob_cfg = config
             .get_filecache_config()
@@ -82,6 +84,7 @@ impl FileCacheMgr {
             cache_encryption_key: blob_cfg.encryption_key.clone(),
             closed: Arc::new(AtomicBool::new(false)),
             user_io_batch_size,
+            metadata_source,
         })
     }
 
@@ -311,6 +314,7 @@ impl FileCacheEntry {
                     Some(blob_meta_reader),
                     false,
                     load_chunk_digest,
+                    mgr.metadata_source,
                 )?;
                 Some(meta)
             } else {
@@ -961,7 +965,14 @@ mod tests {
         let backend = Arc::new(MockBackend {
             metrics: BackendMetrics::new("gc-liveness-test", "mock"),
         });
-        let mgr = FileCacheMgr::new(&config, backend, "gc-liveness-test", 0).unwrap();
+        let mgr = FileCacheMgr::new(
+            &config,
+            backend,
+            "gc-liveness-test",
+            0,
+            MetadataSource::default(),
+        )
+        .unwrap();
         mgr.init().unwrap();
 
         // An empty manager is collectable -- that is the state the factory may reclaim.
