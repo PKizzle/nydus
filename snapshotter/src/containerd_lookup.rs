@@ -114,10 +114,14 @@ struct OciDescriptor {
 
 #[derive(Deserialize)]
 struct OciImageConfig {
+    /// Absent from a manifest that only carries metadata under a non-empty config media type
+    /// (some buildx attestation manifests, a bare `{}` config): like an OCI artifact, it has no
+    /// chainIDs to register.
+    #[serde(default)]
     rootfs: OciRootfs,
 }
 
-#[derive(Deserialize)]
+#[derive(Default, Deserialize)]
 struct OciRootfs {
     #[serde(default, rename = "diff_ids")]
     diff_ids: Vec<String>,
@@ -458,6 +462,9 @@ async fn walk_manifest_via_grpc(
         .with_context(|| format!("fetch image config for {image_ref}"))?;
     let cfg: OciImageConfig = serde_json::from_slice(&cfg_bytes)
         .with_context(|| format!("parse image config for {image_ref}"))?;
+    if cfg.rootfs.diff_ids.is_empty() {
+        return Ok(false);
+    }
     register_chain_ids(image_ref, &cfg.rootfs.diff_ids, &bootstrap_indices, out);
     Ok(true)
 }
@@ -932,6 +939,9 @@ fn walk_manifest_via_cli(
     .with_context(|| format!("fetch image config for {image_ref}"))?;
     let cfg: OciImageConfig = serde_json::from_slice(&cfg_bytes)
         .with_context(|| format!("parse image config for {image_ref}"))?;
+    if cfg.rootfs.diff_ids.is_empty() {
+        return Ok(false);
+    }
     register_chain_ids(image_ref, &cfg.rootfs.diff_ids, &bootstrap_indices, out);
     Ok(true)
 }
@@ -1323,6 +1333,16 @@ mod tests {
         let chains = chain_ids(&diff_ids);
         assert!(out.contains_key(&chains[1]));
         assert!(out.contains_key(chains.last().unwrap()));
+    }
+
+    /// A config without `rootfs` (a bare `{}` under an image config media type) parses with no
+    /// diff_ids instead of failing the walk; resolving a chainID from it still fails.
+    #[test]
+    fn config_without_rootfs_has_no_diff_ids() {
+        let cfg: OciImageConfig = serde_json::from_slice(b"{}").unwrap();
+        assert!(cfg.rootfs.diff_ids.is_empty());
+        let err = top_chain_id(b"{}", "sha256:m").unwrap_err();
+        assert!(format!("{err:#}").contains("has no diff_ids"), "{err:#}");
     }
 
     /// An attestation manifest (empty `{}` config, DSSE layer) is skipped instead of failing the
