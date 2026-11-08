@@ -1126,17 +1126,34 @@ impl From<&BlobCacheEntryConfigV2> for ConfigV2 {
     }
 }
 
+/// How read-only metadata files (RAFS bootstraps, blob compression contexts and chunk digest
+/// files) are brought into memory. Readers see the same bytes either way.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum MetadataSource {
+    /// Map the file: pages are loaded on first access and shared with the page cache. The file
+    /// must not change while mapped.
+    #[default]
+    Mmap,
+    /// Copy the file into memory when it is loaded. Costs its size in memory up front, and later
+    /// writes to the file are not seen. Miri can check only this form.
+    Read,
+}
+
 /// Internal runtime configuration.
 #[derive(Clone, Debug)]
 pub struct ConfigV2Internal {
     /// It's possible to access the raw or more blob objects.
     pub blob_accessible: Arc<AtomicBool>,
+    /// How metadata files are loaded; chosen by the embedding program, not by configuration
+    /// files.
+    pub metadata_source: MetadataSource,
 }
 
 impl Default for ConfigV2Internal {
     fn default() -> Self {
         ConfigV2Internal {
             blob_accessible: Arc::new(AtomicBool::new(false)),
+            metadata_source: MetadataSource::default(),
         }
     }
 }
@@ -1144,6 +1161,7 @@ impl Default for ConfigV2Internal {
 impl PartialEq for ConfigV2Internal {
     fn eq(&self, other: &Self) -> bool {
         self.blob_accessible() == other.blob_accessible()
+            && self.metadata_source == other.metadata_source
     }
 }
 

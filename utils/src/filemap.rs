@@ -10,6 +10,8 @@ use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd, RawFd};
 use std::ptr::NonNull;
 use std::sync::Arc;
 
+use nydus_api::MetadataSource;
+
 use crate::with_context;
 
 /// Types that can be read straight out of mapped file bytes.
@@ -32,22 +34,29 @@ unsafe impl FromMapped for u64 {}
 // no-padding, no-interior-mutability guarantee from `T: FromMapped`.
 unsafe impl<T: FromMapped, const N: usize> FromMapped for [T; N] {}
 
-/// Struct to manage memory range mapped from file objects.
+/// The bytes of a region of a file, held in memory.
 ///
-/// It maps a region from a file into current process by using libc::mmap().
+/// The bytes either come from mapping the region with `mmap` ([`FileMapState::new`]) or from
+/// copying it into a page-aligned buffer ([`FileMapState::read`]). Readers see the same API, page
+/// alignment and bounds checks for both; which one to use is the caller's choice. A copy cannot
+/// change underneath its readers, so it carries none of the mapping's safety contract, and it is
+/// the only form Miri can check.
 pub struct FileMapState {
     base: *const u8,
     size: usize,
     fd: RawFd,
     writable: bool,
+    /// `base` is a heap buffer allocated with [`copy_layout`], not a mapping.
+    copied: bool,
 }
 
-// SAFETY: the mapping is process-wide memory and `fd` is owned, so neither is tied to the creating
-// thread. Shared access only reads, `new` requires that nothing writes the mapped range under live
-// references, and mutable access needs `&mut self` plus the caller's `unsafe` contract.
+// SAFETY: the memory is process-wide (a mapping or a heap buffer) and `fd` is owned, so neither is
+// tied to the creating thread. Shared access only reads, `new` requires that nothing writes the
+// mapped range under live references, and mutable access needs `&mut self` plus the caller's
+// `unsafe` contract.
 unsafe impl Send for FileMapState {}
-// SAFETY: `&FileMapState` only hands out shared references into a mapping that `new` requires to be
-// unchanging while borrowed; see the `Send` impl above.
+// SAFETY: `&FileMapState` only hands out shared references into memory that is unchanging while
+// borrowed (a copy by construction, a mapping by `new`'s contract); see the `Send` impl above.
 unsafe impl Sync for FileMapState {}
 
 impl Default for FileMapState {
@@ -57,6 +66,7 @@ impl Default for FileMapState {
             writable: false,
             base: std::ptr::null(),
             size: 0,
+            copied: false,
         }
     }
 }
@@ -64,10 +74,16 @@ impl Default for FileMapState {
 impl Drop for FileMapState {
     fn drop(&mut self) {
         if !self.base.is_null() {
-            // SAFETY: `base`/`size` describe the mapping created by a successful `mmap` in `new`,
-            // which is unmapped only here. Every reference handed out borrows `self` (or holds an
-            // `Arc` to it), so none outlive this call.
-            unsafe { libc::munmap(self.base as *mut u8 as *mut libc::c_void, self.size) };
+            if self.copied {
+                // SAFETY: `read` allocated `base` with `copy_layout(size)`, and it is freed only
+                // here. Every reference handed out borrows `self` (or holds an `Arc` to it), so
+                // none outlive this call.
+                unsafe { std::alloc::dealloc(self.base.cast_mut(), copy_layout(self.size)) };
+            } else {
+                // SAFETY: `base`/`size` describe the mapping created by a successful `mmap` in
+                // `new`, which is unmapped only here; references are bounded as above.
+                unsafe { libc::munmap(self.base as *mut u8 as *mut libc::c_void, self.size) };
+            }
             self.base = std::ptr::null();
             self.size = 0;
         }
@@ -80,6 +96,14 @@ impl Drop for FileMapState {
 
 fn invalid_input(msg: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, msg)
+}
+
+/// Copies are aligned like a mapping, so a type that is aligned in a mapped file is aligned in a
+/// copy of it.
+const COPY_ALIGN: usize = 4096;
+
+fn copy_layout(size: usize) -> std::alloc::Layout {
+    std::alloc::Layout::from_size_align(size, COPY_ALIGN).expect("size checked by the constructor")
 }
 
 impl FileMapState {
@@ -132,7 +156,63 @@ impl FileMapState {
             writable,
             base,
             size,
+            copied: false,
         })
+    }
+
+    /// Copy a region of the file into a page-aligned buffer, read-only.
+    ///
+    /// It takes ownership of the file object and will close it when the returned object is
+    /// dropped. Unlike a mapping, later writes to the file are not seen, and the region must lie
+    /// inside the file: a short file fails with `UnexpectedEof`.
+    pub fn read(mut file: File, offset: u64, size: usize) -> io::Result<Self> {
+        use std::io::{Read, Seek, SeekFrom};
+
+        if size == 0 || size > isize::MAX as usize - COPY_ALIGN {
+            return Err(invalid_input("invalid read size"));
+        }
+        file.seek(SeekFrom::Start(offset))?;
+        let layout = copy_layout(size);
+        // SAFETY: `size` is non-zero, so the layout is not zero-sized.
+        let base = unsafe { std::alloc::alloc_zeroed(layout) };
+        if base.is_null() {
+            std::alloc::handle_alloc_error(layout);
+        }
+        // Owns `base` from here, so an error below frees it.
+        let mut map = Self {
+            fd: -1,
+            writable: false,
+            base,
+            size,
+            copied: true,
+        };
+        // SAFETY: `base` is a fresh, initialized (zeroed) allocation of `size` bytes that nothing
+        // else references; the slice ends before `map` is returned.
+        let buf = unsafe { std::slice::from_raw_parts_mut(base, size) };
+        file.read_exact(buf)?;
+        map.fd = file.into_raw_fd();
+        Ok(map)
+    }
+
+    /// Bring a read-only region of the file into memory the way `source` says.
+    ///
+    /// # Safety
+    /// For [`MetadataSource::Mmap`], the contract of [`FileMapState::new`]. A copy has none.
+    pub unsafe fn load(
+        source: MetadataSource,
+        file: File,
+        offset: u64,
+        size: usize,
+    ) -> io::Result<Self> {
+        match source {
+            MetadataSource::Mmap => {
+                let offset = libc::off_t::try_from(offset)
+                    .map_err(|_| invalid_input("invalid mmap offset"))?;
+                // SAFETY: forwarded to the caller.
+                unsafe { Self::new(file, offset, size, false) }
+            }
+            MetadataSource::Read => Self::read(file, offset, size),
+        }
     }
 
     /// Get size of mapped region.
@@ -427,6 +507,59 @@ mod tests {
         let _ = map.validate_range(4095, 1).unwrap();
         let _ = map.validate_range(0, 1).unwrap();
         drop(map);
+    }
+
+    fn file_with(bytes: &[u8]) -> File {
+        let temp = tempfile::tempfile().unwrap();
+        (&temp).write_all(bytes).unwrap();
+        temp
+    }
+
+    /// A copy hands out the same bytes as a mapping of the same region, page-aligned.
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support file-backed mmap")]
+    fn copy_matches_mapping() {
+        let bytes: Vec<u8> = (0..3 * 4096u32).map(|i| (i * 7) as u8).collect();
+        // SAFETY: the temporary file is not written while mapped.
+        let mapped = unsafe { FileMapState::new(file_with(&bytes), 0, 8192, false) }.unwrap();
+        let copied = FileMapState::read(file_with(&bytes), 0, 8192).unwrap();
+        assert_eq!(
+            mapped.get_slice::<u8>(0, 8192).unwrap(),
+            copied.get_slice::<u8>(0, 8192).unwrap()
+        );
+        assert!(copied.get_slice::<u8>(0, 1).unwrap().as_ptr() as usize % 4096 == 0);
+    }
+
+    #[test]
+    fn copy_reads_the_region_and_checks_ranges() {
+        let bytes: Vec<u8> = (0..64u8).collect();
+        let copied = FileMapState::read(file_with(&bytes), 8, 32).unwrap();
+        assert_eq!(copied.size(), 32);
+        assert_eq!(copied.get_slice::<u8>(0, 32).unwrap(), &bytes[8..40]);
+        assert_eq!(
+            *copied.get_ref::<u64>(8).unwrap(),
+            u64::from_ne_bytes(bytes[16..24].try_into().unwrap())
+        );
+        assert!(copied.get_ref::<u64>(4).is_err(), "unaligned");
+        assert!(copied.get_slice::<u8>(1, 32).is_err(), "past the end");
+        let slice = MappedSlice::<u32>::new(Arc::new(copied), 4, 7).unwrap();
+        assert_eq!(slice.len(), 7);
+    }
+
+    #[test]
+    fn copy_rejects_a_short_file_and_an_empty_region() {
+        let err = FileMapState::read(file_with(&[0; 16]), 8, 16)
+            .err()
+            .unwrap();
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+        assert!(FileMapState::read(file_with(&[0; 16]), 0, 0).is_err());
+    }
+
+    #[test]
+    fn copy_is_read_only() {
+        let mut copied = FileMapState::read(file_with(&[0; 64]), 0, 64).unwrap();
+        // SAFETY: nothing else accesses the copy; the call must fail before handing out a reference.
+        assert!(unsafe { copied.get_mut::<u64>(0) }.is_err());
     }
 
     #[test]
