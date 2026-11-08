@@ -2505,13 +2505,13 @@ mod tests {
     /// A dirent naming a nid whose inode would overlap the superblocks, the chunk table or lie
     /// past the bootstrap is refused when looked up, not parsed.
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
+    #[cfg_attr(miri, ignore = "Miri does not support readahead")]
     fn test_v6_dirent_nid_outside_the_inode_area_is_refused() {
-        let root = vmm_sys_util::tempdir::TempDir::new().unwrap();
+        let root = tempfile::TempDir::new().unwrap();
         // Without file data the inode area starts at block 0, so small nids reach the superblock.
         let tar = RawTar::default().reg("empty", b"").finish();
         let path = build_v6_variant(
-            root.as_path(),
+            root.path(),
             ConversionType::TarToRafs,
             &tar,
             4096,
@@ -2527,7 +2527,7 @@ mod tests {
         // With file data the chunk table follows the inodes; a nid inside it is refused too.
         let tar = RawTar::default().reg("file", b"data").finish();
         let path = build_v6_variant(
-            root.as_path(),
+            root.path(),
             ConversionType::TarToRafs,
             &tar,
             4096,
@@ -2548,10 +2548,10 @@ mod tests {
     /// each block size, with and without a prefetch table, implicit directories and the inode
     /// sharing xattr prefix table, without blobs, as tarfs, and over a chunk dictionary.
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
+    #[cfg_attr(miri, ignore = "Miri does not support readahead")]
     fn test_v6_layout_variants_load_back() {
-        let root = vmm_sys_util::tempdir::TempDir::new().unwrap();
-        let root = root.as_path();
+        let root = tempfile::TempDir::new().unwrap();
+        let root = root.path();
         // `a/` has no entry of its own, so it becomes an implicit directory.
         let tar = RawTar::default()
             .reg("a/file", b"data")

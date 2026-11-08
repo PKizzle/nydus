@@ -1888,7 +1888,7 @@ mod tests {
     /// A remount swaps the storage backend for the mounted image, so the bootstrap it opens
     /// must be byte-identical to the mounted one.
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
+    #[cfg_attr(miri, ignore = "Miri does not support readahead")]
     fn test_update_requires_the_same_bootstrap() {
         use crate::BufWriter;
         use crate::RafsIoWrite;
@@ -1906,9 +1906,9 @@ mod tests {
         let before = all_chunks(&rs);
         assert!(!before.is_empty());
         let data = std::fs::read(&fixture).unwrap();
-        let dir = vmm_sys_util::tempdir::TempDir::new().unwrap();
+        let dir = tempfile::TempDir::new().unwrap();
         // A copy of the same bytes is the same bootstrap.
-        let copy = dir.as_path().join("copy");
+        let copy = dir.path().join("copy");
         std::fs::write(&copy, &data).unwrap();
         rs.update(&mut open_bootstrap(&copy)).unwrap();
         assert_eq!(all_chunks(&rs), before);
@@ -1921,12 +1921,12 @@ mod tests {
             );
         };
         // Shorter: the tables and inodes past the cut are gone.
-        let short = dir.as_path().join("short");
+        let short = dir.path().join("short");
         std::fs::write(&short, &data[..data.len() - EROFS_BLOCK_SIZE_4096 as usize]).unwrap();
         rejected(&short);
         // A different extended superblock: a moved blob table, a doubled chunk size.
         let edit_ext = |name: &str, edit: &dyn Fn(&mut RafsV6SuperBlockExt)| {
-            let path = dir.as_path().join(name);
+            let path = dir.path().join(name);
             std::fs::write(&path, &data).unwrap();
             let mut ext = RafsV6SuperBlockExt::new();
             ext.load(&mut open_bootstrap(&path)).unwrap();
@@ -1953,7 +1953,7 @@ mod tests {
         assert!(rs.meta.chunk_table_size as usize >= 2 * unit);
         let (first, second) = swapped[table..table + 2 * unit].split_at_mut(unit);
         first.swap_with_slice(second);
-        let path = dir.as_path().join("swapped");
+        let path = dir.path().join("swapped");
         std::fs::write(&path, &swapped).unwrap();
         rejected(&path);
 
