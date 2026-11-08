@@ -831,6 +831,50 @@ mod tests {
     }
 
     #[test]
+    fn test_takeover_from_a_state_without_blob_list() {
+        use crate::upgrade::fanotify_upgrade::adopt_blob_entries;
+
+        let tmpdir = tempfile::TempDir::new().unwrap();
+        let bootstrap = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../tests/texture/bootstrap/rafs-v6-2.2.boot");
+        let config = serde_json::json!({ "blobs": [{
+            "type": "bootstrap",
+            "id": "rafs-v6",
+            "domain_id": "domain1",
+            "config_v2": {
+                "version": 2,
+                "id": "factory1",
+                "backend": { "type": "localfs", "localfs": { "dir": tmpdir.path() } },
+                "cache": { "type": "fanotify", "fanotify": { "work_dir": tmpdir.path() } },
+                "metadata_path": bootstrap,
+                // Miri cannot map files, so under Miri the bootstrap is copied into memory.
+                "metadata_source": if cfg!(miri) { "read" } else { "mmap" },
+            },
+        }]});
+
+        // A successor created with the blob list, as the snapshotter builds it.
+        let mut successor = create_service_controller();
+        successor.upgrade_mgr = Some(Mutex::new(UpgradeManager::new("dummy_socket".into())));
+        successor.initialize_blob_cache(&Some(config)).unwrap();
+        let served = successor.blob_cache_mgr.get_all_data_blobs().len();
+        assert!(served > 0);
+        let configured = successor.upgrade_mgr().unwrap().fanotify_state_for_test();
+
+        // A predecessor's state without entries keeps the configured ones for the next save.
+        let kept = adopt_blob_entries(
+            &successor.blob_cache_mgr,
+            configured.clone(),
+            HashMap::new(),
+        )
+        .unwrap();
+        assert_eq!(kept.keys().collect::<Vec<_>>(), vec!["domain1/rafs-v6"]);
+
+        // A state with the same entries does not register them twice.
+        adopt_blob_entries(&successor.blob_cache_mgr, configured.clone(), configured).unwrap();
+        assert_eq!(successor.blob_cache_mgr.get_all_data_blobs().len(), served);
+    }
+
+    #[test]
     fn test_umount_returns_ok() {
         let service_controller = create_service_controller();
         // stop_services does nothing when fanotify_enabled=false

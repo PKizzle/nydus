@@ -863,19 +863,7 @@ impl DaemonSupervisor {
         // The daemon learns its data blobs only from this blob list: without the
         // bootstrap entry the handler finds no data blob, mounts EROFS without
         // any `device=`, and every file read fails with EIO.
-        let entry = build_auto_accel_blob_cache_entry(
-            backend_dir,
-            &stage_dir,
-            &mountpoint,
-            &daemon_id,
-            &staged_bootstrap,
-            auto_accel_inode_share_domain(
-                self.config.snapshotter.features.erofs_inode_share,
-                built_on_node,
-                crate::probe::erofs_inode_share_fix_detected,
-            ),
-        )?;
-        let cfg_json = serde_json::json!({ "blobs": [entry] });
+        let cfg_json = self.local_blob_list(&slug, backend_dir, built_on_node)?;
         // The process-wide blob factory keys cache managers by config, which is
         // the same for every start of this image, so it would hand back the
         // previous daemon's cache entries; drop the idle ones, whose files the
@@ -1327,6 +1315,31 @@ impl DaemonSupervisor {
         {
             warn!(slug, error = %e, "failed to remove failover state blob");
         }
+    }
+
+    /// The blob list of the node-local fanotify daemon `slug`: its staged bootstrap, with the
+    /// layers read from `backend_dir`.
+    fn local_blob_list(
+        &self,
+        slug: &str,
+        backend_dir: &Path,
+        built_on_node: bool,
+    ) -> Result<serde_json::Value> {
+        let daemon_root = self.daemons_root().join(slug);
+        let stage_dir = daemon_root.join("stage");
+        let entry = build_auto_accel_blob_cache_entry(
+            backend_dir,
+            &stage_dir,
+            &daemon_root.join("mnt"),
+            slug,
+            &stage_dir.join("bootstrap"),
+            auto_accel_inode_share_domain(
+                self.config.snapshotter.features.erofs_inode_share,
+                built_on_node,
+                crate::probe::erofs_inode_share_fix_detected,
+            ),
+        )?;
+        Ok(serde_json::json!({ "blobs": [entry] }))
     }
 
     /// The auto-accel backend dir for `bootstrap`, when the bootstrap is an
@@ -2407,8 +2420,13 @@ impl DaemonSupervisor {
         let state_path = self.failover_state_path(slug);
         let state = fs::read(&state_path)
             .with_context(|| format!("read failover state {}", state_path.display()))?;
+        // The state blob of a build that did not save its blob list carries no entries; the
+        // daemon is given its blob list as a fresh start would build it.
+        let blobs = Self::accel_backend_for(&record.bootstrap)
+            .map(|backend| self.local_blob_list(slug, &backend, record.built_on_node))
+            .transpose()?;
         let (daemon, poll) = self
-            .adopt_fanotify_group(image_ref_str, slug, fan_fd, state, |_| ())
+            .adopt_fanotify_group(image_ref_str, slug, fan_fd, state, blobs, |_| ())
             .await?;
 
         let (refcount, holders) = restored_holder_state(record);
@@ -2438,9 +2456,9 @@ impl DaemonSupervisor {
     /// a predecessor's `save()`, through `Takeover -> Restore -> Start`.
     ///
     /// The daemon-side counterpart is `fanotify_upgrade::restore`
-    /// (`service/src/upgrade.rs`): blob-cache entries are re-added from the state blob (no
-    /// backend config has to be reconstructed here) and the handler is rebuilt around the
-    /// group without re-arming marks or re-mounting. Its workers answer every event already
+    /// (`service/src/upgrade.rs`): blob-cache entries are re-added from the state blob, except
+    /// those `blobs` already registers, and the handler is rebuilt around the group without
+    /// re-arming marks or re-mounting. Its workers answer every event already
     /// queued on the group.
     async fn adopt_fanotify_group(
         &self,
@@ -2448,6 +2466,7 @@ impl DaemonSupervisor {
         slug: &str,
         fan_fd: std::os::fd::RawFd,
         state: Vec<u8>,
+        blobs: Option<serde_json::Value>,
         on_error: impl FnOnce(&Arc<dyn NydusDaemon>) + Send + 'static,
     ) -> Result<(Arc<dyn NydusDaemon>, Arc<Mutex<Poll>>)> {
         let bti = self.build_info.clone();
@@ -2459,9 +2478,9 @@ impl DaemonSupervisor {
         let supervisor_sock = supervisor_sock_path(slug);
         // `upgrade=true` + `Some(api_sock)` skips handler registration and the
         // Mount/Start events, leaving the daemon in INIT ready for takeover.
-        // No fanotify blob_dir/mountpoint and no blob config are passed: the
-        // handler geometry and the blob-cache entries all come from the state
-        // blob captured at save time.
+        // No fanotify blob_dir/mountpoint is passed: the handler geometry comes
+        // from the state blob captured at save time, and so do the blob-cache
+        // entries `blobs` does not provide.
         let api_sock = self.daemons_root().join(slug).join("api.sock");
         let daemon = create_daemon(
             Some(slug.to_string()),
@@ -2469,7 +2488,7 @@ impl DaemonSupervisor {
             None,
             None,
             None,
-            None,
+            blobs,
             bti,
             waker,
             Some(api_sock.as_path()),
@@ -2567,14 +2586,21 @@ impl DaemonSupervisor {
             // A panic may have left the old managers' state half-updated.
             nydus_storage::factory::BLOB_FACTORY.forget(&slug);
             let adopted = self
-                .adopt_fanotify_group(&old.image_ref, &slug, group.as_raw_fd(), state, |new| {
-                    // Its workers stop without answering; the old ones take the queue back.
-                    if let Ok(controller) = controller(new) {
-                        drop(controller.suspend_fanotify_handlers());
-                    }
-                    let _ = new.trigger_stop();
-                    let _ = new.wait();
-                })
+                .adopt_fanotify_group(
+                    &old.image_ref,
+                    &slug,
+                    group.as_raw_fd(),
+                    state,
+                    None,
+                    |new| {
+                        // Its workers stop without answering; the old ones take the queue back.
+                        if let Ok(controller) = controller(new) {
+                            drop(controller.suspend_fanotify_handlers());
+                        }
+                        let _ = new.trigger_stop();
+                        let _ = new.wait();
+                    },
+                )
                 .await;
             let (daemon, poll) = match adopted {
                 Ok(adopted) => adopted,
