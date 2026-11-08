@@ -110,6 +110,7 @@ pub fn build_daemon_config(
         cache: Some(cache),
         rafs: Some(rafs),
         overlay: None,
+        metadata_source: Default::default(),
         internal: Default::default(),
     })
 }
@@ -428,6 +429,7 @@ pub fn build_auto_accel_config(
         cache: Some(cache),
         rafs: Some(rafs),
         overlay: None,
+        metadata_source: Default::default(),
         internal: Default::default(),
     }
 }
@@ -457,6 +459,7 @@ pub fn build_auto_accel_blob_cache_entry(
         external_backends: cfg_v2.external_backends,
         cache: cfg_v2.cache.unwrap_or_default(),
         metadata_path: Some(bootstrap.display().to_string()),
+        metadata_source: cfg_v2.metadata_source,
     };
     let value = json!({
         "type": BLOB_CACHE_TYPE_META_BLOB,
@@ -492,6 +495,7 @@ pub fn build_blob_cache_entry(
         external_backends: cfg_v2.external_backends,
         cache,
         metadata_path: Some(bootstrap.display().to_string()),
+        metadata_source: cfg_v2.metadata_source,
     };
     let value = json!({
         "type": BLOB_CACHE_TYPE_META_BLOB,

@@ -796,10 +796,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(
-        miri,
-        ignore = "blob cache entries cannot ask for a copied bootstrap, and Miri does not support readahead"
-    )]
     fn test_blob_list_is_saved_for_takeover() {
         let tmpdir = tempfile::TempDir::new().unwrap();
         let bootstrap = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -814,6 +810,8 @@ mod tests {
                 "backend": { "type": "localfs", "localfs": { "dir": tmpdir.path() } },
                 "cache": { "type": "fanotify", "fanotify": { "work_dir": tmpdir.path() } },
                 "metadata_path": bootstrap,
+                // Miri cannot map files, so under Miri the bootstrap is copied into memory.
+                "metadata_source": if cfg!(miri) { "read" } else { "mmap" },
             },
         }]});
 

@@ -177,7 +177,7 @@ impl BlobFactory {
                     backend,
                     &config.id,
                     user_io_batch_size,
-                    config.internal.metadata_source,
+                    config.metadata_source,
                 )?;
                 mgr.init()?;
                 Arc::new(mgr) as Arc<dyn BlobCacheMgr>

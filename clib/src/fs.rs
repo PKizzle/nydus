@@ -297,6 +297,7 @@ pub(crate) mod tests {
             r#"
         version = 2
         id = "{}"
+        metadata_source = "{}"
         [backend]
         type = "localfs"
         [backend.localfs]
@@ -306,6 +307,8 @@ pub(crate) mod tests {
         [rafs]
         "#,
             unique_test_id(),
+            // Miri cannot map files, so under Miri the bootstrap is copied into memory.
+            if cfg!(miri) { "read" } else { "mmap" },
             blob_dir.display()
         );
         let config = CString::new(config).unwrap();
@@ -324,7 +327,7 @@ pub(crate) mod tests {
     #[test]
     #[cfg_attr(
         miri,
-        ignore = "Miri supports neither the readahead of a mapped bootstrap nor getegid in Rafs::new"
+        ignore = "the fixture has no explicit uid/gid, so Rafs::new calls getegid"
     )]
     fn test_open_rafs() {
         let fs = open_file_system();
@@ -335,7 +338,7 @@ pub(crate) mod tests {
     #[test]
     #[cfg_attr(
         miri,
-        ignore = "Miri supports neither the readahead of a mapped bootstrap nor getegid in Rafs::new"
+        ignore = "nydus_open_rafs_default builds its own config, which maps the bootstrap, and Miri cannot map files"
     )]
     fn test_open_rafs_default() {
         init_logging();

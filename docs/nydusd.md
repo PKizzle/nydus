@@ -174,6 +174,19 @@ The VMM or runtime-side fault handler connects to the socket, sends the uffd fd 
 }
 ```
 
+#### Metadata Loading
+
+The version 2 configuration format ([sample](../misc/configs/nydusd-config-v2.toml)) and blob
+cache entries (`config_v2`) take a top-level `metadata_source` that controls how read-only
+metadata (bootstraps, blob compression contexts, chunk digests) is loaded:
+
+- `"mmap"` (default): map the file; pages are loaded on first access and shared with the page
+  cache. The file must not change while mounted.
+- `"read"`: copy the whole file into memory when it is loaded. Costs its full size in memory up
+  front, and later writes to the file are not seen.
+
+Any other value is rejected.
+
 #### Use Different Storage Backends
 
 Using different storage backend means that the nydus image metadata (bootstrap) layer is stored in the image registry, but the data layer will be stored on the external storage. Therefore, the option `--target` for `nydusify convert` is still required, the registry image reference is needed to store the metadata layer.

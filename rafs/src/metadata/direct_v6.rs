@@ -1891,8 +1891,10 @@ mod tests {
         use nydus_api::{ConfigV2, MetadataSource};
 
         let load = |path: &std::path::Path, source| {
-            let mut config = ConfigV2::default();
-            config.internal.metadata_source = source;
+            let config = ConfigV2 {
+                metadata_source: source,
+                ..Default::default()
+            };
             crate::metadata::RafsSuper::load_from_file(path, Arc::new(config), false)
                 .unwrap()
                 .0
