@@ -312,9 +312,7 @@ impl BlobMetaChunkInfo for BlobChunkInfoV2Ondisk {
             let ctx = &state.zran_info_array[index];
             let zran_offset = self.get_zran_offset()?;
             if zran_offset >= ctx.out_size()
-                || zran_offset
-                    .checked_add(self.uncompressed_size())
-                    .is_none_or(|end| end > ctx.out_size())
+                || zran_offset as u64 + self.uncompressed_size() as u64 > ctx.out_size() as u64
             {
                 return Err(MetaError::Corrupted(format!(
                     "ZRan range 0x{:x}/0x{:x} is invalid, should be with in 0/0x{:x}",
@@ -341,8 +339,9 @@ impl BlobMetaChunkInfo for BlobChunkInfoV2Ondisk {
                 }
                 let ctx = &state.batch_info_array[index];
                 if ctx.compressed_size() > ctx.uncompressed_batch_size()
-                    || self.get_uncompressed_offset_in_batch_buf()? + self.uncompressed_size()
-                        > ctx.uncompressed_batch_size()
+                    || self.get_uncompressed_offset_in_batch_buf()? as u64
+                        + self.uncompressed_size() as u64
+                        > ctx.uncompressed_batch_size() as u64
                     || u64::MAX - self.compressed_offset() < ctx.compressed_size() as u64
                 {
                     return Err(MetaError::Corrupted(format!(
@@ -559,6 +558,29 @@ mod tests {
         assert!(chunk.validate(&ctx).is_ok());
     }
 
+    /// A ZRan offset near `u32::MAX` must be rejected when the chunk runs past its context,
+    /// not wrap around the 32-bit sum and pass.
+    #[test]
+    fn test_zran_range_past_u32_is_rejected() {
+        use crate::meta::ZranInflateContext;
+
+        let ctx = BlobCompressionContext {
+            compressed_size: 0x1000,
+            uncompressed_size: 0x1000,
+            blob_features: BlobFeatures::ZRAN.bits(),
+            zran_info_array: vec![ZranInflateContext::with_out_len(u32::MAX)].into(),
+            ..Default::default()
+        };
+        let mut chunk = BlobChunkInfoV2Ondisk::default();
+        chunk.set_compressed_size(0x20);
+        chunk.set_uncompressed_size(0x20);
+        chunk.set_compressed(true);
+        chunk.set_zran(true);
+        chunk.set_zran_index(0);
+        chunk.set_zran_offset(u32::MAX - 0x10);
+        assert!(chunk.validate(&ctx).is_err());
+    }
+
     #[test]
     fn test_unknown_chunk_flags() {
         let ctx = BlobCompressionContext {
@@ -579,5 +601,94 @@ mod tests {
         chunk.uncomp_info = u64::to_le(u64::from_le(chunk.uncomp_info) | invalid_flag);
 
         assert!(chunk.validate(&ctx).is_ok());
+    }
+}
+
+#[cfg(kani)]
+mod verification {
+    use super::*;
+    use crate::meta::{BatchInflateContext, ZranInflateContext};
+
+    fn any_chunk() -> BlobChunkInfoV2Ondisk {
+        BlobChunkInfoV2Ondisk {
+            uncomp_info: kani::any(),
+            comp_info: kani::any(),
+            data: kani::any(),
+        }
+    }
+
+    /// Error messages are not under test, and formatting them dominates the solver's time.
+    fn no_format(_args: std::fmt::Arguments<'_>) -> String {
+        String::new()
+    }
+
+    /// `validate` is the gate between an untrusted on-disk chunk record (plus the ZRan or batch
+    /// context it points at) and the offset arithmetic of the read path: it decides every
+    /// record without panicking, and an accepted ZRan or batch chunk lies inside its context.
+    #[kani::proof]
+    #[kani::stub(std::fmt::format, no_format)]
+    fn validate_decides_every_record() {
+        let chunk = any_chunk();
+        // Unknown flags only log a warning, and the logger's global state would swamp the solver.
+        kani::assume(chunk.check_flags() == 0);
+        let state = BlobCompressionContext {
+            blob_features: kani::any(),
+            compressed_size: kani::any(),
+            uncompressed_size: kani::any(),
+            zran_info_array: vec![kani::any::<ZranInflateContext>()].into(),
+            batch_info_array: vec![kani::any::<BatchInflateContext>()].into(),
+            ..Default::default()
+        };
+        // Leak the error: `MetaError` can hold an `io::Error`, whose boxed `dyn Error` the
+        // solver cannot bound, so dropping one unwinds forever.
+        let result = chunk.validate(&state);
+        let accepted = result.is_ok();
+        std::mem::forget(result);
+        if !accepted {
+            return;
+        }
+        let size = chunk.uncompressed_size() as u64;
+        if chunk.is_zran() {
+            let offset = chunk.get_zran_offset().unwrap() as u64;
+            assert!(offset + size <= state.zran_info_array[0].out_size() as u64);
+        }
+        if chunk.is_batch() {
+            let offset = chunk.get_uncompressed_offset_in_batch_buf().unwrap() as u64;
+            let batch = &state.batch_info_array[0];
+            assert!(offset + size <= batch.uncompressed_batch_size() as u64);
+        }
+    }
+
+    /// The packed fields of a chunk record do not overlap: writing each one leaves the others
+    /// readable unchanged.
+    #[kani::proof]
+    fn packed_fields_round_trip() {
+        let comp_offset: u64 = kani::any();
+        let comp_size: u32 = kani::any();
+        let uncomp_offset: u64 = kani::any();
+        let uncomp_size: u32 = kani::any();
+        let (compressed, encrypted, zran): (bool, bool, bool) = kani::any();
+        kani::assume(comp_offset <= CHUNK_V2_COMP_OFFSET_MASK);
+        kani::assume(comp_size as u64 <= BLOB_CCT_CHUNK_SIZE_MASK);
+        kani::assume(uncomp_offset >> CHUNK_V2_UNCOMP_OFFSET_SHIFT <= CHUNK_V2_UNCOMP_OFFSET_MASK);
+        kani::assume(uncomp_offset & ((1 << CHUNK_V2_UNCOMP_OFFSET_SHIFT) - 1) == 0);
+        kani::assume(uncomp_size != 0 && uncomp_size as u64 - 1 <= BLOB_CCT_CHUNK_SIZE_MASK);
+
+        let mut chunk = any_chunk();
+        chunk.set_compressed_offset(comp_offset);
+        chunk.set_compressed_size(comp_size);
+        chunk.set_uncompressed_offset(uncomp_offset);
+        chunk.set_uncompressed_size(uncomp_size);
+        chunk.set_compressed(compressed);
+        chunk.set_encrypted(encrypted);
+        chunk.set_zran(zran);
+
+        assert_eq!(chunk.compressed_offset(), comp_offset);
+        assert_eq!(chunk.compressed_size(), comp_size);
+        assert_eq!(chunk.uncompressed_offset(), uncomp_offset);
+        assert_eq!(chunk.uncompressed_size(), uncomp_size);
+        assert_eq!(chunk.is_compressed(), compressed);
+        assert_eq!(chunk.is_encrypted(), encrypted);
+        assert_eq!(chunk.is_zran(), zran);
     }
 }

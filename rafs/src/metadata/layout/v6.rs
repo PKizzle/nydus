@@ -750,8 +750,9 @@ impl RafsV6SuperBlockExt {
                     "Rafs v6 device table end 0x{devslot_end:x} lies past the bootstrap end 0x{meta_size:x}"
                 ))
             })?;
-        let mut ranges: Vec<(&str, MetaRange)> = Vec::with_capacity(tables.len());
-        for t in &tables {
+        // The ranges accepted so far, by table index.
+        let mut ranges = tables.each_ref().map(|_| None::<MetaRange>);
+        for (i, t) in tables.iter().enumerate() {
             if t.offset == 0 && t.size == 0 {
                 continue;
             }
@@ -770,13 +771,15 @@ impl RafsV6SuperBlockExt {
             {
                 return Err(invalid(t));
             }
-            if let Some((other, _)) = ranges.iter().find(|(_, r)| r.intersect_with(&range)) {
+            if let Some(other) =
+                (0..i).find(|&j| ranges[j].as_ref().is_some_and(|r| r.intersect_with(&range)))
+            {
                 return Err(RafsError::InvalidMetadata(format!(
-                    "{} table intersects with {other} table in Rafs v6 extended superblock",
-                    t.name
+                    "{} table intersects with {} table in Rafs v6 extended superblock",
+                    t.name, tables[other].name
                 )));
             }
-            ranges.push((t.name, range));
+            ranges[i] = Some(range);
         }
 
         Ok(())
@@ -2543,6 +2546,82 @@ impl RafsV6PrefetchTable {
         r.read_exact(data)?;
 
         Ok(data.len())
+    }
+}
+
+#[cfg(kani)]
+mod verification {
+    use super::*;
+
+    /// Error messages are not under test, and formatting them dominates the solver's time.
+    fn no_format(_args: std::fmt::Arguments<'_>) -> String {
+        String::new()
+    }
+
+    /// Whether validation accepted the image. The error is leaked: `RafsError` can hold an
+    /// `io::Error`, whose boxed `dyn Error` the solver cannot bound, so dropping one unwinds
+    /// forever.
+    fn accepted<T>(result: RafsResult<T>) -> Option<T> {
+        match result {
+            Ok(v) => Some(v),
+            Err(e) => {
+                std::mem::forget(e);
+                None
+            }
+        }
+    }
+
+    /// Validating an untrusted primary superblock the way `try_load_v6` does never panics, and an
+    /// accepted one places the metadata area inside the bootstrap.
+    #[kani::proof]
+    #[kani::stub(std::fmt::format, no_format)]
+    fn superblock_decides_every_image() {
+        let meta_size: u64 = kani::any();
+        let mut sb = RafsV6SuperBlock::new();
+        sb.as_mut()
+            .copy_from_slice(&kani::any::<[u8; size_of::<RafsV6SuperBlock>()]>());
+        let Some(block_size) = accepted(sb.validate(meta_size)) else {
+            return;
+        };
+        assert!(sb.meta_addr() as u64 * block_size <= meta_size);
+        assert!(sb.device_table_end() <= meta_size);
+    }
+
+    /// Validating an untrusted extended superblock never panics, and an accepted one places every
+    /// table after the device table and inside the bootstrap. The primary superblock keeps its
+    /// device count and metadata area symbolic; a fully symbolic pair exhausts the solver's memory.
+    #[kani::proof]
+    // validate loops only over the extended superblock's few tables; CBMC cannot see that bound.
+    #[kani::unwind(8)]
+    #[kani::stub(std::fmt::format, no_format)]
+    fn extended_superblock_decides_every_image() {
+        let meta_size: u64 = kani::any();
+        let devices: u16 = kani::any();
+        let mut sb = RafsV6SuperBlock::new();
+        sb.set_inos(1);
+        sb.set_extra_devices(devices);
+        if devices == 0 {
+            sb.set_blocks(0);
+        }
+        sb.set_meta_addr(kani::any::<u32>() as u64 * EROFS_BLOCK_SIZE_4096);
+        sb.set_root_nid(kani::any());
+        let Some(block_size) = accepted(sb.validate(meta_size)) else {
+            return;
+        };
+
+        let mut ext = RafsV6SuperBlockExt::new();
+        ext.as_mut()
+            .copy_from_slice(&kani::any::<[u8; size_of::<RafsV6SuperBlockExt>()]>());
+        if accepted(ext.validate(meta_size, &sb, block_size, 0)).is_none() {
+            return;
+        }
+        if ext.blob_table_size() > 0 {
+            assert!(ext.blob_table_offset() >= sb.device_table_end());
+        }
+        assert!(ext.blob_table_offset() + ext.blob_table_size() as u64 <= meta_size);
+        if ext.chunk_table_size() > 0 {
+            assert!(ext.chunk_table_offset() + ext.chunk_table_size() <= meta_size);
+        }
     }
 }
 

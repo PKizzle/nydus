@@ -7,8 +7,13 @@ use std::any::Any;
 use std::collections::HashMap;
 use std::fmt::Display;
 use std::hash::Hash;
-use std::sync::{Arc, Condvar, Mutex, WaitTimeoutResult};
+use std::sync::Arc;
+#[cfg(not(all(test, nydus_loom)))]
+use std::sync::{Condvar, Mutex, WaitTimeoutResult};
 use std::time::Duration;
+
+#[cfg(all(test, nydus_loom))]
+use loom::sync::{Condvar, Mutex, WaitTimeoutResult};
 
 use crate::cache::SINGLE_INFLIGHT_WAIT_TIMEOUT;
 use crate::cache::state::{BlobRangeMap, ChunkIndexGetter, ChunkMap, IndexedChunkMap, RangeMap};
@@ -836,5 +841,99 @@ pub(crate) mod tests {
         assert!(map.is_range_ready(0, 1).unwrap());
         assert!(map.is_range_ready(9, 1).unwrap());
         assert!(map.is_range_all_ready());
+    }
+}
+
+/// Exhaustive interleavings of the single-flight protocol: of all readers racing for a chunk,
+/// exactly one fetches it, and the rest wait for that fetch instead of starting their own. loom's
+/// `Condvar::wait_timeout` never times out, so a lost wakeup shows up as a deadlock rather than
+/// hiding behind `SINGLE_INFLIGHT_WAIT_TIMEOUT`.
+#[cfg(all(test, nydus_loom))]
+mod loom_tests {
+    use loom::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use loom::thread;
+
+    use super::*;
+    use crate::test::MockChunkInfo;
+
+    /// A single-chunk base map whose ready bit is a loom atomic.
+    #[derive(Default)]
+    struct OneChunk {
+        ready: AtomicBool,
+    }
+
+    impl ChunkMap for OneChunk {
+        fn is_ready(&self, _chunk: &dyn BlobChunkInfo) -> StorageResult<bool> {
+            Ok(self.ready.load(Ordering::Acquire))
+        }
+
+        fn set_ready_and_clear_pending(&self, _chunk: &dyn BlobChunkInfo) -> StorageResult<()> {
+            self.ready.store(true, Ordering::Release);
+            Ok(())
+        }
+    }
+
+    impl ChunkIndexGetter for OneChunk {
+        type Index = u32;
+
+        fn get_index(chunk: &dyn BlobChunkInfo) -> u32 {
+            chunk.id()
+        }
+    }
+
+    type Map = BlobStateMap<OneChunk, u32>;
+
+    /// A reader as the blob cache drives one: fetch the chunk when handed the slot, else wait.
+    fn read(map: &Map, fetches: &AtomicUsize) {
+        let chunk = MockChunkInfo::new();
+        if !map.check_ready_and_mark_pending(&chunk).unwrap() {
+            fetches.fetch_add(1, Ordering::Relaxed);
+            map.set_ready_and_clear_pending(&chunk).unwrap();
+        }
+        assert!(map.is_ready(&chunk).unwrap());
+    }
+
+    fn finish(map: &Map, fetches: &AtomicUsize) {
+        let chunk = MockChunkInfo::new();
+        assert_eq!(fetches.load(Ordering::Relaxed), 1);
+        assert!(map.is_ready(&chunk).unwrap());
+        assert!(!map.is_pending(&chunk).unwrap());
+    }
+
+    #[test]
+    fn loom_racing_readers_fetch_once() {
+        loom::model(|| {
+            let map = Arc::new(Map::from(OneChunk::default()));
+            let fetches = Arc::new(AtomicUsize::new(0));
+            let other = {
+                let (map, fetches) = (map.clone(), fetches.clone());
+                thread::spawn(move || read(&map, &fetches))
+            };
+            read(&map, &fetches);
+            other.join().unwrap();
+            finish(&map, &fetches);
+        });
+    }
+
+    /// A reader whose fetch fails gives the slot back with `clear_pending`; a reader waiting on
+    /// it must wake, take the slot and fetch, not report the chunk ready or wait forever.
+    #[test]
+    fn loom_failed_fetch_hands_the_slot_on() {
+        loom::model(|| {
+            let map = Arc::new(Map::from(OneChunk::default()));
+            let fetches = Arc::new(AtomicUsize::new(0));
+            let failing = {
+                let map = map.clone();
+                thread::spawn(move || {
+                    let chunk = MockChunkInfo::new();
+                    if !map.check_ready_and_mark_pending(&chunk).unwrap() {
+                        map.clear_pending(&chunk);
+                    }
+                })
+            };
+            read(&map, &fetches);
+            failing.join().unwrap();
+            finish(&map, &fetches);
+        });
     }
 }

@@ -2833,3 +2833,44 @@ mod tests {
         assert!(!is_mounted_at(Path::new("/proc-not-really")));
     }
 }
+
+/// The event buffer is filled by the kernel but walked with unchecked `read_unaligned`s, so these
+/// proofs check that no record length, however corrupt, moves a read past the buffer.
+#[cfg(kani)]
+mod verification {
+    use super::*;
+
+    /// A metadata header, two info headers and a range record.
+    const BUF: usize = size_of::<libc::fanotify_event_metadata>()
+        + 2 * size_of::<fanotify_event_info_header>()
+        + size_of::<fanotify_event_info_range>();
+
+    fn any_prefix(buf: &[u8; BUF]) -> &[u8] {
+        let len: usize = kani::any();
+        kani::assume(len <= BUF);
+        &buf[..len]
+    }
+
+    #[kani::proof]
+    #[kani::unwind(10)]
+    fn parse_range_stays_in_bounds() {
+        let buf: [u8; BUF] = kani::any();
+        let raw = any_prefix(&buf);
+        if let Some(range) = FanotifyHandler::parse_range(raw) {
+            assert_eq!(range.hdr.info_type, FAN_EVENT_INFO_TYPE_RANGE);
+        }
+    }
+
+    #[kani::proof]
+    #[kani::unwind(4)]
+    fn event_walk_stays_in_bounds() {
+        let buf: [u8; BUF] = kani::any();
+        let raw = any_prefix(&buf);
+        let mut walked = 0usize;
+        for_each_parsable_event(raw, |meta, record| {
+            assert_eq!(record.len(), meta.event_len as usize);
+            walked += record.len();
+        });
+        assert!(walked <= raw.len());
+    }
+}
