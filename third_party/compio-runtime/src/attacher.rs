@@ -1,0 +1,107 @@
+#[cfg(unix)]
+use std::os::fd::{FromRawFd, RawFd};
+#[cfg(windows)]
+use std::os::windows::io::{FromRawHandle, FromRawSocket, RawHandle, RawSocket};
+use std::{io, ops::Deref};
+
+use compio_buf::IntoInner;
+use compio_driver::{AsFd, AsRawFd, SharedFd, ToSharedFd};
+
+use crate::Runtime;
+
+/// Attach a handle to the driver of current thread.
+///
+/// A handle can and only can attach once to one driver. The attacher will try
+/// to attach the handle.
+#[derive(Debug)]
+pub struct Attacher<S> {
+    source: SharedFd<S>,
+}
+
+impl<S> Attacher<S> {
+    /// Create [`Attacher`] without trying to attach the source.
+    ///
+    /// # Safety
+    ///
+    /// * The user should ensure that the source is attached to the current
+    ///   driver.
+    /// * `S` should be an owned fd.
+    pub unsafe fn new_unchecked(source: S) -> Self {
+        Self {
+            source: unsafe { SharedFd::new_unchecked(source) },
+        }
+    }
+
+    /// Create [`Attacher`] without trying to attach the source.
+    ///
+    /// # Safety
+    ///
+    /// See [`Attacher::new_unchecked`].
+    pub unsafe fn from_shared_fd_unchecked(source: SharedFd<S>) -> Self {
+        Self { source }
+    }
+}
+
+impl<S: AsFd> Attacher<S> {
+    /// Create [`Attacher`]. It tries to attach the source, and will return
+    /// [`Err`] if it fails.
+    ///
+    /// ## Platform specific
+    /// * IOCP: a handle could not be attached more than once. If you want to
+    ///   clone the handle, create the [`Attacher`] before cloning.
+    pub fn new(source: S) -> io::Result<Self> {
+        Runtime::with_current(|r| r.attach(source.as_fd().as_raw_fd()))?;
+        Ok(unsafe { Self::new_unchecked(source) })
+    }
+}
+
+impl<S> IntoInner for Attacher<S> {
+    type Inner = SharedFd<S>;
+
+    fn into_inner(self) -> Self::Inner {
+        self.source
+    }
+}
+
+impl<S> Clone for Attacher<S> {
+    fn clone(&self) -> Self {
+        Self {
+            source: self.source.clone(),
+        }
+    }
+}
+
+#[cfg(windows)]
+impl<S: FromRawHandle> FromRawHandle for Attacher<S> {
+    unsafe fn from_raw_handle(handle: RawHandle) -> Self {
+        unsafe { Self::new_unchecked(S::from_raw_handle(handle)) }
+    }
+}
+
+#[cfg(windows)]
+impl<S: FromRawSocket> FromRawSocket for Attacher<S> {
+    unsafe fn from_raw_socket(sock: RawSocket) -> Self {
+        unsafe { Self::new_unchecked(S::from_raw_socket(sock)) }
+    }
+}
+
+#[cfg(unix)]
+impl<S: FromRawFd> FromRawFd for Attacher<S> {
+    unsafe fn from_raw_fd(fd: RawFd) -> Self {
+        unsafe { Self::new_unchecked(S::from_raw_fd(fd)) }
+    }
+}
+
+impl<S> Deref for Attacher<S> {
+    type Target = S;
+
+    fn deref(&self) -> &Self::Target {
+        self.source.deref()
+    }
+}
+
+impl<S> ToSharedFd<S> for Attacher<S> {
+    fn to_shared_fd(&self) -> SharedFd<S> {
+        self.source.to_shared_fd()
+    }
+}

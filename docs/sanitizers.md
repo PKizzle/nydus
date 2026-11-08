@@ -51,10 +51,10 @@ Pass nextest arguments through `SANITIZER_NEXTEST_ARGS` to narrow a run, for exa
 
 ## Known findings
 
-- **compio runtime leaked at thread exit.** `backend::request::tests::test_call_context_disable_proxy_bypasses_proxy`
-  leaks the per-thread compio runtime from `storage/src/compio_rt.rs` together with a pending
-  hickory DNS task: every allocation is an *indirect* leak, i.e. a reference cycle. compio-runtime
-  0.12's `Runtime::drop` only clears the executor's tasks when it holds the last `Rc<Executor>`,
-  so a queued task that keeps the runtime alive is never dropped, and the io_uring driver goes
-  with it. In production this costs one runtime per exiting `blocking` pool thread that left
-  such a task behind. Suppressed by test name until the runtime clears its tasks on thread exit.
+- **compio runtime leaked at thread exit** (fixed). `backend::request::tests::test_call_context_disable_proxy_bypasses_proxy`
+  leaked the per-thread compio runtime from `storage/src/compio_rt.rs` together with a pending
+  hickory DNS task as a reference cycle: compio-runtime 0.12's `Runtime::drop` only clears the
+  executor's tasks when it holds the last `Rc<Executor>`, and the task held a clone. The vendored
+  `third_party/compio-runtime` clears them when the built runtime drops (see
+  [dependencies.md](dependencies.md)); `compio_rt::tests::thread_exit_drops_tasks_holding_the_runtime`
+  pins it.

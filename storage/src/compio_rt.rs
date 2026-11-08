@@ -72,4 +72,37 @@ mod tests {
         .join()
         .unwrap();
     }
+
+    /// A pending task that holds a clone of the runtime (as hickory's resolver does) is dropped
+    /// when its thread exits, instead of keeping the runtime and itself alive as a cycle.
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support io_uring")]
+    fn thread_exit_drops_tasks_holding_the_runtime() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct SetOnDrop(Arc<AtomicBool>);
+        impl Drop for SetOnDrop {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let dropped = Arc::new(AtomicBool::new(false));
+        let flag = SetOnDrop(dropped.clone());
+        std::thread::spawn(move || {
+            block_on(async move {
+                let rt = Runtime::current();
+                compio::runtime::spawn(async move {
+                    let _hold = (rt, flag);
+                    std::future::pending::<()>().await
+                })
+                .detach();
+            })
+            .expect("runtime");
+        })
+        .join()
+        .unwrap();
+        assert!(dropped.load(Ordering::SeqCst));
+    }
 }

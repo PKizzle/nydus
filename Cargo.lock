@@ -934,8 +934,6 @@ dependencies = [
 [[package]]
 name = "compio-runtime"
 version = "0.12.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d3919cf83e9e531fdceda551085cdf05d570de98436401c89f121d3fae827521"
 dependencies = [
  "compio-buf",
  "compio-driver",
@@ -3576,6 +3574,7 @@ dependencies = [
  "nydus-utils",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.18",
  "vm-memory",
  "vmm-sys-util 0.15.0",
@@ -3818,6 +3817,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "tar",
+ "tempfile",
  "thiserror 2.0.18",
  "vmm-sys-util 0.15.0",
  "xts-mode",
