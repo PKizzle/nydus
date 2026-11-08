@@ -527,7 +527,7 @@ mod tests {
             mapped.get_slice::<u8>(0, 8192).unwrap(),
             copied.get_slice::<u8>(0, 8192).unwrap()
         );
-        assert!(copied.get_slice::<u8>(0, 1).unwrap().as_ptr() as usize % 4096 == 0);
+        assert!((copied.get_slice::<u8>(0, 1).unwrap().as_ptr() as usize).is_multiple_of(4096));
     }
 
     #[test]
