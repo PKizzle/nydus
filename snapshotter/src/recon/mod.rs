@@ -191,9 +191,10 @@ impl Reconciler {
     ///
     /// May run concurrently with the background loop (both share one
     /// `Arc<Reconciler>`): every reconcile op must remain idempotent and
-    /// read-mostly. There is deliberately no in-flight guard — a redundant
-    /// overlapping pass is cheap and self-correcting; add a `try_lock` only if a
-    /// future non-idempotent op needs it.
+    /// read-mostly. There is deliberately no pass-wide in-flight guard — a
+    /// redundant overlapping pass is cheap and self-correcting. The mount-health
+    /// probe is the exception and guards itself: an overlapping probe pass gets
+    /// the last report (`DaemonSupervisor::probe_mount_health`).
     pub async fn run_once(&self) -> Result<()> {
         self.reconcile().await
     }

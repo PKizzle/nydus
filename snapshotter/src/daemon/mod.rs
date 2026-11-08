@@ -507,6 +507,10 @@ pub struct DaemonSupervisor {
     /// probe is still (presumed) in flight. Bounds thread leakage to one per
     /// dead mount per backoff window.
     probes_in_flight: StdMutex<HashMap<String, Instant>>,
+    /// Set while a mount-health pass runs. Passes come from the reconciler
+    /// loop, the Cleanup RPC and the HTTP API; an overlapping pass would read
+    /// the running pass's `probes_in_flight` markers as hung probes.
+    probe_pass_running: AtomicBool,
     probe_timeouts_total: AtomicU64,
     /// Flap guard for `recover()`: a daemon recovered within this window is
     /// skipped on the next pass instead of being restarted again and again.
@@ -534,6 +538,7 @@ impl DaemonSupervisor {
             parked_slugs: StdMutex::new(HashSet::new()),
             last_mount_health: StdMutex::new(None),
             probes_in_flight: StdMutex::new(HashMap::new()),
+            probe_pass_running: AtomicBool::new(false),
             probe_timeouts_total: AtomicU64::new(0),
             recent_recoveries: StdMutex::new(HashMap::new()),
         }
@@ -1189,8 +1194,25 @@ impl DaemonSupervisor {
     /// reactor. A probe that times out leaves its thread behind (a D-state
     /// read cannot be cancelled); `probes_in_flight` prevents re-probing that
     /// slug until a full backoff window (`5 * timeout`) has passed.
+    ///
+    /// One pass runs at a time: a caller arriving while a pass runs gets the
+    /// most recent report instead of probing again. An instance torn down
+    /// while the pass runs is left out of the report, since its mount is gone
+    /// on purpose.
     pub async fn probe_mount_health(&self, timeout: Duration) -> MountHealthReport {
-        let instances: Vec<(String, String, PathBuf, DaemonState)> = {
+        if self.probe_pass_running.swap(true, Ordering::AcqRel) {
+            return self.last_mount_health().unwrap_or_default();
+        }
+        // Cleared on every exit, including a dropped future.
+        struct PassGuard<'a>(&'a AtomicBool);
+        impl Drop for PassGuard<'_> {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::Release);
+            }
+        }
+        let _pass = PassGuard(&self.probe_pass_running);
+
+        let instances: Vec<_> = {
             let map = self.instances.read().await;
             map.iter()
                 .map(|(image_ref, inst)| {
@@ -1199,16 +1221,14 @@ impl DaemonSupervisor {
                         image_ref.clone(),
                         inst.mountpoint.clone(),
                         inst.daemon.get_state(),
+                        inst.daemon.clone(),
                     )
                 })
                 .collect()
         };
 
-        let mut report = MountHealthReport {
-            probed: instances.len(),
-            ..MountHealthReport::default()
-        };
-        for (slug, image_ref, mountpoint, state) in instances {
+        let mut report = MountHealthReport::default();
+        for (slug, image_ref, mountpoint, state, daemon) in instances {
             let fstype = mount_fstype_at(&mountpoint);
             let started = Instant::now();
             let state_str = format!("{state:?}");
@@ -1247,6 +1267,15 @@ impl DaemonSupervisor {
                 }
             };
             if !healthy {
+                let still_live = self
+                    .instances
+                    .read()
+                    .await
+                    .get(&image_ref)
+                    .is_some_and(|inst| Arc::ptr_eq(&inst.daemon, &daemon));
+                if !still_live {
+                    continue;
+                }
                 report.dead += 1;
             }
             report.results.push(MountProbeResult {
@@ -1261,6 +1290,7 @@ impl DaemonSupervisor {
                 probed_at: unix_now(),
             });
         }
+        report.probed = report.results.len();
         *self.last_mount_health.lock().unwrap() = Some(report.clone());
         report
     }
@@ -4890,6 +4920,26 @@ mod tests {
         assert_eq!(report.probed, 0);
         assert_eq!(report.dead, 0);
         assert!(supervisor.last_mount_health().is_some());
+    }
+
+    #[test]
+    fn overlapping_probe_pass_returns_last_report_without_probing() {
+        let dir = tempfile::tempdir().unwrap();
+        let supervisor = DaemonSupervisor::new(SnapshotterConfig::default());
+        let rt = compio::runtime::Runtime::new().unwrap();
+        rt.block_on(supervisor.insert_test_instance("app", dir.path().join("mnt")));
+
+        // Another pass is running: no probe, the (empty) last report comes back.
+        supervisor.probe_pass_running.store(true, Ordering::SeqCst);
+        let report = rt.block_on(supervisor.probe_mount_health(Duration::from_millis(100)));
+        assert_eq!((report.probed, report.dead), (0, 0));
+        assert!(supervisor.last_mount_health().is_none());
+
+        // Once it ends, the next pass probes and finds nothing mounted.
+        supervisor.probe_pass_running.store(false, Ordering::SeqCst);
+        let report = rt.block_on(supervisor.probe_mount_health(Duration::from_millis(100)));
+        assert_eq!((report.probed, report.dead), (1, 1));
+        assert!(!supervisor.probe_pass_running.load(Ordering::SeqCst));
     }
 
     #[test]
