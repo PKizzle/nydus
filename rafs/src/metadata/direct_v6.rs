@@ -1936,7 +1936,6 @@ mod tests {
     /// A remount swaps the storage backend for the mounted image, so the bootstrap it opens
     /// must be byte-identical to the mounted one.
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support readahead")]
     fn test_update_requires_the_same_bootstrap() {
         use crate::BufWriter;
         use crate::RafsIoWrite;
@@ -2012,7 +2011,6 @@ mod tests {
     /// The mapping the state is built from must hold the superblocks that were validated, not
     /// whatever the file holds by the time it is mapped.
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
     fn test_load_requires_the_validated_superblocks() {
         let (path, data) = v6_fixture();
         let sb = load_v6(&data).unwrap();
@@ -2031,7 +2029,6 @@ mod tests {
     /// The whole extent of an inode must lie in the inode area, not just its 32-byte header:
     /// inline xattrs and the chunk index array too.
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support readahead")]
     fn test_inode_extent_must_fit_the_inode_area() {
         let (path, _) = v6_fixture();
         let sb = load_v6(&std::fs::read(&path).unwrap()).unwrap();
@@ -2112,7 +2109,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support readahead")]
     fn test_reject_blob_id_with_path_components() {
         let (_, mut data) = v6_fixture();
         let sb = load_v6(&data).unwrap();
@@ -2132,7 +2128,6 @@ mod tests {
     /// A directory block whose first dirent claims `e_nameoff == 0` holds zero entries; a lookup
     /// in it must fail as corrupt metadata, neither panicking nor answering ENOENT.
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support readahead")]
     fn test_lookup_in_dir_block_without_entries() {
         let (path, mut data) = v6_fixture();
         let sb = load_v6(&data).unwrap();
@@ -2167,7 +2162,6 @@ mod tests {
     /// the bootstrap loads because it is the root, instead of every directory operation walking
     /// all the claimed blocks.
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support readahead")]
     fn test_reject_directory_larger_than_bootstrap() {
         let (path, mut data) = v6_fixture();
         let sb = load_v6(&data).unwrap();

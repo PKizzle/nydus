@@ -1181,7 +1181,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support readahead")]
     fn test_readdir_reports_entry_types() {
         // v6 walks hand the handler each entry's inode; v5 walks hand none.
         let root_dir = &std::env::var("CARGO_MANIFEST_DIR").expect("$CARGO_MANIFEST_DIR");
@@ -1283,7 +1282,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support readahead")]
     fn test_lookup_name_too_long() {
         use std::ffi::CString;
         use std::path::PathBuf;
