@@ -400,7 +400,7 @@ impl TarBuilder {
 pub(crate) fn test_config() -> std::sync::Arc<nydus_api::ConfigV2> {
     let mut config = nydus_api::ConfigV2::default();
     if cfg!(miri) {
-        config.internal.metadata_source = nydus_api::MetadataSource::Read;
+        config.metadata_source = nydus_api::MetadataSource::Read;
     }
     std::sync::Arc::new(config)
 }

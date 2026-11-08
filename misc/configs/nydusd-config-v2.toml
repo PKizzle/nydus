@@ -4,6 +4,10 @@
 version = 2
 # Identifier for the instance.
 id = "my_id"
+# How read-only metadata (bootstraps, blob compression contexts, chunk digests) is loaded:
+# "mmap" (default) maps the file and loads pages on demand; "read" copies the whole file into
+# memory up front and does not see later writes to it.
+metadata_source = "mmap"
 
 [backend]
 # Type of storage backend, valid values: "localfs", "oss", "registry"

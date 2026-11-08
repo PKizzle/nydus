@@ -1805,9 +1805,9 @@ mod tests {
             cache: None,
             rafs: None,
             overlay: None,
+            metadata_source: Default::default(),
             internal: ConfigV2Internal {
                 blob_accessible: Arc::new(AtomicBool::new(true)),
-                ..Default::default()
             },
         };
         ctx.set_configuration(config.into());
