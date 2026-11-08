@@ -544,7 +544,10 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support readahead")]
+    #[cfg_attr(
+        miri,
+        ignore = "mount commands cannot ask for a copied bootstrap, and Miri does not support readahead"
+    )]
     fn it_should_create_rafs_backend() {
         let blob_dir = "../tests/texture/blobs";
         let config = r#"{

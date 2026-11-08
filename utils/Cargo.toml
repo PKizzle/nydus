@@ -53,6 +53,7 @@ flate2 = { version = "1.1.9", features = ["zlib-ng-compat"], default-features = 
 vmm-sys-util = { workspace = true }
 tar = "0.4.46"
 futures = "0.3.32"
+tempfile = "3"
 
 [features]
 zran = ["libz-sys"]

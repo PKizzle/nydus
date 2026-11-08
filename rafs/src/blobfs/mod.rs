@@ -385,6 +385,7 @@ mod tests {
             validate_digest: false,
             ..Default::default()
         };
+        rs.meta.metadata_source = crate::test_util::METADATA_SOURCE;
         rs.load(&mut (Box::new(bootstrap) as RafsIoReader)).unwrap();
         let iter = RafsIterator::new(&rs);
 

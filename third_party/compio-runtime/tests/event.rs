@@ -1,0 +1,56 @@
+#[test]
+#[cfg(windows)]
+fn win32_event() {
+    use std::{
+        os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle},
+        ptr::null,
+        task::Poll,
+    };
+
+    use compio_driver::{OpCode, OpType};
+    use windows_sys::Win32::System::{
+        IO::OVERLAPPED,
+        Threading::{CreateEventW, SetEvent},
+    };
+
+    struct WaitEvent {
+        event: OwnedHandle,
+    }
+
+    unsafe impl OpCode for WaitEvent {
+        type Control = ();
+
+        unsafe fn init(&mut self, _: &mut Self::Control) {}
+
+        fn op_type(&self, _: &Self::Control) -> OpType {
+            OpType::Event(self.event.as_raw_handle() as _)
+        }
+
+        unsafe fn operate(
+            &mut self,
+            _: &mut Self::Control,
+            _optr: *mut OVERLAPPED,
+        ) -> Poll<std::io::Result<usize>> {
+            Poll::Ready(Ok(0))
+        }
+    }
+
+    compio_runtime::Runtime::new().unwrap().block_on(async {
+        let event = unsafe { CreateEventW(null(), 0, 0, null()) };
+        if event.is_null() {
+            panic!("{:?}", std::io::Error::last_os_error());
+        }
+        let event = unsafe { OwnedHandle::from_raw_handle(event as _) };
+
+        let event_raw = event.as_raw_handle() as isize;
+
+        let wait = compio_runtime::submit(WaitEvent { event });
+
+        let task = compio_runtime::spawn_blocking(move || {
+            unsafe { SetEvent(event_raw as _) };
+        });
+
+        wait.await.0.unwrap();
+        task.await.unwrap();
+    })
+}

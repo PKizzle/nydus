@@ -1,0 +1,166 @@
+//! Future combinators.
+
+mod cancel;
+mod personality;
+
+use std::borrow::Cow;
+
+pub use cancel::*;
+use compio_driver::Extra;
+use futures_util::Stream;
+pub use personality::*;
+
+use crate::CancelToken;
+
+#[non_exhaustive]
+#[derive(Debug, Default)]
+pub(crate) struct Ext<'a> {
+    personality: Option<u16>,
+    cancel: Option<Cow<'a, CancelToken>>,
+}
+
+impl<'a> Ext<'a> {
+    pub fn to_owned(&self) -> Ext<'static> {
+        Ext {
+            personality: self.personality,
+            cancel: self
+                .cancel
+                .as_ref()
+                .map(|x| Cow::Owned(x.clone().into_owned())),
+        }
+    }
+}
+
+impl<'a> Ext<'a> {
+    pub fn with_personality(&self, personality: u16) -> Self {
+        Self {
+            personality: Some(personality),
+            cancel: self.cancel.clone(),
+        }
+    }
+
+    pub fn with_cancel(&self, token: &'a CancelToken) -> Self {
+        Self {
+            personality: self.personality,
+            cancel: Some(Cow::Borrowed(token)),
+        }
+    }
+
+    pub fn get_cancel(&self) -> Option<&CancelToken> {
+        self.cancel.as_deref()
+    }
+
+    pub fn set_extra(&self, extra: &mut Extra) -> bool {
+        let mut changed = false;
+        if let Some(personality) = self.personality {
+            extra.set_personality(personality);
+            changed = true;
+        }
+        changed
+    }
+}
+
+/// Extension trait for futures.
+///
+/// # Implementation
+///
+/// Extra data are passed down to runtime when the combinators are polled using
+/// a custom [`Waker`], and those data are single-threaded. This means
+/// - when [`Waker`]s are sent to other threads, the data will be lost.
+/// - when using a "sub-executor" like `FuturesUnordered`, which also creates
+///   its own waker, the data will be lost.
+///
+/// So try to keep the path from the wrapped future to runtime clean, something
+/// like this will generally work:
+///
+/// ```rust,ignore
+/// use std::vec::Vec;
+///
+/// use compio::runtime::{FutureExt, CancelToken};
+/// use compio::fs::File;
+///
+/// let file = File::open("/tmp/file");
+/// let cancel = CancelToken::new();
+/// file.read(Vec::with_capacity(1024)).with_cancel(cancel.clone()).await;
+/// ```
+///
+/// [`Waker`]: std::task::Waker
+pub trait FutureExt {
+    /// Sets the personality for this future.
+    ///
+    /// This only takes effect on io-uring drivers and will be ignored on other
+    /// ones.
+    fn with_personality(self, personality: u16) -> WithPersonality<Self>
+    where
+        Self: Sized,
+    {
+        WithPersonality::new(self, personality)
+    }
+
+    /// Sets the cancel token for this future.
+    ///
+    /// If multiple [`CancelToken`]s are set, the innermost one (the one being
+    /// polled last) will take precedence.
+    fn with_cancel(self, token: CancelToken) -> WithCancel<Self>
+    where
+        Self: Sized,
+    {
+        WithCancel::new(self, token)
+    }
+}
+
+impl<F: Future + ?Sized> FutureExt for F {}
+
+/// Extension trait for streams.
+///
+/// # Implementation
+///
+/// Extra data are passed down to runtime when the combinators are polled using
+/// a custom [`Waker`], and those data are single-threaded. This means
+/// - when [`Waker`]s are sent to other threads, the data will be lost.
+/// - when using a "sub-executor" like `FuturesUnordered`, which also creates
+///   its own waker, the data will be lost.
+///
+/// So try to keep the path from the wrapped stream to runtime clean, something
+/// like this will generally work:
+///
+/// ```rust,ignore
+/// use std::vec::Vec;
+///
+/// use compio::runtime::{StreamExt, CancelToken};
+/// use compio::net::TcpStream;
+///
+/// let input = TcpStream::connect("127.0.0.1:8000").await.unwrap();
+/// let cancel = CancelToken::new();
+/// let mut input_stream = input.read_multi(0).with_cancel(cancel.clone());
+/// while let Some(buf) = input_stream.next().await {
+///     let _ = buf.unwrap();
+/// }
+/// ```
+///
+/// [`Waker`]: std::task::Waker
+pub trait StreamExt {
+    /// Sets the personality for this stream.
+    ///
+    /// This only takes effect on io-uring drivers and will be ignored on other
+    /// ones.
+    fn with_personality(self, personality: u16) -> WithPersonality<Self>
+    where
+        Self: Sized,
+    {
+        WithPersonality::new(self, personality)
+    }
+
+    /// Sets the cancel token for this stream.
+    ///
+    /// If multiple [`CancelToken`]s are set, the innermost one (the one being
+    /// polled last) will take precedence.
+    fn with_cancel(self, token: CancelToken) -> WithCancel<Self>
+    where
+        Self: Sized,
+    {
+        WithCancel::new(self, token)
+    }
+}
+
+impl<F: Stream + ?Sized> StreamExt for F {}

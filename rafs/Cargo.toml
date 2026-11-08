@@ -33,6 +33,7 @@ nydus-utils = { version = "0.7.0", path = "../utils" }
 
 [dev-dependencies]
 vmm-sys-util = { workspace = true }
+tempfile = "3"
 assert_matches = "1.5.0"
 
 [features]

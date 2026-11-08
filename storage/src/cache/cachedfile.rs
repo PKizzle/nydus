@@ -22,6 +22,7 @@ use std::time::{Duration, Instant};
 
 use fuse_backend_rs::file_buf::FileVolatileSlice;
 use nix::sys::uio;
+use nydus_api::MetadataSource;
 use nydus_utils::compress::Decoder;
 use nydus_utils::compress::zstd_frames::ZstdStreamCursor;
 use nydus_utils::crypt::{self, Cipher, CipherContext};
@@ -58,6 +59,7 @@ struct FileCacheMetaLoader {
     blob_info: Arc<BlobInfo>,
     reader: Option<Arc<dyn BlobReader>>,
     validation: bool,
+    source: MetadataSource,
     next_retry: Mutex<Instant>,
 }
 
@@ -68,6 +70,7 @@ impl FileCacheMetaLoader {
             &self.blob_info,
             self.reader.as_ref(),
             self.validation,
+            self.source,
         )
     }
 }
@@ -79,6 +82,7 @@ impl FileCacheMeta {
         reader: Option<Arc<dyn BlobReader>>,
         sync: bool,
         validation: bool,
+        source: MetadataSource,
     ) -> StorageResult<Self> {
         if sync {
             match BlobCompressionContextInfo::new(
@@ -86,6 +90,7 @@ impl FileCacheMeta {
                 &blob_info,
                 reader.as_ref(),
                 validation,
+                source,
             ) {
                 Ok(m) => Ok(FileCacheMeta {
                     has_error: Arc::new(AtomicBool::new(false)),
@@ -100,6 +105,7 @@ impl FileCacheMeta {
                 blob_info,
                 reader,
                 validation,
+                source,
                 next_retry: Mutex::new(Instant::now()),
             });
             let meta = FileCacheMeta {
@@ -2627,7 +2633,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support copy_file_range")]
     fn test_file_cache_meta_reloads_after_background_load_failed() {
         use tempfile::TempDir;
 
@@ -2660,6 +2665,7 @@ mod tests {
                 blob_info: Arc::new(blob_info),
                 reader: None,
                 validation: false,
+                source: crate::meta::tests::test_source(),
                 next_retry: Mutex::new(Instant::now()),
             })),
         };
@@ -2672,7 +2678,11 @@ mod tests {
         assert!(deadline >= started + RELOAD_META_COOLDOWN);
         assert!(deadline <= Instant::now() + RELOAD_META_COOLDOWN);
 
-        std::fs::copy(fixture, path.with_extension("blob.meta")).unwrap();
+        std::fs::write(
+            path.with_extension("blob.meta"),
+            std::fs::read(fixture).unwrap(),
+        )
+        .unwrap();
         // Within the cooldown no reload is attempted, even though the metadata is now there.
         let deadline = Instant::now() + Duration::from_secs(60);
         *loader.next_retry.lock().unwrap() = deadline;
@@ -2691,7 +2701,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support copy_file_range")]
     fn test_file_cache_meta_reload_under_contention_waits_for_the_in_flight_reload() {
         use tempfile::TempDir;
 
@@ -2701,7 +2710,11 @@ mod tests {
         );
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("cached");
-        std::fs::copy(fixture, path.with_extension("blob.meta")).unwrap();
+        std::fs::write(
+            path.with_extension("blob.meta"),
+            std::fs::read(fixture).unwrap(),
+        )
+        .unwrap();
         let mut blob_info = BlobInfo::new(
             0,
             "233c72f2b6b698c07021c4da367cfe2dff4f049efbaa885ca0ff760ea297865a".to_string(),
@@ -2723,6 +2736,7 @@ mod tests {
                 blob_info: Arc::new(blob_info),
                 reader: None,
                 validation: false,
+                source: crate::meta::tests::test_source(),
                 next_retry: Mutex::new(Instant::now()),
             })),
         };

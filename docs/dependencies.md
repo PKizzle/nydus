@@ -43,6 +43,28 @@ cuts a release that lets us switch to a version requirement.
   requirement past it and delete `third_party/compio-executor/` + the
   `[patch.crates-io]` entry.
 
+### compio-runtime (patches 0.12.3)
+
+- **Upstream**: https://github.com/compio-rs/compio
+- **Local copy**: `third_party/compio-runtime/`
+- **Patch target**: `[patch.crates-io]` in `Cargo.toml` (root)
+- **Bug fixed**: `Runtime` is `Clone`, and `Runtime::drop` clears the executor's tasks only
+  when it holds the last `Rc<Executor>`. A pending task that owns a clone (hickory's resolver,
+  through cyper-hickory's `CompioRuntimeProvider`) keeps the executor, the io_uring driver and
+  itself alive as a reference cycle, so every `blocking` pool thread that exits with such a task
+  leaks its runtime from `storage/src/compio_rt.rs`. The vendored copy marks the runtime the
+  builder returned as the owner and clears the tasks when the owner drops, as tokio does; clones
+  keep the upstream behaviour (see the "NYDUS LOCAL PATCH" comments in
+  `third_party/compio-runtime/src/lib.rs`). Pinned by
+  `compio_rt::tests::thread_exit_drops_tasks_holding_the_runtime`.
+- **Version trap**: as for compio-executor, the vendored `version` must track what `compio`
+  resolves (currently 0.12.3); verify `cargo tree -i compio-runtime` shows the `third_party/`
+  path crate after any compio update.
+- **Upstream PR/issue status**: **NOT YET FILED.**
+- **Drop trigger**: upstream clears tasks when the built runtime drops (or stops holding clones
+  in spawned tasks) and releases it; bump `compio` past it and delete
+  `third_party/compio-runtime/` + the `[patch.crates-io]` entry.
+
 ### bbolt-rs (patches 1.3.10)
 
 - **Upstream**: https://github.com/ambaxter/bbolt-rs

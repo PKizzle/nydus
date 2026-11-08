@@ -2587,24 +2587,17 @@ mod verification {
         assert!(sb.device_table_end() <= meta_size);
     }
 
-    /// Validating an untrusted extended superblock never panics, and an accepted one places every
-    /// table after the device table and inside the bootstrap. The primary superblock keeps its
-    /// device count and metadata area symbolic; a fully symbolic pair exhausts the solver's memory.
+    /// Validating an untrusted superblock pair the way `try_load_v6` does never panics, and an
+    /// accepted pair places every table after the device table and inside the bootstrap.
     #[kani::proof]
     // validate loops only over the extended superblock's few tables; CBMC cannot see that bound.
     #[kani::unwind(8)]
     #[kani::stub(std::fmt::format, no_format)]
     fn extended_superblock_decides_every_image() {
         let meta_size: u64 = kani::any();
-        let devices: u16 = kani::any();
         let mut sb = RafsV6SuperBlock::new();
-        sb.set_inos(1);
-        sb.set_extra_devices(devices);
-        if devices == 0 {
-            sb.set_blocks(0);
-        }
-        sb.set_meta_addr(kani::any::<u32>() as u64 * EROFS_BLOCK_SIZE_4096);
-        sb.set_root_nid(kani::any());
+        sb.as_mut()
+            .copy_from_slice(&kani::any::<[u8; size_of::<RafsV6SuperBlock>()]>());
         let Some(block_size) = accepted(sb.validate(meta_size)) else {
             return;
         };
@@ -2612,7 +2605,7 @@ mod verification {
         let mut ext = RafsV6SuperBlockExt::new();
         ext.as_mut()
             .copy_from_slice(&kani::any::<[u8; size_of::<RafsV6SuperBlockExt>()]>());
-        if accepted(ext.validate(meta_size, &sb, block_size, 0)).is_none() {
+        if accepted(ext.validate(meta_size, &sb, block_size, kani::any())).is_none() {
             return;
         }
         if ext.blob_table_size() > 0 {

@@ -928,6 +928,7 @@ mod tests {
             Attributes::default(),
         );
         ctx.fs_version = version;
+        ctx.set_configuration(crate::test_config());
         ctx
     }
 
@@ -1334,7 +1335,7 @@ mod tests {
 
         let sb = nydus_rafs::metadata::RafsSuper::load_from_file(
             &bootstrap_path,
-            Arc::new(nydus_api::ConfigV2::default()),
+            crate::test_config(),
             false,
         )
         .unwrap()
@@ -1360,6 +1361,7 @@ mod tests {
                 &blobs[0],
                 reader,
                 false,
+                nydus_api::MetadataSource::default(),
             )
             .unwrap();
             assert_eq!(meta.get_chunk_count(), 2);
@@ -1466,7 +1468,7 @@ mod tests {
         // Loading the bootstrap back is what detects an inode written at a wrong offset.
         nydus_rafs::metadata::RafsSuper::load_from_file(
             &bootstrap_path,
-            Arc::new(nydus_api::ConfigV2::default()),
+            crate::test_config(),
             false,
         )
         .unwrap()
@@ -1485,7 +1487,6 @@ mod tests {
     // the xattr table itself is written whenever the node has xattrs. If the two disagree, every
     // inode after the hardlink is written at the wrong offset and the bootstrap can't be loaded.
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support readahead")]
     fn test_v5_hardlink_inherits_xattr_flag_from_target() {
         let sb = build_and_load_xattr_hardlink_tar(RafsVersion::V5, "foo");
         // Both names of the hardlink resolve to the inode of the target, which carries the xattr.
@@ -1501,7 +1502,6 @@ mod tests {
     // write past that region, leaking them onto the target and corrupting the inodes stored after
     // it, so the xattrs of the target win even when only the hardlink entry recorded any.
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support readahead")]
     fn test_v6_hardlink_xattrs_stay_identical_to_target() {
         let sb = build_and_load_xattr_hardlink_tar(RafsVersion::V6, "foo-link");
         assert_eq!(xattr_count(&sb, "foo"), 0);
@@ -2096,12 +2096,9 @@ mod tests {
     }
 
     fn load_tree(path: &Path) -> Tree {
-        let (rs, _) = nydus_rafs::metadata::RafsSuper::load_from_file(
-            path,
-            Arc::new(nydus_api::ConfigV2::default()),
-            false,
-        )
-        .unwrap();
+        let (rs, _) =
+            nydus_rafs::metadata::RafsSuper::load_from_file(path, crate::test_config(), false)
+                .unwrap();
         Tree::from_bootstrap(&rs, &mut ()).unwrap()
     }
 
@@ -2114,7 +2111,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support readahead")]
     fn test_implicit_dir_flag_round_trips_v5() {
         let tar = RawTar::default().reg("a/b/c", b"").dir("a/").finish();
         let tree = round_trip_layer(RafsVersion::V5, &tar, false);
@@ -2122,7 +2118,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support readahead")]
     fn test_implicit_dir_flag_round_trips_v6() {
         let tar = RawTar::default().reg("a/b/c", b"").dir("a/").finish();
         let tree = round_trip_layer(RafsVersion::V6, &tar, false);
@@ -2228,7 +2223,7 @@ mod tests {
                 None,
                 ArtifactStorage::SingleFile(out.to_path_buf()),
                 None,
-                Arc::new(nydus_api::ConfigV2::new("cfg")),
+                crate::test_config(),
             )
             .unwrap();
             render(&load_tree(out))
@@ -2259,13 +2254,11 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support readahead")]
     fn test_merge_keeps_lower_metadata_under_implicit_parent_v5() {
         test_merge_keeps_lower_metadata_under_implicit_parent(RafsVersion::V5);
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support readahead")]
     fn test_merge_keeps_lower_metadata_under_implicit_parent_v6() {
         test_merge_keeps_lower_metadata_under_implicit_parent(RafsVersion::V6);
     }
@@ -2355,7 +2348,7 @@ mod tests {
             None,
             ArtifactStorage::SingleFile(out.clone()),
             None,
-            Arc::new(nydus_api::ConfigV2::new("cfg")),
+            crate::test_config(),
         )
         .unwrap();
         render(&load_tree(&out))
@@ -2385,19 +2378,16 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support readahead")]
     fn test_merge_strips_whiteouts_of_first_layer_v5() {
         test_merge_strips_whiteouts_of_first_layer(RafsVersion::V5);
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support readahead")]
     fn test_merge_strips_whiteouts_of_first_layer_v6() {
         test_merge_strips_whiteouts_of_first_layer(RafsVersion::V6);
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support readahead")]
     fn test_merge_applies_non_utf8_whiteout() {
         let layer0 = RawTar::default()
             .member(REG, b"n\xff", b"", 0o644, b"")
@@ -2469,13 +2459,9 @@ mod tests {
         bad: impl Fn(&nydus_rafs::metadata::RafsSuper) -> Vec<u64>,
     ) {
         let load = |path: &Path| {
-            nydus_rafs::metadata::RafsSuper::load_from_file(
-                path,
-                Arc::new(nydus_api::ConfigV2::default()),
-                false,
-            )
-            .unwrap()
-            .0
+            nydus_rafs::metadata::RafsSuper::load_from_file(path, crate::test_config(), false)
+                .unwrap()
+                .0
         };
         let lookup = |rs: &nydus_rafs::metadata::RafsSuper| {
             rs.get_inode(rs.superblock.root_ino(), false)
@@ -2505,13 +2491,12 @@ mod tests {
     /// A dirent naming a nid whose inode would overlap the superblocks, the chunk table or lie
     /// past the bootstrap is refused when looked up, not parsed.
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
     fn test_v6_dirent_nid_outside_the_inode_area_is_refused() {
-        let root = vmm_sys_util::tempdir::TempDir::new().unwrap();
+        let root = tempfile::TempDir::new().unwrap();
         // Without file data the inode area starts at block 0, so small nids reach the superblock.
         let tar = RawTar::default().reg("empty", b"").finish();
         let path = build_v6_variant(
-            root.as_path(),
+            root.path(),
             ConversionType::TarToRafs,
             &tar,
             4096,
@@ -2527,7 +2512,7 @@ mod tests {
         // With file data the chunk table follows the inodes; a nid inside it is refused too.
         let tar = RawTar::default().reg("file", b"data").finish();
         let path = build_v6_variant(
-            root.as_path(),
+            root.path(),
             ConversionType::TarToRafs,
             &tar,
             4096,
@@ -2548,22 +2533,18 @@ mod tests {
     /// each block size, with and without a prefetch table, implicit directories and the inode
     /// sharing xattr prefix table, without blobs, as tarfs, and over a chunk dictionary.
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
     fn test_v6_layout_variants_load_back() {
-        let root = vmm_sys_util::tempdir::TempDir::new().unwrap();
-        let root = root.as_path();
+        let root = tempfile::TempDir::new().unwrap();
+        let root = root.path();
         // `a/` has no entry of its own, so it becomes an implicit directory.
         let tar = RawTar::default()
             .reg("a/file", b"data")
             .reg("empty", b"")
             .finish();
         let load = |path: &Path| {
-            let (rs, _) = nydus_rafs::metadata::RafsSuper::load_from_file(
-                path,
-                Arc::new(nydus_api::ConfigV2::default()),
-                false,
-            )
-            .unwrap();
+            let (rs, _) =
+                nydus_rafs::metadata::RafsSuper::load_from_file(path, crate::test_config(), false)
+                    .unwrap();
             let tree = Tree::from_bootstrap(&rs, &mut ()).unwrap();
             (rs, tree)
         };

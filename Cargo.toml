@@ -218,6 +218,17 @@ fuse-backend-rs = "0.14.0"
 # with the fix; see docs/dependencies.md for filing/tracking status.
 compio-executor = { path = "third_party/compio-executor" }
 
+# Local fix for a per-thread runtime leaked at thread exit (patches compio-runtime 0.12.3).
+# `Runtime` is `Clone`, and `Runtime::drop` clears the executor's tasks only when it holds the
+# last reference. A pending task that owns a clone (hickory's resolver, through cyper-hickory's
+# runtime provider) therefore keeps the executor, the io_uring driver and itself alive forever
+# once the thread that ran `storage/src/compio_rt.rs` exits. The vendored copy marks the runtime
+# the builder returned as the owner and clears the tasks when the owner drops, as tokio does.
+# The vendored `version` MUST track what compio resolves (currently 0.12.3) — same
+# [[patch.unused]] trap as compio-executor above. Drop trigger: upstream clears tasks when the
+# built runtime drops; see docs/dependencies.md.
+compio-runtime = { path = "third_party/compio-runtime" }
+
 # Local patch adding `NoFreelistSync` support to bbolt-rs 1.3.10. Upstream gates
 # `meta.free_list() == PGID_NO_FREE_LIST` with a hard error in `Bolt::new_db`,
 # so it cannot open any bolt file produced by Go's bbolt with that option set —

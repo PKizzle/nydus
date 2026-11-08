@@ -49,12 +49,16 @@ Pass nextest arguments through `SANITIZER_NEXTEST_ARGS` to narrow a run, for exa
   `llvm-symbolizer` (`ASAN_SYMBOLIZER_PATH`); without it reports carry raw addresses and the
   suppressions, which match on function names, do not apply.
 
-## Known findings
+## Miri and read-only metadata
 
-- **compio runtime leaked at thread exit.** `backend::request::tests::test_call_context_disable_proxy_bypasses_proxy`
-  leaks the per-thread compio runtime from `storage/src/compio_rt.rs` together with a pending
-  hickory DNS task: every allocation is an *indirect* leak, i.e. a reference cycle. compio-runtime
-  0.12's `Runtime::drop` only clears the executor's tasks when it holds the last `Rc<Executor>`,
-  so a queued task that keeps the runtime alive is never dropped, and the io_uring driver goes
-  with it. In production this costs one runtime per exiting `blocking` pool thread that left
-  such a task behind. Suppressed by test name until the runtime clears its tasks on thread exit.
+Miri does not support file-backed `mmap` or `readahead`. Bootstraps and blob-meta files are
+therefore loaded through `nydus_utils::filemap::FileMapState::load`, which takes a
+`nydus_api::MetadataSource`: `Mmap` (the default, used in production) maps the region, and
+`Read` copies it into a 4 KiB-aligned buffer. Both run the same parser over the same bytes.
+The choice travels in `ConfigV2::internal.metadata_source` (not part of the config file
+format). Tests pick `Read` under `cfg(miri)` through a test helper in each crate
+(for example `rafs::test_util::test_config`, `builder::test_config`, `storage::meta::tests::test_source`).
+`cfg(miri)` never appears in production code. Native test runs keep Mmap, and
+`test_mmap_and_read_load_the_same_filesystem` (rafs) and
+`mapped_and_copied_meta_parse_identically` (storage) check that both sources give the same result.
+

@@ -30,6 +30,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use arc_swap::{ArcSwap, Guard};
+use nydus_api::MetadataSource;
 use nydus_storage::device::{
     BlobChunkFlags, BlobChunkInfo, BlobDevice, BlobInfo, BlobIoDesc, BlobIoVec, v5::BlobV5ChunkInfo,
 };
@@ -205,16 +206,19 @@ impl DirectSuperBlockV6 {
         })
     }
 
-    /// Map the bootstrap `r` and make it the current state. On a `remount` the bootstrap must
+    /// Load the bootstrap `r` into memory and make it the current state. On a `remount` the bootstrap must
     /// be byte-identical to the mounted one: inodes, chunk records and every offset handed out
     /// before the swap stay valid only for the same image.
     fn update_state(&self, r: &mut RafsIoReader, remount: bool) -> RafsResult<()> {
         let file = clone_file(r.as_raw_fd())?;
         let len = file.metadata()?.len();
         let old_state = self.state.load();
-        readahead(file.as_raw_fd(), 0, len);
+        let source = old_state.meta.metadata_source;
+        if source == MetadataSource::Mmap {
+            readahead(file.as_raw_fd(), 0, len);
+        }
         // SAFETY: nydus only reads the bootstrap, which must not change while it's mounted.
-        let file_map = unsafe { FileMapState::new(file, 0, len as usize, false) }?;
+        let file_map = unsafe { FileMapState::load(source, file, 0, len as usize) }?;
 
         if remount
             && (old_state.map.size() != file_map.size()
@@ -1879,6 +1883,50 @@ mod tests {
         out
     }
 
+    /// Mapping and copying a bootstrap load the same filesystem, v5 and v6 alike, and a copy
+    /// remounts the same bootstrap too.
+    #[test]
+    #[cfg_attr(miri, ignore = "maps the bootstrap, which Miri cannot do")]
+    fn test_mmap_and_read_load_the_same_filesystem() {
+        use nydus_api::{ConfigV2, MetadataSource};
+
+        let load = |path: &std::path::Path, source| {
+            let mut config = ConfigV2::default();
+            config.internal.metadata_source = source;
+            crate::metadata::RafsSuper::load_from_file(path, Arc::new(config), false)
+                .unwrap()
+                .0
+        };
+        let root_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap();
+        for boot in ["rafs-v5.boot", "rafs-v6-2.2.boot"] {
+            let path = std::path::PathBuf::from(&root_dir)
+                .join("../tests/texture/bootstrap")
+                .join(boot);
+            let mapped = load(&path, MetadataSource::Mmap);
+            let copied = load(&path, MetadataSource::Read);
+            assert_eq!(copied.meta.metadata_source, MetadataSource::Read);
+            assert_eq!(
+                mapped.superblock.get_max_ino(),
+                copied.superblock.get_max_ino()
+            );
+            let root = |rs: &crate::metadata::RafsSuper| {
+                let attr = rs
+                    .get_inode(rs.superblock.root_ino(), false)
+                    .unwrap()
+                    .get_attr();
+                (
+                    attr.ino, attr.mode, attr.uid, attr.gid, attr.mtime, attr.nlink,
+                )
+            };
+            assert_eq!(root(&mapped), root(&copied));
+            let chunks = all_chunks(&mapped);
+            assert!(!chunks.is_empty(), "{boot}");
+            assert_eq!(chunks, all_chunks(&copied), "{boot}");
+            copied.update(&mut open_bootstrap(&path)).unwrap();
+            assert_eq!(chunks, all_chunks(&copied), "{boot}");
+        }
+    }
+
     fn superblocks_of(path: &std::path::Path) -> V6Superblocks {
         crate::metadata::md_v6::load_v6_superblocks(&mut open_bootstrap(path))
             .unwrap()
@@ -1888,7 +1936,6 @@ mod tests {
     /// A remount swaps the storage backend for the mounted image, so the bootstrap it opens
     /// must be byte-identical to the mounted one.
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
     fn test_update_requires_the_same_bootstrap() {
         use crate::BufWriter;
         use crate::RafsIoWrite;
@@ -1899,16 +1946,16 @@ mod tests {
         let fixture = v6_fixture_path();
         let (rs, _) = crate::metadata::RafsSuper::load_from_file(
             &fixture,
-            Arc::new(nydus_api::ConfigV2::default()),
+            crate::test_util::test_config(),
             false,
         )
         .unwrap();
         let before = all_chunks(&rs);
         assert!(!before.is_empty());
         let data = std::fs::read(&fixture).unwrap();
-        let dir = vmm_sys_util::tempdir::TempDir::new().unwrap();
+        let dir = tempfile::TempDir::new().unwrap();
         // A copy of the same bytes is the same bootstrap.
-        let copy = dir.as_path().join("copy");
+        let copy = dir.path().join("copy");
         std::fs::write(&copy, &data).unwrap();
         rs.update(&mut open_bootstrap(&copy)).unwrap();
         assert_eq!(all_chunks(&rs), before);
@@ -1921,12 +1968,12 @@ mod tests {
             );
         };
         // Shorter: the tables and inodes past the cut are gone.
-        let short = dir.as_path().join("short");
+        let short = dir.path().join("short");
         std::fs::write(&short, &data[..data.len() - EROFS_BLOCK_SIZE_4096 as usize]).unwrap();
         rejected(&short);
         // A different extended superblock: a moved blob table, a doubled chunk size.
         let edit_ext = |name: &str, edit: &dyn Fn(&mut RafsV6SuperBlockExt)| {
-            let path = dir.as_path().join(name);
+            let path = dir.path().join(name);
             std::fs::write(&path, &data).unwrap();
             let mut ext = RafsV6SuperBlockExt::new();
             ext.load(&mut open_bootstrap(&path)).unwrap();
@@ -1953,7 +2000,7 @@ mod tests {
         assert!(rs.meta.chunk_table_size as usize >= 2 * unit);
         let (first, second) = swapped[table..table + 2 * unit].split_at_mut(unit);
         first.swap_with_slice(second);
-        let path = dir.as_path().join("swapped");
+        let path = dir.path().join("swapped");
         std::fs::write(&path, &swapped).unwrap();
         rejected(&path);
 
@@ -1964,7 +2011,6 @@ mod tests {
     /// The mapping the state is built from must hold the superblocks that were validated, not
     /// whatever the file holds by the time it is mapped.
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support mkdtemp")]
     fn test_load_requires_the_validated_superblocks() {
         let (path, data) = v6_fixture();
         let sb = load_v6(&data).unwrap();
@@ -1983,7 +2029,6 @@ mod tests {
     /// The whole extent of an inode must lie in the inode area, not just its 32-byte header:
     /// inline xattrs and the chunk index array too.
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support readahead")]
     fn test_inode_extent_must_fit_the_inode_area() {
         let (path, _) = v6_fixture();
         let sb = load_v6(&std::fs::read(&path).unwrap()).unwrap();
@@ -2009,13 +2054,13 @@ mod tests {
             meta: state.meta.clone(),
             blob_table: RafsV6BlobTable::new(),
             blob_extra_infos: HashMap::new(),
-            // SAFETY: the fixture copy is not modified while it is mapped.
+            // SAFETY: the fixture is not modified while it is mapped.
             map: unsafe {
-                FileMapState::new(
+                FileMapState::load(
+                    crate::test_util::METADATA_SOURCE,
                     std::fs::File::open(&path).unwrap(),
                     0,
                     state.map.size(),
-                    false,
                 )
             }
             .unwrap(),
@@ -2057,14 +2102,13 @@ mod tests {
         std::fs::write(file.as_path(), data).unwrap();
         crate::metadata::RafsSuper::load_from_file(
             file.as_path(),
-            Arc::new(nydus_api::ConfigV2::default()),
+            crate::test_util::test_config(),
             false,
         )
         .map(|(sb, _)| sb)
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support readahead")]
     fn test_reject_blob_id_with_path_components() {
         let (_, mut data) = v6_fixture();
         let sb = load_v6(&data).unwrap();
@@ -2084,7 +2128,6 @@ mod tests {
     /// A directory block whose first dirent claims `e_nameoff == 0` holds zero entries; a lookup
     /// in it must fail as corrupt metadata, neither panicking nor answering ENOENT.
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support readahead")]
     fn test_lookup_in_dir_block_without_entries() {
         let (path, mut data) = v6_fixture();
         let sb = load_v6(&data).unwrap();
@@ -2119,7 +2162,6 @@ mod tests {
     /// the bootstrap loads because it is the root, instead of every directory operation walking
     /// all the claimed blocks.
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support readahead")]
     fn test_reject_directory_larger_than_bootstrap() {
         let (path, mut data) = v6_fixture();
         let sb = load_v6(&data).unwrap();

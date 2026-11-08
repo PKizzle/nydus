@@ -447,7 +447,7 @@ mod tests {
             None,
             target,
             None,
-            Arc::new(ConfigV2::new("cfg")),
+            crate::test_config(),
         );
         assert!(result.is_err());
         assert!(
@@ -476,7 +476,7 @@ mod tests {
             None,
             target,
             None,
-            Arc::new(ConfigV2::new("cfg")),
+            crate::test_config(),
         );
         assert!(result.is_err());
         assert!(
@@ -505,7 +505,7 @@ mod tests {
             None,
             target,
             None,
-            Arc::new(ConfigV2::new("cfg")),
+            crate::test_config(),
         );
         assert!(result.is_err());
         assert!(
@@ -534,7 +534,7 @@ mod tests {
             None,
             target,
             None,
-            Arc::new(ConfigV2::new("cfg")),
+            crate::test_config(),
         );
         assert!(result.is_err());
         assert!(
@@ -563,7 +563,7 @@ mod tests {
             None,
             target,
             None,
-            Arc::new(ConfigV2::new("cfg")),
+            crate::test_config(),
         );
         assert!(result.is_err());
         assert!(
@@ -592,14 +592,13 @@ mod tests {
             Some(vec![10u64, 20u64]), // len 2
             target,
             None,
-            Arc::new(ConfigV2::new("cfg")),
+            crate::test_config(),
         );
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("toc size entries"));
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support readahead")]
     fn test_merger_merge() {
         let mut ctx = BuildContext::default();
         ctx.configuration.internal.set_blob_accessible(false);
@@ -630,7 +629,7 @@ mod tests {
             Some(vec![64u64, 128]),
             target,
             None,
-            Arc::new(ConfigV2::new("config_v2")),
+            crate::test_config(),
         );
         assert!(build_output.is_ok());
         let build_output = build_output.unwrap();
@@ -684,12 +683,11 @@ mod tests {
             None,
             target,
             None,
-            Arc::new(ConfigV2::new("cfg")),
+            crate::test_config(),
         )
         .unwrap();
         let (rs, _) =
-            RafsSuper::load_from_file(merged.as_path(), Arc::new(ConfigV2::new("cfg")), false)
-                .unwrap();
+            RafsSuper::load_from_file(merged.as_path(), crate::test_config(), false).unwrap();
         assert_eq!(rs.meta.blkszbits, 14);
     }
 
@@ -727,8 +725,7 @@ mod tests {
         use crate::core::chunk_dict::HashChunkDict;
         use nydus_rafs::metadata::layout::v6::RAFSV6_ISHARE_XATTR_NAME;
 
-        let (rs, _) =
-            RafsSuper::load_from_file(layer, Arc::new(ConfigV2::new("cfg")), false).unwrap();
+        let (rs, _) = RafsSuper::load_from_file(layer, crate::test_config(), false).unwrap();
         let mut dict = HashChunkDict::new(digest::Algorithm::Sha256);
         let tree = Tree::from_bootstrap(&rs, &mut dict).unwrap();
         let node = tree.get_node(std::path::Path::new(path)).unwrap();
@@ -784,8 +781,7 @@ mod tests {
 
         let dir = TempDir::new().unwrap();
         let layer = build_v6_layer(&[("f", &[3u8; 9000])], dir.path());
-        let (rs, _) =
-            RafsSuper::load_from_file(&layer, Arc::new(ConfigV2::new("cfg")), false).unwrap();
+        let (rs, _) = RafsSuper::load_from_file(&layer, crate::test_config(), false).unwrap();
         let tree =
             Tree::from_bootstrap(&rs, &mut HashChunkDict::new(digest::Algorithm::Sha256)).unwrap();
         let mut node = tree
@@ -830,7 +826,7 @@ mod tests {
                 None,
                 target,
                 None,
-                Arc::new(ConfigV2::new("cfg")),
+                crate::test_config(),
             )
             .unwrap();
             merged
@@ -849,8 +845,7 @@ mod tests {
         let shared = merge(layer, true);
         assert!(has_ishare(shared.as_path()));
         let (rs, _) =
-            RafsSuper::load_from_file(shared.as_path(), Arc::new(ConfigV2::new("cfg")), false)
-                .unwrap();
+            RafsSuper::load_from_file(shared.as_path(), crate::test_config(), false).unwrap();
         let ino = rs.get_inode(rs.superblock.root_ino(), false).unwrap();
         let f = ino.get_child_by_name(std::ffi::OsStr::new("f")).unwrap();
         assert!(f.get_xattrs().unwrap().is_empty());

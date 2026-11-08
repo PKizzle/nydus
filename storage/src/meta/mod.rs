@@ -34,6 +34,7 @@ use std::os::unix::fs::FileExt;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use nydus_api::MetadataSource;
 use nydus_utils::compress::zlib_random::ZranContext;
 use nydus_utils::crypt::decrypt_with_context;
 use nydus_utils::digest::{DigestData, RafsDigest};
@@ -492,11 +493,14 @@ impl BlobCompressionContextInfo {
     /// The downloaded compression context table will be cached into a file named as
     /// `[blob_id].blob.meta`. The cache file is readonly once created and may be accessed
     /// concurrently by multiple clients.
+    ///
+    /// `source` chooses how the cache file and the chunk digest file are brought into memory.
     pub fn new(
         blob_path: &str,
         blob_info: &BlobInfo,
         reader: Option<&Arc<dyn BlobReader>>,
         load_chunk_digest: bool,
+        source: MetadataSource,
     ) -> MetaResult<Self> {
         assert_eq!(
             size_of::<BlobCompressionContextHeader>() as u64,
@@ -572,32 +576,37 @@ impl BlobCompressionContextInfo {
             )));
         }
 
-        // The tables below borrow this mapping, so it stays read-only, and downloaded metadata is
-        // written through the file instead. Safe because each header reference ends with its
-        // validate_header call, so none is alive while read_metadata writes the file, the file lock
-        // keeps other openers from writing it meanwhile, and no opener writes it once its header is
-        // valid.
-        let map_file = file
-            .try_clone()
-            .map_err(|e| MetaError::io("failed to dup the blob meta file", e))?;
-        let filemap = Arc::new(
-            // SAFETY: the mapping is read-only, and the header references taken from it end with
+        // The tables below borrow these bytes, so a mapping stays read-only, and downloaded
+        // metadata is written through the file instead. Safe because each header reference ends
+        // with its validate_header call, so none is alive while read_metadata writes the file, the
+        // file lock keeps other openers from writing it meanwhile, and no opener writes it once its
+        // header is valid.
+        let load = || -> MetaResult<Arc<FileMapState>> {
+            let map_file = file
+                .try_clone()
+                .map_err(|e| MetaError::io("failed to dup the blob meta file", e))?;
+            // SAFETY: a mapping is read-only, and the header references taken from it end with
             // each `validate_header` call; the file is written only through `file` while none is
-            // alive (see the comment above).
-            unsafe { FileMapState::new(map_file, 0, expected_size, false) }.map_err(|e| {
-                MetaError::io(format!("failed to mmap blob meta file {}", meta_path), e)
-            })?,
-        );
-        let header_is_valid = || {
+            // alive (see the comment above). A copy has no contract.
+            let filemap = unsafe { FileMapState::load(source, map_file, 0, expected_size) }
+                .map_err(|e| {
+                    MetaError::io(format!("failed to load blob meta file {}", meta_path), e)
+                })?;
+            Ok(Arc::new(filemap))
+        };
+        let header_is_valid = |filemap: &FileMapState| {
             let header = filemap
                 .get_ref::<BlobCompressionContextHeader>(aligned_uncompressed_size)
                 .map_err(|e| MetaError::io("failed to reach the blob meta header", e))?;
             Self::validate_header(blob_info, header)
         };
-        if !header_is_valid()? {
+        let mut filemap = load()?;
+        if !header_is_valid(&filemap)? {
             if let Some(reader) = reader {
                 Self::read_metadata(blob_info, reader, &file)?;
-                if !header_is_valid()? {
+                // A copy taken before the download does not see it; for a mapping the reload is a harmless remap.
+                filemap = load()?;
+                if !header_is_valid(&filemap)? {
                     return Err(MetaError::NotFound(
                         "blob meta header is still invalid after re-reading it".to_string(),
                     ));
@@ -609,7 +618,8 @@ impl BlobCompressionContextInfo {
                 )));
             }
         }
-        // The mapping holds a duplicate of `file`, which shares the lock, so release it explicitly.
+        // The loaded bytes hold a duplicate of `file`, which shares the lock, so release it
+        // explicitly.
         file.unlock()
             .map_err(|e| MetaError::io("failed to unlock the blob meta file", e))?;
 
@@ -712,8 +722,8 @@ impl BlobCompressionContextInfo {
 
             let file_map = Arc::new(
                 // SAFETY: the digest file isn't written once it exists.
-                unsafe { FileMapState::new(file, 0, size, false) }
-                    .map_err(|e| MetaError::io("failed to mmap the chunk digest file", e))?,
+                unsafe { FileMapState::load(source, file, 0, size) }
+                    .map_err(|e| MetaError::io("failed to load the chunk digest file", e))?,
             );
             state.chunk_digest_array = MappedOrOwned::Mapped(
                 MappedSlice::new(file_map, 0, chunk_count as usize)
@@ -2332,6 +2342,15 @@ pub(crate) mod tests {
     use std::fs::File;
     use std::path::PathBuf;
 
+    /// Miri cannot map files, so tests run under it load metadata through a copy.
+    pub(crate) fn test_source() -> MetadataSource {
+        if cfg!(miri) {
+            MetadataSource::Read
+        } else {
+            MetadataSource::Mmap
+        }
+    }
+
     pub(crate) struct DummyBlobReader {
         pub metrics: Arc<BackendMetrics>,
         pub file: File,
@@ -2353,7 +2372,6 @@ pub(crate) mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support file-backed mmap")]
     fn chunk_tables_keep_their_mapping_alive() {
         use vmm_sys_util::tempfile::TempFile;
 
@@ -2370,7 +2388,12 @@ pub(crate) mod tests {
             let mapping = Arc::new(
                 // SAFETY: the temp file is private to this test and is not written while mapped.
                 unsafe {
-                    FileMapState::new(file.as_file().try_clone().unwrap(), 0, bytes.len(), false)
+                    FileMapState::load(
+                        test_source(),
+                        file.as_file().try_clone().unwrap(),
+                        0,
+                        bytes.len(),
+                    )
                 }
                 .unwrap(),
             );
@@ -2448,8 +2471,16 @@ pub(crate) mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support file-backed mmap")]
     fn test_load_meta_ci_zran_from_reader() {
+        if !cfg!(miri) {
+            load_meta_ci_zran_from_reader(MetadataSource::Mmap);
+        }
+        // A copy taken before the download is stale, so this checks that the bytes are loaded
+        // again after it.
+        load_meta_ci_zran_from_reader(MetadataSource::Read);
+    }
+
+    fn load_meta_ci_zran_from_reader(source: MetadataSource) {
         let root_dir = &std::env::var("CARGO_MANIFEST_DIR").expect("$CARGO_MANIFEST_DIR");
         let id = "233c72f2b6b698c07021c4da367cfe2dff4f049efbaa885ca0ff760ea297865a";
         let meta_file =
@@ -2495,6 +2526,7 @@ pub(crate) mod tests {
                 &blob_info,
                 Some(&reader),
                 false,
+                source,
             )
             .unwrap();
             assert_eq!(meta.state.chunk_info_array.len(), 0xa3);
@@ -2563,8 +2595,13 @@ pub(crate) mod tests {
         });
         let (tx, rx) = std::sync::mpsc::channel();
         let opener = std::thread::spawn(move || {
-            let meta =
-                BlobCompressionContextInfo::new(&blob_path, &blob_info, Some(&reader), false);
+            let meta = BlobCompressionContextInfo::new(
+                &blob_path,
+                &blob_info,
+                Some(&reader),
+                false,
+                test_source(),
+            );
             tx.send(meta.map(|m| m.state.chunk_info_array.len()))
                 .unwrap();
         });
@@ -2583,6 +2620,125 @@ pub(crate) mod tests {
 
     #[test]
     #[cfg_attr(miri, ignore = "Miri does not support file-backed mmap")]
+    fn mapped_and_copied_meta_parse_identically() {
+        let root_dir = &std::env::var("CARGO_MANIFEST_DIR").expect("$CARGO_MANIFEST_DIR");
+        let id = "233c72f2b6b698c07021c4da367cfe2dff4f049efbaa885ca0ff760ea297865a";
+        let path = PathBuf::from(root_dir).join(format!("../tests/texture/zran/{}", id));
+        let features = BlobFeatures::ALIGNED
+            | BlobFeatures::INLINED_FS_META
+            | BlobFeatures::CHUNK_INFO_V2
+            | BlobFeatures::ZRAN;
+        let mut blob_info = BlobInfo::new(
+            0,
+            id.to_string(),
+            0x16c6000,
+            9839040,
+            RAFS_DEFAULT_CHUNK_SIZE as u32,
+            0xa3,
+            features,
+        );
+        blob_info.set_blob_meta_info(0, 0xa1290, 0xa1290, compress::Algorithm::None as u32);
+        let [mapped, copied] = [MetadataSource::Mmap, MetadataSource::Read].map(|source| {
+            BlobCompressionContextInfo::new(
+                &path.display().to_string(),
+                &blob_info,
+                None,
+                false,
+                source,
+            )
+            .unwrap()
+        });
+
+        let (m, c) = (&mapped.state, &copied.state);
+        assert_eq!(
+            m.chunk_info_array.as_byte_slice(),
+            c.chunk_info_array.as_byte_slice()
+        );
+        assert_eq!(m.zran_info_array.len(), 0x15);
+        let zran_bytes = |s: &BlobCompressionContext| {
+            s.zran_info_array
+                .iter()
+                .flat_map(|z| z.as_slice().to_vec())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(zran_bytes(m), zran_bytes(c));
+        assert_eq!(&m.zran_dict_table[..], &c.zran_dict_table[..]);
+        let chunks = |meta: &BlobCompressionContextInfo| {
+            meta.get_chunks_uncompressed(0x112000, 0x10000, RAFS_DEFAULT_CHUNK_SIZE)
+                .unwrap()
+                .iter()
+                .map(|c| {
+                    (
+                        c.id(),
+                        c.compressed_offset(),
+                        c.compressed_size(),
+                        c.uncompressed_offset(),
+                        c.uncompressed_size(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(chunks(&mapped).len(), 116);
+        assert_eq!(chunks(&mapped), chunks(&copied));
+    }
+
+    /// A local chunk digest file loads through either source, and one of the wrong size is refused.
+    #[test]
+    fn chunk_digest_file_loads_from_either_source() {
+        let root_dir = &std::env::var("CARGO_MANIFEST_DIR").expect("$CARGO_MANIFEST_DIR");
+        let id = "233c72f2b6b698c07021c4da367cfe2dff4f049efbaa885ca0ff760ea297865a";
+        let fixture =
+            PathBuf::from(root_dir).join(format!("../tests/texture/zran/{}.blob.meta", id));
+        let dir = tempfile::TempDir::new().unwrap();
+        let blob_path = dir.path().join(id).display().to_string();
+        std::fs::write(
+            format!("{}.{}", blob_path, BLOB_CCT_FILE_SUFFIX),
+            std::fs::read(fixture).unwrap(),
+        )
+        .unwrap();
+        let chunk_count = 0xa3usize;
+        let mut blob_info = BlobInfo::new(
+            0,
+            id.to_string(),
+            0x16c6000,
+            9839040,
+            RAFS_DEFAULT_CHUNK_SIZE as u32,
+            chunk_count as u32,
+            BlobFeatures::ALIGNED
+                | BlobFeatures::INLINED_FS_META
+                | BlobFeatures::CHUNK_INFO_V2
+                | BlobFeatures::ZRAN
+                | BlobFeatures::INLINED_CHUNK_DIGEST,
+        );
+        blob_info.set_blob_meta_info(0, 0xa1290, 0xa1290, compress::Algorithm::None as u32);
+        let digest_path = format!("{}.{}", blob_path, BLOB_DIGEST_FILE_SUFFIX);
+        let digests: Vec<u8> = (0..32 * chunk_count).map(|i| i as u8).collect();
+        std::fs::write(&digest_path, &digests).unwrap();
+
+        let sources = if cfg!(miri) {
+            vec![MetadataSource::Read]
+        } else {
+            vec![MetadataSource::Mmap, MetadataSource::Read]
+        };
+        for source in sources {
+            let meta = BlobCompressionContextInfo::new(&blob_path, &blob_info, None, true, source)
+                .unwrap();
+            for i in [0, chunk_count - 1] {
+                assert_eq!(
+                    meta.get_chunk_digest(i).unwrap(),
+                    &digests[32 * i..32 * (i + 1)]
+                );
+            }
+        }
+
+        std::fs::write(&digest_path, &digests[32..]).unwrap();
+        assert!(
+            BlobCompressionContextInfo::new(&blob_path, &blob_info, None, true, test_source())
+                .is_err()
+        );
+    }
+
+    #[test]
     fn test_load_meta_ci_zran_add_more_chunks() {
         let root_dir = &std::env::var("CARGO_MANIFEST_DIR").expect("$CARGO_MANIFEST_DIR");
         let path = PathBuf::from(root_dir).join("../tests/texture/zran/233c72f2b6b698c07021c4da367cfe2dff4f049efbaa885ca0ff760ea297865a");
@@ -2601,9 +2757,14 @@ pub(crate) mod tests {
             features,
         );
         blob_info.set_blob_meta_info(0, 0xa1290, 0xa1290, compress::Algorithm::None as u32);
-        let meta =
-            BlobCompressionContextInfo::new(&path.display().to_string(), &blob_info, None, false)
-                .unwrap();
+        let meta = BlobCompressionContextInfo::new(
+            &path.display().to_string(),
+            &blob_info,
+            None,
+            false,
+            test_source(),
+        )
+        .unwrap();
         assert_eq!(meta.state.chunk_info_array.len(), 0xa3);
         assert_eq!(meta.state.zran_info_array.len(), 0x15);
         assert_eq!(meta.state.zran_dict_table.len(), 0xa0348 - 0x15 * 40);
@@ -2638,7 +2799,6 @@ pub(crate) mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support file-backed mmap")]
     fn test_load_meta_ci_zran_get_chunks_uncompressed() {
         let root_dir = &std::env::var("CARGO_MANIFEST_DIR").expect("$CARGO_MANIFEST_DIR");
         let path = PathBuf::from(root_dir).join("../tests/texture/zran/233c72f2b6b698c07021c4da367cfe2dff4f049efbaa885ca0ff760ea297865a");
@@ -2657,9 +2817,14 @@ pub(crate) mod tests {
             features,
         );
         blob_info.set_blob_meta_info(0, 0xa1290, 0xa1290, compress::Algorithm::None as u32);
-        let meta =
-            BlobCompressionContextInfo::new(&path.display().to_string(), &blob_info, None, false)
-                .unwrap();
+        let meta = BlobCompressionContextInfo::new(
+            &path.display().to_string(),
+            &blob_info,
+            None,
+            false,
+            test_source(),
+        )
+        .unwrap();
         assert_eq!(meta.state.chunk_info_array.len(), 0xa3);
         assert_eq!(meta.state.zran_info_array.len(), 0x15);
         assert_eq!(meta.state.zran_dict_table.len(), 0xa0348 - 0x15 * 40);
@@ -2699,7 +2864,6 @@ pub(crate) mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support file-backed mmap")]
     fn test_load_meta_ci_zran_get_chunks_compressed() {
         let root_dir = &std::env::var("CARGO_MANIFEST_DIR").expect("$CARGO_MANIFEST_DIR");
         let path = PathBuf::from(root_dir).join("../tests/texture/zran/233c72f2b6b698c07021c4da367cfe2dff4f049efbaa885ca0ff760ea297865a");
@@ -2718,9 +2882,14 @@ pub(crate) mod tests {
             features,
         );
         blob_info.set_blob_meta_info(0, 0xa1290, 0xa1290, compress::Algorithm::None as u32);
-        let meta =
-            BlobCompressionContextInfo::new(&path.display().to_string(), &blob_info, None, false)
-                .unwrap();
+        let meta = BlobCompressionContextInfo::new(
+            &path.display().to_string(),
+            &blob_info,
+            None,
+            false,
+            test_source(),
+        )
+        .unwrap();
         assert_eq!(meta.state.chunk_info_array.len(), 0xa3);
         assert_eq!(meta.state.zran_info_array.len(), 0x15);
         assert_eq!(meta.state.zran_dict_table.len(), 0xa0348 - 0x15 * 40);

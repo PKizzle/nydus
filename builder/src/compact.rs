@@ -683,7 +683,6 @@ mod tests {
     use crate::{NodeChunk, Overlay};
 
     use super::*;
-    use nydus_api::ConfigV2;
     use nydus_rafs::metadata::RafsSuperConfig;
     use nydus_storage::RAFS_DEFAULT_CHUNK_SIZE;
     use nydus_storage::backend::{BackendResult, BlobReader};
@@ -986,8 +985,7 @@ mod tests {
             is_tarfs_mode: false,
         };
         let dict =
-            HashChunkDict::from_commandline_arg(path, Arc::new(ConfigV2::default()), &rafs_config)
-                .unwrap();
+            HashChunkDict::from_commandline_arg(path, crate::test_config(), &rafs_config).unwrap();
 
         let mut ori_blob_mgr = BlobManager::new(digest::Algorithm::Sha256, false);
         ori_blob_mgr.set_chunk_dict(dict);
@@ -1021,7 +1019,10 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support readahead")]
+    #[cfg_attr(
+        miri,
+        ignore = "Miri runs out of memory building a chunk dictionary from the 11 MiB v5 fixture"
+    )]
     fn test_blob_compactor_new() {
         let compactor = create_blob_compactor();
         assert!(compactor.is_ok());
@@ -1029,7 +1030,10 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support readahead")]
+    #[cfg_attr(
+        miri,
+        ignore = "Miri runs out of memory building a chunk dictionary from the 11 MiB v5 fixture"
+    )]
     fn test_blob_compactor_load_chunk_dict_blobs() {
         let mut compactor = create_blob_compactor().unwrap();
         let chunk_dict = compactor.get_chunk_dict();
@@ -1137,13 +1141,19 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support readahead")]
+    #[cfg_attr(
+        miri,
+        ignore = "Miri runs out of memory building a chunk dictionary from the 11 MiB v5 fixture"
+    )]
     fn test_blob_compactor_load_and_dedup_chunks() {
         assert!(blob_compactor_load_and_dedup_chunks().is_ok());
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support readahead")]
+    #[cfg_attr(
+        miri,
+        ignore = "Miri runs out of memory building a chunk dictionary from the 11 MiB v5 fixture"
+    )]
     fn test_blob_compactor_dump_new_blobs() {
         let tmp_dir = TempDir::new().unwrap();
         let build_ctx = BuildContext::new(
@@ -1246,7 +1256,10 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support readahead")]
+    #[cfg_attr(
+        miri,
+        ignore = "Miri runs out of memory building a chunk dictionary from the 11 MiB v5 fixture"
+    )]
     fn test_blob_compactor_do_compact() {
         let mut compactor = blob_compactor_load_and_dedup_chunks().unwrap();
 

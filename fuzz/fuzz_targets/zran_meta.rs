@@ -9,6 +9,7 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
+use nydus_api::MetadataSource;
 use nydus_storage::RAFS_MAX_CHUNK_SIZE;
 use nydus_storage::device::{BlobFeatures, BlobInfo};
 use nydus_storage::meta::BlobCompressionContextInfo;
@@ -78,9 +79,13 @@ fuzz_target!(|data: &[u8]| {
     );
     blob_info.set_blob_meta_info(0, info_size, info_size, 0);
 
-    let Ok(meta) =
-        BlobCompressionContextInfo::new(blob_path.to_str().unwrap(), &blob_info, None, false)
-    else {
+    let Ok(meta) = BlobCompressionContextInfo::new(
+        blob_path.to_str().unwrap(),
+        &blob_info,
+        None,
+        false,
+        MetadataSource::Read,
+    ) else {
         return;
     };
     let _ = meta.get_chunks_uncompressed(0, blob_size, 0);

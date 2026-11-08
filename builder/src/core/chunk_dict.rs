@@ -253,7 +253,10 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support readahead")]
+    #[cfg_attr(
+        miri,
+        ignore = "Miri runs out of memory building a chunk dictionary from the 11 MiB v5 fixture"
+    )]
     fn test_chunk_dict() {
         let root_dir = &std::env::var("CARGO_MANIFEST_DIR").expect("$CARGO_MANIFEST_DIR");
         let mut source_path = PathBuf::from(root_dir);
@@ -269,8 +272,7 @@ mod tests {
             is_tarfs_mode: false,
         };
         let dict =
-            HashChunkDict::from_commandline_arg(path, Arc::new(ConfigV2::default()), &rafs_config)
-                .unwrap();
+            HashChunkDict::from_commandline_arg(path, crate::test_config(), &rafs_config).unwrap();
 
         assert!(dict.get_chunk(&RafsDigest::default(), 0).is_none());
         assert_eq!(dict.get_blobs().len(), 18);
