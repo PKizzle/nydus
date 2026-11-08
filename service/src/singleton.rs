@@ -88,8 +88,8 @@ impl ServiceController {
                 error!("Failed to add blob list: {}", e);
                 return Err(e);
             }
-            // A takeover successor starts without a config and re-adds blob entries only from
-            // the saved upgrade state; without them its handlers find no backed data blobs.
+            // The upgrade state carries the blob list to a takeover successor, which re-adds the
+            // entries it was not created with; without them its handlers find no backed data blobs.
             if let Some(mut mgr) = self.upgrade_mgr() {
                 for entry in v.blobs {
                     mgr.add_blob_entry_state(entry);
