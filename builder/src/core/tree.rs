@@ -594,15 +594,11 @@ mod tests {
     /// A bootstrap whose root directory lists itself as a child must fail to load instead of
     /// recursing until the stack overflows.
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support readahead")]
     fn test_from_bootstrap_rejects_directory_cycle() {
-        use nydus_api::ConfigV2;
-        use std::sync::Arc;
-
         let root_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap();
         let fixture = PathBuf::from(root_dir).join("../tests/texture/bootstrap/rafs-v6-2.2.boot");
         let mut data = std::fs::read(&fixture).unwrap();
-        let config = Arc::new(ConfigV2::default());
+        let config = crate::test_config();
         let (rs, _) = RafsSuper::load_from_file(&fixture, config.clone(), false).unwrap();
         Tree::from_bootstrap(&rs, &mut ()).unwrap();
 
