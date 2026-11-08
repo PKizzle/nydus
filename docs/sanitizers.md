@@ -59,7 +59,7 @@ The choice is the `metadata_source` config option (`ConfigV2::metadata_source`,
 `BlobCacheEntryConfigV2::metadata_source`; see [nydusd.md](nydusd.md#metadata-loading)). Tests
 pick `Read` under `cfg(miri)` through a test helper in each crate (for example
 `rafs::test_util::test_config`, `builder::test_config`, `storage::meta::tests::test_source`) or
-through the `metadata_source` field of the config document they pass in (clib, service).
+by setting `metadata_source` in the configuration they build (service).
 `cfg(miri)` never appears in production code. Native test runs keep Mmap, and
 `test_mmap_and_read_load_the_same_filesystem` (rafs) and
 `mapped_and_copied_meta_parse_identically` (storage) check that both sources give the same result.

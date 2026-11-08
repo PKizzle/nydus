@@ -103,8 +103,8 @@ pub struct Rafs {
     prefetch_bandwidth_limit: u32,
 
     // static inode attributes
-    i_uid: u32,
-    i_gid: u32,
+    /// The daemon's uid/gid, reported for every inode of an image that does not carry its own.
+    owner_override: Option<(u32, u32)>,
     i_time: u64,
 }
 
@@ -133,12 +133,8 @@ impl Rafs {
         if cfg.is_chunk_validation_enabled() && sb.meta.has_inlined_chunk_digest() {
             sb.superblock.set_blob_device(device.clone());
         }
-        // The daemon's own ids stand in for the image's only when the image does not carry them.
-        let (i_uid, i_gid) = if sb.meta.explicit_uidgid() {
-            (0, 0)
-        } else {
-            (geteuid().into(), getegid().into())
-        };
+        let owner_override =
+            (!sb.meta.explicit_uidgid()).then(|| (geteuid().into(), getegid().into()));
 
         let rafs = Rafs {
             id: mountpoint.to_string(),
@@ -159,8 +155,7 @@ impl Rafs {
             prefetch_threads: rafs_cfg.prefetch.threads_count,
             prefetch_bandwidth_limit: rafs_cfg.prefetch.bandwidth_limit,
 
-            i_uid,
-            i_gid,
+            owner_override,
             i_time: SystemTime::now()
                 .duration_since(SystemTime::UNIX_EPOCH)
                 .unwrap()
@@ -388,10 +383,9 @@ impl Rafs {
         let inode = self.sb.get_inode(ino, false)?;
         let mut attr = inode.get_attr();
 
-        // override uid/gid if there is no explicit inode uid/gid
-        if !self.sb.meta.explicit_uidgid() {
-            attr.uid = self.i_uid;
-            attr.gid = self.i_gid;
+        if let Some((uid, gid)) = self.owner_override {
+            attr.uid = uid;
+            attr.gid = gid;
         }
 
         // Older rafs image or the root inode doesn't include mtime, in such cases
@@ -417,10 +411,9 @@ impl Rafs {
     fn get_inode_entry<I: Deref<Target = dyn RafsInode>>(&self, inode: I) -> Entry {
         let mut entry = inode.get_entry();
 
-        // override uid/gid if there is no explicit inode uid/gid
-        if !self.sb.meta.explicit_uidgid() {
-            entry.attr.st_uid = self.i_uid;
-            entry.attr.st_gid = self.i_gid;
+        if let Some((uid, gid)) = self.owner_override {
+            entry.attr.st_uid = uid;
+            entry.attr.st_gid = gid;
         }
 
         // Older rafs image doesn't include mtime, in such case we use runtime timestamp.
@@ -1235,8 +1228,7 @@ mod tests {
             stream_prefetch: false,
             prefetch_threads: 0,
             prefetch_bandwidth_limit: 0,
-            i_uid: 0,
-            i_gid: 0,
+            owner_override: None,
             i_time: 0,
         };
         assert_eq!(rafs.id(), "foo");
@@ -1281,8 +1273,7 @@ mod tests {
             stream_prefetch: false,
             prefetch_threads: 0,
             prefetch_bandwidth_limit: 0,
-            i_uid: 1000,
-            i_gid: 1000,
+            owner_override: Some((1000, 1000)),
             i_time: 12345678,
         }
     }
@@ -1371,8 +1362,7 @@ mod tests {
             stream_prefetch: false,
             prefetch_threads: 0,
             prefetch_bandwidth_limit: 0,
-            i_uid: 0,
-            i_gid: 0,
+            owner_override: None,
             i_time: 0,
         };
         assert_eq!(rafs.id(), "my-rafs-instance");

@@ -546,7 +546,7 @@ mod tests {
     #[test]
     #[cfg_attr(
         miri,
-        ignore = "the blobcache chunk map is a file-backed mapping, which Miri does not support"
+        ignore = "a v1 config maps the bootstrap, and the blobcache chunk map is a file mapping; Miri supports neither"
     )]
     fn it_should_create_rafs_backend() {
         let blob_dir = "../tests/texture/blobs";
