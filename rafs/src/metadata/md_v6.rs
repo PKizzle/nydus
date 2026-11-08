@@ -289,6 +289,7 @@ mod tests {
             mode: RafsMode::Direct,
             ..Default::default()
         };
+        rs.meta.metadata_source = crate::test_util::METADATA_SOURCE;
         let result = rs.try_load_v6(&mut reader);
         (rs, result)
     }

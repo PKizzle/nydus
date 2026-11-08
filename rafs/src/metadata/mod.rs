@@ -22,7 +22,7 @@ use thiserror::Error;
 use anyhow::{bail, ensure};
 use fuse_backend_rs::abi::fuse_abi::Attr;
 use fuse_backend_rs::api::filesystem::Entry;
-use nydus_api::{ConfigV2, RafsConfigV2};
+use nydus_api::{ConfigV2, MetadataSource, RafsConfigV2};
 use nydus_storage::device::{
     BlobChunkInfo, BlobDevice, BlobFeatures, BlobInfo, BlobIoMerge, BlobIoVec,
 };
@@ -540,6 +540,10 @@ pub struct RafsSuperMeta {
     /// RAFS v6 / EROFS block-size bits (`s_blkszbits`); 12 = 4 KiB, 14 = 16 KiB, 16 = 64 KiB,
     /// 9 = 512 B (tarfs mode). Defaults to 12 for v5 and freshly initialised metas.
     pub blkszbits: u8,
+    /// How the direct-mode loaders bring the bootstrap into memory; set by the embedding
+    /// program, not read from the image.
+    #[serde(skip)]
+    pub metadata_source: MetadataSource,
 }
 
 impl RafsSuperMeta {
@@ -643,6 +647,7 @@ impl Default for RafsSuperMeta {
             chunk_table_offset: 0,
             chunk_table_size: 0,
             blkszbits: crate::metadata::layout::v6::EROFS_BLOCK_BITS_12,
+            metadata_source: MetadataSource::default(),
         }
     }
 }
@@ -798,6 +803,7 @@ impl RafsSuper {
             ..Default::default()
         };
         rs.meta.is_chunk_dict = is_chunk_dict;
+        rs.meta.metadata_source = config.internal.metadata_source;
 
         // open bootstrap file
         let file = OpenOptions::new()

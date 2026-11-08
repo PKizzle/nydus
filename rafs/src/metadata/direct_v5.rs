@@ -26,6 +26,7 @@ use std::os::unix::io::AsRawFd;
 use std::sync::Arc;
 
 use arc_swap::{ArcSwap, Guard};
+use nydus_api::MetadataSource;
 use nydus_storage::device::v5::BlobV5ChunkInfo;
 use nydus_storage::device::{BlobChunkFlags, BlobChunkInfo, BlobDevice, BlobInfo, BlobIoVec};
 use nydus_storage::utils::readahead;
@@ -220,12 +221,14 @@ impl DirectSuperBlockV5 {
             ));
         }
 
-        // Prefetch the bootstrap file
-        readahead(file.as_raw_fd(), 0, len);
+        // Warming the page cache helps only a mapping; a copy reads the whole file anyway.
+        let source = old_state.meta.metadata_source;
+        if source == MetadataSource::Mmap {
+            readahead(file.as_raw_fd(), 0, len);
+        }
 
-        // Mmap the bootstrap file into current process for direct access.
         // SAFETY: nydus only reads the bootstrap, which must not change while it's mounted.
-        let file_map = Arc::new(unsafe { FileMapState::new(file, 0, size, false) }?);
+        let file_map = Arc::new(unsafe { FileMapState::load(source, file, 0, size) }?);
 
         // Load blob table. Safe because we have validated the blob table layout.
         let mut blob_table = RafsV5BlobTable::new();

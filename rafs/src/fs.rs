@@ -1190,7 +1190,8 @@ mod tests {
                 .join("../tests/texture/bootstrap")
                 .join(boot);
             let (sb, _) =
-                RafsSuper::load_from_file(bootstrap, Arc::new(ConfigV2::default()), false).unwrap();
+                RafsSuper::load_from_file(bootstrap, crate::test_util::test_config(), false)
+                    .unwrap();
             let mut rafs = make_test_rafs();
             rafs.sb = Arc::new(sb);
             let root = rafs.sb.superblock.root_ino();
@@ -1287,12 +1288,10 @@ mod tests {
         use std::ffi::CString;
         use std::path::PathBuf;
 
-        use nydus_api::ConfigV2;
-
         let root_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap();
         let path = PathBuf::from(root_dir).join("../tests/texture/bootstrap/rafs-v6-2.2.boot");
         let (sb, _) =
-            RafsSuper::load_from_file(path, Arc::new(ConfigV2::default()), false).unwrap();
+            RafsSuper::load_from_file(path, crate::test_util::test_config(), false).unwrap();
         let root = sb.superblock.root_ino();
         let rafs = Rafs {
             sb: Arc::new(sb),

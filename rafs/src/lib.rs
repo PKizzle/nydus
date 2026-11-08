@@ -411,6 +411,27 @@ impl Iterator for RafsIterator<'_> {
 }
 
 #[cfg(test)]
+pub(crate) mod test_util {
+    use std::sync::Arc;
+
+    use nydus_api::{ConfigV2, MetadataSource};
+
+    /// How tests load bootstraps: Miri cannot map files, so under Miri they are copied.
+    pub(crate) const METADATA_SOURCE: MetadataSource = if cfg!(miri) {
+        MetadataSource::Read
+    } else {
+        MetadataSource::Mmap
+    };
+
+    /// A default configuration that loads metadata the way [`METADATA_SOURCE`] says.
+    pub(crate) fn test_config() -> Arc<ConfigV2> {
+        let mut config = ConfigV2::default();
+        config.internal.metadata_source = METADATA_SOURCE;
+        Arc::new(config)
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::metadata::RafsMode;
@@ -458,6 +479,7 @@ mod tests {
             validate_digest: false,
             ..Default::default()
         };
+        rs.meta.metadata_source = crate::test_util::METADATA_SOURCE;
         rs.load(&mut (Box::new(bootstrap) as RafsIoReader)).unwrap();
         let iter = RafsIterator::new(&rs);
 

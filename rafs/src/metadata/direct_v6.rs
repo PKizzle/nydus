@@ -30,6 +30,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use arc_swap::{ArcSwap, Guard};
+use nydus_api::MetadataSource;
 use nydus_storage::device::{
     BlobChunkFlags, BlobChunkInfo, BlobDevice, BlobInfo, BlobIoDesc, BlobIoVec, v5::BlobV5ChunkInfo,
 };
@@ -205,16 +206,19 @@ impl DirectSuperBlockV6 {
         })
     }
 
-    /// Map the bootstrap `r` and make it the current state. On a `remount` the bootstrap must
+    /// Load the bootstrap `r` into memory and make it the current state. On a `remount` the bootstrap must
     /// be byte-identical to the mounted one: inodes, chunk records and every offset handed out
     /// before the swap stay valid only for the same image.
     fn update_state(&self, r: &mut RafsIoReader, remount: bool) -> RafsResult<()> {
         let file = clone_file(r.as_raw_fd())?;
         let len = file.metadata()?.len();
         let old_state = self.state.load();
-        readahead(file.as_raw_fd(), 0, len);
+        let source = old_state.meta.metadata_source;
+        if source == MetadataSource::Mmap {
+            readahead(file.as_raw_fd(), 0, len);
+        }
         // SAFETY: nydus only reads the bootstrap, which must not change while it's mounted.
-        let file_map = unsafe { FileMapState::new(file, 0, len as usize, false) }?;
+        let file_map = unsafe { FileMapState::load(source, file, 0, len as usize) }?;
 
         if remount
             && (old_state.map.size() != file_map.size()
@@ -1879,6 +1883,50 @@ mod tests {
         out
     }
 
+    /// Mapping and copying a bootstrap load the same filesystem, v5 and v6 alike, and a copy
+    /// remounts the same bootstrap too.
+    #[test]
+    #[cfg_attr(miri, ignore = "maps the bootstrap, which Miri cannot do")]
+    fn test_mmap_and_read_load_the_same_filesystem() {
+        use nydus_api::{ConfigV2, MetadataSource};
+
+        let load = |path: &std::path::Path, source| {
+            let mut config = ConfigV2::default();
+            config.internal.metadata_source = source;
+            crate::metadata::RafsSuper::load_from_file(path, Arc::new(config), false)
+                .unwrap()
+                .0
+        };
+        let root_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap();
+        for boot in ["rafs-v5.boot", "rafs-v6-2.2.boot"] {
+            let path = std::path::PathBuf::from(&root_dir)
+                .join("../tests/texture/bootstrap")
+                .join(boot);
+            let mapped = load(&path, MetadataSource::Mmap);
+            let copied = load(&path, MetadataSource::Read);
+            assert_eq!(copied.meta.metadata_source, MetadataSource::Read);
+            assert_eq!(
+                mapped.superblock.get_max_ino(),
+                copied.superblock.get_max_ino()
+            );
+            let root = |rs: &crate::metadata::RafsSuper| {
+                let attr = rs
+                    .get_inode(rs.superblock.root_ino(), false)
+                    .unwrap()
+                    .get_attr();
+                (
+                    attr.ino, attr.mode, attr.uid, attr.gid, attr.mtime, attr.nlink,
+                )
+            };
+            assert_eq!(root(&mapped), root(&copied));
+            let chunks = all_chunks(&mapped);
+            assert!(!chunks.is_empty(), "{boot}");
+            assert_eq!(chunks, all_chunks(&copied), "{boot}");
+            copied.update(&mut open_bootstrap(&path)).unwrap();
+            assert_eq!(chunks, all_chunks(&copied), "{boot}");
+        }
+    }
+
     fn superblocks_of(path: &std::path::Path) -> V6Superblocks {
         crate::metadata::md_v6::load_v6_superblocks(&mut open_bootstrap(path))
             .unwrap()
@@ -1899,7 +1947,7 @@ mod tests {
         let fixture = v6_fixture_path();
         let (rs, _) = crate::metadata::RafsSuper::load_from_file(
             &fixture,
-            Arc::new(nydus_api::ConfigV2::default()),
+            crate::test_util::test_config(),
             false,
         )
         .unwrap();
@@ -2009,13 +2057,13 @@ mod tests {
             meta: state.meta.clone(),
             blob_table: RafsV6BlobTable::new(),
             blob_extra_infos: HashMap::new(),
-            // SAFETY: the fixture copy is not modified while it is mapped.
+            // SAFETY: the fixture is not modified while it is mapped.
             map: unsafe {
-                FileMapState::new(
+                FileMapState::load(
+                    crate::test_util::METADATA_SOURCE,
                     std::fs::File::open(&path).unwrap(),
                     0,
                     state.map.size(),
-                    false,
                 )
             }
             .unwrap(),
@@ -2057,7 +2105,7 @@ mod tests {
         std::fs::write(file.as_path(), data).unwrap();
         crate::metadata::RafsSuper::load_from_file(
             file.as_path(),
-            Arc::new(nydus_api::ConfigV2::default()),
+            crate::test_util::test_config(),
             false,
         )
         .map(|(sb, _)| sb)
