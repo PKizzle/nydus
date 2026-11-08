@@ -1360,6 +1360,7 @@ mod tests {
                 &blobs[0],
                 reader,
                 false,
+                nydus_api::MetadataSource::default(),
             )
             .unwrap();
             assert_eq!(meta.get_chunk_count(), 2);
