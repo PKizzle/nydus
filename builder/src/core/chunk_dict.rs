@@ -252,33 +252,67 @@ mod tests {
         assert_eq!(dict.get_real_blob_idx(5).unwrap(), 5);
     }
 
-    #[test]
-    #[cfg_attr(
-        miri,
-        ignore = "Miri runs out of memory building a chunk dictionary from the 11 MiB v5 fixture"
-    )]
-    fn test_chunk_dict() {
+    fn check_chunk_dict(
+        bootstrap: &str,
+        version: RafsVersion,
+        compressor: compress::Algorithm,
+        blobs: usize,
+    ) {
         let root_dir = &std::env::var("CARGO_MANIFEST_DIR").expect("$CARGO_MANIFEST_DIR");
         let mut source_path = PathBuf::from(root_dir);
-        source_path.push("../tests/texture/bootstrap/rafs-v5.boot");
+        source_path.push("../tests/texture/bootstrap");
+        source_path.push(bootstrap);
         let path = source_path.to_str().unwrap();
         let rafs_config = RafsSuperConfig {
-            version: RafsVersion::V5,
-            compressor: compress::Algorithm::Lz4Block,
+            version,
+            compressor,
             digester: digest::Algorithm::Blake3,
             chunk_size: 0x100000,
             batch_size: 0,
             explicit_uidgid: true,
             is_tarfs_mode: false,
         };
+        let loaded =
+            HashChunkDict::from_bootstrap_file(&source_path, crate::test_config(), &rafs_config)
+                .unwrap();
+        let (digest, (chunk, _)) = loaded.hashmap().iter().next().expect("no chunk loaded");
         let dict =
             HashChunkDict::from_commandline_arg(path, crate::test_config(), &rafs_config).unwrap();
 
+        let found = dict
+            .get_chunk(digest, chunk.uncompressed_size())
+            .expect("loaded chunk missing from the dictionary");
+        assert_eq!(found.id(), digest);
+        assert!((found.blob_index() as usize) < blobs);
         assert!(dict.get_chunk(&RafsDigest::default(), 0).is_none());
-        assert_eq!(dict.get_blobs().len(), 18);
+        assert_eq!(dict.get_blobs().len(), blobs);
         dict.set_real_blob_idx(0, 10);
         assert_eq!(dict.get_real_blob_idx(0), Some(10));
         assert_eq!(dict.get_real_blob_idx(1), None);
+    }
+
+    #[test]
+    fn test_chunk_dict() {
+        check_chunk_dict(
+            "rafs-v6-2.2.boot",
+            RafsVersion::V6,
+            compress::Algorithm::Zstd,
+            1,
+        );
+    }
+
+    #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "Miri runs out of memory building a chunk dictionary from the 11 MiB v5 fixture"
+    )]
+    fn test_chunk_dict_v5() {
+        check_chunk_dict(
+            "rafs-v5.boot",
+            RafsVersion::V5,
+            compress::Algorithm::Lz4Block,
+            18,
+        );
     }
 
     #[test]

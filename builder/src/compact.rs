@@ -679,12 +679,12 @@ impl BlobCompactor {
 #[cfg(test)]
 mod tests {
     use crate::HashChunkDict;
-    use crate::core::node::Node;
-    use crate::{NodeChunk, Overlay};
+    use crate::NodeChunk;
+    use crate::core::node::{Node, NodeInfo};
 
     use super::*;
     use nydus_rafs::metadata::RafsSuperConfig;
-    use nydus_storage::RAFS_DEFAULT_CHUNK_SIZE;
+    use nydus_rafs::metadata::inode::InodeWrapper;
     use nydus_storage::backend::{BackendResult, BlobReader};
     use nydus_storage::device::v5::BlobV5ChunkInfo;
     use nydus_storage::device::{BlobChunkFlags, BlobChunkInfo, BlobFeatures};
@@ -970,14 +970,27 @@ mod tests {
         assert_eq!(chunk_wrapper2.compressed_offset(), 0x40);
     }
 
+    /// An empty regular file node built in memory, so the tree needs no filesystem (and no
+    /// xattr calls, which Miri cannot run).
+    fn file_node(path: &str) -> Node {
+        let mut inode = InodeWrapper::new(RafsVersion::V6);
+        inode.set_mode(0o644 | crate::mode_bits(libc::S_IFREG));
+        let info = NodeInfo {
+            source: PathBuf::from("/"),
+            path: PathBuf::from(path),
+            ..Default::default()
+        };
+        Node::new(inode, info, 0)
+    }
+
     fn create_blob_compactor() -> Result<BlobCompactor> {
         let root_dir = &std::env::var("CARGO_MANIFEST_DIR").expect("$CARGO_MANIFEST_DIR");
         let mut source_path = PathBuf::from(root_dir);
-        source_path.push("../tests/texture/bootstrap/rafs-v5.boot");
+        source_path.push("../tests/texture/bootstrap/rafs-v6-2.2.boot");
         let path = source_path.to_str().unwrap();
         let rafs_config = RafsSuperConfig {
-            version: RafsVersion::V5,
-            compressor: compress::Algorithm::Lz4Block,
+            version: RafsVersion::V6,
+            compressor: compress::Algorithm::Zstd,
             digester: digest::Algorithm::Blake3,
             chunk_size: 0x100000,
             batch_size: 0,
@@ -994,19 +1007,7 @@ mod tests {
             metrics: BackendMetrics::new("id", "backend_type"),
         });
 
-        let tmpdir = TempDir::new()?;
-        let tmpfile = TempFile::new_in(tmpdir.path())?;
-        let node = Node::from_fs_object(
-            RafsVersion::V6,
-            tmpdir.path().to_path_buf(),
-            tmpfile.as_path().to_path_buf(),
-            Overlay::UpperAddition,
-            RAFS_DEFAULT_CHUNK_SIZE as u32,
-            0,
-            true,
-            false,
-        )?;
-        let tree = Tree::new(node);
+        let tree = Tree::new(file_node("/"));
         let bootstrap = Bootstrap::new(tree)?;
 
         BlobCompactor::new(
@@ -1019,10 +1020,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(
-        miri,
-        ignore = "Miri runs out of memory building a chunk dictionary from the 11 MiB v5 fixture"
-    )]
     fn test_blob_compactor_new() {
         let compactor = create_blob_compactor();
         assert!(compactor.is_ok());
@@ -1030,25 +1027,22 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(
-        miri,
-        ignore = "Miri runs out of memory building a chunk dictionary from the 11 MiB v5 fixture"
-    )]
     fn test_blob_compactor_load_chunk_dict_blobs() {
         let mut compactor = create_blob_compactor().unwrap();
         let chunk_dict = compactor.get_chunk_dict();
         let n = chunk_dict.get_blobs().len();
+        assert!(n > 0);
+        // Shift every dictionary blob up by one, so the state that gets marked is the one at the
+        // real index, not the dictionary-internal one.
         for i in 0..n {
-            chunk_dict.set_real_blob_idx(i as u32, i as u32);
+            chunk_dict.set_real_blob_idx(i as u32, i as u32 + 1);
         }
         compactor.states = vec![State::default(); n + 1];
         compactor.load_chunk_dict_blobs();
 
         assert_eq!(compactor.states.len(), n + 1);
-        assert!(compactor.states[0].is_from_dict());
-        assert!(compactor.states[n >> 1].is_from_dict());
-        assert!(compactor.states[n - 1].is_from_dict());
-        assert!(!compactor.states[n].is_from_dict());
+        assert!(!compactor.states[0].is_from_dict());
+        assert!(compactor.states[1..].iter().all(|s| s.is_from_dict()));
     }
 
     fn blob_compactor_load_and_dedup_chunks() -> Result<BlobCompactor> {
@@ -1092,30 +1086,8 @@ mod tests {
 
         compactor.states = vec![State::ChunkDict; 5];
 
-        let tmpdir = TempDir::new()?;
-        let tmpfile = TempFile::new_in(tmpdir.path())?;
-        let node = Node::from_fs_object(
-            RafsVersion::V6,
-            tmpdir.path().to_path_buf(),
-            tmpfile.as_path().to_path_buf(),
-            Overlay::UpperAddition,
-            RAFS_DEFAULT_CHUNK_SIZE as u32,
-            0,
-            true,
-            false,
-        )?;
-        let mut tree = Tree::new(node);
-        let tmpfile2 = TempFile::new_in(tmpdir.path())?;
-        let mut node = Node::from_fs_object(
-            RafsVersion::V6,
-            tmpdir.path().to_path_buf(),
-            tmpfile2.as_path().to_path_buf(),
-            Overlay::UpperAddition,
-            RAFS_DEFAULT_CHUNK_SIZE as u32,
-            0,
-            true,
-            false,
-        )?;
+        let mut tree = Tree::new(file_node("/"));
+        let mut node = file_node("/file");
         node.chunks.push(node_chunk1);
         node.chunks.push(node_chunk2);
         node.chunks.push(node_chunk3);
@@ -1141,19 +1113,11 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(
-        miri,
-        ignore = "Miri runs out of memory building a chunk dictionary from the 11 MiB v5 fixture"
-    )]
     fn test_blob_compactor_load_and_dedup_chunks() {
         assert!(blob_compactor_load_and_dedup_chunks().is_ok());
     }
 
     #[test]
-    #[cfg_attr(
-        miri,
-        ignore = "Miri runs out of memory building a chunk dictionary from the 11 MiB v5 fixture"
-    )]
     fn test_blob_compactor_dump_new_blobs() {
         let tmp_dir = TempDir::new().unwrap();
         let build_ctx = BuildContext::new(
@@ -1256,10 +1220,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(
-        miri,
-        ignore = "Miri runs out of memory building a chunk dictionary from the 11 MiB v5 fixture"
-    )]
     fn test_blob_compactor_do_compact() {
         let mut compactor = blob_compactor_load_and_dedup_chunks().unwrap();
 
