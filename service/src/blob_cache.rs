@@ -879,7 +879,10 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support readahead")]
+    #[cfg_attr(
+        miri,
+        ignore = "blob cache entries cannot ask for a copied bootstrap, and Miri does not support readahead"
+    )]
     fn test_add_bootstrap() {
         let tmpdir = TempDir::new().unwrap();
         let root_dir = &std::env::var("CARGO_MANIFEST_DIR").expect("$CARGO_MANIFEST_DIR");
@@ -987,7 +990,10 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support readahead")]
+    #[cfg_attr(
+        miri,
+        ignore = "blob cache entries cannot ask for a copied bootstrap, and Miri does not support readahead"
+    )]
     fn test_remove_blob_entry_by_domain() {
         let tmpdir = TempDir::new().unwrap();
         let root_dir = &std::env::var("CARGO_MANIFEST_DIR").expect("$CARGO_MANIFEST_DIR");

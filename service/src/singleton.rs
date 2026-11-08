@@ -796,7 +796,10 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support readahead")]
+    #[cfg_attr(
+        miri,
+        ignore = "blob cache entries cannot ask for a copied bootstrap, and Miri does not support readahead"
+    )]
     fn test_blob_list_is_saved_for_takeover() {
         let tmpdir = tempfile::TempDir::new().unwrap();
         let bootstrap = Path::new(env!("CARGO_MANIFEST_DIR"))

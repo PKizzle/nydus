@@ -394,6 +394,17 @@ impl TarBuilder {
     }
 }
 
+/// A configuration for tests that load a bootstrap: Miri cannot check file-backed mappings, so
+/// under Miri the metadata is copied into memory instead.
+#[cfg(test)]
+pub(crate) fn test_config() -> std::sync::Arc<nydus_api::ConfigV2> {
+    let mut config = nydus_api::ConfigV2::default();
+    if cfg!(miri) {
+        config.internal.metadata_source = nydus_api::MetadataSource::Read;
+    }
+    std::sync::Arc::new(config)
+}
+
 #[cfg(test)]
 mod tests {
     use tempfile::TempDir;

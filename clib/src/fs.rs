@@ -322,7 +322,10 @@ pub(crate) mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support readahead")]
+    #[cfg_attr(
+        miri,
+        ignore = "Miri supports neither the readahead of a mapped bootstrap nor getegid in Rafs::new"
+    )]
     fn test_open_rafs() {
         let fs = open_file_system();
         // SAFETY: `fs` came from `open_file_system` and is closed exactly once.
@@ -330,7 +333,10 @@ pub(crate) mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support readahead")]
+    #[cfg_attr(
+        miri,
+        ignore = "Miri supports neither the readahead of a mapped bootstrap nor getegid in Rafs::new"
+    )]
     fn test_open_rafs_default() {
         init_logging();
         let root_dir = &std::env::var("CARGO_MANIFEST_DIR").expect("$CARGO_MANIFEST_DIR");

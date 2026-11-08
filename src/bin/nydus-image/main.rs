@@ -2437,32 +2437,37 @@ mod tests {
     use nydus_utils::trace::{EventTracerClass, TimingTracerClass, TraceClass};
     use nydus_utils::{register_tracer, root_tracer};
 
+    /// Miri cannot check file-backed mappings, so under Miri the bootstrap is copied into memory.
+    fn test_config() -> Arc<ConfigV2> {
+        let mut config = ConfigV2::default();
+        if cfg!(miri) {
+            config.internal.metadata_source = nydus_api::MetadataSource::Read;
+        }
+        Arc::new(config)
+    }
+
     #[test]
     fn test_ensure_file() {
         Command::ensure_file("/dev/stdin").unwrap();
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support readahead")]
     fn test_execute_inspect_request_rejects_invalid_chunk_offset() {
         let bootstrap =
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/texture/bootstrap/rafs-v5.boot");
         let mut inspector =
-            super::inspect::RafsInspector::new(&bootstrap, true, Arc::new(ConfigV2::default()))
-                .unwrap();
+            super::inspect::RafsInspector::new(&bootstrap, true, test_config()).unwrap();
 
         let err = Command::execute_inspect_request(&mut inspector, "chunk abc").unwrap_err();
         assert!(err.to_string().contains("invalid arguments"));
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support readahead")]
     fn test_execute_inspect_request_rejects_invalid_inode() {
         let bootstrap =
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/texture/bootstrap/rafs-v5.boot");
         let mut inspector =
-            super::inspect::RafsInspector::new(&bootstrap, true, Arc::new(ConfigV2::default()))
-                .unwrap();
+            super::inspect::RafsInspector::new(&bootstrap, true, test_config()).unwrap();
 
         let err = Command::execute_inspect_request(&mut inspector, "icheck abc").unwrap_err();
         assert!(err.to_string().contains("invalid arguments"));
