@@ -133,6 +133,12 @@ impl Rafs {
         if cfg.is_chunk_validation_enabled() && sb.meta.has_inlined_chunk_digest() {
             sb.superblock.set_blob_device(device.clone());
         }
+        // The daemon's own ids stand in for the image's only when the image does not carry them.
+        let (i_uid, i_gid) = if sb.meta.explicit_uidgid() {
+            (0, 0)
+        } else {
+            (geteuid().into(), getegid().into())
+        };
 
         let rafs = Rafs {
             id: mountpoint.to_string(),
@@ -153,8 +159,8 @@ impl Rafs {
             prefetch_threads: rafs_cfg.prefetch.threads_count,
             prefetch_bandwidth_limit: rafs_cfg.prefetch.bandwidth_limit,
 
-            i_uid: geteuid().into(),
-            i_gid: getegid().into(),
+            i_uid,
+            i_gid,
             i_time: SystemTime::now()
                 .duration_since(SystemTime::UNIX_EPOCH)
                 .unwrap()

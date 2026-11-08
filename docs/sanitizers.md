@@ -55,9 +55,11 @@ Miri does not support file-backed `mmap` or `readahead`. Bootstraps and blob-met
 therefore loaded through `nydus_utils::filemap::FileMapState::load`, which takes a
 `nydus_api::MetadataSource`: `Mmap` (the default, used in production) maps the region, and
 `Read` copies it into a 4 KiB-aligned buffer. Both run the same parser over the same bytes.
-The choice travels in `ConfigV2::internal.metadata_source` (not part of the config file
-format). Tests pick `Read` under `cfg(miri)` through a test helper in each crate
-(for example `rafs::test_util::test_config`, `builder::test_config`, `storage::meta::tests::test_source`).
+The choice is the `metadata_source` config option (`ConfigV2::metadata_source`,
+`BlobCacheEntryConfigV2::metadata_source`; see [nydusd.md](nydusd.md#metadata-loading)). Tests
+pick `Read` under `cfg(miri)` through a test helper in each crate (for example
+`rafs::test_util::test_config`, `builder::test_config`, `storage::meta::tests::test_source`) or
+through the `metadata_source` field of the config document they pass in (clib, service).
 `cfg(miri)` never appears in production code. Native test runs keep Mmap, and
 `test_mmap_and_read_load_the_same_filesystem` (rafs) and
 `mapped_and_copied_meta_parse_identically` (storage) check that both sources give the same result.

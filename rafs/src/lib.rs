@@ -425,9 +425,10 @@ pub(crate) mod test_util {
 
     /// A default configuration that loads metadata the way [`METADATA_SOURCE`] says.
     pub(crate) fn test_config() -> Arc<ConfigV2> {
-        let mut config = ConfigV2::default();
-        config.internal.metadata_source = METADATA_SOURCE;
-        Arc::new(config)
+        Arc::new(ConfigV2 {
+            metadata_source: METADATA_SOURCE,
+            ..Default::default()
+        })
     }
 }
 

@@ -736,6 +736,13 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    /// Miri cannot map files, so under Miri bootstraps are copied into memory.
+    const METADATA_SOURCE: nydus_api::MetadataSource = if cfg!(miri) {
+        nydus_api::MetadataSource::Read
+    } else {
+        nydus_api::MetadataSource::Mmap
+    };
+
     fn create_factory_config() -> String {
         let config = r#"
         {
@@ -879,10 +886,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(
-        miri,
-        ignore = "blob cache entries cannot ask for a copied bootstrap, and Miri does not support readahead"
-    )]
     fn test_add_bootstrap() {
         let tmpdir = TempDir::new().unwrap();
         let root_dir = &std::env::var("CARGO_MANIFEST_DIR").expect("$CARGO_MANIFEST_DIR");
@@ -917,6 +920,7 @@ mod tests {
             .replace("RAFS_V5", &source_path.display().to_string());
         let mut entry: BlobCacheEntry = serde_json::from_str(&content).unwrap();
         assert!(entry.prepare_configuration_info());
+        entry.blob_config.as_mut().unwrap().metadata_source = METADATA_SOURCE;
 
         let mgr = BlobCacheMgr::new();
         mgr.add_blob_entry(&entry).unwrap();
@@ -990,10 +994,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(
-        miri,
-        ignore = "blob cache entries cannot ask for a copied bootstrap, and Miri does not support readahead"
-    )]
     fn test_remove_blob_entry_by_domain() {
         let tmpdir = TempDir::new().unwrap();
         let root_dir = &std::env::var("CARGO_MANIFEST_DIR").expect("$CARGO_MANIFEST_DIR");
@@ -1028,6 +1028,7 @@ mod tests {
             .replace("RAFS_V5", &source_path.display().to_string());
         let mut entry: BlobCacheEntry = serde_json::from_str(&content).unwrap();
         assert!(entry.prepare_configuration_info());
+        entry.blob_config.as_mut().unwrap().metadata_source = METADATA_SOURCE;
 
         let mgr = BlobCacheMgr::new();
         mgr.add_blob_entry(&entry).unwrap();

@@ -803,7 +803,7 @@ impl RafsSuper {
             ..Default::default()
         };
         rs.meta.is_chunk_dict = is_chunk_dict;
-        rs.meta.metadata_source = config.internal.metadata_source;
+        rs.meta.metadata_source = config.metadata_source;
 
         // open bootstrap file
         let file = OpenOptions::new()

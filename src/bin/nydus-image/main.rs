@@ -2441,7 +2441,7 @@ mod tests {
     fn test_config() -> Arc<ConfigV2> {
         let mut config = ConfigV2::default();
         if cfg!(miri) {
-            config.internal.metadata_source = nydus_api::MetadataSource::Read;
+            config.metadata_source = nydus_api::MetadataSource::Read;
         }
         Arc::new(config)
     }

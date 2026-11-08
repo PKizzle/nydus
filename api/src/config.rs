@@ -151,6 +151,9 @@ pub struct ConfigV2 {
     pub rafs: Option<RafsConfigV2>,
     /// Overlay configuration information for the instance.
     pub overlay: Option<OverlayConfig>,
+    /// How read-only metadata files are loaded into memory.
+    #[serde(default, skip_serializing_if = "MetadataSource::is_default")]
+    pub metadata_source: MetadataSource,
     /// Internal runtime configuration.
     #[serde(skip)]
     pub internal: ConfigV2Internal,
@@ -166,6 +169,7 @@ impl Default for ConfigV2 {
             cache: None,
             rafs: None,
             overlay: None,
+            metadata_source: MetadataSource::default(),
             internal: ConfigV2Internal::default(),
         }
     }
@@ -182,6 +186,7 @@ impl ConfigV2 {
             cache: None,
             rafs: None,
             overlay: None,
+            metadata_source: MetadataSource::default(),
             internal: ConfigV2Internal::default(),
         }
     }
@@ -1048,6 +1053,9 @@ pub struct BlobCacheEntryConfigV2 {
     /// Optional file path for metadata blob.
     #[serde(default)]
     pub metadata_path: Option<String>,
+    /// How read-only metadata files are loaded into memory.
+    #[serde(default, skip_serializing_if = "MetadataSource::is_default")]
+    pub metadata_source: MetadataSource,
 }
 
 impl BlobCacheEntryConfigV2 {
@@ -1078,6 +1086,7 @@ impl BlobCacheEntryConfigV2 {
             external_backends: config.external_backends,
             cache: config.cache.unwrap_or_default(),
             metadata_path: self.metadata_path.clone(),
+            metadata_source: self.metadata_source,
         }
     }
 }
@@ -1121,14 +1130,17 @@ impl From<&BlobCacheEntryConfigV2> for ConfigV2 {
             cache: Some(c.cache.clone()),
             rafs: None,
             overlay: None,
+            metadata_source: c.metadata_source,
             internal: ConfigV2Internal::default(),
         }
     }
 }
 
 /// How read-only metadata files (RAFS bootstraps, blob compression contexts and chunk digest
-/// files) are brought into memory. Readers see the same bytes either way.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// files) are brought into memory. Readers see the same bytes either way. Configured as
+/// `metadata_source = "mmap" | "read"`; any other value is rejected.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum MetadataSource {
     /// Map the file: pages are loaded on first access and shared with the page cache. The file
     /// must not change while mapped.
@@ -1139,21 +1151,23 @@ pub enum MetadataSource {
     Read,
 }
 
+impl MetadataSource {
+    fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
 /// Internal runtime configuration.
 #[derive(Clone, Debug)]
 pub struct ConfigV2Internal {
     /// It's possible to access the raw or more blob objects.
     pub blob_accessible: Arc<AtomicBool>,
-    /// How metadata files are loaded; chosen by the embedding program, not by configuration
-    /// files.
-    pub metadata_source: MetadataSource,
 }
 
 impl Default for ConfigV2Internal {
     fn default() -> Self {
         ConfigV2Internal {
             blob_accessible: Arc::new(AtomicBool::new(false)),
-            metadata_source: MetadataSource::default(),
         }
     }
 }
@@ -1161,7 +1175,6 @@ impl Default for ConfigV2Internal {
 impl PartialEq for ConfigV2Internal {
     fn eq(&self, other: &Self) -> bool {
         self.blob_accessible() == other.blob_accessible()
-            && self.metadata_source == other.metadata_source
     }
 }
 
@@ -1597,6 +1610,7 @@ impl TryFrom<RafsConfig> for ConfigV2 {
             cache: Some(cache),
             rafs: Some(rafs),
             overlay: None,
+            metadata_source: MetadataSource::default(),
             internal: ConfigV2Internal::default(),
         })
     }
@@ -1735,6 +1749,7 @@ impl TryFrom<&BlobCacheEntryConfig> for BlobCacheEntryConfigV2 {
             external_backends: v.external_backends.clone(),
             cache: (&cache_config).try_into()?,
             metadata_path: v.metadata_path.clone(),
+            metadata_source: MetadataSource::default(),
         })
     }
 }
@@ -1753,6 +1768,41 @@ mod tests {
     use super::*;
     use crate::{BLOB_CACHE_TYPE_META_BLOB, BlobCacheEntry};
     use vmm_sys_util::tempfile::TempFile;
+
+    #[test]
+    fn test_metadata_source_config() {
+        let config: ConfigV2 = toml::from_str("version = 2").unwrap();
+        assert_eq!(config.metadata_source, MetadataSource::Mmap);
+        assert!(
+            !serde_json::to_string(&config)
+                .unwrap()
+                .contains("metadata_source")
+        );
+
+        let config: ConfigV2 =
+            serde_json::from_str(r#"{"version": 2, "metadata_source": "read"}"#).unwrap();
+        assert_eq!(config.metadata_source, MetadataSource::Read);
+        let json = serde_json::to_string(&config).unwrap();
+        assert!(json.contains(r#""metadata_source":"read""#));
+        assert_eq!(serde_json::from_str::<ConfigV2>(&json).unwrap(), config);
+        assert!(ConfigV2::from_str(r#"{"version": 2, "metadata_source": "Read"}"#).is_err());
+        assert!(ConfigV2::from_str(r#"{"version": 2, "metadata_source": "file"}"#).is_err());
+
+        let entry: BlobCacheEntryConfigV2 =
+            serde_json::from_str(r#"{"version": 2, "metadata_source": "read"}"#).unwrap();
+        assert_eq!(entry.metadata_source, MetadataSource::Read);
+        assert_eq!(ConfigV2::from(&entry).metadata_source, MetadataSource::Read);
+        assert_eq!(
+            entry.clone_without_secrets().metadata_source,
+            MetadataSource::Read
+        );
+        assert!(
+            serde_json::from_str::<BlobCacheEntryConfigV2>(
+                r#"{"version": 2, "metadata_source": "mapped"}"#
+            )
+            .is_err()
+        );
+    }
 
     #[test]
     fn test_blob_prefetch_config() {

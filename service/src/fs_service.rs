@@ -546,7 +546,7 @@ mod tests {
     #[test]
     #[cfg_attr(
         miri,
-        ignore = "mount commands cannot ask for a copied bootstrap, and Miri does not support readahead"
+        ignore = "the blobcache chunk map is a file-backed mapping, which Miri does not support"
     )]
     fn it_should_create_rafs_backend() {
         let blob_dir = "../tests/texture/blobs";
