@@ -465,7 +465,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "Miri does not support readahead")]
+    #[cfg_attr(miri, ignore = "walks the whole v5 image: about 30 minutes under Miri")]
     fn test_rafs_iterator() {
         let root_dir = &std::env::var("CARGO_MANIFEST_DIR").expect("$CARGO_MANIFEST_DIR");
         let path = PathBuf::from(root_dir).join("../tests/texture/bootstrap/rafs-v5.boot");
