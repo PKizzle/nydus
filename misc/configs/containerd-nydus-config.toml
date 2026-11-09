@@ -63,8 +63,9 @@ referrer_detect = false
 dual_index_detect = true
 prefetch = true
 metrics = true
-# EROFS page cache sharing (inode_share) between auto-accel images built on this node, so a
-# file present in many images is cached once. Registry and peer-fetched images never share.
+# EROFS page cache sharing (inode_share) between the images served through fanotify, so a file
+# present in many images is cached once. Each image is mounted through a node view whose
+# fingerprints this node computes itself; fingerprints an image ships are ignored.
 # "auto" enables it when a startup self-test finds the kernel supports it and carries the fix
 # "erofs: hold real inodes for shared files" (mainline 7259fb011c14, 7.4, or a backport), without
 # which mmap'd shared files can oops the kernel. "on" enables it on any kernel accepting the option

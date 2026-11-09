@@ -306,16 +306,65 @@ sudo NYDUS_IMAGE=./target/release/nydus-image NYDUSD=./target/release/nydusd \
 `cache_config.erofs_inode_share_domain` mounts the image with
 `inode_share,domain_id=<domain>`: on Linux 7.0+ files whose fingerprint xattrs are equal share
 one page cache across all mounts of the domain, so a library used by many images is cached once.
-The image needs fingerprints (`nydus-image merge --inode-share-fingerprint`); without them the
-kernel mounts normally. A kernel that rejects the options (`EINVAL`, before 7.0) is mounted
-without them. Shared mmaps need the fix "erofs: hold real inodes for shared files" (mainline
-`7259fb011c14`, 7.4; or a backport): without it, a page fault on a mapping whose file was closed
-and whose real inode was evicted dereferences a NULL inode, a kernel oops.
-`misc/fanotify/inode-share-test.sh` checks the sharing in the kernel.
+The handler asks for it only when the bootstrap declares fingerprints and every byte its caches
+serve is verified (see below); otherwise, and when a kernel rejects the options (`EINVAL`, before
+7.0), it mounts without them and logs why at `info`. Shared mmaps need the fix "erofs: hold real
+inodes for shared files" (mainline `7259fb011c14`, 7.4; or a backport): without it, a page fault
+on a mapping whose file was closed and whose real inode was evicted dereferences a NULL inode, a
+kernel oops. `misc/fanotify/inode-share-test.sh` checks the sharing in the kernel.
 
-The snapshotter sets the domain only for auto-accel images this node built, under
-`[snapshotter.features] erofs_inode_share` (`auto`, `on`, `off`). `auto` enables it when the
-startup self-test (`nydus_service::erofs_ishare`) finds both:
+### Trust model
+
+The kernel shares a file's pages with every file of the domain whose fingerprint is byte-equal and
+never compares the data, so a fingerprint is a claim the kernel takes on trust. The snapshotter
+therefore computes every fingerprint in its domain itself, and serves each image, whatever its
+origin, through a **node view** of its bootstrap (`nydus-image node-view`, see
+[nydus-image.md](nydus-image.md#node-view)), built when the mount source is staged:
+
+- **Computed where:** on the node, from the bootstrap alone (no layer data is read), in a
+  subprocess confined like the auto-accel converter (`[snapshotter.auto_zran]` `nydus_image`,
+  `sandbox`, idle priority). The view is a RAFS v6 bootstrap at 4 KiB blocks; it replaces the
+  image's own bootstrap as the EROFS mount source (padded to the page size as usual).
+- **What is computed:** for each regular file, SHA-256 over a scheme tag, the chunk digest
+  algorithm, the file size and each chunk's size and digest, taken from the view's chunk table.
+  A file gets one only if `check_kernel_layout` proves, on the view as written, that the kernel
+  reads exactly those chunk-table chunks for every byte of it; others are not shared.
+- **Why shipped fingerprints are ignored:** a pushed image, a peer's sidecar or a registry
+  nydus image could carry a copy of another image's fingerprint on a file with other content, and
+  every mount of the domain would then read that file's pages for the other one. RAFS readers
+  skip long-prefix xattrs, the only on-disk form of a fingerprint, so nothing a source ships
+  reaches the view, and a source bootstrap staged as it is (no view could be built) is never
+  given a domain.
+- **Why equal fingerprints mean equal bytes:** equal fingerprints mean equal algorithm, size and
+  chunk digest sequence. Every fill of a fanotify cache is validated against the digest in the
+  chunk table of the bootstrap the kernel mounts, which is the view, and each image has its own
+  cache files (`daemons/<image>/stage`). The handler joins the domain only when, for every blob,
+  the chunks already marked ready have been checked against those digests, or none is ready yet,
+  and the cache file has been written since only by validating fills
+  (`BlobObject::is_served_data_verified`). So the bytes each kernel inode reads match the
+  digests its fingerprint was computed from, in both images.
+
+Residual risks: a kernel bug that corrupts a shared page corrupts it for every image of the
+domain; a page mapped before a chunk is revoked (a cache file corrupted on disk after it was
+verified) stays mapped in every process sharing it until unmapped; and the argument rests on the
+chunk digest (SHA-256 or BLAKE3) and SHA-256 being collision resistant.
+
+### Which images share, and when
+
+Every image served through fanotify: auto-accel images built on this node or fetched from a peer,
+and nydus images pulled from a registry. RAFS v5 images take FUSE and never share. An image whose
+own block size exceeds the page size, or whose chunk addresses a kernel would misread at its own
+block size, is still served through fanotify when its 4 KiB view passes the layout check.
+
+`inode_share` is fixed for a mount's life, and a takeover or in-place heal keeps the mount and
+its staged view (the view is rebuilt only when the image's bootstrap changes, recorded in
+`stage/bootstrap.view-of`). Sharing therefore starts with a fresh mount: a fresh cache qualifies
+at once; a cache holding chunks nobody checked yet (filled by an older release) mounts without
+sharing and qualifies on its next mount once the background verifier has recorded it verified.
+`/proc/self/mounts` shows `inode_share,domain_id=nydus-node-local` on a sharing mount.
+
+The domain is set under `[snapshotter.features] erofs_inode_share` (`auto`, `on`, `off`). `auto`
+enables it when the startup self-test (`nydus_service::erofs_ishare`) finds both:
 
 - **support**: a tiny file-backed probe image mounts with `inode_share,domain_id=…`, and
   `inode_share` without `domain_id` fails `EINVAL` (a kernel built without
@@ -325,10 +374,21 @@ startup self-test (`nydus_service::erofs_ishare`) finds both:
 
 It does not compare kernel versions, so a backport counts as fixed. Without kallsyms the result is
 `inconclusive` and `auto` stays off; `on` enables sharing regardless, and `off` skips the self-test.
-The self-test runs in the background at startup; auto-accel mounts made before it finishes go
-without sharing. The startup log and the `nydus_snapshotter_erofs_inode_share{status,mode,enabled}`
+The self-test runs in the background at startup; mounts made before it finishes go without
+sharing. The startup log and the `nydus_snapshotter_erofs_inode_share{status,mode,enabled}`
 gauge report the outcome (`status` is `fix_present`, `fix_absent`, `unsupported` or
 `inconclusive`).
+
+### Cache key encoding before 7.4
+
+Kernels before the fix "erofs: delimit inode_share cache key components" (mainline
+`96bf9831fbf4`, 7.4-rc1) key a shared inode by `fingerprint || domain_id` with no separator, so
+two different (fingerprint, domain) pairs can concatenate to the same key; the fix makes it
+`domain_id || '\0' || fingerprint`. The snapshotter cannot hit that: every fingerprint it writes is
+exactly 32 bytes and every mount uses the one domain `nydus-node-local`, so all its keys split at
+the same byte and equal keys mean equal fingerprints. Only a mount outside the snapshotter, with
+another domain and a fingerprint of another length (which takes root), could build a colliding
+key; nothing is gated on the fix.
 
 ## Troubleshooting
 

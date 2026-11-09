@@ -1195,7 +1195,7 @@ async fn load_or_convert(
 }
 
 /// Build a `LocalAccelConfig` for a job's per-image `work_dir`.
-fn local_accel_config(config: &AutoZranConfig, work_dir: &Path) -> LocalAccelConfig {
+pub(crate) fn local_accel_config(config: &AutoZranConfig, work_dir: &Path) -> LocalAccelConfig {
     LocalAccelConfig {
         nydus_image: config.nydus_image.clone(),
         work_dir: work_dir.to_path_buf(),
