@@ -27,6 +27,9 @@ OUT=$("$NI" create --fs-version 6 --compressor none --block-size "$BLOCK_SIZE" \
   -B "$ROOT/bootstrap" -D "$ROOT/blobs" "$ROOT/src" 2>&1) || fail "nydus-image create: $OUT"
 [ -n "$(ls "$ROOT/blobs")" ] || fail "no data blob"
 
+NYDUS_IMAGE="$NI" "$CARGO" test -p nydus-snapshotter --lib \
+  daemon::tests::stage_mount_source_stages_a_real_view -- --ignored --exact \
+  || fail "the node view was not staged"
 NYDUS_IMAGE="$NI" NYDUS_E2E_ROOT="$ROOT" "$CARGO" test -p nydus-snapshotter --lib \
   daemon::e2e_tests::referrer_daemon_serves_every_file -- --ignored --exact --nocapture \
   || fail "the referrer daemon did not serve every file"

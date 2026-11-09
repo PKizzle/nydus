@@ -412,6 +412,57 @@ pub struct OndiskInodeWrapper {
 }
 
 impl OndiskInodeWrapper {
+    /// The page cache sharing fingerprint the kernel finds on this inode: the value of its xattr
+    /// entry naming long prefix 0 with an empty suffix. Fails on any xattr the kernel could read
+    /// as a fingerprint that RAFS never writes: shared xattr ids, an entry without a namespace,
+    /// another long prefix, a suffix, or a second fingerprint.
+    pub(crate) fn ishare_fingerprint(&self) -> RafsResult<Option<Vec<u8>>> {
+        let state = self.state();
+        let inode = self.disk_inode(&state);
+        let total = inode.xattr_inline_count();
+        if total == 0 {
+            return Ok(None);
+        }
+        let header: &RafsV6XattrIbodyHeader =
+            state.map.get_ref(self.offset + Self::inode_size(inode))?;
+        let invalid = |what: &str| Err(RafsError::InvalidMetadata(format!("v6: {what}")));
+        if header.shared_count() != 0 {
+            return invalid("inode has shared xattrs");
+        }
+        let mut found = None;
+        let mut offset =
+            self.offset + Self::inode_size(inode) + size_of::<RafsV6XattrIbodyHeader>();
+        let mut remaining = (total - 1) as usize * size_of::<RafsV6XattrEntry>();
+        while remaining > 0 {
+            let e: &RafsV6XattrEntry = state.map.get_ref(offset)?;
+            if e.name_len() as usize + e.value_size() as usize > remaining {
+                return invalid("xattr entry runs past the inode");
+            }
+            if is_long_prefix_xattr(e.name_index()) {
+                if e.name_index() != 0x80 || e.name_len() != 0 || found.is_some() {
+                    return invalid("unexpected long-prefix xattr");
+                }
+                let value: &[u8] = state.map.get_slice(
+                    offset + size_of::<RafsV6XattrEntry>(),
+                    e.value_size() as usize,
+                )?;
+                found = Some(value.to_vec());
+            } else {
+                recover_namespace(e.name_index())?;
+            }
+            let s = round_up(
+                (e.name_len() + e.value_size()) as u64 + size_of::<RafsV6XattrEntry>() as u64,
+                size_of::<RafsV6XattrEntry>() as u64,
+            ) as usize;
+            if s >= remaining {
+                break;
+            }
+            remaining -= s;
+            offset += s;
+        }
+        Ok(found)
+    }
+
     fn new(
         state: &DirectMappingState,
         mapping: DirectSuperBlockV6,

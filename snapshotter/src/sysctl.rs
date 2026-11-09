@@ -1053,6 +1053,19 @@ async fn metrics_response(controller: &SystemController) -> HttpResponse {
         );
     }
 
+    body.push_str(
+        "# HELP nydus_snapshotter_inode_share_mounts_total Fresh fanotify mounts by page cache sharing decision: shared, no_view, unverified, no_fingerprints or disabled.\n",
+    );
+    body.push_str("# TYPE nydus_snapshotter_inode_share_mounts_total counter\n");
+    for (outcome, count) in nydus_service::erofs_ishare::mount_counts() {
+        push_labeled_metric(
+            &mut body,
+            "nydus_snapshotter_inode_share_mounts_total",
+            &[("result", outcome.label())],
+            count,
+        );
+    }
+
     body.push_str("# HELP nydusd_counts The counts of nydus daemon.\n");
     body.push_str("# TYPE nydusd_counts gauge\n");
     push_labeled_metric(

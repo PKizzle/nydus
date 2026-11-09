@@ -551,7 +551,7 @@ fn prepare_cmd_args(bti_string: &'static str) -> App {
 
     let app = app.subcommand(
         App::new("node-view")
-            .about("Write the node view of a RAFS v6 bootstrap: 4 KiB blocks and node-computed page cache sharing fingerprints, for the EROFS `inode_share` mount option (Linux 7.0+)")
+            .about("Write the node view of a RAFS v6 bootstrap: 4 KiB blocks and node-computed page cache sharing fingerprints, for the EROFS `inode_share` mount option (Linux 7.0+). Exits 2 when the image has no view, 1 on other failures")
             .arg(
                 Arg::new("bootstrap")
                     .long("bootstrap")
@@ -1614,7 +1614,16 @@ impl Command {
     fn node_view(matches: &ArgMatches) -> Result<()> {
         let source = PathBuf::from(matches.get_one::<String>("SOURCE").unwrap());
         let target = PathBuf::from(matches.get_one::<String>("bootstrap").unwrap());
-        let view = build_node_view(&source, &target, Arc::new(ConfigV2::default()))?;
+        // Exit status 2 says the image has no view (a verdict on it); 1 is any other failure,
+        // such as an I/O error, which says nothing about the image.
+        let view = match build_node_view(&source, &target, Arc::new(ConfigV2::default())) {
+            Ok(view) => view,
+            Err(e) if !e.chain().any(|c| nydus_utils::source_errno(c).is_some()) => {
+                error!("no node view of {}: {e:#}", source.display());
+                std::process::exit(2);
+            }
+            Err(e) => return Err(e),
+        };
         info!(
             "node view {}: {} of {} regular files fingerprinted",
             target.display(),

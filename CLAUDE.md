@@ -179,8 +179,9 @@ nydus/
 13. **Page cache sharing trusts only node-computed fingerprints**: EROFS `inode_share` shares pages
     between files with equal fingerprints and never compares data, so every fanotify image is
     mounted through its node view (`nydus-image node-view`, `stage_mount_source` in
-    `snapshotter/src/daemon/mod.rs`), whose fingerprints the node computes from the view's chunk
-    table; fingerprints an image ships are never read. Only a staged view gets the
+    `snapshotter/src/daemon/mod.rs`) whenever sharing is enabled, whose fingerprints the node
+    computes from the view's chunk table; fingerprints an image ships are never read, and the
+    subprocess's output is re-checked in process (`kernel_layout::check_node_view`). Only a staged view gets the
     `nydus-node-local` domain, and the handler joins it only when every cache serves verified data
     alone (`FanotifyHandler::mount`). Never pass a domain for a bootstrap the node did not build as
     a view. Trust model: "Page cache sharing" in [docs/nydus-fanotify.md](docs/nydus-fanotify.md).

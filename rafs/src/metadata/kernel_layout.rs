@@ -26,7 +26,8 @@ use super::direct_v6::OndiskInodeWrapper;
 use super::layout::v5::RafsV5ChunkInfo;
 use super::layout::v6::{
     EROFS_CHUNK_FORMAT_INDEXES_FLAG, EROFS_CHUNK_FORMAT_SIZE_MASK, EROFS_INODE_CHUNK_BASED,
-    RafsV6Device,
+    EROFS_SUPER_OFFSET, RafsV6Device, RafsV6SuperBlock, ishare_fingerprint,
+    ishare_xattr_prefix_table,
 };
 use super::{RafsInode, RafsInodeExt, RafsSuper};
 use crate::{RafsError, RafsResult};
@@ -266,6 +267,128 @@ pub fn check_kernel_layout(rs: &RafsSuper, bootstrap: &Path) -> RafsResult<Kerne
     Ok(report)
 }
 
+/// The files of `report` whose inode passes the check on every one of its paths: hardlinks
+/// share an inode, so one violating path rules out all of them.
+fn fit_files(report: &KernelLayoutReport) -> impl Iterator<Item = &FileLayout> {
+    let unfit: HashSet<u64> = report
+        .files
+        .iter()
+        .filter(|f| !f.violations.is_empty())
+        .map(|f| f.ino)
+        .collect();
+    report.files.iter().filter(move |f| !unfit.contains(&f.ino))
+}
+
+/// The inode at `path` (absolute, from the root) of `rs`.
+fn inode_at(rs: &RafsSuper, path: &Path) -> RafsResult<Arc<dyn RafsInodeExt>> {
+    let mut inode = rs.get_extended_inode(rs.superblock.root_ino(), false)?;
+    for name in path.iter().skip(1) {
+        inode = inode.get_child_by_name(name)?;
+    }
+    Ok(inode)
+}
+
+/// The number of regular file paths of the RAFS v6 image `rs` loaded from `bootstrap`, and the
+/// page cache sharing fingerprint of each one the kernel reads exactly through its chunk-table
+/// chunks ([`check_kernel_layout`]), computed from those chunks with
+/// [`ishare_fingerprint`]. None at all when a blob's digest algorithm differs from the
+/// image's: fills are validated with the blob's, which the fingerprint must name.
+pub fn node_fingerprints(
+    rs: &RafsSuper,
+    bootstrap: &Path,
+) -> RafsResult<(usize, HashMap<PathBuf, [u8; 32]>)> {
+    let report = check_kernel_layout(rs, bootstrap)?;
+    if !report.image_errors.is_empty() {
+        return Err(RafsError::InvalidMetadata(format!(
+            "the image fails the kernel layout check: {}",
+            report.image_errors.join("; ")
+        )));
+    }
+    let mut fingerprints = HashMap::new();
+    let digester = rs.meta.get_digester();
+    if let Some(blob) = rs
+        .superblock
+        .get_blob_infos()
+        .iter()
+        .find(|b| b.digester() != digester)
+    {
+        warn!(
+            "blob {} uses digest {}, the image {}; not fingerprinting any file",
+            blob.blob_id(),
+            blob.digester(),
+            digester
+        );
+        return Ok((report.files.len(), fingerprints));
+    }
+    for file in fit_files(&report) {
+        let inode = inode_at(rs, &file.path)?;
+        let chunks = (0..inode.get_chunk_count())
+            .map(|i| {
+                inode
+                    .get_chunk_info(i)
+                    .map(|c| (c.uncompressed_size(), c.chunk_id().data))
+            })
+            .collect::<RafsResult<Vec<_>>>()?;
+        if let Some(fingerprint) = ishare_fingerprint(digester, inode.size(), chunks) {
+            fingerprints.insert(file.path.clone(), fingerprint);
+        }
+    }
+    Ok((report.files.len(), fingerprints))
+}
+
+/// Check that the fingerprints the kernel finds in the RAFS v6 image `rs` loaded from
+/// `bootstrap` are exactly the ones [`node_fingerprints`] computes for it: the superblock names
+/// the RAFS fingerprint prefix, every inode the computation fingerprints stores that value, and
+/// no other inode stores any. Returns the number of fingerprinted paths.
+///
+/// This is what makes a node view built by a subprocess trustworthy: what the subprocess wrote
+/// is compared with what this process derives from the view's own chunk table.
+pub fn check_node_view(rs: &RafsSuper, bootstrap: &Path) -> RafsResult<usize> {
+    let mismatch = |what: String| Err(RafsError::InvalidMetadata(what));
+    let (_, want) = node_fingerprints(rs, bootstrap)?;
+    let file = File::open(bootstrap)?;
+    let mut sb = RafsV6SuperBlock::new();
+    file.read_exact_at(sb.as_mut(), EROFS_SUPER_OFFSET as u64)?;
+    if sb.has_ishare_xattrs() {
+        let table = ishare_xattr_prefix_table();
+        let mut stored = vec![0u8; table.len()];
+        let offset = sb.xattr_prefix_table_offset().unwrap_or(u64::MAX);
+        if sb.xattr_prefix_count() != 1
+            || sb.ishare_xattr_prefix_id() != 0
+            || file.read_exact_at(&mut stored, offset).is_err()
+            || stored != table
+        {
+            return mismatch("the fingerprint prefix is not the RAFS one".to_string());
+        }
+    } else if !want.is_empty() {
+        return mismatch("the image declares no fingerprints".to_string());
+    }
+
+    let root = rs.get_extended_inode(rs.superblock.root_ino(), false)?;
+    let mut pending = vec![(PathBuf::from("/"), root)];
+    while let Some((path, inode)) = pending.pop() {
+        if inode.is_dir() {
+            for idx in 0..inode.get_child_count() {
+                let child = inode.get_child_by_index(idx)?;
+                pending.push((path.join(child.name()), child));
+            }
+        }
+        let ondisk = inode
+            .as_any()
+            .downcast_ref::<OndiskInodeWrapper>()
+            .ok_or(RafsError::Unsupported)?;
+        let stored = ondisk.ishare_fingerprint()?;
+        let expected = want.get(&path).map(|f| f.to_vec());
+        if stored != expected {
+            return mismatch(format!(
+                "{}: stored fingerprint {stored:02x?}, computed {expected:02x?}",
+                path.display()
+            ));
+        }
+    }
+    Ok(want.len())
+}
+
 /// Check that the kernel reads RAFS chunk `idx` of `inode` exactly where the fill path writes it.
 fn check_chunk(
     rs: &RafsSuper,
@@ -388,6 +511,40 @@ mod tests {
         let path = dir.join("patched.boot");
         std::fs::write(&path, data).unwrap();
         path
+    }
+
+    /// One violating path of a hardlink group takes the fingerprint from every path of it.
+    #[test]
+    fn a_hardlink_group_with_one_unfit_path_is_unfit() {
+        let file = |ino, path: &str, violations| FileLayout {
+            ino,
+            path: PathBuf::from(path),
+            violations,
+        };
+        let report = KernelLayoutReport {
+            image_errors: Vec::new(),
+            files: vec![
+                file(1, "/a", Vec::new()),
+                file(2, "/b", Vec::new()),
+                file(2, "/b-link", vec![LayoutViolation::Hole { chunk: 0 }]),
+                file(3, "/c", Vec::new()),
+            ],
+        };
+        let fit: Vec<_> = fit_files(&report).map(|f| f.path.clone()).collect();
+        assert_eq!(fit, vec![PathBuf::from("/a"), PathBuf::from("/c")]);
+    }
+
+    /// A builder image without fingerprints is a consistent view; one whose superblock declares
+    /// fingerprints its inodes do not store is not.
+    #[test]
+    #[cfg_attr(miri, ignore = "reads the bootstrap through the file system")]
+    fn check_node_view_compares_stored_fingerprints() {
+        let rs = load(&fixture());
+        let (files, want) = node_fingerprints(&rs, &fixture()).unwrap();
+        assert!(files > 0);
+        // The fixture has no fingerprints although its files could have them.
+        assert!(!want.is_empty());
+        assert!(check_node_view(&rs, &fixture()).is_err());
     }
 
     #[test]

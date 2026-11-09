@@ -522,6 +522,16 @@ impl RafsV6SuperBlock {
         Ok(2 + u16::from_le_bytes(len) as u64)
     }
 
+    /// Number of long xattr prefixes the superblock declares.
+    pub fn xattr_prefix_count(&self) -> u8 {
+        self.s_reserved[SB_RESERVED_XATTR_PREFIX_COUNT]
+    }
+
+    /// Index of the long prefix the kernel reads inode fingerprints under.
+    pub fn ishare_xattr_prefix_id(&self) -> u8 {
+        self.s_reserved[SB_RESERVED_ISHARE_XATTR_PREFIX_ID]
+    }
+
     /// Whether the image carries inode fingerprints for the kernel's `inode_share` mode.
     pub fn has_ishare_xattrs(&self) -> bool {
         u32::from_le(self.s_feature_compat) & EROFS_FEATURE_COMPAT_ISHARE_XATTRS != 0
@@ -2353,6 +2363,11 @@ impl RafsV6XattrIbodyHeader {
     /// Load a `RafsV6XattrIbodyHeader` from a reader.
     pub fn load(&mut self, r: &mut RafsIoReader) -> RafsResult<()> {
         Ok(r.read_exact(self.as_mut())?)
+    }
+
+    /// Number of shared xattr ids following the header; RAFS never writes any.
+    pub fn shared_count(&self) -> u8 {
+        self.h_shared_count
     }
 }
 

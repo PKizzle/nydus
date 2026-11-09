@@ -535,13 +535,26 @@ fn bootstrap_has_fingerprints(bootstrap: &Path) -> Result<bool> {
 /// `nydus_builder::build_node_view`) and every byte its devices serve is checked against the
 /// digests the fingerprints are computed from. `inode_share` is fixed for the mount's life, so a
 /// cache holding chunks nobody checked yet keeps the whole mount out until it is mounted again.
-fn inode_share_refusal(has_fingerprints: Result<bool>, unverified: &[String]) -> Option<String> {
+fn inode_share_refusal(
+    has_fingerprints: Result<bool>,
+    unverified: &[String],
+) -> Option<(crate::erofs_ishare::MountOutcome, String)> {
+    use crate::erofs_ishare::MountOutcome;
     match has_fingerprints {
-        Err(e) => Some(format!("cannot read the bootstrap superblock: {e}")),
-        Ok(false) => Some("the bootstrap carries no fingerprints".to_string()),
-        Ok(true) if !unverified.is_empty() => Some(format!(
-            "cached data of blob(s) {} is not verified yet",
-            unverified.join(", ")
+        Err(e) => Some((
+            MountOutcome::NoFingerprints,
+            format!("cannot read the bootstrap superblock: {e}"),
+        )),
+        Ok(false) => Some((
+            MountOutcome::NoFingerprints,
+            "the bootstrap carries no fingerprints".to_string(),
+        )),
+        Ok(true) if !unverified.is_empty() => Some((
+            MountOutcome::Unverified,
+            format!(
+                "cached data of blob(s) {} is not verified yet",
+                unverified.join(", ")
+            ),
         )),
         Ok(true) => None,
     }
@@ -1418,7 +1431,11 @@ impl FanotifyHandler {
                 bootstrap_has_fingerprints(&self.bootstrap_path),
                 &unverified,
             );
-            if let Some(reason) = &refused {
+            crate::erofs_ishare::record_mount(match &refused {
+                None => crate::erofs_ishare::MountOutcome::Shared,
+                Some((outcome, _)) => *outcome,
+            });
+            if let Some((_, reason)) = &refused {
                 info!(
                     "fanotify: mounting {} without page cache sharing (domain {domain}): {reason}",
                     self.mountpoint.display()
@@ -3090,14 +3107,14 @@ mod tests {
 
     #[test]
     fn inode_share_needs_fingerprints_and_verified_caches() {
+        use crate::erofs_ishare::MountOutcome;
         assert_eq!(inode_share_refusal(Ok(true), &[]), None);
-        assert!(
-            inode_share_refusal(Ok(false), &[])
-                .unwrap()
-                .contains("no fingerprints")
-        );
-        let refused = inode_share_refusal(Ok(true), &["b1".to_string()]).unwrap();
-        assert!(refused.contains("b1"), "{refused}");
+        let (outcome, reason) = inode_share_refusal(Ok(false), &[]).unwrap();
+        assert_eq!(outcome, MountOutcome::NoFingerprints);
+        assert!(reason.contains("no fingerprints"));
+        let (outcome, reason) = inode_share_refusal(Ok(true), &["b1".to_string()]).unwrap();
+        assert_eq!(outcome, MountOutcome::Unverified);
+        assert!(reason.contains("b1"), "{reason}");
         assert!(inode_share_refusal(Err(ErrorKind::NotFound.into()), &[]).is_some());
 
         let dir = tempfile::tempdir().unwrap();

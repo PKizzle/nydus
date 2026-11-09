@@ -326,7 +326,6 @@ fn auto_accel_sidecar_serves_converted_layers() {
             &staged.bootstrap,
             &staged.backend_dir,
             "k1",
-            true,
         ))
         .unwrap_or_else(|e| panic!("auto-accel daemon start: {e:#}"));
     let mountpoint = handle.mountpoint().to_path_buf();

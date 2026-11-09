@@ -323,8 +323,13 @@ origin, through a **node view** of its bootstrap (`nydus-image node-view`, see
 
 - **Computed where:** on the node, from the bootstrap alone (no layer data is read), in a
   subprocess confined like the auto-accel converter (`[snapshotter.auto_zran]` `nydus_image`,
-  `sandbox`, idle priority). The view is a RAFS v6 bootstrap at 4 KiB blocks; it replaces the
-  image's own bootstrap as the EROFS mount source (padded to the page size as usual).
+  `sandbox`) that may write only a scratch dir, never the cache files beside it. It runs at
+  normal priority, since the image's first mount waits for it, and is killed after 30 s plus
+  1 s per MiB of bootstrap. The snapshotter then trusts nothing the subprocess claims: it
+  recomputes every fingerprint from the view's chunk table and compares it with the xattr each
+  inode stores (`kernel_layout::check_node_view`), and discards the view on any difference. The
+  view is a RAFS v6 bootstrap at 4 KiB blocks; it replaces the image's own bootstrap as the EROFS
+  mount source (padded to the page size as usual).
 - **What is computed:** for each regular file, SHA-256 over a scheme tag, the chunk digest
   algorithm, the file size and each chunk's size and digest, taken from the view's chunk table.
   A file gets one only if `check_kernel_layout` proves, on the view as written, that the kernel
@@ -352,16 +357,23 @@ chunk digest (SHA-256 or BLAKE3) and SHA-256 being collision resistant.
 ### Which images share, and when
 
 Every image served through fanotify: auto-accel images built on this node or fetched from a peer,
-and nydus images pulled from a registry. RAFS v5 images take FUSE and never share. An image whose
-own block size exceeds the page size, or whose chunk addresses a kernel would misread at its own
-block size, is still served through fanotify when its 4 KiB view passes the layout check.
+and nydus images pulled from a registry. RAFS v5 images take FUSE and never share. A view is built
+only when sharing is enabled (below), or when the image's own block size exceeds the page size or
+its chunk addresses a kernel would misread at its own block size: such an image is served through
+fanotify when its 4 KiB view passes the checks (the view built for that decision is the one
+staged), and over FUSE when the image has no view. A failure that says nothing about the image
+(spawn, sandbox, I/O, timeout) fails the start, which is retried; for an image fit as it is, it
+only means mounting without sharing, logged once per image. With sharing disabled, a fit image is
+staged as a padded copy of its own bootstrap and no view is built.
 
 `inode_share` is fixed for a mount's life, and a takeover or in-place heal keeps the mount and
 its staged view (the view is rebuilt only when the image's bootstrap changes, recorded in
 `stage/bootstrap.view-of`). Sharing therefore starts with a fresh mount: a fresh cache qualifies
 at once; a cache holding chunks nobody checked yet (filled by an older release) mounts without
 sharing and qualifies on its next mount once the background verifier has recorded it verified.
-`/proc/self/mounts` shows `inode_share,domain_id=nydus-node-local` on a sharing mount.
+`/proc/self/mounts` shows `inode_share,domain_id=nydus-node-local` on a sharing mount, and
+`nydus_snapshotter_inode_share_mounts_total{result}` counts fresh mounts by decision: `shared`,
+`no_view`, `unverified`, `no_fingerprints` or `disabled`.
 
 The domain is set under `[snapshotter.features] erofs_inode_share` (`auto`, `on`, `off`). `auto`
 enables it when the startup self-test (`nydus_service::erofs_ishare`) finds both:

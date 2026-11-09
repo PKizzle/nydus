@@ -12,7 +12,7 @@
 //! so a shipped fingerprint never reaches the view. Each regular file whose kernel reading the
 //! view provably confines to its own chunk-table chunks
 //! ([`check_kernel_layout`](nydus_rafs::metadata::kernel_layout::check_kernel_layout)) gets
-//! [`ishare_fingerprint`] computed from those very chunks; any other file gets none and only
+//! [`ishare_fingerprint`](nydus_rafs::metadata::layout::v6::ishare_fingerprint) computed from those very chunks; any other file gets none and only
 //! misses out on sharing.
 //!
 //! The view uses 4 KiB blocks, which every page size admits, with device slots sized for that
@@ -20,14 +20,14 @@
 //! 4 KiB), so a 16 KiB or 64 KiB source keeps its chunk addresses exact at 4 KiB. No layer data
 //! is read: chunk digests and extents come from the source bootstrap's chunk table.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result, bail, ensure};
 use nydus_api::ConfigV2;
-use nydus_rafs::metadata::kernel_layout::check_kernel_layout;
-use nydus_rafs::metadata::layout::v6::{EROFS_BLOCK_SIZE_4096, ishare_fingerprint};
+use nydus_rafs::metadata::kernel_layout;
+use nydus_rafs::metadata::layout::v6::EROFS_BLOCK_SIZE_4096;
 use nydus_rafs::metadata::{RafsSuper, RafsVersion};
 use nydus_utils::crypt;
 
@@ -72,12 +72,20 @@ pub fn build_node_view(source: &Path, target: &Path, config: Arc<ConfigV2>) -> R
     dump_view(&rs, target, &HashMap::new())?;
     let (regular_files, fingerprints) = node_fingerprints(target, config.clone())?;
     dump_view(&rs, target, &fingerprints)?;
-    let (_, written) = node_fingerprints(target, config)?;
+    let (view, _) = RafsSuper::load_from_file(target, config, false)
+        .with_context(|| format!("failed to load the node view {}", target.display()))?;
+    let (_, written) = kernel_layout::node_fingerprints(&view, target)?;
     ensure!(
         written == fingerprints,
         "the fingerprinted view of {} reads differently from its plain layout",
         source.display()
     );
+    kernel_layout::check_node_view(&view, target).with_context(|| {
+        format!(
+            "the node view of {} stores other fingerprints",
+            source.display()
+        )
+    })?;
     Ok(NodeView {
         regular_files,
         fingerprinted: fingerprints.len(),
@@ -144,60 +152,17 @@ fn node_fingerprints(
 ) -> Result<(usize, HashMap<PathBuf, [u8; 32]>)> {
     let (rs, _) = RafsSuper::load_from_file(path, config, false)
         .with_context(|| format!("failed to load the node view {}", path.display()))?;
-    let report = check_kernel_layout(&rs, path)?;
-    ensure!(
-        report.image_errors.is_empty(),
-        "the node view fails the kernel layout check: {}",
-        report.image_errors.join("; ")
-    );
-    let mut fingerprints = HashMap::new();
-    // Fills are validated with each blob's own algorithm, which the fingerprint must name.
-    let digester = rs.meta.get_digester();
-    if let Some(blob) = rs
-        .superblock
-        .get_blob_infos()
-        .iter()
-        .find(|b| b.digester() != digester)
-    {
-        warn!(
-            "blob {} uses digest {}, the image {}; not fingerprinting any file",
-            blob.blob_id(),
-            blob.digester(),
-            digester
-        );
-        return Ok((report.files.len(), fingerprints));
-    }
-    // Hardlinks share an inode, so one violating path rules out all of them.
-    let unfit: HashSet<u64> = report
-        .files
-        .iter()
-        .filter(|f| !f.violations.is_empty())
-        .map(|f| f.ino)
-        .collect();
-    for file in report.files.iter().filter(|f| !unfit.contains(&f.ino)) {
-        let mut inode = rs.get_extended_inode(rs.superblock.root_ino(), false)?;
-        for name in file.path.iter().skip(1) {
-            inode = inode.get_child_by_name(name)?;
-        }
-        let chunks = (0..inode.get_chunk_count())
-            .map(|i| {
-                inode
-                    .get_chunk_info(i)
-                    .map(|c| (c.uncompressed_size(), c.chunk_id().data))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        if let Some(fingerprint) = ishare_fingerprint(digester, inode.size(), chunks) {
-            fingerprints.insert(file.path.clone(), fingerprint);
-        }
-    }
-    Ok((report.files.len(), fingerprints))
+    Ok(kernel_layout::node_fingerprints(&rs, path)?)
 }
 
 #[cfg(test)]
 mod tests {
     use std::os::unix::fs::FileExt;
 
-    use nydus_rafs::metadata::layout::v6::{EROFS_SUPER_OFFSET, RafsV6SuperBlock};
+    use nydus_rafs::metadata::kernel_layout::check_kernel_layout;
+    use nydus_rafs::metadata::layout::v6::{
+        EROFS_SUPER_OFFSET, RafsV6SuperBlock, ishare_fingerprint,
+    };
     use nydus_utils::digest::{self, RafsDigest};
     use tempfile::TempDir;
 
@@ -404,6 +369,15 @@ mod tests {
         assert_eq!(stored[0], fingerprints(&view)[Path::new("/lib.so")]);
         let (victim_view, _, _v) = view_of(&victim);
         assert_eq!(stored_fingerprints(&victim_view), vec![victim_fp]);
+
+        // A view whose stored fingerprint differs from its chunks fails the check a consumer
+        // runs on a view it did not build itself.
+        assert!(kernel_layout::check_node_view(&load(&view), &view).is_ok());
+        let mut tampered = std::fs::read(&view).unwrap();
+        let at = tampered.windows(32).position(|w| w == stored[0]).unwrap();
+        tampered[at..at + 32].copy_from_slice(&victim_fp);
+        std::fs::write(&view, tampered).unwrap();
+        assert!(kernel_layout::check_node_view(&load(&view), &view).is_err());
     }
 
     /// A file the kernel would not read through its own chunk-table chunks gets no fingerprint;
