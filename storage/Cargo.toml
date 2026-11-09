@@ -81,9 +81,8 @@ cyper = { version = "0.9", default-features = false, features = [
 # root Cargo.toml).
 # The workspace-root [patch.crates-io] swaps in the locally patched copy.
 cyper-core = { version = "0.9", default-features = false, optional = true }
-rusqlite = { version = "0.40.1", features = ["bundled"], optional = true }
+rusqlite = { version = "0.41.1", features = ["bundled"], optional = true }
 r2d2 = { version = "0.8", optional = true }
-r2d2_sqlite = { version = "0.35.0", optional = true }
 serde = { version = "1.0.110", features = ["serde_derive", "rc"] }
 serde_json = "1.0.53"
 sha1 = { version = "0.11.0", optional = true }
@@ -201,7 +200,7 @@ backend-http-proxy = [
     "rustls",
     "rustls-platform-verifier",
 ]
-dedup = ["rusqlite", "r2d2", "r2d2_sqlite"]
+dedup = ["rusqlite", "r2d2"]
 
 backend-dragonfly-proxy = [
     "cyper",
