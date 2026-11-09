@@ -1193,6 +1193,15 @@ pub struct BlobPrefetchRequest {
     pub len: u64,
 }
 
+/// A chunk's digest and uncompressed extent as a bootstrap's chunk table records them: the
+/// reference a fill of that chunk is validated against.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ChunkDigestEntry {
+    pub digest: RafsDigest,
+    pub uncompressed_offset: u64,
+    pub uncompressed_size: u32,
+}
+
 /// Trait to provide direct access to underlying uncompressed blob file.
 ///
 /// The suggested flow to make use of an `BlobObject` is as below:
@@ -1232,6 +1241,32 @@ pub trait BlobObject: AsRawFd {
     ///
     /// [`RangeMap::reset_range_ready`]: crate::cache::state::RangeMap::reset_range_ready
     fn reset_data_ready(&self) -> StorageResult<()> {
+        Err(StorageError::Unsupported)
+    }
+
+    /// Whether every chunk marked ready in the cache file has been checked against its digest,
+    /// both the chunks filled by this cache and those found ready when it was opened.
+    fn is_data_verified(&self) -> bool {
+        false
+    }
+
+    /// Check every chunk already marked ready against its digest, calling `on_mismatch` for each
+    /// one that fails, and record the cache file as verified once all have passed or been
+    /// handled. Returns `Ok(false)` without recording anything when `stop()` turns true first.
+    ///
+    /// `on_mismatch` must revoke the chunk with [`Self::clear_chunk_ready`]; it decides what
+    /// has to happen around that, such as re-arming a pre-content mark first.
+    fn verify_ready_chunks(
+        &self,
+        _stop: &dyn Fn() -> bool,
+        _on_mismatch: &mut dyn FnMut(&dyn BlobChunkInfo) -> StorageResult<()>,
+    ) -> StorageResult<bool> {
+        Err(StorageError::Unsupported)
+    }
+
+    /// Revoke the ready state of one chunk, so the next read of it fetches again. Like
+    /// [`Self::reset_data_ready`], call it before the chunk's bytes go away.
+    fn clear_chunk_ready(&self, _chunk_index: u32) -> StorageResult<()> {
         Err(StorageError::Unsupported)
     }
 }

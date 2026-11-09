@@ -192,6 +192,10 @@ impl ServiceController {
             })
         });
         fanotify.add_workers(workers.collect::<Vec<_>>());
+        match fanotify.spawn_verifier() {
+            Ok(verifier) => fanotify.add_workers([verifier]),
+            Err(e) => warn!("fanotify: cannot start the cache verifier for {image_id}: {e}"),
+        }
     }
 
     /// Rebuild a fanotify handler from a fanotify group fd preserved across a hot upgrade.

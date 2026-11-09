@@ -185,6 +185,18 @@ impl RangeMap for BlobStateMap<IndexedChunkMap, u32> {
         self.c.reset_range_ready()
     }
 
+    fn clear_ready(&self, index: u32) -> StorageResult<()> {
+        self.c.clear_ready(index)
+    }
+
+    fn is_verified(&self) -> bool {
+        self.c.is_verified()
+    }
+
+    fn set_verified(&self, verified: bool) -> StorageResult<()> {
+        self.c.set_verified(verified)
+    }
+
     fn is_range_ready(&self, start: Self::I, count: Self::I) -> StorageResult<bool> {
         self.c.is_range_ready(start, count)
     }

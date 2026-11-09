@@ -76,6 +76,18 @@ impl RangeMap for IndexedChunkMap {
         self.map.reset()
     }
 
+    fn clear_ready(&self, index: u32) -> StorageResult<()> {
+        self.map.clear_chunk_ready(index)
+    }
+
+    fn is_verified(&self) -> bool {
+        self.map.is_verified()
+    }
+
+    fn set_verified(&self, verified: bool) -> StorageResult<()> {
+        self.map.set_verified(verified)
+    }
+
     fn is_range_ready(&self, start_index: u32, count: u32) -> StorageResult<bool> {
         if !self.is_range_all_ready() {
             for idx in 0..count {
@@ -284,6 +296,7 @@ mod tests {
             version: 1,
             magic2: MAGIC2,
             all_ready: MAGIC_ALL_READY,
+            verified: 0,
             reserved: [0x0u8; HEADER_RESERVED_SIZE],
         };
 
@@ -331,6 +344,7 @@ mod tests {
             version: 0,
             magic2: 0,
             all_ready: 0,
+            verified: 0,
             reserved: [0x0u8; HEADER_RESERVED_SIZE],
         };
 
@@ -421,5 +435,46 @@ mod tests {
         let reopened = IndexedChunkMap::new(&blob_path, 8, true).unwrap();
         assert!(!reopened.is_range_all_ready());
         assert_eq!(reopened.map.not_ready_count.load(Ordering::Acquire), 8);
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support file-backed mmap")]
+    fn test_clear_ready_and_verified_survive_reopen() {
+        let dir = TempDir::new().unwrap();
+        let blob_path = dir.path().join("blob-clear");
+        let blob_path = blob_path.as_os_str().to_str().unwrap().to_string();
+        let chunk = |index| MockChunkInfo {
+            index,
+            ..Default::default()
+        };
+
+        {
+            let map = IndexedChunkMap::new(&blob_path, 8, true).unwrap();
+            assert!(!map.is_verified());
+            for idx in 0..8u32 {
+                map.set_ready_and_clear_pending(chunk(idx).as_base())
+                    .unwrap();
+            }
+            assert!(map.is_range_all_ready());
+            map.clear_ready(5).unwrap();
+            assert!(!map.is_range_all_ready());
+            assert!(!map.is_ready(chunk(5).as_base()).unwrap());
+            assert!(map.is_ready(chunk(4).as_base()).unwrap());
+            // Clearing a chunk that is not ready changes nothing.
+            map.clear_ready(5).unwrap();
+            assert_eq!(map.map.not_ready_count.load(Ordering::Acquire), 1);
+            map.set_verified(true).unwrap();
+        }
+
+        let reopened = IndexedChunkMap::new(&blob_path, 8, true).unwrap();
+        assert!(reopened.is_verified());
+        assert!(!reopened.is_ready(chunk(5).as_base()).unwrap());
+        assert_eq!(reopened.map.not_ready_count.load(Ordering::Acquire), 1);
+        reopened.set_verified(false).unwrap();
+        assert!(
+            !IndexedChunkMap::new(&blob_path, 8, true)
+                .unwrap()
+                .is_verified()
+        );
     }
 }

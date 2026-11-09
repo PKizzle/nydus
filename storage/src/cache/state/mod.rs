@@ -163,6 +163,21 @@ pub trait RangeMap: Send + Sync {
     fn reset_range_ready(&self) -> StorageResult<()> {
         Err(StorageError::Unsupported)
     }
+
+    /// Revoke the ready state of one chunk; call it before the chunk's bytes go away.
+    fn clear_ready(&self, _index: Self::I) -> StorageResult<()> {
+        Err(StorageError::Unsupported)
+    }
+
+    /// Whether the map records every ready chunk as checked against its digest.
+    fn is_verified(&self) -> bool {
+        false
+    }
+
+    /// Record whether every ready chunk has been checked against its digest.
+    fn set_verified(&self, _verified: bool) -> StorageResult<()> {
+        Err(StorageError::Unsupported)
+    }
 }
 
 /// Trait to convert a [BlobChunkInfo](../../device/trait.BlobChunkInfo.html) object to an index

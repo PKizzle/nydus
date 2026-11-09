@@ -15,7 +15,7 @@ use nydus_utils::metrics::BlobcacheMetrics;
 use crate::backend::BlobBackend;
 #[cfg(feature = "dedup")]
 use crate::cache::CasMgr;
-use crate::cache::cachedfile::{FileCacheEntry, FileCacheMeta};
+use crate::cache::cachedfile::{BootstrapDigests, FileCacheEntry, FileCacheMeta};
 use crate::cache::state::{
     BlobStateMap, ChunkMap, DigestedChunkMap, IndexedChunkMap, NoopChunkMap,
 };
@@ -39,6 +39,8 @@ pub struct FileCacheMgr {
     worker_mgr: Arc<AsyncWorkerMgr>,
     work_dir: String,
     validate: bool,
+    // The cache file is the EROFS device the kernel reads; see `FileCacheEntry::new_file_cache`.
+    fanotify: bool,
     disable_indexed_map: bool,
     cache_raw_data: bool,
     cache_encrypted: bool,
@@ -78,6 +80,7 @@ impl FileCacheMgr {
             work_dir: work_dir.to_owned(),
             disable_indexed_map: blob_cfg.disable_indexed_map,
             validate: config.cache_validate,
+            fanotify: config.is_fanotify(),
             cache_raw_data: config.cache_compressed,
             cache_encrypted: blob_cfg.enable_encryption,
             cache_convergent_encryption: blob_cfg.enable_convergent_encryption,
@@ -225,9 +228,12 @@ impl FileCacheEntry {
             reader.clone()
         };
 
-        // Turn off chunk deduplication in case of cache data encryption is enabled or is tarfs.
-        let cas_mgr = if mgr.cache_encrypted || mgr.cache_raw_data || is_tarfs {
-            warn!("chunk deduplication trun off");
+        // Turn off chunk deduplication in case of cache data encryption is enabled or is tarfs, and
+        // for fanotify, whose chunks must not become ready by a copy that skips validation.
+        let cas_mgr = if mgr.cache_encrypted || mgr.cache_raw_data || is_tarfs || mgr.fanotify {
+            if !mgr.fanotify {
+                warn!("chunk deduplication trun off");
+            }
             None
         } else {
             #[cfg(feature = "dedup")]
@@ -250,6 +256,7 @@ impl FileCacheEntry {
             is_direct_chunkmap,
             is_get_blob_object_supported,
             need_validation,
+            bootstrap_digests,
         ) = if is_tarfs {
             let file = OpenOptions::new()
                 .create(false)
@@ -259,7 +266,7 @@ impl FileCacheEntry {
                 .map_err(|e| StorageError::cache_io("open the blob cache file", e))?;
             let chunk_map =
                 Arc::new(BlobStateMap::from(NoopChunkMap::new(true))) as Arc<dyn ChunkMap>;
-            (file, None, chunk_map, true, true, false)
+            (file, None, chunk_map, true, true, false, None)
         } else {
             let suffix = if mgr.cache_raw_data {
                 BLOB_RAW_FILE_SUFFIX
@@ -279,9 +286,32 @@ impl FileCacheEntry {
             // External blobs carry no chunk digest, so they can't be validated by digest.
             let validation_supported = !blob_info.meta_ci_is_valid()
                 || blob_info.has_feature(BlobFeatures::INLINED_CHUNK_DIGEST);
-            let need_validation = ((mgr.validate && validation_supported) || !is_direct_chunkmap)
-                && !is_legacy_stargz
-                && !blob_info.is_external();
+            // The kernel reads a fanotify cache file directly, with nothing to check it on the
+            // way, so every fill is validated whatever the configuration says. Its digests come
+            // from the bootstrap (`add_chunk_digests`), so the blob meta need not carry any.
+            let need_validation =
+                (mgr.fanotify || (mgr.validate && validation_supported) || !is_direct_chunkmap)
+                    && !is_legacy_stargz
+                    && !blob_info.is_external();
+            let bootstrap_digests = if mgr.fanotify {
+                Some(BootstrapDigests::open(
+                    format!("{}.digests", blob_data_file_path),
+                    blob_info.chunk_count() as usize,
+                )?)
+            } else {
+                None
+            };
+            // Chunks a non-fanotify opener fills are not checked against digests, and without
+            // the digest file nothing records what the ready chunks were checked against; either
+            // way the file can no longer claim that all of them were.
+            if !bootstrap_digests.as_ref().is_some_and(|(_, found)| *found)
+                && let Some(map) = chunk_map.as_range_map()
+            {
+                map.set_verified(false).or_else(|e| match e {
+                    StorageError::Unsupported => Ok(()),
+                    e => Err(e),
+                })?;
+            }
             // Set cache file to its expected size.
             let file = OpenOptions::new()
                 .create(true)
@@ -304,7 +334,8 @@ impl FileCacheEntry {
                 );
                 return Err(StorageError::InvalidArgument(msg));
             }
-            let load_chunk_digest = need_validation || cas_mgr.is_some();
+            // A fanotify cache validates against the bootstrap, never the blob's own digests.
+            let load_chunk_digest = (need_validation && !mgr.fanotify) || cas_mgr.is_some();
             // A chunkdict-generated blob carries no valid chunk info, so building a
             // `FileCacheMeta` over it reads garbage; only `meta_ci_is_valid()` gates this.
             let meta = if blob_info.meta_ci_is_valid() {
@@ -328,6 +359,7 @@ impl FileCacheEntry {
                 is_direct_chunkmap,
                 is_get_blob_object_supported,
                 need_validation,
+                bootstrap_digests.map(|(digests, _)| digests),
             )
         };
 
@@ -400,6 +432,7 @@ impl FileCacheEntry {
             zstd_stream_cursor: Mutex::new(None),
             dio_enabled: false,
             need_validation,
+            bootstrap_digests,
             user_io_batch_size: mgr.user_io_batch_size,
             prefetch_config,
         })

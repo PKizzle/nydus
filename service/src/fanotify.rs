@@ -32,7 +32,10 @@ use std::sync::{Arc, Barrier, Mutex, RwLock};
 
 use mio::unix::SourceFd;
 use mio::{Events, Interest, Poll, Token, Waker};
+use nydus_rafs::metadata::RafsSuper;
+use nydus_rafs::metadata::kernel_layout::chunk_digest_tables;
 use nydus_rafs::metadata::layout::v6::{EROFS_SUPER_OFFSET, RafsV6Device, RafsV6SuperBlock};
+use nydus_storage::device::BlobChunkInfo;
 
 use crate::blob_cache::{BlobCacheMgr, DataBlob};
 use crate::fanotify_sys::{
@@ -921,7 +924,7 @@ impl FanotifyHandler {
         // Each `DataBlob` owns a handle to its sparse backing file; we record that file's
         // identity so an incoming event fd can be resolved back to the blob without relying on
         // path names.
-        let cache_keys = configs
+        let cache_keys: Vec<(Arc<nydus_api::ConfigV2>, String)> = configs
             .iter()
             .map(|cfg| (cfg.config_v2().clone(), cfg.blob_info().blob_id()))
             .collect();
@@ -995,6 +998,10 @@ impl FanotifyHandler {
                     return Err(std::io::Error::last_os_error());
                 }
             }
+        }
+
+        if let Some((config, _)) = cache_keys.first() {
+            install_bootstrap_digests(&bootstrap_path, config, &blob_backings)?;
         }
 
         // Materialise the EROFS device files from the cache. Each data blob's cache file
@@ -1159,6 +1166,91 @@ impl FanotifyHandler {
                     blob_id, e
                 );
             }
+        }
+    }
+
+    /// Put the blob's mark back unconditionally, before any of its cached bytes stop being
+    /// ready: an unmarked blob raises no event, so the kernel would read them unfilled.
+    /// `FAN_MARK_ADD` on a marked inode is a no-op, so this never consults [`BlobBacking::armed`].
+    fn rearm(&self, backing: &BlobBacking) -> Result<()> {
+        let blob_id = backing.blob.blob_info().blob_id();
+        backing
+            .set_mark(self.fan_fd.as_raw_fd(), libc::FAN_MARK_ADD)
+            .map(|()| backing.armed.store(true, Ordering::Release))
+            .map_err(|e| {
+                std::io::Error::other(format!(
+                    "fanotify: cannot re-arm the mark on blob {}: {}; refusing to discard its \
+                     cached bytes (would serve zeros)",
+                    blob_id, e
+                ))
+            })
+    }
+
+    /// Start a thread that checks, once per cache file, the chunks found already marked ready
+    /// against the bootstrap's digests: fills are validated as they happen, but a cache file
+    /// filled before (or by a non-validating opener) was not. Runs at idle CPU and I/O priority
+    /// while the workers keep serving, and stops with them. Each chunk that fails is revoked
+    /// like an [`invalidate`](Self::invalidate) of just that chunk, under the exclusive
+    /// `io_lock`, so the next read fetches it again through the validating fill.
+    pub(crate) fn spawn_verifier(self: &Arc<Self>) -> Result<std::thread::JoinHandle<()>> {
+        let handler = self.clone();
+        std::thread::Builder::new()
+            .name("fanotify-verify".to_string())
+            .spawn(move || {
+                lower_thread_priority();
+                for backing in &handler.blob_backings {
+                    if let Err(e) = handler.verify_blob(backing) {
+                        warn!(
+                            "fanotify: cannot verify the cache of blob {}: {}",
+                            backing.blob.blob_info().blob_id(),
+                            e
+                        );
+                    }
+                }
+            })
+    }
+
+    fn verify_blob(&self, backing: &BlobBacking) -> Result<()> {
+        let Some(obj) = backing.blob.blob().get_blob_object() else {
+            return Ok(());
+        };
+        if obj.is_data_verified() {
+            return Ok(());
+        }
+        let stop = || !self.active.load(Ordering::Acquire) || self.is_failed();
+        let fd = backing.blob.file().as_raw_fd();
+        let mut revoke = |chunk: &dyn BlobChunkInfo| -> nydus_storage::StorageResult<()> {
+            let _revoking = backing
+                .io_lock
+                .write()
+                .map_err(|_| std::io::Error::other("fanotify: blob io lock poisoned"))
+                .and_then(|guard| {
+                    invalidate_in_order(
+                        || self.rearm(backing),
+                        || Ok(obj.clear_chunk_ready(chunk.id())?),
+                        || {
+                            punch_hole(
+                                fd,
+                                chunk.uncompressed_offset(),
+                                chunk.uncompressed_size() as u64,
+                            )
+                        },
+                    )
+                    .map(|()| guard)
+                })
+                .map_err(|e| nydus_storage::StorageError::cache_io("revoke a cached chunk", e))?;
+            Ok(())
+        };
+        match obj.verify_ready_chunks(&stop, &mut revoke) {
+            Ok(true) => {
+                info!(
+                    "fanotify: checked every cached chunk of blob {} against its digest",
+                    backing.blob.blob_info().blob_id()
+                );
+                Ok(())
+            }
+            Ok(false) | Err(nydus_storage::StorageError::Unsupported) => Ok(()),
+            Err(e) => Err(e.into()),
         }
     }
 
@@ -1819,18 +1911,7 @@ impl FanotifyHandler {
 
         invalidate_in_order(
             // Step 0 — re-arm, so the punched blob raises events again.
-            || {
-                backing
-                    .set_mark(self.fan_fd.as_raw_fd(), libc::FAN_MARK_ADD)
-                    .map(|()| backing.armed.store(true, Ordering::Release))
-                    .map_err(|e| {
-                        std::io::Error::other(format!(
-                            "fanotify: cannot re-arm the mark on blob {}: {}; \
-                             refusing to punch its cache (would serve zeros)",
-                            blob_id, e
-                        ))
-                    })
-            },
+            || self.rearm(backing),
             // Step 1 — revoke the readiness bookkeeping.
             || {
                 obj.reset_data_ready().map_err(|e| {
@@ -1842,26 +1923,7 @@ impl FanotifyHandler {
                 })
             },
             // Step 2 — discard the bytes.
-            || {
-                let len = fd_file_size(fd)?;
-                if len == 0 {
-                    return Ok(());
-                }
-                // SAFETY: `fallocate` only takes integers; `fd` is the blob's open cache file
-                // descriptor.
-                let ret = unsafe {
-                    libc::fallocate(
-                        fd,
-                        libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
-                        0,
-                        len as libc::off_t,
-                    )
-                };
-                if ret != 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            },
+            || punch_hole(fd, 0, fd_file_size(fd)?),
         )?;
 
         info!("fanotify: invalidated cache for blob {}", blob_id);
@@ -1888,6 +1950,88 @@ fn invalidate_in_order(
     rearm_mark()?;
     revoke_ready()?;
     discard_bytes()
+}
+
+/// Deallocate `[offset, offset + len)` of the cache file `fd`, keeping its size, so the range
+/// reads as a hole and raises pre-content events again.
+fn punch_hole(fd: RawFd, offset: u64, len: u64) -> Result<()> {
+    if len == 0 {
+        return Ok(());
+    }
+    // SAFETY: `fallocate` only takes integers; `fd` is the blob's open cache file descriptor.
+    let ret = unsafe {
+        libc::fallocate(
+            fd,
+            libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
+            offset as libc::off_t,
+            len as libc::off_t,
+        )
+    };
+    if ret != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Lower the calling thread to the lowest CPU priority and the idle I/O class, best effort.
+fn lower_thread_priority() {
+    const IOPRIO_WHO_PROCESS: libc::c_long = 1;
+    const IOPRIO_CLASS_IDLE: libc::c_long = 3;
+    const IOPRIO_CLASS_SHIFT: libc::c_long = 13;
+    // SAFETY: both take integers only; on Linux, `who == 0` names the calling thread.
+    unsafe {
+        libc::setpriority(libc::PRIO_PROCESS, 0, 19);
+        libc::syscall(
+            libc::SYS_ioprio_set,
+            IOPRIO_WHO_PROCESS,
+            0,
+            IOPRIO_CLASS_IDLE << IOPRIO_CLASS_SHIFT,
+        );
+    }
+}
+
+/// Have each backing's cache validate its fills against the digests `bootstrap`'s chunk table
+/// records for that blob. Fails, and with it the handler's construction, when the chunk table
+/// is inconsistent, disagrees with a blob's meta, or contradicts digests another bootstrap
+/// supplied for a shared blob before: the fill path could not tell which bytes are right.
+fn install_bootstrap_digests(
+    bootstrap: &Path,
+    config: &Arc<nydus_api::ConfigV2>,
+    backings: &[BlobBacking],
+) -> Result<()> {
+    // `RafsError` keeps only its errno once converted, so the message is logged first.
+    let log = |e: &nydus_rafs::RafsError| {
+        warn!(
+            "fanotify: no chunk digests from bootstrap {}: {e}",
+            bootstrap.display()
+        )
+    };
+    let (rs, _) = RafsSuper::load_from_file(bootstrap, config.clone(), false).inspect_err(log)?;
+    let blobs = rs.superblock.get_blob_infos();
+    let tables = chunk_digest_tables(&rs).inspect_err(log)?;
+    for backing in backings {
+        let info = backing.blob.blob_info();
+        // A tarfs device is the layer's tar itself; nothing is ever filled into it.
+        if info.features().is_tarfs() {
+            continue;
+        }
+        let blob_id = info.blob_id();
+        let index = blobs
+            .iter()
+            .position(|b| b.blob_id() == blob_id)
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    ErrorKind::InvalidInput,
+                    format!("fanotify: bootstrap has no blob {blob_id}"),
+                )
+            })?;
+        backing
+            .blob
+            .blob()
+            .add_chunk_digests(&tables[index])
+            .inspect_err(|e| warn!("fanotify: blob {blob_id}: bootstrap digests refused: {e}"))?;
+    }
+    Ok(())
 }
 
 /// The domain every entry names, or `None` if one names none or they disagree.
@@ -2270,6 +2414,10 @@ mod tests {
             "precondition: wrapper hides the errno"
         );
         assert_eq!(deny_errno_for(&wrapped), libc::EDQUOT);
+
+        // A fill whose data fails validation is denied, never allowed over the unfilled hole.
+        let invalid = nydus_storage::StorageError::InvalidData("digest mismatch".to_string());
+        assert_eq!(deny_errno_for(&std::io::Error::from(invalid)), libc::EIO);
     }
 
     use super::*;

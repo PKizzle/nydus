@@ -17,8 +17,10 @@ use crate::{StorageError, StorageResult};
 pub(crate) const MAGIC1: u32 = 0x424D_4150;
 pub(crate) const MAGIC2: u32 = 0x434D_4150;
 pub(crate) const MAGIC_ALL_READY: u32 = 0x4D4D_4150;
+/// `Header::verified` value: every chunk marked ready has been checked against its digest.
+pub(crate) const MAGIC_VERIFIED: u32 = 0x5644_4150;
 pub(crate) const HEADER_SIZE: usize = 4096;
-pub(crate) const HEADER_RESERVED_SIZE: usize = HEADER_SIZE - 16;
+pub(crate) const HEADER_RESERVED_SIZE: usize = HEADER_SIZE - 20;
 
 /// The blob chunk map file header, 4096 bytes.
 #[repr(C)]
@@ -28,6 +30,9 @@ pub(crate) struct Header {
     pub version: u32,
     pub magic2: u32,
     pub all_ready: u32,
+    /// [MAGIC_VERIFIED] once every ready chunk has been checked against its digest. Openers that
+    /// fill without validating clear it. Zero in maps written before the field existed.
+    pub verified: u32,
     pub reserved: [u8; HEADER_RESERVED_SIZE],
 }
 
@@ -58,8 +63,13 @@ fn atomic_byte(filemap: &FileMapState, offset: usize) -> io::Result<&AtomicU8> {
 
 /// Get the header's `all_ready` word in a chunk map mapping as an atomic.
 fn atomic_all_ready(filemap: &FileMapState) -> io::Result<&AtomicU32> {
+    atomic_header_word(filemap, std::mem::offset_of!(Header, all_ready))
+}
+
+/// Get the header word at `offset` in a chunk map mapping as an atomic.
+fn atomic_header_word(filemap: &FileMapState, offset: usize) -> io::Result<&AtomicU32> {
     let ptr = filemap
-        .validate_range(std::mem::offset_of!(Header, all_ready), size_of::<u32>())?
+        .validate_range(offset, size_of::<u32>())?
         .cast::<u32>();
     if !ptr.is_aligned() {
         return Err(io::Error::new(
@@ -235,6 +245,7 @@ impl PersistMap {
             version: 1,
             magic2: MAGIC2,
             all_ready: 0,
+            verified: 0,
             reserved: [0x0u8; HEADER_RESERVED_SIZE],
         };
 
@@ -325,6 +336,50 @@ impl PersistMap {
             }
         }
 
+        Ok(())
+    }
+
+    /// Clear one chunk's ready state, persisted before returning.
+    pub fn clear_chunk_ready(&self, index: u32) -> StorageResult<()> {
+        let index = self.validate_index(index)?;
+        // The header marker short-circuits readiness checks, so it goes first.
+        let all_ready = atomic_all_ready(&self.filemap)
+            .map_err(|e| StorageError::cache_io("reach the chunk map contents", e))?;
+        all_ready.store(0, Ordering::Release);
+        let byte = atomic_byte(&self.filemap, HEADER_SIZE + (index as usize >> 3))
+            .map_err(|e| StorageError::cache_io("reach the chunk map contents", e))?;
+        let mask = Self::index_to_mask(index);
+        // A count of zero claims every chunk ready whatever the bitmap says, so it must move too.
+        if byte.fetch_and(!mask, Ordering::AcqRel) & mask != 0
+            || self.not_ready_count.load(Ordering::Acquire) == 0
+        {
+            self.not_ready_count.fetch_add(1, Ordering::AcqRel);
+        }
+        self.filemap
+            .sync_data()
+            .map_err(|e| StorageError::cache_io("flush the chunk map", e))
+    }
+
+    fn verified_word(&self) -> StorageResult<&AtomicU32> {
+        atomic_header_word(&self.filemap, std::mem::offset_of!(Header, verified))
+            .map_err(|e| StorageError::cache_io("reach the chunk map contents", e))
+    }
+
+    /// Whether the header records every ready chunk as checked against its digest.
+    pub fn is_verified(&self) -> bool {
+        self.verified_word()
+            .is_ok_and(|w| w.load(Ordering::Acquire) == MAGIC_VERIFIED)
+    }
+
+    /// Record whether every ready chunk has been checked against its digest, persisted before
+    /// returning.
+    pub fn set_verified(&self, verified: bool) -> StorageResult<()> {
+        let value = if verified { MAGIC_VERIFIED } else { 0 };
+        if self.verified_word()?.swap(value, Ordering::AcqRel) != value {
+            self.filemap
+                .sync_data()
+                .map_err(|e| StorageError::cache_io("flush the chunk map", e))?;
+        }
         Ok(())
     }
 
