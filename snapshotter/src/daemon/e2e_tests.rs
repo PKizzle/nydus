@@ -458,6 +458,18 @@ fn registry_config(root: &Path) -> SnapshotterConfig {
     config
 }
 
+/// The mount ID (`/proc/self/mountinfo` field 1) of the top mount at `mountpoint`.
+fn mount_id_at(mountpoint: &Path) -> String {
+    let target = mountpoint.display().to_string();
+    fs::read_to_string("/proc/self/mountinfo")
+        .unwrap()
+        .lines()
+        .rfind(|line| line.split_whitespace().nth(4) == Some(target.as_str()))
+        .and_then(|line| line.split_whitespace().next())
+        .unwrap_or_else(|| panic!("nothing mounted at {target}"))
+        .to_string()
+}
+
 /// Read every regular file under `mountpoint`, expecting each read to fail with EIO.
 fn assert_every_read_fails_with_eio(mountpoint: &Path) {
     let files = regular_files(mountpoint);
@@ -631,7 +643,9 @@ const REGISTRY_TEST: &str = "daemon::e2e_tests::registry_credentials_survive_res
 ///   over from the parked group and serves data the predecessor never fetched;
 /// - **takeover without credentials**: with an empty auth store the successor still takes
 ///   over, but every unfetched read fails with EIO (never zeros) and a warning names the
-///   image;
+///   image; once credentials arrive through the auth API, the daemon is healed on its own
+///   mount and serves every file, while a refresh for a daemon that has credentials heals
+///   nothing;
 ///
 /// and no credential reaches a log line or a file on disk. `NYDUS_E2E_ROOT` is an ext4 dir
 /// holding `src/` (the source tree), `bootstrap` and `blobs/<blob id>`.
@@ -680,18 +694,44 @@ fn registry_credentials_survive_restart_and_heal() {
                 // The credential bridge repopulates the store before the takeover.
                 put_registry_auth(&std::env::var("NYDUS_REG_ADDR").unwrap());
             }
-            let supervisor = DaemonSupervisor::new(registry_config(&root.join("takeover")));
+            let supervisor = Arc::new(DaemonSupervisor::new(registry_config(
+                &root.join("takeover"),
+            )));
+            // As `serve_with_supervisor` does before the auth API serves.
+            supervisor.heal_on_auth_updates();
             assert_eq!(runtime.block_on(supervisor.restore_from_store()), 1);
             let image_ref = std::env::var("NYDUS_REG_IMAGE").unwrap();
             let mountpoint = runtime.block_on(supervisor.instances.read())[&image_ref]
                 .mountpoint
                 .clone();
+            let mount_id = mount_id_at(&mountpoint);
+            let addr = std::env::var("NYDUS_REG_ADDR").unwrap();
+            let heals = || supervisor.auth_heals.load(Ordering::Relaxed);
             if std::env::var("NYDUS_REG_AUTH").as_deref() == Ok("1") {
                 assert_same_files(&root.join("src"), &mountpoint);
                 println!("SUCCESSOR_READ_OK");
+                // Refreshing credentials leaves a daemon that has them alone.
+                put_registry_auth(&addr);
+                std::thread::sleep(AUTH_HEAL_DEBOUNCE + Duration::from_secs(2));
+                assert_eq!(heals(), 0, "a daemon with credentials was healed");
+                println!("REFRESH_NO_HEAL_OK");
             } else {
                 assert_every_read_fails_with_eio(&mountpoint);
                 println!("SUCCESSOR_DENIED_OK");
+                // Credentials arriving later heal the daemon on its own mount.
+                put_registry_auth(&addr);
+                let deadline = Instant::now() + Duration::from_secs(30);
+                while heals() == 0 && Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+                assert_eq!(heals(), 1, "the daemon was not healed within 30s");
+                assert_same_files(&root.join("src"), &mountpoint);
+                assert_eq!(
+                    mount_id_at(&mountpoint),
+                    mount_id,
+                    "the image was remounted"
+                );
+                println!("LATE_AUTH_HEALED_OK heals={}", heals());
             }
             return;
         }
@@ -776,7 +816,7 @@ fn registry_credentials_survive_restart_and_heal() {
     // Takeover with the auth store repopulated.
     let image_ref = format!("{}/e2e/takeover:1", bearer.addr);
     let (ok, served, output) = run_registry_takeover(&root, &bearer, &image_ref, true);
-    assert!(ok && output.contains("SUCCESSOR_READ_OK"), "{output}");
+    assert!(ok && output.contains("REFRESH_NO_HEAL_OK"), "{output}");
     assert!(served > 0, "the successor fetched nothing");
     assert_no_secret_in("the takeover's logs", &output);
     println!("TAKEOVER_OK served={served}");
@@ -792,7 +832,8 @@ fn registry_credentials_survive_restart_and_heal() {
     let image_ref = format!("{}/e2e/noauth:1", bearer.addr);
     let (ok, served, output) = run_registry_takeover(&root, &bearer, &image_ref, false);
     assert!(ok && output.contains("SUCCESSOR_DENIED_OK"), "{output}");
-    assert_eq!(served, 0, "data served without credentials");
+    assert!(output.contains("LATE_AUTH_HEALED_OK"), "{output}");
+    assert!(served > 0, "the healed daemon fetched nothing");
     assert!(
         output.lines().any(|l| l.contains("WARN")
             && l.contains("no registry credentials")
