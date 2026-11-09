@@ -14,7 +14,7 @@
 //! address bits, cannot occur: loading the superblock rejects every incompatible feature but
 //! chunked files and the device table.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
@@ -188,26 +188,32 @@ pub fn check_kernel_layout(rs: &RafsSuper, bootstrap: &Path) -> RafsResult<Kerne
     // RAFS packs above the blob index.
     let device_id_mask = ((devslots.len() + 1).next_power_of_two() - 1) as u16;
 
-    let mut extents: HashMap<u32, BTreeMap<u64, (u32, u64)>> = HashMap::new();
+    let mut extents: HashMap<u32, Vec<(u64, u64, u32)>> = HashMap::new();
     for chunk in chunk_table(rs)? {
-        let end = chunk.uncompressed_offset() + chunk.uncompressed_size() as u64;
-        extents
-            .entry(chunk.blob_index())
-            .or_default()
-            .insert(chunk.uncompressed_offset(), (chunk.id(), end));
+        let start = chunk.uncompressed_offset();
+        extents.entry(chunk.blob_index()).or_default().push((
+            start,
+            start + chunk.uncompressed_size() as u64,
+            chunk.id(),
+        ));
     }
     let mut overlapping: HashSet<(u32, u32)> = HashSet::new();
-    for (blob, by_offset) in &extents {
-        let mut prev: Option<(u32, u64)> = None;
-        for (start, (ci, end)) in by_offset {
-            if let Some((prev_ci, prev_end)) = prev
-                && *start < prev_end
+    for (blob, chunks) in &mut extents {
+        // The chunk table lists a chunk once per reference; only distinct entries can overlap.
+        chunks.sort_unstable();
+        chunks.dedup();
+        // Two chunks that start at the same offset collide even if one of them is empty: the
+        // fill path resolves an offset to one chunk only, and validates that one's digest.
+        let mut prev: Option<(u64, u64, u32)> = None;
+        for &(start, end, ci) in chunks.iter() {
+            if let Some((prev_start, prev_end, prev_ci)) = prev
+                && (start < prev_end || start == prev_start)
             {
                 overlapping.insert((*blob, prev_ci));
-                overlapping.insert((*blob, *ci));
+                overlapping.insert((*blob, ci));
             }
-            if prev.is_none_or(|(_, e)| *end > e) {
-                prev = Some((*ci, *end));
+            if prev.is_none_or(|(_, prev_end, _)| end >= prev_end) {
+                prev = Some((start, end, ci));
             }
         }
     }
@@ -444,6 +450,84 @@ mod tests {
                 .iter()
                 .any(|v| matches!(v, LayoutViolation::ChunkSize { .. }))
         }));
+    }
+
+    /// Two chunks of one blob starting at the same offset, each consistent with the inode that
+    /// uses it: the fill path would validate only one of them for both files.
+    #[test]
+    #[cfg_attr(miri, ignore = "reads the bootstrap through the file system")]
+    fn chunks_sharing_a_start_are_reported() {
+        use super::super::layout::v6::RafsV6InodeChunkAddr;
+
+        let rs = load(&fixture());
+        let table = chunk_table(&rs).unwrap();
+        let block_size = 1u64 << rs.meta.blkszbits;
+        let (a, b) = table
+            .iter()
+            .find_map(|a| {
+                table.iter().find_map(|b| {
+                    (a.blob_index() == b.blob_index()
+                        && a.id() != b.id()
+                        && b.id() > 0
+                        && b.uncompressed_offset() > 0
+                        && a.uncompressed_offset() != b.uncompressed_offset())
+                    .then(|| (a.clone(), b.clone()))
+                })
+            })
+            .expect("two distinct chunks of one blob");
+        let addr = |c: &Arc<dyn BlobChunkInfo>, offset: u64| {
+            let mut addr = RafsV6InodeChunkAddr::new();
+            addr.set_blob_index(c.blob_index());
+            addr.set_blob_ci_index(c.id());
+            addr.set_block_addr((offset / block_size) as u32);
+            addr
+        };
+        let unit = size_of::<RafsV5ChunkInfo>();
+        let field = |rec: usize, at: usize, data: &[u8]| {
+            u32::from_le_bytes(data[rec + at..rec + at + 4].try_into().unwrap())
+        };
+        let offset_at = std::mem::offset_of!(RafsV5ChunkInfo, uncompressed_offset);
+        let mut data = std::fs::read(fixture()).unwrap();
+        // Move `b` onto `a`'s start, in the chunk table and in every inode that uses it.
+        let base = rs.meta.chunk_table_offset as usize;
+        let mut moved = 0;
+        for i in 0..rs.meta.chunk_table_size as usize / unit {
+            let rec = base + i * unit;
+            if field(rec, std::mem::offset_of!(RafsV5ChunkInfo, index), &data) == b.id()
+                && field(
+                    rec,
+                    std::mem::offset_of!(RafsV5ChunkInfo, blob_index),
+                    &data,
+                ) == b.blob_index()
+            {
+                data[rec + offset_at..rec + offset_at + 8]
+                    .copy_from_slice(&a.uncompressed_offset().to_le_bytes());
+                moved += 1;
+            }
+        }
+        assert!(moved > 0);
+        let from = addr(&b, b.uncompressed_offset());
+        let to = addr(&b, a.uncompressed_offset());
+        let mut hits = 0;
+        for i in 0..data.len() - 8 {
+            if &data[i..i + 8] == from.as_ref() {
+                data[i..i + 8].copy_from_slice(to.as_ref());
+                hits += 1;
+            }
+        }
+        assert!(hits > 0);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("shared-start.boot");
+        std::fs::write(&path, &data).unwrap();
+        let rs = load(&path);
+        let report = check_kernel_layout(&rs, &path).unwrap();
+        assert!(
+            report.files.iter().any(|f| f
+                .violations
+                .iter()
+                .any(|v| matches!(v, LayoutViolation::Overlap { .. }))),
+            "{report:#?}"
+        );
     }
 
     #[test]
