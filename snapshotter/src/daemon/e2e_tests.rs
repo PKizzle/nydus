@@ -17,7 +17,7 @@ use crate::auto_zran::{
     AUTO_ACCEL_MANIFEST_VERSION, AutoAccelDescriptor, AutoAccelLayerDescriptor, AutoAccelManifest,
     OciConfigRootfs,
 };
-use crate::config::{ContainerdConfig, PeerMirrorConfig, RegistryBackendConfig};
+use crate::config::{ContainerdConfig, ErofsInodeShare, PeerMirrorConfig, RegistryBackendConfig};
 use crate::content_store::ContentStoreClient;
 use crate::local_accel::{self, LocalAccelConfig, SchedClass, SourceLayer};
 
@@ -172,6 +172,8 @@ fn referrer_daemon_serves_every_file() {
     config.snapshotter.root = root.join("snapshotter");
     config.snapshotter.cache.work_dir = root.join("cache");
     config.snapshotter.auto_zran.nydus_image = nydus_image();
+    // Sharing on, so the image is served through its node view whatever its block size.
+    config.snapshotter.features.erofs_inode_share = ErofsInodeShare::On;
     config.backends.registry = Some(RegistryBackendConfig {
         mirrors: Vec::new(),
         skip_verify: false,
@@ -319,6 +321,7 @@ fn auto_accel_sidecar_serves_converted_layers() {
     let mut config = SnapshotterConfig::default();
     config.snapshotter.root = snapshotter_root;
     config.snapshotter.auto_zran.nydus_image = nydus_image();
+    config.snapshotter.features.erofs_inode_share = ErofsInodeShare::On;
     let supervisor = DaemonSupervisor::new(config);
     let handle = runtime
         .block_on(supervisor.ensure_instance_local(
