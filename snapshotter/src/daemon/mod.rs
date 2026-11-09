@@ -1780,6 +1780,7 @@ impl DaemonSupervisor {
                 // shortcut: an image fit only through its view has the view built here and
                 // again when staged; cache it if such images become common.
                 let view_fits = || {
+                    fs::create_dir_all(&viewer.work_dir)?;
                     let dir = tempfile::tempdir_in(&viewer.work_dir)?;
                     let viewer = crate::local_accel::LocalAccelConfig {
                         work_dir: dir.path().to_path_buf(),
