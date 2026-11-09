@@ -473,6 +473,16 @@ pub mod fanotify_upgrade {
         Ok(())
     }
 
+    /// Rewrite a saved `state` the way releases up to 3.3.0 wrote it: the same handlers, no blob
+    /// list. For takeover tests that start a successor from such a state.
+    #[doc(hidden)]
+    pub fn without_blob_list(state: &[u8]) -> Result<Vec<u8>> {
+        let mut backend_stat = FanotifyBackendState::restore(&mut state.to_vec())
+            .map_err(UpgradeMgrError::Deserialize)?;
+        backend_stat.blob_entry_list.clear();
+        Ok(backend_stat.save().map_err(UpgradeMgrError::Serialize)?)
+    }
+
     /// Register the `saved` blob entries the daemon was not created with (`configured`), and
     /// return both sets: the entries the next save carries.
     ///

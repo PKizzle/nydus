@@ -4332,8 +4332,10 @@ mod tests {
     /// predecessor never fetched. The predecessor and the successor run as child
     /// processes of this test, which stands in for systemd's fd store and kills
     /// the predecessor with SIGKILL while its marks are live. `NYDUS_E2E_ROOT`
-    /// is an ext4 dir holding `artifact/bootstrap` and the localfs
-    /// `artifact/backend/` of a zran image.
+    /// is an ext4 dir holding `artifact/stage/bootstrap` and the localfs
+    /// `artifact/backend/` of a zran image, laid out as an auto-accel sidecar.
+    /// With `NYDUS_TAKEOVER_STATE_WITHOUT_BLOB_LIST` set, the successor starts
+    /// from the state as releases up to 3.3.0 saved it.
     #[cfg(target_os = "linux")]
     #[test]
     #[ignore = "needs root, Linux >= 6.14 and an ext4 work dir; run misc/fanotify/takeover-test.sh"]
@@ -4359,7 +4361,7 @@ mod tests {
                 let handle = runtime
                     .block_on(supervisor().ensure_instance_local(
                         image_ref,
-                        &root.join("artifact/bootstrap"),
+                        &root.join("artifact/stage/bootstrap"),
                         &root.join("artifact/backend"),
                         "k1",
                         false,
@@ -4436,6 +4438,14 @@ mod tests {
         predecessor.kill().unwrap();
         predecessor.wait().unwrap();
         assert_eq!(mount_fstype_at(&mountpoint).as_deref(), Some("erofs"));
+        // An upgrade from a release whose saved state has no blob list.
+        if std::env::var_os("NYDUS_TAKEOVER_STATE_WITHOUT_BLOB_LIST").is_some() {
+            let state_path = supervisor().failover_state_path(&fd_name);
+            let state = fs::read(&state_path).unwrap();
+            let legacy =
+                nydus_service::upgrade::fanotify_upgrade::without_blob_list(&state).unwrap();
+            atomic_write(&state_path, &legacy).unwrap();
+        }
 
         let raw = group_fd.as_raw_fd();
         let mut command = Command::new(std::env::current_exe().unwrap());
