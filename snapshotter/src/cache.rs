@@ -61,6 +61,8 @@ pub struct CacheEntry {
     pub modified: Option<SystemTime>,
     pub accessed: Option<SystemTime>,
     pub kind: CacheArtifactKind,
+    /// Held by a fanotify daemon's stage dir: counted against the budget, never evicted.
+    pub pinned: bool,
 }
 
 impl CacheEntry {
@@ -144,15 +146,30 @@ pub struct CacheGcReport {
 #[derive(Clone, Debug)]
 pub struct CacheManager {
     root: PathBuf,
+    /// `<root>/daemons`, whose `<slug>/stage` dirs hold the caches of fanotify daemons.
+    daemons: Option<PathBuf>,
 }
 
 impl CacheManager {
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
+        Self {
+            root: root.into(),
+            daemons: None,
+        }
     }
 
     pub fn from_config(config: &SnapshotterConfig) -> Self {
         Self::new(config.snapshotter.cache.work_dir.clone())
+            .with_daemon_stages(config.snapshotter.root.join("daemons"))
+    }
+
+    /// Also account the fanotify caches in `daemons/<slug>/stage`. They count against the
+    /// byte budget, so other caches are evicted to make room, but GC never removes them: each
+    /// `.blob.data` there is a live EROFS device, and a dead daemon's dir goes with the
+    /// stale daemon-dir sweep. Only `stage` dirs are read, never a daemon's mountpoint.
+    pub fn with_daemon_stages(mut self, daemons: impl Into<PathBuf>) -> Self {
+        self.daemons = Some(daemons.into());
+        self
     }
 
     pub fn root(&self) -> &Path {
@@ -162,17 +179,16 @@ impl CacheManager {
     /// Scan regular files under the cache root and return aggregate usage.
     /// Missing roots are treated as empty caches so first boot is cheap.
     pub fn scan(&self) -> CacheResult<CacheUsage> {
-        if !self.root.exists() {
-            return Ok(CacheUsage::default());
-        }
-        if !self.root.is_dir() {
-            return Err(CacheError::RootNotDirectory {
-                path: self.root.clone(),
-            });
-        }
-
         let mut usage = CacheUsage::default();
-        self.scan_dir(&self.root, &mut usage)?;
+        if self.root.exists() {
+            if !self.root.is_dir() {
+                return Err(CacheError::RootNotDirectory {
+                    path: self.root.clone(),
+                });
+            }
+            self.scan_dir(&self.root, false, &mut usage)?;
+        }
+        self.scan_daemon_stages(&mut usage)?;
         debug!(
             root = %self.root.display(),
             files = usage.total_files,
@@ -201,8 +217,9 @@ impl CacheManager {
             ..CacheGcReport::default()
         };
 
-        let is_protected =
-            |entry: &CacheEntry| entry_slug(entry).is_some_and(|s| protected_slugs.contains(s));
+        let is_protected = |entry: &CacheEntry| {
+            entry.pinned || entry_slug(entry).is_some_and(|s| protected_slugs.contains(s))
+        };
 
         let mut candidates =
             self.select_age_candidates(&usage.entries, policy.max_age, &is_protected, &mut report);
@@ -260,7 +277,49 @@ impl CacheManager {
         Ok(report)
     }
 
-    fn scan_dir(&self, dir: &Path, usage: &mut CacheUsage) -> CacheResult<()> {
+    /// Add the files of every `daemons/<slug>/stage` dir to `usage`, pinned. A stage dir's
+    /// `blob_<i>` device files are hardlinks to its `.blob.data` files, so each inode counts once.
+    fn scan_daemon_stages(&self, usage: &mut CacheUsage) -> CacheResult<()> {
+        use std::os::unix::fs::MetadataExt;
+
+        let Some(daemons) = self.daemons.as_deref() else {
+            return Ok(());
+        };
+        let slugs = match fs::read_dir(daemons) {
+            Ok(slugs) => slugs,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(source) => {
+                return Err(CacheError::ReadDir {
+                    path: daemons.to_path_buf(),
+                    source,
+                });
+            }
+        };
+        let mut stages = CacheUsage::default();
+        for slug in slugs {
+            let slug = slug.map_err(|source| CacheError::ReadDir {
+                path: daemons.to_path_buf(),
+                source,
+            })?;
+            let stage = slug.path().join("stage");
+            if fs::symlink_metadata(&stage).is_ok_and(|m| m.is_dir()) {
+                self.scan_dir(&stage, true, &mut stages)?;
+            }
+        }
+        let mut seen = HashSet::new();
+        for entry in stages.entries {
+            let inode = fs::symlink_metadata(&entry.path).map(|m| (m.dev(), m.ino()));
+            if inode.is_ok_and(|inode| !seen.insert(inode)) {
+                continue;
+            }
+            usage.total_files += 1;
+            usage.total_bytes += entry.size;
+            usage.entries.push(entry);
+        }
+        Ok(())
+    }
+
+    fn scan_dir(&self, dir: &Path, pinned: bool, usage: &mut CacheUsage) -> CacheResult<()> {
         let entries = fs::read_dir(dir).map_err(|source| CacheError::ReadDir {
             path: dir.to_path_buf(),
             source,
@@ -278,7 +337,7 @@ impl CacheManager {
             })?;
 
             if metadata.is_dir() {
-                self.scan_dir(&path, usage)?;
+                self.scan_dir(&path, pinned, usage)?;
             } else if metadata.is_file() {
                 let relative_path = path.strip_prefix(&self.root).unwrap_or(&path).to_path_buf();
                 let size = metadata.len();
@@ -291,6 +350,7 @@ impl CacheManager {
                     size,
                     modified: metadata.modified().ok(),
                     accessed: metadata.accessed().ok(),
+                    pinned,
                 });
             }
         }
@@ -536,6 +596,38 @@ mod tests {
     }
 
     #[test]
+    fn fanotify_stage_caches_count_once_and_are_never_evicted() {
+        let dir = tempdir().unwrap();
+        let cache = dir.path().join("cache").join("image");
+        fs::create_dir_all(&cache).unwrap();
+        fs::write(cache.join("old.blob.data"), vec![0u8; 10]).unwrap();
+        let daemon = dir.path().join("daemons").join("slug");
+        let stage = daemon.join("stage");
+        fs::create_dir_all(&stage).unwrap();
+        fs::create_dir_all(daemon.join("mnt")).unwrap();
+        fs::write(stage.join("abc.blob.data"), vec![0u8; 100]).unwrap();
+        fs::hard_link(stage.join("abc.blob.data"), stage.join("blob_0")).unwrap();
+        // Never read: a daemon's mountpoint is a live filesystem.
+        fs::write(daemon.join("mnt").join("file"), vec![0u8; 1000]).unwrap();
+
+        let manager = CacheManager::new(dir.path().join("cache"))
+            .with_daemon_stages(dir.path().join("daemons"));
+        let usage = manager.scan().unwrap();
+        assert_eq!(usage.total_bytes, 110);
+        assert_eq!(usage.total_files, 2);
+
+        let policy = CacheGcPolicy {
+            max_age: None,
+            max_bytes: Some(1),
+            dry_run: false,
+        };
+        let report = manager.garbage_collect(&policy, &HashSet::new()).unwrap();
+        assert_eq!(report.removed_bytes, 10);
+        assert!(!cache.join("old.blob.data").exists());
+        assert!(stage.join("abc.blob.data").exists());
+    }
+
+    #[test]
     fn gc_evicts_a_chunk_map_with_its_data_file() {
         let dir = tempdir().unwrap();
         let cache = dir.path().join("cache").join("image");
@@ -690,6 +782,7 @@ mod tests {
             size: 0,
             modified: None,
             accessed: None,
+            pinned: false,
         };
         assert_eq!(entry_slug(&entry("slug/a.blob.data")), Some("slug"));
         assert_eq!(entry_slug(&entry("slug/nested/a.blob.data")), Some("slug"));

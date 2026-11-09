@@ -123,7 +123,7 @@ pub fn build_daemon_config(
 /// [`crate::config::BackendsConfig::validate`]). When none is set the image's
 /// own registry is used. `[backends.localfs]` is NOT
 /// handled here: the `localfs` backend is reserved for the auto-accel sidecar
-/// path (see [`build_auto_accel_config`]).
+/// path (see [`localfs_backend`]).
 ///
 /// `image_ref` / `auth` are consumed only by the registry backend; the object-
 /// store and http-proxy backends are described entirely by their TOML section.
@@ -358,41 +358,43 @@ pub fn auto_accel_inode_share_domain(
     (built_on_node && mode.enabled(fix_detected)).then(|| NODE_LOCAL_INODE_SHARE_DOMAIN.to_string())
 }
 
-/// Build a `ConfigV2` for the **auto-accel sidecar** mount: a `localfs`
-/// backend pointed at the symlinked gzip-layer / zran-index directory + a
-/// `fanotify` pre-content cache pointed at the staging directory holding the
-/// merged bootstrap.
-///
-/// This is the read-side of the node-local acceleration flow: gzip layers
-/// (already in containerd's content store) appear in `backend_dir` as
-/// symlinks keyed by their nydus blob ids; the merged RAFS v6 bootstrap and
-/// per-layer zran index blobs live under the same `backend_dir`. The fanotify
-/// handler stages EROFS device files as hardlinks to the blob cache files and
-/// serves on-demand reads via `FAN_PRE_ACCESS`.
-///
-/// `daemon_mountpoint` is the FUSE mountpoint the snapshotter hands back to
-/// containerd; the fanotify EROFS mount and the FUSE bind reuse it.
-pub fn build_auto_accel_config(
-    backend_dir: &Path,
-    stage_dir: &Path,
-    daemon_mountpoint: &Path,
-    daemon_id: &str,
-    inode_share_domain: Option<String>,
-) -> ConfigV2 {
-    let backend = BackendConfigV2 {
+/// A `localfs` backend reading blobs named by their bare hex digest from `dir`: the
+/// symlinked content-store layers and zran index blobs of an auto-accel sidecar.
+pub fn localfs_backend(dir: &Path) -> BackendConfigV2 {
+    BackendConfigV2 {
         backend_type: "localfs".to_string(),
         localdisk: None,
         localfs: Some(LocalFsConfig {
             blob_file: String::new(),
-            dir: backend_dir.display().to_string(),
+            dir: dir.display().to_string(),
             alt_dirs: Vec::new(),
         }),
         oss: None,
         s3: None,
         registry: None,
         http_proxy: None,
-    };
+    }
+}
 
+/// Build a `ConfigV2` for a **fanotify** daemon: `backend` + a `fanotify`
+/// pre-content cache pointed at the staging directory holding the bootstrap.
+///
+/// `backend` is [`localfs_backend`] for an auto-accel sidecar (gzip layers in
+/// containerd's content store, symlinked by their nydus blob ids next to the
+/// per-layer zran index blobs) and [`build_backend_config`] for an image
+/// pulled from a registry. The fanotify handler stages EROFS device files as
+/// hardlinks to the blob cache files and serves on-demand reads via
+/// `FAN_PRE_ACCESS`, fetching from `backend`.
+///
+/// `daemon_mountpoint` is the mountpoint the snapshotter hands back to
+/// containerd; the EROFS mount lands on it.
+pub fn build_fanotify_config(
+    backend: BackendConfigV2,
+    stage_dir: &Path,
+    daemon_mountpoint: &Path,
+    daemon_id: &str,
+    inode_share_domain: Option<String>,
+) -> ConfigV2 {
     let cache = CacheConfigV2 {
         cache_type: "fanotify".to_string(),
         cache_compressed: false,
@@ -434,19 +436,19 @@ pub fn build_auto_accel_config(
     }
 }
 
-/// Wrap an auto-accel `ConfigV2` + bootstrap in the `BlobCacheEntry` form the
-/// fanotify pre-content path consumes (mirrors `build_blob_cache_entry` but
-/// for the localfs+fanotify combo, not registry+filecache).
-pub fn build_auto_accel_blob_cache_entry(
-    backend_dir: &Path,
+/// Wrap a [`build_fanotify_config`] `ConfigV2` + bootstrap in the `BlobCacheEntry`
+/// form the fanotify pre-content path consumes (mirrors `build_blob_cache_entry`
+/// with a fanotify cache instead of a filecache).
+pub fn build_fanotify_blob_cache_entry(
+    backend: BackendConfigV2,
     stage_dir: &Path,
     daemon_mountpoint: &Path,
     daemon_id: &str,
     bootstrap: &Path,
     inode_share_domain: Option<String>,
 ) -> anyhow::Result<BlobCacheEntry> {
-    let cfg_v2 = build_auto_accel_config(
-        backend_dir,
+    let cfg_v2 = build_fanotify_config(
+        backend,
         stage_dir,
         daemon_mountpoint,
         daemon_id,
@@ -1048,17 +1050,45 @@ mod tests {
         let local = auto_accel_inode_share_domain(ErofsInodeShare::On, true, fixed);
         let dir = PathBuf::from("/tmp/x");
         assert_eq!(
-            fanotify_domain(&build_auto_accel_config(&dir, &dir, &dir, "d", peer)),
+            fanotify_domain(&build_fanotify_config(
+                localfs_backend(&dir),
+                &dir,
+                &dir,
+                "d",
+                peer
+            )),
             None
         );
         assert_eq!(
-            fanotify_domain(&build_auto_accel_config(&dir, &dir, &dir, "d", local)).as_deref(),
+            fanotify_domain(&build_fanotify_config(
+                localfs_backend(&dir),
+                &dir,
+                &dir,
+                "d",
+                local
+            ))
+            .as_deref(),
             Some(NODE_LOCAL_INODE_SHARE_DOMAIN)
         );
-        // Registry-served images are configured without a fanotify section at all.
+        // The FUSE config of a pulled image has no fanotify section at all.
         let mut cfg = SnapshotterConfig::default();
         cfg.snapshotter.features.erofs_inode_share = ErofsInodeShare::On;
         let registry = build_daemon_config(&cfg, &dummy_image(), &dir, None, "d").unwrap();
         assert_eq!(fanotify_domain(&registry), None);
+    }
+
+    #[test]
+    fn fanotify_config_keeps_the_pull_backend() {
+        let cfg = SnapshotterConfig::default();
+        let backend =
+            build_backend_config(&cfg, &dummy_image(), Some("dXNlcjpwYXNz".to_string())).unwrap();
+        let dir = PathBuf::from("/tmp/x");
+        let fanotify = build_fanotify_config(backend.clone(), &dir, &dir, "d", None);
+        assert_eq!(fanotify.backend.as_ref(), Some(&backend));
+        let registry = fanotify.backend.unwrap().registry.unwrap();
+        assert_eq!(registry.auth.as_deref(), Some("dXNlcjpwYXNz"));
+        let cache = fanotify.cache.unwrap();
+        assert_eq!(cache.cache_type, "fanotify");
+        assert!(cache.fanotify.is_some());
     }
 }

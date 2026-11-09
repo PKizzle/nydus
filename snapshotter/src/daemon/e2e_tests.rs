@@ -146,11 +146,12 @@ fn serve_blob_request(stream: TcpStream, dir: &Path) -> std::io::Result<()> {
 }
 
 /// The referrer path: an image whose bootstrap came from a referrer artifact is served
-/// through `ensure_instance` with the fanotify driver selected, its data blobs fetched
-/// from a registry, and every file reads back with the source bytes.
+/// through `ensure_instance` with the fanotify driver selected, mounted as EROFS with its
+/// data blobs fetched on demand from a registry, and every file reads back with the
+/// source bytes.
 /// `NYDUS_E2E_ROOT` holds `src/` (the source tree), `bootstrap` and `blobs/<blob id>`.
 #[test]
-#[ignore = "needs root and FUSE; run misc/fanotify/b4b-referrer-serving-test.sh"]
+#[ignore = "needs root, Linux >= 6.14 and an ext4 work dir; run misc/fanotify/b4b-referrer-serving-test.sh"]
 fn referrer_daemon_serves_every_file() {
     let root = e2e_root();
     let registry = serve_blobs(root.join("blobs"));
@@ -177,11 +178,8 @@ fn referrer_daemon_serves_every_file() {
         ))
         .unwrap_or_else(|e| panic!("referrer daemon start: {e:#}"));
     let mountpoint = handle.mountpoint().to_path_buf();
-    println!(
-        "referrer image mounted as {:?} at {}",
-        mount_fstype_at(&mountpoint),
-        mountpoint.display()
-    );
+    // A consistent RAFS v6 image pulled from a registry is served by the kernel.
+    assert_eq!(mount_fstype_at(&mountpoint).as_deref(), Some("erofs"));
     assert_same_files(&root.join("src"), &mountpoint);
 
     drop(handle);

@@ -144,6 +144,55 @@ nydusd \
 - `--fanotify-mountpoint <path>` — where the EROFS filesystem is mounted.
 - `--fanotify-threads <n>` — number of worker threads draining fanotify events.
 
+## Which images the snapshotter mounts with fanotify
+
+On a node whose active driver is fanotify, the snapshotter serves both node-local auto-accel
+sidecars (localfs backend over containerd's content store) and nydus images pulled from a
+registry or object store (the configured pull backend, with the same credentials, mirrors and
+timeouts the FUSE path uses) through fanotify. A pulled image is checked first
+(`serving_driver` and `kernel_mount_unfit`, `snapshotter/src/daemon/mod.rs`) at every start of
+its daemon, including restarts, recoveries, rebuilds and upgrades, and takes FUSE instead when
+any of these holds:
+
+- a `containerd.io/snapshot/nydus-fs-driver` label asks for another driver. The label is kept in
+  the daemon record, so a restarted daemon keeps the driver `Prepare` gave it;
+- its bootstrap is RAFS v5, which EROFS cannot mount;
+- its EROFS block size exceeds the host page size;
+- it has data blobs but no EROFS device table;
+- its chunk layout is not kernel-consistent: a chunk whose `blkaddr * block_size` differs from its
+  uncompressed offset, or that runs past its device slot (`RafsSuper::check_v6_block_addrs`, the
+  check `nydus-image check` runs). The kernel follows only the block address while FUSE reads the
+  chunk table, so such an image would be misread silently; 16K/64K-block images built before chunk
+  starts were padded to the block size have this layout;
+- the snapshotter's `daemons` dir, which holds the fanotify caches, is on a filesystem without
+  pre-content marks (probed once, on the first such start; the driver probe tests only the cache
+  `work_dir`).
+
+The reason is logged at `info` (at `warn` when a label asked for fanotify). A bootstrap that
+cannot be read or loaded is not a reason: the start fails and is retried, since FUSE could not
+serve it either.
+
+A live fanotify mount at the image's mountpoint (its source is the staged bootstrap) always stays
+on fanotify, whatever the label or check says: overlays may already sit on it, and FUSE stacked on
+top would leave them reading unfilled holes. If fanotify cannot start there, the start fails and
+the mount is detached. The FUSE path refuses to mount over any kernel mount.
+
+The cache of a fanotify daemon lives in its `daemons/<slug>/stage` dir, next to the staged
+bootstrap. Cache GC and the cache-bytes metric count it (each inode once: the `blob_<i>` device
+files are hardlinks to the `.blob.data` files) against `gc_max_bytes`, but never evict it; a dead
+daemon's dir goes with the stale daemon-dir sweep.
+
+A fanotify daemon's saved upgrade state carries its blob list without credentials. A takeover after
+a restart and an in-place heal both rebuild the blob list with the credentials the runtime auth
+store holds at that moment. When a daemon that fetched with credentials finds none (an expired
+entry, or a store not yet repopulated after a restart), a warning names the image, and reads of
+uncached data fail with `EIO` until the daemon is started again with credentials. These images get
+no page cache sharing domain: only bootstraps this node built qualify.
+
+The fanotify path has no RAFS instance, so `[snapshotter.features] prefetch`, runtime prefetch
+lists and `cache.disable_indexed` apply only to images served over FUSE; a fanotify daemon fetches
+on demand only.
+
 ## Block size and host page size
 
 The EROFS logical block size may be smaller than or equal to the host page size; current kernels
@@ -185,11 +234,11 @@ Mitigation, in `nydus_service::erofs_folio`:
 
 | File-backed EROFS mount | Source | Handling |
 | --- | --- | --- |
-| Auto-accel / fanotify (snapshotter) | staged bootstrap copy | padded to a page multiple with a sparse hole (`stage_bootstrap`) |
+| Fanotify (snapshotter: auto-accel and pulled nydus images) | staged bootstrap copy | padded to a page multiple with a sparse hole (`stage_bootstrap`) |
 | Blockdev and tarfs without dm-verity (snapshotter) | exported `image.erofs` | padded at export (`BlockDevice::export`) and before the mount (`mount_blockdev_erofs`), so a cached image that is not a page multiple is covered too |
 | `nydus-image export --block` | the exported `.disk` | padded to a 64 KiB multiple (`EXPORT_ALIGNMENT`, the largest page size) at export, with or without `--verity`: EROFS reads only the blocks the superblock names, dm-verity only `--data-blocks` and the tree at `--hash-offset` |
 | Tarfs with dm-verity | dm block device | not file-backed: unaffected |
-| Regular nydus images (snapshotter) | FUSE | not EROFS: unaffected |
+| Nydus images the snapshotter serves over FUSE | FUSE | not EROFS: unaffected |
 | `nydusd --fanotify` (standalone) | the caller's `bootstrap` | left untouched; when it is not a page multiple, `mount_erofs` mounts an anonymous padded copy (`O_TMPFILE` in the bootstrap's directory, named by its `/proc/self/fd` link), or, where `O_TMPFILE` or that link is unavailable, a named copy it removes once mounted. Nothing is left behind; the mount table shows `/proc/self/fd/<n>` as the source. |
 | Live mounts adopted on restart | staged bootstrap or `image.erofs` | at startup, before adoption, the snapshotter pads every unaligned regular-file source of a live EROFS mount under its `daemons/` dir in place. The kernel retries a failed metadata read on the next access, so the live mount reads cleanly without a remount, and running containers keep working. |
 

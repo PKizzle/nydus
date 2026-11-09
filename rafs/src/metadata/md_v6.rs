@@ -100,6 +100,101 @@ impl RafsSuper {
         }
     }
 
+    /// Check that a kernel EROFS mount of this RAFS v6 bootstrap, loaded from `bootstrap`, reads
+    /// every chunk where FUSE does.
+    ///
+    /// The kernel reads a chunk at `block_addr * block_size` of the device its chunk address
+    /// names, while FUSE reads it at the chunk table's uncompressed offset. Both must agree and
+    /// the chunk must lie inside the device slot, or only a kernel mount reads the wrong bytes,
+    /// without any error. A violation is `InvalidMetadata` naming the first offending chunk.
+    pub fn check_v6_block_addrs(&self, bootstrap: &Path) -> RafsResult<()> {
+        use std::io::{Read, Seek, SeekFrom};
+
+        use super::direct_v6::OndiskInodeWrapper;
+        use super::layout::v6::RafsV6Device;
+
+        let meta = &self.meta;
+        let mut devslots = vec![RafsV6Device::new(); meta.blob_device_table_count as usize];
+        if devslots.is_empty() {
+            return Ok(());
+        }
+        let mut f = std::fs::File::open(bootstrap)?;
+        f.seek(SeekFrom::Start(meta.blob_device_table_offset))?;
+        for devslot in devslots.iter_mut() {
+            f.read_exact(devslot.as_mut())
+                .map_err(|e| RafsError::ReadMetadata(e, "device table".to_string()))?;
+        }
+        let blobs = self.superblock.get_blob_infos();
+        let block_size = 1u64 << meta.blkszbits;
+
+        let root = self.get_extended_inode(self.superblock.root_ino(), false)?;
+        // A bootstrap is untrusted input: a directory reachable twice would loop forever.
+        let mut seen_dirs = HashSet::new();
+        let mut pending = vec![(PathBuf::from("/"), root)];
+        while let Some((path, inode)) = pending.pop() {
+            if inode.is_dir() {
+                if !seen_dirs.insert(inode.ino()) {
+                    return Err(RafsError::InvalidMetadata(format!(
+                        "{}: directory inode {} is reachable twice",
+                        path.display(),
+                        inode.ino()
+                    )));
+                }
+                for idx in 0..inode.get_child_count() {
+                    let child = inode.get_child_by_index(idx)?;
+                    pending.push((path.join(child.name()), child));
+                }
+                continue;
+            }
+            // Only regular files carry chunks; a symlink's size would read as a chunk count.
+            if !inode.is_reg() {
+                continue;
+            }
+            let Some(ondisk) = inode.as_any().downcast_ref::<OndiskInodeWrapper>() else {
+                continue;
+            };
+            for idx in 0..inode.get_chunk_count() {
+                let addr = ondisk.get_chunk_addr(idx)?;
+                let chunk = inode.get_chunk_info(idx)?;
+                let blob_index = addr.blob_index()? as usize;
+                // External blobs are not EROFS devices, so their chunks carry no usable blkaddr.
+                if blobs
+                    .get(blob_index)
+                    .is_some_and(|b| b.has_feature(BlobFeatures::EXTERNAL))
+                {
+                    continue;
+                }
+                let devslot = devslots.get(blob_index).ok_or_else(|| {
+                    RafsError::InvalidMetadata(format!(
+                        "{}: chunk {idx} names device {blob_index}, which the device table lacks",
+                        path.display()
+                    ))
+                })?;
+                let start = addr.block_addr() as u64 * block_size;
+                if start != chunk.uncompressed_offset() {
+                    return Err(RafsError::InvalidMetadata(format!(
+                        "{}: chunk {idx} is at block address 0x{:x} (offset 0x{start:x}) but its \
+                         data starts at uncompressed offset 0x{:x}",
+                        path.display(),
+                        addr.block_addr(),
+                        chunk.uncompressed_offset()
+                    )));
+                }
+                let end = addr.block_addr() as u64
+                    + (chunk.uncompressed_size() as u64).div_ceil(block_size);
+                if end > devslot.blocks() as u64 {
+                    return Err(RafsError::InvalidMetadata(format!(
+                        "{}: chunk {idx} ends at block 0x{end:x}, past the {} blocks of device \
+                         {blob_index}",
+                        path.display(),
+                        devslot.blocks()
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn is_inlay_prefetch_all(&self, r: &mut RafsIoReader) -> RafsResult<bool> {
         let hint_entries = self.meta.prefetch_table_entries as usize;
         if hint_entries != 1 {

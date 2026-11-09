@@ -787,7 +787,7 @@ fn try_fanotify_init() -> Result<()> {
 /// Both must fail the probe so the driver chain falls through to fusedev
 /// cleanly instead of failing at first mount/serve.
 #[cfg(target_os = "linux")]
-fn try_fanotify_pre_content_mark(work_dir: &Path) -> Result<()> {
+pub(crate) fn try_fanotify_pre_content_mark(work_dir: &Path) -> Result<()> {
     const FAN_CLASS_PRE_CONTENT: u32 = 0x0000_0008;
     /// From include/uapi/linux/fanotify.h (6.14): pre-content access event.
     const FAN_PRE_ACCESS: u64 = 0x0010_0000;
@@ -856,7 +856,7 @@ fn try_fanotify_pre_content_mark(work_dir: &Path) -> Result<()> {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn try_fanotify_pre_content_mark(_work_dir: &Path) -> Result<()> {
+pub(crate) fn try_fanotify_pre_content_mark(_work_dir: &Path) -> Result<()> {
     bail!("fanotify is only available on Linux")
 }
 
