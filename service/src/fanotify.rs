@@ -2464,7 +2464,7 @@ pub(crate) mod testing {
         dir: &Path,
         edit: impl FnOnce(&mut RafsV6SuperBlock, &mut RafsV6Device),
     ) {
-        let root = std::env::var("CARGO_MANIFEST_DIR").unwrap();
+        let root = env!("CARGO_MANIFEST_DIR");
         let path = dir.join("bootstrap");
         std::fs::copy(
             format!("{root}/../tests/texture/bootstrap/rafs-v6-2.2.boot"),
@@ -2687,7 +2687,7 @@ mod tests {
             eprintln!("SKIP: set NYDUS_FANOTIFY_TEST_DIR to an ext4 directory and run as root");
             return None;
         };
-        let root = std::env::var("CARGO_MANIFEST_DIR").unwrap();
+        let root = env!("CARGO_MANIFEST_DIR");
         let work = tempfile::TempDir::new_in(base).unwrap();
         let stage = work.path().join("stage");
         std::fs::create_dir_all(&stage).unwrap();
@@ -2929,7 +2929,7 @@ mod tests {
     #[cfg_attr(miri, ignore = "Miri does not support copy_file_range")]
     fn test_refuses_bootstrap_whose_devices_have_no_data_blob() {
         let dir = tempfile::TempDir::new().unwrap();
-        let root = std::env::var("CARGO_MANIFEST_DIR").unwrap();
+        let root = env!("CARGO_MANIFEST_DIR");
         // This bootstrap's device table holds one data blob.
         std::fs::copy(
             format!("{root}/../tests/texture/bootstrap/rafs-v6-2.2.boot"),
@@ -2961,7 +2961,7 @@ mod tests {
     #[cfg_attr(miri, ignore = "Miri does not support copy_file_range")]
     fn refuses_data_blobs_that_do_not_match_the_device_table() {
         const BLOB: &str = "be7d77eeb719f70884758d1aa800ed0fb09d701aaec469964e9d54325f0d5fef";
-        let root = std::env::var("CARGO_MANIFEST_DIR").unwrap();
+        let root = env!("CARGO_MANIFEST_DIR");
         let work = tempfile::TempDir::new().unwrap();
         std::fs::copy(
             format!("{root}/../tests/texture/blobs/{BLOB}"),
