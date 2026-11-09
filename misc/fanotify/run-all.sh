@@ -42,6 +42,7 @@ run() { # <script> <PASS line> [<whole-suite SKIP line the kernel may legitimate
   if ! grep -qF "$2" "$FS/$1.log" || grep -q "SKIP" "$FS/$1.log"; then FAILED="$FAILED $1"; fi
 }
 run runtime-test "==== FANOTIFY FETCH PATH: PASS"
+run corrupt-data-test "==== FANOTIFY FILL VALIDATION: PASS ===="
 run zran-multilayer-test "==== MULTI-LAYER ZRAN: PASS ===="
 run many-devices-test "==== MANY DEVICES: PASS ===="
 run ref-layer-formats-test "==== REF LAYER FORMATS: PASS ===="

@@ -55,6 +55,32 @@ buffer denies everything still parsable before failing, and shutdown drains and 
 queued before the group fd closes. A `FAN_Q_OVERFLOW` record is treated as fatal — the kernel
 fail-opens the events it dropped, so continuing would mean knowingly serving unfetched zeros.
 
+### Fill validation
+
+The kernel reads the cache file directly, so nothing checks its bytes on the way out; they are
+checked on the way in. A fanotify cache (`cache_type = "fanotify"`) validates every chunk it fills
+against its digest whatever `cache.validate` says, and a chunk that fails is never marked ready: the
+event is denied with `EIO` and the next read fetches again. The digests are the bootstrap's own,
+from its chunk table (`kernel_layout::chunk_digest_tables`), supplied by `FanotifyHandler` when it
+is built, so zran, tar-ref and zstd-ref blobs, whose blob meta carries no digests, are validated
+too. The digests are recorded next to the cache file (`<blob_id>.blob.data.digests`), so
+construction fails when the chunk table records one chunk twice differently, when a chunk's extent
+disagrees with the blob meta, or when any bootstrap sharing the blob, now or in an earlier daemon,
+named another digest for a chunk. Chunks no bootstrap references are left out of fills, and a read
+that needs one is denied.
+
+Chunks already marked ready when a cache file is opened were not necessarily validated (a cache
+filled by an older daemon or by a non-validating opener). A low-priority thread per handler checks
+each of them once while serving goes on; a chunk that fails is revoked like an invalidation of that
+one chunk (mark re-armed, ready bit cleared, bytes punched, under the blob's exclusive `io_lock`),
+so a blob whose mark was already dropped is guarded again before anything is discarded. When every
+ready chunk has passed, the chunk map header records the file as verified, which
+`BlobObject::is_data_verified` reports; an opener that fills without validating clears it.
+
+`kernel_layout::check_kernel_layout` proves the other half: that for each regular file the kernel's
+chunk indexes (format, device id, block address, chunk size, device range) name exactly the chunks
+the fill path validates. `nydus-image check` runs it.
+
 Implementation: [`service/src/fanotify.rs`](../service/src/fanotify.rs) (`FanotifyHandler`) and the
 local FFI shim [`service/src/fanotify_sys.rs`](../service/src/fanotify_sys.rs) (the `nix` crate does
 not yet expose the pre-content API).
