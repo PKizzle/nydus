@@ -473,6 +473,36 @@ pub mod fanotify_upgrade {
         Ok(())
     }
 
+    /// Rewrite a saved `state` the way releases up to 3.3.0 wrote it: the same handlers, no blob
+    /// list. For takeover tests that start a successor from such a state.
+    #[doc(hidden)]
+    pub fn without_blob_list(state: &[u8]) -> Result<Vec<u8>> {
+        let mut backend_stat = FanotifyBackendState::restore(&mut state.to_vec())
+            .map_err(UpgradeMgrError::Deserialize)?;
+        backend_stat.blob_entry_list.clear();
+        Ok(backend_stat.save().map_err(UpgradeMgrError::Serialize)?)
+    }
+
+    /// Register the `saved` blob entries the daemon was not created with (`configured`), and
+    /// return both sets: the entries the next save carries.
+    ///
+    /// A state saved without its blob list holds no entries; the `configured` ones stand in.
+    pub(crate) fn adopt_blob_entries(
+        blob_mgr: &crate::blob_cache::BlobCacheMgr,
+        configured: HashMap<String, BlobCacheEntry>,
+        mut saved: HashMap<String, BlobCacheEntry>,
+    ) -> Result<HashMap<String, BlobCacheEntry>> {
+        for (key, entry) in &saved {
+            if !configured.contains_key(key) {
+                blob_mgr.add_blob_entry(entry).map_err(|e| {
+                    UpgradeMgrError::Deserialize(PersistError::Restore(e.to_string()))
+                })?;
+            }
+        }
+        saved.extend(configured);
+        Ok(saved)
+    }
+
     /// Restore fanotify daemon state after a hot upgrade / takeover.
     ///
     /// Re-adds the blob-cache entries, then rebuilds every handler around its preserved fanotify fd
@@ -488,18 +518,16 @@ pub mod fanotify_upgrade {
             let backend_stat = FanotifyBackendState::restore(&mut state_data)
                 .map_err(UpgradeMgrError::Deserialize)?;
 
-            let stat = FanotifyState::try_from(&backend_stat)
+            let mut stat = FanotifyState::try_from(&backend_stat)
                 .map_err(|e| UpgradeMgrError::Deserialize(PersistError::Restore(e.to_string())))?;
 
             // Re-add blob entries first so handler reconstruction sees a populated cache.
-            stat.blob_entry_map
-                .iter()
-                .try_for_each(|(_, entry)| -> Result<()> {
-                    blob_mgr.add_blob_entry(entry).map_err(|e| {
-                        UpgradeMgrError::Deserialize(PersistError::Restore(e.to_string()))
-                    })?;
-                    Ok(())
-                })?;
+            let configured = std::mem::take(&mut mgr.fanotify_deamon_stat.blob_entry_map);
+            stat.blob_entry_map = adopt_blob_entries(
+                &blob_mgr,
+                configured,
+                std::mem::take(&mut stat.blob_entry_map),
+            )?;
 
             if files.len() != stat.handlers.len() {
                 warn!(

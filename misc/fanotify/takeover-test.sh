@@ -15,7 +15,7 @@ ROOT="${ROOT:-/var/tmp/takeover}"
 fail(){ echo "FAIL: $*"; exit 1; }
 
 grep " $ROOT/" /proc/self/mounts | awk '{print $2}' | xargs -r -n1 umount -l
-rm -rf "$ROOT"; mkdir -p "$ROOT"/{src/bin,out,artifact/backend}
+rm -rf "$ROOT"; mkdir -p "$ROOT"/{src/bin,out,artifact/backend,artifact/stage}
 head -c 3000000 /dev/urandom > "$ROOT/src/bin/tool"
 echo "root:x:0:0:root:/root:/bin/sh" > "$ROOT/src/passwd"
 tar -C "$ROOT/src" -czf "$ROOT/layer.tar.gz" .
@@ -27,16 +27,17 @@ BOOTSTRAP=$(echo "$OUT" | sed -n 's/^meta blob path: //p' | tr -d ' ')
 META=$(ls "$ROOT/out" | grep -v "^$(basename "$BOOTSTRAP")\$" | head -1)
 cp "$ROOT/layer.tar.gz" "$ROOT/artifact/backend/$DATA"
 cp "$ROOT/out/$META" "$ROOT/artifact/backend/$META"
-cp "$BOOTSTRAP" "$ROOT/artifact/bootstrap"
+cp "$BOOTSTRAP" "$ROOT/artifact/stage/bootstrap"
 
 # Once as is and once on a single CPU: with one CPU, libtest runs tests serially and its
-# output differs, and the daemon's threads compete for that CPU.
-for pin in "" "taskset -c 0"; do
+# output differs, and the daemon's threads compete for that CPU. A third run starts the
+# successor from a state without the blob list, as releases up to 3.3.0 saved it.
+for run in "" "taskset -c 0" "env NYDUS_TAKEOVER_STATE_WITHOUT_BLOB_LIST=1"; do
   rm -rf "$ROOT/snapshotter"
-  NYDUS_E2E_ROOT="$ROOT" $pin "$CARGO" test -p nydus-snapshotter --lib \
+  NYDUS_E2E_ROOT="$ROOT" $run "$CARGO" test -p nydus-snapshotter --lib \
     daemon::tests::fanotify_takeover_serves_uncached_file_data -- --ignored --exact --nocapture
   rc=$?
   grep " $ROOT/" /proc/self/mounts | awk '{print $2}' | xargs -r -n1 umount -l
-  [ $rc = 0 ] || fail "the successor did not serve the taken-over mount${pin:+ ($pin)}"
+  [ $rc = 0 ] || fail "the successor did not serve the taken-over mount${run:+ ($run)}"
 done
 echo "==== FANOTIFY TAKEOVER: PASS ===="
