@@ -2060,11 +2060,18 @@ fn install_bootstrap_digests(
                     format!("fanotify: bootstrap has no blob {blob_id}"),
                 )
             })?;
-        backing
-            .blob
-            .blob()
-            .add_chunk_digests(&tables[index])
-            .inspect_err(|e| warn!("fanotify: blob {blob_id}: bootstrap digests refused: {e}"))?;
+        match backing.blob.blob().add_chunk_digests(&tables[index]) {
+            Ok(()) => {}
+            // Only a `fanotify` cache validates its fills; any other keeps serving as it always
+            // has, and never reports its data verified.
+            Err(nydus_storage::StorageError::Unsupported) => warn!(
+                "fanotify: blob {blob_id} is not in a fanotify cache; its fills are not validated"
+            ),
+            Err(e) => {
+                warn!("fanotify: blob {blob_id}: bootstrap digests refused: {e}");
+                return Err(e.into());
+            }
+        }
     }
     Ok(())
 }
