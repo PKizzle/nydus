@@ -26,7 +26,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use async_lock::{Mutex, RwLock};
 use mio::{Poll, Token, Waker};
-use nydus_api::BuildTimeInfo;
+use nydus_api::{BackendConfigV2, BuildTimeInfo};
 use nydus_service::Error as ServiceError;
 use nydus_service::daemon::{
     DaemonState, DaemonStateMachineInput, DaemonStateMachineSubscriber, NydusDaemon,
@@ -41,8 +41,8 @@ use tracing::{debug, info, warn};
 
 use crate::config::{FsDriverType, SnapshotterConfig};
 use crate::daemon::config_builder::{
-    auto_accel_inode_share_domain, build_auto_accel_blob_cache_entry, build_blob_cache_entry,
-    build_daemon_config,
+    auto_accel_inode_share_domain, build_backend_config, build_blob_cache_entry,
+    build_daemon_config, build_fanotify_blob_cache_entry, localfs_backend,
 };
 use crate::daemon::image_ref::{ImageRef, parse_image_ref};
 use crate::prefetch_profile::runtime_prefetch_for_image;
@@ -617,8 +617,7 @@ impl DaemonSupervisor {
                 );
             }
             if inst.bootstrap == bootstrap
-                && Self::accel_backend_for(bootstrap).is_some()
-                && mount_fstype_at(&inst.mountpoint).as_deref() == Some("erofs")
+                && is_fanotify_mount(&inst.mountpoint)
                 && let Some(old) = instances.remove(image_ref)
             {
                 // The caller's per-image start lock keeps this image's other starts out; other
@@ -771,7 +770,12 @@ impl DaemonSupervisor {
         }
 
         let instance = self
-            .start_local_instance(image_ref, bootstrap, backend_dir, built_on_node)
+            .start_fanotify_instance(
+                image_ref,
+                bootstrap,
+                localfs_backend(backend_dir),
+                built_on_node,
+            )
             .await
             .with_context(|| format!("failed to start auto-accel daemon for {image_ref}"))?;
         instance.acquire_holder(holder);
@@ -790,17 +794,19 @@ impl DaemonSupervisor {
         Ok(Arc::new(handle))
     }
 
-    /// Spawn an in-process auto-accel daemon. Mirrors the FUSE start path in
-    /// `start_instance` but uses `nydus_service::create_daemon` (the
-    /// fanotify-singleton flavour) instead of `create_fuse_daemon`. The
-    /// resulting daemon mounts EROFS directly via fanotify; gzip-layer reads
-    /// are served on demand by `FanotifyHandler` which decompresses the
-    /// per-layer zran ranges into the file cache.
-    async fn start_local_instance(
+    /// Spawn an in-process fanotify daemon serving `bootstrap` with its blobs
+    /// read from `backend`: an auto-accel sidecar's localfs backend dir, or the
+    /// pull backend of an image published in nydus format. Mirrors the FUSE
+    /// start path in `start_instance` but uses `nydus_service::create_daemon`
+    /// (the fanotify-singleton flavour) instead of `create_fuse_daemon`. The
+    /// resulting daemon mounts EROFS directly via fanotify; reads of uncached
+    /// ranges are served on demand by `FanotifyHandler`, which fetches them
+    /// (decompressing zran ranges) into the file cache.
+    async fn start_fanotify_instance(
         &self,
         image_ref_str: &str,
         bootstrap: &Path,
-        backend_dir: &Path,
+        backend: BackendConfigV2,
         built_on_node: bool,
     ) -> Result<Arc<DaemonInstance>> {
         let slug = slug_for(image_ref_str);
@@ -863,7 +869,8 @@ impl DaemonSupervisor {
         // The daemon learns its data blobs only from this blob list: without the
         // bootstrap entry the handler finds no data blob, mounts EROFS without
         // any `device=`, and every file read fails with EIO.
-        let cfg_json = self.local_blob_list(&slug, backend_dir, built_on_node)?;
+        let backend_type = backend.backend_type.clone();
+        let cfg_json = self.fanotify_blob_list(&slug, backend, built_on_node)?;
         // The process-wide blob factory keys cache managers by config, which is
         // the same for every start of this image, so it would hand back the
         // previous daemon's cache entries; drop the idle ones, whose files the
@@ -886,23 +893,23 @@ impl DaemonSupervisor {
             None::<&Path>,
             false,
         )
-        .map_err(|e| anyhow::anyhow!("failed to create auto-accel fanotify daemon: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("failed to create fanotify daemon: {e}"))?;
 
         wait_for_running_off_reactor(daemon.clone(), self.startup_timeout)
             .await
             .with_context(|| {
-                format!("auto-accel daemon for {image_ref_str} never reached RUNNING")
+                format!("fanotify daemon for {image_ref_str} never reached RUNNING")
             })?;
 
         info!(
             image_ref = %image_ref_str,
             mountpoint = %mountpoint.display(),
-            backend = %backend_dir.display(),
-            "auto-accel fanotify daemon ready"
+            backend = %backend_type,
+            "fanotify daemon ready"
         );
 
-        // Failover armed via fdstore — same code path the registry-backed
-        // FUSE start uses; the snapshot also covers the fanotify group fd
+        // Failover armed via fdstore — same code path the FUSE start uses;
+        // the snapshot also covers the fanotify group fd
         // because the FanotifyHandler is registered in the singleton's
         // ServiceController before READY.
         let armed = self
@@ -1317,18 +1324,18 @@ impl DaemonSupervisor {
         }
     }
 
-    /// The blob list of the node-local fanotify daemon `slug`: its staged bootstrap, with the
-    /// layers read from `backend_dir`.
-    fn local_blob_list(
+    /// The blob list of the fanotify daemon `slug`: its staged bootstrap, with the blobs read
+    /// from `backend`.
+    fn fanotify_blob_list(
         &self,
         slug: &str,
-        backend_dir: &Path,
+        backend: BackendConfigV2,
         built_on_node: bool,
     ) -> Result<serde_json::Value> {
         let daemon_root = self.daemons_root().join(slug);
         let stage_dir = daemon_root.join("stage");
-        let entry = build_auto_accel_blob_cache_entry(
-            backend_dir,
+        let entry = build_fanotify_blob_cache_entry(
+            backend,
             &stage_dir,
             &daemon_root.join("mnt"),
             slug,
@@ -1340,6 +1347,19 @@ impl DaemonSupervisor {
             ),
         )?;
         Ok(serde_json::json!({ "blobs": [entry] }))
+    }
+
+    /// The backend the fanotify daemon of `image_ref` reads `bootstrap`'s blobs from: an
+    /// auto-accel sidecar's localfs backend dir, or else the configured pull backend with the
+    /// credentials resolved now. Saved upgrade states carry no credentials, so every takeover
+    /// and heal rebuilds the blob list through this.
+    fn fanotify_backend_for(&self, image_ref: &str, bootstrap: &Path) -> Result<BackendConfigV2> {
+        if let Some(dir) = Self::accel_backend_for(bootstrap) {
+            return Ok(localfs_backend(&dir));
+        }
+        let parsed = parse_image_ref(image_ref)
+            .with_context(|| format!("invalid image reference '{image_ref}'"))?;
+        build_backend_config(&self.config, &parsed, self.resolve_auth(&parsed))
     }
 
     /// The auto-accel backend dir for `bootstrap`, when the bootstrap is an
@@ -1357,8 +1377,9 @@ impl DaemonSupervisor {
 
     /// Start (or restart) the daemon for a persisted record's identity,
     /// routing auto-accel bootstraps through the node-local content-store
-    /// path and everything else through the registry path. Chunk fetches for
-    /// k3s airgap-preloaded images have no upstream to fall back to, so the
+    /// path and everything else through the registry path, which picks the
+    /// driver again (see `start_instance`). Chunk fetches for k3s
+    /// airgap-preloaded images have no upstream to fall back to, so the
     /// routing must survive restarts and recoveries alike.
     async fn start_instance_for_record(
         &self,
@@ -1368,8 +1389,13 @@ impl DaemonSupervisor {
     ) -> Result<Arc<DaemonInstance>> {
         match Self::accel_backend_for(bootstrap) {
             Some(backend_dir) => {
-                self.start_local_instance(image_ref, bootstrap, &backend_dir, built_on_node)
-                    .await
+                self.start_fanotify_instance(
+                    image_ref,
+                    bootstrap,
+                    localfs_backend(&backend_dir),
+                    built_on_node,
+                )
+                .await
             }
             None => self.start_instance(image_ref, bootstrap, None).await,
         }
@@ -1438,7 +1464,7 @@ impl DaemonSupervisor {
             //   layers) so the restart mounts fresh.
             let fstype = mount_fstype_at(&old.mountpoint);
             let is_erofs = fstype.as_deref() == Some("erofs");
-            let heal = is_erofs && Self::accel_backend_for(&bootstrap).is_some();
+            let heal = is_erofs && is_fanotify_mount(&old.mountpoint);
             let started = if heal {
                 self.heal_fanotify_in_place(&old).await
             } else {
@@ -1677,7 +1703,27 @@ impl DaemonSupervisor {
         let daemon_root = self.config.snapshotter.root.join("daemons").join(&slug);
         let mountpoint = daemon_root.join("mnt");
         let cache_dir = self.config.snapshotter.cache.work_dir.join(&slug);
-        let active_driver = driver_override.unwrap_or_else(|| self.active_fs_driver());
+        let mut active_driver = driver_override.unwrap_or_else(|| self.active_fs_driver());
+        if active_driver == FsDriverType::Fanotify {
+            let node_driver = self.active_fs_driver();
+            let source = bootstrap.to_path_buf();
+            let unfit = blocking::unblock(move || {
+                kernel_mount_unfit(node_driver, &source, nydus_utils::host_page_size())
+            })
+            .await;
+            match unfit {
+                None => {
+                    let backend = self.fanotify_backend_for(image_ref_str, bootstrap)?;
+                    return self
+                        .start_fanotify_instance(image_ref_str, bootstrap, backend, false)
+                        .await;
+                }
+                Some(reason) => {
+                    info!(image_ref = %image_ref_str, reason, "serving the image over FUSE");
+                    active_driver = FsDriverType::Fusedev;
+                }
+            }
+        }
         fs::create_dir_all(&mountpoint).with_context(|| {
             format!(
                 "failed to create daemon mountpoint {}",
@@ -2028,8 +2074,9 @@ impl DaemonSupervisor {
             // predate replace-on-park can hold [dead, ..., live] under one name.
             let Some(fd) = fds.last() else { continue };
             // Route by what is actually mounted at the record's mountpoint —
-            // never by the configured driver. Registry-backed images mount
-            // fusedev even on a fanotify-configured node, and their parked
+            // never by the configured driver. A fanotify-configured node still
+            // mounts fusedev for images a kernel EROFS mount cannot serve
+            // (`kernel_mount_unfit`) or a label sends there, and their parked
             // `/dev/fuse` fds are just as adoptable: what matters is the
             // observed mount, not the node-level default.
             match adoption_route(mount_fstype_at(&record.mountpoint).as_deref()) {
@@ -2420,11 +2467,11 @@ impl DaemonSupervisor {
         let state_path = self.failover_state_path(slug);
         let state = fs::read(&state_path)
             .with_context(|| format!("read failover state {}", state_path.display()))?;
-        // The state blob of a build that did not save its blob list carries no entries; the
-        // daemon is given its blob list as a fresh start would build it.
-        let blobs = Self::accel_backend_for(&record.bootstrap)
-            .map(|backend| self.local_blob_list(slug, &backend, record.built_on_node))
-            .transpose()?;
+        // The state blob of a build that did not save its blob list carries no entries, and a
+        // saved list carries no credentials; the daemon is given its blob list as a fresh start
+        // would build it.
+        let backend = self.fanotify_backend_for(image_ref_str, &record.bootstrap)?;
+        let blobs = Some(self.fanotify_blob_list(slug, backend, record.built_on_node)?);
         let (daemon, poll) = self
             .adopt_fanotify_group(image_ref_str, slug, fan_fd, state, blobs, |_| ())
             .await?;
@@ -2543,7 +2590,8 @@ impl DaemonSupervisor {
     /// systemd fd store keeps holding the same group, so it stays current.
     ///
     /// Nothing of the failed daemon's state is reused: the new daemon rebuilds its blob cache
-    /// managers from the saved blob entries and reopens the cache files without events.
+    /// managers from a freshly built blob list (the saved entries carry no credentials) and
+    /// reopens the cache files without events.
     ///
     /// On failure `old` is left as it was: its failed handlers serve the group again, denying
     /// every read with EIO, and the caller keeps it for a later attempt.
@@ -2565,6 +2613,10 @@ impl DaemonSupervisor {
             }
 
             let slug = slug_for(&old.image_ref);
+            // The saved blob entries carry no credentials, so a registry-backed daemon needs
+            // its blob list rebuilt with them.
+            let backend = self.fanotify_backend_for(&old.image_ref, &old.bootstrap)?;
+            let blobs = self.fanotify_blob_list(&slug, backend, old.built_on_node)?;
             let daemon = old.daemon.clone();
             let sock = supervisor_sock_path(&slug);
             let (group, state, suspended) = blocking::unblock(move || {
@@ -2591,7 +2643,7 @@ impl DaemonSupervisor {
                     &slug,
                     group.as_raw_fd(),
                     state,
-                    None,
+                    Some(blobs),
                     |new| {
                         // Its workers stop without answering; the old ones take the queue back.
                         if let Ok(controller) = controller(new) {
@@ -3430,8 +3482,9 @@ fn is_mounted_at(_mountpoint: &Path) -> bool {
 /// How a preserved fd should be re-attached at startup, decided purely from
 /// the filesystem type observed at the record's mountpoint. Deliberately
 /// independent of the configured driver: a fanotify-configured node still
-/// mounts registry-backed images via fusedev, and those parked `/dev/fuse`
-/// fds are just as adoptable as the group fds of fanotify daemons.
+/// mounts some images via fusedev (see `kernel_mount_unfit`), and those
+/// parked `/dev/fuse` fds are just as adoptable as the group fds of fanotify
+/// daemons.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AdoptionRoute {
     /// EROFS mount: adopt the armed fanotify group fd (marks stay live).
@@ -3608,6 +3661,57 @@ fn overlay_references(options: &str, daemon_mnt: &str) -> bool {
 /// or `None` when nothing is mounted there.
 fn mount_fstype_at(mountpoint: &Path) -> Option<String> {
     mount_at(mountpoint).map(|(_, fstype)| fstype)
+}
+
+/// Whether the mount at `mountpoint` (a daemon dir's `mnt`) is a fanotify daemon's EROFS mount:
+/// its source is the bootstrap staged in the `stage` dir beside it. Blockdev and tarfs mount
+/// their exported disk images instead.
+fn is_fanotify_mount(mountpoint: &Path) -> bool {
+    mount_at(mountpoint).is_some_and(|(source, fstype)| {
+        fstype == "erofs"
+            && Path::new(&source.replace("\\040", " "))
+                == mountpoint.with_file_name("stage").join("bootstrap")
+    })
+}
+
+/// Why a kernel EROFS mount through fanotify cannot serve `bootstrap` on a node whose active
+/// driver is `node_driver` and whose pages are `page_size` bytes, or `None` when it can. The
+/// image then takes FUSE, which reads every chunk through the chunk table.
+///
+/// EROFS mounts only RAFS v6, and only with blocks no larger than a page. The kernel follows
+/// only `blkaddr * block_size` of each chunk, so an image whose chunk addresses disagree with
+/// its chunk table (16K/64K-block images built before v6 chunk starts were padded to the
+/// block size) would be misread without any error.
+fn kernel_mount_unfit(
+    node_driver: FsDriverType,
+    bootstrap: &Path,
+    page_size: u64,
+) -> Option<String> {
+    use nydus_rafs::metadata::RafsSuper;
+
+    if node_driver != FsDriverType::Fanotify {
+        return Some(format!("the node serves images with {node_driver:?}"));
+    }
+    let config = Arc::new(nydus_api::ConfigV2::default());
+    let sb = match RafsSuper::load_from_file(bootstrap, config, false) {
+        Ok((sb, _)) => sb,
+        Err(e) => return Some(format!("unreadable bootstrap: {e}")),
+    };
+    if !sb.meta.is_v6() {
+        return Some("RAFS v5 bootstrap".to_string());
+    }
+    let block_size = 1u64 << sb.meta.blkszbits;
+    if block_size > page_size {
+        return Some(format!(
+            "EROFS block size {block_size} exceeds the {page_size}-byte page size"
+        ));
+    }
+    if sb.meta.blob_device_table_count == 0 && !sb.superblock.get_blob_infos().is_empty() {
+        return Some("bootstrap has no EROFS device table".to_string());
+    }
+    sb.check_v6_block_addrs(bootstrap)
+        .err()
+        .map(|e| format!("chunk layout a kernel mount would misread: {e}"))
 }
 
 /// Source and filesystem type (`/proc/self/mounts` fields 1 and 3) of the
@@ -4133,6 +4237,49 @@ mod tests {
         assert_eq!(
             supervisor.failover_state_path("abc-app"),
             PathBuf::from("/var/lib/nydus/daemons/abc-app/upgrade.state"),
+        );
+    }
+
+    #[test]
+    fn kernel_mount_serves_only_consistent_v6_images_on_fanotify_nodes() {
+        let texture = Path::new(env!("CARGO_MANIFEST_DIR")).join("../tests/texture/bootstrap");
+        let v6 = texture.join("rafs-v6-2.2.boot");
+        let fanotify = FsDriverType::Fanotify;
+        assert_eq!(kernel_mount_unfit(fanotify, &v6, 4096), None);
+
+        for other in [FsDriverType::Fusedev, FsDriverType::Blockdev] {
+            assert!(kernel_mount_unfit(other, &v6, 4096).is_some());
+        }
+        let v5 = kernel_mount_unfit(fanotify, &texture.join("rafs-v5.boot"), 4096);
+        assert!(v5.as_deref().is_some_and(|r| r.contains("v5")), "{v5:?}");
+        let big_blocks = kernel_mount_unfit(fanotify, &v6, 2048);
+        assert!(
+            big_blocks
+                .as_deref()
+                .is_some_and(|r| r.contains("block size")),
+            "{big_blocks:?}"
+        );
+        assert!(kernel_mount_unfit(fanotify, &texture.join("missing"), 4096).is_some());
+
+        // A first device slot of one block, too short for the chunks on it.
+        let dir = tempfile::tempdir().unwrap();
+        let short_device = dir.path().join("bootstrap");
+        let (sb, _) = nydus_rafs::metadata::RafsSuper::load_from_file(
+            &v6,
+            Arc::new(nydus_api::ConfigV2::default()),
+            false,
+        )
+        .unwrap();
+        let blocks_off = sb.meta.blob_device_table_offset as usize + 64;
+        let mut data = fs::read(&v6).unwrap();
+        data[blocks_off..blocks_off + 4].copy_from_slice(&1u32.to_le_bytes());
+        fs::write(&short_device, data).unwrap();
+        let misread = kernel_mount_unfit(fanotify, &short_device, 4096);
+        assert!(
+            misread
+                .as_deref()
+                .is_some_and(|r| r.contains("chunk layout")),
+            "{misread:?}"
         );
     }
 
@@ -5397,7 +5544,7 @@ mod tests {
     fn restore_instance_runs_under_any_configured_driver() {
         // Default driver chain is [Fanotify, Blockdev, Fusedev] -> active=Fanotify.
         // Fusedev takeover must NOT be gated on the configured driver (a
-        // fanotify node still mounts registry images via fusedev); the first
+        // fanotify node still mounts some images via fusedev); the first
         // error must be a *real* validation failure, not a driver guard.
         let supervisor = DaemonSupervisor::new(SnapshotterConfig::default());
         assert_ne!(supervisor.active_fs_driver(), FsDriverType::Fusedev);
