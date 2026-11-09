@@ -474,6 +474,17 @@ impl OndiskInodeWrapper {
         self.blocks_count
     }
 
+    /// The inode's EROFS data layout (`EROFS_INODE_*`) and its raw `i_u` word, whose low half is
+    /// the chunk format of a chunk-based file.
+    pub fn data_layout(&self) -> (u16, u32) {
+        let state = self.state();
+        let inode = self.disk_inode(&state);
+        (
+            (inode.format() >> EROFS_I_VERSION_BITS) & ((1 << EROFS_I_DATALAYOUT_BITS) - 1),
+            inode.union(),
+        )
+    }
+
     fn disk_inode(&self, _state: &Guard<Arc<DirectMappingState>>) -> &dyn RafsV6OndiskInode {
         match &self.disk {
             DiskInode::Compact(i) => i,

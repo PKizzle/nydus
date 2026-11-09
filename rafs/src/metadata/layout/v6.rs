@@ -112,9 +112,9 @@ const EROFS_SUPER_MAGIC_V1: u32 = 0xE0F5_E1E2;
 // Bits of EROFS metadata slot size.
 const EROFS_INODE_SLOT_BITS: u8 = 5;
 // Bit flag indicating whether the inode is chunked or not.
-const EROFS_CHUNK_FORMAT_INDEXES_FLAG: u16 = 0x0020;
+pub(crate) const EROFS_CHUNK_FORMAT_INDEXES_FLAG: u16 = 0x0020;
 // Encoded chunk size (log2(chunk_size) - EROFS_BLOCK_BITS).
-const EROFS_CHUNK_FORMAT_SIZE_MASK: u16 = 0x001F;
+pub(crate) const EROFS_CHUNK_FORMAT_SIZE_MASK: u16 = 0x001F;
 
 /// Checksum of superblock, compatible with EROFS versions prior to Linux kernel 5.5.
 #[allow(dead_code)]
@@ -1510,6 +1510,12 @@ impl RafsV6InodeChunkAddr {
         val &= 0xff00;
         val |= (blob_idx + 1) as u16;
         self.c_blob_addr_hi = val.to_le();
+    }
+
+    /// The raw `device_id` word the kernel reads, before masking it with the device id mask:
+    /// the blob index plus one in the low byte, the top bits of the ci index in the high byte.
+    pub fn device_id(&self) -> u16 {
+        u16::from_le(self.c_blob_addr_hi)
     }
 
     /// Get the 24-bits index into the blob compression information array.
