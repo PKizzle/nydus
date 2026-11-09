@@ -1290,8 +1290,13 @@ mod tests {
         assert!(format!("{err:?}").contains("digest value"), "{err:?}");
         assert!(!is_ready(&blob, 0));
 
-        // A second bootstrap that disagrees about a chunk's digest is refused.
-        assert!(blob.blob().add_chunk_digests(&digests).is_err());
+        // The chunk was never cached, so the wrong digest binds nothing: a bootstrap with the
+        // right one replaces it.
+        blob.blob().add_chunk_digests(&digests).unwrap();
+        obj.fetch_range_uncompressed(0, len).unwrap();
+        assert!(is_ready(&blob, 0));
+        // Now the cached chunk binds its digest: a bootstrap that disagrees is refused.
+        assert!(blob.blob().add_chunk_digests(&wrong).is_err());
 
         let (blob, _tmp) = create_data_blob_with("fanotify");
         let obj = blob.blob().get_blob_object().unwrap();
@@ -1325,7 +1330,7 @@ mod tests {
         assert!(
             obj.verify_ready_chunks(&|| false, &mut |c| {
                 revoked.push(c.id());
-                Ok(())
+                Ok(true)
             })
             .unwrap()
         );
@@ -1344,11 +1349,27 @@ mod tests {
         cache
             .write_all_at(&[byte[0] ^ 0xff], first.uncompressed_offset())
             .unwrap();
+        // Written by something other than a validating fill, as an older release would.
+        assert!(!obj.is_data_verified());
 
+        // A chunk its caller cannot revoke is reported, left in place, and keeps the file
+        // unverified; the check goes on past it.
+        assert!(
+            !obj.verify_ready_chunks(&|| false, &mut |c| {
+                revoked.push(c.id());
+                Ok(false)
+            })
+            .unwrap()
+        );
+        assert_eq!(revoked, vec![first.id()]);
+        assert!(is_ready(&blob, first.id()));
+        assert!(!obj.is_data_verified());
+
+        revoked.clear();
         assert!(
             obj.verify_ready_chunks(&|| false, &mut |c| {
                 revoked.push(c.id());
-                obj.clear_chunk_ready(c.id())
+                obj.revoke_chunk(c.id()).map(|()| true)
             })
             .unwrap()
         );
@@ -1368,7 +1389,29 @@ mod tests {
         let (blob, _tmp) = create_data_blob_with("fanotify");
         let obj = blob.blob().get_blob_object().unwrap();
         blob.blob().add_chunk_digests(&fixture_digests()).unwrap();
-        assert!(!obj.verify_ready_chunks(&|| true, &mut |_| Ok(())).unwrap());
+        assert!(
+            !obj.verify_ready_chunks(&|| true, &mut |_| Ok(true))
+                .unwrap()
+        );
+        assert!(!obj.is_data_verified());
+
+        // A ready chunk no bootstrap of this daemon references is left alone, unverified.
+        let (blob, _tmp) = create_data_blob_with("fanotify");
+        let obj = blob.blob().get_blob_object().unwrap();
+        let mut digests = fixture_digests();
+        assert!(digests.len() > 1);
+        digests[1] = None;
+        blob.blob().add_chunk_digests(&digests).unwrap();
+        let second = blob.blob().get_chunk_info(1).unwrap();
+        blob.blob()
+            .get_chunk_map()
+            .set_ready_and_clear_pending(second.as_ref())
+            .unwrap();
+        assert!(
+            !obj.verify_ready_chunks(&|| false, &mut |_| panic!("not a mismatch"))
+                .unwrap()
+        );
+        assert!(is_ready(&blob, 1));
         assert!(!obj.is_data_verified());
     }
 }

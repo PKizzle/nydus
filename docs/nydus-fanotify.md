@@ -60,32 +60,55 @@ fail-opens the events it dropped, so continuing would mean knowingly serving unf
 The kernel reads the cache file directly, so nothing checks its bytes on the way out; they are
 checked on the way in. A fanotify cache (`cache_type = "fanotify"`) validates every chunk it fills
 against its digest whatever `cache.validate` says, and a chunk that fails is never marked ready: the
-event is denied with `EIO` and the next read fetches again. The digests are the bootstrap's own,
-from its chunk table (`kernel_layout::chunk_digest_tables`), supplied by `FanotifyHandler` when it
-is built, so zran, tar-ref and zstd-ref blobs, whose blob meta carries no digests, are validated
-too. The digests are recorded next to the cache file (`<blob_id>.blob.data.digests`), so
-construction fails when the chunk table records one chunk twice differently, when a chunk's extent
-disagrees with the blob meta (checked again at every fill, as the meta may not be loaded yet), or
-when any bootstrap sharing the blob, now or in an earlier daemon,
-named another digest for a chunk. Chunks no bootstrap references are left out of fills, and a read
+event is denied with `EIO`, the failure is logged with the blob id (as an error once a blob has had
+more than three) and counted in the blob cache metric `digest_mismatches`, and the next read fetches
+again. Legacy stargz and external blobs carry no digests, so a fanotify cache refuses them. The
+digests are the bootstrap's own, from its chunk table (`kernel_layout::chunk_digest_tables`),
+supplied by `FanotifyHandler` when it is built, so zran, tar-ref and zstd-ref blobs, whose blob meta
+carries no digests, are validated too. Construction fails when the chunk table records one chunk
+twice differently or a chunk's extent disagrees with the blob meta (checked again at every fill, as
+the meta may not be loaded yet). Chunks no bootstrap references are left out of fills, and a read
 that needs one is denied.
 
+The digests are recorded next to the cache file (`<blob_id>.blob.data.digests`, checksummed; a
+corrupt file is discarded and re-derived). A recorded digest binds only chunks that are ready, since
+those were validated against it: a bootstrap, in this daemon or a later one, that names another
+digest for a ready chunk fails construction, while one for a chunk not yet cached replaces it.
+
 Chunks already marked ready when a cache file is opened were not necessarily validated (a cache
-filled by an older daemon or by a non-validating opener). A low-priority thread per handler checks
-each of them once while serving goes on; a chunk that fails is revoked like an invalidation of that
-one chunk (mark re-armed, ready bit cleared, bytes punched, under the blob's exclusive `io_lock`),
-so a blob whose mark was already dropped is guarded again before anything is discarded. Re-arming
-only works for a mount that opened the blob while it was marked: the kernel decides at open whether a
-file raises pre-content events at all. So `arm()` leaves a complete blob unmarked only once its cache
-is verified, the verifier drops the mark itself when it finishes, and over a mount the handler did not
-open (a takeover or an in-place heal) a failing chunk stops the check, leaving the blob unverified
-for the next daemon that mounts it. When every
-ready chunk has passed, the chunk map header records the file as verified, which
-`BlobObject::is_data_verified` reports; an opener that fills without validating clears it, and since the header also counts ready chunks, kept by every change this version makes, a fill by a release that predates the record leaves a mismatch that reads as unverified.
+filled by an older release or by a non-validating opener). A low-priority thread per handler checks
+each of them once while serving goes on. A chunk that fails is revoked: under the blob's exclusive
+`io_lock` the mark is re-armed, then the storage layer clears the ready bit and punches the bytes
+out while holding the chunk pending, so no fill of it can complete in between, and finally the
+mounted files that use the chunk are dropped from the page cache (`POSIX_FADV_DONTNEED`). That last
+step is needed: on Linux 7.2, a file-backed EROFS file keeps serving pages it read before its
+backing range was punched, and only `DONTNEED` on the mounted file, not on the device file, evicts
+them. Pages a process has mapped stay until it unmaps them. A ready chunk that no bootstrap of the
+daemon references is left alone, and the blob stays unverified.
+
+Re-arming only works for a mount that opened the blob while it was marked: the kernel decides at
+open whether a file raises pre-content events at all. So `arm()` leaves a complete blob unmarked
+only once its cache is verified, a blob is unmarked after filling only once verified too, and
+`mount()` records, per blob, the unique id of the mount that opened it marked
+(`<blob_id>.blob.data.marked-mount`). A successor that takes the mount over (restart takeover,
+in-place heal) can revoke exactly when the record names the live mount. Otherwise, as for a
+verified blob the mount opened unmarked whose cache file was changed on disk since, a failing chunk
+cannot be revoked without serving a hole: it is logged as an error with blob and chunk, counted in
+`unrevoked_chunks`, the check goes on to report the others, the blob stays unverified, and the bad
+bytes stay served until the image is mounted again. On-disk corruption of a verified, unmarked
+blob therefore needs a remount.
+
+When every ready chunk has passed, the chunk map header records the file as verified, which
+`BlobObject::is_data_verified` and `FanotifyHandler::is_blob_verified` report (one `fstat` and a few
+atomic loads). The record holds only while the header's count of ready chunks matches the bitmap
+and the cache file's change time and size match a stamp this version refreshes after each of its
+own writes, so a release that predates the record cannot fill, or invalidate and refill, the file
+without it reading as unverified. Openers that fill without validating clear it.
 
 `kernel_layout::check_kernel_layout` proves the other half: that for each regular file the kernel's
 chunk indexes (format, device id, block address, chunk size, device range) name exactly the chunks
-the fill path validates. `nydus-image check` runs it.
+the fill path validates. `nydus-image check` runs it; page cache sharing must run it at mount time,
+together with `is_blob_verified` for every device.
 
 Implementation: [`service/src/fanotify.rs`](../service/src/fanotify.rs) (`FanotifyHandler`) and the
 local FFI shim [`service/src/fanotify_sys.rs`](../service/src/fanotify_sys.rs) (the `nix` crate does
