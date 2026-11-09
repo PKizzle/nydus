@@ -1335,6 +1335,16 @@ impl BlobObject for FileCacheEntry {
             }
     }
 
+    fn is_served_data_verified(&self) -> bool {
+        self.bootstrap_digests.is_some()
+            && self.need_validation
+            && (self.is_data_verified()
+                || self
+                    .chunk_map
+                    .as_range_map()
+                    .is_some_and(|map| map.is_none_ready()))
+    }
+
     fn verify_ready_chunks(
         &self,
         stop: &dyn Fn() -> bool,

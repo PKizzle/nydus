@@ -84,6 +84,10 @@ impl RangeMap for IndexedChunkMap {
         self.map.is_verified(data_stamp)
     }
 
+    fn is_none_ready(&self) -> bool {
+        self.map.ready_chunks() == 0
+    }
+
     fn set_verified(&self, data_stamp: Option<u64>) -> StorageResult<()> {
         self.map.set_verified(data_stamp)
     }

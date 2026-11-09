@@ -1252,6 +1252,13 @@ pub trait BlobObject: AsRawFd {
         false
     }
 
+    /// Whether every byte the cache file serves is checked against its digest: the chunks
+    /// marked ready now are ([`Self::is_data_verified`], or there are none), and every fill from
+    /// here on is validated before it is marked ready.
+    fn is_served_data_verified(&self) -> bool {
+        false
+    }
+
     /// Check every chunk already marked ready against its digest, calling `on_mismatch` for each
     /// one that fails. `on_mismatch` returns whether it revoked the chunk (with
     /// [`Self::revoke_chunk`], after whatever has to happen first, such as re-arming a

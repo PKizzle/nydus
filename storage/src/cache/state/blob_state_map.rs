@@ -212,6 +212,10 @@ impl RangeMap for BlobStateMap<IndexedChunkMap, u32> {
         self.c.is_verified(data_stamp)
     }
 
+    fn is_none_ready(&self) -> bool {
+        self.c.is_none_ready()
+    }
+
     fn set_verified(&self, data_stamp: Option<u64>) -> StorageResult<()> {
         self.c.set_verified(data_stamp)
     }

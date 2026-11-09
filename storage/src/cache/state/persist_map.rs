@@ -386,7 +386,7 @@ impl PersistMap {
             .map_err(|e| StorageError::cache_io("reach the chunk map contents", e))
     }
 
-    fn ready_chunks(&self) -> u32 {
+    pub fn ready_chunks(&self) -> u32 {
         self.count - self.not_ready_count.load(Ordering::Acquire)
     }
 

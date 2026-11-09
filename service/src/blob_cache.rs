@@ -1311,6 +1311,45 @@ mod tests {
         assert!(is_ready(&blob, 0));
     }
 
+    /// A fresh cache serves only validated data from the start; one with ready chunks does once
+    /// they are verified, and stops when its file is written by anything but a validating fill.
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support copy_file_range")]
+    fn served_data_is_verified_from_a_fresh_cache_on() {
+        use std::os::unix::fs::FileExt;
+
+        let (blob, _tmp) = create_data_blob_with("fanotify");
+        let obj = blob.blob().get_blob_object().unwrap();
+        blob.blob().add_chunk_digests(&fixture_digests()).unwrap();
+        assert!(obj.is_served_data_verified());
+        assert!(!obj.is_data_verified());
+
+        let first = blob.blob().get_chunk_info(0).unwrap();
+        obj.fetch_range_uncompressed(0, first.uncompressed_size() as u64)
+            .unwrap();
+        assert!(
+            !obj.is_served_data_verified(),
+            "a ready chunk nobody checked yet"
+        );
+        assert!(
+            obj.verify_ready_chunks(&|| false, &mut |_| Ok(true))
+                .unwrap()
+        );
+        assert!(obj.is_served_data_verified());
+        let size = blob.blob_info().uncompressed_size();
+        obj.fetch_range_uncompressed(0, size).unwrap();
+        assert!(obj.is_served_data_verified(), "validated fills keep it");
+
+        // SAFETY: the descriptor is the blob object's open cache file, borrowed for the write.
+        let cache = std::mem::ManuallyDrop::new(unsafe {
+            <std::fs::File as std::os::fd::FromRawFd>::from_raw_fd(obj.as_raw_fd())
+        });
+        cache
+            .write_all_at(&[0], first.uncompressed_offset())
+            .unwrap();
+        assert!(!obj.is_served_data_verified());
+    }
+
     /// The one-time check of chunks already marked ready records a clean cache file as
     /// verified, and hands a corrupted chunk to its caller to revoke, after which the next fill
     /// restores it.
