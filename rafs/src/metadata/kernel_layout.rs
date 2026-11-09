@@ -355,6 +355,17 @@ pub fn check_node_view(rs: &RafsSuper, bootstrap: &Path) -> RafsResult<usize> {
     let file = File::open(bootstrap)?;
     let mut sb = RafsV6SuperBlock::new();
     file.read_exact_at(sb.as_mut(), EROFS_SUPER_OFFSET as u64)?;
+    // The kernel finds the prefix table where `xattr_prefix_start` points only with the plain
+    // prefix feature; it is set exactly when there is a table, which only fingerprints use.
+    let prefixes = sb.xattr_prefix_count() != 0;
+    if sb.has_plain_xattr_prefixes() != prefixes || sb.has_ishare_xattrs() != prefixes {
+        return mismatch(format!(
+            "xattr prefixes {}, plain prefix feature {}, fingerprint feature {}",
+            sb.xattr_prefix_count(),
+            sb.has_plain_xattr_prefixes(),
+            sb.has_ishare_xattrs()
+        ));
+    }
     if sb.has_ishare_xattrs() {
         let table = ishare_xattr_prefix_table();
         let mut stored = vec![0u8; table.len()];

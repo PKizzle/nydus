@@ -522,6 +522,12 @@ impl RafsV6SuperBlock {
         Ok(2 + u16::from_le_bytes(len) as u64)
     }
 
+    /// Whether the long xattr prefix table is stored plainly on the primary device, where the
+    /// superblock's `xattr_prefix_start` points.
+    pub fn has_plain_xattr_prefixes(&self) -> bool {
+        u32::from_le(self.s_feature_compat) & EROFS_FEATURE_COMPAT_PLAIN_XATTR_PFX != 0
+    }
+
     /// Number of long xattr prefixes the superblock declares.
     pub fn xattr_prefix_count(&self) -> u8 {
         self.s_reserved[SB_RESERVED_XATTR_PREFIX_COUNT]

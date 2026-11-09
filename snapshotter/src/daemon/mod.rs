@@ -3142,18 +3142,43 @@ fn view_timeout(size: u64) -> Duration {
     Duration::from_secs(30 + size / (1 << 20))
 }
 
-/// A node view built in a scratch dir of a stage dir and checked in this process. Dropping it
-/// removes it.
+/// A node view checked in this process, in a file of the stage dir only this process wrote.
+/// Dropping it removes it.
 struct BuiltView {
-    scratch: tempfile::TempDir,
+    file: tempfile::NamedTempFile,
     /// SHA-256 of the source it was built from.
     source_digest: String,
 }
 
 impl BuiltView {
     fn path(&self) -> PathBuf {
-        self.scratch.path().join("bootstrap")
+        self.file.path().to_path_buf()
     }
+}
+
+/// Copy the regular file `output` left by a subprocess into a file this process creates in
+/// `dir`. `output` is opened without following a symlink and must have no other link, so the
+/// copy holds what the subprocess wrote there, and nothing it may still hold open changes it.
+fn take_subprocess_output(output: &Path, dir: &Path) -> io::Result<tempfile::NamedTempFile> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+
+    let mut src = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(output)?;
+    let meta = src.metadata()?;
+    if !meta.is_file() || meta.nlink() != 1 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{} is not a regular file with one link", output.display()),
+        ));
+    }
+    let mut copy = tempfile::Builder::new()
+        .prefix("bootstrap.view.")
+        .tempfile_in(dir)?;
+    io::copy(&mut src, copy.as_file_mut())?;
+    copy.as_file().sync_all()?;
+    Ok(copy)
 }
 
 /// Classify a failure to read or check a view: an OS error says nothing about the image.
@@ -3181,17 +3206,22 @@ fn build_view(
         .prefix("view.")
         .tempdir_in(stage_dir)
         .with_context(|| format!("failed to create a scratch dir in {}", stage_dir.display()))?;
-    let view = BuiltView {
-        scratch,
-        source_digest,
-    };
-    let path = view.path();
+    let output = scratch.path().join("bootstrap");
     let viewer = crate::local_accel::LocalAccelConfig {
-        work_dir: view.scratch.path().to_path_buf(),
+        work_dir: scratch.path().to_path_buf(),
         ..viewer.clone()
     };
     let size = fs::metadata(src).map(|m| m.len()).unwrap_or(0);
-    crate::local_accel::node_view(&viewer, src, &path, view_timeout(size))?;
+    crate::local_accel::node_view(&viewer, src, &output, view_timeout(size))?;
+    // Everything below reads this process's own copy, never the subprocess's scratch dir.
+    let file = take_subprocess_output(&output, stage_dir)
+        .map_err(|e| view_error(e, "cannot take the node view"))?;
+    drop(scratch);
+    let view = BuiltView {
+        file,
+        source_digest,
+    };
+    let path = view.path();
 
     let config = Arc::new(nydus_api::ConfigV2::default());
     let (rs, _) = nydus_rafs::metadata::RafsSuper::load_from_file(&path, config, false)
@@ -3250,7 +3280,7 @@ fn stage_mount_source(
     match trial.map_or_else(|| build_view(viewer, src, stage_dir), Ok) {
         Ok(view) => {
             nydus_service::erofs_folio::pad_to_page_size(&view.path())?;
-            fs::rename(view.path(), &staged)?;
+            view.file.persist(&staged).map_err(|e| e.error)?;
             atomic_write(&record, view.source_digest.as_bytes())?;
             Ok(true)
         }
@@ -4502,6 +4532,26 @@ mod tests {
         let v5 = texture.join("rafs-v5.boot");
         let err = stage_mount_source(&viewer(&tool), &v5, &stage, true, None).unwrap_err();
         assert!(format!("{err:#}").contains("v5"), "{err:#}");
+    }
+
+    /// A subprocess's output is taken only as a regular file with one link, and copied.
+    #[test]
+    fn subprocess_output_is_copied_only_from_a_lone_regular_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let (out, own) = (dir.path().join("out"), dir.path().join("own"));
+        fs::create_dir(&own).unwrap();
+        fs::write(&out, b"view").unwrap();
+        let copy = take_subprocess_output(&out, &own).unwrap();
+        fs::write(&out, b"changed").unwrap();
+        assert_eq!(fs::read(copy.path()).unwrap(), b"view");
+
+        let link = dir.path().join("link");
+        fs::hard_link(&out, &link).unwrap();
+        assert!(take_subprocess_output(&out, &own).is_err(), "a second link");
+        fs::remove_file(&link).unwrap();
+        let symlink = dir.path().join("symlink");
+        std::os::unix::fs::symlink(&out, &symlink).unwrap();
+        assert!(take_subprocess_output(&symlink, &own).is_err(), "a symlink");
     }
 
     /// An unreadable view record is an error, never "staged from another source".

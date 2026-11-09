@@ -410,19 +410,28 @@ pub fn node_view(
     let stderr_path = config.work_dir.join("node-view.stderr");
     let stderr = std::fs::File::create(&stderr_path)
         .with_context(|| format!("failed to create {}", stderr_path.display()))?;
+    // Its own process group, so that whatever it leaves running is killed with it.
+    std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
     let mut child = cmd
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(stderr)
         .spawn()
         .context("failed to spawn nydus-image node-view")?;
+    let kill_group = |pid: u32| {
+        // SAFETY: kill(2) with a negative pid signals that process group, which is the child's
+        // own, so nothing else is signalled. ESRCH (all gone) is fine.
+        unsafe { libc::kill(-(pid as libc::pid_t), libc::SIGKILL) };
+    };
     let deadline = std::time::Instant::now() + timeout;
     let status = loop {
         if let Some(status) = child.try_wait().context("failed to wait for nydus-image")? {
+            // Nothing it started may outlive it and write its output after the caller's check.
+            kill_group(child.id());
             break status;
         }
         if std::time::Instant::now() >= deadline {
-            let _ = child.kill();
+            kill_group(child.id());
             let _ = child.wait();
             return Err(
                 anyhow::anyhow!("nydus-image node-view timed out after {timeout:?}").into(),

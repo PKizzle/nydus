@@ -373,6 +373,14 @@ mod tests {
         // A view whose stored fingerprint differs from its chunks fails the check a consumer
         // runs on a view it did not build itself.
         assert!(kernel_layout::check_node_view(&load(&view), &view).is_ok());
+        // Without the plain prefix feature the kernel does not find the prefix table.
+        let mut plain = std::fs::read(&view).unwrap();
+        let compat = EROFS_SUPER_OFFSET as usize + 8;
+        plain[compat] ^= 0x10;
+        let unplain = dir.path().join("unplain");
+        std::fs::write(&unplain, &plain).unwrap();
+        assert!(kernel_layout::check_node_view(&load(&unplain), &unplain).is_err());
+
         let mut tampered = std::fs::read(&view).unwrap();
         let at = tampered.windows(32).position(|w| w == stored[0]).unwrap();
         tampered[at..at + 32].copy_from_slice(&victim_fp);
