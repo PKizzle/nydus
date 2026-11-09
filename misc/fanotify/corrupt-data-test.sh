@@ -4,7 +4,10 @@
 #      returning the bad bytes, and once the backend is repaired the same read succeeds (the
 #      failed fill never marked the chunk ready);
 #   2. a cache file corrupted while no daemon ran: the next daemon's one-time check of the
-#      chunks already marked ready revokes the bad chunk, and the read fetches it again.
+#      chunks already marked ready revokes the bad chunk, and the read fetches it again;
+#   3. a successor that took over a mount revokes a corrupt cached chunk only when that mount
+#      opened the blob marked (the root-only nydus-service test, run from SERVICE_TEST_BIN, the
+#      `cargo test -p nydus-service --lib --no-run` binary, or through cargo when unset).
 # Requirements as for runtime-test.sh: Linux >= 6.14, root, ROOT on ext4 (not tmpfs).
 set -u
 
@@ -106,5 +109,18 @@ MNT_HELLO=$(sha256sum "$ROOT/mnt/hello.txt" | awk '{print $1}')
 echo "case 2: corrupted cached chunk revoked and fetched again"
 
 stop_daemon
+
+step "case 3: revoke after a takeover"
+mkdir -p "$ROOT/takeover"
+if [ -n "${SERVICE_TEST_BIN:-}" ]; then TEST=("$SERVICE_TEST_BIN"); else TEST=(cargo test -q -p nydus-service --lib --); fi
+OUT=$(NYDUS_FANOTIFY_TEST_DIR="$ROOT/takeover" "${TEST[@]}" \
+  fanotify::tests::takeover_revokes_a_corrupt_chunk_only_over_a_mount_that_opened_it_marked \
+  --exact --nocapture 2>&1)
+echo "$OUT" | tail -5
+# The test prints SKIP and passes when it cannot run; here it must run.
+echo "$OUT" | grep -q SKIP && fail "the takeover revoke test did not run"
+echo "$OUT" | grep -q "test result: ok. 1 passed" || fail "the takeover revoke test failed"
+echo "case 3: a successor revokes only over a mount that opened the blob marked"
+
 echo
 echo "==== FANOTIFY FILL VALIDATION: PASS ===="

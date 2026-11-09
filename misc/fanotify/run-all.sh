@@ -6,6 +6,8 @@
 #   NYDUS_IMAGE, NYDUSD    release builds
 #   SNAPSHOTTER_TEST_BIN   `cargo test -p nydus-snapshotter --lib --no-run` binary; unset runs
 #                          the snapshotter tests through cargo instead
+#   SERVICE_TEST_BIN       `cargo test -p nydus-service --lib --no-run` binary; unset runs the
+#                          service tests through cargo instead
 #   IMG                    ext4 image file to create (must not live on tmpfs in a small VM)
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd)
