@@ -297,6 +297,7 @@ mod tests {
             magic2: MAGIC2,
             all_ready: MAGIC_ALL_READY,
             verified: 0,
+            ready_count: 0,
             reserved: [0x0u8; HEADER_RESERVED_SIZE],
         };
 
@@ -345,6 +346,7 @@ mod tests {
             magic2: 0,
             all_ready: 0,
             verified: 0,
+            ready_count: 0,
             reserved: [0x0u8; HEADER_RESERVED_SIZE],
         };
 
@@ -476,5 +478,54 @@ mod tests {
                 .unwrap()
                 .is_verified()
         );
+    }
+
+    /// A release without fill validation sets ready bits but leaves the header's ready count
+    /// alone, so a verified map it filled no longer reads as verified.
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support file-backed mmap")]
+    fn test_verified_does_not_survive_a_fill_by_an_older_release() {
+        use std::os::unix::fs::FileExt;
+
+        let dir = TempDir::new().unwrap();
+        let blob_path = dir.path().join("blob-old-fill");
+        let blob_path = blob_path.as_os_str().to_str().unwrap().to_string();
+        let chunk = |index| MockChunkInfo {
+            index,
+            ..Default::default()
+        };
+        {
+            let map = IndexedChunkMap::new(&blob_path, 16, true).unwrap();
+            map.set_ready_and_clear_pending(chunk(0).as_base()).unwrap();
+            map.set_verified(true).unwrap();
+            // Fills by this version keep the record.
+            map.set_ready_and_clear_pending(chunk(1).as_base()).unwrap();
+            map.clear_ready(0).unwrap();
+            assert!(map.is_verified());
+        }
+        assert!(
+            IndexedChunkMap::new(&blob_path, 16, true)
+                .unwrap()
+                .is_verified()
+        );
+
+        // What an older release does on a fill: set the bit, nothing else.
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(format!("{blob_path}.chunk_map"))
+            .unwrap();
+        let mut byte = [0u8; 1];
+        file.read_exact_at(&mut byte, HEADER_SIZE as u64 + 1)
+            .unwrap();
+        file.write_all_at(&[byte[0] | 0x80], HEADER_SIZE as u64 + 1)
+            .unwrap();
+        drop(file);
+
+        let map = IndexedChunkMap::new(&blob_path, 16, true).unwrap();
+        assert!(map.is_ready(chunk(8).as_base()).unwrap());
+        assert!(!map.is_verified());
+        map.set_verified(true).unwrap();
+        assert!(map.is_verified());
     }
 }

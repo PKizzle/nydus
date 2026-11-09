@@ -20,7 +20,7 @@ pub(crate) const MAGIC_ALL_READY: u32 = 0x4D4D_4150;
 /// `Header::verified` value: every chunk marked ready has been checked against its digest.
 pub(crate) const MAGIC_VERIFIED: u32 = 0x5644_4150;
 pub(crate) const HEADER_SIZE: usize = 4096;
-pub(crate) const HEADER_RESERVED_SIZE: usize = HEADER_SIZE - 20;
+pub(crate) const HEADER_RESERVED_SIZE: usize = HEADER_SIZE - 24;
 
 /// The blob chunk map file header, 4096 bytes.
 #[repr(C)]
@@ -33,10 +33,15 @@ pub(crate) struct Header {
     /// [MAGIC_VERIFIED] once every ready chunk has been checked against its digest. Openers that
     /// fill without validating clear it. Zero in maps written before the field existed.
     pub verified: u32,
+    /// The number of ready chunks, kept by every ready-bit change this version makes.
+    /// `verified` holds only while it matches the bitmap: a release that predates the field
+    /// leaves it alone while it fills chunks without validating them, which the mismatch then
+    /// reveals.
+    pub ready_count: u32,
     pub reserved: [u8; HEADER_RESERVED_SIZE],
 }
 
-// SAFETY: `Header` is `#[repr(C)]` with four `u32`s followed by a byte array, so it has no padding,
+// SAFETY: `Header` is `#[repr(C)]` with six `u32`s followed by a byte array, so it has no padding,
 // no interior mutability, and every bit pattern is valid.
 unsafe impl FromMapped for Header {}
 
@@ -246,6 +251,7 @@ impl PersistMap {
             magic2: MAGIC2,
             all_ready: 0,
             verified: 0,
+            ready_count: 0,
             reserved: [0x0u8; HEADER_RESERVED_SIZE],
         };
 
@@ -326,6 +332,9 @@ impl PersistMap {
             }
 
             if self.write_u8(index, current) {
+                if let Ok(w) = self.ready_count_word() {
+                    w.fetch_add(1, Ordering::AcqRel);
+                }
                 // Flush the map once its last chunk is ready.
                 if self.not_ready_count.fetch_sub(1, Ordering::AcqRel) == 1
                     && let Err(e) = self.filemap.sync_data()
@@ -350,9 +359,11 @@ impl PersistMap {
             .map_err(|e| StorageError::cache_io("reach the chunk map contents", e))?;
         let mask = Self::index_to_mask(index);
         // A count of zero claims every chunk ready whatever the bitmap says, so it must move too.
-        if byte.fetch_and(!mask, Ordering::AcqRel) & mask != 0
-            || self.not_ready_count.load(Ordering::Acquire) == 0
-        {
+        let was_ready = byte.fetch_and(!mask, Ordering::AcqRel) & mask != 0;
+        if was_ready {
+            self.ready_count_word()?.fetch_sub(1, Ordering::AcqRel);
+        }
+        if was_ready || self.not_ready_count.load(Ordering::Acquire) == 0 {
             self.not_ready_count.fetch_add(1, Ordering::AcqRel);
         }
         self.filemap
@@ -365,15 +376,39 @@ impl PersistMap {
             .map_err(|e| StorageError::cache_io("reach the chunk map contents", e))
     }
 
-    /// Whether the header records every ready chunk as checked against its digest.
+    fn ready_count_word(&self) -> StorageResult<&AtomicU32> {
+        atomic_header_word(&self.filemap, std::mem::offset_of!(Header, ready_count))
+            .map_err(|e| StorageError::cache_io("reach the chunk map contents", e))
+    }
+
+    fn ready_chunks(&self) -> u32 {
+        self.count - self.not_ready_count.load(Ordering::Acquire)
+    }
+
+    /// Whether the header records every ready chunk as checked against its digest, and no ready
+    /// bit has changed since but through this version, which validates every chunk it fills.
     pub fn is_verified(&self) -> bool {
         self.verified_word()
             .is_ok_and(|w| w.load(Ordering::Acquire) == MAGIC_VERIFIED)
+            && self
+                .ready_count_word()
+                .is_ok_and(|w| w.load(Ordering::Acquire) == self.ready_chunks())
     }
 
     /// Record whether every ready chunk has been checked against its digest, persisted before
-    /// returning.
+    /// returning. A fill racing with this can leave the count off by one, which reads as not
+    /// verified: the safe direction.
     pub fn set_verified(&self, verified: bool) -> StorageResult<()> {
+        if verified {
+            let word = self.ready_count_word()?;
+            loop {
+                let ready = self.ready_chunks();
+                word.store(ready, Ordering::Release);
+                if self.ready_chunks() == ready {
+                    break;
+                }
+            }
+        }
         let value = if verified { MAGIC_VERIFIED } else { 0 };
         if self.verified_word()?.swap(value, Ordering::AcqRel) != value {
             self.filemap
@@ -417,6 +452,7 @@ impl PersistMap {
             byte.store(0, Ordering::Release);
         }
         self.not_ready_count.store(self.count, Ordering::Release);
+        self.ready_count_word()?.store(0, Ordering::Release);
 
         // Persist before returning: if the process dies between the punch and a later flush,
         // a stale on-disk bitmap would claim the discarded chunks are present.

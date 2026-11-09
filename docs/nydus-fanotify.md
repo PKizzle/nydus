@@ -81,7 +81,7 @@ is verified, the verifier drops the mark itself when it finishes, and over a mou
 open (a takeover or an in-place heal) a failing chunk stops the check, leaving the blob unverified
 for the next daemon that mounts it. When every
 ready chunk has passed, the chunk map header records the file as verified, which
-`BlobObject::is_data_verified` reports; an opener that fills without validating clears it.
+`BlobObject::is_data_verified` reports; an opener that fills without validating clears it, and since the header also counts ready chunks, kept by every change this version makes, a fill by a release that predates the record leaves a mismatch that reads as unverified.
 
 `kernel_layout::check_kernel_layout` proves the other half: that for each regular file the kernel's
 chunk indexes (format, device id, block address, chunk size, device range) name exactly the chunks
