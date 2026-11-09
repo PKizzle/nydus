@@ -4,16 +4,43 @@
 
 #![allow(unused)]
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use r2d2::{Pool, PooledConnection};
-use r2d2_sqlite::SqliteConnectionManager;
+use r2d2::{ManageConnection, Pool, PooledConnection};
 use rusqlite::{Connection, DropBehavior, OpenFlags, OptionalExtension, Transaction};
 
 use super::{CasError, Result};
 
+/// Opens connections to the CAS database file for the pool, in WAL mode.
+#[derive(Debug)]
+struct CasDbManager {
+    path: PathBuf,
+}
+
+impl ManageConnection for CasDbManager {
+    type Connection = Connection;
+    type Error = rusqlite::Error;
+
+    fn connect(&self) -> rusqlite::Result<Connection> {
+        let conn = Connection::open_with_flags(
+            &self.path,
+            OpenFlags::SQLITE_OPEN_CREATE | OpenFlags::SQLITE_OPEN_READ_WRITE,
+        )?;
+        conn.execute_batch("PRAGMA journal_mode = WAL")?;
+        Ok(conn)
+    }
+
+    fn is_valid(&self, conn: &mut Connection) -> rusqlite::Result<()> {
+        conn.execute_batch("")
+    }
+
+    fn has_broken(&self, _conn: &mut Connection) -> bool {
+        false
+    }
+}
+
 pub struct CasDb {
-    pool: Pool<SqliteConnectionManager>,
+    pool: Pool<CasDbManager>,
 }
 
 impl CasDb {
@@ -24,9 +51,9 @@ impl CasDb {
     }
 
     pub fn from_file(db_path: impl AsRef<Path>) -> Result<CasDb> {
-        let mgr = SqliteConnectionManager::file(db_path)
-            .with_flags(OpenFlags::SQLITE_OPEN_CREATE | OpenFlags::SQLITE_OPEN_READ_WRITE)
-            .with_init(|c| c.execute_batch("PRAGMA journal_mode = WAL"));
+        let mgr = CasDbManager {
+            path: db_path.as_ref().to_owned(),
+        };
         let pool = r2d2::Pool::builder().max_size(10).build(mgr)?;
         let conn = pool.get()?;
 
@@ -215,16 +242,14 @@ impl CasDb {
         Ok(())
     }
 
-    fn begin_transaction(
-        conn: &mut PooledConnection<SqliteConnectionManager>,
-    ) -> Result<Transaction<'_>> {
+    fn begin_transaction(conn: &mut PooledConnection<CasDbManager>) -> Result<Transaction<'_>> {
         let mut tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         tx.set_drop_behavior(DropBehavior::Rollback);
         Ok(tx)
     }
 
-    fn get_connection(&self) -> Result<PooledConnection<SqliteConnectionManager>> {
-        let conn = self.pool.get()?;
+    fn get_connection(&self) -> Result<PooledConnection<CasDbManager>> {
+        let mut conn = self.pool.get()?;
         conn.busy_handler(Some(|_v| true))?;
         Ok(conn)
     }
