@@ -1287,10 +1287,7 @@ mod tests {
         wrong[0].as_mut().unwrap().digest.data[0] ^= 1;
         blob.blob().add_chunk_digests(&wrong).unwrap();
         let err = obj.fetch_range_uncompressed(0, len).unwrap_err();
-        assert!(
-            matches!(err, nydus_storage::StorageError::InvalidData(_)),
-            "{err}"
-        );
+        assert!(format!("{err:?}").contains("digest value"), "{err:?}");
         assert!(!is_ready(&blob, 0));
 
         // A second bootstrap that disagrees about a chunk's digest is refused.
@@ -1298,7 +1295,8 @@ mod tests {
 
         let (blob, _tmp) = create_data_blob_with("fanotify");
         let obj = blob.blob().get_blob_object().unwrap();
-        // So is one whose chunk extent disagrees with the blob meta.
+        // So is one whose chunk extent disagrees with the blob meta, once that is loaded.
+        blob.blob().get_blob_meta_info().unwrap().unwrap();
         let mut moved = digests.clone();
         moved[0].as_mut().unwrap().uncompressed_offset += 1;
         assert!(blob.blob().add_chunk_digests(&moved).is_err());

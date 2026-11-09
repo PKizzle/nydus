@@ -91,6 +91,9 @@ CACHE="$ROOT/stage/$BLOB.blob.data"
 COFF=$(grep -abo "$MARK" "$CACHE" | head -1 | cut -d: -f1)
 [ -n "$COFF" ] || fail "marker not found in the cache file"
 flip "$CACHE" $((COFF + 4))
+# As left by a daemon that did not validate: without the digest record, the next daemon cannot
+# trust its ready chunks and checks them all.
+rm "$CACHE.digests"
 start_daemon
 for _ in $(seq 100); do
   grep -q "checked every cached chunk of blob $BLOB against its digest" "$LOG" && break

@@ -65,7 +65,8 @@ from its chunk table (`kernel_layout::chunk_digest_tables`), supplied by `Fanoti
 is built, so zran, tar-ref and zstd-ref blobs, whose blob meta carries no digests, are validated
 too. The digests are recorded next to the cache file (`<blob_id>.blob.data.digests`), so
 construction fails when the chunk table records one chunk twice differently, when a chunk's extent
-disagrees with the blob meta, or when any bootstrap sharing the blob, now or in an earlier daemon,
+disagrees with the blob meta (checked again at every fill, as the meta may not be loaded yet), or
+when any bootstrap sharing the blob, now or in an earlier daemon,
 named another digest for a chunk. Chunks no bootstrap references are left out of fills, and a read
 that needs one is denied.
 
