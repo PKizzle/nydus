@@ -95,24 +95,48 @@ On a node whose active driver is fanotify, the snapshotter serves both node-loca
 sidecars (localfs backend over containerd's content store) and nydus images pulled from a
 registry or object store (the configured pull backend, with the same credentials, mirrors and
 timeouts the FUSE path uses) through fanotify. A pulled image is checked first
-(`kernel_mount_unfit`, `snapshotter/src/daemon/mod.rs`), at every start and every rebuild of its
-daemon, and takes FUSE instead when any of these holds:
+(`serving_driver` and `kernel_mount_unfit`, `snapshotter/src/daemon/mod.rs`) at every start of
+its daemon, including restarts, recoveries, rebuilds and upgrades, and takes FUSE instead when
+any of these holds:
 
-- a `containerd.io/snapshot/nydus-fs-driver` label asks for another driver;
+- a `containerd.io/snapshot/nydus-fs-driver` label asks for another driver. The label is kept in
+  the daemon record, so a restarted daemon keeps the driver `Prepare` gave it;
 - its bootstrap is RAFS v5, which EROFS cannot mount;
 - its EROFS block size exceeds the host page size;
+- it has data blobs but no EROFS device table;
 - its chunk layout is not kernel-consistent: a chunk whose `blkaddr * block_size` differs from its
   uncompressed offset, or that runs past its device slot (`RafsSuper::check_v6_block_addrs`, the
   check `nydus-image check` runs). The kernel follows only the block address while FUSE reads the
   chunk table, so such an image would be misread silently; 16K/64K-block images built before chunk
-  starts were padded to the block size have this layout.
+  starts were padded to the block size have this layout;
+- the snapshotter's `daemons` dir, which holds the fanotify caches, is on a filesystem without
+  pre-content marks (probed once, on the first such start; the driver probe tests only the cache
+  `work_dir`).
 
-The reason is logged at `info`. A failed check is not an error: the image is served over FUSE.
+The reason is logged at `info` (at `warn` when a label asked for fanotify). A bootstrap that
+cannot be read or loaded is not a reason: the start fails and is retried, since FUSE could not
+serve it either.
+
+A live fanotify mount at the image's mountpoint (its source is the staged bootstrap) always stays
+on fanotify, whatever the label or check says: overlays may already sit on it, and FUSE stacked on
+top would leave them reading unfilled holes. If fanotify cannot start there, the start fails and
+the mount is detached. The FUSE path refuses to mount over any kernel mount.
+
+The cache of a fanotify daemon lives in its `daemons/<slug>/stage` dir, next to the staged
+bootstrap. Cache GC and the cache-bytes metric count it (each inode once: the `blob_<i>` device
+files are hardlinks to the `.blob.data` files) against `gc_max_bytes`, but never evict it; a dead
+daemon's dir goes with the stale daemon-dir sweep.
 
 A fanotify daemon's saved upgrade state carries its blob list without credentials. A takeover after
-a restart and an in-place heal both rebuild the blob list, resolving the registry credentials
-again, so a registry-backed daemon keeps fetching after either. These images get no page cache
-sharing domain: only bootstraps this node built qualify.
+a restart and an in-place heal both rebuild the blob list with the credentials the runtime auth
+store holds at that moment. When a daemon that fetched with credentials finds none (an expired
+entry, or a store not yet repopulated after a restart), a warning names the image, and reads of
+uncached data fail with `EIO` until the daemon is started again with credentials. These images get
+no page cache sharing domain: only bootstraps this node built qualify.
+
+The fanotify path has no RAFS instance, so `[snapshotter.features] prefetch`, runtime prefetch
+lists and `cache.disable_indexed` apply only to images served over FUSE; a fanotify daemon fetches
+on demand only.
 
 ## Block size and host page size
 
