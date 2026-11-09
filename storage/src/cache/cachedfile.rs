@@ -289,6 +289,24 @@ pub(crate) struct FileCacheEntry {
     pub(crate) prefetch_config: Arc<AsyncPrefetchConfig>,
 }
 
+/// Whether chunk `index` of `count`, as `get` returns them, starts after the previous chunk ends
+/// and ends before the next one starts: then it is the only chunk covering its bytes.
+fn chunk_is_alone(
+    count: usize,
+    get: impl Fn(usize) -> Arc<dyn BlobChunkInfo>,
+    index: usize,
+) -> bool {
+    let disjoint = |a: &dyn BlobChunkInfo, b: &dyn BlobChunkInfo| {
+        a.uncompressed_end() <= b.uncompressed_offset()
+            && a.uncompressed_offset() < b.uncompressed_offset()
+    };
+    let chunk = get(index);
+    index
+        .checked_sub(1)
+        .is_none_or(|i| disjoint(get(i).as_ref(), chunk.as_ref()))
+        && (index + 1 >= count || disjoint(chunk.as_ref(), get(index + 1).as_ref()))
+}
+
 /// Deallocate `[offset, offset + len)` of `file`, keeping its size.
 #[cfg(target_os = "linux")]
 fn punch_hole(file: &File, offset: u64, len: u64) -> std::io::Result<()> {
@@ -475,6 +493,32 @@ impl FileCacheEntry {
             .wrapping_mul(1_000_000_000)
             .wrapping_add(md.ctime_nsec() as u64);
         Ok(ctime ^ md.len().rotate_left(32))
+    }
+
+    /// Fail unless `chunk` and its neighbours in the blob meta cover disjoint, increasing
+    /// uncompressed ranges.
+    fn check_chunk_alone(
+        &self,
+        meta: &BlobCompressionContextInfo,
+        chunk: &dyn BlobChunkInfo,
+    ) -> StorageResult<()> {
+        let index = chunk.id() as usize;
+        if chunk_is_alone(meta.get_chunk_count(), |i| meta.get_chunk_info(i), index) {
+            Ok(())
+        } else {
+            Err(StorageError::InvalidData(format!(
+                "blob {} chunk {index} overlaps a neighbour in the blob meta",
+                self.blob_id
+            )))
+        }
+    }
+
+    /// Fail unless every chunk of the blob meta passes [`Self::check_chunk_alone`].
+    fn check_chunk_order(&self, meta: &BlobCompressionContextInfo) -> StorageResult<()> {
+        for index in 0..meta.get_chunk_count() {
+            self.check_chunk_alone(meta, meta.get_chunk_info(index).as_ref())?;
+        }
+        Ok(())
     }
 
     /// Record the data file's stamp after this cache wrote it. Best effort: a stale stamp only
@@ -980,14 +1024,15 @@ impl BlobCache for FileCacheEntry {
             .meta
             .as_ref()
             .and_then(|m| m.meta.lock().unwrap().clone());
-        if let Some(meta) = &loaded
-            && meta.get_chunk_count() != count
-        {
-            return Err(StorageError::InvalidData(format!(
-                "blob {}: blob table names {count} chunks, the blob meta {}",
-                self.blob_id,
-                meta.get_chunk_count()
-            )));
+        if let Some(meta) = &loaded {
+            if meta.get_chunk_count() != count {
+                return Err(StorageError::InvalidData(format!(
+                    "blob {}: blob table names {count} chunks, the blob meta {}",
+                    self.blob_id,
+                    meta.get_chunk_count()
+                )));
+            }
+            self.check_chunk_order(meta)?;
         }
         for (index, entry) in digests.iter().enumerate() {
             let Some(meta) = &loaded else { break };
@@ -1485,9 +1530,17 @@ impl BlobObject for FileCacheEntry {
             .get_blob_meta()
             .ok_or_else(|| StorageError::InvalidState("blob meta is not loaded".to_string()))?;
         let mut chunks = meta.get_chunks_uncompressed(offset, size, self.user_io_batch_size())?;
+        let end = offset + size;
+        // The kernel reads by offset and the fill validates by chunk: each chunk filled must be
+        // the only one covering its bytes, or a file using another chunk over the same bytes
+        // would be served data validated against a digest it does not name.
+        if self.bootstrap_digests.is_some() {
+            for c in &chunks {
+                self.check_chunk_alone(&meta, c.as_ref())?;
+            }
+        }
         // A requested chunk without a digest could never be filled, and allowing the read would
         // serve its hole; only the chunks a batch adds around the request may be skipped.
-        let end = offset + size;
         if let Some(c) = chunks.iter().find(|c| {
             c.uncompressed_offset() < end
                 && c.uncompressed_end() > offset
@@ -2552,6 +2605,40 @@ mod tests {
         }));
         assert!(unwound.is_err());
         assert_eq!(*cleared.0.lock().unwrap(), vec![11]);
+    }
+
+    /// A chunk overlapping or sharing a start with a neighbour is not the only one covering its
+    /// bytes.
+    #[test]
+    fn chunks_must_cover_disjoint_increasing_ranges() {
+        let chunks = |extents: &[(u64, u32)]| -> Vec<Arc<dyn BlobChunkInfo>> {
+            extents
+                .iter()
+                .enumerate()
+                .map(|(i, &(offset, size))| {
+                    Arc::new(MockChunkInfo {
+                        index: i as u32,
+                        uncompress_offset: offset,
+                        uncompress_size: size,
+                        ..Default::default()
+                    }) as Arc<dyn BlobChunkInfo>
+                })
+                .collect()
+        };
+        let alone = |c: &[Arc<dyn BlobChunkInfo>]| {
+            (0..c.len())
+                .map(|i| chunk_is_alone(c.len(), |j| c[j].clone(), i))
+                .collect::<Vec<_>>()
+        };
+        // Padding between chunks is fine.
+        let ok = chunks(&[(0, 0x1000), (0x2000, 0x800), (0x3000, 0x1000)]);
+        assert_eq!(alone(&ok), vec![true, true, true]);
+        let same_start = chunks(&[(0, 0x1000), (0x1000, 0x1000), (0x1000, 0x1000)]);
+        assert_eq!(alone(&same_start), vec![true, false, false]);
+        let overlap = chunks(&[(0, 0x1800), (0x1000, 0x1000), (0x3000, 0x1000)]);
+        assert_eq!(alone(&overlap), vec![false, false, true]);
+        let backwards = chunks(&[(0x2000, 0x1000), (0, 0x1000)]);
+        assert_eq!(alone(&backwards), vec![false, false]);
     }
 
     /// Digests recorded once bind every later bootstrap, across reopening the cache too.

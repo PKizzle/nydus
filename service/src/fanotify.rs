@@ -25,7 +25,7 @@
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{ErrorKind, Result};
-use std::os::unix::fs::{FileExt, OpenOptionsExt};
+use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt};
 use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -1083,6 +1083,14 @@ impl FanotifyHandler {
                     ))
                 })?;
             let device_path = cache_path.with_file_name(format!("blob_{i}"));
+            // Already this cache file: re-linking would only change the inode's ctime, which
+            // would make its verified record stale on every start.
+            if std::fs::metadata(&device_path)
+                .is_ok_and(|m| (m.dev(), m.ino()) == (backing.dev, backing.ino))
+            {
+                device_blobs.push(device_path);
+                continue;
+            }
             // Re-link defensively so a stale `blob_<i>` from a previous run cannot point at the
             // wrong inode. Removing the name is safe on both construction paths: on `new()` nothing
             // is mounted yet, and on `from_restored_fd()` (EROFS mount still live) the kernel holds
@@ -2662,6 +2670,125 @@ mod tests {
         out
     }
 
+    const FIXTURE_BLOB: &str = "be7d77eeb719f70884758d1aa800ed0fb09d701aaec469964e9d54325f0d5fef";
+
+    /// A work dir under `NYDUS_FANOTIFY_TEST_DIR` with the fixture blob as the backend, the
+    /// fixture bootstrap staged in `stage/`, and a blob cache manager over a fanotify cache there;
+    /// `None`, after printing SKIP, without that directory or fanotify pre-content support.
+    fn fanotify_fixture(id: &str) -> Option<(tempfile::TempDir, Arc<super::BlobCacheMgr>)> {
+        use super::*;
+
+        let Some(base) = std::env::var_os("NYDUS_FANOTIFY_TEST_DIR") else {
+            eprintln!("SKIP: set NYDUS_FANOTIFY_TEST_DIR to an ext4 directory and run as root");
+            return None;
+        };
+        let root = std::env::var("CARGO_MANIFEST_DIR").unwrap();
+        let work = tempfile::TempDir::new_in(base).unwrap();
+        let stage = work.path().join("stage");
+        std::fs::create_dir_all(&stage).unwrap();
+        std::fs::copy(
+            format!("{root}/../tests/texture/blobs/{FIXTURE_BLOB}"),
+            work.path().join(FIXTURE_BLOB),
+        )
+        .unwrap();
+        stage_bootstrap(&stage, |_, slot| {
+            slot.set_blob_id(FIXTURE_BLOB.as_bytes().try_into().unwrap())
+        });
+        let config = r#"{
+            "type": "bootstrap", "id": "rafs-v6", "domain_id": "d",
+            "config_v2": {
+                "version": 2, "id": "ID",
+                "backend": { "type": "localfs", "localfs": { "dir": "WORK" } },
+                "cache": { "type": "fanotify", "fanotify": { "work_dir": "STAGE" },
+                           "filecache": { "work_dir": "STAGE" } },
+                "metadata_path": "STAGE/bootstrap"
+            }
+        }"#
+        .replace("ID", id)
+        .replace("WORK", work.path().to_str().unwrap())
+        .replace("STAGE", stage.to_str().unwrap());
+        let mut entry: nydus_api::config::BlobCacheEntry = serde_json::from_str(&config).unwrap();
+        assert!(entry.prepare_configuration_info());
+        let mgr = Arc::new(BlobCacheMgr::new());
+        mgr.add_blob_entry(&entry).unwrap();
+        // SAFETY: `fanotify_init` only takes integer flags; the result is checked and closed.
+        let probe = unsafe { libc::fanotify_init(FAN_CLASS_PRE_CONTENT, 0) };
+        if probe < 0 {
+            eprintln!("SKIP: no fanotify pre-content support here");
+            return None;
+        }
+        // SAFETY: `probe` is the descriptor just created and owned by nothing else.
+        unsafe { libc::close(probe) };
+        Some((work, mgr))
+    }
+
+    /// Run one worker thread for `handler`, for `stop_workers` to join.
+    fn spawn_worker(handler: &Arc<super::FanotifyHandler>) {
+        let h = handler.clone();
+        handler.add_workers([std::thread::spawn(move || {
+            let _ = h.run_loop();
+        })]);
+    }
+
+    /// Unmount `mnt`, lazily.
+    fn umount(mnt: &std::path::Path) {
+        let mnt = std::ffi::CString::new(mnt.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: `umount2` takes a NUL-terminated path that outlives the call.
+        unsafe { libc::umount2(mnt.as_ptr(), libc::MNT_DETACH) };
+    }
+
+    /// A verified cache stays verified when its handler is rebuilt over the same work dir with
+    /// no data changed, so the next daemon neither re-checks it nor keeps it from sharing.
+    #[test]
+    fn a_verified_cache_stays_verified_across_handlers() {
+        use super::*;
+
+        let Some((work, mgr)) = fanotify_fixture("verified-across-handlers") else {
+            return;
+        };
+        let (stage, mnt) = (work.path().join("stage"), work.path().join("mnt"));
+        let (stage_s, mnt_s) = (stage.to_str().unwrap(), mnt.to_str().unwrap());
+        let first = Arc::new(FanotifyHandler::new(stage_s, mnt_s, mgr.clone(), 1).unwrap());
+        spawn_worker(&first);
+        first.arm().unwrap();
+        first.mount().unwrap();
+        let good = read_all_cold(&mnt);
+        first.spawn_verifier().unwrap().join().unwrap();
+        assert!(first.is_blob_verified(FIXTURE_BLOB));
+        let cache = first.blob_backings[0].cache_path.clone();
+        let ctime = |p: &Path| {
+            let m = std::fs::metadata(p).unwrap();
+            (m.ctime(), m.ctime_nsec())
+        };
+        let before = ctime(&cache);
+        first.stop();
+        umount(&mnt);
+        drop(first);
+        // As in a new daemon: the next handler opens the cache afresh.
+        nydus_storage::factory::BLOB_FACTORY.forget("verified-across-handlers");
+
+        let second = Arc::new(FanotifyHandler::new(stage_s, mnt_s, mgr.clone(), 1).unwrap());
+        assert_eq!(
+            ctime(&cache),
+            before,
+            "building a handler leaves the cache file alone"
+        );
+        assert!(second.is_blob_verified(FIXTURE_BLOB));
+        spawn_worker(&second);
+        second.arm().unwrap();
+        second.mount().unwrap();
+        assert!(!second.blob_backings[0].armed.load(Ordering::Acquire));
+        second.spawn_verifier().unwrap().join().unwrap();
+        assert_eq!(
+            ctime(&cache),
+            before,
+            "the verifier found nothing to re-check"
+        );
+        assert_eq!(read_all_cold(&mnt), good);
+        second.stop();
+        umount(&mnt);
+    }
+
     /// A successor that takes over a live mount which opened the blob marked revokes a cached
     /// chunk found corrupt, and readers of the mount get the right bytes again; over a mount
     /// that opened it unmarked the chunk is reported and left, and the blob stays unverified.
@@ -2673,55 +2800,13 @@ mod tests {
         use super::*;
         use std::os::unix::fs::FileExt;
 
-        const BLOB: &str = "be7d77eeb719f70884758d1aa800ed0fb09d701aaec469964e9d54325f0d5fef";
-        let Some(base) = std::env::var_os("NYDUS_FANOTIFY_TEST_DIR") else {
-            eprintln!("SKIP: set NYDUS_FANOTIFY_TEST_DIR to an ext4 directory and run as root");
+        let Some((work, mgr)) = fanotify_fixture("takeover-revoke") else {
             return;
         };
-        let root = std::env::var("CARGO_MANIFEST_DIR").unwrap();
-        let work = tempfile::TempDir::new_in(base).unwrap();
         let (stage, mnt) = (work.path().join("stage"), work.path().join("mnt"));
-        std::fs::create_dir_all(&stage).unwrap();
-        std::fs::copy(
-            format!("{root}/../tests/texture/blobs/{BLOB}"),
-            work.path().join(BLOB),
-        )
-        .unwrap();
-        stage_bootstrap(&stage, |_, slot| {
-            slot.set_blob_id(BLOB.as_bytes().try_into().unwrap())
-        });
-        let config = r#"{
-            "type": "bootstrap", "id": "rafs-v6", "domain_id": "d",
-            "config_v2": {
-                "version": 2, "id": "takeover-revoke",
-                "backend": { "type": "localfs", "localfs": { "dir": "WORK" } },
-                "cache": { "type": "fanotify", "fanotify": { "work_dir": "STAGE" },
-                           "filecache": { "work_dir": "STAGE" } },
-                "metadata_path": "STAGE/bootstrap"
-            }
-        }"#
-        .replace("WORK", work.path().to_str().unwrap())
-        .replace("STAGE", stage.to_str().unwrap());
-        let mut entry: nydus_api::config::BlobCacheEntry = serde_json::from_str(&config).unwrap();
-        assert!(entry.prepare_configuration_info());
-        let mgr = Arc::new(BlobCacheMgr::new());
-        mgr.add_blob_entry(&entry).unwrap();
-        let spawn = |h: &Arc<FanotifyHandler>| {
-            let h2 = h.clone();
-            h.add_workers([std::thread::spawn(move || {
-                let _ = h2.run_loop();
-            })]);
-        };
         let (stage_s, mnt_s) = (stage.to_str().unwrap(), mnt.to_str().unwrap());
-
-        let first = match FanotifyHandler::new(stage_s, mnt_s, mgr.clone(), 1) {
-            Ok(h) => Arc::new(h),
-            Err(e) => {
-                eprintln!("SKIP: no fanotify pre-content support here: {e}");
-                return;
-            }
-        };
-        spawn(&first);
+        let first = Arc::new(FanotifyHandler::new(stage_s, mnt_s, mgr.clone(), 1).unwrap());
+        spawn_worker(&first);
         first.arm().unwrap();
         first.mount().unwrap();
         let good = read_all_cold(&mnt);
@@ -2750,10 +2835,10 @@ mod tests {
         let second = Arc::new(
             FanotifyHandler::from_restored_fd(stage_s, mnt_s, mgr.clone(), 1, group).unwrap(),
         );
-        spawn(&second);
+        spawn_worker(&second);
         assert!(second.can_revoke(&second.blob_backings[0]));
         second.spawn_verifier().unwrap().join().unwrap();
-        assert!(second.is_blob_verified(BLOB));
+        assert!(second.is_blob_verified(FIXTURE_BLOB));
         assert_eq!(
             read_all_cold(&mnt),
             good,
@@ -2765,16 +2850,14 @@ mod tests {
         assert!(!second.can_revoke(&second.blob_backings[0]));
         corrupt();
         second.spawn_verifier().unwrap().join().unwrap();
-        assert!(!second.is_blob_verified(BLOB));
+        assert!(!second.is_blob_verified(FIXTURE_BLOB));
         assert!(
             obj.is_all_data_ready(),
             "an unrevocable chunk stays in place"
         );
 
         second.stop();
-        let mnt_c = std::ffi::CString::new(mnt_s).unwrap();
-        // SAFETY: `umount2` takes a NUL-terminated path that outlives the call.
-        unsafe { libc::umount2(mnt_c.as_ptr(), libc::MNT_DETACH) };
+        umount(&mnt);
     }
 
     #[test]
