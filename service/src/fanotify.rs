@@ -25,7 +25,7 @@
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{ErrorKind, Result};
-use std::os::unix::fs::FileExt;
+use std::os::unix::fs::{FileExt, OpenOptionsExt};
 use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -1326,7 +1326,15 @@ impl FanotifyHandler {
             if inode.is_dir() {
                 for idx in 0..inode.get_child_count() {
                     let child = inode.get_child_by_index(idx)?;
-                    pending.push((path.join(child.name()), child));
+                    // The bootstrap is untrusted: a name must stay one component under the mount.
+                    let name = child.name();
+                    if !matches!(
+                        Path::new(&name).components().collect::<Vec<_>>().as_slice(),
+                        [std::path::Component::Normal(_)]
+                    ) {
+                        continue;
+                    }
+                    pending.push((path.join(name), child));
                 }
             } else if inode.is_reg() {
                 for idx in 0..inode.get_chunk_count() {
@@ -2110,13 +2118,17 @@ fn write_atomically(path: &Path, data: &[u8]) -> Result<()> {
 /// keeps its own pages, which punching its bytes out of the backing device file does not
 /// touch; pages a process has mapped stay until it unmaps them.
 fn drop_page_cache(path: &Path) {
-    let dropped = File::open(path).and_then(|f| {
-        // SAFETY: `posix_fadvise` only takes integers; `f` is open for the call.
-        match unsafe { libc::posix_fadvise(f.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED) } {
-            0 => Ok(()),
-            errno => Err(std::io::Error::from_raw_os_error(errno)),
-        }
-    });
+    let dropped = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+        .and_then(|f| {
+            // SAFETY: `posix_fadvise` only takes integers; `f` is open for the call.
+            match unsafe { libc::posix_fadvise(f.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED) } {
+                0 => Ok(()),
+                errno => Err(std::io::Error::from_raw_os_error(errno)),
+            }
+        });
     if let Err(e) = dropped {
         warn!(
             "fanotify: cannot drop the page cache of {}: {e}; it may keep serving a revoked \
