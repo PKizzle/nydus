@@ -186,8 +186,15 @@ A fanotify daemon's saved upgrade state carries its blob list without credential
 a restart and an in-place heal both rebuild the blob list with the credentials the runtime auth
 store holds at that moment. When a daemon that fetched with credentials finds none (an expired
 entry, or a store not yet repopulated after a restart), a warning names the image, and reads of
-uncached data fail with `EIO` until the daemon is started again with credentials. These images get
-no page cache sharing domain: only bootstraps this node built qualify.
+uncached data fail with `EIO` until credentials for it arrive. Every update of the runtime auth
+store (`PUT /api/v1/auth`) schedules a pass, debounced so a burst of updates costs one, that heals
+each such daemon in place once the store holds credentials for its image: the same fanotify group,
+no remount, no unanswered event (`DaemonSupervisor::heal_daemons_missing_auth`). A daemon built
+with credentials is never touched, so refreshing them churns nothing. FUSE daemons have no
+equivalent: their registry credentials are part of the RAFS mount command, which the snapshotter
+does not replace under a live FUSE mount, so a FUSE daemon started without credentials keeps failing until it
+is restarted. These images get no page cache sharing domain: only bootstraps this node built
+qualify.
 
 The fanotify path has no RAFS instance, so `[snapshotter.features] prefetch`, runtime prefetch
 lists and `cache.disable_indexed` apply only to images served over FUSE; a fanotify daemon fetches

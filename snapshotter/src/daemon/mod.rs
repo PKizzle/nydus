@@ -250,6 +250,10 @@ struct DaemonInstance {
     driver_override: Option<FsDriverType>,
     /// See `DaemonStatusRecord::registry_auth`.
     registry_auth: bool,
+    /// The image was fetched with registry credentials, but this daemon was built without
+    /// any (none in the auth store at its takeover or heal), so it fails every uncached read
+    /// until `heal_daemons_missing_auth` rebuilds it once credentials arrive.
+    missing_auth: bool,
 }
 
 impl DaemonInstance {
@@ -531,7 +535,18 @@ pub struct DaemonSupervisor {
     /// Why the daemon dirs cannot take fanotify pre-content marks (`None`: they can), probed
     /// on the first fanotify start. The driver probe tests only the cache `work_dir`.
     daemons_take_marks: Arc<std::sync::OnceLock<Option<String>>>,
+    /// A pass of `heal_daemons_missing_auth` is scheduled and has not started yet; further
+    /// credential updates until it starts are covered by it.
+    auth_heal_pending: AtomicBool,
+    /// Serializes `heal_daemons_missing_auth` passes.
+    auth_heal_pass: async_lock::Mutex<()>,
+    /// Daemons healed because credentials they lacked arrived.
+    auth_heals: AtomicU64,
 }
+
+/// How long a credential update waits before its heal pass, so that a burst of updates (the
+/// credential bridge stores many entries at startup) is served by one pass.
+const AUTH_HEAL_DEBOUNCE: Duration = Duration::from_millis(500);
 
 impl DaemonSupervisor {
     pub fn new(config: SnapshotterConfig) -> Self {
@@ -558,6 +573,9 @@ impl DaemonSupervisor {
             probe_timeouts_total: AtomicU64::new(0),
             recent_recoveries: StdMutex::new(HashMap::new()),
             daemons_take_marks: Arc::new(std::sync::OnceLock::new()),
+            auth_heal_pending: AtomicBool::new(false),
+            auth_heal_pass: async_lock::Mutex::new(()),
+            auth_heals: AtomicU64::new(0),
         }
     }
 
@@ -962,6 +980,7 @@ impl DaemonSupervisor {
             failover_armed: AtomicBool::new(armed),
             driver_override,
             registry_auth,
+            missing_auth: false,
             _poll: poll,
         }))
     }
@@ -1434,7 +1453,7 @@ impl DaemonSupervisor {
             warn!(
                 image_ref,
                 "no registry credentials for an image that was fetched with them; reads of \
-                 uncached data fail until its daemon is restarted with credentials"
+                 uncached data fail until credentials for it arrive"
             );
         }
         Ok(backend)
@@ -1481,6 +1500,98 @@ impl DaemonSupervisor {
                     .await
             }
         }
+    }
+
+    /// Heal, whenever the runtime auth store receives credentials, the fanotify daemons that
+    /// lack credentials their image needs (`DaemonInstance::missing_auth`). The pass runs on
+    /// its own thread, after `AUTH_HEAL_DEBOUNCE`, so the store's writer (the
+    /// `PUT /api/v1/auth` handler) returns at once and a burst of updates costs one pass.
+    pub fn heal_on_auth_updates(self: &Arc<Self>) {
+        let supervisor = Arc::downgrade(self);
+        auth::on_runtime_auth_update(move || {
+            let Some(supervisor) = supervisor.upgrade() else {
+                return;
+            };
+            if supervisor.auth_heal_pending.swap(true, Ordering::AcqRel) {
+                return;
+            }
+            let spawned = std::thread::Builder::new()
+                .name("auth-heal".into())
+                .spawn(move || {
+                    std::thread::sleep(AUTH_HEAL_DEBOUNCE);
+                    supervisor.auth_heal_pending.store(false, Ordering::Release);
+                    match compio::runtime::Runtime::new() {
+                        Ok(runtime) => {
+                            runtime.block_on(supervisor.heal_daemons_missing_auth());
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "no runtime for healing daemons that lack credentials")
+                        }
+                    }
+                });
+            if let Err(e) = spawned {
+                warn!(error = %e, "failed to start healing daemons that lack credentials");
+            }
+        });
+    }
+
+    /// Heal in place every fanotify daemon that lacks credentials its image needs, once the
+    /// runtime auth store holds some for it. A daemon built with credentials is never touched,
+    /// so refreshing them churns nothing. Returns the number healed.
+    pub async fn heal_daemons_missing_auth(&self) -> usize {
+        let _pass = self.auth_heal_pass.lock().await;
+        let candidates: Vec<String> = self
+            .instances
+            .read()
+            .await
+            .iter()
+            .filter(|(_, inst)| inst.missing_auth)
+            .map(|(image_ref, _)| image_ref.clone())
+            .collect();
+        let mut healed = 0;
+        for image_ref in candidates {
+            let has_auth = parse_image_ref(&image_ref)
+                .is_some_and(|parsed| self.resolve_auth(&parsed).is_some());
+            if !has_auth {
+                continue;
+            }
+            let start_lock = self.start_lock(&image_ref).await;
+            let _guard = start_lock.lock().await;
+            let old = {
+                let mut instances = self.instances.write().await;
+                match instances.get(&image_ref) {
+                    Some(inst) if inst.missing_auth && is_fanotify_mount(&inst.mountpoint) => {
+                        instances.remove(&image_ref)
+                    }
+                    _ => None,
+                }
+            };
+            let Some(old) = old else { continue };
+            let replacement = match self.heal_fanotify_in_place(&old).await {
+                Ok(new) => {
+                    info!(
+                        image_ref,
+                        "healed a fanotify daemon with the registry credentials it lacked"
+                    );
+                    healed += 1;
+                    self.auth_heals.fetch_add(1, Ordering::Relaxed);
+                    new
+                }
+                Err(e) => {
+                    warn!(
+                        image_ref,
+                        error = format!("{e:#}"),
+                        "failed to heal a fanotify daemon that lacks registry credentials"
+                    );
+                    old
+                }
+            };
+            if let Err(e) = self.persist_instance_record(&replacement, true).await {
+                warn!(image_ref, error = %e, "failed to persist daemon record");
+            }
+            self.instances.write().await.insert(image_ref, replacement);
+        }
+        healed
     }
 
     /// Reconciler hook: re-check daemon health and restart failed instances.
@@ -1928,6 +2039,7 @@ impl DaemonSupervisor {
                 failover_armed: AtomicBool::new(false),
                 driver_override,
                 registry_auth: false,
+                missing_auth: false,
             }));
         }
 
@@ -2006,6 +2118,7 @@ impl DaemonSupervisor {
                 failover_armed: AtomicBool::new(false),
                 driver_override,
                 registry_auth: false,
+                missing_auth: false,
             }));
         }
 
@@ -2087,6 +2200,7 @@ impl DaemonSupervisor {
             failover_armed: AtomicBool::new(armed),
             driver_override,
             registry_auth: false,
+            missing_auth: false,
             _poll: poll,
         }))
     }
@@ -2569,6 +2683,7 @@ impl DaemonSupervisor {
             failover_armed: AtomicBool::new(true),
             driver_override: record.driver_override,
             registry_auth: record.registry_auth,
+            missing_auth: false,
         });
         self.note_parked_slug(slug);
         self.instances
@@ -2614,6 +2729,7 @@ impl DaemonSupervisor {
         // would build it.
         let backend =
             self.fanotify_backend_for(image_ref_str, &record.bootstrap, record.registry_auth)?;
+        let has_auth = backend.registry.as_ref().is_some_and(|r| r.auth.is_some());
         let blobs = Some(self.fanotify_blob_list(slug, backend)?);
         let (daemon, poll) = self
             .adopt_fanotify_group(image_ref_str, slug, fan_fd, state, blobs, |_| ())
@@ -2634,6 +2750,7 @@ impl DaemonSupervisor {
             failover_armed: AtomicBool::new(true),
             driver_override: record.driver_override,
             registry_auth: record.registry_auth,
+            missing_auth: record.registry_auth && !has_auth,
         });
         self.note_parked_slug(slug);
         self.instances
@@ -2761,6 +2878,7 @@ impl DaemonSupervisor {
             // its blob list rebuilt with them.
             let backend =
                 self.fanotify_backend_for(&old.image_ref, &old.bootstrap, old.registry_auth)?;
+            let has_auth = backend.registry.as_ref().is_some_and(|r| r.auth.is_some());
             let blobs = self.fanotify_blob_list(&slug, backend)?;
             let daemon = old.daemon.clone();
             let sock = supervisor_sock_path(&slug);
@@ -2822,6 +2940,7 @@ impl DaemonSupervisor {
                 failover_armed: AtomicBool::new(old.failover_armed.load(Ordering::SeqCst)),
                 driver_override: old.driver_override,
                 registry_auth: old.registry_auth,
+                missing_auth: old.registry_auth && !has_auth,
                 _poll: poll,
             }))
         }
@@ -4318,6 +4437,7 @@ fn test_instance_with_daemon(
         failover_armed: AtomicBool::new(false),
         driver_override: None,
         registry_auth: false,
+        missing_auth: false,
     }
 }
 

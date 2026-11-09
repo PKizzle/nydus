@@ -1410,6 +1410,8 @@ pub async fn serve_with_supervisor(
     store: Arc<SnapshotStore>,
 ) -> Result<()> {
     let socket_path = PathBuf::from(&config.snapshotter.address);
+    // Before the HTTP API that receives credentials starts serving.
+    supervisor.heal_on_auth_updates();
 
     let cache_gc_policy = CacheGcPolicy::from_config(&config)?;
     let cache_manager = CacheManager::from_config(&config);
