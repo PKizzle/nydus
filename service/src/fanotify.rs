@@ -307,6 +307,14 @@ impl BlobBacking {
         Ok(())
     }
 
+    /// Whether every chunk marked ready in this blob's cache file was checked against its digest.
+    fn is_verified(&self) -> bool {
+        self.blob
+            .blob()
+            .get_blob_object()
+            .is_some_and(|obj| obj.is_data_verified())
+    }
+
     /// Whether every byte of this blob is already in its cache file.
     ///
     /// `false` whenever the answer is unavailable, which keeps the mark armed -- the direction
@@ -448,6 +456,11 @@ pub struct FanotifyHandler {
     device_blobs: Vec<PathBuf>,
     /// EROFS `domain_id` to mount with `inode_share`, from the blobs' fanotify cache config.
     inode_share_domain: Option<String>,
+    /// Whether [`mount`](Self::mount) mounted the image itself, after `arm()` had marked every
+    /// blob that is not both complete and verified. The kernel decides whether a file raises
+    /// pre-content events when it is opened, from the marks present then, so only a mount
+    /// opened that way is known to see a mark added later; see [`Self::verify_blob`].
+    mounted_here: AtomicBool,
 }
 
 // Helper: open the blob directory and enumerate blob files.
@@ -1051,6 +1064,7 @@ impl FanotifyHandler {
             bootstrap_path,
             device_blobs,
             inode_share_domain,
+            mounted_here: AtomicBool::new(false),
         })
     }
 
@@ -1095,7 +1109,9 @@ impl FanotifyHandler {
                     ),
                 ));
             }
-            if backing.is_fully_cached() {
+            // A complete blob whose cache was never checked stays marked: the verifier may yet
+            // revoke chunks of it, and only a mount that opened it marked raises events then.
+            if backing.is_fully_cached() && backing.is_verified() {
                 info!(
                     "fanotify: blob {} is already fully cached; leaving it unmarked so the \
                      kernel can read it ahead",
@@ -1192,6 +1208,13 @@ impl FanotifyHandler {
     /// while the workers keep serving, and stops with them. Each chunk that fails is revoked
     /// like an [`invalidate`](Self::invalidate) of just that chunk, under the exclusive
     /// `io_lock`, so the next read fetches it again through the validating fill.
+    ///
+    /// Revoking is only safe over a mount this handler opened after `arm()`: the kernel decides
+    /// at open whether a file raises pre-content events at all, from the marks present then, so
+    /// re-arming a blob a mount opened unmarked would leave the punched chunk readable as zeros.
+    /// Over an inherited mount a failing chunk therefore stops the check with an error and the
+    /// blob stays unverified, to be checked by the next handler that mounts it. Start it after
+    /// [`mount`](Self::mount).
     pub(crate) fn spawn_verifier(self: &Arc<Self>) -> Result<std::thread::JoinHandle<()>> {
         let handler = self.clone();
         std::thread::Builder::new()
@@ -1220,6 +1243,12 @@ impl FanotifyHandler {
         let stop = || !self.active.load(Ordering::Acquire) || self.is_failed();
         let fd = backing.blob.file().as_raw_fd();
         let mut revoke = |chunk: &dyn BlobChunkInfo| -> nydus_storage::StorageResult<()> {
+            if !self.mounted_here.load(Ordering::Acquire) {
+                return Err(nydus_storage::StorageError::InvalidState(format!(
+                    "chunk {} cannot be revoked over a mount this daemon did not open",
+                    chunk.id()
+                )));
+            }
             let _revoking = backing
                 .io_lock
                 .write()
@@ -1247,6 +1276,10 @@ impl FanotifyHandler {
                     "fanotify: checked every cached chunk of blob {} against its digest",
                     backing.blob.blob_info().blob_id()
                 );
+                // `arm()` kept the blob marked until now if it was complete but unchecked.
+                if let Ok(_serving) = backing.io_lock.read() {
+                    self.disarm_if_complete(backing);
+                }
                 Ok(())
             }
             Ok(false) | Err(nydus_storage::StorageError::Unsupported) => Ok(()),
@@ -1282,7 +1315,9 @@ impl FanotifyHandler {
             &self.device_blobs,
             &self.mountpoint,
             self.inode_share_domain.as_deref(),
-        )
+        )?;
+        self.mounted_here.store(true, Ordering::Release);
+        Ok(())
     }
 
     /// Number of worker threads.

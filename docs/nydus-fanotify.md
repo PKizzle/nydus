@@ -74,7 +74,12 @@ Chunks already marked ready when a cache file is opened were not necessarily val
 filled by an older daemon or by a non-validating opener). A low-priority thread per handler checks
 each of them once while serving goes on; a chunk that fails is revoked like an invalidation of that
 one chunk (mark re-armed, ready bit cleared, bytes punched, under the blob's exclusive `io_lock`),
-so a blob whose mark was already dropped is guarded again before anything is discarded. When every
+so a blob whose mark was already dropped is guarded again before anything is discarded. Re-arming
+only works for a mount that opened the blob while it was marked: the kernel decides at open whether a
+file raises pre-content events at all. So `arm()` leaves a complete blob unmarked only once its cache
+is verified, the verifier drops the mark itself when it finishes, and over a mount the handler did not
+open (a takeover or an in-place heal) a failing chunk stops the check, leaving the blob unverified
+for the next daemon that mounts it. When every
 ready chunk has passed, the chunk map header records the file as verified, which
 `BlobObject::is_data_verified` reports; an opener that fills without validating clears it.
 
