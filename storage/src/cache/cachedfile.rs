@@ -282,24 +282,57 @@ pub(crate) struct FileCacheEntry {
     // For a fanotify cache, the digests chunk data is validated against; `None` for every
     // other cache.
     pub(crate) bootstrap_digests: Option<BootstrapDigests>,
+    // Chunks of this blob that failed validation, for escalating the log.
+    pub(crate) digest_mismatches: AtomicU32,
     // Amplified user IO request batch size to read data from remote storage backend / local cache.
     pub(crate) user_io_batch_size: u32,
     pub(crate) prefetch_config: Arc<AsyncPrefetchConfig>,
 }
 
+/// Deallocate `[offset, offset + len)` of `file`, keeping its size.
+#[cfg(target_os = "linux")]
+fn punch_hole(file: &File, offset: u64, len: u64) -> std::io::Result<()> {
+    // SAFETY: `fallocate` only takes integers; `file` is open for the call.
+    let ret = unsafe {
+        libc::fallocate(
+            file.as_raw_fd(),
+            libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
+            offset as libc::off_t,
+            len as libc::off_t,
+        )
+    };
+    if ret != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn punch_hole(_file: &File, _offset: u64, _len: u64) -> std::io::Result<()> {
+    Err(std::io::Error::from(ErrorKind::Unsupported))
+}
+
 /// The digests a fanotify cache validates chunk data against, by chunk index, as the bootstraps
 /// served from it supplied them, with the extent each bootstrap gave the chunk.
 ///
-/// The digests are persisted next to the cache file (32 bytes per chunk, zero for none), so that
-/// every later bootstrap, in this daemon or the next, is held to the digests the cached data was
-/// validated against: one that names another digest for a chunk is refused rather than served
-/// bytes it does not describe. Extents are kept in memory only: a chunk is validated only while
-/// a bootstrap of this daemon references it, and only if the blob meta places it where that
-/// bootstrap does.
+/// The digests are persisted next to the cache file, so that every later bootstrap, in this
+/// daemon or the next, is held to the digest a ready chunk was validated against: one that names
+/// another digest for a ready chunk is refused rather than served bytes it does not describe. A
+/// chunk that is not ready binds nothing, so a later bootstrap may replace its digest. Extents
+/// are kept in memory only: a chunk is validated only while a bootstrap of this daemon
+/// references it, and only if the blob meta places it where that bootstrap does.
+///
+/// File format: [DIGESTS_MAGIC], the chunk count as a little-endian `u32`, 32 bytes per chunk
+/// (zero for none), then the SHA-256 of everything before it.
 pub(crate) struct BootstrapDigests {
     path: String,
     table: RwLock<DigestTable>,
 }
+
+const DIGESTS_MAGIC: &[u8; 8] = b"NYDDGST1";
+
+/// Mismatches on one blob after which each further one is logged as an error.
+const DIGEST_MISMATCHES_TO_ESCALATE: u32 = 3;
 
 #[derive(Clone, Default, PartialEq)]
 struct DigestTable {
@@ -310,32 +343,19 @@ struct DigestTable {
 impl BootstrapDigests {
     /// Load the digests persisted at `path` for a blob of `chunk_count` chunks. The flag tells
     /// whether there were any: without them, nothing records what the cached data was checked
-    /// against.
+    /// against. A file that fails its own checksum is discarded, as if there were none.
     pub(crate) fn open(path: String, chunk_count: usize) -> StorageResult<(Self, bool)> {
         let data = match std::fs::read(&path) {
-            Ok(data) if data.len() == chunk_count * 32 => Some(data),
-            Ok(_) => {
-                warn!("chunk digest file {path} has the wrong size; starting a new one");
+            Ok(data) => Self::decode(&data, chunk_count).or_else(|| {
+                warn!("chunk digest file {path} is corrupt or for another blob; discarding it");
                 None
-            }
+            }),
             Err(e) if e.kind() == ErrorKind::NotFound => None,
             Err(e) => return Err(StorageError::cache_io("read the chunk digest file", e)),
         };
         let found = data.is_some();
-        let digests = data
-            .map(|data| {
-                data.chunks_exact(32)
-                    .map(|d| {
-                        let digest = RafsDigest {
-                            data: d.try_into().unwrap(),
-                        };
-                        (digest != RafsDigest::default()).then_some(digest)
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
         let table = DigestTable {
-            digests,
+            digests: data.unwrap_or_default(),
             extents: Vec::new(),
         };
         Ok((
@@ -345,6 +365,45 @@ impl BootstrapDigests {
             },
             found,
         ))
+    }
+
+    fn encode(digests: &[Option<RafsDigest>]) -> Vec<u8> {
+        let mut data = Vec::with_capacity(DIGESTS_MAGIC.len() + 4 + digests.len() * 32 + 32);
+        data.extend_from_slice(DIGESTS_MAGIC);
+        data.extend_from_slice(&(digests.len() as u32).to_le_bytes());
+        for digest in digests {
+            data.extend_from_slice(&digest.unwrap_or_default().data);
+        }
+        let sum = RafsDigest::from_buf(&data, digest::Algorithm::Sha256);
+        data.extend_from_slice(&sum.data);
+        data
+    }
+
+    fn decode(data: &[u8], chunk_count: usize) -> Option<Vec<Option<RafsDigest>>> {
+        let header = DIGESTS_MAGIC.len() + 4;
+        if data.len() != header + chunk_count * 32 + 32
+            || &data[..DIGESTS_MAGIC.len()] != DIGESTS_MAGIC
+        {
+            return None;
+        }
+        let (body, sum) = data.split_at(data.len() - 32);
+        if RafsDigest::from_buf(body, digest::Algorithm::Sha256).data != sum
+            || u32::from_le_bytes(body[DIGESTS_MAGIC.len()..header].try_into().unwrap()) as usize
+                != chunk_count
+        {
+            return None;
+        }
+        Some(
+            body[header..]
+                .chunks_exact(32)
+                .map(|d| {
+                    let digest = RafsDigest {
+                        data: d.try_into().unwrap(),
+                    };
+                    (digest != RafsDigest::default()).then_some(digest)
+                })
+                .collect(),
+        )
     }
 
     /// The digest of `chunk`, if a bootstrap of this daemon references it at the extent the
@@ -359,9 +418,14 @@ impl BootstrapDigests {
         table.digests.get(index).copied().flatten()
     }
 
-    /// Add `entries`, refusing all of them if one contradicts a digest or extent already
-    /// recorded, and persist the digests before returning.
-    fn merge(&self, blob_id: &str, entries: &[Option<ChunkDigestEntry>]) -> StorageResult<()> {
+    /// Add `entries`, refusing all of them if one contradicts the digest or extent recorded for
+    /// a chunk `is_ready` reports ready, and persist the digests before returning.
+    fn merge(
+        &self,
+        blob_id: &str,
+        entries: &[Option<ChunkDigestEntry>],
+        is_ready: &dyn Fn(u32) -> bool,
+    ) -> StorageResult<()> {
         let mut table = self.table.write().unwrap();
         let mut merged = table.clone();
         merged.digests.resize(entries.len(), None);
@@ -369,12 +433,12 @@ impl BootstrapDigests {
         for (index, entry) in entries.iter().enumerate() {
             let Some(entry) = entry else { continue };
             let extent = (entry.uncompressed_offset, entry.uncompressed_size);
-            if merged.digests[index].is_some_and(|d| d != entry.digest)
-                || merged.extents[index].is_some_and(|e| e != extent)
-            {
+            let differs = merged.digests[index].is_some_and(|d| d != entry.digest)
+                || merged.extents[index].is_some_and(|e| e != extent);
+            if differs && is_ready(index as u32) {
                 return Err(StorageError::InvalidData(format!(
-                    "blob {blob_id} chunk {index}: the bootstrap describes it differently from \
-                     the digest this cache validates against"
+                    "blob {blob_id} chunk {index}: the bootstrap describes a cached chunk \
+                     differently from the digest it was validated against"
                 )));
             }
             merged.digests[index] = Some(entry.digest);
@@ -384,10 +448,7 @@ impl BootstrapDigests {
             return Ok(());
         }
         if merged.digests != table.digests {
-            let mut data = Vec::with_capacity(merged.digests.len() * 32);
-            for digest in &merged.digests {
-                data.extend_from_slice(&digest.unwrap_or_default().data);
-            }
+            let data = Self::encode(&merged.digests);
             let tmp = format!("{}.tmp", self.path);
             let write = || -> std::io::Result<()> {
                 let mut f = File::create(&tmp)?;
@@ -403,6 +464,30 @@ impl BootstrapDigests {
 }
 
 impl FileCacheEntry {
+    /// The data file's change time and size as one value, for [RangeMap::is_verified].
+    fn data_stamp(&self) -> StorageResult<u64> {
+        let md = self
+            .file
+            .metadata()
+            .map_err(|e| StorageError::cache_io("stat the blob data file", e))?;
+        use std::os::unix::fs::MetadataExt;
+        let ctime = (md.ctime() as u64)
+            .wrapping_mul(1_000_000_000)
+            .wrapping_add(md.ctime_nsec() as u64);
+        Ok(ctime ^ md.len().rotate_left(32))
+    }
+
+    /// Record the data file's stamp after this cache wrote it. Best effort: a stale stamp only
+    /// reads as unverified.
+    fn update_data_stamp(&self) {
+        if self.bootstrap_digests.is_none() {
+            return;
+        }
+        if let (Some(map), Ok(stamp)) = (self.chunk_map.as_range_map(), self.data_stamp()) {
+            let _ = map.update_data_stamp(stamp);
+        }
+    }
+
     pub(crate) fn get_blob_size(
         reader: &Arc<dyn BlobReader>,
         blob_info: &BlobInfo,
@@ -518,6 +603,9 @@ impl FileCacheEntry {
         let offset = chunk.uncompressed_offset();
         let res = Self::persist_cached_data(&self.file, offset, buf);
         self.update_chunk_persist_status(chunk, &res);
+        if res.is_ok() {
+            self.update_data_stamp();
+        }
         #[cfg(feature = "dedup")]
         if let Some(mgr) = &self.cas_mgr
             && let Err(e) = mgr.record_chunk(&self.blob_info, chunk, self.file_path.as_ref())
@@ -854,6 +942,25 @@ impl BlobCache for FileCacheEntry {
         }
     }
 
+    fn report_digest_mismatch(&self, chunk: &dyn BlobChunkInfo) {
+        self.metrics.digest_mismatches.inc();
+        let seen = self.digest_mismatches.fetch_add(1, Ordering::AcqRel) + 1;
+        if seen > DIGEST_MISMATCHES_TO_ESCALATE {
+            error!(
+                "blob {}: chunk {} fails validation, {seen} mismatches on this blob so far; \
+                 its backend data or cache file is corrupt",
+                self.blob_id,
+                chunk.id()
+            );
+        } else {
+            warn!(
+                "blob {}: chunk {} fails validation against its digest",
+                self.blob_id,
+                chunk.id()
+            );
+        }
+    }
+
     fn add_chunk_digests(&self, digests: &[Option<ChunkDigestEntry>]) -> StorageResult<()> {
         let Some(table) = &self.bootstrap_digests else {
             return Err(StorageError::Unsupported);
@@ -899,7 +1006,10 @@ impl BlobCache for FileCacheEntry {
                 )));
             }
         }
-        table.merge(&self.blob_id, digests)
+        let map = self.chunk_map.as_range_map();
+        let is_ready =
+            |index: u32| map.is_some_and(|m| !matches!(m.is_range_ready(index, 1), Ok(false)));
+        table.merge(&self.blob_id, digests, &is_ready)
     }
 
     fn reader(&self) -> &dyn BlobReader {
@@ -1219,16 +1329,16 @@ impl BlobObject for FileCacheEntry {
 
     fn is_data_verified(&self) -> bool {
         self.bootstrap_digests.is_some()
-            && self
-                .chunk_map
-                .as_range_map()
-                .is_some_and(|m| m.is_verified())
+            && match (self.chunk_map.as_range_map(), self.data_stamp()) {
+                (Some(map), Ok(stamp)) => map.is_verified(stamp),
+                _ => false,
+            }
     }
 
     fn verify_ready_chunks(
         &self,
         stop: &dyn Fn() -> bool,
-        on_mismatch: &mut dyn FnMut(&dyn BlobChunkInfo) -> StorageResult<()>,
+        on_mismatch: &mut dyn FnMut(&dyn BlobChunkInfo) -> StorageResult<bool>,
     ) -> StorageResult<bool> {
         if self.bootstrap_digests.is_none() || !self.need_validation {
             return Err(StorageError::Unsupported);
@@ -1240,6 +1350,7 @@ impl BlobObject for FileCacheEntry {
         let meta = self.get_blob_meta_info()?.ok_or_else(|| {
             StorageError::InvalidState(format!("blob {} has no chunk table", self.blob_id))
         })?;
+        let mut complete = true;
         let mut buf = Vec::new();
         for index in 0..meta.get_chunk_count() {
             if stop() {
@@ -1249,6 +1360,12 @@ impl BlobObject for FileCacheEntry {
                 continue;
             }
             let chunk = meta.get_chunk_info(index);
+            // A chunk no bootstrap of this daemon references has no digest here; it is left
+            // alone, and the file unverified, rather than discarded on no evidence.
+            if self.expected_chunk_digest(chunk.as_ref()).is_none() {
+                complete = false;
+                continue;
+            }
             buf.resize(chunk.uncompressed_size() as usize, 0);
             std::os::unix::fs::FileExt::read_exact_at(
                 self.file.as_ref(),
@@ -1256,23 +1373,44 @@ impl BlobObject for FileCacheEntry {
                 chunk.uncompressed_offset(),
             )
             .map_err(|e| StorageError::cache_io("read a cached chunk to verify it", e))?;
-            if let Err(e) = self.validate_chunk_data(chunk.as_ref(), &buf) {
-                warn!(
-                    "blob {}: cached chunk {index} fails validation ({e}); fetching it again",
+            if self.validate_chunk_data(chunk.as_ref(), &buf).is_err()
+                && !on_mismatch(chunk.as_ref())?
+            {
+                self.metrics.unrevoked_chunks.inc();
+                error!(
+                    "blob {}: cached chunk {index} fails validation and cannot be revoked; it \
+                     stays served until the blob is mounted again",
                     self.blob_id
                 );
-                on_mismatch(chunk.as_ref())?;
+                complete = false;
             }
         }
-        map.set_verified(true)?;
-        Ok(true)
+        if complete {
+            map.set_verified(Some(self.data_stamp()?))?;
+        } else {
+            map.set_verified(None)?;
+        }
+        Ok(complete)
     }
 
-    fn clear_chunk_ready(&self, chunk_index: u32) -> StorageResult<()> {
-        self.chunk_map
+    fn revoke_chunk(&self, chunk_index: u32) -> StorageResult<()> {
+        let map = self
+            .chunk_map
             .as_range_map()
-            .ok_or(StorageError::Unsupported)?
-            .clear_ready(chunk_index)
+            .ok_or(StorageError::Unsupported)?;
+        let chunk = self.get_chunk_info(chunk_index).ok_or_else(|| {
+            StorageError::InvalidState(format!("blob {} has no chunk table", self.blob_id))
+        })?;
+        map.revoke(chunk_index, &mut || {
+            punch_hole(
+                &self.file,
+                chunk.uncompressed_offset(),
+                chunk.uncompressed_size() as u64,
+            )
+            .map_err(|e| StorageError::cache_io("punch a revoked chunk out of the cache file", e))
+        })?;
+        self.update_data_stamp();
+        Ok(())
     }
 
     fn reset_data_ready(&self) -> StorageResult<()> {
@@ -2431,19 +2569,23 @@ mod tests {
             ..Default::default()
         };
 
+        let all = |_: u32| true;
+        let none = |_: u32| false;
         let (digests, found) = BootstrapDigests::open(path.clone(), 3).unwrap();
         assert!(!found);
-        digests.merge("b", &[e(1, 0), None, e(3, 2)]).unwrap();
+        digests.merge("b", &[e(1, 0), None, e(3, 2)], &all).unwrap();
         // Agreeing entries and new ones for unknown chunks are fine.
-        digests.merge("b", &[e(1, 0), e(2, 1), None]).unwrap();
-        // An extent contradicting the recorded one is not.
-        assert!(digests.merge("b", &[e(1, 5), None, None]).is_err());
+        digests.merge("b", &[e(1, 0), e(2, 1), None], &all).unwrap();
+        // An extent contradicting the one recorded for a ready chunk is not.
+        assert!(digests.merge("b", &[e(1, 5), None, None], &all).is_err());
 
         let (digests, found) = BootstrapDigests::open(path.clone(), 3).unwrap();
         assert!(found);
         // Persisted digests count only for chunks a bootstrap of this daemon places.
         assert_eq!(digests.get(&chunk(0, 0)), None);
-        digests.merge("b", &[e(1, 0), e(2, 1), e(3, 2)]).unwrap();
+        digests
+            .merge("b", &[e(1, 0), e(2, 1), e(3, 2)], &all)
+            .unwrap();
         assert_eq!(
             (0..3)
                 .map(|i| digests.get(&chunk(i, i as u64)))
@@ -2452,10 +2594,24 @@ mod tests {
         );
         // A chunk the blob meta places elsewhere has no digest.
         assert_eq!(digests.get(&chunk(2, 7)), None);
-        assert!(digests.merge("b", &[None, None, e(4, 2)]).is_err());
+        // A ready chunk binds its digest, also for the next daemon.
+        assert!(digests.merge("b", &[None, None, e(4, 2)], &all).is_err());
         assert_eq!(digests.get(&chunk(2, 2)), d(3));
         let (digests, _) = BootstrapDigests::open(path.clone(), 3).unwrap();
-        assert!(digests.merge("b", &[None, None, e(4, 2)]).is_err());
+        assert!(digests.merge("b", &[None, None, e(4, 2)], &all).is_err());
+        // A chunk that is not ready binds nothing.
+        digests.merge("b", &[None, None, e(4, 2)], &none).unwrap();
+        assert_eq!(digests.get(&chunk(2, 2)), d(4));
+
+        // A corrupted file is discarded rather than trusted or fatal.
+        let mut data = std::fs::read(&path).unwrap();
+        let mid = data.len() / 2;
+        data[mid] ^= 1;
+        std::fs::write(&path, &data).unwrap();
+        assert!(!BootstrapDigests::open(path.clone(), 3).unwrap().1);
+        let (digests, _) = BootstrapDigests::open(path.clone(), 3).unwrap();
+        digests.merge("b", &[e(5, 0), None, None], &all).unwrap();
+        assert!(BootstrapDigests::open(path.clone(), 3).unwrap().1);
 
         // A file for another chunk count is not trusted.
         assert!(!BootstrapDigests::open(path, 4).unwrap().1);

@@ -755,6 +755,11 @@ pub struct BlobcacheMetrics {
     pub prefetch_end_time_millis: BasicMetric,
     pub buffered_backend_size: BasicMetric,
     pub data_all_ready: AtomicBool,
+    // Chunks whose data failed validation against its digest, from a fill or a check of chunks
+    // already cached.
+    pub digest_mismatches: BasicMetric,
+    // Cached chunks found failing validation that could not be revoked and stay served.
+    pub unrevoked_chunks: BasicMetric,
 }
 
 impl BlobcacheMetrics {

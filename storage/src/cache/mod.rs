@@ -206,6 +206,9 @@ pub trait BlobCache: Send + Sync {
         Some(*chunk.chunk_id())
     }
 
+    /// Account for `chunk` failing validation against its digest.
+    fn report_digest_mismatch(&self, _chunk: &dyn BlobChunkInfo) {}
+
     /// Supply the digest and extent of chunks by chunk index, from a bootstrap's chunk table, so
     /// the cache validates their data against the bootstrap rather than against digests in the
     /// blob meta. `None` marks a chunk the bootstrap does not reference. Fails when an extent
@@ -500,14 +503,17 @@ pub trait BlobCache: Send + Sync {
             match self.expected_chunk_digest(chunk) {
                 Some(digest) if check_hash(buffer, &digest, self.blob_digester()) => {}
                 Some(_) => {
+                    self.report_digest_mismatch(chunk);
                     return Err(StorageError::InvalidData(format!(
-                        "data digest value of chunk {} doesn't match",
+                        "blob {}: data digest value of chunk {} doesn't match",
+                        self.blob_id(),
                         chunk.id()
                     )));
                 }
                 None => {
                     return Err(StorageError::InvalidData(format!(
-                        "no digest to validate chunk {} against",
+                        "blob {}: no digest to validate chunk {} against",
+                        self.blob_id(),
                         chunk.id()
                     )));
                 }

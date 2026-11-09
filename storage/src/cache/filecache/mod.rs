@@ -293,6 +293,13 @@ impl FileCacheEntry {
                 (mgr.fanotify || (mgr.validate && validation_supported) || !is_direct_chunkmap)
                     && !is_legacy_stargz
                     && !blob_info.is_external();
+            // Neither carries digests to validate a fill against.
+            if mgr.fanotify && (is_legacy_stargz || blob_info.is_external()) {
+                return Err(StorageError::InvalidArgument(format!(
+                    "blob {blob_id}: a fanotify cache cannot serve a legacy stargz or external \
+                     blob, whose fills cannot be validated"
+                )));
+            }
             let bootstrap_digests = if mgr.fanotify {
                 Some(BootstrapDigests::open(
                     format!("{}.digests", blob_data_file_path),
@@ -307,7 +314,7 @@ impl FileCacheEntry {
             if !bootstrap_digests.as_ref().is_some_and(|(_, found)| *found)
                 && let Some(map) = chunk_map.as_range_map()
             {
-                map.set_verified(false).or_else(|e| match e {
+                map.set_verified(None).or_else(|e| match e {
                     StorageError::Unsupported => Ok(()),
                     e => Err(e),
                 })?;
@@ -433,6 +440,7 @@ impl FileCacheEntry {
             dio_enabled: false,
             need_validation,
             bootstrap_digests,
+            digest_mismatches: AtomicU32::new(0),
             user_io_batch_size: mgr.user_io_batch_size,
             prefetch_config,
         })

@@ -80,12 +80,16 @@ impl RangeMap for IndexedChunkMap {
         self.map.clear_chunk_ready(index)
     }
 
-    fn is_verified(&self) -> bool {
-        self.map.is_verified()
+    fn is_verified(&self, data_stamp: u64) -> bool {
+        self.map.is_verified(data_stamp)
     }
 
-    fn set_verified(&self, verified: bool) -> StorageResult<()> {
-        self.map.set_verified(verified)
+    fn set_verified(&self, data_stamp: Option<u64>) -> StorageResult<()> {
+        self.map.set_verified(data_stamp)
+    }
+
+    fn update_data_stamp(&self, data_stamp: u64) -> StorageResult<()> {
+        self.map.update_data_stamp(data_stamp)
     }
 
     fn is_range_ready(&self, start_index: u32, count: u32) -> StorageResult<bool> {
@@ -298,6 +302,7 @@ mod tests {
             all_ready: MAGIC_ALL_READY,
             verified: 0,
             ready_count: 0,
+            data_stamp: 0,
             reserved: [0x0u8; HEADER_RESERVED_SIZE],
         };
 
@@ -347,6 +352,7 @@ mod tests {
             all_ready: 0,
             verified: 0,
             ready_count: 0,
+            data_stamp: 0,
             reserved: [0x0u8; HEADER_RESERVED_SIZE],
         };
 
@@ -452,7 +458,7 @@ mod tests {
 
         {
             let map = IndexedChunkMap::new(&blob_path, 8, true).unwrap();
-            assert!(!map.is_verified());
+            assert!(!map.is_verified(7));
             for idx in 0..8u32 {
                 map.set_ready_and_clear_pending(chunk(idx).as_base())
                     .unwrap();
@@ -465,18 +471,20 @@ mod tests {
             // Clearing a chunk that is not ready changes nothing.
             map.clear_ready(5).unwrap();
             assert_eq!(map.map.not_ready_count.load(Ordering::Acquire), 1);
-            map.set_verified(true).unwrap();
+            map.set_verified(Some(7)).unwrap();
         }
 
         let reopened = IndexedChunkMap::new(&blob_path, 8, true).unwrap();
-        assert!(reopened.is_verified());
+        assert!(reopened.is_verified(7));
+        // A data file changed since, by anyone, is not verified.
+        assert!(!reopened.is_verified(8));
         assert!(!reopened.is_ready(chunk(5).as_base()).unwrap());
         assert_eq!(reopened.map.not_ready_count.load(Ordering::Acquire), 1);
-        reopened.set_verified(false).unwrap();
+        reopened.set_verified(None).unwrap();
         assert!(
             !IndexedChunkMap::new(&blob_path, 8, true)
                 .unwrap()
-                .is_verified()
+                .is_verified(7)
         );
     }
 
@@ -497,16 +505,16 @@ mod tests {
         {
             let map = IndexedChunkMap::new(&blob_path, 16, true).unwrap();
             map.set_ready_and_clear_pending(chunk(0).as_base()).unwrap();
-            map.set_verified(true).unwrap();
+            map.set_verified(Some(7)).unwrap();
             // Fills by this version keep the record.
             map.set_ready_and_clear_pending(chunk(1).as_base()).unwrap();
             map.clear_ready(0).unwrap();
-            assert!(map.is_verified());
+            assert!(map.is_verified(7));
         }
         assert!(
             IndexedChunkMap::new(&blob_path, 16, true)
                 .unwrap()
-                .is_verified()
+                .is_verified(7)
         );
 
         // What an older release does on a fill: set the bit, nothing else.
@@ -524,8 +532,8 @@ mod tests {
 
         let map = IndexedChunkMap::new(&blob_path, 16, true).unwrap();
         assert!(map.is_ready(chunk(8).as_base()).unwrap());
-        assert!(!map.is_verified());
-        map.set_verified(true).unwrap();
-        assert!(map.is_verified());
+        assert!(!map.is_verified(7));
+        map.set_verified(Some(7)).unwrap();
+        assert!(map.is_verified(7));
     }
 }

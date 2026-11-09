@@ -6,7 +6,7 @@
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::os::unix::io::AsRawFd;
-use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
 
 use nydus_utils::div_round_up;
 use nydus_utils::filemap::{FileMapState, FromMapped, clone_file};
@@ -20,7 +20,7 @@ pub(crate) const MAGIC_ALL_READY: u32 = 0x4D4D_4150;
 /// `Header::verified` value: every chunk marked ready has been checked against its digest.
 pub(crate) const MAGIC_VERIFIED: u32 = 0x5644_4150;
 pub(crate) const HEADER_SIZE: usize = 4096;
-pub(crate) const HEADER_RESERVED_SIZE: usize = HEADER_SIZE - 24;
+pub(crate) const HEADER_RESERVED_SIZE: usize = HEADER_SIZE - 32;
 
 /// The blob chunk map file header, 4096 bytes.
 #[repr(C)]
@@ -38,10 +38,14 @@ pub(crate) struct Header {
     /// leaves it alone while it fills chunks without validating them, which the mismatch then
     /// reveals.
     pub ready_count: u32,
+    /// A stamp of the data file's change time and size, kept by every write this version makes
+    /// to it. `verified` holds only while it matches: a release that predates the field cannot
+    /// write the data file, not even to invalidate and refill it, without changing its ctime.
+    pub data_stamp: u64,
     pub reserved: [u8; HEADER_RESERVED_SIZE],
 }
 
-// SAFETY: `Header` is `#[repr(C)]` with six `u32`s followed by a byte array, so it has no padding,
+// SAFETY: `Header` is `#[repr(C)]` with six `u32`s and a `u64` at an 8-byte offset followed by a byte array, so it has no padding,
 // no interior mutability, and every bit pattern is valid.
 unsafe impl FromMapped for Header {}
 
@@ -252,6 +256,7 @@ impl PersistMap {
             all_ready: 0,
             verified: 0,
             ready_count: 0,
+            data_stamp: 0,
             reserved: [0x0u8; HEADER_RESERVED_SIZE],
         };
 
@@ -385,21 +390,50 @@ impl PersistMap {
         self.count - self.not_ready_count.load(Ordering::Acquire)
     }
 
-    /// Whether the header records every ready chunk as checked against its digest, and no ready
-    /// bit has changed since but through this version, which validates every chunk it fills.
-    pub fn is_verified(&self) -> bool {
+    fn data_stamp_word(&self) -> StorageResult<&AtomicU64> {
+        let ptr = self
+            .filemap
+            .validate_range(std::mem::offset_of!(Header, data_stamp), size_of::<u64>())
+            .map_err(|e| StorageError::cache_io("reach the chunk map contents", e))?
+            .cast::<u64>();
+        if !ptr.is_aligned() {
+            return Err(StorageError::InvalidState(
+                "unaligned chunk map header".to_string(),
+            ));
+        }
+        // SAFETY: the word is aligned and in the writable mapping, which outlives the reference,
+        // and once the map is open it is only accessed atomically.
+        Ok(unsafe { AtomicU64::from_ptr(ptr.cast_mut()) })
+    }
+
+    /// Whether the header records every ready chunk as checked against its digest, and neither
+    /// a ready bit nor the data file (`data_stamp`, see [Header::data_stamp]) has changed since
+    /// but through this version, which validates every chunk it fills.
+    pub fn is_verified(&self, data_stamp: u64) -> bool {
         self.verified_word()
             .is_ok_and(|w| w.load(Ordering::Acquire) == MAGIC_VERIFIED)
             && self
                 .ready_count_word()
                 .is_ok_and(|w| w.load(Ordering::Acquire) == self.ready_chunks())
+            && self
+                .data_stamp_word()
+                .is_ok_and(|w| w.load(Ordering::Acquire) == data_stamp)
     }
 
-    /// Record whether every ready chunk has been checked against its digest, persisted before
-    /// returning. A fill racing with this can leave the count off by one, which reads as not
-    /// verified: the safe direction.
-    pub fn set_verified(&self, verified: bool) -> StorageResult<()> {
-        if verified {
+    /// Record the data file's stamp after this version wrote it.
+    pub fn update_data_stamp(&self, data_stamp: u64) -> StorageResult<()> {
+        self.data_stamp_word()?.store(data_stamp, Ordering::Release);
+        Ok(())
+    }
+
+    /// Record every ready chunk as checked against its digest with the data file at
+    /// `data_stamp`, or with `None` that they are not, persisted before returning. A fill racing
+    /// with this can leave the count or stamp stale, which reads as not verified: the safe
+    /// direction.
+    pub fn set_verified(&self, data_stamp: Option<u64>) -> StorageResult<()> {
+        let verified = data_stamp.is_some();
+        if let Some(stamp) = data_stamp {
+            self.update_data_stamp(stamp)?;
             let word = self.ready_count_word()?;
             loop {
                 let ready = self.ready_chunks();

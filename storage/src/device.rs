@@ -1245,28 +1245,33 @@ pub trait BlobObject: AsRawFd {
     }
 
     /// Whether every chunk marked ready in the cache file has been checked against its digest,
-    /// both the chunks filled by this cache and those found ready when it was opened.
+    /// both the chunks filled by this cache and those found ready when it was opened, and the
+    /// file has not been written since but by validating fills. One `fstat(2)` and a few atomic
+    /// loads, cheap enough to ask at mount time.
     fn is_data_verified(&self) -> bool {
         false
     }
 
     /// Check every chunk already marked ready against its digest, calling `on_mismatch` for each
-    /// one that fails, and record the cache file as verified once all have passed or been
-    /// handled. Returns `Ok(false)` without recording anything when `stop()` turns true first.
+    /// one that fails. `on_mismatch` returns whether it revoked the chunk (with
+    /// [`Self::revoke_chunk`], after whatever has to happen first, such as re-arming a
+    /// pre-content mark); the check carries on either way, so that every bad chunk is reported.
     ///
-    /// `on_mismatch` must revoke the chunk with [`Self::clear_chunk_ready`]; it decides what
-    /// has to happen around that, such as re-arming a pre-content mark first.
+    /// Returns whether the cache file is now recorded as verified: not when a failing chunk was
+    /// left in place or a ready chunk has no digest to check it against, and not when `stop()`
+    /// turned true first, in which case nothing is recorded.
     fn verify_ready_chunks(
         &self,
         _stop: &dyn Fn() -> bool,
-        _on_mismatch: &mut dyn FnMut(&dyn BlobChunkInfo) -> StorageResult<()>,
+        _on_mismatch: &mut dyn FnMut(&dyn BlobChunkInfo) -> StorageResult<bool>,
     ) -> StorageResult<bool> {
         Err(StorageError::Unsupported)
     }
 
-    /// Revoke the ready state of one chunk, so the next read of it fetches again. Like
-    /// [`Self::reset_data_ready`], call it before the chunk's bytes go away.
-    fn clear_chunk_ready(&self, _chunk_index: u32) -> StorageResult<()> {
+    /// Revoke the ready state of one chunk and deallocate its bytes, so the next read of it
+    /// fetches again. The chunk is held pending meanwhile, so no fill can mark it ready over
+    /// the hole.
+    fn revoke_chunk(&self, _chunk_index: u32) -> StorageResult<()> {
         Err(StorageError::Unsupported)
     }
 }
