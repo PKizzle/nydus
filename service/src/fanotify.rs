@@ -1405,6 +1405,16 @@ impl FanotifyHandler {
         Ok(users)
     }
 
+    /// Blobs whose cache may serve data not checked against its digests, which keeps a mount
+    /// out of the page cache sharing domain.
+    fn unverified_blobs(&self) -> Vec<String> {
+        self.blob_backings
+            .iter()
+            .filter(|b| !b.is_served_verified())
+            .map(|b| b.blob.blob_info().blob_id())
+            .collect()
+    }
+
     /// Mount the EROFS filesystem after all marks are in place.
     ///
     /// This must be called **after** `new()`, **after** `arm()`, and **after** the workers start.
@@ -1429,12 +1439,7 @@ impl FanotifyHandler {
             return Ok(());
         }
         let share = self.inode_share_domain.as_deref().filter(|domain| {
-            let unverified: Vec<String> = self
-                .blob_backings
-                .iter()
-                .filter(|b| !b.is_served_verified())
-                .map(|b| b.blob.blob_info().blob_id())
-                .collect();
+            let unverified = self.unverified_blobs();
             let refused = inode_share_refusal(
                 bootstrap_has_fingerprints(&self.bootstrap_path),
                 &unverified,
@@ -2749,10 +2754,16 @@ mod tests {
         let (stage, mnt) = (work.path().join("stage"), work.path().join("mnt"));
         let (stage_s, mnt_s) = (stage.to_str().unwrap(), mnt.to_str().unwrap());
         let first = Arc::new(FanotifyHandler::new(stage_s, mnt_s, mgr.clone(), 1).unwrap());
+        // A fresh cache may share from its first mount on.
+        assert!(first.unverified_blobs().is_empty());
         spawn_worker(&first);
         first.arm().unwrap();
         first.mount().unwrap();
         let good = read_all_cold(&mnt);
+        assert!(
+            !first.unverified_blobs().is_empty(),
+            "filled, not yet verified"
+        );
         first.spawn_verifier().unwrap().join().unwrap();
         assert!(first.is_blob_verified(FIXTURE_BLOB));
         let cache = first.blob_backings[0].cache_path.clone();
@@ -2774,6 +2785,12 @@ mod tests {
             "building a handler leaves the cache file alone"
         );
         assert!(second.is_blob_verified(FIXTURE_BLOB));
+        // The warm cache of the restarted daemon still lets its mount share page cache.
+        assert!(second.unverified_blobs().is_empty());
+        assert_eq!(
+            inode_share_refusal(Ok(true), &second.unverified_blobs()),
+            None
+        );
         spawn_worker(&second);
         second.arm().unwrap();
         second.mount().unwrap();

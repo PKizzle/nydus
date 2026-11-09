@@ -403,6 +403,60 @@ mod tests {
         assert!(left.contains_key(Path::new("/g")));
     }
 
+    /// Two files whose different chunks claim one start in the blob: the kernel reads the same
+    /// bytes for both, while each is validated against its own digest. Neither may be
+    /// fingerprinted, whatever the source claims.
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support xattrs")]
+    fn chunks_sharing_a_start_get_no_fingerprint() {
+        use nydus_rafs::metadata::layout::v6::RafsV6InodeChunkAddr;
+
+        let dir = TempDir::new().unwrap();
+        let (f, g) = (vec![5u8; 9000], vec![6u8; 9000]);
+        let source = layer(
+            &[("f", &f), ("g", &g), ("h", &[7u8; 5000])],
+            dir.path(),
+            4096,
+        );
+        let rs = load(&source);
+        let chunk = |name: &str| {
+            let root = rs
+                .get_extended_inode(rs.superblock.root_ino(), false)
+                .unwrap();
+            let inode = root.get_child_by_name(std::ffi::OsStr::new(name)).unwrap();
+            inode.get_chunk_info(0).unwrap()
+        };
+        let (cf, cg) = (chunk("f"), chunk("g"));
+        let addr = |c: &dyn nydus_storage::device::BlobChunkInfo, offset: u64| {
+            let mut a = RafsV6InodeChunkAddr::new();
+            a.set_blob_index(c.blob_index());
+            a.set_blob_ci_index(c.id());
+            a.set_block_addr((offset / 4096) as u32);
+            a.as_ref().to_vec()
+        };
+        let mut data = std::fs::read(&source).unwrap();
+        // g's chunk-table entry and its inode's chunk address both move to f's start.
+        let at = data
+            .windows(32)
+            .position(|w| w == cg.chunk_id().data)
+            .unwrap();
+        data[at + 56..at + 64].copy_from_slice(&cf.uncompressed_offset().to_le_bytes());
+        let (from, to) = (
+            addr(cg.as_ref(), cg.uncompressed_offset()),
+            addr(cg.as_ref(), cf.uncompressed_offset()),
+        );
+        let at = data.windows(8).position(|w| w == from).unwrap();
+        data[at..at + 8].copy_from_slice(&to);
+        std::fs::write(&source, data).unwrap();
+
+        let target = dir.path().join("view");
+        build_node_view(&source, &target, crate::test_config()).unwrap();
+        let fps = fingerprints(&target);
+        assert!(!fps.contains_key(Path::new("/f")), "{fps:?}");
+        assert!(!fps.contains_key(Path::new("/g")), "{fps:?}");
+        assert!(fps.contains_key(Path::new("/h")), "{fps:?}");
+    }
+
     /// A 16 KiB-block image becomes a 4 KiB-block view the kernel reads exactly.
     #[test]
     #[cfg_attr(miri, ignore = "Miri does not support xattrs")]
