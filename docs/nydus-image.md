@@ -198,12 +198,24 @@ data blobs: ["9e50ae5ac02b2ef6ffb86075720e49d95d8240eed4717dd8ac9c68cadba00762"]
 
 `--inode-share-fingerprint` (RAFS v6) writes a content fingerprint on every non-empty regular
 file, for the EROFS `inode_share` mount option (Linux 7.0+): mounts sharing a `domain_id` then
-share one page cache for files with equal fingerprints. The fingerprint is a SHA-256 over the
-file size and its chunk digests, which `nydus-image` computed from the uncompressed data; it is
-stored as a hidden xattr (long prefix `nydus.fingerprint.v1`, base index 0) and declared with the
-`ishare_xattrs` superblock feature. A file whose chunks lack content digests or do not cover
-it end to end gets no fingerprint (logged as a warning) and is simply not shared. Only mount images whose fingerprints you produced yourself in
-one domain: a forged fingerprint makes another image's file read this one's pages.
+share one page cache for files with equal fingerprints. The fingerprint is a SHA-256 over a scheme
+tag, the chunk digest algorithm, the file size and each chunk's size and digest, which
+`nydus-image` computed from the uncompressed data; it is stored as a hidden xattr (long prefix
+`nydus.fingerprint.v2`, base index 0) and declared with the `ishare_xattrs` superblock feature. A
+file whose chunks lack content digests or do not cover it end to end gets no fingerprint (logged
+as a warning) and is simply not shared. Only mount images whose fingerprints you produced
+yourself in one domain: a forged fingerprint makes another image's file read this one's pages.
+
+### Node view
+
+`nydus-image node-view -B <view> <bootstrap>` writes the node view of any RAFS v6 bootstrap: the
+same tree, xattrs and chunk table, laid out at 4 KiB blocks with device slots sized for them, and
+a fingerprint (scheme as above) on each regular file the kernel provably reads through exactly
+its own chunk-table chunks, computed from those chunks. Fingerprints the source carries are never
+read: RAFS readers skip long-prefix xattrs, the only form a fingerprint has on disk. Only the
+bootstrap is read, never layer data. A v5, tarfs or encrypted source, or one whose chunks do not
+start on 4 KiB boundaries, fails. The snapshotter mounts every fanotify image through its view;
+see [nydus-fanotify.md](nydus-fanotify.md).
 
 ### Layer apply model
 

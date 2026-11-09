@@ -43,7 +43,7 @@ use nydus_builder::{
     BuildContext, BuildOutput, Builder, ChunkdictBlobInfo, ChunkdictChunkInfo, ConversionType,
     DirectoryBuilder, Feature, Features, Generator, HashChunkDict, Merger, OptimizePrefetch,
     Prefetch, PrefetchPolicy, StargzBuilder, TarballBuilder, Tree, WhiteoutSpec,
-    attributes::Attributes, generate_prefetch_file_info, parse_chunk_dict_arg,
+    attributes::Attributes, build_node_view, generate_prefetch_file_info, parse_chunk_dict_arg,
     update_ctx_from_bootstrap,
 };
 
@@ -550,6 +550,23 @@ fn prepare_cmd_args(bti_string: &'static str) -> App {
     );
 
     let app = app.subcommand(
+        App::new("node-view")
+            .about("Write the node view of a RAFS v6 bootstrap: 4 KiB blocks and node-computed page cache sharing fingerprints, for the EROFS `inode_share` mount option (Linux 7.0+)")
+            .arg(
+                Arg::new("bootstrap")
+                    .long("bootstrap")
+                    .short('B')
+                    .help("Output path of the node view")
+                    .required(true),
+            )
+            .arg(
+                Arg::new("SOURCE")
+                    .help("RAFS v6 bootstrap to view; only its metadata is read")
+                    .required(true),
+            ),
+    );
+
+    let app = app.subcommand(
         App::new("check")
             .about("Validate RAFS filesystem metadata")
             .arg(
@@ -998,6 +1015,8 @@ fn main() -> Result<()> {
             std::process::exit(2);
         }
         result
+    } else if let Some(matches) = cmd.subcommand_matches("node-view") {
+        Command::node_view(matches)
     } else if let Some(matches) = cmd.subcommand_matches("check") {
         Command::check(matches, &build_info)
     } else if let Some(matches) = cmd.subcommand_matches("inspect") {
@@ -1589,6 +1608,19 @@ impl Command {
                 .unwrap_or_default(),
         );
 
+        Ok(())
+    }
+
+    fn node_view(matches: &ArgMatches) -> Result<()> {
+        let source = PathBuf::from(matches.get_one::<String>("SOURCE").unwrap());
+        let target = PathBuf::from(matches.get_one::<String>("bootstrap").unwrap());
+        let view = build_node_view(&source, &target, Arc::new(ConfigV2::default()))?;
+        info!(
+            "node view {}: {} of {} regular files fingerprinted",
+            target.display(),
+            view.fingerprinted,
+            view.regular_files
+        );
         Ok(())
     }
 

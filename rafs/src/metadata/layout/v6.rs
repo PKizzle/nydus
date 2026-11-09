@@ -140,7 +140,44 @@ const SB_RESERVED_ISHARE_XATTR_PREFIX_ID: usize = 15;
 ///
 /// It has no xattr namespace, so `RafsXAttrs::add` can never accept it from a source image, and on
 /// disk it is the long prefix with index 0 of the image's prefix table (`EROFS_XATTR_LONG_PREFIX`).
-pub const RAFSV6_ISHARE_XATTR_NAME: &str = "nydus.fingerprint.v1";
+/// The kernel keys shared inodes by the xattr value alone, not its name: what keeps fingerprints
+/// of different schemes apart is the scheme tag hashed into [`ishare_fingerprint`].
+pub const RAFSV6_ISHARE_XATTR_NAME: &str = "nydus.fingerprint.v2";
+
+/// The page cache sharing fingerprint of a regular file of `size` bytes whose data is `chunks`, in
+/// file order, each as its uncompressed size and its content digest under `digester`, the
+/// algorithm fills of the chunk are validated with.
+///
+/// A SHA-256 over a scheme tag, the digest algorithm, the file size and each chunk's size and
+/// digest: equal fingerprints mean equal chunk digest sequences under one algorithm, so equal
+/// content wherever every chunk's bytes are checked against its digest. `None` for an empty
+/// file, a chunk without a digest (all zero), or chunks that do not cover the file end to end:
+/// such a file is not identified by its chunks and must not share.
+pub fn ishare_fingerprint(
+    digester: digest::Algorithm,
+    size: u64,
+    chunks: impl IntoIterator<Item = (u32, [u8; 32])>,
+) -> Option<[u8; 32]> {
+    use nydus_utils::digest::DigestHasher;
+
+    if size == 0 {
+        return None;
+    }
+    let mut hasher = digest::RafsDigest::hasher(digest::Algorithm::Sha256);
+    hasher.digest_update(b"nydus-rafs-chunks-v2\0");
+    hasher.digest_update(&(digester as u32).to_le_bytes());
+    hasher.digest_update(&size.to_le_bytes());
+    let mut covered = 0u64;
+    for (chunk_size, id) in chunks {
+        if id == [0u8; 32] {
+            return None;
+        }
+        covered += chunk_size as u64;
+        hasher.digest_update(&chunk_size.to_le_bytes());
+        hasher.digest_update(&id);
+    }
+    (covered == size).then(|| hasher.digest_finalize().data)
+}
 
 /// Size of SHA256 digest string.
 const BLOB_SHA256_LEN: usize = 64;
