@@ -2889,7 +2889,7 @@ mod tests {
             }
         }"#
         .replace("WORK", work.path().to_str().unwrap())
-        .replace("ROOT", &root);
+        .replace("ROOT", root);
         let mut entry: nydus_api::config::BlobCacheEntry = serde_json::from_str(&config).unwrap();
         assert!(entry.prepare_configuration_info());
         let mgr = Arc::new(BlobCacheMgr::new());
