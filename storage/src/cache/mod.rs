@@ -22,15 +22,17 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use fuse_backend_rs::file_buf::FileVolatileSlice;
+use nydus_utils::compress;
 use nydus_utils::compress::zlib_random::ZranDecoder;
 use nydus_utils::compress::zstd_frames::{self, ZstdStreamCursor};
 use nydus_utils::crypt::{self, Cipher, CipherContext};
-use nydus_utils::{compress, digest};
+use nydus_utils::digest::{self, RafsDigest};
 
 use crate::backend::{BlobBackend, BlobReader, RequestSource};
 use crate::cache::state::ChunkMap;
 use crate::device::{
     BlobChunkInfo, BlobInfo, BlobIoDesc, BlobIoRange, BlobIoVec, BlobObject, BlobPrefetchRequest,
+    ChunkDigestEntry,
 };
 use crate::meta::BlobCompressionContextInfo;
 use crate::utils::{AlignedBuf, alloc_buf, check_crc, check_hash, check_xxh3};
@@ -198,6 +200,22 @@ pub trait BlobCache: Send + Sync {
 
     /// Check whether need to validate the data chunk by digest value.
     fn need_validation(&self) -> bool;
+
+    /// The digest chunk data is validated against, or `None` when the cache has none for it.
+    fn expected_chunk_digest(&self, chunk: &dyn BlobChunkInfo) -> Option<RafsDigest> {
+        Some(*chunk.chunk_id())
+    }
+
+    /// Account for `chunk` failing validation against its digest.
+    fn report_digest_mismatch(&self, _chunk: &dyn BlobChunkInfo) {}
+
+    /// Supply the digest and extent of chunks by chunk index, from a bootstrap's chunk table, so
+    /// the cache validates their data against the bootstrap rather than against digests in the
+    /// blob meta. `None` marks a chunk the bootstrap does not reference. Fails when an extent
+    /// disagrees with the blob meta or a digest disagrees with one supplied before.
+    fn add_chunk_digests(&self, _digests: &[Option<ChunkDigestEntry>]) -> StorageResult<()> {
+        Err(StorageError::Unsupported)
+    }
 
     /// Get the [BlobReader](../backend/trait.BlobReader.html) to read data from storage backend.
     fn reader(&self) -> &dyn BlobReader;
@@ -482,10 +500,23 @@ pub trait BlobCache: Send + Sync {
         }
 
         if self.need_validation() {
-            if !check_hash(buffer, chunk.chunk_id(), self.blob_digester()) {
-                return Err(StorageError::InvalidData(
-                    "data digest value doesn't match".to_string(),
-                ));
+            match self.expected_chunk_digest(chunk) {
+                Some(digest) if check_hash(buffer, &digest, self.blob_digester()) => {}
+                Some(_) => {
+                    self.report_digest_mismatch(chunk);
+                    return Err(StorageError::InvalidData(format!(
+                        "blob {}: data digest value of chunk {} doesn't match",
+                        self.blob_id(),
+                        chunk.id()
+                    )));
+                }
+                None => {
+                    return Err(StorageError::InvalidData(format!(
+                        "blob {}: no digest to validate chunk {} against",
+                        self.blob_id(),
+                        chunk.id()
+                    )));
+                }
             }
         } else if chunk.has_xxh3() {
             if !check_xxh3(buffer, chunk.xxh3()) {

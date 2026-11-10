@@ -1118,6 +1118,11 @@ mod tests {
     /// Helper to create a DataBlob from the test fixture bootstrap.
     /// Returns (DataBlob, TempDir) — TempDir must be kept alive.
     fn create_data_blob() -> (DataBlob, TempDir) {
+        create_data_blob_with("filecache")
+    }
+
+    /// [create_data_blob] with a cache of type `cache_type`.
+    fn create_data_blob_with(cache_type: &str) -> (DataBlob, TempDir) {
         use std::os::fd::AsRawFd;
 
         let tmp_dir = TempDir::new().unwrap();
@@ -1145,14 +1150,22 @@ mod tests {
                     "type": "localfs",
                     "localfs": { "dir": "/tmp/nydus" }
                 },
-                "cache": {
-                    "type": "filecache",
-                    "filecache": { "work_dir": "/tmp/nydus" }
-                },
+                "cache": { CACHE_SECTION },
                 "metadata_path": "BOOT_PATH"
             }
         }"#;
         let content = config
+            // A fanotify cache reads its work dir from the file cache section, which the v1
+            // configuration form fills in.
+            .replace(
+                "CACHE_SECTION",
+                &match cache_type {
+                    "fanotify" => r#""type": "fanotify", "fanotify": { "work_dir": "/tmp/nydus" },
+                        "filecache": { "work_dir": "/tmp/nydus" }"#
+                        .to_string(),
+                    t => format!(r#""type": "{t}", "{t}": {{ "work_dir": "/tmp/nydus" }}"#),
+                },
+            )
             .replace("/tmp/nydus", tmp_dir.path().to_str().unwrap())
             .replace("BOOT_PATH", &boot_path.display().to_string());
         let mut entry: BlobCacheEntry = serde_json::from_str(&content).unwrap();
@@ -1223,5 +1236,183 @@ mod tests {
                 // Verify we got actual data (not all zeros)
                 assert!(buf.iter().any(|&b| b != 0));
             });
+    }
+
+    /// The fixture bootstrap's digest table for the fixture blob.
+    fn fixture_digests() -> Vec<Option<nydus_storage::device::ChunkDigestEntry>> {
+        let root_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap();
+        let boot = PathBuf::from(root_dir).join("../tests/texture/bootstrap/rafs-v6-2.2.boot");
+        let (rs, _) =
+            RafsSuper::load_from_file(&boot, Arc::new(ConfigV2::default()), false).unwrap();
+        let mut tables = nydus_rafs::metadata::kernel_layout::chunk_digest_tables(&rs).unwrap();
+        assert_eq!(tables.len(), 1);
+        tables.remove(0)
+    }
+
+    fn is_ready(blob: &DataBlob, index: u32) -> bool {
+        let chunk = blob.blob().get_chunk_info(index).unwrap();
+        blob.blob()
+            .get_chunk_map()
+            .is_ready(chunk.as_ref())
+            .unwrap()
+    }
+
+    /// A fanotify cache fills nothing it cannot validate, validates against the bootstrap's
+    /// chunk table even though the blob meta carries no digests, and never marks a chunk that
+    /// fails validation ready.
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support copy_file_range")]
+    fn fanotify_fills_are_validated_against_the_bootstrap() {
+        use nydus_storage::device::BlobFeatures;
+
+        let (blob, _tmp) = create_data_blob_with("fanotify");
+        // The fixture's blob meta inlines chunk digests, but a fanotify cache never loads them:
+        // it has only the bootstrap's, as for zran and tar-ref blobs, which inline none.
+        assert!(
+            blob.blob_info()
+                .has_feature(BlobFeatures::INLINED_CHUNK_DIGEST)
+        );
+        let meta = blob.blob().get_blob_meta_info().unwrap().unwrap();
+        assert!(meta.get_chunk_digest(0).is_none());
+        let obj = blob.blob().get_blob_object().unwrap();
+        let first = blob.blob().get_chunk_info(0).unwrap();
+        let len = first.uncompressed_size() as u64;
+
+        // Before any bootstrap supplied digests, there is nothing to validate against.
+        assert!(obj.fetch_range_uncompressed(0, len).is_err());
+        assert!(!is_ready(&blob, 0));
+
+        // A digest that does not match the data: the fill fails and the chunk stays unready.
+        let digests = fixture_digests();
+        let mut wrong = digests.clone();
+        wrong[0].as_mut().unwrap().digest.data[0] ^= 1;
+        blob.blob().add_chunk_digests(&wrong).unwrap();
+        let err = obj.fetch_range_uncompressed(0, len).unwrap_err();
+        assert!(format!("{err:?}").contains("digest value"), "{err:?}");
+        assert!(!is_ready(&blob, 0));
+
+        // The chunk was never cached, so the wrong digest binds nothing: a bootstrap with the
+        // right one replaces it.
+        blob.blob().add_chunk_digests(&digests).unwrap();
+        obj.fetch_range_uncompressed(0, len).unwrap();
+        assert!(is_ready(&blob, 0));
+        // Now the cached chunk binds its digest: a bootstrap that disagrees is refused.
+        assert!(blob.blob().add_chunk_digests(&wrong).is_err());
+
+        let (blob, _tmp) = create_data_blob_with("fanotify");
+        let obj = blob.blob().get_blob_object().unwrap();
+        // So is one whose chunk extent disagrees with the blob meta, once that is loaded.
+        blob.blob().get_blob_meta_info().unwrap().unwrap();
+        let mut moved = digests.clone();
+        moved[0].as_mut().unwrap().uncompressed_offset += 1;
+        assert!(blob.blob().add_chunk_digests(&moved).is_err());
+        blob.blob().add_chunk_digests(&digests).unwrap();
+        obj.fetch_range_uncompressed(0, len).unwrap();
+        assert!(is_ready(&blob, 0));
+    }
+
+    /// The one-time check of chunks already marked ready records a clean cache file as
+    /// verified, and hands a corrupted chunk to its caller to revoke, after which the next fill
+    /// restores it.
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support copy_file_range")]
+    fn ready_chunks_are_verified_once() {
+        use std::os::unix::fs::FileExt;
+
+        let (blob, _tmp) = create_data_blob_with("fanotify");
+        let obj = blob.blob().get_blob_object().unwrap();
+        blob.blob().add_chunk_digests(&fixture_digests()).unwrap();
+        let size = blob.blob_info().uncompressed_size();
+        obj.fetch_range_uncompressed(0, size).unwrap();
+        assert!(obj.is_all_data_ready());
+        assert!(!obj.is_data_verified());
+
+        let mut revoked = Vec::new();
+        assert!(
+            obj.verify_ready_chunks(&|| false, &mut |c| {
+                revoked.push(c.id());
+                Ok(true)
+            })
+            .unwrap()
+        );
+        assert!(revoked.is_empty());
+        assert!(obj.is_data_verified());
+
+        let first = blob.blob().get_chunk_info(0).unwrap();
+        // SAFETY: the descriptor is the blob object's open cache file, borrowed for the write.
+        let cache = std::mem::ManuallyDrop::new(unsafe {
+            <std::fs::File as std::os::fd::FromRawFd>::from_raw_fd(obj.as_raw_fd())
+        });
+        let mut byte = [0u8; 1];
+        cache
+            .read_exact_at(&mut byte, first.uncompressed_offset())
+            .unwrap();
+        cache
+            .write_all_at(&[byte[0] ^ 0xff], first.uncompressed_offset())
+            .unwrap();
+        // Written by something other than a validating fill, as an older release would.
+        assert!(!obj.is_data_verified());
+
+        // A chunk its caller cannot revoke is reported, left in place, and keeps the file
+        // unverified; the check goes on past it.
+        assert!(
+            !obj.verify_ready_chunks(&|| false, &mut |c| {
+                revoked.push(c.id());
+                Ok(false)
+            })
+            .unwrap()
+        );
+        assert_eq!(revoked, vec![first.id()]);
+        assert!(is_ready(&blob, first.id()));
+        assert!(!obj.is_data_verified());
+
+        revoked.clear();
+        assert!(
+            obj.verify_ready_chunks(&|| false, &mut |c| {
+                revoked.push(c.id());
+                obj.revoke_chunk(c.id()).map(|()| true)
+            })
+            .unwrap()
+        );
+        assert_eq!(revoked, vec![first.id()]);
+        assert!(!is_ready(&blob, first.id()));
+        assert!(obj.is_data_verified());
+
+        obj.fetch_range_uncompressed(0, first.uncompressed_size() as u64)
+            .unwrap();
+        let mut again = [0u8; 1];
+        cache
+            .read_exact_at(&mut again, first.uncompressed_offset())
+            .unwrap();
+        assert_eq!(again, byte);
+
+        // A stop request ends the check without recording anything.
+        let (blob, _tmp) = create_data_blob_with("fanotify");
+        let obj = blob.blob().get_blob_object().unwrap();
+        blob.blob().add_chunk_digests(&fixture_digests()).unwrap();
+        assert!(
+            !obj.verify_ready_chunks(&|| true, &mut |_| Ok(true))
+                .unwrap()
+        );
+        assert!(!obj.is_data_verified());
+
+        // A ready chunk no bootstrap of this daemon references is left alone, unverified.
+        let (blob, _tmp) = create_data_blob_with("fanotify");
+        let obj = blob.blob().get_blob_object().unwrap();
+        let mut digests = fixture_digests();
+        assert!(digests.len() > 1);
+        digests[1] = None;
+        blob.blob().add_chunk_digests(&digests).unwrap();
+        let second = blob.blob().get_chunk_info(1).unwrap();
+        blob.blob()
+            .get_chunk_map()
+            .set_ready_and_clear_pending(second.as_ref())
+            .unwrap();
+        assert!(
+            !obj.verify_ready_chunks(&|| false, &mut |_| panic!("not a mismatch"))
+                .unwrap()
+        );
+        assert!(is_ready(&blob, 1));
+        assert!(!obj.is_data_verified());
     }
 }

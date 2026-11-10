@@ -76,6 +76,22 @@ impl RangeMap for IndexedChunkMap {
         self.map.reset()
     }
 
+    fn clear_ready(&self, index: u32) -> StorageResult<()> {
+        self.map.clear_chunk_ready(index)
+    }
+
+    fn is_verified(&self, data_stamp: u64) -> bool {
+        self.map.is_verified(data_stamp)
+    }
+
+    fn set_verified(&self, data_stamp: Option<u64>) -> StorageResult<()> {
+        self.map.set_verified(data_stamp)
+    }
+
+    fn update_data_stamp(&self, data_stamp: u64) -> StorageResult<()> {
+        self.map.update_data_stamp(data_stamp)
+    }
+
     fn is_range_ready(&self, start_index: u32, count: u32) -> StorageResult<bool> {
         if !self.is_range_all_ready() {
             for idx in 0..count {
@@ -284,6 +300,9 @@ mod tests {
             version: 1,
             magic2: MAGIC2,
             all_ready: MAGIC_ALL_READY,
+            verified: 0,
+            ready_count: 0,
+            data_stamp: 0,
             reserved: [0x0u8; HEADER_RESERVED_SIZE],
         };
 
@@ -331,6 +350,9 @@ mod tests {
             version: 0,
             magic2: 0,
             all_ready: 0,
+            verified: 0,
+            ready_count: 0,
+            data_stamp: 0,
             reserved: [0x0u8; HEADER_RESERVED_SIZE],
         };
 
@@ -421,5 +443,97 @@ mod tests {
         let reopened = IndexedChunkMap::new(&blob_path, 8, true).unwrap();
         assert!(!reopened.is_range_all_ready());
         assert_eq!(reopened.map.not_ready_count.load(Ordering::Acquire), 8);
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support file-backed mmap")]
+    fn test_clear_ready_and_verified_survive_reopen() {
+        let dir = TempDir::new().unwrap();
+        let blob_path = dir.path().join("blob-clear");
+        let blob_path = blob_path.as_os_str().to_str().unwrap().to_string();
+        let chunk = |index| MockChunkInfo {
+            index,
+            ..Default::default()
+        };
+
+        {
+            let map = IndexedChunkMap::new(&blob_path, 8, true).unwrap();
+            assert!(!map.is_verified(7));
+            for idx in 0..8u32 {
+                map.set_ready_and_clear_pending(chunk(idx).as_base())
+                    .unwrap();
+            }
+            assert!(map.is_range_all_ready());
+            map.clear_ready(5).unwrap();
+            assert!(!map.is_range_all_ready());
+            assert!(!map.is_ready(chunk(5).as_base()).unwrap());
+            assert!(map.is_ready(chunk(4).as_base()).unwrap());
+            // Clearing a chunk that is not ready changes nothing.
+            map.clear_ready(5).unwrap();
+            assert_eq!(map.map.not_ready_count.load(Ordering::Acquire), 1);
+            map.set_verified(Some(7)).unwrap();
+        }
+
+        let reopened = IndexedChunkMap::new(&blob_path, 8, true).unwrap();
+        assert!(reopened.is_verified(7));
+        // A data file changed since, by anyone, is not verified.
+        assert!(!reopened.is_verified(8));
+        assert!(!reopened.is_ready(chunk(5).as_base()).unwrap());
+        assert_eq!(reopened.map.not_ready_count.load(Ordering::Acquire), 1);
+        reopened.set_verified(None).unwrap();
+        assert!(
+            !IndexedChunkMap::new(&blob_path, 8, true)
+                .unwrap()
+                .is_verified(7)
+        );
+    }
+
+    /// A release without fill validation sets ready bits but leaves the header's ready count
+    /// alone, so a verified map it filled no longer reads as verified.
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support file-backed mmap")]
+    fn test_verified_does_not_survive_a_fill_by_an_older_release() {
+        use std::os::unix::fs::FileExt;
+
+        let dir = TempDir::new().unwrap();
+        let blob_path = dir.path().join("blob-old-fill");
+        let blob_path = blob_path.as_os_str().to_str().unwrap().to_string();
+        let chunk = |index| MockChunkInfo {
+            index,
+            ..Default::default()
+        };
+        {
+            let map = IndexedChunkMap::new(&blob_path, 16, true).unwrap();
+            map.set_ready_and_clear_pending(chunk(0).as_base()).unwrap();
+            map.set_verified(Some(7)).unwrap();
+            // Fills by this version keep the record.
+            map.set_ready_and_clear_pending(chunk(1).as_base()).unwrap();
+            map.clear_ready(0).unwrap();
+            assert!(map.is_verified(7));
+        }
+        assert!(
+            IndexedChunkMap::new(&blob_path, 16, true)
+                .unwrap()
+                .is_verified(7)
+        );
+
+        // What an older release does on a fill: set the bit, nothing else.
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(format!("{blob_path}.chunk_map"))
+            .unwrap();
+        let mut byte = [0u8; 1];
+        file.read_exact_at(&mut byte, HEADER_SIZE as u64 + 1)
+            .unwrap();
+        file.write_all_at(&[byte[0] | 0x80], HEADER_SIZE as u64 + 1)
+            .unwrap();
+        drop(file);
+
+        let map = IndexedChunkMap::new(&blob_path, 16, true).unwrap();
+        assert!(map.is_ready(chunk(8).as_base()).unwrap());
+        assert!(!map.is_verified(7));
+        map.set_verified(Some(7)).unwrap();
+        assert!(map.is_verified(7));
     }
 }

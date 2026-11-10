@@ -47,6 +47,7 @@ pub mod chunk;
 pub mod direct_v5;
 pub mod direct_v6;
 pub mod inode;
+pub mod kernel_layout;
 pub mod layout;
 
 // Reexport from nydus_storage crate.

@@ -185,6 +185,41 @@ impl RangeMap for BlobStateMap<IndexedChunkMap, u32> {
         self.c.reset_range_ready()
     }
 
+    fn clear_ready(&self, index: u32) -> StorageResult<()> {
+        self.c.clear_ready(index)
+    }
+
+    fn revoke(
+        &self,
+        index: u32,
+        discard: &mut dyn FnMut() -> StorageResult<()>,
+    ) -> StorageResult<()> {
+        {
+            let mut guard = self.inflight_tracer.lock().unwrap();
+            if guard.contains_key(&index) {
+                // Only a fill holds a chunk pending, and a fill only takes a chunk not ready:
+                // there is nothing cached to revoke.
+                return Ok(());
+            }
+            guard.insert(index, Arc::new(Slot::new()));
+        }
+        let result = self.c.clear_ready(index).and_then(|()| discard());
+        self.clear_range_pending(index, 1);
+        result
+    }
+
+    fn is_verified(&self, data_stamp: u64) -> bool {
+        self.c.is_verified(data_stamp)
+    }
+
+    fn set_verified(&self, data_stamp: Option<u64>) -> StorageResult<()> {
+        self.c.set_verified(data_stamp)
+    }
+
+    fn update_data_stamp(&self, data_stamp: u64) -> StorageResult<()> {
+        self.c.update_data_stamp(data_stamp)
+    }
+
     fn is_range_ready(&self, start: Self::I, count: Self::I) -> StorageResult<bool> {
         self.c.is_range_ready(start, count)
     }

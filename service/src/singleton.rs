@@ -160,6 +160,7 @@ impl ServiceController {
             fanotify.stop();
             return Err(e);
         }
+        self.spawn_fanotify_verifier(image_id, &fanotify);
 
         let mut handlers = self.fanotify.lock().unwrap();
         handlers.insert(image_id.to_string(), fanotify);
@@ -194,6 +195,18 @@ impl ServiceController {
         fanotify.add_workers(workers.collect::<Vec<_>>());
     }
 
+    /// Start `fanotify`'s check of the chunks its caches held before it, once its mount is up.
+    fn spawn_fanotify_verifier(
+        &self,
+        image_id: &str,
+        fanotify: &Arc<crate::fanotify::FanotifyHandler>,
+    ) {
+        match fanotify.spawn_verifier() {
+            Ok(verifier) => fanotify.add_workers([verifier]),
+            Err(e) => warn!("fanotify: cannot start the cache verifier for {image_id}: {e}"),
+        }
+    }
+
     /// Rebuild a fanotify handler from a fanotify group fd preserved across a hot upgrade.
     ///
     /// The marks and EROFS mount survived the daemon swap (the fd kept the group alive), so this
@@ -221,6 +234,7 @@ impl ServiceController {
         )?);
 
         self.spawn_fanotify_workers(image_id, &fanotify);
+        self.spawn_fanotify_verifier(image_id, &fanotify);
 
         let mut handlers = self.fanotify.lock().unwrap();
         handlers.insert(image_id.to_string(), fanotify);
@@ -281,6 +295,7 @@ impl ServiceController {
             info!("Resuming fanotify handler for {}", image_id);
             fanotify.reactivate();
             self.spawn_fanotify_workers(image_id, fanotify);
+            self.spawn_fanotify_verifier(image_id, fanotify);
         }
         self.fanotify.lock().unwrap().extend(handlers);
     }

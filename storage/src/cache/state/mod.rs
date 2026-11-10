@@ -163,6 +163,39 @@ pub trait RangeMap: Send + Sync {
     fn reset_range_ready(&self) -> StorageResult<()> {
         Err(StorageError::Unsupported)
     }
+
+    /// Revoke the ready state of one chunk; call it before the chunk's bytes go away.
+    fn clear_ready(&self, _index: Self::I) -> StorageResult<()> {
+        Err(StorageError::Unsupported)
+    }
+
+    /// Revoke the ready state of one chunk and run `discard` to drop its bytes, with the chunk
+    /// held pending throughout, so that no fill can mark it ready again before `discard`
+    /// finishes: a fill of it waits, then finds it not ready and fetches it again.
+    fn revoke(
+        &self,
+        _index: Self::I,
+        _discard: &mut dyn FnMut() -> StorageResult<()>,
+    ) -> StorageResult<()> {
+        Err(StorageError::Unsupported)
+    }
+
+    /// Whether the map records every ready chunk as checked against its digest, with the data
+    /// file still at `data_stamp`.
+    fn is_verified(&self, _data_stamp: u64) -> bool {
+        false
+    }
+
+    /// Record every ready chunk as checked against its digest with the data file at
+    /// `data_stamp`, or with `None` that they are not.
+    fn set_verified(&self, _data_stamp: Option<u64>) -> StorageResult<()> {
+        Err(StorageError::Unsupported)
+    }
+
+    /// Record the data file's stamp after a write to it.
+    fn update_data_stamp(&self, _data_stamp: u64) -> StorageResult<()> {
+        Err(StorageError::Unsupported)
+    }
 }
 
 /// Trait to convert a [BlobChunkInfo](../../device/trait.BlobChunkInfo.html) object to an index

@@ -6,7 +6,7 @@
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::os::unix::io::AsRawFd;
-use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
 
 use nydus_utils::div_round_up;
 use nydus_utils::filemap::{FileMapState, FromMapped, clone_file};
@@ -17,8 +17,10 @@ use crate::{StorageError, StorageResult};
 pub(crate) const MAGIC1: u32 = 0x424D_4150;
 pub(crate) const MAGIC2: u32 = 0x434D_4150;
 pub(crate) const MAGIC_ALL_READY: u32 = 0x4D4D_4150;
+/// `Header::verified` value: every chunk marked ready has been checked against its digest.
+pub(crate) const MAGIC_VERIFIED: u32 = 0x5644_4150;
 pub(crate) const HEADER_SIZE: usize = 4096;
-pub(crate) const HEADER_RESERVED_SIZE: usize = HEADER_SIZE - 16;
+pub(crate) const HEADER_RESERVED_SIZE: usize = HEADER_SIZE - 32;
 
 /// The blob chunk map file header, 4096 bytes.
 #[repr(C)]
@@ -28,10 +30,22 @@ pub(crate) struct Header {
     pub version: u32,
     pub magic2: u32,
     pub all_ready: u32,
+    /// [MAGIC_VERIFIED] once every ready chunk has been checked against its digest. Openers that
+    /// fill without validating clear it. Zero in maps written before the field existed.
+    pub verified: u32,
+    /// The number of ready chunks, kept by every ready-bit change this version makes.
+    /// `verified` holds only while it matches the bitmap: a release that predates the field
+    /// leaves it alone while it fills chunks without validating them, which the mismatch then
+    /// reveals.
+    pub ready_count: u32,
+    /// A stamp of the data file's change time and size, kept by every write this version makes
+    /// to it. `verified` holds only while it matches: a release that predates the field cannot
+    /// write the data file, not even to invalidate and refill it, without changing its ctime.
+    pub data_stamp: u64,
     pub reserved: [u8; HEADER_RESERVED_SIZE],
 }
 
-// SAFETY: `Header` is `#[repr(C)]` with four `u32`s followed by a byte array, so it has no padding,
+// SAFETY: `Header` is `#[repr(C)]` with six `u32`s and a `u64` at an 8-byte offset followed by a byte array, so it has no padding,
 // no interior mutability, and every bit pattern is valid.
 unsafe impl FromMapped for Header {}
 
@@ -58,8 +72,13 @@ fn atomic_byte(filemap: &FileMapState, offset: usize) -> io::Result<&AtomicU8> {
 
 /// Get the header's `all_ready` word in a chunk map mapping as an atomic.
 fn atomic_all_ready(filemap: &FileMapState) -> io::Result<&AtomicU32> {
+    atomic_header_word(filemap, std::mem::offset_of!(Header, all_ready))
+}
+
+/// Get the header word at `offset` in a chunk map mapping as an atomic.
+fn atomic_header_word(filemap: &FileMapState, offset: usize) -> io::Result<&AtomicU32> {
     let ptr = filemap
-        .validate_range(std::mem::offset_of!(Header, all_ready), size_of::<u32>())?
+        .validate_range(offset, size_of::<u32>())?
         .cast::<u32>();
     if !ptr.is_aligned() {
         return Err(io::Error::new(
@@ -235,6 +254,9 @@ impl PersistMap {
             version: 1,
             magic2: MAGIC2,
             all_ready: 0,
+            verified: 0,
+            ready_count: 0,
+            data_stamp: 0,
             reserved: [0x0u8; HEADER_RESERVED_SIZE],
         };
 
@@ -315,6 +337,9 @@ impl PersistMap {
             }
 
             if self.write_u8(index, current) {
+                if let Ok(w) = self.ready_count_word() {
+                    w.fetch_add(1, Ordering::AcqRel);
+                }
                 // Flush the map once its last chunk is ready.
                 if self.not_ready_count.fetch_sub(1, Ordering::AcqRel) == 1
                     && let Err(e) = self.filemap.sync_data()
@@ -325,6 +350,105 @@ impl PersistMap {
             }
         }
 
+        Ok(())
+    }
+
+    /// Clear one chunk's ready state, persisted before returning.
+    pub fn clear_chunk_ready(&self, index: u32) -> StorageResult<()> {
+        let index = self.validate_index(index)?;
+        // The header marker short-circuits readiness checks, so it goes first.
+        let all_ready = atomic_all_ready(&self.filemap)
+            .map_err(|e| StorageError::cache_io("reach the chunk map contents", e))?;
+        all_ready.store(0, Ordering::Release);
+        let byte = atomic_byte(&self.filemap, HEADER_SIZE + (index as usize >> 3))
+            .map_err(|e| StorageError::cache_io("reach the chunk map contents", e))?;
+        let mask = Self::index_to_mask(index);
+        // A count of zero claims every chunk ready whatever the bitmap says, so it must move too.
+        let was_ready = byte.fetch_and(!mask, Ordering::AcqRel) & mask != 0;
+        if was_ready {
+            self.ready_count_word()?.fetch_sub(1, Ordering::AcqRel);
+        }
+        if was_ready || self.not_ready_count.load(Ordering::Acquire) == 0 {
+            self.not_ready_count.fetch_add(1, Ordering::AcqRel);
+        }
+        self.filemap
+            .sync_data()
+            .map_err(|e| StorageError::cache_io("flush the chunk map", e))
+    }
+
+    fn verified_word(&self) -> StorageResult<&AtomicU32> {
+        atomic_header_word(&self.filemap, std::mem::offset_of!(Header, verified))
+            .map_err(|e| StorageError::cache_io("reach the chunk map contents", e))
+    }
+
+    fn ready_count_word(&self) -> StorageResult<&AtomicU32> {
+        atomic_header_word(&self.filemap, std::mem::offset_of!(Header, ready_count))
+            .map_err(|e| StorageError::cache_io("reach the chunk map contents", e))
+    }
+
+    fn ready_chunks(&self) -> u32 {
+        self.count - self.not_ready_count.load(Ordering::Acquire)
+    }
+
+    fn data_stamp_word(&self) -> StorageResult<&AtomicU64> {
+        let ptr = self
+            .filemap
+            .validate_range(std::mem::offset_of!(Header, data_stamp), size_of::<u64>())
+            .map_err(|e| StorageError::cache_io("reach the chunk map contents", e))?
+            .cast::<u64>();
+        if !ptr.is_aligned() {
+            return Err(StorageError::InvalidState(
+                "unaligned chunk map header".to_string(),
+            ));
+        }
+        // SAFETY: the word is aligned and in the writable mapping, which outlives the reference,
+        // and once the map is open it is only accessed atomically.
+        Ok(unsafe { AtomicU64::from_ptr(ptr.cast_mut()) })
+    }
+
+    /// Whether the header records every ready chunk as checked against its digest, and neither
+    /// a ready bit nor the data file (`data_stamp`, see [Header::data_stamp]) has changed since
+    /// but through this version, which validates every chunk it fills.
+    pub fn is_verified(&self, data_stamp: u64) -> bool {
+        self.verified_word()
+            .is_ok_and(|w| w.load(Ordering::Acquire) == MAGIC_VERIFIED)
+            && self
+                .ready_count_word()
+                .is_ok_and(|w| w.load(Ordering::Acquire) == self.ready_chunks())
+            && self
+                .data_stamp_word()
+                .is_ok_and(|w| w.load(Ordering::Acquire) == data_stamp)
+    }
+
+    /// Record the data file's stamp after this version wrote it.
+    pub fn update_data_stamp(&self, data_stamp: u64) -> StorageResult<()> {
+        self.data_stamp_word()?.store(data_stamp, Ordering::Release);
+        Ok(())
+    }
+
+    /// Record every ready chunk as checked against its digest with the data file at
+    /// `data_stamp`, or with `None` that they are not, persisted before returning. A fill racing
+    /// with this can leave the count or stamp stale, which reads as not verified: the safe
+    /// direction.
+    pub fn set_verified(&self, data_stamp: Option<u64>) -> StorageResult<()> {
+        let verified = data_stamp.is_some();
+        if let Some(stamp) = data_stamp {
+            self.update_data_stamp(stamp)?;
+            let word = self.ready_count_word()?;
+            loop {
+                let ready = self.ready_chunks();
+                word.store(ready, Ordering::Release);
+                if self.ready_chunks() == ready {
+                    break;
+                }
+            }
+        }
+        let value = if verified { MAGIC_VERIFIED } else { 0 };
+        if self.verified_word()?.swap(value, Ordering::AcqRel) != value {
+            self.filemap
+                .sync_data()
+                .map_err(|e| StorageError::cache_io("flush the chunk map", e))?;
+        }
         Ok(())
     }
 
@@ -362,6 +486,7 @@ impl PersistMap {
             byte.store(0, Ordering::Release);
         }
         self.not_ready_count.store(self.count, Ordering::Release);
+        self.ready_count_word()?.store(0, Ordering::Release);
 
         // Persist before returning: if the process dies between the punch and a later flush,
         // a stale on-disk bitmap would claim the discarded chunks are present.

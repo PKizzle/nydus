@@ -7,9 +7,10 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
 use nydus_api::ConfigV2;
 use nydus_builder::Tree;
+use nydus_rafs::metadata::kernel_layout::{LayoutViolation, check_kernel_layout};
 use nydus_rafs::metadata::{RafsSuper, RafsVersion};
 use nydus_storage::device::BlobInfo;
 use nydus_utils::compress;
@@ -50,7 +51,7 @@ impl Validator {
         let compressor = self.sb.meta.get_compressor();
         let rafs_version: RafsVersion = self.sb.meta.version.try_into().unwrap();
         if rafs_version == RafsVersion::V6 {
-            self.sb.check_v6_block_addrs(&self.path)?;
+            self.check_v6_block_addrs()?;
         }
 
         Ok((
@@ -58,6 +59,28 @@ impl Validator {
             compressor,
             rafs_version,
         ))
+    }
+
+    /// The kernel reads a chunk at `block_addr * block_size` of the device its chunk address
+    /// names, while FUSE and the fill path read it at the chunk table's uncompressed offset.
+    /// Both must agree for every byte of every file, or only a kernel mount reads the wrong
+    /// bytes. External blobs are not EROFS devices, so their chunks are left out.
+    fn check_v6_block_addrs(&self) -> Result<()> {
+        let report = check_kernel_layout(&self.sb, &self.path)?;
+        let mut errors = report.image_errors.clone();
+        for file in &report.files {
+            for v in &file.violations {
+                if !matches!(v, LayoutViolation::ExternalBlob { .. }) {
+                    errors.push(format!("{}: {v}", file.path.display()));
+                }
+            }
+        }
+        ensure!(
+            errors.is_empty(),
+            "the kernel would not read what the chunk table describes:\n{}",
+            errors.join("\n")
+        );
+        Ok(())
     }
 }
 
@@ -215,7 +238,7 @@ mod tests {
             shift_chunk_offset(&bootstrap, 5000u64.next_multiple_of(block_size));
             let err = check_image(&dir, &bootstrap).unwrap_err();
             assert!(
-                format!("{err:#}").contains("but its data starts at uncompressed offset"),
+                format!("{err:#}").contains("the chunk starts at 0x"),
                 "{err:#}"
             );
 

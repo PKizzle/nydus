@@ -22,9 +22,10 @@
 //!
 //! The kernel floor for this path is **Linux 6.14** (`CONFIG_FANOTIFY_ACCESS_PERMISSIONS=y`).
 
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{ErrorKind, Result};
-use std::os::unix::fs::FileExt;
+use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt};
 use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -32,7 +33,10 @@ use std::sync::{Arc, Barrier, Mutex, RwLock};
 
 use mio::unix::SourceFd;
 use mio::{Events, Interest, Poll, Token, Waker};
+use nydus_rafs::metadata::RafsSuper;
+use nydus_rafs::metadata::kernel_layout::chunk_digest_tables;
 use nydus_rafs::metadata::layout::v6::{EROFS_SUPER_OFFSET, RafsV6Device, RafsV6SuperBlock};
+use nydus_storage::device::BlobChunkInfo;
 
 use crate::blob_cache::{BlobCacheMgr, DataBlob};
 use crate::fanotify_sys::{
@@ -272,6 +276,8 @@ struct BlobBacking {
     /// [`FanotifyHandler::from_restored_fd`], which inherits live marks without calling `arm()`
     /// and so must set this explicitly; see the note there.
     armed: AtomicBool,
+    /// The cache file's path, next to which the mount's marked-open record lives.
+    cache_path: PathBuf,
 }
 
 impl BlobBacking {
@@ -302,6 +308,14 @@ impl BlobBacking {
             return Err(err);
         }
         Ok(())
+    }
+
+    /// Whether every chunk marked ready in this blob's cache file was checked against its digest.
+    fn is_verified(&self) -> bool {
+        self.blob
+            .blob()
+            .get_blob_object()
+            .is_some_and(|obj| obj.is_data_verified())
     }
 
     /// Whether every byte of this blob is already in its cache file.
@@ -921,7 +935,7 @@ impl FanotifyHandler {
         // Each `DataBlob` owns a handle to its sparse backing file; we record that file's
         // identity so an incoming event fd can be resolved back to the blob without relying on
         // path names.
-        let cache_keys = configs
+        let cache_keys: Vec<(Arc<nydus_api::ConfigV2>, String)> = configs
             .iter()
             .map(|cfg| (cfg.config_v2().clone(), cfg.blob_info().blob_id()))
             .collect();
@@ -954,12 +968,15 @@ impl FanotifyHandler {
                 std::io::Error::from(e)
             })?;
             let (dev, ino) = fd_identity(blob.file().as_raw_fd())?;
+            let cache_path =
+                std::fs::read_link(format!("/proc/self/fd/{}", blob.file().as_raw_fd()))?;
             blob_backings.push(BlobBacking {
                 dev,
                 ino,
                 blob: AssertBlobThreadSafe(blob),
                 io_lock: RwLock::new(()),
                 armed: AtomicBool::new(false),
+                cache_path,
             });
         }
 
@@ -997,6 +1014,10 @@ impl FanotifyHandler {
             }
         }
 
+        if let Some((config, _)) = cache_keys.first() {
+            install_bootstrap_digests(&bootstrap_path, config, &blob_backings)?;
+        }
+
         // Materialise the EROFS device files from the cache. Each data blob's cache file
         // (`<work_dir>/<blob_id>.blob.data`) *is* the device the kernel reads on demand; hardlink it
         // to a stable `blob_<i>` name so `mount_erofs` and the event inode-match resolve to a single
@@ -1013,6 +1034,14 @@ impl FanotifyHandler {
                     ))
                 })?;
             let device_path = cache_path.with_file_name(format!("blob_{i}"));
+            // Already this cache file: re-linking would only change the inode's ctime, which
+            // would make its verified record stale on every start.
+            if std::fs::metadata(&device_path)
+                .is_ok_and(|m| (m.dev(), m.ino()) == (backing.dev, backing.ino))
+            {
+                device_blobs.push(device_path);
+                continue;
+            }
             // Re-link defensively so a stale `blob_<i>` from a previous run cannot point at the
             // wrong inode. Removing the name is safe on both construction paths: on `new()` nothing
             // is mounted yet, and on `from_restored_fd()` (EROFS mount still live) the kernel holds
@@ -1088,7 +1117,9 @@ impl FanotifyHandler {
                     ),
                 ));
             }
-            if backing.is_fully_cached() {
+            // A complete blob whose cache was never checked stays marked: the verifier may yet
+            // revoke chunks of it, and only a mount that opened it marked raises events then.
+            if backing.is_fully_cached() && backing.is_verified() {
                 info!(
                     "fanotify: blob {} is already fully cached; leaving it unmarked so the \
                      kernel can read it ahead",
@@ -1131,7 +1162,10 @@ impl FanotifyHandler {
     /// a read that has just been served correctly must not be turned into a denial because an
     /// optimisation could not be applied.
     fn disarm_if_complete(&self, backing: &BlobBacking) {
-        if !backing.armed.load(Ordering::Acquire) || !backing.is_fully_cached() {
+        if !backing.armed.load(Ordering::Acquire)
+            || !backing.is_fully_cached()
+            || !backing.is_verified()
+        {
             return;
         }
         // Whichever worker wins the swap issues the syscall; the rest return immediately.
@@ -1162,6 +1196,166 @@ impl FanotifyHandler {
         }
     }
 
+    /// Put the blob's mark back unconditionally, before any of its cached bytes stop being
+    /// ready: an unmarked blob raises no event, so the kernel would read them unfilled.
+    /// `FAN_MARK_ADD` on a marked inode is a no-op, so this never consults [`BlobBacking::armed`].
+    fn rearm(&self, backing: &BlobBacking) -> Result<()> {
+        backing
+            .set_mark(self.fan_fd.as_raw_fd(), libc::FAN_MARK_ADD)
+            .map(|()| backing.armed.store(true, Ordering::Release))
+            .inspect_err(|e| {
+                warn!(
+                    "fanotify: cannot re-arm the mark on blob {}: {e}; leaving its cached bytes \
+                     in place",
+                    backing.blob.blob_info().blob_id()
+                )
+            })
+    }
+
+    /// Whether this blob's chunks may be revoked under the live mount: only if that mount
+    /// opened the blob while it was marked, as recorded by [`Self::mount`]. The kernel decides
+    /// when it opens a file whether reads of it raise pre-content events at all, so a mark
+    /// added later would not stop the mount reading a revoked chunk as a hole.
+    fn can_revoke(&self, backing: &BlobBacking) -> bool {
+        let recorded = std::fs::read_to_string(marked_mount_record(&backing.cache_path));
+        match (recorded, mount_unique_id(&self.mountpoint)) {
+            (Ok(recorded), Ok(live)) => recorded.trim() == live.to_string(),
+            _ => false,
+        }
+    }
+
+    /// Whether every chunk marked ready in the cache of `blob_id` has been checked against its
+    /// digest and the cache file has not been written since but by validating fills.
+    pub fn is_blob_verified(&self, blob_id: &str) -> bool {
+        self.blob_backings
+            .iter()
+            .find(|b| b.blob.blob_info().blob_id() == blob_id)
+            .is_some_and(|b| b.is_verified())
+    }
+
+    /// Start a thread that checks, once per cache file, the chunks found already marked ready
+    /// against the bootstrap's digests: fills are validated as they happen, but a cache file
+    /// filled before (or by a non-validating opener) was not. Runs at idle CPU and I/O priority
+    /// while the workers keep serving, and stops with them. Start it after [`Self::mount`].
+    ///
+    /// A failing chunk is revoked under the exclusive `io_lock`: the mark is re-armed, the
+    /// storage layer clears its ready bit and punches it out while holding it pending, so no
+    /// fill can mark it ready over the hole, and the mounted files that use it are dropped from
+    /// the page cache, which would otherwise keep serving what was read before. The next read
+    /// fetches it again through the validating fill. When the mount opened the blob unmarked
+    /// ([`Self::can_revoke`]), the chunk cannot be revoked: it is reported, counted, and the
+    /// blob stays unverified until it is mounted again.
+    pub(crate) fn spawn_verifier(self: &Arc<Self>) -> Result<std::thread::JoinHandle<()>> {
+        let handler = self.clone();
+        std::thread::Builder::new()
+            .name("fanotify-verify".to_string())
+            .spawn(move || {
+                lower_thread_priority();
+                for backing in &handler.blob_backings {
+                    if let Err(e) = handler.verify_blob(backing) {
+                        warn!(
+                            "fanotify: cannot verify the cache of blob {}: {}",
+                            backing.blob.blob_info().blob_id(),
+                            e
+                        );
+                    }
+                }
+            })
+    }
+
+    fn verify_blob(&self, backing: &BlobBacking) -> Result<()> {
+        let Some(obj) = backing.blob.blob().get_blob_object() else {
+            return Ok(());
+        };
+        if obj.is_data_verified() {
+            return Ok(());
+        }
+        let stop = || !self.active.load(Ordering::Acquire) || self.is_failed();
+        let revocable = self.can_revoke(backing);
+        let mut users: Option<HashMap<u32, Vec<PathBuf>>> = None;
+        let mut revoke = |chunk: &dyn BlobChunkInfo| -> nydus_storage::StorageResult<bool> {
+            if !revocable {
+                return Ok(false);
+            }
+            let users = match &mut users {
+                Some(users) => users,
+                None => users.insert(self.chunk_users(backing).map_err(|e| {
+                    nydus_storage::StorageError::cache_io("find the files a chunk belongs to", e)
+                })?),
+            };
+            let _revoking = backing.io_lock.write().map_err(|_| {
+                nydus_storage::StorageError::InvalidState("blob io lock poisoned".to_string())
+            })?;
+            self.rearm(backing)
+                .map_err(|e| nydus_storage::StorageError::cache_io("re-arm a blob's mark", e))?;
+            obj.revoke_chunk(chunk.id())?;
+            for path in users.get(&chunk.id()).into_iter().flatten() {
+                drop_page_cache(&self.mountpoint.join(path));
+            }
+            Ok(true)
+        };
+        match obj.verify_ready_chunks(&stop, &mut revoke) {
+            Ok(true) => {
+                info!(
+                    "fanotify: checked every cached chunk of blob {} against its digest",
+                    backing.blob.blob_info().blob_id()
+                );
+                // `arm()` kept the blob marked until now if it was complete but unchecked.
+                if let Ok(_serving) = backing.io_lock.read() {
+                    self.disarm_if_complete(backing);
+                }
+                Ok(())
+            }
+            Ok(false) | Err(nydus_storage::StorageError::Unsupported) => Ok(()),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// The mounted files, relative to the mountpoint, that read each chunk of `backing`'s blob.
+    fn chunk_users(&self, backing: &BlobBacking) -> Result<HashMap<u32, Vec<PathBuf>>> {
+        let (rs, _) = RafsSuper::load_from_file(
+            &self.bootstrap_path,
+            Arc::new(nydus_api::ConfigV2::default()),
+            false,
+        )?;
+        let blob_id = backing.blob.blob_info().blob_id();
+        let Some(blob_index) = rs
+            .superblock
+            .get_blob_infos()
+            .iter()
+            .position(|b| b.blob_id() == blob_id)
+        else {
+            return Ok(HashMap::new());
+        };
+        let mut users: HashMap<u32, Vec<PathBuf>> = HashMap::new();
+        let root = rs.get_extended_inode(rs.superblock.root_ino(), false)?;
+        let mut pending = vec![(PathBuf::new(), root)];
+        while let Some((path, inode)) = pending.pop() {
+            if inode.is_dir() {
+                for idx in 0..inode.get_child_count() {
+                    let child = inode.get_child_by_index(idx)?;
+                    // The bootstrap is untrusted: a name must stay one component under the mount.
+                    let name = child.name();
+                    if !matches!(
+                        Path::new(&name).components().collect::<Vec<_>>().as_slice(),
+                        [std::path::Component::Normal(_)]
+                    ) {
+                        continue;
+                    }
+                    pending.push((path.join(name), child));
+                }
+            } else if inode.is_reg() {
+                for idx in 0..inode.get_chunk_count() {
+                    let chunk = inode.get_chunk_info(idx)?;
+                    if chunk.blob_index() as usize == blob_index {
+                        users.entry(chunk.id()).or_default().push(path.clone());
+                    }
+                }
+            }
+        }
+        Ok(users)
+    }
+
     /// Mount the EROFS filesystem after all marks are in place.
     ///
     /// This must be called **after** `new()`, **after** `arm()`, and **after** the workers start.
@@ -1190,7 +1384,29 @@ impl FanotifyHandler {
             &self.device_blobs,
             &self.mountpoint,
             self.inode_share_domain.as_deref(),
-        )
+        )?;
+        // Record, per blob, that this mount opened it marked, so that this handler and any that
+        // takes the mount over may revoke its chunks; a blob it opened unmarked has none.
+        match mount_unique_id(&self.mountpoint) {
+            Ok(id) => {
+                for backing in &self.blob_backings {
+                    let record = marked_mount_record(&backing.cache_path);
+                    if backing.armed.load(Ordering::Acquire) {
+                        if let Err(e) = write_atomically(&record, id.to_string().as_bytes()) {
+                            warn!("fanotify: cannot record the mount of {record:?}: {e}");
+                        }
+                    } else {
+                        let _ = std::fs::remove_file(&record);
+                    }
+                }
+            }
+            Err(e) => warn!(
+                "fanotify: cannot identify the mount at {}: {e}; its cached chunks cannot be \
+                 revoked",
+                self.mountpoint.display()
+            ),
+        }
+        Ok(())
     }
 
     /// Number of worker threads.
@@ -1819,18 +2035,7 @@ impl FanotifyHandler {
 
         invalidate_in_order(
             // Step 0 — re-arm, so the punched blob raises events again.
-            || {
-                backing
-                    .set_mark(self.fan_fd.as_raw_fd(), libc::FAN_MARK_ADD)
-                    .map(|()| backing.armed.store(true, Ordering::Release))
-                    .map_err(|e| {
-                        std::io::Error::other(format!(
-                            "fanotify: cannot re-arm the mark on blob {}: {}; \
-                             refusing to punch its cache (would serve zeros)",
-                            blob_id, e
-                        ))
-                    })
-            },
+            || self.rearm(backing),
             // Step 1 — revoke the readiness bookkeeping.
             || {
                 obj.reset_data_ready().map_err(|e| {
@@ -1842,26 +2047,7 @@ impl FanotifyHandler {
                 })
             },
             // Step 2 — discard the bytes.
-            || {
-                let len = fd_file_size(fd)?;
-                if len == 0 {
-                    return Ok(());
-                }
-                // SAFETY: `fallocate` only takes integers; `fd` is the blob's open cache file
-                // descriptor.
-                let ret = unsafe {
-                    libc::fallocate(
-                        fd,
-                        libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
-                        0,
-                        len as libc::off_t,
-                    )
-                };
-                if ret != 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            },
+            || punch_hole(fd, 0, fd_file_size(fd)?),
         )?;
 
         info!("fanotify: invalidated cache for blob {}", blob_id);
@@ -1888,6 +2074,165 @@ fn invalidate_in_order(
     rearm_mark()?;
     revoke_ready()?;
     discard_bytes()
+}
+
+/// Where [`FanotifyHandler::mount`] records that the live mount opened a blob marked.
+fn marked_mount_record(cache_path: &Path) -> PathBuf {
+    let mut name = cache_path.as_os_str().to_owned();
+    name.push(".marked-mount");
+    PathBuf::from(name)
+}
+
+/// The kernel's unique id (`STATX_MNT_ID_UNIQUE`) of the mount at `mountpoint`, which no later
+/// mount reuses.
+fn mount_unique_id(mountpoint: &Path) -> Result<u64> {
+    const STATX_MNT_ID_UNIQUE: u32 = 0x4000;
+    // `struct statx`: `stx_mask` at offset 0, `stx_mnt_id` at offset 144, 256 bytes in all.
+    let mut buf = [0u64; 32];
+    let path = std::ffi::CString::new(mountpoint.as_os_str().as_encoded_bytes())
+        .map_err(|e| std::io::Error::new(ErrorKind::InvalidInput, e))?;
+    // SAFETY: `path` is NUL-terminated and `buf` is a writable, 8-byte aligned 256-byte buffer,
+    // the size of `struct statx`; both outlive the call.
+    let ret = unsafe {
+        libc::syscall(
+            libc::SYS_statx,
+            libc::AT_FDCWD,
+            path.as_ptr(),
+            0,
+            STATX_MNT_ID_UNIQUE,
+            buf.as_mut_ptr(),
+        )
+    };
+    if ret != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if (buf[0] as u32) & STATX_MNT_ID_UNIQUE == 0 {
+        return Err(std::io::Error::from(ErrorKind::Unsupported));
+    }
+    Ok(buf[144 / 8])
+}
+
+/// Replace `path` with `data`, durably and atomically.
+fn write_atomically(path: &Path, data: &[u8]) -> Result<()> {
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    let mut f = File::create(&tmp)?;
+    std::io::Write::write_all(&mut f, data)?;
+    f.sync_all()?;
+    std::fs::rename(&tmp, path)
+}
+
+/// Drop the page cache of the mounted file at `path`, best effort. A file-backed EROFS file
+/// keeps its own pages, which punching its bytes out of the backing device file does not
+/// touch; pages a process has mapped stay until it unmaps them.
+fn drop_page_cache(path: &Path) {
+    let dropped = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+        .and_then(|f| {
+            // SAFETY: `posix_fadvise` only takes integers; `f` is open for the call.
+            match unsafe { libc::posix_fadvise(f.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED) } {
+                0 => Ok(()),
+                errno => Err(std::io::Error::from_raw_os_error(errno)),
+            }
+        });
+    if let Err(e) = dropped {
+        warn!(
+            "fanotify: cannot drop the page cache of {}: {e}; it may keep serving a revoked \
+             chunk until evicted",
+            path.display()
+        );
+    }
+}
+
+/// Deallocate `[offset, offset + len)` of the cache file `fd`, keeping its size, so the range
+/// reads as a hole and raises pre-content events again.
+fn punch_hole(fd: RawFd, offset: u64, len: u64) -> Result<()> {
+    if len == 0 {
+        return Ok(());
+    }
+    // SAFETY: `fallocate` only takes integers; `fd` is the blob's open cache file descriptor.
+    let ret = unsafe {
+        libc::fallocate(
+            fd,
+            libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
+            offset as libc::off_t,
+            len as libc::off_t,
+        )
+    };
+    if ret != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Lower the calling thread to the lowest CPU priority and the idle I/O class, best effort.
+fn lower_thread_priority() {
+    const IOPRIO_WHO_PROCESS: libc::c_long = 1;
+    const IOPRIO_CLASS_IDLE: libc::c_long = 3;
+    const IOPRIO_CLASS_SHIFT: libc::c_long = 13;
+    // SAFETY: both take integers only; on Linux, `who == 0` names the calling thread.
+    unsafe {
+        libc::setpriority(libc::PRIO_PROCESS, 0, 19);
+        libc::syscall(
+            libc::SYS_ioprio_set,
+            IOPRIO_WHO_PROCESS,
+            0,
+            IOPRIO_CLASS_IDLE << IOPRIO_CLASS_SHIFT,
+        );
+    }
+}
+
+/// Have each backing's cache validate its fills against the digests `bootstrap`'s chunk table
+/// records for that blob. Fails, and with it the handler's construction, when the chunk table
+/// is inconsistent, disagrees with a blob's meta, or contradicts digests another bootstrap
+/// supplied for a shared blob before: the fill path could not tell which bytes are right.
+fn install_bootstrap_digests(
+    bootstrap: &Path,
+    config: &Arc<nydus_api::ConfigV2>,
+    backings: &[BlobBacking],
+) -> Result<()> {
+    // `RafsError` keeps only its errno once converted, so the message is logged first.
+    let log = |e: &nydus_rafs::RafsError| {
+        warn!(
+            "fanotify: no chunk digests from bootstrap {}: {e}",
+            bootstrap.display()
+        )
+    };
+    let (rs, _) = RafsSuper::load_from_file(bootstrap, config.clone(), false).inspect_err(log)?;
+    let blobs = rs.superblock.get_blob_infos();
+    let tables = chunk_digest_tables(&rs).inspect_err(log)?;
+    for backing in backings {
+        let info = backing.blob.blob_info();
+        // A tarfs device is the layer's tar itself; nothing is ever filled into it.
+        if info.features().is_tarfs() {
+            continue;
+        }
+        let blob_id = info.blob_id();
+        let index = blobs
+            .iter()
+            .position(|b| b.blob_id() == blob_id)
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    ErrorKind::InvalidInput,
+                    format!("fanotify: bootstrap has no blob {blob_id}"),
+                )
+            })?;
+        match backing.blob.blob().add_chunk_digests(&tables[index]) {
+            Ok(()) => {}
+            // Only a `fanotify` cache validates its fills; any other keeps serving as it always
+            // has, and never reports its data verified.
+            Err(nydus_storage::StorageError::Unsupported) => warn!(
+                "fanotify: blob {blob_id} is not in a fanotify cache; its fills are not validated"
+            ),
+            Err(e) => {
+                warn!("fanotify: blob {blob_id}: bootstrap digests refused: {e}");
+                return Err(e.into());
+            }
+        }
+    }
+    Ok(())
 }
 
 /// The domain every entry names, or `None` if one names none or they disagree.
@@ -2042,7 +2387,7 @@ pub(crate) mod testing {
         dir: &Path,
         edit: impl FnOnce(&mut RafsV6SuperBlock, &mut RafsV6Device),
     ) {
-        let root = std::env::var("CARGO_MANIFEST_DIR").unwrap();
+        let root = env!("CARGO_MANIFEST_DIR");
         let path = dir.join("bootstrap");
         std::fs::copy(
             format!("{root}/../tests/texture/bootstrap/rafs-v6-2.2.boot"),
@@ -2232,6 +2577,217 @@ pub(crate) mod testing {
 mod tests {
     use super::testing::*;
 
+    /// Every regular file under `dir` with its contents, read through the mount after dropping
+    /// its page cache, so the read reaches the cache file.
+    fn read_all_cold(dir: &std::path::Path) -> Vec<(std::path::PathBuf, Vec<u8>)> {
+        let mut out = Vec::new();
+        let mut stack = vec![dir.to_path_buf()];
+        while let Some(d) = stack.pop() {
+            for entry in std::fs::read_dir(&d).unwrap() {
+                let entry = entry.unwrap();
+                let ft = entry.file_type().unwrap();
+                if ft.is_dir() {
+                    stack.push(entry.path());
+                } else if ft.is_file() {
+                    super::drop_page_cache(&entry.path());
+                    out.push((entry.path(), std::fs::read(entry.path()).unwrap()));
+                }
+            }
+        }
+        out.sort();
+        out
+    }
+
+    const FIXTURE_BLOB: &str = "be7d77eeb719f70884758d1aa800ed0fb09d701aaec469964e9d54325f0d5fef";
+
+    /// A work dir under `NYDUS_FANOTIFY_TEST_DIR` with the fixture blob as the backend, the
+    /// fixture bootstrap staged in `stage/`, and a blob cache manager over a fanotify cache there;
+    /// `None`, after printing SKIP, without that directory or fanotify pre-content support.
+    fn fanotify_fixture(id: &str) -> Option<(tempfile::TempDir, Arc<super::BlobCacheMgr>)> {
+        use super::*;
+
+        let Some(base) = std::env::var_os("NYDUS_FANOTIFY_TEST_DIR") else {
+            eprintln!("SKIP: set NYDUS_FANOTIFY_TEST_DIR to an ext4 directory and run as root");
+            return None;
+        };
+        let root = env!("CARGO_MANIFEST_DIR");
+        let work = tempfile::TempDir::new_in(base).unwrap();
+        let stage = work.path().join("stage");
+        std::fs::create_dir_all(&stage).unwrap();
+        std::fs::copy(
+            format!("{root}/../tests/texture/blobs/{FIXTURE_BLOB}"),
+            work.path().join(FIXTURE_BLOB),
+        )
+        .unwrap();
+        stage_bootstrap(&stage, |_, slot| {
+            slot.set_blob_id(FIXTURE_BLOB.as_bytes().try_into().unwrap())
+        });
+        let config = r#"{
+            "type": "bootstrap", "id": "rafs-v6", "domain_id": "d",
+            "config_v2": {
+                "version": 2, "id": "ID",
+                "backend": { "type": "localfs", "localfs": { "dir": "WORK" } },
+                "cache": { "type": "fanotify", "fanotify": { "work_dir": "STAGE" },
+                           "filecache": { "work_dir": "STAGE" } },
+                "metadata_path": "STAGE/bootstrap"
+            }
+        }"#
+        .replace("ID", id)
+        .replace("WORK", work.path().to_str().unwrap())
+        .replace("STAGE", stage.to_str().unwrap());
+        let mut entry: nydus_api::config::BlobCacheEntry = serde_json::from_str(&config).unwrap();
+        assert!(entry.prepare_configuration_info());
+        let mgr = Arc::new(BlobCacheMgr::new());
+        mgr.add_blob_entry(&entry).unwrap();
+        // SAFETY: `fanotify_init` only takes integer flags; the result is checked and closed.
+        let probe = unsafe { libc::fanotify_init(FAN_CLASS_PRE_CONTENT, 0) };
+        if probe < 0 {
+            eprintln!("SKIP: no fanotify pre-content support here");
+            return None;
+        }
+        // SAFETY: `probe` is the descriptor just created and owned by nothing else.
+        unsafe { libc::close(probe) };
+        Some((work, mgr))
+    }
+
+    /// Run one worker thread for `handler`, for `stop_workers` to join.
+    fn spawn_worker(handler: &Arc<super::FanotifyHandler>) {
+        let h = handler.clone();
+        handler.add_workers([std::thread::spawn(move || {
+            let _ = h.run_loop();
+        })]);
+    }
+
+    /// Unmount `mnt`, lazily.
+    fn umount(mnt: &std::path::Path) {
+        let mnt = std::ffi::CString::new(mnt.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: `umount2` takes a NUL-terminated path that outlives the call.
+        unsafe { libc::umount2(mnt.as_ptr(), libc::MNT_DETACH) };
+    }
+
+    /// A verified cache stays verified when its handler is rebuilt over the same work dir with
+    /// no data changed, so the next daemon neither re-checks it nor keeps it from sharing.
+    #[test]
+    fn a_verified_cache_stays_verified_across_handlers() {
+        use super::*;
+
+        let Some((work, mgr)) = fanotify_fixture("verified-across-handlers") else {
+            return;
+        };
+        let (stage, mnt) = (work.path().join("stage"), work.path().join("mnt"));
+        let (stage_s, mnt_s) = (stage.to_str().unwrap(), mnt.to_str().unwrap());
+        let first = Arc::new(FanotifyHandler::new(stage_s, mnt_s, mgr.clone(), 1).unwrap());
+        spawn_worker(&first);
+        first.arm().unwrap();
+        first.mount().unwrap();
+        let good = read_all_cold(&mnt);
+        first.spawn_verifier().unwrap().join().unwrap();
+        assert!(first.is_blob_verified(FIXTURE_BLOB));
+        let cache = first.blob_backings[0].cache_path.clone();
+        let ctime = |p: &Path| {
+            let m = std::fs::metadata(p).unwrap();
+            (m.ctime(), m.ctime_nsec())
+        };
+        let before = ctime(&cache);
+        first.stop();
+        umount(&mnt);
+        drop(first);
+        // As in a new daemon: the next handler opens the cache afresh.
+        nydus_storage::factory::BLOB_FACTORY.forget("verified-across-handlers");
+
+        let second = Arc::new(FanotifyHandler::new(stage_s, mnt_s, mgr.clone(), 1).unwrap());
+        assert_eq!(
+            ctime(&cache),
+            before,
+            "building a handler leaves the cache file alone"
+        );
+        assert!(second.is_blob_verified(FIXTURE_BLOB));
+        spawn_worker(&second);
+        second.arm().unwrap();
+        second.mount().unwrap();
+        assert!(!second.blob_backings[0].armed.load(Ordering::Acquire));
+        second.spawn_verifier().unwrap().join().unwrap();
+        assert_eq!(
+            ctime(&cache),
+            before,
+            "the verifier found nothing to re-check"
+        );
+        assert_eq!(read_all_cold(&mnt), good);
+        second.stop();
+        umount(&mnt);
+    }
+
+    /// A successor that takes over a live mount which opened the blob marked revokes a cached
+    /// chunk found corrupt, and readers of the mount get the right bytes again; over a mount
+    /// that opened it unmarked the chunk is reported and left, and the blob stays unverified.
+    ///
+    /// Needs root, a >= 6.14 kernel and `NYDUS_FANOTIFY_TEST_DIR` on a file system with
+    /// pre-content marks (ext4); prints SKIP otherwise.
+    #[test]
+    fn takeover_revokes_a_corrupt_chunk_only_over_a_mount_that_opened_it_marked() {
+        use super::*;
+        use std::os::unix::fs::FileExt;
+
+        let Some((work, mgr)) = fanotify_fixture("takeover-revoke") else {
+            return;
+        };
+        let (stage, mnt) = (work.path().join("stage"), work.path().join("mnt"));
+        let (stage_s, mnt_s) = (stage.to_str().unwrap(), mnt.to_str().unwrap());
+        let first = Arc::new(FanotifyHandler::new(stage_s, mnt_s, mgr.clone(), 1).unwrap());
+        spawn_worker(&first);
+        first.arm().unwrap();
+        first.mount().unwrap();
+        let good = read_all_cold(&mnt);
+        let backing = &first.blob_backings[0];
+        let obj = backing.blob.blob().get_blob_object().unwrap();
+        assert!(obj.is_all_data_ready());
+        // Corrupt the first chunk behind the daemon's back, through the event-free descriptor.
+        let chunk = backing.blob.blob().get_chunk_info(0).unwrap();
+        // SAFETY: the descriptor is the blob object's open cache file, borrowed for the I/O.
+        let cache = std::mem::ManuallyDrop::new(unsafe { File::from_raw_fd(obj.as_raw_fd()) });
+        let corrupt = || {
+            let mut byte = [0u8; 1];
+            cache
+                .read_exact_at(&mut byte, chunk.uncompressed_offset())
+                .unwrap();
+            cache
+                .write_all_at(&[byte[0] ^ 0xff], chunk.uncompressed_offset())
+                .unwrap();
+        };
+        corrupt();
+        assert_ne!(read_all_cold(&mnt), good, "the corruption reaches readers");
+
+        // Take the mount over, as a restarted daemon does, and check the cache.
+        let group = first.get_file().unwrap();
+        first.stop_workers();
+        let second = Arc::new(
+            FanotifyHandler::from_restored_fd(stage_s, mnt_s, mgr.clone(), 1, group).unwrap(),
+        );
+        spawn_worker(&second);
+        assert!(second.can_revoke(&second.blob_backings[0]));
+        second.spawn_verifier().unwrap().join().unwrap();
+        assert!(second.is_blob_verified(FIXTURE_BLOB));
+        assert_eq!(
+            read_all_cold(&mnt),
+            good,
+            "the revoked chunk is fetched again"
+        );
+
+        // Without the record that the mount opened the blob marked, nothing is revoked.
+        std::fs::remove_file(marked_mount_record(&second.blob_backings[0].cache_path)).unwrap();
+        assert!(!second.can_revoke(&second.blob_backings[0]));
+        corrupt();
+        second.spawn_verifier().unwrap().join().unwrap();
+        assert!(!second.is_blob_verified(FIXTURE_BLOB));
+        assert!(
+            obj.is_all_data_ready(),
+            "an unrevocable chunk stays in place"
+        );
+
+        second.stop();
+        umount(&mnt);
+    }
+
     #[test]
     fn deny_errno_passthrough_table() {
         use super::deny_errno_for;
@@ -2270,6 +2826,10 @@ mod tests {
             "precondition: wrapper hides the errno"
         );
         assert_eq!(deny_errno_for(&wrapped), libc::EDQUOT);
+
+        // A fill whose data fails validation is denied, never allowed over the unfilled hole.
+        let invalid = nydus_storage::StorageError::InvalidData("digest mismatch".to_string());
+        assert_eq!(deny_errno_for(&std::io::Error::from(invalid)), libc::EIO);
     }
 
     use super::*;
@@ -2280,7 +2840,7 @@ mod tests {
     #[cfg_attr(miri, ignore = "Miri does not support copy_file_range")]
     fn test_refuses_bootstrap_whose_devices_have_no_data_blob() {
         let dir = tempfile::TempDir::new().unwrap();
-        let root = std::env::var("CARGO_MANIFEST_DIR").unwrap();
+        let root = env!("CARGO_MANIFEST_DIR");
         // This bootstrap's device table holds one data blob.
         std::fs::copy(
             format!("{root}/../tests/texture/bootstrap/rafs-v6-2.2.boot"),
@@ -2312,7 +2872,7 @@ mod tests {
     #[cfg_attr(miri, ignore = "Miri does not support copy_file_range")]
     fn refuses_data_blobs_that_do_not_match_the_device_table() {
         const BLOB: &str = "be7d77eeb719f70884758d1aa800ed0fb09d701aaec469964e9d54325f0d5fef";
-        let root = std::env::var("CARGO_MANIFEST_DIR").unwrap();
+        let root = env!("CARGO_MANIFEST_DIR");
         let work = tempfile::TempDir::new().unwrap();
         std::fs::copy(
             format!("{root}/../tests/texture/blobs/{BLOB}"),
@@ -2329,7 +2889,7 @@ mod tests {
             }
         }"#
         .replace("WORK", work.path().to_str().unwrap())
-        .replace("ROOT", &root);
+        .replace("ROOT", root);
         let mut entry: nydus_api::config::BlobCacheEntry = serde_json::from_str(&config).unwrap();
         assert!(entry.prepare_configuration_info());
         let mgr = Arc::new(BlobCacheMgr::new());
