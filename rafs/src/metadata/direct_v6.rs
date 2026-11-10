@@ -2171,6 +2171,58 @@ mod tests {
         ));
     }
 
+    /// A dirent of the root pointed back at the root makes the root reachable
+    /// twice; the block address check refuses it instead of walking the loop forever.
+    #[test]
+    fn test_block_addr_check_rejects_directory_loops() {
+        const EROFS_FT_DIR: u8 = 2;
+        let (path, mut data) = v6_fixture();
+        let sb = load_v6(&data).unwrap();
+        sb.check_v6_block_addrs(&path).unwrap();
+        let mut dsb = DirectSuperBlockV6::new(&sb.meta, superblocks_of(&path));
+        dsb.load(&mut open_bootstrap(&path)).unwrap();
+        let state = dsb.state.load();
+        let root = dsb.inode_wrapper(&state, sb.meta.root_nid as u64).unwrap();
+        let block = root
+            .data_block_offset(&state, root.disk_inode(&state), 0)
+            .unwrap();
+        drop(state);
+
+        // RafsV6Dirent { e_nid: u64, e_nameoff: u16, e_file_type: u8, reserved: u8 }; the
+        // first entry's name offset ends the dirent array.
+        let dirent = |i: usize| block + i * 12;
+        let names_at = u16::from_le_bytes([data[block + 8], data[block + 9]]) as usize;
+        let name = |i: usize| {
+            let start = u16::from_le_bytes([data[dirent(i) + 8], data[dirent(i) + 9]]) as usize;
+            let end = if (i + 1) * 12 < names_at {
+                u16::from_le_bytes([data[dirent(i + 1) + 8], data[dirent(i + 1) + 9]]) as usize
+            } else {
+                start + 256
+            };
+            data[block + start..block + end]
+                .split(|b| *b == 0)
+                .next()
+                .unwrap()
+                .to_vec()
+        };
+        // The fixture's root holds only files; turn the first into a directory entry for the root.
+        let child = (0..names_at / 12)
+            .find(|&i| name(i) != b"." && name(i) != b"..")
+            .expect("the fixture's root has a child");
+        let at = dirent(child);
+        data[at..at + 8].copy_from_slice(&(sb.meta.root_nid as u64).to_le_bytes());
+        data[at + 10] = EROFS_FT_DIR;
+
+        let file = vmm_sys_util::tempfile::TempFile::new().unwrap();
+        std::fs::write(file.as_path(), &data).unwrap();
+        let sb = load_v6(&data).unwrap();
+        let err = sb.check_v6_block_addrs(file.as_path()).unwrap_err();
+        assert!(
+            matches!(&err, RafsError::InvalidMetadata(m) if m.contains("reachable twice")),
+            "{err}"
+        );
+    }
+
     /// A directory claiming more dirent blocks than the bootstrap holds is rejected, here when
     /// the bootstrap loads because it is the root, instead of every directory operation walking
     /// all the claimed blocks.

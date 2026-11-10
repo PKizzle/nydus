@@ -21,6 +21,19 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 static RUNTIME_AUTH: OnceLock<Mutex<RuntimeAuthStore>> = OnceLock::new();
 
+type AuthListener = Box<dyn Fn() + Send + Sync>;
+
+/// Called after every update that stored credentials.
+static AUTH_LISTENERS: Mutex<Vec<AuthListener>> = Mutex::new(Vec::new());
+
+/// Call `listener` after every update of the runtime auth store that stores credentials.
+/// It runs on the updating thread, so it must not block.
+pub fn on_runtime_auth_update(listener: impl Fn() + Send + Sync + 'static) {
+    if let Ok(mut listeners) = AUTH_LISTENERS.lock() {
+        listeners.push(Box::new(listener));
+    }
+}
+
 #[derive(Default)]
 struct RuntimeAuthStore {
     entries: HashMap<String, RuntimeAuthEntry>,
@@ -66,10 +79,12 @@ pub fn set_runtime_auth(entries: Vec<RuntimeAuthRequest>) -> Result<usize, Runti
         .lock()
         .map_err(|_| RuntimeAuthError::StorePoisoned)?;
     store.prune_expired(SystemTime::now());
+    let mut stored = false;
     for entry in entries {
         if entry.auth.is_empty() || entry.registry.trim().is_empty() {
             continue;
         }
+        stored = true;
         let expires_at = entry
             .expires_in_seconds
             .map(|ttl| SystemTime::now() + Duration::from_secs(ttl));
@@ -81,7 +96,12 @@ pub fn set_runtime_auth(entries: Vec<RuntimeAuthRequest>) -> Result<usize, Runti
             },
         );
     }
-    Ok(store.entries.len())
+    let count = store.entries.len();
+    drop(store);
+    if stored && let Ok(listeners) = AUTH_LISTENERS.lock() {
+        listeners.iter().for_each(|listener| listener());
+    }
+    Ok(count)
 }
 
 pub fn runtime_auth_records() -> Result<Vec<RuntimeAuthRecord>, RuntimeAuthError> {
