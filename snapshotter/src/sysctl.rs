@@ -490,8 +490,8 @@ struct HttpRequest {
 }
 
 #[derive(Debug)]
-struct HttpResponse {
-    status: u16,
+pub(crate) struct HttpResponse {
+    pub(crate) status: u16,
     content_type: &'static str,
     body: Vec<u8>,
 }
@@ -642,7 +642,7 @@ fn extract_lowerdir(line: &str) -> Option<String> {
     None
 }
 
-fn handle_auth_put(body: &[u8]) -> HttpResponse {
+pub(crate) fn handle_auth_put(body: &[u8]) -> HttpResponse {
     let entries = match serde_json::from_slice::<Vec<RuntimeAuthRequest>>(body) {
         Ok(entries) => entries,
         Err(e) => return error_response(400, format!("invalid auth request: {e}")),
@@ -1859,6 +1859,8 @@ mod tests {
             updated_at: 1,
             pid: 0,
             built_on_node: false,
+            driver_override: None,
+            registry_auth: false,
         };
         let records_dir = controller.supervisor.daemons_root().join("records");
         std::fs::create_dir_all(&records_dir).unwrap();

@@ -362,20 +362,21 @@ impl BlobCacheMgr {
             BLOB_CACHE_TYPE_META_BLOB => {
                 let (path, config) = self.get_meta_info(entry)?;
                 self.add_meta_object(&entry.domain_id, &entry.blob_id, path, config)
-                    .inspect_err(|_e| {
+                    // Never the entry itself: its backend config may carry registry credentials.
+                    .inspect_err(|e| {
                         warn!(
-                            "blob_cache: failed to add cache entry for meta blob: {:?}",
-                            entry
+                            "blob_cache: failed to add cache entry for meta blob {} in domain {}: {}",
+                            entry.blob_id, entry.domain_id, e
                         );
                     })
             }
             BLOB_CACHE_TYPE_DATA_BLOB => Err(Error::InvalidArguments(format!(
                 "blob_cache: invalid data blob cache entry: {:?}",
-                entry
+                entry.clone_without_secrets()
             ))),
             _ => Err(Error::InvalidArguments(format!(
                 "blob_cache: invalid blob cache entry, {:?}",
-                entry
+                entry.clone_without_secrets()
             ))),
         }
     }

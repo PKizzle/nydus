@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # B4b: serve a nydus image whose bootstrap came from an OCI referrer artifact (the nydusify /
 # Go-snapshotter model) the way the snapshotter's Prepare path does: through
-# `DaemonSupervisor::ensure_instance` with the fanotify driver selected, its data blob fetched on
-# demand from a registry. Builds the image, then runs the root-only
+# `DaemonSupervisor::ensure_instance` with the fanotify driver selected: mounted as EROFS, its
+# data blob fetched on demand from a registry. Builds the image, then runs the root-only
 # `referrer_daemon_serves_every_file` test, which serves the blob from a local HTTP registry and
 # compares every file of the mount with the source. Detection, the cosign trust policy and
 # bootstrap materialization are covered by `misc/referrer/trust-e2e.sh`.
 #
-# Needs root, FUSE and cargo.
+# Needs root, Linux >= 6.14, cargo, and ROOT on ext4 (tmpfs has no pre-content marks).
 set -u
 NI="${NYDUS_IMAGE:-./target/release/nydus-image}"
 CARGO="${CARGO:-cargo}"

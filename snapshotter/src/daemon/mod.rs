@@ -26,7 +26,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use async_lock::{Mutex, RwLock};
 use mio::{Poll, Token, Waker};
-use nydus_api::BuildTimeInfo;
+use nydus_api::{BackendConfigV2, BuildTimeInfo};
 use nydus_service::Error as ServiceError;
 use nydus_service::daemon::{
     DaemonState, DaemonStateMachineInput, DaemonStateMachineSubscriber, NydusDaemon,
@@ -41,8 +41,8 @@ use tracing::{debug, info, warn};
 
 use crate::config::{FsDriverType, SnapshotterConfig};
 use crate::daemon::config_builder::{
-    auto_accel_inode_share_domain, build_auto_accel_blob_cache_entry, build_blob_cache_entry,
-    build_daemon_config,
+    auto_accel_inode_share_domain, build_backend_config, build_blob_cache_entry,
+    build_daemon_config, build_fanotify_blob_cache_entry, localfs_backend,
 };
 use crate::daemon::image_ref::{ImageRef, parse_image_ref};
 use crate::prefetch_profile::runtime_prefetch_for_image;
@@ -130,6 +130,15 @@ pub struct DaemonStatusRecord {
     /// mount eligible for EROFS page cache sharing. Restarts keep the mount's eligibility.
     #[serde(default)]
     pub built_on_node: bool,
+    /// The driver the image's `containerd.io/snapshot/nydus-fs-driver` label asked for, so a
+    /// restart, recovery or upgrade starts it the way `Prepare` did. `None` in records of
+    /// older builds and for images without the label.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub driver_override: Option<FsDriverType>,
+    /// Whether the fanotify daemon fetched from a registry with credentials (never the
+    /// credentials themselves), so a successor that finds none can say so.
+    #[serde(default)]
+    pub registry_auth: bool,
 }
 
 /// Outcome for one daemon recovery attempt.
@@ -239,6 +248,14 @@ struct DaemonInstance {
     failover_armed: AtomicBool,
     /// See `DaemonStatusRecord::built_on_node`.
     built_on_node: bool,
+    /// See `DaemonStatusRecord::driver_override`.
+    driver_override: Option<FsDriverType>,
+    /// See `DaemonStatusRecord::registry_auth`.
+    registry_auth: bool,
+    /// The image was fetched with registry credentials, but this daemon was built without
+    /// any (none in the auth store at its takeover or heal), so it fails every uncached read
+    /// until `heal_daemons_missing_auth` rebuilds it once credentials arrive.
+    missing_auth: bool,
 }
 
 impl DaemonInstance {
@@ -517,7 +534,21 @@ pub struct DaemonSupervisor {
     /// Flap guard for `recover()`: a daemon recovered within this window is
     /// skipped on the next pass instead of being restarted again and again.
     recent_recoveries: StdMutex<HashMap<String, Instant>>,
+    /// Why the daemon dirs cannot take fanotify pre-content marks (`None`: they can), probed
+    /// on the first fanotify start. The driver probe tests only the cache `work_dir`.
+    daemons_take_marks: Arc<std::sync::OnceLock<Option<String>>>,
+    /// A pass of `heal_daemons_missing_auth` is scheduled and has not started yet; further
+    /// credential updates until it starts are covered by it.
+    auth_heal_pending: AtomicBool,
+    /// Serializes `heal_daemons_missing_auth` passes.
+    auth_heal_pass: async_lock::Mutex<()>,
+    /// Daemons healed because credentials they lacked arrived.
+    auth_heals: AtomicU64,
 }
+
+/// How long a credential update waits before its heal pass, so that a burst of updates (the
+/// credential bridge stores many entries at startup) is served by one pass.
+const AUTH_HEAL_DEBOUNCE: Duration = Duration::from_millis(500);
 
 impl DaemonSupervisor {
     pub fn new(config: SnapshotterConfig) -> Self {
@@ -543,6 +574,10 @@ impl DaemonSupervisor {
             probe_pass: async_lock::Mutex::new(()),
             probe_timeouts_total: AtomicU64::new(0),
             recent_recoveries: StdMutex::new(HashMap::new()),
+            daemons_take_marks: Arc::new(std::sync::OnceLock::new()),
+            auth_heal_pending: AtomicBool::new(false),
+            auth_heal_pass: async_lock::Mutex::new(()),
+            auth_heals: AtomicU64::new(0),
         }
     }
 
@@ -617,8 +652,7 @@ impl DaemonSupervisor {
                 );
             }
             if inst.bootstrap == bootstrap
-                && Self::accel_backend_for(bootstrap).is_some()
-                && mount_fstype_at(&inst.mountpoint).as_deref() == Some("erofs")
+                && is_fanotify_mount(&inst.mountpoint)
                 && let Some(old) = instances.remove(image_ref)
             {
                 // The caller's per-image start lock keeps this image's other starts out; other
@@ -771,7 +805,13 @@ impl DaemonSupervisor {
         }
 
         let instance = self
-            .start_local_instance(image_ref, bootstrap, backend_dir, built_on_node)
+            .start_fanotify_instance(
+                image_ref,
+                bootstrap,
+                localfs_backend(backend_dir),
+                built_on_node,
+                None,
+            )
             .await
             .with_context(|| format!("failed to start auto-accel daemon for {image_ref}"))?;
         instance.acquire_holder(holder);
@@ -790,18 +830,22 @@ impl DaemonSupervisor {
         Ok(Arc::new(handle))
     }
 
-    /// Spawn an in-process auto-accel daemon. Mirrors the FUSE start path in
-    /// `start_instance` but uses `nydus_service::create_daemon` (the
-    /// fanotify-singleton flavour) instead of `create_fuse_daemon`. The
-    /// resulting daemon mounts EROFS directly via fanotify; gzip-layer reads
-    /// are served on demand by `FanotifyHandler` which decompresses the
-    /// per-layer zran ranges into the file cache.
-    async fn start_local_instance(
+    /// Spawn an in-process fanotify daemon serving `bootstrap` with its blobs
+    /// read from `backend`: an auto-accel sidecar's localfs backend dir, or the
+    /// pull backend of an image published in nydus format. Mirrors the FUSE
+    /// start path in `start_instance` but uses `nydus_service::create_daemon`
+    /// (the fanotify-singleton flavour) instead of `create_fuse_daemon`. The
+    /// resulting daemon mounts EROFS directly via fanotify; reads of uncached
+    /// ranges are served on demand by `FanotifyHandler`, which fetches them
+    /// (decompressing zran ranges) into the file cache. `driver_override` is
+    /// only recorded, for restarts (see `DaemonStatusRecord::driver_override`).
+    async fn start_fanotify_instance(
         &self,
         image_ref_str: &str,
         bootstrap: &Path,
-        backend_dir: &Path,
+        backend: BackendConfigV2,
         built_on_node: bool,
+        driver_override: Option<FsDriverType>,
     ) -> Result<Arc<DaemonInstance>> {
         let slug = slug_for(image_ref_str);
         let daemon_root = self.config.snapshotter.root.join("daemons").join(&slug);
@@ -833,7 +877,7 @@ impl DaemonSupervisor {
         // is the bootstrap staged again.
         let mut heal = false;
         if let Some((source, _)) = mount_at(&mountpoint) {
-            heal = Path::new(&source.replace("\\040", " ")) == staged_bootstrap
+            heal = Path::new(&crate::recon::unescape_mount_field(&source)) == staged_bootstrap
                 && is_staged_copy(bootstrap, &staged_bootstrap);
             if !heal {
                 warn!(image_ref = %image_ref_str, source, "replacing a mount of another bootstrap");
@@ -863,7 +907,9 @@ impl DaemonSupervisor {
         // The daemon learns its data blobs only from this blob list: without the
         // bootstrap entry the handler finds no data blob, mounts EROFS without
         // any `device=`, and every file read fails with EIO.
-        let cfg_json = self.local_blob_list(&slug, backend_dir, built_on_node)?;
+        let backend_type = backend.backend_type.clone();
+        let registry_auth = backend.registry.as_ref().is_some_and(|r| r.auth.is_some());
+        let cfg_json = self.fanotify_blob_list(&slug, backend, built_on_node)?;
         // The process-wide blob factory keys cache managers by config, which is
         // the same for every start of this image, so it would hand back the
         // previous daemon's cache entries; drop the idle ones, whose files the
@@ -886,23 +932,23 @@ impl DaemonSupervisor {
             None::<&Path>,
             false,
         )
-        .map_err(|e| anyhow::anyhow!("failed to create auto-accel fanotify daemon: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("failed to create fanotify daemon: {e}"))?;
 
         wait_for_running_off_reactor(daemon.clone(), self.startup_timeout)
             .await
             .with_context(|| {
-                format!("auto-accel daemon for {image_ref_str} never reached RUNNING")
+                format!("fanotify daemon for {image_ref_str} never reached RUNNING")
             })?;
 
         info!(
             image_ref = %image_ref_str,
             mountpoint = %mountpoint.display(),
-            backend = %backend_dir.display(),
-            "auto-accel fanotify daemon ready"
+            backend = %backend_type,
+            "fanotify daemon ready"
         );
 
-        // Failover armed via fdstore — same code path the registry-backed
-        // FUSE start uses; the snapshot also covers the fanotify group fd
+        // Failover armed via fdstore — same code path the FUSE start uses;
+        // the snapshot also covers the fanotify group fd
         // because the FanotifyHandler is registered in the singleton's
         // ServiceController before READY.
         let armed = self
@@ -919,6 +965,9 @@ impl DaemonSupervisor {
             restored_holders: StdMutex::new(HashSet::new()),
             failover_armed: AtomicBool::new(armed),
             built_on_node,
+            driver_override,
+            registry_auth,
+            missing_auth: false,
             _poll: poll,
         }))
     }
@@ -954,6 +1003,7 @@ impl DaemonSupervisor {
             }
         }
 
+        let driver_override = instances.get(image_ref).and_then(|i| i.driver_override);
         if let Some(old) = instances.remove(image_ref) {
             warn!(
                 image_ref,
@@ -969,7 +1019,7 @@ impl DaemonSupervisor {
         }
 
         let instance = self
-            .start_instance(image_ref, bootstrap, None)
+            .start_instance(image_ref, bootstrap, driver_override)
             .await
             .with_context(|| format!("failed to spawn nydus daemon for {image_ref}"))?;
         let record = self.record_for_instance(&instance, true);
@@ -1317,18 +1367,18 @@ impl DaemonSupervisor {
         }
     }
 
-    /// The blob list of the node-local fanotify daemon `slug`: its staged bootstrap, with the
-    /// layers read from `backend_dir`.
-    fn local_blob_list(
+    /// The blob list of the fanotify daemon `slug`: its staged bootstrap, with the blobs read
+    /// from `backend`.
+    fn fanotify_blob_list(
         &self,
         slug: &str,
-        backend_dir: &Path,
+        backend: BackendConfigV2,
         built_on_node: bool,
     ) -> Result<serde_json::Value> {
         let daemon_root = self.daemons_root().join(slug);
         let stage_dir = daemon_root.join("stage");
-        let entry = build_auto_accel_blob_cache_entry(
-            backend_dir,
+        let entry = build_fanotify_blob_cache_entry(
+            backend,
             &stage_dir,
             &daemon_root.join("mnt"),
             slug,
@@ -1340,6 +1390,37 @@ impl DaemonSupervisor {
             ),
         )?;
         Ok(serde_json::json!({ "blobs": [entry] }))
+    }
+
+    /// The backend the fanotify daemon of `image_ref` reads `bootstrap`'s blobs from: an
+    /// auto-accel sidecar's localfs backend dir, or else the configured pull backend with
+    /// whatever credentials the runtime auth store holds for the image at this moment. Saved
+    /// upgrade states carry no credentials, so every takeover and heal rebuilds the blob list
+    /// through this.
+    ///
+    /// `had_auth` says the daemon being replaced fetched with credentials. Finding none now
+    /// (an expired entry, or a store not yet repopulated after a restart) leaves every uncached
+    /// read failing with EIO, so it is logged.
+    fn fanotify_backend_for(
+        &self,
+        image_ref: &str,
+        bootstrap: &Path,
+        had_auth: bool,
+    ) -> Result<BackendConfigV2> {
+        if let Some(dir) = Self::accel_backend_for(bootstrap) {
+            return Ok(localfs_backend(&dir));
+        }
+        let parsed = parse_image_ref(image_ref)
+            .with_context(|| format!("invalid image reference '{image_ref}'"))?;
+        let backend = build_backend_config(&self.config, &parsed, self.resolve_auth(&parsed))?;
+        if had_auth && backend.registry.as_ref().is_some_and(|r| r.auth.is_none()) {
+            warn!(
+                image_ref,
+                "no registry credentials for an image that was fetched with them; reads of \
+                 uncached data fail until credentials for it arrive"
+            );
+        }
+        Ok(backend)
     }
 
     /// The auto-accel backend dir for `bootstrap`, when the bootstrap is an
@@ -1357,22 +1438,125 @@ impl DaemonSupervisor {
 
     /// Start (or restart) the daemon for a persisted record's identity,
     /// routing auto-accel bootstraps through the node-local content-store
-    /// path and everything else through the registry path. Chunk fetches for
-    /// k3s airgap-preloaded images have no upstream to fall back to, so the
+    /// path and everything else through the registry path, which picks the
+    /// driver again (see `start_instance`). Chunk fetches for k3s
+    /// airgap-preloaded images have no upstream to fall back to, so the
     /// routing must survive restarts and recoveries alike.
     async fn start_instance_for_record(
         &self,
         image_ref: &str,
         bootstrap: &Path,
         built_on_node: bool,
+        driver_override: Option<FsDriverType>,
     ) -> Result<Arc<DaemonInstance>> {
         match Self::accel_backend_for(bootstrap) {
             Some(backend_dir) => {
-                self.start_local_instance(image_ref, bootstrap, &backend_dir, built_on_node)
+                self.start_fanotify_instance(
+                    image_ref,
+                    bootstrap,
+                    localfs_backend(&backend_dir),
+                    built_on_node,
+                    driver_override,
+                )
+                .await
+            }
+            None => {
+                self.start_instance(image_ref, bootstrap, driver_override)
                     .await
             }
-            None => self.start_instance(image_ref, bootstrap, None).await,
         }
+    }
+
+    /// Heal, whenever the runtime auth store receives credentials, the fanotify daemons that
+    /// lack credentials their image needs (`DaemonInstance::missing_auth`). The pass runs on
+    /// its own thread, after `AUTH_HEAL_DEBOUNCE`, so the store's writer (the
+    /// `PUT /api/v1/auth` handler) returns at once and a burst of updates costs one pass.
+    pub fn heal_on_auth_updates(self: &Arc<Self>) {
+        let supervisor = Arc::downgrade(self);
+        auth::on_runtime_auth_update(move || {
+            let Some(supervisor) = supervisor.upgrade() else {
+                return;
+            };
+            if supervisor.auth_heal_pending.swap(true, Ordering::AcqRel) {
+                return;
+            }
+            let spawned = std::thread::Builder::new()
+                .name("auth-heal".into())
+                .spawn(move || {
+                    std::thread::sleep(AUTH_HEAL_DEBOUNCE);
+                    supervisor.auth_heal_pending.store(false, Ordering::Release);
+                    match compio::runtime::Runtime::new() {
+                        Ok(runtime) => {
+                            runtime.block_on(supervisor.heal_daemons_missing_auth());
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "no runtime for healing daemons that lack credentials")
+                        }
+                    }
+                });
+            if let Err(e) = spawned {
+                warn!(error = %e, "failed to start healing daemons that lack credentials");
+            }
+        });
+    }
+
+    /// Heal in place every fanotify daemon that lacks credentials its image needs, once the
+    /// runtime auth store holds some for it. A daemon built with credentials is never touched,
+    /// so refreshing them churns nothing. Returns the number healed.
+    pub async fn heal_daemons_missing_auth(&self) -> usize {
+        let _pass = self.auth_heal_pass.lock().await;
+        let candidates: Vec<String> = self
+            .instances
+            .read()
+            .await
+            .iter()
+            .filter(|(_, inst)| inst.missing_auth)
+            .map(|(image_ref, _)| image_ref.clone())
+            .collect();
+        let mut healed = 0;
+        for image_ref in candidates {
+            let has_auth = parse_image_ref(&image_ref)
+                .is_some_and(|parsed| self.resolve_auth(&parsed).is_some());
+            if !has_auth {
+                continue;
+            }
+            let start_lock = self.start_lock(&image_ref).await;
+            let _guard = start_lock.lock().await;
+            let old = {
+                let mut instances = self.instances.write().await;
+                match instances.get(&image_ref) {
+                    Some(inst) if inst.missing_auth && is_fanotify_mount(&inst.mountpoint) => {
+                        instances.remove(&image_ref)
+                    }
+                    _ => None,
+                }
+            };
+            let Some(old) = old else { continue };
+            let replacement = match self.heal_fanotify_in_place(&old).await {
+                Ok(new) => {
+                    info!(
+                        image_ref,
+                        "healed a fanotify daemon with the registry credentials it lacked"
+                    );
+                    healed += 1;
+                    self.auth_heals.fetch_add(1, Ordering::Relaxed);
+                    new
+                }
+                Err(e) => {
+                    warn!(
+                        image_ref,
+                        error = format!("{e:#}"),
+                        "failed to heal a fanotify daemon that lacks registry credentials"
+                    );
+                    old
+                }
+            };
+            if let Err(e) = self.persist_instance_record(&replacement, true).await {
+                warn!(image_ref, error = %e, "failed to persist daemon record");
+            }
+            self.instances.write().await.insert(image_ref, replacement);
+        }
+        healed
     }
 
     /// Reconciler hook: re-check daemon health and restart failed instances.
@@ -1438,7 +1622,7 @@ impl DaemonSupervisor {
             //   layers) so the restart mounts fresh.
             let fstype = mount_fstype_at(&old.mountpoint);
             let is_erofs = fstype.as_deref() == Some("erofs");
-            let heal = is_erofs && Self::accel_backend_for(&bootstrap).is_some();
+            let heal = is_erofs && is_fanotify_mount(&old.mountpoint);
             let started = if heal {
                 self.heal_fanotify_in_place(&old).await
             } else {
@@ -1459,8 +1643,13 @@ impl DaemonSupervisor {
                 if let Err(e) = self.persist_instance_record(&old, false).await {
                     warn!(image_ref, error = %e, "failed to persist stopped daemon record");
                 }
-                self.start_instance_for_record(&image_ref, &bootstrap, old.built_on_node)
-                    .await
+                self.start_instance_for_record(
+                    &image_ref,
+                    &bootstrap,
+                    old.built_on_node,
+                    old.driver_override,
+                )
+                .await
             };
 
             match started {
@@ -1677,7 +1866,48 @@ impl DaemonSupervisor {
         let daemon_root = self.config.snapshotter.root.join("daemons").join(&slug);
         let mountpoint = daemon_root.join("mnt");
         let cache_dir = self.config.snapshotter.cache.work_dir.join(&slug);
-        let active_driver = driver_override.unwrap_or_else(|| self.active_fs_driver());
+        let requested = driver_override.unwrap_or_else(|| self.active_fs_driver());
+        let live_fanotify = is_fanotify_mount(&mountpoint);
+        let node_driver = self.active_fs_driver();
+        let source = bootstrap.to_path_buf();
+        let daemons = self.daemons_root();
+        let daemons_take_marks = self.daemons_take_marks.clone();
+        let (active_driver, unfit) = blocking::unblock(move || {
+            serving_driver(requested, live_fanotify, || {
+                if let Some(reason) =
+                    kernel_mount_unfit(node_driver, &source, nydus_utils::host_page_size())?
+                {
+                    return Ok(Some(reason));
+                }
+                // The fanotify caches live in the daemon dirs, which the driver probe never
+                // tested: a filesystem without pre-content marks there must not fail the start.
+                Ok(daemons_take_marks
+                    .get_or_init(|| {
+                        crate::probe::try_fanotify_pre_content_mark(&daemons)
+                            .err()
+                            .map(|e| format!("{e:#}"))
+                    })
+                    .clone())
+            })
+        })
+        .await
+        .with_context(|| format!("failed to check how to serve {image_ref_str}"))?;
+        if live_fanotify && requested != FsDriverType::Fanotify {
+            info!(image_ref = %image_ref_str, requested = ?requested, "keeping the live fanotify mount on fanotify");
+        }
+        if let Some(reason) = unfit {
+            if driver_override == Some(FsDriverType::Fanotify) {
+                warn!(image_ref = %image_ref_str, reason, "the fs-driver label asks for fanotify; serving the image over FUSE");
+            } else {
+                info!(image_ref = %image_ref_str, reason, "serving the image over FUSE");
+            }
+        }
+        if active_driver == FsDriverType::Fanotify {
+            let backend = self.fanotify_backend_for(image_ref_str, bootstrap, false)?;
+            return self
+                .start_fanotify_instance(image_ref_str, bootstrap, backend, false, driver_override)
+                .await;
+        }
         fs::create_dir_all(&mountpoint).with_context(|| {
             format!(
                 "failed to create daemon mountpoint {}",
@@ -1751,6 +1981,9 @@ impl DaemonSupervisor {
                 // Blockdev/EROFS export has no fuse fd to preserve.
                 failover_armed: AtomicBool::new(false),
                 built_on_node: false,
+                driver_override,
+                registry_auth: false,
+                missing_auth: false,
             }));
         }
 
@@ -1828,6 +2061,9 @@ impl DaemonSupervisor {
                 // Tarfs is a kernel mount; there is no fuse fd to preserve.
                 failover_armed: AtomicBool::new(false),
                 built_on_node: false,
+                driver_override,
+                registry_auth: false,
+                missing_auth: false,
             }));
         }
 
@@ -1855,6 +2091,14 @@ impl DaemonSupervisor {
         // Give the daemon a supervisor socket so its upgrade manager records
         // mount state and holds the `/dev/fuse` fd. `save()` is driven into
         // that socket right after start to snapshot the fd + state for failover.
+        // A FUSE mount stacked over a kernel mount would leave every overlay that already uses
+        // the kernel mount reading it unserved; that mount is detached on a terminal failure.
+        if let Some(fstype) = mount_fstype_at(&mountpoint).filter(|t| !t.contains("fuse")) {
+            bail!(
+                "refusing to mount FUSE over the live {fstype} mount at {}",
+                mountpoint.display()
+            );
+        }
         let supervisor_sock = supervisor_sock_path(&slug);
         let daemon = create_fuse_daemon(
             &mountpoint_str,
@@ -1900,6 +2144,9 @@ impl DaemonSupervisor {
             restored_holders: StdMutex::new(HashSet::new()),
             failover_armed: AtomicBool::new(armed),
             built_on_node: false,
+            driver_override,
+            registry_auth: false,
+            missing_auth: false,
             _poll: poll,
         }))
     }
@@ -2028,8 +2275,9 @@ impl DaemonSupervisor {
             // predate replace-on-park can hold [dead, ..., live] under one name.
             let Some(fd) = fds.last() else { continue };
             // Route by what is actually mounted at the record's mountpoint —
-            // never by the configured driver. Registry-backed images mount
-            // fusedev even on a fanotify-configured node, and their parked
+            // never by the configured driver. A fanotify-configured node still
+            // mounts fusedev for images a kernel EROFS mount cannot serve
+            // (`kernel_mount_unfit`) or a label sends there, and their parked
             // `/dev/fuse` fds are just as adoptable: what matters is the
             // observed mount, not the node-level default.
             match adoption_route(mount_fstype_at(&record.mountpoint).as_deref()) {
@@ -2132,6 +2380,7 @@ impl DaemonSupervisor {
                     &record.image_ref,
                     &record.bootstrap,
                     record.built_on_node,
+                    record.driver_override,
                 )
                 .await;
             match started {
@@ -2380,6 +2629,9 @@ impl DaemonSupervisor {
             // still recoverable by the next successor.
             failover_armed: AtomicBool::new(true),
             built_on_node: record.built_on_node,
+            driver_override: record.driver_override,
+            registry_auth: record.registry_auth,
+            missing_auth: false,
         });
         self.note_parked_slug(slug);
         self.instances
@@ -2420,11 +2672,13 @@ impl DaemonSupervisor {
         let state_path = self.failover_state_path(slug);
         let state = fs::read(&state_path)
             .with_context(|| format!("read failover state {}", state_path.display()))?;
-        // The state blob of a build that did not save its blob list carries no entries; the
-        // daemon is given its blob list as a fresh start would build it.
-        let blobs = Self::accel_backend_for(&record.bootstrap)
-            .map(|backend| self.local_blob_list(slug, &backend, record.built_on_node))
-            .transpose()?;
+        // The state blob of a build that did not save its blob list carries no entries, and a
+        // saved list carries no credentials; the daemon is given its blob list as a fresh start
+        // would build it.
+        let backend =
+            self.fanotify_backend_for(image_ref_str, &record.bootstrap, record.registry_auth)?;
+        let has_auth = backend.registry.as_ref().is_some_and(|r| r.auth.is_some());
+        let blobs = Some(self.fanotify_blob_list(slug, backend, record.built_on_node)?);
         let (daemon, poll) = self
             .adopt_fanotify_group(image_ref_str, slug, fan_fd, state, blobs, |_| ())
             .await?;
@@ -2443,6 +2697,9 @@ impl DaemonSupervisor {
             // daemon remains recoverable by the next successor too.
             failover_armed: AtomicBool::new(true),
             built_on_node: record.built_on_node,
+            driver_override: record.driver_override,
+            registry_auth: record.registry_auth,
+            missing_auth: record.registry_auth && !has_auth,
         });
         self.note_parked_slug(slug);
         self.instances
@@ -2543,7 +2800,8 @@ impl DaemonSupervisor {
     /// systemd fd store keeps holding the same group, so it stays current.
     ///
     /// Nothing of the failed daemon's state is reused: the new daemon rebuilds its blob cache
-    /// managers from the saved blob entries and reopens the cache files without events.
+    /// managers from a freshly built blob list (the saved entries carry no credentials) and
+    /// reopens the cache files without events.
     ///
     /// On failure `old` is left as it was: its failed handlers serve the group again, denying
     /// every read with EIO, and the caller keeps it for a later attempt.
@@ -2565,6 +2823,12 @@ impl DaemonSupervisor {
             }
 
             let slug = slug_for(&old.image_ref);
+            // The saved blob entries carry no credentials, so a registry-backed daemon needs
+            // its blob list rebuilt with them.
+            let backend =
+                self.fanotify_backend_for(&old.image_ref, &old.bootstrap, old.registry_auth)?;
+            let has_auth = backend.registry.as_ref().is_some_and(|r| r.auth.is_some());
+            let blobs = self.fanotify_blob_list(&slug, backend, old.built_on_node)?;
             let daemon = old.daemon.clone();
             let sock = supervisor_sock_path(&slug);
             let (group, state, suspended) = blocking::unblock(move || {
@@ -2591,7 +2855,7 @@ impl DaemonSupervisor {
                     &slug,
                     group.as_raw_fd(),
                     state,
-                    None,
+                    Some(blobs),
                     |new| {
                         // Its workers stop without answering; the old ones take the queue back.
                         if let Ok(controller) = controller(new) {
@@ -2624,6 +2888,9 @@ impl DaemonSupervisor {
                 restored_holders: StdMutex::new(old.restored_holders.lock().unwrap().clone()),
                 failover_armed: AtomicBool::new(old.failover_armed.load(Ordering::SeqCst)),
                 built_on_node: old.built_on_node,
+                driver_override: old.driver_override,
+                registry_auth: old.registry_auth,
+                missing_auth: old.registry_auth && !has_auth,
                 _poll: poll,
             }))
         }
@@ -2710,7 +2977,10 @@ impl DaemonSupervisor {
             }
             self.clear_failover_state(&slug);
 
-            match self.start_instance(&image_ref, &bootstrap, None).await {
+            match self
+                .start_instance(&image_ref, &bootstrap, old.driver_override)
+                .await
+            {
                 Ok(instance) => {
                     instance.refcount.store(refcount, Ordering::SeqCst);
                     let after_state = format!("{:?}", instance.daemon.get_state());
@@ -2794,6 +3064,8 @@ impl DaemonSupervisor {
             // so `kill -9` restarts it and the successor takes the mount over.
             pid: if live { std::process::id() } else { 0 },
             built_on_node: inst.built_on_node,
+            driver_override: inst.driver_override,
+            registry_auth: inst.registry_auth,
         }
     }
 
@@ -3430,8 +3702,9 @@ fn is_mounted_at(_mountpoint: &Path) -> bool {
 /// How a preserved fd should be re-attached at startup, decided purely from
 /// the filesystem type observed at the record's mountpoint. Deliberately
 /// independent of the configured driver: a fanotify-configured node still
-/// mounts registry-backed images via fusedev, and those parked `/dev/fuse`
-/// fds are just as adoptable as the group fds of fanotify daemons.
+/// mounts some images via fusedev (see `kernel_mount_unfit`), and those
+/// parked `/dev/fuse` fds are just as adoptable as the group fds of fanotify
+/// daemons.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AdoptionRoute {
     /// EROFS mount: adopt the armed fanotify group fd (marks stay live).
@@ -3608,6 +3881,94 @@ fn overlay_references(options: &str, daemon_mnt: &str) -> bool {
 /// or `None` when nothing is mounted there.
 fn mount_fstype_at(mountpoint: &Path) -> Option<String> {
     mount_at(mountpoint).map(|(_, fstype)| fstype)
+}
+
+/// Whether the mount at `mountpoint` (a daemon dir's `mnt`) is a fanotify daemon's EROFS mount.
+fn is_fanotify_mount(mountpoint: &Path) -> bool {
+    mount_at(mountpoint)
+        .is_some_and(|(source, fstype)| is_fanotify_mount_entry(mountpoint, &source, &fstype))
+}
+
+/// Whether a `/proc/self/mounts` entry at `mountpoint` is a fanotify daemon's EROFS mount: its
+/// source is the bootstrap staged in the `stage` dir beside `mountpoint`. Blockdev and tarfs
+/// mount their exported disk images instead.
+fn is_fanotify_mount_entry(mountpoint: &Path, source: &str, fstype: &str) -> bool {
+    fstype == "erofs"
+        && Path::new(&crate::recon::unescape_mount_field(source))
+            == mountpoint.with_file_name("stage").join("bootstrap")
+}
+
+/// The driver `start_instance` serves an image with, and why it is not the `requested` one,
+/// if it is not.
+///
+/// A live fanotify mount at the image's mountpoint keeps fanotify whatever is requested: it
+/// was judged fit when it was mounted, containers' overlays may sit on it, and FUSE stacked on
+/// top would leave them reading it unserved. Otherwise a request for fanotify takes FUSE when
+/// `unfit` gives a reason. An error from `unfit` fails the start.
+fn serving_driver(
+    requested: FsDriverType,
+    live_fanotify_mount: bool,
+    unfit: impl FnOnce() -> Result<Option<String>>,
+) -> Result<(FsDriverType, Option<String>)> {
+    if live_fanotify_mount {
+        return Ok((FsDriverType::Fanotify, None));
+    }
+    if requested != FsDriverType::Fanotify {
+        return Ok((requested, None));
+    }
+    Ok(match unfit()? {
+        None => (FsDriverType::Fanotify, None),
+        Some(reason) => (FsDriverType::Fusedev, Some(reason)),
+    })
+}
+
+/// Why a kernel EROFS mount through fanotify cannot serve `bootstrap` on a node whose active
+/// driver is `node_driver` and whose pages are `page_size` bytes, or `None` when it can. The
+/// image then takes FUSE, which reads every chunk through the chunk table.
+///
+/// EROFS mounts only RAFS v6, and only with blocks no larger than a page. The kernel follows
+/// only `blkaddr * block_size` of each chunk, so an image whose chunk addresses disagree with
+/// its chunk table (16K/64K-block images built before v6 chunk starts were padded to the
+/// block size) would be misread without any error.
+///
+/// Only a verdict on the image is a reason. A bootstrap that cannot be read or loaded is an
+/// error: FUSE could not serve it either, and the start is retried.
+fn kernel_mount_unfit(
+    node_driver: FsDriverType,
+    bootstrap: &Path,
+    page_size: u64,
+) -> Result<Option<String>> {
+    use nydus_rafs::RafsError;
+    use nydus_rafs::metadata::RafsSuper;
+
+    if node_driver != FsDriverType::Fanotify {
+        return Ok(Some(format!("the node serves images with {node_driver:?}")));
+    }
+    let config = Arc::new(nydus_api::ConfigV2::default());
+    let (sb, _) = RafsSuper::load_from_file(bootstrap, config, false)
+        .with_context(|| format!("failed to load bootstrap {}", bootstrap.display()))?;
+    if !sb.meta.is_v6() {
+        return Ok(Some("RAFS v5 bootstrap".to_string()));
+    }
+    let block_size = 1u64 << sb.meta.blkszbits;
+    if block_size > page_size {
+        return Ok(Some(format!(
+            "EROFS block size {block_size} exceeds the {page_size}-byte page size"
+        )));
+    }
+    if sb.meta.blob_device_table_count == 0 && !sb.superblock.get_blob_infos().is_empty() {
+        return Ok(Some("bootstrap has no EROFS device table".to_string()));
+    }
+    match sb.check_v6_block_addrs(bootstrap) {
+        Ok(()) => Ok(None),
+        Err(e @ RafsError::InvalidMetadata(_)) => Ok(Some(format!(
+            "chunk layout a kernel mount would misread: {e}"
+        ))),
+        Err(e) => Err(anyhow::Error::new(e).context(format!(
+            "failed to check the chunk layout of {}",
+            bootstrap.display()
+        ))),
+    }
 }
 
 /// Source and filesystem type (`/proc/self/mounts` fields 1 and 3) of the
@@ -3818,6 +4179,9 @@ fn test_instance_with_daemon(
         _poll: Arc::new(Mutex::new(Poll::new().unwrap())),
         failover_armed: AtomicBool::new(false),
         built_on_node: false,
+        driver_override: None,
+        registry_auth: false,
+        missing_auth: false,
     }
 }
 
@@ -4079,6 +4443,8 @@ mod tests {
             updated_at: 0,
             pid: 0,
             built_on_node: false,
+            driver_override: None,
+            registry_auth: false,
         }
     }
 
@@ -4133,6 +4499,116 @@ mod tests {
         assert_eq!(
             supervisor.failover_state_path("abc-app"),
             PathBuf::from("/var/lib/nydus/daemons/abc-app/upgrade.state"),
+        );
+    }
+
+    #[test]
+    fn kernel_mount_serves_only_consistent_v6_images_on_fanotify_nodes() {
+        let texture = Path::new(env!("CARGO_MANIFEST_DIR")).join("../tests/texture/bootstrap");
+        let v6 = texture.join("rafs-v6-2.2.boot");
+        let fanotify = FsDriverType::Fanotify;
+        let unfit = |driver, bootstrap: &Path, page_size| {
+            kernel_mount_unfit(driver, bootstrap, page_size).unwrap()
+        };
+        assert_eq!(unfit(fanotify, &v6, 4096), None);
+
+        for other in [FsDriverType::Fusedev, FsDriverType::Blockdev] {
+            assert!(unfit(other, &v6, 4096).is_some());
+        }
+        let v5 = unfit(fanotify, &texture.join("rafs-v5.boot"), 4096);
+        assert!(v5.as_deref().is_some_and(|r| r.contains("v5")), "{v5:?}");
+        let big_blocks = unfit(fanotify, &v6, 2048);
+        assert!(
+            big_blocks
+                .as_deref()
+                .is_some_and(|r| r.contains("block size")),
+            "{big_blocks:?}"
+        );
+        // A bootstrap that cannot be read is an error, not a reason to take FUSE.
+        assert!(kernel_mount_unfit(fanotify, &texture.join("missing"), 4096).is_err());
+
+        // A first device slot of one block, too short for the chunks on it.
+        let dir = tempfile::tempdir().unwrap();
+        let short_device = dir.path().join("bootstrap");
+        let (sb, _) = nydus_rafs::metadata::RafsSuper::load_from_file(
+            &v6,
+            Arc::new(nydus_api::ConfigV2::default()),
+            false,
+        )
+        .unwrap();
+        let blocks_off = sb.meta.blob_device_table_offset as usize + 64;
+        let mut data = fs::read(&v6).unwrap();
+        data[blocks_off..blocks_off + 4].copy_from_slice(&1u32.to_le_bytes());
+        fs::write(&short_device, data).unwrap();
+        let misread = unfit(fanotify, &short_device, 4096);
+        assert!(
+            misread
+                .as_deref()
+                .is_some_and(|r| r.contains("chunk layout")),
+            "{misread:?}"
+        );
+    }
+
+    #[test]
+    fn a_live_fanotify_mount_keeps_fanotify_whatever_is_requested() {
+        let never = || -> Result<Option<String>> { panic!("a live mount is not re-judged") };
+        for requested in [
+            FsDriverType::Fanotify,
+            FsDriverType::Fusedev,
+            FsDriverType::Blockdev,
+        ] {
+            assert_eq!(
+                serving_driver(requested, true, never).unwrap(),
+                (FsDriverType::Fanotify, None)
+            );
+        }
+        // Without one, an unfit image takes FUSE, a fit one fanotify, and an error fails.
+        let reason = || Ok(Some("RAFS v5 bootstrap".to_string()));
+        assert_eq!(
+            serving_driver(FsDriverType::Fanotify, false, reason).unwrap(),
+            (FsDriverType::Fusedev, Some("RAFS v5 bootstrap".to_string()))
+        );
+        assert_eq!(
+            serving_driver(FsDriverType::Fanotify, false, || Ok(None)).unwrap(),
+            (FsDriverType::Fanotify, None)
+        );
+        assert!(serving_driver(FsDriverType::Fanotify, false, || bail!("EIO")).is_err());
+        assert_eq!(
+            serving_driver(FsDriverType::Fusedev, false, never).unwrap(),
+            (FsDriverType::Fusedev, None)
+        );
+    }
+
+    #[test]
+    fn fanotify_mounts_are_recognised_by_their_staged_bootstrap() {
+        let mnt = Path::new("/var/lib/nydus/daemons/a b/mnt");
+        let staged = "/var/lib/nydus/daemons/a\\040b/stage/bootstrap";
+        assert!(is_fanotify_mount_entry(mnt, staged, "erofs"));
+        assert!(!is_fanotify_mount_entry(mnt, staged, "fuse.nydus"));
+        let blockdev = "/var/lib/nydus/daemons/a\\040b/blockdev/image.erofs";
+        assert!(!is_fanotify_mount_entry(mnt, blockdev, "erofs"));
+        assert!(!is_fanotify_mount_entry(mnt, "/dev/loop3", "erofs"));
+    }
+
+    #[test]
+    fn records_keep_the_driver_label_and_read_old_records_without_it() {
+        let mut record = sample_record(PathBuf::from("/b"));
+        record.driver_override = Some(FsDriverType::Fusedev);
+        let json = serde_json::to_string(&record).unwrap();
+        let back: DaemonStatusRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.driver_override, Some(FsDriverType::Fusedev));
+
+        let mut old: serde_json::Value = serde_json::to_value(&record).unwrap();
+        old.as_object_mut().unwrap().remove("driver_override");
+        let back: DaemonStatusRecord = serde_json::from_value(old).unwrap();
+        assert_eq!(back.driver_override, None);
+
+        let mut inst = test_daemon_instance("img", PathBuf::from("/m"));
+        inst.driver_override = Some(FsDriverType::Fusedev);
+        let supervisor = DaemonSupervisor::new(SnapshotterConfig::default());
+        assert_eq!(
+            supervisor.record_for_instance(&inst, true).driver_override,
+            Some(FsDriverType::Fusedev)
         );
     }
 
@@ -5397,7 +5873,7 @@ mod tests {
     fn restore_instance_runs_under_any_configured_driver() {
         // Default driver chain is [Fanotify, Blockdev, Fusedev] -> active=Fanotify.
         // Fusedev takeover must NOT be gated on the configured driver (a
-        // fanotify node still mounts registry images via fusedev); the first
+        // fanotify node still mounts some images via fusedev); the first
         // error must be a *real* validation failure, not a driver guard.
         let supervisor = DaemonSupervisor::new(SnapshotterConfig::default());
         assert_ne!(supervisor.active_fs_driver(), FsDriverType::Fusedev);
