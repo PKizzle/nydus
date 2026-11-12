@@ -44,6 +44,19 @@ ignore = [
     { id = "RUSTSEC-2025-0141", reason = "No safe upgrade is available! The team considers version 1.3.3 a complete version of bincode that is not in need of any updates" },
     { id = "RUSTSEC-2026-0118", reason = "hickory-proto v0.25.2 NSEC3 loop only affects DNSSEC validation (DnssecDnsHandle). Nydus uses TokioResolver for plain IP lookups without DNSSEC. Transitive dep via reqwest under the opt-in backend-dragonfly-proxy feature; the default HTTP path (cyper -> hickory-resolver) uses the fixed 0.26.1." },
     { id = "RUSTSEC-2026-0119", reason = "hickory-proto v0.25.2 O(n^2) label compression in BinEncoder only triggers with many-record messages. Nydus only sends simple single-record A/AAAA queries; the encoding path cannot be reached by external input. Transitive dep via reqwest under the opt-in backend-dragonfly-proxy feature; the default path uses the fixed hickory 0.26.1." },
+    # hickory-proto v0.25.2 reaches the build only through the opt-in backend-dragonfly-proxy
+    # feature (dragonfly-client-request -> reqwest 0.12 -> hickory-resolver ^0.25); the default
+    # path uses hickory 0.26. No 0.25 release fixes these. Drop them once
+    # dragonfly-client-request depends on a reqwest using hickory 0.26.
+    { id = "RUSTSEC-2026-0504", reason = "hickory-proto v0.25.2 DNSSEC validation (NSEC3 comparison): nydus resolves plain A/AAAA records without DNSSEC; opt-in backend-dragonfly-proxy only." },
+    { id = "RUSTSEC-2026-0505", reason = "hickory-proto v0.25.2 DNSSEC validation (NSEC3 owner names): nydus resolves without DNSSEC; opt-in backend-dragonfly-proxy only." },
+    { id = "RUSTSEC-2026-0511", reason = "hickory-proto v0.25.2 DNSSEC validation (empty non-terminal NXDOMAIN): nydus resolves without DNSSEC; opt-in backend-dragonfly-proxy only." },
+    { id = "RUSTSEC-2026-0512", reason = "hickory-proto v0.25.2 DNSSEC validation (unrelated signed RRset): nydus resolves without DNSSEC; opt-in backend-dragonfly-proxy only." },
+    { id = "RUSTSEC-2026-0514", reason = "hickory-resolver v0.25.2 returning records that failed DNSSEC validation: nydus does not enable DNSSEC validation; opt-in backend-dragonfly-proxy only." },
+    { id = "RUSTSEC-2026-0487", reason = "hickory-proto v0.25.2 panic parsing SVCB/HTTPS alpn values from text: nydus never parses records from text; opt-in backend-dragonfly-proxy only." },
+    { id = "RUSTSEC-2026-0489", reason = "hickory-proto v0.25.2 panic parsing SVCB/HTTPS parameters from text: nydus never parses records from text; opt-in backend-dragonfly-proxy only." },
+    { id = "RUSTSEC-2026-0490", reason = "hickory-proto v0.25.2 zone file lexer panic: nydus never parses zone files; opt-in backend-dragonfly-proxy only." },
+    { id = "RUSTSEC-2026-0491", reason = "hickory-proto v0.25.2 memory amplification from DNS header record counts: reachable by a malicious DNS server, but only with the opt-in backend-dragonfly-proxy feature; the default resolver uses the fixed hickory 0.26." },
     { id = "RUSTSEC-2024-0449", reason = "unsafe-libyaml v0.2.11 is unmaintained with no safe upgrade. Pulled in by serde_yaml, which nydus-api uses only to parse local config files; tracked until nydus-api moves to a safe-Rust YAML parser." },
     { id = "RUSTSEC-2026-0441", reason = "pin-utils 0.1.0 is unmaintained, not vulnerable, and has no maintained release. It is reached only through loom, a cfg(loom) dependency of the vendored compio-executor that no normal build compiles; drop this when loom no longer depends on it." },
 ]
