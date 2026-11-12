@@ -163,8 +163,8 @@ pub fn targz_ref_args(layer: &Path, bootstrap_out: &Path, blob_out_dir: &Path) -
 /// Build the args for `nydus-image merge` of the per-layer bootstraps (lower→upper) into one
 /// overlaid bootstrap. `original_blob_ids` are the gzip-layer digests in the same order.
 ///
-/// The merge fingerprints every regular file for EROFS page cache sharing: this node computes
-/// the fingerprints itself, so its own artifacts are the ones it may mount with `inode_share`.
+/// The merge writes no page cache sharing fingerprints: a node mounts every image, its own
+/// artifacts included, through a [`node_view`] that computes them.
 pub fn merge_args(
     bootstrap_out: &Path,
     original_blob_ids: &[String],
@@ -176,7 +176,6 @@ pub fn merge_args(
         bootstrap_out.into(),
         "--original-blob-ids".into(),
         original_blob_ids.join(",").into(),
-        "--inode-share-fingerprint".into(),
     ];
     for b in layer_bootstraps {
         args.push(b.into());
@@ -365,6 +364,92 @@ pub fn convert(config: &LocalAccelConfig, layers: &[SourceLayer]) -> Result<Node
         prefetch_blob_id: None,
         format_version: AUTO_ACCEL_MANIFEST_VERSION,
     })
+}
+
+/// How `nydus-image node-view` ended without a view.
+#[derive(Debug, thiserror::Error)]
+pub enum NodeViewError {
+    /// The image has no view (exit status 2): a verdict on the image.
+    #[error("the image has no node view: {0}")]
+    Refused(String),
+    /// The node could not build one: spawn, sandbox, I/O failure or timeout. Says nothing
+    /// about the image.
+    #[error(transparent)]
+    Failed(#[from] anyhow::Error),
+}
+
+/// Write the node view of the RAFS v6 bootstrap `source` to `target`, which must lie under
+/// `config.work_dir`, the only place the subprocess may write: `nydus-image node-view`, a
+/// metadata-only rebuild at 4 KiB blocks with page cache sharing fingerprints (see
+/// `nydus_builder::build_node_view`). The source is untrusted, so the subprocess runs confined
+/// like a conversion, and is killed after `timeout`. Its output is untrusted too: the caller
+/// checks it (`nydus_rafs::metadata::kernel_layout::check_node_view`).
+pub fn node_view(
+    config: &LocalAccelConfig,
+    source: &Path,
+    target: &Path,
+    timeout: std::time::Duration,
+) -> std::result::Result<(), NodeViewError> {
+    let args: Vec<OsString> = vec![
+        "node-view".into(),
+        "-B".into(),
+        target.into(),
+        source.into(),
+    ];
+    let mut cmd = build_command(&config.nydus_image, &args, config.sched, config.nice);
+    #[cfg(target_os = "linux")]
+    if config.sandbox {
+        sandbox::confine(
+            &mut cmd,
+            &[config.nydus_image.as_path(), source],
+            &config.work_dir,
+        )
+        .context("failed to confine nydus-image node-view")?;
+    }
+    // A file rather than a pipe: a child blocked on a full pipe would only time out.
+    let stderr_path = config.work_dir.join("node-view.stderr");
+    let stderr = std::fs::File::create(&stderr_path)
+        .with_context(|| format!("failed to create {}", stderr_path.display()))?;
+    // Its own process group, so that whatever it leaves running is killed with it.
+    std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
+    let mut child = cmd
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(stderr)
+        .spawn()
+        .context("failed to spawn nydus-image node-view")?;
+    let kill_group = |pid: u32| {
+        // SAFETY: kill(2) with a negative pid signals that process group, which is the child's
+        // own, so nothing else is signalled. ESRCH (all gone) is fine.
+        unsafe { libc::kill(-(pid as libc::pid_t), libc::SIGKILL) };
+    };
+    let deadline = std::time::Instant::now() + timeout;
+    let status = loop {
+        if let Some(status) = child.try_wait().context("failed to wait for nydus-image")? {
+            // Nothing it started may outlive it and write its output after the caller's check.
+            kill_group(child.id());
+            break status;
+        }
+        if std::time::Instant::now() >= deadline {
+            kill_group(child.id());
+            let _ = child.wait();
+            return Err(
+                anyhow::anyhow!("nydus-image node-view timed out after {timeout:?}").into(),
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    if status.success() {
+        return Ok(());
+    }
+    let stderr = std::fs::read_to_string(&stderr_path).unwrap_or_default();
+    let tail = stderr.lines().rev().take(5).collect::<Vec<_>>();
+    let tail = tail.into_iter().rev().collect::<Vec<_>>().join("\n");
+    if status.code() == Some(2) {
+        Err(NodeViewError::Refused(tail))
+    } else {
+        Err(anyhow::anyhow!("nydus-image node-view failed ({status}): {tail}").into())
+    }
 }
 
 /// Move `src` into the backend as `dst`, both of which live under the same
@@ -571,7 +656,7 @@ mod tests {
         let s: Vec<String> = args.iter().map(|a| a.to_string_lossy().into()).collect();
         assert_eq!(s[0], "merge");
         assert!(s.windows(2).any(|w| w == ["--original-blob-ids", "d0,d1"]));
-        assert!(s.iter().any(|a| a == "--inode-share-fingerprint"));
+        assert!(!s.iter().any(|a| a == "--inode-share-fingerprint"));
         // sources follow, lower then upper
         assert_eq!(s[s.len() - 2], "/w/l0/bootstrap");
         assert_eq!(s[s.len() - 1], "/w/l1/bootstrap");

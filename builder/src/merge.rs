@@ -730,7 +730,7 @@ mod tests {
         let tree = Tree::from_bootstrap(&rs, &mut dict).unwrap();
         let node = tree.get_node(std::path::Path::new(path)).unwrap();
         let mut node = node.borrow_mut_node();
-        node.v6_set_inode_share_fingerprint();
+        node.v6_set_inode_share_fingerprint(digest::Algorithm::Sha256);
         node.info
             .xattrs
             .get(std::ffi::OsStr::new(RAFSV6_ISHARE_XATTR_NAME))
@@ -789,7 +789,7 @@ mod tests {
             .unwrap()
             .borrow_mut_node();
         node.inode.set_size(20000);
-        node.v6_set_inode_share_fingerprint();
+        node.v6_set_inode_share_fingerprint(digest::Algorithm::Sha256);
         assert!(
             node.info
                 .xattrs

@@ -318,6 +318,15 @@ impl BlobBacking {
             .is_some_and(|obj| obj.is_data_verified())
     }
 
+    /// Whether every byte the kernel can read from this blob's cache file has been checked
+    /// against its digest, and every later fill will be.
+    fn is_served_verified(&self) -> bool {
+        self.blob
+            .blob()
+            .get_blob_object()
+            .is_some_and(|obj| obj.is_served_data_verified())
+    }
+
     /// Whether every byte of this blob is already in its cache file.
     ///
     /// `false` whenever the answer is unavailable, which keeps the mark armed -- the direction
@@ -509,6 +518,46 @@ static PANIC_ON_NEXT_EVENT: Mutex<Option<PathBuf>> = Mutex::new(None);
 #[cfg(any(test, feature = "fault-injection"))]
 pub fn inject_panic_on_next_event(mountpoint: &Path) {
     *PANIC_ON_NEXT_EVENT.lock().unwrap() = Some(mountpoint.to_path_buf());
+}
+
+/// Whether the bootstrap declares inode fingerprints for EROFS page cache sharing.
+fn bootstrap_has_fingerprints(bootstrap: &Path) -> Result<bool> {
+    let mut sb = RafsV6SuperBlock::new();
+    File::open(bootstrap)?.read_exact_at(sb.as_mut(), EROFS_SUPER_OFFSET as u64)?;
+    Ok(sb.has_ishare_xattrs())
+}
+
+/// Why a mount must not join its page cache sharing domain, or `None` when it may.
+///
+/// The kernel shares a file's pages with every file of the domain whose fingerprint is equal and
+/// never looks at the data, so a mount joins only when an equal fingerprint means equal bytes:
+/// the bootstrap carries fingerprints (the caller passes a domain only for a node-built view, see
+/// `nydus_builder::build_node_view`) and every byte its devices serve is checked against the
+/// digests the fingerprints are computed from. `inode_share` is fixed for the mount's life, so a
+/// cache holding chunks nobody checked yet keeps the whole mount out until it is mounted again.
+fn inode_share_refusal(
+    has_fingerprints: Result<bool>,
+    unverified: &[String],
+) -> Option<(crate::erofs_ishare::MountOutcome, String)> {
+    use crate::erofs_ishare::MountOutcome;
+    match has_fingerprints {
+        Err(e) => Some((
+            MountOutcome::NoFingerprints,
+            format!("cannot read the bootstrap superblock: {e}"),
+        )),
+        Ok(false) => Some((
+            MountOutcome::NoFingerprints,
+            "the bootstrap carries no fingerprints".to_string(),
+        )),
+        Ok(true) if !unverified.is_empty() => Some((
+            MountOutcome::Unverified,
+            format!(
+                "cached data of blob(s) {} is not verified yet",
+                unverified.join(", ")
+            ),
+        )),
+        Ok(true) => None,
+    }
 }
 
 /// Blob ids of the bootstrap's EROFS device table, in device order.
@@ -1356,6 +1405,16 @@ impl FanotifyHandler {
         Ok(users)
     }
 
+    /// Blobs whose cache may serve data not checked against its digests, which keeps a mount
+    /// out of the page cache sharing domain.
+    fn unverified_blobs(&self) -> Vec<String> {
+        self.blob_backings
+            .iter()
+            .filter(|b| !b.is_served_verified())
+            .map(|b| b.blob.blob_info().blob_id())
+            .collect()
+    }
+
     /// Mount the EROFS filesystem after all marks are in place.
     ///
     /// This must be called **after** `new()`, **after** `arm()`, and **after** the workers start.
@@ -1379,11 +1438,29 @@ impl FanotifyHandler {
             );
             return Ok(());
         }
+        let share = self.inode_share_domain.as_deref().filter(|domain| {
+            let unverified = self.unverified_blobs();
+            let refused = inode_share_refusal(
+                bootstrap_has_fingerprints(&self.bootstrap_path),
+                &unverified,
+            );
+            crate::erofs_ishare::record_mount(match &refused {
+                None => crate::erofs_ishare::MountOutcome::Shared,
+                Some((outcome, _)) => *outcome,
+            });
+            if let Some((_, reason)) = &refused {
+                info!(
+                    "fanotify: mounting {} without page cache sharing (domain {domain}): {reason}",
+                    self.mountpoint.display()
+                );
+            }
+            refused.is_none()
+        });
         mount_erofs(
             &self.bootstrap_path,
             &self.device_blobs,
             &self.mountpoint,
-            self.inode_share_domain.as_deref(),
+            share,
         )?;
         // Record, per blob, that this mount opened it marked, so that this handler and any that
         // takes the mount over may revoke its chunks; a blob it opened unmarked has none.
@@ -2677,10 +2754,16 @@ mod tests {
         let (stage, mnt) = (work.path().join("stage"), work.path().join("mnt"));
         let (stage_s, mnt_s) = (stage.to_str().unwrap(), mnt.to_str().unwrap());
         let first = Arc::new(FanotifyHandler::new(stage_s, mnt_s, mgr.clone(), 1).unwrap());
+        // A fresh cache may share from its first mount on.
+        assert!(first.unverified_blobs().is_empty());
         spawn_worker(&first);
         first.arm().unwrap();
         first.mount().unwrap();
         let good = read_all_cold(&mnt);
+        assert!(
+            !first.unverified_blobs().is_empty(),
+            "filled, not yet verified"
+        );
         first.spawn_verifier().unwrap().join().unwrap();
         assert!(first.is_blob_verified(FIXTURE_BLOB));
         let cache = first.blob_backings[0].cache_path.clone();
@@ -2702,6 +2785,12 @@ mod tests {
             "building a handler leaves the cache file alone"
         );
         assert!(second.is_blob_verified(FIXTURE_BLOB));
+        // The warm cache of the restarted daemon still lets its mount share page cache.
+        assert!(second.unverified_blobs().is_empty());
+        assert_eq!(
+            inode_share_refusal(Ok(true), &second.unverified_blobs()),
+            None
+        );
         spawn_worker(&second);
         second.arm().unwrap();
         second.mount().unwrap();
@@ -3114,6 +3203,31 @@ mod tests {
             err.to_string().contains("shorter blob cache directory"),
             "error should say how to fix it: {err}"
         );
+    }
+
+    #[test]
+    fn inode_share_needs_fingerprints_and_verified_caches() {
+        use crate::erofs_ishare::MountOutcome;
+        assert_eq!(inode_share_refusal(Ok(true), &[]), None);
+        let (outcome, reason) = inode_share_refusal(Ok(false), &[]).unwrap();
+        assert_eq!(outcome, MountOutcome::NoFingerprints);
+        assert!(reason.contains("no fingerprints"));
+        let (outcome, reason) = inode_share_refusal(Ok(true), &["b1".to_string()]).unwrap();
+        assert_eq!(outcome, MountOutcome::Unverified);
+        assert!(reason.contains("b1"), "{reason}");
+        assert!(inode_share_refusal(Err(ErrorKind::NotFound.into()), &[]).is_some());
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bootstrap");
+        let mut image = vec![0u8; 4096];
+        std::fs::write(&path, &image).unwrap();
+        assert!(!bootstrap_has_fingerprints(&path).unwrap());
+        let mut sb = RafsV6SuperBlock::new();
+        sb.set_ishare_xattr_prefix(1024).unwrap();
+        let at = EROFS_SUPER_OFFSET as usize;
+        image[at..at + sb.as_ref().len()].copy_from_slice(sb.as_ref());
+        std::fs::write(&path, &image).unwrap();
+        assert!(bootstrap_has_fingerprints(&path).unwrap());
     }
 
     #[test]

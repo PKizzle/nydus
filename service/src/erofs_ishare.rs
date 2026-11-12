@@ -23,6 +23,61 @@
 
 use std::io::{self, BufRead};
 
+/// How a fresh fanotify mount decided on page cache sharing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MountOutcome {
+    /// Mounted asking for `inode_share`.
+    Shared,
+    /// Sharing is enabled, but the image has no node view to share through.
+    NoView,
+    /// A cache held data not verified against its digests yet.
+    Unverified,
+    /// The mounted bootstrap declares no fingerprints.
+    NoFingerprints,
+    /// Sharing is off: configuration, or the kernel self-test.
+    Disabled,
+}
+
+impl MountOutcome {
+    /// Every outcome, in [`MountOutcome::label`] order of the counters.
+    pub const ALL: [MountOutcome; 5] = [
+        Self::Shared,
+        Self::NoView,
+        Self::Unverified,
+        Self::NoFingerprints,
+        Self::Disabled,
+    ];
+
+    /// The metric label value.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Shared => "shared",
+            Self::NoView => "no_view",
+            Self::Unverified => "unverified",
+            Self::NoFingerprints => "no_fingerprints",
+            Self::Disabled => "disabled",
+        }
+    }
+}
+
+static MOUNTS: [std::sync::atomic::AtomicU64; 5] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+
+/// Count one fresh mount's sharing decision.
+pub fn record_mount(outcome: MountOutcome) {
+    MOUNTS[outcome as usize].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Fresh mounts per sharing decision since the process started.
+pub fn mount_counts() -> [(MountOutcome, u64); 5] {
+    MountOutcome::ALL.map(|o| {
+        (
+            o,
+            MOUNTS[o as usize].load(std::sync::atomic::Ordering::Relaxed),
+        )
+    })
+}
+
 /// The upstream commit that makes shared mmaps keep their real inode alive.
 pub const UPSTREAM_FIX: &str = "7259fb011c14";
 

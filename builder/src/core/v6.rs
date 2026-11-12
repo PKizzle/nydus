@@ -17,13 +17,13 @@ use nydus_rafs::metadata::chunk::ChunkWrapper;
 use nydus_rafs::metadata::layout::v6::{
     EROFS_BLOCK_BITS_9, EROFS_BLOCK_SIZE_512, EROFS_DEVTABLE_OFFSET, EROFS_INODE_CHUNK_BASED,
     EROFS_INODE_FLAT_INLINE, EROFS_INODE_FLAT_PLAIN, EROFS_INODE_SLOT_SIZE, EROFS_SUPER_BLOCK_SIZE,
-    EROFS_SUPER_OFFSET, RafsV6BlobTable, RafsV6Device, RafsV6Dirent, RafsV6InodeChunkAddr,
-    RafsV6InodeChunkHeader, RafsV6OndiskInode, RafsV6PrefetchTable, RafsV6SuperBlock,
-    RafsV6SuperBlockExt, align_offset, block_bits_from_size, calculate_nid,
-    ishare_xattr_prefix_table, new_v6_inode,
+    EROFS_SUPER_OFFSET, RAFSV6_ISHARE_XATTR_NAME, RafsV6BlobTable, RafsV6Device, RafsV6Dirent,
+    RafsV6InodeChunkAddr, RafsV6InodeChunkHeader, RafsV6OndiskInode, RafsV6PrefetchTable,
+    RafsV6SuperBlock, RafsV6SuperBlockExt, align_offset, block_bits_from_size, calculate_nid,
+    ishare_fingerprint, ishare_xattr_prefix_table, new_v6_inode,
 };
 use nydus_storage::device::{BlobFeatures, BlobInfo};
-use nydus_utils::digest::{self, DigestHasher, RafsDigest};
+use nydus_utils::digest;
 use nydus_utils::{root_tracer, round_down, round_up, timing_tracer};
 
 use super::chunk_dict::DigestWithBlobIndex;
@@ -115,48 +115,34 @@ impl Node {
         Ok(())
     }
 
-    /// Compute the page cache sharing fingerprint of a regular file and store it as the hidden
-    /// `RAFSV6_ISHARE_XATTR_NAME` xattr, before layout sizes the inode.
+    /// Compute the page cache sharing fingerprint of a regular file ([`ishare_fingerprint`] over
+    /// its chunks, whose digests the builder computed from the uncompressed data under
+    /// `digester`) and store it as the hidden `RAFSV6_ISHARE_XATTR_NAME` xattr, before layout
+    /// sizes the inode.
     ///
     /// The kernel's EROFS `inode_share` mode shares one page cache between files of a domain
     /// whose fingerprints are byte-equal, so the value has to identify the file content alone.
-    /// It is a SHA-256 over the file size and each chunk's digest, which the builder computed
-    /// from the chunk's uncompressed data; the chunks must cover the file end to end. Nothing is
-    /// read from the source image's own metadata. Empty files carry no data to share and get none.
-    /// Nor does a file whose chunks cannot identify it: it only misses out on sharing, so it is
-    /// logged and skipped rather than failing the build.
-    pub fn v6_set_inode_share_fingerprint(&mut self) {
+    /// Empty files carry no data to share and get none. Nor does a file whose chunks cannot
+    /// identify it: it only misses out on sharing, so it is logged and skipped rather than
+    /// failing the build.
+    pub fn v6_set_inode_share_fingerprint(&mut self, digester: digest::Algorithm) {
         let size = self.inode.size();
         if !self.is_reg() || size == 0 {
             return;
         }
-        let mut hasher = RafsDigest::hasher(digest::Algorithm::Sha256);
-        hasher.digest_update(b"nydus-rafs-chunks-v1\0");
-        hasher.digest_update(&size.to_le_bytes());
-        let mut covered = 0u64;
-        for chunk in &self.chunks {
-            let id = chunk.inner.id();
-            if id.data == [0u8; 32] {
-                warn!(
-                    "{}: chunk has no content digest, not fingerprinting it",
-                    self.path().display()
-                );
-                return;
-            }
-            covered += chunk.inner.uncompressed_size() as u64;
-            hasher.digest_update(&chunk.inner.uncompressed_size().to_le_bytes());
-            hasher.digest_update(&id.data);
-        }
-        if covered != size {
-            warn!(
-                "{}: chunks cover {covered} of {size} bytes, not fingerprinting it",
+        let chunks = self
+            .chunks
+            .iter()
+            .map(|c| (c.inner.uncompressed_size(), c.inner.id().data));
+        match ishare_fingerprint(digester, size, chunks) {
+            Some(fingerprint) => Arc::make_mut(&mut self.info)
+                .xattrs
+                .set_ishare_fingerprint(fingerprint.to_vec()),
+            None => warn!(
+                "{}: chunks do not identify its {size} bytes, not fingerprinting it",
                 self.path().display()
-            );
-            return;
+            ),
         }
-        Arc::make_mut(&mut self.info)
-            .xattrs
-            .set_ishare_fingerprint(hasher.digest_finalize().data.to_vec());
     }
 
     /// Update whether compact mode can be used for this inode or not.
@@ -887,8 +873,19 @@ impl Bootstrap {
             "chunk_table offset {} size {}",
             chunk_table_offset, chunk_table_size
         );
-        // The kernel reads the long xattr prefix table from `xattr_prefix_start * 4`.
-        let ishare_prefix_offset = if ctx.inode_share_fingerprint {
+        // The kernel reads the long xattr prefix table from `xattr_prefix_start * 4`. An image
+        // declares it exactly when one of its inodes carries a fingerprint, however it got there.
+        let mut has_fingerprints = false;
+        self.tree.walk_bfs(true, &mut |t| {
+            has_fingerprints |= t
+                .borrow_mut_node()
+                .info
+                .xattrs
+                .get(std::ffi::OsStr::new(RAFSV6_ISHARE_XATTR_NAME))
+                .is_some();
+            Ok(())
+        })?;
+        let ishare_prefix_offset = if has_fingerprints {
             let end = chunk_table_offset + chunk_table_size;
             let offset = align_offset(end, 4);
             bootstrap_ctx

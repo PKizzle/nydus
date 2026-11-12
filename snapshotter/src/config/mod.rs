@@ -681,8 +681,8 @@ pub struct FeaturesConfig {
     pub prefetch: bool,
     #[serde(default = "default_true")]
     pub metrics: bool,
-    /// EROFS page cache sharing (`inode_share`) between auto-accel images this node built
-    /// itself; see [`ErofsInodeShare`].
+    /// EROFS page cache sharing (`inode_share`) between the images this node serves through
+    /// fanotify; see [`ErofsInodeShare`].
     #[serde(default)]
     pub erofs_inode_share: ErofsInodeShare,
 }
@@ -741,12 +741,13 @@ impl From<FeaturesConfigToml> for FeaturesConfig {
     }
 }
 
-/// When auto-accel mounts use the EROFS `inode_share` option, which lets files with identical
+/// When fanotify mounts use the EROFS `inode_share` option, which lets files with identical
 /// content in different images share one page cache.
 ///
-/// Only artifacts built on this node by `local_accel` carry fingerprints the snapshotter trusts,
-/// so only they are ever mounted with it; registry and peer-fetched images never are, whatever
-/// this says, because a crafted fingerprint would alias another image's pages.
+/// The kernel trusts the fingerprints it compares, so the snapshotter mounts every image through
+/// a node view (`nydus-image node-view`) whose fingerprints this node computed itself, and
+/// ignores any an image ships. A mount joins the sharing domain only while every byte its caches
+/// serve is checked against its digests (see `docs/nydus-fanotify.md`).
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ErofsInodeShare {

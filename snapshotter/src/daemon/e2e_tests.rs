@@ -17,12 +17,24 @@ use crate::auto_zran::{
     AUTO_ACCEL_MANIFEST_VERSION, AutoAccelDescriptor, AutoAccelLayerDescriptor, AutoAccelManifest,
     OciConfigRootfs,
 };
-use crate::config::{ContainerdConfig, PeerMirrorConfig, RegistryBackendConfig};
+use crate::config::{ContainerdConfig, ErofsInodeShare, PeerMirrorConfig, RegistryBackendConfig};
 use crate::content_store::ContentStoreClient;
 use crate::local_accel::{self, LocalAccelConfig, SchedClass, SourceLayer};
 
 fn e2e_root() -> PathBuf {
     PathBuf::from(std::env::var("NYDUS_E2E_ROOT").expect("NYDUS_E2E_ROOT unset"))
+}
+
+fn nydus_image() -> PathBuf {
+    PathBuf::from(std::env::var("NYDUS_IMAGE").expect("NYDUS_IMAGE unset"))
+}
+
+/// Whether the daemon mounted at `mountpoint` serves its image through the node view.
+fn serves_node_view(mountpoint: &Path) -> bool {
+    mountpoint
+        .with_file_name("stage")
+        .join(VIEW_SOURCE_RECORD)
+        .is_file()
 }
 
 fn file_sha256(path: &Path) -> String {
@@ -259,7 +271,8 @@ fn serve_registry_request(
 /// through `ensure_instance` with the fanotify driver selected, mounted as EROFS with its
 /// data blobs fetched on demand from a registry, and every file reads back with the
 /// source bytes.
-/// `NYDUS_E2E_ROOT` holds `src/` (the source tree), `bootstrap` and `blobs/<blob id>`.
+/// `NYDUS_E2E_ROOT` holds `src/` (the source tree), `bootstrap` and `blobs/<blob id>`;
+/// `NYDUS_IMAGE` is the `nydus-image` binary that builds the node view.
 #[test]
 #[ignore = "needs root, Linux >= 6.14 and an ext4 work dir; run misc/fanotify/b4b-referrer-serving-test.sh"]
 fn referrer_daemon_serves_every_file() {
@@ -268,6 +281,9 @@ fn referrer_daemon_serves_every_file() {
     let mut config = SnapshotterConfig::default();
     config.snapshotter.root = root.join("snapshotter");
     config.snapshotter.cache.work_dir = root.join("cache");
+    config.snapshotter.auto_zran.nydus_image = nydus_image();
+    // Sharing on, so the image is served through its node view whatever its block size.
+    config.snapshotter.features.erofs_inode_share = ErofsInodeShare::On;
     config.backends.registry = Some(RegistryBackendConfig {
         mirrors: Vec::new(),
         skip_verify: false,
@@ -288,8 +304,10 @@ fn referrer_daemon_serves_every_file() {
         ))
         .unwrap_or_else(|e| panic!("referrer daemon start: {e:#}"));
     let mountpoint = handle.mountpoint().to_path_buf();
-    // A consistent RAFS v6 image pulled from a registry is served by the kernel.
+    // A RAFS v6 image pulled from a registry is served by the kernel, through its node view,
+    // whatever its own block size.
     assert_eq!(mount_fstype_at(&mountpoint).as_deref(), Some("erofs"));
+    assert!(serves_node_view(&mountpoint));
     assert_same_files(&root.join("src"), &mountpoint);
 
     drop(handle);
@@ -343,7 +361,7 @@ fn auto_accel_sidecar_serves_converted_layers() {
 
     let artifact = local_accel::convert(
         &LocalAccelConfig {
-            nydus_image: PathBuf::from(std::env::var("NYDUS_IMAGE").expect("NYDUS_IMAGE unset")),
+            nydus_image: nydus_image(),
             work_dir: root.join("convert"),
             sched: SchedClass::Normal,
             nice: 0,
@@ -353,7 +371,7 @@ fn auto_accel_sidecar_serves_converted_layers() {
     )
     .unwrap_or_else(|e| panic!("convert: {e:#}"));
     // The kernel follows only block addresses, so validate the merged layout before serving it.
-    let check = std::process::Command::new(std::env::var("NYDUS_IMAGE").unwrap())
+    let check = std::process::Command::new(nydus_image())
         .args(["check", "-B"])
         .arg(&artifact.bootstrap)
         .arg("--blob-dir")
@@ -412,6 +430,8 @@ fn auto_accel_sidecar_serves_converted_layers() {
 
     let mut config = SnapshotterConfig::default();
     config.snapshotter.root = snapshotter_root;
+    config.snapshotter.auto_zran.nydus_image = nydus_image();
+    config.snapshotter.features.erofs_inode_share = ErofsInodeShare::On;
     let supervisor = DaemonSupervisor::new(config);
     let handle = runtime
         .block_on(supervisor.ensure_instance_local(
@@ -419,11 +439,11 @@ fn auto_accel_sidecar_serves_converted_layers() {
             &staged.bootstrap,
             &staged.backend_dir,
             "k1",
-            true,
         ))
         .unwrap_or_else(|e| panic!("auto-accel daemon start: {e:#}"));
     let mountpoint = handle.mountpoint().to_path_buf();
     assert_eq!(mount_fstype_at(&mountpoint).as_deref(), Some("erofs"));
+    assert!(serves_node_view(&mountpoint));
     assert_same_files(&root.join("expected"), &mountpoint);
 
     drop(handle);

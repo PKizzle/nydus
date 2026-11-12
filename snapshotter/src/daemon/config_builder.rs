@@ -341,21 +341,21 @@ fn resolve_credential_env(var_name: &str) -> anyhow::Result<String> {
 /// EROFS `domain_id` of the node-local page cache sharing domain.
 ///
 /// The kernel shares pages between files of one domain whose fingerprint xattrs are equal, so a
-/// domain must only ever hold images whose fingerprints the node computed itself. Every artifact
-/// `local_accel` builds is fingerprinted by the same `nydus-image merge` from data it hashed, so
-/// one fixed domain lets all of them share with each other and with nothing else.
+/// domain must only ever hold images whose fingerprints the node computed itself: the node views
+/// (`nydus-image node-view`) it stages as the mount source of every fanotify image. All of them
+/// use one fingerprint scheme, so one fixed domain lets every image share with every other and
+/// with nothing else.
 pub const NODE_LOCAL_INODE_SHARE_DOMAIN: &str = "nydus-node-local";
 
-/// The `inode_share` domain to mount an auto-accel sidecar with, or `None` to mount without
-/// page cache sharing. Only a bootstrap built on this node qualifies: a peer's could carry a
-/// crafted fingerprint that aliases another image's file, so it never gets the option.
-/// `fix_detected` is consulted only for a node-built bootstrap in `auto` mode.
-pub fn auto_accel_inode_share_domain(
+/// The `inode_share` domain to mount a staged node view with, or `None` to mount without page
+/// cache sharing. The fanotify handler joins it only once the view's caches hold verified data
+/// alone; a source bootstrap staged as it is never gets a domain.
+pub fn inode_share_domain(
     mode: ErofsInodeShare,
-    built_on_node: bool,
     fix_detected: impl FnOnce() -> bool,
 ) -> Option<String> {
-    (built_on_node && mode.enabled(fix_detected)).then(|| NODE_LOCAL_INODE_SHARE_DOMAIN.to_string())
+    mode.enabled(fix_detected)
+        .then(|| NODE_LOCAL_INODE_SHARE_DOMAIN.to_string())
 }
 
 /// A `localfs` backend reading blobs named by their bare hex digest from `dir`: the
@@ -1014,31 +1014,18 @@ mod tests {
     }
 
     #[test]
-    fn inode_share_only_for_node_built_auto_accel_bootstraps() {
+    fn inode_share_domain_follows_the_mode() {
         let fixed = || true;
-        for mode in [
-            ErofsInodeShare::Auto,
-            ErofsInodeShare::On,
-            ErofsInodeShare::Off,
-        ] {
-            // A peer-fetched sidecar never gets the option, whatever the mode.
-            assert_eq!(
-                auto_accel_inode_share_domain(mode, false, || unreachable!()),
-                None
-            );
-        }
         assert_eq!(
-            auto_accel_inode_share_domain(ErofsInodeShare::Auto, true, fixed).as_deref(),
+            inode_share_domain(ErofsInodeShare::Auto, fixed).as_deref(),
             Some(NODE_LOCAL_INODE_SHARE_DOMAIN)
         );
+        assert_eq!(inode_share_domain(ErofsInodeShare::Auto, || false), None);
         assert_eq!(
-            auto_accel_inode_share_domain(ErofsInodeShare::Auto, true, || false),
-            None
+            inode_share_domain(ErofsInodeShare::On, || unreachable!()).as_deref(),
+            Some(NODE_LOCAL_INODE_SHARE_DOMAIN)
         );
-        assert_eq!(
-            auto_accel_inode_share_domain(ErofsInodeShare::Off, true, fixed),
-            None
-        );
+        assert_eq!(inode_share_domain(ErofsInodeShare::Off, fixed), None);
 
         let fanotify_domain = |cfg: &ConfigV2| {
             cfg.cache
@@ -1046,26 +1033,15 @@ mod tests {
                 .and_then(|c| c.fanotify.as_ref())
                 .and_then(|f| f.erofs_inode_share_domain.clone())
         };
-        let peer = auto_accel_inode_share_domain(ErofsInodeShare::On, false, fixed);
-        let local = auto_accel_inode_share_domain(ErofsInodeShare::On, true, fixed);
         let dir = PathBuf::from("/tmp/x");
+        let shared = inode_share_domain(ErofsInodeShare::On, fixed);
         assert_eq!(
             fanotify_domain(&build_fanotify_config(
                 localfs_backend(&dir),
                 &dir,
                 &dir,
                 "d",
-                peer
-            )),
-            None
-        );
-        assert_eq!(
-            fanotify_domain(&build_fanotify_config(
-                localfs_backend(&dir),
-                &dir,
-                &dir,
-                "d",
-                local
+                shared
             ))
             .as_deref(),
             Some(NODE_LOCAL_INODE_SHARE_DOMAIN)

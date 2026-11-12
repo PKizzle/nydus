@@ -1037,7 +1037,7 @@ async fn metrics_response(controller: &SystemController) -> HttpResponse {
     #[cfg(target_os = "linux")]
     if let Some((status, mode, enabled)) = crate::probe::erofs_inode_share_decision() {
         body.push_str(&format!(
-            "# HELP nydus_snapshotter_erofs_inode_share EROFS page cache sharing for node-built auto-accel images, from the startup self-test: status (unsupported, fix_absent, fix_present or inconclusive; the fix is upstream {}), configured mode and whether it is enabled.\n",
+            "# HELP nydus_snapshotter_erofs_inode_share EROFS page cache sharing for fanotify images, from the startup self-test: status (unsupported, fix_absent, fix_present or inconclusive; the fix is upstream {}), configured mode and whether it is enabled.\n",
             nydus_service::erofs_ishare::UPSTREAM_FIX
         ));
         body.push_str("# TYPE nydus_snapshotter_erofs_inode_share gauge\n");
@@ -1050,6 +1050,19 @@ async fn metrics_response(controller: &SystemController) -> HttpResponse {
                 ("enabled", &enabled.to_string()),
             ],
             1u64,
+        );
+    }
+
+    body.push_str(
+        "# HELP nydus_snapshotter_inode_share_mounts_total Fresh fanotify mounts by page cache sharing decision: shared, no_view, unverified, no_fingerprints or disabled.\n",
+    );
+    body.push_str("# TYPE nydus_snapshotter_inode_share_mounts_total counter\n");
+    for (outcome, count) in nydus_service::erofs_ishare::mount_counts() {
+        push_labeled_metric(
+            &mut body,
+            "nydus_snapshotter_inode_share_mounts_total",
+            &[("result", outcome.label())],
+            count,
         );
     }
 

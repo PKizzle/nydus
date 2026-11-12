@@ -186,6 +186,11 @@ pub trait RangeMap: Send + Sync {
         false
     }
 
+    /// Whether no chunk is marked ready. `false` when the map cannot tell.
+    fn is_none_ready(&self) -> bool {
+        false
+    }
+
     /// Record every ready chunk as checked against its digest with the data file at
     /// `data_stamp`, or with `None` that they are not.
     fn set_verified(&self, _data_stamp: Option<u64>) -> StorageResult<()> {

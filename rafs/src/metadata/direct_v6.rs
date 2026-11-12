@@ -411,7 +411,61 @@ pub struct OndiskInodeWrapper {
     name: Option<OsString>,
 }
 
+/// The fingerprint in the inline xattr entries `area` of an inode, as
+/// [`OndiskInodeWrapper::ishare_fingerprint`] defines it. An entry running past the area fails,
+/// as the kernel fails it (`EFSCORRUPTED`).
+fn ishare_fingerprint_in(mut area: &[u8]) -> RafsResult<Option<Vec<u8>>> {
+    let invalid = |what: &str| Err(RafsError::InvalidMetadata(format!("v6: {what}")));
+    let header = size_of::<RafsV6XattrEntry>();
+    let mut found = None;
+    while !area.is_empty() {
+        if area.len() < header {
+            return invalid("xattr entry runs past the inode");
+        }
+        let (name_len, index) = (area[0] as usize, area[1]);
+        let value_size = u16::from_le_bytes([area[2], area[3]]) as usize;
+        let size = round_up((header + name_len + value_size) as u64, header as u64) as usize;
+        if size > area.len() {
+            return invalid("xattr entry runs past the inode");
+        }
+        if is_long_prefix_xattr(index) {
+            if index != 0x80 || name_len != 0 || found.is_some() {
+                return invalid("unexpected long-prefix xattr");
+            }
+            found = Some(area[header..header + value_size].to_vec());
+        } else {
+            recover_namespace(index)?;
+        }
+        area = &area[size..];
+    }
+    Ok(found)
+}
+
 impl OndiskInodeWrapper {
+    /// The page cache sharing fingerprint the kernel finds on this inode: the value of its xattr
+    /// entry naming long prefix 0 with an empty suffix. Fails on any xattr the kernel could read
+    /// as a fingerprint that RAFS never writes: shared xattr ids, an entry without a namespace,
+    /// another long prefix, a suffix, or a second fingerprint.
+    pub(crate) fn ishare_fingerprint(&self) -> RafsResult<Option<Vec<u8>>> {
+        let state = self.state();
+        let inode = self.disk_inode(&state);
+        let total = inode.xattr_inline_count();
+        if total == 0 {
+            return Ok(None);
+        }
+        let header: &RafsV6XattrIbodyHeader =
+            state.map.get_ref(self.offset + Self::inode_size(inode))?;
+        let invalid = |what: &str| Err(RafsError::InvalidMetadata(format!("v6: {what}")));
+        if header.shared_count() != 0 {
+            return invalid("inode has shared xattrs");
+        }
+        let area: &[u8] = state.map.get_slice(
+            self.offset + Self::inode_size(inode) + size_of::<RafsV6XattrIbodyHeader>(),
+            (total - 1) as usize * size_of::<RafsV6XattrEntry>(),
+        )?;
+        ishare_fingerprint_in(area)
+    }
+
     fn new(
         state: &DirectMappingState,
         mapping: DirectSuperBlockV6,
@@ -1777,6 +1831,27 @@ impl BlobV5ChunkInfo for TarfsChunkInfoV6 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A fingerprint entry is read only whole: one running past the xattr area is corrupt.
+    #[test]
+    fn ishare_fingerprint_entries_must_fit_the_area() {
+        let mut area = vec![0u8, 0x80, 32, 0];
+        area.extend_from_slice(&[9u8; 32]);
+        assert_eq!(ishare_fingerprint_in(&area).unwrap(), Some(vec![9u8; 32]));
+        assert_eq!(ishare_fingerprint_in(&[]).unwrap(), None);
+        // The value runs past the area.
+        assert!(ishare_fingerprint_in(&area[..20]).is_err());
+        // Not even a whole entry header.
+        assert!(ishare_fingerprint_in(&area[..2]).is_err());
+        // A second fingerprint, another long prefix, or a suffix.
+        assert!(ishare_fingerprint_in(&[area.clone(), area.clone()].concat()).is_err());
+        let mut other = area.clone();
+        other[1] = 0x81;
+        assert!(ishare_fingerprint_in(&other).is_err());
+        let mut suffix = vec![4u8, 0x80, 0, 0];
+        suffix.extend_from_slice(b"abcd");
+        assert!(ishare_fingerprint_in(&suffix).is_err());
+    }
 
     #[test]
     fn test_direct_mapping_state() {

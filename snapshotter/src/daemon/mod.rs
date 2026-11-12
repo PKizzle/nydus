@@ -41,10 +41,11 @@ use tracing::{debug, info, warn};
 
 use crate::config::{FsDriverType, SnapshotterConfig};
 use crate::daemon::config_builder::{
-    auto_accel_inode_share_domain, build_backend_config, build_blob_cache_entry,
-    build_daemon_config, build_fanotify_blob_cache_entry, localfs_backend,
+    build_backend_config, build_blob_cache_entry, build_daemon_config,
+    build_fanotify_blob_cache_entry, inode_share_domain, localfs_backend,
 };
 use crate::daemon::image_ref::{ImageRef, parse_image_ref};
+use crate::local_accel::NodeViewError;
 use crate::prefetch_profile::runtime_prefetch_for_image;
 
 #[cfg(target_os = "linux")]
@@ -126,8 +127,7 @@ pub struct DaemonStatusRecord {
     /// (written before this field existed) loadable.
     #[serde(default)]
     pub pid: u32,
-    /// Whether this node's `local_accel` built the bootstrap, which alone makes an auto-accel
-    /// mount eligible for EROFS page cache sharing. Restarts keep the mount's eligibility.
+    /// Unused, always `false`; kept so records stay readable by builds that still read it.
     #[serde(default)]
     pub built_on_node: bool,
     /// The driver the image's `containerd.io/snapshot/nydus-fs-driver` label asked for, so a
@@ -246,8 +246,6 @@ struct DaemonInstance {
     /// a successor can take its mount over. When false, the mount must be
     /// unmounted on shutdown rather than left held (which would wedge in D-state).
     failover_armed: AtomicBool,
-    /// See `DaemonStatusRecord::built_on_node`.
-    built_on_node: bool,
     /// See `DaemonStatusRecord::driver_override`.
     driver_override: Option<FsDriverType>,
     /// See `DaemonStatusRecord::registry_auth`.
@@ -761,16 +759,12 @@ impl DaemonSupervisor {
     /// back to the overlay path; an unhealthy one is stopped and replaced.
     /// `holder` follows the same idempotent-per-snapshot-key contract as
     /// [`ensure_instance`](Self::ensure_instance).
-    ///
-    /// `built_on_node` says the bootstrap came from this node's `local_accel`, which alone makes
-    /// it eligible for EROFS page cache sharing (`[features] erofs_inode_share`).
     pub async fn ensure_instance_local(
         &self,
         image_ref: &str,
         bootstrap: &Path,
         backend_dir: &Path,
         holder: &str,
-        built_on_node: bool,
     ) -> Result<Arc<MountHandle>> {
         if image_ref.is_empty() {
             bail!("image reference must be non-empty to mount an auto-accel sidecar");
@@ -809,7 +803,7 @@ impl DaemonSupervisor {
                 image_ref,
                 bootstrap,
                 localfs_backend(backend_dir),
-                built_on_node,
+                None,
                 None,
             )
             .await
@@ -839,13 +833,15 @@ impl DaemonSupervisor {
     /// ranges are served on demand by `FanotifyHandler`, which fetches them
     /// (decompressing zran ranges) into the file cache. `driver_override` is
     /// only recorded, for restarts (see `DaemonStatusRecord::driver_override`).
+    /// `trial_view` is the node view `start_instance` built to judge an image unfit at its own
+    /// layout, staged instead of building it again.
     async fn start_fanotify_instance(
         &self,
         image_ref_str: &str,
         bootstrap: &Path,
         backend: BackendConfigV2,
-        built_on_node: bool,
         driver_override: Option<FsDriverType>,
+        trial_view: Option<BuiltView>,
     ) -> Result<Arc<DaemonInstance>> {
         let slug = slug_for(image_ref_str);
         let daemon_root = self.config.snapshotter.root.join("daemons").join(&slug);
@@ -867,18 +863,22 @@ impl DaemonSupervisor {
                 stage_dir.display()
             )
         })?;
-        // Copy the bootstrap into the stage dir so the fanotify handler finds
-        // it under the expected `bootstrap` filename (see
-        // `service/src/fanotify.rs::discover_blobs`).
+        // The mount source is staged in the stage dir under the `bootstrap` filename the
+        // fanotify handler expects (see `service/src/fanotify.rs::discover_blobs`).
         let staged_bootstrap = stage_dir.join("bootstrap");
-        // Only a mount of this staged bootstrap, still holding the same content, is healed in
-        // place: that file is its live source, so it is left as it is. Any other mount, such as
-        // one without data devices that answers every read with EIO, is replaced, and only then
-        // is the bootstrap staged again.
+        // Only a mount of this staged bootstrap, still staged from the same source, is healed in
+        // place: that file is its live source, so it is left as it is, and no other view is
+        // built under it. Any other mount, such as one without data devices that answers every
+        // read with EIO, is replaced, and only then is the source staged again.
         let mut heal = false;
         if let Some((source, _)) = mount_at(&mountpoint) {
             heal = Path::new(&crate::recon::unescape_mount_field(&source)) == staged_bootstrap
-                && is_staged_copy(bootstrap, &staged_bootstrap);
+                && is_staged_from(bootstrap, &stage_dir).with_context(|| {
+                    format!(
+                        "failed to check what {} was staged from",
+                        stage_dir.display()
+                    )
+                })?;
             if !heal {
                 warn!(image_ref = %image_ref_str, source, "replacing a mount of another bootstrap");
                 detach_mount_stack(&mountpoint)
@@ -886,13 +886,27 @@ impl DaemonSupervisor {
             }
         }
         if !heal {
-            stage_bootstrap(bootstrap, &staged_bootstrap).with_context(|| {
+            let viewer = self.node_viewer();
+            let want_view = self.inode_share_domain().is_some();
+            let (src, stage) = (bootstrap.to_path_buf(), stage_dir.clone());
+            let is_view = blocking::unblock(move || {
+                stage_mount_source(&viewer, &src, &stage, want_view, trial_view)
+            })
+            .await
+            .with_context(|| {
                 format!(
                     "failed to stage bootstrap {} -> {}",
                     bootstrap.display(),
                     staged_bootstrap.display()
                 )
             })?;
+            // The handler counts the mounts it gives a domain; these get none.
+            use nydus_service::erofs_ishare::{MountOutcome, record_mount};
+            match (want_view, is_view) {
+                (false, _) => record_mount(MountOutcome::Disabled),
+                (true, false) => record_mount(MountOutcome::NoView),
+                (true, true) => {}
+            }
         }
 
         let threads = self.config.snapshotter.daemon.threads.max(1) as u32;
@@ -909,7 +923,7 @@ impl DaemonSupervisor {
         // any `device=`, and every file read fails with EIO.
         let backend_type = backend.backend_type.clone();
         let registry_auth = backend.registry.as_ref().is_some_and(|r| r.auth.is_some());
-        let cfg_json = self.fanotify_blob_list(&slug, backend, built_on_node)?;
+        let cfg_json = self.fanotify_blob_list(&slug, backend)?;
         // The process-wide blob factory keys cache managers by config, which is
         // the same for every start of this image, so it would hand back the
         // previous daemon's cache entries; drop the idle ones, whose files the
@@ -964,7 +978,6 @@ impl DaemonSupervisor {
             holders: StdMutex::new(HashSet::new()),
             restored_holders: StdMutex::new(HashSet::new()),
             failover_armed: AtomicBool::new(armed),
-            built_on_node,
             driver_override,
             registry_auth,
             missing_auth: false,
@@ -1368,28 +1381,51 @@ impl DaemonSupervisor {
     }
 
     /// The blob list of the fanotify daemon `slug`: its staged bootstrap, with the blobs read
-    /// from `backend`.
+    /// from `backend`. Only a staged node view, whose fingerprints this node computed, is given
+    /// the page cache sharing domain.
     fn fanotify_blob_list(
         &self,
         slug: &str,
         backend: BackendConfigV2,
-        built_on_node: bool,
     ) -> Result<serde_json::Value> {
         let daemon_root = self.daemons_root().join(slug);
         let stage_dir = daemon_root.join("stage");
+        let domain = if stage_dir.join(VIEW_SOURCE_RECORD).is_file() {
+            self.inode_share_domain()
+        } else {
+            None
+        };
         let entry = build_fanotify_blob_cache_entry(
             backend,
             &stage_dir,
             &daemon_root.join("mnt"),
             slug,
             &stage_dir.join("bootstrap"),
-            auto_accel_inode_share_domain(
-                self.config.snapshotter.features.erofs_inode_share,
-                built_on_node,
-                crate::probe::erofs_inode_share_fix_detected,
-            ),
+            domain,
         )?;
         Ok(serde_json::json!({ "blobs": [entry] }))
+    }
+
+    /// The page cache sharing domain mounts join, when the configuration and the kernel
+    /// self-test allow sharing.
+    fn inode_share_domain(&self) -> Option<String> {
+        inode_share_domain(
+            self.config.snapshotter.features.erofs_inode_share,
+            crate::probe::erofs_inode_share_fix_detected,
+        )
+    }
+
+    /// How this node runs `nydus-image node-view`: the auto-zran converter's binary and
+    /// confinement, at normal priority since the image's first mount waits for it. `build_view`
+    /// sets the writable dir.
+    fn node_viewer(&self) -> crate::local_accel::LocalAccelConfig {
+        crate::local_accel::LocalAccelConfig {
+            sched: crate::local_accel::SchedClass::Normal,
+            ..crate::auto_zran::local_accel_config(
+                &self.config.snapshotter.auto_zran,
+                Path::new(""),
+            )
+        }
     }
 
     /// The backend the fanotify daemon of `image_ref` reads `bootstrap`'s blobs from: an
@@ -1446,7 +1482,6 @@ impl DaemonSupervisor {
         &self,
         image_ref: &str,
         bootstrap: &Path,
-        built_on_node: bool,
         driver_override: Option<FsDriverType>,
     ) -> Result<Arc<DaemonInstance>> {
         match Self::accel_backend_for(bootstrap) {
@@ -1455,8 +1490,8 @@ impl DaemonSupervisor {
                     image_ref,
                     bootstrap,
                     localfs_backend(&backend_dir),
-                    built_on_node,
                     driver_override,
+                    None,
                 )
                 .await
             }
@@ -1643,13 +1678,8 @@ impl DaemonSupervisor {
                 if let Err(e) = self.persist_instance_record(&old, false).await {
                     warn!(image_ref, error = %e, "failed to persist stopped daemon record");
                 }
-                self.start_instance_for_record(
-                    &image_ref,
-                    &bootstrap,
-                    old.built_on_node,
-                    old.driver_override,
-                )
-                .await
+                self.start_instance_for_record(&image_ref, &bootstrap, old.driver_override)
+                    .await
             };
 
             match started {
@@ -1872,12 +1902,32 @@ impl DaemonSupervisor {
         let source = bootstrap.to_path_buf();
         let daemons = self.daemons_root();
         let daemons_take_marks = self.daemons_take_marks.clone();
-        let (active_driver, unfit) = blocking::unblock(move || {
-            serving_driver(requested, live_fanotify, || {
-                if let Some(reason) =
-                    kernel_mount_unfit(node_driver, &source, nydus_utils::host_page_size())?
-                {
-                    return Ok(Some(reason));
+        let viewer = self.node_viewer();
+        let stage_dir = daemon_root.join("stage");
+        let (active_driver, unfit, trial_view) = blocking::unblock(move || {
+            let mut trial_view = None;
+            let decision = serving_driver(requested, live_fanotify, || {
+                match source_unfit(node_driver, &source, nydus_utils::host_page_size())? {
+                    None => {}
+                    Some(Unfit::Final(reason)) => return Ok(Some(reason)),
+                    // Fit only through its node view, which is built here and staged as is.
+                    Some(Unfit::Layout(reason)) => {
+                        fs::create_dir_all(&stage_dir)
+                            .with_context(|| format!("failed to create {}", stage_dir.display()))?;
+                        match build_view(&viewer, &source, &stage_dir) {
+                            Ok(view) => trial_view = Some(view),
+                            Err(NodeViewError::Refused(why)) => {
+                                return Ok(Some(format!(
+                                    "{reason}, and it has no node view: {why}"
+                                )));
+                            }
+                            Err(NodeViewError::Failed(e)) => {
+                                return Err(
+                                    e.context(format!("{reason}; failed to build its node view"))
+                                );
+                            }
+                        }
+                    }
                 }
                 // The fanotify caches live in the daemon dirs, which the driver probe never
                 // tested: a filesystem without pre-content marks there must not fail the start.
@@ -1888,7 +1938,8 @@ impl DaemonSupervisor {
                             .map(|e| format!("{e:#}"))
                     })
                     .clone())
-            })
+            })?;
+            Ok::<_, anyhow::Error>((decision.0, decision.1, trial_view))
         })
         .await
         .with_context(|| format!("failed to check how to serve {image_ref_str}"))?;
@@ -1905,7 +1956,13 @@ impl DaemonSupervisor {
         if active_driver == FsDriverType::Fanotify {
             let backend = self.fanotify_backend_for(image_ref_str, bootstrap, false)?;
             return self
-                .start_fanotify_instance(image_ref_str, bootstrap, backend, false, driver_override)
+                .start_fanotify_instance(
+                    image_ref_str,
+                    bootstrap,
+                    backend,
+                    driver_override,
+                    trial_view,
+                )
                 .await;
         }
         fs::create_dir_all(&mountpoint).with_context(|| {
@@ -1980,7 +2037,6 @@ impl DaemonSupervisor {
                 _poll: poll,
                 // Blockdev/EROFS export has no fuse fd to preserve.
                 failover_armed: AtomicBool::new(false),
-                built_on_node: false,
                 driver_override,
                 registry_auth: false,
                 missing_auth: false,
@@ -2060,7 +2116,6 @@ impl DaemonSupervisor {
                 _poll: poll,
                 // Tarfs is a kernel mount; there is no fuse fd to preserve.
                 failover_armed: AtomicBool::new(false),
-                built_on_node: false,
                 driver_override,
                 registry_auth: false,
                 missing_auth: false,
@@ -2143,7 +2198,6 @@ impl DaemonSupervisor {
             holders: StdMutex::new(HashSet::new()),
             restored_holders: StdMutex::new(HashSet::new()),
             failover_armed: AtomicBool::new(armed),
-            built_on_node: false,
             driver_override,
             registry_auth: false,
             missing_auth: false,
@@ -2379,7 +2433,6 @@ impl DaemonSupervisor {
                 .start_instance_for_record(
                     &record.image_ref,
                     &record.bootstrap,
-                    record.built_on_node,
                     record.driver_override,
                 )
                 .await;
@@ -2628,7 +2681,6 @@ impl DaemonSupervisor {
             // The fd stays in systemd's store across restarts, so this daemon is
             // still recoverable by the next successor.
             failover_armed: AtomicBool::new(true),
-            built_on_node: record.built_on_node,
             driver_override: record.driver_override,
             registry_auth: record.registry_auth,
             missing_auth: false,
@@ -2678,7 +2730,7 @@ impl DaemonSupervisor {
         let backend =
             self.fanotify_backend_for(image_ref_str, &record.bootstrap, record.registry_auth)?;
         let has_auth = backend.registry.as_ref().is_some_and(|r| r.auth.is_some());
-        let blobs = Some(self.fanotify_blob_list(slug, backend, record.built_on_node)?);
+        let blobs = Some(self.fanotify_blob_list(slug, backend)?);
         let (daemon, poll) = self
             .adopt_fanotify_group(image_ref_str, slug, fan_fd, state, blobs, |_| ())
             .await?;
@@ -2696,7 +2748,6 @@ impl DaemonSupervisor {
             // The fd stays in systemd's store (it holds its own dup), so this
             // daemon remains recoverable by the next successor too.
             failover_armed: AtomicBool::new(true),
-            built_on_node: record.built_on_node,
             driver_override: record.driver_override,
             registry_auth: record.registry_auth,
             missing_auth: record.registry_auth && !has_auth,
@@ -2828,7 +2879,7 @@ impl DaemonSupervisor {
             let backend =
                 self.fanotify_backend_for(&old.image_ref, &old.bootstrap, old.registry_auth)?;
             let has_auth = backend.registry.as_ref().is_some_and(|r| r.auth.is_some());
-            let blobs = self.fanotify_blob_list(&slug, backend, old.built_on_node)?;
+            let blobs = self.fanotify_blob_list(&slug, backend)?;
             let daemon = old.daemon.clone();
             let sock = supervisor_sock_path(&slug);
             let (group, state, suspended) = blocking::unblock(move || {
@@ -2887,7 +2938,6 @@ impl DaemonSupervisor {
                 holders: StdMutex::new(old.holders.lock().unwrap().clone()),
                 restored_holders: StdMutex::new(old.restored_holders.lock().unwrap().clone()),
                 failover_armed: AtomicBool::new(old.failover_armed.load(Ordering::SeqCst)),
-                built_on_node: old.built_on_node,
                 driver_override: old.driver_override,
                 registry_auth: old.registry_auth,
                 missing_auth: old.registry_auth && !has_auth,
@@ -3063,7 +3113,7 @@ impl DaemonSupervisor {
             // In-process daemon: failover targets the snapshotter process itself,
             // so `kill -9` restarts it and the successor takes the mount over.
             pid: if live { std::process::id() } else { 0 },
-            built_on_node: inst.built_on_node,
+            built_on_node: false,
             driver_override: inst.driver_override,
             registry_auth: inst.registry_auth,
         }
@@ -3195,6 +3245,200 @@ fn pad_live_erofs_sources(mounts: &str, daemons: &Path) -> usize {
         }
     }
     padded
+}
+
+/// File in a fanotify stage dir recording the source its staged `bootstrap` is the node view of:
+/// the SHA-256 of the source bootstrap. Present exactly while a node view is staged.
+const VIEW_SOURCE_RECORD: &str = "bootstrap.view-of";
+
+fn source_digest(src: &Path) -> io::Result<String> {
+    Ok(hex::encode(Sha256::digest(fs::read(src)?)))
+}
+
+/// How long `nydus-image node-view` may take for a bootstrap of `size` bytes. It blocks the
+/// image's first mount, and does a few passes over metadata only: well under a second per MiB.
+fn view_timeout(size: u64) -> Duration {
+    Duration::from_secs(30 + size / (1 << 20))
+}
+
+/// A node view checked in this process, in a file of the stage dir only this process wrote.
+/// Dropping it removes it.
+struct BuiltView {
+    file: tempfile::NamedTempFile,
+    /// SHA-256 of the source it was built from.
+    source_digest: String,
+}
+
+impl BuiltView {
+    fn path(&self) -> PathBuf {
+        self.file.path().to_path_buf()
+    }
+}
+
+/// Copy the regular file `output` left by a subprocess into a file this process creates in
+/// `dir`. `output` is opened without following a symlink and must have no other link, so the
+/// copy holds what the subprocess wrote there, and nothing it may still hold open changes it.
+fn take_subprocess_output(output: &Path, dir: &Path) -> io::Result<tempfile::NamedTempFile> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+
+    let mut src = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(output)?;
+    let meta = src.metadata()?;
+    if !meta.is_file() || meta.nlink() != 1 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{} is not a regular file with one link", output.display()),
+        ));
+    }
+    let mut copy = tempfile::Builder::new()
+        .prefix("bootstrap.view.")
+        .tempfile_in(dir)?;
+    io::copy(&mut src, copy.as_file_mut())?;
+    copy.as_file().sync_all()?;
+    Ok(copy)
+}
+
+/// Classify a failure to read or check a view: an OS error says nothing about the image.
+fn view_error(e: impl Into<anyhow::Error>, what: &str) -> NodeViewError {
+    let e = e.into();
+    if e.chain().any(|c| nydus_utils::source_errno(c).is_some()) {
+        NodeViewError::Failed(e.context(what.to_string()))
+    } else {
+        NodeViewError::Refused(format!("{what}: {e:#}"))
+    }
+}
+
+/// Build the node view of `src` with `viewer` in a scratch dir of `stage_dir`, the only place the
+/// subprocess may write (never the stage dir itself, which holds the caches), and check it here:
+/// the fingerprints it stores must be exactly those this process computes from its chunk table,
+/// and a kernel mount must read it exactly.
+fn build_view(
+    viewer: &crate::local_accel::LocalAccelConfig,
+    src: &Path,
+    stage_dir: &Path,
+) -> std::result::Result<BuiltView, NodeViewError> {
+    let source_digest =
+        source_digest(src).with_context(|| format!("failed to read {}", src.display()))?;
+    let scratch = tempfile::Builder::new()
+        .prefix("view.")
+        .tempdir_in(stage_dir)
+        .with_context(|| format!("failed to create a scratch dir in {}", stage_dir.display()))?;
+    let output = scratch.path().join("bootstrap");
+    let viewer = crate::local_accel::LocalAccelConfig {
+        work_dir: scratch.path().to_path_buf(),
+        ..viewer.clone()
+    };
+    let size = fs::metadata(src).map(|m| m.len()).unwrap_or(0);
+    crate::local_accel::node_view(&viewer, src, &output, view_timeout(size))?;
+    // Everything below reads this process's own copy, never the subprocess's scratch dir.
+    let file = take_subprocess_output(&output, stage_dir)
+        .map_err(|e| view_error(e, "cannot take the node view"))?;
+    drop(scratch);
+    let view = BuiltView {
+        file,
+        source_digest,
+    };
+    let path = view.path();
+
+    let config = Arc::new(nydus_api::ConfigV2::default());
+    let (rs, _) = nydus_rafs::metadata::RafsSuper::load_from_file(&path, config, false)
+        .map_err(|e| view_error(e, "the node view does not load"))?;
+    nydus_rafs::metadata::kernel_layout::check_node_view(&rs, &path).map_err(|e| {
+        view_error(
+            e,
+            "the node view stores other fingerprints than its chunks give",
+        )
+    })?;
+    match source_unfit(FsDriverType::Fanotify, &path, nydus_utils::host_page_size())
+        .map_err(|e| view_error(e, "cannot check the node view"))?
+    {
+        None => Ok(view),
+        Some(Unfit::Final(r) | Unfit::Layout(r)) => Err(NodeViewError::Refused(format!(
+            "the node view is unfit for a kernel mount: {r}"
+        ))),
+    }
+}
+
+/// Stage directories whose missing node view was already reported.
+static NO_VIEW_REPORTED: StdMutex<Option<HashSet<PathBuf>>> = StdMutex::new(None);
+
+/// Stage the EROFS mount source of a fanotify daemon as `stage_dir/bootstrap`.
+///
+/// The node view of `src` is staged (padded to the page size, its source recorded) when
+/// `want_view` (page cache sharing is enabled) or when `src` itself is unfit for a kernel mount
+/// at its own block size or alignment; `trial` is a view already built for that decision.
+/// Otherwise, and when sharing alone wanted a view that cannot be built, a padded copy of `src`
+/// is staged. An unfit `src` without a view fails, as does any I/O error on the way. Returns
+/// whether it staged a view: only a view, whose fingerprints the node computed, may join the
+/// page cache sharing domain.
+fn stage_mount_source(
+    viewer: &crate::local_accel::LocalAccelConfig,
+    src: &Path,
+    stage_dir: &Path,
+    want_view: bool,
+    trial: Option<BuiltView>,
+) -> Result<bool> {
+    let staged = stage_dir.join("bootstrap");
+    let record = stage_dir.join(VIEW_SOURCE_RECORD);
+    match fs::remove_file(&record) {
+        Err(e) if e.kind() != io::ErrorKind::NotFound => {
+            return Err(e).with_context(|| format!("failed to remove {}", record.display()));
+        }
+        _ => {}
+    }
+    let unfit = source_unfit(FsDriverType::Fanotify, src, nydus_utils::host_page_size())?;
+    if let Some(Unfit::Final(reason)) = &unfit {
+        bail!("cannot mount {} with EROFS: {reason}", src.display());
+    }
+    if !want_view && unfit.is_none() {
+        stage_bootstrap(src, &staged)?;
+        return Ok(false);
+    }
+    match trial.map_or_else(|| build_view(viewer, src, stage_dir), Ok) {
+        Ok(view) => {
+            nydus_service::erofs_folio::pad_to_page_size(&view.path())?;
+            view.file.persist(&staged).map_err(|e| e.error)?;
+            atomic_write(&record, view.source_digest.as_bytes())?;
+            Ok(true)
+        }
+        Err(e) => {
+            if let Some(Unfit::Layout(reason)) = unfit {
+                return Err(anyhow::Error::new(e).context(format!(
+                    "{} is unfit ({reason}) and has no node view",
+                    src.display()
+                )));
+            }
+            let first = NO_VIEW_REPORTED
+                .lock()
+                .unwrap()
+                .get_or_insert_with(HashSet::new)
+                .insert(stage_dir.to_path_buf());
+            if first {
+                warn!(
+                    source = %src.display(),
+                    error = %format!("{e:#}"),
+                    "no node view; mounting the image's own bootstrap without page cache sharing"
+                );
+            }
+            stage_bootstrap(src, &staged)?;
+            Ok(false)
+        }
+    }
+}
+
+/// Whether the stage dir's `bootstrap` was staged from `src`: as its node view (by the record),
+/// or, without a record, as a copy. An unreadable record is an error, never a mismatch: a
+/// mismatch replaces the live mount.
+fn is_staged_from(src: &Path, stage_dir: &Path) -> io::Result<bool> {
+    match fs::read_to_string(stage_dir.join(VIEW_SOURCE_RECORD)) {
+        Ok(recorded) => Ok(source_digest(src)? == recorded.trim()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            Ok(is_staged_copy(src, &stage_dir.join("bootstrap")))
+        }
+        Err(e) => Err(e),
+    }
 }
 
 /// Whether `staged` holds exactly what [`stage_bootstrap`] makes of `src`.
@@ -3922,9 +4166,18 @@ fn serving_driver(
     })
 }
 
-/// Why a kernel EROFS mount through fanotify cannot serve `bootstrap` on a node whose active
-/// driver is `node_driver` and whose pages are `page_size` bytes, or `None` when it can. The
-/// image then takes FUSE, which reads every chunk through the chunk table.
+/// Why a kernel EROFS mount through fanotify cannot serve a bootstrap as it is.
+#[derive(Debug, PartialEq, Eq)]
+enum Unfit {
+    /// Nothing helps: the image takes FUSE for this reason.
+    Final(String),
+    /// The image's own block size, device table or chunk addresses; its node view, which is
+    /// what gets mounted, may still be fit.
+    Layout(String),
+}
+
+/// Why a kernel EROFS mount through fanotify cannot serve `bootstrap` as it is on a node whose
+/// active driver is `node_driver` and whose pages are `page_size` bytes, or `None` when it can.
 ///
 /// EROFS mounts only RAFS v6, and only with blocks no larger than a page. The kernel follows
 /// only `blkaddr * block_size` of each chunk, so an image whose chunk addresses disagree with
@@ -3933,37 +4186,41 @@ fn serving_driver(
 ///
 /// Only a verdict on the image is a reason. A bootstrap that cannot be read or loaded is an
 /// error: FUSE could not serve it either, and the start is retried.
-fn kernel_mount_unfit(
+fn source_unfit(
     node_driver: FsDriverType,
     bootstrap: &Path,
     page_size: u64,
-) -> Result<Option<String>> {
+) -> Result<Option<Unfit>> {
     use nydus_rafs::RafsError;
     use nydus_rafs::metadata::RafsSuper;
 
     if node_driver != FsDriverType::Fanotify {
-        return Ok(Some(format!("the node serves images with {node_driver:?}")));
+        return Ok(Some(Unfit::Final(format!(
+            "the node serves images with {node_driver:?}"
+        ))));
     }
     let config = Arc::new(nydus_api::ConfigV2::default());
     let (sb, _) = RafsSuper::load_from_file(bootstrap, config, false)
         .with_context(|| format!("failed to load bootstrap {}", bootstrap.display()))?;
     if !sb.meta.is_v6() {
-        return Ok(Some("RAFS v5 bootstrap".to_string()));
+        return Ok(Some(Unfit::Final("RAFS v5 bootstrap".to_string())));
     }
     let block_size = 1u64 << sb.meta.blkszbits;
     if block_size > page_size {
-        return Ok(Some(format!(
+        return Ok(Some(Unfit::Layout(format!(
             "EROFS block size {block_size} exceeds the {page_size}-byte page size"
-        )));
+        ))));
     }
     if sb.meta.blob_device_table_count == 0 && !sb.superblock.get_blob_infos().is_empty() {
-        return Ok(Some("bootstrap has no EROFS device table".to_string()));
+        return Ok(Some(Unfit::Layout(
+            "bootstrap has no EROFS device table".to_string(),
+        )));
     }
     match sb.check_v6_block_addrs(bootstrap) {
         Ok(()) => Ok(None),
-        Err(e @ RafsError::InvalidMetadata(_)) => Ok(Some(format!(
+        Err(e @ RafsError::InvalidMetadata(_)) => Ok(Some(Unfit::Layout(format!(
             "chunk layout a kernel mount would misread: {e}"
-        ))),
+        )))),
         Err(e) => Err(anyhow::Error::new(e).context(format!(
             "failed to check the chunk layout of {}",
             bootstrap.display()
@@ -4178,7 +4435,6 @@ fn test_instance_with_daemon(
         restored_holders: StdMutex::new(HashSet::new()),
         _poll: Arc::new(Mutex::new(Poll::new().unwrap())),
         failover_armed: AtomicBool::new(false),
-        built_on_node: false,
         driver_override: None,
         registry_auth: false,
         missing_auth: false,
@@ -4345,6 +4601,135 @@ mod tests {
         assert!(!is_staged_copy(&src, &dst), "different length");
     }
 
+    fn viewer(nydus_image: &Path) -> crate::local_accel::LocalAccelConfig {
+        crate::local_accel::LocalAccelConfig {
+            nydus_image: nydus_image.to_path_buf(),
+            work_dir: PathBuf::new(),
+            sched: crate::local_accel::SchedClass::Normal,
+            nice: 0,
+            sandbox: false,
+        }
+    }
+
+    /// With sharing off, a fit image is staged as a padded copy and no view is built; one whose
+    /// view cannot be built takes a copy too, unless it is unfit itself.
+    #[test]
+    fn stage_mount_source_builds_a_view_only_when_needed() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let texture = Path::new(env!("CARGO_MANIFEST_DIR")).join("../tests/texture/bootstrap");
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("source");
+        fs::copy(texture.join("rafs-v6-2.2.boot"), &src).unwrap();
+        let stage = dir.path().join("stage");
+        fs::create_dir(&stage).unwrap();
+        // Records that it ran, and fails like an image without a view.
+        let ran = dir.path().join("ran");
+        let tool = dir.path().join("nydus-image");
+        fs::write(
+            &tool,
+            format!("#!/bin/sh\ntouch {}\nexit 2\n", ran.display()),
+        )
+        .unwrap();
+        fs::set_permissions(&tool, fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(!stage_mount_source(&viewer(&tool), &src, &stage, false, None).unwrap());
+        assert!(!ran.exists(), "sharing is off and the image fit: no view");
+        assert!(is_staged_copy(&src, &stage.join("bootstrap")));
+        assert!(is_staged_from(&src, &stage).unwrap());
+
+        assert!(!stage_mount_source(&viewer(&tool), &src, &stage, true, None).unwrap());
+        assert!(ran.exists());
+        assert!(!stage.join(VIEW_SOURCE_RECORD).exists());
+        assert!(is_staged_copy(&src, &stage.join("bootstrap")));
+        // No scratch dir is left behind in the stage dir.
+        let left: Vec<_> = fs::read_dir(&stage)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(left, vec![std::ffi::OsString::from("bootstrap")]);
+
+        let v5 = texture.join("rafs-v5.boot");
+        let err = stage_mount_source(&viewer(&tool), &v5, &stage, true, None).unwrap_err();
+        assert!(format!("{err:#}").contains("v5"), "{err:#}");
+    }
+
+    /// A subprocess's output is taken only as a regular file with one link, and copied.
+    #[test]
+    fn subprocess_output_is_copied_only_from_a_lone_regular_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let (out, own) = (dir.path().join("out"), dir.path().join("own"));
+        fs::create_dir(&own).unwrap();
+        fs::write(&out, b"view").unwrap();
+        let copy = take_subprocess_output(&out, &own).unwrap();
+        fs::write(&out, b"changed").unwrap();
+        assert_eq!(fs::read(copy.path()).unwrap(), b"view");
+
+        let link = dir.path().join("link");
+        fs::hard_link(&out, &link).unwrap();
+        assert!(take_subprocess_output(&out, &own).is_err(), "a second link");
+        fs::remove_file(&link).unwrap();
+        let symlink = dir.path().join("symlink");
+        std::os::unix::fs::symlink(&out, &symlink).unwrap();
+        assert!(take_subprocess_output(&symlink, &own).is_err(), "a symlink");
+    }
+
+    /// An unreadable view record is an error, never "staged from another source".
+    #[test]
+    fn is_staged_from_propagates_record_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("source");
+        fs::write(&src, b"bootstrap").unwrap();
+        fs::create_dir(dir.path().join(VIEW_SOURCE_RECORD)).unwrap();
+        assert!(is_staged_from(&src, dir.path()).is_err());
+        fs::remove_dir(dir.path().join(VIEW_SOURCE_RECORD)).unwrap();
+        fs::write(
+            dir.path().join(VIEW_SOURCE_RECORD),
+            source_digest(&src).unwrap(),
+        )
+        .unwrap();
+        assert!(is_staged_from(&src, dir.path()).unwrap());
+        fs::write(&src, b"another").unwrap();
+        assert!(!is_staged_from(&src, dir.path()).unwrap());
+    }
+
+    /// With a real `nydus-image`: the view is staged, recorded and checked, a heal keeps it
+    /// while the source is unchanged, and an image unfit at its own block size is staged
+    /// through its view. `NYDUS_IMAGE` is the binary; `misc/fanotify/b4b-referrer-serving-test.sh`
+    /// runs this.
+    #[test]
+    #[ignore = "needs NYDUS_IMAGE; run misc/fanotify/b4b-referrer-serving-test.sh"]
+    fn stage_mount_source_stages_a_real_view() {
+        let nydus_image = PathBuf::from(std::env::var("NYDUS_IMAGE").expect("NYDUS_IMAGE unset"));
+        let texture = Path::new(env!("CARGO_MANIFEST_DIR")).join("../tests/texture/bootstrap");
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("source");
+        fs::copy(texture.join("rafs-v6-2.2.boot"), &src).unwrap();
+        let stage = dir.path().join("stage");
+        fs::create_dir(&stage).unwrap();
+
+        assert!(stage_mount_source(&viewer(&nydus_image), &src, &stage, true, None).unwrap());
+        assert!(is_staged_from(&src, &stage).unwrap());
+        let staged = stage.join("bootstrap");
+        let config = Arc::new(nydus_api::ConfigV2::default());
+        let (rs, _) =
+            nydus_rafs::metadata::RafsSuper::load_from_file(&staged, config, false).unwrap();
+        assert_eq!(rs.meta.blkszbits, 12);
+        assert!(nydus_rafs::metadata::kernel_layout::check_node_view(&rs, &staged).unwrap() > 0);
+        let other = dir.path().join("other");
+        fs::copy(texture.join("rafs-v5.boot"), &other).unwrap();
+        assert!(!is_staged_from(&other, &stage).unwrap());
+
+        // A view built for the eligibility decision is staged as it is.
+        let trial = build_view(&viewer(&nydus_image), &src, &stage).unwrap();
+        let trial_path = trial.path();
+        assert!(
+            stage_mount_source(&viewer(&nydus_image), &src, &stage, true, Some(trial)).unwrap()
+        );
+        assert!(!trial_path.exists());
+        assert!(is_staged_from(&src, &stage).unwrap());
+    }
+
     #[test]
     fn slug_is_deterministic_and_sanitised() {
         let a = slug_for("docker.io/library/nginx:latest");
@@ -4448,8 +4833,7 @@ mod tests {
         }
     }
 
-    /// A restart must start an auto-accel mount with the page cache sharing it had, so the
-    /// record carries who built the bootstrap; older records load as not built here.
+    /// The unused `built_on_node` field still round-trips, and records without it load.
     #[test]
     fn record_keeps_built_on_node_and_older_records_default_it() {
         let mut record = sample_record(PathBuf::from("/tmp/bootstrap"));
@@ -4508,24 +4892,27 @@ mod tests {
         let v6 = texture.join("rafs-v6-2.2.boot");
         let fanotify = FsDriverType::Fanotify;
         let unfit = |driver, bootstrap: &Path, page_size| {
-            kernel_mount_unfit(driver, bootstrap, page_size).unwrap()
+            source_unfit(driver, bootstrap, page_size).unwrap()
         };
         assert_eq!(unfit(fanotify, &v6, 4096), None);
 
+        // No node view helps another driver or a v5 image.
         for other in [FsDriverType::Fusedev, FsDriverType::Blockdev] {
-            assert!(unfit(other, &v6, 4096).is_some());
+            assert!(matches!(unfit(other, &v6, 4096), Some(Unfit::Final(_))));
         }
         let v5 = unfit(fanotify, &texture.join("rafs-v5.boot"), 4096);
-        assert!(v5.as_deref().is_some_and(|r| r.contains("v5")), "{v5:?}");
+        assert!(
+            matches!(&v5, Some(Unfit::Final(r)) if r.contains("v5")),
+            "{v5:?}"
+        );
+        // The image's own layout is unfit; its view may still be fit.
         let big_blocks = unfit(fanotify, &v6, 2048);
         assert!(
-            big_blocks
-                .as_deref()
-                .is_some_and(|r| r.contains("block size")),
+            matches!(&big_blocks, Some(Unfit::Layout(r)) if r.contains("block size")),
             "{big_blocks:?}"
         );
         // A bootstrap that cannot be read is an error, not a reason to take FUSE.
-        assert!(kernel_mount_unfit(fanotify, &texture.join("missing"), 4096).is_err());
+        assert!(source_unfit(fanotify, &texture.join("missing"), 4096).is_err());
 
         // A first device slot of one block, too short for the chunks on it.
         let dir = tempfile::tempdir().unwrap();
@@ -4542,9 +4929,7 @@ mod tests {
         fs::write(&short_device, data).unwrap();
         let misread = unfit(fanotify, &short_device, 4096);
         assert!(
-            misread
-                .as_deref()
-                .is_some_and(|r| r.contains("chunk layout")),
+            matches!(&misread, Some(Unfit::Layout(r)) if r.contains("chunk layout")),
             "{misread:?}"
         );
     }
@@ -4686,9 +5071,7 @@ mod tests {
         let image_ref = "e2e.invalid/release/app:1";
 
         let handle = runtime
-            .block_on(
-                supervisor.ensure_instance_local(image_ref, &bootstrap, &backend, "k1", false),
-            )
+            .block_on(supervisor.ensure_instance_local(image_ref, &bootstrap, &backend, "k1"))
             .unwrap();
         let mountpoint = handle.mountpoint().to_path_buf();
         assert_eq!(mount_fstype_at(&mountpoint).as_deref(), Some("erofs"));
@@ -4757,9 +5140,7 @@ mod tests {
             "over a device-less mount",
         ] {
             let handle = runtime
-                .block_on(
-                    supervisor.ensure_instance_local(image_ref, &bootstrap, &backend, round, false),
-                )
+                .block_on(supervisor.ensure_instance_local(image_ref, &bootstrap, &backend, round))
                 .unwrap_or_else(|e| panic!("{round}: {e:#}"));
             let mountpoint = handle.mountpoint().to_path_buf();
             let (total, failed) = read_every_file(&mountpoint);
@@ -4840,7 +5221,6 @@ mod tests {
                         &root.join("artifact/stage/bootstrap"),
                         &root.join("artifact/backend"),
                         "k1",
-                        false,
                     ))
                     .unwrap();
                 println!("PREDECESSOR_READY {}", handle.mountpoint().display());
@@ -5142,9 +5522,7 @@ mod tests {
         let refs = ["e2e.invalid/panic/broken:1", "e2e.invalid/panic/healthy:1"];
         let [broken, healthy] = refs.map(|image_ref| {
             runtime
-                .block_on(
-                    supervisor.ensure_instance_local(image_ref, &bootstrap, &backend, "t", false),
-                )
+                .block_on(supervisor.ensure_instance_local(image_ref, &bootstrap, &backend, "t"))
                 .unwrap()
         });
         let broken_slug = slug_for(refs[0]);

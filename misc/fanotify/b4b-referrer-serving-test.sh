@@ -5,11 +5,13 @@
 # data blob fetched on demand from a registry. Builds the image, then runs the root-only
 # `referrer_daemon_serves_every_file` test, which serves the blob from a local HTTP registry and
 # compares every file of the mount with the source. Detection, the cosign trust policy and
-# bootstrap materialization are covered by `misc/referrer/trust-e2e.sh`.
+# bootstrap materialization are covered by `misc/referrer/trust-e2e.sh`. The image is mounted
+# through its node view, so BLOCK_SIZE may exceed the page size (the view uses 4 KiB blocks).
 #
 # Needs root, Linux >= 6.14, cargo, and ROOT on ext4 (tmpfs has no pre-content marks).
 set -u
-NI="${NYDUS_IMAGE:-./target/release/nydus-image}"
+NI=$(realpath "${NYDUS_IMAGE:-./target/release/nydus-image}")
+BLOCK_SIZE="${BLOCK_SIZE:-4096}"
 CARGO="${CARGO:-cargo}"
 ROOT="${ROOT:-/var/tmp/b4b-rt}"
 
@@ -21,11 +23,14 @@ perl -e 'print "B4B_REFERRER_SERVING_OK_0123456789AB" x 4096' > "$ROOT/src/hello
 head -c 180000 /dev/urandom > "$ROOT/src/random.bin"
 echo "b4b-subdir-marker" > "$ROOT/src/sub/small.txt"
 
-OUT=$("$NI" create --fs-version 6 --compressor none --block-size 4096 \
+OUT=$("$NI" create --fs-version 6 --compressor none --block-size "$BLOCK_SIZE" \
   -B "$ROOT/bootstrap" -D "$ROOT/blobs" "$ROOT/src" 2>&1) || fail "nydus-image create: $OUT"
 [ -n "$(ls "$ROOT/blobs")" ] || fail "no data blob"
 
-NYDUS_E2E_ROOT="$ROOT" "$CARGO" test -p nydus-snapshotter --lib \
+NYDUS_IMAGE="$NI" "$CARGO" test -p nydus-snapshotter --lib \
+  daemon::tests::stage_mount_source_stages_a_real_view -- --ignored --exact \
+  || fail "the node view was not staged"
+NYDUS_IMAGE="$NI" NYDUS_E2E_ROOT="$ROOT" "$CARGO" test -p nydus-snapshotter --lib \
   daemon::e2e_tests::referrer_daemon_serves_every_file -- --ignored --exact --nocapture \
   || fail "the referrer daemon did not serve every file"
 if grep -q " $ROOT/" /proc/self/mounts; then

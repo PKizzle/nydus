@@ -486,7 +486,7 @@ pub fn erofs_inode_share_fix_detected() -> bool {
 }
 
 /// The startup EROFS page cache sharing decision: self-test status, configured mode and whether
-/// node-built auto-accel images are mounted with `inode_share`. `None` until the self-test ran,
+/// fanotify images are mounted with `inode_share`. `None` until the self-test ran,
 /// and with `erofs_inode_share = "off"`, which skips it.
 #[cfg(target_os = "linux")]
 pub fn erofs_inode_share_decision() -> Option<(
@@ -526,7 +526,7 @@ fn probe_erofs_inode_share(work_dir: &Path, mode: ErofsInodeShare) {
         enabled,
         upstream_fix = erofs_ishare::UPSTREAM_FIX,
         detail,
-        "EROFS page cache sharing (inode_share) for node-built auto-accel images"
+        "EROFS page cache sharing (inode_share) for fanotify images"
     );
 }
 
