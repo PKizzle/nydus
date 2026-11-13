@@ -53,7 +53,8 @@ cat > "$R/cfg.json" <<EOF
 EOF
 "$ND" singleton --config "$R/cfg.json" --fanotify "$R/stage" --fanotify-mountpoint "$R/mnt" \
   --fanotify-threads 2 --log-level info > "$R/log" 2>&1 &
-sleep 4
+# Polled rather than slept: under emulation the daemon takes far longer to mount.
+for _ in $(seq 120); do grep -q " $R/mnt erofs " /proc/mounts && break; sleep 1; done
 mount | grep -q "$R/mnt" && echo "MOUNTED" || { echo "NOT MOUNTED"; tail -15 "$R/log"|sed 's/\x1b\[[0-9;]*m//g'; }
 echo "tree:"; find "$R/mnt" -type f 2>/dev/null | sed "s#$R/mnt##"
 APP_S=$(sha256sum "$R/l1/bin/app"|awk '{print $1}');     APP_M=$(sha256sum "$R/mnt/bin/app" 2>/dev/null|awk '{print $1}')

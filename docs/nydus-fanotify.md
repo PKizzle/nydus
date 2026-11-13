@@ -67,8 +67,18 @@ digests are the bootstrap's own, from its chunk table (`kernel_layout::chunk_dig
 supplied by `FanotifyHandler` when it is built, so zran, tar-ref and zstd-ref blobs, whose blob meta
 carries no digests, are validated too. Construction fails when the chunk table records one chunk
 twice differently or a chunk's extent disagrees with the blob meta (checked again at every fill, as
-the meta may not be loaded yet). Chunks no bootstrap references are left out of fills, and a read
-that needs one is denied.
+the meta may not be loaded yet).
+
+Chunks no bootstrap of the daemon references (the dead chunks of a layer whose files an upper layer
+deleted or replaced) are never filled, validated or marked ready, and a read spanning one is served
+once every referenced chunk it spans is ready: their bytes stay a hole, or an older fill nobody
+validated, in the cache file, but they are never file data. EROFS maps a file's data only through
+its chunk indexes, each to the device blocks of one referenced chunk (`check_kernel_layout`), and
+zeroes what lies past them, so their bytes can reach the backing file's page cache but never a
+file's pages. On a host with pages larger than the EROFS block, or under readahead, a pre-content
+event routinely spans such a chunk next to a referenced one. A blob with unreferenced chunks never
+counts as fully cached, so its mark stays armed. A chunk a bootstrap references at another extent
+than the blob meta's still fails the read.
 
 The digests are recorded next to the cache file (`<blob_id>.blob.data.digests`, checksummed; a
 corrupt file is discarded and re-derived). A recorded digest binds only chunks that are ready, since
@@ -84,7 +94,7 @@ mounted files that use the chunk are dropped from the page cache (`POSIX_FADV_DO
 step is needed: on Linux 7.2, a file-backed EROFS file keeps serving pages it read before its
 backing range was punched, and only `DONTNEED` on the mounted file, not on the device file, evicts
 them. Pages a process has mapped stay until it unmaps them. A ready chunk that no bootstrap of the
-daemon references is left alone, and the blob stays unverified.
+daemon references is left alone and does not keep the blob unverified, as it is never file data.
 
 Re-arming only works for a mount that opened the blob while it was marked: the kernel decides at
 open whether a file raises pre-content events at all. So `arm()` leaves a complete blob unmarked
@@ -218,6 +228,17 @@ RAFS v6 superblock (`s_blkszbits`). The builder starts every chunk on a block bo
 each device table entry to cover its whole blob, since the kernel locates data only through block
 addresses. `runtime-test.sh` and `export-block-test.sh` take `BLOCK_SIZE=` to verify a block size
 in the kernel.
+
+With pages larger than the block, a pre-content event spans several chunks, among them chunks the
+image no longer references (see [Fill validation](#fill-validation)), so a change to the fanotify
+or fill path must pass on a large-page kernel, not only on a 4K one. The gate is the
+`erofs-folio-arm64` job of `.github/workflows/fanotify-vm.yml`: `misc/erofs-folio/qemu-test.sh`
+boots Ubuntu's arm64 64K-page kernels under QEMU and, with `FANOTIFY_TESTS`, runs
+`dead-chunk-test.sh`, `runtime-test.sh` and `zran-multilayer-test.sh` in the guest with static
+`nydusd` and `nydus-image` builds, failing unless the guest really ran on 64K pages
+(`EXPECT_PAGE_SIZE`). A release is canaried on a 16K-page host as well as on a 4K one. The other
+`misc/fanotify` scripts need a full userland (perl, python3, strace, the snapshotter test binary)
+and run only in the 4K-page virtme-ng job.
 
 ### File-backed EROFS partial-folio metadata bug
 

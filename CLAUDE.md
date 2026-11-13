@@ -185,6 +185,11 @@ nydus/
     `nydus-node-local` domain, and the handler joins it only when every cache serves verified data
     alone (`FanotifyHandler::mount`). Never pass a domain for a bootstrap the node did not build as
     a view. Trust model: "Page cache sharing" in [docs/nydus-fanotify.md](docs/nydus-fanotify.md).
+14. **Fanotify/fill-path changes must pass on a large-page kernel**: with pages larger than the
+    EROFS block, one pre-content event spans several chunks, including ones the image no longer
+    references, which 4K-page hosts never show. The gate is the `erofs-folio-arm64` job in
+    `.github/workflows/fanotify-vm.yml` (64K pages under QEMU, `misc/erofs-folio/qemu-test.sh`
+    with `FANOTIFY_TESTS`); canary releases on a 16K-page host as well as a 4K one.
 
 ## Node-local acceleration (transparent, no tag change)
 

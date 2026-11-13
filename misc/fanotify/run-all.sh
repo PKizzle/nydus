@@ -9,6 +9,7 @@
 #   SERVICE_TEST_BIN       `cargo test -p nydus-service --lib --no-run` binary; unset runs the
 #                          service tests through cargo instead
 #   IMG                    ext4 image file to create (must not live on tmpfs in a small VM)
+#   MMAP_CAT               optional static build of mmap-cat.c, for dead-chunk-test's mmap reads
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd)
 : "${NYDUS_IMAGE:?}" "${NYDUSD:?}"
@@ -46,6 +47,7 @@ run() { # <script> <PASS line> [<whole-suite SKIP line the kernel may legitimate
 run runtime-test "==== FANOTIFY FETCH PATH: PASS"
 run corrupt-data-test "==== FANOTIFY FILL VALIDATION: PASS ===="
 run zran-multilayer-test "==== MULTI-LAYER ZRAN: PASS ===="
+run dead-chunk-test "==== DEAD CHUNKS: PASS"
 run many-devices-test "==== MANY DEVICES: PASS ===="
 run ref-layer-formats-test "==== REF LAYER FORMATS: PASS ===="
 run b4b-referrer-serving-test "==== B4b REFERRER SERVING: PASS ===="
