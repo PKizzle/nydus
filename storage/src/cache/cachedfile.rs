@@ -1436,11 +1436,11 @@ impl BlobObject for FileCacheEntry {
                 continue;
             }
             let chunk = meta.get_chunk_info(index);
-            // A chunk without a digest here is left alone rather than discarded on no evidence.
-            // Unreferenced, it is never served as file data and leaves the file verified;
-            // referenced at another extent than the blob meta's, it keeps the file unverified.
+            // A chunk without a digest here is left alone rather than discarded on no evidence,
+            // and keeps the file unverified: the verified stamp outlives this daemon, and a later
+            // bootstrap may reference the chunk and then trust the stamp without checking it.
             if self.expected_chunk_digest(chunk.as_ref()).is_none() {
-                complete &= self.is_unreferenced(chunk.as_ref());
+                complete = false;
                 continue;
             }
             buf.resize(chunk.uncompressed_size() as usize, 0);

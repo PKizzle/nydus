@@ -1452,8 +1452,7 @@ mod tests {
         );
         assert!(!obj.is_data_verified());
 
-        // A ready chunk no bootstrap of this daemon references is left alone, and is no reason
-        // to keep the file unverified: no file data is ever read from it.
+        // A ready chunk no bootstrap of this daemon references is left alone, unverified.
         let (blob, _tmp) = create_data_blob_with("fanotify");
         let obj = blob.blob().get_blob_object().unwrap();
         let mut digests = fixture_digests();
@@ -1466,11 +1465,11 @@ mod tests {
             .set_ready_and_clear_pending(second.as_ref())
             .unwrap();
         assert!(
-            obj.verify_ready_chunks(&|| false, &mut |_| panic!("not a mismatch"))
+            !obj.verify_ready_chunks(&|| false, &mut |_| panic!("not a mismatch"))
                 .unwrap()
         );
         assert!(is_ready(&blob, 1));
-        assert!(obj.is_data_verified());
+        assert!(!obj.is_data_verified());
     }
 
     /// Pre-content event ranges as the kernel raises them for host pages of 4K, 16K and 64K and
@@ -1551,7 +1550,13 @@ mod tests {
                         assert!(bytes[..n].iter().all(|&b| b == 0), "chunk {i} was filled");
                     } else if corrupt && i == victim {
                         assert!(!is_ready(&blob, i as u32), "window {window:#x}");
-                    } else if !corrupt {
+                    } else if !corrupt
+                        || !overlaps(
+                            victim,
+                            start & !(window - 1),
+                            (end + window - 1) & !(window - 1),
+                        )
+                    {
                         assert!(is_ready(&blob, i as u32), "window {window:#x} chunk {i}");
                     }
                 }

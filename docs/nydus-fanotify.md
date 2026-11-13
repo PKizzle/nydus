@@ -94,7 +94,8 @@ mounted files that use the chunk are dropped from the page cache (`POSIX_FADV_DO
 step is needed: on Linux 7.2, a file-backed EROFS file keeps serving pages it read before its
 backing range was punched, and only `DONTNEED` on the mounted file, not on the device file, evicts
 them. Pages a process has mapped stay until it unmaps them. A ready chunk that no bootstrap of the
-daemon references is left alone and does not keep the blob unverified, as it is never file data.
+daemon references is left alone and keeps the blob unverified: the verified stamp outlives the
+daemon, and a later bootstrap referencing the chunk would trust it unchecked.
 
 Re-arming only works for a mount that opened the blob while it was marked: the kernel decides at
 open whether a file raises pre-content events at all. So `arm()` leaves a complete blob unmarked

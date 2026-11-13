@@ -86,6 +86,8 @@ check "read after drop_caches" cat
 if [ -n "${MMAP_CAT:-}" ]; then
   echo 3 > /proc/sys/vm/drop_caches
   check "mmap read" "$MMAP_CAT"
+else
+  echo "mmap read: skipped (MMAP_CAT unset)"
 fi
 for f in $(seq 0 3 47); do [ ! -e "$R/mnt/f$f" ] || fail "deleted file f$f is visible"; done
 if grep -E "no digest|failed to serve pre-content" "$R/log"; then fail "events were denied"; fi
