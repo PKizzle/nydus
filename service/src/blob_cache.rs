@@ -1121,22 +1121,35 @@ mod tests {
         create_data_blob_with("filecache")
     }
 
+    const FIXTURE_BLOB: &str = "be7d77eeb719f70884758d1aa800ed0fb09d701aaec469964e9d54325f0d5fef";
+    const FIXTURE_BOOT: &str = "rafs-v6-2.2.boot";
+    /// Sixteen files of sizes ending at, inside and past 4K and 16K page boundaries, one chunk
+    /// each, in one blob.
+    const SMALL_FILES_BLOB: &str =
+        "b0101724e1204f4956d532826eed5003a241e1f0e8e03934bafb76354044fffb";
+    const SMALL_FILES_BOOT: &str = "rafs-v6-small-files.boot";
+
     /// [create_data_blob] with a cache of type `cache_type`.
     fn create_data_blob_with(cache_type: &str) -> (DataBlob, TempDir) {
+        create_fixture_blob(cache_type, FIXTURE_BLOB, FIXTURE_BOOT)
+    }
+
+    /// The data blob `blob_id` of the fixture bootstrap `boot`, in a cache of type `cache_type`.
+    fn create_fixture_blob(cache_type: &str, blob_id: &str, boot: &str) -> (DataBlob, TempDir) {
         use std::os::fd::AsRawFd;
 
         let tmp_dir = TempDir::new().unwrap();
         let root_dir = &std::env::var("CARGO_MANIFEST_DIR").expect("$CARGO_MANIFEST_DIR");
 
         // Copy blob file to tmpdir
-        let mut blob_src = PathBuf::from(root_dir);
-        blob_src.push("../tests/texture/blobs/be7d77eeb719f70884758d1aa800ed0fb09d701aaec469964e9d54325f0d5fef");
-        let mut blob_dst = tmp_dir.path().to_path_buf();
-        blob_dst.push("be7d77eeb719f70884758d1aa800ed0fb09d701aaec469964e9d54325f0d5fef");
-        std::fs::copy(&blob_src, &blob_dst).unwrap();
+        let blob_src = PathBuf::from(root_dir)
+            .join("../tests/texture/blobs")
+            .join(blob_id);
+        std::fs::copy(&blob_src, tmp_dir.path().join(blob_id)).unwrap();
 
-        let mut boot_path = PathBuf::from(root_dir);
-        boot_path.push("../tests/texture/bootstrap/rafs-v6-2.2.boot");
+        let boot_path = PathBuf::from(root_dir)
+            .join("../tests/texture/bootstrap")
+            .join(boot);
 
         let config = r#"
         {
@@ -1174,10 +1187,7 @@ mod tests {
         let mgr = BlobCacheMgr::new();
         mgr.add_blob_entry(&entry).unwrap();
 
-        let blob_key = generate_blob_key(
-            "domain-test",
-            "be7d77eeb719f70884758d1aa800ed0fb09d701aaec469964e9d54325f0d5fef",
-        );
+        let blob_key = generate_blob_key("domain-test", blob_id);
         let blob_config = mgr.get_config(&blob_key).unwrap();
         let data_blob_config = match blob_config {
             BlobConfig::DataBlob(c) => c,
@@ -1240,8 +1250,15 @@ mod tests {
 
     /// The fixture bootstrap's digest table for the fixture blob.
     fn fixture_digests() -> Vec<Option<nydus_storage::device::ChunkDigestEntry>> {
+        boot_digests(FIXTURE_BOOT)
+    }
+
+    /// The digest table of the fixture bootstrap `boot` for its only blob.
+    fn boot_digests(boot: &str) -> Vec<Option<nydus_storage::device::ChunkDigestEntry>> {
         let root_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap();
-        let boot = PathBuf::from(root_dir).join("../tests/texture/bootstrap/rafs-v6-2.2.boot");
+        let boot = PathBuf::from(root_dir)
+            .join("../tests/texture/bootstrap")
+            .join(boot);
         let (rs, _) =
             RafsSuper::load_from_file(&boot, Arc::new(ConfigV2::default()), false).unwrap();
         let mut tables = nydus_rafs::metadata::kernel_layout::chunk_digest_tables(&rs).unwrap();
@@ -1435,7 +1452,8 @@ mod tests {
         );
         assert!(!obj.is_data_verified());
 
-        // A ready chunk no bootstrap of this daemon references is left alone, unverified.
+        // A ready chunk no bootstrap of this daemon references is left alone, and is no reason
+        // to keep the file unverified: no file data is ever read from it.
         let (blob, _tmp) = create_data_blob_with("fanotify");
         let obj = blob.blob().get_blob_object().unwrap();
         let mut digests = fixture_digests();
@@ -1448,10 +1466,103 @@ mod tests {
             .set_ready_and_clear_pending(second.as_ref())
             .unwrap();
         assert!(
-            !obj.verify_ready_chunks(&|| false, &mut |_| panic!("not a mismatch"))
+            obj.verify_ready_chunks(&|| false, &mut |_| panic!("not a mismatch"))
                 .unwrap()
         );
         assert!(is_ready(&blob, 1));
-        assert!(!obj.is_data_verified());
+        assert!(obj.is_data_verified());
+    }
+
+    /// Pre-content event ranges as the kernel raises them for host pages of 4K, 16K and 64K and
+    /// for readahead windows, over a blob whose bootstrap leaves chunks unreferenced between
+    /// referenced ones (the dead chunks of a layer whose files an upper layer replaced): every
+    /// range covering referenced data is served, referenced chunks are filled and validated,
+    /// unreferenced ones stay holes, and a referenced chunk failing validation is still refused.
+    #[test]
+    #[cfg(target_os = "linux")]
+    #[cfg_attr(miri, ignore = "Miri does not support copy_file_range")]
+    fn event_ranges_of_every_page_size_leave_unreferenced_chunks_alone() {
+        use std::os::unix::fs::FileExt;
+
+        let full = boot_digests(SMALL_FILES_BOOT);
+        let unreferenced = |i: usize| i % 3 == 1;
+        let digests: Vec<_> = full
+            .iter()
+            .enumerate()
+            .map(|(i, d)| if unreferenced(i) { None } else { *d })
+            .collect();
+        let fixture = || create_fixture_blob("fanotify", SMALL_FILES_BLOB, SMALL_FILES_BOOT);
+        let (probe, _tmp) = fixture();
+        let size = probe.blob_info().uncompressed_size();
+        let extents: Vec<(u64, u64)> = (0..full.len() as u32)
+            .map(|i| {
+                let c = probe.blob().get_chunk_info(i).unwrap();
+                (c.uncompressed_offset(), c.uncompressed_end())
+            })
+            .collect();
+        let overlaps = |i: usize, start: u64, end: u64| extents[i].0 < end && extents[i].1 > start;
+        // The fixture covers what large pages do differently: an unreferenced chunk shares a
+        // 16K page with a referenced one, and a chunk ends inside a 4K page.
+        assert!((0..extents.len()).any(|i| unreferenced(i)
+            && (0..extents.len()).any(|j| !unreferenced(j)
+                && overlaps(j, extents[i].0 & !0x3fff, (extents[i].1 + 0x3fff) & !0x3fff))));
+        assert!(extents.iter().any(|&(_, end)| end % 4096 != 0));
+        // The referenced chunk whose digest the corrupt runs get wrong.
+        let victim = 2;
+        assert!(!unreferenced(victim));
+
+        for window in [4096u64, 16384, 65536, 128 << 10, 512 << 10] {
+            for corrupt in [false, true] {
+                let (blob, _tmp) = fixture();
+                let obj = blob.blob().get_blob_object().unwrap();
+                let mut table = digests.clone();
+                if corrupt {
+                    table[victim].as_mut().unwrap().digest.data[0] ^= 1;
+                }
+                blob.blob().add_chunk_digests(&table).unwrap();
+                // Ranges start on window boundaries, the last ones past the blob's end.
+                for start in (0..size + 2 * window).step_by(window as usize) {
+                    let end = start + window;
+                    // The kernel raises events only for reads of file data, which lies in
+                    // referenced chunks.
+                    if !(0..extents.len()).any(|i| !unreferenced(i) && overlaps(i, start, end)) {
+                        continue;
+                    }
+                    let Some(count) = crate::fanotify::fill_count(start, window, size) else {
+                        continue;
+                    };
+                    let served = obj.fetch_range_uncompressed(start, count);
+                    if corrupt && overlaps(victim, start, start + count) {
+                        assert!(served.is_err(), "window {window:#x} at {start:#x}");
+                    } else if !corrupt {
+                        served.unwrap_or_else(|e| panic!("window {window:#x} at {start:#x}: {e}"));
+                    }
+                }
+                let cache = blob.blob().get_blob_object().unwrap();
+                // SAFETY: the descriptor is the blob object's open cache file, borrowed here.
+                let file = std::mem::ManuallyDrop::new(unsafe {
+                    <std::fs::File as std::os::fd::FromRawFd>::from_raw_fd(cache.as_raw_fd())
+                });
+                for (i, &(start, end)) in extents.iter().enumerate() {
+                    if unreferenced(i) {
+                        assert!(!is_ready(&blob, i as u32), "window {window:#x} chunk {i}");
+                        let mut bytes = vec![0xffu8; (end - start) as usize];
+                        let n = file.read_at(&mut bytes, start).unwrap();
+                        assert!(bytes[..n].iter().all(|&b| b == 0), "chunk {i} was filled");
+                    } else if corrupt && i == victim {
+                        assert!(!is_ready(&blob, i as u32), "window {window:#x}");
+                    } else if !corrupt {
+                        assert!(is_ready(&blob, i as u32), "window {window:#x} chunk {i}");
+                    }
+                }
+                if !corrupt {
+                    assert!(
+                        obj.verify_ready_chunks(&|| false, &mut |c| panic!("chunk {}", c.id()))
+                            .unwrap()
+                    );
+                    assert!(obj.is_data_verified());
+                }
+            }
+        }
     }
 }
