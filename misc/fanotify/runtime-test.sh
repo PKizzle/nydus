@@ -41,7 +41,7 @@ mkdir -p "$ROOT"/{src,src/sub,out,backend,stage,mnt}
 
 step "build source rootfs with distinctive content"
 # A multi-block distinctive file + a random file + a small file in a subdir.
-perl -e 'print "FANOTIFY_FETCH_OK_0123456789ABCDEF" x 4096' > "$ROOT/src/hello.txt"   # ~128 KiB
+yes FANOTIFY_FETCH_OK_0123456789ABCDEF | head -n 4096 | tr -d '\n' > "$ROOT/src/hello.txt"   # ~128 KiB
 head -c 262144 /dev/urandom > "$ROOT/src/random.bin"                                    # 256 KiB
 echo "subdir-small-file-marker" > "$ROOT/src/sub/small.txt"
 SRC_HELLO=$(sha256sum "$ROOT/src/hello.txt"  | awk '{print $1}')
@@ -82,7 +82,8 @@ step "launch nydusd singleton --fanotify (root for mount)"
 sudo "$ND" singleton --config "$ROOT/config.json" \
   --fanotify "$ROOT/stage" --fanotify-mountpoint "$ROOT/mnt" --fanotify-threads 2 \
   --log-level info > "$LOG" 2>&1 &
-sleep 4
+# Polled rather than slept: under emulation the daemon takes far longer to mount.
+for _ in $(seq 120); do grep -q " $ROOT/mnt erofs " /proc/mounts && break; sleep 1; done
 
 step "mount table"
 mount | grep -F "$ROOT/mnt type erofs" || { echo "--- nydusd.log ---"; cat "$LOG"; fail "EROFS not mounted"; }

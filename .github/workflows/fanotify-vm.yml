@@ -98,6 +98,7 @@ jobs:
           | jq -r 'select(.profile.test and .executable != null and (.target.kind | index("lib"))) | .executable' | tail -1)
         test -x "$BIN"
         echo "SERVICE_TEST_BIN=$BIN" >> "$GITHUB_ENV"
+        cc -static -O2 -o "$RUNNER_TEMP/mmap-cat" misc/fanotify/mmap-cat.c
     - name: Install VM tooling
       run: |
         sudo apt-get update -qq
@@ -152,16 +153,19 @@ jobs:
           NYDUSD='$GITHUB_WORKSPACE/target/release/nydusd' \
           SNAPSHOTTER_TEST_BIN='$SNAPSHOTTER_TEST_BIN' \
           SERVICE_TEST_BIN='$SERVICE_TEST_BIN' \
+          MMAP_CAT='$RUNNER_TEMP/mmap-cat' \
           IMG='$RUNNER_TEMP/fanotify-ci.img' \
           bash misc/fanotify/run-all.sh"
 
-  # The partial-folio bug's common trigger: 4K-block images on a large-page kernel. Hosted runners
-  # have no 16K/64K-page kernel and no KVM, so misc/erofs-folio/qemu-test.sh boots Ubuntu's arm64
-  # 64K-page builds under QEMU TCG with a busybox initrd (seconds per boot).
+  # Large pages: 4K-block images on a 64K-page kernel, the partial-folio bug's common trigger, and
+  # the fanotify fill path, whose events then span several chunks (dead chunks of a lower layer
+  # included). Hosted runners have no 16K/64K-page kernel and no KVM, so
+  # misc/erofs-folio/qemu-test.sh boots Ubuntu's arm64 64K-page builds under QEMU TCG with a
+  # busybox initrd and runs the probes and misc/fanotify scripts in it with static binaries.
   erofs-folio-arm64:
     name: erofs-folio (arm64 64K pages, ${{ matrix.kernel }})
     runs-on: ubuntu-24.04-arm
-    timeout-minutes: 30
+    timeout-minutes: 60
     concurrency:
       group: ${{ github.workflow }}-${{ github.head_ref || github.ref_name }}-arm64-${{ matrix.kernel }}
       cancel-in-progress: true
@@ -198,7 +202,7 @@ jobs:
     - name: Install tooling
       run: |
         sudo apt-get update -qq
-        sudo apt-get install -y -qq musl-tools qemu-system-arm busybox-static cpio zstd e2fsprogs erofs-utils
+        sudo apt-get install -y -qq musl-tools qemu-system-arm busybox-static bash-static cpio zstd e2fsprogs erofs-utils
     - uses: dsherret/rust-toolchain-file@v1
     - name: Add musl target
       run: rustup target add aarch64-unknown-linux-musl
@@ -207,8 +211,13 @@ jobs:
       with:
         cache-on-failure: true
         shared-key: erofs-folio-arm64
-    - name: Build the static probe
-      run: cargo build --release -p nydus-service --example erofs_folio_probe --target aarch64-unknown-linux-musl
+    - name: Install protoc
+      run: bash misc/install-protoc.sh
+    - name: Build the static probe, nydusd, nydus-image and mmap-cat
+      run: |
+        cargo build --release -p nydus-service --example erofs_folio_probe --target aarch64-unknown-linux-musl
+        cargo build --release --bin nydusd --bin nydus-image --target aarch64-unknown-linux-musl
+        musl-gcc -static -O2 -o "$RUNNER_TEMP/mmap-cat" misc/fanotify/mmap-cat.c
     - name: Fetch kernel
       run: |
         K="$RUNNER_TEMP/kernel"; mkdir -p "$K"; cd "$K"
@@ -220,10 +229,14 @@ jobs:
         # The config ships in the modules package.
         tar xOf modules.tar --wildcards '*/boot/config-*' | grep -E '^CONFIG_ARM64_64K_PAGES=y'
         echo "VMLINUZ=$(ls "$K"/root/boot/vmlinuz-*)" >> "$GITHUB_ENV"
-    - name: EROFS partial-folio self-test under QEMU
+    - name: EROFS partial-folio self-test and fanotify suites under QEMU
       run: |
         # 4K blocks, the nydus default.
         bash misc/erofs-folio/demo-image.sh "$RUNNER_TEMP/demo.erofs" 4096 65536
-        KERNEL="$VMLINUZ" PROBE=target/aarch64-unknown-linux-musl/release/examples/erofs_folio_probe \
+        R=target/aarch64-unknown-linux-musl/release
+        KERNEL="$VMLINUZ" PROBE=$R/examples/erofs_folio_probe \
         MODULES_TAR="$RUNNER_TEMP/kernel/modules.tar" DEMO_IMAGE="$RUNNER_TEMP/demo.erofs" EXPECT="$EROFS_FOLIO" \
+        EXPECT_PAGE_SIZE=64 QEMU_TIMEOUT=2400 \
+        FANOTIFY_TESTS="dead-chunk-test runtime-test zran-multilayer-test" \
+        NYDUSD=$R/nydusd NYDUS_IMAGE=$R/nydus-image BASH_STATIC=/bin/bash-static MMAP_CAT="$RUNNER_TEMP/mmap-cat" \
           bash misc/erofs-folio/qemu-test.sh

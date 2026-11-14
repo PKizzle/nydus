@@ -18,6 +18,13 @@
 #                with DEMO_IMAGE, the image reads as `expect.sh` requires
 #   EXPECT_ISHARE  optional unsupported|fix_absent|fix_present|inconclusive, likewise
 #   BUSYBOX      static busybox (default: the one on PATH)
+#   FANOTIFY_TESTS  optional misc/fanotify scripts to run in the guest after the probes, e.g.
+#                "dead-chunk-test runtime-test zran-multilayer-test"; the script fails unless each
+#                prints its PASS line. Needs NYDUSD and NYDUS_IMAGE (static aarch64 builds),
+#                BASH_STATIC (e.g. Debian's bash-static) and optionally MMAP_CAT (a static
+#                build of misc/fanotify/mmap-cat.c)
+#   EXPECT_PAGE_SIZE  optional page size in KiB the guest kernel must use
+#   QEMU_TIMEOUT seconds the guest may run (default 300)
 #
 # Prints the guest console and ends with "==== EROFS FOLIO PROBE: <status> ====" and
 # "==== EROFS ISHARE PROBE: <status> ====".
@@ -28,12 +35,25 @@ WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
 
 ROOT="$WORK/root"
-mkdir -p "$ROOT"/{bin,proc,sys,dev,ext}
+mkdir -p "$ROOT"/{bin,sbin,usr/bin,usr/sbin,proc,sys,dev,ext}
 cp "$BUSYBOX" "$ROOT/bin/busybox"
 for applet in sh mount umount insmod mkdir cat echo dmesg grep poweroff sync; do
   ln -s busybox "$ROOT/bin/$applet"
 done
 cp "$PROBE" "$ROOT/probe"
+if [ -n "${FANOTIFY_TESTS:-}" ]; then
+  : "${NYDUSD:?}" "${NYDUS_IMAGE:?}" "${BASH_STATIC:?}"
+  mkdir -p "$ROOT"/{tests,var/tmp}
+  cp "$NYDUSD" "$ROOT/bin/nydusd"
+  cp "$NYDUS_IMAGE" "$ROOT/bin/nydus-image"
+  cp "$BASH_STATIC" "$ROOT/bin/bash"
+  [ -z "${MMAP_CAT:-}" ] || cp "$MMAP_CAT" "$ROOT/bin/mmap-cat"
+  # The guest runs as root; the scripts' `sudo` is a pass-through.
+  printf '#!/bin/sh\nexec "$@"\n' > "$ROOT/bin/sudo"
+  chmod +x "$ROOT/bin/sudo"
+  for t in $FANOTIFY_TESTS; do cp "$(dirname "$0")/../fanotify/$t.sh" "$ROOT/tests/"; done
+  echo "$FANOTIFY_TESTS" > "$ROOT/tests/list"
+fi
 if [ -n "${MODULES_TAR:-}" ]; then
   ko=$(tar tf "$MODULES_TAR" | grep '/kernel/fs/erofs/erofs\.ko')
   ko=${ko%%$'\n'*}
@@ -54,7 +74,7 @@ if [ "$(dd if="$KERNEL" bs=1 skip=4 count=4 2>/dev/null)" = zimg ]; then
   KERNEL="$WORK/Image"
 fi
 [ -n "${DEMO_IMAGE:-}" ] && cp "$DEMO_IMAGE" "$ROOT/demo.erofs"
-truncate -s 16M "$ROOT/ext4.img"
+truncate -s "$([ -n "${FANOTIFY_TESTS:-}" ] && echo 512M || echo 16M)" "$ROOT/ext4.img"
 mkfs.ext4 -q -F "$ROOT/ext4.img"
 
 cat > "$ROOT/init" <<'INIT'
@@ -62,11 +82,26 @@ cat > "$ROOT/init" <<'INIT'
 mount -t proc proc /proc
 mount -t sysfs sys /sys
 mount -t devtmpfs dev /dev
+/bin/busybox --install -s
 [ -f /erofs.ko ] && insmod /erofs.ko
 mount -o loop /ext4.img /ext
 echo "==== kernel $(cat /proc/sys/kernel/osrelease)"
 if [ -f /demo.erofs ]; then /probe /ext /demo.erofs; else /probe /ext; fi
 echo "==== probe exit $?"
+echo "==== page size $(sed -n 's/^KernelPageSize: *\([0-9]*\) kB/\1/p' /proc/self/smaps | head -1) KiB"
+for t in $(cat /tests/list 2>/dev/null); do
+  case $t in
+    dead-chunk-test) pass="==== DEAD CHUNKS: PASS" ;;
+    runtime-test) pass="==== FANOTIFY FETCH PATH: PASS" ;;
+    zran-multilayer-test) pass="==== MULTI-LAYER ZRAN: PASS ====" ;;
+    *) pass="unknown test $t" ;;
+  esac
+  ROOT=/ext/$t NYDUSD=/bin/nydusd NYDUS_IMAGE=/bin/nydus-image \
+    MMAP_CAT=$([ -x /bin/mmap-cat ] && echo /bin/mmap-cat) bash /tests/$t.sh > /ext/$t.log 2>&1
+  cat /ext/$t.log
+  if grep -qF "$pass" /ext/$t.log && ! grep -q SKIP /ext/$t.log; then r=PASS; else r=FAIL; fi
+  echo "==== FANOTIFY $t: $r ===="
+done
 dmesg | grep -m5 'erofs.*failed' || true
 sync
 poweroff -f
@@ -76,7 +111,7 @@ chmod +x "$ROOT/init"
 
 # Neoverse-N1 has the 4K, 16K and 64K granules; QEMU 8.2 (Ubuntu 24.04) hangs booting Ubuntu's
 # 7.3/7.4 arm64 kernels with `-cpu max`.
-timeout 300 qemu-system-aarch64 -machine virt -cpu neoverse-n1 -m 1024 -nographic -no-reboot \
+timeout "${QEMU_TIMEOUT:-300}" qemu-system-aarch64 -machine virt -cpu neoverse-n1 -smp 2 -m 2048 -nographic -no-reboot \
   -kernel "$KERNEL" -initrd "$WORK/initrd.gz" \
   -append "console=ttyAMA0 rdinit=/init panic=-1 quiet" </dev/null | tee "$WORK/console.log"
 
@@ -86,3 +121,11 @@ bash "$(dirname "$0")/expect.sh" "$WORK/console.log" "${EXPECT:-}" "${DEMO_IMAGE
 echo "==== EROFS ISHARE PROBE: ${ishare:-none} ===="
 [ "$rc" = 0 ]
 [ -z "${EXPECT_ISHARE:-}" ] || [ "$ishare" = "$EXPECT_ISHARE" ]
+page=$(sed -n 's/^==== page size \([0-9]*\) KiB.*/\1/p' "$WORK/console.log" | tr -d '\r')
+[ -z "${EXPECT_PAGE_SIZE:-}" ] || [ "$page" = "$EXPECT_PAGE_SIZE" ] ||
+  { echo "::error::guest page size '${page:-none}' KiB, expected $EXPECT_PAGE_SIZE"; exit 1; }
+for t in ${FANOTIFY_TESTS:-}; do
+  grep -q "==== FANOTIFY $t: PASS ====" "$WORK/console.log" ||
+    { echo "::error::fanotify $t did not pass in the guest"; rc=1; }
+done
+[ "$rc" = 0 ]

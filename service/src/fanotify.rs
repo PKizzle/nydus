@@ -2025,17 +2025,15 @@ impl FanotifyHandler {
         // widening read granularity), while `get_chunks_uncompressed` hard-errors on
         // any range past the end — without the clamp a legitimate read of the last
         // partial block would be answered FAN_DENY_ERRNO(EIO).
-        let blob_size = backing.blob.blob_info().uncompressed_size();
-        if range.offset >= blob_size {
+        // A zero-length range (the kernel can deliver count == 0) has nothing to fill; it is not
+        // pushed into the chunk resolver, whose behavior for empty ranges is not a contract.
+        let Some(count) = fill_count(
+            range.offset,
+            range.count,
+            backing.blob.blob_info().uncompressed_size(),
+        ) else {
             return Ok(());
-        }
-        let count = range.count.min(blob_size - range.offset);
-        if count == 0 {
-            // A zero-length range (the kernel can deliver count == 0) has
-            // nothing to fill; don't push an empty request into the chunk
-            // resolver, whose behavior for empty ranges is not a contract.
-            return Ok(());
-        }
+        };
 
         // Download and decompress the requested range into the sparse backing file.
         let obj = backing.blob.blob().get_blob_object().ok_or_else(|| {
@@ -2310,6 +2308,12 @@ fn install_bootstrap_digests(
         }
     }
     Ok(())
+}
+
+/// The number of bytes from `offset` of a pre-content event range of `count` bytes that lie in
+/// a blob of `blob_size` uncompressed bytes, or `None` when there are none to fill.
+pub(crate) fn fill_count(offset: u64, count: u64, blob_size: u64) -> Option<u64> {
+    Some(count.min(blob_size.checked_sub(offset)?)).filter(|&c| c > 0)
 }
 
 /// The domain every entry names, or `None` if one names none or they disagree.

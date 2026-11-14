@@ -436,6 +436,17 @@ impl BootstrapDigests {
         table.digests.get(index).copied().flatten()
     }
 
+    /// Whether no bootstrap of this daemon references chunk `index`, which is known only once
+    /// one has supplied its digests.
+    fn is_unreferenced(&self, index: u32) -> bool {
+        let table = self.table.read().unwrap();
+        !table.extents.is_empty()
+            && table
+                .extents
+                .get(index as usize)
+                .is_none_or(Option::is_none)
+    }
+
     /// Add `entries`, refusing all of them if one contradicts the digest or extent recorded for
     /// a chunk `is_ready` reports ready, and persist the digests before returning.
     fn merge(
@@ -493,6 +504,16 @@ impl FileCacheEntry {
             .wrapping_mul(1_000_000_000)
             .wrapping_add(md.ctime_nsec() as u64);
         Ok(ctime ^ md.len().rotate_left(32))
+    }
+
+    /// Whether `chunk` is one no bootstrap served from this cache references. No file maps such
+    /// a chunk, and EROFS copies into a file's pages only the device blocks its chunk indexes
+    /// name, so its bytes (a hole, or an older fill nobody validated) are never served as file
+    /// data, though a large page or a readahead window may span it next to a referenced chunk.
+    fn is_unreferenced(&self, chunk: &dyn BlobChunkInfo) -> bool {
+        self.bootstrap_digests
+            .as_ref()
+            .is_some_and(|t| t.is_unreferenced(chunk.id()))
     }
 
     /// Fail unless `chunk` and its neighbours in the blob meta cover disjoint, increasing
@@ -1415,8 +1436,9 @@ impl BlobObject for FileCacheEntry {
                 continue;
             }
             let chunk = meta.get_chunk_info(index);
-            // A chunk no bootstrap of this daemon references has no digest here; it is left
-            // alone, and the file unverified, rather than discarded on no evidence.
+            // A chunk without a digest here is left alone rather than discarded on no evidence,
+            // and keeps the file unverified: the verified stamp outlives this daemon, and a later
+            // bootstrap may reference the chunk and then trust the stamp without checking it.
             if self.expected_chunk_digest(chunk.as_ref()).is_none() {
                 complete = false;
                 continue;
@@ -1539,12 +1561,15 @@ impl BlobObject for FileCacheEntry {
                 self.check_chunk_alone(&meta, c.as_ref())?;
             }
         }
-        // A requested chunk without a digest could never be filled, and allowing the read would
-        // serve its hole; only the chunks a batch adds around the request may be skipped.
+        // A requested chunk a bootstrap references but without a digest could never be filled,
+        // and allowing the read would serve its hole. Unreferenced chunks stay unfilled, inside
+        // the request too: a large page or a readahead window spans them next to referenced
+        // ones, and no file data is read from them (`is_unreferenced`).
         if let Some(c) = chunks.iter().find(|c| {
             c.uncompressed_offset() < end
                 && c.uncompressed_end() > offset
                 && self.expected_chunk_digest(c.as_ref()).is_none()
+                && !self.is_unreferenced(c.as_ref())
         }) {
             return Err(StorageError::InvalidData(format!(
                 "blob {} chunk {} has no digest to validate it against",
