@@ -2005,10 +2005,16 @@ impl DaemonSupervisor {
             )
             .context("failed to build blob cache entry for blockdev export")?;
 
-            let export_disk = disk_image.clone();
-            blocking::unblock(move || export_blockdev_image(entry, export_disk, threads))
-                .await
-                .context("blockdev export failed")?;
+            let (export_disk, source, target) = (
+                disk_image.clone(),
+                bootstrap.to_path_buf(),
+                mountpoint.clone(),
+            );
+            blocking::unblock(move || {
+                export_blockdev_image(entry, export_disk, source, target, threads)
+            })
+            .await
+            .context("blockdev export failed")?;
 
             let mount_disk = disk_image.clone();
             let mount_target = mountpoint.clone();
@@ -2064,12 +2070,17 @@ impl DaemonSupervisor {
             )
             .context("failed to build blob cache entry for tarfs export")?;
 
-            let export_disk = disk_image.clone();
+            let (export_disk, source, target) = (
+                disk_image.clone(),
+                bootstrap.to_path_buf(),
+                mountpoint.clone(),
+            );
             let verity = tarfs_cfg.verity;
-            let verity_info =
-                blocking::unblock(move || export_tarfs_image(entry, export_disk, threads, verity))
-                    .await
-                    .context("tarfs export failed")?;
+            let verity_info = blocking::unblock(move || {
+                export_tarfs_image(entry, export_disk, source, target, threads, verity)
+            })
+            .await
+            .context("tarfs export failed")?;
 
             let dm_name = tarfs_dm_name(&slug);
             let mount_disk = disk_image.clone();
@@ -3370,7 +3381,8 @@ static NO_VIEW_REPORTED: StdMutex<Option<HashSet<PathBuf>>> = StdMutex::new(None
 /// `want_view` (page cache sharing is enabled) or when `src` itself is unfit for a kernel mount
 /// at its own block size or alignment; `trial` is a view already built for that decision.
 /// Otherwise, and when sharing alone wanted a view that cannot be built, a padded copy of `src`
-/// is staged. An unfit `src` without a view fails, as does any I/O error on the way. Returns
+/// is staged. A stage dir staged from another source is emptied first (see [`wipe_stage`]); the
+/// caller has detached any mount of it. An unfit `src` without a view fails, as does any I/O error on the way. Returns
 /// whether it staged a view: only a view, whose fingerprints the node computed, may join the
 /// page cache sharing domain.
 fn stage_mount_source(
@@ -3382,6 +3394,10 @@ fn stage_mount_source(
 ) -> Result<bool> {
     let staged = stage_dir.join("bootstrap");
     let record = stage_dir.join(VIEW_SOURCE_RECORD);
+    let digest = source_digest(src).with_context(|| format!("failed to read {}", src.display()))?;
+    if staged_from_other(src, &digest, stage_dir)? {
+        wipe_stage(stage_dir, trial.as_ref().map(BuiltView::path).as_deref())?;
+    }
     match fs::remove_file(&record) {
         Err(e) if e.kind() != io::ErrorKind::NotFound => {
             return Err(e).with_context(|| format!("failed to remove {}", record.display()));
@@ -3441,6 +3457,51 @@ fn is_staged_from(src: &Path, stage_dir: &Path) -> io::Result<bool> {
     }
 }
 
+/// Whether the stage dir holds a `bootstrap` staged from another source than `src`, whose SHA-256
+/// is `digest`: a node view of another source, or a file that is no copy of `src`.
+fn staged_from_other(src: &Path, digest: &str, stage_dir: &Path) -> io::Result<bool> {
+    let staged = stage_dir.join("bootstrap");
+    match fs::read_to_string(stage_dir.join(VIEW_SOURCE_RECORD)) {
+        Ok(recorded) => Ok(recorded.trim() != digest),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            Ok(staged.exists() && !is_staged_copy(src, &staged))
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Remove everything in a fanotify stage dir but `keep`. The stage dir is named after the image
+/// ref, so after its tag moved it still holds the caches of the image it named before, which
+/// nothing would read or remove. Never runs under a mount of the daemon dir.
+fn wipe_stage(stage_dir: &Path, keep: Option<&Path>) -> Result<()> {
+    let mountpoint = stage_dir.with_file_name("mnt");
+    if is_mounted_at(&mountpoint) {
+        bail!(
+            "{} is still mounted; not wiping {}",
+            mountpoint.display(),
+            stage_dir.display()
+        );
+    }
+    info!(stage = %stage_dir.display(), "removing the stage of another source");
+    for entry in fs::read_dir(stage_dir)
+        .with_context(|| format!("failed to read {}", stage_dir.display()))?
+    {
+        let path = entry
+            .with_context(|| format!("failed to read {}", stage_dir.display()))?
+            .path();
+        if Some(path.as_path()) == keep {
+            continue;
+        }
+        let removed = if fs::symlink_metadata(&path).is_ok_and(|m| m.is_dir()) {
+            fs::remove_dir_all(&path)
+        } else {
+            fs::remove_file(&path)
+        };
+        removed.with_context(|| format!("failed to remove {}", path.display()))?;
+    }
+    Ok(())
+}
+
 /// Whether `staged` holds exactly what [`stage_bootstrap`] makes of `src`.
 fn is_staged_copy(src: &Path, staged: &Path) -> bool {
     let (Ok(src_meta), Ok(staged_meta)) = (fs::metadata(src), fs::metadata(staged)) else {
@@ -3491,35 +3552,120 @@ fn service_io_error(error: io::Error) -> ServiceError {
     ServiceError::WaitDaemon(error)
 }
 
+/// How an exported EROFS image of a blockdev or tarfs daemon dir relates to the bootstrap a
+/// start serves. The dir is named after the image ref, whose tag can move to another image.
+#[cfg(any(target_os = "linux", test))]
+#[derive(Debug, PartialEq, Eq)]
+enum ExportState {
+    /// Mounted at the daemon's mountpoint and kept: exported from this bootstrap, or before
+    /// sources were recorded.
+    Mounted,
+    /// Exported from this bootstrap.
+    Current,
+    /// Missing, or exported from another bootstrap.
+    Stale,
+}
+
+/// File next to an exported EROFS image recording the SHA-256 of the bootstrap it was exported
+/// from. Written after the image is in place, so an image without it is exported again.
+#[cfg(any(target_os = "linux", test))]
+fn export_source_record(disk_image: &Path) -> PathBuf {
+    let mut name = disk_image.as_os_str().to_os_string();
+    name.push(".source");
+    PathBuf::from(name)
+}
+
+/// Whether `disk_image` can serve `bootstrap`. A mounted image is never replaced: one recorded as
+/// exported from another bootstrap fails the start instead of serving the old image.
+#[cfg(any(target_os = "linux", test))]
+fn export_state(disk_image: &Path, bootstrap: &Path, mountpoint: &Path) -> Result<ExportState> {
+    let record = export_source_record(disk_image);
+    let same = match fs::read_to_string(&record) {
+        Ok(recorded) => Some(
+            recorded.trim()
+                == source_digest(bootstrap)
+                    .with_context(|| format!("failed to read {}", bootstrap.display()))?,
+        ),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+        Err(e) => return Err(e).with_context(|| format!("failed to read {}", record.display())),
+    };
+    if is_mounted_at(mountpoint) {
+        if same == Some(false) {
+            bail!(
+                "{} is mounted from {}, which was exported from another bootstrap",
+                mountpoint.display(),
+                disk_image.display()
+            );
+        }
+        return Ok(ExportState::Mounted);
+    }
+    let exported = fs::metadata(disk_image).is_ok_and(|m| m.is_file() && m.len() > 0);
+    Ok(if same == Some(true) && exported {
+        ExportState::Current
+    } else {
+        ExportState::Stale
+    })
+}
+
+/// Export `bootstrap` with `export` into a new file next to `disk_image`, move it into place and
+/// record its source. The export tool writes into an existing file without truncating it, and a
+/// lazily detached mount may still read the old file, so the image is never rewritten in place.
+#[cfg(any(target_os = "linux", test))]
+fn export_replacing<T>(
+    disk_image: &Path,
+    bootstrap: &Path,
+    export: impl FnOnce(&Path) -> Result<T>,
+) -> Result<T> {
+    let record = export_source_record(disk_image);
+    match fs::remove_file(&record) {
+        Err(e) if e.kind() != io::ErrorKind::NotFound => {
+            return Err(e).with_context(|| format!("failed to remove {}", record.display()));
+        }
+        _ => {}
+    }
+    let digest = source_digest(bootstrap)
+        .with_context(|| format!("failed to read {}", bootstrap.display()))?;
+    let dir = disk_image
+        .parent()
+        .with_context(|| format!("{} has no parent dir", disk_image.display()))?;
+    fs::create_dir_all(dir)
+        .with_context(|| format!("failed to create disk image directory {}", dir.display()))?;
+    let tmp = tempfile::Builder::new()
+        .prefix("image.erofs.")
+        .tempfile_in(dir)
+        .with_context(|| format!("failed to create a temporary file in {}", dir.display()))?
+        .into_temp_path();
+    let out = export(&tmp)?;
+    fs::File::open(&tmp)
+        .and_then(|f| f.sync_all())
+        .with_context(|| format!("failed to sync {}", tmp.display()))?;
+    tmp.persist(disk_image)
+        .map_err(|e| e.error)
+        .with_context(|| format!("failed to move the export to {}", disk_image.display()))?;
+    atomic_write(&record, digest.as_bytes())
+        .with_context(|| format!("failed to write {}", record.display()))?;
+    Ok(out)
+}
+
 #[cfg(target_os = "linux")]
 fn export_blockdev_image(
     entry: nydus_api::BlobCacheEntry,
     disk_image: PathBuf,
+    bootstrap: PathBuf,
+    mountpoint: PathBuf,
     threads: u32,
 ) -> Result<()> {
-    if disk_image.is_file() && disk_image.metadata().map(|m| m.len()).unwrap_or(0) > 0 {
+    if export_state(&disk_image, &bootstrap, &mountpoint)? != ExportState::Stale {
         return Ok(());
     }
-    if let Some(parent) = disk_image.parent() {
-        fs::create_dir_all(parent).with_context(|| {
-            format!(
-                "failed to create blockdev disk image directory {}",
-                parent.display()
-            )
-        })?;
-    }
-    BlockDevice::export(
-        entry,
-        Some(disk_image.display().to_string()),
-        None,
-        threads,
-        false,
-    )
-    .with_context(|| {
-        format!(
-            "failed to export blockdev disk image {}",
-            disk_image.display()
-        )
+    export_replacing(&disk_image, &bootstrap, |out| {
+        BlockDevice::export(entry, Some(out.display().to_string()), None, threads, false)
+            .with_context(|| {
+                format!(
+                    "failed to export blockdev disk image {}",
+                    disk_image.display()
+                )
+            })
     })?;
     Ok(())
 }
@@ -3528,6 +3674,8 @@ fn export_blockdev_image(
 fn export_blockdev_image(
     _entry: nydus_api::BlobCacheEntry,
     _disk_image: PathBuf,
+    _bootstrap: PathBuf,
+    _mountpoint: PathBuf,
     _threads: u32,
 ) -> Result<()> {
     bail!("blockdev EROFS export requires Linux")
@@ -3621,35 +3769,43 @@ fn tarfs_dm_name(slug: &str) -> String {
 fn export_tarfs_image(
     entry: nydus_api::BlobCacheEntry,
     disk_image: PathBuf,
+    bootstrap: PathBuf,
+    mountpoint: PathBuf,
     threads: u32,
     verity: bool,
 ) -> Result<Option<TarfsVerityParams>> {
     let sidecar = verity_sidecar_path(&disk_image);
-    let disk_ready =
-        disk_image.is_file() && disk_image.metadata().map(|m| m.len()).unwrap_or(0) > 0;
-    if disk_ready {
-        if !verity {
-            return Ok(None);
+    match export_state(&disk_image, &bootstrap, &mountpoint)? {
+        // The live mount is kept as it is (see `setup_and_mount_tarfs`).
+        ExportState::Mounted => {
+            return Ok(verity.then(|| load_verity_sidecar(&sidecar)).flatten());
         }
-        if let Some(info) = load_verity_sidecar(&sidecar) {
-            return Ok(Some(info));
+        ExportState::Current if !verity => return Ok(None),
+        ExportState::Current => {
+            if let Some(info) = load_verity_sidecar(&sidecar) {
+                return Ok(Some(info));
+            }
+            // No cached verity params: export again to regenerate them.
         }
-        // Disk present but no cached verity params — fall through and re-export
-        // to regenerate them (the export overwrites the disk in place).
+        ExportState::Stale => {}
     }
-    if let Some(parent) = disk_image.parent() {
-        fs::create_dir_all(parent).with_context(|| {
-            format!("failed to create tarfs disk directory {}", parent.display())
-        })?;
+    // The parameters of another export must never pass for this one's.
+    match fs::remove_file(&sidecar) {
+        Err(e) if e.kind() != io::ErrorKind::NotFound => {
+            return Err(e).with_context(|| format!("failed to remove {}", sidecar.display()));
+        }
+        _ => {}
     }
-    let info = BlockDevice::export(
-        entry,
-        Some(disk_image.display().to_string()),
-        None,
-        threads,
-        verity,
-    )
-    .with_context(|| format!("failed to export tarfs disk image {}", disk_image.display()))?
+    let info = export_replacing(&disk_image, &bootstrap, |out| {
+        BlockDevice::export(
+            entry,
+            Some(out.display().to_string()),
+            None,
+            threads,
+            verity,
+        )
+        .with_context(|| format!("failed to export tarfs disk image {}", disk_image.display()))
+    })?
     .map(|v| TarfsVerityParams {
         data_block_size: v.data_block_size,
         data_blocks: v.data_blocks,
@@ -3666,6 +3822,8 @@ fn export_tarfs_image(
 fn export_tarfs_image(
     _entry: nydus_api::BlobCacheEntry,
     _disk_image: PathBuf,
+    _bootstrap: PathBuf,
+    _mountpoint: PathBuf,
     _threads: u32,
     _verity: bool,
 ) -> Result<Option<TarfsVerityParams>> {
@@ -4691,6 +4849,93 @@ mod tests {
         assert!(is_staged_from(&src, dir.path()).unwrap());
         fs::write(&src, b"another").unwrap();
         assert!(!is_staged_from(&src, dir.path()).unwrap());
+    }
+
+    /// After the image ref's tag moved, the stage dir of the image it named before is emptied
+    /// before the new source is staged; restaging the same source keeps its caches.
+    #[test]
+    fn a_stage_of_another_source_is_wiped() {
+        let texture = Path::new(env!("CARGO_MANIFEST_DIR")).join("../tests/texture/bootstrap");
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b) = (dir.path().join("a"), dir.path().join("b"));
+        fs::copy(texture.join("rafs-v6-2.2.boot"), &a).unwrap();
+        fs::copy(texture.join("rafs-v6-small-files.boot"), &b).unwrap();
+        let stage = dir.path().join("stage");
+        fs::create_dir(&stage).unwrap();
+        let tool = dir.path().join("no-nydus-image");
+
+        assert!(!stage_mount_source(&viewer(&tool), &a, &stage, false, None).unwrap());
+        let cache = stage.join("0123.blob.data");
+        fs::write(&cache, b"data of a").unwrap();
+        fs::hard_link(&cache, stage.join("blob_0")).unwrap();
+        fs::create_dir(stage.join("view.scratch")).unwrap();
+
+        assert!(!stage_mount_source(&viewer(&tool), &a, &stage, false, None).unwrap());
+        assert!(cache.exists(), "the same source keeps its caches");
+
+        assert!(!stage_mount_source(&viewer(&tool), &b, &stage, false, None).unwrap());
+        let mut left: Vec<_> = fs::read_dir(&stage)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        left.sort();
+        assert_eq!(left, vec![std::ffi::OsString::from("bootstrap")]);
+        assert!(is_staged_copy(&b, &stage.join("bootstrap")));
+
+        // A view of another source counts as another source too.
+        fs::write(&cache, b"data of b").unwrap();
+        fs::write(stage.join(VIEW_SOURCE_RECORD), source_digest(&a).unwrap()).unwrap();
+        assert!(!stage_mount_source(&viewer(&tool), &b, &stage, false, None).unwrap());
+        assert!(!cache.exists());
+    }
+
+    /// A blockdev/tarfs image is served again only for the bootstrap it was exported from:
+    /// after the tag moved, the next start exports the new bootstrap into a new file.
+    #[test]
+    fn an_export_of_another_bootstrap_is_replaced() {
+        use std::io::Write as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b) = (dir.path().join("a"), dir.path().join("b"));
+        fs::write(&a, b"bootstrap a").unwrap();
+        fs::write(&b, b"bootstrap b").unwrap();
+        let disk = dir.path().join("blockdev/image.erofs");
+        let mnt = dir.path().join("mnt");
+        let serve = |src: &Path| -> Result<()> {
+            if export_state(&disk, src, &mnt)? == ExportState::Stale {
+                // Stands in for `BlockDevice::export`, which writes without truncating.
+                export_replacing(&disk, src, |out| {
+                    let mut f = fs::OpenOptions::new().write(true).open(out)?;
+                    f.write_all(&fs::read(src)?)?;
+                    Ok(())
+                })?;
+            }
+            Ok(())
+        };
+
+        assert_eq!(export_state(&disk, &a, &mnt).unwrap(), ExportState::Stale);
+        serve(&a).unwrap();
+        assert_eq!(fs::read(&disk).unwrap(), b"bootstrap a");
+        assert_eq!(export_state(&disk, &a, &mnt).unwrap(), ExportState::Current);
+
+        serve(&b).unwrap();
+        assert_eq!(fs::read(&disk).unwrap(), b"bootstrap b");
+        assert_eq!(export_state(&disk, &b, &mnt).unwrap(), ExportState::Current);
+        assert_eq!(export_state(&disk, &a, &mnt).unwrap(), ExportState::Stale);
+
+        // An image without a recorded source, such as one whose export was interrupted, is
+        // exported again.
+        fs::remove_file(export_source_record(&disk)).unwrap();
+        assert_eq!(export_state(&disk, &b, &mnt).unwrap(), ExportState::Stale);
+        // A failed export keeps neither a record nor a temporary file.
+        let failed = export_replacing(&disk, &b, |_| -> Result<()> { bail!("export failed") });
+        assert!(failed.is_err());
+        let mut left: Vec<_> = fs::read_dir(disk.parent().unwrap())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        left.sort();
+        assert_eq!(left, vec![std::ffi::OsString::from("image.erofs")]);
     }
 
     /// With a real `nydus-image`: the view is staged, recorded and checked, a heal keeps it

@@ -193,6 +193,15 @@ bootstrap. Cache GC and the cache-bytes metric count it (each inode once: the `b
 files are hardlinks to the `.blob.data` files) against `gc_max_bytes`, but never evict it; a dead
 daemon's dir goes with the stale daemon-dir sweep.
 
+The slug is derived from the image ref, so after its tag moved to another image a start finds the
+daemon dir of the image the ref named before. A fanotify stage dir whose `bootstrap` was staged
+from another source (its `bootstrap.view-of` records another source, or it is no copy of the new
+one) is emptied before the new source is staged, caches included. A blockdev or tarfs
+`image.erofs` is served again only when `image.erofs.source` records the SHA-256 of the bootstrap
+being served; otherwise the bootstrap is exported into a new file that is then moved into place,
+and its source recorded. A mounted image is never replaced: a start that finds one exported from
+another bootstrap fails.
+
 A fanotify daemon's saved upgrade state carries its blob list without credentials. A takeover after
 a restart and an in-place heal both rebuild the blob list with the credentials the runtime auth
 store holds at that moment. When a daemon that fetched with credentials finds none (an expired
