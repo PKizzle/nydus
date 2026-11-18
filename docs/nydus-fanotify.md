@@ -116,6 +116,49 @@ and the cache file's change time and size match a stamp this version refreshes a
 own writes, so a release that predates the record cannot fill, or invalidate and refill, the file
 without it reading as unverified. Openers that fill without validating clear it.
 
+### Seal and crash recovery
+
+Cache data and chunk map reach the disk through writeback, in no particular order, so after a power
+loss the map can claim chunks whose bytes never left the page cache, and the kernel would read
+them as zeros. A fanotify cache therefore records in its chunk map header (`unsealed_boot`) the boot
+(`/proc/sys/kernel/random/boot_id`) in which it is filled, flushed before the first ready bit of
+that boot, and a clean stop seals it:
+
+- **Fill.** Before a fill fetches anything, and again before each ready bit, the header must name
+  the current boot; when it does not, it is set and the map flushed first, and a failure fails the
+  fill with its errno. Checking costs one atomic load; the flush happens once per blob per seal.
+- **Seal** (`BlobObject::seal`, from `FanotifyHandler::seal`). The data file is flushed
+  (`fdatasync`), then the header cleared and the map flushed. Ready bits wait for a seal in
+  progress (a lock per map file, shared by every opener in the process), so none is set between
+  the flush and the clearing; a fill after the seal unseals the map again first. The verified stamp
+  is refreshed at the same time, when the map is verified, its ready count is current and the
+  file's change time is the latest this cache saw after its own writes: that repairs a stamp
+  concurrent fills stored out of order, and leaves a file something else wrote since unverified. Any
+  error leaves the cache unsealed. A daemon seals after `stop()` when its handlers stop or are
+  unregistered, and the snapshotter seals every instance whose group it parks for a successor at
+  shutdown, so a clean reboot keeps the caches trusted. A failed handler is never sealed, nor one a
+  heal or takeover suspends (its successor serves the same caches), nor anything from `Drop`.
+- **Open.** A cache whose header names another boot forgets its ready chunks and its verified
+  record, keeps the data file, and turns on `recheck` in the header. One that names this boot (a
+  killed or healed daemon, a takeover) keeps everything: the page cache still holds whatever was
+  written.
+- **Recheck.** While `recheck` is on, a fill of a chunk not ready first reads the bytes the data
+  file already holds for it (an extent that is all hole is skipped with `SEEK_DATA`) and marks it
+  ready without a backend request when they match the digest the bootstrap gives it; otherwise it
+  fetches as usual. A chunk without a digest is never marked ready this way. `recheck` turns off
+  once every chunk is ready.
+
+Not detected: storage rolled back, or remounted with older contents, within one boot (the boot is
+the same, so the cache is trusted); devices that acknowledge a flush without making the data
+durable; and a root attacker, who can rewrite the cache file and the map alike (and the staged
+bootstrap). A write to the cache file between a fill's write and its `fstat` is also folded into
+that fill's stamp.
+
+Older releases leave the header word alone and do not set it. A map sealed by this release and
+then filled by an older one reads as sealed, so its fills are as exposed to a power loss as they
+were with that release; a map left unsealed reads as another boot's after the next reboot and is
+rechecked. Maps written before the field existed read as sealed.
+
 `kernel_layout::check_kernel_layout` proves the other half: that for each regular file the kernel's
 chunk indexes (format, device id, block address, chunk size, device range) name exactly the chunks
 the fill path validates. `nydus-image check` runs it; page cache sharing must run it at mount time,
