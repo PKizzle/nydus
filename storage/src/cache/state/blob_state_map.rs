@@ -119,6 +119,14 @@ where
     }
 
     fn check_ready_and_mark_pending(&self, chunk: &dyn BlobChunkInfo) -> StorageResult<bool> {
+        self.check_ready_and_mark_pending_until(chunk, self.wait_deadline())
+    }
+
+    fn check_ready_and_mark_pending_until(
+        &self,
+        chunk: &dyn BlobChunkInfo,
+        deadline: Instant,
+    ) -> StorageResult<bool> {
         let mut ready = self.c.is_ready(chunk)?;
 
         if ready {
@@ -130,7 +138,7 @@ where
 
         if let Some(i) = guard.get(&index).cloned() {
             drop(guard);
-            let result = i.wait_for_inflight(self.wait_deadline());
+            let result = i.wait_for_inflight(deadline);
             if let Err(StorageError::Timeout) = result {
                 warn!(
                     "Waiting for backend IO expires. chunk index {}, compressed offset {}",
@@ -142,7 +150,7 @@ where
             } else {
                 // Check if the chunk is ready in local cache again. It should be READY
                 // since wait_for_inflight must return OK in this branch by one more check.
-                self.check_ready_and_mark_pending(chunk)
+                self.check_ready_and_mark_pending_until(chunk, deadline)
             }
         } else {
             // Double check to close the window where prior slot was just removed after backend IO
@@ -295,14 +303,22 @@ impl RangeMap for BlobStateMap<IndexedChunkMap, u32> {
     }
 
     fn wait_for_range_ready(&self, start: Self::I, count: Self::I) -> StorageResult<bool> {
+        self.wait_for_range_ready_until(start, count, self.wait_deadline())
+    }
+
+    // One deadline for the whole range, so waiting on its fills one by one stays bounded.
+    fn wait_for_range_ready_until(
+        &self,
+        start: Self::I,
+        count: Self::I,
+        deadline: Instant,
+    ) -> StorageResult<bool> {
         let count = std::cmp::min(count, u32::MAX - start);
         let end = start + count;
         if self.is_range_ready(start, count)? {
             return Ok(true);
         }
 
-        // One deadline for the whole range, so waiting on its fills one by one stays bounded.
-        let deadline = self.wait_deadline();
         let mut guard = self.inflight_tracer.lock().unwrap();
         for index in start..end {
             if let Some(i) = guard.get(&index).cloned() {
@@ -397,13 +413,21 @@ impl RangeMap for BlobStateMap<BlobRangeMap, u64> {
     }
 
     fn wait_for_range_ready(&self, start: Self::I, count: Self::I) -> StorageResult<bool> {
+        self.wait_for_range_ready_until(start, count, self.wait_deadline())
+    }
+
+    // One deadline for the whole range, so waiting on its fills one by one stays bounded.
+    fn wait_for_range_ready_until(
+        &self,
+        start: Self::I,
+        count: Self::I,
+        deadline: Instant,
+    ) -> StorageResult<bool> {
         if self.c.is_range_ready(start, count)? {
             return Ok(true);
         }
 
         let (start_index, end_index) = self.c.get_range(start, count)?;
-        // One deadline for the whole range, so waiting on its fills one by one stays bounded.
-        let deadline = self.wait_deadline();
         let mut guard = self.inflight_tracer.lock().unwrap();
         for index in start_index..end_index {
             let idx = (index as u64) << self.c.shift;

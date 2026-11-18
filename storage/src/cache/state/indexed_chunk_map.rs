@@ -198,10 +198,7 @@ mod tests {
         let chunk = MockChunkInfo::new();
         assert_eq!(chunk.id(), 0);
 
-        // Replaced by an empty map of the right size.
-        let map = IndexedChunkMap::new(&blob_path, 1, true).unwrap();
-        assert_eq!(map.map.size(), 0x1001);
-        assert!(!map.is_ready(chunk.as_base()).unwrap());
+        assert!(IndexedChunkMap::new(&blob_path, 1, true).is_err());
     }
 
     #[test]
@@ -594,9 +591,10 @@ mod tests {
         assert!(!map.is_range_all_ready());
     }
 
-    /// A chunk map of the wrong size or with a damaged header is replaced by an empty one, not
-    /// refused: refusing fails the blob's open on every start. A process that still maps the
-    /// old file keeps it intact.
+    /// A chunk map with a damaged header is replaced by an empty one, not refused: refusing
+    /// fails the blob's open on every start. A process that still maps the old file keeps it
+    /// intact. A map of the wrong size is still refused, since a live opener with another chunk
+    /// count may be using it.
     #[test]
     #[cfg_attr(miri, ignore = "Miri does not support file-backed mmap")]
     fn test_corrupt_map_is_recreated() {
@@ -639,7 +637,8 @@ mod tests {
         file.set_len(HEADER_SIZE as u64 + 4).unwrap();
         drop(file);
         drop(live);
-        assert_fresh();
+        assert!(IndexedChunkMap::new(&blob_path, 64, true).is_err());
+        std::fs::remove_file(&map_path).unwrap();
 
         // Damaged magic.
         let live = filled();

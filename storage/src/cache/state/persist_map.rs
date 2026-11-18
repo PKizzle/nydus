@@ -167,10 +167,12 @@ impl PersistMap {
             new_content = true;
             Self::write_header(&mut file, expected_size)?;
         } else if file_size != expected_size {
-            return damaged(
-                &file,
-                &format!("size {file_size}, expected {expected_size}"),
-            );
+            // Not replaced like a damaged header: a live opener with another chunk count may
+            // still use this map, and two maps over one data file would disagree about which of
+            // its chunks are present.
+            return Err(StorageError::InvalidData(format!(
+                "chunk map file {filename:?}: size {file_size}, expected {expected_size}"
+            )));
         }
         if create {
             Self::reserve(&file, expected_size, new_content)?;
