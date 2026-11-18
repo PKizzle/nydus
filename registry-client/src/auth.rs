@@ -81,6 +81,8 @@ pub fn mount_scope(repo: &str, from_repo: &str) -> String {
 /// Default token lifetime when the token service omits `expires_in`
 /// (the OCI distribution token spec defines 60 seconds as the minimum).
 const DEFAULT_TOKEN_TTL_SECS: u64 = 60;
+/// Longest lifetime a token is cached for, whatever the service advertises.
+const MAX_TOKEN_TTL_SECS: u64 = 24 * 60 * 60;
 /// Re-mint this long before nominal expiry so an in-flight request never
 /// carries a token that expires mid-transfer (mirrors the storage backend's
 /// `REGISTRY_TOKEN_REFRESH_MARGIN`).
@@ -104,7 +106,12 @@ fn random_u64() -> u64 {
 
 /// Lifetime to assume for a token the service described as `expires_in`.
 fn ttl_from(expires_in: Option<u64>) -> Duration {
-    Duration::from_secs(expires_in.unwrap_or(DEFAULT_TOKEN_TTL_SECS))
+    // Capped: `Instant + Duration` panics on overflow, and the lifetime comes from the server.
+    Duration::from_secs(
+        expires_in
+            .unwrap_or(DEFAULT_TOKEN_TTL_SECS)
+            .min(MAX_TOKEN_TTL_SECS),
+    )
 }
 
 /// Width of the refresh jitter window for a token living `ttl`.
@@ -641,6 +648,13 @@ mod tests {
             compute_refresh_at(now, Some(10), jitter),
             now + Duration::from_secs(5)
         );
+    }
+
+    #[test]
+    fn huge_lifetime_does_not_overflow_the_clock() {
+        let mut cache = TokenCache::new();
+        cache.insert("repository:a:pull", "tok", Some(u64::MAX));
+        assert_eq!(cache.get("repository:a:pull"), Some("tok"));
     }
 
     #[test]

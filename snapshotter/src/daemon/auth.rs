@@ -87,7 +87,8 @@ pub fn set_runtime_auth(entries: Vec<RuntimeAuthRequest>) -> Result<usize, Runti
         stored = true;
         let expires_at = entry
             .expires_in_seconds
-            .map(|ttl| SystemTime::now() + Duration::from_secs(ttl));
+            // A lifetime past the end of the clock never expires.
+            .and_then(|ttl| SystemTime::now().checked_add(Duration::from_secs(ttl)));
         store.entries.insert(
             normalize_registry_key(&entry.registry),
             RuntimeAuthEntry {
@@ -223,6 +224,18 @@ mod tests {
                 .iter()
                 .any(|record| record.registry == "registry.runtime")
         );
+    }
+
+    #[test]
+    fn huge_runtime_auth_lifetime_does_not_overflow_the_clock() {
+        let image = parse_image_ref("registry.forever/team/app:1").unwrap();
+        set_runtime_auth(vec![RuntimeAuthRequest {
+            registry: "registry.forever".to_string(),
+            auth: "forever-auth".to_string(),
+            expires_in_seconds: Some(u64::MAX),
+        }])
+        .unwrap();
+        assert_eq!(runtime_auth(&image).as_deref(), Some("forever-auth"));
     }
 
     #[test]
