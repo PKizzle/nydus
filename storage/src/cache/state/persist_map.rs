@@ -172,6 +172,9 @@ impl PersistMap {
                 &format!("size {file_size}, expected {expected_size}"),
             );
         }
+        if create {
+            Self::reserve(&file, expected_size, new_content)?;
+        }
 
         let file2 = clone_file(file.as_raw_fd())
             .map_err(|e| StorageError::cache_io("dup the chunk map fd", e))?;
@@ -288,6 +291,35 @@ impl PersistMap {
             )),
             _ => Ok(()),
         }
+    }
+
+    /// Allocate every block of the map, held under its exclusive lock. The bitmap is written
+    /// through a shared mapping, and a store into a hole on a full file system raises SIGBUS,
+    /// which kills the whole process; reserving the blocks here turns that into an error
+    /// (ENOSPC) from the open instead. Maps left sparse by older releases are reserved too.
+    fn reserve(file: &File, size: u64, new: bool) -> StorageResult<()> {
+        #[cfg(target_os = "linux")]
+        {
+            // SAFETY: a plain syscall on an open descriptor; mode 0 only allocates blocks and
+            // the file already has this size, so its contents do not change.
+            if unsafe { libc::fallocate(file.as_raw_fd(), 0, 0, size as libc::off_t) } == 0 {
+                return Ok(());
+            }
+            let err = io::Error::last_os_error();
+            if err.raw_os_error() != Some(libc::EOPNOTSUPP) {
+                return Err(StorageError::cache_io("reserve the chunk map blocks", err));
+            }
+        }
+        // Without fallocate, writing zeros allocates the blocks of a new map. An existing map's
+        // bitmap is live state that other openers may be changing, so it stays as it is.
+        if new {
+            use std::os::unix::fs::FileExt;
+            let bitmap = vec![0u8; (size - HEADER_SIZE as u64) as usize];
+            file.write_all_at(&bitmap, HEADER_SIZE as u64)
+                .and_then(|()| file.sync_all())
+                .map_err(|e| StorageError::cache_io("reserve the chunk map blocks", e))?;
+        }
+        Ok(())
     }
 
     fn write_header(file: &mut File, size: u64) -> StorageResult<()> {

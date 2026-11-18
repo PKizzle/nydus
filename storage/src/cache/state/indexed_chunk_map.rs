@@ -544,6 +544,56 @@ mod tests {
         assert!(map.is_verified(7));
     }
 
+    /// Every block of a chunk map is allocated when it is opened, new or left sparse by an older
+    /// release: the bitmap is written through a shared mapping, where a store into a hole on a
+    /// full file system raises SIGBUS instead of returning an error.
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support file-backed mmap")]
+    fn test_map_has_no_holes() {
+        use std::os::unix::fs::MetadataExt;
+
+        // Allocated blocks, not SEEK_HOLE: ext4 and btrfs report fallocated (unwritten) extents
+        // as holes there, although their blocks are reserved.
+        let no_holes = |path: &str| {
+            let md = std::fs::metadata(path).unwrap();
+            assert!(
+                md.blocks() * 512 >= md.len(),
+                "{path}: {} bytes allocated of {}",
+                md.blocks() * 512,
+                md.len()
+            );
+        };
+        let dir = TempDir::new().unwrap();
+        // A bitmap spanning several file system blocks.
+        let chunks = 8 * 3 * 4096;
+
+        let new = dir.path().join("blob-new").to_str().unwrap().to_string();
+        let map = IndexedChunkMap::new(&new, chunks, true).unwrap();
+        no_holes(&format!("{new}.{FILE_SUFFIX}"));
+        drop(map);
+
+        let old = dir.path().join("blob-old").to_str().unwrap().to_string();
+        let path = format!("{old}.{FILE_SUFFIX}");
+        let mut file = std::fs::File::create(&path).unwrap();
+        let header = Header {
+            magic: MAGIC1,
+            version: 1,
+            magic2: MAGIC2,
+            all_ready: 0,
+            verified: 0,
+            ready_count: 0,
+            data_stamp: 0,
+            reserved: [0x0u8; HEADER_RESERVED_SIZE],
+        };
+        file.write_all(header.as_slice()).unwrap();
+        file.set_len(HEADER_SIZE as u64 + chunks as u64 / 8)
+            .unwrap();
+        drop(file);
+        let map = IndexedChunkMap::new(&old, chunks, true).unwrap();
+        no_holes(&path);
+        assert!(!map.is_range_all_ready());
+    }
+
     /// A chunk map of the wrong size or with a damaged header is replaced by an empty one, not
     /// refused: refusing fails the blob's open on every start. A process that still maps the
     /// old file keeps it intact.
