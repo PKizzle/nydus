@@ -663,8 +663,8 @@ impl FileCacheEntry {
     ///
     /// The remaining `let _ =` call sites are deliberate, not swallows: on
     /// failure `update_chunk_pending_status(false)` clears pending WITHOUT
-    /// marking the chunk ready, so `wait_for_range_ready` times out into
-    /// `do_fetch_chunks`' terminal retry, which re-fetches and propagates the
+    /// marking the chunk ready, so `wait_for_range_ready` reports it not ready
+    /// and `do_fetch_chunks` falls into its terminal retry, which re-fetches and propagates the
     /// real errno via `?`. Only that terminal retry must (and does) return
     /// this result.
     fn persist_chunk_data(&self, chunk: &dyn BlobChunkInfo, buf: &[u8]) -> StorageResult<()> {
@@ -1202,61 +1202,80 @@ impl BlobCache for FileCacheEntry {
             }
         }
 
-        let mut total_size = 0;
-        let mut start = 0;
-        while start < pending.len() {
-            // Figure out the range with continuous chunk ids, be careful that `end` is inclusive.
-            let mut end = start;
-            while end < pending.len() - 1 && pending[end + 1].id() == pending[end].id() + 1 {
-                end += 1;
-            }
+        // `pending[..resolved]` are cached or released; an early return releases the rest, or
+        // readers of those chunks would wait for a fill that never comes.
+        let mut resolved = 0;
+        let result = (|| {
+            let mut total_size = 0;
+            let mut start = 0;
+            while start < pending.len() {
+                resolved = start;
+                // Figure out the range with continuous chunk ids, be careful that `end` is
+                // inclusive.
+                let mut end = start;
+                while end < pending.len() - 1 && pending[end + 1].id() == pending[end].id() + 1 {
+                    end += 1;
+                }
 
-            let (blob_offset, _blob_end, blob_size) = self.get_blob_range(&pending[start..=end])?;
-            match self.read_chunks_from_backend(blob_offset, blob_size, &pending[start..=end], true)
-            {
-                Ok(mut bufs) => {
-                    total_size += blob_size;
-                    if self.is_raw_data {
-                        let res = Self::persist_cached_data(
-                            &self.file,
-                            blob_offset,
-                            bufs.compressed_buf(),
-                        );
-                        for c in pending.iter().take(end + 1).skip(start) {
-                            self.update_chunk_persist_status(c.as_ref(), &res);
-                        }
-                    } else {
-                        for idx in start..=end {
-                            let buf = match bufs.next() {
-                                None => {
-                                    return Err(StorageError::InvalidData(
-                                        "invalid chunk decompressed status".to_string(),
-                                    ));
-                                }
-                                Some(Err(e)) => {
-                                    for chunk in &mut pending[idx..=end] {
-                                        self.update_chunk_pending_status(chunk.as_ref(), false);
+                let (blob_offset, _blob_end, blob_size) =
+                    self.get_blob_range(&pending[start..=end])?;
+                match self.read_chunks_from_backend(
+                    blob_offset,
+                    blob_size,
+                    &pending[start..=end],
+                    true,
+                ) {
+                    Ok(mut bufs) => {
+                        total_size += blob_size;
+                        if self.is_raw_data {
+                            let res = Self::persist_cached_data(
+                                &self.file,
+                                blob_offset,
+                                bufs.compressed_buf(),
+                            );
+                            for c in pending.iter().take(end + 1).skip(start) {
+                                self.update_chunk_persist_status(c.as_ref(), &res);
+                            }
+                        } else {
+                            for (idx, chunk) in pending.iter().enumerate().take(end + 1).skip(start)
+                            {
+                                resolved = idx;
+                                let buf = match bufs.next() {
+                                    None => {
+                                        return Err(StorageError::InvalidData(
+                                            "invalid chunk decompressed status".to_string(),
+                                        ));
                                     }
-                                    return Err(StorageError::cache_io("decompress a chunk", e));
-                                }
-                                Some(Ok(v)) => v,
-                            };
-                            let _ = self.persist_chunk_data(pending[idx].as_ref(), &buf);
+                                    Some(Err(e)) => {
+                                        return Err(StorageError::cache_io(
+                                            "decompress a chunk",
+                                            e,
+                                        ));
+                                    }
+                                    Some(Ok(v)) => v,
+                                };
+                                let _ = self.persist_chunk_data(chunk.as_ref(), &buf);
+                            }
+                        }
+                    }
+                    Err(_e) => {
+                        // Clear the pending flag for all chunks in processing.
+                        for chunk in &pending[start..=end] {
+                            self.update_chunk_pending_status(chunk.as_ref(), false);
                         }
                     }
                 }
-                Err(_e) => {
-                    // Clear the pending flag for all chunks in processing.
-                    for chunk in &mut pending[start..=end] {
-                        self.update_chunk_pending_status(chunk.as_ref(), false);
-                    }
-                }
+
+                start = end + 1;
             }
-
-            start = end + 1;
+            Ok(total_size)
+        })();
+        if result.is_err() {
+            for chunk in &pending[resolved..] {
+                self.update_chunk_pending_status(chunk.as_ref(), false);
+            }
         }
-
-        Ok(total_size)
+        result
     }
 
     fn read(&self, iovec: &mut BlobIoVec, buffers: &[FileVolatileSlice]) -> StorageResult<usize> {
@@ -1750,13 +1769,13 @@ impl FileCacheEntry {
                 )));
             }
 
-            // if we are in on-demand path, retry for the timeout chunks
+            // On demand, fetch the chunks whose fill by another thread failed.
             for chunk in chunks {
                 match self.chunk_map.check_ready_and_mark_pending(chunk.as_ref()) {
                     Err(e) => return Err(e),
                     Ok(true) => {}
                     Ok(false) => {
-                        info!("retry for timeout chunk, {}", chunk.id());
+                        info!("retry for failed chunk, {}", chunk.id());
                         let mut buf = alloc_buf(chunk.uncompressed_size() as usize);
                         self.read_chunk_from_backend(chunk.as_ref(), &mut buf)
                             .inspect_err(|_| {

@@ -10,7 +10,7 @@ use std::hash::Hash;
 use std::sync::Arc;
 #[cfg(not(all(test, nydus_loom)))]
 use std::sync::{Condvar, Mutex, WaitTimeoutResult};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[cfg(all(test, nydus_loom))]
 use loom::sync::{Condvar, Mutex, WaitTimeoutResult};
@@ -49,16 +49,18 @@ impl Slot {
         self.notify();
     }
 
-    fn wait_for_inflight(&self, timeout: Duration) -> StorageResult<Status> {
+    /// Wait until the fill completes or gives up, failing with `Timeout` at `deadline`.
+    fn wait_for_inflight(&self, deadline: Instant) -> StorageResult<Status> {
         let mut state = self.state.lock().unwrap();
         let mut tor: WaitTimeoutResult;
 
         while *state == Status::Inflight {
+            let timeout = deadline.saturating_duration_since(Instant::now());
             // Do not expect poisoned lock, so unwrap here.
             let r = self.condvar.wait_timeout(state, timeout).unwrap();
             state = r.0;
             tor = r.1;
-            if tor.timed_out() {
+            if tor.timed_out() && *state == Status::Inflight {
                 return Err(StorageError::Timeout);
             }
         }
@@ -77,6 +79,15 @@ impl Slot {
 pub struct BlobStateMap<C, I> {
     c: C,
     inflight_tracer: Mutex<HashMap<I, Arc<Slot>>>,
+    /// How long a reader waits for another thread's fill, [SINGLE_INFLIGHT_WAIT_TIMEOUT].
+    wait_limit: Duration,
+}
+
+impl<C, I> BlobStateMap<C, I> {
+    /// The deadline of a wait for in-flight fills starting now.
+    fn wait_deadline(&self) -> Instant {
+        Instant::now() + self.wait_limit
+    }
 }
 
 impl<C, I> From<C> for BlobStateMap<C, I>
@@ -88,6 +99,7 @@ where
         Self {
             c,
             inflight_tracer: Mutex::new(HashMap::new()),
+            wait_limit: Duration::from_millis(SINGLE_INFLIGHT_WAIT_TIMEOUT),
         }
     }
 }
@@ -118,7 +130,7 @@ where
 
         if let Some(i) = guard.get(&index).cloned() {
             drop(guard);
-            let result = i.wait_for_inflight(Duration::from_millis(SINGLE_INFLIGHT_WAIT_TIMEOUT));
+            let result = i.wait_for_inflight(self.wait_deadline());
             if let Err(StorageError::Timeout) = result {
                 warn!(
                     "Waiting for backend IO expires. chunk index {}, compressed offset {}",
@@ -289,18 +301,18 @@ impl RangeMap for BlobStateMap<IndexedChunkMap, u32> {
             return Ok(true);
         }
 
+        // One deadline for the whole range, so waiting on its fills one by one stays bounded.
+        let deadline = self.wait_deadline();
         let mut guard = self.inflight_tracer.lock().unwrap();
         for index in start..end {
             if let Some(i) = guard.get(&index).cloned() {
                 drop(guard);
-                let result =
-                    i.wait_for_inflight(Duration::from_millis(SINGLE_INFLIGHT_WAIT_TIMEOUT));
-                if let Err(StorageError::Timeout) = result {
+                if let Err(e) = i.wait_for_inflight(deadline) {
                     warn!(
                         "Waiting for range backend IO expires. chunk index {}. range[{}, {}]",
                         index, start, count
                     );
-                    break;
+                    return Err(e);
                 };
                 if !self.c.is_range_ready(index, 1)? {
                     return Ok(false);
@@ -390,19 +402,19 @@ impl RangeMap for BlobStateMap<BlobRangeMap, u64> {
         }
 
         let (start_index, end_index) = self.c.get_range(start, count)?;
+        // One deadline for the whole range, so waiting on its fills one by one stays bounded.
+        let deadline = self.wait_deadline();
         let mut guard = self.inflight_tracer.lock().unwrap();
         for index in start_index..end_index {
             let idx = (index as u64) << self.c.shift;
             if let Some(i) = guard.get(&idx).cloned() {
                 drop(guard);
-                let result =
-                    i.wait_for_inflight(Duration::from_millis(SINGLE_INFLIGHT_WAIT_TIMEOUT));
-                if let Err(StorageError::Timeout) = result {
+                if let Err(e) = i.wait_for_inflight(deadline) {
                     warn!(
                         "Waiting for range backend IO expires. chunk index {}. range[{}, {}]",
                         index, start, count
                     );
-                    break;
+                    return Err(e);
                 };
                 if !self.c.is_range_ready(idx, 1)? {
                     return Ok(false);
@@ -421,6 +433,7 @@ impl BlobStateMap<BlobRangeMap, u64> {
         Self {
             c: map,
             inflight_tracer: Mutex::new(HashMap::new()),
+            wait_limit: Duration::from_millis(SINGLE_INFLIGHT_WAIT_TIMEOUT),
         }
     }
 }
@@ -639,6 +652,13 @@ pub(crate) mod tests {
         );
     }
 
+    /// `map` with waits for in-flight fills cut short, for tests that wait out a fill nobody
+    /// completes.
+    fn short_wait<C, I>(mut map: BlobStateMap<C, I>) -> BlobStateMap<C, I> {
+        map.wait_limit = Duration::from_millis(200);
+        map
+    }
+
     #[test]
     #[cfg_attr(miri, ignore = "Miri does not support file-backed mmap")]
     fn test_inflight_tracer() {
@@ -656,9 +676,9 @@ pub(crate) mod tests {
         });
         // indexed ChunkMap
         let tmp_file = TempFile::new().unwrap();
-        let index_map = Arc::new(BlobStateMap::from(
+        let index_map = Arc::new(short_wait(BlobStateMap::from(
             IndexedChunkMap::new(tmp_file.as_path().to_str().unwrap(), 10, true).unwrap(),
-        ));
+        )));
         index_map
             .check_ready_and_mark_pending(chunk_1.as_ref())
             .unwrap();
@@ -706,7 +726,7 @@ pub(crate) mod tests {
         assert_eq!(index_map.inflight_tracer.lock().unwrap().len(), 0);
 
         // digested ChunkMap
-        let digest_map = Arc::new(BlobStateMap::from(DigestedChunkMap::new()));
+        let digest_map = Arc::new(short_wait(BlobStateMap::from(DigestedChunkMap::new())));
         digest_map
             .check_ready_and_mark_pending(chunk_1.as_ref())
             .unwrap();
@@ -811,9 +831,9 @@ pub(crate) mod tests {
     #[cfg_attr(miri, ignore = "Miri does not support file-backed mmap")]
     fn test_inflight_tracer_timeout() {
         let tmp_file = TempFile::new().unwrap();
-        let map = Arc::new(BlobStateMap::from(
+        let map = Arc::new(short_wait(BlobStateMap::from(
             IndexedChunkMap::new(tmp_file.as_path().to_str().unwrap(), 10, true).unwrap(),
-        ));
+        )));
 
         let chunk_4: Arc<dyn BlobChunkInfo> = Arc::new({
             let mut c = MockChunkInfo::new();
@@ -880,6 +900,70 @@ pub(crate) mod tests {
         assert!(map.is_range_ready(0, 1).unwrap());
         assert!(map.is_range_ready(9, 1).unwrap());
         assert!(map.is_range_all_ready());
+    }
+
+    /// Readers of a chunk another thread is filling wait for that fill however long it takes,
+    /// both the way a range fill waits and the way a single-chunk read does, and a fill that
+    /// fails releases them at once.
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support file-backed mmap")]
+    fn waiters_follow_a_slow_fill_and_leave_with_a_failed_one() {
+        let tmp_file = TempFile::new().unwrap();
+        let map = Arc::new(BlobStateMap::from(
+            IndexedChunkMap::new(tmp_file.as_path().to_str().unwrap(), 10, true).unwrap(),
+        ));
+        let chunk = |index| MockChunkInfo {
+            index,
+            ..Default::default()
+        };
+        // Longer than a reader's two consecutive 2 s waits on the in-flight fill.
+        let slow = Duration::from_millis(4500);
+
+        assert_eq!(
+            map.check_range_ready_and_mark_pending(0, 1).unwrap(),
+            Some(vec![0])
+        );
+        let range_waiter = {
+            let map = map.clone();
+            thread::spawn(move || {
+                assert_eq!(
+                    map.check_range_ready_and_mark_pending(0, 1).unwrap(),
+                    Some(vec![])
+                );
+                map.wait_for_range_ready(0, 1)
+            })
+        };
+        let chunk_waiter = {
+            let map = map.clone();
+            thread::spawn(move || map.check_ready_and_mark_pending(&chunk(0)))
+        };
+        thread::sleep(slow);
+        map.set_range_ready_and_clear_pending(0, 1).unwrap();
+        assert!(
+            range_waiter.join().unwrap().unwrap(),
+            "range waiter gave up"
+        );
+        assert!(
+            chunk_waiter.join().unwrap().unwrap(),
+            "chunk waiter gave up"
+        );
+
+        // A fill that fails: waiters return at once, not ready, and the next one fills.
+        assert_eq!(
+            map.check_range_ready_and_mark_pending(1, 1).unwrap(),
+            Some(vec![1])
+        );
+        let started = Instant::now();
+        let range_waiter = {
+            let map = map.clone();
+            thread::spawn(move || map.wait_for_range_ready(1, 1))
+        };
+        thread::sleep(Duration::from_millis(200));
+        map.clear_range_pending(1, 1);
+        assert!(!range_waiter.join().unwrap().unwrap());
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(!map.check_ready_and_mark_pending(&chunk(1)).unwrap());
+        map.clear_pending(&chunk(1));
     }
 }
 
