@@ -154,7 +154,8 @@ The sysctl `/metrics` endpoint reports:
 | `nydus_snapshotter_retention_fs_available_bytes` | gauge | space available on the filesystem holding `daemons/` |
 
 The gauges appear once a retention pass has run. `GET /api/v1/daemons` lists the stopped records
-of retained (and evicted) stages with `live: false`; `updated_at` is the stop time.
+of retained (and evicted) stages with `live: false`; `updated_at` is the stop time, and
+`start_gap` the image's learned start gap in seconds.
 
 ## CPU profiling: `perf` and `samply`
 

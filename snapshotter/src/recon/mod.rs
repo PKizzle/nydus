@@ -656,6 +656,7 @@ impl Reconciler {
                 slug: record.slug.clone(),
                 bytes,
                 stopped_at: record.updated_at,
+                gap: record.start_gap,
             });
         }
         self.retained_sizes

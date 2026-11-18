@@ -332,19 +332,26 @@ keeps them too.
 Every reconcile tick, the reconciler reads the records and the filesystem's free space (one
 `statvfs`) and evicts, one stage at a time:
 
-1. every retained stage idle longer than its limit (`"auto"`: 26 h);
+1. every retained stage idle longer than its limit;
 2. then, while there is a deficit, the stage idle longest relative to its limit, the larger first on
    a tie. The deficit is the largest of: retained bytes over `retention_max_bytes`;
    `retention_min_free` over the space available to unprivileged users (`f_bavail`); and, on the
    slow pass with `gc_max_bytes` set, all cache bytes over `gc_max_bytes`. That pass runs before the
    cache GC, so retained stages go before any `work_dir` file.
 
+With `retention_idle_limit = "auto"`, each image learns its start gap `G` from its own starts:
+every start after a stop sets `G = max(now - last stop, 0.75 * G)`, so `G` follows a longer gap at
+once and forgets it by a quarter per start. The limit is `2 * G`, at least 1 h and at most 30 days,
+and 26 h while `G` is unknown. `G` is kept in the daemon record (`start_gap`, seconds), which the
+records endpoint shows.
+
 A stage's files are measured (allocated blocks, each inode once) once after it became retained. An
 eviction takes the image's start lock and checks again that no daemon serves the image, that the
 record is unchanged and still stopped, and that nothing is mounted under the dir; a start that got
 there first keeps its stage. The record outlives its stage. Stopped records without a stage are
-deleted after 60 days idle, and beyond the newest 4096. A stop time in the future (the clock
-stepped back) counts as idle for zero seconds.
+deleted after 60 days idle, and beyond the newest 4096, so a gap longer than the stage lived can
+still be learned. A stop time in the future (the clock stepped back) counts as idle for zero
+seconds and teaches no gap.
 
 A retained cache is trusted no more than any cache a stopped daemon left behind (see [Fill
 validation](#fill-validation)): unless it still reads as verified, its ready chunks are checked

@@ -139,6 +139,11 @@ pub struct DaemonStatusRecord {
     /// credentials themselves), so a successor that finds none can say so.
     #[serde(default)]
     pub registry_auth: bool,
+    /// The image's learned start gap in seconds, the idle limit of its retained stage under
+    /// `retention_idle_limit = "auto"` (`crate::retention::learn_gap`). Absent until the image
+    /// started again after a stop.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_gap: Option<u64>,
 }
 
 /// Outcome for one daemon recovery attempt.
@@ -254,6 +259,8 @@ struct DaemonInstance {
     /// any (none in the auth store at its takeover or heal), so it fails every uncached read
     /// until `heal_daemons_missing_auth` rebuilds it once credentials arrive.
     missing_auth: bool,
+    /// See `DaemonStatusRecord::start_gap`.
+    start_gap: Option<u64>,
 }
 
 impl DaemonInstance {
@@ -948,6 +955,11 @@ impl DaemonSupervisor {
             }
         }
 
+        let previous = fs::read(self.record_path(&slug))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<DaemonStatusRecord>(&bytes).ok());
+        let start_gap = start_gap_after(previous.as_ref(), unix_now());
+
         let threads = self.config.snapshotter.daemon.threads.max(1) as u32;
         let bti = self.build_info.clone();
         let daemon_id = slug.clone();
@@ -1020,6 +1032,7 @@ impl DaemonSupervisor {
             driver_override,
             registry_auth,
             missing_auth: false,
+            start_gap,
             _poll: poll,
         }))
     }
@@ -2181,6 +2194,7 @@ impl DaemonSupervisor {
                 driver_override,
                 registry_auth: false,
                 missing_auth: false,
+                start_gap: None,
             }));
         }
 
@@ -2265,6 +2279,7 @@ impl DaemonSupervisor {
                 driver_override,
                 registry_auth: false,
                 missing_auth: false,
+                start_gap: None,
             }));
         }
 
@@ -2347,6 +2362,7 @@ impl DaemonSupervisor {
             driver_override,
             registry_auth: false,
             missing_auth: false,
+            start_gap: None,
             _poll: poll,
         }))
     }
@@ -2830,6 +2846,7 @@ impl DaemonSupervisor {
             driver_override: record.driver_override,
             registry_auth: record.registry_auth,
             missing_auth: false,
+            start_gap: record.start_gap,
         });
         self.note_parked_slug(slug);
         self.instances
@@ -2897,6 +2914,7 @@ impl DaemonSupervisor {
             driver_override: record.driver_override,
             registry_auth: record.registry_auth,
             missing_auth: record.registry_auth && !has_auth,
+            start_gap: record.start_gap,
         });
         self.note_parked_slug(slug);
         self.instances
@@ -3087,6 +3105,7 @@ impl DaemonSupervisor {
                 driver_override: old.driver_override,
                 registry_auth: old.registry_auth,
                 missing_auth: old.registry_auth && !has_auth,
+                start_gap: old.start_gap,
                 _poll: poll,
             }))
         }
@@ -3262,6 +3281,7 @@ impl DaemonSupervisor {
             built_on_node: false,
             driver_override: inst.driver_override,
             registry_auth: inst.registry_auth,
+            start_gap: inst.start_gap,
         }
     }
 
@@ -3311,6 +3331,18 @@ impl DaemonSupervisor {
             }
         }
         out
+    }
+}
+
+/// The start gap of a daemon of the image whose record is `previous`, starting at `now`: learned
+/// from the stop a stopped record marks; kept from a live one, since a heal or a replacement is no
+/// new start.
+fn start_gap_after(previous: Option<&DaemonStatusRecord>, now: i64) -> Option<u64> {
+    let previous = previous?;
+    if previous.live {
+        previous.start_gap
+    } else {
+        crate::retention::learn_gap(previous.start_gap, previous.updated_at, now)
     }
 }
 
@@ -4852,6 +4884,7 @@ fn test_instance_with_daemon(
         driver_override: None,
         registry_auth: false,
         missing_auth: false,
+        start_gap: None,
     }
 }
 
@@ -5483,7 +5516,34 @@ mod tests {
             built_on_node: false,
             driver_override: None,
             registry_auth: false,
+            start_gap: None,
         }
+    }
+
+    /// A start learns the gap since the stop its stopped record marks; a heal or replacement of a
+    /// live daemon keeps the gap.
+    #[test]
+    fn a_start_learns_the_gap_since_the_last_stop() {
+        let mut record = sample_record(PathBuf::from("/b"));
+        assert_eq!(start_gap_after(None, 1000), None);
+        record.start_gap = Some(600);
+        assert_eq!(start_gap_after(Some(&record), 1000), Some(600), "live");
+        record.live = false;
+        record.updated_at = 100;
+        assert_eq!(start_gap_after(Some(&record), 1000), Some(900));
+        assert_eq!(
+            start_gap_after(Some(&record), 50),
+            Some(600),
+            "clock stepped back"
+        );
+
+        let json = serde_json::to_string(&record).unwrap();
+        assert!(json.contains("\"start_gap\":600"), "{json}");
+        let decoded: DaemonStatusRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.start_gap, Some(600));
+        record.start_gap = None;
+        let json = serde_json::to_string(&record).unwrap();
+        assert!(!json.contains("start_gap"), "{json}");
     }
 
     /// The unused `built_on_node` field still round-trips, and records without it load.

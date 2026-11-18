@@ -20,9 +20,12 @@ use std::time::Duration;
 use crate::config::{CacheConfig, ConfigError};
 
 const HOUR: u64 = 3600;
-/// Idle limit of `retention_idle_limit = "auto"`: a daily job keeps its stage with two hours to
-/// spare.
+/// Idle limit of `retention_idle_limit = "auto"` while an image's start gap is unknown: a daily
+/// job keeps its stage with two hours to spare.
 pub const AUTO_IDLE_LIMIT: Duration = Duration::from_secs(26 * HOUR);
+/// Bounds of a learned idle limit.
+pub const AUTO_MIN_LIMIT: Duration = Duration::from_secs(HOUR);
+pub const AUTO_MAX_LIMIT: Duration = Duration::from_secs(30 * 24 * HOUR);
 
 /// A size limit: bytes, or a percentage of the filesystem holding `daemons/`.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -75,13 +78,30 @@ impl IdleLimit {
         }
     }
 
-    /// The idle limit of one stage, in seconds.
-    pub fn secs(self) -> u64 {
-        match self {
-            Self::Auto => AUTO_IDLE_LIMIT.as_secs(),
-            Self::Fixed(limit) => limit.as_secs(),
+    /// The idle limit, in seconds, of a stage whose image has the learned start gap `gap`
+    /// ([`learn_gap`]): `"auto"` allows twice the gap, within [`AUTO_MIN_LIMIT`] and
+    /// [`AUTO_MAX_LIMIT`], and [`AUTO_IDLE_LIMIT`] while it is unknown.
+    pub fn secs(self, gap: Option<u64>) -> u64 {
+        match (self, gap) {
+            (Self::Fixed(limit), _) => limit.as_secs(),
+            (Self::Auto, None) => AUTO_IDLE_LIMIT.as_secs(),
+            (Self::Auto, Some(gap)) => gap
+                .saturating_mul(2)
+                .clamp(AUTO_MIN_LIMIT.as_secs(), AUTO_MAX_LIMIT.as_secs()),
         }
     }
+}
+
+/// The start gap `G` of an image, learned at a start at `now` from its previous `G` and its last
+/// stop: `G = max(now - stopped_at, 0.75 * G)`. So `G` follows a longer gap at once and forgets
+/// one slowly, by a quarter per start. A stop in the future (the clock stepped back) teaches
+/// nothing.
+pub fn learn_gap(previous: Option<u64>, stopped_at: i64, now: i64) -> Option<u64> {
+    if now < stopped_at {
+        return previous;
+    }
+    let gap = now.abs_diff(stopped_at);
+    Some(previous.map_or(gap, |g| gap.max(g - g / 4)))
 }
 
 /// The retention settings of `[snapshotter.cache]`.
@@ -131,6 +151,8 @@ pub struct Stage {
     pub bytes: u64,
     /// When its daemon stopped (Unix seconds).
     pub stopped_at: i64,
+    /// Its image's learned start gap, in seconds ([`learn_gap`]).
+    pub gap: Option<u64>,
 }
 
 /// Size and free space of the filesystem holding `daemons/`.
@@ -174,7 +196,7 @@ impl Reason {
 /// The retained stages to evict, in order, each with its reason.
 ///
 /// Stages idle past their limit go first, then, while a deficit remains, the stage with the
-/// highest idle time relative to its limit, the larger one first on a tie. The deficit is the
+/// highest idle time relative to its limit ([`IdleLimit::secs`]), the larger one first on a tie. The deficit is the
 /// largest of: retained bytes over `max_bytes`, `min_free` over available space, and
 /// `cache_excess` (all cache bytes over `gc_max_bytes`, 0 without it); every eviction lowers each
 /// term by the stage's bytes. A stop time in the future (the clock stepped back) counts as idle
@@ -186,7 +208,7 @@ pub fn plan(
     cache_excess: u64,
     now: i64,
 ) -> Vec<(String, Reason)> {
-    let limit = policy.idle_limit.secs().max(1);
+    let limit = |stage: &Stage| policy.idle_limit.secs(stage.gap).max(1);
     let idle = |stage: &Stage| now.saturating_sub(stage.stopped_at).max(0) as u64;
     let retained: u64 = stages.iter().map(|s| s.bytes).sum();
     let mut deficits = [
@@ -201,15 +223,17 @@ pub fn plan(
         (Reason::GcMaxBytes, cache_excess),
     ];
     let mut order: Vec<&Stage> = stages.iter().collect();
+    // idle(a) / limit(a) > idle(b) / limit(b), without rounding.
+    let relative = |a: &Stage, b: &Stage| u128::from(idle(a)) * u128::from(limit(b));
     order.sort_by(|a, b| {
-        idle(b)
-            .cmp(&idle(a))
+        relative(b, a)
+            .cmp(&relative(a, b))
             .then(b.bytes.cmp(&a.bytes))
             .then(a.slug.cmp(&b.slug))
     });
     let mut evict = Vec::new();
     for stage in order {
-        let reason = if idle(stage) >= limit {
+        let reason = if idle(stage) >= limit(stage) {
             Reason::Idle
         } else {
             match deficits.iter().max_by_key(|(_, deficit)| *deficit) {
@@ -292,7 +316,13 @@ mod tests {
             slug: slug.to_string(),
             bytes: gib * GIB,
             stopped_at: NOW - idle_hours * 3600,
+            gap: None,
         }
+    }
+
+    fn learned(mut stage: Stage, gap_hours: u64) -> Stage {
+        stage.gap = Some(gap_hours * 3600);
+        stage
     }
 
     fn policy(max_bytes: &str, min_free: &str, idle_limit: &str) -> Policy {
@@ -322,7 +352,56 @@ mod tests {
             Ok(IdleLimit::Fixed(Duration::from_secs(7 * 86400)))
         );
         assert!(IdleLimit::parse("soon").is_err());
-        assert_eq!(IdleLimit::Auto.secs(), 26 * 3600);
+    }
+
+    #[test]
+    fn idle_limits_follow_the_learned_gap() {
+        let hour = 3600;
+        assert_eq!(IdleLimit::Auto.secs(None), 26 * hour);
+        assert_eq!(IdleLimit::Auto.secs(Some(12 * hour)), 24 * hour);
+        assert_eq!(IdleLimit::Auto.secs(Some(60)), hour, "at least an hour");
+        assert_eq!(
+            IdleLimit::Auto.secs(Some(60 * 24 * hour)),
+            30 * 24 * hour,
+            "at most 30 days"
+        );
+        assert_eq!(IdleLimit::Auto.secs(Some(u64::MAX)), 30 * 24 * hour);
+        let fixed = IdleLimit::Fixed(Duration::from_secs(5 * hour));
+        assert_eq!(fixed.secs(Some(100 * hour)), 5 * hour);
+    }
+
+    #[test]
+    fn the_start_gap_is_learned_from_each_start() {
+        assert_eq!(learn_gap(None, 100, 400), Some(300));
+        assert_eq!(
+            learn_gap(Some(100), 0, 1000),
+            Some(1000),
+            "a longer gap at once"
+        );
+        assert_eq!(
+            learn_gap(Some(1000), 100, 200),
+            Some(750),
+            "a quarter per start"
+        );
+        assert_eq!(learn_gap(Some(1000), 100, 1000), Some(900));
+        // The clock stepped back past the stop: nothing to learn.
+        assert_eq!(learn_gap(Some(500), 1000, 900), Some(500));
+        assert_eq!(learn_gap(None, 1000, 900), None);
+
+        // A twice-daily job, then one start right after a stop: its stage is kept for a day.
+        let half_day = 12 * 3600;
+        let mut gap = None;
+        for _ in 0..10 {
+            gap = learn_gap(gap, 0, half_day);
+        }
+        assert_eq!(gap, Some(half_day as u64));
+        gap = learn_gap(gap, 0, 60);
+        assert_eq!(IdleLimit::Auto.secs(gap), 18 * 3600);
+        // A weekly job outlives the 26 h fallback once its gap is known.
+        assert_eq!(
+            IdleLimit::Auto.secs(learn_gap(None, 0, 7 * 86400)),
+            14 * 86400
+        );
     }
 
     /// One row per scenario: stages as (slug, GiB, hours idle), the filesystem in GiB
@@ -410,6 +489,30 @@ mod tests {
                 (100, 15),
                 1,
                 vec![("old", Reason::Idle), ("b", Reason::MinFree)],
+            ),
+            (
+                "auto: twice the learned gap, 26 h while unknown",
+                policy("10%", "20%", "auto"),
+                vec![
+                    learned(stage("hourly", 1, 3), 1),
+                    learned(stage("daily", 1, 30), 24),
+                    stage("unknown", 1, 25),
+                    stage("unknown-old", 1, 27),
+                ],
+                roomy,
+                0,
+                vec![("hourly", Reason::Idle), ("unknown-old", Reason::Idle)],
+            ),
+            (
+                "under pressure: idle relative to the limit, not idle time",
+                policy("1GiB", "0%", "auto"),
+                vec![
+                    learned(stage("weekly", 1, 100), 7 * 24),
+                    learned(stage("hourly", 1, 1), 1),
+                ],
+                roomy,
+                0,
+                vec![("hourly", Reason::MaxBytes)],
             ),
             (
                 "clock stepped back: a stop in the future is not idle",

@@ -383,6 +383,14 @@ fn released_stage_starts_warm() {
     );
     let warm = start();
     assert_eq!(warm, cold, "the node view was built again");
+    let record = runtime
+        .block_on(supervisor.daemon_record(&image_ref))
+        .unwrap();
+    assert!(!record.live);
+    assert!(
+        record.start_gap.is_some(),
+        "the second start learned no start gap"
+    );
     assert_eq!(
         registry.served(),
         fetched,
