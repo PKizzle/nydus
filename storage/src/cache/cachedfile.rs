@@ -492,18 +492,21 @@ impl BootstrapDigests {
     }
 }
 
+/// A data file's change time and size as one value, for [RangeMap::is_verified].
+pub(crate) fn data_file_stamp(file: &File) -> StorageResult<u64> {
+    let md = file
+        .metadata()
+        .map_err(|e| StorageError::cache_io("stat the blob data file", e))?;
+    use std::os::unix::fs::MetadataExt;
+    let ctime = (md.ctime() as u64)
+        .wrapping_mul(1_000_000_000)
+        .wrapping_add(md.ctime_nsec() as u64);
+    Ok(ctime ^ md.len().rotate_left(32))
+}
+
 impl FileCacheEntry {
-    /// The data file's change time and size as one value, for [RangeMap::is_verified].
     fn data_stamp(&self) -> StorageResult<u64> {
-        let md = self
-            .file
-            .metadata()
-            .map_err(|e| StorageError::cache_io("stat the blob data file", e))?;
-        use std::os::unix::fs::MetadataExt;
-        let ctime = (md.ctime() as u64)
-            .wrapping_mul(1_000_000_000)
-            .wrapping_add(md.ctime_nsec() as u64);
-        Ok(ctime ^ md.len().rotate_left(32))
+        data_file_stamp(&self.file)
     }
 
     /// Whether `chunk` is one no bootstrap served from this cache references. No file maps such
