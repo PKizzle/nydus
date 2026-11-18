@@ -981,7 +981,7 @@ impl RegistryReader {
         if let Some(cached_redirect) = cached_redirect {
             // Hot path: the cached redirect is the final blob URL, so stream the
             // body straight into `buf` instead of buffering the whole blob first.
-            let (status, content_range, written) = self
+            let res = self
                 .request
                 .call_stream_status(
                     Method::GET,
@@ -992,18 +992,26 @@ impl RegistryReader {
                     false,
                     buf,
                 )
-                .map_err(request_err_to_registry)?;
+                .map_err(request_err_to_registry);
 
-            // The request has expired or has been denied, need to re-request
-            if allow_retry && [StatusCode::UNAUTHORIZED, StatusCode::FORBIDDEN].contains(&status) {
+            // A presigned link that expired or was revoked is answered with a 4xx (401/403,
+            // and 400/404/410 by some stores), and a link to a store that is gone does not
+            // connect. Resolve the redirect again through the registry, once.
+            let dead = match &res {
+                Ok((status, _, _)) => status.is_client_error().then(|| status.to_string()),
+                Err(e) => Some(e.to_string()),
+            };
+            if let Some(reason) = dead.filter(|_| allow_retry) {
                 warn!(
-                    "The redirected link has expired: {}, will retry read",
-                    redact_url(&cached_redirect)
+                    "The redirected link has expired: {}, {}, will retry read",
+                    redact_url(&cached_redirect),
+                    reason
                 );
                 self.state.cached_redirect.remove(&self.blob_id);
                 // Try read again only once
                 return self._try_read(buf, offset, false, context);
             }
+            let (status, content_range, written) = res?;
             check_range_status(status, content_range.as_ref(), offset, &range)
                 .map_err(RegistryBackendError::Request)?;
             return Ok(written);
@@ -3016,5 +3024,80 @@ mod tests {
             .expect("a read whose body stalls must fail, not hang")
             .expect_err("a stalled body is not a successful read");
         assert!(err.contains("no data"), "{err}");
+    }
+
+    /// A cached redirect is a presigned URL that can die in more ways than a 401/403: the
+    /// store may answer an expired or revoked link with 404/410 (or 400), or be gone
+    /// entirely. Each of these resolves the redirect again through the registry once,
+    /// instead of failing every read of the blob on the dead link.
+    #[cfg(feature = "backend-registry")]
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support io_uring")]
+    fn test_dead_cached_redirect_is_resolved_again() {
+        let body = "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-4/5\r\n\
+                    Content-Length: 5\r\nConnection: close\r\n\r\nabcde"
+            .to_string();
+        let redirect_to = |target: &str| {
+            format!(
+                "HTTP/1.1 307 Temporary Redirect\r\nLocation: {target}\r\n\
+                 Content-Length: 0\r\nConnection: close\r\n\r\n"
+            )
+        };
+        let read_twice = |host: String| {
+            let config = RegistryConfig {
+                scheme: "http".to_string(),
+                host,
+                repo: "library/test".to_string(),
+                retry_limit: 0,
+                timeout: 5,
+                connect_timeout: 5,
+                ..Default::default()
+            };
+            let registry = Registry::new(&config, Some("test-dead-redirect")).unwrap();
+            let reader = registry.get_reader("sha256:abc").unwrap();
+            let mut buf = [0u8; 5];
+            assert_eq!(reader.try_read(&mut buf, 0).unwrap(), 5);
+            (reader, buf)
+        };
+
+        // The store answers the cached link with 404 Not Found.
+        let gone = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        let (addr, seen, shutdown) = serve_sequence(vec![
+            redirect_to("http://{addr}/store/blob"),
+            body.clone(),
+            gone.to_string(),
+            redirect_to("http://{addr}/store/blob"),
+            body.clone(),
+        ]);
+        let (reader, mut buf) = read_twice(addr.to_string());
+        let read = reader.try_read(&mut buf, 0);
+        shutdown.store(true, Ordering::Relaxed);
+        assert_eq!(read.unwrap(), 5, "requests: {:?}", seen.lock().unwrap());
+        assert_eq!(&buf, b"abcde");
+
+        // The store is gone: the cached link no longer connects.
+        let (store_a, _, store_a_down) = serve_sequence(vec![body.clone()]);
+        let (store_b, _, store_b_down) = serve_sequence(vec![body.clone()]);
+        let (registry, seen, registry_down) = serve_sequence(vec![
+            redirect_to(&format!("http://{store_a}/blob")),
+            redirect_to(&format!("http://{store_b}/blob")),
+        ]);
+        let (reader, mut buf) = read_twice(registry.to_string());
+        store_a_down.store(true, Ordering::Relaxed);
+        // Wait until the listener is closed, so the cached link is refused.
+        let refused = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::net::TcpStream::connect(store_a).is_ok() {
+            assert!(std::time::Instant::now() < refused, "store A still accepts");
+            thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let read = reader.try_read(&mut buf, 0);
+        registry_down.store(true, Ordering::Relaxed);
+        store_b_down.store(true, Ordering::Relaxed);
+        assert_eq!(read.unwrap(), 5, "requests: {:?}", seen.lock().unwrap());
+        assert_eq!(
+            seen.lock().unwrap().len(),
+            2,
+            "the redirect is resolved again"
+        );
     }
 }
