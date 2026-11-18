@@ -65,7 +65,7 @@ impl S3 {
             object_prefix: s3_config.object_prefix.clone(),
             endpoint: final_endpoint,
             access_key_id: s3_config.access_key_id.clone(),
-            access_key_secret: s3_config.access_key_secret.clone(),
+            access_key_secret: s3_config.access_key_secret.expose().to_string(),
             bucket_name: s3_config.bucket_name.clone(),
             retry_limit,
         });

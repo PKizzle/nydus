@@ -26,7 +26,9 @@ use crate::backend::connection::{
 };
 use crate::backend::request;
 use crate::backend::request::is_success_status;
-use crate::backend::{BackendContext, BackendError, BackendResult, BlobBackend, BlobReader};
+use crate::backend::{
+    BackendContext, BackendError, BackendResult, BlobBackend, BlobReader, redact_url,
+};
 
 const REGISTRY_CLIENT_ID: &str = "nydus-registry-client";
 const HEADER_AUTHORIZATION: &str = "Authorization";
@@ -996,7 +998,7 @@ impl RegistryReader {
             if allow_retry && [StatusCode::UNAUTHORIZED, StatusCode::FORBIDDEN].contains(&status) {
                 warn!(
                     "The redirected link has expired: {}, will retry read",
-                    cached_redirect.as_str()
+                    redact_url(&cached_redirect)
                 );
                 self.state.cached_redirect.remove(&self.blob_id);
                 // Try read again only once
@@ -1086,7 +1088,7 @@ impl RegistryReader {
                                 self.state.blob_redirected_host.as_str(),
                                 e
                             );
-                            RegistryBackendError::Url(location.to_string(), e)
+                            RegistryBackendError::Url(redact_url(location.as_str()), e)
                         })?;
                     debug!("New redirected location {:?}", location.host_str());
                 }
@@ -1296,8 +1298,13 @@ impl Registry {
         let proxy_config = con_config.proxy.clone();
         let connection = Connection::new(&con_config).map_err(BackendError::Connection)?;
         let request = request::Request::new(connection, proxy_config, false, id);
-        let auth = trim(config.auth.clone());
-        let registry_token = trim(config.registry_token.clone());
+        let auth = trim(config.auth.as_ref().map(|s| s.expose().to_string()));
+        let registry_token = trim(
+            config
+                .registry_token
+                .as_ref()
+                .map(|s| s.expose().to_string()),
+        );
         Self::validate_authorization_info(&auth)?;
         let cached_auth = if let Some(registry_token) = registry_token {
             // Store the registry bearer token to cached_auth, prefer to
@@ -2815,5 +2822,143 @@ mod tests {
             }
             other => panic!("expected Unsupported, got: {:?}", other),
         }
+    }
+
+    /// Serve one canned response per request, in order (the last one repeats); `{addr}`
+    /// in a response becomes the server address. Returns the address, the request lines
+    /// seen and a stop flag.
+    #[cfg(feature = "backend-registry")]
+    fn serve_sequence(
+        responses: Vec<String>,
+    ) -> (
+        std::net::SocketAddr,
+        Arc<std::sync::Mutex<Vec<String>>>,
+        Arc<AtomicBool>,
+    ) {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (shutdown_srv, seen_srv) = (shutdown.clone(), seen.clone());
+        thread::spawn(move || {
+            listener.set_nonblocking(true).unwrap();
+            while !shutdown_srv.load(Ordering::Relaxed) {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    thread::sleep(std::time::Duration::from_millis(5));
+                    continue;
+                };
+                stream.set_nonblocking(false).unwrap();
+                let mut buf = [0u8; 4096];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                if n == 0 {
+                    continue;
+                }
+                let line = String::from_utf8_lossy(&buf[..n])
+                    .lines()
+                    .next()
+                    .unwrap_or_default()
+                    .to_string();
+                let mut seen = seen_srv.lock().unwrap();
+                let response = &responses[seen.len().min(responses.len() - 1)];
+                seen.push(line);
+                drop(seen);
+                let response = response.replace("{addr}", &addr.to_string());
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+        (addr, seen, shutdown)
+    }
+
+    /// Captures every log record of the process, so a test can search what was logged.
+    struct CaptureLogger(std::sync::Mutex<Vec<String>>);
+
+    impl log::Log for CaptureLogger {
+        fn enabled(&self, _: &log::Metadata) -> bool {
+            true
+        }
+        fn log(&self, record: &log::Record) {
+            self.0
+                .lock()
+                .unwrap()
+                .push(format!("{} {}", record.level(), record.args()));
+        }
+        fn flush(&self) {}
+    }
+
+    static CAPTURE: CaptureLogger = CaptureLogger(std::sync::Mutex::new(Vec::new()));
+
+    fn captured_logs() -> &'static CaptureLogger {
+        static INSTALL: std::sync::Once = std::sync::Once::new();
+        INSTALL.call_once(|| {
+            log::set_logger(&CAPTURE).expect("no other logger in the storage tests");
+            log::set_max_level(log::LevelFilter::Trace);
+        });
+        &CAPTURE
+    }
+
+    /// A presigned redirect carries the credential that grants the blob in its query.
+    /// Expiry of the cached link and failed reads both log the request URL; neither
+    /// may log the query.
+    #[cfg(feature = "backend-registry")]
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support io_uring")]
+    fn test_presigned_redirect_query_never_reaches_the_log() {
+        const SECRET: &str = "not-a-real-signature-0123";
+        let logs = captured_logs();
+        let redirect = format!(
+            "HTTP/1.1 307 Temporary Redirect\r\n\
+             Location: http://{{addr}}/store/blob?X-Amz-Signature={SECRET}\r\n\
+             Content-Length: 0\r\nConnection: close\r\n\r\n"
+        );
+        let body = "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-4/5\r\n\
+                    Content-Length: 5\r\nConnection: close\r\n\r\nabcde"
+            .to_string();
+        let expired = "HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            .to_string();
+        let failed =
+            "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                .to_string();
+        let (addr, seen, shutdown) =
+            serve_sequence(vec![redirect.clone(), body, expired, redirect, failed]);
+
+        let config = RegistryConfig {
+            scheme: "http".to_string(),
+            host: addr.to_string(),
+            repo: "library/test".to_string(),
+            timeout: 5,
+            connect_timeout: 5,
+            ..Default::default()
+        };
+        let registry = Registry::new(&config, Some("test-redacted-redirect")).unwrap();
+        let reader = registry.get_reader("sha256:abc").unwrap();
+        let mut buf = [0u8; 5];
+        // The first read caches the redirect; the second finds it expired (401), resolves
+        // it again and then fails at the store, which retry_op logs on every attempt.
+        assert_eq!(reader.read(&mut buf, 0).unwrap(), 5);
+        assert!(reader.read(&mut buf, 0).is_err());
+        shutdown.store(true, Ordering::Relaxed);
+
+        let requests = seen.lock().unwrap().clone();
+        assert!(
+            requests.iter().filter(|l| l.contains(SECRET)).count() >= 3,
+            "the presigned URL is still requested in full: {requests:?}"
+        );
+        let logs = logs.0.lock().unwrap();
+        assert!(
+            logs.iter()
+                .any(|l| l.contains("redirected link has expired") && l.contains("/store/blob")),
+            "the expiry is logged: {logs:?}"
+        );
+        assert!(
+            logs.iter()
+                .any(|l| l.starts_with("ERROR") && l.contains("/store/blob")),
+            "the failed read is logged with its URL: {logs:?}"
+        );
+        let leaked: Vec<_> = logs.iter().filter(|l| l.contains(SECRET)).collect();
+        assert!(leaked.is_empty(), "signature logged: {leaked:?}");
     }
 }

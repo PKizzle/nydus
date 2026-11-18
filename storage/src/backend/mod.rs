@@ -92,7 +92,8 @@ pub struct BackendContext {
     pub request_source: RequestSource,
     /// HTTP method of the request (e.g., "GET").
     pub method: String,
-    /// Request URL.
+    /// Request URL for logs, passed through [`redact_url`]: a presigned redirect
+    /// carries its credential in the query.
     pub url: String,
     /// Whether the current attempt is going through a proxy.
     pub using_proxy: bool,
@@ -104,6 +105,26 @@ pub struct BackendContext {
     pub using_proxy_sdk: bool,
     /// Error message from the last failed attempt.
     pub error: Option<String>,
+}
+
+/// `url` without userinfo, query or fragment, for logs and error messages.
+///
+/// Presigned blob URLs (S3, GCS, Azure, CloudFront) carry the signature or token that
+/// grants the blob in the query, and a `user:password@host` URL carries it in the
+/// authority; neither may reach a log.
+pub fn redact_url(url: &str) -> String {
+    let end = url.find(['?', '#']).unwrap_or(url.len());
+    let url = &url[..end];
+    let Some(scheme_end) = url.find("://").map(|i| i + 3) else {
+        return url.to_string();
+    };
+    let authority_end = url[scheme_end..]
+        .find('/')
+        .map_or(url.len(), |i| scheme_end + i);
+    match url[scheme_end..authority_end].rfind('@') {
+        Some(at) => format!("{}{}", &url[..scheme_end], &url[scheme_end + at + 1..]),
+        None => url.to_string(),
+    }
 }
 
 /// Global QPS limiter for source backend fallback, limited to 1 QPS.
@@ -640,6 +661,23 @@ impl Read for BlobBufReader {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn test_redact_url_strips_credentials() {
+        use super::redact_url;
+        assert_eq!(
+            redact_url("https://bucket.example.com/blobs/sha256:ab?X-Amz-Signature=sig#frag"),
+            "https://bucket.example.com/blobs/sha256:ab"
+        );
+        assert_eq!(
+            redact_url("https://user:pass@registry.example.com/v2/x?token=t"),
+            "https://registry.example.com/v2/x"
+        );
+        assert_eq!(redact_url("http://u@host"), "http://host");
+        // An `@` in the path is not userinfo.
+        assert_eq!(redact_url("http://host/a@b"), "http://host/a@b");
+        assert_eq!(redact_url("/v2/x?sig=1"), "/v2/x");
+    }
+
     use super::*;
     use std::io::Read;
 

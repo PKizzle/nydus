@@ -14,7 +14,7 @@ use anyhow::Context;
 use nydus_api::{
     BLOB_CACHE_TYPE_META_BLOB, BackendConfigV2, BlobCacheEntry, BlobCacheEntryConfigV2,
     CacheConfigV2, ConfigV2, FanotifyConfig, FileCacheConfig, HttpProxyConfig, LocalFsConfig,
-    OssConfig, PrefetchConfigV2, RafsConfigV2, RegistryConfig, S3Config,
+    OssConfig, PrefetchConfigV2, RafsConfigV2, RedactedString, RegistryConfig, S3Config,
     default_prefetch_batch_size, default_prefetch_threads_count,
 };
 use serde_json::json;
@@ -86,7 +86,7 @@ pub fn build_daemon_config(
             disable_indexed_map: cfg.snapshotter.cache.disable_indexed,
             enable_encryption: false,
             enable_convergent_encryption: false,
-            encryption_key: String::new(),
+            encryption_key: Default::default(),
         }),
         fanotify: None,
     };
@@ -184,7 +184,7 @@ fn build_registry_backend(
         scheme: scheme.to_string(),
         host: image_ref.api_host.clone(),
         repo: image_ref.repo.clone(),
-        auth,
+        auth: auth.map(RedactedString::new),
         skip_verify: registry_cfg.map(|c| c.skip_verify).unwrap_or(false),
         ca_cert_files: registry_cfg
             .map(|c| c.ca_cert_files.clone())
@@ -224,7 +224,7 @@ fn build_s3_backend(s3: &S3BackendConfig) -> anyhow::Result<BackendConfigV2> {
         bucket_name: s3.bucket.clone(),
         object_prefix: s3.object_prefix.clone().unwrap_or_default(),
         access_key_id,
-        access_key_secret,
+        access_key_secret: RedactedString::new(access_key_secret),
         skip_verify: s3.skip_verify,
         ca_cert_files: s3.ca_cert_files.clone(),
         timeout: DEFAULT_HTTP_TIMEOUT_SECS,
@@ -258,7 +258,7 @@ fn build_oss_backend(oss: &OssBackendConfig) -> anyhow::Result<BackendConfigV2> 
         bucket_name: oss.bucket.clone(),
         object_prefix: oss.object_prefix.clone().unwrap_or_default(),
         access_key_id,
-        access_key_secret,
+        access_key_secret: RedactedString::new(access_key_secret),
         skip_verify: oss.skip_verify,
         ca_cert_files: oss.ca_cert_files.clone(),
         timeout: DEFAULT_HTTP_TIMEOUT_SECS,
@@ -556,7 +556,10 @@ mod tests {
         let reg = backend.registry.as_ref().unwrap();
         assert_eq!(reg.host, "registry-1.docker.io");
         assert_eq!(reg.repo, "library/nginx");
-        assert_eq!(reg.auth.as_deref(), Some("dXNlcjpwYXNz"));
+        assert_eq!(
+            reg.auth.as_ref().map(RedactedString::expose),
+            Some("dXNlcjpwYXNz")
+        );
         let cache = cv2.cache.as_ref().unwrap();
         assert_eq!(cache.cache_type, "filecache");
         assert_eq!(
@@ -691,7 +694,10 @@ mod tests {
         assert!(reg.skip_verify);
         assert_eq!(reg.timeout, 45);
         assert_eq!(reg.connect_timeout, 45);
-        assert_eq!(reg.auth.as_deref(), Some("dXNlcjpwYXNz"));
+        assert_eq!(
+            reg.auth.as_ref().map(RedactedString::expose),
+            Some("dXNlcjpwYXNz")
+        );
     }
 
     #[test]
@@ -759,7 +765,7 @@ mod tests {
         assert_eq!(s3.bucket_name, "my-nydus-blobs");
         assert_eq!(s3.object_prefix, "nydus/");
         assert_eq!(s3.access_key_id, "AKIAEXAMPLE");
-        assert_eq!(s3.access_key_secret, "s3cr3t");
+        assert_eq!(s3.access_key_secret.expose(), "s3cr3t");
         assert_eq!(s3.retry_limit, BACKEND_RETRY_LIMIT);
         // The mapped backend must pass nydus-api's own validator.
         let bc = BackendConfigV2 {
@@ -852,7 +858,7 @@ mod tests {
         assert_eq!(oss.bucket_name, "nydus-bucket");
         assert_eq!(oss.object_prefix, "blobs/");
         assert_eq!(oss.access_key_id, "");
-        assert_eq!(oss.access_key_secret, "");
+        assert_eq!(oss.access_key_secret.expose(), "");
         let bc = BackendConfigV2 {
             backend_type: "oss".to_string(),
             oss: backend.oss.clone(),
@@ -1062,7 +1068,10 @@ mod tests {
         let fanotify = build_fanotify_config(backend.clone(), &dir, &dir, "d", None);
         assert_eq!(fanotify.backend.as_ref(), Some(&backend));
         let registry = fanotify.backend.unwrap().registry.unwrap();
-        assert_eq!(registry.auth.as_deref(), Some("dXNlcjpwYXNz"));
+        assert_eq!(
+            registry.auth.as_ref().map(RedactedString::expose),
+            Some("dXNlcjpwYXNz")
+        );
         let cache = fanotify.cache.unwrap();
         assert_eq!(cache.cache_type, "fanotify");
         assert!(cache.fanotify.is_some());

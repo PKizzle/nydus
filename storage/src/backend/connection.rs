@@ -23,6 +23,8 @@ use http::{
 use url::Url;
 
 use nydus_api::{HttpProxyConfig, OssConfig, ProxyConfig, RegistryConfig, S3Config};
+
+use super::redact_url;
 use url::ParseError;
 
 const HEADER_AUTHORIZATION: &str = "Authorization";
@@ -283,7 +285,7 @@ impl Proxy {
                     .store(SCHEME_REVERSION_CACHE_RETAIN, Ordering::Relaxed);
                 None
             } else {
-                warn!("Can't replace http scheme, url {}", url);
+                warn!("Can't replace http scheme, url {}", redact_url(url));
                 None
             }
         } else {
@@ -636,7 +638,9 @@ impl Connection {
 
                 debug!(
                     "connection: routing via PROXY (fallback={}), url={} -> {}",
-                    proxy.fallback, url, replaced_url,
+                    proxy.fallback,
+                    redact_url(url),
+                    redact_url(replaced_url),
                 );
 
                 let result = self.call_inner(
@@ -691,7 +695,7 @@ impl Connection {
 
         debug!(
             "connection: routing DIRECT (no proxy or fallback), url={}",
-            url
+            redact_url(url)
         );
         self.call_inner(
             false,
@@ -823,7 +827,8 @@ impl Connection {
                     Ok(r) => r.map_err(ConnectionError::Common)?,
                     Err(_) => {
                         return Err(ConnectionError::ErrorWithMsg(format!(
-                            "request to {url_owned} timed out"
+                            "request to {} timed out",
+                            redact_url(&url_owned)
                         )));
                     }
                 },
@@ -843,7 +848,7 @@ impl Connection {
             "{} Request: {} {} headers: {:?}, proxy: {}, data: {}, duration: {}ms",
             std::thread::current().name().unwrap_or_default(),
             method,
-            url,
+            redact_url(url),
             display_headers,
             proxy,
             has_data,
@@ -903,7 +908,8 @@ impl Connection {
                     Ok(r) => r.map_err(ConnectionError::Common)?,
                     Err(_) => {
                         return Err(ConnectionError::ErrorWithMsg(format!(
-                            "request to {url_owned} timed out"
+                            "request to {} timed out",
+                            redact_url(&url_owned)
                         )));
                     }
                 },

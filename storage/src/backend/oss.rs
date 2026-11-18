@@ -173,7 +173,7 @@ impl Oss {
             object_prefix: oss_config.object_prefix.clone(),
             endpoint: oss_config.endpoint.clone(),
             access_key_id: oss_config.access_key_id.clone(),
-            access_key_secret: oss_config.access_key_secret.clone(),
+            access_key_secret: oss_config.access_key_secret.expose().to_string(),
             bucket_name: oss_config.bucket_name.clone(),
             retry_limit,
         });

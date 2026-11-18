@@ -233,7 +233,7 @@ impl Request {
 
         // Populate context for diagnostic logging
         context.method = method.to_string();
-        context.url = url.to_string();
+        context.url = super::redact_url(url);
         context.using_proxy = false;
 
         // If proxy is disabled for this request or no proxy is configured, go direct.
@@ -434,7 +434,7 @@ impl Request {
         // HTTP path (direct or HTTP proxy): stream into `dst`.
         headers.extend(self.custom_headers.clone());
         context.method = method.to_string();
-        context.url = url.to_string();
+        context.url = super::redact_url(url);
         context.using_proxy = false;
         self.connection
             .call_stream(
@@ -499,7 +499,7 @@ impl Request {
         // HTTP path (direct or HTTP proxy): stream into `dst`.
         headers.extend(self.custom_headers.clone());
         context.method = method.to_string();
-        context.url = url.to_string();
+        context.url = super::redact_url(url);
         context.using_proxy = false;
         self.connection
             .call_stream_status(method, url, query, headers, temp_disable_proxy, dst)

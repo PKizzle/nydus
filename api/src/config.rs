@@ -15,6 +15,46 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use serde::Deserialize;
 use serde_json::Value;
 
+/// A secret configuration string, such as a credential or an encryption key.
+///
+/// `Debug` and `Display` print a placeholder, so structs holding one keep a derived `Debug`
+/// that is safe to log. The value is read only through [`RedactedString::expose`], which
+/// marks every place a secret leaves the wrapper. Serializes as the plain string.
+#[derive(Clone, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(transparent)]
+pub struct RedactedString(String);
+
+impl RedactedString {
+    const PLACEHOLDER: &'static str = "[REDACTED]";
+
+    /// Wrap a secret value.
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    /// The secret value.
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+
+    /// Whether the secret is empty, i.e. not configured.
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+impl std::fmt::Debug for RedactedString {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(Self::PLACEHOLDER)
+    }
+}
+
+impl std::fmt::Display for RedactedString {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(Self::PLACEHOLDER)
+    }
+}
+
 /// Maximum size accepted for a configuration file.
 pub const MAX_CONFIG_FILE_SIZE: u64 = 0x100000;
 
@@ -278,7 +318,7 @@ impl ConfigV2 {
         if let Some(backend_cfg) = cfg.backend.as_mut() {
             if let Some(oss_cfg) = backend_cfg.oss.as_mut() {
                 oss_cfg.access_key_id = String::new();
-                oss_cfg.access_key_secret = String::new();
+                oss_cfg.access_key_secret = RedactedString::default();
             }
             if let Some(registry_cfg) = backend_cfg.registry.as_mut() {
                 registry_cfg.auth = None;
@@ -286,13 +326,13 @@ impl ConfigV2 {
             }
             if let Some(s3_cfg) = backend_cfg.s3.as_mut() {
                 s3_cfg.access_key_id = String::new();
-                s3_cfg.access_key_secret = String::new();
+                s3_cfg.access_key_secret = RedactedString::default();
             }
         }
         if let Some(cache_cfg) = cfg.cache.as_mut()
             && let Some(file_cache_cfg) = cache_cfg.file_cache.as_mut()
         {
-            file_cache_cfg.encryption_key = String::new();
+            file_cache_cfg.encryption_key = RedactedString::default();
         }
         for external_backend in cfg.external_backends.iter_mut() {
             redact_sensitive_map(&mut external_backend.patch);
@@ -333,7 +373,7 @@ impl ConfigV2 {
             && let Some(backend) = self.backend.as_mut()
             && let Some(registry) = backend.registry.as_mut()
         {
-            registry.auth = Some(auth.to_string());
+            registry.auth = Some(RedactedString::new(auth.as_str()));
         }
     }
 }
@@ -590,7 +630,7 @@ pub struct OssConfig {
     pub access_key_id: String,
     /// Oss secret
     #[serde(default)]
-    pub access_key_secret: String,
+    pub access_key_secret: RedactedString,
     /// Skip SSL certificate validation for HTTPS scheme.
     #[serde(default)]
     pub skip_verify: bool,
@@ -634,7 +674,7 @@ pub struct S3Config {
     pub access_key_id: String,
     /// S3 secret
     #[serde(default)]
-    pub access_key_secret: String,
+    pub access_key_secret: RedactedString,
     /// Skip SSL certificate validation for HTTPS scheme.
     #[serde(default)]
     pub skip_verify: bool,
@@ -696,7 +736,7 @@ pub struct RegistryConfig {
     pub repo: String,
     /// Base64_encoded(username:password), the field should be sent to registry auth server to get a bearer token.
     #[serde(default)]
-    pub auth: Option<String>,
+    pub auth: Option<RedactedString>,
     /// Skip SSL certificate validation for HTTPS scheme.
     /// When true, also allows automatic HTTPS-to-HTTP fallback on TLS errors.
     #[serde(default)]
@@ -715,7 +755,7 @@ pub struct RegistryConfig {
     pub retry_limit: u8,
     /// The field is a bearer token to be sent to registry to authorize registry requests.
     #[serde(default)]
-    pub registry_token: Option<String>,
+    pub registry_token: Option<RedactedString>,
     /// The http scheme to access blobs. It is used to workaround some P2P subsystem
     /// that requires a different scheme than the registry.
     #[serde(default)]
@@ -852,7 +892,7 @@ pub struct FileCacheConfig {
     pub enable_convergent_encryption: bool,
     /// Key for data encryption, a heximal representation of [u8; 32].
     #[serde(default)]
-    pub encryption_key: String,
+    pub encryption_key: RedactedString,
 }
 
 impl FileCacheConfig {
@@ -1770,6 +1810,32 @@ mod tests {
     use vmm_sys_util::tempfile::TempFile;
 
     #[test]
+    fn test_redacted_string_keeps_secrets_out_of_debug_output() {
+        let json = r#"{"host":"registry.example.com","repo":"library/x",
+            "auth":"not-a-real-auth","registry_token":"not-a-real-token"}"#;
+        let registry: RegistryConfig = serde_json::from_str(json).unwrap();
+        let printed = format!("{registry:?} {}", registry.auth.as_ref().unwrap());
+        assert!(!printed.contains("not-a-real"), "{printed}");
+        assert!(printed.contains("[REDACTED]"), "{printed}");
+        assert_eq!(registry.auth.as_ref().unwrap().expose(), "not-a-real-auth");
+
+        // The serialized form is the plain string, as before.
+        let value = serde_json::to_value(&registry).unwrap();
+        assert_eq!(value["auth"], "not-a-real-auth");
+        assert_eq!(value["registry_token"], "not-a-real-token");
+
+        let oss: OssConfig = serde_json::from_str(
+            r#"{"endpoint":"e","bucket_name":"b","access_key_secret":"not-a-real-secret"}"#,
+        )
+        .unwrap();
+        assert!(!format!("{oss:?}").contains("not-a-real"));
+        assert_eq!(
+            serde_json::to_value(&oss).unwrap()["access_key_secret"],
+            "not-a-real-secret"
+        );
+    }
+
+    #[test]
     fn test_metadata_source_config() {
         let config: ConfigV2 = toml::from_str("version = 2").unwrap();
         assert_eq!(config.metadata_source, MetadataSource::Mmap);
@@ -2085,7 +2151,8 @@ external_backends:
                 .as_ref()
                 .unwrap()
                 .auth
-                .as_deref(),
+                .as_ref()
+                .map(RedactedString::expose),
             Some("dXNlcjpwYXNz")
         );
 
@@ -2221,7 +2288,7 @@ external_backends:
         assert_eq!(&oss.bucket_name, "my_bucket_name");
         assert_eq!(&oss.object_prefix, "my_object_prefix");
         assert_eq!(&oss.access_key_id, "my_access_key_id");
-        assert_eq!(&oss.access_key_secret, "my_access_key_secret");
+        assert_eq!(oss.access_key_secret.expose(), "my_access_key_secret");
         assert_eq!(&oss.scheme, "http");
         assert!(oss.skip_verify);
         assert_eq!(oss.timeout, 10);
@@ -2271,12 +2338,15 @@ external_backends:
         assert_eq!(&registry.scheme, "http");
         assert_eq!(&registry.host, "localhost");
         assert_eq!(&registry.repo, "nydus");
-        assert_eq!(registry.auth.as_ref().unwrap(), "auth");
+        assert_eq!(registry.auth.as_ref().unwrap().expose(), "auth");
         assert!(registry.skip_verify);
         assert_eq!(registry.timeout, 10);
         assert_eq!(registry.connect_timeout, 10);
         assert_eq!(registry.retry_limit, 5);
-        assert_eq!(registry.registry_token.as_ref().unwrap(), "bear_token");
+        assert_eq!(
+            registry.registry_token.as_ref().unwrap().expose(),
+            "bear_token"
+        );
         assert_eq!(registry.blob_url_scheme, "https");
         assert_eq!(registry.blob_redirected_host, "redirect.registry.com");
 
@@ -2531,7 +2601,7 @@ external_backends:
         let backend = rafs_config.backend.unwrap();
         let registry = backend.registry.unwrap();
         let auth = registry.auth.unwrap();
-        assert_eq!(auth, test_auth);
+        assert_eq!(auth.expose(), test_auth);
     }
 
     #[test]
