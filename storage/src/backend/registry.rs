@@ -3168,8 +3168,8 @@ mod tests {
         );
     }
 
-    /// An error response whose body stops arriving must fail the read like a stalled blob
-    /// body does, not hang it.
+    /// An error response whose body stops arriving must not hang the read, and must still
+    /// fail it with its HTTP status: retry and dead-redirect decisions rest on the status.
     #[cfg(feature = "backend-registry")]
     #[test]
     #[cfg_attr(miri, ignore = "Miri does not support io_uring")]
@@ -3187,9 +3187,8 @@ mod tests {
             };
             let mut buf = [0u8; 4096];
             let _ = stream.read(&mut buf);
-            let _ = stream.write_all(
-                b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 100\r\n\r\npartial",
-            );
+            let _ =
+                stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 100\r\n\r\npartial");
             let _ = stream.flush();
             // Hold the connection open without sending the rest.
             while !shutdown_srv.load(Ordering::Relaxed) {
@@ -3222,7 +3221,8 @@ mod tests {
         registry_down.store(true, Ordering::Relaxed);
         let err = read
             .expect("a read whose error body stalls must fail, not hang")
-            .expect_err("a 500 is not a successful read");
-        assert!(err.contains("no data"), "{err}");
+            .expect_err("a 404 is not a successful read");
+        // The status survives the stalled body, so callers can still act on it.
+        assert!(err.contains("404"), "{err}");
     }
 }

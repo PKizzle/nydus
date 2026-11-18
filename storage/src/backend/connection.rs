@@ -977,14 +977,23 @@ impl Connection {
             } else {
                 // Keep the start of the error body for the caller's message. It gets the
                 // same stall bound as a blob body, and a size cap: nothing needs the rest.
+                // A body that stalls or breaks still returns the status, which is what the
+                // caller's retry and redirect decisions rest on.
                 const ERROR_BODY_LIMIT: usize = 4096;
                 let mut body = Vec::new();
                 let mut stream = resp.bytes_stream();
-                while body.len() < ERROR_BODY_LIMIT
-                    && let Some(chunk) = self.next_chunk(&mut stream, is_proxy, &url_owned).await?
-                {
-                    let n = chunk.len().min(ERROR_BODY_LIMIT - body.len());
-                    body.extend_from_slice(&chunk[..n]);
+                while body.len() < ERROR_BODY_LIMIT {
+                    match self.next_chunk(&mut stream, is_proxy, &url_owned).await {
+                        Ok(Some(chunk)) => {
+                            let n = chunk.len().min(ERROR_BODY_LIMIT - body.len());
+                            body.extend_from_slice(&chunk[..n]);
+                        }
+                        Ok(None) => break,
+                        Err(e) => {
+                            body.extend_from_slice(format!(" [body incomplete: {e}]").as_bytes());
+                            break;
+                        }
+                    }
                 }
                 Ok((
                     status,
