@@ -114,7 +114,11 @@ impl FileCacheMeta {
                 meta: Arc::new(Mutex::new(None)),
                 loader: Some(loader.clone()),
             };
-            let meta1 = meta.clone();
+            // Weak: once the blob cache that wants the metadata is gone (its filesystem
+            // unmounted), the load stops instead of retrying for nobody, taking the meta
+            // file's exclusive lock on every attempt and stalling the next load of the blob.
+            let slot = Arc::downgrade(&meta.meta);
+            let has_error = Arc::downgrade(&meta.has_error);
 
             // Download blob meta off the calling thread on the global blocking
             // pool (runtime-agnostic; replaces tokio's spawn_blocking). `detach`
@@ -126,9 +130,14 @@ impl FileCacheMeta {
                     Duration::from_millis(DOWNLOAD_META_RETRY_DELAY),
                 );
                 while retry < DOWNLOAD_META_RETRY_COUNT {
+                    if slot.strong_count() == 0 {
+                        return;
+                    }
                     match loader.load() {
                         Ok(m) => {
-                            *meta1.meta.lock().unwrap() = Some(Arc::new(m));
+                            if let Some(slot) = slot.upgrade() {
+                                *slot.lock().unwrap() = Some(Arc::new(m));
+                            }
                             return;
                         }
                         Err(e) => {
@@ -139,7 +148,9 @@ impl FileCacheMeta {
                     }
                 }
                 warn!("failed to get blob.meta");
-                meta1.has_error.store(true, Ordering::Release);
+                if let Some(has_error) = has_error.upgrade() {
+                    has_error.store(true, Ordering::Release);
+                }
             })
             .detach();
 
@@ -3227,6 +3238,79 @@ mod tests {
             metrics.entries_count.count(),
             5,
             "entries_count should be incremented to 5 after multiple successful updates"
+        );
+    }
+
+    #[test]
+    fn test_background_meta_load_stops_once_its_cache_is_gone() {
+        use crate::backend::{BackendError, BackendResult};
+        use nydus_utils::metrics::BackendMetrics;
+        use std::sync::atomic::AtomicUsize;
+        use tempfile::TempDir;
+
+        /// A backend that is down: every metadata read fails, and is counted.
+        struct FailingReader {
+            metrics: Arc<BackendMetrics>,
+            reads: Arc<AtomicUsize>,
+        }
+        impl BlobReader for FailingReader {
+            fn blob_size(&self) -> BackendResult<u64> {
+                Ok(0)
+            }
+            fn try_read(&self, _buf: &mut [u8], _offset: u64) -> BackendResult<usize> {
+                unreachable!("read_all is overridden")
+            }
+            fn read_all(&self, _buf: &mut [u8], _offset: u64) -> BackendResult<usize> {
+                self.reads.fetch_add(1, Ordering::SeqCst);
+                Err(BackendError::Unsupported("backend is down".to_string()))
+            }
+            fn metrics(&self) -> &BackendMetrics {
+                &self.metrics
+            }
+        }
+
+        let dir = TempDir::new().unwrap();
+        let mut blob_info = BlobInfo::new(
+            0,
+            "blob".to_string(),
+            0x16c6000,
+            9839040,
+            RAFS_DEFAULT_CHUNK_SIZE as u32,
+            0xa3,
+            BlobFeatures::ALIGNED | BlobFeatures::INLINED_FS_META | BlobFeatures::CHUNK_INFO_V2,
+        );
+        blob_info.set_blob_meta_info(0, 0xa1290, 0xa1290, compress::Algorithm::None as u32);
+        let reads = Arc::new(AtomicUsize::new(0));
+        let reader: Arc<dyn BlobReader> = Arc::new(FailingReader {
+            metrics: BackendMetrics::new("test-meta-load-stops", "test"),
+            reads: reads.clone(),
+        });
+        let meta = FileCacheMeta::new(
+            dir.path().join("blob").display().to_string(),
+            Arc::new(blob_info),
+            Some(reader),
+            false,
+            false,
+            crate::meta::tests::test_source(),
+        )
+        .unwrap();
+
+        // One load attempt reads the metadata four times (read_metadata retries three
+        // times), then the loader backs off before its next attempt. Drop the cache in
+        // that pause, as an unmount does.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while reads.load(Ordering::SeqCst) < 4 {
+            assert!(Instant::now() < deadline, "the first load never ran");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        drop(meta);
+
+        // A loader still running would have made its next attempts by now.
+        std::thread::sleep(Duration::from_millis(2500));
+        assert_eq!(
+            reads.load(Ordering::SeqCst),
+            4,
+            "the load kept retrying for a cache that was gone"
         );
     }
 
