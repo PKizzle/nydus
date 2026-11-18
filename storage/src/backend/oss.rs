@@ -13,7 +13,7 @@ use http::Method;
 use http::header::HeaderMap;
 use sha1::Sha1;
 
-use nydus_api::OssConfig;
+use nydus_api::{OssConfig, RedactedString};
 use nydus_utils::metrics::BackendMetrics;
 
 use crate::backend::connection::{Connection, ConnectionConfig};
@@ -32,7 +32,7 @@ type HmacSha1 = Hmac<Sha1>;
 #[derive(Debug)]
 pub struct OssState {
     access_key_id: String,
-    access_key_secret: String,
+    access_key_secret: RedactedString,
     scheme: String,
     object_prefix: String,
     endpoint: String,
@@ -56,7 +56,7 @@ impl OssState {
             .as_secs()
             + 3600;
         let string_to_sign = format!("{}\n\n\n{}\n{}", method.as_str(), expiry, resource);
-        let hmac = HmacSha1::new_from_slice(self.access_key_secret.as_bytes())
+        let hmac = HmacSha1::new_from_slice(self.access_key_secret.expose().as_bytes())
             .map_err(|e| ObjectStorageError::Auth(format!("invalid OSS access key secret, {e}")))?
             .chain_update(string_to_sign.as_bytes())
             .finalize()
@@ -127,7 +127,7 @@ impl ObjectStorageState for OssState {
             data.insert(4, canonicalized_oss_headers.as_str());
         }
         let data = data.join("\n");
-        let hmac = HmacSha1::new_from_slice(self.access_key_secret.as_bytes())
+        let hmac = HmacSha1::new_from_slice(self.access_key_secret.expose().as_bytes())
             .map_err(|e| ObjectStorageError::Auth(format!("invalid OSS access key secret, {e}")))?
             .chain_update(data.as_bytes())
             .finalize()
@@ -173,7 +173,7 @@ impl Oss {
             object_prefix: oss_config.object_prefix.clone(),
             endpoint: oss_config.endpoint.clone(),
             access_key_id: oss_config.access_key_id.clone(),
-            access_key_secret: oss_config.access_key_secret.expose().to_string(),
+            access_key_secret: oss_config.access_key_secret.clone(),
             bucket_name: oss_config.bucket_name.clone(),
             retry_limit,
         });
@@ -198,7 +198,7 @@ mod tests {
     fn test_oss_state() {
         let state = OssState {
             access_key_id: "key".to_string(),
-            access_key_secret: "secret".to_string(),
+            access_key_secret: RedactedString::new("secret"),
             scheme: "https".to_string(),
             object_prefix: "nydus".to_string(),
             endpoint: "oss".to_string(),
@@ -251,7 +251,7 @@ mod tests {
     fn test_oss_url_empty_query() {
         let state = OssState {
             access_key_id: "key".to_string(),
-            access_key_secret: "secret".to_string(),
+            access_key_secret: RedactedString::new("secret"),
             scheme: "https".to_string(),
             object_prefix: "prefix/".to_string(),
             endpoint: "oss-cn-hangzhou.aliyuncs.com".to_string(),
@@ -272,7 +272,7 @@ mod tests {
     fn test_oss_sign_with_oss_headers() {
         let state = OssState {
             access_key_id: "ak".to_string(),
-            access_key_secret: "sk".to_string(),
+            access_key_secret: RedactedString::new("sk"),
             scheme: "https".to_string(),
             object_prefix: "".to_string(),
             endpoint: "oss.example.com".to_string(),
@@ -298,7 +298,7 @@ mod tests {
     fn test_sign_by_url() {
         let state = OssState {
             access_key_id: "test-key-id".to_string(),
-            access_key_secret: "test-key-secret".to_string(),
+            access_key_secret: RedactedString::new("test-key-secret"),
             scheme: "https".to_string(),
             object_prefix: "".to_string(),
             endpoint: "oss.example.com".to_string(),
@@ -317,7 +317,7 @@ mod tests {
     fn test_oss_url_preserves_path_separators() {
         let state = OssState {
             access_key_id: "key".to_string(),
-            access_key_secret: "secret".to_string(),
+            access_key_secret: RedactedString::new("secret"),
             scheme: "https".to_string(),
             object_prefix: "prefix/".to_string(),
             endpoint: "oss.example.com".to_string(),

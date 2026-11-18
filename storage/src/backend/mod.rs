@@ -107,25 +107,7 @@ pub struct BackendContext {
     pub error: Option<String>,
 }
 
-/// `url` without userinfo, query or fragment, for logs and error messages.
-///
-/// Presigned blob URLs (S3, GCS, Azure, CloudFront) carry the signature or token that
-/// grants the blob in the query, and a `user:password@host` URL carries it in the
-/// authority; neither may reach a log.
-pub fn redact_url(url: &str) -> String {
-    let end = url.find(['?', '#']).unwrap_or(url.len());
-    let url = &url[..end];
-    let Some(scheme_end) = url.find("://").map(|i| i + 3) else {
-        return url.to_string();
-    };
-    let authority_end = url[scheme_end..]
-        .find('/')
-        .map_or(url.len(), |i| scheme_end + i);
-    match url[scheme_end..authority_end].rfind('@') {
-        Some(at) => format!("{}{}", &url[..scheme_end], &url[scheme_end + at + 1..]),
-        None => url.to_string(),
-    }
-}
+pub use nydus_api::redact_url;
 
 /// Global QPS limiter for source backend fallback, limited to 1 QPS.
 pub static BACKEND_QPS_LIMITER: std::sync::LazyLock<self::qps::QpsLimiter> =
@@ -692,7 +674,7 @@ impl Read for BlobBufReader {
 mod tests {
     #[test]
     fn test_redact_url_strips_credentials() {
-        use super::redact_url;
+        use nydus_api::redact_url;
         assert_eq!(
             redact_url("https://bucket.example.com/blobs/sha256:ab?X-Amz-Signature=sig#frag"),
             "https://bucket.example.com/blobs/sha256:ab"

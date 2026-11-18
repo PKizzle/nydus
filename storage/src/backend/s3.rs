@@ -13,7 +13,7 @@ use hmac::{Hmac, KeyInit, Mac};
 use http::Method;
 use http::Uri;
 use http::header::HeaderMap;
-use nydus_api::S3Config;
+use nydus_api::{RedactedString, S3Config};
 use nydus_utils::metrics::BackendMetrics;
 use sha2::{Digest, Sha256};
 use time::{OffsetDateTime, format_description};
@@ -35,7 +35,7 @@ const S3_DEFAULT_ENDPOINT: &str = "s3.amazonaws.com";
 pub struct S3State {
     region: String,
     access_key_id: String,
-    access_key_secret: String,
+    access_key_secret: RedactedString,
     scheme: String,
     object_prefix: String,
     endpoint: String,
@@ -65,7 +65,7 @@ impl S3 {
             object_prefix: s3_config.object_prefix.clone(),
             endpoint: final_endpoint,
             access_key_id: s3_config.access_key_id.clone(),
-            access_key_secret: s3_config.access_key_secret.expose().to_string(),
+            access_key_secret: s3_config.access_key_secret.clone(),
             bucket_name: s3_config.bucket_name.clone(),
             retry_limit,
         });
@@ -139,7 +139,7 @@ impl S3State {
     // under apache 2.0 license
     pub fn get_signing_key(&self, date: &OffsetDateTime) -> Vec<u8> {
         let mut key: Vec<u8> = b"AWS4".to_vec();
-        key.extend(self.access_key_secret.as_bytes());
+        key.extend(self.access_key_secret.expose().as_bytes());
 
         let date_key = hmac_hash(key.as_slice(), to_signer_date(date).as_bytes());
         let date_region_key = hmac_hash(date_key.as_slice(), self.region.as_bytes());
@@ -291,7 +291,7 @@ fn to_awz_date(date: &OffsetDateTime) -> String {
 #[cfg(test)]
 mod tests {
     use http::{HeaderMap, Method};
-    use nydus_api::S3Config;
+    use nydus_api::{RedactedString, S3Config};
 
     use crate::backend::BlobBackend;
     use crate::backend::object_storage::ObjectStorageState;
@@ -303,7 +303,7 @@ mod tests {
         let state = S3State {
             region: "us-east-1".to_string(),
             access_key_id: "test-key".to_string(),
-            access_key_secret: "test-key-secret".to_string(),
+            access_key_secret: RedactedString::new("test-key-secret"),
             scheme: "http".to_string(),
             object_prefix: "test-prefix-".to_string(),
             endpoint: "localhost:9000".to_string(),

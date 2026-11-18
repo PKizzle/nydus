@@ -55,6 +55,26 @@ impl std::fmt::Display for RedactedString {
     }
 }
 
+/// `url` without userinfo, query or fragment, for logs and error messages.
+///
+/// Presigned blob URLs (S3, GCS, Azure, CloudFront) carry the signature or token that
+/// grants the blob in the query, and a `user:password@host` URL carries it in the
+/// authority; neither may reach a log.
+pub fn redact_url(url: &str) -> String {
+    let end = url.find(['?', '#']).unwrap_or(url.len());
+    let url = &url[..end];
+    let Some(scheme_end) = url.find("://").map(|i| i + 3) else {
+        return url.to_string();
+    };
+    let authority_end = url[scheme_end..]
+        .find('/')
+        .map_or(url.len(), |i| scheme_end + i);
+    match url[scheme_end..authority_end].rfind('@') {
+        Some(at) => format!("{}{}", &url[..scheme_end], &url[scheme_end + at + 1..]),
+        None => url.to_string(),
+    }
+}
+
 /// Maximum size accepted for a configuration file.
 pub const MAX_CONFIG_FILE_SIZE: u64 = 0x100000;
 
@@ -1034,7 +1054,7 @@ pub struct PrefetchConfigV2 {
 }
 
 /// Configuration information for network proxy.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ProxyConfig {
     /// Access remote storage backend via proxy, e.g. Dragonfly dfdaemon server URL.
     #[serde(default)]
@@ -1065,6 +1085,38 @@ pub struct ProxyConfig {
 
 fn default_dragonfly_sdk_timeout() -> u64 {
     5
+}
+
+impl ProxyConfig {
+    /// Timeout of one Dragonfly SDK request. Zero would fail every request at once, so it
+    /// means the default.
+    pub fn dragonfly_sdk_timeout(&self) -> std::time::Duration {
+        let secs = match self.dragonfly_sdk_timeout {
+            0 => default_dragonfly_sdk_timeout(),
+            secs => secs,
+        };
+        std::time::Duration::from_secs(secs)
+    }
+}
+
+// Manual: a proxy URL may carry `user:password@`, and the backend configs that embed this one
+// are printed with `{:?}`.
+impl std::fmt::Debug for ProxyConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProxyConfig")
+            .field("url", &redact_url(&self.url))
+            .field("ping_url", &redact_url(&self.ping_url))
+            .field("fallback", &self.fallback)
+            .field("check_interval", &self.check_interval)
+            .field("use_http", &self.use_http)
+            .field("check_pause_elapsed", &self.check_pause_elapsed)
+            .field(
+                "dragonfly_scheduler_endpoint",
+                &redact_url(&self.dragonfly_scheduler_endpoint),
+            )
+            .field("dragonfly_sdk_timeout", &self.dragonfly_sdk_timeout)
+            .finish()
+    }
 }
 
 impl Default for ProxyConfig {
@@ -1535,7 +1587,7 @@ struct CacheConfig {
 
 /// Additional configuration information for external backend, its items
 /// will be merged to the configuration from image.
-#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ExternalBackendConfig {
     /// External backend identifier to merge.
     pub patch: HashMap<String, String>,
@@ -1544,6 +1596,20 @@ pub struct ExternalBackendConfig {
     pub kind: String,
     /// External backend config items to merge.
     pub config: HashMap<String, String>,
+}
+
+// Manual: `patch` and `config` are free-form and may hold credentials.
+impl std::fmt::Debug for ExternalBackendConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (mut patch, mut config) = (self.patch.clone(), self.config.clone());
+        redact_sensitive_map(&mut patch);
+        redact_sensitive_map(&mut config);
+        f.debug_struct("ExternalBackendConfig")
+            .field("patch", &patch)
+            .field("kind", &self.kind)
+            .field("config", &config)
+            .finish()
+    }
 }
 
 impl TryFrom<&CacheConfig> for CacheConfigV2 {
@@ -1838,6 +1904,27 @@ mod tests {
         )
         .unwrap();
         assert!(!format!("{oss:?}").contains("not-a-real"));
+
+        // A proxy URL's userinfo, and credential-like keys of an external backend.
+        let mut with_proxy = registry.clone();
+        with_proxy.proxy.url = "http://user:not-a-real-pass@proxy.example.com:65001".to_string();
+        let printed = format!("{with_proxy:?}");
+        assert!(!printed.contains("not-a-real"), "{printed}");
+        assert!(printed.contains("proxy.example.com:65001"), "{printed}");
+        let external = ExternalBackendConfig {
+            patch: HashMap::from([("auth".to_string(), "not-a-real-auth".to_string())]),
+            kind: "x".to_string(),
+            config: HashMap::from([
+                (
+                    "access_key_secret".to_string(),
+                    "not-a-real-secret".to_string(),
+                ),
+                ("bucket".to_string(), "kept".to_string()),
+            ]),
+        };
+        let printed = format!("{external:?}");
+        assert!(!printed.contains("not-a-real"), "{printed}");
+        assert!(printed.contains("kept"), "{printed}");
         assert_eq!(
             serde_json::to_value(&oss).unwrap()["access_key_secret"],
             "not-a-real-secret"
@@ -2033,6 +2120,18 @@ mod tests {
         }"#;
         let config: ProxyConfig = serde_json::from_str(content).unwrap();
         assert_eq!(config.dragonfly_sdk_timeout, 60);
+        assert_eq!(
+            config.dragonfly_sdk_timeout(),
+            std::time::Duration::from_secs(60)
+        );
+        let zero = ProxyConfig {
+            dragonfly_sdk_timeout: 0,
+            ..Default::default()
+        };
+        assert_eq!(
+            zero.dragonfly_sdk_timeout(),
+            std::time::Duration::from_secs(5)
+        );
     }
 
     #[test]

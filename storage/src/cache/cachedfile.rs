@@ -3246,12 +3246,17 @@ mod tests {
         use crate::backend::{BackendError, BackendResult};
         use nydus_utils::metrics::BackendMetrics;
         use std::sync::atomic::AtomicUsize;
+        use std::sync::mpsc::{Receiver, Sender, channel};
         use tempfile::TempDir;
 
-        /// A backend that is down: every metadata read fails, and is counted.
+        /// A backend that is down: every metadata read fails and is counted. The first read
+        /// waits for the test, and dropping the reader (when the loader ends) is reported.
         struct FailingReader {
             metrics: Arc<BackendMetrics>,
             reads: Arc<AtomicUsize>,
+            entered: Sender<()>,
+            release: Mutex<Receiver<()>>,
+            dropped: Sender<()>,
         }
         impl BlobReader for FailingReader {
             fn blob_size(&self) -> BackendResult<u64> {
@@ -3261,11 +3266,19 @@ mod tests {
                 unreachable!("read_all is overridden")
             }
             fn read_all(&self, _buf: &mut [u8], _offset: u64) -> BackendResult<usize> {
-                self.reads.fetch_add(1, Ordering::SeqCst);
+                if self.reads.fetch_add(1, Ordering::SeqCst) == 0 {
+                    self.entered.send(()).unwrap();
+                    self.release.lock().unwrap().recv().unwrap();
+                }
                 Err(BackendError::Unsupported("backend is down".to_string()))
             }
             fn metrics(&self) -> &BackendMetrics {
                 &self.metrics
+            }
+        }
+        impl Drop for FailingReader {
+            fn drop(&mut self) {
+                let _ = self.dropped.send(());
             }
         }
 
@@ -3281,9 +3294,15 @@ mod tests {
         );
         blob_info.set_blob_meta_info(0, 0xa1290, 0xa1290, compress::Algorithm::None as u32);
         let reads = Arc::new(AtomicUsize::new(0));
+        let (entered_tx, entered) = channel();
+        let (release, release_rx) = channel();
+        let (dropped_tx, dropped) = channel();
         let reader: Arc<dyn BlobReader> = Arc::new(FailingReader {
             metrics: BackendMetrics::new("test-meta-load-stops", "test"),
             reads: reads.clone(),
+            entered: entered_tx,
+            release: Mutex::new(release_rx),
+            dropped: dropped_tx,
         });
         let meta = FileCacheMeta::new(
             dir.path().join("blob").display().to_string(),
@@ -3295,18 +3314,17 @@ mod tests {
         )
         .unwrap();
 
-        // One load attempt reads the metadata four times (read_metadata retries three
-        // times), then the loader backs off before its next attempt. Drop the cache in
-        // that pause, as an unmount does.
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while reads.load(Ordering::SeqCst) < 4 {
-            assert!(Instant::now() < deadline, "the first load never ran");
-            std::thread::sleep(Duration::from_millis(1));
-        }
+        // Drop the cache while the first load attempt is in flight, as an unmount does.
+        entered.recv_timeout(Duration::from_secs(30)).unwrap();
         drop(meta);
+        release.send(()).unwrap();
 
-        // A loader still running would have made its next attempts by now.
-        std::thread::sleep(Duration::from_millis(2500));
+        // The reader is dropped when the loader ends. That attempt reads the metadata four
+        // times (read_metadata retries three times); a loader that kept going after the
+        // cache was gone would have made its further attempts first.
+        dropped
+            .recv_timeout(Duration::from_secs(60))
+            .expect("the loader never ended");
         assert_eq!(
             reads.load(Ordering::SeqCst),
             4,

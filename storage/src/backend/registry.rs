@@ -148,6 +148,18 @@ fn request_err_to_registry(e: request::RequestError) -> RegistryBackendError {
     }
 }
 
+/// Statuses an object store answers a dead presigned link with.
+fn is_dead_link_status(status: StatusCode) -> bool {
+    [
+        StatusCode::BAD_REQUEST,
+        StatusCode::UNAUTHORIZED,
+        StatusCode::FORBIDDEN,
+        StatusCode::NOT_FOUND,
+        StatusCode::GONE,
+    ]
+    .contains(&status)
+}
+
 /// Convert a request::Response into a RegistryResult, checking status if needed.
 fn respond(resp: request::Response, catch_status: bool) -> RegistryResult<request::Response> {
     if !catch_status || is_success_status(resp.status()) {
@@ -994,12 +1006,17 @@ impl RegistryReader {
                 )
                 .map_err(request_err_to_registry);
 
-            // A presigned link that expired or was revoked is answered with a 4xx (401/403,
-            // and 400/404/410 by some stores), and a link to a store that is gone does not
-            // connect. Resolve the redirect again through the registry, once.
+            // A presigned link that expired or was revoked is answered with 401/403 (and
+            // 400/404/410 by some stores), and a link to a store that is gone does not
+            // connect. Resolve the redirect again through the registry, once. Anything else
+            // (429, 416, a timeout, a proxy's verdict) says nothing about the link and is
+            // left to retry_op.
             let dead = match &res {
-                Ok((status, _, _)) => status.is_client_error().then(|| status.to_string()),
-                Err(e) => Some(e.to_string()),
+                Ok((status, _, _)) => is_dead_link_status(*status).then(|| status.to_string()),
+                Err(e @ RegistryBackendError::Request(ConnectionError::Common(_))) => {
+                    Some(e.to_string())
+                }
+                Err(_) => None,
             };
             if let Some(reason) = dead.filter(|_| allow_retry) {
                 warn!(
@@ -1077,7 +1094,7 @@ impl RegistryReader {
                 })?;
                 let mut location = Url::parse(url.as_str())
                     .and_then(|base| base.join(location))
-                    .map_err(|e| RegistryBackendError::Url(location.to_string(), e))?;
+                    .map_err(|e| RegistryBackendError::Url(redact_url(location), e))?;
                 // Note: Some P2P proxy server supports only scheme specified origin blob server,
                 // so we need change scheme to `blob_url_scheme` here
                 if !self.state.blob_url_scheme.is_empty() {
@@ -2919,7 +2936,7 @@ mod tests {
         let logs = captured_logs();
         let redirect = format!(
             "HTTP/1.1 307 Temporary Redirect\r\n\
-             Location: http://{{addr}}/store/blob?X-Amz-Signature={SECRET}\r\n\
+             Location: http://{{addr}}/presigned-redaction-test/blob?X-Amz-Signature={SECRET}\r\n\
              Content-Length: 0\r\nConnection: close\r\n\r\n"
         );
         let body = "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-4/5\r\n\
@@ -2958,12 +2975,13 @@ mod tests {
         let logs = logs.0.lock().unwrap();
         assert!(
             logs.iter()
-                .any(|l| l.contains("redirected link has expired") && l.contains("/store/blob")),
+                .any(|l| l.contains("redirected link has expired")
+                    && l.contains("/presigned-redaction-test/blob")),
             "the expiry is logged: {logs:?}"
         );
         assert!(
             logs.iter()
-                .any(|l| l.starts_with("ERROR") && l.contains("/store/blob")),
+                .any(|l| l.starts_with("ERROR") && l.contains("/presigned-redaction-test/blob")),
             "the failed read is logged with its URL: {logs:?}"
         );
         let leaked: Vec<_> = logs.iter().filter(|l| l.contains(SECRET)).collect();
@@ -3099,5 +3117,112 @@ mod tests {
             2,
             "the redirect is resolved again"
         );
+    }
+
+    /// 429 (rate limited) and 416 (range not satisfiable) say nothing about whether the
+    /// cached link is still good, so they leave it cached for retry_op's next attempt
+    /// instead of sending the read back through the registry.
+    #[cfg(feature = "backend-registry")]
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support io_uring")]
+    fn test_cached_redirect_survives_statuses_that_do_not_condemn_it() {
+        let body = "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-4/5\r\n\
+                    Content-Length: 5\r\nConnection: close\r\n\r\nabcde"
+            .to_string();
+        let status = |line: &str| {
+            format!("HTTP/1.1 {line}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+        };
+        let (addr, seen, shutdown) = serve_sequence(vec![
+            "HTTP/1.1 307 Temporary Redirect\r\nLocation: http://{addr}/kept-link/blob\r\n\
+             Content-Length: 0\r\nConnection: close\r\n\r\n"
+                .to_string(),
+            body.clone(),
+            status("429 Too Many Requests"),
+            status("416 Range Not Satisfiable"),
+            body,
+        ]);
+        let config = RegistryConfig {
+            scheme: "http".to_string(),
+            host: addr.to_string(),
+            repo: "library/test".to_string(),
+            retry_limit: 0,
+            timeout: 5,
+            connect_timeout: 5,
+            ..Default::default()
+        };
+        let registry = Registry::new(&config, Some("test-kept-redirect")).unwrap();
+        let reader = registry.get_reader("sha256:abc").unwrap();
+        let mut buf = [0u8; 5];
+        assert_eq!(reader.try_read(&mut buf, 0).unwrap(), 5);
+        assert!(reader.try_read(&mut buf, 0).is_err());
+        assert!(reader.try_read(&mut buf, 0).is_err());
+        let last = reader.try_read(&mut buf, 0);
+        shutdown.store(true, Ordering::Relaxed);
+        assert_eq!(last.unwrap(), 5);
+
+        let requests = seen.lock().unwrap().clone();
+        assert_eq!(requests.len(), 5, "{requests:?}");
+        assert!(
+            requests[1..].iter().all(|l| l.contains("/kept-link/blob")),
+            "the cached link is reused, not resolved again: {requests:?}"
+        );
+    }
+
+    /// An error response whose body stops arriving must fail the read like a stalled blob
+    /// body does, not hang it.
+    #[cfg(feature = "backend-registry")]
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support io_uring")]
+    fn test_read_fails_when_an_error_body_stalls() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let store = TcpListener::bind("127.0.0.1:0").unwrap();
+        let store_addr = store.local_addr().unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown_srv = shutdown.clone();
+        thread::spawn(move || {
+            let Ok((mut stream, _)) = store.accept() else {
+                return;
+            };
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf);
+            let _ = stream.write_all(
+                b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 100\r\n\r\npartial",
+            );
+            let _ = stream.flush();
+            // Hold the connection open without sending the rest.
+            while !shutdown_srv.load(Ordering::Relaxed) {
+                thread::sleep(std::time::Duration::from_millis(20));
+            }
+        });
+        let (registry_addr, _, registry_down) = serve_sequence(vec![format!(
+            "HTTP/1.1 307 Temporary Redirect\r\nLocation: http://{store_addr}/blob\r\n\
+             Content-Length: 0\r\nConnection: close\r\n\r\n"
+        )]);
+
+        let config = RegistryConfig {
+            scheme: "http".to_string(),
+            host: registry_addr.to_string(),
+            repo: "library/test".to_string(),
+            retry_limit: 0,
+            timeout: 1,
+            connect_timeout: 1,
+            ..Default::default()
+        };
+        let (done, result) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let registry = Registry::new(&config, Some("test-stalled-error-body")).unwrap();
+            let reader = registry.get_reader("sha256:abc").unwrap();
+            let mut buf = [0u8; 10];
+            let _ = done.send(reader.try_read(&mut buf, 0).map_err(|e| e.to_string()));
+        });
+        let read = result.recv_timeout(std::time::Duration::from_secs(15));
+        shutdown.store(true, Ordering::Relaxed);
+        registry_down.store(true, Ordering::Relaxed);
+        let err = read
+            .expect("a read whose error body stalls must fail, not hang")
+            .expect_err("a 500 is not a successful read");
+        assert!(err.contains("no data"), "{err}");
     }
 }

@@ -975,8 +975,17 @@ impl Connection {
                 }
                 Ok((status, content_range, written, None))
             } else {
-                // Buffer the (small) error body for the caller's message.
-                let body = resp.bytes().await.map_err(ConnectionError::Common)?;
+                // Keep the start of the error body for the caller's message. It gets the
+                // same stall bound as a blob body, and a size cap: nothing needs the rest.
+                const ERROR_BODY_LIMIT: usize = 4096;
+                let mut body = Vec::new();
+                let mut stream = resp.bytes_stream();
+                while body.len() < ERROR_BODY_LIMIT
+                    && let Some(chunk) = self.next_chunk(&mut stream, is_proxy, &url_owned).await?
+                {
+                    let n = chunk.len().min(ERROR_BODY_LIMIT - body.len());
+                    body.extend_from_slice(&chunk[..n]);
+                }
                 Ok((
                     status,
                     content_range,

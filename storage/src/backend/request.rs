@@ -245,7 +245,7 @@ impl Request {
                 temp_disable_proxy,
                 context.disable_proxy,
                 self.proxy_config.url.is_empty(),
-                url,
+                super::redact_url(url),
             );
             return self
                 .connection
@@ -288,7 +288,8 @@ impl Request {
                 context.using_proxy_sdk = true;
                 trace!(
                     "request path: SDK_PROXY, endpoint={}, url={}",
-                    endpoint, url,
+                    endpoint,
+                    super::redact_url(url),
                 );
                 let priority = Some(match context.request_source {
                     RequestSource::Prefetch => proxy::HEADER_VALUE_DRAGONFLY_PRIORITY_3,
@@ -302,8 +303,7 @@ impl Request {
                     )))
                 })?;
 
-                let timeout =
-                    std::time::Duration::from_secs(self.proxy_config.dragonfly_sdk_timeout);
+                let timeout = self.proxy_config.dragonfly_sdk_timeout();
                 return match proxy_sdk_client.request(
                     url,
                     headers.clone(),
@@ -330,7 +330,8 @@ impl Request {
             context.using_proxy = true;
             trace!(
                 "request path: HTTP_PROXY, proxy_url={}, url={}",
-                self.proxy_config.url, url,
+                super::redact_url(&self.proxy_config.url),
+                super::redact_url(url),
             );
 
             // Inject Dragonfly priority headers for HTTP proxy mode.
