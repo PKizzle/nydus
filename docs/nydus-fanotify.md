@@ -191,7 +191,10 @@ the mount is detached. The FUSE path refuses to mount over any kernel mount.
 The cache of a fanotify daemon lives in its `daemons/<slug>/stage` dir, next to the staged
 bootstrap. Cache GC and the cache-bytes metric count it (each inode once: the `blob_<i>` device
 files are hardlinks to the `.blob.data` files) against `gc_max_bytes`, but never evict it; a dead
-daemon's dir goes with the stale daemon-dir sweep.
+daemon's dir goes with the stale daemon-dir sweep. Cache accounting counts the bytes allocated on
+disk (`st_blocks`), not file lengths: a sparse cache file counts only the chunks it holds, so
+`gc_max_bytes` bounds real disk use. Both `/metrics` endpoints answer from a scan at most 60 s
+old.
 
 The slug is derived from the image ref, so after its tag moved to another image a start finds the
 daemon dir of the image the ref named before. A fanotify stage dir whose `bootstrap` was staged
