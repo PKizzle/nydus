@@ -302,8 +302,15 @@ impl Request {
                     )))
                 })?;
 
-                return match proxy_sdk_client.request(url, headers.clone(), priority, catch_status)
-                {
+                let timeout =
+                    std::time::Duration::from_secs(self.proxy_config.dragonfly_sdk_timeout);
+                return match proxy_sdk_client.request(
+                    url,
+                    headers.clone(),
+                    priority,
+                    catch_status,
+                    timeout,
+                ) {
                     Ok(get_resp) => {
                         let status = get_resp.status_code.unwrap_or(StatusCode::BAD_GATEWAY);
                         if status >= StatusCode::INTERNAL_SERVER_ERROR {
