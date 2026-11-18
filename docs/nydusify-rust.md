@@ -360,7 +360,7 @@ nydusify mount --target myregistry/repo:tag-nydus --mount-path ./image-fs
 
 Pulls the bootstrap via `registry-client`, writes a `nydusd` fusedev config pointing at a registry
 backend for the target image, and spawns `nydusd` (override with `--nydusd`) in the foreground
-until SIGINT/SIGTERM, then unmounts and stops it. Only `--backend-type registry` (the default) is
+until SIGINT/SIGTERM/SIGHUP, then unmounts and stops it. Only `--backend-type registry` (the default) is
 implemented; `oss`/`s3`/`localfs` are validated but rejected as follow-up work. This subcommand
 requires a working `nydusd` FUSE mount, i.e. a Linux host.
 

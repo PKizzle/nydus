@@ -4,7 +4,7 @@
 
 //! `nydusify mount`: pull a nydus image's bootstrap, spawn a foreground
 //! `nydusd` FUSE daemon backed by the image's registry, and hold the mount
-//! until the process receives SIGINT/SIGTERM — then unmount and stop nydusd.
+//! until the process receives SIGINT/SIGTERM/SIGHUP — then unmount and stop nydusd.
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
@@ -316,7 +316,7 @@ fn ensure_dir(path: &Path) -> Result<()> {
     std::fs::create_dir_all(path).with_context(|| format!("create directory {}", path.display()))
 }
 
-/// SIGINT/SIGTERM handling for the foreground mount. A tiny async-signal-safe
+/// SIGINT/SIGTERM/SIGHUP handling for the foreground mount. A tiny async-signal-safe
 /// handler flips an atomic flag that [`supervise`] polls.
 #[cfg(unix)]
 mod signal {
@@ -335,6 +335,7 @@ mod signal {
         unsafe {
             libc::signal(libc::SIGINT, handler);
             libc::signal(libc::SIGTERM, handler);
+            libc::signal(libc::SIGHUP, handler);
         }
     }
 
@@ -424,5 +425,15 @@ mod tests {
     fn nydusd_config_omits_auth_when_no_credentials() {
         let config = build_nydusd_config("r.io", "a/b", Path::new("/c"), false, false, None);
         assert!(config["device"]["backend"]["config"].get("auth").is_none());
+    }
+
+    /// A dropped ssh session sends SIGHUP; nydusd runs in its own session and would outlive us.
+    #[cfg(unix)]
+    #[test]
+    fn hangup_requests_teardown() {
+        signal::install();
+        // SAFETY: raise(2) only delivers the signal to this process.
+        assert_eq!(unsafe { libc::raise(libc::SIGHUP) }, 0);
+        assert!(signal::terminated());
     }
 }

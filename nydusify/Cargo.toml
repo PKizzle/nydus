@@ -51,7 +51,7 @@ tempfile = "3"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
-# Unix signal handling (SIGINT/SIGTERM) for the foreground `mount` subcommand,
+# Unix signal handling (SIGINT/SIGTERM/SIGHUP) for the foreground `mount` subcommand,
 # which supervises a nydusd child and unmounts on exit.
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
