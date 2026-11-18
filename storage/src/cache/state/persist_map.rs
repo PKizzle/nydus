@@ -104,6 +104,28 @@ impl PersistMap {
         create: bool,
         persist: bool,
     ) -> StorageResult<Self> {
+        Self::open_or_replace(filename, chunk_count, create, persist, true)
+    }
+
+    /// Open the map, replacing one found damaged with an empty map when `create` and
+    /// `may_replace` allow it.
+    fn open_or_replace(
+        filename: &str,
+        chunk_count: u32,
+        create: bool,
+        persist: bool,
+        may_replace: bool,
+    ) -> StorageResult<Self> {
+        let damaged = |file: &File, reason: &str| -> StorageResult<Self> {
+            if !(create && may_replace) {
+                return Err(StorageError::InvalidData(format!(
+                    "chunk map file {filename:?}: {reason}"
+                )));
+            }
+            Self::replace(filename, file, reason)?;
+            Self::open_or_replace(filename, chunk_count, create, persist, false)
+        };
+
         if chunk_count == 0 {
             return Err(StorageError::InvalidArgument(
                 "chunk count should be greater than 0".to_string(),
@@ -145,13 +167,10 @@ impl PersistMap {
             new_content = true;
             Self::write_header(&mut file, expected_size)?;
         } else if file_size != expected_size {
-            // File size doesn't match, it's too risky to accept the chunk state file. Fallback to
-            // always mark chunk data as not ready.
-            warn!("blob chunk_map file may be corrupted: {:?}", filename);
-            return Err(StorageError::InvalidData(format!(
-                "chunk_map file {:?} is invalid",
-                filename
-            )));
+            return damaged(
+                &file,
+                &format!("size {file_size}, expected {expected_size}"),
+            );
         }
 
         let file2 = clone_file(file.as_raw_fd())
@@ -179,10 +198,8 @@ impl PersistMap {
                 let byte = atomic_byte(&filemap, idx)
                     .map_err(|e| StorageError::cache_io("reach the chunk map contents", e))?;
                 if byte.load(Ordering::Acquire) != 0 {
-                    return Err(StorageError::InvalidData(format!(
-                        "invalid blob chunk_map file header: {:?}",
-                        filename
-                    )));
+                    drop(filemap);
+                    return damaged(&file, "bad magic");
                 }
             }
 
@@ -197,10 +214,8 @@ impl PersistMap {
         let mut not_ready_count = chunk_count;
         if header.version >= 1 {
             if header.magic2 != MAGIC2 {
-                return Err(StorageError::InvalidData(format!(
-                    "invalid blob chunk_map file header: {:?}",
-                    filename
-                )));
+                drop(filemap);
+                return damaged(&file, "bad second magic");
             }
             if header.all_ready == MAGIC_ALL_READY {
                 not_ready_count = 0;
@@ -246,6 +261,33 @@ impl PersistMap {
             not_ready_count: AtomicU32::new(not_ready_count),
             filemap,
         })
+    }
+
+    /// Unlink the damaged map `file` at `filename`, held under its exclusive lock, so the next
+    /// open creates an empty one. The map holds only readiness: losing it costs refetches, and
+    /// the data file is left alone. Unlinking rather than truncating keeps the old file intact
+    /// for any process that still maps it, which would fault on a truncated mapping.
+    fn replace(filename: &str, file: &File, reason: &str) -> StorageResult<()> {
+        use std::os::unix::fs::MetadataExt;
+
+        let held = file
+            .metadata()
+            .map_err(|e| StorageError::cache_io("stat the chunk map file", e))?;
+        // Another opener that found the same damage may have replaced the file already.
+        match std::fs::metadata(filename) {
+            Ok(m) if m.dev() == held.dev() && m.ino() == held.ino() => {}
+            Ok(_) => return Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(StorageError::cache_io("stat the chunk map file", e)),
+        }
+        warn!("chunk map file {filename:?} is damaged ({reason}), replacing it with an empty one");
+        match std::fs::remove_file(filename) {
+            Err(e) if e.kind() != io::ErrorKind::NotFound => Err(StorageError::cache_io(
+                "remove the damaged chunk map file",
+                e,
+            )),
+            _ => Ok(()),
+        }
     }
 
     fn write_header(file: &mut File, size: u64) -> StorageResult<()> {
