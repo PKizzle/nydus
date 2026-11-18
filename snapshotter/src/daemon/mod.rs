@@ -1914,14 +1914,21 @@ impl DaemonSupervisor {
                     Some(Unfit::Layout(reason)) => {
                         fs::create_dir_all(&stage_dir)
                             .with_context(|| format!("failed to create {}", stage_dir.display()))?;
-                        match build_view(&viewer, &source, &stage_dir) {
-                            Ok(view) => trial_view = Some(view),
-                            Err(NodeViewError::Refused(why)) => {
+                        // A view staged and checked before is mounted as it is.
+                        let staged = source_digest(&source)
+                            .and_then(|digest| staged_view_is_current(&digest, &stage_dir))
+                            .with_context(|| {
+                                format!("failed to check the view in {}", stage_dir.display())
+                            })?;
+                        match (!staged).then(|| build_view(&viewer, &source, &stage_dir)) {
+                            None => {}
+                            Some(Ok(view)) => trial_view = Some(view),
+                            Some(Err(NodeViewError::Refused(why))) => {
                                 return Ok(Some(format!(
                                     "{reason}, and it has no node view: {why}"
                                 )));
                             }
-                            Err(NodeViewError::Failed(e)) => {
+                            Some(Err(NodeViewError::Failed(e))) => {
                                 return Err(
                                     e.context(format!("{reason}; failed to build its node view"))
                                 );
@@ -3262,6 +3269,11 @@ fn pad_live_erofs_sources(mounts: &str, daemons: &Path) -> usize {
 /// the SHA-256 of the source bootstrap. Present exactly while a node view is staged.
 const VIEW_SOURCE_RECORD: &str = "bootstrap.view-of";
 
+/// File in a fanotify stage dir recording that its staged node view passed the checks of
+/// [`build_view`]: the SHA-256 of the staged file and the snapshotter version (see
+/// [`view_check`]). A start mounts a view without building it again only while this matches.
+const VIEW_CHECK_RECORD: &str = "bootstrap.view-checked";
+
 fn source_digest(src: &Path) -> io::Result<String> {
     Ok(hex::encode(Sha256::digest(fs::read(src)?)))
 }
@@ -3398,24 +3410,29 @@ fn stage_mount_source(
     if staged_from_other(src, &digest, stage_dir)? {
         wipe_stage(stage_dir, trial.as_ref().map(BuiltView::path).as_deref())?;
     }
-    match fs::remove_file(&record) {
-        Err(e) if e.kind() != io::ErrorKind::NotFound => {
-            return Err(e).with_context(|| format!("failed to remove {}", record.display()));
-        }
-        _ => {}
-    }
     let unfit = source_unfit(FsDriverType::Fanotify, src, nydus_utils::host_page_size())?;
     if let Some(Unfit::Final(reason)) = &unfit {
         bail!("cannot mount {} with EROFS: {reason}", src.display());
     }
     if !want_view && unfit.is_none() {
-        stage_bootstrap(src, &staged)?;
+        remove_view_records(stage_dir)?;
+        if !is_staged_copy(src, &staged) {
+            stage_bootstrap(src, &staged)?;
+        }
         return Ok(false);
     }
+    if trial.is_none() && staged_view_is_current(&digest, stage_dir)? {
+        return Ok(true);
+    }
+    remove_view_records(stage_dir)?;
     match trial.map_or_else(|| build_view(viewer, src, stage_dir), Ok) {
         Ok(view) => {
             nydus_service::erofs_folio::pad_to_page_size(&view.path())?;
             view.file.persist(&staged).map_err(|e| e.error)?;
+            atomic_write(
+                &stage_dir.join(VIEW_CHECK_RECORD),
+                view_check(&staged)?.as_bytes(),
+            )?;
             atomic_write(&record, view.source_digest.as_bytes())?;
             Ok(true)
         }
@@ -3438,9 +3455,56 @@ fn stage_mount_source(
                     "no node view; mounting the image's own bootstrap without page cache sharing"
                 );
             }
-            stage_bootstrap(src, &staged)?;
+            if !is_staged_copy(src, &staged) {
+                stage_bootstrap(src, &staged)?;
+            }
             Ok(false)
         }
+    }
+}
+
+/// Remove the records of a staged node view, its source record first: without it the stage dir
+/// holds no view.
+fn remove_view_records(stage_dir: &Path) -> io::Result<()> {
+    for name in [VIEW_SOURCE_RECORD, VIEW_CHECK_RECORD] {
+        match fs::remove_file(stage_dir.join(name)) {
+            Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// What [`VIEW_CHECK_RECORD`] holds for the view file `view`: its SHA-256 and the version of the
+/// snapshotter whose checks it passed.
+fn view_check(view: &Path) -> io::Result<String> {
+    Ok(format!(
+        "{} {}",
+        source_digest(view)?,
+        env!("CARGO_PKG_VERSION")
+    ))
+}
+
+/// Whether the stage dir holds a node view of the source with SHA-256 `digest` that can be mounted
+/// without building it again: [`build_view`] checked it in a snapshotter of this version, and its
+/// bytes are what they were then. Anything else is built again.
+fn staged_view_is_current(digest: &str, stage_dir: &Path) -> io::Result<bool> {
+    let read = |name: &str| match fs::read_to_string(stage_dir.join(name)) {
+        Ok(text) => Ok(Some(text)),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    };
+    let (Some(source), Some(checked)) = (read(VIEW_SOURCE_RECORD)?, read(VIEW_CHECK_RECORD)?)
+    else {
+        return Ok(false);
+    };
+    if source.trim() != digest {
+        return Ok(false);
+    }
+    match view_check(&stage_dir.join("bootstrap")) {
+        Ok(current) => Ok(checked.trim() == current),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e),
     }
 }
 
@@ -4889,6 +4953,77 @@ mod tests {
         assert!(!cache.exists());
     }
 
+    /// A staged view that this version checked and nobody changed since is mounted again without
+    /// building it; a changed view, another snapshotter version or another source builds it.
+    #[test]
+    fn stage_mount_source_reuses_a_checked_view() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let texture = Path::new(env!("CARGO_MANIFEST_DIR")).join("../tests/texture/bootstrap");
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("source");
+        fs::copy(texture.join("rafs-v6-2.2.boot"), &src).unwrap();
+        let stage = dir.path().join("stage");
+        fs::create_dir(&stage).unwrap();
+        let staged = stage.join("bootstrap");
+        // Counts its runs, and fails like an image without a view.
+        let runs = dir.path().join("runs");
+        let tool = dir.path().join("nydus-image");
+        fs::write(
+            &tool,
+            format!("#!/bin/sh\necho >> {}\nexit 2\n", runs.display()),
+        )
+        .unwrap();
+        fs::set_permissions(&tool, fs::Permissions::from_mode(0o755)).unwrap();
+        let runs = || fs::read_to_string(&runs).map_or(0, |s| s.lines().count());
+        // What an earlier start leaves behind after staging a view it checked.
+        let stage_view = |view: &[u8]| {
+            fs::write(&staged, view).unwrap();
+            fs::write(stage.join(VIEW_CHECK_RECORD), view_check(&staged).unwrap()).unwrap();
+            fs::write(stage.join(VIEW_SOURCE_RECORD), source_digest(&src).unwrap()).unwrap();
+        };
+        let view = fs::read(texture.join("rafs-v6-small-files.boot")).unwrap();
+
+        stage_view(&view);
+        assert!(stage_mount_source(&viewer(&tool), &src, &stage, true, None).unwrap());
+        assert_eq!(runs(), 0, "a checked view is not built again");
+        assert_eq!(fs::read(&staged).unwrap(), view);
+
+        // A view changed since its check is built again.
+        let mut tampered = view.clone();
+        tampered[100] ^= 1;
+        stage_view(&view);
+        fs::write(&staged, &tampered).unwrap();
+        assert!(!stage_mount_source(&viewer(&tool), &src, &stage, true, None).unwrap());
+        assert_eq!(runs(), 1);
+        assert!(is_staged_copy(&src, &staged));
+        assert!(!stage.join(VIEW_CHECK_RECORD).exists());
+
+        // So is one checked by another version.
+        stage_view(&view);
+        let checked = view_check(&staged).unwrap();
+        let (hash, _) = checked.split_once(' ').unwrap();
+        fs::write(stage.join(VIEW_CHECK_RECORD), format!("{hash} 0.0.0")).unwrap();
+        assert!(!stage_mount_source(&viewer(&tool), &src, &stage, true, None).unwrap());
+        assert_eq!(runs(), 2);
+
+        // And a view of another source.
+        stage_view(&view);
+        fs::write(stage.join(VIEW_SOURCE_RECORD), "0".repeat(64)).unwrap();
+        assert!(!stage_mount_source(&viewer(&tool), &src, &stage, true, None).unwrap());
+        assert_eq!(runs(), 3);
+
+        // Without sharing, a fit image is staged as a copy, and a copy already staged is kept.
+        let before = fs::metadata(&staged).unwrap().modified().unwrap();
+        assert!(!stage_mount_source(&viewer(&tool), &src, &stage, false, None).unwrap());
+        assert_eq!(fs::metadata(&staged).unwrap().modified().unwrap(), before);
+        stage_view(&view);
+        assert!(!stage_mount_source(&viewer(&tool), &src, &stage, false, None).unwrap());
+        assert!(is_staged_copy(&src, &staged));
+        assert!(!stage.join(VIEW_SOURCE_RECORD).exists());
+        assert_eq!(runs(), 3);
+    }
+
     /// A blockdev/tarfs image is served again only for the bootstrap it was exported from:
     /// after the tag moved, the next start exports the new bootstrap into a new file.
     #[test]
@@ -4961,6 +5096,9 @@ mod tests {
             nydus_rafs::metadata::RafsSuper::load_from_file(&staged, config, false).unwrap();
         assert_eq!(rs.meta.blkszbits, 12);
         assert!(nydus_rafs::metadata::kernel_layout::check_node_view(&rs, &staged).unwrap() > 0);
+        // The next start mounts the checked view as it is: no tool runs.
+        let missing = dir.path().join("no-nydus-image");
+        assert!(stage_mount_source(&viewer(&missing), &src, &stage, true, None).unwrap());
         let other = dir.path().join("other");
         fs::copy(texture.join("rafs-v5.boot"), &other).unwrap();
         assert!(!is_staged_from(&other, &stage).unwrap());

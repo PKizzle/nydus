@@ -406,7 +406,14 @@ staged as a padded copy of its own bootstrap and no view is built.
 
 `inode_share` is fixed for a mount's life, and a takeover or in-place heal keeps the mount and
 its staged view (the view is rebuilt only when the image's bootstrap changes, recorded in
-`stage/bootstrap.view-of`). Sharing therefore starts with a fresh mount: a fresh cache qualifies
+`stage/bootstrap.view-of`). A fresh start of an image whose stage dir is still there mounts the
+view staged before without building or checking it again only while `stage/bootstrap.view-of`
+matches the SHA-256 of the image's bootstrap and `stage/bootstrap.view-checked` holds the SHA-256
+of the staged view and the version of the running snapshotter. That record is written only after
+`check_node_view` and the layout checks passed, so the view a mount uses was checked by this
+release, in this or an earlier process, and its bytes are unchanged since; anything else builds
+the view again. A staged padded copy of the bootstrap is likewise kept while it is still a copy
+of it. Sharing therefore starts with a fresh mount: a fresh cache qualifies
 at once; a cache holding chunks nobody checked yet (filled by an older release) mounts without
 sharing and qualifies on its next mount once the background verifier has recorded it verified.
 `/proc/self/mounts` shows `inode_share,domain_id=nydus-node-local` on a sharing mount, and
