@@ -483,6 +483,25 @@ pub fn alloc_buf(size: usize) -> AlignedBuf {
     }
 }
 
+/// A non-zero value identifying the running kernel boot, from
+/// `/proc/sys/kernel/random/boot_id`. A cache filled in another boot may have lost data with
+/// that boot's page cache. Where the boot id cannot be read, the value identifies this process
+/// instead, so every restart reads as a new boot: the safe direction.
+pub fn boot_id() -> u64 {
+    static BOOT_ID: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *BOOT_ID.get_or_init(|| {
+        let id = std::fs::read("/proc/sys/kernel/random/boot_id").unwrap_or_else(|e| {
+            warn!("cannot read the boot id ({e}); caches filled by this process are not trusted after it exits unsealed");
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default();
+            format!("process {} {}", std::process::id(), now.as_nanos()).into_bytes()
+        });
+        let digest = RafsDigest::from_buf(&id, digest::Algorithm::Sha256);
+        u64::from_le_bytes(digest.data[..8].try_into().unwrap()).max(1)
+    })
+}
+
 /// Check hash of data matches provided one
 pub fn check_hash(data: &[u8], digest: &RafsDigest, digester: digest::Algorithm) -> bool {
     digest == &RafsDigest::from_buf(data, digester)

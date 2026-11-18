@@ -222,6 +222,30 @@ pub trait RangeMap: Send + Sync {
     fn update_data_stamp(&self, _data_stamp: u64) -> StorageResult<()> {
         Err(StorageError::Unsupported)
     }
+
+    /// Track boots as boot `boot`, recording it in the map before each ready bit until the map
+    /// is sealed. A map another boot left unsealed forgets its ready chunks and starts
+    /// rechecking; returns whether that happened.
+    fn adopt_boot(&self, _boot: u64) -> StorageResult<bool> {
+        Err(StorageError::Unsupported)
+    }
+
+    /// Record the tracked boot as filling the map, flushed before returning.
+    fn mark_unsealed(&self) -> StorageResult<()> {
+        Ok(())
+    }
+
+    /// Seal the map once every ready chunk's data is on stable storage; `flush` makes it so and
+    /// returns the data file's stamp when it may replace the recorded one. Returns whether the
+    /// map was unsealed.
+    fn seal(&self, _flush: &mut dyn FnMut() -> StorageResult<Option<u64>>) -> StorageResult<bool> {
+        Err(StorageError::Unsupported)
+    }
+
+    /// Whether a fill checks the bytes already cached for a chunk before fetching it.
+    fn is_rechecking(&self) -> bool {
+        false
+    }
 }
 
 /// Trait to convert a [BlobChunkInfo](../../device/trait.BlobChunkInfo.html) object to an index

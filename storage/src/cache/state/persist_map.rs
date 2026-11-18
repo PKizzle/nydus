@@ -3,10 +3,12 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
+use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::os::unix::io::AsRawFd;
 use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, RwLock, Weak};
 
 use nydus_utils::div_round_up;
 use nydus_utils::filemap::{FileMapState, FromMapped, clone_file};
@@ -20,7 +22,7 @@ pub(crate) const MAGIC_ALL_READY: u32 = 0x4D4D_4150;
 /// `Header::verified` value: every chunk marked ready has been checked against its digest.
 pub(crate) const MAGIC_VERIFIED: u32 = 0x5644_4150;
 pub(crate) const HEADER_SIZE: usize = 4096;
-pub(crate) const HEADER_RESERVED_SIZE: usize = HEADER_SIZE - 32;
+pub(crate) const HEADER_RESERVED_SIZE: usize = HEADER_SIZE - 48;
 
 /// The blob chunk map file header, 4096 bytes.
 #[repr(C)]
@@ -42,12 +44,24 @@ pub(crate) struct Header {
     /// to it. `verified` holds only while it matches: a release that predates the field cannot
     /// write the data file, not even to invalidate and refill it, without changing its ctime.
     pub data_stamp: u64,
+    /// Zero when every ready bit is backed by data on stable storage: the map is sealed, or no
+    /// release that tracks it has filled the cache. Otherwise the [boot_id](crate::utils::boot_id)
+    /// of the boot in which a fill marked chunks ready since the last seal. Set and flushed
+    /// before such a fill's first ready bit, so a map found marked by another boot may claim
+    /// data lost with that boot's page cache. Zero in maps written before the field existed.
+    pub unsealed_boot: u64,
+    /// Non-zero while chunks the map forgot after a crash may still be in the data file: a fill
+    /// first checks the bytes there against the chunk's digest. Cleared once every chunk is
+    /// ready.
+    pub recheck: u64,
     pub reserved: [u8; HEADER_RESERVED_SIZE],
 }
 
-// SAFETY: `Header` is `#[repr(C)]` with six `u32`s and a `u64` at an 8-byte offset followed by a byte array, so it has no padding,
+// SAFETY: `Header` is `#[repr(C)]` with six `u32`s and three `u64`s at 8-byte offsets followed by a byte array, so it has no padding,
 // no interior mutability, and every bit pattern is valid.
 unsafe impl FromMapped for Header {}
+
+const _: () = assert!(size_of::<Header>() == HEADER_SIZE);
 
 impl Header {
     pub fn as_slice(&self) -> &[u8] {
@@ -91,10 +105,47 @@ fn atomic_header_word(filemap: &FileMapState, offset: usize) -> io::Result<&Atom
     Ok(unsafe { AtomicU32::from_ptr(ptr.cast_mut()) })
 }
 
+/// Get the 8-byte header word at `offset` in a chunk map mapping as an atomic.
+fn atomic_header_u64(filemap: &FileMapState, offset: usize) -> StorageResult<&AtomicU64> {
+    let ptr = filemap
+        .validate_range(offset, size_of::<u64>())
+        .map_err(|e| StorageError::cache_io("reach the chunk map contents", e))?
+        .cast::<u64>();
+    if !ptr.is_aligned() {
+        return Err(StorageError::InvalidState(
+            "unaligned chunk map header".to_string(),
+        ));
+    }
+    // SAFETY: the word is aligned and in the writable mapping, which outlives the reference,
+    // and once the map is open it is only accessed atomically.
+    Ok(unsafe { AtomicU64::from_ptr(ptr.cast_mut()) })
+}
+
+/// The lock that orders ready bits against [PersistMap::seal] for the map file `file`, shared
+/// by every map of that file in this process: a seal must not run between a fill finding the
+/// map marked and that fill's ready bit.
+fn seal_lock_of(file: &File) -> io::Result<Arc<RwLock<()>>> {
+    use std::os::unix::fs::MetadataExt;
+    type Locks = BTreeMap<(u64, u64), Weak<RwLock<()>>>;
+    static LOCKS: Mutex<Locks> = Mutex::new(BTreeMap::new());
+
+    let md = file.metadata()?;
+    let mut locks = LOCKS.lock().unwrap_or_else(|e| e.into_inner());
+    locks.retain(|_, lock| lock.strong_count() > 0);
+    let key = (md.dev(), md.ino());
+    let lock = locks.get(&key).and_then(Weak::upgrade).unwrap_or_default();
+    locks.insert(key, Arc::downgrade(&lock));
+    Ok(lock)
+}
+
 pub(crate) struct PersistMap {
     pub count: u32,
     pub not_ready_count: AtomicU32,
     filemap: FileMapState,
+    /// The boot recorded in [Header::unsealed_boot] before a ready bit is set; zero for a map
+    /// whose opener does not track boots.
+    boot: AtomicU64,
+    seal_lock: Arc<RwLock<()>>,
 }
 
 impl PersistMap {
@@ -257,6 +308,8 @@ impl PersistMap {
             .map_err(|e| StorageError::cache_io("unlock the chunk map file", e))?;
 
         readahead(file.as_raw_fd(), 0, expected_size);
+        let seal_lock = seal_lock_of(&file)
+            .map_err(|e| StorageError::cache_io("stat the chunk map file", e))?;
         if !persist {
             let _ = std::fs::remove_file(filename);
         }
@@ -265,6 +318,8 @@ impl PersistMap {
             count: chunk_count,
             not_ready_count: AtomicU32::new(not_ready_count),
             filemap,
+            boot: AtomicU64::new(0),
+            seal_lock,
         })
     }
 
@@ -333,6 +388,8 @@ impl PersistMap {
             verified: 0,
             ready_count: 0,
             data_stamp: 0,
+            unsealed_boot: 0,
+            recheck: 0,
             reserved: [0x0u8; HEADER_RESERVED_SIZE],
         };
 
@@ -404,6 +461,12 @@ impl PersistMap {
 
     pub fn set_chunk_ready(&self, index: u32) -> StorageResult<()> {
         let index = self.validate_index(index)?;
+        if self.is_chunk_ready(index).0 {
+            return Ok(());
+        }
+        // Held until the bit is set, so a seal cannot clear the mark in between.
+        let _fill = self.seal_lock.read().unwrap_or_else(|e| e.into_inner());
+        self.mark_unsealed_locked()?;
 
         // Loop to atomically update the state bit corresponding to the chunk index.
         loop {
@@ -416,11 +479,14 @@ impl PersistMap {
                 if let Ok(w) = self.ready_count_word() {
                     w.fetch_add(1, Ordering::AcqRel);
                 }
-                // Flush the map once its last chunk is ready.
-                if self.not_ready_count.fetch_sub(1, Ordering::AcqRel) == 1
-                    && let Err(e) = self.filemap.sync_data()
-                {
-                    warn!("failed to flush the completed chunk map: {e}");
+                // Flush the map once its last chunk is ready; nothing is left to recheck.
+                if self.not_ready_count.fetch_sub(1, Ordering::AcqRel) == 1 {
+                    if let Ok(w) = self.recheck_word() {
+                        w.store(0, Ordering::Release);
+                    }
+                    if let Err(e) = self.filemap.sync_data() {
+                        warn!("failed to flush the completed chunk map: {e}");
+                    }
                 }
                 break;
             }
@@ -467,19 +533,88 @@ impl PersistMap {
     }
 
     fn data_stamp_word(&self) -> StorageResult<&AtomicU64> {
-        let ptr = self
-            .filemap
-            .validate_range(std::mem::offset_of!(Header, data_stamp), size_of::<u64>())
-            .map_err(|e| StorageError::cache_io("reach the chunk map contents", e))?
-            .cast::<u64>();
-        if !ptr.is_aligned() {
-            return Err(StorageError::InvalidState(
-                "unaligned chunk map header".to_string(),
-            ));
+        atomic_header_u64(&self.filemap, std::mem::offset_of!(Header, data_stamp))
+    }
+
+    fn unsealed_boot_word(&self) -> StorageResult<&AtomicU64> {
+        atomic_header_u64(&self.filemap, std::mem::offset_of!(Header, unsealed_boot))
+    }
+
+    fn recheck_word(&self) -> StorageResult<&AtomicU64> {
+        atomic_header_u64(&self.filemap, std::mem::offset_of!(Header, recheck))
+    }
+
+    /// Track boots for this map from now on, as boot `boot`. A map left unsealed by another
+    /// boot may claim chunks whose data was lost with that boot's page cache: its ready bits
+    /// and verified record are cleared and [Self::is_rechecking] turns on, keeping the data
+    /// file for the fills to check. Returns whether that happened.
+    pub fn adopt_boot(&self, boot: u64) -> StorageResult<bool> {
+        let unsealed = self.unsealed_boot_word()?.load(Ordering::Acquire);
+        let foreign = unsealed != 0 && unsealed != boot;
+        if foreign {
+            self.recheck_word()?.store(1, Ordering::Release);
+            self.reset()?;
+            self.set_verified(None)?;
         }
-        // SAFETY: the word is aligned and in the writable mapping, which outlives the reference,
-        // and once the map is open it is only accessed atomically.
-        Ok(unsafe { AtomicU64::from_ptr(ptr.cast_mut()) })
+        self.boot.store(boot, Ordering::Release);
+        Ok(foreign)
+    }
+
+    /// Record the tracked boot in the header and flush it, unless it is there already. Takes no
+    /// lock: callers setting a ready bit next hold the seal lock across both.
+    fn mark_unsealed_locked(&self) -> StorageResult<()> {
+        let boot = self.boot.load(Ordering::Acquire);
+        if boot == 0 {
+            return Ok(());
+        }
+        let word = self.unsealed_boot_word()?;
+        if word.load(Ordering::Acquire) == boot {
+            return Ok(());
+        }
+        word.store(boot, Ordering::Release);
+        self.filemap
+            .sync_data()
+            .map_err(|e| StorageError::cache_io("flush the chunk map", e))
+    }
+
+    /// Record the tracked boot as filling the map, flushed before returning. Every ready bit
+    /// does this too; a fill calls it first to fail before fetching anything.
+    pub fn mark_unsealed(&self) -> StorageResult<()> {
+        let _fill = self.seal_lock.read().unwrap_or_else(|e| e.into_inner());
+        self.mark_unsealed_locked()
+    }
+
+    /// Seal the map: record that every ready bit is backed by data on stable storage. With no
+    /// ready bit set in between, `flush` makes the data file durable and returns its current
+    /// stamp when this opener's own writes account for its change time. That stamp replaces
+    /// the recorded one only if the map is verified and its ready count is current. Returns
+    /// whether the map was unsealed; an error leaves it unsealed.
+    pub fn seal(
+        &self,
+        flush: &mut dyn FnMut() -> StorageResult<Option<u64>>,
+    ) -> StorageResult<bool> {
+        let _sealing = self.seal_lock.write().unwrap_or_else(|e| e.into_inner());
+        let word = self.unsealed_boot_word()?;
+        if word.load(Ordering::Acquire) == 0 {
+            return Ok(false);
+        }
+        if let Some(stamp) = flush()?
+            && self.verified_word()?.load(Ordering::Acquire) == MAGIC_VERIFIED
+            && self.ready_count_word()?.load(Ordering::Acquire) == self.ready_chunks()
+        {
+            self.update_data_stamp(stamp)?;
+        }
+        word.store(0, Ordering::Release);
+        self.filemap
+            .sync_data()
+            .map_err(|e| StorageError::cache_io("flush the chunk map", e))?;
+        Ok(true)
+    }
+
+    /// Whether a fill checks the bytes already in the data file before fetching a chunk.
+    pub fn is_rechecking(&self) -> bool {
+        self.recheck_word()
+            .is_ok_and(|w| w.load(Ordering::Acquire) != 0)
     }
 
     /// Whether the header records every ready chunk as checked against its digest, and neither

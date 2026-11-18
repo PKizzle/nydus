@@ -1281,6 +1281,16 @@ pub trait BlobObject: AsRawFd {
     fn revoke_chunk(&self, _chunk_index: u32) -> StorageResult<()> {
         Err(StorageError::Unsupported)
     }
+
+    /// Seal the cache once nothing fills it any more: flush its data file, then record that
+    /// every chunk marked ready is on stable storage, so a later boot trusts it. A cache not
+    /// sealed when its boot ends forgets its ready chunks in the next one and rechecks their
+    /// bytes as they are read. A fill after the seal unseals it again first. Its verified
+    /// stamp is refreshed only when the file changed through this cache's own writes alone.
+    /// Never seal a cache a failed or panicked filler may have left half-updated.
+    fn seal(&self) -> StorageResult<()> {
+        Err(StorageError::Unsupported)
+    }
 }
 
 /// A wrapping object over an underlying [BlobCache] object.

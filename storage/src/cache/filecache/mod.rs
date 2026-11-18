@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 use std::fs::OpenOptions;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use nydus_api::{CacheConfigV2, MetadataSource};
@@ -319,6 +319,18 @@ impl FileCacheEntry {
                     e => Err(e),
                 })?;
             }
+            // The kernel reads a fanotify cache's ready chunks unchecked, and after a crash
+            // their bytes may have been lost with the page cache. A map another boot left
+            // unsealed forgets them, keeping the data file for the fills to recheck.
+            if mgr.fanotify
+                && let Some(map) = chunk_map.as_range_map()
+                && map.adopt_boot(crate::utils::boot_id())?
+            {
+                warn!(
+                    "blob {blob_id}: cache was not sealed before the last reboot; rechecking its \
+                     cached chunks as they are read"
+                );
+            }
             // Set cache file to its expected size.
             let file = OpenOptions::new()
                 .create(true)
@@ -450,6 +462,7 @@ impl FileCacheEntry {
             need_validation,
             bootstrap_digests,
             digest_mismatches: AtomicU32::new(0),
+            own_ctime: AtomicU64::new(0),
             user_io_batch_size: mgr.user_io_batch_size,
             prefetch_config,
         })
