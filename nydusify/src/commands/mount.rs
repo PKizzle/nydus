@@ -86,7 +86,7 @@ pub async fn run(args: MountArgs) -> Result<()> {
         );
     }
 
-    let config = build_nydusd_config(
+    let mut config = build_nydusd_config(
         &target_ref.api_host,
         &target_ref.repo,
         &cache_dir,
@@ -94,6 +94,9 @@ pub async fn run(args: MountArgs) -> Result<()> {
         args.prefetch,
         auth.as_deref(),
     );
+    if let Some(proxy) = super::common::env_registry_proxy(&target_ref.api_host, false) {
+        config["device"]["backend"]["config"]["proxy"] = proxy;
+    }
     let config_path = args.work_dir.join("nydusd-config.json");
     std::fs::write(&config_path, serde_json::to_vec_pretty(&config)?)
         .with_context(|| format!("write nydusd config {}", config_path.display()))?;
