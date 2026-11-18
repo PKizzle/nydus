@@ -3416,15 +3416,19 @@ fn stage_mount_source(
     }
     if !want_view && unfit.is_none() {
         remove_view_records(stage_dir)?;
-        if !is_staged_copy(src, &staged) {
-            stage_bootstrap(src, &staged)?;
-        }
+        stage_copy(src, &staged)?;
         return Ok(false);
     }
     if trial.is_none() && staged_view_is_current(&digest, stage_dir)? {
         return Ok(true);
     }
-    remove_view_records(stage_dir)?;
+    // `bootstrap.view-of` stays while the view is rebuilt: without it an interrupted rebuild
+    // would leave a stage that looks staged from another source, and the next start would wipe
+    // this image's caches. A view of this source checked earlier stays staged meanwhile.
+    match fs::remove_file(stage_dir.join(VIEW_CHECK_RECORD)) {
+        Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e.into()),
+        _ => {}
+    }
     match trial.map_or_else(|| build_view(viewer, src, stage_dir), Ok) {
         Ok(view) => {
             nydus_service::erofs_folio::pad_to_page_size(&view.path())?;
@@ -3455,12 +3459,22 @@ fn stage_mount_source(
                     "no node view; mounting the image's own bootstrap without page cache sharing"
                 );
             }
-            if !is_staged_copy(src, &staged) {
-                stage_bootstrap(src, &staged)?;
-            }
+            remove_view_records(stage_dir)?;
+            stage_copy(src, &staged)?;
             Ok(false)
         }
     }
+}
+
+/// Stage a padded copy of `src` as `staged`, keeping one already staged (padded again to the
+/// current page size).
+fn stage_copy(src: &Path, staged: &Path) -> Result<()> {
+    if is_staged_copy(src, staged)? {
+        nydus_service::erofs_folio::pad_to_page_size(staged)?;
+    } else {
+        stage_bootstrap(src, staged)?;
+    }
+    Ok(())
 }
 
 /// Remove the records of a staged node view, its source record first: without it the stage dir
@@ -3475,13 +3489,15 @@ fn remove_view_records(stage_dir: &Path) -> io::Result<()> {
     Ok(())
 }
 
-/// What [`VIEW_CHECK_RECORD`] holds for the view file `view`: its SHA-256 and the version of the
-/// snapshotter whose checks it passed.
+/// What [`VIEW_CHECK_RECORD`] holds for the view file `view`: its SHA-256, the version of the
+/// snapshotter whose checks it passed and the host page size it was padded to. A view staged
+/// under another page size is built again, so the mount source stays the staged file.
 fn view_check(view: &Path) -> io::Result<String> {
     Ok(format!(
-        "{} {}",
+        "{} {} {}",
         source_digest(view)?,
-        env!("CARGO_PKG_VERSION")
+        env!("CARGO_PKG_VERSION"),
+        nydus_utils::host_page_size()
     ))
 }
 
@@ -3515,7 +3531,7 @@ fn is_staged_from(src: &Path, stage_dir: &Path) -> io::Result<bool> {
     match fs::read_to_string(stage_dir.join(VIEW_SOURCE_RECORD)) {
         Ok(recorded) => Ok(source_digest(src)? == recorded.trim()),
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
-            Ok(is_staged_copy(src, &stage_dir.join("bootstrap")))
+            is_staged_copy(src, &stage_dir.join("bootstrap"))
         }
         Err(e) => Err(e),
     }
@@ -3528,7 +3544,7 @@ fn staged_from_other(src: &Path, digest: &str, stage_dir: &Path) -> io::Result<b
     match fs::read_to_string(stage_dir.join(VIEW_SOURCE_RECORD)) {
         Ok(recorded) => Ok(recorded.trim() != digest),
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
-            Ok(staged.exists() && !is_staged_copy(src, &staged))
+            Ok(staged.exists() && !is_staged_copy(src, &staged)?)
         }
         Err(e) => Err(e),
     }
@@ -3539,7 +3555,9 @@ fn staged_from_other(src: &Path, digest: &str, stage_dir: &Path) -> io::Result<b
 /// nothing would read or remove. Never runs under a mount of the daemon dir.
 fn wipe_stage(stage_dir: &Path, keep: Option<&Path>) -> Result<()> {
     let mountpoint = stage_dir.with_file_name("mnt");
-    if is_mounted_at(&mountpoint) {
+    if mounted_at(&mountpoint)
+        .with_context(|| format!("cannot tell whether {} is mounted", mountpoint.display()))?
+    {
         bail!(
             "{} is still mounted; not wiping {}",
             mountpoint.display(),
@@ -3547,13 +3565,19 @@ fn wipe_stage(stage_dir: &Path, keep: Option<&Path>) -> Result<()> {
         );
     }
     info!(stage = %stage_dir.display(), "removing the stage of another source");
+    // The source record and the staged bootstrap go last: until then an interrupted wipe still
+    // looks staged from another source, and the next start finishes it.
+    let (record, staged) = (
+        stage_dir.join(VIEW_SOURCE_RECORD),
+        stage_dir.join("bootstrap"),
+    );
     for entry in fs::read_dir(stage_dir)
         .with_context(|| format!("failed to read {}", stage_dir.display()))?
     {
         let path = entry
             .with_context(|| format!("failed to read {}", stage_dir.display()))?
             .path();
-        if Some(path.as_path()) == keep {
+        if Some(path.as_path()) == keep || path == record || path == staged {
             continue;
         }
         let removed = if fs::symlink_metadata(&path).is_ok_and(|m| m.is_dir()) {
@@ -3563,27 +3587,30 @@ fn wipe_stage(stage_dir: &Path, keep: Option<&Path>) -> Result<()> {
         };
         removed.with_context(|| format!("failed to remove {}", path.display()))?;
     }
+    for path in [record, staged] {
+        match fs::remove_file(&path) {
+            Err(e) if e.kind() != io::ErrorKind::NotFound => {
+                return Err(e).with_context(|| format!("failed to remove {}", path.display()));
+            }
+            _ => {}
+        }
+    }
     Ok(())
 }
 
-/// Whether `staged` holds exactly what [`stage_bootstrap`] makes of `src`.
-fn is_staged_copy(src: &Path, staged: &Path) -> bool {
-    let (Ok(src_meta), Ok(staged_meta)) = (fs::metadata(src), fs::metadata(staged)) else {
-        return false;
+/// Whether `staged` holds what [`stage_bootstrap`] makes of `src` under any page size: `src`
+/// followed by zeros. A missing `staged` is no copy; any other I/O error is an error.
+fn is_staged_copy(src: &Path, staged: &Path) -> io::Result<bool> {
+    let staged_len = match fs::metadata(staged) {
+        Ok(meta) => meta.len(),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e),
     };
-    if staged_meta.len()
-        != src_meta
-            .len()
-            .next_multiple_of(nydus_utils::host_page_size())
-    {
-        return false;
+    if staged_len < fs::metadata(src)?.len() {
+        return Ok(false);
     }
-    let (Ok(src), Ok(staged)) = (fs::read(src), fs::read(staged)) else {
-        return false;
-    };
-    staged.len() as u64 == (src.len() as u64).next_multiple_of(nydus_utils::host_page_size())
-        && staged.starts_with(&src)
-        && staged[src.len()..].iter().all(|&b| b == 0)
+    let (src, staged) = (fs::read(src)?, fs::read(staged)?);
+    Ok(staged.starts_with(&src) && staged[src.len()..].iter().all(|&b| b == 0))
 }
 
 fn validate_spawn_request(image_ref: &str, bootstrap: &Path) -> Result<()> {
@@ -3694,6 +3721,23 @@ fn export_replacing<T>(
         .with_context(|| format!("{} has no parent dir", disk_image.display()))?;
     fs::create_dir_all(dir)
         .with_context(|| format!("failed to create disk image directory {}", dir.display()))?;
+    // A crash mid-export leaves a full-size temporary file behind.
+    let mut sidecar = disk_image.as_os_str().to_os_string();
+    sidecar.push(".verity.json");
+    let keep = [record.clone(), PathBuf::from(sidecar)];
+    for entry in fs::read_dir(dir).with_context(|| format!("failed to read {}", dir.display()))? {
+        let path = entry
+            .with_context(|| format!("failed to read {}", dir.display()))?
+            .path();
+        let temporary = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with("image.erofs."));
+        if temporary && !keep.contains(&path) {
+            fs::remove_file(&path)
+                .with_context(|| format!("failed to remove {}", path.display()))?;
+        }
+    }
     let tmp = tempfile::Builder::new()
         .prefix("image.erofs.")
         .tempfile_in(dir)
@@ -4165,6 +4209,11 @@ fn is_mounted_at(_mountpoint: &Path) -> bool {
     false
 }
 
+#[cfg(not(target_os = "linux"))]
+fn mounted_at(_mountpoint: &Path) -> io::Result<bool> {
+    Ok(false)
+}
+
 /// How a preserved fd should be re-attached at startup, decided purely from
 /// the filesystem type observed at the record's mountpoint. Deliberately
 /// independent of the configured driver: a fanotify-configured node still
@@ -4476,18 +4525,20 @@ fn mount_at(_mountpoint: &Path) -> Option<(String, String)> {
 
 #[cfg(target_os = "linux")]
 fn is_mounted_at(mountpoint: &Path) -> bool {
+    mounted_at(mountpoint).unwrap_or(false)
+}
+
+/// Whether anything is mounted at `mountpoint`; an unreadable mount table is an error.
+#[cfg(target_os = "linux")]
+fn mounted_at(mountpoint: &Path) -> io::Result<bool> {
     let target = mountpoint.display().to_string();
     let escaped = target.replace(' ', "\\040");
-    fs::read_to_string("/proc/self/mounts")
-        .map(|mounts| {
-            mounts.lines().any(|line| {
-                line.split_whitespace()
-                    .nth(1)
-                    .map(|path| path == target || path == escaped)
-                    .unwrap_or(false)
-            })
-        })
-        .unwrap_or(false)
+    let mounts = fs::read_to_string("/proc/self/mounts")?;
+    Ok(mounts.lines().any(|line| {
+        line.split_whitespace()
+            .nth(1)
+            .is_some_and(|path| path == target || path == escaped)
+    }))
 }
 
 /// Stop a daemon's service threads WITHOUT unmounting its mountpoint or
@@ -4814,13 +4865,26 @@ mod tests {
         let src = dir.path().join("src");
         let dst = dir.path().join("bootstrap");
         fs::write(&src, vec![7u8; 5000]).unwrap();
-        assert!(!is_staged_copy(&src, &dst), "nothing staged yet");
+        assert!(!is_staged_copy(&src, &dst).unwrap(), "nothing staged yet");
         stage_bootstrap(&src, &dst).unwrap();
-        assert!(is_staged_copy(&src, &dst));
+        assert!(is_staged_copy(&src, &dst).unwrap());
+        // A copy padded under a larger page size is still a copy.
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&dst)
+            .unwrap()
+            .set_len(65536)
+            .unwrap();
+        assert!(is_staged_copy(&src, &dst).unwrap());
         fs::write(&src, vec![8u8; 5000]).unwrap();
-        assert!(!is_staged_copy(&src, &dst), "different content");
+        assert!(!is_staged_copy(&src, &dst).unwrap(), "different content");
         fs::write(&src, vec![7u8; 5001]).unwrap();
-        assert!(!is_staged_copy(&src, &dst), "different length");
+        assert!(!is_staged_copy(&src, &dst).unwrap(), "different length");
+        // A read error is an error, never "another source".
+        fs::remove_file(&src).unwrap();
+        fs::create_dir(&src).unwrap();
+        fs::write(&dst, vec![0u8; 1 << 20]).unwrap();
+        assert!(is_staged_copy(&src, &dst).is_err());
     }
 
     fn viewer(nydus_image: &Path) -> crate::local_accel::LocalAccelConfig {
@@ -4857,13 +4921,13 @@ mod tests {
 
         assert!(!stage_mount_source(&viewer(&tool), &src, &stage, false, None).unwrap());
         assert!(!ran.exists(), "sharing is off and the image fit: no view");
-        assert!(is_staged_copy(&src, &stage.join("bootstrap")));
+        assert!(is_staged_copy(&src, &stage.join("bootstrap")).unwrap());
         assert!(is_staged_from(&src, &stage).unwrap());
 
         assert!(!stage_mount_source(&viewer(&tool), &src, &stage, true, None).unwrap());
         assert!(ran.exists());
         assert!(!stage.join(VIEW_SOURCE_RECORD).exists());
-        assert!(is_staged_copy(&src, &stage.join("bootstrap")));
+        assert!(is_staged_copy(&src, &stage.join("bootstrap")).unwrap());
         // No scratch dir is left behind in the stage dir.
         let left: Vec<_> = fs::read_dir(&stage)
             .unwrap()
@@ -4944,7 +5008,7 @@ mod tests {
             .collect();
         left.sort();
         assert_eq!(left, vec![std::ffi::OsString::from("bootstrap")]);
-        assert!(is_staged_copy(&b, &stage.join("bootstrap")));
+        assert!(is_staged_copy(&b, &stage.join("bootstrap")).unwrap());
 
         // A view of another source counts as another source too.
         fs::write(&cache, b"data of b").unwrap();
@@ -4996,7 +5060,7 @@ mod tests {
         fs::write(&staged, &tampered).unwrap();
         assert!(!stage_mount_source(&viewer(&tool), &src, &stage, true, None).unwrap());
         assert_eq!(runs(), 1);
-        assert!(is_staged_copy(&src, &staged));
+        assert!(is_staged_copy(&src, &staged).unwrap());
         assert!(!stage.join(VIEW_CHECK_RECORD).exists());
 
         // So is one checked by another version.
@@ -5007,11 +5071,23 @@ mod tests {
         assert!(!stage_mount_source(&viewer(&tool), &src, &stage, true, None).unwrap());
         assert_eq!(runs(), 2);
 
+        // And one padded under another page size: reused as it is, it would be mounted through
+        // an anonymous padded copy instead of the staged file.
+        stage_view(&view);
+        let other_page = format!(
+            "{hash} {} {}",
+            env!("CARGO_PKG_VERSION"),
+            nydus_utils::host_page_size() * 4
+        );
+        fs::write(stage.join(VIEW_CHECK_RECORD), other_page).unwrap();
+        assert!(!stage_mount_source(&viewer(&tool), &src, &stage, true, None).unwrap());
+        assert_eq!(runs(), 3);
+
         // And a view of another source.
         stage_view(&view);
         fs::write(stage.join(VIEW_SOURCE_RECORD), "0".repeat(64)).unwrap();
         assert!(!stage_mount_source(&viewer(&tool), &src, &stage, true, None).unwrap());
-        assert_eq!(runs(), 3);
+        assert_eq!(runs(), 4);
 
         // Without sharing, a fit image is staged as a copy, and a copy already staged is kept.
         let before = fs::metadata(&staged).unwrap().modified().unwrap();
@@ -5019,9 +5095,50 @@ mod tests {
         assert_eq!(fs::metadata(&staged).unwrap().modified().unwrap(), before);
         stage_view(&view);
         assert!(!stage_mount_source(&viewer(&tool), &src, &stage, false, None).unwrap());
-        assert!(is_staged_copy(&src, &staged));
+        assert!(is_staged_copy(&src, &staged).unwrap());
         assert!(!stage.join(VIEW_SOURCE_RECORD).exists());
-        assert_eq!(runs(), 3);
+        assert_eq!(runs(), 4);
+    }
+
+    /// A view rebuilt for a new snapshotter version keeps `bootstrap.view-of` while the tool runs,
+    /// so a rebuild killed midway leaves a stage of this source and its caches survive.
+    #[test]
+    fn an_interrupted_view_rebuild_keeps_the_caches() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let texture = Path::new(env!("CARGO_MANIFEST_DIR")).join("../tests/texture/bootstrap");
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("source");
+        fs::copy(texture.join("rafs-v6-2.2.boot"), &src).unwrap();
+        let stage = dir.path().join("stage");
+        fs::create_dir(&stage).unwrap();
+        let staged = stage.join("bootstrap");
+        fs::copy(texture.join("rafs-v6-small-files.boot"), &staged).unwrap();
+        fs::write(stage.join(VIEW_CHECK_RECORD), "checked by another version").unwrap();
+        fs::write(stage.join(VIEW_SOURCE_RECORD), source_digest(&src).unwrap()).unwrap();
+        let cache = stage.join("0123.blob.data");
+        fs::write(&cache, b"cached").unwrap();
+        // Records whether the source record was still there while it ran, and is "killed".
+        let saw = dir.path().join("saw-view-of");
+        let tool = dir.path().join("nydus-image");
+        fs::write(
+            &tool,
+            format!(
+                "#!/bin/sh\ntest -f {} && touch {}\nexit 2\n",
+                stage.join(VIEW_SOURCE_RECORD).display(),
+                saw.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&tool, fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(!stage_mount_source(&viewer(&tool), &src, &stage, true, None).unwrap());
+        assert!(
+            saw.exists(),
+            "bootstrap.view-of was gone during the rebuild"
+        );
+        assert!(!staged_from_other(&src, &source_digest(&src).unwrap(), &stage).unwrap());
+        assert!(cache.exists());
     }
 
     /// A blockdev/tarfs image is served again only for the bootstrap it was exported from:
@@ -5057,6 +5174,18 @@ mod tests {
         assert_eq!(fs::read(&disk).unwrap(), b"bootstrap b");
         assert_eq!(export_state(&disk, &b, &mnt).unwrap(), ExportState::Current);
         assert_eq!(export_state(&disk, &a, &mnt).unwrap(), ExportState::Stale);
+
+        // A temporary file left by a crashed export is removed by the next export; the source
+        // record and verity parameters are not temporary.
+        let leftover = dir.path().join("blockdev/image.erofs.Ab12Cd");
+        fs::write(&leftover, b"partial export").unwrap();
+        let sidecar = dir.path().join("blockdev/image.erofs.verity.json");
+        fs::write(&sidecar, b"{}").unwrap();
+        serve(&a).unwrap();
+        assert!(!leftover.exists());
+        assert!(sidecar.exists());
+        fs::remove_file(&sidecar).unwrap();
+        serve(&b).unwrap();
 
         // An image without a recorded source, such as one whose export was interrupted, is
         // exported again.
