@@ -87,7 +87,7 @@ impl ImageInfo {
     }
 
     fn dump(&self) {
-        println!(
+        outln!(
             r#"
 Directories:            {dirs}
 Files:                  {files}
@@ -107,28 +107,28 @@ Compressed Size:        {comp_size}"#,
             comp_size = self.comp_size,
         );
 
-        println!("\nFile Size Bits:\t\tFile Count:");
+        outln!("\nFile Size Bits:\t\tFile Count:");
         for sz in 0..=44 {
-            println!("{}:\t\t\t{}", sz, self.file_sizes[sz]);
+            outln!("{}:\t\t\t{}", sz, self.file_sizes[sz]);
         }
 
-        println!("\nChunk Size Bits:\tChunk Count:");
+        outln!("\nChunk Size Bits:\tChunk Count:");
         for sz in 12..=20 {
-            println!("{}:\t\t\t{}", sz, self.chunk_sizes[sz - 12]);
+            outln!("{}:\t\t\t{}", sz, self.chunk_sizes[sz - 12]);
         }
 
-        println!("\nRaw Content Size:\t{}", self.file_size);
-        println!("Comp Content Size:\t{}", self.comp_size);
-        println!("Raw Chunk Count:\t{}", self.chunks);
-        println!("Dedup Comp Size:\t{}", self.dedup_comp_size);
-        println!("Dedup Uncomp Size:\t{}", self.dedup_uncomp_size);
-        println!("Dedup Chunk Count:\t{}", self.dedup_chunks);
-        println!("Owned Comp Size:\t{}", self.own_comp_size);
-        println!("Owned Uncomp Size:\t{}", self.own_uncomp_size);
-        println!("Owned Chunk Count:\t{}", self.own_chunks);
-        println!("Referenced Comp Size:\t{}", self.ref_comp_size);
-        println!("Referenced Uncomp Size:\t{}", self.ref_uncomp_size);
-        println!("Referenced Chunk Count:\t{}", self.ref_chunks);
+        outln!("\nRaw Content Size:\t{}", self.file_size);
+        outln!("Comp Content Size:\t{}", self.comp_size);
+        outln!("Raw Chunk Count:\t{}", self.chunks);
+        outln!("Dedup Comp Size:\t{}", self.dedup_comp_size);
+        outln!("Dedup Uncomp Size:\t{}", self.dedup_uncomp_size);
+        outln!("Dedup Chunk Count:\t{}", self.dedup_chunks);
+        outln!("Owned Comp Size:\t{}", self.own_comp_size);
+        outln!("Owned Uncomp Size:\t{}", self.own_uncomp_size);
+        outln!("Owned Chunk Count:\t{}", self.own_chunks);
+        outln!("Referenced Comp Size:\t{}", self.ref_comp_size);
+        outln!("Referenced Uncomp Size:\t{}", self.ref_uncomp_size);
+        outln!("Referenced Chunk Count:\t{}", self.ref_chunks);
     }
 }
 
@@ -291,23 +291,23 @@ impl ImageStat {
 
     pub fn dump(&self) {
         if self.target_enabled {
-            println!("Target Image Statistics:");
+            outln!("Target Image Statistics:");
             self.target_image.dump();
         }
 
-        println!("\n\nBase Image Statistics:");
+        outln!("\n\nBase Image Statistics:");
         self.base_image.dump();
 
         if self.dedup_enabled {
-            println!("\n\nChunk Deduplication Statistics:");
-            println!(
+            outln!("\n\nChunk Deduplication Statistics:");
+            outln!(
                 "Global Dedup Thresh:\tRaw Chunks:\tDedup Chunks:\tComp Content Size:\tComp Base Size:\tComp Image Size:\tUncomp Content Size:\tUncomp Base Size\tUncomp Image Size"
             );
             for (idx, info) in self.dedup_info.iter().enumerate() {
                 if info.dedup_chunks == 0 {
                     break;
                 }
-                println!(
+                outln!(
                     "{:<24}0x{:<14x}0x{:<14x}0x{:<14x}0x{:<14x}0x{:<14x}0x{:<14x}0x{:<14x}0x{:<14x}",
                     idx + 1,
                     info.raw_chunks,

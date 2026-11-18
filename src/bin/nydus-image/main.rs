@@ -70,6 +70,44 @@ use nydus_service::ServiceArgs;
 #[cfg(target_os = "linux")]
 use std::str::FromStr;
 
+/// `print!` for this binary: std's panics once stdout's reader is gone
+/// (`nydus-image check -v | head`), and the panic policy turns that into an abort.
+macro_rules! out {
+    ($($arg:tt)*) => {
+        $crate::write_stdout(format_args!($($arg)*))
+    };
+}
+
+/// `println!` for this binary, see [`out!`].
+macro_rules! outln {
+    ($($arg:tt)*) => {
+        $crate::write_stdout(format_args!("{}\n", format_args!($($arg)*)))
+    };
+}
+
+/// Write to stdout, exiting quietly once nobody reads it any more.
+fn write_stdout(args: std::fmt::Arguments) {
+    use std::io::Write;
+    stdout_result(std::io::stdout().lock().write_fmt(args));
+}
+
+/// Flush stdout, with the same broken-pipe handling as [`out!`].
+fn flush_stdout() {
+    use std::io::Write;
+    stdout_result(std::io::stdout().flush());
+}
+
+/// A write to a reader that went away exits 141 (128 + SIGPIPE), the status a shell
+/// pipeline reports for a writer killed by SIGPIPE, so `set -o pipefail` still sees it.
+fn stdout_result(result: std::io::Result<()>) {
+    if let Err(e) = result {
+        if e.kind() == std::io::ErrorKind::BrokenPipe {
+            std::process::exit(128 + libc::SIGPIPE);
+        }
+        panic!("failed printing to stdout: {e}");
+    }
+}
+
 mod deduplicate;
 mod inspect;
 mod stat;
@@ -1002,7 +1040,7 @@ fn main() -> Result<()> {
                 &build_info,
             ),
             _ => {
-                println!("{}", usage);
+                outln!("{}", usage);
                 Ok(())
             }
         }
@@ -1034,12 +1072,12 @@ fn main() -> Result<()> {
         if let Some(matches) = cmd.subcommand_matches("export") {
             Command::export(&cmd, matches, &build_info)
         } else {
-            println!("{}", usage);
+            outln!("{}", usage);
             Ok(())
         }
         #[cfg(not(target_os = "linux"))]
         {
-            println!("{}", usage);
+            outln!("{}", usage);
             Ok(())
         }
     }
@@ -1823,10 +1861,10 @@ impl Command {
             .check(verbose)
             .with_context(|| format!("failed to check bootstrap {:?}", bootstrap_path))?;
 
-        println!("RAFS filesystem metadata is valid, referenced data blobs: ");
+        outln!("RAFS filesystem metadata is valid, referenced data blobs: ");
         let mut blob_ids = Vec::new();
         for (idx, blob) in blobs.iter().enumerate() {
-            println!(
+            outln!(
                 "\t {}: {}, compressed size {}, uncompressed size {}, chunk size: {}, chunk count: {}, features: {}",
                 idx,
                 blob.blob_id(),
@@ -2456,9 +2494,12 @@ impl Command {
         // Preserve the CLI's dm-verity hint output (the exported `.disk` plus
         // this line are all the operator needs for `veritysetup open`).
         if let Some(v) = verity_info {
-            println!(
+            outln!(
                 "dm-verity options: --no-superblock --format=1 -s \"\" --hash=sha256 --data-block-size={} --hash-block-size=4096 --data-blocks {} --hash-offset {} {}",
-                v.data_block_size, v.data_blocks, v.hash_offset, v.root_digest
+                v.data_block_size,
+                v.data_blocks,
+                v.hash_offset,
+                v.root_digest
             );
         }
         Ok(())
