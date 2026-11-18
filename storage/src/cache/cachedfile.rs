@@ -1183,11 +1183,13 @@ impl BlobCache for FileCacheEntry {
             let mut buf = alloc_buf(d_size);
 
             for c in range.chunks.iter() {
-                if let Ok(true) = self
-                    .chunk_map
-                    .check_ready_and_mark_pending_until(c.as_ref(), deadline)
-                {
-                    // The chunk is ready, so skip it.
+                // Only a chunk this call marked is its to fill: one that is ready, or still in
+                // another thread's fill at the deadline, is skipped, never filled or released here.
+                if !matches!(
+                    self.chunk_map
+                        .check_ready_and_mark_pending_until(c.as_ref(), deadline),
+                    Ok(false)
+                ) {
                     continue;
                 }
 
@@ -1203,13 +1205,12 @@ impl BlobCache for FileCacheEntry {
             }
         } else {
             for c in range.chunks.iter() {
-                if let Ok(true) = self
-                    .chunk_map
-                    .check_ready_and_mark_pending_until(c.as_ref(), deadline)
-                {
-                    // The chunk is ready, so skip it.
-                    continue;
-                } else {
+                // As above: fill only the chunks this call marked.
+                if matches!(
+                    self.chunk_map
+                        .check_ready_and_mark_pending_until(c.as_ref(), deadline),
+                    Ok(false)
+                ) {
                     pending.push(c.clone());
                 }
             }
