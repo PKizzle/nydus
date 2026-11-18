@@ -364,6 +364,12 @@ until SIGINT/SIGTERM/SIGHUP, then unmounts and stops it. Only `--backend-type re
 implemented; `oss`/`s3`/`localfs` are validated but rejected as follow-up work. This subcommand
 requires a working `nydusd` FUSE mount, i.e. a Linux host.
 
+`mount` and `optimize` hand the daemon they start the http or https forward proxy that
+`HTTPS_PROXY`/`HTTP_PROXY`/`ALL_PROXY` name for the registry (`NO_PROXY` applies), the proxy
+nydusify's own requests use. That proxy carries blob reads only: the daemon always fetches
+bearer tokens directly. On a network where nothing leaves without the proxy, `mount` and
+`optimize` therefore still fail whenever the registry's token server is not reachable directly.
+
 ## `nydusify commit`
 
 ```shell
