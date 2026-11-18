@@ -603,11 +603,20 @@ impl ContentStoreClient {
     /// un-roots the sidecar blob tree so containerd's (asynchronous) GC can
     /// collect it, which in turn releases the original gzip layers the
     /// sidecar's `gc.ref.content.*` labels were keeping alive.
+    ///
+    /// With `target`, containerd 2.0+ deletes the record only while it still
+    /// points at that digest (NotFound otherwise, so also success here): a
+    /// record repointed since it was listed is left alone. Older containerd
+    /// ignores the field and deletes unconditionally.
     #[instrument(level = "debug", skip(self), err)]
-    pub async fn images_delete(&self, name: &str) -> Result<()> {
+    pub async fn images_delete(&self, name: &str, target: Option<&str>) -> Result<()> {
         let request = tonic::Request::new(DeleteImageRequest {
             name: name.to_string(),
             sync: false,
+            target: target.map(|digest| types_proto::Descriptor {
+                digest: digest.to_string(),
+                ..Default::default()
+            }),
         });
         match self.images().delete(request).await {
             Ok(_) => Ok(()),

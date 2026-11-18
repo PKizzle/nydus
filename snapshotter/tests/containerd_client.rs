@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+use nydus_snapshotter::auto_zran::completeness_check;
 use nydus_snapshotter::config::ContainerdConfig;
 use nydus_snapshotter::containerd_api::services::leases::v1::{
     CreateRequest, DeleteRequest, ListRequest, leases_client::LeasesClient,
@@ -121,6 +122,19 @@ async fn lease_ids(channel: &ContainerdChannel) -> Vec<String> {
         .collect()
 }
 
+/// Major version of the `containerd` on PATH.
+fn containerd_major() -> u32 {
+    let out = Command::new("containerd")
+        .arg("--version")
+        .output()
+        .unwrap();
+    // "containerd <source> v1.6.20 <commit>" or "... 2.0.4 ..."
+    String::from_utf8_lossy(&out.stdout)
+        .split_whitespace()
+        .find_map(|w| w.trim_start_matches('v').split('.').next()?.parse().ok())
+        .expect("containerd --version names a version")
+}
+
 fn digest_of(bytes: &[u8]) -> String {
     let hex: String = Sha256::digest(bytes)
         .iter()
@@ -205,7 +219,7 @@ fn content_and_images_round_trip_and_survive_a_containerd_restart() {
             .unwrap()
             .expect("image present");
         assert_eq!(image.digest, big_digest);
-        client.images_delete(name).await.unwrap();
+        client.images_delete(name, None).await.unwrap();
         assert!(client.images_get(name).await.unwrap().is_none());
 
         // An absent digest is NotFound, not an error.
@@ -374,4 +388,86 @@ fn an_upload_lease_holds_content_until_the_image_record_roots_it() {
         .unwrap();
         assert!(!lease_ids(&channel).await.contains(&same_lease));
     });
+}
+
+#[test]
+#[ignore = "needs root and containerd; run misc/containerd-grpc/client-test.sh"]
+fn incomplete_sidecars_are_detected_and_deletes_honour_the_listed_target() {
+    let dir = tempfile::tempdir().unwrap();
+    let containerd = Containerd::start(dir.path());
+    let client = ContentStoreClient::new(&containerd.config()).unwrap();
+    let missing = digest_of(b"never written");
+
+    compio::runtime::Runtime::new().unwrap().block_on(async {
+        let upload = client.begin_upload("test-sidecar").await.unwrap();
+        let config = upload.write_bytes(b"{}", "config", labels()).await.unwrap();
+        let layer = upload
+            .write_bytes(b"bootstrap", "layer", labels())
+            .await
+            .unwrap();
+        let manifest_naming = |layers: &[&str]| {
+            serde_json::json!({
+                "schemaVersion": 2,
+                "mediaType": OCI_MANIFEST,
+                "config": {"mediaType": "application/json", "digest": config, "size": 2},
+                "layers": layers.iter().map(|d| serde_json::json!(
+                    {"mediaType": "application/octet-stream", "digest": d, "size": 9}
+                )).collect::<Vec<_>>(),
+            })
+            .to_string()
+            .into_bytes()
+        };
+        let complete = manifest_naming(&[&layer]);
+        let incomplete = manifest_naming(&[&layer, &missing]);
+        let complete_digest = upload
+            .write_bytes(&complete, "complete", labels())
+            .await
+            .unwrap();
+        let incomplete_digest = upload
+            .write_bytes(&incomplete, "incomplete", labels())
+            .await
+            .unwrap();
+
+        let check = |digest: String| {
+            let client = client.clone();
+            async move { completeness_check(&client, &digest).await.unwrap() }
+        };
+        assert!(check(complete_digest.clone()).await);
+        assert!(
+            !check(incomplete_digest.clone()).await,
+            "a named blob is missing"
+        );
+        assert!(
+            !check(missing.clone()).await,
+            "the manifest itself is missing"
+        );
+
+        let name = "nydus.test/sidecar:target";
+        upload
+            .finish_upsert(
+                name,
+                &complete_digest,
+                complete.len() as u64,
+                OCI_MANIFEST,
+                labels(),
+            )
+            .await
+            .unwrap();
+        client
+            .images_delete(name, Some(&incomplete_digest))
+            .await
+            .unwrap();
+        // containerd 2.0 added the conditional delete; older ones ignore the target.
+        assert_eq!(
+            client.images_get(name).await.unwrap().is_some(),
+            containerd_major() >= 2,
+            "a record pointing elsewhere than the listed target is kept (containerd 2.0+)"
+        );
+        client
+            .images_delete(name, Some(&complete_digest))
+            .await
+            .unwrap();
+        assert!(client.images_get(name).await.unwrap().is_none());
+    });
+    containerd.stop();
 }

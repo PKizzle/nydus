@@ -1291,7 +1291,7 @@ async fn existing_sidecar_state(
     if state == SidecarState::Stale {
         return (SidecarState::Stale, None);
     }
-    match completeness_check(deps, &existing.digest).await {
+    match completeness_check(&deps.content_store, &existing.digest).await {
         Ok(true) => {}
         Ok(false) => {
             warn!(image_name = %image_name, "auto-accel sidecar present but some referenced blobs are missing; re-converting");
@@ -1646,9 +1646,20 @@ fn job_work_dir(config: &AutoZranConfig, image: &str) -> std::path::PathBuf {
 /// during backend staging (`ensure_present` in auto_accel_sidecar.rs)
 /// and degrade to overlay — silently if our log filter happens to miss
 /// it. Catches: snapshotter killed mid-upload, containerd GC race after
-/// a label-stripping bug, manual `ctr content rm` poking.
-async fn completeness_check(deps: &ConversionDeps, manifest_digest: &str) -> Result<bool> {
-    let manifest_bytes = match deps.content_store.fetch_bytes(manifest_digest).await {
+/// a label-stripping bug, manual `ctr content rm` poking. The reconciler's
+/// sidecar sweep uses it too, to drop records that can never be served.
+///
+/// `Ok(false)` only on evidence: the manifest or a blob it names is absent
+/// (containerd answered NotFound), or the manifest has no config or layers.
+/// Any RPC failure is an error, never `Ok(false)`.
+pub async fn completeness_check(
+    content_store: &crate::content_store::ContentStoreClient,
+    manifest_digest: &str,
+) -> Result<bool> {
+    if content_store.info(manifest_digest).await?.is_none() {
+        return Ok(false);
+    }
+    let manifest_bytes = match content_store.fetch_bytes(manifest_digest).await {
         Ok(b) => b,
         Err(e) => {
             return Err(anyhow::anyhow!(
@@ -1680,7 +1691,7 @@ async fn completeness_check(deps: &ConversionDeps, manifest_digest: &str) -> Res
         return Ok(false);
     }
     for digest in descriptors {
-        if deps.content_store.info(&digest).await?.is_none() {
+        if content_store.info(&digest).await?.is_none() {
             debug!(missing = %digest, "auto-accel completeness check: blob missing");
             return Ok(false);
         }
