@@ -1301,7 +1301,10 @@ impl UffdService {
                     continue;
                 }
                 Err(e) => {
-                    warn!("block_uffd: accept error: {e}");
+                    // EMFILE and the like persist until something else lets go; retrying at
+                    // once would burn a core and flood the log.
+                    warn!("block_uffd: accept error, retrying in 1s: {e}");
+                    std::thread::sleep(std::time::Duration::from_secs(1));
                 }
             }
         }
