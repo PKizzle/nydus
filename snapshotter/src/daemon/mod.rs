@@ -289,6 +289,22 @@ impl DaemonInstance {
     }
 }
 
+/// Whether anything is mounted at or below `dir`.
+#[cfg(target_os = "linux")]
+fn mounted_under(dir: &Path) -> io::Result<bool> {
+    let mounts = fs::read_to_string("/proc/self/mounts")?;
+    Ok(mounts.lines().any(|line| {
+        line.split_whitespace().nth(1).is_some_and(|target| {
+            Path::new(&crate::recon::unescape_mount_field(target)).starts_with(dir)
+        })
+    }))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn mounted_under(_dir: &Path) -> io::Result<bool> {
+    Ok(false)
+}
+
 /// Lightweight daemon facade for the host-mounted blockdev/EROFS path.
 struct BlockdevDaemon {
     id: String,
@@ -542,7 +558,15 @@ pub struct DaemonSupervisor {
     auth_heal_pass: async_lock::Mutex<()>,
     /// Daemons healed because credentials they lacked arrived.
     auth_heals: AtomicU64,
+    /// Counters and gauges of stage retention (see `crate::retention`).
+    retention: crate::retention::Stats,
 }
+
+/// A stopped daemon record whose stage is gone is deleted after this long idle. It outlives its
+/// stage so the image's start history is not lost with it.
+pub const RECORD_MAX_IDLE: Duration = Duration::from_secs(60 * 24 * 3600);
+/// At most this many stopped records without a stage are kept; the oldest go first.
+pub const RECORD_MAX_STOPPED: usize = 4096;
 
 /// How long a credential update waits before its heal pass, so that a burst of updates (the
 /// credential bridge stores many entries at startup) is served by one pass.
@@ -576,7 +600,20 @@ impl DaemonSupervisor {
             auth_heal_pending: AtomicBool::new(false),
             auth_heal_pass: async_lock::Mutex::new(()),
             auth_heals: AtomicU64::new(0),
+            retention: crate::retention::Stats::default(),
         }
+    }
+
+    /// The retention policy, `None` with retention off (or invalid keys, which
+    /// `SnapshotterConfig::validate` rejects at startup).
+    pub fn retention_policy(&self) -> Option<crate::retention::Policy> {
+        crate::retention::Policy::from_config(&self.config.snapshotter.cache)
+            .ok()
+            .flatten()
+    }
+
+    pub fn retention_stats(&self) -> &crate::retention::Stats {
+        &self.retention
     }
 
     /// Take the per-image startup lock for `image_ref` (see `start_locks`).
@@ -886,6 +923,8 @@ impl DaemonSupervisor {
             }
         }
         if !heal {
+            self.retention
+                .record_start(staged_bootstrap.try_exists().unwrap_or(false));
             let viewer = self.node_viewer();
             let want_view = self.inode_share_domain().is_some();
             let (src, stage) = (bootstrap.to_path_buf(), stage_dir.clone());
@@ -1094,7 +1133,14 @@ impl DaemonSupervisor {
             return false;
         };
         let stopping = inst.clone();
-        if let Err(e) = blocking::unblock(move || stop_unreferenced_instance(&stopping)).await {
+        let stopped = blocking::unblock(move || {
+            let stopped = stop_unreferenced_instance(&stopping);
+            // Close the stopped daemon's cache files: a retained stage keeps no fd open.
+            nydus_storage::factory::BLOB_FACTORY.gc(None);
+            stopped
+        })
+        .await;
+        if let Err(e) = stopped {
             warn!(image_ref, error = %e, "failed to stop nydus daemon cleanly");
         }
         if let Err(e) = self.persist_instance_record(&inst, false).await {
@@ -1104,6 +1150,88 @@ impl DaemonSupervisor {
         // revive a daemon nobody references on the next start.
         self.clear_failover_state(&slug_for(image_ref));
         true
+    }
+
+    /// Evict the retained stage of `record`, a stopped daemon record the retention policy chose:
+    /// remove `daemons/<slug>/`, keeping the record. Runs under the image's start lock and
+    /// re-checks there that no daemon serves the image, that the record on disk is still `record`
+    /// (not live, same `updated_at`) and that nothing is mounted under the dir, so a start that
+    /// came first keeps its stage. Returns whether the dir was removed.
+    pub async fn evict_retained(&self, record: &DaemonStatusRecord) -> Result<bool> {
+        if record.live || slug_for(&record.image_ref) != record.slug {
+            return Ok(false);
+        }
+        let start_lock = self.start_lock(&record.image_ref).await;
+        let _guard = start_lock.lock().await;
+        if self.instances.read().await.contains_key(&record.image_ref) {
+            return Ok(false);
+        }
+        let path = self.record_path(&record.slug);
+        let dir = self.daemons_root().join(&record.slug);
+        let updated_at = record.updated_at;
+        blocking::unblock(move || {
+            let current: DaemonStatusRecord = match fs::read(&path) {
+                Ok(bytes) => serde_json::from_slice(&bytes)
+                    .with_context(|| format!("failed to decode {}", path.display()))?,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
+                Err(e) => {
+                    return Err(e).with_context(|| format!("failed to read {}", path.display()));
+                }
+            };
+            if current.live || current.updated_at != updated_at {
+                return Ok(false);
+            }
+            if mounted_under(&dir).context("failed to read the mount table")? {
+                warn!(dir = %dir.display(), "a retained stage has a mount under it; not evicting it");
+                return Ok(false);
+            }
+            // Close cache files a stopped daemon may still hold, or the removal frees nothing.
+            nydus_storage::factory::BLOB_FACTORY.gc(None);
+            match fs::remove_dir_all(&dir) {
+                Ok(()) => Ok(true),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+                Err(e) => Err(e).with_context(|| format!("failed to remove {}", dir.display())),
+            }
+        })
+        .await
+    }
+
+    /// Delete the stopped records whose daemon dir is gone and that are idle longer than
+    /// [`RECORD_MAX_IDLE`], and the oldest beyond [`RECORD_MAX_STOPPED`], each under its image's
+    /// start lock after reading it again. Returns how many were deleted.
+    pub async fn prune_stopped_records(&self, now: i64) -> usize {
+        let daemons = self.daemons_root();
+        let mut stopped: Vec<DaemonStatusRecord> = self
+            .read_persisted_records()
+            .into_iter()
+            .filter(|r| !r.live && !daemons.join(&r.slug).exists())
+            .collect();
+        stopped.sort_by_key(|r| std::cmp::Reverse(r.updated_at));
+        let cutoff = now.saturating_sub(RECORD_MAX_IDLE.as_secs() as i64);
+        let mut pruned = 0;
+        for (i, record) in stopped.iter().enumerate() {
+            if (i < RECORD_MAX_STOPPED && record.updated_at >= cutoff)
+                || slug_for(&record.image_ref) != record.slug
+            {
+                continue;
+            }
+            let start_lock = self.start_lock(&record.image_ref).await;
+            let _guard = start_lock.lock().await;
+            let path = self.record_path(&record.slug);
+            let unchanged = fs::read(&path)
+                .ok()
+                .and_then(|b| serde_json::from_slice::<DaemonStatusRecord>(&b).ok())
+                .is_some_and(|r| !r.live && r.updated_at == record.updated_at);
+            if unchanged && !daemons.join(&record.slug).exists() {
+                match fs::remove_file(&path) {
+                    Ok(()) => pruned += 1,
+                    Err(e) => {
+                        warn!(path = %path.display(), error = %e, "failed to prune a daemon record")
+                    }
+                }
+            }
+        }
+        pruned
     }
 
     /// Clamp daemon refcounts down to the holders that actually exist.
@@ -3159,7 +3287,7 @@ impl DaemonSupervisor {
         .await
     }
 
-    fn read_persisted_records(&self) -> Vec<DaemonStatusRecord> {
+    pub(crate) fn read_persisted_records(&self) -> Vec<DaemonStatusRecord> {
         let entries = match fs::read_dir(self.record_dir()) {
             Ok(entries) => entries,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
@@ -3420,6 +3548,7 @@ fn stage_mount_source(
         return Ok(false);
     }
     if trial.is_none() && staged_view_is_current(&digest, stage_dir)? {
+        VIEW_STAGING[0].fetch_add(1, Ordering::Relaxed);
         return Ok(true);
     }
     // `bootstrap.view-of` stays while the view is rebuilt: without it an interrupted rebuild
@@ -3431,6 +3560,7 @@ fn stage_mount_source(
     }
     match trial.map_or_else(|| build_view(viewer, src, stage_dir), Ok) {
         Ok(view) => {
+            VIEW_STAGING[1].fetch_add(1, Ordering::Relaxed);
             nydus_service::erofs_folio::pad_to_page_size(&view.path())?;
             view.file.persist(&staged).map_err(|e| e.error)?;
             atomic_write(
@@ -3475,6 +3605,17 @@ fn stage_copy(src: &Path, staged: &Path) -> Result<()> {
         stage_bootstrap(src, staged)?;
     }
     Ok(())
+}
+
+/// Node views staged for a fanotify start: mounted again as staged (`[0]`) and built (`[1]`).
+static VIEW_STAGING: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+
+/// Node views staged for fanotify starts so far: (mounted again as staged, built).
+pub fn view_staging_counts() -> (u64, u64) {
+    (
+        VIEW_STAGING[0].load(Ordering::Relaxed),
+        VIEW_STAGING[1].load(Ordering::Relaxed),
+    )
 }
 
 /// Remove the records of a staged node view, its source record first: without it the stage dir
@@ -6475,6 +6616,123 @@ mod tests {
         let lonely = lonely_stage.join("bootstrap");
         std::fs::write(&lonely, b"x").unwrap();
         assert_eq!(DaemonSupervisor::accel_backend_for(&lonely), None);
+    }
+
+    /// A supervisor with retention on under `root`, and the record and stage dir of a stopped
+    /// daemon of `image_ref`.
+    async fn retained(
+        root: &Path,
+        image_ref: &str,
+    ) -> (Arc<DaemonSupervisor>, DaemonInstance, PathBuf) {
+        let mut config = SnapshotterConfig::default();
+        config.snapshotter.root = root.to_path_buf();
+        config.snapshotter.cache.retention = true;
+        let supervisor = Arc::new(DaemonSupervisor::new(config));
+        let dir = supervisor.daemons_root().join(slug_for(image_ref));
+        fs::create_dir_all(dir.join("stage")).unwrap();
+        fs::write(dir.join("stage/bootstrap"), b"view").unwrap();
+        let inst = test_daemon_instance(image_ref, dir.join("mnt"));
+        supervisor
+            .persist_instance_record(&inst, false)
+            .await
+            .unwrap();
+        (supervisor, inst, dir)
+    }
+
+    /// An eviction waits for a start that holds the image's start lock, and then keeps the
+    /// stage the start took. Once the image is stopped again its stage is evicted, and its record
+    /// stays.
+    #[compio::test]
+    async fn an_eviction_racing_a_start_keeps_the_started_stage() {
+        let tmp = tempfile::tempdir().unwrap();
+        let image_ref = "registry.local/team/app:1";
+        let (supervisor, inst, dir) = retained(tmp.path(), image_ref).await;
+        let stopped = supervisor.read_persisted_records().pop().unwrap();
+
+        let start_lock = supervisor.start_lock(image_ref).await;
+        let starting = start_lock.lock().await;
+        let eviction = compio::runtime::spawn({
+            let supervisor = supervisor.clone();
+            let stopped = stopped.clone();
+            async move { supervisor.evict_retained(&stopped).await }
+        });
+        compio::time::sleep(Duration::from_millis(50)).await;
+        assert!(dir.join("stage").exists(), "the eviction did not wait");
+        supervisor
+            .persist_instance_record(&inst, true)
+            .await
+            .unwrap();
+        drop(starting);
+        assert!(!eviction.await.unwrap().unwrap());
+        assert!(dir.join("stage/bootstrap").exists());
+
+        // A daemon serves it: kept.
+        supervisor
+            .insert_test_instance(image_ref, dir.join("mnt"))
+            .await;
+        let live = supervisor.read_persisted_records().pop().unwrap();
+        assert!(!supervisor.evict_retained(&live).await.unwrap());
+        supervisor.instances.write().await.clear();
+
+        supervisor
+            .persist_instance_record(&inst, false)
+            .await
+            .unwrap();
+        let stopped = supervisor.read_persisted_records().pop().unwrap();
+        assert!(supervisor.evict_retained(&stopped).await.unwrap());
+        assert!(!dir.exists());
+        assert_eq!(supervisor.read_persisted_records(), vec![stopped]);
+    }
+
+    /// A record changed since the policy read it (stopped again later) keeps its stage.
+    #[compio::test]
+    async fn an_eviction_skips_a_changed_record() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (supervisor, _, dir) = retained(tmp.path(), "registry.local/team/app:1").await;
+        let mut seen = supervisor.read_persisted_records().pop().unwrap();
+        seen.updated_at -= 10;
+        assert!(!supervisor.evict_retained(&seen).await.unwrap());
+        // A record that names another image's dir is never acted on.
+        let mut forged = supervisor.read_persisted_records().pop().unwrap();
+        forged.slug = "..".to_string();
+        assert!(!supervisor.evict_retained(&forged).await.unwrap());
+        assert!(dir.join("stage/bootstrap").exists());
+    }
+
+    /// Stopped records outlive their stage until they are idle too long or too many.
+    #[compio::test]
+    async fn stopped_records_are_pruned_by_age_and_count() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (supervisor, _, dir) = retained(tmp.path(), "registry.local/team/app:1").await;
+        let now = unix_now();
+        let old = now + RECORD_MAX_IDLE.as_secs() as i64 + 1;
+        assert_eq!(
+            supervisor.prune_stopped_records(old).await,
+            0,
+            "its stage is still there"
+        );
+        fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(supervisor.prune_stopped_records(now).await, 0);
+        assert_eq!(supervisor.prune_stopped_records(old).await, 1);
+        assert!(supervisor.read_persisted_records().is_empty());
+
+        let records = supervisor.record_dir();
+        for i in 0..=RECORD_MAX_STOPPED {
+            let image_ref = format!("registry.local/team/app{i}:1");
+            let mut record = sample_record(PathBuf::from("/b"));
+            record.slug = slug_for(&image_ref);
+            record.image_ref = image_ref;
+            record.live = false;
+            record.updated_at = now - i as i64;
+            fs::write(
+                records.join(format!("{}.json", record.slug)),
+                serde_json::to_vec(&record).unwrap(),
+            )
+            .unwrap();
+        }
+        assert_eq!(supervisor.prune_stopped_records(now).await, 1);
+        let oldest = slug_for(&format!("registry.local/team/app{RECORD_MAX_STOPPED}:1"));
+        assert!(!records.join(format!("{oldest}.json")).exists());
     }
 
     #[test]

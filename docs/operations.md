@@ -133,6 +133,29 @@ Caveat: the TCP endpoint emits the process and snapshot-operation metrics plus
 tracked inside the sysctl controller and are unreachable from the TCP handler, so they render as
 `0`/absent there. Scrape the UDS `/metrics` if you need the GC counters.
 
+## Stage retention
+
+With `[snapshotter.cache] retention = true`, the node view and caches of a released fanotify image
+stay on the node for its next start, within a byte budget, a free-space floor and an idle limit
+(see [Stage retention](nydus-fanotify.md#stage-retention) for the policy). Size the floor above the
+kubelet's thresholds: image GC starts at 85 % used by default and node-pressure eviction at 10 %
+(`nodefs`) or 15 % (`imagefs`) available, and a retained stage is space neither of them can free.
+The default `retention_min_free = "20%"` stays clear of both defaults.
+
+The sysctl `/metrics` endpoint reports:
+
+| Metric | Type | Meaning |
+|---|---|---|
+| `nydus_snapshotter_fanotify_starts_total{stage="warm\|cold"}` | counter | fanotify starts that found a staged mount source, and those that did not |
+| `nydus_snapshotter_node_views_total{result="reused\|built"}` | counter | node views mounted again as staged, and built |
+| `nydus_snapshotter_retention_evictions_total{reason}` | counter | evicted stages: `idle`, `max_bytes`, `min_free`, `gc_max_bytes` |
+| `nydus_snapshotter_retained_stages`, `nydus_snapshotter_retained_bytes` | gauge | retained stages and their allocated bytes after the last pass |
+| `nydus_snapshotter_retention_max_bytes`, `nydus_snapshotter_retention_min_free_bytes` | gauge | the effective limits |
+| `nydus_snapshotter_retention_fs_available_bytes` | gauge | space available on the filesystem holding `daemons/` |
+
+The gauges appear once a retention pass has run. `GET /api/v1/daemons` lists the stopped records
+of retained (and evicted) stages with `live: false`; `updated_at` is the stop time.
+
 ## CPU profiling: `perf` and `samply`
 
 For actual CPU profiling (where is the process spending time?), use a system sampling profiler
