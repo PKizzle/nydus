@@ -1,8 +1,31 @@
 # Evaluating upstream's `v3` branch
 
 *Assessed against `upstream/v3` @ `3f9e12ed`, re-checked at tags `v3.0.0-alpha.1` and
-`v3.0.0-beta.1` (`fc2c3dfc`) and `v3.0.0-beta.3` (`bdff19e9`), last at branch head `8e92cc2f`
-(266 commits). Re-check before acting on any of this — the branch is still moving.*
+`v3.0.0-beta.1` (`fc2c3dfc`) and `v3.0.0-beta.3` (`bdff19e9`), last at branch head `3ed9ab0b`.
+Re-check before acting on any of this — the branch is still moving.*
+
+> **Re-checked at `3ed9ab0b`.** Decision unchanged. `git grep -i zran upstream/v3` and
+> `git grep -il snapshotter upstream/v3 -- '*.rs'` are both still empty, the README still says
+> formats may change and it is not production-ready, and tokio still drives the registry backend.
+> The range adds an incremental image writer for VM snapshots (`64414566`..`ff5ce878`), ready bits
+> that count only within the boot that set them (`34adcb50`), credentials as a redacted type
+> (`a6e81995`, `3ed9ab0b`) and a rewritten e2e harness.
+> - **Snapshotter: open PR #2215, in review.** A containerd proxy snapshotter written in **Go**,
+>   running one `nydus fuse` daemon per image as a systemd transient unit, with a bbolt store,
+>   credential rotation and a cache GC. It is FUSE-only, serves v3 images only, and lists failover,
+>   hot upgrade and repairing a cache after an unclean reboot as out of scope. It hands plain OCI
+>   layers to containerd to download and unpack, so precondition (a) stays unmet even if it merges.
+>   None of the open PRs (#2186, #2188, #2215, #2216, #2225, #2228, #2233, #2234) adds zran or lazy
+>   serving of an unmodified layer.
+> - **PR #2225** ports 52 fixes from v2 or from the same failure classes. Compared with this tree,
+>   the ones whose defect class also applies here are: ready bits and the `verified` stamp trusted across
+>   an unclean reboot (`34adcb50`), no timeout on a blob body once headers arrive (`30f9ddc1`),
+>   signed redirect URLs in logs (`0a3da4d7`), a sparse chunk map that turns a ready bit on a full
+>   disk into `SIGBUS` (`8783a955`), uffd fills of a partly present range (`ac29607b`), OSS and S3
+>   reads that do not check `Content-Range` (`dbd8d24f`), and symlink targets normalised by the
+>   `tar` writers of `nydus-image unpack` and `nydusify commit` (`46c720ec`). The reader and
+>   builder fixes for `st_blocks`, 4 GiB reads, root nid, over-long names and merged hardlink
+>   counts already hold here.
 
 > **Re-checked at `v3.0.0-beta.3` / `8e92cc2f`.** Decision unchanged: `git grep -i zran upstream/v3`
 > and `git grep -il snapshotter upstream/v3 -- '*.rs'` are both still empty, and tokio still drives
@@ -76,7 +99,7 @@ Against this fork, v3 is a large capability regression (v3 column as of `02156de
 
 | | our fork | upstream v3 |
 |---|---|---|
-| containerd snapshotter | yes (`snapshotter/`) | **none** — no gRPC/proxy-plugin at all |
+| containerd snapshotter | yes (`snapshotter/`) | **none** — no gRPC/proxy-plugin at all (a Go one is open PR #2215) |
 | zran / `targz-ref` | yes, end to end | **none** — gzip is decoded on build input only; every layer is re-encoded |
 | backends | registry, localfs, oss, s3, localdisk, http-proxy, mirrors | `local`, `registry`, Dragonfly |
 | compressors | lz4, zstd, gzip, none | `{none, zstd, lz4}` + native `erofs-{none,lz4,zstd}` |
@@ -92,7 +115,9 @@ each OCI layer. It cannot reference an unmodified gzip layer as its data blob, w
 basis of our node-local acceleration path ([ARCHITECTURE.md](../ARCHITECTURE.md), *Node-Local Acceleration*).
 
 **Do not rebase onto v3, and do not track it as a merge target.** Its value to us is as an
-independent second implementation of the fanotify pre-content path to compare against.
+independent second implementation of the fanotify pre-content path to compare against. Revisit
+only when v3 has both (a) lazy serving of an unmodified OCI layer with no push and (b) a
+containerd snapshotter.
 
 ## What we took from it
 
@@ -245,6 +270,13 @@ Ranked. None of these require adopting v3's format.
    xattr filtering (`trusted.*`, `user.*` on special files), setgid parent groups, directory
    mtime restamping, wall-clock mtime on synthesized parents, invalid whiteout names, and which
    hardlink member's metadata wins on the shared inode.
+8. **Boot-scoped cache readiness.** v3 tags its group map with the kernel boot id and clears the
+   ready bits on the first open of a new boot, keeping the data and re-adopting each group after
+   checking it (`34adcb50`). Writeback orders nothing between a cache file and its map, so a bit
+   can survive a power loss that its bytes did not.
+9. **Cache GC shape** from PR #2215: eviction by whole blob family, usage from allocated blocks,
+   a quota on the cache's own bytes with high and low watermarks, last-use times kept in the
+   metadata store, and candidates rechecked under a lock that daemon start also takes.
 
 Not worth porting: concurrent multi-blob reads (`c66b591b`; our per-blob loop in
 `rafs/src/fs.rs` only matters for chunk-dict files spanning blobs, never on the fanotify path),
