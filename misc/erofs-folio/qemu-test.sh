@@ -92,6 +92,7 @@ echo "==== page size $(sed -n 's/^KernelPageSize: *\([0-9]*\) kB/\1/p' /proc/sel
 for t in $(cat /tests/list 2>/dev/null); do
   case $t in
     dead-chunk-test) pass="==== DEAD CHUNKS: PASS" ;;
+    reuse-test) pass="==== CACHE REUSE: PASS ====" ;;
     runtime-test) pass="==== FANOTIFY FETCH PATH: PASS" ;;
     zran-multilayer-test) pass="==== MULTI-LAYER ZRAN: PASS ====" ;;
     *) pass="unknown test $t" ;;

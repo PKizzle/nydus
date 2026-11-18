@@ -237,6 +237,6 @@ jobs:
         KERNEL="$VMLINUZ" PROBE=$R/examples/erofs_folio_probe \
         MODULES_TAR="$RUNNER_TEMP/kernel/modules.tar" DEMO_IMAGE="$RUNNER_TEMP/demo.erofs" EXPECT="$EROFS_FOLIO" \
         EXPECT_PAGE_SIZE=64 QEMU_TIMEOUT=2400 \
-        FANOTIFY_TESTS="dead-chunk-test runtime-test zran-multilayer-test" \
+        FANOTIFY_TESTS="dead-chunk-test runtime-test zran-multilayer-test reuse-test" \
         NYDUSD=$R/nydusd NYDUS_IMAGE=$R/nydus-image BASH_STATIC=/bin/bash-static MMAP_CAT="$RUNNER_TEMP/mmap-cat" \
           bash misc/erofs-folio/qemu-test.sh
