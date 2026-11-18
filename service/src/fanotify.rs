@@ -1505,6 +1505,35 @@ impl FanotifyHandler {
         self.drain_deny_pending();
     }
 
+    /// Seal every blob's cache after [`stop`](Self::stop) or [`stop_workers`](Self::stop_workers),
+    /// so a later boot trusts what it holds (`BlobObject::seal`). A failed handler seals
+    /// nothing: whatever failed may have left its caches half-updated, and an unsealed cache
+    /// is only rechecked. Never call it from `Drop`, nor for a handler a heal or takeover
+    /// suspends: its successor serves the same caches.
+    pub fn seal(&self) {
+        if self.is_failed() {
+            return;
+        }
+        for backing in &self.blob_backings {
+            let blob_id = backing.blob.blob_info().blob_id();
+            // Excludes the verifier's revocations; fills are ordered by the chunk map itself.
+            let Ok(_sealing) = backing.io_lock.write() else {
+                warn!("fanotify: not sealing the cache of blob {blob_id}: its io lock is poisoned");
+                continue;
+            };
+            let Some(obj) = backing.blob.blob().get_blob_object() else {
+                continue;
+            };
+            match obj.seal() {
+                Ok(()) | Err(nydus_storage::StorageError::Unsupported) => {}
+                Err(e) => warn!(
+                    "fanotify: cannot seal the cache of blob {blob_id}: {e}; it is rechecked \
+                     after a reboot"
+                ),
+            }
+        }
+    }
+
     /// Signal all workers to stop and wait until they have exited, leaving queued events for a
     /// successor handler on the same group. Every event a worker read has been answered by then:
     /// a worker answers its whole batch before it looks at the stop signal. Idempotent.
@@ -2739,6 +2768,38 @@ mod tests {
         })]);
     }
 
+    /// Every regular file under `dir`, unread.
+    fn walkdir(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let mut out = Vec::new();
+        let mut stack = vec![dir.to_path_buf()];
+        while let Some(d) = stack.pop() {
+            for entry in std::fs::read_dir(&d).unwrap() {
+                let entry = entry.unwrap();
+                let ft = entry.file_type().unwrap();
+                if ft.is_dir() {
+                    stack.push(entry.path());
+                } else if ft.is_file() {
+                    out.push(entry.path());
+                }
+            }
+        }
+        out.sort();
+        out
+    }
+
+    /// The 8-byte chunk map header word at `offset` of the cache file `cache`.
+    fn chunk_map_word(cache: &std::path::Path, offset: u64) -> u64 {
+        use std::os::unix::fs::FileExt;
+        let mut map = cache.as_os_str().to_owned();
+        map.push(".chunk_map");
+        let mut word = [0u8; 8];
+        std::fs::File::open(map)
+            .unwrap()
+            .read_exact_at(&mut word, offset)
+            .unwrap();
+        u64::from_ne_bytes(word)
+    }
+
     /// Unmount `mnt`, lazily.
     fn umount(mnt: &std::path::Path) {
         let mnt = std::ffi::CString::new(mnt.as_os_str().as_encoded_bytes()).unwrap();
@@ -2747,7 +2808,9 @@ mod tests {
     }
 
     /// A verified cache stays verified when its handler is rebuilt over the same work dir with
-    /// no data changed, so the next daemon neither re-checks it nor keeps it from sharing.
+    /// no data changed, so the next daemon neither re-checks it nor keeps it from sharing. Two
+    /// workers fill it concurrently after it was verified, which may leave the stamp of the
+    /// slower fill recorded; the seal at stop repairs that and records the cache as sealed.
     #[test]
     fn a_verified_cache_stays_verified_across_handlers() {
         use super::*;
@@ -2757,20 +2820,38 @@ mod tests {
         };
         let (stage, mnt) = (work.path().join("stage"), work.path().join("mnt"));
         let (stage_s, mnt_s) = (stage.to_str().unwrap(), mnt.to_str().unwrap());
-        let first = Arc::new(FanotifyHandler::new(stage_s, mnt_s, mgr.clone(), 1).unwrap());
+        let first = Arc::new(FanotifyHandler::new(stage_s, mnt_s, mgr.clone(), 2).unwrap());
         // A fresh cache may share from its first mount on.
         assert!(first.unverified_blobs().is_empty());
         spawn_worker(&first);
+        spawn_worker(&first);
         first.arm().unwrap();
         first.mount().unwrap();
-        let good = read_all_cold(&mnt);
-        assert!(
-            !first.unverified_blobs().is_empty(),
-            "filled, not yet verified"
-        );
+        let files: Vec<_> = walkdir(&mnt);
+        assert!(files.len() > 1);
+        // Verify after one file, then fill the rest from two readers at once.
+        drop_page_cache(&files[0]);
+        std::fs::read(&files[0]).unwrap();
         first.spawn_verifier().unwrap().join().unwrap();
         assert!(first.is_blob_verified(FIXTURE_BLOB));
+        let (left, right) = files[1..].split_at(files.len() / 2);
+        std::thread::scope(|s| {
+            for half in [left, right] {
+                s.spawn(move || {
+                    for f in half {
+                        drop_page_cache(f);
+                        std::fs::read(f).unwrap();
+                    }
+                });
+            }
+        });
+        let good = read_all_cold(&mnt);
         let cache = first.blob_backings[0].cache_path.clone();
+        assert_ne!(
+            chunk_map_word(&cache, 32),
+            0,
+            "filled without unsealing the map"
+        );
         let ctime = |p: &Path| {
             let m = std::fs::metadata(p).unwrap();
             (m.ctime(), m.ctime_nsec())
@@ -2778,6 +2859,9 @@ mod tests {
         let before = ctime(&cache);
         first.stop();
         umount(&mnt);
+        first.seal();
+        assert_eq!(chunk_map_word(&cache, 32), 0, "stopped cleanly, not sealed");
+        assert!(first.is_blob_verified(FIXTURE_BLOB));
         drop(first);
         // As in a new daemon: the next handler opens the cache afresh.
         nydus_storage::factory::BLOB_FACTORY.forget("verified-across-handlers");
