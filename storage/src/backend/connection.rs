@@ -826,6 +826,7 @@ impl Connection {
                 Some(t) => match compio::runtime::time::timeout(t, send).await {
                     Ok(r) => r.map_err(ConnectionError::Common)?,
                     Err(_) => {
+                        self.drop_client(is_proxy);
                         return Err(ConnectionError::ErrorWithMsg(format!(
                             "request to {} timed out",
                             redact_url(&url_owned)
@@ -836,11 +837,15 @@ impl Connection {
             };
             let status = cyper_resp.status();
             let resp_headers = cyper_resp.headers().clone();
-            let body = cyper_resp.bytes().await.map_err(ConnectionError::Common)?;
+            let mut body = Vec::new();
+            let mut stream = cyper_resp.bytes_stream();
+            while let Some(chunk) = self.next_chunk(&mut stream, is_proxy, &url_owned).await? {
+                body.extend_from_slice(&chunk);
+            }
             Ok(Response {
                 status,
                 headers: resp_headers,
-                body: std::io::Cursor::new(body),
+                body: std::io::Cursor::new(body.into()),
             })
         });
 
@@ -856,6 +861,43 @@ impl Connection {
         );
 
         result.and_then(|resp| respond(resp, catch_status))
+    }
+
+    /// The next chunk of a response body, or an error once no data has arrived for the
+    /// request timeout. This bounds a stall, not the whole transfer: a slow body that keeps
+    /// moving is not cut off, while a peer that went silent mid-body fails the read so the
+    /// caller can retry instead of waiting forever.
+    async fn next_chunk<S>(
+        &self,
+        stream: &mut S,
+        is_proxy: bool,
+        url: &str,
+    ) -> ConnectionResult<Option<bytes::Bytes>>
+    where
+        S: futures_util::Stream<Item = cyper::Result<bytes::Bytes>> + Unpin,
+    {
+        let next = match self.timeout {
+            Some(t) => match compio::runtime::time::timeout(t, stream.next()).await {
+                Ok(next) => next,
+                Err(_) => {
+                    self.drop_client(is_proxy);
+                    return Err(ConnectionError::ErrorWithMsg(format!(
+                        "no data from {} for {t:?}",
+                        redact_url(url)
+                    )));
+                }
+            },
+            None => stream.next().await,
+        };
+        next.transpose().map_err(ConnectionError::Common)
+    }
+
+    /// Drop this thread's client, and with it its connection pool, after a request on it
+    /// timed out. A pooled HTTP/2 connection whose peer vanished without a FIN or RST still
+    /// looks open to the pool (the client sends no keep-alive pings), so every later request
+    /// multiplexed onto it would time out the same way; the next request builds a new client.
+    fn drop_client(&self, is_proxy: bool) {
+        HTTP_CLIENTS.with(|clients| clients.borrow_mut().remove(&(self.id, is_proxy)));
     }
 
     /// Streaming variant of `call_inner` for the blob read path: stream the
@@ -907,6 +949,7 @@ impl Connection {
                 Some(t) => match compio::runtime::time::timeout(t, send).await {
                     Ok(r) => r.map_err(ConnectionError::Common)?,
                     Err(_) => {
+                        self.drop_client(is_proxy);
                         return Err(ConnectionError::ErrorWithMsg(format!(
                             "request to {} timed out",
                             redact_url(&url_owned)
@@ -922,8 +965,7 @@ impl Connection {
                 // Stream the body straight into `dst` - no full-body allocation.
                 let mut written = 0usize;
                 let mut stream = resp.bytes_stream();
-                while let Some(chunk) = stream.next().await {
-                    let chunk = chunk.map_err(ConnectionError::Common)?;
+                while let Some(chunk) = self.next_chunk(&mut stream, is_proxy, &url_owned).await? {
                     if written >= dst.len() {
                         break;
                     }

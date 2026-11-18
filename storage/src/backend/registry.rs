@@ -2961,4 +2961,60 @@ mod tests {
         let leaked: Vec<_> = logs.iter().filter(|l| l.contains(SECRET)).collect();
         assert!(leaked.is_empty(), "signature logged: {leaked:?}");
     }
+
+    /// A peer that sends the headers and part of the body, then goes silent without
+    /// closing (lost NAT state, a wedged mirror). The read must fail once no data has
+    /// arrived for the configured timeout, so the caller can retry, instead of waiting
+    /// forever: on the fanotify path that wait is an unanswered permission event.
+    #[cfg(feature = "backend-registry")]
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support io_uring")]
+    fn test_read_fails_when_the_body_stalls() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown_srv = shutdown.clone();
+        thread::spawn(move || {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf);
+            let _ = stream.write_all(
+                b"HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-9/10\r\n\
+                  Content-Length: 10\r\n\r\nabcde",
+            );
+            let _ = stream.flush();
+            // Hold the connection open without sending the rest.
+            while !shutdown_srv.load(Ordering::Relaxed) {
+                thread::sleep(std::time::Duration::from_millis(20));
+            }
+        });
+
+        let config = RegistryConfig {
+            scheme: "http".to_string(),
+            host: addr.to_string(),
+            repo: "library/test".to_string(),
+            retry_limit: 0,
+            timeout: 1,
+            connect_timeout: 1,
+            ..Default::default()
+        };
+        let (done, result) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let registry = Registry::new(&config, Some("test-stalled-body")).unwrap();
+            let reader = registry.get_reader("sha256:abc").unwrap();
+            let mut buf = [0u8; 10];
+            let _ = done.send(reader.try_read(&mut buf, 0).map_err(|e| e.to_string()));
+        });
+        let read = result.recv_timeout(std::time::Duration::from_secs(15));
+        shutdown.store(true, Ordering::Relaxed);
+        let err = read
+            .expect("a read whose body stalls must fail, not hang")
+            .expect_err("a stalled body is not a successful read");
+        assert!(err.contains("no data"), "{err}");
+    }
 }
