@@ -987,14 +987,9 @@ impl Connection {
         })
     }
 
-    /// Streaming counterpart of `call` for the blob read path: routes through the
-    /// proxy with origin fallback like the buffered path, but streams the
-    /// response body into `dst` and returns the number of bytes written.
-    /// Proxy-aware streaming core: streams the response body into `dst` and
-    /// returns `(status, content_range, bytes_written, error_body)` *without* applying
-    /// `catch_status`. Callers decide how to treat the status (e.g. registry
-    /// inspects 307/401/403 itself). Shared by `call_stream` and
-    /// `call_stream_status`.
+    /// Proxy-aware streaming core: routes through the proxy with origin fallback like
+    /// the buffered path, streams the response body into `dst` and returns
+    /// `(status, content_range, bytes_written, error_body)` without judging the status.
     fn call_stream_status_err(
         &self,
         method: Method,
@@ -1047,29 +1042,10 @@ impl Connection {
         self.call_inner_stream(false, method, url, &query, headers, dst)
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub fn call_stream(
-        &self,
-        method: Method,
-        url: &str,
-        query: Option<&[(&str, &str)]>,
-        headers: &HeaderMap,
-        catch_status: bool,
-        skip_proxy: bool,
-        dst: &mut [u8],
-    ) -> ConnectionResult<usize> {
-        let (status, _content_range, written, err) =
-            self.call_stream_status_err(method, url, query, headers, skip_proxy, dst)?;
-        if catch_status && !is_success_status(status) {
-            return Err(ConnectionError::ErrorWithMsg(err.unwrap_or_default()));
-        }
-        Ok(written)
-    }
-
-    /// Like `call_stream`, but returns the HTTP status and `Content-Range` alongside
-    /// the byte count instead of folding non-success into an error. Used by the
-    /// registry blob read path, which must distinguish 200 (stream the blob) from
-    /// 401/403 (a stale cached redirect to retry) and check which range arrived.
+    /// Streaming counterpart of `call`: returns the HTTP status and `Content-Range` alongside
+    /// the byte count instead of folding non-success into an error. Blob range reads use it:
+    /// the registry must distinguish 200 (stream the blob) from 401/403 (a stale cached
+    /// redirect to retry), and every caller checks which range arrived.
     pub fn call_stream_status(
         &self,
         method: Method,
@@ -1079,8 +1055,14 @@ impl Connection {
         skip_proxy: bool,
         dst: &mut [u8],
     ) -> ConnectionResult<(StatusCode, Option<HeaderValue>, usize)> {
-        let (status, content_range, written, _err) =
+        let (status, content_range, written, err) =
             self.call_stream_status_err(method, url, query, headers, skip_proxy, dst)?;
+        // The status alone reaches the caller's error; the body often says why (an object
+        // store's error code, for one).
+        if let Some(body) = err.filter(|b| !b.is_empty()) {
+            let end = body.floor_char_boundary(512);
+            warn!("HTTP {status} from {}: {}", redact_url(url), &body[..end]);
+        }
         Ok((status, content_range, written))
     }
 }
