@@ -41,21 +41,28 @@ impl Containerd {
             .arg("--config")
             .arg("/dev/null")
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(std::fs::File::create(root.join("containerd.log")).expect("containerd log"))
             .spawn()
             .expect("start containerd (is it on PATH, and are we root?)");
+        let mut this = Self {
+            child,
+            root: root.to_path_buf(),
+        };
+        // containerd 2.x creates the socket before it accepts on it: wait for a connection.
         let deadline = Instant::now() + Duration::from_secs(15);
-        while !socket.exists() {
+        while std::os::unix::net::UnixStream::connect(&socket).is_err() {
+            let log = || std::fs::read_to_string(root.join("containerd.log")).unwrap_or_default();
+            if let Ok(Some(status)) = this.child.try_wait() {
+                panic!("containerd exited ({status}):\n{}", log());
+            }
             assert!(
                 Instant::now() < deadline,
-                "containerd socket never appeared"
+                "containerd never accepted on its socket:\n{}",
+                log()
             );
             std::thread::sleep(Duration::from_millis(100));
         }
-        Self {
-            child,
-            root: root.to_path_buf(),
-        }
+        this
     }
 
     fn config(&self) -> ContainerdConfig {
