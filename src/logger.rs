@@ -147,7 +147,12 @@ pub fn setup_logging(
             let log_rotation_size_byte: u64 = rotation_size * 1024 * 1024;
             logger = logger.rotate(
                 Criterion::Size(log_rotation_size_byte),
-                Naming::Timestamps,
+                // An empty current infix keeps writing to the configured path; rotated files
+                // get a timestamp infix. `Naming::Timestamps` would write to `<name>_rCURRENT`.
+                Naming::TimestampsCustomFormat {
+                    current_infix: Some(""),
+                    format: "r%Y-%m-%d_%H-%M-%S",
+                },
                 Cleanup::KeepCompressedFiles(10),
             );
         }
@@ -347,5 +352,35 @@ mod tests {
 
         assert_eq!(log_file.file_stem(), Some(std::ffi::OsStr::new("myapp")));
         assert_eq!(log_file.extension(), Some(std::ffi::OsStr::new("txt")));
+    }
+
+    /// The only test in this binary that installs the global logger.
+    #[test]
+    #[cfg_attr(miri, ignore = "flexi_logger spawns threads and opens files")]
+    fn rotation_keeps_logging_to_the_configured_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nydusd.log");
+        setup_logging(Some(path.clone()), LevelFilter::Info, 1).unwrap();
+        let line = "x".repeat(1024);
+        for _ in 0..1100 {
+            log::info!("{line}");
+        }
+        log::info!("after rotation");
+        log::logger().flush();
+        let current = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            current.contains("after rotation"),
+            "the configured path stopped receiving logs"
+        );
+        let files: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert!(
+            files
+                .iter()
+                .any(|f| f.to_string_lossy().starts_with("nydusd_r")),
+            "no rotated file in {files:?}"
+        );
     }
 }
