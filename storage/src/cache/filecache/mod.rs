@@ -15,7 +15,7 @@ use nydus_utils::metrics::BlobcacheMetrics;
 use crate::backend::BlobBackend;
 #[cfg(feature = "dedup")]
 use crate::cache::CasMgr;
-use crate::cache::cachedfile::{BootstrapDigests, FileCacheEntry, FileCacheMeta};
+use crate::cache::cachedfile::{BootstrapDigests, FileCacheEntry, FileCacheMeta, data_file_stamp};
 use crate::cache::state::{
     BlobStateMap, ChunkMap, DigestedChunkMap, IndexedChunkMap, NoopChunkMap,
 };
@@ -340,6 +340,15 @@ impl FileCacheEntry {
                     file_size, cached_file_size
                 );
                 return Err(StorageError::InvalidArgument(msg));
+            }
+            // A verified map vouches for the data file only at the stamp it recorded. Drop the
+            // record of a file changed since, before a fill stores the current stamp over it
+            // and makes the unchecked chunks read as verified again.
+            if bootstrap_digests.is_some()
+                && let Some(map) = chunk_map.as_range_map()
+                && !map.is_verified(data_file_stamp(&file)?)
+            {
+                map.set_verified(None)?;
             }
             // A fanotify cache validates against the bootstrap, never the blob's own digests.
             let load_chunk_digest = (need_validation && !mgr.fanotify) || cas_mgr.is_some();

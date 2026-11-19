@@ -182,9 +182,9 @@ mod tests {
         let paused_duration = pauser.wait();
         let elapsed = start.elapsed();
 
-        // Should return immediately
+        // Should return immediately; Miri runs too slowly for a wall-clock bound.
         assert_eq!(paused_duration, Duration::ZERO);
-        assert!(elapsed.as_millis() < 10);
+        assert!(cfg!(miri) || elapsed.as_millis() < 10);
     }
 
     #[test]
