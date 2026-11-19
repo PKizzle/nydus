@@ -46,7 +46,8 @@
 
 use std::collections::BTreeMap;
 use std::fs::{self, File, Metadata};
-use std::io::{self, BufWriter};
+use std::io::{self, BufWriter, Read};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
 
@@ -203,9 +204,51 @@ fn append_dir_contents<W: io::Write>(
 /// Copy one upperdir entry into the layer, xattrs included.
 fn append_entry<W: io::Write>(builder: &mut Builder<W>, abs: &Path, rel: &Path) -> Result<()> {
     append_pax_xattrs(builder, abs, rel)?;
+    let md = fs::symlink_metadata(abs).with_context(|| format!("stat {}", abs.display()))?;
+    if md.file_type().is_symlink() {
+        let target =
+            fs::read_link(abs).with_context(|| format!("read symlink {}", abs.display()))?;
+        let mut header = Header::new_gnu();
+        header.set_metadata_in_mode(&md, HeaderMode::Complete);
+        return append_symlink(builder, &mut header, rel, &target)
+            .with_context(|| format!("append {} to the upper layer", rel.display()));
+    }
     builder
         .append_path_with_name(abs, rel)
         .with_context(|| format!("append {} to the upper layer", rel.display()))
+}
+
+/// Append a symlink whose target is stored byte for byte. `tar` rebuilds a
+/// target that fits the header from its path components, which turns `a//b`
+/// into `a/b` and drops `.` components, so the target is set literally and a
+/// longer one goes out as a GNU long-link record, as `tar` itself writes it.
+pub(crate) fn append_symlink<W: io::Write>(
+    builder: &mut Builder<W>,
+    header: &mut Header,
+    name: &Path,
+    target: &Path,
+) -> io::Result<()> {
+    let target = target.as_os_str().as_bytes();
+    let slot = header.as_old().linkname.len();
+    if target.len() > slot {
+        let mut long = Header::new_gnu();
+        let long_name = b"././@LongLink";
+        long.as_gnu_mut().expect("a GNU header").name[..long_name.len()].copy_from_slice(long_name);
+        long.set_mode(0o644);
+        long.set_uid(0);
+        long.set_gid(0);
+        long.set_mtime(0);
+        // NUL-terminated, as GNU tar writes it.
+        long.set_size(target.len() as u64 + 1);
+        long.set_entry_type(EntryType::GNULongLink);
+        long.set_cksum();
+        builder.append(&long, target.chain(&[0u8][..]))?;
+        header.set_link_name_literal(&target[..slot])?;
+    } else {
+        header.set_link_name_literal(target)?;
+    }
+    header.set_size(0);
+    builder.append_data(header, name, io::empty())
 }
 
 /// Emit the entry's non-overlayfs xattrs as a PAX header. PAX extended headers
@@ -403,7 +446,7 @@ fn is_absent_or_unsupported(e: &io::Error) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::io::Read;
 
     use super::*;
@@ -487,6 +530,50 @@ mod tests {
         // A followed symlink would have copied the 7-byte payload.
         assert_eq!(entries[1].2, 0);
         fs::remove_file(&out).unwrap();
+    }
+
+    /// Symlink targets that `Path::components` would rewrite, the last one
+    /// fitting the 100-byte header only once rewritten.
+    pub(crate) fn literal_link_targets() -> Vec<Vec<u8>> {
+        let mut long = b"a//".to_vec();
+        long.extend([b'x'; 98]);
+        vec![
+            b"../a/./b/".to_vec(),
+            b"a//b".to_vec(),
+            b"dir/.".to_vec(),
+            b"a/\xff/b".to_vec(),
+            long,
+        ]
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support xattrs")]
+    fn symlink_targets_are_archived_byte_for_byte() {
+        let upper = tempfile::tempdir().unwrap();
+        let targets = literal_link_targets();
+        for (i, target) in targets.iter().enumerate() {
+            std::os::unix::fs::symlink(
+                std::ffi::OsStr::from_bytes(target),
+                upper.path().join(format!("l{i}")),
+            )
+            .unwrap();
+        }
+        let out = upper
+            .path()
+            .parent()
+            .unwrap()
+            .join("upper-literal-links.tar");
+
+        write_upper_layer_tar(upper.path(), &out).unwrap();
+
+        let mut archive = tar::Archive::new(File::open(&out).unwrap());
+        let links: Vec<Vec<u8>> = archive
+            .entries()
+            .unwrap()
+            .map(|e| e.unwrap().link_name_bytes().unwrap().into_owned())
+            .collect();
+        fs::remove_file(&out).unwrap();
+        assert_eq!(links, targets);
     }
 
     #[test]
