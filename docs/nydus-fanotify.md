@@ -336,16 +336,23 @@ Every reconcile tick, the reconciler reads the records and the filesystem's free
 2. then, while there is a deficit, the stage idle longest relative to its limit, the larger first on
    a tie. The deficit is the largest of: retained bytes over `retention_max_bytes`;
    `retention_min_free` over the space available to unprivileged users (`f_bavail`); and, on the
-   slow pass with `gc_max_bytes` set, all cache bytes over `gc_max_bytes`. That pass runs before the
-   cache GC, so retained stages go before any `work_dir` file.
+   slow pass with `gc_max_bytes` set (and `gc_dry_run` off), all cache bytes over `gc_max_bytes`.
+   That pass runs before the cache GC, so retained stages go before any `work_dir` file.
+
+The plan is made again after every eviction. A stage whose eviction fails or is refused still counts
+against the limits but is not chosen again in that pass, so the next stage goes instead. If the
+records cannot be read, the pass fails and no daemon dir is swept.
 
 With `retention_idle_limit = "auto"`, each image learns its start gap `G` from its own starts:
-every start after a stop sets `G = max(now - last stop, 0.75 * G)`, so `G` follows a longer gap at
+every start after a release (the last holder of the image went; the stopped record carries
+`released_at`) sets `G = max(now - released_at, 0.75 * G)`, so `G` follows a longer gap at
 once and forgets it by a quarter per start. The limit is `2 * G`, at least 1 h and at most 30 days,
 and 26 h while `G` is unknown. `G` is kept in the daemon record (`start_gap`, seconds), which the
-records endpoint shows.
+records endpoint shows. A heal, replacement, upgrade, or start after a snapshotter shutdown keeps
+`G` and is not counted as a warm or cold start.
 
-A stage's files are measured (allocated blocks, each inode once) once after it became retained. An
+A stage's files are measured (allocated blocks, each inode once) once after it became retained; a
+stage that cannot be measured is counted at its last known size, or left out of that pass. An
 eviction takes the image's start lock and checks again that no daemon serves the image, that the
 record is unchanged and still stopped, and that nothing is mounted under the dir; a start that got
 there first keeps its stage. The record outlives its stage. Stopped records without a stage are

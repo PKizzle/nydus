@@ -19,7 +19,7 @@ use std::fs;
 use std::io;
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
@@ -144,6 +144,11 @@ pub struct DaemonStatusRecord {
     /// started again after a stop.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub start_gap: Option<u64>,
+    /// When the last holder released the daemon (Unix seconds), in the stopped record a release
+    /// writes. A stop for a replacement, an upgrade or a shutdown has none, so the next start
+    /// learns no start gap from it and is not counted as a warm or cold start.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub released_at: Option<i64>,
 }
 
 /// Outcome for one daemon recovery attempt.
@@ -261,6 +266,9 @@ struct DaemonInstance {
     missing_auth: bool,
     /// See `DaemonStatusRecord::start_gap`.
     start_gap: Option<u64>,
+    /// When the last holder released it (Unix seconds, 0: not released); see
+    /// `DaemonStatusRecord::released_at`.
+    released_at: AtomicI64,
 }
 
 impl DaemonInstance {
@@ -929,9 +937,14 @@ impl DaemonSupervisor {
                     .with_context(|| format!("failed to detach {}", mountpoint.display()))?;
             }
         }
-        if !heal {
+        let previous = fs::read(self.record_path(&slug))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<DaemonStatusRecord>(&bytes).ok());
+        if !heal && previous.as_ref().is_none_or(|r| r.released_at.is_some()) {
             self.retention
                 .record_start(staged_bootstrap.try_exists().unwrap_or(false));
+        }
+        if !heal {
             let viewer = self.node_viewer();
             let want_view = self.inode_share_domain().is_some();
             let (src, stage) = (bootstrap.to_path_buf(), stage_dir.clone());
@@ -955,9 +968,6 @@ impl DaemonSupervisor {
             }
         }
 
-        let previous = fs::read(self.record_path(&slug))
-            .ok()
-            .and_then(|bytes| serde_json::from_slice::<DaemonStatusRecord>(&bytes).ok());
         let start_gap = start_gap_after(previous.as_ref(), unix_now());
 
         let threads = self.config.snapshotter.daemon.threads.max(1) as u32;
@@ -1033,6 +1043,7 @@ impl DaemonSupervisor {
             registry_auth,
             missing_auth: false,
             start_gap,
+            released_at: AtomicI64::new(0),
             _poll: poll,
         }))
     }
@@ -1051,6 +1062,9 @@ impl DaemonSupervisor {
     ) -> Result<DaemonStatusRecord> {
         validate_spawn_request(image_ref, bootstrap)?;
 
+        // Like the ensure_* paths: no eviction or teardown of this image runs meanwhile.
+        let start_lock = self.start_lock(image_ref).await;
+        let _guard = start_lock.lock().await;
         let mut instances = self.instances.write().await;
         if let Some(inst) = instances.get(image_ref) {
             if inst.bootstrap != bootstrap {
@@ -1156,6 +1170,7 @@ impl DaemonSupervisor {
         if let Err(e) = stopped {
             warn!(image_ref, error = %e, "failed to stop nydus daemon cleanly");
         }
+        inst.released_at.store(unix_now(), Ordering::SeqCst);
         if let Err(e) = self.persist_instance_record(&inst, false).await {
             warn!(image_ref, error = %e, "failed to persist stopped daemon record");
         }
@@ -1209,16 +1224,16 @@ impl DaemonSupervisor {
         .await
     }
 
-    /// Delete the stopped records whose daemon dir is gone and that are idle longer than
-    /// [`RECORD_MAX_IDLE`], and the oldest beyond [`RECORD_MAX_STOPPED`], each under its image's
-    /// start lock after reading it again. Returns how many were deleted.
-    pub async fn prune_stopped_records(&self, now: i64) -> usize {
+    /// Of `stopped`, stopped records whose daemon dir was gone when they were read, delete those
+    /// idle longer than [`RECORD_MAX_IDLE`] and the oldest beyond [`RECORD_MAX_STOPPED`], each
+    /// under its image's start lock after reading it and checking its dir again. Returns how many
+    /// were deleted.
+    pub async fn prune_stopped_records(
+        &self,
+        mut stopped: Vec<DaemonStatusRecord>,
+        now: i64,
+    ) -> usize {
         let daemons = self.daemons_root();
-        let mut stopped: Vec<DaemonStatusRecord> = self
-            .read_persisted_records()
-            .into_iter()
-            .filter(|r| !r.live && !daemons.join(&r.slug).exists())
-            .collect();
         stopped.sort_by_key(|r| std::cmp::Reverse(r.updated_at));
         let cutoff = now.saturating_sub(RECORD_MAX_IDLE.as_secs() as i64);
         let mut pruned = 0;
@@ -2195,6 +2210,7 @@ impl DaemonSupervisor {
                 registry_auth: false,
                 missing_auth: false,
                 start_gap: None,
+                released_at: AtomicI64::new(0),
             }));
         }
 
@@ -2280,6 +2296,7 @@ impl DaemonSupervisor {
                 registry_auth: false,
                 missing_auth: false,
                 start_gap: None,
+                released_at: AtomicI64::new(0),
             }));
         }
 
@@ -2363,6 +2380,7 @@ impl DaemonSupervisor {
             registry_auth: false,
             missing_auth: false,
             start_gap: None,
+            released_at: AtomicI64::new(0),
             _poll: poll,
         }))
     }
@@ -2847,6 +2865,7 @@ impl DaemonSupervisor {
             registry_auth: record.registry_auth,
             missing_auth: false,
             start_gap: record.start_gap,
+            released_at: AtomicI64::new(0),
         });
         self.note_parked_slug(slug);
         self.instances
@@ -2915,6 +2934,7 @@ impl DaemonSupervisor {
             registry_auth: record.registry_auth,
             missing_auth: record.registry_auth && !has_auth,
             start_gap: record.start_gap,
+            released_at: AtomicI64::new(0),
         });
         self.note_parked_slug(slug);
         self.instances
@@ -3106,6 +3126,7 @@ impl DaemonSupervisor {
                 registry_auth: old.registry_auth,
                 missing_auth: old.registry_auth && !has_auth,
                 start_gap: old.start_gap,
+                released_at: AtomicI64::new(0),
                 _poll: poll,
             }))
         }
@@ -3282,6 +3303,9 @@ impl DaemonSupervisor {
             driver_override: inst.driver_override,
             registry_auth: inst.registry_auth,
             start_gap: inst.start_gap,
+            released_at: (!live)
+                .then(|| inst.released_at.load(Ordering::SeqCst))
+                .filter(|&at| at != 0),
         }
     }
 
@@ -3308,13 +3332,19 @@ impl DaemonSupervisor {
     }
 
     pub(crate) fn read_persisted_records(&self) -> Vec<DaemonStatusRecord> {
+        self.try_read_persisted_records().unwrap_or_else(|e| {
+            warn!(error = %e, "failed to read daemon records directory");
+            Vec::new()
+        })
+    }
+
+    /// The persisted daemon records; an unreadable records dir is an error, a missing one empty.
+    /// An undecodable record is skipped with a warning.
+    pub(crate) fn try_read_persisted_records(&self) -> io::Result<Vec<DaemonStatusRecord>> {
         let entries = match fs::read_dir(self.record_dir()) {
             Ok(entries) => entries,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
-            Err(e) => {
-                warn!(error = %e, "failed to read daemon records directory");
-                return Vec::new();
-            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(e),
         };
         let mut out = Vec::new();
         for entry in entries.flatten() {
@@ -3330,19 +3360,20 @@ impl DaemonSupervisor {
                 None => warn!(path = %entry.path().display(), "failed to decode daemon record"),
             }
         }
-        out
+        Ok(out)
     }
 }
 
 /// The start gap of a daemon of the image whose record is `previous`, starting at `now`: learned
-/// from the stop a stopped record marks; kept from a live one, since a heal or a replacement is no
-/// new start.
+/// from the release a stopped record marks (`released_at`); kept from any other record, since a
+/// heal, a replacement, an upgrade or a start after a shutdown is no new start of the image.
 fn start_gap_after(previous: Option<&DaemonStatusRecord>, now: i64) -> Option<u64> {
     let previous = previous?;
-    if previous.live {
-        previous.start_gap
-    } else {
-        crate::retention::learn_gap(previous.start_gap, previous.updated_at, now)
+    match previous.released_at {
+        Some(released_at) if !previous.live => {
+            crate::retention::learn_gap(previous.start_gap, released_at, now)
+        }
+        _ => previous.start_gap,
     }
 }
 
@@ -4885,6 +4916,7 @@ fn test_instance_with_daemon(
         registry_auth: false,
         missing_auth: false,
         start_gap: None,
+        released_at: AtomicI64::new(0),
     }
 }
 
@@ -5517,19 +5549,26 @@ mod tests {
             driver_override: None,
             registry_auth: false,
             start_gap: None,
+            released_at: None,
         }
     }
 
-    /// A start learns the gap since the stop its stopped record marks; a heal or replacement of a
-    /// live daemon keeps the gap.
+    /// A start learns the gap since the release its stopped record marks; any other record (a
+    /// live one, or one stopped for a replacement, upgrade or shutdown) keeps the gap.
     #[test]
-    fn a_start_learns_the_gap_since_the_last_stop() {
+    fn a_start_learns_the_gap_since_the_last_release() {
         let mut record = sample_record(PathBuf::from("/b"));
         assert_eq!(start_gap_after(None, 1000), None);
         record.start_gap = Some(600);
         assert_eq!(start_gap_after(Some(&record), 1000), Some(600), "live");
         record.live = false;
-        record.updated_at = 100;
+        record.updated_at = 990;
+        assert_eq!(
+            start_gap_after(Some(&record), 1000),
+            Some(600),
+            "stopped without a release"
+        );
+        record.released_at = Some(100);
         assert_eq!(start_gap_after(Some(&record), 1000), Some(900));
         assert_eq!(
             start_gap_after(Some(&record), 50),
@@ -5539,11 +5578,36 @@ mod tests {
 
         let json = serde_json::to_string(&record).unwrap();
         assert!(json.contains("\"start_gap\":600"), "{json}");
+        assert!(json.contains("\"released_at\":100"), "{json}");
         let decoded: DaemonStatusRecord = serde_json::from_str(&json).unwrap();
-        assert_eq!(decoded.start_gap, Some(600));
+        assert_eq!(decoded, record);
         record.start_gap = None;
+        record.released_at = None;
         let json = serde_json::to_string(&record).unwrap();
-        assert!(!json.contains("start_gap"), "{json}");
+        assert!(
+            !json.contains("start_gap") && !json.contains("released_at"),
+            "{json}"
+        );
+    }
+
+    /// Only the stopped record a release writes carries `released_at`.
+    #[test]
+    fn only_a_released_record_carries_its_release_time() {
+        let supervisor = DaemonSupervisor::new(SnapshotterConfig::default());
+        let inst = test_instance();
+        assert_eq!(
+            supervisor.record_for_instance(&inst, false).released_at,
+            None
+        );
+        inst.released_at.store(1234, Ordering::SeqCst);
+        assert_eq!(
+            supervisor.record_for_instance(&inst, false).released_at,
+            Some(1234)
+        );
+        assert_eq!(
+            supervisor.record_for_instance(&inst, true).released_at,
+            None
+        );
     }
 
     /// The unused `built_on_node` field still round-trips, and records without it load.
@@ -6744,6 +6808,37 @@ mod tests {
         assert_eq!(supervisor.read_persisted_records(), vec![stopped]);
     }
 
+    /// An explicit spawn waits for the image's start lock, so it cannot stage or mount while an
+    /// eviction removes the dir.
+    #[compio::test]
+    async fn a_spawn_waits_for_the_start_lock() {
+        let tmp = tempfile::tempdir().unwrap();
+        let image_ref = "registry.local/team/app:1";
+        let (supervisor, _, dir) = retained(tmp.path(), image_ref).await;
+        supervisor
+            .insert_test_instance(image_ref, dir.join("mnt"))
+            .await;
+        // Another bootstrap than the instance's: the spawn fails as soon as it gets in.
+        let other = tmp.path().join("other-bootstrap");
+        fs::write(&other, b"other").unwrap();
+
+        let start_lock = supervisor.start_lock(image_ref).await;
+        let evicting = start_lock.lock().await;
+        let done = Arc::new(AtomicBool::new(false));
+        let spawn = compio::runtime::spawn({
+            let (supervisor, done) = (supervisor.clone(), done.clone());
+            async move {
+                let result = supervisor.spawn_instance(image_ref, &other).await;
+                done.store(true, Ordering::SeqCst);
+                result
+            }
+        });
+        compio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!done.load(Ordering::SeqCst), "the spawn did not wait");
+        drop(evicting);
+        assert!(spawn.await.unwrap().is_err());
+    }
+
     /// A record changed since the policy read it (stopped again later) keeps its stage.
     #[compio::test]
     async fn an_eviction_skips_a_changed_record() {
@@ -6766,14 +6861,15 @@ mod tests {
         let (supervisor, _, dir) = retained(tmp.path(), "registry.local/team/app:1").await;
         let now = unix_now();
         let old = now + RECORD_MAX_IDLE.as_secs() as i64 + 1;
+        let stopped = || supervisor.read_persisted_records();
         assert_eq!(
-            supervisor.prune_stopped_records(old).await,
+            supervisor.prune_stopped_records(stopped(), old).await,
             0,
             "its stage is still there"
         );
         fs::remove_dir_all(&dir).unwrap();
-        assert_eq!(supervisor.prune_stopped_records(now).await, 0);
-        assert_eq!(supervisor.prune_stopped_records(old).await, 1);
+        assert_eq!(supervisor.prune_stopped_records(stopped(), now).await, 0);
+        assert_eq!(supervisor.prune_stopped_records(stopped(), old).await, 1);
         assert!(supervisor.read_persisted_records().is_empty());
 
         let records = supervisor.record_dir();
@@ -6790,7 +6886,7 @@ mod tests {
             )
             .unwrap();
         }
-        assert_eq!(supervisor.prune_stopped_records(now).await, 1);
+        assert_eq!(supervisor.prune_stopped_records(stopped(), now).await, 1);
         let oldest = slug_for(&format!("registry.local/team/app{RECORD_MAX_STOPPED}:1"));
         assert!(!records.join(format!("{oldest}.json")).exists());
     }

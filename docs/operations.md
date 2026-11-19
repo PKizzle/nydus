@@ -146,7 +146,7 @@ The sysctl `/metrics` endpoint reports:
 
 | Metric | Type | Meaning |
 |---|---|---|
-| `nydus_snapshotter_fanotify_starts_total{stage="warm\|cold"}` | counter | fanotify starts that found a staged mount source, and those that did not |
+| `nydus_snapshotter_fanotify_starts_total{stage="warm\|cold"}` | counter | fanotify starts after a release (or of a new image) that found a staged mount source, and those that did not |
 | `nydus_snapshotter_node_views_total{result="reused\|built"}` | counter | node views mounted again as staged, and built |
 | `nydus_snapshotter_retention_evictions_total{reason}` | counter | evicted stages: `idle`, `max_bytes`, `min_free`, `gc_max_bytes` |
 | `nydus_snapshotter_retained_stages`, `nydus_snapshotter_retained_bytes` | gauge | retained stages and their allocated bytes after the last pass |
@@ -155,7 +155,7 @@ The sysctl `/metrics` endpoint reports:
 
 The gauges appear once a retention pass has run. `GET /api/v1/daemons` lists the stopped records
 of retained (and evicted) stages with `live: false`; `updated_at` is the stop time, and
-`start_gap` the image's learned start gap in seconds.
+`released_at` the time of the release, and `start_gap` the image's learned start gap in seconds.
 
 ## CPU profiling: `perf` and `samply`
 

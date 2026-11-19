@@ -49,7 +49,11 @@ impl Size {
         }
         crate::cgroup::normalize_memory_value(value)
             .map(|bytes| Self::Bytes(bytes.parse().expect("normalized byte value")))
-            .map_err(|e| format!("{e:#}"))
+            .map_err(|_| {
+                "expected a byte count with an optional unit (B, K, M, G, T, Ki, Mi, Gi, Ti) or a \
+                 percentage"
+                    .to_string()
+            })
     }
 
     /// The limit in bytes on a filesystem of `total` bytes.
@@ -153,6 +157,9 @@ pub struct Stage {
     pub stopped_at: i64,
     /// Its image's learned start gap, in seconds ([`learn_gap`]).
     pub gap: Option<u64>,
+    /// Its eviction failed or was refused this pass: it still counts against the limits, but is
+    /// not chosen again.
+    pub pinned: bool,
 }
 
 /// Size and free space of the filesystem holding `daemons/`.
@@ -233,6 +240,9 @@ pub fn plan(
     });
     let mut evict = Vec::new();
     for stage in order {
+        if stage.pinned {
+            continue;
+        }
         let reason = if idle(stage) >= limit(stage) {
             Reason::Idle
         } else {
@@ -317,7 +327,13 @@ mod tests {
             bytes: gib * GIB,
             stopped_at: NOW - idle_hours * 3600,
             gap: None,
+            pinned: false,
         }
+    }
+
+    fn pinned(mut stage: Stage) -> Stage {
+        stage.pinned = true;
+        stage
     }
 
     fn learned(mut stage: Stage, gap_hours: u64) -> Stage {
@@ -513,6 +529,23 @@ mod tests {
                 roomy,
                 0,
                 vec![("hourly", Reason::MaxBytes)],
+            ),
+            (
+                "a stage that could not be evicted still counts, and the next ones go instead",
+                policy("2GiB", "0%", "26h"),
+                vec![
+                    pinned(stage("stuck", 2, 30)),
+                    stage("b", 1, 3),
+                    stage("c", 1, 2),
+                    stage("d", 1, 1),
+                ],
+                roomy,
+                0,
+                vec![
+                    ("b", Reason::MaxBytes),
+                    ("c", Reason::MaxBytes),
+                    ("d", Reason::MaxBytes),
+                ],
             ),
             (
                 "clock stepped back: a stop in the future is not idle",
