@@ -103,7 +103,7 @@ impl LayerBackfill {
         let transfer = self.transfer(&reference, &record).await;
         // Delete the record whether or not the transfer succeeded: a partial fetch leaves it
         // behind too, and the real image's manifest is what keeps the fetched blobs.
-        let cleanup = self.content_store.images_delete(&record).await;
+        let cleanup = self.content_store.images_delete(&record, None).await;
         transfer.with_context(|| format!("containerd transfer of {reference}"))?;
         cleanup?;
 
@@ -135,7 +135,7 @@ impl LayerBackfill {
         let mut removed = 0;
         for record in self.content_store.images_list().await? {
             if record.name.starts_with(RECORD_PREFIX) {
-                self.content_store.images_delete(&record.name).await?;
+                self.content_store.images_delete(&record.name, None).await?;
                 removed += 1;
             }
         }
