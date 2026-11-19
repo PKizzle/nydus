@@ -55,12 +55,13 @@ cp "$R/out/$BLOB" "$R/backend/$BLOB"
 MAP="$R/stage/$BLOB.blob.data.chunk_map"
 DATA="$R/stage/$BLOB.blob.data"
 
-# With EROFS page cache sharing compiled in, `inode_share` without `domain_id` is refused.
+# Page cache sharing is in use only if the kernel keeps the option: a kernel before 7.0 refuses
+# it, one built without CONFIG_EROFS_FS_PAGE_CACHE_SHARE drops it.
 SHARE=0
-if ! mount -t erofs -o ro,inode_share "$R/stage/bootstrap" "$R/probe" 2>/dev/null; then
-  mount -t erofs -o ro "$R/stage/bootstrap" "$R/probe" 2>/dev/null && SHARE=1
+if mount -t erofs -o ro,inode_share,domain_id=reuse-probe "$R/stage/bootstrap" "$R/probe" 2>/dev/null; then
+  grep " $R/probe erofs " /proc/mounts | grep -q inode_share && SHARE=1
+  umount "$R/probe"
 fi
-umount "$R/probe" 2>/dev/null
 DOMAIN=""
 [ "$SHARE" = 1 ] && DOMAIN=', "erofs_inode_share_domain": "reuse-test"'
 echo "page cache sharing: $([ "$SHARE" = 1 ] && echo supported || echo not supported)"
