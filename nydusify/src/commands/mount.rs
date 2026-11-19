@@ -430,6 +430,7 @@ mod tests {
     /// A dropped ssh session sends SIGHUP; nydusd runs in its own session and would outlive us.
     #[cfg(unix)]
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support signal(2)")]
     fn hangup_requests_teardown() {
         signal::install();
         // SAFETY: raise(2) only delivers the signal to this process.
