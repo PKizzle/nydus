@@ -42,12 +42,16 @@ head -c 524288 /dev/urandom > "$R/src/random.bin"
 for i in $(seq 0 15); do head -c $((i * 1111 + 7)) /dev/urandom > "$R/src/sub/f$i"; done
 FILES=$(cd "$R/src" && find . -type f | sort)
 
-"$NI" create --fs-version 6 --compressor none -B "$R/out/bootstrap" -D "$R/out" "$R/src" \
-  > "$R/create.log" 2>&1 || fail "nydus-image create"
+"$NI" create --fs-version 6 --compressor none --digester sha256 -B "$R/out/bootstrap" -D "$R/out" \
+  "$R/src" > "$R/create.log" 2>&1 || fail "nydus-image create"
 BLOB=$(ls "$R/out" | grep -vE '^bootstrap' | head -1)
 [ -n "$BLOB" ] || fail "no data blob"
 cp "$R/out/$BLOB" "$R/backend/$BLOB"
-cp "$R/out/bootstrap" "$R/stage/bootstrap"
+# Staged as the snapshotter stages it: a node view carrying page cache sharing fingerprints.
+"$NI" merge --inode-share-fingerprint -B "$R/out/source" --original-blob-ids "$BLOB" \
+  "$R/out/bootstrap" > "$R/merge.log" 2>&1 || fail "nydus-image merge"
+"$NI" node-view -B "$R/stage/bootstrap" "$R/out/source" > "$R/view.log" 2>&1 ||
+  fail "nydus-image node-view"
 MAP="$R/stage/$BLOB.blob.data.chunk_map"
 DATA="$R/stage/$BLOB.blob.data"
 
@@ -107,6 +111,9 @@ SIZE=$(stat -c %s "$R/backend/$BLOB")
 mv "$R/backend/$BLOB" "$R/blob.good"
 truncate -s "$SIZE" "$R/backend/$BLOB"
 serve
+# Complete and verified: the daemon leaves the blob unmarked.
+grep -q "is already fully cached; leaving it unmarked" "$R/log" ||
+  fail "the sealed cache was not found complete and verified"
 if [ "$SHARE" = 1 ]; then
   grep " $R/mnt erofs " /proc/mounts | grep -q inode_share ||
     fail "the sealed, verified cache was kept out of page cache sharing"
