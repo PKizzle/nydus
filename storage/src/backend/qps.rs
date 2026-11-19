@@ -254,6 +254,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri runs too slowly for the refill-free window this assumes")]
     fn test_multiple_tokens_acquisition() {
         let limiter = QpsLimiter::new(10.0);
 
