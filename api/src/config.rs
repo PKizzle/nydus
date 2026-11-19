@@ -335,18 +335,29 @@ impl ConfigV2 {
     pub fn clone_without_secrets(&self) -> Self {
         let mut cfg = self.clone();
 
+        // A proxy URL may carry `user:password@`.
+        let redact_proxy = |proxy: &mut ProxyConfig| {
+            proxy.url = redact_url(&proxy.url);
+            proxy.ping_url = redact_url(&proxy.ping_url);
+        };
         if let Some(backend_cfg) = cfg.backend.as_mut() {
             if let Some(oss_cfg) = backend_cfg.oss.as_mut() {
                 oss_cfg.access_key_id = String::new();
                 oss_cfg.access_key_secret = RedactedString::default();
+                redact_proxy(&mut oss_cfg.proxy);
             }
             if let Some(registry_cfg) = backend_cfg.registry.as_mut() {
                 registry_cfg.auth = None;
                 registry_cfg.registry_token = None;
+                redact_proxy(&mut registry_cfg.proxy);
             }
             if let Some(s3_cfg) = backend_cfg.s3.as_mut() {
                 s3_cfg.access_key_id = String::new();
                 s3_cfg.access_key_secret = RedactedString::default();
+                redact_proxy(&mut s3_cfg.proxy);
+            }
+            if let Some(http_proxy_cfg) = backend_cfg.http_proxy.as_mut() {
+                redact_proxy(&mut http_proxy_cfg.proxy);
             }
         }
         if let Some(cache_cfg) = cfg.cache.as_mut()
@@ -3132,6 +3143,47 @@ external_backends:
             &orig_backend.oss.as_ref().unwrap().access_key_id,
             "my_ak_id"
         );
+    }
+
+    /// A proxy URL may carry credentials (`nydusify` passes the environment's proxy on).
+    #[test]
+    fn test_clone_without_secrets_strips_proxy_credentials() {
+        let content = r#"version=2
+        [backend]
+        type = "registry"
+        [backend.registry]
+        host = "localhost"
+        repo = "nydus"
+        [backend.registry.proxy]
+        url = "http://user:secret@proxy.local:3128"
+        ping_url = "http://user:secret@proxy.local:3128/ping"
+        [backend.oss]
+        endpoint = "e"
+        bucket_name = "b"
+        [backend.oss.proxy]
+        url = "http://u:oss-secret@proxy.local:3128"
+        [backend.s3]
+        endpoint = "e"
+        bucket_name = "b"
+        region = "r"
+        [backend.s3.proxy]
+        url = "http://u:s3-secret@proxy.local:3128"
+        [backend.http-proxy]
+        addr = "http://upstream.local"
+        [backend.http-proxy.proxy]
+        url = "http://u:hp-secret@proxy.local:3128"
+        "#;
+        let cfg: ConfigV2 = toml::from_str(content).unwrap();
+        let clean = serde_json::to_string(&cfg.clone_without_secrets()).unwrap();
+        assert!(!clean.contains("secret@"), "{clean}");
+        let registry = cfg
+            .clone_without_secrets()
+            .backend
+            .unwrap()
+            .registry
+            .unwrap();
+        assert_eq!(registry.proxy.url, "http://proxy.local:3128");
+        assert_eq!(registry.proxy.ping_url, "http://proxy.local:3128/ping");
     }
 
     #[test]
