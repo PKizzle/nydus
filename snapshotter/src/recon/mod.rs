@@ -382,7 +382,8 @@ impl Reconciler {
     }
 
     /// Delete auto-accel sidecar Image records whose subject image no longer
-    /// exists on the node (see [`Reconciler::with_sidecar_gc`]). Best-effort
+    /// exists on the node (see [`Reconciler::with_sidecar_gc`]), or whose
+    /// manifest or blobs containerd no longer has. Best-effort
     /// and conservative: any failure to enumerate or resolve images aborts the
     /// pass without deleting anything, so a transient containerd hiccup can
     /// never sweep a live sidecar.
@@ -440,16 +441,44 @@ impl Reconciler {
         for sidecar in sidecars {
             let subject_hex = &sidecar.name[SIDECAR_PREFIX.len()..];
             let subject = format!("sha256:{subject_hex}");
-            if live_subjects.contains(&subject) {
-                continue;
-            }
-            match deps.content_store.images_delete(&sidecar.name).await {
+            let reason = if !live_subjects.contains(&subject) {
+                "subject image gone"
+            } else {
+                // A record whose manifest or blobs are gone can never be served, and
+                // keeps failing every image walk; a conversion of the subject rebuilds
+                // it. Only NotFound counts as gone: an RPC failure leaves it alone.
+                match crate::auto_zran::completeness_check(
+                    &deps.content_store,
+                    &sidecar.target_digest,
+                )
+                .await
+                {
+                    Ok(true) => continue,
+                    Ok(false) => "content incomplete",
+                    Err(e) => {
+                        debug!(
+                            sidecar = %sidecar.name,
+                            error = %format_args!("{e:#}"),
+                            "recon: sidecar completeness unknown; keeping it"
+                        );
+                        continue;
+                    }
+                }
+            };
+            // Conditional on the listed target, so a record a conversion repointed
+            // since the listing is kept.
+            match deps
+                .content_store
+                .images_delete(&sidecar.name, Some(&sidecar.target_digest))
+                .await
+            {
                 Ok(()) => {
                     removed += 1;
                     info!(
                         sidecar = %sidecar.name,
                         subject = %subject,
-                        "recon: removed orphan auto-accel sidecar record (subject image gone)"
+                        reason,
+                        "recon: removed auto-accel sidecar record"
                     );
                 }
                 Err(e) => warn!(

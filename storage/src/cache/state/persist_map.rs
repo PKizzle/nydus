@@ -104,6 +104,28 @@ impl PersistMap {
         create: bool,
         persist: bool,
     ) -> StorageResult<Self> {
+        Self::open_or_replace(filename, chunk_count, create, persist, true)
+    }
+
+    /// Open the map, replacing one found damaged with an empty map when `create` and
+    /// `may_replace` allow it.
+    fn open_or_replace(
+        filename: &str,
+        chunk_count: u32,
+        create: bool,
+        persist: bool,
+        may_replace: bool,
+    ) -> StorageResult<Self> {
+        let damaged = |file: &File, reason: &str| -> StorageResult<Self> {
+            if !(create && may_replace) {
+                return Err(StorageError::InvalidData(format!(
+                    "chunk map file {filename:?}: {reason}"
+                )));
+            }
+            Self::replace(filename, file, reason)?;
+            Self::open_or_replace(filename, chunk_count, create, persist, false)
+        };
+
         if chunk_count == 0 {
             return Err(StorageError::InvalidArgument(
                 "chunk count should be greater than 0".to_string(),
@@ -145,13 +167,15 @@ impl PersistMap {
             new_content = true;
             Self::write_header(&mut file, expected_size)?;
         } else if file_size != expected_size {
-            // File size doesn't match, it's too risky to accept the chunk state file. Fallback to
-            // always mark chunk data as not ready.
-            warn!("blob chunk_map file may be corrupted: {:?}", filename);
+            // Not replaced like a damaged header: a live opener with another chunk count may
+            // still use this map, and two maps over one data file would disagree about which of
+            // its chunks are present.
             return Err(StorageError::InvalidData(format!(
-                "chunk_map file {:?} is invalid",
-                filename
+                "chunk map file {filename:?}: size {file_size}, expected {expected_size}"
             )));
+        }
+        if create {
+            Self::reserve(&file, expected_size, new_content)?;
         }
 
         let file2 = clone_file(file.as_raw_fd())
@@ -179,10 +203,8 @@ impl PersistMap {
                 let byte = atomic_byte(&filemap, idx)
                     .map_err(|e| StorageError::cache_io("reach the chunk map contents", e))?;
                 if byte.load(Ordering::Acquire) != 0 {
-                    return Err(StorageError::InvalidData(format!(
-                        "invalid blob chunk_map file header: {:?}",
-                        filename
-                    )));
+                    drop(filemap);
+                    return damaged(&file, "bad magic");
                 }
             }
 
@@ -197,10 +219,8 @@ impl PersistMap {
         let mut not_ready_count = chunk_count;
         if header.version >= 1 {
             if header.magic2 != MAGIC2 {
-                return Err(StorageError::InvalidData(format!(
-                    "invalid blob chunk_map file header: {:?}",
-                    filename
-                )));
+                drop(filemap);
+                return damaged(&file, "bad second magic");
             }
             if header.all_ready == MAGIC_ALL_READY {
                 not_ready_count = 0;
@@ -246,6 +266,62 @@ impl PersistMap {
             not_ready_count: AtomicU32::new(not_ready_count),
             filemap,
         })
+    }
+
+    /// Unlink the damaged map `file` at `filename`, held under its exclusive lock, so the next
+    /// open creates an empty one. The map holds only readiness: losing it costs refetches, and
+    /// the data file is left alone. Unlinking rather than truncating keeps the old file intact
+    /// for any process that still maps it, which would fault on a truncated mapping.
+    fn replace(filename: &str, file: &File, reason: &str) -> StorageResult<()> {
+        use std::os::unix::fs::MetadataExt;
+
+        let held = file
+            .metadata()
+            .map_err(|e| StorageError::cache_io("stat the chunk map file", e))?;
+        // Another opener that found the same damage may have replaced the file already.
+        match std::fs::metadata(filename) {
+            Ok(m) if m.dev() == held.dev() && m.ino() == held.ino() => {}
+            Ok(_) => return Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(StorageError::cache_io("stat the chunk map file", e)),
+        }
+        warn!("chunk map file {filename:?} is damaged ({reason}), replacing it with an empty one");
+        match std::fs::remove_file(filename) {
+            Err(e) if e.kind() != io::ErrorKind::NotFound => Err(StorageError::cache_io(
+                "remove the damaged chunk map file",
+                e,
+            )),
+            _ => Ok(()),
+        }
+    }
+
+    /// Allocate every block of the map, held under its exclusive lock. The bitmap is written
+    /// through a shared mapping, and a store into a hole on a full file system raises SIGBUS,
+    /// which kills the whole process; reserving the blocks here turns that into an error
+    /// (ENOSPC) from the open instead. Maps left sparse by older releases are reserved too.
+    fn reserve(file: &File, size: u64, new: bool) -> StorageResult<()> {
+        #[cfg(target_os = "linux")]
+        {
+            // SAFETY: a plain syscall on an open descriptor; mode 0 only allocates blocks and
+            // the file already has this size, so its contents do not change.
+            if unsafe { libc::fallocate(file.as_raw_fd(), 0, 0, size as libc::off_t) } == 0 {
+                return Ok(());
+            }
+            let err = io::Error::last_os_error();
+            if err.raw_os_error() != Some(libc::EOPNOTSUPP) {
+                return Err(StorageError::cache_io("reserve the chunk map blocks", err));
+            }
+        }
+        // Without fallocate, writing zeros allocates the blocks of a new map. An existing map's
+        // bitmap is live state that other openers may be changing, so it stays as it is.
+        if new {
+            use std::os::unix::fs::FileExt;
+            let bitmap = vec![0u8; (size - HEADER_SIZE as u64) as usize];
+            file.write_all_at(&bitmap, HEADER_SIZE as u64)
+                .and_then(|()| file.sync_all())
+                .map_err(|e| StorageError::cache_io("reserve the chunk map blocks", e))?;
+        }
+        Ok(())
     }
 
     fn write_header(file: &mut File, size: u64) -> StorageResult<()> {
