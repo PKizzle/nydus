@@ -242,7 +242,19 @@ the mount is detached. The FUSE path refuses to mount over any kernel mount.
 The cache of a fanotify daemon lives in its `daemons/<slug>/stage` dir, next to the staged
 bootstrap. Cache GC and the cache-bytes metric count it (each inode once: the `blob_<i>` device
 files are hardlinks to the `.blob.data` files) against `gc_max_bytes`, but never evict it; a dead
-daemon's dir goes with the stale daemon-dir sweep.
+daemon's dir goes with the stale daemon-dir sweep. Cache accounting counts the bytes allocated on
+disk (`st_blocks`), not file lengths: a sparse cache file counts only the chunks it holds, so
+`gc_max_bytes` bounds real disk use. Both `/metrics` endpoints answer from a scan at most 60 s
+old.
+
+The slug is derived from the image ref, so after its tag moved to another image a start finds the
+daemon dir of the image the ref named before. A fanotify stage dir whose `bootstrap` was staged
+from another source (its `bootstrap.view-of` records another source, or it is no copy of the new
+one) is emptied before the new source is staged, caches included. A blockdev or tarfs
+`image.erofs` is served again only when `image.erofs.source` records the SHA-256 of the bootstrap
+being served; otherwise the bootstrap is exported into a new file that is then moved into place,
+and its source recorded. A mounted image is never replaced: a start that finds one exported from
+another bootstrap fails.
 
 A fanotify daemon's saved upgrade state carries its blob list without credentials. A takeover after
 a restart and an in-place heal both rebuild the blob list with the credentials the runtime auth
@@ -448,7 +460,16 @@ staged as a padded copy of its own bootstrap and no view is built.
 
 `inode_share` is fixed for a mount's life, and a takeover or in-place heal keeps the mount and
 its staged view (the view is rebuilt only when the image's bootstrap changes, recorded in
-`stage/bootstrap.view-of`). Sharing therefore starts with a fresh mount: a fresh cache qualifies
+`stage/bootstrap.view-of`). A fresh start of an image whose stage dir is still there mounts the
+view staged before without building or checking it again only while `stage/bootstrap.view-of`
+matches the SHA-256 of the image's bootstrap and `stage/bootstrap.view-checked` holds the SHA-256
+of the staged view, the version of the running snapshotter and the host page size. That record is
+written only after `check_node_view` and the layout checks passed, so the view a mount uses was
+checked by this release, in this or an earlier process, padded to this page size, and its bytes
+are unchanged since; anything else builds the view again. `bootstrap.view-of` stays while a view
+is rebuilt, so an interrupted rebuild never makes the stage look staged from another source. A
+staged padded copy of the bootstrap is likewise kept while it is still a copy of it, and padded to
+the current page size. Sharing therefore starts with a fresh mount: a fresh cache qualifies
 at once; a cache holding chunks nobody checked yet (filled by an older release) mounts without
 sharing and qualifies on its next mount once the background verifier has recorded it verified.
 `/proc/self/mounts` shows `inode_share,domain_id=nydus-node-local` on a sharing mount, and

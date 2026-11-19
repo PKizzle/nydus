@@ -5,7 +5,9 @@
 # data blob fetched on demand from a registry. Builds the image, then runs the root-only
 # `referrer_daemon_serves_every_file` test, which serves the blob from a local HTTP registry and
 # compares every file of the mount with the source. Detection, the cosign trust policy and
-# bootstrap materialization are covered by `misc/referrer/trust-e2e.sh`. The image is mounted
+# bootstrap materialization are covered by `misc/referrer/trust-e2e.sh`. It then releases the
+# image and starts it again from the same daemon dir, which mounts the staged node view as it is
+# and fetches nothing (`released_stage_starts_warm`). The image is mounted
 # through its node view, so BLOCK_SIZE may exceed the page size (the view uses 4 KiB blocks).
 #
 # Needs root, Linux >= 6.14, cargo, and ROOT on ext4 (tmpfs has no pre-content marks).
@@ -33,6 +35,9 @@ NYDUS_IMAGE="$NI" "$CARGO" test -p nydus-snapshotter --lib \
 NYDUS_IMAGE="$NI" NYDUS_E2E_ROOT="$ROOT" "$CARGO" test -p nydus-snapshotter --lib \
   daemon::e2e_tests::referrer_daemon_serves_every_file -- --ignored --exact --nocapture \
   || fail "the referrer daemon did not serve every file"
+NYDUS_IMAGE="$NI" NYDUS_E2E_ROOT="$ROOT" "$CARGO" test -p nydus-snapshotter --lib \
+  daemon::e2e_tests::released_stage_starts_warm -- --ignored --exact --nocapture \
+  || fail "a released stage did not start warm"
 if grep -q " $ROOT/" /proc/self/mounts; then
   grep " $ROOT/" /proc/self/mounts
   fail "mount still present under $ROOT"
