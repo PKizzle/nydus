@@ -72,8 +72,7 @@ impl ServiceController {
             let mut handlers = self.fanotify.lock().unwrap();
             for (image_id, fanotify) in handlers.drain() {
                 info!("Stopping fanotify handler for {}", image_id);
-                fanotify.stop();
-                fanotify.seal();
+                fanotify.stop_and_seal();
             }
         }
     }
@@ -337,8 +336,12 @@ impl ServiceController {
             // Unmount the EROFS filesystem
             let mountpoint = fanotify.mountpoint().to_path_buf();
             result = Self::umount_fanotify_erofs(&fanotify, &mountpoint);
-            // After the unmount, so no reader waits for the flush.
+            // After the unmount, so no reader waits for the flush; if the mount is still up,
+            // whatever it queued meanwhile is denied before the handler drops.
             fanotify.seal();
+            if result.is_err() {
+                fanotify.drain_deny_pending();
+            }
             // Only now may the handler — and the group fd it owns — drop; `stop()` joined its
             // workers. Then release its cache managers: the blob factory keys them by
             // config, so an idle one would otherwise keep its cache files open after the

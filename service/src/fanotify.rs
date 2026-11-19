@@ -438,6 +438,10 @@ pub struct FanotifyHandler {
     /// event instead of serving it, and the owning daemon reports itself unhealthy so the
     /// supervisor replaces the handler. See [`fail`](Self::fail).
     failed: AtomicBool,
+    /// Runs as [`seal`](Self::seal) starts, for tests to raise an event during a seal.
+    #[cfg(test)]
+    #[allow(clippy::type_complexity)]
+    before_seal: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     /// Barrier that workers must reach before `stop()` returns.
     barrier: Barrier,
     /// The worker threads, joined once they pass the barrier, so a stopped handler is held
@@ -1108,6 +1112,8 @@ impl FanotifyHandler {
         Ok(FanotifyHandler {
             active: AtomicBool::new(true),
             failed: AtomicBool::new(false),
+            #[cfg(test)]
+            before_seal: Mutex::new(None),
             barrier: Barrier::new(threads + 1),
             workers: Mutex::new(Vec::new()),
             threads,
@@ -1505,12 +1511,25 @@ impl FanotifyHandler {
         self.drain_deny_pending();
     }
 
+    /// [`stop`](Self::stop) with a [`seal`](Self::seal) between stopping the workers and the
+    /// drain, so events raised during the seal's flush are denied too rather than left for the
+    /// group's release to allow.
+    pub fn stop_and_seal(&self) {
+        self.stop_workers();
+        self.seal();
+        self.drain_deny_pending();
+    }
+
     /// Seal every blob's cache after [`stop`](Self::stop) or [`stop_workers`](Self::stop_workers),
     /// so a later boot trusts what it holds (`BlobObject::seal`). A failed handler seals
     /// nothing: whatever failed may have left its caches half-updated, and an unsealed cache
     /// is only rechecked. Never call it from `Drop`, nor for a handler a heal or takeover
     /// suspends: its successor serves the same caches.
     pub fn seal(&self) {
+        #[cfg(test)]
+        if let Some(hook) = self.before_seal.lock().unwrap().take() {
+            hook();
+        }
         if self.is_failed() {
             return;
         }
@@ -3137,6 +3156,31 @@ mod tests {
         let c = event_fd();
         h.send(&pre_access_event(c));
         assert_eq!(h.response(), (c, deny));
+        h.stop();
+    }
+
+    /// An event raised while a stopping handler seals its caches, with no worker left to serve
+    /// it, is denied by the drain after the seal instead of being allowed when the group closes.
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support copy_file_range")]
+    fn an_event_raised_during_a_seal_is_denied() {
+        let h = SocketHandler::start(1);
+        let peer = h.peer.try_clone().unwrap();
+        let fd = event_fd();
+        *h.handler.before_seal.lock().unwrap() = Some(Box::new(move || {
+            let buf = pre_access_event(fd);
+            // SAFETY: `buf` is readable for `buf.len()` bytes and `peer` is open.
+            let n = unsafe {
+                libc::write(
+                    std::os::fd::AsRawFd::as_raw_fd(&peer),
+                    buf.as_ptr() as *const libc::c_void,
+                    buf.len(),
+                )
+            };
+            assert_eq!(n, buf.len() as isize);
+        }));
+        h.handler.stop_and_seal();
+        assert_eq!(h.response(), (fd, fan_deny_errno(libc::EIO)));
         h.stop();
     }
 
