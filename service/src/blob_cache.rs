@@ -1136,8 +1136,6 @@ mod tests {
 
     /// The data blob `blob_id` of the fixture bootstrap `boot`, in a cache of type `cache_type`.
     fn create_fixture_blob(cache_type: &str, blob_id: &str, boot: &str) -> (DataBlob, TempDir) {
-        use std::os::fd::AsRawFd;
-
         let tmp_dir = TempDir::new().unwrap();
         let root_dir = &std::env::var("CARGO_MANIFEST_DIR").expect("$CARGO_MANIFEST_DIR");
 
@@ -1147,6 +1145,22 @@ mod tests {
             .join(blob_id);
         std::fs::copy(&blob_src, tmp_dir.path().join(blob_id)).unwrap();
 
+        let data_blob = open_fixture_blob(cache_type, blob_id, boot, &tmp_dir, "factory1");
+        (data_blob, tmp_dir)
+    }
+
+    /// Open the data blob `blob_id` of the fixture bootstrap `boot`, already copied into
+    /// `tmp_dir`, with a cache there of type `cache_type` built under the configuration id `id`.
+    fn open_fixture_blob(
+        cache_type: &str,
+        blob_id: &str,
+        boot: &str,
+        tmp_dir: &TempDir,
+        id: &str,
+    ) -> DataBlob {
+        use std::os::fd::AsRawFd;
+
+        let root_dir = &std::env::var("CARGO_MANIFEST_DIR").expect("$CARGO_MANIFEST_DIR");
         let boot_path = PathBuf::from(root_dir)
             .join("../tests/texture/bootstrap")
             .join(boot);
@@ -1158,7 +1172,7 @@ mod tests {
             "domain_id": "domain-test",
             "config_v2": {
                 "version": 2,
-                "id": "factory1",
+                "id": "CONFIG_ID",
                 "backend": {
                     "type": "localfs",
                     "localfs": { "dir": "/tmp/nydus" }
@@ -1180,7 +1194,8 @@ mod tests {
                 },
             )
             .replace("/tmp/nydus", tmp_dir.path().to_str().unwrap())
-            .replace("BOOT_PATH", &boot_path.display().to_string());
+            .replace("BOOT_PATH", &boot_path.display().to_string())
+            .replace("CONFIG_ID", id);
         let mut entry: BlobCacheEntry = serde_json::from_str(&content).unwrap();
         assert!(entry.prepare_configuration_info());
 
@@ -1199,7 +1214,7 @@ mod tests {
             .block_on(DataBlob::new(&data_blob_config))
             .unwrap();
         assert!(data_blob.file().as_raw_fd() >= 0);
-        (data_blob, tmp_dir)
+        data_blob
     }
 
     #[test]
@@ -1365,6 +1380,71 @@ mod tests {
             .write_all_at(&[0], first.uncompressed_offset())
             .unwrap();
         assert!(!obj.is_served_data_verified());
+    }
+
+    /// A cache file changed behind a verified chunk map while no daemon had it open stays
+    /// unverified in the next daemon, whose own validated fills record a new stamp but must not
+    /// vouch for the chunks nobody checked since.
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support copy_file_range")]
+    fn a_stale_cache_is_not_verified_again_by_a_fill() {
+        use std::os::unix::fs::FileExt;
+
+        let id = "stale-stamp";
+        let tmp = TempDir::new().unwrap();
+        let root_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap();
+        std::fs::copy(
+            PathBuf::from(root_dir)
+                .join("../tests/texture/blobs")
+                .join(FIXTURE_BLOB),
+            tmp.path().join(FIXTURE_BLOB),
+        )
+        .unwrap();
+        let blob = open_fixture_blob("fanotify", FIXTURE_BLOB, FIXTURE_BOOT, &tmp, id);
+        blob.blob().add_chunk_digests(&fixture_digests()).unwrap();
+        let obj = blob.blob().get_blob_object().unwrap();
+        let first = blob.blob().get_chunk_info(0).unwrap();
+        obj.fetch_range_uncompressed(0, first.uncompressed_size() as u64)
+            .unwrap();
+        assert!(
+            obj.verify_ready_chunks(&|| false, &mut |_| Ok(true))
+                .unwrap()
+        );
+        assert!(obj.is_data_verified());
+        drop(blob);
+        nydus_storage::factory::BLOB_FACTORY.forget(id);
+
+        // Corrupt the cached chunk while no daemon has the cache open.
+        let cache = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(tmp.path().join(format!("{FIXTURE_BLOB}.blob.data")))
+            .unwrap();
+        let mut byte = [0u8; 1];
+        cache
+            .read_exact_at(&mut byte, first.uncompressed_offset())
+            .unwrap();
+        cache
+            .write_all_at(&[byte[0] ^ 0xff], first.uncompressed_offset())
+            .unwrap();
+        drop(cache);
+
+        let blob = open_fixture_blob("fanotify", FIXTURE_BLOB, FIXTURE_BOOT, &tmp, id);
+        blob.blob().add_chunk_digests(&fixture_digests()).unwrap();
+        let obj = blob.blob().get_blob_object().unwrap();
+        assert!(!obj.is_data_verified());
+        let second = blob.blob().get_chunk_info(1).unwrap();
+        obj.fetch_range_uncompressed(
+            second.uncompressed_offset(),
+            second.uncompressed_size() as u64,
+        )
+        .unwrap();
+        assert!(is_ready(&blob, 1));
+        assert!(
+            !obj.is_data_verified(),
+            "a fill re-validated a cache file changed behind its map"
+        );
+        nydus_storage::factory::BLOB_FACTORY.forget(id);
     }
 
     /// The one-time check of chunks already marked ready records a clean cache file as

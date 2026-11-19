@@ -33,6 +33,7 @@
 //!   based backend storage or dummy cache.
 
 use std::any::Any;
+use std::time::Instant;
 
 use crate::device::BlobChunkInfo;
 use crate::{StorageError, StorageResult};
@@ -78,6 +79,16 @@ pub trait ChunkMap: Any + Send + Sync {
     ///   clear_pending() must be called to clear the pending state.
     fn check_ready_and_mark_pending(&self, _chunk: &dyn BlobChunkInfo) -> StorageResult<bool> {
         panic!("no support of check_ready_and_mark_pending()");
+    }
+
+    /// [Self::check_ready_and_mark_pending], waiting for another thread's fill of the chunk no
+    /// later than `deadline`, so a caller checking several chunks can bound its total wait.
+    fn check_ready_and_mark_pending_until(
+        &self,
+        chunk: &dyn BlobChunkInfo,
+        _deadline: Instant,
+    ) -> StorageResult<bool> {
+        self.check_ready_and_mark_pending(chunk)
     }
 
     /// Set the chunk to ready for use and clear the pending state.
@@ -152,6 +163,16 @@ pub trait RangeMap: Send + Sync {
     /// Wait for all chunks or data in the range to be ready until timeout.
     fn wait_for_range_ready(&self, _start: Self::I, _count: Self::I) -> StorageResult<bool> {
         Err(StorageError::Unsupported)
+    }
+
+    /// [Self::wait_for_range_ready], failing with `Timeout` at `deadline`.
+    fn wait_for_range_ready_until(
+        &self,
+        start: Self::I,
+        count: Self::I,
+        _deadline: Instant,
+    ) -> StorageResult<bool> {
+        self.wait_for_range_ready(start, count)
     }
 
     /// Revoke the ready state of everything the map tracks.

@@ -592,7 +592,8 @@ pub struct CacheConfig {
     /// Maximum age for cache artifacts before they become GC candidates (e.g. "168h").
     #[serde(default)]
     pub gc_max_age: Option<String>,
-    /// Maximum cache size in bytes. Oldest artifacts are evicted first.
+    /// Maximum cache size in bytes allocated on disk (sparse cache files count only what they
+    /// hold). Oldest artifacts are evicted first.
     #[serde(default)]
     pub gc_max_bytes: Option<u64>,
     /// Report GC candidates without deleting files.

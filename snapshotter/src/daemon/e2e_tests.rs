@@ -320,6 +320,68 @@ fn referrer_daemon_serves_every_file() {
     );
 }
 
+/// A released image whose daemon dir is still there starts warm: the next `ensure_instance`
+/// mounts the node view staged before without building it again, and serves every file from
+/// the caches the first start filled, without a registry request.
+/// `NYDUS_E2E_ROOT` and `NYDUS_IMAGE` as for [`referrer_daemon_serves_every_file`].
+#[test]
+#[ignore = "needs root, Linux >= 6.14 and an ext4 work dir; run misc/fanotify/b4b-referrer-serving-test.sh"]
+fn released_stage_starts_warm() {
+    use std::os::unix::fs::MetadataExt;
+
+    let root = e2e_root();
+    let registry = serve_registry(root.join("blobs"), RegistryAuth::None);
+    let mut config = SnapshotterConfig::default();
+    config.snapshotter.root = root.join("snapshotter-warm");
+    config.snapshotter.cache.work_dir = root.join("cache-warm");
+    config.snapshotter.auto_zran.nydus_image = nydus_image();
+    config.snapshotter.features.erofs_inode_share = ErofsInodeShare::On;
+    config.backends.registry = Some(RegistryBackendConfig {
+        mirrors: Vec::new(),
+        skip_verify: false,
+        ca_cert_files: Vec::new(),
+        plain_http: true,
+        request_timeout: "10s".to_string(),
+    });
+    let supervisor = DaemonSupervisor::new(config);
+    let runtime = compio::runtime::Runtime::new().unwrap();
+    let image_ref = format!("{}/warm/app:1", registry.addr);
+    let start = || {
+        let handle = runtime
+            .block_on(supervisor.ensure_instance(
+                &image_ref,
+                &root.join("bootstrap"),
+                "k1",
+                Some(FsDriverType::Fanotify),
+            ))
+            .unwrap_or_else(|e| panic!("daemon start: {e:#}"));
+        let mountpoint = handle.mountpoint().to_path_buf();
+        assert!(serves_node_view(&mountpoint));
+        assert_same_files(&root.join("src"), &mountpoint);
+        drop(handle);
+        runtime
+            .block_on(supervisor.release(&image_ref, "k1"))
+            .unwrap();
+        assert!(!is_mounted_at(&mountpoint), "mount outlived its release");
+        let view = fs::metadata(mountpoint.with_file_name("stage").join("bootstrap")).unwrap();
+        (view.ino(), view.mtime_nsec(), view.mtime())
+    };
+
+    let cold = start();
+    let fetched = registry.served();
+    assert!(
+        fetched > 0,
+        "the first start read nothing from the registry"
+    );
+    let warm = start();
+    assert_eq!(warm, cold, "the node view was built again");
+    assert_eq!(
+        registry.served(),
+        fetched,
+        "the warm start fetched data the first start had cached"
+    );
+}
+
 /// The auto-accel path from conversion to data: `local_accel::convert` builds the
 /// artifact, its blobs go into a content store the way the auto-zran worker uploads
 /// them, `SidecarLocator::stage` lays out the backend dir from there, and the daemon

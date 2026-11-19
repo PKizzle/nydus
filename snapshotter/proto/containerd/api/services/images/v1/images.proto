@@ -76,6 +76,9 @@ message DeleteImageRequest {
     // Sync indicates that the image deletion and removal of unreferenced
     // resources should occur synchronously before returning a response.
     bool sync = 2;
+    // If set, the record is deleted only while it still points at this
+    // digest; otherwise containerd answers NotFound (containerd >= 2.0).
+    optional containerd.types.Descriptor target = 3;
 }
 
 service Images {
