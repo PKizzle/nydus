@@ -322,7 +322,8 @@ fn referrer_daemon_serves_every_file() {
 
 /// A released image whose daemon dir is still there starts warm: the next `ensure_instance`
 /// mounts the node view staged before without building it again, and serves every file from
-/// the caches the first start filled, without a registry request.
+/// the caches the first start filled, without a registry request. Retention is on and a
+/// reconcile pass runs after each release, so the stage survives the stale daemon-dir sweep.
 /// `NYDUS_E2E_ROOT` and `NYDUS_IMAGE` as for [`referrer_daemon_serves_every_file`].
 #[test]
 #[ignore = "needs root, Linux >= 6.14 and an ext4 work dir; run misc/fanotify/b4b-referrer-serving-test.sh"]
@@ -331,7 +332,8 @@ fn released_stage_starts_warm() {
 
     let root = e2e_root();
     let registry = serve_registry(root.join("blobs"), RegistryAuth::None);
-    let mut config = SnapshotterConfig::default();
+    let mut config: SnapshotterConfig =
+        toml::from_str("[snapshotter.cache]\nretention = true\n").unwrap();
     config.snapshotter.root = root.join("snapshotter-warm");
     config.snapshotter.cache.work_dir = root.join("cache-warm");
     config.snapshotter.auto_zran.nydus_image = nydus_image();
@@ -343,7 +345,11 @@ fn released_stage_starts_warm() {
         plain_http: true,
         request_timeout: "10s".to_string(),
     });
-    let supervisor = DaemonSupervisor::new(config);
+    let store = crate::store::SnapshotStore::open(&root.join("metadata-warm.fjall")).unwrap();
+    let supervisor = Arc::new(DaemonSupervisor::new(config));
+    // Sweeps daemon dirs of any age, so the released stage is exposed to it.
+    let reconciler =
+        crate::recon::Reconciler::new(supervisor.clone(), Arc::new(store), Duration::ZERO);
     let runtime = compio::runtime::Runtime::new().unwrap();
     let image_ref = format!("{}/warm/app:1", registry.addr);
     let start = || {
@@ -363,7 +369,9 @@ fn released_stage_starts_warm() {
             .block_on(supervisor.release(&image_ref, "k1"))
             .unwrap();
         assert!(!is_mounted_at(&mountpoint), "mount outlived its release");
-        let view = fs::metadata(mountpoint.with_file_name("stage").join("bootstrap")).unwrap();
+        let _ = runtime.block_on(reconciler.run_once());
+        let view = fs::metadata(mountpoint.with_file_name("stage").join("bootstrap"))
+            .expect("the released stage was swept");
         (view.ino(), view.mtime_nsec(), view.mtime())
     };
 
@@ -375,6 +383,14 @@ fn released_stage_starts_warm() {
     );
     let warm = start();
     assert_eq!(warm, cold, "the node view was built again");
+    let record = runtime
+        .block_on(supervisor.daemon_record(&image_ref))
+        .unwrap();
+    assert!(!record.live);
+    assert!(
+        record.start_gap.is_some(),
+        "the second start learned no start gap"
+    );
     assert_eq!(
         registry.served(),
         fetched,
