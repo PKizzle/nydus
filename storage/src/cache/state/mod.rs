@@ -224,9 +224,10 @@ pub trait RangeMap: Send + Sync {
     }
 
     /// Track boots as boot `boot`, recording it in the map before each ready bit until the map
-    /// is sealed. A map another boot left unsealed forgets its ready chunks and starts
-    /// rechecking; returns whether that happened.
-    fn adopt_boot(&self, _boot: u64) -> StorageResult<bool> {
+    /// is sealed. With `forget_untrusted`, a map another boot left unsealed, or one no release
+    /// tracking boots created, forgets its ready chunks and starts rechecking; returns whether
+    /// that happened.
+    fn adopt_boot(&self, _boot: u64, _forget_untrusted: bool) -> StorageResult<bool> {
         Err(StorageError::Unsupported)
     }
 

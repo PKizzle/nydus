@@ -96,8 +96,8 @@ impl RangeMap for IndexedChunkMap {
         self.map.update_data_stamp(data_stamp)
     }
 
-    fn adopt_boot(&self, boot: u64) -> StorageResult<bool> {
-        self.map.adopt_boot(boot)
+    fn adopt_boot(&self, boot: u64, forget_untrusted: bool) -> StorageResult<bool> {
+        self.map.adopt_boot(boot, forget_untrusted)
     }
 
     fn mark_unsealed(&self) -> StorageResult<()> {
@@ -325,6 +325,7 @@ mod tests {
             data_stamp: 0,
             unsealed_boot: 0,
             recheck: 0,
+            tracked: 0,
             reserved: [0x0u8; HEADER_RESERVED_SIZE],
         };
 
@@ -377,6 +378,7 @@ mod tests {
             data_stamp: 0,
             unsealed_boot: 0,
             recheck: 0,
+            tracked: 0,
             reserved: [0x0u8; HEADER_RESERVED_SIZE],
         };
 
@@ -602,6 +604,7 @@ mod tests {
             data_stamp: 0,
             unsealed_boot: 0,
             recheck: 0,
+            tracked: 0,
             reserved: [0x0u8; HEADER_RESERVED_SIZE],
         };
         file.write_all(header.as_slice()).unwrap();
@@ -728,7 +731,7 @@ mod tests {
         // Nothing to seal.
         assert!(!map.seal(&mut || panic!("flushed a sealed map")).unwrap());
 
-        assert!(!map.adopt_boot(7).unwrap());
+        assert!(!map.adopt_boot(7, true).unwrap());
         assert!(map.is_ready(chunk(0).as_base()).unwrap());
         map.mark_unsealed().unwrap();
         assert_eq!(unsealed_boot_on_disk(&blob_path), 7);
@@ -767,7 +770,7 @@ mod tests {
         };
         let fill = |boot| {
             let map = IndexedChunkMap::new(&blob_path, 4, true).unwrap();
-            map.adopt_boot(boot).unwrap();
+            map.adopt_boot(boot, true).unwrap();
             // As a fill starts, even of chunks already ready.
             map.mark_unsealed().unwrap();
             for idx in 0..4 {
@@ -781,7 +784,7 @@ mod tests {
         // Sealed: kept in any boot.
         assert!(fill(1).seal(&mut || Ok(None)).unwrap());
         let map = IndexedChunkMap::new(&blob_path, 4, true).unwrap();
-        assert!(!map.adopt_boot(2).unwrap());
+        assert!(!map.adopt_boot(2, true).unwrap());
         assert!(map.is_range_all_ready() && map.is_verified(7));
         assert!(!map.is_rechecking());
         drop(map);
@@ -789,13 +792,13 @@ mod tests {
         // Unsealed by this boot, as after a kill: the page cache still holds the data.
         drop(fill(2));
         let map = IndexedChunkMap::new(&blob_path, 4, true).unwrap();
-        assert!(!map.adopt_boot(2).unwrap());
+        assert!(!map.adopt_boot(2, true).unwrap());
         assert!(map.is_range_all_ready() && map.is_verified(7));
         drop(map);
 
         // Unsealed by another boot.
         let map = IndexedChunkMap::new(&blob_path, 4, true).unwrap();
-        assert!(map.adopt_boot(3).unwrap());
+        assert!(map.adopt_boot(3, true).unwrap());
         assert!(map.is_rechecking());
         assert!(!map.is_verified(7));
         for idx in 0..4 {
@@ -804,7 +807,7 @@ mod tests {
         drop(map);
         // Persisted, and the first ready bit claims the map for this boot.
         let map = IndexedChunkMap::new(&blob_path, 4, true).unwrap();
-        assert!(map.adopt_boot(3).unwrap());
+        assert!(map.adopt_boot(3, true).unwrap());
         assert!(map.is_rechecking());
         for idx in 0..3 {
             map.set_ready_and_clear_pending(chunk(idx).as_base())
@@ -816,7 +819,7 @@ mod tests {
         assert!(!map.is_rechecking(), "complete, nothing left to recheck");
         drop(map);
         let map = IndexedChunkMap::new(&blob_path, 4, true).unwrap();
-        assert!(!map.adopt_boot(3).unwrap());
+        assert!(!map.adopt_boot(3, true).unwrap());
         assert!(map.is_range_all_ready() && !map.is_rechecking());
     }
 
@@ -830,8 +833,8 @@ mod tests {
         let blob_path = blob_path.as_os_str().to_str().unwrap().to_string();
         let map = IndexedChunkMap::new(&blob_path, 8, true).unwrap();
         let other = std::sync::Arc::new(IndexedChunkMap::new(&blob_path, 8, true).unwrap());
-        map.adopt_boot(7).unwrap();
-        other.adopt_boot(7).unwrap();
+        map.adopt_boot(7, true).unwrap();
+        other.adopt_boot(7, true).unwrap();
         map.mark_unsealed().unwrap();
 
         let mut filler = None;
@@ -845,7 +848,10 @@ mod tests {
                     };
                     racing.set_ready_and_clear_pending(chunk.as_base()).unwrap();
                 }));
-                std::thread::sleep(std::time::Duration::from_millis(100));
+                // Wait until the filler is at the seal lock, which this seal holds.
+                while other.map.seal.arrived.load(Ordering::Acquire) == 0 {
+                    std::thread::yield_now();
+                }
                 assert!(!other.map.is_chunk_ready(1).0, "a bit was set mid-seal");
                 Ok(None)
             })
@@ -854,5 +860,78 @@ mod tests {
         filler.unwrap().join().unwrap();
         assert!(other.map.is_chunk_ready(1).0);
         assert_eq!(unsealed_boot_on_disk(&blob_path), 7);
+    }
+
+    /// A mark whose flush failed is not taken as durable: the fill fails, and the next ready
+    /// bit flushes the mark again before it is set.
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support file-backed mmap")]
+    fn test_a_failed_mark_flush_is_retried() {
+        let dir = TempDir::new().unwrap();
+        let blob_path = dir.path().join("blob-flush");
+        let blob_path = blob_path.as_os_str().to_str().unwrap().to_string();
+        let chunk = |index| MockChunkInfo {
+            index,
+            ..Default::default()
+        };
+        let map = IndexedChunkMap::new(&blob_path, 8, true).unwrap();
+        map.adopt_boot(7, true).unwrap();
+        map.map.fail_next_flush.store(true, Ordering::Release);
+        assert!(map.set_ready_and_clear_pending(chunk(0).as_base()).is_err());
+        assert!(!map.is_ready(chunk(0).as_base()).unwrap());
+        // The word is in the mapping, but not known to be on disk: the next bit flushes it.
+        map.map.fail_next_flush.store(true, Ordering::Release);
+        assert!(map.set_ready_and_clear_pending(chunk(1).as_base()).is_err());
+        assert!(!map.is_ready(chunk(1).as_base()).unwrap());
+        map.set_ready_and_clear_pending(chunk(1).as_base()).unwrap();
+        assert_eq!(unsealed_boot_on_disk(&blob_path), 7);
+        // Once durable, later bits need no flush.
+        map.map.fail_next_flush.store(true, Ordering::Release);
+        map.set_ready_and_clear_pending(chunk(2).as_base()).unwrap();
+    }
+
+    /// A map no release tracking boots created (an older release's) forgets its ready chunks
+    /// once, for a fanotify opener; any opener records its boot before a ready bit.
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support file-backed mmap")]
+    fn test_an_untracked_map_is_rechecked_once() {
+        use std::os::unix::fs::FileExt;
+
+        let dir = TempDir::new().unwrap();
+        let blob_path = dir.path().join("blob-untracked");
+        let blob_path = blob_path.as_os_str().to_str().unwrap().to_string();
+        let chunk = |index| MockChunkInfo {
+            index,
+            ..Default::default()
+        };
+        let map = IndexedChunkMap::new(&blob_path, 4, true).unwrap();
+        // Not forgetting: a non-fanotify opener keeps the bits but marks before its own.
+        assert!(!map.adopt_boot(5, false).unwrap());
+        map.set_ready_and_clear_pending(chunk(0).as_base()).unwrap();
+        assert_eq!(unsealed_boot_on_disk(&blob_path), 5);
+        assert!(map.seal(&mut || Ok(None)).unwrap());
+        drop(map);
+        // What an older release leaves: sealed-looking, never tracked.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(format!("{blob_path}.chunk_map"))
+            .unwrap()
+            .write_all_at(
+                &0u64.to_ne_bytes(),
+                std::mem::offset_of!(Header, tracked) as u64,
+            )
+            .unwrap();
+
+        let map = IndexedChunkMap::new(&blob_path, 4, true).unwrap();
+        assert!(!map.adopt_boot(5, false).unwrap());
+        assert!(map.is_ready(chunk(0).as_base()).unwrap());
+        drop(map);
+        let map = IndexedChunkMap::new(&blob_path, 4, true).unwrap();
+        assert!(map.adopt_boot(5, true).unwrap());
+        assert!(!map.is_ready(chunk(0).as_base()).unwrap());
+        assert!(map.is_rechecking());
+        drop(map);
+        let map = IndexedChunkMap::new(&blob_path, 4, true).unwrap();
+        assert!(!map.adopt_boot(5, true).unwrap(), "rechecked only once");
     }
 }

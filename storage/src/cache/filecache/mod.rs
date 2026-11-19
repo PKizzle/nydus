@@ -319,17 +319,21 @@ impl FileCacheEntry {
                     e => Err(e),
                 })?;
             }
-            // The kernel reads a fanotify cache's ready chunks unchecked, and after a crash
-            // their bytes may have been lost with the page cache. A map another boot left
-            // unsealed forgets them, keeping the data file for the fills to recheck.
-            if mgr.fanotify
-                && let Some(map) = chunk_map.as_range_map()
-                && map.adopt_boot(crate::utils::boot_id())?
-            {
-                warn!(
-                    "blob {blob_id}: cache was not sealed before the last reboot; rechecking its \
-                     cached chunks as they are read"
-                );
+            // Every opener records its boot before a ready bit, since a fanotify daemon may
+            // serve these files next. The kernel reads a fanotify cache's ready chunks unchecked,
+            // and after a crash their bytes may have been lost with the page cache: a map
+            // another boot left unsealed, or an older release filled, forgets them, keeping the
+            // data file for the fills to recheck.
+            if let Some(map) = chunk_map.as_range_map() {
+                match map.adopt_boot(crate::utils::boot_id(), mgr.fanotify) {
+                    Ok(true) => warn!(
+                        "blob {blob_id}: cache not known to be on stable storage (not sealed \
+                         before the last reboot, or filled by an older release); rechecking its \
+                         cached chunks as they are read"
+                    ),
+                    Ok(false) | Err(StorageError::Unsupported) => {}
+                    Err(e) => return Err(e),
+                }
             }
             // Set cache file to its expected size.
             let file = OpenOptions::new()
