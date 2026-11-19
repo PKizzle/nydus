@@ -43,6 +43,13 @@ work_dir = "/var/lib/containerd-nydus/cache"
 # NOTE: the fanotify driver needs work_dir on a filesystem that supports
 # pre-content marks — ext4 works, tmpfs does not.
 gc_period = "6h"
+# Keep the node view and caches of a released fanotify image for its next start
+# (docs/nydus-fanotify.md, "Stage retention"). Sizes are bytes ("20GiB") or a
+# percentage of the filesystem holding daemons/.
+retention = false
+retention_max_bytes = "10%"
+retention_min_free = "20%"
+retention_idle_limit = "auto"   # or a duration such as "7d"
 
 # Optional cgroup v2 memory controls for the snapshotter and its in-process
 # daemons. The process remains in its systemd service cgroup. memory_high is

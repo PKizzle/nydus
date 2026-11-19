@@ -174,7 +174,8 @@ impl CacheManager {
     /// Also account the fanotify caches in `daemons/<slug>/stage`. They count against the
     /// byte budget, so other caches are evicted to make room, but GC never removes them: each
     /// `.blob.data` there is a live EROFS device, and a dead daemon's dir goes with the
-    /// stale daemon-dir sweep. Only `stage` dirs are read, never a daemon's mountpoint.
+    /// stale daemon-dir sweep or stage retention (`crate::retention`), which the reconciler
+    /// runs before GC. Only `stage` dirs are read, never a daemon's mountpoint.
     pub fn with_daemon_stages(mut self, daemons: impl Into<PathBuf>) -> Self {
         self.daemons = Some(daemons.into());
         self
@@ -571,6 +572,28 @@ pub fn parse_duration(value: &str) -> CacheResult<Duration> {
     Ok(Duration::from_secs(seconds))
 }
 
+/// Bytes allocated on disk for the files under `dir`, each inode once: a stage's `blob_<i>`
+/// device files are hardlinks to its `.blob.data` files. Symlinks are not followed.
+pub fn allocated_tree_bytes(dir: &Path) -> io::Result<u64> {
+    use std::os::unix::fs::MetadataExt;
+
+    let mut seen = HashSet::new();
+    let mut total = 0;
+    let mut dirs = vec![dir.to_path_buf()];
+    while let Some(dir) = dirs.pop() {
+        for entry in fs::read_dir(&dir)? {
+            let entry = entry?;
+            let metadata = entry.metadata()?;
+            if metadata.is_dir() {
+                dirs.push(entry.path());
+            } else if metadata.is_file() && seen.insert((metadata.dev(), metadata.ino())) {
+                total += allocated_bytes(&metadata);
+            }
+        }
+    }
+    Ok(total)
+}
+
 /// Bytes a file occupies on disk (`st_blocks` counts 512-byte units on every Unix).
 fn allocated_bytes(metadata: &fs::Metadata) -> u64 {
     use std::os::unix::fs::MetadataExt;
@@ -681,6 +704,23 @@ mod tests {
         let fresh = manager.scan_recent(Duration::ZERO).unwrap();
         assert_eq!(fresh.total_files, 2);
         assert!(fresh.total_bytes >= 1 << 20);
+    }
+
+    #[test]
+    fn allocated_tree_bytes_counts_each_inode_once() {
+        let dir = tempdir().unwrap();
+        let stage = dir.path().join("stage");
+        fs::create_dir_all(stage.join("sub")).unwrap();
+        fs::write(stage.join("abc.blob.data"), vec![1u8; 1 << 16]).unwrap();
+        fs::hard_link(stage.join("abc.blob.data"), stage.join("blob_0")).unwrap();
+        fs::write(stage.join("sub/bootstrap"), vec![1u8; 1 << 12]).unwrap();
+        std::os::unix::fs::symlink(dir.path(), stage.join("link")).unwrap();
+        let want: u64 = ["abc.blob.data", "sub/bootstrap"]
+            .iter()
+            .map(|name| allocated_bytes(&fs::metadata(stage.join(name)).unwrap()))
+            .sum();
+        assert_eq!(allocated_tree_bytes(&stage).unwrap(), want);
+        assert!(allocated_tree_bytes(&dir.path().join("missing")).is_err());
     }
 
     #[test]

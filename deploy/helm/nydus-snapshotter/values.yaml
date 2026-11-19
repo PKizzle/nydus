@@ -75,6 +75,15 @@ config:
   root: /var/lib/containerd-nydus
   logLevel: info
   cacheWorkDir: /var/lib/containerd-nydus/cache
+  # Keep the node view and caches of a released fanotify image for its next start
+  # (docs/nydus-fanotify.md, "Stage retention"). Sizes are bytes ("20GiB") or a percentage
+  # of the filesystem holding <root>/daemons; keep minFree above the kubelet's thresholds.
+  retention:
+    enable: false
+    maxBytes: "10%"
+    minFree: "20%"
+    # "auto" or a duration such as "7d".
+    idleLimit: "auto"
   # Ordered fallback chain; the probe picks the first viable driver. fanotify needs kernel >= 6.14.
   fsDrivers:
     - { type: fanotify, minKernel: "6.14", requireCaps: ["CAP_SYS_ADMIN"] }
