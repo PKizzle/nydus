@@ -922,7 +922,10 @@ async fn metrics_response(controller: &SystemController) -> HttpResponse {
         Ok(records) => records,
         Err(e) => return error_response(500, e.to_string()),
     };
-    let cache = match controller.cache_usage() {
+    let cache = match controller
+        .cache
+        .scan_recent(crate::cache::METRICS_SCAN_MAX_AGE)
+    {
         Ok(usage) => usage,
         Err(e) => return error_response(500, e.to_string()),
     };
@@ -1976,7 +1979,10 @@ mod tests {
         assert_eq!(response.status, 200);
         let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
         assert_eq!(body["total_files"], 1);
-        assert_eq!(body["total_bytes"], 4);
+        assert_eq!(
+            body["total_bytes"],
+            allocated(&controller.cache.root().join("item.blob.data"))
+        );
         assert_eq!(body["entries"][0]["kind"], "blob_data");
     }
 
@@ -2175,9 +2181,12 @@ mod tests {
         assert!(body.contains("nydus_snapshotter_daemon_upgrade_runs_total 0"));
         assert!(body.contains("nydus_snapshotter_snapshots 1"));
         assert!(body.contains("nydus_snapshotter_snapshots_by_kind{kind=\"active\"} 1"));
-        assert!(body.contains("nydus_snapshotter_cache_bytes 4"));
+        let bytes = allocated(&controller.cache.root().join("item.blob.data"));
+        assert!(body.contains(&format!("nydus_snapshotter_cache_bytes {bytes}")));
         assert!(body.contains("nydus_snapshotter_cache_files 1"));
-        assert!(body.contains("nydus_snapshotter_cache_artifact_bytes{kind=\"blob_data\"} 4"));
+        assert!(body.contains(&format!(
+            "nydus_snapshotter_cache_artifact_bytes{{kind=\"blob_data\"}} {bytes}"
+        )));
         assert!(body.contains("nydus_snapshotter_cache_artifact_files{kind=\"blob_data\"} 1"));
         assert!(body.contains("nydus_snapshotter_cache_gc_runs_total 1"));
         // The GC above was a DRY RUN — it deleted nothing, so the "removed"
@@ -2188,8 +2197,17 @@ mod tests {
         assert!(body.contains("nydusd_counts{version=\"in-process\"} 0"));
         assert!(body.contains("nydusd_lifetime_event_counts{event=\"spawn\"} 0"));
         assert!(body.contains("snapshotter_snapshot_operation_elapsed_milliseconds"));
-        assert!(body.contains("snapshotter_cache_usage_kilobytes 0"));
+        assert!(body.contains(&format!(
+            "snapshotter_cache_usage_kilobytes {}",
+            bytes / 1024
+        )));
         assert!(body.contains("snapshotter_run_time_seconds"));
+    }
+
+    /// Bytes `path` occupies on disk, as cache accounting counts them.
+    fn allocated(path: &Path) -> u64 {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata(path).unwrap().blocks() * 512
     }
 
     #[test]
