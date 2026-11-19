@@ -605,13 +605,16 @@ impl Reconciler {
                 info!(pruned, "recon: pruned stopped daemon records");
             }
         }
-        let busy = read_proc_mounts()
-            .map(|m| {
-                m.into_iter()
-                    .map(|e| e.target)
-                    .collect::<HashSet<PathBuf>>()
-            })
-            .unwrap_or_default();
+        // Without the mount table a dir with a mount under it looks sweepable: sweep nothing.
+        let busy = match read_proc_mounts() {
+            Ok(mounts) => mounts
+                .into_iter()
+                .map(|e| e.target)
+                .collect::<HashSet<PathBuf>>(),
+            Err(e) => {
+                return result.and(Err(anyhow::Error::new(e)).context("not sweeping daemon dirs"));
+            }
+        };
 
         let removed = sweep_stale_daemon_dirs(&daemons_root, &keep, &busy, self.interval)?;
         if removed > 0 {
