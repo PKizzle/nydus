@@ -210,6 +210,11 @@ impl Request {
         endpoint
     }
 
+    /// Whether registry token requests go through the configured proxy.
+    pub fn auth_via_proxy(&self) -> bool {
+        self.proxy_config.auth_via_proxy
+    }
+
     /// Returns true if using HTTP proxy mode (no Dragonfly SDK scheduler).
     pub fn is_proxy_mode(&self) -> bool {
         self.dragonfly_scheduler_endpoint().is_empty()

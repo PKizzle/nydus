@@ -366,9 +366,9 @@ requires a working `nydusd` FUSE mount, i.e. a Linux host.
 
 `mount` and `optimize` hand the daemon they start the http or https forward proxy that
 `HTTPS_PROXY`/`HTTP_PROXY`/`ALL_PROXY` name for the registry (`NO_PROXY` applies), the proxy
-nydusify's own requests use. That proxy carries blob reads only: the daemon always fetches
-bearer tokens directly. On a network where nothing leaves without the proxy, `mount` and
-`optimize` therefore still fail whenever the registry's token server is not reachable directly.
+nydusify's own requests use. Blob reads and bearer token requests both go through it
+(`proxy.auth_via_proxy`), so a network where nothing leaves without the proxy works. The proxy
+is chosen for the registry host; the token server, often on another host, uses the same one.
 
 ## `nydusify commit`
 

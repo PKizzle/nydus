@@ -1092,6 +1092,12 @@ pub struct ProxyConfig {
     /// requests, for example behind a rate limit to the source.
     #[serde(default = "default_dragonfly_sdk_timeout")]
     pub dragonfly_sdk_timeout: u64,
+    /// Fetch registry bearer tokens through the proxy too. For a plain forward proxy on a
+    /// network where the token server is reachable only through it. Off by default: a
+    /// Dragonfly proxy serves blobs, not auth, so tokens go direct. `use_http` rewrites the
+    /// token URL as well then.
+    #[serde(default)]
+    pub auth_via_proxy: bool,
 }
 
 fn default_dragonfly_sdk_timeout() -> u64 {
@@ -1126,6 +1132,7 @@ impl std::fmt::Debug for ProxyConfig {
                 &redact_url(&self.dragonfly_scheduler_endpoint),
             )
             .field("dragonfly_sdk_timeout", &self.dragonfly_sdk_timeout)
+            .field("auth_via_proxy", &self.auth_via_proxy)
             .finish()
     }
 }
@@ -1141,6 +1148,7 @@ impl Default for ProxyConfig {
             check_pause_elapsed: 300,
             dragonfly_scheduler_endpoint: String::new(),
             dragonfly_sdk_timeout: default_dragonfly_sdk_timeout(),
+            auth_via_proxy: false,
         }
     }
 }
