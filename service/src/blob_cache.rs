@@ -1447,6 +1447,298 @@ mod tests {
         nydus_storage::factory::BLOB_FACTORY.forget(id);
     }
 
+    /// Chunk map header offsets of the data stamp, the boot that left the map unsealed, and
+    /// the recheck flag.
+    const MAP_DATA_STAMP: u64 = 24;
+    const MAP_UNSEALED_BOOT: u64 = 32;
+    const MAP_RECHECK: u64 = 40;
+
+    /// The file of the only blob cache in `dir` named with `suffix` after `.blob.data`.
+    fn cache_file(dir: &TempDir, suffix: &str) -> PathBuf {
+        let name = format!(".blob.data{suffix}");
+        std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .find(|p| p.to_str().unwrap().ends_with(&name))
+            .unwrap()
+    }
+
+    /// The 8-byte chunk map header word at `offset` of the blob cache in `dir`.
+    fn map_word(dir: &TempDir, offset: u64) -> u64 {
+        use std::os::unix::fs::FileExt;
+        let mut word = [0u8; 8];
+        std::fs::File::open(cache_file(dir, ".chunk_map"))
+            .unwrap()
+            .read_exact_at(&mut word, offset)
+            .unwrap();
+        u64::from_ne_bytes(word)
+    }
+
+    /// Overwrite that word, as another release or boot would have left it.
+    fn set_map_word(dir: &TempDir, offset: u64, value: u64) {
+        use std::os::unix::fs::FileExt;
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(cache_file(dir, ".chunk_map"))
+            .unwrap();
+        file.write_all_at(&value.to_ne_bytes(), offset).unwrap();
+        file.sync_all().unwrap();
+    }
+
+    /// A new directory holding a copy of the fixture blob `blob_id`, the backend of the caches
+    /// there.
+    fn fixture_backend(blob_id: &str) -> TempDir {
+        let tmp = TempDir::new().unwrap();
+        let root_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap();
+        std::fs::copy(
+            PathBuf::from(root_dir)
+                .join("../tests/texture/blobs")
+                .join(blob_id),
+            tmp.path().join(blob_id),
+        )
+        .unwrap();
+        tmp
+    }
+
+    /// The cached bytes of chunk `index` of the blob cache in `dir`.
+    fn cached_chunk(dir: &TempDir, blob: &DataBlob, index: u32) -> Vec<u8> {
+        use std::os::unix::fs::FileExt;
+        let chunk = blob.blob().get_chunk_info(index).unwrap();
+        let mut buf = vec![0u8; chunk.uncompressed_size() as usize];
+        std::fs::File::open(cache_file(dir, ""))
+            .unwrap()
+            .read_exact_at(&mut buf, chunk.uncompressed_offset())
+            .unwrap();
+        buf
+    }
+
+    fn fetch_chunk(blob: &DataBlob, index: u32) -> nydus_storage::StorageResult<()> {
+        let chunk = blob.blob().get_chunk_info(index).unwrap();
+        blob.blob()
+            .get_blob_object()
+            .unwrap()
+            .fetch_range_uncompressed(
+                chunk.uncompressed_offset(),
+                chunk.uncompressed_size() as u64,
+            )
+    }
+
+    /// A fanotify fill records the boot in the chunk map before it marks a chunk ready, and a
+    /// seal clears it once the data is on stable storage, until the next fill.
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support copy_file_range")]
+    fn a_fill_unseals_its_cache_until_the_next_seal() {
+        let id = "unseal-on-fill";
+        let tmp = fixture_backend(FIXTURE_BLOB);
+        let blob = open_fixture_blob("fanotify", FIXTURE_BLOB, FIXTURE_BOOT, &tmp, id);
+        blob.blob().add_chunk_digests(&fixture_digests()).unwrap();
+        let obj = blob.blob().get_blob_object().unwrap();
+        assert_eq!(map_word(&tmp, MAP_UNSEALED_BOOT), 0);
+
+        fetch_chunk(&blob, 0).unwrap();
+        assert!(is_ready(&blob, 0));
+        assert_eq!(
+            map_word(&tmp, MAP_UNSEALED_BOOT),
+            nydus_storage::utils::boot_id(),
+            "a chunk was marked ready in a map not recorded as unsealed"
+        );
+
+        obj.seal().unwrap();
+        assert_eq!(map_word(&tmp, MAP_UNSEALED_BOOT), 0);
+        assert!(is_ready(&blob, 0));
+
+        fetch_chunk(&blob, 1).unwrap();
+        assert_eq!(
+            map_word(&tmp, MAP_UNSEALED_BOOT),
+            nydus_storage::utils::boot_id()
+        );
+        drop(blob);
+        nydus_storage::factory::BLOB_FACTORY.forget(id);
+    }
+
+    /// After a crash the chunk map may claim chunks whose bytes were lost with the page cache.
+    /// A cache another boot left unsealed forgets its ready chunks, keeps its data file, and
+    /// marks a chunk ready again only once its cached bytes pass the digest, without a backend
+    /// read; lost or damaged chunks are fetched again. No chunk is served unchecked.
+    #[test]
+    #[cfg(target_os = "linux")]
+    #[cfg_attr(miri, ignore = "Miri does not support copy_file_range")]
+    fn a_cache_unsealed_by_another_boot_is_rechecked_not_trusted() {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::FileExt;
+
+        let id = "foreign-boot";
+        let tmp = fixture_backend(SMALL_FILES_BLOB);
+        let blob = open_fixture_blob("fanotify", SMALL_FILES_BLOB, SMALL_FILES_BOOT, &tmp, id);
+        blob.blob()
+            .add_chunk_digests(&boot_digests(SMALL_FILES_BOOT))
+            .unwrap();
+        let obj = blob.blob().get_blob_object().unwrap();
+        obj.fetch_range_uncompressed(0, blob.blob_info().uncompressed_size())
+            .unwrap();
+        assert!(
+            obj.verify_ready_chunks(&|| false, &mut |_| Ok(true))
+                .unwrap()
+        );
+        let count = blob.blob_info().chunk_count();
+        assert!(count > 2);
+        let good: Vec<_> = (0..3).map(|i| cached_chunk(&tmp, &blob, i)).collect();
+        let chunks: Vec<_> = (0..3)
+            .map(|i| blob.blob().get_chunk_info(i).unwrap())
+            .collect();
+        drop(blob);
+        nydus_storage::factory::BLOB_FACTORY.forget(id);
+
+        // The crash: chunk 0's bytes never reached the disk, chunk 1's are damaged, and the
+        // map was last filled in another boot.
+        let data = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(tmp.path().join(format!("{SMALL_FILES_BLOB}.blob.data")))
+            .unwrap();
+        // SAFETY: `fallocate` only takes integers; `data` is open for the call.
+        let ret = unsafe {
+            libc::fallocate(
+                data.as_raw_fd(),
+                libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
+                chunks[0].uncompressed_offset() as libc::off_t,
+                chunks[0].uncompressed_size() as libc::off_t,
+            )
+        };
+        assert_eq!(ret, 0, "{}", std::io::Error::last_os_error());
+        let mut byte = [0u8; 1];
+        data.read_exact_at(&mut byte, chunks[1].uncompressed_offset())
+            .unwrap();
+        data.write_all_at(&[byte[0] ^ 0xff], chunks[1].uncompressed_offset())
+            .unwrap();
+        drop(data);
+        set_map_word(
+            &tmp,
+            MAP_UNSEALED_BOOT,
+            nydus_storage::utils::boot_id() ^ 0x5a5a,
+        );
+        // And the backend cannot serve these chunks: a fill that succeeds read the cache. The
+        // damage is an XOR, so doing it twice undoes it.
+        let backend = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(tmp.path().join(SMALL_FILES_BLOB))
+            .unwrap();
+        let toggle_damage = || {
+            for chunk in &chunks {
+                let mut buf = vec![0u8; chunk.compressed_size() as usize];
+                backend
+                    .read_exact_at(&mut buf, chunk.compressed_offset())
+                    .unwrap();
+                buf.iter_mut().for_each(|b| *b ^= 0xa5);
+                backend
+                    .write_all_at(&buf, chunk.compressed_offset())
+                    .unwrap();
+            }
+        };
+        toggle_damage();
+
+        let blob = open_fixture_blob("fanotify", SMALL_FILES_BLOB, SMALL_FILES_BOOT, &tmp, id);
+        blob.blob()
+            .add_chunk_digests(&boot_digests(SMALL_FILES_BOOT))
+            .unwrap();
+        let obj = blob.blob().get_blob_object().unwrap();
+        for index in 0..count {
+            assert!(
+                !is_ready(&blob, index),
+                "chunk {index} is trusted from a boot that ended unsealed"
+            );
+        }
+        assert!(!obj.is_data_verified());
+        assert_ne!(map_word(&tmp, MAP_RECHECK), 0);
+
+        // The intact chunk is rechecked from the cache file.
+        fetch_chunk(&blob, 2).unwrap();
+        assert!(is_ready(&blob, 2));
+        // The lost and the damaged one are not: they need the backend.
+        assert!(fetch_chunk(&blob, 0).is_err());
+        assert!(fetch_chunk(&blob, 1).is_err());
+        assert!(!is_ready(&blob, 0) && !is_ready(&blob, 1));
+
+        toggle_damage();
+        fetch_chunk(&blob, 0).unwrap();
+        fetch_chunk(&blob, 1).unwrap();
+        for (index, good) in good.iter().enumerate() {
+            assert_eq!(&cached_chunk(&tmp, &blob, index as u32), good);
+        }
+        obj.fetch_range_uncompressed(0, blob.blob_info().uncompressed_size())
+            .unwrap();
+        assert!(obj.is_all_data_ready());
+        assert_eq!(
+            map_word(&tmp, MAP_RECHECK),
+            0,
+            "complete, nothing to recheck"
+        );
+        drop(blob);
+        nydus_storage::factory::BLOB_FACTORY.forget(id);
+    }
+
+    /// A seal refreshes a verified cache's stamp when its own fills account for the data
+    /// file's change time, which repairs a stamp concurrent fills stored out of order, but not
+    /// when anything else wrote the file after its last fill.
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support copy_file_range")]
+    fn a_seal_vouches_only_for_the_caches_own_writes() {
+        use std::os::unix::fs::FileExt;
+
+        let id = "seal-stamp";
+        let tmp = fixture_backend(FIXTURE_BLOB);
+        let blob = open_fixture_blob("fanotify", FIXTURE_BLOB, FIXTURE_BOOT, &tmp, id);
+        blob.blob().add_chunk_digests(&fixture_digests()).unwrap();
+        let obj = blob.blob().get_blob_object().unwrap();
+        fetch_chunk(&blob, 0).unwrap();
+        assert!(
+            obj.verify_ready_chunks(&|| false, &mut |_| Ok(true))
+                .unwrap()
+        );
+        assert!(obj.is_data_verified());
+        // A stamp a slower fill stored over a later one's.
+        let stamp = map_word(&tmp, MAP_DATA_STAMP);
+        set_map_word(&tmp, MAP_DATA_STAMP, stamp ^ 1);
+        assert!(!obj.is_data_verified());
+        obj.seal().unwrap();
+        assert!(obj.is_data_verified(), "the seal did not repair the stamp");
+
+        fetch_chunk(&blob, 1).unwrap();
+        assert!(obj.is_data_verified());
+        // Something else writes the file after the last fill, leaving its bytes as they were.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let chunk = blob.blob().get_chunk_info(1).unwrap();
+        let data = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(tmp.path().join(format!("{FIXTURE_BLOB}.blob.data")))
+            .unwrap();
+        let mut byte = [0u8; 1];
+        data.read_exact_at(&mut byte, chunk.uncompressed_offset())
+            .unwrap();
+        data.write_all_at(&byte, chunk.uncompressed_offset())
+            .unwrap();
+        drop(data);
+        assert!(!obj.is_data_verified());
+        obj.seal().unwrap();
+        assert_eq!(map_word(&tmp, MAP_UNSEALED_BOOT), 0);
+        assert!(
+            !obj.is_data_verified(),
+            "the seal vouched for a foreign write"
+        );
+        drop(blob);
+        nydus_storage::factory::BLOB_FACTORY.forget(id);
+
+        // Sealed, so its ready chunks are kept, but not as verified.
+        let blob = open_fixture_blob("fanotify", FIXTURE_BLOB, FIXTURE_BOOT, &tmp, id);
+        blob.blob().add_chunk_digests(&fixture_digests()).unwrap();
+        assert!(is_ready(&blob, 0) && is_ready(&blob, 1));
+        assert!(!blob.blob().get_blob_object().unwrap().is_data_verified());
+        drop(blob);
+        nydus_storage::factory::BLOB_FACTORY.forget(id);
+    }
+
     /// The one-time check of chunks already marked ready records a clean cache file as
     /// verified, and hands a corrupted chunk to its caller to revoke, after which the next fill
     /// restores it.

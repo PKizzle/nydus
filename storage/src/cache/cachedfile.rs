@@ -16,7 +16,7 @@ use std::mem::ManuallyDrop;
 #[cfg(feature = "dedup")]
 use std::ops::Deref;
 use std::os::unix::io::{AsRawFd, RawFd};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
@@ -315,6 +315,9 @@ pub(crate) struct FileCacheEntry {
     pub(crate) bootstrap_digests: Option<BootstrapDigests>,
     // Chunks of this blob that failed validation, for escalating the log.
     pub(crate) digest_mismatches: AtomicU32,
+    // The latest data file change time seen after a write of this entry: a later one at seal
+    // time means something else wrote the file.
+    pub(crate) own_ctime: AtomicU64,
     // Amplified user IO request batch size to read data from remote storage backend / local cache.
     pub(crate) user_io_batch_size: u32,
     pub(crate) prefetch_config: Arc<AsyncPrefetchConfig>,
@@ -531,6 +534,11 @@ fn fill_wait_deadline() -> Instant {
 
 /// A data file's change time and size as one value, for [RangeMap::is_verified].
 pub(crate) fn data_file_stamp(file: &File) -> StorageResult<u64> {
+    data_file_times(file).map(|(_, stamp)| stamp)
+}
+
+/// A data file's change time in nanoseconds, and its [data_file_stamp].
+fn data_file_times(file: &File) -> StorageResult<(u64, u64)> {
     let md = file
         .metadata()
         .map_err(|e| StorageError::cache_io("stat the blob data file", e))?;
@@ -538,7 +546,7 @@ pub(crate) fn data_file_stamp(file: &File) -> StorageResult<u64> {
     let ctime = (md.ctime() as u64)
         .wrapping_mul(1_000_000_000)
         .wrapping_add(md.ctime_nsec() as u64);
-    Ok(ctime ^ md.len().rotate_left(32))
+    Ok((ctime, ctime ^ md.len().rotate_left(32)))
 }
 
 impl FileCacheEntry {
@@ -588,8 +596,11 @@ impl FileCacheEntry {
         if self.bootstrap_digests.is_none() {
             return;
         }
-        if let (Some(map), Ok(stamp)) = (self.chunk_map.as_range_map(), self.data_stamp()) {
+        if let (Some(map), Ok((ctime, stamp))) =
+            (self.chunk_map.as_range_map(), data_file_times(&self.file))
+        {
             let _ = map.update_data_stamp(stamp);
+            self.own_ctime.fetch_max(ctime, Ordering::AcqRel);
         }
     }
 
@@ -1546,6 +1557,26 @@ impl BlobObject for FileCacheEntry {
         Ok(())
     }
 
+    fn seal(&self) -> StorageResult<()> {
+        if self.bootstrap_digests.is_none() {
+            return Err(StorageError::Unsupported);
+        }
+        let map = self
+            .chunk_map
+            .as_range_map()
+            .ok_or(StorageError::Unsupported)?;
+        map.seal(&mut || {
+            self.file
+                .sync_data()
+                .map_err(|e| StorageError::cache_io("flush the blob data file", e))?;
+            let (ctime, stamp) = data_file_times(&self.file)?;
+            // Concurrent fills may have stored their stamps out of order; a change time no
+            // write of this entry saw means another writer, whose bytes nobody checked.
+            Ok((ctime == self.own_ctime.load(Ordering::Acquire)).then_some(stamp))
+        })?;
+        Ok(())
+    }
+
     fn reset_data_ready(&self) -> StorageResult<()> {
         // A tarfs blob is the tar itself rather than a populated cache; there is no readiness
         // bookkeeping to revoke and nothing that could be re-fetched.
@@ -1717,16 +1748,26 @@ impl FileCacheEntry {
             chunks,
             pending: vec![false; count as usize],
         };
-        let (start_idx, end_idx) = {
-            let mut start = u32::MAX;
-            let mut end = 0;
-            for chunk_id in pending.iter() {
-                status.pending[(*chunk_id - chunk_index) as usize] = true;
-                start = std::cmp::min(*chunk_id - chunk_index, start);
-                end = std::cmp::max(*chunk_id - chunk_index, end);
+        for chunk_id in pending.iter() {
+            status.pending[(*chunk_id - chunk_index) as usize] = true;
+        }
+        if self.bootstrap_digests.is_some() {
+            // Before anything is fetched; fails the fill, its errno intact, if the map cannot
+            // record that it is unsealed. Each ready bit checks again.
+            bitmap.mark_unsealed()?;
+        }
+        if self.bootstrap_digests.is_some() && bitmap.is_rechecking() {
+            for (chunk, pending) in chunks.iter().zip(status.pending.iter_mut()) {
+                if *pending && self.cached_chunk_is_intact(chunk.as_ref()) {
+                    self.update_chunk_pending_status(chunk.as_ref(), true);
+                    *pending = false;
+                }
             }
-            (start as usize, end as usize)
-        };
+        }
+        let (start_idx, end_idx) = (
+            status.pending.iter().position(|p| *p).unwrap_or(usize::MAX),
+            status.pending.iter().rposition(|p| *p).unwrap_or(0),
+        );
 
         if start_idx <= end_idx {
             let start_chunk = &chunks[start_idx];
@@ -1836,6 +1877,48 @@ impl FileCacheEntry {
         }
 
         Ok(())
+    }
+
+    /// Whether the bytes the data file already holds at `chunk`'s extent match the digest a
+    /// bootstrap gives it, so a chunk the map forgot after a crash can be marked ready without
+    /// fetching it. A chunk without a digest, or an extent that is all hole, is fetched.
+    fn cached_chunk_is_intact(&self, chunk: &dyn BlobChunkInfo) -> bool {
+        if self.is_raw_data || self.is_cache_encrypted || !self.need_validation {
+            return false;
+        }
+        let Some(digest) = self.expected_chunk_digest(chunk) else {
+            return false;
+        };
+        let offset = chunk.uncompressed_offset();
+        let size = chunk.uncompressed_size() as usize;
+        #[cfg(target_os = "linux")]
+        {
+            // SAFETY: `lseek` only takes integers; the file is open for the call.
+            let data = unsafe {
+                libc::lseek(
+                    self.file.as_raw_fd(),
+                    offset as libc::off_t,
+                    libc::SEEK_DATA,
+                )
+            };
+            if data < 0 || data as u64 >= offset + size as u64 {
+                return false;
+            }
+        }
+        let mut buf = alloc_buf(size);
+        if std::os::unix::fs::FileExt::read_exact_at(self.file.as_ref(), buf.as_mut_slice(), offset)
+            .is_err()
+        {
+            return false;
+        }
+        let intact = crate::utils::check_hash(buf.as_slice(), &digest, self.blob_digester());
+        debug!(
+            "blob {}: rechecked cached chunk {}: {}",
+            self.blob_id,
+            chunk.id(),
+            if intact { "intact" } else { "refetching" }
+        );
+        intact
     }
 
     fn adjust_buffer_for_dio(&self, buf: &mut AlignedBuf) {

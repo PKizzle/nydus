@@ -72,7 +72,7 @@ impl ServiceController {
             let mut handlers = self.fanotify.lock().unwrap();
             for (image_id, fanotify) in handlers.drain() {
                 info!("Stopping fanotify handler for {}", image_id);
-                fanotify.stop();
+                fanotify.stop_and_seal();
             }
         }
     }
@@ -285,6 +285,17 @@ impl ServiceController {
         handlers
     }
 
+    /// Stop every fanotify handler's workers and seal its caches, leaving queued events and
+    /// the mounts for a successor process that takes the preserved groups over. For a process
+    /// exiting with its groups parked: a clean reboot after it keeps the caches trusted.
+    pub fn seal_fanotify_handlers(&self) {
+        for (image_id, fanotify) in self.fanotify.lock().unwrap().iter() {
+            info!("Sealing the caches of fanotify handler for {}", image_id);
+            fanotify.stop_workers();
+            fanotify.seal();
+        }
+    }
+
     /// Register handlers [`suspend_fanotify_handlers`](Self::suspend_fanotify_handlers) took out
     /// again and restart their workers, which answer what queued meanwhile.
     pub fn resume_fanotify_handlers(
@@ -321,10 +332,16 @@ impl ServiceController {
         if let Some(fanotify) = handlers.remove(image_id) {
             is_empty = handlers.is_empty();
             fanotify.stop();
+            drop(handlers); // Release lock before unmounting
             // Unmount the EROFS filesystem
             let mountpoint = fanotify.mountpoint().to_path_buf();
-            drop(handlers); // Release lock before unmounting
             result = Self::umount_fanotify_erofs(&fanotify, &mountpoint);
+            // After the unmount, so no reader waits for the flush; if the mount is still up,
+            // whatever it queued meanwhile is denied before the handler drops.
+            fanotify.seal();
+            if result.is_err() {
+                fanotify.drain_deny_pending();
+            }
             // Only now may the handler — and the group fd it owns — drop; `stop()` joined its
             // workers. Then release its cache managers: the blob factory keys them by
             // config, so an idle one would otherwise keep its cache files open after the
