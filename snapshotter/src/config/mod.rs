@@ -443,6 +443,12 @@ pub enum ConfigError {
         #[source]
         source: crate::source::trust::TrustError,
     },
+    #[error("invalid [snapshotter.cache].{field} value {value:?}: {reason}")]
+    InvalidRetentionSetting {
+        field: &'static str,
+        value: String,
+        reason: String,
+    },
     #[error("invalid [snapshotter.cgroup].{field} value {value:?}: {reason}")]
     InvalidCgroupMemorySetting {
         field: &'static str,
@@ -592,7 +598,8 @@ pub struct CacheConfig {
     /// Maximum age for cache artifacts before they become GC candidates (e.g. "168h").
     #[serde(default)]
     pub gc_max_age: Option<String>,
-    /// Maximum cache size in bytes. Oldest artifacts are evicted first.
+    /// Maximum cache size in bytes allocated on disk (sparse cache files count only what they
+    /// hold). Oldest artifacts are evicted first.
     #[serde(default)]
     pub gc_max_bytes: Option<u64>,
     /// Report GC candidates without deleting files.
@@ -601,6 +608,21 @@ pub struct CacheConfig {
     /// Disable indexed blob caching.
     #[serde(default)]
     pub disable_indexed: bool,
+    /// Keep the stage (node view and verified caches) of a released fanotify image for its next
+    /// start, within the limits below; see `crate::retention`.
+    #[serde(default)]
+    pub retention: bool,
+    /// Most bytes retained stages may hold: a byte count (`"20GiB"`) or a percentage of the
+    /// filesystem holding `daemons/` (`"10%"`).
+    #[serde(default = "default_retention_max_bytes")]
+    pub retention_max_bytes: String,
+    /// Retained stages are evicted while the filesystem holding `daemons/` has less than this
+    /// available, in the same units as `retention_max_bytes`.
+    #[serde(default = "default_retention_min_free")]
+    pub retention_min_free: String,
+    /// How long a retained stage may stay idle: `"auto"` or a duration (`"7d"`).
+    #[serde(default = "default_retention_idle_limit")]
+    pub retention_idle_limit: String,
 }
 
 impl Default for CacheConfig {
@@ -612,6 +634,10 @@ impl Default for CacheConfig {
             gc_max_bytes: None,
             gc_dry_run: false,
             disable_indexed: false,
+            retention: false,
+            retention_max_bytes: default_retention_max_bytes(),
+            retention_min_free: default_retention_min_free(),
+            retention_idle_limit: default_retention_idle_limit(),
         }
     }
 }
@@ -1431,6 +1457,7 @@ impl SnapshotterConfig {
     pub fn validate(&self) -> Result<(), ConfigError> {
         self.backends.validate()?;
         self.snapshotter.cgroup.memory_controls()?;
+        crate::retention::Policy::from_config(&self.snapshotter.cache)?;
         for rule in &self.snapshotter.referrer_trust.rules {
             crate::source::trust::validate_rule(rule).map_err(|source| {
                 ConfigError::InvalidReferrerTrustRule {
@@ -1606,6 +1633,15 @@ fn default_cache_work_dir() -> PathBuf {
 fn default_gc_period() -> String {
     "24h".to_string()
 }
+fn default_retention_max_bytes() -> String {
+    "10%".to_string()
+}
+fn default_retention_min_free() -> String {
+    "20%".to_string()
+}
+fn default_retention_idle_limit() -> String {
+    "auto".to_string()
+}
 fn default_request_timeout() -> String {
     "30s".to_string()
 }
@@ -1686,6 +1722,48 @@ fn default_fs_drivers() -> Vec<FsDriverEntry> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Retention is off by default; its keys are checked whether it is on or not.
+    #[test]
+    fn retention_keys_parse_and_validate() {
+        use crate::retention::{IdleLimit, Policy, Size};
+
+        let config = SnapshotterConfig::default();
+        config.validate().unwrap();
+        assert_eq!(
+            Policy::from_config(&config.snapshotter.cache).unwrap(),
+            None
+        );
+
+        let config: SnapshotterConfig = toml::from_str(
+            "[snapshotter.cache]\nretention = true\nretention_max_bytes = \"20GiB\"\n\
+             retention_min_free = \"15%\"\nretention_idle_limit = \"7d\"\n",
+        )
+        .unwrap();
+        config.validate().unwrap();
+        assert_eq!(
+            Policy::from_config(&config.snapshotter.cache).unwrap(),
+            Some(Policy {
+                max_bytes: Size::Bytes(20 << 30),
+                min_free: Size::Percent(15.0),
+                idle_limit: IdleLimit::Fixed(std::time::Duration::from_secs(7 * 86400)),
+            })
+        );
+
+        for (key, value) in [
+            ("retention_max_bytes", "lots"),
+            ("retention_min_free", "120%"),
+            ("retention_idle_limit", "sometimes"),
+        ] {
+            let config: SnapshotterConfig =
+                toml::from_str(&format!("[snapshotter.cache]\n{key} = \"{value}\"\n")).unwrap();
+            let err = config.validate().unwrap_err();
+            assert!(
+                matches!(&err, ConfigError::InvalidRetentionSetting { field, .. } if *field == key),
+                "{key}: {err}"
+            );
+        }
+    }
 
     /// The example config shipped in the release tarball must always parse
     /// and validate against the current schema.

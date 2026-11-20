@@ -922,7 +922,10 @@ async fn metrics_response(controller: &SystemController) -> HttpResponse {
         Ok(records) => records,
         Err(e) => return error_response(500, e.to_string()),
     };
-    let cache = match controller.cache_usage() {
+    let cache = match controller
+        .cache
+        .scan_recent(crate::cache::METRICS_SCAN_MAX_AGE)
+    {
         Ok(usage) => usage,
         Err(e) => return error_response(500, e.to_string()),
     };
@@ -1018,6 +1021,8 @@ async fn metrics_response(controller: &SystemController) -> HttpResponse {
         "nydus_snapshotter_mount_probe_timeouts_total",
         controller.supervisor.mount_probe_timeouts_total(),
     );
+
+    render_retention_metrics(&mut body, &controller.supervisor);
 
     #[cfg(target_os = "linux")]
     if let Some(status) = nydus_service::erofs_folio::detected() {
@@ -1261,6 +1266,91 @@ async fn metrics_response(controller: &SystemController) -> HttpResponse {
         status: 200,
         content_type: "text/plain; version=0.0.4",
         body: body.into_bytes(),
+    }
+}
+
+/// Stage retention: starts, view staging and evictions always; the gauges once a retention pass
+/// has run (retention on).
+fn render_retention_metrics(body: &mut String, supervisor: &crate::daemon::DaemonSupervisor) {
+    let stats = supervisor.retention_stats();
+    let (warm, cold) = stats.starts();
+    body.push_str(
+        "# HELP nydus_snapshotter_fanotify_starts_total Fanotify daemon starts: warm when a staged mount source was there to start from.\n",
+    );
+    body.push_str("# TYPE nydus_snapshotter_fanotify_starts_total counter\n");
+    push_labeled_metric(
+        body,
+        "nydus_snapshotter_fanotify_starts_total",
+        &[("stage", "warm")],
+        warm,
+    );
+    push_labeled_metric(
+        body,
+        "nydus_snapshotter_fanotify_starts_total",
+        &[("stage", "cold")],
+        cold,
+    );
+    let (reused, built) = crate::daemon::view_staging_counts();
+    body.push_str(
+        "# HELP nydus_snapshotter_node_views_total Node views staged for fanotify starts: reused as staged or built.\n",
+    );
+    body.push_str("# TYPE nydus_snapshotter_node_views_total counter\n");
+    push_labeled_metric(
+        body,
+        "nydus_snapshotter_node_views_total",
+        &[("result", "reused")],
+        reused,
+    );
+    push_labeled_metric(
+        body,
+        "nydus_snapshotter_node_views_total",
+        &[("result", "built")],
+        built,
+    );
+    body.push_str(
+        "# HELP nydus_snapshotter_retention_evictions_total Retained stages evicted, by reason.\n",
+    );
+    body.push_str("# TYPE nydus_snapshotter_retention_evictions_total counter\n");
+    for reason in crate::retention::Reason::ALL {
+        push_labeled_metric(
+            body,
+            "nydus_snapshotter_retention_evictions_total",
+            &[("reason", reason.label())],
+            stats.evictions(reason),
+        );
+    }
+    let Some(gauges) = stats.gauges() else {
+        return;
+    };
+    for (name, help, value) in [
+        (
+            "nydus_snapshotter_retained_stages",
+            "Stages of released images kept for their next start.",
+            gauges.retained_stages,
+        ),
+        (
+            "nydus_snapshotter_retained_bytes",
+            "Bytes allocated on disk by retained stages.",
+            gauges.retained_bytes,
+        ),
+        (
+            "nydus_snapshotter_retention_max_bytes",
+            "Effective retention_max_bytes.",
+            gauges.max_bytes,
+        ),
+        (
+            "nydus_snapshotter_retention_min_free_bytes",
+            "Effective retention_min_free.",
+            gauges.min_free,
+        ),
+        (
+            "nydus_snapshotter_retention_fs_available_bytes",
+            "Space available on the filesystem holding daemons/ after the last retention pass.",
+            gauges.fs_available,
+        ),
+    ] {
+        body.push_str(&format!("# HELP {name} {help}\n# TYPE {name} gauge\n"));
+        push_metric(body, name, value);
     }
 }
 
@@ -1874,6 +1964,8 @@ mod tests {
             built_on_node: false,
             driver_override: None,
             registry_auth: false,
+            start_gap: None,
+            released_at: None,
         };
         let records_dir = controller.supervisor.daemons_root().join("records");
         std::fs::create_dir_all(&records_dir).unwrap();
@@ -1976,7 +2068,10 @@ mod tests {
         assert_eq!(response.status, 200);
         let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
         assert_eq!(body["total_files"], 1);
-        assert_eq!(body["total_bytes"], 4);
+        assert_eq!(
+            body["total_bytes"],
+            allocated(&controller.cache.root().join("item.blob.data"))
+        );
         assert_eq!(body["entries"][0]["kind"], "blob_data");
     }
 
@@ -2175,9 +2270,12 @@ mod tests {
         assert!(body.contains("nydus_snapshotter_daemon_upgrade_runs_total 0"));
         assert!(body.contains("nydus_snapshotter_snapshots 1"));
         assert!(body.contains("nydus_snapshotter_snapshots_by_kind{kind=\"active\"} 1"));
-        assert!(body.contains("nydus_snapshotter_cache_bytes 4"));
+        let bytes = allocated(&controller.cache.root().join("item.blob.data"));
+        assert!(body.contains(&format!("nydus_snapshotter_cache_bytes {bytes}")));
         assert!(body.contains("nydus_snapshotter_cache_files 1"));
-        assert!(body.contains("nydus_snapshotter_cache_artifact_bytes{kind=\"blob_data\"} 4"));
+        assert!(body.contains(&format!(
+            "nydus_snapshotter_cache_artifact_bytes{{kind=\"blob_data\"}} {bytes}"
+        )));
         assert!(body.contains("nydus_snapshotter_cache_artifact_files{kind=\"blob_data\"} 1"));
         assert!(body.contains("nydus_snapshotter_cache_gc_runs_total 1"));
         // The GC above was a DRY RUN — it deleted nothing, so the "removed"
@@ -2188,8 +2286,17 @@ mod tests {
         assert!(body.contains("nydusd_counts{version=\"in-process\"} 0"));
         assert!(body.contains("nydusd_lifetime_event_counts{event=\"spawn\"} 0"));
         assert!(body.contains("snapshotter_snapshot_operation_elapsed_milliseconds"));
-        assert!(body.contains("snapshotter_cache_usage_kilobytes 0"));
+        assert!(body.contains(&format!(
+            "snapshotter_cache_usage_kilobytes {}",
+            bytes / 1024
+        )));
         assert!(body.contains("snapshotter_run_time_seconds"));
+    }
+
+    /// Bytes `path` occupies on disk, as cache accounting counts them.
+    fn allocated(path: &Path) -> u64 {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata(path).unwrap().blocks() * 512
     }
 
     #[test]

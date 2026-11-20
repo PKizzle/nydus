@@ -112,6 +112,21 @@ sudo nydusd uffd \
 
 The VMM or runtime-side fault handler connects to the socket, sends the uffd fd and VMA regions via `SCM_RIGHTS`, and then maps returned blob ranges on demand. See [nydus-uffd.md](nydus-uffd.md) for protocol details and the full Kata/VM configuration matrix.
 
+### Logging
+
+Without `--log-file`, `nydusd` logs to stderr. With `--log-file <path>`, it appends to that file
+and rotates it when it reaches `--log-rotation-size` MB (default `100`). Rotated files get a
+timestamp in their name and are compressed, and the 10 newest are kept, so the logs of one
+daemon take about 100 MB plus the compressed files at most. `--log-rotation-size 0` turns
+rotation off, and the file then grows without a bound.
+
+```shell
+sudo nydusd --log-file /var/log/nydusd.log --log-rotation-size 20 ...
+```
+
+The snapshotter's in-process daemons log through the snapshotter and are not affected by these
+options.
+
 ### Nydus Configuration
 
 #### Common Fields In Config

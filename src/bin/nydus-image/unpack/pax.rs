@@ -563,8 +563,10 @@ impl PAXUtil {
     fn set_link(header: &mut Header, path: &Path) -> Result<Option<PAXRecord>> {
         let max_len = header.as_old().linkname.len();
         if path.as_os_str().len() <= max_len {
+            // `set_link_name` rebuilds the target from its components, which
+            // turns `a//b` into `a/b` and drops `.` components.
             return header
-                .set_link_name(path)
+                .set_link_name_literal(path.as_os_str().as_bytes())
                 .with_context(|| "fail to set short link for pax header")
                 .map(|_| None);
         }

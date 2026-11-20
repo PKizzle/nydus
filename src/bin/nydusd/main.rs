@@ -270,8 +270,8 @@ fn prepare_commandline_options() -> Command {
         .arg(
             Arg::new("log-rotation-size")
                 .long("log-rotation-size")
-                .help("Specify log rotation size(MB), 0 to disable")
-                .default_value("0")
+                .help("Rotate the log file when it reaches this size (MB), 0 to disable")
+                .default_value("100")
                 .required(false)
                 .global(true),
         )
@@ -995,4 +995,20 @@ fn main() -> Result<()> {
     DAEMON_CONTROLLER.shutdown();
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn log_file_rotates_by_default() {
+        let args = super::prepare_commandline_options()
+            .try_get_matches_from(["nydusd", "--mountpoint", "/mnt", "--log-file", "nydusd.log"])
+            .unwrap();
+        let size: u64 = args
+            .get_one::<String>("log-rotation-size")
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!(size > 0, "a log file without rotation grows unbounded");
+    }
 }

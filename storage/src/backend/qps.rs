@@ -254,6 +254,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "timing-sensitive; Miri runs too slowly")]
     fn test_multiple_tokens_acquisition() {
         let limiter = QpsLimiter::new(10.0);
 

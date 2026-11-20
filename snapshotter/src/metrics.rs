@@ -702,7 +702,13 @@ async fn handle_metrics(
 /// blocking thread via `blocking::unblock` — the same pattern peer_mirror /
 /// referrer use for blocking work — so the reactor stays responsive.
 async fn scan_cache_bytes(cache: crate::cache::CacheManager) -> u64 {
-    blocking::unblock(move || cache.scan().map(|usage| usage.total_bytes).unwrap_or(0)).await
+    blocking::unblock(move || {
+        cache
+            .scan_recent(crate::cache::METRICS_SCAN_MAX_AGE)
+            .map(|usage| usage.total_bytes)
+            .unwrap_or(0)
+    })
+    .await
 }
 
 /// Render the Prometheus body for the TCP endpoint. `total_bytes` is the live
@@ -745,13 +751,23 @@ mod tests {
         std::fs::write(dir.path().join("blob.data"), b"0123456789").unwrap();
         let cache = crate::cache::CacheManager::new(dir.path());
         let total_bytes = scan_cache_bytes(cache).await;
-        assert_eq!(total_bytes, 10);
+        // Bytes allocated on disk, not the file length.
+        let allocated = {
+            use std::os::unix::fs::MetadataExt;
+            std::fs::metadata(dir.path().join("blob.data"))
+                .unwrap()
+                .blocks()
+                * 512
+        };
+        assert_eq!(total_bytes, allocated);
 
         let metrics = SnapshotterMetrics::new();
         let body = render_metrics_body(&metrics, total_bytes);
-        // 10 bytes -> 0 KiB (integer division), proving the offloaded total
-        // flows into the reused renderer.
-        assert!(body.contains("snapshotter_cache_usage_kilobytes 0"));
+        // The offloaded total flows into the reused renderer.
+        assert!(body.contains(&format!(
+            "snapshotter_cache_usage_kilobytes {}",
+            total_bytes / 1024
+        )));
     }
 
     #[compio::test]

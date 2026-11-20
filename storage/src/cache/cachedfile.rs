@@ -523,18 +523,27 @@ impl BootstrapDigests {
     }
 }
 
+/// The deadline for one request's waits on other threads' fills, however many chunks it waits
+/// for: see [SINGLE_INFLIGHT_WAIT_TIMEOUT](crate::cache::SINGLE_INFLIGHT_WAIT_TIMEOUT).
+fn fill_wait_deadline() -> Instant {
+    Instant::now() + Duration::from_millis(crate::cache::SINGLE_INFLIGHT_WAIT_TIMEOUT)
+}
+
+/// A data file's change time and size as one value, for [RangeMap::is_verified].
+pub(crate) fn data_file_stamp(file: &File) -> StorageResult<u64> {
+    let md = file
+        .metadata()
+        .map_err(|e| StorageError::cache_io("stat the blob data file", e))?;
+    use std::os::unix::fs::MetadataExt;
+    let ctime = (md.ctime() as u64)
+        .wrapping_mul(1_000_000_000)
+        .wrapping_add(md.ctime_nsec() as u64);
+    Ok(ctime ^ md.len().rotate_left(32))
+}
+
 impl FileCacheEntry {
-    /// The data file's change time and size as one value, for [RangeMap::is_verified].
     fn data_stamp(&self) -> StorageResult<u64> {
-        let md = self
-            .file
-            .metadata()
-            .map_err(|e| StorageError::cache_io("stat the blob data file", e))?;
-        use std::os::unix::fs::MetadataExt;
-        let ctime = (md.ctime() as u64)
-            .wrapping_mul(1_000_000_000)
-            .wrapping_add(md.ctime_nsec() as u64);
-        Ok(ctime ^ md.len().rotate_left(32))
+        data_file_stamp(&self.file)
     }
 
     /// Whether `chunk` is one no bootstrap served from this cache references. No file maps such
@@ -691,8 +700,8 @@ impl FileCacheEntry {
     ///
     /// The remaining `let _ =` call sites are deliberate, not swallows: on
     /// failure `update_chunk_pending_status(false)` clears pending WITHOUT
-    /// marking the chunk ready, so `wait_for_range_ready` times out into
-    /// `do_fetch_chunks`' terminal retry, which re-fetches and propagates the
+    /// marking the chunk ready, so `wait_for_range_ready` reports it not ready
+    /// and `do_fetch_chunks` falls into its terminal retry, which re-fetches and propagates the
     /// real errno via `?`. Only that terminal retry must (and does) return
     /// this result.
     fn persist_chunk_data(&self, chunk: &dyn BlobChunkInfo, buf: &[u8]) -> StorageResult<()> {
@@ -1196,6 +1205,7 @@ impl BlobCache for FileCacheEntry {
 
     fn prefetch_range(&self, range: &BlobIoRange) -> StorageResult<usize> {
         let mut pending = Vec::with_capacity(range.chunks.len());
+        let deadline = fill_wait_deadline();
         if !self.chunk_map.is_persist() {
             let mut d_size = 0;
             for c in range.chunks.iter() {
@@ -1204,8 +1214,13 @@ impl BlobCache for FileCacheEntry {
             let mut buf = alloc_buf(d_size);
 
             for c in range.chunks.iter() {
-                if let Ok(true) = self.chunk_map.check_ready_and_mark_pending(c.as_ref()) {
-                    // The chunk is ready, so skip it.
+                // Only a chunk this call marked is its to fill: one that is ready, or still in
+                // another thread's fill at the deadline, is skipped, never filled or released here.
+                if !matches!(
+                    self.chunk_map
+                        .check_ready_and_mark_pending_until(c.as_ref(), deadline),
+                    Ok(false)
+                ) {
                     continue;
                 }
 
@@ -1221,18 +1236,26 @@ impl BlobCache for FileCacheEntry {
             }
         } else {
             for c in range.chunks.iter() {
-                if let Ok(true) = self.chunk_map.check_ready_and_mark_pending(c.as_ref()) {
-                    // The chunk is ready, so skip it.
-                    continue;
-                } else {
+                // As above: fill only the chunks this call marked.
+                if matches!(
+                    self.chunk_map
+                        .check_ready_and_mark_pending_until(c.as_ref(), deadline),
+                    Ok(false)
+                ) {
                     pending.push(c.clone());
                 }
             }
         }
 
+        // Readers of a chunk whose mark nobody clears wait for a fill that never comes.
+        let mut marks = PendingMarks::new(
+            self.chunk_map.as_ref(),
+            pending.iter().map(|c| c.as_ref()).collect(),
+        );
         let mut total_size = 0;
         let mut start = 0;
         while start < pending.len() {
+            marks.resolved = start;
             // Figure out the range with continuous chunk ids, be careful that `end` is inclusive.
             let mut end = start;
             while end < pending.len() - 1 && pending[end + 1].id() == pending[end].id() + 1 {
@@ -1254,7 +1277,8 @@ impl BlobCache for FileCacheEntry {
                             self.update_chunk_persist_status(c.as_ref(), &res);
                         }
                     } else {
-                        for idx in start..=end {
+                        for (idx, chunk) in pending.iter().enumerate().take(end + 1).skip(start) {
+                            marks.resolved = idx;
                             let buf = match bufs.next() {
                                 None => {
                                     return Err(StorageError::InvalidData(
@@ -1262,20 +1286,17 @@ impl BlobCache for FileCacheEntry {
                                     ));
                                 }
                                 Some(Err(e)) => {
-                                    for chunk in &mut pending[idx..=end] {
-                                        self.update_chunk_pending_status(chunk.as_ref(), false);
-                                    }
                                     return Err(StorageError::cache_io("decompress a chunk", e));
                                 }
                                 Some(Ok(v)) => v,
                             };
-                            let _ = self.persist_chunk_data(pending[idx].as_ref(), &buf);
+                            let _ = self.persist_chunk_data(chunk.as_ref(), &buf);
                         }
                     }
                 }
                 Err(_e) => {
                     // Clear the pending flag for all chunks in processing.
-                    for chunk in &mut pending[start..=end] {
+                    for chunk in &pending[start..=end] {
                         self.update_chunk_pending_status(chunk.as_ref(), false);
                     }
                 }
@@ -1283,6 +1304,7 @@ impl BlobCache for FileCacheEntry {
 
             start = end + 1;
         }
+        marks.resolve_all();
 
         Ok(total_size)
     }
@@ -1341,7 +1363,9 @@ impl BlobCache for FileCacheEntry {
 
         // All fallible operations are inside this closure so that
         // update_chunk_pending_status is always called on any error path,
-        // preventing chunks from being permanently stuck in pending state.
+        // preventing chunks from being permanently stuck in pending state;
+        // the guard covers an unwind.
+        let mark = PendingMarks::new(self.chunk_map.as_ref(), vec![chunk]);
         let result = (|| -> StorageResult<()> {
             if self.is_raw_data {
                 // Cache stores compressed data directly
@@ -1403,6 +1427,7 @@ impl BlobCache for FileCacheEntry {
             }
         })();
 
+        mark.resolve_all();
         self.update_chunk_persist_status(chunk, &result);
         result.map(|_| true)
     }
@@ -1770,7 +1795,9 @@ impl FileCacheEntry {
             }
         }
 
-        if !bitmap.wait_for_range_ready(chunk_index, count)? {
+        // One deadline for every wait on other threads' fills below.
+        let deadline = fill_wait_deadline();
+        if !bitmap.wait_for_range_ready_until(chunk_index, count, deadline)? {
             if prefetch {
                 return Err(StorageError::InvalidData(format!(
                     "failed to prefetch data from storage backend for chunk {}/{}",
@@ -1778,27 +1805,31 @@ impl FileCacheEntry {
                 )));
             }
 
-            // if we are in on-demand path, retry for the timeout chunks
+            // On demand, fetch the chunks whose fill by another thread failed.
             for chunk in chunks {
-                match self.chunk_map.check_ready_and_mark_pending(chunk.as_ref()) {
+                match self
+                    .chunk_map
+                    .check_ready_and_mark_pending_until(chunk.as_ref(), deadline)
+                {
                     Err(e) => return Err(e),
                     Ok(true) => {}
                     Ok(false) => {
-                        info!("retry for timeout chunk, {}", chunk.id());
+                        info!("retry for failed chunk, {}", chunk.id());
+                        let mark = PendingMarks::new(self.chunk_map.as_ref(), vec![chunk.as_ref()]);
                         let mut buf = alloc_buf(chunk.uncompressed_size() as usize);
-                        self.read_chunk_from_backend(chunk.as_ref(), &mut buf)
-                            .inspect_err(|_| {
-                                self.update_chunk_pending_status(chunk.as_ref(), false)
-                            })?;
+                        self.read_chunk_from_backend(chunk.as_ref(), &mut buf)?;
                         if self.dio_enabled {
                             self.adjust_buffer_for_dio(&mut buf)
                         }
-                        // Terminal path: this chunk already timed out once and
+                        // Terminal path: this chunk's fill already failed once and
                         // was re-read from the backend. If the cache write
                         // fails again (ENOSPC, EDQUOT, I/O error), the range
                         // cannot be materialized — propagate so the fanotify
                         // handler denies the read instead of allowing zeros.
-                        self.persist_chunk_data(chunk.as_ref(), &buf)?;
+                        // `persist_chunk_data` resolves the mark either way.
+                        let res = self.persist_chunk_data(chunk.as_ref(), &buf);
+                        mark.resolve_all();
+                        res?;
                     }
                 }
             }
@@ -1869,11 +1900,15 @@ impl FileCacheEntry {
 
         trace!("dispatch single io range {:?}", req);
         let mut blob_cci = BlobCCI::new();
+        let deadline = fill_wait_deadline();
         for (i, chunk) in req.chunks.iter().enumerate() {
             // The reassignment lives behind `dedup` (a default feature, but disableable —
             // e.g. clib's feature set), so the `mut` is unused in some builds only.
             #[cfg_attr(not(feature = "dedup"), allow(unused_mut))]
-            let mut is_ready = match self.chunk_map.check_ready_and_mark_pending(chunk.as_ref()) {
+            let mut is_ready = match self
+                .chunk_map
+                .check_ready_and_mark_pending_until(chunk.as_ref(), deadline)
+            {
                 Ok(true) => true,
                 Ok(false) => false,
                 Err(StorageError::Timeout) => false, // Retry if waiting for inflight IO timeouts
@@ -2624,6 +2659,39 @@ impl Drop for PendingChunks<'_> {
     }
 }
 
+/// Chunks marked in flight through [ChunkMap::check_ready_and_mark_pending], of which the first
+/// `resolved` are cached or released by their filler.
+///
+/// Dropping it clears the marks of the rest, however the fill ends, an unwind included.
+struct PendingMarks<'a> {
+    map: &'a dyn ChunkMap,
+    chunks: Vec<&'a dyn BlobChunkInfo>,
+    resolved: usize,
+}
+
+impl<'a> PendingMarks<'a> {
+    fn new(map: &'a dyn ChunkMap, chunks: Vec<&'a dyn BlobChunkInfo>) -> Self {
+        Self {
+            map,
+            chunks,
+            resolved: 0,
+        }
+    }
+
+    /// Every mark is resolved: drop without clearing any.
+    fn resolve_all(mut self) {
+        self.resolved = self.chunks.len();
+    }
+}
+
+impl Drop for PendingMarks<'_> {
+    fn drop(&mut self) {
+        for chunk in &self.chunks[self.resolved.min(self.chunks.len())..] {
+            self.map.clear_pending(*chunk);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -2661,6 +2729,42 @@ mod tests {
         }));
         assert!(unwound.is_err());
         assert_eq!(*cleared.0.lock().unwrap(), vec![11]);
+    }
+
+    /// A fill that unwinds after marking chunks in flight one by one leaves no mark of its own
+    /// behind, and touches none it already resolved; a fill that resolved them all clears none.
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support file-backed mmap")]
+    fn pending_marks_clear_unresolved_marks_on_unwind() {
+        use super::{ChunkMap, PendingMarks};
+        use crate::cache::state::{BlobStateMap, IndexedChunkMap};
+        use crate::test::MockChunkInfo;
+
+        let tmp = vmm_sys_util::tempfile::TempFile::new().unwrap();
+        let map = BlobStateMap::from(
+            IndexedChunkMap::new(tmp.as_path().to_str().unwrap(), 8, true).unwrap(),
+        );
+        let chunks: Vec<MockChunkInfo> = (0..3)
+            .map(|index| MockChunkInfo {
+                index,
+                ..Default::default()
+            })
+            .collect();
+        for chunk in &chunks {
+            assert!(!map.check_ready_and_mark_pending(chunk).unwrap());
+        }
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut marks = PendingMarks::new(&map, chunks.iter().map(|c| c as _).collect());
+            marks.resolved = 1;
+            panic!("decoder panicked");
+        }));
+        assert!(unwound.is_err());
+        let pending: Vec<bool> = chunks.iter().map(|c| map.is_pending(c).unwrap()).collect();
+        assert_eq!(pending, vec![true, false, false]);
+
+        assert!(!map.check_ready_and_mark_pending(&chunks[1]).unwrap());
+        PendingMarks::new(&map, vec![&chunks[1]]).resolve_all();
+        assert!(map.is_pending(&chunks[1]).unwrap());
     }
 
     /// A chunk overlapping or sharing a start with a neighbour is not the only one covering its

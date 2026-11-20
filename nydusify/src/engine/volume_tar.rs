@@ -44,7 +44,7 @@ use anyhow::{Context, Result, bail};
 use tar::{Builder, EntryType, Header, HeaderMode};
 use tracing::{debug, warn};
 
-use super::overlay_diff::{collect_xattrs, is_oci_whiteout_name};
+use super::overlay_diff::{append_symlink, collect_xattrs, is_oci_whiteout_name};
 
 /// What [`write_volume_tar`] archived and what it had to leave out.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -150,8 +150,7 @@ impl<W: Write> Walker<W> {
             // descriptor dereferences the link.
             let target =
                 read_link(&entry).with_context(|| format!("read symlink {}", name.display()))?;
-            self.builder
-                .append_link(&mut header, name, target)
+            append_symlink(&mut self.builder, &mut header, name, &target)
                 .with_context(|| format!("append symlink {}", name.display()))?;
         } else if ft.is_file() {
             // Like `tar --ignore-failed-read`: one unreadable file does not
@@ -381,6 +380,31 @@ mod tests {
         assert_eq!(escape.kind, EntryType::Symlink);
         assert_eq!(escape.link.as_deref(), Some("/etc"));
         assert_eq!(find(&entries, "vol/data").data, b"volume data");
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support O_PATH")]
+    fn symlink_targets_are_archived_byte_for_byte() {
+        let root = fake_root();
+        let targets = crate::engine::overlay_diff::tests::literal_link_targets();
+        for (i, target) in targets.iter().enumerate() {
+            symlink(
+                OsStr::from_bytes(target),
+                root.path().join(format!("vol/l{i}")),
+            )
+            .unwrap();
+        }
+
+        let mut out = Vec::new();
+        write_volume_tar_to(root.path(), Path::new("/vol"), &mut out).unwrap();
+
+        let mut ar = tar::Archive::new(out.as_slice());
+        let links: Vec<Vec<u8>> = ar
+            .entries()
+            .unwrap()
+            .filter_map(|e| e.unwrap().link_name_bytes().map(|l| l.into_owned()))
+            .collect();
+        assert_eq!(links, targets);
     }
 
     #[test]

@@ -15,7 +15,8 @@ use std::collections::HashSet;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime};
 use tracing::{debug, info, warn};
 
 /// Result alias for cache-manager operations.
@@ -142,12 +143,18 @@ pub struct CacheGcReport {
     pub failures: Vec<CacheGcFailure>,
 }
 
+/// How long a scan answers the metrics endpoints: a scrape would walk the whole cache tree
+/// otherwise.
+pub const METRICS_SCAN_MAX_AGE: Duration = Duration::from_secs(60);
+
 /// Cache manager rooted at the configured blob-cache work directory.
 #[derive(Clone, Debug)]
 pub struct CacheManager {
     root: PathBuf,
     /// `<root>/daemons`, whose `<slug>/stage` dirs hold the caches of fanotify daemons.
     daemons: Option<PathBuf>,
+    /// The last scan of [`scan_recent`](Self::scan_recent), shared by clones.
+    recent: Arc<Mutex<Option<(Instant, CacheUsage)>>>,
 }
 
 impl CacheManager {
@@ -155,6 +162,7 @@ impl CacheManager {
         Self {
             root: root.into(),
             daemons: None,
+            recent: Arc::default(),
         }
     }
 
@@ -166,7 +174,8 @@ impl CacheManager {
     /// Also account the fanotify caches in `daemons/<slug>/stage`. They count against the
     /// byte budget, so other caches are evicted to make room, but GC never removes them: each
     /// `.blob.data` there is a live EROFS device, and a dead daemon's dir goes with the
-    /// stale daemon-dir sweep. Only `stage` dirs are read, never a daemon's mountpoint.
+    /// stale daemon-dir sweep or stage retention (`crate::retention`), which the reconciler
+    /// runs before GC. Only `stage` dirs are read, never a daemon's mountpoint.
     pub fn with_daemon_stages(mut self, daemons: impl Into<PathBuf>) -> Self {
         self.daemons = Some(daemons.into());
         self
@@ -176,8 +185,23 @@ impl CacheManager {
         &self.root
     }
 
-    /// Scan regular files under the cache root and return aggregate usage.
-    /// Missing roots are treated as empty caches so first boot is cheap.
+    /// [`scan`](Self::scan), answered by the previous call while it is younger than `max_age`.
+    /// Concurrent callers wait for one scan.
+    pub fn scan_recent(&self, max_age: Duration) -> CacheResult<CacheUsage> {
+        let mut recent = self.recent.lock().unwrap();
+        if let Some((at, usage)) = recent.as_ref()
+            && at.elapsed() < max_age
+        {
+            return Ok(usage.clone());
+        }
+        let usage = self.scan()?;
+        *recent = Some((Instant::now(), usage.clone()));
+        Ok(usage)
+    }
+
+    /// Scan regular files under the cache root and return aggregate usage: the bytes allocated
+    /// on disk, so a sparse cache file counts only what it holds. Missing roots are treated as
+    /// empty caches so first boot is cheap.
     pub fn scan(&self) -> CacheResult<CacheUsage> {
         let mut usage = CacheUsage::default();
         if self.root.exists() {
@@ -340,7 +364,7 @@ impl CacheManager {
                 self.scan_dir(&path, pinned, usage)?;
             } else if metadata.is_file() {
                 let relative_path = path.strip_prefix(&self.root).unwrap_or(&path).to_path_buf();
-                let size = metadata.len();
+                let size = allocated_bytes(&metadata);
                 usage.total_files += 1;
                 usage.total_bytes += size;
                 usage.entries.push(CacheEntry {
@@ -548,6 +572,34 @@ pub fn parse_duration(value: &str) -> CacheResult<Duration> {
     Ok(Duration::from_secs(seconds))
 }
 
+/// Bytes allocated on disk for the files under `dir`, each inode once: a stage's `blob_<i>`
+/// device files are hardlinks to its `.blob.data` files. Symlinks are not followed.
+pub fn allocated_tree_bytes(dir: &Path) -> io::Result<u64> {
+    use std::os::unix::fs::MetadataExt;
+
+    let mut seen = HashSet::new();
+    let mut total = 0;
+    let mut dirs = vec![dir.to_path_buf()];
+    while let Some(dir) = dirs.pop() {
+        for entry in fs::read_dir(&dir)? {
+            let entry = entry?;
+            let metadata = entry.metadata()?;
+            if metadata.is_dir() {
+                dirs.push(entry.path());
+            } else if metadata.is_file() && seen.insert((metadata.dev(), metadata.ino())) {
+                total += allocated_bytes(&metadata);
+            }
+        }
+    }
+    Ok(total)
+}
+
+/// Bytes a file occupies on disk (`st_blocks` counts 512-byte units on every Unix).
+fn allocated_bytes(metadata: &fs::Metadata) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    metadata.blocks() * 512
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -574,7 +626,11 @@ mod tests {
         let manager = CacheManager::new(dir.path().join("cache"));
         let usage = manager.scan().unwrap();
         assert_eq!(usage.total_files, 3);
-        assert_eq!(usage.total_bytes, 11);
+        let allocated: u64 = ["abc.blob.data", "abc.blob.meta", "abc.chunk_map"]
+            .iter()
+            .map(|name| allocated_bytes(&fs::metadata(cache.join(name)).unwrap()))
+            .sum();
+        assert_eq!(usage.total_bytes, allocated);
         assert!(
             usage
                 .entries
@@ -613,7 +669,9 @@ mod tests {
         let manager = CacheManager::new(dir.path().join("cache"))
             .with_daemon_stages(dir.path().join("daemons"));
         let usage = manager.scan().unwrap();
-        assert_eq!(usage.total_bytes, 110);
+        let old = allocated_bytes(&fs::metadata(cache.join("old.blob.data")).unwrap());
+        let staged = allocated_bytes(&fs::metadata(stage.join("abc.blob.data")).unwrap());
+        assert_eq!(usage.total_bytes, old + staged);
         assert_eq!(usage.total_files, 2);
 
         let policy = CacheGcPolicy {
@@ -622,9 +680,47 @@ mod tests {
             dry_run: false,
         };
         let report = manager.garbage_collect(&policy, &HashSet::new()).unwrap();
-        assert_eq!(report.removed_bytes, 10);
+        assert_eq!(report.removed_bytes, old);
         assert!(!cache.join("old.blob.data").exists());
         assert!(stage.join("abc.blob.data").exists());
+    }
+
+    /// A sparse cache file counts the blocks it holds, not its length, and a memoised scan
+    /// answers until it ages out.
+    #[test]
+    fn scan_counts_allocated_bytes() {
+        let dir = tempdir().unwrap();
+        let cache = dir.path().join("cache");
+        fs::create_dir_all(&cache).unwrap();
+        let sparse = fs::File::create(cache.join("abc.blob.data")).unwrap();
+        sparse.set_len(64 << 20).unwrap();
+        let manager = CacheManager::new(&cache);
+        let usage = manager.scan_recent(Duration::from_secs(60)).unwrap();
+        assert!(usage.total_bytes < 1 << 20, "{}", usage.total_bytes);
+
+        fs::write(cache.join("def.blob.data"), vec![1u8; 1 << 20]).unwrap();
+        let cached = manager.scan_recent(Duration::from_secs(60)).unwrap();
+        assert_eq!(cached.total_files, 1, "answered by the previous scan");
+        let fresh = manager.scan_recent(Duration::ZERO).unwrap();
+        assert_eq!(fresh.total_files, 2);
+        assert!(fresh.total_bytes >= 1 << 20);
+    }
+
+    #[test]
+    fn allocated_tree_bytes_counts_each_inode_once() {
+        let dir = tempdir().unwrap();
+        let stage = dir.path().join("stage");
+        fs::create_dir_all(stage.join("sub")).unwrap();
+        fs::write(stage.join("abc.blob.data"), vec![1u8; 1 << 16]).unwrap();
+        fs::hard_link(stage.join("abc.blob.data"), stage.join("blob_0")).unwrap();
+        fs::write(stage.join("sub/bootstrap"), vec![1u8; 1 << 12]).unwrap();
+        std::os::unix::fs::symlink(dir.path(), stage.join("link")).unwrap();
+        let want: u64 = ["abc.blob.data", "sub/bootstrap"]
+            .iter()
+            .map(|name| allocated_bytes(&fs::metadata(stage.join(name)).unwrap()))
+            .sum();
+        assert_eq!(allocated_tree_bytes(&stage).unwrap(), want);
+        assert!(allocated_tree_bytes(&dir.path().join("missing")).is_err());
     }
 
     #[test]
@@ -640,11 +736,15 @@ mod tests {
         fs::write(&other_map, b"map").unwrap();
 
         // A byte budget that the data file alone satisfies: LRU would stop before the map.
+        let maps = [&map, &other_map]
+            .iter()
+            .map(|path| allocated_bytes(&fs::metadata(path).unwrap()))
+            .sum();
         let manager = CacheManager::new(dir.path().join("cache"));
         let report = manager
             .garbage_collect(
                 &CacheGcPolicy {
-                    max_bytes: Some(6),
+                    max_bytes: Some(maps),
                     ..CacheGcPolicy::default()
                 },
                 &HashSet::new(),
@@ -711,7 +811,10 @@ mod tests {
             .unwrap();
 
         assert_eq!(report.removed_files, 1);
-        assert_eq!(report.removed_bytes, 4);
+        assert_eq!(
+            report.removed_bytes,
+            allocated_bytes(&fs::metadata(&file).unwrap())
+        );
         assert!(report.removals[0].dry_run);
         assert!(file.exists());
     }
@@ -739,7 +842,10 @@ mod tests {
 
         assert_eq!(report.removed_files, 1);
         assert_eq!(report.spared_files, 1);
-        assert_eq!(report.spared_bytes, 4);
+        assert_eq!(
+            report.spared_bytes,
+            allocated_bytes(&fs::metadata(cache.join("live-slug/a.blob.data")).unwrap())
+        );
         assert!(cache.join("live-slug/a.blob.data").exists());
         assert!(!cache.join("idle-slug/b.blob.data").exists());
     }
