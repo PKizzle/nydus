@@ -188,6 +188,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "timing-sensitive; Miri runs too slowly")]
     fn test_wait_with_pause() {
         let pauser = Pauser::new();
         pauser.set_pause(Duration::from_millis(100));
@@ -251,6 +252,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "timing-sensitive; Miri runs too slowly")]
     fn test_multiple_waits() {
         let pauser = Pauser::new();
 
