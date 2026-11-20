@@ -15,6 +15,7 @@ use http::header::{CONTENT_LENGTH, HeaderMap};
 
 use nydus_utils::metrics::BackendMetrics;
 
+use super::connection::check_range_status;
 use super::request::{self, is_success_status};
 use super::{BackendContext, BackendError, BackendResult, BlobBackend, BlobReader};
 
@@ -143,19 +144,22 @@ where
         self.state
             .sign(Method::GET, &mut headers, resource.as_str(), url.as_str())?;
 
-        let written = self
+        let (status, content_range, written) = self
             .request
-            .call_stream(
+            .call_stream_status(
                 Method::GET,
                 url.as_str(),
                 None,
                 &mut headers,
-                true,
                 ctx,
                 false,
                 buf,
             )
             .map_err(BackendError::Request)?;
+        // A gateway that ignores `Range` answers 200 with the object from its start: only
+        // the status and `Content-Range` tell whether the bytes are the ones asked for.
+        check_range_status(status, content_range.as_ref(), offset, &range)
+            .map_err(|e| BackendError::Request(request::RequestError::Connection(e)))?;
         Ok(written)
     }
 

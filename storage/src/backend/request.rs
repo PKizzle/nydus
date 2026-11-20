@@ -233,7 +233,7 @@ impl Request {
 
         // Populate context for diagnostic logging
         context.method = method.to_string();
-        context.url = url.to_string();
+        context.url = super::redact_url(url);
         context.using_proxy = false;
 
         // If proxy is disabled for this request or no proxy is configured, go direct.
@@ -245,7 +245,7 @@ impl Request {
                 temp_disable_proxy,
                 context.disable_proxy,
                 self.proxy_config.url.is_empty(),
-                url,
+                super::redact_url(url),
             );
             return self
                 .connection
@@ -288,7 +288,8 @@ impl Request {
                 context.using_proxy_sdk = true;
                 trace!(
                     "request path: SDK_PROXY, endpoint={}, url={}",
-                    endpoint, url,
+                    endpoint,
+                    super::redact_url(url),
                 );
                 let priority = Some(match context.request_source {
                     RequestSource::Prefetch => proxy::HEADER_VALUE_DRAGONFLY_PRIORITY_3,
@@ -302,8 +303,14 @@ impl Request {
                     )))
                 })?;
 
-                return match proxy_sdk_client.request(url, headers.clone(), priority, catch_status)
-                {
+                let timeout = self.proxy_config.dragonfly_sdk_timeout();
+                return match proxy_sdk_client.request(
+                    url,
+                    headers.clone(),
+                    priority,
+                    catch_status,
+                    timeout,
+                ) {
                     Ok(get_resp) => {
                         let status = get_resp.status_code.unwrap_or(StatusCode::BAD_GATEWAY);
                         if status >= StatusCode::INTERNAL_SERVER_ERROR {
@@ -323,7 +330,8 @@ impl Request {
             context.using_proxy = true;
             trace!(
                 "request path: HTTP_PROXY, proxy_url={}, url={}",
-                self.proxy_config.url, url,
+                super::redact_url(&self.proxy_config.url),
+                super::redact_url(url),
             );
 
             // Inject Dragonfly priority headers for HTTP proxy mode.
@@ -387,69 +395,7 @@ impl Request {
         Ok(resp)
     }
 
-    /// Streaming counterpart of `call` for the blob read path: streams the
-    /// response body directly into `dst` and returns the number of bytes
-    /// written, avoiding a full-body buffer. The Dragonfly SDK path cannot
-    /// stream, so it falls back to the buffered `call` + a direct slice copy.
-    #[allow(clippy::too_many_arguments)]
-    pub fn call_stream(
-        &self,
-        method: Method,
-        url: &str,
-        query: Option<&[(&str, &str)]>,
-        headers: &mut HeaderMap,
-        catch_status: bool,
-        context: &mut BackendContext,
-        temp_disable_proxy: bool,
-        dst: &mut [u8],
-    ) -> RequestResult<usize> {
-        // The Dragonfly SDK path can't stream into `dst`; fall back to buffered.
-        #[cfg(feature = "backend-dragonfly-proxy")]
-        {
-            let endpoint = self.dragonfly_scheduler_endpoint();
-            let use_sdk = !temp_disable_proxy
-                && !context.disable_proxy
-                && !self.proxy_config.url.is_empty()
-                && !endpoint.is_empty()
-                && !context.disable_proxy_sdk
-                && method == Method::GET;
-            if use_sdk {
-                let resp = self.call(
-                    method,
-                    url,
-                    query,
-                    None::<ReqBody<&[u8]>>,
-                    headers,
-                    catch_status,
-                    context,
-                    temp_disable_proxy,
-                )?;
-                return resp
-                    .copy_to(dst)
-                    .map(|n| n as usize)
-                    .map_err(RequestError::Common);
-            }
-        }
-
-        // HTTP path (direct or HTTP proxy): stream into `dst`.
-        headers.extend(self.custom_headers.clone());
-        context.method = method.to_string();
-        context.url = url.to_string();
-        context.using_proxy = false;
-        self.connection
-            .call_stream(
-                method,
-                url,
-                query,
-                headers,
-                catch_status,
-                temp_disable_proxy,
-                dst,
-            )
-            .map_err(RequestError::Connection)
-    }
-
-    /// Like `call_stream`, but returns the HTTP status and `Content-Range` with
+    /// Streaming counterpart of `call`: returns the HTTP status and `Content-Range` with
     /// the byte count instead of folding non-success into an error. The registry
     /// read path uses this to stream a 200 blob body while still seeing 401/403
     /// (stale cached redirect) without an error round-trip, and to check which
@@ -499,7 +445,7 @@ impl Request {
         // HTTP path (direct or HTTP proxy): stream into `dst`.
         headers.extend(self.custom_headers.clone());
         context.method = method.to_string();
-        context.url = url.to_string();
+        context.url = super::redact_url(url);
         context.using_proxy = false;
         self.connection
             .call_stream_status(method, url, query, headers, temp_disable_proxy, dst)

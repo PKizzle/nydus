@@ -13,7 +13,7 @@ use hmac::{Hmac, KeyInit, Mac};
 use http::Method;
 use http::Uri;
 use http::header::HeaderMap;
-use nydus_api::S3Config;
+use nydus_api::{RedactedString, S3Config};
 use nydus_utils::metrics::BackendMetrics;
 use sha2::{Digest, Sha256};
 use time::{OffsetDateTime, format_description};
@@ -35,7 +35,7 @@ const S3_DEFAULT_ENDPOINT: &str = "s3.amazonaws.com";
 pub struct S3State {
     region: String,
     access_key_id: String,
-    access_key_secret: String,
+    access_key_secret: RedactedString,
     scheme: String,
     object_prefix: String,
     endpoint: String,
@@ -139,7 +139,7 @@ impl S3State {
     // under apache 2.0 license
     pub fn get_signing_key(&self, date: &OffsetDateTime) -> Vec<u8> {
         let mut key: Vec<u8> = b"AWS4".to_vec();
-        key.extend(self.access_key_secret.as_bytes());
+        key.extend(self.access_key_secret.expose().as_bytes());
 
         let date_key = hmac_hash(key.as_slice(), to_signer_date(date).as_bytes());
         let date_region_key = hmac_hash(date_key.as_slice(), self.region.as_bytes());
@@ -291,7 +291,7 @@ fn to_awz_date(date: &OffsetDateTime) -> String {
 #[cfg(test)]
 mod tests {
     use http::{HeaderMap, Method};
-    use nydus_api::S3Config;
+    use nydus_api::{RedactedString, S3Config};
 
     use crate::backend::BlobBackend;
     use crate::backend::object_storage::ObjectStorageState;
@@ -303,7 +303,7 @@ mod tests {
         let state = S3State {
             region: "us-east-1".to_string(),
             access_key_id: "test-key".to_string(),
-            access_key_secret: "test-key-secret".to_string(),
+            access_key_secret: RedactedString::new("test-key-secret"),
             scheme: "http".to_string(),
             object_prefix: "test-prefix-".to_string(),
             endpoint: "localhost:9000".to_string(),
@@ -359,5 +359,83 @@ mod tests {
         let re = Regex::new(r"^AWS4-HMAC-SHA256 Credential=test-key/[0-9]{8}/us-east-1/s3/aws4_request, SignedHeaders=host;range;x-amz-content-sha256;x-amz-date, Signature=[A-Fa-f0-9]{64}$").unwrap();
         let authorization = headers.get("Authorization").unwrap();
         assert!(re.is_match(authorization.to_str().unwrap()));
+    }
+
+    /// A gateway that ignores `Range` answers 200 with the object from its start. Only a
+    /// read at offset 0 may accept that; any other offset would cache the blob's first
+    /// bytes in place of the requested ones.
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support io_uring")]
+    fn test_read_rejects_responses_for_the_wrong_range() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        const BLOB: &[u8] = b"0123456789abcdefghij";
+        let read_at = |response: String, offset: u64, len: usize| {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let shutdown = Arc::new(AtomicBool::new(false));
+            let shutdown_srv = shutdown.clone();
+            std::thread::spawn(move || {
+                listener.set_nonblocking(true).unwrap();
+                while !shutdown_srv.load(Ordering::Relaxed) {
+                    let Ok((mut stream, _)) = listener.accept() else {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                        continue;
+                    };
+                    stream.set_nonblocking(false).unwrap();
+                    let mut buf = [0u8; 4096];
+                    if stream.read(&mut buf).unwrap_or(0) == 0 {
+                        continue;
+                    }
+                    let _ = stream.write_all(response.as_bytes());
+                    let _ = stream.flush();
+                }
+            });
+            let config = S3Config {
+                scheme: "http".to_string(),
+                endpoint: addr.to_string(),
+                region: "us-east-1".to_string(),
+                bucket_name: "bucket".to_string(),
+                timeout: 5,
+                connect_timeout: 5,
+                ..Default::default()
+            };
+            let s3 = S3::new(&config, Some("test-s3-range")).unwrap();
+            let reader = s3.get_reader("blob").unwrap();
+            let mut buf = vec![0u8; len];
+            let res = reader
+                .try_read(&mut buf, offset)
+                .map(|n| buf[..n].to_vec())
+                .map_err(|e| e.to_string());
+            shutdown.store(true, Ordering::Relaxed);
+            res
+        };
+        let full = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            BLOB.len(),
+            String::from_utf8_lossy(BLOB)
+        );
+
+        assert_eq!(read_at(full.clone(), 0, 5).unwrap(), &BLOB[..5]);
+        let err = read_at(full, 10, 5).unwrap_err();
+        assert!(err.contains("200"), "{err}");
+
+        let partial = "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 10-14/20\r\n\
+                       Content-Length: 5\r\nConnection: close\r\n\r\nabcde"
+            .to_string();
+        assert_eq!(read_at(partial, 10, 5).unwrap(), b"abcde");
+
+        let wrong_partial = "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-4/20\r\n\
+                             Content-Length: 5\r\nConnection: close\r\n\r\n01234"
+            .to_string();
+        let err = read_at(wrong_partial, 10, 5).unwrap_err();
+        assert!(err.contains("bytes 0-4/20"), "{err}");
+
+        let missing =
+            "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string();
+        assert!(read_at(missing, 0, 5).is_err());
     }
 }

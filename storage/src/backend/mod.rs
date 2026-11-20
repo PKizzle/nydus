@@ -92,7 +92,8 @@ pub struct BackendContext {
     pub request_source: RequestSource,
     /// HTTP method of the request (e.g., "GET").
     pub method: String,
-    /// Request URL.
+    /// Request URL for logs, passed through [`redact_url`]: a presigned redirect
+    /// carries its credential in the query.
     pub url: String,
     /// Whether the current attempt is going through a proxy.
     pub using_proxy: bool,
@@ -105,6 +106,8 @@ pub struct BackendContext {
     /// Error message from the last failed attempt.
     pub error: Option<String>,
 }
+
+pub use nydus_api::redact_url;
 
 /// Global QPS limiter for source backend fallback, limited to 1 QPS.
 pub static BACKEND_QPS_LIMITER: std::sync::LazyLock<self::qps::QpsLimiter> =
@@ -210,6 +213,31 @@ impl BackendError {
         )) = self
         {
             return true;
+        }
+        false
+    }
+
+    /// Returns true if the request found its connection shut down: the backend's filesystem
+    /// was unmounted, so every later request fails the same way and a retry only delays the
+    /// error.
+    pub fn is_disconnected(&self) -> bool {
+        #[cfg(any(
+            feature = "backend-oss",
+            feature = "backend-registry",
+            feature = "backend-s3",
+            feature = "backend-http-proxy",
+        ))]
+        {
+            let mut err: Option<&(dyn std::error::Error + 'static)> = Some(self);
+            while let Some(e) = err {
+                if matches!(
+                    e.downcast_ref::<self::connection::ConnectionError>(),
+                    Some(self::connection::ConnectionError::Disconnected)
+                ) {
+                    return true;
+                }
+                err = e.source();
+            }
         }
         false
     }
@@ -339,7 +367,11 @@ where
                 // 1. No remaining retry count
                 // 2. Proxy forbidden
                 // 3. Proxy limited + prefetch
-                if retry_count > 0 && !proxy_forbidden && !(proxy_limited && is_prefetch) {
+                // 4. A shut-down connection, which fails every retry too: retrying it only
+                //    holds the caller (and any lock it holds) through the QPS limiter's waits.
+                let final_error =
+                    proxy_forbidden || (proxy_limited && is_prefetch) || err.is_disconnected();
+                if retry_count > 0 && !final_error {
                     retry_count -= 1;
 
                     // Last retry or rate-limited on-demand: disable proxy, use QPS limiter
@@ -640,6 +672,23 @@ impl Read for BlobBufReader {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn test_redact_url_strips_credentials() {
+        use nydus_api::redact_url;
+        assert_eq!(
+            redact_url("https://bucket.example.com/blobs/sha256:ab?X-Amz-Signature=sig#frag"),
+            "https://bucket.example.com/blobs/sha256:ab"
+        );
+        assert_eq!(
+            redact_url("https://user:pass@registry.example.com/v2/x?token=t"),
+            "https://registry.example.com/v2/x"
+        );
+        assert_eq!(redact_url("http://u@host"), "http://host");
+        // An `@` in the path is not userinfo.
+        assert_eq!(redact_url("http://host/a@b"), "http://host/a@b");
+        assert_eq!(redact_url("/v2/x?sig=1"), "/v2/x");
+    }
+
     use super::*;
     use std::io::Read;
 
@@ -875,6 +924,27 @@ mod tests {
 
         assert_eq!(result.unwrap(), 99);
         assert_eq!(attempt, 3);
+    }
+
+    #[test]
+    #[cfg(feature = "backend-registry")]
+    fn test_retry_op_does_not_retry_a_shut_down_connection() {
+        let metrics = BackendMetrics::new("test-retry-disconnected", "test");
+        let mut ctx = BackendContext::default();
+
+        let mut attempt = 0;
+        let result: BackendResult<usize> = retry_op(&metrics, &mut ctx, 1024, |_ctx| {
+            attempt += 1;
+            Err(BackendError::Registry(
+                self::registry::RegistryBackendError::Request(
+                    self::connection::ConnectionError::Disconnected,
+                ),
+            ))
+        });
+
+        assert!(result.unwrap_err().is_disconnected());
+        assert_eq!(attempt, 1);
+        assert!(!BackendError::Unsupported("test".to_string()).is_disconnected());
     }
 
     #[test]
