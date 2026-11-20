@@ -265,8 +265,9 @@ pub async fn uffdio_zeropage(uffd_fd: RawFd, start_addr: u64, len: u64) -> Resul
         let ret = unsafe { libc::ioctl(uffd_fd, UFFDIO_ZEROPAGE, &mut ioctl_arg) };
         if ret < 0 {
             let err = std::io::Error::last_os_error();
+            // The page is present already; wake whoever faulted on it, as for UFFDIO_COPY.
             if err.raw_os_error() == Some(libc::EEXIST) {
-                return Ok(());
+                return wake_range(uffd_fd, start_addr, len);
             }
             return Err(Error::Uffd(format!("UFFDIO_ZEROPAGE failed: {}", err)));
         }
@@ -307,10 +308,14 @@ pub async fn uffdio_copy<B: AsRef<[u8]> + Send + 'static>(
         // the kernel validates the destination range itself.
         let ret = unsafe { libc::ioctl(uffd_fd, UFFDIO_COPY, &mut ioctl_arg) };
         if ret < 0 {
-            return Err(Error::Uffd(format!(
-                "UFFDIO_COPY failed: {}",
-                std::io::Error::last_os_error()
-            )));
+            let err = std::io::Error::last_os_error();
+            // A fault handler fills exactly one VMA page, so EEXIST means the page is present:
+            // a second fault on it was queued before the first fill. The kernel wakes only the
+            // range it fills, so wake this one too: no faulting thread is left waiting.
+            if err.raw_os_error() == Some(libc::EEXIST) {
+                return wake_range(uffd_fd, dst, len);
+            }
+            return Err(Error::Uffd(format!("UFFDIO_COPY failed: {err}")));
         }
         Ok(())
     })
@@ -322,31 +327,34 @@ pub async fn uffdio_copy<B: AsRef<[u8]> + Send + 'static>(
 /// Perform UFFDIO_WAKE ioctl asynchronously.
 #[allow(dead_code)]
 pub async fn uffdio_wake(uffd_fd: RawFd, start_addr: u64, len: u64) -> Result<()> {
-    spawn_blocking(move || {
-        #[repr(C)]
-        struct UffdioRange {
-            start: u64,
-            len: u64,
+    spawn_blocking(move || wake_range(uffd_fd, start_addr, len))
+        .await
+        .resume_unwind()
+        .unwrap_or_else(|| Err(Error::Uffd("uffd ioctl task was cancelled".to_string())))
+}
+
+/// UFFDIO_WAKE on `[start_addr, start_addr + len)`, on the calling thread.
+fn wake_range(uffd_fd: RawFd, start_addr: u64, len: u64) -> Result<()> {
+    #[repr(C)]
+    struct UffdioRange {
+        start: u64,
+        len: u64,
+    }
+    let mut range = UffdioRange {
+        start: start_addr,
+        len,
+    };
+    // SAFETY: `range` is a `#[repr(C)]` `{start, len}` pair matching the `UFFDIO_WAKE` ABI and
+    // outlives the call.
+    let ret = unsafe { libc::ioctl(uffd_fd, UFFDIO_WAKE, &mut range) };
+    if ret < 0 {
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() == Some(libc::EEXIST) {
+            return Ok(());
         }
-        let mut range = UffdioRange {
-            start: start_addr,
-            len,
-        };
-        // SAFETY: `range` is a `#[repr(C)]` `{start, len}` pair matching the `UFFDIO_WAKE` ABI and
-        // outlives the call.
-        let ret = unsafe { libc::ioctl(uffd_fd, UFFDIO_WAKE, &mut range) };
-        if ret < 0 {
-            let err = std::io::Error::last_os_error();
-            if err.raw_os_error() == Some(libc::EEXIST) {
-                return Ok(());
-            }
-            return Err(Error::Uffd(format!("UFFDIO_WAKE failed: {}", err)));
-        }
-        Ok(())
-    })
-    .await
-    .resume_unwind()
-    .unwrap_or_else(|| Err(Error::Uffd("uffd ioctl task was cancelled".to_string())))
+        return Err(Error::Uffd(format!("UFFDIO_WAKE failed: {}", err)));
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1293,7 +1301,10 @@ impl UffdService {
                     continue;
                 }
                 Err(e) => {
-                    warn!("block_uffd: accept error: {e}");
+                    // EMFILE and the like persist until something else lets go; retrying at
+                    // once would burn a core and flood the log.
+                    warn!("block_uffd: accept error, retrying in 1s: {e}");
+                    std::thread::sleep(std::time::Duration::from_secs(1));
                 }
             }
         }
@@ -3191,6 +3202,29 @@ mod tests {
         });
 
         cleanup_uffd_region(uffd_fd, addr, mmap_size);
+    }
+
+    /// Two threads faulting on one page queue two messages; the second fill finds the page
+    /// present. That fault is resolved, not a reason to drop the connection.
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support io_uring")]
+    fn filling_a_present_page_succeeds() {
+        compio::runtime::Runtime::new().unwrap().block_on(async {
+            let (uffd_fd, addr, mmap_size) = setup_uffd_region(4096).unwrap();
+
+            uffdio_copy(uffd_fd, addr, vec![7u8; 4096], 4096)
+                .await
+                .unwrap();
+            uffdio_copy(uffd_fd, addr, vec![9u8; 4096], 4096)
+                .await
+                .expect("a copy onto a present page must succeed");
+            // A zero fill finds it present too (the past-device-end case of a fault).
+            uffdio_zeropage(uffd_fd, addr, 4096).await.unwrap();
+            // SAFETY: `addr` is the start of the live mapping, and the page is filled.
+            assert_eq!(unsafe { *(addr as *const u8) }, 7);
+
+            cleanup_uffd_region(uffd_fd, addr, mmap_size);
+        });
     }
 
     #[test]

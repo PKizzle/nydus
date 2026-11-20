@@ -6,7 +6,6 @@ use std::{
     collections::BTreeMap,
     ffi::OsString,
     fs::Permissions,
-    io::Write,
     ops::DerefMut,
     os::unix::prelude::PermissionsExt,
     path::{Path, PathBuf},
@@ -82,7 +81,7 @@ impl RafsInspector {
         let o = if self.request_mode {
             Some(json!({"inodes_count": self.rafs_meta.meta.inodes_count}))
         } else {
-            println!(
+            outln!(
                 r#"
     Version:                {version}
     Inodes Count:           {inodes_count}
@@ -137,7 +136,7 @@ impl RafsInspector {
                 " "
             };
 
-            println!(
+            outln!(
                 r#"{}    {inode_number:<8} {name:?}"#,
                 sign,
                 name = f,
@@ -188,7 +187,7 @@ impl RafsInspector {
             self.parent_inodes.push(self.cur_dir_ino);
             self.cur_dir_ino = n;
         } else {
-            println!("{} is {}", dir_name, err);
+            outln!("{} is {}", dir_name, err);
         }
 
         Ok(None)
@@ -229,7 +228,7 @@ impl RafsInspector {
                     chunks.push(cur_chunk);
                 }
 
-                println!("  Chunk list:");
+                outln!("  Chunk list:");
                 for (i, c) in chunks.iter().enumerate() {
                     let blob_id = if let Ok(id) = self.get_blob_id_by_index(c.blob_index()) {
                         id.to_owned()
@@ -244,7 +243,7 @@ impl RafsInspector {
                     // file_offset = chunk_index * chunk_size
                     let file_offset = i * self.rafs_meta.meta.chunk_size as usize;
 
-                    println!(
+                    outln!(
                         r#"        {} ->
         file offset: {file_offset}, chunk index: {chunk_index}
         compressed size: {compressed_size}, decompressed size: {decompressed_size}
@@ -295,7 +294,7 @@ impl RafsInspector {
                     .get(&blob_info.blob_id())
                     .map(|v| v.mapped_blkaddr)
                     .unwrap_or_default();
-                print!(
+                out!(
                     r#"
 Blob Index:             {blob_index}
 Blob ID:                {blob_id}
@@ -414,7 +413,7 @@ RAFS Blob Size:         {rafs_size}
             }
             Some(value)
         } else {
-            println!(
+            outln!(
                 "Total Prefetching Files: {}",
                 self.rafs_meta.meta.prefetch_table_entries
             );
@@ -425,7 +424,7 @@ RAFS Blob Size:         {rafs_size}
                     .map(|x| String::from(x.to_string_lossy()))
                     .collect();
 
-                println!(
+                outln!(
                     r#"Inode Number:{inode_number:10} | Path: {path:?} "#,
                     path = path_string.join(" "),
                     inode_number = ino,
@@ -465,7 +464,7 @@ RAFS Blob Size:         {rafs_size}
                             ));
                         };
 
-                        println!(
+                        outln!(
                             r#"
 File: {:width$} Parent Path: {:width$}
 Compressed Offset: {}, Compressed Size: {}
@@ -554,7 +553,7 @@ Blob ID: {}
                         let child = parent_inode.get_child_by_index(idx)?;
                         if child.ino() == ino {
                             let path = parent_path.join(child.name());
-                            println!(r#"{}"#, path.to_string_lossy(),);
+                            outln!(r#"{}"#, path.to_string_lossy(),);
                             self.stat_single_file(
                                 Some(parent_inode.as_ref()),
                                 current_inode.as_ref(),
@@ -571,7 +570,7 @@ Blob ID: {}
                 None,
                 &mut |parent, inode, path| {
                     if inode.ino() == ino {
-                        println!(r#"{}"#, path.to_string_lossy(),);
+                        outln!(r#"{}"#, path.to_string_lossy(),);
                         self.stat_single_file(parent, inode)?;
                     }
                     Ok(())
@@ -620,7 +619,7 @@ impl RafsInspector {
         let inode_attr = inode.get_attr();
 
         if let Some(parent) = parent_inode {
-            println!(
+            outln!(
                 r#"
 Inode Number:       {inode_number}
 Name:               {name:?}
@@ -705,20 +704,20 @@ impl Executor {
             ("prefetch", None) => inspector.cmd_list_prefetch(),
             ("chunk", Some(argument)) => {
                 let offset: u64 = argument.parse().map_err(|_| {
-                    println!("Wrong OFFSET is specified. Is it a valid u64 value?");
+                    outln!("Wrong OFFSET is specified. Is it a valid u64 value?");
                     ExecuteError::ArgumentParse
                 })?;
                 inspector.cmd_show_chunk(offset)
             }
             ("icheck", Some(argument)) => {
                 let ino: u64 = argument.parse().map_err(|_| {
-                    println!("Wrong INODE is specified. Is it a inode number?");
+                    outln!("Wrong INODE is specified. Is it a inode number?");
                     ExecuteError::ArgumentParse
                 })?;
                 inspector.cmd_check_inode(ino)
             }
             (cmd, _) => {
-                println!("Unsupported command: {}", cmd);
+                outln!("Unsupported command: {}", cmd);
                 {
                     Self::usage();
                     return Err(ExecuteError::IllegalCommand);
@@ -731,7 +730,7 @@ impl Executor {
     }
 
     pub(crate) fn usage() {
-        println!(
+        outln!(
             r#"
     stats:              Display RAFS filesystesm metadata
     ls:                 Show files in current directory
@@ -752,8 +751,8 @@ pub(crate) struct Prompt {}
 impl Prompt {
     pub(crate) fn run(mut inspector: RafsInspector) {
         loop {
-            print!("Inspecting RAFS :> ");
-            std::io::stdout().flush().unwrap();
+            out!("Inspecting RAFS :> ");
+            crate::flush_stdout();
 
             let mut input = String::new();
             std::io::stdin().read_line(&mut input).unwrap();
@@ -764,7 +763,7 @@ impl Prompt {
                 Err(ExecuteError::HelpCommand) => continue,
                 Err(ExecuteError::ArgumentParse) => continue,
                 Err(ExecuteError::ExecError(e)) => {
-                    println!("Failed to execute command, {:?}", e);
+                    outln!("Failed to execute command, {:?}", e);
                     continue;
                 }
                 Ok(Some(o)) => {

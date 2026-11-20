@@ -304,7 +304,7 @@ impl Generator {
                 blob_ctx.blob_compressor != Algorithm::None
                     && chunk_info.chunk_compressed_size != chunk_info.chunk_uncompressed_size,
             );
-            chunk.set_id(RafsDigest::from_string(&chunk_info.chunk_digest));
+            chunk.set_id(RafsDigest::from_string(&chunk_info.chunk_digest)?);
             chunk.set_crc32(chunk_info.chunk_crc32);
 
             node.chunks.push(NodeChunk {
@@ -492,9 +492,9 @@ mod tests {
         // These chunks compress unevenly, so a compressed stride produces offsets that
         // do not describe the uncompressed stream at all.
         let chunks = vec![
-            sized_chunk("blob-a", "d1", 10, 4096, 0),
-            sized_chunk("blob-a", "d2", 4096, 4096, 10),
-            sized_chunk("blob-a", "d3", 100, 1024, 4106),
+            sized_chunk("blob-a", &"d1".repeat(32), 10, 4096, 0),
+            sized_chunk("blob-a", &"d2".repeat(32), 4096, 4096, 10),
+            sized_chunk("blob-a", &"d3".repeat(32), 100, 1024, 4106),
         ];
         let blobs = vec![blob_info("blob-a", "zstd")];
 
@@ -520,8 +520,8 @@ mod tests {
         // Within a zstd blob, a chunk that did not shrink is stored uncompressed; the
         // runtime needs the flag to tell the two apart.
         let chunks = vec![
-            sized_chunk("blob-a", "d1", 100, 4096, 0),
-            sized_chunk("blob-a", "d2", 4096, 4096, 100),
+            sized_chunk("blob-a", &"d1".repeat(32), 100, 4096, 0),
+            sized_chunk("blob-a", &"d2".repeat(32), 4096, 4096, 100),
         ];
         let blobs = vec![blob_info("blob-a", "zstd")];
 
@@ -537,7 +537,7 @@ mod tests {
     #[test]
     fn compressed_flag_is_clear_for_uncompressed_blobs() {
         // Compressor "none": no chunk is compressed, whatever the sizes say.
-        let chunks = vec![sized_chunk("blob-a", "d1", 100, 4096, 0)];
+        let chunks = vec![sized_chunk("blob-a", &"d1".repeat(32), 100, 4096, 0)];
         let blobs = vec![blob_info("blob-a", "none")];
 
         let built = build_chunks(&chunks, &blobs);
@@ -552,8 +552,8 @@ mod tests {
         // only exists on v5 (`InodeWrapper::digest()` is unimplemented elsewhere), so
         // this has to be built against a v5 context.
         let chunks = vec![
-            sized_chunk("blob-a", "d1", 10, 4096, 0),
-            sized_chunk("blob-a", "d2", 20, 4096, 10),
+            sized_chunk("blob-a", &"d1".repeat(32), 10, 4096, 0),
+            sized_chunk("blob-a", &"d2".repeat(32), 20, 4096, 10),
         ];
         let blobs = vec![blob_info("blob-a", "zstd")];
 

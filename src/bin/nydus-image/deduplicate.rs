@@ -187,7 +187,7 @@ pub fn check_bootstrap_versions_consistency(
         ctx.fs_version = first_version;
         if versions.iter().any(|(_, v)| *v != first_version) {
             for (path, version) in &versions {
-                println!("Bootstrap path {:?} has version {:?}", path, version);
+                outln!("Bootstrap path {:?} has version {:?}", path, version);
             }
             return Err(anyhow!(
                 "Bootstrap versions are inconsistent, cannot use chunkdict."

@@ -6,6 +6,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
+use base64::Engine as _;
+use base64::prelude::BASE64_STANDARD;
+use hyper_util::client::proxy::matcher::Matcher;
 
 use crate::cli::BackendType;
 
@@ -139,10 +142,78 @@ pub fn parse_chunk_dict_reference(value: &str) -> Result<ChunkDictReference> {
     })
 }
 
+/// The `proxy` section of a registry backend config for the forward proxy the environment
+/// names for `host`, chosen the way nydusify's own requests choose theirs (`NO_PROXY`
+/// included). A daemon nydusify starts uses a proxy only when its config names one.
+pub fn env_registry_proxy(host: &str, plain_http: bool) -> Option<serde_json::Value> {
+    registry_proxy(&Matcher::from_system(), host, plain_http)
+}
+
+fn registry_proxy(matcher: &Matcher, host: &str, plain_http: bool) -> Option<serde_json::Value> {
+    let scheme = if plain_http { "http" } else { "https" };
+    let proxy = matcher.intercept(&format!("{scheme}://{host}/").parse().ok()?)?;
+    let uri = proxy.uri();
+    // The daemon takes an http or https forward proxy only; a socks proxy is left out.
+    let proxy_scheme = uri
+        .scheme_str()
+        .filter(|s| matches!(*s, "http" | "https"))?;
+    let userinfo = proxy
+        .basic_auth()
+        .and_then(|header| basic_auth_userinfo(header.as_bytes()))
+        .map(|userinfo| format!("{userinfo}@"))
+        .unwrap_or_default();
+    Some(serde_json::json!({
+        "url": format!("{proxy_scheme}://{userinfo}{}", uri.authority()?),
+        // Going direct cannot work where a proxy is required, and would hide the proxy's error.
+        "fallback": false,
+    }))
+}
+
+/// `user:password` for a URL, from a `Basic` header value.
+fn basic_auth_userinfo(header: &[u8]) -> Option<String> {
+    let encoded = header.strip_prefix(b"Basic ")?;
+    let decoded = String::from_utf8(BASE64_STANDARD.decode(encoded).ok()?).ok()?;
+    let (user, password) = decoded.split_once(':')?;
+    let escape = |s: &str| -> String {
+        s.bytes()
+            .map(|b| {
+                if b.is_ascii_alphanumeric() || b"-._~".contains(&b) {
+                    char::from(b).to_string()
+                } else {
+                    format!("%{b:02X}")
+                }
+            })
+            .collect()
+    };
+    Some(format!("{}:{}", escape(user), escape(password)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::cli::default_platform;
+
+    #[test]
+    fn registry_proxy_follows_the_environment_rules() {
+        let matcher = Matcher::builder()
+            .https("http://us%40r:p%40ss@proxy.local:3128")
+            .http("http://plain.local:8080")
+            .no("internal.local")
+            .build();
+        assert_eq!(
+            registry_proxy(&matcher, "registry.example.com", false).unwrap(),
+            serde_json::json!({"url": "http://us%40r:p%40ss@proxy.local:3128", "fallback": false})
+        );
+        assert_eq!(
+            registry_proxy(&matcher, "registry.example.com:5000", true).unwrap()["url"],
+            "http://plain.local:8080"
+        );
+        assert!(registry_proxy(&matcher, "internal.local", false).is_none());
+
+        let socks = Matcher::builder().all("socks5h://proxy.local:1080").build();
+        assert!(registry_proxy(&socks, "registry.example.com", false).is_none());
+        assert!(registry_proxy(&Matcher::builder().build(), "r.io", false).is_none());
+    }
 
     #[test]
     fn suffix_rejects_digest_reference() {

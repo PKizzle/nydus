@@ -19,6 +19,11 @@ pub const RAFS_DIGEST_LENGTH: usize = 32;
 /// Type alias for digest data.
 pub type DigestData = [u8; RAFS_DIGEST_LENGTH];
 
+/// A string that is not a digest's hex form.
+#[derive(Debug, thiserror::Error)]
+#[error("{0:?} is not a {RAFS_DIGEST_LENGTH}-byte hex digest")]
+pub struct InvalidDigestString(pub String);
+
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum Algorithm {
@@ -179,16 +184,18 @@ impl RafsDigest {
         }
     }
 
-    /// According to the format of sha256.
-    pub fn from_string(input: &str) -> Self {
-        let mut digest = RafsDigest::default();
-
-        for (i, byte) in input.as_bytes().chunks(2).enumerate() {
-            let hex_str = std::str::from_utf8(byte).unwrap();
-            digest.data[i] = u8::from_str_radix(hex_str, 16).unwrap();
+    /// Parse a digest from the hex form `String::from` prints.
+    pub fn from_string(input: &str) -> Result<Self, InvalidDigestString> {
+        let invalid = || InvalidDigestString(input.to_string());
+        if input.len() != RAFS_DIGEST_LENGTH * 2 {
+            return Err(invalid());
         }
-
-        digest
+        let mut digest = RafsDigest::default();
+        for (byte, pair) in digest.data.iter_mut().zip(input.as_bytes().chunks(2)) {
+            let pair = std::str::from_utf8(pair).map_err(|_| invalid())?;
+            *byte = u8::from_str_radix(pair, 16).map_err(|_| invalid())?;
+        }
+        Ok(digest)
     }
 
     pub fn hasher(algorithm: Algorithm) -> RafsDigestHasher {
@@ -357,7 +364,22 @@ mod test {
         let digest = RafsDigest::from_buf(text, Algorithm::Blake3);
         let hex = String::from(digest);
 
-        assert_eq!(RafsDigest::from_string(&hex), digest);
+        assert_eq!(RafsDigest::from_string(&hex).unwrap(), digest);
+    }
+
+    #[test]
+    fn from_string_rejects_malformed_hex() {
+        let valid = String::from(RafsDigest::from_buf(b"x", Algorithm::Sha256));
+        for bad in [
+            "",
+            "zz",
+            "abc",
+            &valid[..valid.len() - 2],
+            &format!("{valid}00"),
+            &format!("{}é", &valid[..valid.len() - 2]),
+        ] {
+            assert!(RafsDigest::from_string(bad).is_err(), "{bad:?} accepted");
+        }
     }
 
     #[test]

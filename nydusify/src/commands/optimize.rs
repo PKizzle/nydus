@@ -291,6 +291,9 @@ fn run_optimize(
     if let Some(auth) = &auth {
         backend_config["auth"] = json!(auth);
     }
+    if let Some(proxy) = super::common::env_registry_proxy(&source_ref.api_host, plain_http) {
+        backend_config["proxy"] = proxy;
+    }
     let backend_config_path = work.join("backend.json");
     std::fs::write(
         &backend_config_path,

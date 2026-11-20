@@ -411,6 +411,64 @@ pub struct OndiskInodeWrapper {
     name: Option<OsString>,
 }
 
+/// The xattrs of an inode, `(name, value)`, in the order the kernel lists them: the inline
+/// entries of its ibody (`image[ibody]`, header included), then the shared entries the header
+/// names. A shared entry sits at `xattr_blkaddr * block_size + 4 * id`, and the superblock check
+/// only accepts `xattr_blkaddr == 0`. Long-prefix entries are left out: RAFS writes one only as
+/// the page cache sharing fingerprint. Every entry must fit, as the kernel requires
+/// (`EFSCORRUPTED`); the bootstrap is untrusted.
+fn xattrs_in(image: &[u8], ibody: Range<usize>) -> RafsResult<Vec<(XattrName, &[u8])>> {
+    let invalid = |what: &str| RafsError::InvalidMetadata(format!("v6: {what}"));
+    let header = size_of::<RafsV6XattrIbodyHeader>();
+    let area = image
+        .get(ibody)
+        .filter(|area| area.len() >= header)
+        .ok_or_else(|| invalid("xattr ibody runs past the bootstrap"))?;
+    // `h_shared_count` follows the 4-byte name filter.
+    let ids_end = header + area[4] as usize * size_of::<u32>();
+    let ids = area
+        .get(header..ids_end)
+        .ok_or_else(|| invalid("shared xattr ids run past the inode"))?;
+
+    // One entry at the start of `entry`; returns its size, padded to the entry alignment.
+    fn push<'a>(entry: &'a [u8], xattrs: &mut Vec<(XattrName, &'a [u8])>) -> RafsResult<usize> {
+        let invalid = |what: &str| RafsError::InvalidMetadata(format!("v6: {what}"));
+        let fixed = size_of::<RafsV6XattrEntry>();
+        if entry.len() < fixed {
+            return Err(invalid("xattr entry runs past its area"));
+        }
+        let (name_len, index) = (entry[0] as usize, entry[1]);
+        let value_size = u16::from_le_bytes([entry[2], entry[3]]) as usize;
+        let value_end = fixed + name_len + value_size;
+        if value_end > entry.len() {
+            return Err(invalid("xattr entry runs past its area"));
+        }
+        if !is_long_prefix_xattr(index) {
+            let mut name = recover_namespace(index)?.into_vec();
+            name.extend_from_slice(&entry[fixed..fixed + name_len]);
+            xattrs.push((name, &entry[fixed + name_len..value_end]));
+        }
+        Ok(round_up(value_end as u64, fixed as u64) as usize)
+    }
+
+    let mut xattrs = Vec::new();
+
+    let mut inline = &area[ids_end..];
+    while !inline.is_empty() {
+        let size = push(inline, &mut xattrs)?;
+        inline = inline.get(size..).unwrap_or_default();
+    }
+    for id in ids.chunks_exact(size_of::<u32>()) {
+        let id = u32::from_le_bytes([id[0], id[1], id[2], id[3]]) as usize;
+        let entry = id
+            .checked_mul(size_of::<u32>())
+            .and_then(|pos| image.get(pos..))
+            .unwrap_or_default();
+        push(entry, &mut xattrs)?;
+    }
+    Ok(xattrs)
+}
+
 /// The fingerprint in the inline xattr entries `area` of an inode, as
 /// [`OndiskInodeWrapper::ishare_fingerprint`] defines it. An entry running past the area fails,
 /// as the kernel fails it (`EFSCORRUPTED`).
@@ -812,6 +870,13 @@ impl OndiskInodeWrapper {
         } else {
             0
         }
+    }
+
+    /// The bootstrap range of the inode's xattr ibody, header included; `None` without xattrs.
+    fn xattr_ibody(&self, state: &Guard<Arc<DirectMappingState>>) -> Option<Range<usize>> {
+        let inode = self.disk_inode(state);
+        let start = self.offset + Self::inode_size(inode);
+        Some(start..start + Self::xattr_size(inode)).filter(|r| !r.is_empty())
     }
 
     // Get sum of inode and xattr size aligned to RafsV6InodeChunkAddr.
@@ -1217,93 +1282,26 @@ impl RafsInode for OndiskInodeWrapper {
 
     fn get_xattr(&self, name: &OsStr) -> RafsResult<Option<XattrValue>> {
         let state = self.state();
-        let inode = self.disk_inode(&state);
-        let total = inode.xattr_inline_count();
-        if total == 0 {
+        let Some(ibody) = self.xattr_ibody(&state) else {
             return Ok(None);
-        }
-
-        let mut offset =
-            self.offset + Self::inode_size(inode) + size_of::<RafsV6XattrIbodyHeader>();
-        let mut remaining = (total - 1) as usize * size_of::<RafsV6XattrEntry>();
-        while remaining > 0 {
-            let e: &RafsV6XattrEntry = state.map.get_ref(offset)?;
-            if e.name_len() as usize + e.value_size() as usize > remaining {
-                return Err(RafsError::InvalidMetadata(format!(
-                    "v6: invalid xattr name size {}",
-                    e.name_len()
-                )));
-            }
-            let mut xa_name = OsString::new();
-            if !is_long_prefix_xattr(e.name_index()) {
-                xa_name = recover_namespace(e.name_index())?;
-                let suffix: &[u8] = state.map.get_slice(
-                    offset + size_of::<RafsV6XattrEntry>(),
-                    e.name_len() as usize,
-                )?;
-                xa_name.push(OsStr::from_bytes(suffix));
-            }
-            if !xa_name.is_empty() && xa_name == name {
-                let data: &[u8] = state.map.get_slice(
-                    offset + size_of::<RafsV6XattrEntry>() + e.name_len() as usize,
-                    e.value_size() as usize,
-                )?;
-                return Ok(Some(data.to_vec()));
-            }
-
-            let mut s = e.name_len() + e.value_size() + size_of::<RafsV6XattrEntry>() as u32;
-            s = round_up(s as u64, size_of::<RafsV6XattrEntry>() as u64) as u32;
-            if s as usize >= remaining {
-                break;
-            }
-            remaining -= s as usize;
-            offset += s as usize;
-        }
-
-        Ok(None)
+        };
+        let image: &[u8] = state.map.get_slice(0, state.map.size())?;
+        Ok(xattrs_in(image, ibody)?
+            .into_iter()
+            .find(|(xa_name, _)| xa_name.as_slice() == name.as_bytes())
+            .map(|(_, value)| value.to_vec()))
     }
 
     fn get_xattrs(&self) -> RafsResult<Vec<XattrName>> {
         let state = self.state();
-        let inode = self.disk_inode(&state);
-        let mut xattrs = Vec::new();
-        let total = inode.xattr_inline_count();
-        if total == 0 {
-            return Ok(xattrs);
-        }
-
-        let mut offset =
-            self.offset + Self::inode_size(inode) + size_of::<RafsV6XattrIbodyHeader>();
-        let mut remaining = (total - 1) as usize * size_of::<RafsV6XattrEntry>();
-        while remaining > 0 {
-            let e: &RafsV6XattrEntry = state.map.get_ref(offset)?;
-            if e.name_len() as usize + e.value_size() as usize > remaining {
-                return Err(RafsError::InvalidMetadata(format!(
-                    "v6: invalid xattr name size {}",
-                    e.name_len()
-                )));
-            }
-            if !is_long_prefix_xattr(e.name_index()) {
-                let name: &[u8] = state.map.get_slice(
-                    offset + size_of::<RafsV6XattrEntry>(),
-                    e.name_len() as usize,
-                )?;
-                let ns = recover_namespace(e.name_index())?;
-                let mut xa = ns.into_vec();
-                xa.extend_from_slice(name);
-                xattrs.push(xa);
-            }
-
-            let mut s = e.name_len() + e.value_size() + size_of::<RafsV6XattrEntry>() as u32;
-            s = round_up(s as u64, size_of::<RafsV6XattrEntry>() as u64) as u32;
-            if s as usize >= remaining {
-                break;
-            }
-            offset += s as usize;
-            remaining -= s as usize;
-        }
-
-        Ok(xattrs)
+        let Some(ibody) = self.xattr_ibody(&state) else {
+            return Ok(Vec::new());
+        };
+        let image: &[u8] = state.map.get_slice(0, state.map.size())?;
+        Ok(xattrs_in(image, ibody)?
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect())
     }
 
     /// Get symlink target of the inode.
@@ -1853,6 +1851,48 @@ mod tests {
         assert!(ishare_fingerprint_in(&suffix).is_err());
     }
 
+    /// Shared xattr ids sit between the ibody header and the inline entries; each names an
+    /// entry at `4 * id` in the bootstrap (`xattr_blkaddr == 0`).
+    #[test]
+    fn xattrs_include_shared_entries() {
+        let entry = |index: u8, name: &[u8], value: &[u8]| {
+            let mut e = vec![name.len() as u8, index];
+            e.extend_from_slice(&(value.len() as u16).to_le_bytes());
+            e.extend_from_slice(name);
+            e.extend_from_slice(value);
+            e.resize(e.len().div_ceil(4) * 4, 0);
+            e
+        };
+        // 1 = "user.", 6 = "security."; the shared entry lives at bootstrap offset 8 = 4 * 2.
+        let mut image = vec![0u8; 8];
+        image.extend(entry(6, b"selinux", b"ctx"));
+        let ibody_start = image.len();
+        image.extend([0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0]);
+        image.extend(2u32.to_le_bytes());
+        image.extend(entry(1, b"a", b"inline"));
+        let ibody = ibody_start..image.len();
+
+        let xattrs = xattrs_in(&image, ibody.clone()).unwrap();
+        let named: Vec<(&[u8], &[u8])> = xattrs.iter().map(|(n, v)| (n.as_slice(), *v)).collect();
+        assert_eq!(
+            named,
+            [
+                (&b"user.a"[..], &b"inline"[..]),
+                (&b"security.selinux"[..], &b"ctx"[..])
+            ]
+        );
+
+        // A shared id past the bootstrap, ids past the ibody, an inline entry past the ibody.
+        let mut bad = image.clone();
+        bad[ibody_start + 12] = 0xff;
+        assert!(xattrs_in(&bad, ibody.clone()).is_err());
+        let mut bad = image.clone();
+        bad[ibody_start + 4] = 9;
+        assert!(xattrs_in(&bad, ibody.clone()).is_err());
+        assert!(xattrs_in(&image, ibody.start..ibody.end - 4).is_err());
+        assert!(xattrs_in(&image, ibody.start..ibody.end + 1).is_err());
+    }
+
     #[test]
     fn test_direct_mapping_state() {
         let mut meta = RafsSuperMeta::default();
@@ -2324,5 +2364,50 @@ mod tests {
         }
         // The root inode's tail-packed data now runs past the inode area, which loading checks.
         assert!(matches!(load_v6(&data), Err(RafsError::InvalidMetadata(_))));
+    }
+
+    /// FUSE lists what the kernel lists: an inode's shared xattrs as well as its inline ones.
+    #[test]
+    fn test_inode_xattrs_include_shared_entries() {
+        let (path, mut data) = v6_fixture();
+        let sb = load_v6(&data).unwrap();
+        let mut dsb = DirectSuperBlockV6::new(&sb.meta, superblocks_of(&path));
+        dsb.load(&mut open_bootstrap(&path)).unwrap();
+        let ino = all_chunks(&sb)[0].0;
+        let offset = dsb.info.meta_offset + ino as usize * EROFS_INODE_SLOT_SIZE;
+        let inode_size = if data[offset] & 1 == 0 { 32 } else { 64 };
+
+        // Empty the file, so its chunk index is gone, and put an ibody where it was: one
+        // shared id naming bootstrap offset 16 (unused, the superblock starts at 1024), then an
+        // inline "user.a". `i_size` sits at byte 8 and `i_xattr_icount` at byte 2.
+        assert!(data[..1024].iter().all(|b| *b == 0));
+        data[16..32].copy_from_slice(b"\x07\x06\x03\x00selinuxctx\x00\x00");
+        let mut ibody = vec![0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0];
+        ibody.extend(4u32.to_le_bytes());
+        ibody.extend(b"\x01\x01\x06\x00ainline\x00");
+        let at = offset + inode_size;
+        data[at..at + ibody.len()].copy_from_slice(&ibody);
+        let icount = 1 + (ibody.len() - 12) / 4;
+        data[offset + 2..offset + 4].copy_from_slice(&(icount as u16).to_le_bytes());
+        if inode_size == 32 {
+            data[offset + 8..offset + 12].fill(0);
+        } else {
+            data[offset + 8..offset + 16].fill(0);
+        }
+
+        let sb = load_v6(&data).unwrap();
+        let inode = sb.superblock.get_inode(ino, false).unwrap();
+        assert_eq!(
+            inode.get_xattrs().unwrap(),
+            [b"user.a".to_vec(), b"security.selinux".to_vec()]
+        );
+        assert_eq!(
+            inode.get_xattr(OsStr::new("security.selinux")).unwrap(),
+            Some(b"ctx".to_vec())
+        );
+        assert_eq!(
+            inode.get_xattr(OsStr::new("user.a")).unwrap(),
+            Some(b"inline".to_vec())
+        );
     }
 }
