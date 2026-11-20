@@ -19,7 +19,7 @@ use std::fs;
 use std::io;
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
@@ -139,6 +139,16 @@ pub struct DaemonStatusRecord {
     /// credentials themselves), so a successor that finds none can say so.
     #[serde(default)]
     pub registry_auth: bool,
+    /// The image's learned start gap in seconds, the idle limit of its retained stage under
+    /// `retention_idle_limit = "auto"` (`crate::retention::learn_gap`). Absent until the image
+    /// started again after a stop.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_gap: Option<u64>,
+    /// When the last holder released the daemon (Unix seconds), in the stopped record a release
+    /// writes. A stop for a replacement, an upgrade or a shutdown has none, so the next start
+    /// learns no start gap from it and is not counted as a warm or cold start.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub released_at: Option<i64>,
 }
 
 /// Outcome for one daemon recovery attempt.
@@ -254,6 +264,11 @@ struct DaemonInstance {
     /// any (none in the auth store at its takeover or heal), so it fails every uncached read
     /// until `heal_daemons_missing_auth` rebuilds it once credentials arrive.
     missing_auth: bool,
+    /// See `DaemonStatusRecord::start_gap`.
+    start_gap: Option<u64>,
+    /// When the last holder released it (Unix seconds, 0: not released); see
+    /// `DaemonStatusRecord::released_at`.
+    released_at: AtomicI64,
 }
 
 impl DaemonInstance {
@@ -287,6 +302,22 @@ impl DaemonInstance {
             current
         }
     }
+}
+
+/// Whether anything is mounted at or below `dir`.
+#[cfg(target_os = "linux")]
+fn mounted_under(dir: &Path) -> io::Result<bool> {
+    let mounts = fs::read_to_string("/proc/self/mounts")?;
+    Ok(mounts.lines().any(|line| {
+        line.split_whitespace().nth(1).is_some_and(|target| {
+            Path::new(&crate::recon::unescape_mount_field(target)).starts_with(dir)
+        })
+    }))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn mounted_under(_dir: &Path) -> io::Result<bool> {
+    Ok(false)
 }
 
 /// Lightweight daemon facade for the host-mounted blockdev/EROFS path.
@@ -542,7 +573,15 @@ pub struct DaemonSupervisor {
     auth_heal_pass: async_lock::Mutex<()>,
     /// Daemons healed because credentials they lacked arrived.
     auth_heals: AtomicU64,
+    /// Counters and gauges of stage retention (see `crate::retention`).
+    retention: crate::retention::Stats,
 }
+
+/// A stopped daemon record whose stage is gone is deleted after this long idle. It outlives its
+/// stage so the image's start history is not lost with it.
+pub const RECORD_MAX_IDLE: Duration = Duration::from_secs(60 * 24 * 3600);
+/// At most this many stopped records without a stage are kept; the oldest go first.
+pub const RECORD_MAX_STOPPED: usize = 4096;
 
 /// How long a credential update waits before its heal pass, so that a burst of updates (the
 /// credential bridge stores many entries at startup) is served by one pass.
@@ -576,7 +615,20 @@ impl DaemonSupervisor {
             auth_heal_pending: AtomicBool::new(false),
             auth_heal_pass: async_lock::Mutex::new(()),
             auth_heals: AtomicU64::new(0),
+            retention: crate::retention::Stats::default(),
         }
+    }
+
+    /// The retention policy, `None` with retention off (or invalid keys, which
+    /// `SnapshotterConfig::validate` rejects at startup).
+    pub fn retention_policy(&self) -> Option<crate::retention::Policy> {
+        crate::retention::Policy::from_config(&self.config.snapshotter.cache)
+            .ok()
+            .flatten()
+    }
+
+    pub fn retention_stats(&self) -> &crate::retention::Stats {
+        &self.retention
     }
 
     /// Take the per-image startup lock for `image_ref` (see `start_locks`).
@@ -885,6 +937,13 @@ impl DaemonSupervisor {
                     .with_context(|| format!("failed to detach {}", mountpoint.display()))?;
             }
         }
+        let previous = fs::read(self.record_path(&slug))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<DaemonStatusRecord>(&bytes).ok());
+        if !heal && previous.as_ref().is_none_or(|r| r.released_at.is_some()) {
+            self.retention
+                .record_start(staged_bootstrap.try_exists().unwrap_or(false));
+        }
         if !heal {
             let viewer = self.node_viewer();
             let want_view = self.inode_share_domain().is_some();
@@ -908,6 +967,8 @@ impl DaemonSupervisor {
                 (true, true) => {}
             }
         }
+
+        let start_gap = start_gap_after(previous.as_ref(), unix_now());
 
         let threads = self.config.snapshotter.daemon.threads.max(1) as u32;
         let bti = self.build_info.clone();
@@ -981,6 +1042,8 @@ impl DaemonSupervisor {
             driver_override,
             registry_auth,
             missing_auth: false,
+            start_gap,
+            released_at: AtomicI64::new(0),
             _poll: poll,
         }))
     }
@@ -999,6 +1062,9 @@ impl DaemonSupervisor {
     ) -> Result<DaemonStatusRecord> {
         validate_spawn_request(image_ref, bootstrap)?;
 
+        // Like the ensure_* paths: no eviction or teardown of this image runs meanwhile.
+        let start_lock = self.start_lock(image_ref).await;
+        let _guard = start_lock.lock().await;
         let mut instances = self.instances.write().await;
         if let Some(inst) = instances.get(image_ref) {
             if inst.bootstrap != bootstrap {
@@ -1094,9 +1160,17 @@ impl DaemonSupervisor {
             return false;
         };
         let stopping = inst.clone();
-        if let Err(e) = blocking::unblock(move || stop_unreferenced_instance(&stopping)).await {
+        let stopped = blocking::unblock(move || {
+            let stopped = stop_unreferenced_instance(&stopping);
+            // Close the stopped daemon's cache files: a retained stage keeps no fd open.
+            nydus_storage::factory::BLOB_FACTORY.gc(None);
+            stopped
+        })
+        .await;
+        if let Err(e) = stopped {
             warn!(image_ref, error = %e, "failed to stop nydus daemon cleanly");
         }
+        inst.released_at.store(unix_now(), Ordering::SeqCst);
         if let Err(e) = self.persist_instance_record(&inst, false).await {
             warn!(image_ref, error = %e, "failed to persist stopped daemon record");
         }
@@ -1104,6 +1178,88 @@ impl DaemonSupervisor {
         // revive a daemon nobody references on the next start.
         self.clear_failover_state(&slug_for(image_ref));
         true
+    }
+
+    /// Evict the retained stage of `record`, a stopped daemon record the retention policy chose:
+    /// remove `daemons/<slug>/`, keeping the record. Runs under the image's start lock and
+    /// re-checks there that no daemon serves the image, that the record on disk is still `record`
+    /// (not live, same `updated_at`) and that nothing is mounted under the dir, so a start that
+    /// came first keeps its stage. Returns whether the dir was removed.
+    pub async fn evict_retained(&self, record: &DaemonStatusRecord) -> Result<bool> {
+        if record.live || slug_for(&record.image_ref) != record.slug {
+            return Ok(false);
+        }
+        let start_lock = self.start_lock(&record.image_ref).await;
+        let _guard = start_lock.lock().await;
+        if self.instances.read().await.contains_key(&record.image_ref) {
+            return Ok(false);
+        }
+        let path = self.record_path(&record.slug);
+        let dir = self.daemons_root().join(&record.slug);
+        let updated_at = record.updated_at;
+        blocking::unblock(move || {
+            let current: DaemonStatusRecord = match fs::read(&path) {
+                Ok(bytes) => serde_json::from_slice(&bytes)
+                    .with_context(|| format!("failed to decode {}", path.display()))?,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
+                Err(e) => {
+                    return Err(e).with_context(|| format!("failed to read {}", path.display()));
+                }
+            };
+            if current.live || current.updated_at != updated_at {
+                return Ok(false);
+            }
+            if mounted_under(&dir).context("failed to read the mount table")? {
+                warn!(dir = %dir.display(), "a retained stage has a mount under it; not evicting it");
+                return Ok(false);
+            }
+            // Close cache files a stopped daemon may still hold, or the removal frees nothing.
+            nydus_storage::factory::BLOB_FACTORY.gc(None);
+            match fs::remove_dir_all(&dir) {
+                Ok(()) => Ok(true),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+                Err(e) => Err(e).with_context(|| format!("failed to remove {}", dir.display())),
+            }
+        })
+        .await
+    }
+
+    /// Of `stopped`, stopped records whose daemon dir was gone when they were read, delete those
+    /// idle longer than [`RECORD_MAX_IDLE`] and the oldest beyond [`RECORD_MAX_STOPPED`], each
+    /// under its image's start lock after reading it and checking its dir again. Returns how many
+    /// were deleted.
+    pub async fn prune_stopped_records(
+        &self,
+        mut stopped: Vec<DaemonStatusRecord>,
+        now: i64,
+    ) -> usize {
+        let daemons = self.daemons_root();
+        stopped.sort_by_key(|r| std::cmp::Reverse(r.updated_at));
+        let cutoff = now.saturating_sub(RECORD_MAX_IDLE.as_secs() as i64);
+        let mut pruned = 0;
+        for (i, record) in stopped.iter().enumerate() {
+            if (i < RECORD_MAX_STOPPED && record.updated_at >= cutoff)
+                || slug_for(&record.image_ref) != record.slug
+            {
+                continue;
+            }
+            let start_lock = self.start_lock(&record.image_ref).await;
+            let _guard = start_lock.lock().await;
+            let path = self.record_path(&record.slug);
+            let unchanged = fs::read(&path)
+                .ok()
+                .and_then(|b| serde_json::from_slice::<DaemonStatusRecord>(&b).ok())
+                .is_some_and(|r| !r.live && r.updated_at == record.updated_at);
+            if unchanged && !daemons.join(&record.slug).exists() {
+                match fs::remove_file(&path) {
+                    Ok(()) => pruned += 1,
+                    Err(e) => {
+                        warn!(path = %path.display(), error = %e, "failed to prune a daemon record")
+                    }
+                }
+            }
+        }
+        pruned
     }
 
     /// Clamp daemon refcounts down to the holders that actually exist.
@@ -1914,14 +2070,21 @@ impl DaemonSupervisor {
                     Some(Unfit::Layout(reason)) => {
                         fs::create_dir_all(&stage_dir)
                             .with_context(|| format!("failed to create {}", stage_dir.display()))?;
-                        match build_view(&viewer, &source, &stage_dir) {
-                            Ok(view) => trial_view = Some(view),
-                            Err(NodeViewError::Refused(why)) => {
+                        // A view staged and checked before is mounted as it is.
+                        let staged = source_digest(&source)
+                            .and_then(|digest| staged_view_is_current(&digest, &stage_dir))
+                            .with_context(|| {
+                                format!("failed to check the view in {}", stage_dir.display())
+                            })?;
+                        match (!staged).then(|| build_view(&viewer, &source, &stage_dir)) {
+                            None => {}
+                            Some(Ok(view)) => trial_view = Some(view),
+                            Some(Err(NodeViewError::Refused(why))) => {
                                 return Ok(Some(format!(
                                     "{reason}, and it has no node view: {why}"
                                 )));
                             }
-                            Err(NodeViewError::Failed(e)) => {
+                            Some(Err(NodeViewError::Failed(e))) => {
                                 return Err(
                                     e.context(format!("{reason}; failed to build its node view"))
                                 );
@@ -2005,10 +2168,16 @@ impl DaemonSupervisor {
             )
             .context("failed to build blob cache entry for blockdev export")?;
 
-            let export_disk = disk_image.clone();
-            blocking::unblock(move || export_blockdev_image(entry, export_disk, threads))
-                .await
-                .context("blockdev export failed")?;
+            let (export_disk, source, target) = (
+                disk_image.clone(),
+                bootstrap.to_path_buf(),
+                mountpoint.clone(),
+            );
+            blocking::unblock(move || {
+                export_blockdev_image(entry, export_disk, source, target, threads)
+            })
+            .await
+            .context("blockdev export failed")?;
 
             let mount_disk = disk_image.clone();
             let mount_target = mountpoint.clone();
@@ -2040,6 +2209,8 @@ impl DaemonSupervisor {
                 driver_override,
                 registry_auth: false,
                 missing_auth: false,
+                start_gap: None,
+                released_at: AtomicI64::new(0),
             }));
         }
 
@@ -2064,12 +2235,17 @@ impl DaemonSupervisor {
             )
             .context("failed to build blob cache entry for tarfs export")?;
 
-            let export_disk = disk_image.clone();
+            let (export_disk, source, target) = (
+                disk_image.clone(),
+                bootstrap.to_path_buf(),
+                mountpoint.clone(),
+            );
             let verity = tarfs_cfg.verity;
-            let verity_info =
-                blocking::unblock(move || export_tarfs_image(entry, export_disk, threads, verity))
-                    .await
-                    .context("tarfs export failed")?;
+            let verity_info = blocking::unblock(move || {
+                export_tarfs_image(entry, export_disk, source, target, threads, verity)
+            })
+            .await
+            .context("tarfs export failed")?;
 
             let dm_name = tarfs_dm_name(&slug);
             let mount_disk = disk_image.clone();
@@ -2119,6 +2295,8 @@ impl DaemonSupervisor {
                 driver_override,
                 registry_auth: false,
                 missing_auth: false,
+                start_gap: None,
+                released_at: AtomicI64::new(0),
             }));
         }
 
@@ -2201,6 +2379,8 @@ impl DaemonSupervisor {
             driver_override,
             registry_auth: false,
             missing_auth: false,
+            start_gap: None,
+            released_at: AtomicI64::new(0),
             _poll: poll,
         }))
     }
@@ -2684,6 +2864,8 @@ impl DaemonSupervisor {
             driver_override: record.driver_override,
             registry_auth: record.registry_auth,
             missing_auth: false,
+            start_gap: record.start_gap,
+            released_at: AtomicI64::new(0),
         });
         self.note_parked_slug(slug);
         self.instances
@@ -2751,6 +2933,8 @@ impl DaemonSupervisor {
             driver_override: record.driver_override,
             registry_auth: record.registry_auth,
             missing_auth: record.registry_auth && !has_auth,
+            start_gap: record.start_gap,
+            released_at: AtomicI64::new(0),
         });
         self.note_parked_slug(slug);
         self.instances
@@ -2941,6 +3125,8 @@ impl DaemonSupervisor {
                 driver_override: old.driver_override,
                 registry_auth: old.registry_auth,
                 missing_auth: old.registry_auth && !has_auth,
+                start_gap: old.start_gap,
+                released_at: AtomicI64::new(0),
                 _poll: poll,
             }))
         }
@@ -3116,6 +3302,10 @@ impl DaemonSupervisor {
             built_on_node: false,
             driver_override: inst.driver_override,
             registry_auth: inst.registry_auth,
+            start_gap: inst.start_gap,
+            released_at: (!live)
+                .then(|| inst.released_at.load(Ordering::SeqCst))
+                .filter(|&at| at != 0),
         }
     }
 
@@ -3141,14 +3331,20 @@ impl DaemonSupervisor {
         .await
     }
 
-    fn read_persisted_records(&self) -> Vec<DaemonStatusRecord> {
+    pub(crate) fn read_persisted_records(&self) -> Vec<DaemonStatusRecord> {
+        self.try_read_persisted_records().unwrap_or_else(|e| {
+            warn!(error = %e, "failed to read daemon records directory");
+            Vec::new()
+        })
+    }
+
+    /// The persisted daemon records; an unreadable records dir is an error, a missing one empty.
+    /// An undecodable record is skipped with a warning.
+    pub(crate) fn try_read_persisted_records(&self) -> io::Result<Vec<DaemonStatusRecord>> {
         let entries = match fs::read_dir(self.record_dir()) {
             Ok(entries) => entries,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
-            Err(e) => {
-                warn!(error = %e, "failed to read daemon records directory");
-                return Vec::new();
-            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(e),
         };
         let mut out = Vec::new();
         for entry in entries.flatten() {
@@ -3164,7 +3360,20 @@ impl DaemonSupervisor {
                 None => warn!(path = %entry.path().display(), "failed to decode daemon record"),
             }
         }
-        out
+        Ok(out)
+    }
+}
+
+/// The start gap of a daemon of the image whose record is `previous`, starting at `now`: learned
+/// from the release a stopped record marks (`released_at`); kept from any other record, since a
+/// heal, a replacement, an upgrade or a start after a shutdown is no new start of the image.
+fn start_gap_after(previous: Option<&DaemonStatusRecord>, now: i64) -> Option<u64> {
+    let previous = previous?;
+    match previous.released_at {
+        Some(released_at) if !previous.live => {
+            crate::retention::learn_gap(previous.start_gap, released_at, now)
+        }
+        _ => previous.start_gap,
     }
 }
 
@@ -3250,6 +3459,11 @@ fn pad_live_erofs_sources(mounts: &str, daemons: &Path) -> usize {
 /// File in a fanotify stage dir recording the source its staged `bootstrap` is the node view of:
 /// the SHA-256 of the source bootstrap. Present exactly while a node view is staged.
 const VIEW_SOURCE_RECORD: &str = "bootstrap.view-of";
+
+/// File in a fanotify stage dir recording that its staged node view passed the checks of
+/// [`build_view`]: the SHA-256 of the staged file and the snapshotter version (see
+/// [`view_check`]). A start mounts a view without building it again only while this matches.
+const VIEW_CHECK_RECORD: &str = "bootstrap.view-checked";
 
 fn source_digest(src: &Path) -> io::Result<String> {
     Ok(hex::encode(Sha256::digest(fs::read(src)?)))
@@ -3370,7 +3584,8 @@ static NO_VIEW_REPORTED: StdMutex<Option<HashSet<PathBuf>>> = StdMutex::new(None
 /// `want_view` (page cache sharing is enabled) or when `src` itself is unfit for a kernel mount
 /// at its own block size or alignment; `trial` is a view already built for that decision.
 /// Otherwise, and when sharing alone wanted a view that cannot be built, a padded copy of `src`
-/// is staged. An unfit `src` without a view fails, as does any I/O error on the way. Returns
+/// is staged. A stage dir staged from another source is emptied first (see [`wipe_stage`]); the
+/// caller has detached any mount of it. An unfit `src` without a view fails, as does any I/O error on the way. Returns
 /// whether it staged a view: only a view, whose fingerprints the node computed, may join the
 /// page cache sharing domain.
 fn stage_mount_source(
@@ -3382,24 +3597,39 @@ fn stage_mount_source(
 ) -> Result<bool> {
     let staged = stage_dir.join("bootstrap");
     let record = stage_dir.join(VIEW_SOURCE_RECORD);
-    match fs::remove_file(&record) {
-        Err(e) if e.kind() != io::ErrorKind::NotFound => {
-            return Err(e).with_context(|| format!("failed to remove {}", record.display()));
-        }
-        _ => {}
+    let digest = source_digest(src).with_context(|| format!("failed to read {}", src.display()))?;
+    if staged_from_other(src, &digest, stage_dir)? {
+        wipe_stage(stage_dir, trial.as_ref().map(BuiltView::path).as_deref())?;
     }
     let unfit = source_unfit(FsDriverType::Fanotify, src, nydus_utils::host_page_size())?;
     if let Some(Unfit::Final(reason)) = &unfit {
         bail!("cannot mount {} with EROFS: {reason}", src.display());
     }
     if !want_view && unfit.is_none() {
-        stage_bootstrap(src, &staged)?;
+        remove_view_records(stage_dir)?;
+        stage_copy(src, &staged)?;
         return Ok(false);
+    }
+    if trial.is_none() && staged_view_is_current(&digest, stage_dir)? {
+        VIEW_STAGING[0].fetch_add(1, Ordering::Relaxed);
+        return Ok(true);
+    }
+    // `bootstrap.view-of` stays while the view is rebuilt: without it an interrupted rebuild
+    // would leave a stage that looks staged from another source, and the next start would wipe
+    // this image's caches. A view of this source checked earlier stays staged meanwhile.
+    match fs::remove_file(stage_dir.join(VIEW_CHECK_RECORD)) {
+        Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e.into()),
+        _ => {}
     }
     match trial.map_or_else(|| build_view(viewer, src, stage_dir), Ok) {
         Ok(view) => {
+            VIEW_STAGING[1].fetch_add(1, Ordering::Relaxed);
             nydus_service::erofs_folio::pad_to_page_size(&view.path())?;
             view.file.persist(&staged).map_err(|e| e.error)?;
+            atomic_write(
+                &stage_dir.join(VIEW_CHECK_RECORD),
+                view_check(&staged)?.as_bytes(),
+            )?;
             atomic_write(&record, view.source_digest.as_bytes())?;
             Ok(true)
         }
@@ -3422,9 +3652,79 @@ fn stage_mount_source(
                     "no node view; mounting the image's own bootstrap without page cache sharing"
                 );
             }
-            stage_bootstrap(src, &staged)?;
+            remove_view_records(stage_dir)?;
+            stage_copy(src, &staged)?;
             Ok(false)
         }
+    }
+}
+
+/// Stage a padded copy of `src` as `staged`, keeping one already staged (padded again to the
+/// current page size).
+fn stage_copy(src: &Path, staged: &Path) -> Result<()> {
+    if is_staged_copy(src, staged)? {
+        nydus_service::erofs_folio::pad_to_page_size(staged)?;
+    } else {
+        stage_bootstrap(src, staged)?;
+    }
+    Ok(())
+}
+
+/// Node views staged for a fanotify start: mounted again as staged (`[0]`) and built (`[1]`).
+static VIEW_STAGING: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+
+/// Node views staged for fanotify starts so far: (mounted again as staged, built).
+pub fn view_staging_counts() -> (u64, u64) {
+    (
+        VIEW_STAGING[0].load(Ordering::Relaxed),
+        VIEW_STAGING[1].load(Ordering::Relaxed),
+    )
+}
+
+/// Remove the records of a staged node view, its source record first: without it the stage dir
+/// holds no view.
+fn remove_view_records(stage_dir: &Path) -> io::Result<()> {
+    for name in [VIEW_SOURCE_RECORD, VIEW_CHECK_RECORD] {
+        match fs::remove_file(stage_dir.join(name)) {
+            Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// What [`VIEW_CHECK_RECORD`] holds for the view file `view`: its SHA-256, the version of the
+/// snapshotter whose checks it passed and the host page size it was padded to. A view staged
+/// under another page size is built again, so the mount source stays the staged file.
+fn view_check(view: &Path) -> io::Result<String> {
+    Ok(format!(
+        "{} {} {}",
+        source_digest(view)?,
+        env!("CARGO_PKG_VERSION"),
+        nydus_utils::host_page_size()
+    ))
+}
+
+/// Whether the stage dir holds a node view of the source with SHA-256 `digest` that can be mounted
+/// without building it again: [`build_view`] checked it in a snapshotter of this version, and its
+/// bytes are what they were then. Anything else is built again.
+fn staged_view_is_current(digest: &str, stage_dir: &Path) -> io::Result<bool> {
+    let read = |name: &str| match fs::read_to_string(stage_dir.join(name)) {
+        Ok(text) => Ok(Some(text)),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    };
+    let (Some(source), Some(checked)) = (read(VIEW_SOURCE_RECORD)?, read(VIEW_CHECK_RECORD)?)
+    else {
+        return Ok(false);
+    };
+    if source.trim() != digest {
+        return Ok(false);
+    }
+    match view_check(&stage_dir.join("bootstrap")) {
+        Ok(current) => Ok(checked.trim() == current),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e),
     }
 }
 
@@ -3435,30 +3735,86 @@ fn is_staged_from(src: &Path, stage_dir: &Path) -> io::Result<bool> {
     match fs::read_to_string(stage_dir.join(VIEW_SOURCE_RECORD)) {
         Ok(recorded) => Ok(source_digest(src)? == recorded.trim()),
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
-            Ok(is_staged_copy(src, &stage_dir.join("bootstrap")))
+            is_staged_copy(src, &stage_dir.join("bootstrap"))
         }
         Err(e) => Err(e),
     }
 }
 
-/// Whether `staged` holds exactly what [`stage_bootstrap`] makes of `src`.
-fn is_staged_copy(src: &Path, staged: &Path) -> bool {
-    let (Ok(src_meta), Ok(staged_meta)) = (fs::metadata(src), fs::metadata(staged)) else {
-        return false;
-    };
-    if staged_meta.len()
-        != src_meta
-            .len()
-            .next_multiple_of(nydus_utils::host_page_size())
-    {
-        return false;
+/// Whether the stage dir holds a `bootstrap` staged from another source than `src`, whose SHA-256
+/// is `digest`: a node view of another source, or a file that is no copy of `src`.
+fn staged_from_other(src: &Path, digest: &str, stage_dir: &Path) -> io::Result<bool> {
+    let staged = stage_dir.join("bootstrap");
+    match fs::read_to_string(stage_dir.join(VIEW_SOURCE_RECORD)) {
+        Ok(recorded) => Ok(recorded.trim() != digest),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            Ok(staged.exists() && !is_staged_copy(src, &staged)?)
+        }
+        Err(e) => Err(e),
     }
-    let (Ok(src), Ok(staged)) = (fs::read(src), fs::read(staged)) else {
-        return false;
+}
+
+/// Remove everything in a fanotify stage dir but `keep`. The stage dir is named after the image
+/// ref, so after its tag moved it still holds the caches of the image it named before, which
+/// nothing would read or remove. Never runs under a mount of the daemon dir.
+fn wipe_stage(stage_dir: &Path, keep: Option<&Path>) -> Result<()> {
+    let mountpoint = stage_dir.with_file_name("mnt");
+    if mounted_at(&mountpoint)
+        .with_context(|| format!("cannot tell whether {} is mounted", mountpoint.display()))?
+    {
+        bail!(
+            "{} is still mounted; not wiping {}",
+            mountpoint.display(),
+            stage_dir.display()
+        );
+    }
+    info!(stage = %stage_dir.display(), "removing the stage of another source");
+    // The source record and the staged bootstrap go last: until then an interrupted wipe still
+    // looks staged from another source, and the next start finishes it.
+    let (record, staged) = (
+        stage_dir.join(VIEW_SOURCE_RECORD),
+        stage_dir.join("bootstrap"),
+    );
+    for entry in fs::read_dir(stage_dir)
+        .with_context(|| format!("failed to read {}", stage_dir.display()))?
+    {
+        let path = entry
+            .with_context(|| format!("failed to read {}", stage_dir.display()))?
+            .path();
+        if Some(path.as_path()) == keep || path == record || path == staged {
+            continue;
+        }
+        let removed = if fs::symlink_metadata(&path).is_ok_and(|m| m.is_dir()) {
+            fs::remove_dir_all(&path)
+        } else {
+            fs::remove_file(&path)
+        };
+        removed.with_context(|| format!("failed to remove {}", path.display()))?;
+    }
+    for path in [record, staged] {
+        match fs::remove_file(&path) {
+            Err(e) if e.kind() != io::ErrorKind::NotFound => {
+                return Err(e).with_context(|| format!("failed to remove {}", path.display()));
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// Whether `staged` holds what [`stage_bootstrap`] makes of `src` under any page size: `src`
+/// followed by zeros. A missing `staged` is no copy; any other I/O error is an error.
+fn is_staged_copy(src: &Path, staged: &Path) -> io::Result<bool> {
+    let staged_len = match fs::metadata(staged) {
+        Ok(meta) => meta.len(),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e),
     };
-    staged.len() as u64 == (src.len() as u64).next_multiple_of(nydus_utils::host_page_size())
-        && staged.starts_with(&src)
-        && staged[src.len()..].iter().all(|&b| b == 0)
+    if staged_len < fs::metadata(src)?.len() {
+        return Ok(false);
+    }
+    let (src, staged) = (fs::read(src)?, fs::read(staged)?);
+    Ok(staged.starts_with(&src) && staged[src.len()..].iter().all(|&b| b == 0))
 }
 
 fn validate_spawn_request(image_ref: &str, bootstrap: &Path) -> Result<()> {
@@ -3491,35 +3847,137 @@ fn service_io_error(error: io::Error) -> ServiceError {
     ServiceError::WaitDaemon(error)
 }
 
+/// How an exported EROFS image of a blockdev or tarfs daemon dir relates to the bootstrap a
+/// start serves. The dir is named after the image ref, whose tag can move to another image.
+#[cfg(any(target_os = "linux", test))]
+#[derive(Debug, PartialEq, Eq)]
+enum ExportState {
+    /// Mounted at the daemon's mountpoint and kept: exported from this bootstrap, or before
+    /// sources were recorded.
+    Mounted,
+    /// Exported from this bootstrap.
+    Current,
+    /// Missing, or exported from another bootstrap.
+    Stale,
+}
+
+/// File next to an exported EROFS image recording the SHA-256 of the bootstrap it was exported
+/// from. Written after the image is in place, so an image without it is exported again.
+#[cfg(any(target_os = "linux", test))]
+fn export_source_record(disk_image: &Path) -> PathBuf {
+    let mut name = disk_image.as_os_str().to_os_string();
+    name.push(".source");
+    PathBuf::from(name)
+}
+
+/// Whether `disk_image` can serve `bootstrap`. A mounted image is never replaced: one recorded as
+/// exported from another bootstrap fails the start instead of serving the old image.
+#[cfg(any(target_os = "linux", test))]
+fn export_state(disk_image: &Path, bootstrap: &Path, mountpoint: &Path) -> Result<ExportState> {
+    let record = export_source_record(disk_image);
+    let same = match fs::read_to_string(&record) {
+        Ok(recorded) => Some(
+            recorded.trim()
+                == source_digest(bootstrap)
+                    .with_context(|| format!("failed to read {}", bootstrap.display()))?,
+        ),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+        Err(e) => return Err(e).with_context(|| format!("failed to read {}", record.display())),
+    };
+    if is_mounted_at(mountpoint) {
+        if same == Some(false) {
+            bail!(
+                "{} is mounted from {}, which was exported from another bootstrap",
+                mountpoint.display(),
+                disk_image.display()
+            );
+        }
+        return Ok(ExportState::Mounted);
+    }
+    let exported = fs::metadata(disk_image).is_ok_and(|m| m.is_file() && m.len() > 0);
+    Ok(if same == Some(true) && exported {
+        ExportState::Current
+    } else {
+        ExportState::Stale
+    })
+}
+
+/// Export `bootstrap` with `export` into a new file next to `disk_image`, move it into place and
+/// record its source. The export tool writes into an existing file without truncating it, and a
+/// lazily detached mount may still read the old file, so the image is never rewritten in place.
+#[cfg(any(target_os = "linux", test))]
+fn export_replacing<T>(
+    disk_image: &Path,
+    bootstrap: &Path,
+    export: impl FnOnce(&Path) -> Result<T>,
+) -> Result<T> {
+    let record = export_source_record(disk_image);
+    match fs::remove_file(&record) {
+        Err(e) if e.kind() != io::ErrorKind::NotFound => {
+            return Err(e).with_context(|| format!("failed to remove {}", record.display()));
+        }
+        _ => {}
+    }
+    let digest = source_digest(bootstrap)
+        .with_context(|| format!("failed to read {}", bootstrap.display()))?;
+    let dir = disk_image
+        .parent()
+        .with_context(|| format!("{} has no parent dir", disk_image.display()))?;
+    fs::create_dir_all(dir)
+        .with_context(|| format!("failed to create disk image directory {}", dir.display()))?;
+    // A crash mid-export leaves a full-size temporary file behind.
+    let mut sidecar = disk_image.as_os_str().to_os_string();
+    sidecar.push(".verity.json");
+    let keep = [record.clone(), PathBuf::from(sidecar)];
+    for entry in fs::read_dir(dir).with_context(|| format!("failed to read {}", dir.display()))? {
+        let path = entry
+            .with_context(|| format!("failed to read {}", dir.display()))?
+            .path();
+        let temporary = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with("image.erofs."));
+        if temporary && !keep.contains(&path) {
+            fs::remove_file(&path)
+                .with_context(|| format!("failed to remove {}", path.display()))?;
+        }
+    }
+    let tmp = tempfile::Builder::new()
+        .prefix("image.erofs.")
+        .tempfile_in(dir)
+        .with_context(|| format!("failed to create a temporary file in {}", dir.display()))?
+        .into_temp_path();
+    let out = export(&tmp)?;
+    fs::File::open(&tmp)
+        .and_then(|f| f.sync_all())
+        .with_context(|| format!("failed to sync {}", tmp.display()))?;
+    tmp.persist(disk_image)
+        .map_err(|e| e.error)
+        .with_context(|| format!("failed to move the export to {}", disk_image.display()))?;
+    atomic_write(&record, digest.as_bytes())
+        .with_context(|| format!("failed to write {}", record.display()))?;
+    Ok(out)
+}
+
 #[cfg(target_os = "linux")]
 fn export_blockdev_image(
     entry: nydus_api::BlobCacheEntry,
     disk_image: PathBuf,
+    bootstrap: PathBuf,
+    mountpoint: PathBuf,
     threads: u32,
 ) -> Result<()> {
-    if disk_image.is_file() && disk_image.metadata().map(|m| m.len()).unwrap_or(0) > 0 {
+    if export_state(&disk_image, &bootstrap, &mountpoint)? != ExportState::Stale {
         return Ok(());
     }
-    if let Some(parent) = disk_image.parent() {
-        fs::create_dir_all(parent).with_context(|| {
-            format!(
-                "failed to create blockdev disk image directory {}",
-                parent.display()
-            )
-        })?;
-    }
-    BlockDevice::export(
-        entry,
-        Some(disk_image.display().to_string()),
-        None,
-        threads,
-        false,
-    )
-    .with_context(|| {
-        format!(
-            "failed to export blockdev disk image {}",
-            disk_image.display()
-        )
+    export_replacing(&disk_image, &bootstrap, |out| {
+        BlockDevice::export(entry, Some(out.display().to_string()), None, threads, false)
+            .with_context(|| {
+                format!(
+                    "failed to export blockdev disk image {}",
+                    disk_image.display()
+                )
+            })
     })?;
     Ok(())
 }
@@ -3528,6 +3986,8 @@ fn export_blockdev_image(
 fn export_blockdev_image(
     _entry: nydus_api::BlobCacheEntry,
     _disk_image: PathBuf,
+    _bootstrap: PathBuf,
+    _mountpoint: PathBuf,
     _threads: u32,
 ) -> Result<()> {
     bail!("blockdev EROFS export requires Linux")
@@ -3621,35 +4081,43 @@ fn tarfs_dm_name(slug: &str) -> String {
 fn export_tarfs_image(
     entry: nydus_api::BlobCacheEntry,
     disk_image: PathBuf,
+    bootstrap: PathBuf,
+    mountpoint: PathBuf,
     threads: u32,
     verity: bool,
 ) -> Result<Option<TarfsVerityParams>> {
     let sidecar = verity_sidecar_path(&disk_image);
-    let disk_ready =
-        disk_image.is_file() && disk_image.metadata().map(|m| m.len()).unwrap_or(0) > 0;
-    if disk_ready {
-        if !verity {
-            return Ok(None);
+    match export_state(&disk_image, &bootstrap, &mountpoint)? {
+        // The live mount is kept as it is (see `setup_and_mount_tarfs`).
+        ExportState::Mounted => {
+            return Ok(verity.then(|| load_verity_sidecar(&sidecar)).flatten());
         }
-        if let Some(info) = load_verity_sidecar(&sidecar) {
-            return Ok(Some(info));
+        ExportState::Current if !verity => return Ok(None),
+        ExportState::Current => {
+            if let Some(info) = load_verity_sidecar(&sidecar) {
+                return Ok(Some(info));
+            }
+            // No cached verity params: export again to regenerate them.
         }
-        // Disk present but no cached verity params — fall through and re-export
-        // to regenerate them (the export overwrites the disk in place).
+        ExportState::Stale => {}
     }
-    if let Some(parent) = disk_image.parent() {
-        fs::create_dir_all(parent).with_context(|| {
-            format!("failed to create tarfs disk directory {}", parent.display())
-        })?;
+    // The parameters of another export must never pass for this one's.
+    match fs::remove_file(&sidecar) {
+        Err(e) if e.kind() != io::ErrorKind::NotFound => {
+            return Err(e).with_context(|| format!("failed to remove {}", sidecar.display()));
+        }
+        _ => {}
     }
-    let info = BlockDevice::export(
-        entry,
-        Some(disk_image.display().to_string()),
-        None,
-        threads,
-        verity,
-    )
-    .with_context(|| format!("failed to export tarfs disk image {}", disk_image.display()))?
+    let info = export_replacing(&disk_image, &bootstrap, |out| {
+        BlockDevice::export(
+            entry,
+            Some(out.display().to_string()),
+            None,
+            threads,
+            verity,
+        )
+        .with_context(|| format!("failed to export tarfs disk image {}", disk_image.display()))
+    })?
     .map(|v| TarfsVerityParams {
         data_block_size: v.data_block_size,
         data_blocks: v.data_blocks,
@@ -3666,6 +4134,8 @@ fn export_tarfs_image(
 fn export_tarfs_image(
     _entry: nydus_api::BlobCacheEntry,
     _disk_image: PathBuf,
+    _bootstrap: PathBuf,
+    _mountpoint: PathBuf,
     _threads: u32,
     _verity: bool,
 ) -> Result<Option<TarfsVerityParams>> {
@@ -3941,6 +4411,11 @@ fn detach_mount_stack(mountpoint: &Path) -> io::Result<usize> {
 #[cfg(not(target_os = "linux"))]
 fn is_mounted_at(_mountpoint: &Path) -> bool {
     false
+}
+
+#[cfg(not(target_os = "linux"))]
+fn mounted_at(_mountpoint: &Path) -> io::Result<bool> {
+    Ok(false)
 }
 
 /// How a preserved fd should be re-attached at startup, decided purely from
@@ -4254,18 +4729,20 @@ fn mount_at(_mountpoint: &Path) -> Option<(String, String)> {
 
 #[cfg(target_os = "linux")]
 fn is_mounted_at(mountpoint: &Path) -> bool {
+    mounted_at(mountpoint).unwrap_or(false)
+}
+
+/// Whether anything is mounted at `mountpoint`; an unreadable mount table is an error.
+#[cfg(target_os = "linux")]
+fn mounted_at(mountpoint: &Path) -> io::Result<bool> {
     let target = mountpoint.display().to_string();
     let escaped = target.replace(' ', "\\040");
-    fs::read_to_string("/proc/self/mounts")
-        .map(|mounts| {
-            mounts.lines().any(|line| {
-                line.split_whitespace()
-                    .nth(1)
-                    .map(|path| path == target || path == escaped)
-                    .unwrap_or(false)
-            })
-        })
-        .unwrap_or(false)
+    let mounts = fs::read_to_string("/proc/self/mounts")?;
+    Ok(mounts.lines().any(|line| {
+        line.split_whitespace()
+            .nth(1)
+            .is_some_and(|path| path == target || path == escaped)
+    }))
 }
 
 /// Stop a daemon's service threads WITHOUT unmounting its mountpoint or
@@ -4438,6 +4915,8 @@ fn test_instance_with_daemon(
         driver_override: None,
         registry_auth: false,
         missing_auth: false,
+        start_gap: None,
+        released_at: AtomicI64::new(0),
     }
 }
 
@@ -4592,13 +5071,26 @@ mod tests {
         let src = dir.path().join("src");
         let dst = dir.path().join("bootstrap");
         fs::write(&src, vec![7u8; 5000]).unwrap();
-        assert!(!is_staged_copy(&src, &dst), "nothing staged yet");
+        assert!(!is_staged_copy(&src, &dst).unwrap(), "nothing staged yet");
         stage_bootstrap(&src, &dst).unwrap();
-        assert!(is_staged_copy(&src, &dst));
+        assert!(is_staged_copy(&src, &dst).unwrap());
+        // A copy padded under a larger page size is still a copy.
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&dst)
+            .unwrap()
+            .set_len(65536)
+            .unwrap();
+        assert!(is_staged_copy(&src, &dst).unwrap());
         fs::write(&src, vec![8u8; 5000]).unwrap();
-        assert!(!is_staged_copy(&src, &dst), "different content");
+        assert!(!is_staged_copy(&src, &dst).unwrap(), "different content");
         fs::write(&src, vec![7u8; 5001]).unwrap();
-        assert!(!is_staged_copy(&src, &dst), "different length");
+        assert!(!is_staged_copy(&src, &dst).unwrap(), "different length");
+        // A read error is an error, never "another source".
+        fs::remove_file(&src).unwrap();
+        fs::create_dir(&src).unwrap();
+        fs::write(&dst, vec![0u8; 1 << 20]).unwrap();
+        assert!(is_staged_copy(&src, &dst).is_err());
     }
 
     fn viewer(nydus_image: &Path) -> crate::local_accel::LocalAccelConfig {
@@ -4635,13 +5127,13 @@ mod tests {
 
         assert!(!stage_mount_source(&viewer(&tool), &src, &stage, false, None).unwrap());
         assert!(!ran.exists(), "sharing is off and the image fit: no view");
-        assert!(is_staged_copy(&src, &stage.join("bootstrap")));
+        assert!(is_staged_copy(&src, &stage.join("bootstrap")).unwrap());
         assert!(is_staged_from(&src, &stage).unwrap());
 
         assert!(!stage_mount_source(&viewer(&tool), &src, &stage, true, None).unwrap());
         assert!(ran.exists());
         assert!(!stage.join(VIEW_SOURCE_RECORD).exists());
-        assert!(is_staged_copy(&src, &stage.join("bootstrap")));
+        assert!(is_staged_copy(&src, &stage.join("bootstrap")).unwrap());
         // No scratch dir is left behind in the stage dir.
         let left: Vec<_> = fs::read_dir(&stage)
             .unwrap()
@@ -4693,6 +5185,229 @@ mod tests {
         assert!(!is_staged_from(&src, dir.path()).unwrap());
     }
 
+    /// After the image ref's tag moved, the stage dir of the image it named before is emptied
+    /// before the new source is staged; restaging the same source keeps its caches.
+    #[test]
+    fn a_stage_of_another_source_is_wiped() {
+        let texture = Path::new(env!("CARGO_MANIFEST_DIR")).join("../tests/texture/bootstrap");
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b) = (dir.path().join("a"), dir.path().join("b"));
+        fs::copy(texture.join("rafs-v6-2.2.boot"), &a).unwrap();
+        fs::copy(texture.join("rafs-v6-small-files.boot"), &b).unwrap();
+        let stage = dir.path().join("stage");
+        fs::create_dir(&stage).unwrap();
+        let tool = dir.path().join("no-nydus-image");
+
+        assert!(!stage_mount_source(&viewer(&tool), &a, &stage, false, None).unwrap());
+        let cache = stage.join("0123.blob.data");
+        fs::write(&cache, b"data of a").unwrap();
+        fs::hard_link(&cache, stage.join("blob_0")).unwrap();
+        fs::create_dir(stage.join("view.scratch")).unwrap();
+
+        assert!(!stage_mount_source(&viewer(&tool), &a, &stage, false, None).unwrap());
+        assert!(cache.exists(), "the same source keeps its caches");
+
+        assert!(!stage_mount_source(&viewer(&tool), &b, &stage, false, None).unwrap());
+        let mut left: Vec<_> = fs::read_dir(&stage)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        left.sort();
+        assert_eq!(left, vec![std::ffi::OsString::from("bootstrap")]);
+        assert!(is_staged_copy(&b, &stage.join("bootstrap")).unwrap());
+
+        // A view of another source counts as another source too.
+        fs::write(&cache, b"data of b").unwrap();
+        fs::write(stage.join(VIEW_SOURCE_RECORD), source_digest(&a).unwrap()).unwrap();
+        assert!(!stage_mount_source(&viewer(&tool), &b, &stage, false, None).unwrap());
+        assert!(!cache.exists());
+    }
+
+    /// A staged view that this version checked and nobody changed since is mounted again without
+    /// building it; a changed view, another snapshotter version or another source builds it.
+    #[test]
+    fn stage_mount_source_reuses_a_checked_view() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let texture = Path::new(env!("CARGO_MANIFEST_DIR")).join("../tests/texture/bootstrap");
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("source");
+        fs::copy(texture.join("rafs-v6-2.2.boot"), &src).unwrap();
+        let stage = dir.path().join("stage");
+        fs::create_dir(&stage).unwrap();
+        let staged = stage.join("bootstrap");
+        // Counts its runs, and fails like an image without a view.
+        let runs = dir.path().join("runs");
+        let tool = dir.path().join("nydus-image");
+        fs::write(
+            &tool,
+            format!("#!/bin/sh\necho >> {}\nexit 2\n", runs.display()),
+        )
+        .unwrap();
+        fs::set_permissions(&tool, fs::Permissions::from_mode(0o755)).unwrap();
+        let runs = || fs::read_to_string(&runs).map_or(0, |s| s.lines().count());
+        // What an earlier start leaves behind after staging a view it checked.
+        let stage_view = |view: &[u8]| {
+            fs::write(&staged, view).unwrap();
+            fs::write(stage.join(VIEW_CHECK_RECORD), view_check(&staged).unwrap()).unwrap();
+            fs::write(stage.join(VIEW_SOURCE_RECORD), source_digest(&src).unwrap()).unwrap();
+        };
+        let view = fs::read(texture.join("rafs-v6-small-files.boot")).unwrap();
+
+        stage_view(&view);
+        assert!(stage_mount_source(&viewer(&tool), &src, &stage, true, None).unwrap());
+        assert_eq!(runs(), 0, "a checked view is not built again");
+        assert_eq!(fs::read(&staged).unwrap(), view);
+
+        // A view changed since its check is built again.
+        let mut tampered = view.clone();
+        tampered[100] ^= 1;
+        stage_view(&view);
+        fs::write(&staged, &tampered).unwrap();
+        assert!(!stage_mount_source(&viewer(&tool), &src, &stage, true, None).unwrap());
+        assert_eq!(runs(), 1);
+        assert!(is_staged_copy(&src, &staged).unwrap());
+        assert!(!stage.join(VIEW_CHECK_RECORD).exists());
+
+        // So is one checked by another version.
+        stage_view(&view);
+        let checked = view_check(&staged).unwrap();
+        let (hash, _) = checked.split_once(' ').unwrap();
+        fs::write(stage.join(VIEW_CHECK_RECORD), format!("{hash} 0.0.0")).unwrap();
+        assert!(!stage_mount_source(&viewer(&tool), &src, &stage, true, None).unwrap());
+        assert_eq!(runs(), 2);
+
+        // And one padded under another page size: reused as it is, it would be mounted through
+        // an anonymous padded copy instead of the staged file.
+        stage_view(&view);
+        let other_page = format!(
+            "{hash} {} {}",
+            env!("CARGO_PKG_VERSION"),
+            nydus_utils::host_page_size() * 4
+        );
+        fs::write(stage.join(VIEW_CHECK_RECORD), other_page).unwrap();
+        assert!(!stage_mount_source(&viewer(&tool), &src, &stage, true, None).unwrap());
+        assert_eq!(runs(), 3);
+
+        // And a view of another source.
+        stage_view(&view);
+        fs::write(stage.join(VIEW_SOURCE_RECORD), "0".repeat(64)).unwrap();
+        assert!(!stage_mount_source(&viewer(&tool), &src, &stage, true, None).unwrap());
+        assert_eq!(runs(), 4);
+
+        // Without sharing, a fit image is staged as a copy, and a copy already staged is kept.
+        let before = fs::metadata(&staged).unwrap().modified().unwrap();
+        assert!(!stage_mount_source(&viewer(&tool), &src, &stage, false, None).unwrap());
+        assert_eq!(fs::metadata(&staged).unwrap().modified().unwrap(), before);
+        stage_view(&view);
+        assert!(!stage_mount_source(&viewer(&tool), &src, &stage, false, None).unwrap());
+        assert!(is_staged_copy(&src, &staged).unwrap());
+        assert!(!stage.join(VIEW_SOURCE_RECORD).exists());
+        assert_eq!(runs(), 4);
+    }
+
+    /// A view rebuilt for a new snapshotter version keeps `bootstrap.view-of` while the tool runs,
+    /// so a rebuild killed midway leaves a stage of this source and its caches survive.
+    #[test]
+    fn an_interrupted_view_rebuild_keeps_the_caches() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let texture = Path::new(env!("CARGO_MANIFEST_DIR")).join("../tests/texture/bootstrap");
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("source");
+        fs::copy(texture.join("rafs-v6-2.2.boot"), &src).unwrap();
+        let stage = dir.path().join("stage");
+        fs::create_dir(&stage).unwrap();
+        let staged = stage.join("bootstrap");
+        fs::copy(texture.join("rafs-v6-small-files.boot"), &staged).unwrap();
+        fs::write(stage.join(VIEW_CHECK_RECORD), "checked by another version").unwrap();
+        fs::write(stage.join(VIEW_SOURCE_RECORD), source_digest(&src).unwrap()).unwrap();
+        let cache = stage.join("0123.blob.data");
+        fs::write(&cache, b"cached").unwrap();
+        // Records whether the source record was still there while it ran, and is "killed".
+        let saw = dir.path().join("saw-view-of");
+        let tool = dir.path().join("nydus-image");
+        fs::write(
+            &tool,
+            format!(
+                "#!/bin/sh\ntest -f {} && touch {}\nexit 2\n",
+                stage.join(VIEW_SOURCE_RECORD).display(),
+                saw.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&tool, fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(!stage_mount_source(&viewer(&tool), &src, &stage, true, None).unwrap());
+        assert!(
+            saw.exists(),
+            "bootstrap.view-of was gone during the rebuild"
+        );
+        assert!(!staged_from_other(&src, &source_digest(&src).unwrap(), &stage).unwrap());
+        assert!(cache.exists());
+    }
+
+    /// A blockdev/tarfs image is served again only for the bootstrap it was exported from:
+    /// after the tag moved, the next start exports the new bootstrap into a new file.
+    #[test]
+    fn an_export_of_another_bootstrap_is_replaced() {
+        use std::io::Write as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b) = (dir.path().join("a"), dir.path().join("b"));
+        fs::write(&a, b"bootstrap a").unwrap();
+        fs::write(&b, b"bootstrap b").unwrap();
+        let disk = dir.path().join("blockdev/image.erofs");
+        let mnt = dir.path().join("mnt");
+        let serve = |src: &Path| -> Result<()> {
+            if export_state(&disk, src, &mnt)? == ExportState::Stale {
+                // Stands in for `BlockDevice::export`, which writes without truncating.
+                export_replacing(&disk, src, |out| {
+                    let mut f = fs::OpenOptions::new().write(true).open(out)?;
+                    f.write_all(&fs::read(src)?)?;
+                    Ok(())
+                })?;
+            }
+            Ok(())
+        };
+
+        assert_eq!(export_state(&disk, &a, &mnt).unwrap(), ExportState::Stale);
+        serve(&a).unwrap();
+        assert_eq!(fs::read(&disk).unwrap(), b"bootstrap a");
+        assert_eq!(export_state(&disk, &a, &mnt).unwrap(), ExportState::Current);
+
+        serve(&b).unwrap();
+        assert_eq!(fs::read(&disk).unwrap(), b"bootstrap b");
+        assert_eq!(export_state(&disk, &b, &mnt).unwrap(), ExportState::Current);
+        assert_eq!(export_state(&disk, &a, &mnt).unwrap(), ExportState::Stale);
+
+        // A temporary file left by a crashed export is removed by the next export; the source
+        // record and verity parameters are not temporary.
+        let leftover = dir.path().join("blockdev/image.erofs.Ab12Cd");
+        fs::write(&leftover, b"partial export").unwrap();
+        let sidecar = dir.path().join("blockdev/image.erofs.verity.json");
+        fs::write(&sidecar, b"{}").unwrap();
+        serve(&a).unwrap();
+        assert!(!leftover.exists());
+        assert!(sidecar.exists());
+        fs::remove_file(&sidecar).unwrap();
+        serve(&b).unwrap();
+
+        // An image without a recorded source, such as one whose export was interrupted, is
+        // exported again.
+        fs::remove_file(export_source_record(&disk)).unwrap();
+        assert_eq!(export_state(&disk, &b, &mnt).unwrap(), ExportState::Stale);
+        // A failed export keeps neither a record nor a temporary file.
+        let failed = export_replacing(&disk, &b, |_| -> Result<()> { bail!("export failed") });
+        assert!(failed.is_err());
+        let mut left: Vec<_> = fs::read_dir(disk.parent().unwrap())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        left.sort();
+        assert_eq!(left, vec![std::ffi::OsString::from("image.erofs")]);
+    }
+
     /// With a real `nydus-image`: the view is staged, recorded and checked, a heal keeps it
     /// while the source is unchanged, and an image unfit at its own block size is staged
     /// through its view. `NYDUS_IMAGE` is the binary; `misc/fanotify/b4b-referrer-serving-test.sh`
@@ -4716,6 +5431,9 @@ mod tests {
             nydus_rafs::metadata::RafsSuper::load_from_file(&staged, config, false).unwrap();
         assert_eq!(rs.meta.blkszbits, 12);
         assert!(nydus_rafs::metadata::kernel_layout::check_node_view(&rs, &staged).unwrap() > 0);
+        // The next start mounts the checked view as it is: no tool runs.
+        let missing = dir.path().join("no-nydus-image");
+        assert!(stage_mount_source(&viewer(&missing), &src, &stage, true, None).unwrap());
         let other = dir.path().join("other");
         fs::copy(texture.join("rafs-v5.boot"), &other).unwrap();
         assert!(!is_staged_from(&other, &stage).unwrap());
@@ -4830,7 +5548,66 @@ mod tests {
             built_on_node: false,
             driver_override: None,
             registry_auth: false,
+            start_gap: None,
+            released_at: None,
         }
+    }
+
+    /// A start learns the gap since the release its stopped record marks; any other record (a
+    /// live one, or one stopped for a replacement, upgrade or shutdown) keeps the gap.
+    #[test]
+    fn a_start_learns_the_gap_since_the_last_release() {
+        let mut record = sample_record(PathBuf::from("/b"));
+        assert_eq!(start_gap_after(None, 1000), None);
+        record.start_gap = Some(600);
+        assert_eq!(start_gap_after(Some(&record), 1000), Some(600), "live");
+        record.live = false;
+        record.updated_at = 990;
+        assert_eq!(
+            start_gap_after(Some(&record), 1000),
+            Some(600),
+            "stopped without a release"
+        );
+        record.released_at = Some(100);
+        assert_eq!(start_gap_after(Some(&record), 1000), Some(900));
+        assert_eq!(
+            start_gap_after(Some(&record), 50),
+            Some(600),
+            "clock stepped back"
+        );
+
+        let json = serde_json::to_string(&record).unwrap();
+        assert!(json.contains("\"start_gap\":600"), "{json}");
+        assert!(json.contains("\"released_at\":100"), "{json}");
+        let decoded: DaemonStatusRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, record);
+        record.start_gap = None;
+        record.released_at = None;
+        let json = serde_json::to_string(&record).unwrap();
+        assert!(
+            !json.contains("start_gap") && !json.contains("released_at"),
+            "{json}"
+        );
+    }
+
+    /// Only the stopped record a release writes carries `released_at`.
+    #[test]
+    fn only_a_released_record_carries_its_release_time() {
+        let supervisor = DaemonSupervisor::new(SnapshotterConfig::default());
+        let inst = test_instance();
+        assert_eq!(
+            supervisor.record_for_instance(&inst, false).released_at,
+            None
+        );
+        inst.released_at.store(1234, Ordering::SeqCst);
+        assert_eq!(
+            supervisor.record_for_instance(&inst, false).released_at,
+            Some(1234)
+        );
+        assert_eq!(
+            supervisor.record_for_instance(&inst, true).released_at,
+            None
+        );
     }
 
     /// The unused `built_on_node` field still round-trips, and records without it load.
@@ -5963,6 +6740,155 @@ mod tests {
         let lonely = lonely_stage.join("bootstrap");
         std::fs::write(&lonely, b"x").unwrap();
         assert_eq!(DaemonSupervisor::accel_backend_for(&lonely), None);
+    }
+
+    /// A supervisor with retention on under `root`, and the record and stage dir of a stopped
+    /// daemon of `image_ref`.
+    async fn retained(
+        root: &Path,
+        image_ref: &str,
+    ) -> (Arc<DaemonSupervisor>, DaemonInstance, PathBuf) {
+        let mut config = SnapshotterConfig::default();
+        config.snapshotter.root = root.to_path_buf();
+        config.snapshotter.cache.retention = true;
+        let supervisor = Arc::new(DaemonSupervisor::new(config));
+        let dir = supervisor.daemons_root().join(slug_for(image_ref));
+        fs::create_dir_all(dir.join("stage")).unwrap();
+        fs::write(dir.join("stage/bootstrap"), b"view").unwrap();
+        let inst = test_daemon_instance(image_ref, dir.join("mnt"));
+        supervisor
+            .persist_instance_record(&inst, false)
+            .await
+            .unwrap();
+        (supervisor, inst, dir)
+    }
+
+    /// An eviction waits for a start that holds the image's start lock, and then keeps the
+    /// stage the start took. Once the image is stopped again its stage is evicted, and its record
+    /// stays.
+    #[compio::test]
+    async fn an_eviction_racing_a_start_keeps_the_started_stage() {
+        let tmp = tempfile::tempdir().unwrap();
+        let image_ref = "registry.local/team/app:1";
+        let (supervisor, inst, dir) = retained(tmp.path(), image_ref).await;
+        let stopped = supervisor.read_persisted_records().pop().unwrap();
+
+        let start_lock = supervisor.start_lock(image_ref).await;
+        let starting = start_lock.lock().await;
+        let eviction = compio::runtime::spawn({
+            let supervisor = supervisor.clone();
+            let stopped = stopped.clone();
+            async move { supervisor.evict_retained(&stopped).await }
+        });
+        compio::time::sleep(Duration::from_millis(50)).await;
+        assert!(dir.join("stage").exists(), "the eviction did not wait");
+        supervisor
+            .persist_instance_record(&inst, true)
+            .await
+            .unwrap();
+        drop(starting);
+        assert!(!eviction.await.unwrap().unwrap());
+        assert!(dir.join("stage/bootstrap").exists());
+
+        // A daemon serves it: kept.
+        supervisor
+            .insert_test_instance(image_ref, dir.join("mnt"))
+            .await;
+        let live = supervisor.read_persisted_records().pop().unwrap();
+        assert!(!supervisor.evict_retained(&live).await.unwrap());
+        supervisor.instances.write().await.clear();
+
+        supervisor
+            .persist_instance_record(&inst, false)
+            .await
+            .unwrap();
+        let stopped = supervisor.read_persisted_records().pop().unwrap();
+        assert!(supervisor.evict_retained(&stopped).await.unwrap());
+        assert!(!dir.exists());
+        assert_eq!(supervisor.read_persisted_records(), vec![stopped]);
+    }
+
+    /// An explicit spawn waits for the image's start lock, so it cannot stage or mount while an
+    /// eviction removes the dir.
+    #[compio::test]
+    async fn a_spawn_waits_for_the_start_lock() {
+        let tmp = tempfile::tempdir().unwrap();
+        let image_ref = "registry.local/team/app:1";
+        let (supervisor, _, dir) = retained(tmp.path(), image_ref).await;
+        supervisor
+            .insert_test_instance(image_ref, dir.join("mnt"))
+            .await;
+        // Another bootstrap than the instance's: the spawn fails as soon as it gets in.
+        let other = tmp.path().join("other-bootstrap");
+        fs::write(&other, b"other").unwrap();
+
+        let start_lock = supervisor.start_lock(image_ref).await;
+        let evicting = start_lock.lock().await;
+        let done = Arc::new(AtomicBool::new(false));
+        let spawn = compio::runtime::spawn({
+            let (supervisor, done) = (supervisor.clone(), done.clone());
+            async move {
+                let result = supervisor.spawn_instance(image_ref, &other).await;
+                done.store(true, Ordering::SeqCst);
+                result
+            }
+        });
+        compio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!done.load(Ordering::SeqCst), "the spawn did not wait");
+        drop(evicting);
+        assert!(spawn.await.unwrap().is_err());
+    }
+
+    /// A record changed since the policy read it (stopped again later) keeps its stage.
+    #[compio::test]
+    async fn an_eviction_skips_a_changed_record() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (supervisor, _, dir) = retained(tmp.path(), "registry.local/team/app:1").await;
+        let mut seen = supervisor.read_persisted_records().pop().unwrap();
+        seen.updated_at -= 10;
+        assert!(!supervisor.evict_retained(&seen).await.unwrap());
+        // A record that names another image's dir is never acted on.
+        let mut forged = supervisor.read_persisted_records().pop().unwrap();
+        forged.slug = "..".to_string();
+        assert!(!supervisor.evict_retained(&forged).await.unwrap());
+        assert!(dir.join("stage/bootstrap").exists());
+    }
+
+    /// Stopped records outlive their stage until they are idle too long or too many.
+    #[compio::test]
+    async fn stopped_records_are_pruned_by_age_and_count() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (supervisor, _, dir) = retained(tmp.path(), "registry.local/team/app:1").await;
+        let now = unix_now();
+        let old = now + RECORD_MAX_IDLE.as_secs() as i64 + 1;
+        let stopped = || supervisor.read_persisted_records();
+        assert_eq!(
+            supervisor.prune_stopped_records(stopped(), old).await,
+            0,
+            "its stage is still there"
+        );
+        fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(supervisor.prune_stopped_records(stopped(), now).await, 0);
+        assert_eq!(supervisor.prune_stopped_records(stopped(), old).await, 1);
+        assert!(supervisor.read_persisted_records().is_empty());
+
+        let records = supervisor.record_dir();
+        for i in 0..=RECORD_MAX_STOPPED {
+            let image_ref = format!("registry.local/team/app{i}:1");
+            let mut record = sample_record(PathBuf::from("/b"));
+            record.slug = slug_for(&image_ref);
+            record.image_ref = image_ref;
+            record.live = false;
+            record.updated_at = now - i as i64;
+            fs::write(
+                records.join(format!("{}.json", record.slug)),
+                serde_json::to_vec(&record).unwrap(),
+            )
+            .unwrap();
+        }
+        assert_eq!(supervisor.prune_stopped_records(stopped(), now).await, 1);
+        let oldest = slug_for(&format!("registry.local/team/app{RECORD_MAX_STOPPED}:1"));
+        assert!(!records.join(format!("{oldest}.json")).exists());
     }
 
     #[test]

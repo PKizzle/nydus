@@ -50,8 +50,13 @@ pub mod state;
 pub use dummycache::DummyCacheMgr;
 pub use filecache::{BLOB_DATA_FILE_SUFFIX, BLOB_RAW_FILE_SUFFIX, FileCacheMgr};
 
-/// Timeout in milli-seconds to retrieve blob data from backend storage.
-pub const SINGLE_INFLIGHT_WAIT_TIMEOUT: u64 = 2000;
+/// Longest time in milliseconds a reader waits for another thread's fill of the chunks it needs.
+///
+/// Every way a fill ends (data cached, an error, an unwind) clears its pending marks and wakes
+/// its waiters at once, so this bounds only a fill stuck in the backend. It stays far above a
+/// normal fill, which a slow backend or a large decode can stretch to many seconds, and finite,
+/// so a reader on the fanotify path still gets its permission event answered.
+pub const SINGLE_INFLIGHT_WAIT_TIMEOUT: u64 = 120_000;
 
 struct BlobIoMergeState<'a, F: FnMut(BlobIoRange)> {
     cb: F,

@@ -540,4 +540,136 @@ mod tests {
         map.set_verified(Some(7)).unwrap();
         assert!(map.is_verified(7));
     }
+
+    /// Every block of a chunk map is allocated when it is opened, new or left sparse by an older
+    /// release: the bitmap is written through a shared mapping, where a store into a hole on a
+    /// full file system raises SIGBUS instead of returning an error.
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support file-backed mmap")]
+    fn test_map_has_no_holes() {
+        use std::os::unix::fs::MetadataExt;
+
+        // Allocated blocks, not SEEK_HOLE: ext4 and btrfs report fallocated (unwritten) extents
+        // as holes there, although their blocks are reserved.
+        let no_holes = |path: &str| {
+            let md = std::fs::metadata(path).unwrap();
+            assert!(
+                md.blocks() * 512 >= md.len(),
+                "{path}: {} bytes allocated of {}",
+                md.blocks() * 512,
+                md.len()
+            );
+        };
+        let dir = TempDir::new().unwrap();
+        // A bitmap spanning several file system blocks.
+        let chunks = 8 * 3 * 4096;
+
+        let new = dir.path().join("blob-new").to_str().unwrap().to_string();
+        let map = IndexedChunkMap::new(&new, chunks, true).unwrap();
+        no_holes(&format!("{new}.{FILE_SUFFIX}"));
+        drop(map);
+
+        let old = dir.path().join("blob-old").to_str().unwrap().to_string();
+        let path = format!("{old}.{FILE_SUFFIX}");
+        let mut file = std::fs::File::create(&path).unwrap();
+        let header = Header {
+            magic: MAGIC1,
+            version: 1,
+            magic2: MAGIC2,
+            all_ready: 0,
+            verified: 0,
+            ready_count: 0,
+            data_stamp: 0,
+            reserved: [0x0u8; HEADER_RESERVED_SIZE],
+        };
+        file.write_all(header.as_slice()).unwrap();
+        file.set_len(HEADER_SIZE as u64 + chunks as u64 / 8)
+            .unwrap();
+        drop(file);
+        let map = IndexedChunkMap::new(&old, chunks, true).unwrap();
+        no_holes(&path);
+        assert!(!map.is_range_all_ready());
+    }
+
+    /// A chunk map with a damaged header is replaced by an empty one, not refused: refusing
+    /// fails the blob's open on every start. A process that still maps the old file keeps it
+    /// intact. A map of the wrong size is still refused, since a live opener with another chunk
+    /// count may be using it.
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support file-backed mmap")]
+    fn test_corrupt_map_is_recreated() {
+        use std::os::unix::fs::FileExt;
+
+        let dir = TempDir::new().unwrap();
+        let blob_path = dir.path().join("blob-corrupt");
+        let blob_path = blob_path.as_os_str().to_str().unwrap().to_string();
+        let map_path = format!("{blob_path}.{FILE_SUFFIX}");
+        let chunk = |index| MockChunkInfo {
+            index,
+            ..Default::default()
+        };
+        let filled = || {
+            let map = IndexedChunkMap::new(&blob_path, 64, true).unwrap();
+            for idx in 0..64u32 {
+                map.set_ready_and_clear_pending(chunk(idx).as_base())
+                    .unwrap();
+            }
+            map.set_verified(Some(7)).unwrap();
+            map
+        };
+        let assert_fresh = || {
+            let map = IndexedChunkMap::new(&blob_path, 64, true).unwrap();
+            assert!(!map.is_range_all_ready());
+            assert!(!map.is_verified(7));
+            for idx in 0..64u32 {
+                assert!(!map.is_ready(chunk(idx).as_base()).unwrap());
+            }
+            map.set_ready_and_clear_pending(chunk(3).as_base()).unwrap();
+            assert!(map.is_ready(chunk(3).as_base()).unwrap());
+        };
+
+        // Wrong size.
+        let live = filled();
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&map_path)
+            .unwrap();
+        file.set_len(HEADER_SIZE as u64 + 4).unwrap();
+        drop(file);
+        drop(live);
+        assert!(IndexedChunkMap::new(&blob_path, 64, true).is_err());
+        std::fs::remove_file(&map_path).unwrap();
+
+        // Damaged magic.
+        let live = filled();
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&map_path)
+            .unwrap();
+        file.write_all_at(&[0xff; 4], 0).unwrap();
+        drop(file);
+        drop(live);
+        assert_fresh();
+
+        // Damaged second magic, while another opener still maps the old file.
+        let live = filled();
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&map_path)
+            .unwrap();
+        file.write_all_at(&[0xff; 4], 8).unwrap();
+        drop(file);
+        assert_fresh();
+        assert!(live.is_ready(chunk(10).as_base()).unwrap());
+        assert!(live.is_range_all_ready());
+
+        // An opener that may not create the map still refuses a damaged one.
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&map_path)
+            .unwrap();
+        file.write_all_at(&[0xff; 4], 8).unwrap();
+        drop(file);
+        assert!(PersistMap::open(&map_path, 64, false, true).is_err());
+    }
 }

@@ -191,7 +191,20 @@ the mount is detached. The FUSE path refuses to mount over any kernel mount.
 The cache of a fanotify daemon lives in its `daemons/<slug>/stage` dir, next to the staged
 bootstrap. Cache GC and the cache-bytes metric count it (each inode once: the `blob_<i>` device
 files are hardlinks to the `.blob.data` files) against `gc_max_bytes`, but never evict it; a dead
-daemon's dir goes with the stale daemon-dir sweep.
+daemon's dir goes with the stale daemon-dir sweep, or is kept and evicted by [stage
+retention](#stage-retention) when that is on. Cache accounting counts the bytes allocated on
+disk (`st_blocks`), not file lengths: a sparse cache file counts only the chunks it holds, so
+`gc_max_bytes` bounds real disk use. Both `/metrics` endpoints answer from a scan at most 60 s
+old.
+
+The slug is derived from the image ref, so after its tag moved to another image a start finds the
+daemon dir of the image the ref named before. A fanotify stage dir whose `bootstrap` was staged
+from another source (its `bootstrap.view-of` records another source, or it is no copy of the new
+one) is emptied before the new source is staged, caches included. A blockdev or tarfs
+`image.erofs` is served again only when `image.erofs.source` records the SHA-256 of the bootstrap
+being served; otherwise the bootstrap is exported into a new file that is then moved into place,
+and its source recorded. A mounted image is never replaced: a start that finds one exported from
+another bootstrap fails.
 
 A fanotify daemon's saved upgrade state carries its blob list without credentials. A takeover after
 a restart and an in-place heal both rebuild the blob list with the credentials the runtime auth
@@ -293,6 +306,63 @@ CI (`.github/workflows/fanotify-vm.yml`) runs the self-test and walks an image f
 4K-block image. `misc/erofs-folio/expect.sh` fails the job unless the verdict is the one the matrix
 lists for that kernel (affected for 7.3.1, unaffected for the others), the padded copy reads
 cleanly, and the unpadded one fails exactly on an affected kernel.
+
+## Stage retention
+
+When the last container of an image exits, its fanotify daemon stops and its mount goes. Without
+retention, the reconciler then removes `daemons/<slug>/` (node view and caches) once it is older
+than the reconcile period, so the next start of the image is cold. With retention on, the stage
+stays, and the next start mounts the staged node view again and serves from the caches it holds.
+Nothing else is kept: no daemon, mount or open file.
+
+```toml
+[snapshotter.cache]
+retention = false               # default
+retention_max_bytes = "10%"     # bytes ("20GiB") or a percentage of the filesystem holding daemons/
+retention_min_free = "20%"      # same units
+retention_idle_limit = "auto"   # or a duration such as "7d"
+```
+
+A stage is retained while its image has a stopped daemon record (`daemons/records/<slug>.json`,
+`live = false`, `updated_at` is the stop time), a `stage` dir and no daemon. Daemon dirs without a
+record, and blockdev or tarfs dirs (no `stage`), are swept as before. A snapshotter restart ignores
+retained stages until their image starts again; the Cleanup RPC runs a normal reconcile pass and
+keeps them too.
+
+Every reconcile tick, the reconciler reads the records and the filesystem's free space (one
+`statvfs`) and evicts, one stage at a time:
+
+1. every retained stage idle longer than its limit;
+2. then, while there is a deficit, the stage idle longest relative to its limit, the larger first on
+   a tie. The deficit is the largest of: retained bytes over `retention_max_bytes`;
+   `retention_min_free` over the space available to unprivileged users (`f_bavail`); and, on the
+   slow pass with `gc_max_bytes` set (and `gc_dry_run` off), all cache bytes over `gc_max_bytes`.
+   That pass runs before the cache GC, so retained stages go before any `work_dir` file.
+
+The plan is made again after every eviction. A stage whose eviction fails or is refused still counts
+against the limits but is not chosen again in that pass, so the next stage goes instead. If the
+records cannot be read, the pass fails and no daemon dir is swept.
+
+With `retention_idle_limit = "auto"`, each image learns its start gap `G` from its own starts:
+every start after a release (the last holder of the image went; the stopped record carries
+`released_at`) sets `G = max(now - released_at, 0.75 * G)`, so `G` follows a longer gap at
+once and forgets it by a quarter per start. The limit is `2 * G`, at least 1 h and at most 30 days,
+and 26 h while `G` is unknown. `G` is kept in the daemon record (`start_gap`, seconds), which the
+records endpoint shows. A heal, replacement, upgrade, or start after a snapshotter shutdown keeps
+`G` and is not counted as a warm or cold start.
+
+A stage's files are measured (allocated blocks, each inode once) once after it became retained; a
+stage that cannot be measured is counted at its last known size, or left out of that pass. An
+eviction takes the image's start lock and checks again that no daemon serves the image, that the
+record is unchanged and still stopped, and that nothing is mounted under the dir; a start that got
+there first keeps its stage. The record outlives its stage. Stopped records without a stage are
+deleted after 60 days idle, and beyond the newest 4096, so a gap longer than the stage lived can
+still be learned. A stop time in the future (the clock stepped back) counts as idle for zero
+seconds and teaches no gap.
+
+A retained cache is trusted no more than any cache a stopped daemon left behind (see [Fill
+validation](#fill-validation)): unless it still reads as verified, its ready chunks are checked
+again while serving goes on.
 
 ## Cache eviction
 
@@ -397,7 +467,16 @@ staged as a padded copy of its own bootstrap and no view is built.
 
 `inode_share` is fixed for a mount's life, and a takeover or in-place heal keeps the mount and
 its staged view (the view is rebuilt only when the image's bootstrap changes, recorded in
-`stage/bootstrap.view-of`). Sharing therefore starts with a fresh mount: a fresh cache qualifies
+`stage/bootstrap.view-of`). A fresh start of an image whose stage dir is still there mounts the
+view staged before without building or checking it again only while `stage/bootstrap.view-of`
+matches the SHA-256 of the image's bootstrap and `stage/bootstrap.view-checked` holds the SHA-256
+of the staged view, the version of the running snapshotter and the host page size. That record is
+written only after `check_node_view` and the layout checks passed, so the view a mount uses was
+checked by this release, in this or an earlier process, padded to this page size, and its bytes
+are unchanged since; anything else builds the view again. `bootstrap.view-of` stays while a view
+is rebuilt, so an interrupted rebuild never makes the stage look staged from another source. A
+staged padded copy of the bootstrap is likewise kept while it is still a copy of it, and padded to
+the current page size. Sharing therefore starts with a fresh mount: a fresh cache qualifies
 at once; a cache holding chunks nobody checked yet (filled by an older release) mounts without
 sharing and qualifies on its next mount once the background verifier has recorded it verified.
 `/proc/self/mounts` shows `inode_share,domain_id=nydus-node-local` on a sharing mount, and

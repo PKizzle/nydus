@@ -79,6 +79,9 @@ pub struct Reconciler {
     /// Slugs the last mount-health pass found dead, so each one is logged
     /// when it dies and when it recovers rather than on every tick.
     dead_mounts: std::sync::Mutex<HashSet<String>>,
+    /// Allocated bytes of each retained stage, with the `updated_at` of the record it was
+    /// measured under: a retained stage has no writer, so it is measured once per retention.
+    retained_sizes: std::sync::Mutex<HashMap<String, (i64, u64)>>,
 }
 
 impl Reconciler {
@@ -101,6 +104,7 @@ impl Reconciler {
             mount_probe_timeout: None,
             refcount_recon: None,
             dead_mounts: std::sync::Mutex::new(HashSet::new()),
+            retained_sizes: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -221,12 +225,6 @@ impl Reconciler {
         // 2. Check for orphan overlay mounts under the snapshots root.
         note("orphan mounts", self.check_orphan_mounts().await);
 
-        // 3. Check for stale per-daemon state directories.
-        note("stale daemon dirs", self.check_stale_daemon_dirs().await);
-
-        // 4. Probe live daemon mountpoints for consumer-visible health.
-        self.check_mount_health().await;
-
         let run_slow = {
             let mut last = self.last_slow_pass.lock().unwrap();
             let due = last.is_none_or(|at| at.elapsed() >= self.slow_interval);
@@ -235,6 +233,18 @@ impl Reconciler {
             }
             due
         };
+
+        // 3. Evict retained stages past their limits and sweep stale per-daemon state
+        //    directories. On the slow pass this runs before the cache GC, so retained stages
+        //    go before any work_dir file.
+        note(
+            "stale daemon dirs",
+            self.check_stale_daemon_dirs(run_slow).await,
+        );
+
+        // 4. Probe live daemon mountpoints for consumer-visible health.
+        self.check_mount_health().await;
+
         if run_slow {
             // 5. Account for and optionally garbage-collect blob-cache artifacts.
             note("cache gc", self.check_cache_gc().await);
@@ -372,7 +382,8 @@ impl Reconciler {
     }
 
     /// Delete auto-accel sidecar Image records whose subject image no longer
-    /// exists on the node (see [`Reconciler::with_sidecar_gc`]). Best-effort
+    /// exists on the node (see [`Reconciler::with_sidecar_gc`]), or whose
+    /// manifest or blobs containerd no longer has. Best-effort
     /// and conservative: any failure to enumerate or resolve images aborts the
     /// pass without deleting anything, so a transient containerd hiccup can
     /// never sweep a live sidecar.
@@ -430,16 +441,44 @@ impl Reconciler {
         for sidecar in sidecars {
             let subject_hex = &sidecar.name[SIDECAR_PREFIX.len()..];
             let subject = format!("sha256:{subject_hex}");
-            if live_subjects.contains(&subject) {
-                continue;
-            }
-            match deps.content_store.images_delete(&sidecar.name).await {
+            let reason = if !live_subjects.contains(&subject) {
+                "subject image gone"
+            } else {
+                // A record whose manifest or blobs are gone can never be served, and
+                // keeps failing every image walk; a conversion of the subject rebuilds
+                // it. Only NotFound counts as gone: an RPC failure leaves it alone.
+                match crate::auto_zran::completeness_check(
+                    &deps.content_store,
+                    &sidecar.target_digest,
+                )
+                .await
+                {
+                    Ok(true) => continue,
+                    Ok(false) => "content incomplete",
+                    Err(e) => {
+                        debug!(
+                            sidecar = %sidecar.name,
+                            error = %format_args!("{e:#}"),
+                            "recon: sidecar completeness unknown; keeping it"
+                        );
+                        continue;
+                    }
+                }
+            };
+            // Conditional on the listed target, so a record a conversion repointed
+            // since the listing is kept.
+            match deps
+                .content_store
+                .images_delete(&sidecar.name, Some(&sidecar.target_digest))
+                .await
+            {
                 Ok(()) => {
                     removed += 1;
                     info!(
                         sidecar = %sidecar.name,
                         subject = %subject,
-                        "recon: removed orphan auto-accel sidecar record (subject image gone)"
+                        reason,
+                        "recon: removed auto-accel sidecar record"
                     );
                 }
                 Err(e) => warn!(
@@ -551,23 +590,204 @@ impl Reconciler {
 
     /// Remove `{root}/daemons/<slug>/` directories that no longer correspond
     /// to a live daemon instance. Avoids removing the mountpoint while it is
-    /// in use by checking `/proc/mounts` first.
-    async fn check_stale_daemon_dirs(&self) -> Result<()> {
+    /// in use by checking `/proc/mounts` first. With retention on, the stages
+    /// of stopped daemon records are kept within the retention limits instead
+    /// (see [`Self::check_retention`]); `slow` is whether this is a slow pass.
+    /// When the records cannot be read, nothing is swept: a retained stage
+    /// would look like a dir without a record.
+    async fn check_stale_daemon_dirs(&self, slow: bool) -> Result<()> {
         let daemons_root = self.supervisor.daemons_root();
-        let active = self.supervisor.active_slugs().await;
-        let busy = read_proc_mounts()
-            .map(|m| {
-                m.into_iter()
-                    .map(|e| e.target)
-                    .collect::<HashSet<PathBuf>>()
-            })
-            .unwrap_or_default();
+        let mut keep = self.supervisor.active_slugs().await;
+        let mut result = Ok(());
+        if let Some(policy) = self.supervisor.retention_policy() {
+            let records = self
+                .read_daemon_records(&daemons_root)
+                .await
+                .context("failed to read the daemon records; not sweeping daemon dirs")?;
+            let retained: Vec<_> = records
+                .iter()
+                .filter(|r| !r.record.live && r.has_stage && !keep.contains(&r.record.slug))
+                .map(|r| r.record.clone())
+                .collect();
+            let stopped_without_dir = records
+                .into_iter()
+                .filter(|r| !r.record.live && !r.has_dir)
+                .map(|r| r.record)
+                .collect();
+            let kept = match self
+                .check_retention(policy, &daemons_root, retained.clone(), slow)
+                .await
+            {
+                Ok(kept) => kept,
+                // A failed retention pass must not hand the retained stages to the sweep.
+                Err(e) => {
+                    result = Err(e);
+                    retained
+                }
+            };
+            keep.extend(kept.into_iter().map(|r| r.slug));
+            let pruned = self
+                .supervisor
+                .prune_stopped_records(stopped_without_dir, unix_now())
+                .await;
+            if pruned > 0 {
+                info!(pruned, "recon: pruned stopped daemon records");
+            }
+        }
+        // Without the mount table a dir with a mount under it looks sweepable: sweep nothing.
+        let busy = match read_proc_mounts() {
+            Ok(mounts) => mounts
+                .into_iter()
+                .map(|e| e.target)
+                .collect::<HashSet<PathBuf>>(),
+            Err(e) => {
+                return result.and(Err(anyhow::Error::new(e)).context("not sweeping daemon dirs"));
+            }
+        };
 
-        let removed = sweep_stale_daemon_dirs(&daemons_root, &active, &busy, self.interval)?;
+        let removed = sweep_stale_daemon_dirs(&daemons_root, &keep, &busy, self.interval)?;
         if removed > 0 {
             info!(removed, "recon: stale daemon dir sweep completed");
         }
-        Ok(())
+        result
+    }
+
+    /// The persisted daemon records, each with whether its daemon dir and its stage dir exist,
+    /// read in one go on the blocking pool.
+    async fn read_daemon_records(&self, daemons_root: &Path) -> std::io::Result<Vec<RecordDirs>> {
+        let supervisor = self.supervisor.clone();
+        let root = daemons_root.to_path_buf();
+        blocking::unblock(move || {
+            Ok(supervisor
+                .try_read_persisted_records()?
+                .into_iter()
+                .map(|record| {
+                    let dir = root.join(&record.slug);
+                    RecordDirs {
+                        has_dir: dir.exists(),
+                        has_stage: std::fs::symlink_metadata(dir.join("stage"))
+                            .is_ok_and(|m| m.is_dir()),
+                        record,
+                    }
+                })
+                .collect())
+        })
+        .await
+    }
+
+    /// Evict the retained stages the retention policy chooses ([`crate::retention::plan`]),
+    /// one at a time on the blocking pool, and return the retained stages that remain. The plan
+    /// is made again after each eviction; a stage whose eviction fails or is refused stays
+    /// counted, but is not chosen again this pass. Costs one `statvfs` per tick; a stage's files
+    /// are measured once after it became retained, and every cache file only on the slow pass
+    /// with `gc_max_bytes` set (not with `gc_dry_run`). A stage that cannot be measured is
+    /// counted at its last known size, or left out of the policy this pass.
+    async fn check_retention(
+        &self,
+        policy: crate::retention::Policy,
+        daemons_root: &Path,
+        mut retained: Vec<crate::daemon::DaemonStatusRecord>,
+        slow: bool,
+    ) -> Result<Vec<crate::daemon::DaemonStatusRecord>> {
+        let now = unix_now();
+        let mut stages = Vec::with_capacity(retained.len());
+        for record in &retained {
+            let memo = self
+                .retained_sizes
+                .lock()
+                .unwrap()
+                .get(&record.slug)
+                .copied();
+            let stage = daemons_root.join(&record.slug).join("stage");
+            let measured = match memo {
+                Some((at, _)) if at == record.updated_at => None,
+                _ => Some(
+                    blocking::unblock(move || crate::cache::allocated_tree_bytes(&stage)).await,
+                ),
+            };
+            if let Some(Ok(bytes)) = &measured {
+                self.retained_sizes
+                    .lock()
+                    .unwrap()
+                    .insert(record.slug.clone(), (record.updated_at, *bytes));
+            }
+            let bytes = retained_size(&record.slug, record.updated_at, memo, measured.as_ref());
+            if let Some(bytes) = bytes {
+                stages.push(crate::retention::Stage {
+                    slug: record.slug.clone(),
+                    bytes,
+                    stopped_at: record.updated_at,
+                    gap: record.start_gap,
+                    pinned: false,
+                });
+            }
+        }
+        self.retained_sizes
+            .lock()
+            .unwrap()
+            .retain(|slug, _| retained.iter().any(|r| &r.slug == slug));
+
+        let root = daemons_root.to_path_buf();
+        let mut fs = blocking::unblock(move || filesystem_of(&root))
+            .await
+            .with_context(|| format!("failed to statvfs {}", daemons_root.display()))?;
+        let mut cache_excess = match (&self.cache_gc, slow) {
+            (Some((manager, gc)), true) if gc.max_bytes.is_some() && !gc.dry_run => {
+                let manager = manager.clone();
+                let total = blocking::unblock(move || manager.scan().map(|u| u.total_bytes))
+                    .await
+                    .context("failed to scan the cache")?;
+                total.saturating_sub(gc.max_bytes.unwrap_or(u64::MAX))
+            }
+            _ => 0,
+        };
+
+        while let Some((slug, reason)) =
+            crate::retention::plan(&policy, &stages, fs, cache_excess, now)
+                .into_iter()
+                .next()
+        {
+            let pos = stages.iter().position(|s| s.slug == slug).expect("planned");
+            let at = retained
+                .iter()
+                .position(|r| r.slug == slug)
+                .expect("measured");
+            match self.supervisor.evict_retained(&retained[at]).await {
+                Ok(true) => {
+                    let bytes = stages.remove(pos).bytes;
+                    fs.available = fs.available.saturating_add(bytes);
+                    cache_excess = cache_excess.saturating_sub(bytes);
+                    self.supervisor.retention_stats().record_eviction(reason);
+                    info!(
+                        slug,
+                        reason = reason.label(),
+                        bytes,
+                        "recon: evicted a retained stage"
+                    );
+                    retained.remove(at);
+                }
+                result => {
+                    match result {
+                        Ok(_) => debug!(slug, "recon: retained stage changed; not evicting it"),
+                        Err(e) => {
+                            warn!(slug, error = %format!("{e:#}"), "recon: failed to evict a retained stage")
+                        }
+                    }
+                    stages[pos].pinned = true;
+                }
+            }
+        }
+
+        self.supervisor
+            .retention_stats()
+            .set_gauges(crate::retention::Gauges {
+                retained_stages: retained.len() as u64,
+                retained_bytes: stages.iter().map(|s| s.bytes).sum(),
+                max_bytes: policy.max_bytes.bytes(fs.total),
+                min_free: policy.min_free.bytes(fs.total),
+                fs_available: fs.available,
+            });
+        Ok(retained)
     }
 
     /// Remove `{auto_zran.work_dir}/<job-key>/` scratch directories that have
@@ -839,6 +1059,49 @@ fn sweep_stale_daemon_dirs(
         }
     }
     Ok(removed)
+}
+
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64)
+}
+
+/// Size and space available to unprivileged users of the filesystem holding `path`.
+fn filesystem_of(path: &Path) -> std::io::Result<crate::retention::Filesystem> {
+    let stat = nix::sys::statvfs::statvfs(path).map_err(std::io::Error::from)?;
+    let frsize = stat.fragment_size() as u64;
+    Ok(crate::retention::Filesystem {
+        total: (stat.blocks() as u64).saturating_mul(frsize),
+        available: (stat.blocks_available() as u64).saturating_mul(frsize),
+    })
+}
+
+/// The size to plan a retained stage with: the memo `(updated_at, bytes)` while it is current,
+/// else the fresh `measured` size; when that failed, the last known size, or `None` to leave the
+/// stage out of this pass.
+fn retained_size(
+    slug: &str,
+    updated_at: i64,
+    memo: Option<(i64, u64)>,
+    measured: Option<&std::io::Result<u64>>,
+) -> Option<u64> {
+    match (memo, measured) {
+        (Some((at, bytes)), _) if at == updated_at => Some(bytes),
+        (_, Some(Ok(bytes))) => Some(*bytes),
+        (memo, Some(Err(e))) => {
+            warn!(slug, error = %e, "recon: failed to measure a retained stage");
+            memo.map(|(_, bytes)| bytes)
+        }
+        (_, None) => None,
+    }
+}
+
+/// A persisted daemon record and what exists of its daemon dir.
+struct RecordDirs {
+    record: crate::daemon::DaemonStatusRecord,
+    has_dir: bool,
+    has_stage: bool,
 }
 
 /// One row of `/proc/mounts` that the reconciler cares about.
@@ -1230,5 +1493,172 @@ proc /proc proc rw,nosuid 0 0
         // Idempotent, and a missing dir is not an error.
         assert_eq!(sweep_orphan_short_links(&link_dir), 0);
         assert_eq!(sweep_orphan_short_links(&root.path().join("nope")), 0);
+    }
+
+    /// Writes the stopped daemon record of image `name` with stop time `stopped_at` and returns
+    /// its daemon dir, holding a stage aged two hours.
+    fn retained_stage(root: &Path, name: &str, stopped_at: i64) -> PathBuf {
+        let image_ref = format!("registry.example/{name}:1");
+        let slug = &crate::daemon::slug_for(&image_ref);
+        let records = root.join("daemons/records");
+        std::fs::create_dir_all(&records).unwrap();
+        let record = serde_json::json!({
+            "image_ref": image_ref,
+            "slug": slug,
+            "mountpoint": root.join("daemons").join(slug).join("mnt"),
+            "bootstrap": "/nonexistent/bootstrap",
+            "refcount": 0,
+            "state": "STOPPED",
+            "live": false,
+            "updated_at": stopped_at,
+        });
+        std::fs::write(records.join(format!("{slug}.json")), record.to_string()).unwrap();
+        let dir = root.join("daemons").join(slug);
+        std::fs::create_dir_all(dir.join("stage")).unwrap();
+        std::fs::create_dir_all(dir.join("mnt")).unwrap();
+        std::fs::write(dir.join("stage/bootstrap"), vec![1u8; 8192]).unwrap();
+        touch_dir_with_age(&root.join("daemons"), slug, Duration::from_secs(7200))
+    }
+
+    /// With retention on, a reconcile pass keeps the stage of a released image that is within
+    /// its limits, and still sweeps a daemon dir without a record.
+    #[compio::test]
+    async fn a_reconcile_pass_keeps_a_retained_stage() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config: crate::config::SnapshotterConfig =
+            toml::from_str("[snapshotter.cache]\nretention = true\nretention_min_free = \"0%\"\n")
+                .unwrap();
+        config.snapshotter.root = tmp.path().to_path_buf();
+        let now = unix_now();
+        let retained = retained_stage(tmp.path(), "retained", now - 60);
+        let orphan = touch_dir_with_age(
+            &tmp.path().join("daemons"),
+            "bbbb-orphan",
+            Duration::from_secs(7200),
+        );
+        let reconciler = Reconciler::new(
+            Arc::new(DaemonSupervisor::new(config)),
+            Arc::new(SnapshotStore::open(&tmp.path().join("metadata.fjall")).unwrap()),
+            Duration::from_secs(3600),
+        );
+
+        let _ = reconciler.run_once().await;
+        assert!(
+            retained.join("stage/bootstrap").exists(),
+            "the retained stage was swept"
+        );
+        assert!(
+            !orphan.exists(),
+            "a dir without a record is swept as before"
+        );
+    }
+
+    /// With `gc_dry_run`, `gc_max_bytes` evicts no retained stage either.
+    #[compio::test]
+    async fn gc_dry_run_evicts_no_retained_stage() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config: crate::config::SnapshotterConfig = toml::from_str(
+            "[snapshotter.cache]\nretention = true\nretention_min_free = \"0%\"\n\
+             gc_max_bytes = 0\ngc_dry_run = true\n",
+        )
+        .unwrap();
+        config.snapshotter.root = tmp.path().to_path_buf();
+        config.snapshotter.cache.work_dir = tmp.path().join("cache");
+        let stage = retained_stage(tmp.path(), "recent", unix_now() - 60);
+        let manager = CacheManager::from_config(&config);
+        let policy = CacheGcPolicy::from_config(&config).unwrap();
+        let reconciler = Reconciler::new(
+            Arc::new(DaemonSupervisor::new(config)),
+            Arc::new(SnapshotStore::open(&tmp.path().join("metadata.fjall")).unwrap()),
+            Duration::from_secs(3600),
+        )
+        .with_cache_gc(manager, policy);
+
+        let _ = reconciler.run_once().await;
+        assert!(stage.join("stage/bootstrap").exists());
+    }
+
+    /// A stage that cannot be measured keeps its last known size, or sits this pass out.
+    #[test]
+    fn an_unmeasurable_stage_keeps_its_last_size() {
+        let failed = Err(std::io::Error::from_raw_os_error(libc::EIO));
+        assert_eq!(retained_size("s", 5, Some((5, 10)), None), Some(10));
+        assert_eq!(
+            retained_size("s", 6, Some((5, 10)), Some(&Ok(20))),
+            Some(20)
+        );
+        assert_eq!(
+            retained_size("s", 6, Some((5, 10)), Some(&failed)),
+            Some(10)
+        );
+        assert_eq!(retained_size("s", 6, None, Some(&failed)), None);
+    }
+
+    /// When the records cannot be read, the pass fails and sweeps nothing: a retained stage would
+    /// look like a dir without a record.
+    #[compio::test]
+    async fn unreadable_records_sweep_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config: crate::config::SnapshotterConfig =
+            toml::from_str("[snapshotter.cache]\nretention = true\n").unwrap();
+        config.snapshotter.root = tmp.path().to_path_buf();
+        let stage = retained_stage(tmp.path(), "retained", unix_now() - 60);
+        // Not a directory: reading it fails with ENOTDIR, whoever runs the test.
+        let records = tmp.path().join("daemons/records");
+        std::fs::remove_dir_all(&records).unwrap();
+        std::fs::write(&records, b"").unwrap();
+        let reconciler = Reconciler::new(
+            Arc::new(DaemonSupervisor::new(config)),
+            Arc::new(SnapshotStore::open(&tmp.path().join("metadata.fjall")).unwrap()),
+            Duration::from_secs(3600),
+        );
+
+        let err = reconciler.run_once().await.unwrap_err();
+        assert!(format!("{err:#}").contains("daemon records"), "{err:#}");
+        assert!(stage.join("stage/bootstrap").exists());
+    }
+
+    /// A retained stage idle past its limit is evicted, its record kept. On the slow pass with
+    /// `gc_max_bytes` set, retained stages go before any `work_dir` file.
+    #[compio::test]
+    async fn retention_evicts_idle_stages_before_work_dir_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = tmp.path().join("cache");
+        std::fs::create_dir_all(cache.join("img")).unwrap();
+        std::fs::write(cache.join("img/abc.blob.data"), vec![1u8; 4096]).unwrap();
+        let mut config: crate::config::SnapshotterConfig = toml::from_str(
+            "[snapshotter.cache]\nretention = true\nretention_idle_limit = \"1h\"\n\
+             retention_min_free = \"0%\"\n",
+        )
+        .unwrap();
+        config.snapshotter.root = tmp.path().to_path_buf();
+        config.snapshotter.cache.work_dir = cache.clone();
+        let now = unix_now();
+        let idle = retained_stage(tmp.path(), "idle", now - 7200);
+        let recent = retained_stage(tmp.path(), "recent", now - 60);
+        let manager = CacheManager::from_config(&config);
+        let work_dir_bytes = crate::cache::allocated_tree_bytes(&cache).unwrap();
+        let recent_bytes = crate::cache::allocated_tree_bytes(&recent.join("stage")).unwrap();
+        // Room for the work_dir file, not for the recent stage as well.
+        config.snapshotter.cache.gc_max_bytes = Some(work_dir_bytes + recent_bytes / 2);
+        let policy = CacheGcPolicy::from_config(&config).unwrap();
+        let supervisor = Arc::new(DaemonSupervisor::new(config));
+        let reconciler = Reconciler::new(
+            supervisor.clone(),
+            Arc::new(SnapshotStore::open(&tmp.path().join("metadata.fjall")).unwrap()),
+            Duration::from_secs(3600),
+        )
+        .with_cache_gc(manager, policy);
+
+        let _ = reconciler.run_once().await;
+        assert!(!idle.exists(), "the idle stage was kept");
+        assert!(!recent.exists(), "the stage went after a work_dir file");
+        assert!(cache.join("img/abc.blob.data").exists());
+        assert_eq!(supervisor.read_persisted_records().len(), 2);
+        let stats = supervisor.retention_stats();
+        assert_eq!(stats.evictions(crate::retention::Reason::Idle), 1);
+        assert_eq!(stats.evictions(crate::retention::Reason::GcMaxBytes), 1);
+        let gauges = stats.gauges().unwrap();
+        assert_eq!((gauges.retained_stages, gauges.retained_bytes), (0, 0));
     }
 }

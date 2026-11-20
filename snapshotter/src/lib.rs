@@ -60,6 +60,7 @@ pub mod peer_mirror_selfcheck;
 pub mod prefetch_profile;
 pub mod probe;
 pub mod recon;
+pub mod retention;
 pub mod source;
 pub mod store;
 pub mod sysctl;
