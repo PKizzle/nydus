@@ -244,6 +244,22 @@ impl RangeMap for BlobStateMap<IndexedChunkMap, u32> {
         self.c.update_data_stamp(data_stamp)
     }
 
+    fn adopt_boot(&self, boot: u64, forget_untrusted: bool) -> StorageResult<bool> {
+        self.c.adopt_boot(boot, forget_untrusted)
+    }
+
+    fn mark_unsealed(&self) -> StorageResult<()> {
+        self.c.mark_unsealed()
+    }
+
+    fn seal(&self, flush: &mut dyn FnMut() -> StorageResult<Option<u64>>) -> StorageResult<bool> {
+        self.c.seal(flush)
+    }
+
+    fn is_rechecking(&self) -> bool {
+        self.c.is_rechecking()
+    }
+
     fn is_range_ready(&self, start: Self::I, count: Self::I) -> StorageResult<bool> {
         self.c.is_range_ready(start, count)
     }

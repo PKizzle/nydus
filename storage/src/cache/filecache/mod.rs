@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 use std::fs::OpenOptions;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use nydus_api::{CacheConfigV2, MetadataSource};
@@ -319,6 +319,22 @@ impl FileCacheEntry {
                     e => Err(e),
                 })?;
             }
+            // Every opener records its boot before a ready bit, since a fanotify daemon may
+            // serve these files next. The kernel reads a fanotify cache's ready chunks unchecked,
+            // and after a crash their bytes may have been lost with the page cache: a map
+            // another boot left unsealed, or an older release filled, forgets them, keeping the
+            // data file for the fills to recheck.
+            if let Some(map) = chunk_map.as_range_map() {
+                match map.adopt_boot(crate::utils::boot_id(), mgr.fanotify) {
+                    Ok(true) => warn!(
+                        "blob {blob_id}: cache not known to be on stable storage (not sealed \
+                         before the last reboot, or filled by an older release); rechecking its \
+                         cached chunks as they are read"
+                    ),
+                    Ok(false) | Err(StorageError::Unsupported) => {}
+                    Err(e) => return Err(e),
+                }
+            }
             // Set cache file to its expected size.
             let file = OpenOptions::new()
                 .create(true)
@@ -450,6 +466,7 @@ impl FileCacheEntry {
             need_validation,
             bootstrap_digests,
             digest_mismatches: AtomicU32::new(0),
+            own_ctime: AtomicU64::new(0),
             user_io_batch_size: mgr.user_io_batch_size,
             prefetch_config,
         })

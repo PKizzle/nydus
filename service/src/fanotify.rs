@@ -438,6 +438,10 @@ pub struct FanotifyHandler {
     /// event instead of serving it, and the owning daemon reports itself unhealthy so the
     /// supervisor replaces the handler. See [`fail`](Self::fail).
     failed: AtomicBool,
+    /// Runs as [`seal`](Self::seal) starts, for tests to raise an event during a seal.
+    #[cfg(test)]
+    #[allow(clippy::type_complexity)]
+    before_seal: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     /// Barrier that workers must reach before `stop()` returns.
     barrier: Barrier,
     /// The worker threads, joined once they pass the barrier, so a stopped handler is held
@@ -1108,6 +1112,8 @@ impl FanotifyHandler {
         Ok(FanotifyHandler {
             active: AtomicBool::new(true),
             failed: AtomicBool::new(false),
+            #[cfg(test)]
+            before_seal: Mutex::new(None),
             barrier: Barrier::new(threads + 1),
             workers: Mutex::new(Vec::new()),
             threads,
@@ -1503,6 +1509,48 @@ impl FanotifyHandler {
     pub fn stop(&self) {
         self.stop_workers();
         self.drain_deny_pending();
+    }
+
+    /// [`stop`](Self::stop) with a [`seal`](Self::seal) between stopping the workers and the
+    /// drain, so events raised during the seal's flush are denied too rather than left for the
+    /// group's release to allow.
+    pub fn stop_and_seal(&self) {
+        self.stop_workers();
+        self.seal();
+        self.drain_deny_pending();
+    }
+
+    /// Seal every blob's cache after [`stop`](Self::stop) or [`stop_workers`](Self::stop_workers),
+    /// so a later boot trusts what it holds (`BlobObject::seal`). A failed handler seals
+    /// nothing: whatever failed may have left its caches half-updated, and an unsealed cache
+    /// is only rechecked. Never call it from `Drop`, nor for a handler a heal or takeover
+    /// suspends: its successor serves the same caches.
+    pub fn seal(&self) {
+        #[cfg(test)]
+        if let Some(hook) = self.before_seal.lock().unwrap().take() {
+            hook();
+        }
+        if self.is_failed() {
+            return;
+        }
+        for backing in &self.blob_backings {
+            let blob_id = backing.blob.blob_info().blob_id();
+            // Excludes the verifier's revocations; fills are ordered by the chunk map itself.
+            let Ok(_sealing) = backing.io_lock.write() else {
+                warn!("fanotify: not sealing the cache of blob {blob_id}: its io lock is poisoned");
+                continue;
+            };
+            let Some(obj) = backing.blob.blob().get_blob_object() else {
+                continue;
+            };
+            match obj.seal() {
+                Ok(()) | Err(nydus_storage::StorageError::Unsupported) => {}
+                Err(e) => warn!(
+                    "fanotify: cannot seal the cache of blob {blob_id}: {e}; it is rechecked \
+                     after a reboot"
+                ),
+            }
+        }
     }
 
     /// Signal all workers to stop and wait until they have exited, leaving queued events for a
@@ -2739,6 +2787,38 @@ mod tests {
         })]);
     }
 
+    /// Every regular file under `dir`, unread.
+    fn walkdir(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let mut out = Vec::new();
+        let mut stack = vec![dir.to_path_buf()];
+        while let Some(d) = stack.pop() {
+            for entry in std::fs::read_dir(&d).unwrap() {
+                let entry = entry.unwrap();
+                let ft = entry.file_type().unwrap();
+                if ft.is_dir() {
+                    stack.push(entry.path());
+                } else if ft.is_file() {
+                    out.push(entry.path());
+                }
+            }
+        }
+        out.sort();
+        out
+    }
+
+    /// The 8-byte chunk map header word at `offset` of the cache file `cache`.
+    fn chunk_map_word(cache: &std::path::Path, offset: u64) -> u64 {
+        use std::os::unix::fs::FileExt;
+        let mut map = cache.as_os_str().to_owned();
+        map.push(".chunk_map");
+        let mut word = [0u8; 8];
+        std::fs::File::open(map)
+            .unwrap()
+            .read_exact_at(&mut word, offset)
+            .unwrap();
+        u64::from_ne_bytes(word)
+    }
+
     /// Unmount `mnt`, lazily.
     fn umount(mnt: &std::path::Path) {
         let mnt = std::ffi::CString::new(mnt.as_os_str().as_encoded_bytes()).unwrap();
@@ -2747,7 +2827,9 @@ mod tests {
     }
 
     /// A verified cache stays verified when its handler is rebuilt over the same work dir with
-    /// no data changed, so the next daemon neither re-checks it nor keeps it from sharing.
+    /// no data changed, so the next daemon neither re-checks it nor keeps it from sharing. Two
+    /// workers fill it concurrently after it was verified, which may leave the stamp of the
+    /// slower fill recorded; the seal at stop repairs that and records the cache as sealed.
     #[test]
     fn a_verified_cache_stays_verified_across_handlers() {
         use super::*;
@@ -2757,20 +2839,38 @@ mod tests {
         };
         let (stage, mnt) = (work.path().join("stage"), work.path().join("mnt"));
         let (stage_s, mnt_s) = (stage.to_str().unwrap(), mnt.to_str().unwrap());
-        let first = Arc::new(FanotifyHandler::new(stage_s, mnt_s, mgr.clone(), 1).unwrap());
+        let first = Arc::new(FanotifyHandler::new(stage_s, mnt_s, mgr.clone(), 2).unwrap());
         // A fresh cache may share from its first mount on.
         assert!(first.unverified_blobs().is_empty());
         spawn_worker(&first);
+        spawn_worker(&first);
         first.arm().unwrap();
         first.mount().unwrap();
-        let good = read_all_cold(&mnt);
-        assert!(
-            !first.unverified_blobs().is_empty(),
-            "filled, not yet verified"
-        );
+        let files: Vec<_> = walkdir(&mnt);
+        assert!(files.len() > 1);
+        // Verify after one file, then fill the rest from two readers at once.
+        drop_page_cache(&files[0]);
+        std::fs::read(&files[0]).unwrap();
         first.spawn_verifier().unwrap().join().unwrap();
         assert!(first.is_blob_verified(FIXTURE_BLOB));
+        let (left, right) = files[1..].split_at(files.len() / 2);
+        std::thread::scope(|s| {
+            for half in [left, right] {
+                s.spawn(move || {
+                    for f in half {
+                        drop_page_cache(f);
+                        std::fs::read(f).unwrap();
+                    }
+                });
+            }
+        });
+        let good = read_all_cold(&mnt);
         let cache = first.blob_backings[0].cache_path.clone();
+        assert_ne!(
+            chunk_map_word(&cache, 32),
+            0,
+            "filled without unsealing the map"
+        );
         let ctime = |p: &Path| {
             let m = std::fs::metadata(p).unwrap();
             (m.ctime(), m.ctime_nsec())
@@ -2778,6 +2878,9 @@ mod tests {
         let before = ctime(&cache);
         first.stop();
         umount(&mnt);
+        first.seal();
+        assert_eq!(chunk_map_word(&cache, 32), 0, "stopped cleanly, not sealed");
+        assert!(first.is_blob_verified(FIXTURE_BLOB));
         drop(first);
         // As in a new daemon: the next handler opens the cache afresh.
         nydus_storage::factory::BLOB_FACTORY.forget("verified-across-handlers");
@@ -3053,6 +3156,31 @@ mod tests {
         let c = event_fd();
         h.send(&pre_access_event(c));
         assert_eq!(h.response(), (c, deny));
+        h.stop();
+    }
+
+    /// An event raised while a stopping handler seals its caches, with no worker left to serve
+    /// it, is denied by the drain after the seal instead of being allowed when the group closes.
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support copy_file_range")]
+    fn an_event_raised_during_a_seal_is_denied() {
+        let h = SocketHandler::start(1);
+        let peer = h.peer.try_clone().unwrap();
+        let fd = event_fd();
+        *h.handler.before_seal.lock().unwrap() = Some(Box::new(move || {
+            let buf = pre_access_event(fd);
+            // SAFETY: `buf` is readable for `buf.len()` bytes and `peer` is open.
+            let n = unsafe {
+                libc::write(
+                    std::os::fd::AsRawFd::as_raw_fd(&peer),
+                    buf.as_ptr() as *const libc::c_void,
+                    buf.len(),
+                )
+            };
+            assert_eq!(n, buf.len() as isize);
+        }));
+        h.handler.stop_and_seal();
+        assert_eq!(h.response(), (fd, fan_deny_errno(libc::EIO)));
         h.stop();
     }
 

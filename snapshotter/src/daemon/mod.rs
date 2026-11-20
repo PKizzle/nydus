@@ -2027,6 +2027,21 @@ impl DaemonSupervisor {
         for (image_ref, inst) in instances.iter() {
             if inst.failover_armed.load(Ordering::SeqCst) {
                 debug!(image_ref, "leaving mount held for failover takeover");
+                // Its successor runs in a later process, maybe after a reboot: seal the caches
+                // so a clean one keeps them trusted. Fills of the successor unseal them again.
+                #[cfg(target_os = "linux")]
+                {
+                    let daemon = inst.daemon.clone();
+                    blocking::unblock(move || {
+                        if let Some(controller) = daemon
+                            .as_any()
+                            .downcast_ref::<nydus_service::ServiceController>()
+                        {
+                            controller.seal_fanotify_handlers();
+                        }
+                    })
+                    .await;
+                }
             } else {
                 info!(
                     image_ref,
