@@ -53,6 +53,9 @@ pub(crate) struct FileCacheMeta {
     meta: Arc<Mutex<Option<Arc<BlobCompressionContextInfo>>>>,
     // Kept after the background load gives up so later reads can reload the metadata.
     loader: Option<Arc<FileCacheMetaLoader>>,
+    // The background loader's thread, for tests that wait for it to end.
+    #[cfg(test)]
+    loader_thread: Arc<Mutex<Option<std::thread::JoinHandle<()>>>>,
 }
 
 struct FileCacheMetaLoader {
@@ -97,6 +100,8 @@ impl FileCacheMeta {
                     has_error: Arc::new(AtomicBool::new(false)),
                     meta: Arc::new(Mutex::new(Some(Arc::new(m)))),
                     loader: None,
+                    #[cfg(test)]
+                    loader_thread: Default::default(),
                 }),
                 Err(e) => Err(e.into()),
             }
@@ -113,35 +118,61 @@ impl FileCacheMeta {
                 has_error: Arc::new(AtomicBool::new(false)),
                 meta: Arc::new(Mutex::new(None)),
                 loader: Some(loader.clone()),
+                #[cfg(test)]
+                loader_thread: Default::default(),
             };
-            let meta1 = meta.clone();
+            // Weak: once the blob cache that wants the metadata is gone (its filesystem
+            // unmounted), the load stops instead of retrying for nobody, taking the meta
+            // file's exclusive lock on every attempt and stalling the next load of the blob.
+            let slot = Arc::downgrade(&meta.meta);
+            let has_error = Arc::downgrade(&meta.has_error);
 
-            // Download blob meta off the calling thread on the global blocking
-            // pool (runtime-agnostic; replaces tokio's spawn_blocking). `detach`
-            // keeps it running fire-and-forget — `blocking`'s Task cancels on drop.
-            blocking::unblock(move || {
-                let mut retry = 0;
-                let mut delayer = Delayer::new(
-                    DelayType::BackOff,
-                    Duration::from_millis(DOWNLOAD_META_RETRY_DELAY),
-                );
-                while retry < DOWNLOAD_META_RETRY_COUNT {
-                    match loader.load() {
-                        Ok(m) => {
-                            *meta1.meta.lock().unwrap() = Some(Arc::new(m));
+            // Download blob meta off the calling thread, on a thread of its own that ends
+            // with the load.
+            let spawned = std::thread::Builder::new()
+                .name("blob-meta-loader".to_string())
+                .spawn(move || {
+                    let mut retry = 0;
+                    let mut delayer = Delayer::new(
+                        DelayType::BackOff,
+                        Duration::from_millis(DOWNLOAD_META_RETRY_DELAY),
+                    );
+                    while retry < DOWNLOAD_META_RETRY_COUNT {
+                        if slot.strong_count() == 0 {
                             return;
                         }
-                        Err(e) => {
-                            info!("temporarily failed to get blob.meta, {}", e);
-                            delayer.delay();
-                            retry += 1;
+                        match loader.load() {
+                            Ok(m) => {
+                                if let Some(slot) = slot.upgrade() {
+                                    *slot.lock().unwrap() = Some(Arc::new(m));
+                                }
+                                return;
+                            }
+                            Err(e) => {
+                                info!("temporarily failed to get blob.meta, {}", e);
+                                delayer.delay();
+                                retry += 1;
+                            }
                         }
                     }
+                    warn!("failed to get blob.meta");
+                    if let Some(has_error) = has_error.upgrade() {
+                        has_error.store(true, Ordering::Release);
+                    }
+                });
+            match spawned {
+                Ok(_handle) => {
+                    #[cfg(test)]
+                    {
+                        *meta.loader_thread.lock().unwrap() = Some(_handle);
+                    }
                 }
-                warn!("failed to get blob.meta");
-                meta1.has_error.store(true, Ordering::Release);
-            })
-            .detach();
+                // Readers then load the metadata themselves (`reload_blob_meta`).
+                Err(e) => {
+                    warn!("failed to start the blob.meta loader thread, {}", e);
+                    meta.has_error.store(true, Ordering::Release);
+                }
+            }
 
             Ok(meta)
         }
@@ -3418,6 +3449,97 @@ mod tests {
     }
 
     #[test]
+    fn test_background_meta_load_stops_once_its_cache_is_gone() {
+        use crate::backend::{BackendError, BackendResult};
+        use nydus_utils::metrics::BackendMetrics;
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::mpsc::{Receiver, Sender, channel};
+        use tempfile::TempDir;
+
+        /// A backend that is down: every metadata read fails and is counted. The first read
+        /// waits for the test, and dropping the reader (when the loader ends) is reported.
+        struct FailingReader {
+            metrics: Arc<BackendMetrics>,
+            reads: Arc<AtomicUsize>,
+            entered: Sender<()>,
+            release: Mutex<Receiver<()>>,
+            dropped: Sender<()>,
+        }
+        impl BlobReader for FailingReader {
+            fn blob_size(&self) -> BackendResult<u64> {
+                Ok(0)
+            }
+            fn try_read(&self, _buf: &mut [u8], _offset: u64) -> BackendResult<usize> {
+                unreachable!("read_all is overridden")
+            }
+            fn read_all(&self, _buf: &mut [u8], _offset: u64) -> BackendResult<usize> {
+                if self.reads.fetch_add(1, Ordering::SeqCst) == 0 {
+                    self.entered.send(()).unwrap();
+                    self.release.lock().unwrap().recv().unwrap();
+                }
+                Err(BackendError::Unsupported("backend is down".to_string()))
+            }
+            fn metrics(&self) -> &BackendMetrics {
+                &self.metrics
+            }
+        }
+        impl Drop for FailingReader {
+            fn drop(&mut self) {
+                let _ = self.dropped.send(());
+            }
+        }
+
+        let dir = TempDir::new().unwrap();
+        let mut blob_info = BlobInfo::new(
+            0,
+            "blob".to_string(),
+            0x16c6000,
+            9839040,
+            RAFS_DEFAULT_CHUNK_SIZE as u32,
+            0xa3,
+            BlobFeatures::ALIGNED | BlobFeatures::INLINED_FS_META | BlobFeatures::CHUNK_INFO_V2,
+        );
+        blob_info.set_blob_meta_info(0, 0xa1290, 0xa1290, compress::Algorithm::None as u32);
+        let reads = Arc::new(AtomicUsize::new(0));
+        let (entered_tx, entered) = channel();
+        let (release, release_rx) = channel();
+        let (dropped_tx, dropped) = channel();
+        let reader: Arc<dyn BlobReader> = Arc::new(FailingReader {
+            metrics: BackendMetrics::new("test-meta-load-stops", "test"),
+            reads: reads.clone(),
+            entered: entered_tx,
+            release: Mutex::new(release_rx),
+            dropped: dropped_tx,
+        });
+        let meta = FileCacheMeta::new(
+            dir.path().join("blob").display().to_string(),
+            Arc::new(blob_info),
+            Some(reader),
+            false,
+            false,
+            crate::meta::tests::test_source(),
+        )
+        .unwrap();
+
+        // Drop the cache while the first load attempt is in flight, as an unmount does.
+        entered.recv_timeout(Duration::from_secs(30)).unwrap();
+        drop(meta);
+        release.send(()).unwrap();
+
+        // The reader is dropped when the loader ends. That attempt reads the metadata four
+        // times (read_metadata retries three times); a loader that kept going after the
+        // cache was gone would have made its further attempts first.
+        dropped
+            .recv_timeout(Duration::from_secs(60))
+            .expect("the loader never ended");
+        assert_eq!(
+            reads.load(Ordering::SeqCst),
+            4,
+            "the load kept retrying for a cache that was gone"
+        );
+    }
+
+    #[test]
     fn test_file_cache_meta_reloads_after_background_load_failed() {
         use tempfile::TempDir;
 
@@ -3453,6 +3575,7 @@ mod tests {
                 source: crate::meta::tests::test_source(),
                 next_retry: Mutex::new(Instant::now()),
             })),
+            loader_thread: Default::default(),
         };
 
         // The reload fails (no blob.meta yet) and arms the cooldown.
@@ -3524,6 +3647,7 @@ mod tests {
                 source: crate::meta::tests::test_source(),
                 next_retry: Mutex::new(Instant::now()),
             })),
+            loader_thread: Default::default(),
         };
 
         // A reload in flight holds `next_retry`; a concurrent reader must wait for it
@@ -3552,6 +3676,7 @@ mod tests {
             has_error: Arc::new(AtomicBool::new(false)),
             meta: Arc::new(Mutex::new(Some(meta.clone()))),
             loader: None,
+            loader_thread: Default::default(),
         };
 
         let result = file_cache_meta.get_blob_meta();
@@ -3565,6 +3690,7 @@ mod tests {
             has_error: Arc::new(AtomicBool::new(false)),
             meta: Arc::new(Mutex::new(None)),
             loader: None,
+            loader_thread: Default::default(),
         };
         let meta_clone = file_cache_meta.clone();
         let expected = Arc::new(BlobCompressionContextInfo {
@@ -3588,6 +3714,7 @@ mod tests {
             has_error: Arc::new(AtomicBool::new(true)),
             meta: Arc::new(Mutex::new(None)),
             loader: None,
+            loader_thread: Default::default(),
         };
 
         assert!(file_cache_meta.get_blob_meta().is_none());
@@ -3599,6 +3726,7 @@ mod tests {
             has_error: Arc::new(AtomicBool::new(false)),
             meta: Arc::new(Mutex::new(None)),
             loader: None,
+            loader_thread: Default::default(),
         };
         let cloned = file_cache_meta.clone();
         let shared = Arc::new(BlobCompressionContextInfo {

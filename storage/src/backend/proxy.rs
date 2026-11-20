@@ -158,6 +158,35 @@ pub struct ProxySDKClient {
     client: Proxy,
 }
 
+/// Seed peers to choose from for one request. The client shuffles the replicas before its
+/// first attempt, and `max_retries(0)` leaves no second attempt, so more than one replica
+/// sends each request to a random replica, often one that has not cached the blob, instead
+/// of the task's consistent-hash seed peer.
+const SDK_REPLICAS: usize = 1;
+
+/// The SDK request for `url`.
+fn get_request(
+    url: &str,
+    headers: HeaderMap,
+    priority: Option<i32>,
+    timeout: Duration,
+) -> GetRequest {
+    GetRequest {
+        url: url.to_string(),
+        header: headers,
+        piece_length: None,
+        tag: None,
+        application: None,
+        filtered_query_params: Vec::new(),
+        content_for_calculating_task_id: None,
+        enable_task_id_based_blob_digest: true,
+        priority,
+        replicas: SDK_REPLICAS,
+        timeout,
+        client_cert: None,
+    }
+}
+
 impl ProxySDKClient {
     pub fn request(
         &self,
@@ -165,21 +194,9 @@ impl ProxySDKClient {
         headers: HeaderMap,
         priority: Option<i32>,
         catch_status: bool,
+        timeout: Duration,
     ) -> Result<GetResponse<Body>, ProxyError> {
-        let request = GetRequest {
-            url: url.to_string(),
-            header: headers,
-            piece_length: None,
-            tag: None,
-            application: None,
-            filtered_query_params: Vec::new(),
-            content_for_calculating_task_id: None,
-            enable_task_id_based_blob_digest: true,
-            priority,
-            replicas: 2,
-            timeout: Duration::from_secs(5),
-            client_cert: None,
-        };
+        let request = get_request(url, headers, priority, timeout);
         let resp = runtime().block_on(async { self.client.get(&request).await });
         match resp {
             Ok(resp) => Ok(resp),
@@ -276,6 +293,18 @@ mod tests {
 
     fn body(chunks: Vec<dragonfly_client_request::Result<Bytes>>) -> Body {
         Box::new(futures_util::stream::iter(chunks))
+    }
+
+    #[test]
+    fn sdk_requests_use_one_seed_peer() {
+        let request = get_request(
+            "https://registry.example.com/v2/repo/blobs/sha256:0123",
+            HeaderMap::new(),
+            None,
+            Duration::from_secs(7),
+        );
+        assert_eq!(request.replicas, 1);
+        assert_eq!(request.timeout, Duration::from_secs(7));
     }
 
     #[test]

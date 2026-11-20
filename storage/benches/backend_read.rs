@@ -138,7 +138,7 @@ fn make_reader(endpoint: &str) -> Arc<dyn BlobReader> {
         bucket_name: "bench".to_string(),
         object_prefix: String::new(),
         access_key_id: "bench-ak".to_string(),
-        access_key_secret: "bench-sk".to_string(),
+        access_key_secret: nydus_api::RedactedString::new("bench-sk"),
         ..Default::default()
     };
     let backend = S3::new(&config, Some("bench")).unwrap();

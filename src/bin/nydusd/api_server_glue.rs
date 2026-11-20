@@ -424,7 +424,7 @@ impl ApiServer {
                             nydus_utils::config::set(
                                 use_id,
                                 &nydus_utils::config::Keys::RegistryAuth,
-                                auth.clone(),
+                                auth.expose().to_string(),
                             );
                         }
                         Self::update_proxy_runtime_config(use_id, &registry.proxy);

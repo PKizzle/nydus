@@ -84,7 +84,7 @@ impl FileCacheMgr {
             cache_raw_data: config.cache_compressed,
             cache_encrypted: blob_cfg.enable_encryption,
             cache_convergent_encryption: blob_cfg.enable_convergent_encryption,
-            cache_encryption_key: blob_cfg.encryption_key.clone(),
+            cache_encryption_key: blob_cfg.encryption_key.expose().to_string(),
             closed: Arc::new(AtomicBool::new(false)),
             user_io_batch_size,
             metadata_source,

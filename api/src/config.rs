@@ -15,6 +15,66 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use serde::Deserialize;
 use serde_json::Value;
 
+/// A secret configuration string, such as a credential or an encryption key.
+///
+/// `Debug` and `Display` print a placeholder, so structs holding one keep a derived `Debug`
+/// that is safe to log. The value is read only through [`RedactedString::expose`], which
+/// marks every place a secret leaves the wrapper. Serializes as the plain string.
+#[derive(Clone, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(transparent)]
+pub struct RedactedString(String);
+
+impl RedactedString {
+    const PLACEHOLDER: &'static str = "[REDACTED]";
+
+    /// Wrap a secret value.
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    /// The secret value.
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+
+    /// Whether the secret is empty, i.e. not configured.
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+impl std::fmt::Debug for RedactedString {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(Self::PLACEHOLDER)
+    }
+}
+
+impl std::fmt::Display for RedactedString {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(Self::PLACEHOLDER)
+    }
+}
+
+/// `url` without userinfo, query or fragment, for logs and error messages.
+///
+/// Presigned blob URLs (S3, GCS, Azure, CloudFront) carry the signature or token that
+/// grants the blob in the query, and a `user:password@host` URL carries it in the
+/// authority; neither may reach a log.
+pub fn redact_url(url: &str) -> String {
+    let end = url.find(['?', '#']).unwrap_or(url.len());
+    let url = &url[..end];
+    let Some(scheme_end) = url.find("://").map(|i| i + 3) else {
+        return url.to_string();
+    };
+    let authority_end = url[scheme_end..]
+        .find('/')
+        .map_or(url.len(), |i| scheme_end + i);
+    match url[scheme_end..authority_end].rfind('@') {
+        Some(at) => format!("{}{}", &url[..scheme_end], &url[scheme_end + at + 1..]),
+        None => url.to_string(),
+    }
+}
+
 /// Maximum size accepted for a configuration file.
 pub const MAX_CONFIG_FILE_SIZE: u64 = 0x100000;
 
@@ -278,7 +338,7 @@ impl ConfigV2 {
         if let Some(backend_cfg) = cfg.backend.as_mut() {
             if let Some(oss_cfg) = backend_cfg.oss.as_mut() {
                 oss_cfg.access_key_id = String::new();
-                oss_cfg.access_key_secret = String::new();
+                oss_cfg.access_key_secret = RedactedString::default();
             }
             if let Some(registry_cfg) = backend_cfg.registry.as_mut() {
                 registry_cfg.auth = None;
@@ -286,13 +346,13 @@ impl ConfigV2 {
             }
             if let Some(s3_cfg) = backend_cfg.s3.as_mut() {
                 s3_cfg.access_key_id = String::new();
-                s3_cfg.access_key_secret = String::new();
+                s3_cfg.access_key_secret = RedactedString::default();
             }
         }
         if let Some(cache_cfg) = cfg.cache.as_mut()
             && let Some(file_cache_cfg) = cache_cfg.file_cache.as_mut()
         {
-            file_cache_cfg.encryption_key = String::new();
+            file_cache_cfg.encryption_key = RedactedString::default();
         }
         for external_backend in cfg.external_backends.iter_mut() {
             redact_sensitive_map(&mut external_backend.patch);
@@ -333,7 +393,7 @@ impl ConfigV2 {
             && let Some(backend) = self.backend.as_mut()
             && let Some(registry) = backend.registry.as_mut()
         {
-            registry.auth = Some(auth.to_string());
+            registry.auth = Some(RedactedString::new(auth.as_str()));
         }
     }
 }
@@ -590,7 +650,7 @@ pub struct OssConfig {
     pub access_key_id: String,
     /// Oss secret
     #[serde(default)]
-    pub access_key_secret: String,
+    pub access_key_secret: RedactedString,
     /// Skip SSL certificate validation for HTTPS scheme.
     #[serde(default)]
     pub skip_verify: bool,
@@ -634,7 +694,7 @@ pub struct S3Config {
     pub access_key_id: String,
     /// S3 secret
     #[serde(default)]
-    pub access_key_secret: String,
+    pub access_key_secret: RedactedString,
     /// Skip SSL certificate validation for HTTPS scheme.
     #[serde(default)]
     pub skip_verify: bool,
@@ -696,7 +756,7 @@ pub struct RegistryConfig {
     pub repo: String,
     /// Base64_encoded(username:password), the field should be sent to registry auth server to get a bearer token.
     #[serde(default)]
-    pub auth: Option<String>,
+    pub auth: Option<RedactedString>,
     /// Skip SSL certificate validation for HTTPS scheme.
     /// When true, also allows automatic HTTPS-to-HTTP fallback on TLS errors.
     #[serde(default)]
@@ -715,7 +775,7 @@ pub struct RegistryConfig {
     pub retry_limit: u8,
     /// The field is a bearer token to be sent to registry to authorize registry requests.
     #[serde(default)]
-    pub registry_token: Option<String>,
+    pub registry_token: Option<RedactedString>,
     /// The http scheme to access blobs. It is used to workaround some P2P subsystem
     /// that requires a different scheme than the registry.
     #[serde(default)]
@@ -852,7 +912,7 @@ pub struct FileCacheConfig {
     pub enable_convergent_encryption: bool,
     /// Key for data encryption, a heximal representation of [u8; 32].
     #[serde(default)]
-    pub encryption_key: String,
+    pub encryption_key: RedactedString,
 }
 
 impl FileCacheConfig {
@@ -994,7 +1054,7 @@ pub struct PrefetchConfigV2 {
 }
 
 /// Configuration information for network proxy.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ProxyConfig {
     /// Access remote storage backend via proxy, e.g. Dragonfly dfdaemon server URL.
     #[serde(default)]
@@ -1017,6 +1077,46 @@ pub struct ProxyConfig {
     /// Dragonfly scheduler endpoint URL for SDK-based proxy.
     #[serde(default)]
     pub dragonfly_scheduler_endpoint: String,
+    /// Timeout of one Dragonfly SDK request, in seconds. Raise it when the proxy may queue
+    /// requests, for example behind a rate limit to the source.
+    #[serde(default = "default_dragonfly_sdk_timeout")]
+    pub dragonfly_sdk_timeout: u64,
+}
+
+fn default_dragonfly_sdk_timeout() -> u64 {
+    5
+}
+
+impl ProxyConfig {
+    /// Timeout of one Dragonfly SDK request. Zero would fail every request at once, so it
+    /// means the default.
+    pub fn dragonfly_sdk_timeout(&self) -> std::time::Duration {
+        let secs = match self.dragonfly_sdk_timeout {
+            0 => default_dragonfly_sdk_timeout(),
+            secs => secs,
+        };
+        std::time::Duration::from_secs(secs)
+    }
+}
+
+// Manual: a proxy URL may carry `user:password@`, and the backend configs that embed this one
+// are printed with `{:?}`.
+impl std::fmt::Debug for ProxyConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProxyConfig")
+            .field("url", &redact_url(&self.url))
+            .field("ping_url", &redact_url(&self.ping_url))
+            .field("fallback", &self.fallback)
+            .field("check_interval", &self.check_interval)
+            .field("use_http", &self.use_http)
+            .field("check_pause_elapsed", &self.check_pause_elapsed)
+            .field(
+                "dragonfly_scheduler_endpoint",
+                &redact_url(&self.dragonfly_scheduler_endpoint),
+            )
+            .field("dragonfly_sdk_timeout", &self.dragonfly_sdk_timeout)
+            .finish()
+    }
 }
 
 impl Default for ProxyConfig {
@@ -1029,6 +1129,7 @@ impl Default for ProxyConfig {
             use_http: false,
             check_pause_elapsed: 300,
             dragonfly_scheduler_endpoint: String::new(),
+            dragonfly_sdk_timeout: default_dragonfly_sdk_timeout(),
         }
     }
 }
@@ -1486,7 +1587,7 @@ struct CacheConfig {
 
 /// Additional configuration information for external backend, its items
 /// will be merged to the configuration from image.
-#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ExternalBackendConfig {
     /// External backend identifier to merge.
     pub patch: HashMap<String, String>,
@@ -1495,6 +1596,20 @@ pub struct ExternalBackendConfig {
     pub kind: String,
     /// External backend config items to merge.
     pub config: HashMap<String, String>,
+}
+
+// Manual: `patch` and `config` are free-form and may hold credentials.
+impl std::fmt::Debug for ExternalBackendConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (mut patch, mut config) = (self.patch.clone(), self.config.clone());
+        redact_sensitive_map(&mut patch);
+        redact_sensitive_map(&mut config);
+        f.debug_struct("ExternalBackendConfig")
+            .field("patch", &patch)
+            .field("kind", &self.kind)
+            .field("config", &config)
+            .finish()
+    }
 }
 
 impl TryFrom<&CacheConfig> for CacheConfigV2 {
@@ -1770,6 +1885,53 @@ mod tests {
     use vmm_sys_util::tempfile::TempFile;
 
     #[test]
+    fn test_redacted_string_keeps_secrets_out_of_debug_output() {
+        let json = r#"{"host":"registry.example.com","repo":"library/x",
+            "auth":"not-a-real-auth","registry_token":"not-a-real-token"}"#;
+        let registry: RegistryConfig = serde_json::from_str(json).unwrap();
+        let printed = format!("{registry:?} {}", registry.auth.as_ref().unwrap());
+        assert!(!printed.contains("not-a-real"), "{printed}");
+        assert!(printed.contains("[REDACTED]"), "{printed}");
+        assert_eq!(registry.auth.as_ref().unwrap().expose(), "not-a-real-auth");
+
+        // The serialized form is the plain string, as before.
+        let value = serde_json::to_value(&registry).unwrap();
+        assert_eq!(value["auth"], "not-a-real-auth");
+        assert_eq!(value["registry_token"], "not-a-real-token");
+
+        let oss: OssConfig = serde_json::from_str(
+            r#"{"endpoint":"e","bucket_name":"b","access_key_secret":"not-a-real-secret"}"#,
+        )
+        .unwrap();
+        assert!(!format!("{oss:?}").contains("not-a-real"));
+
+        // A proxy URL's userinfo, and credential-like keys of an external backend.
+        let mut with_proxy = registry.clone();
+        with_proxy.proxy.url = "http://user:not-a-real-pass@proxy.example.com:65001".to_string();
+        let printed = format!("{with_proxy:?}");
+        assert!(!printed.contains("not-a-real"), "{printed}");
+        assert!(printed.contains("proxy.example.com:65001"), "{printed}");
+        let external = ExternalBackendConfig {
+            patch: HashMap::from([("auth".to_string(), "not-a-real-auth".to_string())]),
+            kind: "x".to_string(),
+            config: HashMap::from([
+                (
+                    "access_key_secret".to_string(),
+                    "not-a-real-secret".to_string(),
+                ),
+                ("bucket".to_string(), "kept".to_string()),
+            ]),
+        };
+        let printed = format!("{external:?}");
+        assert!(!printed.contains("not-a-real"), "{printed}");
+        assert!(printed.contains("kept"), "{printed}");
+        assert_eq!(
+            serde_json::to_value(&oss).unwrap()["access_key_secret"],
+            "not-a-real-secret"
+        );
+    }
+
+    #[test]
     fn test_metadata_source_config() {
         let config: ConfigV2 = toml::from_str("version = 2").unwrap();
         assert_eq!(config.metadata_source, MetadataSource::Mmap);
@@ -1948,6 +2110,28 @@ mod tests {
         assert_eq!(config.ping_url, "ping.foo.com");
         assert!(config.fallback);
         assert_eq!(config.check_interval, 5);
+        assert_eq!(config.dragonfly_sdk_timeout, 5);
+        assert_eq!(ProxyConfig::default().dragonfly_sdk_timeout, 5);
+
+        let content = r#"{
+            "url": "foo.com",
+            "dragonfly_scheduler_endpoint": "http://127.0.0.1:8002",
+            "dragonfly_sdk_timeout": 60
+        }"#;
+        let config: ProxyConfig = serde_json::from_str(content).unwrap();
+        assert_eq!(config.dragonfly_sdk_timeout, 60);
+        assert_eq!(
+            config.dragonfly_sdk_timeout(),
+            std::time::Duration::from_secs(60)
+        );
+        let zero = ProxyConfig {
+            dragonfly_sdk_timeout: 0,
+            ..Default::default()
+        };
+        assert_eq!(
+            zero.dragonfly_sdk_timeout(),
+            std::time::Duration::from_secs(5)
+        );
     }
 
     #[test]
@@ -2085,7 +2269,8 @@ external_backends:
                 .as_ref()
                 .unwrap()
                 .auth
-                .as_deref(),
+                .as_ref()
+                .map(RedactedString::expose),
             Some("dXNlcjpwYXNz")
         );
 
@@ -2221,7 +2406,7 @@ external_backends:
         assert_eq!(&oss.bucket_name, "my_bucket_name");
         assert_eq!(&oss.object_prefix, "my_object_prefix");
         assert_eq!(&oss.access_key_id, "my_access_key_id");
-        assert_eq!(&oss.access_key_secret, "my_access_key_secret");
+        assert_eq!(oss.access_key_secret.expose(), "my_access_key_secret");
         assert_eq!(&oss.scheme, "http");
         assert!(oss.skip_verify);
         assert_eq!(oss.timeout, 10);
@@ -2271,12 +2456,15 @@ external_backends:
         assert_eq!(&registry.scheme, "http");
         assert_eq!(&registry.host, "localhost");
         assert_eq!(&registry.repo, "nydus");
-        assert_eq!(registry.auth.as_ref().unwrap(), "auth");
+        assert_eq!(registry.auth.as_ref().unwrap().expose(), "auth");
         assert!(registry.skip_verify);
         assert_eq!(registry.timeout, 10);
         assert_eq!(registry.connect_timeout, 10);
         assert_eq!(registry.retry_limit, 5);
-        assert_eq!(registry.registry_token.as_ref().unwrap(), "bear_token");
+        assert_eq!(
+            registry.registry_token.as_ref().unwrap().expose(),
+            "bear_token"
+        );
         assert_eq!(registry.blob_url_scheme, "https");
         assert_eq!(registry.blob_redirected_host, "redirect.registry.com");
 
@@ -2531,7 +2719,7 @@ external_backends:
         let backend = rafs_config.backend.unwrap();
         let registry = backend.registry.unwrap();
         let auth = registry.auth.unwrap();
-        assert_eq!(auth, test_auth);
+        assert_eq!(auth.expose(), test_auth);
     }
 
     #[test]

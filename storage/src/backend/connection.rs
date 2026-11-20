@@ -23,6 +23,8 @@ use http::{
 use url::Url;
 
 use nydus_api::{HttpProxyConfig, OssConfig, ProxyConfig, RegistryConfig, S3Config};
+
+use super::redact_url;
 use url::ParseError;
 
 const HEADER_AUTHORIZATION: &str = "Authorization";
@@ -283,7 +285,7 @@ impl Proxy {
                     .store(SCHEME_REVERSION_CACHE_RETAIN, Ordering::Relaxed);
                 None
             } else {
-                warn!("Can't replace http scheme, url {}", url);
+                warn!("Can't replace http scheme, url {}", redact_url(url));
                 None
             }
         } else {
@@ -636,7 +638,9 @@ impl Connection {
 
                 debug!(
                     "connection: routing via PROXY (fallback={}), url={} -> {}",
-                    proxy.fallback, url, replaced_url,
+                    proxy.fallback,
+                    redact_url(url),
+                    redact_url(replaced_url),
                 );
 
                 let result = self.call_inner(
@@ -691,7 +695,7 @@ impl Connection {
 
         debug!(
             "connection: routing DIRECT (no proxy or fallback), url={}",
-            url
+            redact_url(url)
         );
         self.call_inner(
             false,
@@ -822,8 +826,10 @@ impl Connection {
                 Some(t) => match compio::runtime::time::timeout(t, send).await {
                     Ok(r) => r.map_err(ConnectionError::Common)?,
                     Err(_) => {
+                        self.drop_client(is_proxy);
                         return Err(ConnectionError::ErrorWithMsg(format!(
-                            "request to {url_owned} timed out"
+                            "request to {} timed out",
+                            redact_url(&url_owned)
                         )));
                     }
                 },
@@ -831,11 +837,15 @@ impl Connection {
             };
             let status = cyper_resp.status();
             let resp_headers = cyper_resp.headers().clone();
-            let body = cyper_resp.bytes().await.map_err(ConnectionError::Common)?;
+            let mut body = Vec::new();
+            let mut stream = cyper_resp.bytes_stream();
+            while let Some(chunk) = self.next_chunk(&mut stream, is_proxy, &url_owned).await? {
+                body.extend_from_slice(&chunk);
+            }
             Ok(Response {
                 status,
                 headers: resp_headers,
-                body: std::io::Cursor::new(body),
+                body: std::io::Cursor::new(body.into()),
             })
         });
 
@@ -843,7 +853,7 @@ impl Connection {
             "{} Request: {} {} headers: {:?}, proxy: {}, data: {}, duration: {}ms",
             std::thread::current().name().unwrap_or_default(),
             method,
-            url,
+            redact_url(url),
             display_headers,
             proxy,
             has_data,
@@ -851,6 +861,43 @@ impl Connection {
         );
 
         result.and_then(|resp| respond(resp, catch_status))
+    }
+
+    /// The next chunk of a response body, or an error once no data has arrived for the
+    /// request timeout. This bounds a stall, not the whole transfer: a slow body that keeps
+    /// moving is not cut off, while a peer that went silent mid-body fails the read so the
+    /// caller can retry instead of waiting forever.
+    async fn next_chunk<S>(
+        &self,
+        stream: &mut S,
+        is_proxy: bool,
+        url: &str,
+    ) -> ConnectionResult<Option<bytes::Bytes>>
+    where
+        S: futures_util::Stream<Item = cyper::Result<bytes::Bytes>> + Unpin,
+    {
+        let next = match self.timeout {
+            Some(t) => match compio::runtime::time::timeout(t, stream.next()).await {
+                Ok(next) => next,
+                Err(_) => {
+                    self.drop_client(is_proxy);
+                    return Err(ConnectionError::ErrorWithMsg(format!(
+                        "no data from {} for {t:?}",
+                        redact_url(url)
+                    )));
+                }
+            },
+            None => stream.next().await,
+        };
+        next.transpose().map_err(ConnectionError::Common)
+    }
+
+    /// Drop this thread's client, and with it its connection pool, after a request on it
+    /// timed out. A pooled HTTP/2 connection whose peer vanished without a FIN or RST still
+    /// looks open to the pool (the client sends no keep-alive pings), so every later request
+    /// multiplexed onto it would time out the same way; the next request builds a new client.
+    fn drop_client(&self, is_proxy: bool) {
+        HTTP_CLIENTS.with(|clients| clients.borrow_mut().remove(&(self.id, is_proxy)));
     }
 
     /// Streaming variant of `call_inner` for the blob read path: stream the
@@ -902,8 +949,10 @@ impl Connection {
                 Some(t) => match compio::runtime::time::timeout(t, send).await {
                     Ok(r) => r.map_err(ConnectionError::Common)?,
                     Err(_) => {
+                        self.drop_client(is_proxy);
                         return Err(ConnectionError::ErrorWithMsg(format!(
-                            "request to {url_owned} timed out"
+                            "request to {} timed out",
+                            redact_url(&url_owned)
                         )));
                     }
                 },
@@ -916,8 +965,7 @@ impl Connection {
                 // Stream the body straight into `dst` - no full-body allocation.
                 let mut written = 0usize;
                 let mut stream = resp.bytes_stream();
-                while let Some(chunk) = stream.next().await {
-                    let chunk = chunk.map_err(ConnectionError::Common)?;
+                while let Some(chunk) = self.next_chunk(&mut stream, is_proxy, &url_owned).await? {
                     if written >= dst.len() {
                         break;
                     }
@@ -927,8 +975,26 @@ impl Connection {
                 }
                 Ok((status, content_range, written, None))
             } else {
-                // Buffer the (small) error body for the caller's message.
-                let body = resp.bytes().await.map_err(ConnectionError::Common)?;
+                // Keep the start of the error body for the caller's message. It gets the
+                // same stall bound as a blob body, and a size cap: nothing needs the rest.
+                // A body that stalls or breaks still returns the status, which is what the
+                // caller's retry and redirect decisions rest on.
+                const ERROR_BODY_LIMIT: usize = 4096;
+                let mut body = Vec::new();
+                let mut stream = resp.bytes_stream();
+                while body.len() < ERROR_BODY_LIMIT {
+                    match self.next_chunk(&mut stream, is_proxy, &url_owned).await {
+                        Ok(Some(chunk)) => {
+                            let n = chunk.len().min(ERROR_BODY_LIMIT - body.len());
+                            body.extend_from_slice(&chunk[..n]);
+                        }
+                        Ok(None) => break,
+                        Err(e) => {
+                            body.extend_from_slice(format!(" [body incomplete: {e}]").as_bytes());
+                            break;
+                        }
+                    }
+                }
                 Ok((
                     status,
                     content_range,
@@ -939,14 +1005,9 @@ impl Connection {
         })
     }
 
-    /// Streaming counterpart of `call` for the blob read path: routes through the
-    /// proxy with origin fallback like the buffered path, but streams the
-    /// response body into `dst` and returns the number of bytes written.
-    /// Proxy-aware streaming core: streams the response body into `dst` and
-    /// returns `(status, content_range, bytes_written, error_body)` *without* applying
-    /// `catch_status`. Callers decide how to treat the status (e.g. registry
-    /// inspects 307/401/403 itself). Shared by `call_stream` and
-    /// `call_stream_status`.
+    /// Proxy-aware streaming core: routes through the proxy with origin fallback like
+    /// the buffered path, streams the response body into `dst` and returns
+    /// `(status, content_range, bytes_written, error_body)` without judging the status.
     fn call_stream_status_err(
         &self,
         method: Method,
@@ -999,29 +1060,10 @@ impl Connection {
         self.call_inner_stream(false, method, url, &query, headers, dst)
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub fn call_stream(
-        &self,
-        method: Method,
-        url: &str,
-        query: Option<&[(&str, &str)]>,
-        headers: &HeaderMap,
-        catch_status: bool,
-        skip_proxy: bool,
-        dst: &mut [u8],
-    ) -> ConnectionResult<usize> {
-        let (status, _content_range, written, err) =
-            self.call_stream_status_err(method, url, query, headers, skip_proxy, dst)?;
-        if catch_status && !is_success_status(status) {
-            return Err(ConnectionError::ErrorWithMsg(err.unwrap_or_default()));
-        }
-        Ok(written)
-    }
-
-    /// Like `call_stream`, but returns the HTTP status and `Content-Range` alongside
-    /// the byte count instead of folding non-success into an error. Used by the
-    /// registry blob read path, which must distinguish 200 (stream the blob) from
-    /// 401/403 (a stale cached redirect to retry) and check which range arrived.
+    /// Streaming counterpart of `call`: returns the HTTP status and `Content-Range` alongside
+    /// the byte count instead of folding non-success into an error. Blob range reads use it:
+    /// the registry must distinguish 200 (stream the blob) from 401/403 (a stale cached
+    /// redirect to retry), and every caller checks which range arrived.
     pub fn call_stream_status(
         &self,
         method: Method,
@@ -1031,8 +1073,14 @@ impl Connection {
         skip_proxy: bool,
         dst: &mut [u8],
     ) -> ConnectionResult<(StatusCode, Option<HeaderValue>, usize)> {
-        let (status, content_range, written, _err) =
+        let (status, content_range, written, err) =
             self.call_stream_status_err(method, url, query, headers, skip_proxy, dst)?;
+        // The status alone reaches the caller's error; the body often says why (an object
+        // store's error code, for one).
+        if let Some(body) = err.filter(|b| !b.is_empty()) {
+            let end = body.floor_char_boundary(512);
+            warn!("HTTP {status} from {}: {}", redact_url(url), &body[..end]);
+        }
         Ok((status, content_range, written))
     }
 }

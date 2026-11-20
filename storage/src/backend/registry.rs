@@ -26,7 +26,9 @@ use crate::backend::connection::{
 };
 use crate::backend::request;
 use crate::backend::request::is_success_status;
-use crate::backend::{BackendContext, BackendError, BackendResult, BlobBackend, BlobReader};
+use crate::backend::{
+    BackendContext, BackendError, BackendResult, BlobBackend, BlobReader, redact_url,
+};
 
 const REGISTRY_CLIENT_ID: &str = "nydus-registry-client";
 const HEADER_AUTHORIZATION: &str = "Authorization";
@@ -144,6 +146,18 @@ fn request_err_to_registry(e: request::RequestError) -> RegistryBackendError {
             RegistryBackendError::Request(ConnectionError::ErrorWithMsg(format!("{:?}", other)))
         }
     }
+}
+
+/// Statuses an object store answers a dead presigned link with.
+fn is_dead_link_status(status: StatusCode) -> bool {
+    [
+        StatusCode::BAD_REQUEST,
+        StatusCode::UNAUTHORIZED,
+        StatusCode::FORBIDDEN,
+        StatusCode::NOT_FOUND,
+        StatusCode::GONE,
+    ]
+    .contains(&status)
 }
 
 /// Convert a request::Response into a RegistryResult, checking status if needed.
@@ -979,7 +993,7 @@ impl RegistryReader {
         if let Some(cached_redirect) = cached_redirect {
             // Hot path: the cached redirect is the final blob URL, so stream the
             // body straight into `buf` instead of buffering the whole blob first.
-            let (status, content_range, written) = self
+            let res = self
                 .request
                 .call_stream_status(
                     Method::GET,
@@ -990,18 +1004,31 @@ impl RegistryReader {
                     false,
                     buf,
                 )
-                .map_err(request_err_to_registry)?;
+                .map_err(request_err_to_registry);
 
-            // The request has expired or has been denied, need to re-request
-            if allow_retry && [StatusCode::UNAUTHORIZED, StatusCode::FORBIDDEN].contains(&status) {
+            // A presigned link that expired or was revoked is answered with 401/403 (and
+            // 400/404/410 by some stores), and a link to a store that is gone does not
+            // connect. Resolve the redirect again through the registry, once. Anything else
+            // (429, 416, a timeout, a proxy's verdict) says nothing about the link and is
+            // left to retry_op.
+            let dead = match &res {
+                Ok((status, _, _)) => is_dead_link_status(*status).then(|| status.to_string()),
+                Err(e @ RegistryBackendError::Request(ConnectionError::Common(_))) => {
+                    Some(e.to_string())
+                }
+                Err(_) => None,
+            };
+            if let Some(reason) = dead.filter(|_| allow_retry) {
                 warn!(
-                    "The redirected link has expired: {}, will retry read",
-                    cached_redirect.as_str()
+                    "The redirected link has expired: {}, {}, will retry read",
+                    redact_url(&cached_redirect),
+                    reason
                 );
                 self.state.cached_redirect.remove(&self.blob_id);
                 // Try read again only once
                 return self._try_read(buf, offset, false, context);
             }
+            let (status, content_range, written) = res?;
             check_range_status(status, content_range.as_ref(), offset, &range)
                 .map_err(RegistryBackendError::Request)?;
             return Ok(written);
@@ -1067,7 +1094,7 @@ impl RegistryReader {
                 })?;
                 let mut location = Url::parse(url.as_str())
                     .and_then(|base| base.join(location))
-                    .map_err(|e| RegistryBackendError::Url(location.to_string(), e))?;
+                    .map_err(|e| RegistryBackendError::Url(redact_url(location), e))?;
                 // Note: Some P2P proxy server supports only scheme specified origin blob server,
                 // so we need change scheme to `blob_url_scheme` here
                 if !self.state.blob_url_scheme.is_empty() {
@@ -1086,7 +1113,7 @@ impl RegistryReader {
                                 self.state.blob_redirected_host.as_str(),
                                 e
                             );
-                            RegistryBackendError::Url(location.to_string(), e)
+                            RegistryBackendError::Url(redact_url(location.as_str()), e)
                         })?;
                     debug!("New redirected location {:?}", location.host_str());
                 }
@@ -1296,8 +1323,13 @@ impl Registry {
         let proxy_config = con_config.proxy.clone();
         let connection = Connection::new(&con_config).map_err(BackendError::Connection)?;
         let request = request::Request::new(connection, proxy_config, false, id);
-        let auth = trim(config.auth.clone());
-        let registry_token = trim(config.registry_token.clone());
+        let auth = trim(config.auth.as_ref().map(|s| s.expose().to_string()));
+        let registry_token = trim(
+            config
+                .registry_token
+                .as_ref()
+                .map(|s| s.expose().to_string()),
+        );
         Self::validate_authorization_info(&auth)?;
         let cached_auth = if let Some(registry_token) = registry_token {
             // Store the registry bearer token to cached_auth, prefer to
@@ -2815,5 +2847,382 @@ mod tests {
             }
             other => panic!("expected Unsupported, got: {:?}", other),
         }
+    }
+
+    /// Serve one canned response per request, in order (the last one repeats); `{addr}`
+    /// in a response becomes the server address. Returns the address, the request lines
+    /// seen and a stop flag.
+    #[cfg(feature = "backend-registry")]
+    fn serve_sequence(
+        responses: Vec<String>,
+    ) -> (
+        std::net::SocketAddr,
+        Arc<std::sync::Mutex<Vec<String>>>,
+        Arc<AtomicBool>,
+    ) {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (shutdown_srv, seen_srv) = (shutdown.clone(), seen.clone());
+        thread::spawn(move || {
+            listener.set_nonblocking(true).unwrap();
+            while !shutdown_srv.load(Ordering::Relaxed) {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    thread::sleep(std::time::Duration::from_millis(5));
+                    continue;
+                };
+                stream.set_nonblocking(false).unwrap();
+                let mut buf = [0u8; 4096];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                if n == 0 {
+                    continue;
+                }
+                let line = String::from_utf8_lossy(&buf[..n])
+                    .lines()
+                    .next()
+                    .unwrap_or_default()
+                    .to_string();
+                let mut seen = seen_srv.lock().unwrap();
+                let response = &responses[seen.len().min(responses.len() - 1)];
+                seen.push(line);
+                drop(seen);
+                let response = response.replace("{addr}", &addr.to_string());
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+        (addr, seen, shutdown)
+    }
+
+    /// Captures every log record of the process, so a test can search what was logged.
+    struct CaptureLogger(std::sync::Mutex<Vec<String>>);
+
+    impl log::Log for CaptureLogger {
+        fn enabled(&self, _: &log::Metadata) -> bool {
+            true
+        }
+        fn log(&self, record: &log::Record) {
+            self.0
+                .lock()
+                .unwrap()
+                .push(format!("{} {}", record.level(), record.args()));
+        }
+        fn flush(&self) {}
+    }
+
+    static CAPTURE: CaptureLogger = CaptureLogger(std::sync::Mutex::new(Vec::new()));
+
+    fn captured_logs() -> &'static CaptureLogger {
+        static INSTALL: std::sync::Once = std::sync::Once::new();
+        INSTALL.call_once(|| {
+            log::set_logger(&CAPTURE).expect("no other logger in the storage tests");
+            log::set_max_level(log::LevelFilter::Trace);
+        });
+        &CAPTURE
+    }
+
+    /// A presigned redirect carries the credential that grants the blob in its query.
+    /// Expiry of the cached link and failed reads both log the request URL; neither
+    /// may log the query.
+    #[cfg(feature = "backend-registry")]
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support io_uring")]
+    fn test_presigned_redirect_query_never_reaches_the_log() {
+        const SECRET: &str = "not-a-real-signature-0123";
+        let logs = captured_logs();
+        let redirect = format!(
+            "HTTP/1.1 307 Temporary Redirect\r\n\
+             Location: http://{{addr}}/presigned-redaction-test/blob?X-Amz-Signature={SECRET}\r\n\
+             Content-Length: 0\r\nConnection: close\r\n\r\n"
+        );
+        let body = "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-4/5\r\n\
+                    Content-Length: 5\r\nConnection: close\r\n\r\nabcde"
+            .to_string();
+        let expired = "HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            .to_string();
+        let failed =
+            "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                .to_string();
+        let (addr, seen, shutdown) =
+            serve_sequence(vec![redirect.clone(), body, expired, redirect, failed]);
+
+        let config = RegistryConfig {
+            scheme: "http".to_string(),
+            host: addr.to_string(),
+            repo: "library/test".to_string(),
+            timeout: 5,
+            connect_timeout: 5,
+            ..Default::default()
+        };
+        let registry = Registry::new(&config, Some("test-redacted-redirect")).unwrap();
+        let reader = registry.get_reader("sha256:abc").unwrap();
+        let mut buf = [0u8; 5];
+        // The first read caches the redirect; the second finds it expired (401), resolves
+        // it again and then fails at the store, which retry_op logs on every attempt.
+        assert_eq!(reader.read(&mut buf, 0).unwrap(), 5);
+        assert!(reader.read(&mut buf, 0).is_err());
+        shutdown.store(true, Ordering::Relaxed);
+
+        let requests = seen.lock().unwrap().clone();
+        assert!(
+            requests.iter().filter(|l| l.contains(SECRET)).count() >= 3,
+            "the presigned URL is still requested in full: {requests:?}"
+        );
+        let logs = logs.0.lock().unwrap();
+        assert!(
+            logs.iter()
+                .any(|l| l.contains("redirected link has expired")
+                    && l.contains("/presigned-redaction-test/blob")),
+            "the expiry is logged: {logs:?}"
+        );
+        assert!(
+            logs.iter()
+                .any(|l| l.starts_with("ERROR") && l.contains("/presigned-redaction-test/blob")),
+            "the failed read is logged with its URL: {logs:?}"
+        );
+        let leaked: Vec<_> = logs.iter().filter(|l| l.contains(SECRET)).collect();
+        assert!(leaked.is_empty(), "signature logged: {leaked:?}");
+    }
+
+    /// A peer that sends the headers and part of the body, then goes silent without
+    /// closing (lost NAT state, a wedged mirror). The read must fail once no data has
+    /// arrived for the configured timeout, so the caller can retry, instead of waiting
+    /// forever: on the fanotify path that wait is an unanswered permission event.
+    #[cfg(feature = "backend-registry")]
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support io_uring")]
+    fn test_read_fails_when_the_body_stalls() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown_srv = shutdown.clone();
+        thread::spawn(move || {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf);
+            let _ = stream.write_all(
+                b"HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-9/10\r\n\
+                  Content-Length: 10\r\n\r\nabcde",
+            );
+            let _ = stream.flush();
+            // Hold the connection open without sending the rest.
+            while !shutdown_srv.load(Ordering::Relaxed) {
+                thread::sleep(std::time::Duration::from_millis(20));
+            }
+        });
+
+        let config = RegistryConfig {
+            scheme: "http".to_string(),
+            host: addr.to_string(),
+            repo: "library/test".to_string(),
+            retry_limit: 0,
+            timeout: 1,
+            connect_timeout: 1,
+            ..Default::default()
+        };
+        let (done, result) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let registry = Registry::new(&config, Some("test-stalled-body")).unwrap();
+            let reader = registry.get_reader("sha256:abc").unwrap();
+            let mut buf = [0u8; 10];
+            let _ = done.send(reader.try_read(&mut buf, 0).map_err(|e| e.to_string()));
+        });
+        let read = result.recv_timeout(std::time::Duration::from_secs(15));
+        shutdown.store(true, Ordering::Relaxed);
+        let err = read
+            .expect("a read whose body stalls must fail, not hang")
+            .expect_err("a stalled body is not a successful read");
+        assert!(err.contains("no data"), "{err}");
+    }
+
+    /// A cached redirect is a presigned URL that can die in more ways than a 401/403: the
+    /// store may answer an expired or revoked link with 404/410 (or 400), or be gone
+    /// entirely. Each of these resolves the redirect again through the registry once,
+    /// instead of failing every read of the blob on the dead link.
+    #[cfg(feature = "backend-registry")]
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support io_uring")]
+    fn test_dead_cached_redirect_is_resolved_again() {
+        let body = "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-4/5\r\n\
+                    Content-Length: 5\r\nConnection: close\r\n\r\nabcde"
+            .to_string();
+        let redirect_to = |target: &str| {
+            format!(
+                "HTTP/1.1 307 Temporary Redirect\r\nLocation: {target}\r\n\
+                 Content-Length: 0\r\nConnection: close\r\n\r\n"
+            )
+        };
+        let read_twice = |host: String| {
+            let config = RegistryConfig {
+                scheme: "http".to_string(),
+                host,
+                repo: "library/test".to_string(),
+                retry_limit: 0,
+                timeout: 5,
+                connect_timeout: 5,
+                ..Default::default()
+            };
+            let registry = Registry::new(&config, Some("test-dead-redirect")).unwrap();
+            let reader = registry.get_reader("sha256:abc").unwrap();
+            let mut buf = [0u8; 5];
+            assert_eq!(reader.try_read(&mut buf, 0).unwrap(), 5);
+            (reader, buf)
+        };
+
+        // The store answers the cached link with 404 Not Found.
+        let gone = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        let (addr, seen, shutdown) = serve_sequence(vec![
+            redirect_to("http://{addr}/store/blob"),
+            body.clone(),
+            gone.to_string(),
+            redirect_to("http://{addr}/store/blob"),
+            body.clone(),
+        ]);
+        let (reader, mut buf) = read_twice(addr.to_string());
+        let read = reader.try_read(&mut buf, 0);
+        shutdown.store(true, Ordering::Relaxed);
+        assert_eq!(read.unwrap(), 5, "requests: {:?}", seen.lock().unwrap());
+        assert_eq!(&buf, b"abcde");
+
+        // The store is gone: the cached link no longer connects.
+        let (store_a, _, store_a_down) = serve_sequence(vec![body.clone()]);
+        let (store_b, _, store_b_down) = serve_sequence(vec![body.clone()]);
+        let (registry, seen, registry_down) = serve_sequence(vec![
+            redirect_to(&format!("http://{store_a}/blob")),
+            redirect_to(&format!("http://{store_b}/blob")),
+        ]);
+        let (reader, mut buf) = read_twice(registry.to_string());
+        store_a_down.store(true, Ordering::Relaxed);
+        // Wait until the listener is closed, so the cached link is refused.
+        let refused = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::net::TcpStream::connect(store_a).is_ok() {
+            assert!(std::time::Instant::now() < refused, "store A still accepts");
+            thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let read = reader.try_read(&mut buf, 0);
+        registry_down.store(true, Ordering::Relaxed);
+        store_b_down.store(true, Ordering::Relaxed);
+        assert_eq!(read.unwrap(), 5, "requests: {:?}", seen.lock().unwrap());
+        assert_eq!(
+            seen.lock().unwrap().len(),
+            2,
+            "the redirect is resolved again"
+        );
+    }
+
+    /// 429 (rate limited) and 416 (range not satisfiable) say nothing about whether the
+    /// cached link is still good, so they leave it cached for retry_op's next attempt
+    /// instead of sending the read back through the registry.
+    #[cfg(feature = "backend-registry")]
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support io_uring")]
+    fn test_cached_redirect_survives_statuses_that_do_not_condemn_it() {
+        let body = "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-4/5\r\n\
+                    Content-Length: 5\r\nConnection: close\r\n\r\nabcde"
+            .to_string();
+        let status = |line: &str| {
+            format!("HTTP/1.1 {line}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+        };
+        let (addr, seen, shutdown) = serve_sequence(vec![
+            "HTTP/1.1 307 Temporary Redirect\r\nLocation: http://{addr}/kept-link/blob\r\n\
+             Content-Length: 0\r\nConnection: close\r\n\r\n"
+                .to_string(),
+            body.clone(),
+            status("429 Too Many Requests"),
+            status("416 Range Not Satisfiable"),
+            body,
+        ]);
+        let config = RegistryConfig {
+            scheme: "http".to_string(),
+            host: addr.to_string(),
+            repo: "library/test".to_string(),
+            retry_limit: 0,
+            timeout: 5,
+            connect_timeout: 5,
+            ..Default::default()
+        };
+        let registry = Registry::new(&config, Some("test-kept-redirect")).unwrap();
+        let reader = registry.get_reader("sha256:abc").unwrap();
+        let mut buf = [0u8; 5];
+        assert_eq!(reader.try_read(&mut buf, 0).unwrap(), 5);
+        assert!(reader.try_read(&mut buf, 0).is_err());
+        assert!(reader.try_read(&mut buf, 0).is_err());
+        let last = reader.try_read(&mut buf, 0);
+        shutdown.store(true, Ordering::Relaxed);
+        assert_eq!(last.unwrap(), 5);
+
+        let requests = seen.lock().unwrap().clone();
+        assert_eq!(requests.len(), 5, "{requests:?}");
+        assert!(
+            requests[1..].iter().all(|l| l.contains("/kept-link/blob")),
+            "the cached link is reused, not resolved again: {requests:?}"
+        );
+    }
+
+    /// An error response whose body stops arriving must not hang the read, and must still
+    /// fail it with its HTTP status: retry and dead-redirect decisions rest on the status.
+    #[cfg(feature = "backend-registry")]
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support io_uring")]
+    fn test_read_fails_when_an_error_body_stalls() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let store = TcpListener::bind("127.0.0.1:0").unwrap();
+        let store_addr = store.local_addr().unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown_srv = shutdown.clone();
+        thread::spawn(move || {
+            let Ok((mut stream, _)) = store.accept() else {
+                return;
+            };
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf);
+            let _ =
+                stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 100\r\n\r\npartial");
+            let _ = stream.flush();
+            // Hold the connection open without sending the rest.
+            while !shutdown_srv.load(Ordering::Relaxed) {
+                thread::sleep(std::time::Duration::from_millis(20));
+            }
+        });
+        let (registry_addr, _, registry_down) = serve_sequence(vec![format!(
+            "HTTP/1.1 307 Temporary Redirect\r\nLocation: http://{store_addr}/blob\r\n\
+             Content-Length: 0\r\nConnection: close\r\n\r\n"
+        )]);
+
+        let config = RegistryConfig {
+            scheme: "http".to_string(),
+            host: registry_addr.to_string(),
+            repo: "library/test".to_string(),
+            retry_limit: 0,
+            timeout: 1,
+            connect_timeout: 1,
+            ..Default::default()
+        };
+        let (done, result) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let registry = Registry::new(&config, Some("test-stalled-error-body")).unwrap();
+            let reader = registry.get_reader("sha256:abc").unwrap();
+            let mut buf = [0u8; 10];
+            let _ = done.send(reader.try_read(&mut buf, 0).map_err(|e| e.to_string()));
+        });
+        let read = result.recv_timeout(std::time::Duration::from_secs(15));
+        shutdown.store(true, Ordering::Relaxed);
+        registry_down.store(true, Ordering::Relaxed);
+        let err = read
+            .expect("a read whose error body stalls must fail, not hang")
+            .expect_err("a 404 is not a successful read");
+        // The status survives the stalled body, so callers can still act on it.
+        assert!(err.contains("404"), "{err}");
     }
 }
