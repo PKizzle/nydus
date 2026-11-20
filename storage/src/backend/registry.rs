@@ -651,7 +651,11 @@ impl RegistryState {
             }
         }
 
-        let mut ctx = BackendContext::default();
+        // The Dragonfly SDK serves blobs only, so a token never goes through it.
+        let mut ctx = BackendContext {
+            disable_proxy_sdk: true,
+            ..Default::default()
+        };
         let token_resp = request
             .call::<&[u8]>(
                 method.clone(),
@@ -661,7 +665,9 @@ impl RegistryState {
                 &mut headers,
                 true,
                 &mut ctx,
-                true, // temp_disable_proxy: auth always goes direct
+                // A Dragonfly proxy serves blobs, not auth: tokens go direct unless the
+                // config says the proxy is the way out.
+                !request.auth_via_proxy(),
             )
             .map_err(move |e| {
                 RegistryBackendError::Auth(format!(
@@ -1510,6 +1516,7 @@ fn trim(value: Option<String>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nydus_api::ProxyConfig;
     use serde_json::json;
     use std::error::Error as StdError;
     use std::fmt::{Display, Formatter};
@@ -2896,6 +2903,82 @@ mod tests {
             }
         });
         (addr, seen, shutdown)
+    }
+
+    /// Fetch a bearer token from a realm on one test server with `proxy` pointed at another;
+    /// returns the request lines each saw.
+    #[cfg(feature = "backend-registry")]
+    fn token_request_route(proxy: ProxyConfig) -> (Vec<String>, Vec<String>) {
+        const TOKEN: &str = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+             Content-Length: 14\r\nConnection: close\r\n\r\n{\"token\":\"t1\"}";
+        let (proxy_addr, proxy_seen, proxy_stop) = serve_sequence(vec![TOKEN.to_string()]);
+        let (realm_addr, realm_seen, realm_stop) = serve_sequence(vec![TOKEN.to_string()]);
+        let config = RegistryConfig {
+            scheme: "http".to_string(),
+            host: "registry.invalid".to_string(),
+            repo: "library/test".to_string(),
+            timeout: 5,
+            connect_timeout: 5,
+            proxy: ProxyConfig {
+                url: format!("http://{proxy_addr}"),
+                fallback: false,
+                ..proxy
+            },
+            ..Default::default()
+        };
+        let registry = Registry::new(&config, Some("test-token-route")).unwrap();
+        let auth = BearerAuth {
+            realm: format!("http://{realm_addr}/token"),
+            service: "registry".to_string(),
+            scope: "repository:library/test:pull".to_string(),
+        };
+        let token = registry.state.get_token(auth, &registry.request);
+        proxy_stop.store(true, Ordering::Relaxed);
+        realm_stop.store(true, Ordering::Relaxed);
+        assert_eq!(token.expect("token request must succeed").token, "t1");
+        let seen = |s: Arc<std::sync::Mutex<Vec<String>>>| s.lock().unwrap().clone();
+        (seen(proxy_seen), seen(realm_seen))
+    }
+
+    #[cfg(feature = "backend-registry")]
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support io_uring")]
+    fn test_token_request_goes_through_a_forward_proxy() {
+        let (proxy, realm) = token_request_route(ProxyConfig {
+            auth_via_proxy: true,
+            ..Default::default()
+        });
+        assert!(realm.is_empty(), "token went direct: {realm:?}");
+        assert_eq!(proxy.len(), 1, "{proxy:?}");
+        // A forward proxy gets the absolute URI of the realm.
+        assert!(
+            proxy[0].starts_with("POST http://") && proxy[0].contains("/token"),
+            "{proxy:?}"
+        );
+    }
+
+    #[cfg(feature = "backend-registry")]
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support io_uring")]
+    fn test_token_request_stays_direct_by_default() {
+        let (proxy, realm) = token_request_route(ProxyConfig::default());
+        assert!(proxy.is_empty(), "token went through the proxy: {proxy:?}");
+        assert_eq!(realm.len(), 1, "{realm:?}");
+        assert!(realm[0].starts_with("POST /token"), "{realm:?}");
+    }
+
+    #[cfg(feature = "backend-registry")]
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support io_uring")]
+    fn test_token_request_stays_direct_for_a_dragonfly_proxy() {
+        let (proxy, realm) = token_request_route(ProxyConfig {
+            ping_url: "http://127.0.0.1:1/server/ping".to_string(),
+            use_http: true,
+            dragonfly_scheduler_endpoint: "http://127.0.0.1:1".to_string(),
+            ..Default::default()
+        });
+        assert!(proxy.is_empty(), "token went through the proxy: {proxy:?}");
+        assert_eq!(realm.len(), 1, "{realm:?}");
     }
 
     /// Captures every log record of the process, so a test can search what was logged.

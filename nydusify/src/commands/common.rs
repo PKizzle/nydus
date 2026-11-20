@@ -166,6 +166,8 @@ fn registry_proxy(matcher: &Matcher, host: &str, plain_http: bool) -> Option<ser
         "url": format!("{proxy_scheme}://{userinfo}{}", uri.authority()?),
         // Going direct cannot work where a proxy is required, and would hide the proxy's error.
         "fallback": false,
+        // The token server sits behind the same proxy.
+        "auth_via_proxy": true,
     }))
 }
 
@@ -202,7 +204,11 @@ mod tests {
             .build();
         assert_eq!(
             registry_proxy(&matcher, "registry.example.com", false).unwrap(),
-            serde_json::json!({"url": "http://us%40r:p%40ss@proxy.local:3128", "fallback": false})
+            serde_json::json!({
+                "url": "http://us%40r:p%40ss@proxy.local:3128",
+                "fallback": false,
+                "auth_via_proxy": true,
+            })
         );
         assert_eq!(
             registry_proxy(&matcher, "registry.example.com:5000", true).unwrap()["url"],
