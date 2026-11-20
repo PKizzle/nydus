@@ -31,6 +31,14 @@ impl Containerd {
     fn start(root: &Path) -> Self {
         let socket = root.join("containerd.sock");
         let _ = std::fs::remove_file(&socket);
+        // CRI and NRI are not needed, and NRI binds the fixed /var/run/nri/nri.sock, so tests
+        // running in parallel would race for it.
+        let config = root.join("config.toml");
+        std::fs::write(
+            &config,
+            "disabled_plugins = [\"io.containerd.grpc.v1.cri\", \"io.containerd.nri.v1.nri\"]\n",
+        )
+        .expect("containerd config");
         let child = Command::new("containerd")
             .arg("--root")
             .arg(root.join("root"))
@@ -39,7 +47,7 @@ impl Containerd {
             .arg("--address")
             .arg(&socket)
             .arg("--config")
-            .arg("/dev/null")
+            .arg(&config)
             .stdout(Stdio::null())
             .stderr(std::fs::File::create(root.join("containerd.log")).expect("containerd log"))
             .spawn()

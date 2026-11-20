@@ -260,3 +260,26 @@ fn create_default_chunk_reader() -> ChunkReader {
 
     ChunkReader::new(compressors, readers, vec![chunk_meta1, chunk_meta2])
 }
+
+#[test]
+fn test_set_link_keeps_target_bytes() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+    use std::path::Path;
+
+    let mut long = b"a//".to_vec();
+    long.extend([b'x'; 98]);
+    for target in [&b"../a/./b/"[..], b"a//b", b"dir/.", b"a/\xff/b", &long] {
+        let mut header = tar::Header::new_ustar();
+        let pax =
+            super::PAXUtil::set_link(&mut header, Path::new(OsStr::from_bytes(target))).unwrap();
+        let stored = match pax {
+            Some(record) => {
+                assert_eq!(record.k, b"linkpath");
+                record.v
+            }
+            None => header.link_name_bytes().unwrap().into_owned(),
+        };
+        assert_eq!(stored, target);
+    }
+}
