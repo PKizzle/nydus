@@ -1356,6 +1356,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "the health thread starts a compio runtime (timerfd)")]
     fn test_shutdown_stops_proxy_health_checker() {
         let conn = health_check_connection();
         let proxy = Arc::downgrade(conn.proxy.as_ref().unwrap());
@@ -1367,6 +1368,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "the health thread starts a compio runtime (timerfd)")]
     fn test_drop_stops_proxy_health_checker() {
         let conn = health_check_connection();
         let proxy = Arc::downgrade(conn.proxy.as_ref().unwrap());
