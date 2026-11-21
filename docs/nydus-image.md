@@ -98,7 +98,9 @@ data blobs: ["d3bb8a2cdb6778cbdc31d97be88ef00217d29e4c119f41ef0a4d9f202088d813"]
 `targz-ref` references the source tarball in place. It accepts gzip (zran contexts), uncompressed
 tar, and zstd: zstd contexts start at frame boundaries, so multi-frame layers (zstd:chunked, the
 zstd seekable format) decode in small units, while a single-frame layer is decoded forward from
-its start on demand. A zstd frame may decode to at most 4 GiB.
+its start on demand. A zstd frame may decode to at most 4 GiB. With `--diff-id sha256:<hex>` (the
+layer's diff ID from its image config) the build fails with exit status 3 unless the source
+decompresses to exactly that tar, the bytes after its end-of-archive marker included.
 ```shell
 nydus-image create -t targz-ref \
   -D /path/to/output/directory \

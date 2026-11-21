@@ -47,7 +47,7 @@ pub use self::optimize_prefetch::OptimizePrefetch;
 pub use self::optimize_prefetch::generate_prefetch_file_info;
 pub use self::optimize_prefetch::update_ctx_from_bootstrap;
 pub use self::stargz::StargzBuilder;
-pub use self::tarball::TarballBuilder;
+pub use self::tarball::{DiffIdMismatch, TarballBuilder};
 
 pub mod attributes;
 mod chunkdict_generator;

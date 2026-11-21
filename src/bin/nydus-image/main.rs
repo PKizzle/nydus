@@ -41,8 +41,8 @@ use nydus_api::{BuildTimeInfo, ConfigV2, LocalFsConfig};
 use nydus_builder::{
     ArtifactStorage, BlobCacheGenerator, BlobCompactor, BlobManager, BootstrapManager,
     BuildContext, BuildOutput, Builder, ChunkdictBlobInfo, ChunkdictChunkInfo, ConversionType,
-    DirectoryBuilder, Feature, Features, Generator, HashChunkDict, Merger, OptimizePrefetch,
-    Prefetch, PrefetchPolicy, StargzBuilder, TarballBuilder, Tree, WhiteoutSpec,
+    DiffIdMismatch, DirectoryBuilder, Feature, Features, Generator, HashChunkDict, Merger,
+    OptimizePrefetch, Prefetch, PrefetchPolicy, StargzBuilder, TarballBuilder, Tree, WhiteoutSpec,
     attributes::Attributes, build_node_view, generate_prefetch_file_info, parse_chunk_dict_arg,
     update_ctx_from_bootstrap,
 };
@@ -216,6 +216,18 @@ impl OutputSerializer {
     }
 }
 
+/// A diff ID as an image config spells it: `sha256:` and 64 lowercase hex digits.
+fn parse_diff_id(s: &str) -> std::result::Result<String, String> {
+    match s.strip_prefix("sha256:") {
+        Some(hex)
+            if hex.len() == 64 && hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) =>
+        {
+            Ok(s.to_string())
+        }
+        _ => Err(format!("{s} is not a sha256:<64 lowercase hex> digest")),
+    }
+}
+
 fn prepare_cmd_args(bti_string: &'static str) -> App {
     let arg_chunk_dict = Arg::new("chunk-dict")
         .long("chunk-dict")
@@ -329,6 +341,12 @@ fn prepare_cmd_args(bti_string: &'static str) -> App {
                         .long("blob-id")
                         .required_if_eq_any([("type", "estargztoc-ref"), ("type", "stargz_index")])
                         .help("OSS object id for the generated RAFS data blob")
+                )
+                .arg(
+                    Arg::new("diff-id")
+                        .long("diff-id")
+                        .help("Diff ID (sha256:<hex> of the uncompressed tar) the source of a ref conversion must have; a mismatch fails with exit status 3")
+                        .value_parser(parse_diff_id),
                 )
                 .arg(
                     Arg::new("blob-data-size")
@@ -1032,7 +1050,14 @@ fn main() -> Result<()> {
     register_tracer!(TraceClass::Event, EventTracerClass);
 
     if let Some(matches) = cmd.subcommand_matches("create") {
-        Command::create(matches, &build_info)
+        let result = Command::create(matches, &build_info);
+        if let Err(ref err) = result
+            && err.chain().any(|c| c.is::<DiffIdMismatch>())
+        {
+            error!("{err:#}");
+            std::process::exit(3);
+        }
+        result
     } else if let Some(matches) = cmd.subcommand_matches("chunkdict") {
         match matches.subcommand_name() {
             Some("generate") => Command::chunkdict_generate(
@@ -1374,6 +1399,7 @@ impl Command {
         build_ctx.set_chunk_size(chunk_size);
         build_ctx.set_batch_size(batch_size);
         build_ctx.set_blob_block_size(block_size);
+        build_ctx.source_diff_id = matches.get_one::<String>("diff-id").cloned();
 
         if let Some(excludes) = matches.get_many::<PathBuf>("exclude") {
             let excludes: Vec<PathBuf> = excludes.cloned().collect();

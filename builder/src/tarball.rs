@@ -83,6 +83,37 @@ impl Read for TarReader {
     }
 }
 
+/// The uncompressed stream of a ref conversion's source, hashed when the build must check its
+/// diff ID. Hashing needs every byte read, so it never seeks.
+struct SourceReader {
+    inner: TarReader,
+    hasher: Option<sha2::Sha256>,
+}
+
+impl Read for SourceReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        if let Some(hasher) = &mut self.hasher {
+            sha2::Digest::update(hasher, &buf[..n]);
+        }
+        Ok(n)
+    }
+}
+
+impl Seek for SourceReader {
+    fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+        self.inner.seek(pos)
+    }
+}
+
+/// The uncompressed source of a ref conversion is not the tar its expected diff ID names.
+#[derive(Debug, thiserror::Error)]
+#[error("tarball: source has diff ID {actual}, expected {expected}")]
+pub struct DiffIdMismatch {
+    pub expected: String,
+    pub actual: String,
+}
+
 impl TarReader {
     fn seekable(&self) -> bool {
         matches!(
@@ -220,7 +251,20 @@ impl<'a> TarballTreeBuilder<'a> {
             _ => return Err(anyhow!("tarball: unsupported image conversion type")),
         };
 
-        let is_seekable = reader.seekable();
+        let expected_diff_id = match self.ty {
+            ConversionType::EStargzToRef
+            | ConversionType::TargzToRef
+            | ConversionType::TarToRef => self.ctx.source_diff_id.clone(),
+            _ if self.ctx.source_diff_id.is_some() => {
+                bail!("tarball: a diff ID is checked for ref conversions only")
+            }
+            _ => None,
+        };
+        let reader = SourceReader {
+            hasher: expected_diff_id.as_ref().map(|_| sha2::Sha256::default()),
+            inner: reader,
+        };
+        let is_seekable = reader.hasher.is_none() && reader.inner.seekable();
         let mut members = Members::new(reader, is_seekable);
 
         // Prepare scratch buffer for dumping file data.
@@ -252,6 +296,18 @@ impl<'a> TarballTreeBuilder<'a> {
             // Apply ignores a member resolving to the root directory.
             if path != Path::new("/") && !self.builder.is_stargz_special_files(&path) {
                 self.parse_entry(&mut tree, &member, &mut members.data(), &path)?;
+            }
+        }
+
+        // The member loop read the whole stream, everything after the end-of-archive marker
+        // included, so the digest covers every byte the layer decompresses to.
+        if let (Some(expected), Some(hasher)) = (expected_diff_id, members.into_inner().hasher) {
+            let actual = format!(
+                "sha256:{}",
+                crate::sha256_digest_hex(sha2::Digest::finalize(hasher))
+            );
+            if actual != expected {
+                return Err(DiffIdMismatch { expected, actual }.into());
             }
         }
 
@@ -807,6 +863,7 @@ mod tests {
     use crate::{ArtifactStorage, Bootstrap, BootstrapContext, Features, Prefetch, WhiteoutSpec};
     use nydus_rafs::metadata::layout::v6::EROFS_BLOCK_SIZE_4096;
     use nydus_utils::{compress, digest};
+    use sha2::Digest;
 
     // Metadata of the hardlink targets in `create_hardlink_tar`, chosen to differ from the
     // metadata of the hardlink entries pointing at them.
@@ -2022,6 +2079,44 @@ mod tests {
             chunk.id(),
             &RafsDigest::from_buf(b"payload", digest::Algorithm::Sha256)
         );
+    }
+
+    /// A ref conversion given a diff ID builds only from a source whose whole uncompressed
+    /// stream, the bytes after the end-of-archive marker included, hashes to it.
+    #[test]
+    #[cfg_attr(miri, ignore = "calls the C zlib and zstd libraries")]
+    fn test_ref_conversion_checks_the_diff_id() {
+        let mut tar = pax_payload_tar();
+        tar.extend_from_slice(&RawTar::default().reg("hidden", b"").finish());
+        let diff_id = format!(
+            "sha256:{}",
+            crate::sha256_digest_hex(sha2::Sha256::digest(&tar))
+        );
+        let mut other = tar.clone();
+        *other.last_mut().unwrap() = 1;
+        for algorithm in [
+            compress::Algorithm::None,
+            compress::Algorithm::GZip,
+            compress::Algorithm::Zstd,
+        ] {
+            let encode = |tar: &[u8]| match algorithm {
+                compress::Algorithm::None => tar.to_vec(),
+                _ => compress::compress(tar, algorithm).unwrap().0.into_owned(),
+            };
+            let build = |source: &[u8], expected: &str| {
+                let (_tmp, mut ctx) = layer_ctx(source);
+                ctx.conversion_type = ConversionType::TargzToRef;
+                ctx.blob_features
+                    .insert(BlobFeatures::SEPARATE | BlobFeatures::CHUNK_INFO_V2);
+                ctx.source_diff_id = Some(expected.to_string());
+                build_tree_as(&mut ctx, ConversionType::TargzToRef)
+            };
+            build(&encode(&tar), &diff_id).unwrap();
+            let err = build(&encode(&other), &diff_id).err().unwrap();
+            let mismatch = err.downcast_ref::<DiffIdMismatch>().unwrap();
+            assert_eq!(mismatch.expected, diff_id, "{algorithm:?}");
+            assert_ne!(mismatch.actual, diff_id, "{algorithm:?}");
+        }
     }
 
     #[test]
