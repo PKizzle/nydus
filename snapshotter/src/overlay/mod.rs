@@ -410,7 +410,7 @@ impl OverlayEngine {
                             .filter(|s| is_image_ref_like(s))
                     })
                     .or_else(|| match self.cached_claim(&snap.key) {
-                        Some(Ok(Claim::One(claimant))) => Some(claimant.image_ref().to_string()),
+                        Some(Claim::One(claimant)) => Some(claimant.image_ref().to_string()),
                         _ => None,
                     }),
             };
@@ -431,21 +431,24 @@ impl OverlayEngine {
     }
 
     /// The memo's claim on committed snapshot `key`'s digest in its
-    /// namespace; `None` without a namespace, digest or lookup.
-    fn cached_claim(&self, key: &str) -> Option<Result<Claim>> {
+    /// namespace, from the targets that could be walked; `None` without a
+    /// namespace, digest or lookup. A daemon reads only blobs the bootstrap
+    /// names by digest, so a target that could not be walked cannot change
+    /// what it serves.
+    fn cached_claim(&self, key: &str) -> Option<Claim> {
         let namespace = namespace_of_key(key)?;
         let digest = bootstrap_digest_from_key(key)?;
         Some(
             self.containerd_lookup
                 .as_ref()?
-                .lookup_cached(namespace, digest),
+                .lookup_walked(namespace, digest),
         )
     }
 
     /// The image a daemon serving meta layer `key` fetches blobs through: see
     /// [`Self::nydus_meta_info`].
     fn serving_image_ref(&self, key: &str, stored: Option<&str>) -> Result<String> {
-        match self.cached_claim(key).transpose()? {
+        match self.cached_claim(key) {
             Some(Claim::One(claimant)) => Ok(stored
                 .filter(|s| claimant.admits(s))
                 .unwrap_or(claimant.image_ref())

@@ -551,11 +551,10 @@ impl NydusSnapshotter {
                 // of which images claim it. List containerd's images first, so
                 // an image pulled or removed since the last lookup cannot
                 // decide it; without a current listing nothing is served.
-                if let (Some(namespace), Some(digest), Some(lookup)) = (
+                if let (Some(namespace), Some(lookup)) = (
                     namespace_of_key(&meta_key),
-                    parent_chain_digest(&meta_key),
                     self.overlay.containerd_lookup(),
-                ) && let Err(e) = lookup.lookup(namespace, digest).await
+                ) && let Err(e) = lookup.refresh(namespace).await
                 {
                     warn!(meta_key, error = %format_args!("{e:#}"), "containerd image claims unknown; not serving the nydus image");
                     return Err(SnapshotterError::unavailable(format!(

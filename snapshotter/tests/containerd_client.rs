@@ -580,3 +580,82 @@ fn a_lookup_never_answers_from_a_listing_older_than_itself() {
         );
     });
 }
+
+/// containerd's Go decoder lets a later duplicate key win, so an image whose manifest repeats
+/// `layers` and whose config repeats `rootfs` is a usable image claiming the chain of its last
+/// `rootfs`. The lookup reads it the same way, and JSON containerd cannot parse either claims
+/// nothing, so neither makes another repository's claim uncertain.
+#[test]
+#[ignore = "needs root and containerd; run misc/containerd-grpc/client-test.sh"]
+fn image_json_is_read_as_containerd_reads_it() {
+    use nydus_snapshotter::containerd_lookup::{Claim, ContainerdLookup};
+
+    let dir = tempfile::tempdir().unwrap();
+    let containerd = Containerd::start(dir.path());
+    let namespace = containerd.config().namespace;
+    let client = ContentStoreClient::new(&containerd.config()).unwrap();
+    let lookup = ContainerdLookup::new(client.clone());
+
+    compio::runtime::Runtime::new().unwrap().block_on(async {
+        let (first, last, app) = (digest_of(b"first"), digest_of(b"last"), digest_of(b"app"));
+        let upload = client.begin_upload("test").await.unwrap();
+        let image = async |name: &str, config: String, layers: &str| {
+            let config_digest = upload
+                .write_bytes(config.as_bytes(), &format!("config-{name}"), labels())
+                .await
+                .unwrap();
+            let manifest = format!(
+                r#"{{"schemaVersion":2,"mediaType":"{OCI_MANIFEST}","config":{{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"{config_digest}","size":{}}},{layers}}}"#,
+                config.len()
+            );
+            let digest = upload
+                .write_bytes(manifest.as_bytes(), &format!("manifest-{name}"), labels())
+                .await
+                .unwrap();
+            client
+                .images_create(name, &digest, manifest.len() as u64, OCI_MANIFEST, labels())
+                .await
+                .unwrap();
+        };
+        let rootfs = |diff_id: &str| format!(r#""rootfs":{{"type":"layers","diff_ids":["{diff_id}"]}}"#);
+        image(
+            "nydus.test/app:1",
+            format!(r#"{{"architecture":"amd64","os":"linux",{}}}"#, rootfs(&app)),
+            r#""layers":[]"#,
+        )
+        .await;
+        image(
+            "nydus.test/dup:1",
+            format!(
+                r#"{{"architecture":"amd64","os":"linux",{},{}}}"#,
+                rootfs(&first),
+                rootfs(&last)
+            ),
+            r#""layers":[{"digest":"sha256:00"}],"layers":[]"#,
+        )
+        .await;
+        image(
+            "nydus.test/broken:1",
+            r#"{"architecture":"amd64","os":"linux","rootfs":"#.to_string(),
+            r#""layers":[]"#,
+        )
+        .await;
+
+        let claimant = |claim: Claim| match claim {
+            Claim::One(claimant) => claimant.repository,
+            other => panic!("expected one claimant, got {other:?}"),
+        };
+        assert_eq!(
+            claimant(lookup.lookup(&namespace, &app).await.unwrap()),
+            "nydus.test/app"
+        );
+        assert_eq!(
+            claimant(lookup.lookup(&namespace, &last).await.unwrap()),
+            "nydus.test/dup"
+        );
+        assert_eq!(
+            lookup.lookup(&namespace, &first).await.unwrap(),
+            Claim::Unclaimed
+        );
+    });
+}

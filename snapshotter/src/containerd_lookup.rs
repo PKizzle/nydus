@@ -23,10 +23,11 @@
 //! (`Images.List`, one RPC) started after the lookup was called, so a
 //! claimant pulled before the call is never missed. Walks are memoized by
 //! record target digest: a target names immutable content, so only targets
-//! not seen before cost `Content.Read`s. A target that cannot be walked is
-//! kept as unknown and makes every claim it could change uncertain (an
-//! error), never a smaller claimant set, unless its content is absent (no
-//! container can be created from it). Refreshes are single-flight per
+//! not seen before cost `Content.Read`s. Image JSON is read as containerd's Go
+//! decoder reads it ([`go_json`]). A target that cannot be walked is kept as
+//! unknown and makes every claim it could change uncertain (an error), never a
+//! smaller claimant set, unless its content is absent or containerd could not
+//! parse it either (no container can be created from it). Refreshes are single-flight per
 //! namespace, and lookups that arrive while one runs share the next listing,
 //! success or failure, so a burst of N lookups costs two listings rather than
 //! N.
@@ -40,6 +41,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde::Deserialize;
+use serde::de::DeserializeOwned;
 use sha2::{Digest, Sha256};
 use tracing::{debug, info, warn};
 
@@ -131,6 +133,38 @@ fn tag_named(names: &[String]) -> bool {
     names.iter().any(|n| is_tag_ref(n))
 }
 
+/// Image JSON that containerd's decoder rejects as well (see [`go_json`]):
+/// no container can be created from it.
+#[derive(Debug, thiserror::Error)]
+#[error("unparsable image JSON: {0}")]
+struct Unparsable(String);
+
+fn is_unparsable(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| c.is::<Unparsable>())
+}
+
+/// Parse image JSON (an index, manifest or config) as containerd's Go
+/// decoder (`encoding/json`) does, so the walk sees what containerd uses: a
+/// later duplicate key wins, invalid UTF-8 reads as U+FFFD, and a `null`
+/// member leaves its field at the default. JSON this rejects is
+/// [`Unparsable`].
+fn go_json<T: DeserializeOwned>(bytes: &[u8]) -> Result<T> {
+    fn drop_null_members(value: &mut serde_json::Value) {
+        match value {
+            serde_json::Value::Object(map) => {
+                map.retain(|_, v| !v.is_null());
+                map.values_mut().for_each(drop_null_members);
+            }
+            serde_json::Value::Array(items) => items.iter_mut().for_each(drop_null_members),
+            _ => {}
+        }
+    }
+    let mut value: serde_json::Value = serde_json::from_str(&String::from_utf8_lossy(bytes))
+        .map_err(|e| Unparsable(e.to_string()))?;
+    drop_null_members(&mut value);
+    Ok(serde_json::from_value(value).map_err(|e| Unparsable(e.to_string()))?)
+}
+
 /// The repository part of an image ref (`host/repo` of `host/repo:tag` or
 /// `host/repo@sha256:…`); `None` for a bare image-ID ref.
 fn repository(image_ref: &str) -> Option<&str> {
@@ -170,9 +204,10 @@ struct WalkFailure {
     /// The record update the walk failed for; a newer one is walked again.
     updated: Updated,
     retry_at: Instant,
-    /// Its content is absent from the content store. CRI resolves an image's
-    /// manifest and config from there to create a container, so no container
-    /// being prepared can come from it, and it claims nothing.
+    /// Its content is absent from the content store, or containerd could not
+    /// parse it either. CRI resolves an image's manifest and config from there
+    /// to create a container, so no container being prepared can come from
+    /// it, and it claims nothing.
     absent: bool,
     error: String,
 }
@@ -316,6 +351,16 @@ impl ContainerdLookup {
         Ok(claim)
     }
 
+    /// The claim of the walked targets alone, whatever targets could not be
+    /// walked: for a caller whose served content does not depend on which
+    /// claimant a container came from. Never walks containerd; a caller runs
+    /// [`refresh`] first.
+    ///
+    /// [`refresh`]: Self::refresh
+    pub fn lookup_walked(&self, namespace: &str, digest: &str) -> Claim {
+        claim_of(&lock_cache(&self.namespace(namespace).memo).walks, digest)
+    }
+
     fn namespace(&self, namespace: &str) -> Arc<NamespaceClaims> {
         lock_cache(&self.namespaces)
             .entry(namespace.to_string())
@@ -326,7 +371,7 @@ impl ContainerdLookup {
     /// List `namespace`'s image records and bring its memo in line with
     /// them, unless a listing that started after this call already finished:
     /// its outcome, success or failure, is this call's.
-    async fn refresh(&self, namespace: &str) -> Result<()> {
+    pub async fn refresh(&self, namespace: &str) -> Result<()> {
         let state = self.namespace(namespace);
         // A listing with a higher id than this started after this call did,
         // so it saw every record this call could need.
@@ -479,7 +524,7 @@ async fn refresh_memo(cs: &ContentStoreClient, memo: &Mutex<Memo>) -> Result<()>
                                 names: group.names,
                                 updated: group.updated,
                                 retry_at,
-                                absent: is_not_found(&e),
+                                absent: is_not_found(&e) || is_unparsable(&e),
                                 error: format!("{e:#}"),
                             },
                         );
@@ -660,7 +705,7 @@ async fn walk_manifest_via_grpc(
         .with_context(|| format!("fetch manifest {digest}"))?;
     // Try as index first (multi-arch); if no `manifests` field, treat as
     // manifest. Recursion is bounded by OCI nesting (index → manifest).
-    if let Ok(index) = serde_json::from_slice::<OciIndexWithPlatforms>(&bytes)
+    if let Ok(index) = go_json::<OciIndexWithPlatforms>(&bytes)
         && !index.manifests.is_empty()
     {
         let (host, rest) = walkable_children(&index);
@@ -687,7 +732,8 @@ async fn walk_manifest_via_grpc(
         }
         return index_walk_result(digest, host_results, rest_resolved).map(|()| true);
     }
-    let manifest: OciManifest = serde_json::from_slice(&bytes)?;
+    let manifest: OciManifest =
+        go_json(&bytes).with_context(|| format!("parse manifest {digest}"))?;
     let bootstrap_indices = collect_bootstrap_layers(&manifest, image_ref, out);
     let Some(cfg_desc) = image_config(&manifest) else {
         return Ok(false);
@@ -696,8 +742,8 @@ async fn walk_manifest_via_grpc(
         .fetch_bytes(&cfg_desc.digest)
         .await
         .with_context(|| format!("fetch image config for {image_ref}"))?;
-    let cfg: OciImageConfig = serde_json::from_slice(&cfg_bytes)
-        .with_context(|| format!("parse image config for {image_ref}"))?;
+    let cfg: OciImageConfig =
+        go_json(&cfg_bytes).with_context(|| format!("parse image config for {image_ref}"))?;
     if cfg.rootfs.diff_ids.is_empty() {
         return Ok(false);
     }
@@ -808,8 +854,8 @@ pub struct ManifestInfo {
 
 /// An image config's `rootfs.diff_ids`.
 fn config_diff_ids(cfg_bytes: &[u8], manifest: &str) -> Result<Vec<String>> {
-    let cfg: OciImageConfig = serde_json::from_slice(cfg_bytes)
-        .with_context(|| format!("parse image config of manifest {manifest}"))?;
+    let cfg: OciImageConfig =
+        go_json(cfg_bytes).with_context(|| format!("parse image config of manifest {manifest}"))?;
     Ok(cfg.rootfs.diff_ids)
 }
 
@@ -860,15 +906,15 @@ async fn resolve_accel_layers_via_grpc(
                 );
             }
         })?;
-    if let Ok(index) = serde_json::from_slice::<OciIndexWithPlatforms>(&bytes)
+    if let Ok(index) = go_json::<OciIndexWithPlatforms>(&bytes)
         && !index.manifests.is_empty()
     {
         let child = pick_host_arch_child(&index)
             .with_context(|| format!("no manifest in index {digest} matches this host"))?;
         return Box::pin(resolve_accel_layers_via_grpc(cs, &child, content_root)).await;
     }
-    let manifest: OciManifest = serde_json::from_slice(&bytes)
-        .map_err(|e| anyhow::anyhow!("parse manifest {digest}: {e}"))?;
+    let manifest: OciManifest =
+        go_json(&bytes).with_context(|| format!("parse manifest {digest}"))?;
     let config = config_digest(&manifest, digest)?;
     let cfg_bytes = cs
         .fetch_bytes(config)
@@ -1140,15 +1186,15 @@ fn resolve_accel_layers_via_cli(
         &["ctr", "-n", "k8s.io", "content", "get", digest],
         &["k3s", "ctr", "-n", "k8s.io", "content", "get", digest],
     ])?;
-    if let Ok(index) = serde_json::from_slice::<OciIndexWithPlatforms>(&bytes)
+    if let Ok(index) = go_json::<OciIndexWithPlatforms>(&bytes)
         && !index.manifests.is_empty()
     {
         let child = pick_host_arch_child(&index)
             .with_context(|| format!("no manifest in index {digest} matches this host"))?;
         return resolve_accel_layers_via_cli(&child, content_root);
     }
-    let manifest: OciManifest = serde_json::from_slice(&bytes)
-        .map_err(|e| anyhow::anyhow!("parse manifest {digest}: {e}"))?;
+    let manifest: OciManifest =
+        go_json(&bytes).with_context(|| format!("parse manifest {digest}"))?;
     let config = config_digest(&manifest, digest)?;
     let cfg_bytes = run_first_ok(&[
         &["ctr", "-n", "k8s.io", "content", "get", config],
@@ -1285,6 +1331,38 @@ mod tests {
         let err =
             accel_layers_from_manifest(&nydus, "sha256:m", root.path(), &diff_ids(2)).unwrap_err();
         assert!(format!("{err:#}").contains("nydus layer"), "{err:#}");
+    }
+
+    /// Image JSON reads as containerd's Go decoder reads it: the last of
+    /// duplicate keys wins, `null` leaves a field at its default, and invalid
+    /// UTF-8 is no error; JSON it rejects is [`Unparsable`].
+    #[test]
+    fn image_json_is_read_like_go() {
+        let json = [
+            &br#"{"layers":[{"digest":"sha256:a"}],"config":null,"layers":[{"digest":"sha256:b","annotations":{"k":""#[..],
+            &[0xff],
+            br#""}}]}"#,
+        ]
+        .concat();
+        let manifest: OciManifest = go_json(&json).unwrap();
+        assert_eq!(
+            manifest
+                .layers
+                .iter()
+                .map(|l| l.digest.as_str())
+                .collect::<Vec<_>>(),
+            ["sha256:b"]
+        );
+        assert!(manifest.config.is_none());
+        let config: OciImageConfig = go_json(
+            br#"{"rootfs":{"diff_ids":["sha256:first"]},"rootfs":{"diff_ids":["sha256:last"]}}"#,
+        )
+        .unwrap();
+        assert_eq!(config.rootfs.diff_ids, ["sha256:last"]);
+        for broken in [&br#"{"rootfs":"#[..], br#"{"layers":"many"}"#] {
+            let err = go_json::<OciManifest>(broken).err().unwrap();
+            assert!(is_unparsable(&err.context("walk")));
+        }
     }
 
     #[test]
@@ -1660,6 +1738,11 @@ mod tests {
         fail(&["reg/app:2"]);
         assert!(matches!(
             lookup.lookup_cached(NS, "sha256:x").unwrap(),
+            Claim::One(_)
+        ));
+        // What the walked targets claim stays known.
+        assert!(matches!(
+            lookup.lookup_walked(NS, "sha256:x"),
             Claim::One(_)
         ));
         for names in [
