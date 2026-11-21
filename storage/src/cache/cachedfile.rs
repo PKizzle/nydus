@@ -4120,6 +4120,43 @@ mod borrow_tests {
         assert!(b.entry.lenders[0].file().is_none());
     }
 
+    /// A user read, the FUSE and block device path, borrows too.
+    #[test]
+    fn a_user_read_borrows() {
+        use crate::device::{BlobIoChunk, BlobIoDesc, BlobIoVec};
+
+        let root = TempDir::new().unwrap();
+        let info = blob_info();
+        let chunks = chunks(&info);
+        Image::plain(root.path(), "a").fetch(&chunks);
+        let b = Image::plain(root.path(), "b");
+        let read = |c: &Arc<dyn BlobChunkInfo>| {
+            let mut iovec = BlobIoVec::new(info.clone());
+            iovec.push(BlobIoDesc::new(
+                info.clone(),
+                BlobIoChunk::from(c.clone()),
+                0,
+                CHUNK as u32,
+                true,
+            ));
+            let mut buf = vec![0u8; CHUNK as usize];
+            // SAFETY: `buf` outlives the read and is not otherwise accessed during it.
+            let slice = unsafe { FileVolatileSlice::from_raw_ptr(buf.as_mut_ptr(), buf.len()) };
+            assert_eq!(b.entry.read(&mut iovec, &[slice]).unwrap(), CHUNK as usize);
+            let offset = c.uncompressed_offset();
+            assert!(
+                buf.iter()
+                    .enumerate()
+                    .all(|(i, v)| *v == byte(offset + i as u64))
+            );
+        };
+        read(&chunks[0]);
+        assert_eq!(b.reads(), 1);
+        read(&chunks[1]);
+        assert_eq!(b.reads(), 1, "the user read fetched a chunk a holds");
+        assert!(b.entry.chunk_map.is_ready(chunks[1].as_ref()).unwrap());
+    }
+
     /// Descriptors of this process open on `path`.
     #[cfg(target_os = "linux")]
     fn fds_on(path: &Path) -> usize {
