@@ -666,16 +666,20 @@ impl FileSystem for Rafs {
             ))));
         }
         let parent = self.sb.get_inode(ino, self.digest_validate)?;
+        // The kernel resolves a file handle by looking up "." on the handle's own inode, which
+        // need not be a directory (FUSE `EXPORT_SUPPORT`).
+        if target == DOT || (ino == ROOT_ID && target == DOTDOT) {
+            rec.mark_success(0);
+            let mut entry = self.get_inode_entry(parent);
+            entry.inode = ino;
+            return Ok(entry);
+        }
         if !parent.is_dir() {
             return Err(Error::from_raw_os_error(libc::ENOTDIR));
         }
 
         rec.mark_success(0);
-        if target == DOT || (ino == ROOT_ID && target == DOTDOT) {
-            let mut entry = self.get_inode_entry(parent);
-            entry.inode = ino;
-            Ok(entry)
-        } else if target == DOTDOT {
+        if target == DOTDOT {
             let parent = self.sb.get_extended_inode(parent.ino(), false)?;
             Ok(self
                 .sb
@@ -1275,6 +1279,71 @@ mod tests {
             prefetch_bandwidth_limit: 0,
             owner_override: Some((1000, 1000)),
             i_time: 12345678,
+        }
+    }
+
+    /// The kernel resolves a file handle whose dentry was evicted (FUSE `EXPORT_SUPPORT`) by
+    /// looking up "." on the handle's own node id, a file's included, and reconnects a
+    /// directory by looking up ".." up to the root.
+    #[test]
+    fn test_lookup_dot_and_dotdot_for_file_handles() {
+        let root_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap();
+        for boot in [
+            "bootstrap/rafs-v5.boot",
+            // top.txt, d1/f1.txt, d1/d2/f2.txt, d1/d2/d3/f3.txt
+            "bootstrap/rafs-v6-nested.boot",
+        ] {
+            let path = PathBuf::from(&root_dir).join("../tests/texture").join(boot);
+            let (sb, _) =
+                RafsSuper::load_from_file(path, crate::test_util::test_config(), false).unwrap();
+            let rafs = Rafs {
+                sb: Arc::new(sb),
+                ..make_test_rafs()
+            };
+            let root = rafs.sb.superblock.root_ino();
+            let lookup = |parent: u64, name: &str| {
+                let name = std::ffi::CString::new(name).unwrap();
+                match rafs.lookup(&Context::default(), parent, &name) {
+                    Ok(entry) => entry.inode,
+                    Err(e) => panic!("{boot}: lookup({parent}, {name:?}): {e}"),
+                }
+            };
+
+            assert_eq!(lookup(root, "."), root, "{boot}");
+            assert_eq!(lookup(root, ".."), root, "{boot}");
+
+            // (inode, parent, depth) of every node below the root, breadth first.
+            let (mut dirs, mut files) = (Vec::new(), Vec::new());
+            let mut queue = std::collections::VecDeque::from([(root, 0)]);
+            while let Some((dir, depth)) = queue.pop_front() {
+                rafs.do_readdir(dir, u32::MAX, 0, &mut |entry| {
+                    if entry.name != DOT.as_bytes() && entry.name != DOTDOT.as_bytes() {
+                        if entry.type_ == u32::from(libc::DT_DIR) {
+                            dirs.push((entry.ino, dir, depth + 1));
+                            queue.push_back((entry.ino, depth + 1));
+                        } else {
+                            files.push(entry.ino);
+                        }
+                    }
+                    Ok(1)
+                })
+                .unwrap();
+            }
+            assert!(!files.is_empty(), "{boot}: no file");
+            assert!(dirs.iter().any(|d| d.2 == 1), "{boot}: no directory");
+            assert!(dirs.iter().any(|d| d.2 > 1), "{boot}: no nested directory");
+
+            for &file in &files {
+                assert_eq!(lookup(file, "."), file, "{boot}: \".\" on file {file}");
+            }
+            for &(dir, parent, _) in &dirs {
+                assert_eq!(lookup(dir, "."), dir, "{boot}: \".\" on directory {dir}");
+                assert_eq!(
+                    lookup(dir, ".."),
+                    parent,
+                    "{boot}: \"..\" on directory {dir}"
+                );
+            }
         }
     }
 
