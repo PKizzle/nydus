@@ -14,6 +14,7 @@
 #       reopen served from a dentry that was never evicted passes H1-H3 without testing the
 #       export path, so H4 is what makes them count. CONTROL=1 skips dropping the caches and
 #       must fail H4.
+#   H5  nydusd exits on its own within 10 s of the mount being unmounted.
 #
 # Requirements: root (mount(2), drop_caches), FUSE, a C compiler, curl and python3.
 # Override the binaries via env, e.g. NYDUS_IMAGE=... NYDUSD=... ROOT=... CC=...
@@ -109,9 +110,20 @@ else
   echo "  ok: H4: $((after - before)) lookups served the reopens"
 fi
 
+step "H5: nydusd exits after umount"
+umount "$ROOT/mnt" || { echo "  !! FAIL: H5: umount failed"; rc=1; }
+for _ in $(seq 50); do kill -0 "$NYDUSD_PID" 2>/dev/null || break; sleep 0.2; done
+if kill -0 "$NYDUSD_PID" 2>/dev/null; then
+  echo "  !! FAIL: H5: nydusd still running 10 s after umount"; rc=1
+else
+  wait "$NYDUSD_PID" 2>/dev/null
+  NYDUSD_PID=
+  echo "  ok: H5: nydusd exited after umount"
+fi
+
 echo
 if [ "$rc" -eq 0 ]; then
-  echo "PASS: every handle reopened through nydusd after dentry eviction"
+  echo "PASS: every handle reopened through nydusd after dentry eviction, and nydusd exited on umount"
 else
   echo "FAIL: see above"
 fi

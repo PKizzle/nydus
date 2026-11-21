@@ -471,11 +471,13 @@ impl FusedevDaemon {
         let thread = thread::Builder::new()
             .name("fuse_server".to_string())
             .spawn(move || {
-                if let Err(_err) = s.svc_loop(&inflight_op) {
-                    // Notify the daemon controller that one working thread has exited.
-                    if let Err(err) = waker.wake() {
-                        error!("fail to exit daemon, error: {:?}", err);
-                    }
+                if let Err(err) = s.svc_loop(&inflight_op) {
+                    warn!("fuse server failed: {}", err);
+                }
+                // A worker leaves its loop only when the session ends, a umount (ENODEV or
+                // ECONNABORTED from the device) included, so the daemon controller must exit too.
+                if let Err(err) = waker.wake() {
+                    error!("fail to exit daemon, error: {:?}", err);
                 }
                 Ok(())
             })
