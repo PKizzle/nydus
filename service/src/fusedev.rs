@@ -117,9 +117,6 @@ impl FuseServer {
     }
 
     fn svc_loop(&mut self, metrics_hook: &dyn MetricsHook) -> Result<()> {
-        // Given error EBADF, it means kernel has shut down this session.
-        let _ebadf = std::io::Error::from_raw_os_error(libc::EBADF);
-
         loop {
             if let Some((reader, writer)) = self.ch.get_request().map_err(|e| {
                 NydusError::StartService(format!(
@@ -131,17 +128,13 @@ impl FuseServer {
                     self.server
                         .handle_message(reader, writer.into(), None, Some(metrics_hook))
                 {
-                    match e {
-                        fuse_backend_rs::Error::EncodeMessage(_ebadf) => {
-                            return Err(NydusError::StartService(
-                                "fuse session has been shut down".to_string(),
-                            ));
-                        }
-                        _ => {
-                            error!("Handling fuse message, {}", NydusError::ProcessQueue(e));
-                            continue;
-                        }
+                    if session_shut_down(&e) {
+                        return Err(NydusError::StartService(
+                            "fuse session has been shut down".to_string(),
+                        ));
                     }
+                    error!("Handling fuse message, {}", NydusError::ProcessQueue(e));
+                    continue;
                 }
             } else {
                 info!("fuse server exits");
@@ -151,6 +144,13 @@ impl FuseServer {
 
         Ok(())
     }
+}
+
+/// Whether a failed reply means the kernel has shut down this session (EBADF). Any other failed
+/// write, such as ENOENT for a request the kernel has already interrupted, loses one reply only.
+fn session_shut_down(e: &fuse_backend_rs::Error) -> bool {
+    matches!(e, fuse_backend_rs::Error::EncodeMessage(io)
+        if nydus_utils::source_errno(io) == Some(libc::EBADF))
 }
 
 struct FusedevNotifier<'a> {
@@ -853,6 +853,18 @@ pub fn create_vfs_backend(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_only_ebadf_shuts_the_session_down() {
+        let encode =
+            |errno| fuse_backend_rs::Error::EncodeMessage(std::io::Error::from_raw_os_error(errno));
+        assert!(session_shut_down(&encode(libc::EBADF)));
+        assert!(!session_shut_down(&encode(libc::ENOENT)));
+        assert!(!session_shut_down(&encode(libc::EIO)));
+        assert!(!session_shut_down(&fuse_backend_rs::Error::DecodeMessage(
+            std::io::Error::from_raw_os_error(libc::EBADF)
+        )));
+    }
 
     #[cfg(target_os = "linux")]
     #[test]
