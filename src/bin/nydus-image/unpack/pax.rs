@@ -786,6 +786,13 @@ impl BlobSources {
             .compressors
             .get(&blob_index)
             .ok_or_else(|| anyhow!("no compressor for blob index {}", blob_index))?;
+        if size as u64 > RAFS_MAX_CHUNK_SIZE {
+            bail!(
+                "chunk size {} in blob index {} is too large",
+                size,
+                blob_index
+            );
+        }
         let mut data = alloc_buf(size);
         let decoded = if compressed && compressor != Algorithm::None {
             compress::decompress(src, data.as_mut_slice(), compressor)

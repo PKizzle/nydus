@@ -2607,7 +2607,10 @@ mod tests {
             .map(|i| (format!("dir/file-{i}"), bytes(100 * (i + 1))))
             .collect();
         files.push(("empty".to_string(), Vec::new()));
-        files.push(("large".to_string(), bytes(3 << 20)));
+        // Shorter than one XTS block, so encryption pads it.
+        files.push(("tiny".to_string(), bytes(5)));
+        // Several chunks, the last one partial.
+        files.push(("large".to_string(), bytes((3 << 20) + 1234)));
         files
     }
 
