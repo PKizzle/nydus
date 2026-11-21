@@ -8,6 +8,7 @@
 #                          the snapshotter tests through cargo instead
 #   SERVICE_TEST_BIN       `cargo test -p nydus-service --lib --no-run` binary; unset runs the
 #                          service tests through cargo instead
+#   STORAGE_TEST_BIN       likewise for nydus-storage
 #   IMG                    ext4 image file to create (must not live on tmpfs in a small VM)
 #   MMAP_CAT               optional static build of mmap-cat.c, for dead-chunk-test's mmap reads
 set -u
@@ -52,6 +53,7 @@ run reuse-test "==== CACHE REUSE: PASS ===="
 run many-devices-test "==== MANY DEVICES: PASS ===="
 run ref-layer-formats-test "==== REF LAYER FORMATS: PASS ===="
 run b4b-referrer-serving-test "==== B4b REFERRER SERVING: PASS ===="
+run borrow-test "==== CACHE BORROWING: PASS ===="
 run registry-auth-test "==== REGISTRY AUTH: PASS ===="
 run release-unmount-test "==== RELEASE-UNMOUNT: PASS ===="
 run auto-accel-restart-test "==== AUTO-ACCEL RESTART: PASS ===="

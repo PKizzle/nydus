@@ -23,6 +23,8 @@ pub mod crc32;
 pub mod crypt;
 pub mod digest;
 pub mod error_chain;
+#[cfg(target_os = "linux")]
+pub mod fanotify;
 pub mod fd_limit;
 pub mod filemap;
 pub mod inode_bitmap;

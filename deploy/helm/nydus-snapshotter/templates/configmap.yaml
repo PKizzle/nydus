@@ -27,6 +27,7 @@ data:
     retention_max_bytes = {{ .Values.config.retention.maxBytes | quote }}
     retention_min_free = {{ .Values.config.retention.minFree | quote }}
     retention_idle_limit = {{ .Values.config.retention.idleLimit | quote }}
+    borrow = {{ .Values.config.borrow }}
 
     [snapshotter.features]
     referrer_detect = {{ .Values.config.features.referrerDetect }}

@@ -50,6 +50,10 @@ retention = false
 retention_max_bytes = "10%"
 retention_min_free = "20%"
 retention_idle_limit = "auto"   # or a duration such as "7d"
+# Fill a chunk an image misses from another image's cache of the same blob on
+# this node, checked against the image's own chunk digest (docs/nydus-fanotify.md,
+# "Borrowing"). Saves fetches and decompression, not disk.
+borrow = false
 
 # Optional cgroup v2 memory controls for the snapshotter and its in-process
 # daemons. The process remains in its systemd service cgroup. memory_high is
