@@ -398,9 +398,10 @@ fn released_stage_starts_warm() {
     );
 }
 
-/// Two images sharing a blob, with borrowing on: once the first has read every file, the
-/// second reads them all with at most one registry request of its own per blob, the one that
-/// lets it borrow, and fills everything else from the first image's cache.
+/// Three images sharing a blob, with borrowing on: once the first has read every file, the
+/// second, another tag of the same repository, reads them all with at most one registry request
+/// of its own per blob, the one that lets it borrow, and fills everything else from the first
+/// image's cache. The third, from another repository, borrows nothing.
 /// `NYDUS_E2E_ROOT` holds `src/`, `bootstrap` and `blobs/` of an image with small chunks;
 /// `NYDUS_IMAGE` is the `nydus-image` binary.
 #[test]
@@ -440,8 +441,8 @@ fn a_second_image_borrows_a_shared_blob() {
     let borrowed = nydus_storage::cache::borrow_counters().chunks;
     let mut images = Vec::new();
     let mut reads = Vec::new();
-    for name in ["one", "two"] {
-        let image_ref = format!("{}/{name}/app:1", registry.addr);
+    for name in ["app:1", "app:2", "other/app:1"] {
+        let image_ref = format!("{}/{name}", registry.addr);
         let handle = runtime
             .block_on(supervisor.ensure_instance(
                 &image_ref,
@@ -459,9 +460,9 @@ fn a_second_image_borrows_a_shared_blob() {
     }
     let borrowed = nydus_storage::cache::borrow_counters().chunks - borrowed;
     println!(
-        "BORROW E2E: {blobs} blobs; registry reads of file data: first image {}, second {}; \
-         {borrowed} chunks borrowed",
-        reads[0], reads[1]
+        "BORROW E2E: {blobs} blobs; registry reads of file data: first image {}, second {}, \
+         other repository {}; {borrowed} chunks borrowed",
+        reads[0], reads[1], reads[2]
     );
     for (image_ref, handle) in images {
         drop(handle);
@@ -476,6 +477,10 @@ fn a_second_image_borrows_a_shared_blob() {
     assert!(
         reads[1] <= blobs,
         "the second image fetched chunks the first had cached"
+    );
+    assert_eq!(
+        reads[2], reads[0],
+        "an image from another repository borrowed"
     );
     assert!(borrowed > 0);
 }

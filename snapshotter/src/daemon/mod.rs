@@ -47,6 +47,7 @@ use crate::daemon::config_builder::{
 use crate::daemon::image_ref::{ImageRef, parse_image_ref};
 use crate::local_accel::NodeViewError;
 use crate::prefetch_profile::runtime_prefetch_for_image;
+use nydus_storage::cache::BORROW_IDENTITY_FILE;
 
 #[cfg(target_os = "linux")]
 use nydus_service::block_device::BlockDevice;
@@ -1216,7 +1217,10 @@ impl DaemonSupervisor {
             // Close cache files a stopped daemon may still hold, or the removal frees nothing.
             nydus_storage::factory::BLOB_FACTORY.gc(None);
             nydus_storage::cache::release_lenders_under(&dir);
-            match fs::remove_dir_all(&dir) {
+            let removed = fs::remove_dir_all(&dir);
+            // Again, for a lender a borrower opened while the dir was being removed.
+            nydus_storage::cache::release_lenders_under(&dir);
+            match removed {
                 Ok(()) => Ok(true),
                 Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
                 Err(e) => Err(e).with_context(|| format!("failed to remove {}", dir.display())),
@@ -1537,6 +1541,38 @@ impl DaemonSupervisor {
         }
     }
 
+    /// With borrowing on, name the backend the caches in `dir` are filled from
+    /// ([`BORROW_IDENTITY_FILE`]), once: caches borrow only from dirs naming the same one. A
+    /// registry is named by scheme, host and repository, and the auto-accel content-store
+    /// backend by the content store's root; other backends get no name, so their caches neither
+    /// lend nor borrow. Failing to write the name only leaves borrowing off for `dir`.
+    fn write_borrow_identity(&self, dir: &Path, backend: &BackendConfigV2) {
+        if !self.config.snapshotter.cache.borrow {
+            return;
+        }
+        let path = dir.join(BORROW_IDENTITY_FILE);
+        if fs::symlink_metadata(&path).is_ok() {
+            return;
+        }
+        let identity = match backend.backend_type.as_str() {
+            "registry" => backend
+                .registry
+                .as_ref()
+                .map(|r| format!("registry {}://{}/{}", r.scheme, r.host, r.repo)),
+            "localfs" => fs::canonicalize(self.config.snapshotter.containerd.content_root())
+                .ok()
+                .map(|root| format!("content-store {}", root.display())),
+            _ => None,
+        };
+        let Some(identity) = identity else {
+            return;
+        };
+        let tmp = dir.join(format!("{BORROW_IDENTITY_FILE}.tmp"));
+        if let Err(e) = fs::write(&tmp, identity).and_then(|()| fs::rename(&tmp, &path)) {
+            warn!(dir = %dir.display(), error = %e, "cannot name the backend of a cache dir; it will not borrow");
+        }
+    }
+
     /// The blob list of the fanotify daemon `slug`: its staged bootstrap, with the blobs read
     /// from `backend`. Only a staged node view, whose fingerprints this node computed, is given
     /// the page cache sharing domain.
@@ -1552,6 +1588,7 @@ impl DaemonSupervisor {
         } else {
             None
         };
+        self.write_borrow_identity(&stage_dir, &backend);
         let entry = build_fanotify_blob_cache_entry(
             backend,
             &stage_dir,
@@ -2153,6 +2190,9 @@ impl DaemonSupervisor {
         })?;
         fs::create_dir_all(&cache_dir)
             .with_context(|| format!("failed to create blob cache dir {}", cache_dir.display()))?;
+        if let Ok(backend) = build_backend_config(&self.config, &parsed, None) {
+            self.write_borrow_identity(&cache_dir, &backend);
+        }
 
         let auth = self.resolve_auth(&parsed);
         let threads = self.config.snapshotter.daemon.threads.max(1) as u32;
@@ -2795,6 +2835,9 @@ impl DaemonSupervisor {
         let cache_dir = self.config.snapshotter.cache.work_dir.join(slug);
         fs::create_dir_all(&mountpoint)?;
         fs::create_dir_all(&cache_dir)?;
+        if let Ok(backend) = build_backend_config(&self.config, &parsed, None) {
+            self.write_borrow_identity(&cache_dir, &backend);
+        }
 
         let auth = self.resolve_auth(&parsed);
         let threads = self.config.snapshotter.daemon.threads.max(1) as u32;
@@ -3775,6 +3818,15 @@ fn staged_from_other(src: &Path, digest: &str, stage_dir: &Path) -> io::Result<b
 /// ref, so after its tag moved it still holds the caches of the image it named before, which
 /// nothing would read or remove. Never runs under a mount of the daemon dir.
 fn wipe_stage(stage_dir: &Path, keep: Option<&Path>) -> Result<()> {
+    nydus_storage::cache::release_lenders_under(stage_dir);
+    let wiped = wipe_stage_files(stage_dir, keep);
+    // Again, for a lender a borrower opened while the files were being removed.
+    nydus_storage::cache::release_lenders_under(stage_dir);
+    wiped
+}
+
+/// [`wipe_stage`] without releasing lender descriptors.
+fn wipe_stage_files(stage_dir: &Path, keep: Option<&Path>) -> Result<()> {
     let mountpoint = stage_dir.with_file_name("mnt");
     if mounted_at(&mountpoint)
         .with_context(|| format!("cannot tell whether {} is mounted", mountpoint.display()))?
@@ -3786,7 +3838,6 @@ fn wipe_stage(stage_dir: &Path, keep: Option<&Path>) -> Result<()> {
         );
     }
     info!(stage = %stage_dir.display(), "removing the stage of another source");
-    nydus_storage::cache::release_lenders_under(stage_dir);
     // The source record and the staged bootstrap go last: until then an interrupted wipe still
     // looks staged from another source, and the next start finishes it.
     let (record, staged) = (
