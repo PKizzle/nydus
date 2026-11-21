@@ -602,6 +602,7 @@ impl ContentStoreClient {
                 Some(crate::containerd_lookup::ImageRecord {
                     name: image.name,
                     target_digest: target.digest,
+                    target_media_type: target.media_type,
                     updated: image.updated_at.map_or((0, 0), |t| (t.seconds, t.nanos)),
                 })
             })

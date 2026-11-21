@@ -24,7 +24,8 @@
 //! claimant pulled before the call is never missed. Walks are memoized by
 //! record target digest: a target names immutable content, so only targets
 //! not seen before cost `Content.Read`s. Image JSON is read as containerd's Go
-//! decoder reads it ([`go_json`]). A target that cannot be walked is kept as
+//! decoder reads it ([`crate::go_json`]), as an index or a manifest by the media
+//! type of the descriptor naming it ([`read_document`]). A target that cannot be walked is kept as
 //! unknown and makes every claim it could change uncertain (an error), never a
 //! smaller claimant set, unless its content is absent or containerd could not
 //! parse it either (no container can be created from it). Refreshes are single-flight per
@@ -41,11 +42,11 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use serde::Deserialize;
-use serde::de::DeserializeOwned;
 use sha2::{Digest, Sha256};
 use tracing::{debug, info, warn};
 
 use crate::content_store::{ContentStoreClient, is_not_found, is_rpc_failure};
+use crate::go_json::{GoType, Shape, Unparsable, decode as go_json};
 
 /// Acquire a lock without panicking on poisoning. A previous panic while a
 /// lock was held would only have left the memo in a partially-populated
@@ -133,36 +134,10 @@ fn tag_named(names: &[String]) -> bool {
     names.iter().any(|n| is_tag_ref(n))
 }
 
-/// Image JSON that containerd's decoder rejects as well (see [`go_json`]):
-/// no container can be created from it.
-#[derive(Debug, thiserror::Error)]
-#[error("unparsable image JSON: {0}")]
-struct Unparsable(String);
-
+/// Image JSON that containerd rejects as well (see [`crate::go_json`] and
+/// [`read_document`]): no container can be created from it.
 fn is_unparsable(e: &anyhow::Error) -> bool {
     e.chain().any(|c| c.is::<Unparsable>())
-}
-
-/// Parse image JSON (an index, manifest or config) as containerd's Go
-/// decoder (`encoding/json`) does, so the walk sees what containerd uses: a
-/// later duplicate key wins, invalid UTF-8 reads as U+FFFD, and a `null`
-/// member leaves its field at the default. JSON this rejects is
-/// [`Unparsable`].
-fn go_json<T: DeserializeOwned>(bytes: &[u8]) -> Result<T> {
-    fn drop_null_members(value: &mut serde_json::Value) {
-        match value {
-            serde_json::Value::Object(map) => {
-                map.retain(|_, v| !v.is_null());
-                map.values_mut().for_each(drop_null_members);
-            }
-            serde_json::Value::Array(items) => items.iter_mut().for_each(drop_null_members),
-            _ => {}
-        }
-    }
-    let mut value: serde_json::Value = serde_json::from_str(&String::from_utf8_lossy(bytes))
-        .map_err(|e| Unparsable(e.to_string()))?;
-    drop_null_members(&mut value);
-    Ok(serde_json::from_value(value).map_err(|e| Unparsable(e.to_string()))?)
 }
 
 /// The repository part of an image ref (`host/repo` of `host/repo:tag` or
@@ -262,12 +237,15 @@ struct CrictlImage {
 struct OciManifest {
     #[serde(default)]
     layers: Vec<OciDescriptor>,
+    /// Go's `ocispec.Manifest.Config` is a value, so an absent config is a
+    /// zero descriptor (empty digest).
     #[serde(default)]
-    config: Option<OciDescriptor>,
+    config: OciDescriptor,
 }
 
-#[derive(Deserialize)]
+#[derive(Default, Deserialize)]
 struct OciDescriptor {
+    #[serde(default)]
     digest: String,
     #[serde(default)]
     annotations: HashMap<String, String>,
@@ -288,6 +266,105 @@ struct OciImageConfig {
 struct OciRootfs {
     #[serde(default, rename = "diff_ids")]
     diff_ids: Vec<String>,
+}
+
+/// containerd's `images.unknownDocument`: what `validateMediaType` checks.
+#[derive(Deserialize)]
+struct UnknownDocument {
+    #[serde(rename = "mediaType")]
+    media_type: String,
+    config: bool,
+    layers: bool,
+    manifests: bool,
+    #[serde(rename = "fsLayers")]
+    fs_layers: bool,
+}
+
+/// The Go types containerd decodes these documents into (`ocispec`), for the
+/// fields read here.
+const PLATFORM_SHAPE: Shape = Shape::Struct(&[("architecture", Shape::Str), ("os", Shape::Str)]);
+const DESCRIPTOR_SHAPE: Shape = Shape::Struct(&[
+    ("mediaType", Shape::Str),
+    ("digest", Shape::Str),
+    ("annotations", Shape::StrMap),
+    ("platform", Shape::Ptr(&PLATFORM_SHAPE)),
+]);
+
+impl GoType for OciManifest {
+    const SHAPE: Shape = Shape::Struct(&[
+        ("config", DESCRIPTOR_SHAPE),
+        ("layers", Shape::List(&DESCRIPTOR_SHAPE)),
+    ]);
+}
+
+impl GoType for OciIndexWithPlatforms {
+    const SHAPE: Shape = Shape::Struct(&[("manifests", Shape::List(&DESCRIPTOR_SHAPE))]);
+}
+
+impl GoType for OciImageConfig {
+    const SHAPE: Shape = Shape::Struct(&[(
+        "rootfs",
+        Shape::Struct(&[("diff_ids", Shape::List(&Shape::Str))]),
+    )]);
+}
+
+impl GoType for UnknownDocument {
+    const SHAPE: Shape = Shape::Struct(&[
+        ("mediaType", Shape::Str),
+        ("config", Shape::Raw),
+        ("layers", Shape::Raw),
+        ("manifests", Shape::Raw),
+        ("fsLayers", Shape::Raw),
+    ]);
+}
+
+const MEDIA_TYPE_DOCKER_MANIFEST: &str = "application/vnd.docker.distribution.manifest.v2+json";
+const MEDIA_TYPE_DOCKER_MANIFEST_LIST: &str =
+    "application/vnd.docker.distribution.manifest.list.v2+json";
+const MEDIA_TYPE_OCI_MANIFEST: &str = "application/vnd.oci.image.manifest.v1+json";
+const MEDIA_TYPE_OCI_INDEX: &str = "application/vnd.oci.image.index.v1+json";
+
+fn is_manifest_type(media_type: &str) -> bool {
+    media_type == MEDIA_TYPE_DOCKER_MANIFEST || media_type == MEDIA_TYPE_OCI_MANIFEST
+}
+
+fn is_index_type(media_type: &str) -> bool {
+    media_type == MEDIA_TYPE_DOCKER_MANIFEST_LIST || media_type == MEDIA_TYPE_OCI_INDEX
+}
+
+enum Document {
+    Index(OciIndexWithPlatforms),
+    Manifest(OciManifest),
+}
+
+/// Read an image document as containerd's `images.Children` and
+/// `images.Manifest` read it: by `media_type`, the media type of the
+/// descriptor naming it (the document's own `mediaType` when the caller has
+/// none), checked as `images.validateMediaType` checks it. Any other media type
+/// has no image behind it for containerd, so it is [`Unparsable`].
+fn read_document(bytes: &[u8], media_type: &str) -> Result<Document> {
+    let doc: UnknownDocument = go_json(bytes)?;
+    let media_type = if media_type.is_empty() {
+        doc.media_type.as_str()
+    } else {
+        media_type
+    };
+    if doc.fs_layers {
+        return Err(Unparsable("schema 1 manifest".to_string()).into());
+    }
+    if is_manifest_type(media_type) {
+        if doc.manifests || is_index_type(&doc.media_type) {
+            return Err(Unparsable(format!("{media_type} document holds an index")).into());
+        }
+        return Ok(Document::Manifest(go_json(bytes)?));
+    }
+    if is_index_type(media_type) {
+        if doc.config || doc.layers || is_manifest_type(&doc.media_type) {
+            return Err(Unparsable(format!("{media_type} document holds a manifest")).into());
+        }
+        return Ok(Document::Index(go_json(bytes)?));
+    }
+    Err(Unparsable(format!("unexpected media type {media_type:?}")).into())
 }
 
 impl ContainerdLookup {
@@ -432,27 +509,27 @@ impl ContainerdLookup {
         image_ref: &str,
         content_root: &std::path::Path,
     ) -> Result<ManifestInfo> {
-        // Exact-name fast path first (`name:tag` / `name@sha256:...`).
-        let target = match cs.images_get(image_ref).await? {
-            Some(info) => Some(info.digest),
-            None => {
-                // The ref may be name-only (`docker.io/library/nginx`) —
-                // match it against the name part of every record, exactly
-                // like the legacy crictl matcher did.
-                let records = cs.images_list().await.context("containerd Images.List")?;
-                records
-                    .iter()
-                    .find(|r| record_matches_ref(&r.name, image_ref))
-                    .map(|r| r.target_digest.clone())
-            }
-        };
-        let Some(target) = target else {
+        // The exact name (`name:tag` / `name@sha256:...`) first; else the ref
+        // may be name-only (`docker.io/library/nginx`), matched against the
+        // name part of every record like the legacy crictl matcher did.
+        let records = cs.images_list().await.context("containerd Images.List")?;
+        let Some(target) = records.iter().find(|r| r.name == image_ref).or_else(|| {
+            records
+                .iter()
+                .find(|r| record_matches_ref(&r.name, image_ref))
+        }) else {
             bail!(
                 "image {image_ref} not found in containerd image store; \
                  make sure it's been pulled at least once"
             );
         };
-        resolve_accel_layers_via_grpc(cs, &target, content_root).await
+        resolve_accel_layers_via_grpc(
+            cs,
+            &target.target_digest,
+            &target.target_media_type,
+            content_root,
+        )
+        .await
     }
 }
 
@@ -461,6 +538,8 @@ impl ContainerdLookup {
 pub struct ImageRecord {
     pub name: String,
     pub target_digest: String,
+    /// The target descriptor's media type, which decides how containerd reads it.
+    pub target_media_type: String,
     /// When the record was last updated (seconds, nanoseconds).
     pub updated: (i64, i32),
 }
@@ -468,6 +547,8 @@ pub struct ImageRecord {
 /// The records pointing at one target.
 struct RecordGroup {
     target: String,
+    /// Every media type a record gives the target.
+    media_types: BTreeSet<String>,
     /// Every record name, sorted.
     names: Vec<String>,
     /// The latest update of any of them.
@@ -508,8 +589,8 @@ async fn refresh_memo(cs: &ContentStoreClient, memo: &Mutex<Memo>) -> Result<()>
             }
             (None, None) => {
                 let mut out = HashMap::new();
-                match walk_manifest_via_grpc(cs, &group.target, &group.names[0], &mut out).await {
-                    Ok(_) => walked += 1,
+                match walk_target(cs, &group, &mut out).await {
+                    Ok(()) => walked += 1,
                     Err(e) => {
                         failed += 1;
                         debug!(image = %group.names[0], error = %format_args!("{e:#}"), "image walk failed");
@@ -550,6 +631,31 @@ async fn refresh_memo(cs: &ContentStoreClient, memo: &Mutex<Memo>) -> Result<()>
         failed, total, unknown, "containerd image claims refreshed"
     );
     Ok(())
+}
+
+/// Walk a target under each media type its records give it. A media type
+/// containerd cannot read the target as names no image, so the walk fails only
+/// when every media type does, and is unknown (not absent) when any failure is
+/// neither absence nor unparsable content.
+async fn walk_target(
+    cs: &ContentStoreClient,
+    group: &RecordGroup,
+    out: &mut HashMap<String, String>,
+) -> Result<()> {
+    let (mut resolved, mut absent) = (false, None);
+    for media_type in &group.media_types {
+        match walk_manifest_via_grpc(cs, &group.target, media_type, &group.names[0], out).await {
+            Ok(_) => resolved = true,
+            Err(e) if is_not_found(&e) || is_unparsable(&e) => {
+                absent.get_or_insert(e);
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    match absent {
+        Some(e) if !resolved => Err(e),
+        _ => Ok(()),
+    }
 }
 
 /// Who claims `digest` among `walks`: see [`Claim`]. Independent of listing
@@ -654,16 +760,20 @@ fn ref_name_rank(name: &str) -> u8 {
 /// repository, since mapping a chain to a bare digest poisons every consumer
 /// downstream (registry backend, auto-accel routing, capture).
 fn group_records_by_target(records: &[ImageRecord]) -> Vec<RecordGroup> {
-    let mut by_target: BTreeMap<&str, (BTreeSet<&str>, Updated)> = BTreeMap::new();
+    type Group<'a> = (BTreeSet<&'a str>, BTreeSet<String>, Updated);
+    let mut by_target: BTreeMap<&str, Group> = BTreeMap::new();
     for record in records {
-        let (names, updated) = by_target.entry(record.target_digest.as_str()).or_default();
+        let (names, media_types, updated) =
+            by_target.entry(record.target_digest.as_str()).or_default();
         names.insert(record.name.as_str());
+        media_types.insert(record.target_media_type.clone());
         *updated = (*updated).max(record.updated);
     }
     by_target
         .into_iter()
-        .map(|(target, (names, updated))| RecordGroup {
+        .map(|(target, (names, media_types, updated))| RecordGroup {
             target: target.to_string(),
+            media_types,
             names: names.into_iter().map(str::to_string).collect(),
             updated,
         })
@@ -696,6 +806,7 @@ fn record_matches_ref(record_name: &str, image_ref: &str) -> bool {
 async fn walk_manifest_via_grpc(
     cs: &ContentStoreClient,
     digest: &str,
+    media_type: &str,
     image_ref: &str,
     out: &mut HashMap<String, String>,
 ) -> Result<bool> {
@@ -703,37 +814,53 @@ async fn walk_manifest_via_grpc(
         .fetch_bytes(digest)
         .await
         .with_context(|| format!("fetch manifest {digest}"))?;
-    // Try as index first (multi-arch); if no `manifests` field, treat as
-    // manifest. Recursion is bounded by OCI nesting (index → manifest).
-    if let Ok(index) = go_json::<OciIndexWithPlatforms>(&bytes)
-        && !index.manifests.is_empty()
+    // Recursion is bounded by OCI nesting (index → manifest).
+    let manifest = match read_document(&bytes, media_type)
+        .with_context(|| format!("parse manifest {digest}"))?
     {
-        let (host, rest) = walkable_children(&index);
-        let mut host_results = Vec::with_capacity(host.len());
-        for child in host {
-            let result = Box::pin(walk_manifest_via_grpc(cs, child, image_ref, out))
+        // No child: containerd finds no manifest for it.
+        Document::Index(index) if index.manifests.is_empty() => return Ok(false),
+        Document::Index(index) => {
+            let (host, rest) = walkable_children(&index);
+            let mut host_results = Vec::with_capacity(host.len());
+            for child in host {
+                let result = Box::pin(walk_manifest_via_grpc(
+                    cs,
+                    &child.digest,
+                    &child.media_type,
+                    image_ref,
+                    out,
+                ))
                 .await
                 .map(|_| ());
-            if let Err(e) = &result {
-                debug!(child = %child, error = %format_args!("{e:#}"), "host-platform child walk failed");
+                if let Err(e) = &result {
+                    debug!(child = %child.digest, error = %format_args!("{e:#}"), "host-platform child walk failed");
+                }
+                host_results.push(result);
             }
-            host_results.push(result);
-        }
-        let mut rest_resolved = false;
-        if walk_rest_children(&host_results, is_not_found) {
-            for child in rest {
-                match Box::pin(walk_manifest_via_grpc(cs, child, image_ref, out)).await {
-                    Ok(registered) => rest_resolved |= registered,
-                    Err(e) => {
-                        debug!(child = %child, error = %format_args!("{e:#}"), "child walk failed")
+            let mut rest_resolved = false;
+            if walk_rest_children(&host_results, is_not_found) {
+                for child in rest {
+                    match Box::pin(walk_manifest_via_grpc(
+                        cs,
+                        &child.digest,
+                        &child.media_type,
+                        image_ref,
+                        out,
+                    ))
+                    .await
+                    {
+                        Ok(registered) => rest_resolved |= registered,
+                        Err(e) => {
+                            debug!(child = %child.digest, error = %format_args!("{e:#}"), "child walk failed")
+                        }
                     }
                 }
             }
+            return index_walk_result(digest, host_results, rest_resolved).map(|()| true);
         }
-        return index_walk_result(digest, host_results, rest_resolved).map(|()| true);
-    }
-    let manifest: OciManifest =
-        go_json(&bytes).with_context(|| format!("parse manifest {digest}"))?;
+        Document::Manifest(manifest) => manifest,
+    };
     let bootstrap_indices = collect_bootstrap_layers(&manifest, image_ref, out);
     let Some(cfg_desc) = image_config(&manifest) else {
         return Ok(false);
@@ -756,10 +883,8 @@ async fn walk_manifest_via_grpc(
 /// `{}` config and no rootfs, so it has no chainIDs to register. A walk that reaches one returns
 /// `Ok(false)`, which an index does not count as a resolved child.
 fn image_config(manifest: &OciManifest) -> Option<&OciDescriptor> {
-    manifest
-        .config
-        .as_ref()
-        .filter(|c| c.media_type != "application/vnd.oci.empty.v1+json")
+    Some(&manifest.config)
+        .filter(|c| !c.digest.is_empty() && c.media_type != "application/vnd.oci.empty.v1+json")
 }
 
 /// Record bootstrap-annotated layers into the cache map (by layer digest)
@@ -769,7 +894,7 @@ fn collect_bootstrap_layers(
     image_ref: &str,
     out: &mut HashMap<String, String>,
 ) -> Vec<usize> {
-    if manifest.layers.is_empty() && manifest.config.is_none() {
+    if manifest.layers.is_empty() && manifest.config.digest.is_empty() {
         // Typically an index whose `manifests` failed to parse (e.g. a
         // non-object `platform`) falling through to the manifest parse.
         debug!(image = %image_ref, "manifest has neither layers nor config; nothing to register");
@@ -873,11 +998,10 @@ fn top_chain_of(diff_ids: &[String], manifest: &str) -> Result<String> {
 
 /// The config descriptor digest of a manifest; every image manifest has one.
 fn config_digest<'a>(manifest: &'a OciManifest, digest: &str) -> Result<&'a str> {
-    manifest
-        .config
-        .as_ref()
-        .map(|c| c.digest.as_str())
-        .with_context(|| format!("manifest {digest} has no config"))
+    match manifest.config.digest.as_str() {
+        "" => bail!("manifest {digest} has no config"),
+        config => Ok(config),
+    }
 }
 
 /// Resolve an index/manifest digest to (manifest_digest, gzip_layers) for
@@ -887,6 +1011,7 @@ fn config_digest<'a>(manifest: &'a OciManifest, digest: &str) -> Result<&'a str>
 async fn resolve_accel_layers_via_grpc(
     cs: &ContentStoreClient,
     digest: &str,
+    media_type: &str,
     content_root: &std::path::Path,
 ) -> Result<ManifestInfo> {
     // The digest is the image record's target or the host child picked
@@ -906,15 +1031,22 @@ async fn resolve_accel_layers_via_grpc(
                 );
             }
         })?;
-    if let Ok(index) = go_json::<OciIndexWithPlatforms>(&bytes)
-        && !index.manifests.is_empty()
+    let manifest = match read_document(&bytes, media_type)
+        .with_context(|| format!("parse manifest {digest}"))?
     {
-        let child = pick_host_arch_child(&index)
-            .with_context(|| format!("no manifest in index {digest} matches this host"))?;
-        return Box::pin(resolve_accel_layers_via_grpc(cs, &child, content_root)).await;
-    }
-    let manifest: OciManifest =
-        go_json(&bytes).with_context(|| format!("parse manifest {digest}"))?;
+        Document::Index(index) => {
+            let child = pick_host_arch_child(&index)
+                .with_context(|| format!("no manifest in index {digest} matches this host"))?;
+            return Box::pin(resolve_accel_layers_via_grpc(
+                cs,
+                &child.digest,
+                &child.media_type,
+                content_root,
+            ))
+            .await;
+        }
+        Document::Manifest(manifest) => manifest,
+    };
     let config = config_digest(&manifest, digest)?;
     let cfg_bytes = cs
         .fetch_bytes(config)
@@ -930,12 +1062,8 @@ async fn resolve_accel_layers_via_grpc(
 
 /// Pick the index child matching the host architecture/OS. Pure so tests
 /// can pin the GOARCH translation.
-fn pick_host_arch_child(index: &OciIndexWithPlatforms) -> Option<String> {
-    index
-        .manifests
-        .iter()
-        .find(|child| is_host_platform(child))
-        .map(|child| child.digest.clone())
+fn pick_host_arch_child(index: &OciIndexWithPlatforms) -> Option<&OciIndexEntry> {
+    index.manifests.iter().find(|child| is_host_platform(child))
 }
 
 /// Index children for the chainID map, split into `(host, rest)`: the
@@ -946,7 +1074,7 @@ fn pick_host_arch_child(index: &OciIndexWithPlatforms) -> Option<String> {
 /// absent and are walked only when `walk_rest_children` says so. That
 /// fallback keeps indices without platform info, and images pulled for a
 /// foreign platform (`--platform`, tarball import), resolvable.
-fn walkable_children(index: &OciIndexWithPlatforms) -> (Vec<&str>, Vec<&str>) {
+fn walkable_children(index: &OciIndexWithPlatforms) -> (Vec<&OciIndexEntry>, Vec<&OciIndexEntry>) {
     let (mut host, mut rest) = (Vec::new(), Vec::new());
     for child in &index.manifests {
         let group = if is_host_platform(child) {
@@ -954,7 +1082,7 @@ fn walkable_children(index: &OciIndexWithPlatforms) -> (Vec<&str>, Vec<&str>) {
         } else {
             &mut rest
         };
-        group.push(child.digest.as_str());
+        group.push(child);
     }
     (host, rest)
 }
@@ -1106,7 +1234,10 @@ struct OciIndexWithPlatforms {
 
 #[derive(Deserialize)]
 struct OciIndexEntry {
+    #[serde(default)]
     digest: String,
+    #[serde(default, rename = "mediaType")]
+    media_type: String,
     #[serde(default)]
     platform: Option<OciPlatform>,
 }
@@ -1170,7 +1301,8 @@ fn manifest_info_via_cli(image_ref: &str, content_root: &std::path::Path) -> Res
         let Some(manifest_digest) = matched_manifest else {
             continue;
         };
-        return resolve_accel_layers_via_cli(&manifest_digest, content_root);
+        // crictl does not report the target's media type: the document's own decides.
+        return resolve_accel_layers_via_cli(&manifest_digest, "", content_root);
     }
     bail!(
         "image {image_ref} not found in crictl images output; \
@@ -1180,21 +1312,23 @@ fn manifest_info_via_cli(image_ref: &str, content_root: &std::path::Path) -> Res
 
 fn resolve_accel_layers_via_cli(
     digest: &str,
+    media_type: &str,
     content_root: &std::path::Path,
 ) -> Result<ManifestInfo> {
     let bytes = run_first_ok(&[
         &["ctr", "-n", "k8s.io", "content", "get", digest],
         &["k3s", "ctr", "-n", "k8s.io", "content", "get", digest],
     ])?;
-    if let Ok(index) = go_json::<OciIndexWithPlatforms>(&bytes)
-        && !index.manifests.is_empty()
+    let manifest = match read_document(&bytes, media_type)
+        .with_context(|| format!("parse manifest {digest}"))?
     {
-        let child = pick_host_arch_child(&index)
-            .with_context(|| format!("no manifest in index {digest} matches this host"))?;
-        return resolve_accel_layers_via_cli(&child, content_root);
-    }
-    let manifest: OciManifest =
-        go_json(&bytes).with_context(|| format!("parse manifest {digest}"))?;
+        Document::Index(index) => {
+            let child = pick_host_arch_child(&index)
+                .with_context(|| format!("no manifest in index {digest} matches this host"))?;
+            return resolve_accel_layers_via_cli(&child.digest, &child.media_type, content_root);
+        }
+        Document::Manifest(manifest) => manifest,
+    };
     let config = config_digest(&manifest, digest)?;
     let cfg_bytes = run_first_ok(&[
         &["ctr", "-n", "k8s.io", "content", "get", config],
@@ -1333,9 +1467,8 @@ mod tests {
         assert!(format!("{err:#}").contains("nydus layer"), "{err:#}");
     }
 
-    /// Image JSON reads as containerd's Go decoder reads it: the last of
-    /// duplicate keys wins, `null` leaves a field at its default, and invalid
-    /// UTF-8 is no error; JSON it rejects is [`Unparsable`].
+    /// Image JSON reads as containerd's Go decoder reads it (the cases are
+    /// pinned in [`crate::go_json`]); JSON it rejects is [`Unparsable`].
     #[test]
     fn image_json_is_read_like_go() {
         let json = [
@@ -1353,15 +1486,63 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["sha256:b"]
         );
-        assert!(manifest.config.is_none());
+        assert!(manifest.config.digest.is_empty());
         let config: OciImageConfig = go_json(
             br#"{"rootfs":{"diff_ids":["sha256:first"]},"rootfs":{"diff_ids":["sha256:last"]}}"#,
         )
         .unwrap();
         assert_eq!(config.rootfs.diff_ids, ["sha256:last"]);
         for broken in [&br#"{"rootfs":"#[..], br#"{"layers":"many"}"#] {
-            let err = go_json::<OciManifest>(broken).err().unwrap();
+            let err = anyhow::Error::from(go_json::<OciManifest>(broken).err().unwrap());
             assert!(is_unparsable(&err.context("walk")));
+        }
+    }
+
+    /// A document is an index or a manifest by the media type of the
+    /// descriptor naming it, falling back to its own `mediaType`, and is
+    /// rejected where containerd's `validateMediaType` rejects it.
+    #[test]
+    fn documents_are_read_by_media_type() {
+        let index = br#"{"manifests":[{"digest":"sha256:c"}]}"#;
+        let manifest = br#"{"config":{"digest":"sha256:cfg"},"layers":[]}"#;
+        let is_index = |bytes: &[u8], media_type: &str| match read_document(bytes, media_type) {
+            Ok(Document::Index(_)) => Some(true),
+            Ok(Document::Manifest(_)) => Some(false),
+            Err(e) => {
+                assert!(is_unparsable(&e), "{e:#}");
+                None
+            }
+        };
+        for mt in [MEDIA_TYPE_OCI_INDEX, MEDIA_TYPE_DOCKER_MANIFEST_LIST] {
+            assert_eq!(is_index(index, mt), Some(true));
+            // An index without children is still an index.
+            assert_eq!(is_index(b"{}", mt), Some(true));
+            assert_eq!(is_index(manifest, mt), None);
+            assert_eq!(is_index(br#"{"Layers":null}"#, mt), None);
+            let typed = format!(r#"{{"mediaType":"{MEDIA_TYPE_OCI_MANIFEST}"}}"#);
+            assert_eq!(is_index(typed.as_bytes(), mt), None);
+        }
+        for mt in [MEDIA_TYPE_OCI_MANIFEST, MEDIA_TYPE_DOCKER_MANIFEST] {
+            assert_eq!(is_index(manifest, mt), Some(false));
+            assert_eq!(is_index(b"{}", mt), Some(false));
+            assert_eq!(is_index(index, mt), None);
+            assert_eq!(is_index(br#"{"MANIFESTS":[]}"#, mt), None);
+            let typed = format!(r#"{{"mediaType":"{MEDIA_TYPE_OCI_INDEX}"}}"#);
+            assert_eq!(is_index(typed.as_bytes(), mt), None);
+            // A document naming some other media type of its own is no index.
+            assert_eq!(is_index(br#"{"mediaType":"x"}"#, mt), Some(false));
+        }
+        let own = |mt: &str, body: &str| format!(r#"{{"mediaType":"{mt}",{body}}}"#);
+        let own_index = own(MEDIA_TYPE_OCI_INDEX, r#""manifests":[]"#);
+        assert_eq!(is_index(own_index.as_bytes(), ""), Some(true));
+        let own_manifest = own(MEDIA_TYPE_DOCKER_MANIFEST, r#""layers":[]"#);
+        assert_eq!(is_index(own_manifest.as_bytes(), ""), Some(false));
+        for (bytes, mt) in [
+            (&index[..], ""),
+            (&index[..], "application/vnd.oci.image.config.v1+json"),
+            (br#"{"fsLayers":[]}"#, MEDIA_TYPE_OCI_MANIFEST),
+        ] {
+            assert_eq!(is_index(bytes, mt), None, "{mt}");
         }
     }
 
@@ -1416,6 +1597,14 @@ mod tests {
         serde_json::from_value(json).expect("valid index JSON")
     }
 
+    fn digests_of<'a>(
+        (host, rest): (Vec<&'a OciIndexEntry>, Vec<&'a OciIndexEntry>),
+    ) -> (Vec<&'a str>, Vec<&'a str>) {
+        let digests =
+            |v: Vec<&'a OciIndexEntry>| v.into_iter().map(|c| c.digest.as_str()).collect();
+        (digests(host), digests(rest))
+    }
+
     fn entry(digest: &str, arch: &str, os: &str) -> serde_json::Value {
         serde_json::json!({
             "digest": digest,
@@ -1439,7 +1628,7 @@ mod tests {
             entry("sha256:attest-foreign", "unknown", "unknown"),
             entry("sha256:other-os", host, "windows"),
         ]}));
-        let (host_children, rest) = walkable_children(&index);
+        let (host_children, rest) = digests_of(walkable_children(&index));
         assert_eq!(host_children, vec!["sha256:host"]);
         assert_eq!(
             rest,
@@ -1451,7 +1640,10 @@ mod tests {
                 "sha256:other-os",
             ]
         );
-        assert_eq!(pick_host_arch_child(&index).as_deref(), Some("sha256:host"));
+        assert_eq!(
+            pick_host_arch_child(&index).map(|c| c.digest.as_str()),
+            Some("sha256:host")
+        );
     }
 
     /// Variants (arm64/v8 vs bare arm64) and `os.features` (the nydus
@@ -1470,7 +1662,7 @@ mod tests {
                             "os.features": ["nydus.remoteimage.v1"] } },
             entry("sha256:foreign", "riscv-none", os),
         ]}));
-        let (host_children, rest) = walkable_children(&index);
+        let (host_children, rest) = digests_of(walkable_children(&index));
         assert_eq!(
             host_children,
             vec!["sha256:bare", "sha256:v8", "sha256:nydus"]
@@ -1487,11 +1679,11 @@ mod tests {
             { "digest": "sha256:b", "platform": {} },
             entry("sha256:c", "riscv-none", "plan9"),
         ]}));
-        let (host_children, rest) = walkable_children(&index);
+        let (host_children, rest) = digests_of(walkable_children(&index));
         assert!(host_children.is_empty());
         assert_eq!(rest, vec!["sha256:a", "sha256:b", "sha256:c"]);
         assert!(walk_rest_children(&[], is_not_found));
-        assert_eq!(pick_host_arch_child(&index), None);
+        assert!(pick_host_arch_child(&index).is_none());
     }
 
     fn not_found(digest: &str) -> Result<()> {
@@ -1512,7 +1704,7 @@ mod tests {
             entry("sha256:foreign", foreign, os),
             entry("sha256:host", host, os),
         ]}));
-        let (host_children, rest) = walkable_children(&index);
+        let (host_children, rest) = digests_of(walkable_children(&index));
         assert_eq!(host_children, vec!["sha256:host"]);
         assert_eq!(rest, vec!["sha256:foreign"]);
 
@@ -1940,6 +2132,7 @@ mod tests {
             name: name.to_string(),
             target_digest: target.to_string(),
             updated: (updated, 0),
+            ..ImageRecord::default()
         };
         let mut records = vec![
             record("reg/app:1", "sha256:m", 5),
@@ -1947,6 +2140,19 @@ mod tests {
             record("reg/app@sha256:m", "sha256:m", 9),
             record("sha256:0c0da35587", "sha256:m", 2),
         ];
+        records[1].target_media_type = MEDIA_TYPE_OCI_INDEX.to_string();
+        records[2].target_media_type = MEDIA_TYPE_OCI_MANIFEST.to_string();
+        let media_types: Vec<_> = group_records_by_target(&records)
+            .into_iter()
+            .map(|g| g.media_types.into_iter().collect::<Vec<_>>())
+            .collect();
+        assert_eq!(
+            media_types,
+            [
+                vec![MEDIA_TYPE_OCI_INDEX],
+                vec!["", MEDIA_TYPE_OCI_MANIFEST]
+            ]
+        );
         let key = |groups: Vec<RecordGroup>| -> Vec<(String, Vec<String>, Updated)> {
             groups
                 .into_iter()

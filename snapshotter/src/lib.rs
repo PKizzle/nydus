@@ -47,6 +47,7 @@ pub mod content_store;
 pub mod daemon;
 pub mod failover;
 pub mod fdstore;
+pub(crate) mod go_json;
 pub mod grpc;
 pub mod local_accel;
 pub mod metrics;
