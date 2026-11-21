@@ -775,11 +775,21 @@ pub struct ManifestInfo {
     pub chain_id: String,
 }
 
-/// Topmost chainID of an image config's `rootfs.diff_ids`.
-fn top_chain_id(cfg_bytes: &[u8], manifest: &str) -> Result<String> {
+/// An image config's `rootfs.diff_ids`.
+fn config_diff_ids(cfg_bytes: &[u8], manifest: &str) -> Result<Vec<String>> {
     let cfg: OciImageConfig = serde_json::from_slice(cfg_bytes)
         .with_context(|| format!("parse image config of manifest {manifest}"))?;
-    chain_ids(&cfg.rootfs.diff_ids)
+    Ok(cfg.rootfs.diff_ids)
+}
+
+/// Topmost chainID of an image config's `rootfs.diff_ids`.
+#[cfg(test)]
+fn top_chain_id(cfg_bytes: &[u8], manifest: &str) -> Result<String> {
+    top_chain_of(&config_diff_ids(cfg_bytes, manifest)?, manifest)
+}
+
+fn top_chain_of(diff_ids: &[String], manifest: &str) -> Result<String> {
+    chain_ids(diff_ids)
         .pop()
         .with_context(|| format!("image config of manifest {manifest} has no diff_ids"))
 }
@@ -828,16 +838,16 @@ async fn resolve_accel_layers_via_grpc(
     }
     let manifest: OciManifest = serde_json::from_slice(&bytes)
         .map_err(|e| anyhow::anyhow!("parse manifest {digest}: {e}"))?;
-    let layers = accel_layers_from_manifest(&manifest, digest, content_root)?;
     let config = config_digest(&manifest, digest)?;
     let cfg_bytes = cs
         .fetch_bytes(config)
         .await
         .with_context(|| format!("fetch image config {config}"))?;
+    let diff_ids = config_diff_ids(&cfg_bytes, digest)?;
     Ok(ManifestInfo {
         manifest_digest: digest.to_string(),
-        layers,
-        chain_id: top_chain_id(&cfg_bytes, digest)?,
+        layers: accel_layers_from_manifest(&manifest, digest, content_root, &diff_ids)?,
+        chain_id: top_chain_of(&diff_ids, digest)?,
     })
 }
 
@@ -939,28 +949,38 @@ pub struct MissingLayers {
     pub digests: Vec<String>,
 }
 
-/// Filter a manifest's layers down to the data layers the auto-accel
-/// path consumes, resolving each to its on-disk content-store path. Pure
+/// A manifest's layers as the auto-accel path converts them, each with the
+/// diff ID its config lists at its index and its on-disk content-store path.
+/// Every layer must be a tar, gzip or zstd layer with a diff ID: the artifact
+/// stands for the chain those diff IDs make, so none may be left out. Pure
 /// (filesystem check aside) and shared by the gRPC and CLI paths. Absent blobs
 /// fail with [`MissingLayers`], naming all of them.
 fn accel_layers_from_manifest(
     manifest: &OciManifest,
     digest: &str,
     content_root: &std::path::Path,
+    diff_ids: &[String],
 ) -> Result<Vec<crate::local_accel::SourceLayer>> {
+    if manifest.layers.len() != diff_ids.len() {
+        bail!(
+            "manifest {digest} has {} layers but its config {} diff IDs",
+            manifest.layers.len(),
+            diff_ids.len()
+        );
+    }
     let mut layers = Vec::with_capacity(manifest.layers.len());
     let mut missing = Vec::new();
-    for layer in &manifest.layers {
-        // Skip nydus-bootstrap / nydus-blob layers — they're not data
-        // layers from the auto-accel path's perspective.
+    for (layer, diff_id) in manifest.layers.iter().zip(diff_ids) {
         let is_nydus = layer
             .annotations
             .get(NYDUS_BOOTSTRAP_ANNOTATION)
-            .map(|s| s == "true")
-            .unwrap_or(false)
+            .is_some_and(|s| s == "true")
             || layer.media_type.contains("nydus");
         if is_nydus {
-            continue;
+            bail!(
+                "layer {} is a nydus layer; node-local acceleration converts OCI images",
+                layer.digest
+            );
         }
         // Layers are referenced in place: gzip through zran, zstd through frame-aligned
         // contexts, uncompressed tar directly. Checked before the blob lookup so any other
@@ -984,6 +1004,7 @@ fn accel_layers_from_manifest(
         }
         layers.push(crate::local_accel::SourceLayer {
             digest: layer.digest.clone(),
+            diff_id: diff_id.clone(),
             path,
         });
     }
@@ -1097,17 +1118,17 @@ fn resolve_accel_layers_via_cli(
     }
     let manifest: OciManifest = serde_json::from_slice(&bytes)
         .map_err(|e| anyhow::anyhow!("parse manifest {digest}: {e}"))?;
-    let layers = accel_layers_from_manifest(&manifest, digest, content_root)?;
     let config = config_digest(&manifest, digest)?;
     let cfg_bytes = run_first_ok(&[
         &["ctr", "-n", "k8s.io", "content", "get", config],
         &["k3s", "ctr", "-n", "k8s.io", "content", "get", config],
     ])
     .with_context(|| format!("fetch image config {config}"))?;
+    let diff_ids = config_diff_ids(&cfg_bytes, digest)?;
     Ok(ManifestInfo {
         manifest_digest: digest.to_string(),
-        layers,
-        chain_id: top_chain_id(&cfg_bytes, digest)?,
+        layers: accel_layers_from_manifest(&manifest, digest, content_root, &diff_ids)?,
+        chain_id: top_chain_of(&diff_ids, digest)?,
     })
 }
 
@@ -1176,14 +1197,63 @@ mod tests {
         ]}))
         .unwrap();
         // The content root does not exist: the media type must be rejected first.
-        let err =
-            accel_layers_from_manifest(&manifest, "sha256:m", std::path::Path::new("/nonexistent"))
-                .unwrap_err()
-                .to_string();
+        let err = accel_layers_from_manifest(
+            &manifest,
+            "sha256:m",
+            std::path::Path::new("/nonexistent"),
+            &diff_ids(1),
+        )
+        .unwrap_err()
+        .to_string();
         assert!(
             err.contains("tar+bzip2") && err.contains("needs tar"),
             "{err}"
         );
+    }
+
+    fn diff_ids(n: usize) -> Vec<String> {
+        (0..n).map(|i| format!("sha256:d{i}")).collect()
+    }
+
+    /// Each layer carries the diff ID at its index, and an image whose layers
+    /// and diff IDs do not pair up, or that holds a nydus layer, is no
+    /// candidate.
+    #[test]
+    fn accel_layers_carry_their_diff_ids() {
+        let root = tempfile::tempdir().unwrap();
+        let blobs = root.path().join("blobs/sha256");
+        std::fs::create_dir_all(&blobs).unwrap();
+        std::fs::write(blobs.join("aa"), b"a").unwrap();
+        std::fs::write(blobs.join("bb"), b"b").unwrap();
+        let gzip = "application/vnd.oci.image.layer.v1.tar+gzip";
+        let manifest: OciManifest = serde_json::from_value(serde_json::json!({ "layers": [
+            { "digest": "sha256:aa", "mediaType": gzip },
+            { "digest": "sha256:bb", "mediaType": "application/vnd.oci.image.layer.v1.tar" },
+        ]}))
+        .unwrap();
+        let layers =
+            accel_layers_from_manifest(&manifest, "sha256:m", root.path(), &diff_ids(2)).unwrap();
+        assert_eq!(
+            layers
+                .iter()
+                .map(|l| l.diff_id.as_str())
+                .collect::<Vec<_>>(),
+            ["sha256:d0", "sha256:d1"]
+        );
+        for n in [1, 3] {
+            let err = accel_layers_from_manifest(&manifest, "sha256:m", root.path(), &diff_ids(n))
+                .unwrap_err();
+            assert!(format!("{err:#}").contains("diff IDs"), "{err:#}");
+        }
+        let nydus: OciManifest = serde_json::from_value(serde_json::json!({ "layers": [
+            { "digest": "sha256:aa", "mediaType": gzip },
+            { "digest": "sha256:bb", "mediaType": gzip,
+              "annotations": { NYDUS_BOOTSTRAP_ANNOTATION: "true" } },
+        ]}))
+        .unwrap();
+        let err =
+            accel_layers_from_manifest(&nydus, "sha256:m", root.path(), &diff_ids(2)).unwrap_err();
+        assert!(format!("{err:#}").contains("nydus layer"), "{err:#}");
     }
 
     #[test]
@@ -1220,7 +1290,8 @@ mod tests {
             { "digest": "sha256:cc", "mediaType": gzip },
         ]}))
         .unwrap();
-        let err = accel_layers_from_manifest(&manifest, "sha256:m", root.path()).unwrap_err();
+        let err = accel_layers_from_manifest(&manifest, "sha256:m", root.path(), &diff_ids(3))
+            .unwrap_err();
         // Downcastable through the context callers attach.
         let err = err.context("resolve manifest");
         assert_eq!(
