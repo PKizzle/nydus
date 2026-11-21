@@ -44,6 +44,9 @@ pub struct SnapshotterMetrics {
     /// Container-rootfs prepares whose parent chain several images claim, so
     /// no accelerated content was served for it.
     ambiguous_chain_total: AtomicU64,
+    /// Prepare/View calls refused because their parent chain stacks on a
+    /// nydus data layer with no bootstrap vouching for it.
+    unapplied_chain_refused_total: AtomicU64,
     /// The conversion worker, once it exists (auto_zran enabled); its status is rendered as
     /// the `snapshotter_auto_zran_*` families.
     auto_zran: OnceLock<Arc<AutoZranManager>>,
@@ -97,6 +100,7 @@ impl SnapshotterMetrics {
             peer_mirror_selfcheck_ok: Mutex::new(None),
             daemon_release_missing_total: AtomicU64::new(0),
             ambiguous_chain_total: AtomicU64::new(0),
+            unapplied_chain_refused_total: AtomicU64::new(0),
             auto_zran: OnceLock::new(),
         }
     }
@@ -119,6 +123,13 @@ impl SnapshotterMetrics {
     /// `snapshotter_ambiguous_chain_total` counter.
     pub fn record_ambiguous_chain(&self) {
         self.ambiguous_chain_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Count a Prepare/View refused on an unapplied nydus data layer. Feeds
+    /// the `snapshotter_unapplied_chain_refused_total` counter.
+    pub fn record_unapplied_chain_refused(&self) {
+        self.unapplied_chain_refused_total
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     /// Record the outcome of the latest peer-mirror local self-check. `true`
@@ -271,6 +282,13 @@ impl SnapshotterMetrics {
             out,
             "snapshotter_daemon_release_missing_total",
             self.daemon_release_missing_total.load(Ordering::Relaxed),
+        );
+        out.push_str("# HELP snapshotter_unapplied_chain_refused_total Prepare/View calls refused because their parent chain stacks on an unapplied nydus data layer.\n");
+        out.push_str("# TYPE snapshotter_unapplied_chain_refused_total counter\n");
+        push_metric(
+            out,
+            "snapshotter_unapplied_chain_refused_total",
+            self.unapplied_chain_refused_total.load(Ordering::Relaxed),
         );
     }
 

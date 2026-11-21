@@ -16,6 +16,11 @@ use std::collections::HashMap;
 /// committed snapshot name (chain ID) for a layer extraction.
 pub const TARGET_SNAPSHOT_REF: &str = "containerd.io/snapshot.ref";
 
+/// Set by containerd's image unpacker (2.3 and later) on `Prepare`: the diff
+/// ID the image's config declares for the layer, which
+/// [`TARGET_SNAPSHOT_REF`] is derived from.
+pub const SNAPSHOT_DIFF_ID: &str = "containerd.io/snapshot/diff-id";
+
 /// Marks a layer as a Nydus data blob
 /// (`application/vnd.oci.image.layer.nydus.blob.v1`).
 pub const NYDUS_DATA_LAYER: &str = "containerd.io/snapshot/nydus-blob";

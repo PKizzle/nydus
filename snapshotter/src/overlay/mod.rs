@@ -15,7 +15,8 @@ mod paths;
 use crate::config::SnapshotterConfig;
 use crate::containerd_lookup::ContainerdLookup;
 use crate::source::{
-    CRI_IMAGE_REF, LayerKind, NYDUS_META_LAYER, classify_layer, target_snapshot_ref,
+    CRI_IMAGE_REF, LayerKind, NYDUS_META_LAYER, SNAPSHOT_DIFF_ID, classify_layer,
+    target_snapshot_ref,
 };
 use crate::store::{SnapshotKind, SnapshotStore, StoreError};
 use anyhow::{Context, Result, bail};
@@ -24,11 +25,67 @@ use labels::{bootstrap_digest_from_key, image_ref, is_image_ref_like, normalize_
 use mounts::{bind_mount, overlay_mount};
 pub use paths::snapshot_dir_name;
 use paths::{dir_usage, ensure_short_link, fs_dir, remove_short_link, snapshot_dir, work_dir};
+use sha2::Digest as _;
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tracing::{debug, info, warn};
+
+/// Why a snapshot chain holding a nydus data layer cannot be used.
+#[derive(Debug, thiserror::Error)]
+pub enum ChainError {
+    /// A layer would stack on a nydus data layer, which the snapshotter
+    /// committed without containerd applying it, with no nydus bootstrap
+    /// vouching for it.
+    #[error(
+        "parent chain {chain} holds unapplied nydus data layer {layer} with no nydus bootstrap above it"
+    )]
+    UnappliedDataLayer { chain: String, layer: String },
+    /// A nydus meta layer whose image is unknown, so no daemon can serve the
+    /// data layers below it.
+    #[error("nydus meta snapshot {0} has no usable image reference")]
+    NoImageRef(String),
+}
+
+/// Check that `target`, the chain ID a nydus data layer is to be committed
+/// under unapplied, is the one containerd derives from `parent` and the
+/// diff ID it sent in [`SNAPSHOT_DIFF_ID`]. containerd before 2.3 sends no
+/// diff ID; such a layer is refused rather than committed on trust.
+fn check_claimed_chain(
+    target: &str,
+    parent: Option<&str>,
+    labels: &HashMap<String, String>,
+) -> Result<()> {
+    let Some(diff_id) = labels.get(SNAPSHOT_DIFF_ID) else {
+        bail!(
+            "nydus data layer {target} carries no {SNAPSHOT_DIFF_ID} label (containerd 2.3 or later sets it); refusing to commit it unapplied"
+        );
+    };
+    let expected = match parent {
+        None => diff_id.clone(),
+        Some(parent) => {
+            let parent_chain = parent.rsplit('/').next().unwrap_or(parent);
+            let digest = sha2::Sha256::digest(format!("{parent_chain} {diff_id}"));
+            format!("sha256:{}", hex::encode(digest))
+        }
+    };
+    if expected != target {
+        bail!(
+            "nydus data layer {target} does not match parent {parent:?} and diff ID {diff_id}; refusing to commit it unapplied"
+        );
+    }
+    Ok(())
+}
+
+/// What [`OverlayEngine::nydus_meta_info`] resolves the image for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MetaUse {
+    /// Start or reuse a daemon to serve the chain.
+    Serve,
+    /// Find the daemon a snapshot already holds a reference on.
+    Account,
+}
 
 /// Outcome of a `Prepare` call, signalling whether containerd should mount
 /// the returned filesystem or treat the layer as already extracted.
@@ -79,6 +136,11 @@ impl OverlayEngine {
         self
     }
 
+    /// The lookup [`Self::nydus_meta_info`] resolves a meta layer's image with.
+    pub fn containerd_lookup(&self) -> Option<&Arc<ContainerdLookup>> {
+        self.containerd_lookup.as_ref()
+    }
+
     /// Return mounts for an existing active/view snapshot.
     pub fn mounts(&self, store: &SnapshotStore, key: &str) -> Result<Vec<Mount>> {
         let info = store.stat(key)?;
@@ -105,6 +167,13 @@ impl OverlayEngine {
         debug!(key, parent, "prepare snapshot");
         let parent = normalize_parent(parent);
         self.validate_parent(store, parent, labels)?;
+        let skip_target = match (target_snapshot_ref(labels), classify_layer(labels)) {
+            (Some(target), LayerKind::NydusData) => {
+                check_claimed_chain(target, parent, labels)?;
+                Some(target)
+            }
+            _ => None,
+        };
         self.create_snapshot_dirs(key, false)?;
         let result = store.create(
             key,
@@ -119,9 +188,7 @@ impl OverlayEngine {
             return Err(e);
         }
 
-        if let (Some(target), LayerKind::NydusData) =
-            (target_snapshot_ref(labels), classify_layer(labels))
-        {
+        if let Some(target) = skip_target {
             info!(
                 %key,
                 target,
@@ -272,62 +339,76 @@ impl OverlayEngine {
 
     /// Walk the parent chain starting at `parent` and return Nydus meta info
     /// (bootstrap path + image ref) if any ancestor is a committed Nydus
-    /// bootstrap layer.
+    /// bootstrap layer: one labelled as such whose content holds a bootstrap.
+    ///
+    /// Labels and the image ref stored on a shared snapshot are whatever the
+    /// image that committed the chain first claimed. [`MetaUse::Serve`]
+    /// therefore takes the image only from this call's labels or containerd's
+    /// image store, and fails rather than fall back to a plain overlay over
+    /// the empty data layers. [`MetaUse::Account`] (which daemon a snapshot
+    /// holds) also reads the stored ref, and reports no daemon when none is
+    /// known.
     pub fn nydus_meta_info(
         &self,
         store: &SnapshotStore,
         parent: &str,
         call_labels: &HashMap<String, String>,
+        usage: MetaUse,
     ) -> Result<Option<NydusMetaInfo>> {
         if parent.is_empty() {
             return Ok(None);
         }
-        let call_image_ref = call_labels.get(CRI_IMAGE_REF).cloned();
+        let call_image_ref = call_labels
+            .get(CRI_IMAGE_REF)
+            .cloned()
+            .filter(|s| is_image_ref_like(s));
         for snap in store.parent_chain(parent)? {
-            if !snap.labels.contains_key(NYDUS_META_LAYER) {
+            if !snap.labels.contains_key(NYDUS_META_LAYER) || !self.holds_bootstrap(&snap.key) {
                 continue;
             }
             let stored = snap.image_ref.clone().filter(|s| is_image_ref_like(s));
-            let from_containerd = if call_image_ref.is_none() && stored.is_none() {
-                // Cache-only: this is sync code on the gRPC runtime, so it
-                // must never trigger an image-store walk. The cache is
-                // shared with (and populated by) the async prepare path.
-                // Guarded like `stored`: a cache populated by an older binary
-                // can map a chain to a bare image-ID record (`sha256:…`), and
-                // a daemon built from that fetches blobs from repo
-                // "library/sha256" — every data read EIOs (the 0.2.9-nydus
-                // mirrors incident).
-                bootstrap_digest_from_key(&snap.key)
-                    .and_then(|d| self.containerd_lookup.as_ref()?.lookup_cached(d))
-                    .filter(|s| is_image_ref_like(s))
-            } else {
-                None
-            };
-            // Every candidate is digest-guarded: call/stored/from_containerd
-            // via `is_image_ref_like`, the snapshot CRI label inline here.
-            let image_ref = call_image_ref
-                .clone()
-                .filter(|s| is_image_ref_like(s))
-                .or_else(|| stored.clone())
-                .or_else(|| {
-                    snap.labels
-                        .get(CRI_IMAGE_REF)
-                        .cloned()
+            let from_containerd =
+                if call_image_ref.is_none() && (usage == MetaUse::Serve || stored.is_none()) {
+                    // Cache-only: this is sync code on the gRPC runtime, so it
+                    // must never trigger an image-store walk. The cache is
+                    // shared with (and populated by) the async prepare path.
+                    // Guarded like `stored`: a cache populated by an older binary
+                    // can map a chain to a bare image-ID record (`sha256:…`), and
+                    // a daemon built from that fetches blobs from repo
+                    // "library/sha256" — every data read EIOs (the 0.2.9-nydus
+                    // mirrors incident).
+                    bootstrap_digest_from_key(&snap.key)
+                        .and_then(|d| self.containerd_lookup.as_ref()?.lookup_cached(d))
                         .filter(|s| is_image_ref_like(s))
-                })
-                .or(from_containerd.clone());
+                } else {
+                    None
+                };
+            let image_ref = match usage {
+                MetaUse::Serve => call_image_ref.clone().or(from_containerd.clone()),
+                MetaUse::Account => call_image_ref
+                    .clone()
+                    .or_else(|| stored.clone())
+                    .or_else(|| {
+                        snap.labels
+                            .get(CRI_IMAGE_REF)
+                            .cloned()
+                            .filter(|s| is_image_ref_like(s))
+                    })
+                    .or(from_containerd.clone()),
+            };
             let Some(image_ref) = image_ref else {
+                if usage == MetaUse::Serve {
+                    return Err(ChainError::NoImageRef(snap.key.clone()).into());
+                }
                 info!(
                     snap = %snap.key,
-                    has_call_label = call_labels.contains_key(CRI_IMAGE_REF),
                     stored = ?snap.image_ref,
                     "nydus meta layer found but no usable image reference"
                 );
                 continue;
             };
-            // Backfill bogus stored image_ref values written by older versions
-            // (e.g. raw `sha256:…` digests) so reattach calls without a CRI
-            // label can still resolve the right image.
+            // Record the ref a daemon was resolved with, so accounting after
+            // a restart (cold lookup cache) still finds it.
             let has_authoritative = call_image_ref.is_some() || from_containerd.is_some();
             if stored.as_deref() != Some(image_ref.as_str())
                 && has_authoritative
@@ -336,17 +417,9 @@ impl OverlayEngine {
                 warn!(snap = %snap.key, error = %e, "failed to persist image_ref backfill");
             }
             info!(snap = %snap.key, %image_ref, "resolved nydus image ref");
-            let bootstrap = self.fs_dir(&snap.key).join("image").join("image.boot");
-            if !bootstrap.is_file() {
-                bail!(
-                    "nydus meta snapshot {} is missing bootstrap at {}",
-                    snap.key,
-                    bootstrap.display()
-                );
-            }
             return Ok(Some(NydusMetaInfo {
                 image_ref,
-                bootstrap,
+                bootstrap: self.fs_dir(&snap.key).join("image").join("image.boot"),
             }));
         }
         Ok(None)
@@ -428,10 +501,10 @@ impl OverlayEngine {
     /// Check that `parent` is a committed chain a layer described by `labels`
     /// may stack on.
     ///
-    /// A nydus data layer is committed without containerd applying it, so it
-    /// is only trusted below a nydus bootstrap (whose layer containerd applied
-    /// and verified) or beneath further nydus layers of the same unpack; any
-    /// other snapshot on top of it is refused.
+    /// A nydus data layer is committed without containerd applying it. On a
+    /// chain holding one, an unpack may only add further nydus data
+    /// or bootstrap layers, and any other snapshot needs a nydus meta layer
+    /// above every data layer that actually holds a bootstrap file.
     fn validate_parent(
         &self,
         store: &SnapshotStore,
@@ -442,23 +515,43 @@ impl OverlayEngine {
             return Ok(());
         };
         let chain = store.parent_chain(parent)?;
-        if matches!(
-            classify_layer(labels),
-            LayerKind::NydusData | LayerKind::NydusMeta
-        ) {
+        let Some(data) = chain
+            .iter()
+            .find(|s| classify_layer(&s.labels) == LayerKind::NydusData)
+        else {
             return Ok(());
+        };
+        let refused = || {
+            Err(ChainError::UnappliedDataLayer {
+                chain: parent.to_string(),
+                layer: data.key.clone(),
+            }
+            .into())
+        };
+        if target_snapshot_ref(labels).is_some() {
+            return match classify_layer(labels) {
+                LayerKind::NydusData | LayerKind::NydusMeta => Ok(()),
+                _ => refused(),
+            };
         }
         for snap in &chain {
             match classify_layer(&snap.labels) {
-                LayerKind::NydusMeta => break,
-                LayerKind::NydusData => bail!(
-                    "parent chain {parent} holds unapplied nydus data layer {} with no nydus bootstrap above it",
-                    snap.key
-                ),
+                LayerKind::NydusMeta if self.holds_bootstrap(&snap.key) => return Ok(()),
+                LayerKind::NydusData => return refused(),
                 _ => {}
             }
         }
-        Ok(())
+        refused()
+    }
+
+    /// Whether committed snapshot `key` holds a nydus bootstrap. The meta
+    /// label is a manifest annotation; the file is content containerd applied
+    /// and checked against the layer's diff ID. Neither path component may be
+    /// a symlink, which would lend the layer content it does not hold.
+    fn holds_bootstrap(&self, key: &str) -> bool {
+        let dir = self.fs_dir(key).join("image");
+        fs::symlink_metadata(&dir).is_ok_and(|m| m.is_dir())
+            && fs::symlink_metadata(dir.join("image.boot")).is_ok_and(|m| m.is_file())
     }
 
     fn mounts_for_created_snapshot(
@@ -828,6 +921,7 @@ mod tests {
         let mut labels = HashMap::new();
         labels.insert(TARGET_SNAPSHOT_REF.to_string(), "sha256:target".to_string());
         labels.insert(NYDUS_DATA_LAYER.to_string(), "true".to_string());
+        labels.insert(SNAPSHOT_DIFF_ID.to_string(), "sha256:target".to_string());
 
         let outcome = engine.prepare(&store, "active", "", &labels).unwrap();
         assert!(
@@ -878,24 +972,69 @@ mod tests {
         assert_eq!(mounts[0].r#type, "bind");
     }
 
-    /// Commit an unpack prepare of `target` on `parent` with `kind` the way
-    /// the gRPC layer does: a nydus data layer is committed as prepared, any
-    /// other layer after containerd applied it.
+    /// The chain ID containerd derives for a layer with `diff_id` on `parent`.
+    fn chain_id(parent: &str, diff_id: &str) -> String {
+        if parent.is_empty() {
+            return diff_id.to_string();
+        }
+        format!(
+            "sha256:{}",
+            hex::encode(sha2::Sha256::digest(format!("{parent} {diff_id}")))
+        )
+    }
+
+    /// Commit an unpack prepare of the layer with `diff_id` on `parent`, as
+    /// containerd's unpacker and the gRPC layer do: a nydus data layer is
+    /// committed as prepared, any other layer after containerd applied it.
+    /// Returns the committed chain ID.
     fn commit_layer(
         engine: &OverlayEngine,
         store: &SnapshotStore,
-        target: &str,
+        diff_id: &str,
         parent: &str,
         kind: Option<&str>,
-    ) -> Result<()> {
+    ) -> Result<String> {
         use crate::source::TARGET_SNAPSHOT_REF;
-        let mut labels = HashMap::from([(TARGET_SNAPSHOT_REF.to_string(), target.to_string())]);
+        let target = chain_id(parent, diff_id);
+        let mut labels = HashMap::from([
+            (TARGET_SNAPSHOT_REF.to_string(), target.clone()),
+            (SNAPSHOT_DIFF_ID.to_string(), diff_id.to_string()),
+        ]);
         if let Some(kind) = kind {
             labels.insert(kind.to_string(), "true".to_string());
         }
         let key = format!("default/1/extract-1 {target}");
         engine.prepare(store, &key, parent, &labels)?;
-        engine.commit(store, target, &key, &labels)
+        engine.commit(store, &target, &key, &labels)?;
+        Ok(target)
+    }
+
+    /// Put a bootstrap file into committed snapshot `key`, as applying a
+    /// nydus meta layer does.
+    fn write_bootstrap(engine: &OverlayEngine, key: &str) {
+        let dir = engine.fs_dir(key).join("image");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("image.boot"), b"bootstrap").unwrap();
+    }
+
+    fn assert_refused(result: Result<impl std::fmt::Debug>) {
+        let err = result.expect_err("snapshot on an unapplied nydus data layer must be refused");
+        assert!(
+            matches!(
+                err.downcast_ref(),
+                Some(ChainError::UnappliedDataLayer { .. })
+            ),
+            "{err:#}"
+        );
+    }
+
+    /// An image claiming the victim's base layer as a nydus blob, and, with
+    /// `meta`, the victim's real second layer as a nydus bootstrap.
+    fn claimed_chain(engine: &OverlayEngine, store: &SnapshotStore) -> (String, String) {
+        use crate::source::{NYDUS_DATA_LAYER, NYDUS_META_LAYER};
+        let c1 = commit_layer(engine, store, "sha256:d1", "", Some(NYDUS_DATA_LAYER)).unwrap();
+        let c2 = commit_layer(engine, store, "sha256:d2", &c1, Some(NYDUS_META_LAYER)).unwrap();
+        (c1, c2)
     }
 
     #[test]
@@ -904,22 +1043,12 @@ mod tests {
         let dir = tempdir().unwrap();
         let (engine, store) = test_engine(dir.path());
         // A committed nydus data layer with nothing above it.
-        commit_layer(&engine, &store, "sha256:base", "", Some(NYDUS_DATA_LAYER)).unwrap();
+        let c1 = commit_layer(&engine, &store, "sha256:d1", "", Some(NYDUS_DATA_LAYER)).unwrap();
 
-        let err = commit_layer(&engine, &store, "sha256:app", "sha256:base", None)
-            .expect_err("an applied layer must not stack on an unapplied nydus blob");
-        assert!(format!("{err:#}").contains("nydus bootstrap"), "{err:#}");
-        assert!(store.stat("default/1/extract-1 sha256:app").is_err());
-        assert!(
-            engine
-                .prepare(&store, "container", "sha256:base", &HashMap::new())
-                .is_err()
-        );
-        assert!(
-            engine
-                .view(&store, "view", "sha256:base", &HashMap::new())
-                .is_err()
-        );
+        assert_refused(commit_layer(&engine, &store, "sha256:d2", &c1, None));
+        assert!(store.list().unwrap().iter().all(|s| s.key == c1));
+        assert_refused(engine.prepare(&store, "container", &c1, &HashMap::new()));
+        assert_refused(engine.view(&store, "view", &c1, &HashMap::new()));
     }
 
     #[test]
@@ -927,31 +1056,180 @@ mod tests {
         use crate::source::{NYDUS_DATA_LAYER, NYDUS_META_LAYER};
         let dir = tempdir().unwrap();
         let (engine, store) = test_engine(dir.path());
-        commit_layer(&engine, &store, "sha256:b1", "", Some(NYDUS_DATA_LAYER)).unwrap();
-        commit_layer(
-            &engine,
-            &store,
-            "sha256:b2",
-            "sha256:b1",
-            Some(NYDUS_DATA_LAYER),
-        )
-        .unwrap();
-        commit_layer(
-            &engine,
-            &store,
-            "sha256:meta",
-            "sha256:b2",
-            Some(NYDUS_META_LAYER),
-        )
-        .unwrap();
+        let b1 = commit_layer(&engine, &store, "sha256:b1", "", Some(NYDUS_DATA_LAYER)).unwrap();
+        let b2 = commit_layer(&engine, &store, "sha256:b2", &b1, Some(NYDUS_DATA_LAYER)).unwrap();
+        let meta = commit_layer(&engine, &store, "sha256:m", &b2, Some(NYDUS_META_LAYER)).unwrap();
+        write_bootstrap(&engine, &meta);
 
         expect_mounts(
             engine
-                .prepare(&store, "container", "sha256:meta", &HashMap::new())
+                .prepare(&store, "container", &meta, &HashMap::new())
                 .unwrap(),
         );
+        engine.view(&store, "view", &meta, &HashMap::new()).unwrap();
+    }
+
+    #[test]
+    fn layer_on_meta_layer_on_unapplied_data_layer_is_refused() {
+        let dir = tempdir().unwrap();
+        let (engine, store) = test_engine(dir.path());
+        let (_, c2) = claimed_chain(&engine, &store);
+
+        assert_refused(commit_layer(&engine, &store, "sha256:d3", &c2, None));
+        // Even a meta layer holding a bootstrap vouches only for containers,
+        // not for further applied layers.
+        write_bootstrap(&engine, &c2);
+        assert_refused(commit_layer(&engine, &store, "sha256:d3", &c2, None));
+    }
+
+    #[test]
+    fn meta_layer_without_bootstrap_file_does_not_vouch_for_data_layers() {
+        let dir = tempdir().unwrap();
+        let (engine, store) = test_engine(dir.path());
+        let (_, c2) = claimed_chain(&engine, &store);
+
+        assert_refused(engine.prepare(&store, "container", &c2, &HashMap::new()));
+        assert_refused(engine.view(&store, "view", &c2, &HashMap::new()));
+
+        // A symlinked `image` dir lends the layer a bootstrap it does not hold.
+        let elsewhere = dir.path().join("elsewhere");
+        fs::create_dir_all(&elsewhere).unwrap();
+        fs::write(elsewhere.join("image.boot"), b"bootstrap").unwrap();
+        std::os::unix::fs::symlink(&elsewhere, engine.fs_dir(&c2).join("image")).unwrap();
+        assert_refused(engine.prepare(&store, "container", &c2, &HashMap::new()));
+    }
+
+    #[test]
+    fn nydus_labels_exempt_only_unpack_prepares() {
+        use crate::source::NYDUS_DATA_LAYER;
+        let dir = tempdir().unwrap();
+        let (engine, store) = test_engine(dir.path());
+        let c1 = commit_layer(&engine, &store, "sha256:d1", "", Some(NYDUS_DATA_LAYER)).unwrap();
+
+        let labels = HashMap::from([(NYDUS_DATA_LAYER.to_string(), "true".to_string())]);
+        assert_refused(engine.prepare(&store, "container", &c1, &labels));
+    }
+
+    #[test]
+    fn meta_layer_without_image_ref_is_an_error() {
+        let dir = tempdir().unwrap();
+        let (engine, store) = test_engine(dir.path());
+        let (_, c2) = claimed_chain(&engine, &store);
+        write_bootstrap(&engine, &c2);
+
+        let err = engine
+            .nydus_meta_info(&store, &c2, &HashMap::new(), MetaUse::Serve)
+            .expect_err("an overlay over empty data layers is not the image's rootfs");
+        assert!(
+            matches!(err.downcast_ref(), Some(ChainError::NoImageRef(_))),
+            "{err:#}"
+        );
+    }
+
+    #[test]
+    fn meta_label_without_bootstrap_file_is_a_plain_layer() {
+        use crate::source::{NYDUS_META_LAYER, TARGET_SNAPSHOT_REF};
+        let dir = tempdir().unwrap();
+        let (engine, store) = test_engine(dir.path());
+        // A layer labelled a nydus bootstrap whose content holds none.
+        let c1 = commit_layer(&engine, &store, "sha256:d1", "", None).unwrap();
+        let c2 = chain_id(&c1, "sha256:d2");
+        let labels = HashMap::from([
+            (TARGET_SNAPSHOT_REF.to_string(), c2.clone()),
+            (SNAPSHOT_DIFF_ID.to_string(), "sha256:d2".to_string()),
+            (NYDUS_META_LAYER.to_string(), "true".to_string()),
+            (
+                CRI_IMAGE_REF.to_string(),
+                "claimant.example/copy:1".to_string(),
+            ),
+        ]);
+        engine.prepare(&store, "extract-2", &c1, &labels).unwrap();
+        engine.commit(&store, &c2, "extract-2", &labels).unwrap();
+
+        let own = HashMap::from([(CRI_IMAGE_REF.to_string(), "own.example/plain:1".to_string())]);
+        for usage in [MetaUse::Serve, MetaUse::Account] {
+            assert!(
+                engine
+                    .nydus_meta_info(&store, &c2, &own, usage)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        expect_mounts(
+            engine
+                .prepare(&store, "container", &c2, &HashMap::new())
+                .unwrap(),
+        );
+    }
+
+    #[test]
+    fn stored_image_ref_is_used_only_for_accounting() {
+        use crate::source::NYDUS_META_LAYER;
+        let dir = tempdir().unwrap();
+        let (engine, store) = test_engine(dir.path());
+        // The image that committed the bootstrap first named its own registry.
+        let mut labels = HashMap::from([
+            (
+                crate::source::TARGET_SNAPSHOT_REF.to_string(),
+                "sha256:m".to_string(),
+            ),
+            (NYDUS_META_LAYER.to_string(), "true".to_string()),
+            (
+                CRI_IMAGE_REF.to_string(),
+                "first.example/claimant:1".to_string(),
+            ),
+        ]);
         engine
-            .view(&store, "view", "sha256:meta", &HashMap::new())
+            .prepare(&store, "default/1/extract-1 sha256:m", "", &labels)
             .unwrap();
+        engine
+            .commit(&store, "sha256:m", "default/1/extract-1 sha256:m", &labels)
+            .unwrap();
+        write_bootstrap(&engine, "sha256:m");
+
+        let err = engine
+            .nydus_meta_info(&store, "sha256:m", &HashMap::new(), MetaUse::Serve)
+            .expect_err("a first committer's image ref must not pick the registry");
+        assert!(
+            matches!(err.downcast_ref(), Some(ChainError::NoImageRef(_))),
+            "{err:#}"
+        );
+        let accounted = engine
+            .nydus_meta_info(&store, "sha256:m", &HashMap::new(), MetaUse::Account)
+            .unwrap()
+            .unwrap();
+        assert_eq!(accounted.image_ref, "first.example/claimant:1");
+
+        labels = HashMap::from([(CRI_IMAGE_REF.to_string(), "own.example/image:1".to_string())]);
+        let served = engine
+            .nydus_meta_info(&store, "sha256:m", &labels, MetaUse::Serve)
+            .unwrap()
+            .unwrap();
+        assert_eq!(served.image_ref, "own.example/image:1");
+    }
+
+    #[test]
+    fn nydus_data_layer_needs_a_matching_diff_id() {
+        use crate::source::{NYDUS_DATA_LAYER, TARGET_SNAPSHOT_REF};
+        let dir = tempdir().unwrap();
+        let (engine, store) = test_engine(dir.path());
+        let base = commit_layer(&engine, &store, "sha256:d1", "", None).unwrap();
+        let target = chain_id(&base, "sha256:d2");
+        let mut labels = HashMap::from([
+            (TARGET_SNAPSHOT_REF.to_string(), target.clone()),
+            (NYDUS_DATA_LAYER.to_string(), "true".to_string()),
+        ]);
+
+        // containerd before 2.3 sends no diff ID.
+        assert!(engine.prepare(&store, "k1", &base, &labels).is_err());
+        labels.insert(SNAPSHOT_DIFF_ID.to_string(), "sha256:other".to_string());
+        assert!(engine.prepare(&store, "k2", &base, &labels).is_err());
+        assert!(store.list().unwrap().iter().all(|s| s.key == base));
+
+        labels.insert(SNAPSHOT_DIFF_ID.to_string(), "sha256:d2".to_string());
+        assert!(matches!(
+            engine.prepare(&store, "k3", &base, &labels).unwrap(),
+            PrepareOutcome::AlreadyExists { .. }
+        ));
     }
 }

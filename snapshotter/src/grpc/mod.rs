@@ -13,7 +13,7 @@ use crate::config::SnapshotterConfig;
 use crate::containerd_lookup::Claim;
 use crate::daemon::DaemonSupervisor;
 use crate::metrics::SnapshotterMetrics;
-use crate::overlay::{NydusMetaInfo, OverlayEngine, PrepareOutcome};
+use crate::overlay::{ChainError, MetaUse, NydusMetaInfo, OverlayEngine, PrepareOutcome};
 use crate::recon::Reconciler;
 use crate::store::{SnapshotInfo, SnapshotStore, StoreError};
 use crate::sysctl::serve_unix as serve_sysctl_unix;
@@ -484,11 +484,25 @@ impl NydusSnapshotter {
         holder: &str,
     ) -> Result<Option<(NydusMetaInfo, PathBuf)>, SnapshotterError> {
         let store = self.store.as_ref();
-        let meta = self
+        let mut meta = self
             .overlay
-            .nydus_meta_info(store, parent, call_labels)
-            // A missing ancestor is a broken chain, not a missing `holder`.
-            .map_err(|e| SnapshotterError::internal(format!("{e:#}")))?;
+            .nydus_meta_info(store, parent, call_labels, MetaUse::Serve);
+        // The image-ref cache may just be cold: fill it from containerd's
+        // image store once and retry.
+        if let Err(e) = &meta
+            && let Some(ChainError::NoImageRef(snap)) = e.downcast_ref()
+            && let (Some(chain), Some(lookup)) =
+                (parent_chain_digest(snap), self.overlay.containerd_lookup())
+        {
+            if let Err(e) = lookup.lookup(chain).await {
+                warn!(chain, error = %e, "containerd-lookup refresh failed");
+            }
+            meta = self
+                .overlay
+                .nydus_meta_info(store, parent, call_labels, MetaUse::Serve);
+        }
+        // A missing ancestor is a broken chain, not a missing `holder`.
+        let meta = meta.map_err(|e| SnapshotterError::internal(format!("{e:#}")))?;
         let Some(meta) = meta else {
             return Ok(None);
         };
@@ -526,7 +540,10 @@ impl NydusSnapshotter {
         };
         let mut holds = Vec::new();
         if let Some(parent) = info.parent.as_deref() {
-            match self.overlay.nydus_meta_info(store, parent, &info.labels) {
+            match self
+                .overlay
+                .nydus_meta_info(store, parent, &info.labels, MetaUse::Account)
+            {
                 Ok(meta) => holds.extend(meta.map(|meta| meta.image_ref)),
                 Err(e) => {
                     warn!(key, error = %e, "daemon resolution failed; a daemon release may be missed");
@@ -542,6 +559,21 @@ impl NydusSnapshotter {
             holds.push(stamped.clone());
         }
         holds
+    }
+
+    /// Count and log a snapshot refused because its parent chain stacks on
+    /// a nydus data layer nothing vouches for (see
+    /// `OverlayEngine::validate_parent`). The pull or container start fails
+    /// until the image that committed that layer is removed.
+    fn note_refused_chain(&self, e: &anyhow::Error) {
+        if let Some(ChainError::UnappliedDataLayer { chain, layer }) = e.downcast_ref() {
+            warn!(
+                chain,
+                layer,
+                "refused a snapshot on an unapplied nydus data layer; remove the image that committed it to pull images sharing the chain"
+            );
+            self.metrics.record_unapplied_chain_refused();
+        }
     }
 
     /// Release the references `key` held, once its row is gone from the store.
@@ -914,6 +946,7 @@ impl snapshots::Snapshotter for NydusSnapshotter {
                 .prepare(store, &key, &parent, &labels)
                 .map_err(|e| {
                     warn!(key, parent, error = %e, "prepare snapshot failed");
+                    self.note_refused_chain(&e);
                     grpc_error(&e)
                 })?;
 
@@ -1191,6 +1224,7 @@ impl snapshots::Snapshotter for NydusSnapshotter {
                 })
                 .map_err(|e| {
                     warn!(key, parent, error = %e, "view snapshot failed");
+                    self.note_refused_chain(&e);
                     grpc_error(&e)
                 })?;
 
@@ -1551,9 +1585,18 @@ pub async fn serve_with_supervisor(
 
     // The overlay engine shares the gRPC layer's lookup so its sync
     // `nydus_meta_info` fallback reads the cache the async prepare path
-    // populates (cache-only — sync code never walks the image store).
-    let overlay = OverlayEngine::new(config.clone())
-        .with_containerd_lookup(containerd_lookup_for_discovery.clone());
+    // populates (cache-only — sync code never walks the image store). Serving
+    // a nydus meta layer takes its image from there or the call's labels, never
+    // from the ref the chain's first committer stored, so it exists whatever
+    // auto_zran says.
+    let meta_lookup = match containerd_lookup_for_discovery.clone() {
+        Some(lookup) => lookup,
+        None => Arc::new(crate::containerd_lookup::ContainerdLookup::new(
+            crate::content_store::ContentStoreClient::new(&config.snapshotter.containerd)
+                .context("connect to containerd content store")?,
+        )),
+    };
+    let overlay = OverlayEngine::new(config.clone()).with_containerd_lookup(Some(meta_lookup));
 
     if config.snapshotter.sysctl.enable {
         let sysctl_path = config.snapshotter.sysctl.address.clone();
@@ -1723,7 +1766,7 @@ mod tests {
 
     use super::*;
     use crate::metrics::CacheMetricSnapshot;
-    use crate::source::{NYDUS_DATA_LAYER, TARGET_SNAPSHOT_REF};
+    use crate::source::{NYDUS_DATA_LAYER, SNAPSHOT_DIFF_ID, TARGET_SNAPSHOT_REF};
     use containerd_snapshots::Snapshotter as _;
     use std::path::Path;
     use tempfile::tempdir;
@@ -1766,6 +1809,8 @@ mod tests {
         HashMap::from([
             (TARGET_SNAPSHOT_REF.to_string(), target.to_string()),
             (NYDUS_DATA_LAYER.to_string(), "true".to_string()),
+            // A base layer's chain ID is its diff ID.
+            (SNAPSHOT_DIFF_ID.to_string(), target.to_string()),
         ])
     }
 
