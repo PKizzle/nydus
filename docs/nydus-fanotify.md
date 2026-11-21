@@ -448,12 +448,26 @@ which on the fanotify path is the EROFS device the kernel reads. A chunk without
 digest three times is no longer used by that cache; a lender being filled at the same time can
 fail once, a corrupt or hostile one fails every time.
 
-**Authorization.** A cache borrows only after its own backend has served it chunk data at least
-once, so an image that cannot read the blob from its own registry or store gets no bytes from
-other images' caches. This does not cover an image whose own backend serves the blob and whose
-bootstrap states the chunk digests: it gets the bytes, as it could have fetched them. A borrowed
-read is also faster than a fetch, which tells an image that another image on the node holds the
-blob.
+**Authorization.** Two rules decide who may borrow from whom:
+
+- *Same backend.* With borrowing on, the snapshotter writes the backend a cache dir is filled
+  from into `borrow-identity` in that dir when it starts the image there, once: `registry
+  <scheme>://<host>/<repository>` for a registry, `content-store <root>` for the auto-accel
+  backend, which reads containerd's content store. Other backends (object stores, HTTP proxy)
+  get no identity. A cache borrows only from dirs whose identity file is a regular file with the
+  same owner and the same contents as its own; a dir without one neither lends nor borrows. An
+  image whose bootstrap names another image's blob but whose backend is a registry or repository
+  of its own choosing therefore gets nothing from that image's cache.
+- *Own read first.* A cache borrows only after its own backend has served it chunk data at least
+  once, so an image whose backend is the same repository but which cannot read the blob there
+  (no credentials for it) gets nothing either.
+
+Not covered: an image of the same repository whose own backend serves the blob gets the bytes,
+as it could have fetched them. Within one repository, images are not told apart by tag or
+credentials beyond that first read. All auto-accel images share one identity, the content store,
+whose layers containerd shares between the images of the node anyway. Timing is a side channel:
+a borrowed read is faster than a fetch, which tells an image that another image on the node holds
+the blob and which of its chunks that image has read.
 
 **Event-free descriptors.** A lender may be another image's live EROFS device, carrying that
 image's `FAN_PRE_ACCESS` mark. An ordinary read of it would raise events in the other image's
