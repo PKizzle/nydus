@@ -129,9 +129,15 @@ cuts a release that lets us switch to a version requirement.
   see the "NYDUS LOCAL PATCH" comments in `third_party/fuse-backend-rs/src/api/vfs/`).
   Upstream master tags node ids with a per-index generation; 0.14.0 has none,
   so the port answers generation 0 throughout.
+- **Also carried** (released upstream after 0.14.0, each its own "NYDUS LOCAL
+  PATCH" region):
+  - `Opcode::from` matches each value instead of transmuting it; an opcode in a
+    hole of the enum (0, 7, 19) was undefined behaviour, reachable from a
+    `trace!` on a bad request (upstream 074c06c).
 - **Upstream PR/issue status**: filed,
   https://github.com/cloud-hypervisor/fuse-backend-rs/pull/376 (open).
-- **Drop trigger**: upstream releases the fix (PR #376); bump the workspace's
+- **Drop trigger**: upstream releases the fix (PR #376) together with the
+  carried fixes above; bump the workspace's
   `fuse-backend-rs` requirement to that release and delete
   `third_party/fuse-backend-rs/` + the `[patch.crates-io]` entry.
 
