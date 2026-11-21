@@ -10,10 +10,10 @@
 # See Cargo.toml.orig for the original contents.
 
 # NYDUS LOCAL PATCH: vendored copy of the crates.io 0.14.0 package with the
-# Vfs "." / ".." lookup fix from upstream PR #376 ported (see "NYDUS LOCAL
-# PATCH" comments in src/api/vfs/, plus docs/dependencies.md). The empty
-# [workspace] table below detaches this crate from the enclosing nydus
-# workspace so `cargo test` works standalone in this directory.
+# Vfs "." / ".." lookup fix from upstream PR #376 and later upstream fixes
+# ported (see "NYDUS LOCAL PATCH" comments in src/, plus docs/dependencies.md).
+# The empty [workspace] table below detaches this crate from the enclosing
+# nydus workspace so `cargo test` works standalone in this directory.
 [workspace]
 
 [package]
