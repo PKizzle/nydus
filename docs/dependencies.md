@@ -141,6 +141,10 @@ cuts a release that lets us switch to a version requirement.
   - `Vfs` passes xattr names containing '/' to the file system instead of
     answering EINVAL; Linux allows '/' in an xattr name, so such an xattr in an
     image could not be read through nydusd (upstream 53985a0).
+  - A fusedev worker ends cleanly on umount: an epoll error state on the FUSE
+    device is read like readiness, so the read reports ENODEV, and ECONNABORTED
+    (a read racing the connection abort) is treated like ENODEV. Unpatched,
+    both end the worker as a session failure (upstream b226095, 8ead687).
 - **Upstream PR/issue status**: filed,
   https://github.com/cloud-hypervisor/fuse-backend-rs/pull/376 (open).
 - **Drop trigger**: upstream releases the fix (PR #376) together with the

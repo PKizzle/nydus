@@ -339,7 +339,9 @@ impl FuseChannel {
             }
 
             for event in events.iter() {
-                if event.is_readable() {
+                // NYDUS LOCAL PATCH (upstream b226095): an error state is read like readiness, so
+                // the read below reports why the device failed (ENODEV on umount ends cleanly).
+                if event.is_readable() || event.is_error() {
                     match event.token() {
                         EXIT_FUSE_EVENT => need_exit = true,
                         FUSE_DEV_EVENT => fusereq_available = true,
@@ -348,9 +350,6 @@ impl FuseChannel {
                             return Err(SessionFailure(format!("unexpected epoll event: {}", x.0)));
                         }
                     }
-                } else if event.is_error() {
-                    info!("FUSE channel already closed!");
-                    return Err(SessionFailure("epoll error".to_string()));
                 } else {
                     // We should not step into this branch as other event is not registered.
                     panic!("unknown epoll result events");
@@ -398,6 +397,13 @@ impl FuseChannel {
                         }
                         Errno::ENODEV => {
                             info!("fuse filesystem umounted");
+                            return Ok(None);
+                        }
+                        // NYDUS LOCAL PATCH (upstream 8ead687): the kernel answers ECONNABORTED
+                        // instead of ENODEV when the connection is aborted while a request is
+                        // being handed over to this reader. Either way the session is gone.
+                        Errno::ECONNABORTED => {
+                            info!("fuse connection aborted");
                             return Ok(None);
                         }
                         e => {
