@@ -104,7 +104,7 @@ impl OverlayEngine {
     ) -> Result<PrepareOutcome> {
         debug!(key, parent, "prepare snapshot");
         let parent = normalize_parent(parent);
-        self.validate_parent(store, parent)?;
+        self.validate_parent(store, parent, labels)?;
         self.create_snapshot_dirs(key, false)?;
         let result = store.create(
             key,
@@ -148,7 +148,7 @@ impl OverlayEngine {
     ) -> Result<Vec<Mount>> {
         debug!(key, parent, "view snapshot");
         let parent = normalize_parent(parent);
-        self.validate_parent(store, parent)?;
+        self.validate_parent(store, parent, labels)?;
         self.create_snapshot_dirs(key, true)?;
         let result = store.create(
             key,
@@ -425,9 +425,38 @@ impl OverlayEngine {
             .collect()
     }
 
-    fn validate_parent(&self, store: &SnapshotStore, parent: Option<&str>) -> Result<()> {
-        if let Some(parent) = parent {
-            let _ = store.parent_chain(parent)?;
+    /// Check that `parent` is a committed chain a layer described by `labels`
+    /// may stack on.
+    ///
+    /// A nydus data layer is committed without containerd applying it, so it
+    /// is only trusted below a nydus bootstrap (whose layer containerd applied
+    /// and verified) or beneath further nydus layers of the same unpack; any
+    /// other snapshot on top of it is refused.
+    fn validate_parent(
+        &self,
+        store: &SnapshotStore,
+        parent: Option<&str>,
+        labels: &HashMap<String, String>,
+    ) -> Result<()> {
+        let Some(parent) = parent else {
+            return Ok(());
+        };
+        let chain = store.parent_chain(parent)?;
+        if matches!(
+            classify_layer(labels),
+            LayerKind::NydusData | LayerKind::NydusMeta
+        ) {
+            return Ok(());
+        }
+        for snap in &chain {
+            match classify_layer(&snap.labels) {
+                LayerKind::NydusMeta => break,
+                LayerKind::NydusData => bail!(
+                    "parent chain {parent} holds unapplied nydus data layer {} with no nydus bootstrap above it",
+                    snap.key
+                ),
+                _ => {}
+            }
         }
         Ok(())
     }
@@ -847,5 +876,82 @@ mod tests {
 
         let mounts = expect_mounts(engine.prepare(&store, "active", "", &labels).unwrap());
         assert_eq!(mounts[0].r#type, "bind");
+    }
+
+    /// Commit an unpack prepare of `target` on `parent` with `kind` the way
+    /// the gRPC layer does: a nydus data layer is committed as prepared, any
+    /// other layer after containerd applied it.
+    fn commit_layer(
+        engine: &OverlayEngine,
+        store: &SnapshotStore,
+        target: &str,
+        parent: &str,
+        kind: Option<&str>,
+    ) -> Result<()> {
+        use crate::source::TARGET_SNAPSHOT_REF;
+        let mut labels = HashMap::from([(TARGET_SNAPSHOT_REF.to_string(), target.to_string())]);
+        if let Some(kind) = kind {
+            labels.insert(kind.to_string(), "true".to_string());
+        }
+        let key = format!("default/1/extract-1 {target}");
+        engine.prepare(store, &key, parent, &labels)?;
+        engine.commit(store, target, &key, &labels)
+    }
+
+    #[test]
+    fn layer_on_unapplied_nydus_data_layer_without_bootstrap_is_refused() {
+        use crate::source::NYDUS_DATA_LAYER;
+        let dir = tempdir().unwrap();
+        let (engine, store) = test_engine(dir.path());
+        // A committed nydus data layer with nothing above it.
+        commit_layer(&engine, &store, "sha256:base", "", Some(NYDUS_DATA_LAYER)).unwrap();
+
+        let err = commit_layer(&engine, &store, "sha256:app", "sha256:base", None)
+            .expect_err("an applied layer must not stack on an unapplied nydus blob");
+        assert!(format!("{err:#}").contains("nydus bootstrap"), "{err:#}");
+        assert!(store.stat("default/1/extract-1 sha256:app").is_err());
+        assert!(
+            engine
+                .prepare(&store, "container", "sha256:base", &HashMap::new())
+                .is_err()
+        );
+        assert!(
+            engine
+                .view(&store, "view", "sha256:base", &HashMap::new())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn nydus_image_chain_still_prepares() {
+        use crate::source::{NYDUS_DATA_LAYER, NYDUS_META_LAYER};
+        let dir = tempdir().unwrap();
+        let (engine, store) = test_engine(dir.path());
+        commit_layer(&engine, &store, "sha256:b1", "", Some(NYDUS_DATA_LAYER)).unwrap();
+        commit_layer(
+            &engine,
+            &store,
+            "sha256:b2",
+            "sha256:b1",
+            Some(NYDUS_DATA_LAYER),
+        )
+        .unwrap();
+        commit_layer(
+            &engine,
+            &store,
+            "sha256:meta",
+            "sha256:b2",
+            Some(NYDUS_META_LAYER),
+        )
+        .unwrap();
+
+        expect_mounts(
+            engine
+                .prepare(&store, "container", "sha256:meta", &HashMap::new())
+                .unwrap(),
+        );
+        engine
+            .view(&store, "view", "sha256:meta", &HashMap::new())
+            .unwrap();
     }
 }
