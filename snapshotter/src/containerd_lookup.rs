@@ -54,6 +54,40 @@ pub enum Claim {
     Ambiguous(Vec<String>),
 }
 
+impl Claim {
+    /// An image to fetch a nydus image's blobs through: the sole claimant, or
+    /// the first of several that all name one repository. Claimants in
+    /// different repositories name none, since each repository decides what
+    /// bytes it serves for a blob digest; neither does a bare image-ID ref.
+    pub fn image_in_one_repository(&self) -> Option<&str> {
+        let refs = match self {
+            Claim::Unclaimed => return None,
+            Claim::One(image_ref) => std::slice::from_ref(image_ref),
+            Claim::Ambiguous(refs) => refs.as_slice(),
+        };
+        let first = refs.first()?;
+        let repo = repository(first)?;
+        refs.iter()
+            .all(|r| repository(r) == Some(repo))
+            .then_some(first.as_str())
+    }
+}
+
+/// The repository part of an image ref (`host/repo` of `host/repo:tag` or
+/// `host/repo@sha256:…`); `None` for a bare image-ID ref.
+fn repository(image_ref: &str) -> Option<&str> {
+    if ref_name_rank(image_ref) == 0 {
+        return None;
+    }
+    let name = image_ref
+        .split_once('@')
+        .map_or(image_ref, |(name, _)| name);
+    Some(match name.rsplit_once(':') {
+        Some((repo, tag)) if !tag.contains('/') => repo,
+        _ => name,
+    })
+}
+
 /// The digests one image record target claims.
 #[derive(Clone, Debug)]
 struct TargetWalk {
@@ -161,16 +195,17 @@ impl ContainerdLookup {
         Ok(claim)
     }
 
-    /// Memo-only lookup: never walks containerd, never blocks. For sync
-    /// call sites (e.g. `OverlayEngine::nydus_meta_info`'s last-resort
-    /// fallback) that share this instance with the async prepare path —
-    /// they read what the last refresh learned, and get an image only when
-    /// it alone claims `digest`.
+    /// Memo-only lookup for serving a nydus meta layer: never walks
+    /// containerd, never blocks, and answers from what the last [`lookup`]
+    /// learned, so a caller that serves with the answer runs `lookup` first.
+    /// Gives a ref only when the claimants of `digest` agree on one
+    /// repository (see [`Claim::image_in_one_repository`]).
+    ///
+    /// [`lookup`]: Self::lookup
     pub fn lookup_cached(&self, digest: &str) -> Option<String> {
-        match self.claims(digest) {
-            Claim::One(image_ref) => Some(image_ref),
-            Claim::Unclaimed | Claim::Ambiguous(_) => None,
-        }
+        self.claims(digest)
+            .image_in_one_repository()
+            .map(str::to_string)
     }
 
     /// Claimants of `digest` in the memo. Independent of walk order: targets
@@ -1373,6 +1408,23 @@ mod tests {
             ref_name_rank("sha256:0c0da3558734bbf673448b752bb6c139cbd3ece806"),
             0
         );
+    }
+
+    #[test]
+    fn claimants_in_one_repository_name_an_image() {
+        let refs = |r: &[&str]| Claim::Ambiguous(r.iter().map(|s| s.to_string()).collect());
+        let same = refs(&["localhost:5000/app:1", "localhost:5000/app@sha256:abc"]);
+        assert_eq!(same.image_in_one_repository(), Some("localhost:5000/app:1"));
+        let split = refs(&["reg/evil:1", "reg/victim:1"]);
+        assert_eq!(split.image_in_one_repository(), None);
+        let id = "sha256:0c0da3558734bbf673448b752bb6c139cbd3ece8060c6589370280b8ba631d9e";
+        assert_eq!(refs(&[id, id]).image_in_one_repository(), None);
+        assert_eq!(
+            Claim::One("reg/app:1".into()).image_in_one_repository(),
+            Some("reg/app:1")
+        );
+        assert_eq!(Claim::Unclaimed.image_in_one_repository(), None);
+        assert_eq!(repository("localhost:5000/app"), Some("localhost:5000/app"));
     }
 
     /// Two images whose configs share a top chainID: the chain names neither
