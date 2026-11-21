@@ -398,6 +398,93 @@ fn released_stage_starts_warm() {
     );
 }
 
+/// Three images sharing a blob, with borrowing on: once the first has read every file, the
+/// second, another tag of the same repository, reads them all with at most one registry request
+/// of its own per blob, the one that lets it borrow, and fills everything else from the first
+/// image's cache. The third, from another repository, borrows nothing.
+/// `NYDUS_E2E_ROOT` holds `src/`, `bootstrap` and `blobs/` of an image with small chunks;
+/// `NYDUS_IMAGE` is the `nydus-image` binary.
+#[test]
+#[ignore = "needs root, Linux >= 6.14 and an ext4 work dir; run misc/fanotify/borrow-test.sh"]
+fn a_second_image_borrows_a_shared_blob() {
+    let root = e2e_root();
+    let registry = serve_registry(root.join("blobs"), RegistryAuth::None);
+    let mut config: SnapshotterConfig =
+        toml::from_str("[snapshotter.cache]\nborrow = true\n").unwrap();
+    config.snapshotter.root = root.join("snapshotter");
+    config.snapshotter.cache.work_dir = root.join("cache");
+    config.snapshotter.auto_zran.nydus_image = nydus_image();
+    // Off, so the second image's reads reach its own cache rather than the first one's pages.
+    config.snapshotter.features.erofs_inode_share = ErofsInodeShare::Off;
+    config.backends.registry = Some(RegistryBackendConfig {
+        mirrors: Vec::new(),
+        skip_verify: false,
+        ca_cert_files: Vec::new(),
+        plain_http: true,
+        request_timeout: "10s".to_string(),
+    });
+    let supervisor = DaemonSupervisor::new(config);
+    let runtime = compio::runtime::Runtime::new().unwrap();
+    let blobs = fs::read_dir(root.join("blobs")).unwrap().count();
+    // Requests made while a daemon starts (its blob meta) are not reads of file data.
+    let settled = || {
+        let mut served = registry.served();
+        loop {
+            std::thread::sleep(Duration::from_millis(300));
+            let now = registry.served();
+            if now == served {
+                return served;
+            }
+            served = now;
+        }
+    };
+    let borrowed = nydus_storage::cache::borrow_counters().chunks;
+    let mut images = Vec::new();
+    let mut reads = Vec::new();
+    for name in ["app:1", "app:2", "other/app:1"] {
+        let image_ref = format!("{}/{name}", registry.addr);
+        let handle = runtime
+            .block_on(supervisor.ensure_instance(
+                &image_ref,
+                &root.join("bootstrap"),
+                "k1",
+                Some(FsDriverType::Fanotify),
+            ))
+            .unwrap_or_else(|e| panic!("daemon start of {image_ref}: {e:#}"));
+        let mountpoint = handle.mountpoint().to_path_buf();
+        assert_eq!(mount_fstype_at(&mountpoint).as_deref(), Some("erofs"));
+        let before = settled();
+        assert_same_files(&root.join("src"), &mountpoint);
+        reads.push(registry.served() - before);
+        images.push((image_ref, handle));
+    }
+    let borrowed = nydus_storage::cache::borrow_counters().chunks - borrowed;
+    println!(
+        "BORROW E2E: {blobs} blobs; registry reads of file data: first image {}, second {}, \
+         other repository {}; {borrowed} chunks borrowed",
+        reads[0], reads[1], reads[2]
+    );
+    for (image_ref, handle) in images {
+        drop(handle);
+        runtime
+            .block_on(supervisor.release(&image_ref, "k1"))
+            .unwrap();
+    }
+    assert!(
+        reads[0] > blobs,
+        "the first image read too few ranges to show borrowing"
+    );
+    assert!(
+        reads[1] <= blobs,
+        "the second image fetched chunks the first had cached"
+    );
+    assert_eq!(
+        reads[2], reads[0],
+        "an image from another repository borrowed"
+    );
+    assert!(borrowed > 0);
+}
+
 /// The auto-accel path from conversion to data: `local_accel::convert` builds the
 /// artifact, its blobs go into a content store the way the auto-zran worker uploads
 /// them, `SidecarLocator::stage` lays out the backend dir from there, and the daemon

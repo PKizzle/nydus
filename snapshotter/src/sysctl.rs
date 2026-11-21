@@ -1071,6 +1071,28 @@ async fn metrics_response(controller: &SystemController) -> HttpResponse {
         );
     }
 
+    let borrowed = nydus_storage::cache::borrow_counters();
+    for (name, help, value) in [
+        (
+            "nydus_snapshotter_borrowed_chunks_total",
+            "Chunks filled from another image's cache of the same blob.",
+            borrowed.chunks,
+        ),
+        (
+            "nydus_snapshotter_borrowed_bytes_total",
+            "Bytes of the chunks filled from another image's cache.",
+            borrowed.bytes,
+        ),
+        (
+            "nydus_snapshotter_lender_mismatches_total",
+            "Chunks read from another image's cache that failed the borrower's digest.",
+            borrowed.mismatches,
+        ),
+    ] {
+        body.push_str(&format!("# HELP {name} {help}\n# TYPE {name} counter\n"));
+        push_metric(&mut body, name, value);
+    }
+
     body.push_str("# HELP nydusd_counts The counts of nydus daemon.\n");
     body.push_str("# TYPE nydusd_counts gauge\n");
     push_labeled_metric(

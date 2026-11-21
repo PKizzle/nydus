@@ -157,6 +157,23 @@ The gauges appear once a retention pass has run. `GET /api/v1/daemons` lists the
 of retained (and evicted) stages with `live: false`; `updated_at` is the stop time, and
 `released_at` the time of the release, and `start_gap` the image's learned start gap in seconds.
 
+## Cache borrowing
+
+With `[snapshotter.cache] borrow = true`, a daemon fills a chunk its image misses from another
+image's cache of the same blob on the node, after checking it against the image's own digest (see
+[Borrowing](nydus-fanotify.md#borrowing)). Off by default. The sysctl `/metrics` endpoint reports:
+
+| Metric | Type | Meaning |
+|---|---|---|
+| `nydus_snapshotter_borrowed_chunks_total` | counter | chunks filled from another image's cache |
+| `nydus_snapshotter_borrowed_bytes_total` | counter | bytes of those chunks |
+| `nydus_snapshotter_lender_mismatches_total` | counter | chunks read from another image's cache that failed the borrower's digest; a lender is dropped by a cache after three |
+
+Borrowing happens only between caches of the same backend: each cache dir names its backend in a
+`borrow-identity` file written at the image's first start with borrowing on. Opening a lender for
+the first time briefly creates a fanotify group (one of `fs.fanotify.max_user_groups`); an open
+that fails for such a limit is retried later with a backoff.
+
 ## CPU profiling: `perf` and `samply`
 
 For actual CPU profiling (where is the process spending time?), use a system sampling profiler

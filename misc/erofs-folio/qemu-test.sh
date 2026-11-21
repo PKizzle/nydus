@@ -23,6 +23,12 @@
 #                prints its PASS line. Needs NYDUSD and NYDUS_IMAGE (static aarch64 builds),
 #                BASH_STATIC (e.g. Debian's bash-static) and optionally MMAP_CAT (a static
 #                build of misc/fanotify/mmap-cat.c)
+#   STORAGE_TEST_BIN, SERVICE_TEST_BIN, SNAPSHOTTER_TEST_BIN
+#                optional static aarch64 builds of the nydus-storage, nydus-service and
+#                nydus-snapshotter lib test binaries, for borrow-test in FANOTIFY_TESTS
+#                (`cargo test --release --target aarch64-unknown-linux-musl -p <crate> --lib
+#                --no-run`); the service tests' fixtures are copied to the path of this checkout,
+#                which must be the one the binaries were built in
 #   EXPECT_PAGE_SIZE  optional page size in KiB the guest kernel must use
 #   QEMU_TIMEOUT seconds the guest may run (default 300)
 #
@@ -52,6 +58,28 @@ if [ -n "${FANOTIFY_TESTS:-}" ]; then
   printf '#!/bin/sh\nexec "$@"\n' > "$ROOT/bin/sudo"
   chmod +x "$ROOT/bin/sudo"
   for t in $FANOTIFY_TESTS; do cp "$(dirname "$0")/../fanotify/$t.sh" "$ROOT/tests/"; done
+  [ -z "${STORAGE_TEST_BIN:-}" ] || cp "$STORAGE_TEST_BIN" "$ROOT/bin/storage-tests"
+  if [ -n "${SERVICE_TEST_BIN:-}" ]; then
+    cp "$SERVICE_TEST_BIN" "$ROOT/bin/service-tests"
+    # The tests find their fixtures by the crate path they were built at.
+    repo=$(cd "$(dirname "$0")/../.." && pwd)
+    mkdir -p "$ROOT$repo/service" "$ROOT$repo/tests/texture/blobs" "$ROOT$repo/tests/texture/bootstrap"
+    cp "$repo/tests/texture/bootstrap/rafs-v6-2.2.boot" "$ROOT$repo/tests/texture/bootstrap/"
+    cp "$repo/tests/texture/blobs/be7d77eeb719f70884758d1aa800ed0fb09d701aaec469964e9d54325f0d5fef" \
+      "$ROOT$repo/tests/texture/blobs/"
+  fi
+  if [ -n "${SNAPSHOTTER_TEST_BIN:-}" ]; then
+    cp "$SNAPSHOTTER_TEST_BIN" "$ROOT/bin/snapshotter-tests"
+    # The registry backend builds its TLS client from the system roots and its resolver from
+    # resolv.conf even for a plain-HTTP registry on loopback; without either every fetch fails.
+    mkdir -p "$ROOT/etc/ssl/certs"
+    cp /etc/ssl/certs/ca-certificates.crt "$ROOT/etc/ssl/certs/"
+    echo 'nameserver 127.0.0.1' > "$ROOT/etc/resolv.conf"
+    # The scripts run `$CARGO test -p nydus-snapshotter --lib <test> -- <args>`.
+    printf '#!/bin/sh\nwhile [ "$1" != "--lib" ]; do shift; done\ntest=$2; shift 3\nexec /bin/snapshotter-tests "$test" "$@"\n' \
+      > "$ROOT/bin/cargo-prebuilt"
+    chmod +x "$ROOT/bin/cargo-prebuilt"
+  fi
   echo "$FANOTIFY_TESTS" > "$ROOT/tests/list"
 fi
 if [ -n "${MODULES_TAR:-}" ]; then
@@ -85,6 +113,9 @@ mount -t devtmpfs dev /dev
 /bin/busybox --install -s
 [ -f /erofs.ko ] && insmod /erofs.ko
 mount -o loop /ext4.img /ext
+mkdir -p /tmp /run
+# Loopback, for the local registry of the snapshotter tests.
+ifconfig lo 127.0.0.1 up
 echo "==== kernel $(cat /proc/sys/kernel/osrelease)"
 if [ -f /demo.erofs ]; then /probe /ext /demo.erofs; else /probe /ext; fi
 echo "==== probe exit $?"
@@ -95,10 +126,15 @@ for t in $(cat /tests/list 2>/dev/null); do
     reuse-test) pass="==== CACHE REUSE: PASS ====" ;;
     runtime-test) pass="==== FANOTIFY FETCH PATH: PASS" ;;
     zran-multilayer-test) pass="==== MULTI-LAYER ZRAN: PASS ====" ;;
+    borrow-test) pass="==== CACHE BORROWING: PASS ====" ;;
     *) pass="unknown test $t" ;;
   esac
   ROOT=/ext/$t NYDUSD=/bin/nydusd NYDUS_IMAGE=/bin/nydus-image \
-    MMAP_CAT=$([ -x /bin/mmap-cat ] && echo /bin/mmap-cat) bash /tests/$t.sh > /ext/$t.log 2>&1
+    MMAP_CAT=$([ -x /bin/mmap-cat ] && echo /bin/mmap-cat) \
+    STORAGE_TEST_BIN=$([ -x /bin/storage-tests ] && echo /bin/storage-tests) \
+    SERVICE_TEST_BIN=$([ -x /bin/service-tests ] && echo /bin/service-tests) \
+    CARGO=$([ -x /bin/cargo-prebuilt ] && echo /bin/cargo-prebuilt) \
+    bash /tests/$t.sh > /ext/$t.log 2>&1
   cat /ext/$t.log
   if grep -qF "$pass" /ext/$t.log && ! grep -q SKIP /ext/$t.log; then r=PASS; else r=FAIL; fi
   echo "==== FANOTIFY $t: $r ===="

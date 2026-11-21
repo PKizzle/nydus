@@ -89,7 +89,7 @@ jobs:
     - uses: dsherret/rust-toolchain-file@v1
     - name: Install protoc
       run: bash misc/install-protoc.sh
-    - name: Build nydusd, nydus-image and the snapshotter and service test binaries
+    - name: Build nydusd, nydus-image and the snapshotter, service and storage test binaries
       run: |
         cargo build --release --bin nydusd --bin nydus-image
         cargo build --release -p nydus-service --example erofs_folio_probe
@@ -101,6 +101,10 @@ jobs:
           | jq -r 'select(.profile.test and .executable != null and (.target.kind | index("lib"))) | .executable' | tail -1)
         test -x "$BIN"
         echo "SERVICE_TEST_BIN=$BIN" >> "$GITHUB_ENV"
+        BIN=$(cargo test -p nydus-storage --lib --no-run --message-format=json \
+          | jq -r 'select(.profile.test and .executable != null and (.target.kind | index("lib"))) | .executable' | tail -1)
+        test -x "$BIN"
+        echo "STORAGE_TEST_BIN=$BIN" >> "$GITHUB_ENV"
         cc -static -O2 -o "$RUNNER_TEMP/mmap-cat" misc/fanotify/mmap-cat.c
     - name: Install VM tooling
       run: |
@@ -156,6 +160,7 @@ jobs:
           NYDUSD='$GITHUB_WORKSPACE/target/release/nydusd' \
           SNAPSHOTTER_TEST_BIN='$SNAPSHOTTER_TEST_BIN' \
           SERVICE_TEST_BIN='$SERVICE_TEST_BIN' \
+          STORAGE_TEST_BIN='$STORAGE_TEST_BIN' \
           MMAP_CAT='$RUNNER_TEMP/mmap-cat' \
           IMG='$RUNNER_TEMP/fanotify-ci.img' \
           bash misc/fanotify/run-all.sh"
@@ -221,6 +226,15 @@ jobs:
         cargo build --release -p nydus-service --example erofs_folio_probe --target aarch64-unknown-linux-musl
         cargo build --release --bin nydusd --bin nydus-image --target aarch64-unknown-linux-musl
         musl-gcc -static -O2 -o "$RUNNER_TEMP/mmap-cat" misc/fanotify/mmap-cat.c
+    - name: Build the static test binaries borrow-test runs
+      run: |
+        for crate in storage service snapshotter; do
+          BIN=$(CARGO_PROFILE_RELEASE_STRIP=true cargo test --release -p "nydus-$crate" --lib --no-run \
+            --target aarch64-unknown-linux-musl --message-format=json \
+            | jq -r 'select(.profile.test and .executable != null and (.target.kind | index("lib"))) | .executable' | tail -1)
+          test -x "$BIN"
+          echo "$(echo "$crate" | tr a-z A-Z)_TEST_BIN=$BIN" >> "$GITHUB_ENV"
+        done
     - name: Fetch kernel
       run: |
         K="$RUNNER_TEMP/kernel"; mkdir -p "$K"; cd "$K"
@@ -240,6 +254,6 @@ jobs:
         KERNEL="$VMLINUZ" PROBE=$R/examples/erofs_folio_probe \
         MODULES_TAR="$RUNNER_TEMP/kernel/modules.tar" DEMO_IMAGE="$RUNNER_TEMP/demo.erofs" EXPECT="$EROFS_FOLIO" \
         EXPECT_PAGE_SIZE=64 QEMU_TIMEOUT=2400 \
-        FANOTIFY_TESTS="dead-chunk-test runtime-test zran-multilayer-test reuse-test" \
+        FANOTIFY_TESTS="dead-chunk-test runtime-test zran-multilayer-test reuse-test borrow-test" \
         NYDUSD=$R/nydusd NYDUS_IMAGE=$R/nydus-image BASH_STATIC=/bin/bash-static MMAP_CAT="$RUNNER_TEMP/mmap-cat" \
           bash misc/erofs-folio/qemu-test.sh
