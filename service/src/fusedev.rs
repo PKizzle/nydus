@@ -830,6 +830,13 @@ pub fn create_vfs_backend(
         FsBackendType::Rafs => {
             // rafs can be readonly and skip open
             opts.no_open = true;
+            // File handles (`open_by_handle_at`, NFS export, overlayfs `index=on`) survive dentry
+            // eviction: the kernel looks a forgotten node id up again through "." and "..". RAFS
+            // inode numbers are fixed by the image, and the Vfs hands out a file system index
+            // again only after 255 further mounts in this daemon, so a node id keeps naming the
+            // same file. Any other backend mounted into this Vfs later answers a node id it has
+            // forgotten with an error, which the kernel reports as ESTALE.
+            opts.out_opts |= fuse_backend_rs::api::filesystem::FsOptions::EXPORT_SUPPORT;
         }
     };
 
@@ -846,6 +853,19 @@ pub fn create_vfs_backend(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_vfs_backend_negotiates_export_support_for_rafs_only() {
+        use fuse_backend_rs::api::filesystem::{FileSystem, FsOptions};
+
+        let negotiated = |fs_type| {
+            let vfs = create_vfs_backend(fs_type, true, false).unwrap();
+            vfs.init(FsOptions::all()).unwrap()
+        };
+        assert!(negotiated(FsBackendType::Rafs).contains(FsOptions::EXPORT_SUPPORT));
+        assert!(!negotiated(FsBackendType::PassthroughFs).contains(FsOptions::EXPORT_SUPPORT));
+    }
 
     #[test]
     fn test_get_possible_base_paths_returns_two_paths() {
