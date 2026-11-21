@@ -177,6 +177,11 @@ impl<'a> TarballTreeBuilder<'a> {
             Err(_) => false,
         };
 
+        // eStargz metadata members are no part of the image's tree; other layers keep them.
+        let skips_stargz_files = matches!(
+            self.ty,
+            ConversionType::EStargzToRef | ConversionType::EStargzToRafs
+        );
         let reader = match self.ty {
             ConversionType::EStargzToRef
             | ConversionType::TargzToRef
@@ -294,7 +299,9 @@ impl<'a> TarballTreeBuilder<'a> {
                 continue;
             }
             // Apply ignores a member resolving to the root directory.
-            if path != Path::new("/") && !self.builder.is_stargz_special_files(&path) {
+            if path != Path::new("/")
+                && !(skips_stargz_files && self.builder.is_stargz_special_files(&path))
+            {
                 self.parse_entry(&mut tree, &member, &mut members.data(), &path)?;
             }
         }
@@ -2012,6 +2019,39 @@ mod tests {
         let bootstrap = build_layer(&tar);
         assert_eq!(outline(&bootstrap), ["/ dir", "/d dir", "/d/x file"]);
         assert_eq!(get_node(&bootstrap, "/d").inode.mode() & 0o7777, 0o750);
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "calls the C zlib library")]
+    fn test_stargz_metadata_paths_are_skipped_for_estargz_only() {
+        let tar = RawTar::default()
+            .reg("stargz.index.json", b"{}")
+            .reg(".prefetch.landmark", b"")
+            .reg(".no.prefetch.landmark", b"")
+            .reg("f", b"")
+            .finish();
+        let gz = compress::compress(&tar, compress::Algorithm::GZip)
+            .unwrap()
+            .0;
+        let metadata = [
+            "/stargz.index.json",
+            "/.prefetch.landmark",
+            "/.no.prefetch.landmark",
+        ];
+        let kept = |ty: ConversionType, layer: &[u8]| -> Vec<bool> {
+            let (_tmp, mut ctx) = layer_ctx(layer);
+            ctx.conversion_type = ty;
+            ctx.blob_features.insert(BlobFeatures::SEPARATE);
+            let tree = build_tree_as(&mut ctx, ty).unwrap();
+            assert!(tree.get_node(Path::new("/f")).is_some());
+            metadata
+                .iter()
+                .map(|p| tree.get_node(Path::new(p)).is_some())
+                .collect()
+        };
+        assert_eq!(kept(ConversionType::TargzToRef, &gz), [true; 3]);
+        assert_eq!(kept(ConversionType::TarToRef, &tar), [true; 3]);
+        assert_eq!(kept(ConversionType::EStargzToRef, &gz), [false; 3]);
     }
 
     #[test]
