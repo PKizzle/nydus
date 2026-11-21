@@ -462,10 +462,11 @@ fn pull_error(body: String) -> PullOutcome {
 }
 
 /// Fetch the sidecar for `manifest_digest` from the peer mirror and verify
-/// it. Peers are untrusted and the tag is synthetic, so the manifest is
-/// bound to the image by its subject annotation (and the config's
-/// `subject_manifest_digest`), and every blob by its descriptor digest and
-/// size. All fetches share one deadline.
+/// it. The tag is synthetic, so the manifest is bound to the image by its
+/// subject annotation (and the config's `subject_manifest_digest`), and every
+/// blob by its descriptor digest and size. The bootstrap is not re-derived:
+/// mirror peers are trusted to produce sidecars ("Sidecar trust model" in
+/// ARCHITECTURE.md). All fetches share one deadline.
 async fn fetch_peer_sidecar(
     mirror: &Arc<PeerMirror>,
     manifest_digest: &str,
