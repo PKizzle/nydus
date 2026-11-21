@@ -679,7 +679,7 @@ impl FileSystem for Rafs {
             let parent = self.sb.get_extended_inode(parent.ino(), false)?;
             Ok(self
                 .sb
-                .get_inode(parent.parent(), self.digest_validate)
+                .get_inode(parent.parent()?, self.digest_validate)
                 .map(|i| self.get_inode_entry(i))
                 .unwrap_or_else(|_| self.negative_entry()))
         } else {

@@ -608,7 +608,7 @@ impl RafsInode for OndiskInodeWrapper {
         }
 
         if cur_offset == 1 {
-            let parent = if self.ino() == 1 { 1 } else { self.parent() };
+            let parent = if self.ino() == 1 { 1 } else { self.parent()? };
             cur_offset += 1;
             // Safe to unwrap since conversion from DOTDOT to os string can't fail.
             match handler(None, OsString::from(DOTDOT), parent, cur_offset) {
@@ -783,7 +783,11 @@ impl RafsInodeExt for OndiskInodeWrapper {
     }
 
     impl_inode_getter!(get_name_size, i_name_size, u16);
-    impl_inode_getter!(parent, i_parent, u64);
+
+    fn parent(&self) -> RafsResult<u64> {
+        let state = self.state();
+        Ok(self.inode(state.deref()).i_parent)
+    }
 }
 
 impl RafsV5InodeChunkOps for OndiskInodeWrapper {
