@@ -109,6 +109,32 @@ cuts a release that lets us switch to a version requirement.
   entry (this also removes the need to git-pin cyper-core in
   `storage/Cargo.toml`, see below).
 
+### fuse-backend-rs (patches 0.14.0)
+
+- **Upstream**: https://github.com/cloud-hypervisor/fuse-backend-rs
+- **Local copy**: `third_party/fuse-backend-rs/`
+- **Patch target**: `[patch.crates-io]` in `Cargo.toml` (root). The vendored
+  `version` must track the workspace requirement (same [[patch.unused]] trap
+  as compio-executor); `cargo tree -i fuse-backend-rs` must show the
+  `third_party/` path crate.
+- **Bug fixed**: `Vfs::lookup` answers "." and ".." with node ids the kernel
+  does not have. At the root of a file system mounted at "/" it returns the
+  backend's hashed node id instead of `ROOT_ID`, and ".." in the root of a file
+  system mounted below "/" is passed to the backend, which cannot know the
+  mountpoint's parent. With FUSE `EXPORT_SUPPORT`, the kernel resolves a file
+  handle whose dentry was evicted by looking up "." on its node id and
+  reconnects a directory by looking up ".." up to the root, so every directory
+  handle fails with `ESTALE`. The vendored copy ports the fix and its tests
+  (`convert_lookup_entry`, `lookup_mount_root_parent`, `dot_lookup_cases`;
+  see the "NYDUS LOCAL PATCH" comments in `third_party/fuse-backend-rs/src/api/vfs/`).
+  Upstream master tags node ids with a per-index generation; 0.14.0 has none,
+  so the port answers generation 0 throughout.
+- **Upstream PR/issue status**: filed,
+  https://github.com/cloud-hypervisor/fuse-backend-rs/pull/376 (open).
+- **Drop trigger**: upstream releases the fix (PR #376); bump the workspace's
+  `fuse-backend-rs` requirement to that release and delete
+  `third_party/fuse-backend-rs/` + the `[patch.crates-io]` entry.
+
 ## Git-pinned dependencies (not on crates.io versions)
 
 ### containerd-snapshots

@@ -259,3 +259,15 @@ bbolt-rs = { path = "third_party/bbolt-rs" }
 # fixes the zero-fill window and cyper-core publishes a release at/after the
 # fix commit; see docs/dependencies.md for filing/tracking status.
 cyper-core = { path = "third_party/cyper-core" }
+
+# Local fix for "." and ".." lookups in fuse-backend-rs 0.14.0's `Vfs`. At the root of a
+# file system mounted at "/" it answers with the backend's hashed node id instead of the
+# FUSE root id, and ".." in the root of a file system mounted below "/" asks the backend,
+# which cannot know the mountpoint's parent. The kernel's file-handle export path
+# (`open_by_handle_at` after the dentry is evicted, FUSE `EXPORT_SUPPORT`) looks up "." and
+# ".." by node id and fails with ESTALE on a mismatch. The vendored copy ports the fix and
+# tests of https://github.com/cloud-hypervisor/fuse-backend-rs/pull/376. The vendored
+# `version` MUST track the workspace requirement (currently 0.14.0) — same
+# [[patch.unused]] trap as compio-executor above. Drop trigger: upstream releases the fix;
+# see docs/dependencies.md.
+fuse-backend-rs = { path = "third_party/fuse-backend-rs" }
