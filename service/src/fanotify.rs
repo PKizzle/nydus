@@ -2553,24 +2553,37 @@ mod tests {
     /// fixture bootstrap staged in `stage/`, and a blob cache manager over a fanotify cache there;
     /// `None`, after printing SKIP, without that directory or fanotify pre-content support.
     fn fanotify_fixture(id: &str) -> Option<(tempfile::TempDir, Arc<super::BlobCacheMgr>)> {
-        fanotify_fixture_borrowing(id, &[])
+        let base = fanotify_test_dir()?;
+        fanotify_fixture_borrowing(base.as_ref(), id, &[])
     }
 
-    /// [`fanotify_fixture`] with a cache that borrows from the cache dirs `borrow_from` matches.
+    /// `NYDUS_FANOTIFY_TEST_DIR`, or `None` after printing SKIP.
+    fn fanotify_test_dir() -> Option<std::ffi::OsString> {
+        let base = std::env::var_os("NYDUS_FANOTIFY_TEST_DIR");
+        if base.is_none() {
+            eprintln!("SKIP: set NYDUS_FANOTIFY_TEST_DIR to an ext4 directory and run as root");
+        }
+        base
+    }
+
+    /// [`fanotify_fixture`] in a work dir under `base`, with a cache that borrows from the
+    /// cache dirs `borrow_from` matches. Every fixture stage names one backend identity.
     fn fanotify_fixture_borrowing(
+        base: &std::path::Path,
         id: &str,
         borrow_from: &[String],
     ) -> Option<(tempfile::TempDir, Arc<super::BlobCacheMgr>)> {
         use super::*;
 
-        let Some(base) = std::env::var_os("NYDUS_FANOTIFY_TEST_DIR") else {
-            eprintln!("SKIP: set NYDUS_FANOTIFY_TEST_DIR to an ext4 directory and run as root");
-            return None;
-        };
         let root = env!("CARGO_MANIFEST_DIR");
         let work = tempfile::TempDir::new_in(base).unwrap();
         let stage = work.path().join("stage");
         std::fs::create_dir_all(&stage).unwrap();
+        std::fs::write(
+            stage.join(nydus_storage::cache::BORROW_IDENTITY_FILE),
+            "fanotify-fixture",
+        )
+        .unwrap();
         std::fs::copy(
             format!("{root}/../tests/texture/blobs/{FIXTURE_BLOB}"),
             work.path().join(FIXTURE_BLOB),
@@ -2827,19 +2840,19 @@ mod tests {
         use std::os::unix::fs::FileExt;
         use std::sync::atomic::AtomicUsize;
 
-        let Some(base) = std::env::var_os("NYDUS_FANOTIFY_TEST_DIR") else {
-            eprintln!("SKIP: set NYDUS_FANOTIFY_TEST_DIR to an ext4 directory and run as root");
+        let Some(base) = fanotify_test_dir() else {
             return;
         };
         // Both images' work dirs sit in one directory, so each stage matches `<dir>/*/stage`.
         let dir = tempfile::TempDir::new_in(base).unwrap();
-        // SAFETY: setting a variable before any thread of this test reads it.
-        unsafe { std::env::set_var("NYDUS_FANOTIFY_TEST_DIR", dir.path()) };
-        let Some((lender_work, lender_mgr)) = fanotify_fixture("borrow-lender") else {
+        let Some((lender_work, lender_mgr)) =
+            fanotify_fixture_borrowing(dir.path(), "borrow-lender", &[])
+        else {
             return;
         };
         let pattern = format!("{}/*/stage", dir.path().display());
-        let (work, mgr) = fanotify_fixture_borrowing("borrow-borrower", &[pattern]).unwrap();
+        let (work, mgr) =
+            fanotify_fixture_borrowing(dir.path(), "borrow-borrower", &[pattern]).unwrap();
         let serve = |work: &tempfile::TempDir, mgr: Arc<BlobCacheMgr>| {
             let (stage, mnt) = (work.path().join("stage"), work.path().join("mnt"));
             let handler = Arc::new(
