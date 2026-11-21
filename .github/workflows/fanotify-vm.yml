@@ -101,7 +101,8 @@ jobs:
           | jq -r 'select(.profile.test and .executable != null and (.target.kind | index("lib"))) | .executable' | tail -1)
         test -x "$BIN"
         echo "SERVICE_TEST_BIN=$BIN" >> "$GITHUB_ENV"
-        BIN=$(cargo test -p nydus-storage --lib --no-run --message-format=json \
+        # Release, which reuses nydusd's dependency builds and keeps the runner's disk free.
+        BIN=$(cargo test --release -p nydus-storage --lib --no-run --message-format=json \
           | jq -r 'select(.profile.test and .executable != null and (.target.kind | index("lib"))) | .executable' | tail -1)
         test -x "$BIN"
         echo "STORAGE_TEST_BIN=$BIN" >> "$GITHUB_ENV"
@@ -144,6 +145,7 @@ jobs:
       if: ${{ !cancelled() && steps.fetch.outcome == 'success' }}
       run: |
         echo "runner kernel: $(uname -r)"
+        df -h / "$RUNNER_TEMP"
         vng --run "$VMLINUZ" --user root --cpus 4 --memory 6G --rwdir "$RUNNER_TEMP" --exec "
           set -e
           modprobe erofs
