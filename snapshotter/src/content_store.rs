@@ -575,7 +575,7 @@ impl ContentStoreClient {
     }
 
     /// List all containerd Image records (name + target digest). Used by
-    /// `containerd_lookup` to build the chainID → image-ref cache without
+    /// `containerd_lookup` to learn which images claim which chainIDs without
     /// shelling out to `crictl images`.
     #[instrument(level = "debug", skip(self), err)]
     pub async fn images_list(&self) -> Result<Vec<crate::containerd_lookup::ImageRecord>> {

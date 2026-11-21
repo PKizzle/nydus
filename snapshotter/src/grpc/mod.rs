@@ -10,6 +10,7 @@
 use crate::auto_zran::AutoZranManager;
 use crate::cache::{CacheGcPolicy, CacheManager, parse_duration};
 use crate::config::SnapshotterConfig;
+use crate::containerd_lookup::Claim;
 use crate::daemon::DaemonSupervisor;
 use crate::metrics::SnapshotterMetrics;
 use crate::overlay::{NydusMetaInfo, OverlayEngine, PrepareOutcome};
@@ -406,6 +407,32 @@ fn image_is_parent(image_chain: &str, parent: &str) -> bool {
     parent_chain_digest(parent) == Some(image_chain)
 }
 
+/// The image a container-rootfs prepare without an image label serves
+/// image-specific content for (an auto-accel sidecar, a published nydus
+/// entry, a referrer): only one that alone claims the parent's chain.
+///
+/// A chainID names layer content, not an image, so when several images claim
+/// it nothing tells which one the container was created from, and it gets the
+/// plain overlay: the layers containerd applied for the chain, unaccelerated.
+/// A sole claimant is the image the container was created
+/// from: a container is created only from an image record containerd holds,
+/// and every lookup lists the records afresh.
+fn sole_chain_claimant(chain: &str, claim: Claim, metrics: &SnapshotterMetrics) -> Option<String> {
+    match claim {
+        Claim::One(image_ref) => Some(image_ref),
+        Claim::Unclaimed => None,
+        Claim::Ambiguous(images) => {
+            metrics.record_ambiguous_chain();
+            debug!(
+                chain,
+                ?images,
+                "several images claim the parent chain; serving the plain overlay"
+            );
+            None
+        }
+    }
+}
+
 /// The main snapshotter implementation.
 ///
 /// Bridges containerd's gRPC proxy-plugin protocol to the overlay engine
@@ -603,11 +630,6 @@ impl NydusSnapshotter {
                 image_chain = %info.chain_id,
                 "auto-accel image ref points at other content than the parent; falling back to overlay"
             );
-            // A cached chain → ref entry left behind by a repointed tag:
-            // drop it so the next prepare walks containerd again.
-            if let Some(chain) = parent_chain_digest(parent) {
-                lookup.forget(chain, image_ref);
-            }
             return Ok(None);
         }
         let staged = match discovery.resolve(&info.manifest_digest).await {
@@ -905,9 +927,9 @@ impl snapshots::Snapshotter for NydusSnapshotter {
                     // CRI plugin (v2.x in k3s 1.36+) does not pass
                     // `cri.image-ref` on the container rootfs prepare —
                     // labels are empty. Fall back to a chainID lookup against
-                    // containerd's image store via `ContainerdLookup`, which
-                    // walks images once and caches `topmost chainID →
-                    // image_ref` for every image containerd knows.
+                    // containerd's image store via `ContainerdLookup`, and
+                    // name an image only when it alone claims the parent's
+                    // chain (`sole_chain_claimant`).
                     //
                     // Unpack prepares (containerd's image-puller extracting
                     // layers, marked by `containerd.io/snapshot.ref`) are
@@ -924,7 +946,7 @@ impl snapshots::Snapshotter for NydusSnapshotter {
                         && let Some(lookup) = self.containerd_lookup.as_ref()
                     {
                         image_ref = match lookup.lookup(chain).await {
-                            Ok(opt) => opt,
+                            Ok(claim) => sole_chain_claimant(chain, claim, &self.metrics),
                             Err(e) => {
                                 // Refresh failure (containerd unreachable,
                                 // JSON parse error, etc.) is loudly logged
@@ -2248,6 +2270,30 @@ mod tests {
 
         // The detached server thread keeps serving; keep its root alive.
         std::mem::forget(dir);
+    }
+
+    /// A chain several images claim names no image, so the prepare serves
+    /// the plain overlay; the counter records it.
+    #[test]
+    fn ambiguous_chain_names_no_image_and_is_counted() {
+        use crate::containerd_lookup::Claim;
+        let metrics = crate::metrics::SnapshotterMetrics::new();
+        let chain = "sha256:c";
+        let ambiguous = Claim::Ambiguous(vec!["reg/evil:1".into(), "reg/victim:1".into()]);
+        assert_eq!(super::sole_chain_claimant(chain, ambiguous, &metrics), None);
+        assert_eq!(
+            super::sole_chain_claimant(chain, Claim::Unclaimed, &metrics),
+            None
+        );
+        assert_eq!(
+            super::sole_chain_claimant(chain, Claim::One("reg/victim:1".into()), &metrics),
+            Some("reg/victim:1".to_string())
+        );
+        let rendered = metrics.render_prometheus(Default::default());
+        assert!(
+            rendered.contains("snapshotter_ambiguous_chain_total 1"),
+            "{rendered}"
+        );
     }
 
     /// `parent_chain_digest` is the linchpin of the Gap 1 fallback: it

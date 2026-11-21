@@ -41,6 +41,9 @@ pub struct SnapshotterMetrics {
     /// release that never happened. The reconciler's clamp pass repairs the
     /// count; this counter says how often that repair is being relied on.
     daemon_release_missing_total: AtomicU64,
+    /// Container-rootfs prepares whose parent chain several images claim, so
+    /// no accelerated content was served for it.
+    ambiguous_chain_total: AtomicU64,
     /// The conversion worker, once it exists (auto_zran enabled); its status is rendered as
     /// the `snapshotter_auto_zran_*` families.
     auto_zran: OnceLock<Arc<AutoZranManager>>,
@@ -93,6 +96,7 @@ impl SnapshotterMetrics {
             snapshot_operations: Mutex::new(BTreeMap::new()),
             peer_mirror_selfcheck_ok: Mutex::new(None),
             daemon_release_missing_total: AtomicU64::new(0),
+            ambiguous_chain_total: AtomicU64::new(0),
             auto_zran: OnceLock::new(),
         }
     }
@@ -108,6 +112,13 @@ impl SnapshotterMetrics {
     pub fn record_daemon_release_missing(&self) {
         self.daemon_release_missing_total
             .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Count a container-rootfs prepare served the plain overlay because
+    /// several images claim its parent chain. Feeds the
+    /// `snapshotter_ambiguous_chain_total` counter.
+    pub fn record_ambiguous_chain(&self) {
+        self.ambiguous_chain_total.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Record the outcome of the latest peer-mirror local self-check. `true`
@@ -204,6 +215,7 @@ impl SnapshotterMetrics {
         self.render_cache_metrics(&mut out, cache);
         self.render_peer_mirror_selfcheck(&mut out);
         self.render_release_missing(&mut out);
+        self.render_ambiguous_chain(&mut out);
         self.render_auto_zran(&mut out);
         render_containerd_reachable(&mut out, crate::containerd_grpc::containerd_reachable());
         out
@@ -259,6 +271,16 @@ impl SnapshotterMetrics {
             out,
             "snapshotter_daemon_release_missing_total",
             self.daemon_release_missing_total.load(Ordering::Relaxed),
+        );
+    }
+
+    fn render_ambiguous_chain(&self, out: &mut String) {
+        out.push_str("# HELP snapshotter_ambiguous_chain_total Container-rootfs prepares served the plain overlay because several images claim the parent chain.\n");
+        out.push_str("# TYPE snapshotter_ambiguous_chain_total counter\n");
+        push_metric(
+            out,
+            "snapshotter_ambiguous_chain_total",
+            self.ambiguous_chain_total.load(Ordering::Relaxed),
         );
     }
 

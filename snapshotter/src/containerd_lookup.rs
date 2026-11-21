@@ -6,32 +6,25 @@
 //!
 //! containerd 2.x (as shipped in k3s ≥ v1.36) does not forward the
 //! `containerd.io/snapshot/cri.image-ref` label to proxy-plugin snapshotters
-//! at container Prepare time. To still resolve the image reference for a
-//! given snapshot chainID (or Nydus bootstrap blob digest) we walk all
-//! images known to containerd, fetch their manifests and record the
-//! digest → image-ref mapping in a small in-memory cache.
+//! at container Prepare time. To still name the image behind a snapshot
+//! chainID (or Nydus bootstrap blob digest) we walk every image containerd
+//! knows and record which images claim which digests.
 //!
-//! Data access goes through the containerd gRPC API (`Images.List` +
-//! `Content.Read` via [`ContentStoreClient`]) when a client is wired in;
-//! the legacy `crictl` / `ctr` CLI walk remains only as a fallback for
-//! binaries constructed without one. The CLI fallback spawns the ~200 MB
-//! k3s binary once per image, which on a loaded node turns a refresh into
-//! a minute-plus stall — never run it on the snapshotter's gRPC runtime
-//! (every caller here is async and the fallback is pushed through
-//! `blocking::unblock`).
+//! A chainID names layer content, not an image, so the lookup keeps the full
+//! set of claimants and answers [`Claim::Ambiguous`] when more than one image
+//! claims a digest; callers serve nothing image-specific for it.
 //!
-//! Refreshes are single-flight and rate-limited: concurrent cache misses
-//! await one shared walk instead of each starting their own, and a walk
-//! that just completed is not repeated for `REFRESH_MIN_INTERVAL` even on
-//! a miss (a chainID that wasn't found won't appear by walking again two
-//! seconds later — it shows up when containerd finishes pulling the image,
-//! which the next interval-spaced refresh observes).
+//! Every lookup lists the image records again (`Images.List`, one RPC), so a
+//! claimant pulled after an earlier lookup is never missed. Walks are
+//! memoized by record target digest: a target names immutable content, so
+//! only targets not seen before cost `Content.Read`s. Refreshes are
+//! single-flight; concurrent lookups queue behind the walk in progress and
+//! each runs its own listing.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt::Write as _;
 use std::process::Command;
 use std::sync::{Mutex, MutexGuard, PoisonError};
-use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
@@ -41,41 +34,51 @@ use tracing::{debug, info, warn};
 use crate::content_store::{ContentStoreClient, is_not_found, is_rpc_failure};
 
 /// Acquire a lock without panicking on poisoning. A previous panic while a
-/// lock was held would only have left the cache in a partially-populated
-/// state; the worst case is a redundant containerd refresh, which is safe.
+/// lock was held would only have left the memo in a partially-populated
+/// state; the next refresh rebuilds it.
 fn lock_cache<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 const NYDUS_BOOTSTRAP_ANNOTATION: &str = "containerd.io/snapshot/nydus-bootstrap";
 
-/// Minimum spacing between two full image-store walks. A refresh is only
-/// triggered by a cache miss; back-to-back misses (e.g. several pods of a
-/// not-yet-pulled image scheduling together) must coalesce instead of
-/// stampeding containerd.
-const REFRESH_MIN_INTERVAL: Duration = Duration::from_secs(15);
+/// Which images claim a digest (a chainID or a nydus bootstrap layer digest).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Claim {
+    /// No image record claims it.
+    Unclaimed,
+    /// Exactly one image claims it: its best registry ref.
+    One(String),
+    /// Several images claim it: their refs, sorted. Nothing tells which one a
+    /// container was created from.
+    Ambiguous(Vec<String>),
+}
+
+/// The digests one image record target claims.
+#[derive(Clone, Debug)]
+struct TargetWalk {
+    display_ref: String,
+    digests: BTreeSet<String>,
+}
 
 pub struct ContainerdLookup {
-    /// Cache: snapshot key digest (chainID **or** layer digest, `sha256:…`)
-    /// → image ref. Both are populated so a lookup using either kind of
-    /// digest succeeds.
-    cache: Mutex<HashMap<String, String>>,
-    /// gRPC client for containerd's Images + Content services. `None`
-    /// only in legacy constructions — the CLI fallback then applies.
+    /// Record target digest → what its walk found. Rebuilt from `Images.List`
+    /// on every refresh, reusing the walk of a target listed before.
+    walks: Mutex<BTreeMap<String, TargetWalk>>,
+    /// gRPC client for containerd's Images + Content services. `None` only
+    /// in legacy constructions: chain lookups then find nothing, and
+    /// `manifest_info` falls back to the `crictl` / `ctr` CLI.
     content_store: Option<ContentStoreClient>,
-    /// Single-flight gate for refreshes. Holding the lock across the walk
-    /// makes concurrent missers await the same walk; the instant records
-    /// when the last walk finished so misses inside
-    /// `REFRESH_MIN_INTERVAL` skip straight to "miss" without walking.
-    refresh_gate: async_lock::Mutex<Option<Instant>>,
+    /// Single-flight gate for refreshes.
+    refresh_gate: async_lock::Mutex<()>,
 }
 
 impl Default for ContainerdLookup {
     fn default() -> Self {
         Self {
-            cache: Mutex::new(HashMap::new()),
+            walks: Mutex::new(BTreeMap::new()),
             content_store: None,
-            refresh_gate: async_lock::Mutex::new(None),
+            refresh_gate: async_lock::Mutex::new(()),
         }
     }
 }
@@ -132,127 +135,118 @@ impl ContainerdLookup {
     /// through Images.List / Content.Read, no subprocess spawns).
     pub fn new(content_store: ContentStoreClient) -> Self {
         Self {
-            cache: Mutex::new(HashMap::new()),
             content_store: Some(content_store),
-            refresh_gate: async_lock::Mutex::new(None),
+            ..Self::default()
         }
     }
 
-    /// Legacy construction without a gRPC client; every read falls back to
-    /// `crictl` / `ctr` subprocesses (run on the blocking pool).
+    /// Legacy construction without a gRPC client: chain lookups find
+    /// nothing and `manifest_info` runs `crictl` / `ctr` subprocesses (on
+    /// the blocking pool).
     pub fn new_cli_only() -> Self {
         Self::default()
     }
 
-    /// Look up the image ref for a given bootstrap layer / topmost chain
-    /// digest. Returns:
-    ///
-    /// - `Ok(Some(image_ref))` — hit.
-    /// - `Ok(None)` — refresh succeeded but no image references this digest
-    ///   (genuine miss).
-    /// - `Err(_)` — couldn't refresh (containerd unreachable, JSON
-    ///   unparsable, etc.). Distinguishing this from a miss lets callers
-    ///   log loudly when discovery is broken vs simply absent.
-    pub async fn lookup(&self, bootstrap_digest: &str) -> Result<Option<String>> {
-        if let Some(r) = lock_cache(&self.cache).get(bootstrap_digest) {
-            return Ok(Some(r.clone()));
+    /// Which images claim `digest` (a topmost chainID or a nydus bootstrap
+    /// layer digest), from a listing of the image store taken by this call.
+    /// `Err` means the store could not be read (containerd unreachable, a
+    /// content read failed in transport): callers must not take that for a
+    /// miss, and must not serve anything image-specific either.
+    pub async fn lookup(&self, digest: &str) -> Result<Claim> {
+        self.refresh().await?;
+        let claim = self.claims(digest);
+        if claim == Claim::Unclaimed {
+            info!(digest, "no containerd image claims this digest");
         }
-        self.refresh_coalesced().await?;
-        let hit = lock_cache(&self.cache).get(bootstrap_digest).cloned();
-        if hit.is_none() {
-            info!(
-                bootstrap = %bootstrap_digest,
-                "no containerd image found containing nydus bootstrap digest"
-            );
-        }
-        Ok(hit)
+        Ok(claim)
     }
 
-    /// Cache-only lookup: never walks containerd, never blocks. For sync
+    /// Memo-only lookup: never walks containerd, never blocks. For sync
     /// call sites (e.g. `OverlayEngine::nydus_meta_info`'s last-resort
     /// fallback) that share this instance with the async prepare path —
-    /// they read whatever the async lookups have already learned.
-    pub fn lookup_cached(&self, bootstrap_digest: &str) -> Option<String> {
-        lock_cache(&self.cache).get(bootstrap_digest).cloned()
-    }
-
-    /// Run (or await) one image-store walk. Misses arriving while a walk
-    /// is in flight wait for it and re-check the cache; misses arriving
-    /// within `REFRESH_MIN_INTERVAL` of the last walk return immediately.
-    async fn refresh_coalesced(&self) -> Result<()> {
-        let mut last_walk = self.refresh_gate.lock().await;
-        if let Some(at) = *last_walk
-            && at.elapsed() < REFRESH_MIN_INTERVAL
-        {
-            return Ok(());
+    /// they read what the last refresh learned, and get an image only when
+    /// it alone claims `digest`.
+    pub fn lookup_cached(&self, digest: &str) -> Option<String> {
+        match self.claims(digest) {
+            Claim::One(image_ref) => Some(image_ref),
+            Claim::Unclaimed | Claim::Ambiguous(_) => None,
         }
-        let result = self.refresh().await;
-        *last_walk = Some(Instant::now());
-        result
     }
 
+    /// Claimants of `digest` in the memo. Independent of walk order: targets
+    /// are kept sorted and the refs of several claimants are sorted.
+    fn claims(&self, digest: &str) -> Claim {
+        let walks = lock_cache(&self.walks);
+        let mut refs: Vec<&str> = walks
+            .values()
+            .filter(|w| w.digests.contains(digest))
+            .map(|w| w.display_ref.as_str())
+            .collect();
+        match refs.as_slice() {
+            [] => Claim::Unclaimed,
+            // A bare image-ID record (`sha256:…`) is a claimant, but useless
+            // as a registry ref: see `ref_name_rank`.
+            [only] if ref_name_rank(only) == 0 => Claim::Unclaimed,
+            [only] => Claim::One(only.to_string()),
+            _ => {
+                refs.sort_unstable();
+                Claim::Ambiguous(refs.into_iter().map(str::to_string).collect())
+            }
+        }
+    }
+
+    /// List the image records and bring the memo in line with them: walk
+    /// targets not seen before, drop targets no longer listed.
     async fn refresh(&self) -> Result<()> {
-        let mut map: HashMap<String, String> = HashMap::new();
-        let failed = match &self.content_store {
-            Some(cs) => self.refresh_via_grpc(cs, &mut map).await?,
-            None => {
-                // CLI fallback: spawning crictl/ctr is slow and blocking —
-                // keep it off the gRPC runtime.
-                let (walked, failed) = blocking::unblock(walk_images_via_cli).await?;
-                map = walked;
-                failed
-            }
+        let _gate = self.refresh_gate.lock().await;
+        let Some(cs) = &self.content_store else {
+            return Ok(());
         };
-        let count = map.len();
-        let total = self.merge_walk(map);
-        info!(
-            entries = count,
-            failed, total, "containerd image-ref cache refreshed"
-        );
-        Ok(())
-    }
-
-    /// Fold one image-store walk into the cache. The walk wins over a cached
-    /// entry: a repointed tag must stop answering for the chain it left.
-    /// Returns the cache size.
-    fn merge_walk(&self, map: HashMap<String, String>) -> usize {
-        let mut cache = lock_cache(&self.cache);
-        cache.extend(map);
-        cache.len()
-    }
-
-    /// Drop `digest → image_ref` if the cache still holds that mapping, so the
-    /// next lookup walks containerd again. For a caller that found `image_ref`
-    /// no longer resolves to the content behind `digest`.
-    pub fn forget(&self, digest: &str, image_ref: &str) {
-        let mut cache = lock_cache(&self.cache);
-        if cache.get(digest).is_some_and(|r| r == image_ref) {
-            cache.remove(digest);
-        }
-    }
-
-    /// Walk every image record into `map`; returns how many records
-    /// resolved to nothing. Their digests come from Images.List, so a
-    /// failure is a record whose content is missing or unreadable.
-    async fn refresh_via_grpc(
-        &self,
-        cs: &ContentStoreClient,
-        map: &mut HashMap<String, String>,
-    ) -> Result<usize> {
         let records = cs.images_list().await.context("containerd Images.List")?;
+        let mut walked = 0;
         let mut failed = 0;
+        let mut fresh = BTreeMap::new();
         for group in group_records_by_target(&records) {
-            if let Err(e) = walk_manifest_via_grpc(cs, &group.target, &group.display_ref, map).await
-            {
-                failed += 1;
-                if is_rpc_failure(&e) {
-                    debug!(image = %group.display_ref, error = %format_args!("{e:#}"), "image walk failed");
-                } else {
-                    warn!(image = %group.display_ref, error = %format_args!("{e:#}"), "image walk failed");
+            let known = lock_cache(&self.walks)
+                .get(&group.target)
+                .map(|w| w.digests.clone());
+            let digests = match known {
+                Some(digests) => digests,
+                None => {
+                    let mut out = HashMap::new();
+                    match walk_manifest_via_grpc(cs, &group.target, &group.display_ref, &mut out)
+                        .await
+                    {
+                        Ok(_) => walked += 1,
+                        // A transport failure leaves this target's claims
+                        // unknown, so no answer can be complete.
+                        Err(e) if is_rpc_failure(&e) => {
+                            return Err(e.context(format!("walk image {}", group.display_ref)));
+                        }
+                        // Unreadable content: no container can be created
+                        // from this record either. Not memoized, so it is
+                        // walked again once its content is complete.
+                        Err(e) => {
+                            failed += 1;
+                            debug!(image = %group.display_ref, error = %format_args!("{e:#}"), "image walk failed");
+                            continue;
+                        }
+                    }
+                    out.into_keys().collect()
                 }
-            }
+            };
+            fresh.insert(
+                group.target,
+                TargetWalk {
+                    display_ref: group.display_ref,
+                    digests,
+                },
+            );
         }
-        Ok(failed)
+        let total = fresh.len();
+        *lock_cache(&self.walks) = fresh;
+        debug!(walked, failed, total, "containerd image claims refreshed");
+        Ok(())
     }
 
     /// Forward direction: resolve an image reference to its manifest digest
@@ -351,40 +345,26 @@ fn ref_name_rank(name: &str) -> u8 {
 
 /// Group image records by target digest, choosing the highest-ranked name
 /// (see [`ref_name_rank`]) as the display ref — real tag refs first, then
-/// `repo@digest` refs; bare image-ID records (`sha256:...`) never win, and a
-/// group consisting ONLY of image-ID records is dropped entirely: mapping a
-/// chain to a bare digest poisons every consumer downstream (registry
-/// backend, auto-accel routing, capture).
+/// `repo@digest` refs. A group of bare image-ID records (`sha256:...`) only
+/// is kept: it still claims its chains, but [`ContainerdLookup::claims`]
+/// never answers with its name, since mapping a chain to a bare digest
+/// poisons every consumer downstream (registry backend, auto-accel routing,
+/// capture).
 fn group_records_by_target(records: &[ImageRecord]) -> Vec<RecordGroup> {
-    let mut by_target: HashMap<&str, &str> = HashMap::new();
+    let mut by_target: BTreeMap<&str, &str> = BTreeMap::new();
     for record in records {
-        let entry = by_target.entry(record.target_digest.as_str());
-        match entry {
-            std::collections::hash_map::Entry::Vacant(v) => {
-                v.insert(record.name.as_str());
-            }
-            std::collections::hash_map::Entry::Occupied(mut o) => {
-                if ref_name_rank(record.name.as_str()) > ref_name_rank(o.get()) {
-                    o.insert(record.name.as_str());
-                }
-            }
+        let chosen = by_target
+            .entry(record.target_digest.as_str())
+            .or_insert(record.name.as_str());
+        if ref_name_rank(record.name.as_str()) > ref_name_rank(chosen) {
+            *chosen = record.name.as_str();
         }
     }
     by_target
         .into_iter()
-        .filter_map(|(target, chosen)| {
-            if ref_name_rank(chosen) == 0 {
-                debug!(
-                    target,
-                    name = chosen,
-                    "skipping image group with only image-ID records (no usable ref)"
-                );
-                return None;
-            }
-            Some(RecordGroup {
-                target: target.to_string(),
-                display_ref: chosen.to_string(),
-            })
+        .map(|(target, chosen)| RecordGroup {
+            target: target.to_string(),
+            display_ref: chosen.to_string(),
         })
         .collect()
 }
@@ -481,8 +461,7 @@ fn image_config(manifest: &OciManifest) -> Option<&OciDescriptor> {
 }
 
 /// Record bootstrap-annotated layers into the cache map (by layer digest)
-/// and return their indices for chainID registration. Shared between the
-/// gRPC and CLI walks.
+/// and return their indices for chainID registration.
 fn collect_bootstrap_layers(
     manifest: &OciManifest,
     image_ref: &str,
@@ -842,109 +821,10 @@ fn hex_lower(bytes: &[u8]) -> String {
     out
 }
 
-/// If `repo_tags` is non-empty prefer it (human-readable ref), else fall back to `name`.
-fn preferred_ref(repo_tags: &[String], name: &str) -> String {
-    repo_tags
-        .first()
-        .cloned()
-        .unwrap_or_else(|| name.to_string())
-}
-
 // ---------------------------------------------------------------------------
 // Legacy CLI fallback (no gRPC client wired). Each helper spawns crictl/ctr
 // subprocesses — callers run these via `blocking::unblock` only.
 // ---------------------------------------------------------------------------
-
-/// CLI twin of `refresh_via_grpc`: the cache map and how many image
-/// digests resolved to nothing.
-fn walk_images_via_cli() -> Result<(HashMap<String, String>, usize)> {
-    let out = run_first_ok(&[
-        &["crictl", "images", "-o", "json"],
-        &["k3s", "crictl", "images", "-o", "json"],
-    ])?;
-    let parsed: CrictlImages = serde_json::from_slice(&out)?;
-    let mut map: HashMap<String, String> = HashMap::new();
-    let mut failed = 0;
-    for img in parsed.images {
-        // Use repoDigests when available; they carry both ref and manifest
-        // digest. repoTags alone carry no digest to walk from.
-        for repo_digest in &img.repo_digests {
-            // Format: "name@sha256:<digest>"
-            let Some((name, manifest_digest)) = repo_digest.split_once('@') else {
-                continue;
-            };
-            let ref_name = preferred_ref(&img.repo_tags, name);
-            if let Err(e) = walk_manifest_via_cli(manifest_digest, &ref_name, &mut map) {
-                failed += 1;
-                warn!(image = %ref_name, error = %format_args!("{e:#}"), "image walk failed");
-            }
-        }
-    }
-    Ok((map, failed))
-}
-
-fn walk_manifest_via_cli(
-    digest: &str,
-    image_ref: &str,
-    out: &mut HashMap<String, String>,
-) -> Result<bool> {
-    let bytes = run_first_ok(&[
-        &["ctr", "-n", "k8s.io", "content", "get", digest],
-        &["k3s", "ctr", "-n", "k8s.io", "content", "get", digest],
-    ])?;
-    if let Ok(index) = serde_json::from_slice::<OciIndexWithPlatforms>(&bytes)
-        && !index.manifests.is_empty()
-    {
-        let (host, rest) = walkable_children(&index);
-        let mut host_results = Vec::with_capacity(host.len());
-        for child in host {
-            let result = walk_manifest_via_cli(child, image_ref, out).map(|_| ());
-            if let Err(e) = &result {
-                debug!(child = %child, error = %format_args!("{e:#}"), "host-platform child walk failed");
-            }
-            host_results.push(result);
-        }
-        let mut rest_resolved = false;
-        // A failed `ctr content get` does not say why, so every host
-        // failure counts as a miss here.
-        if walk_rest_children(&host_results, |_| true) {
-            for child in rest {
-                match walk_manifest_via_cli(child, image_ref, out) {
-                    Ok(registered) => rest_resolved |= registered,
-                    Err(e) => {
-                        debug!(child = %child, error = %format_args!("{e:#}"), "child walk failed")
-                    }
-                }
-            }
-        }
-        return index_walk_result(digest, host_results, rest_resolved).map(|()| true);
-    }
-    let manifest: OciManifest = serde_json::from_slice(&bytes)?;
-    let bootstrap_indices = collect_bootstrap_layers(&manifest, image_ref, out);
-    let Some(cfg_desc) = image_config(&manifest) else {
-        return Ok(false);
-    };
-    let cfg_bytes = run_first_ok(&[
-        &["ctr", "-n", "k8s.io", "content", "get", &cfg_desc.digest],
-        &[
-            "k3s",
-            "ctr",
-            "-n",
-            "k8s.io",
-            "content",
-            "get",
-            &cfg_desc.digest,
-        ],
-    ])
-    .with_context(|| format!("fetch image config for {image_ref}"))?;
-    let cfg: OciImageConfig = serde_json::from_slice(&cfg_bytes)
-        .with_context(|| format!("parse image config for {image_ref}"))?;
-    if cfg.rootfs.diff_ids.is_empty() {
-        return Ok(false);
-    }
-    register_chain_ids(image_ref, &cfg.rootfs.diff_ids, &bootstrap_indices, out);
-    Ok(true)
-}
 
 fn manifest_info_via_cli(image_ref: &str, content_root: &std::path::Path) -> Result<ManifestInfo> {
     let out = run_first_ok(&[
@@ -1249,36 +1129,51 @@ mod tests {
         assert!(err.to_string().contains("sha256:idx"), "{err}");
     }
 
-    /// `app:v1` and `app:latest` both pointed at X and the cache answered
-    /// X's chain with `app:latest`. After `latest` moves to Y, the next walk
-    /// registers X's chain under `app:v1` only, and that must win.
-    #[test]
-    fn refresh_overwrites_an_entry_left_by_a_repointed_tag() {
+    /// A lookup seeded with `(target, display ref, claimed digests)` walks,
+    /// inserted in the given order.
+    fn seeded(walks: &[(&str, &str, &[&str])]) -> ContainerdLookup {
         let lookup = ContainerdLookup::new_cli_only();
-        let chain_x = "sha256:x".to_string();
-        lookup.merge_walk(HashMap::from([(chain_x.clone(), "app:latest".to_string())]));
-        lookup.merge_walk(HashMap::from([
-            (chain_x.clone(), "app:v1".to_string()),
-            ("sha256:y".to_string(), "app:latest".to_string()),
-        ]));
-        assert_eq!(lookup.lookup_cached(&chain_x).as_deref(), Some("app:v1"));
+        let mut memo = lock_cache(&lookup.walks);
+        for (target, display_ref, digests) in walks {
+            memo.insert(
+                target.to_string(),
+                TargetWalk {
+                    display_ref: display_ref.to_string(),
+                    digests: digests.iter().map(|d| d.to_string()).collect(),
+                },
+            );
+        }
+        drop(memo);
+        lookup
+    }
+
+    #[test]
+    fn one_image_claiming_a_chain_is_named() {
+        let lookup = seeded(&[
+            ("sha256:tx", "app:v1", &["sha256:x"]),
+            ("sha256:ty", "app:latest", &["sha256:y"]),
+        ]);
+        assert_eq!(lookup.claims("sha256:x"), Claim::One("app:v1".to_string()));
         assert_eq!(
             lookup.lookup_cached("sha256:y").as_deref(),
             Some("app:latest")
         );
+        assert_eq!(lookup.claims("sha256:z"), Claim::Unclaimed);
     }
 
+    /// A bare image-ID record still claims its chain: alone it names nothing,
+    /// next to a named image it makes the chain ambiguous.
     #[test]
-    fn forget_drops_only_the_named_mapping() {
-        let lookup = ContainerdLookup::new_cli_only();
-        lookup.merge_walk(HashMap::from([(
-            "sha256:x".to_string(),
-            "app:v1".to_string(),
-        )]));
-        lookup.forget("sha256:x", "app:latest");
-        assert_eq!(lookup.lookup_cached("sha256:x").as_deref(), Some("app:v1"));
-        lookup.forget("sha256:x", "app:v1");
-        assert_eq!(lookup.lookup_cached("sha256:x"), None);
+    fn image_id_records_claim_but_are_never_named() {
+        let id = "sha256:0c0da3558734bbf673448b752bb6c139cbd3ece8060c6589370280b8ba631d9e";
+        let alone = seeded(&[("sha256:t1", id, &["sha256:x"])]);
+        assert_eq!(alone.claims("sha256:x"), Claim::Unclaimed);
+        let shared = seeded(&[
+            ("sha256:t1", id, &["sha256:x"]),
+            ("sha256:t2", "reg/evil:1", &["sha256:x"]),
+        ]);
+        assert!(matches!(shared.claims("sha256:x"), Claim::Ambiguous(_)));
+        assert_eq!(shared.lookup_cached("sha256:x"), None);
     }
 
     #[test]
@@ -1378,21 +1273,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn preferred_ref_prefers_repo_tags() {
-        assert_eq!(
-            preferred_ref(
-                &["docker.io/library/nginx:1.27".to_string()],
-                "docker.io/library/nginx"
-            ),
-            "docker.io/library/nginx:1.27"
-        );
-        assert_eq!(
-            preferred_ref(&[], "docker.io/library/nginx"),
-            "docker.io/library/nginx"
-        );
-    }
-
     /// `record_matches_ref` replaces the crictl repoTags/repoDigests
     /// matcher — pin all three accepted shapes plus the registry-port
     /// corner case.
@@ -1418,8 +1298,7 @@ mod tests {
         assert!(!record_matches_ref("localhost:5000/img", "localhost"));
     }
 
-    /// Tag-form names win over digest-form names as the display ref —
-    /// matches the legacy crictl `preferred_ref` behaviour.
+    /// Tag-form names win over digest-form names as the display ref.
     #[test]
     fn group_records_prefers_tag_form_display_ref() {
         let records = vec![
@@ -1473,13 +1352,15 @@ mod tests {
     /// A target known ONLY by image-ID records has no usable ref — the group
     /// is dropped rather than poisoning the chain map with a bare digest.
     #[test]
-    fn group_records_drops_image_id_only_groups() {
+    fn group_records_keeps_image_id_only_groups() {
+        let id = "sha256:0c0da3558734bbf673448b752bb6c139cbd3ece8060c6589370280b8ba631d9e";
         let records = vec![ImageRecord {
-            name: "sha256:0c0da3558734bbf673448b752bb6c139cbd3ece8060c6589370280b8ba631d9e"
-                .to_string(),
+            name: id.to_string(),
             target_digest: "sha256:tgt".to_string(),
         }];
-        assert!(group_records_by_target(&records).is_empty());
+        let groups = group_records_by_target(&records);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].display_ref, id);
     }
 
     #[test]
@@ -1492,5 +1373,79 @@ mod tests {
             ref_name_rank("sha256:0c0da3558734bbf673448b752bb6c139cbd3ece806"),
             0
         );
+    }
+
+    /// Two images whose configs share a top chainID: the chain names neither
+    /// image, whatever order the image store lists or walks them in.
+    #[test]
+    fn shared_top_chain_answers_no_single_image() {
+        let diff_ids = vec!["sha256:base".to_string(), "sha256:app".to_string()];
+        let top = chain_ids(&diff_ids).last().unwrap().clone();
+        let images = [
+            ("sha256:victim-manifest", "reg/victim:1"),
+            ("sha256:evil-index", "reg/evil:1"),
+            ("sha256:other", "reg/other:2"),
+        ];
+        let orders = [
+            [0, 1, 2],
+            [0, 2, 1],
+            [1, 0, 2],
+            [1, 2, 0],
+            [2, 0, 1],
+            [2, 1, 0],
+        ];
+        for order in orders {
+            let lookup = ContainerdLookup::new_cli_only();
+            for i in order {
+                let (target, image_ref) = images[i];
+                let mut out = HashMap::new();
+                if i < 2 {
+                    register_chain_ids(image_ref, &diff_ids, &[], &mut out);
+                }
+                lock_cache(&lookup.walks).insert(
+                    target.to_string(),
+                    TargetWalk {
+                        display_ref: image_ref.to_string(),
+                        digests: out.into_keys().collect(),
+                    },
+                );
+            }
+            assert_eq!(
+                lookup.claims(&top),
+                Claim::Ambiguous(vec!["reg/evil:1".to_string(), "reg/victim:1".to_string()]),
+                "order {order:?}"
+            );
+            assert_eq!(lookup.lookup_cached(&top), None, "order {order:?}");
+        }
+    }
+
+    /// Listing the same records in any order yields the same groups.
+    #[test]
+    fn group_records_is_independent_of_listing_order() {
+        let mut records = vec![
+            ImageRecord {
+                name: "reg/victim:1".to_string(),
+                target_digest: "sha256:m".to_string(),
+            },
+            ImageRecord {
+                name: "reg/evil:1".to_string(),
+                target_digest: "sha256:i".to_string(),
+            },
+            ImageRecord {
+                name: "reg/victim@sha256:m".to_string(),
+                target_digest: "sha256:m".to_string(),
+            },
+        ];
+        let key = |groups: Vec<RecordGroup>| -> Vec<(String, String)> {
+            groups
+                .into_iter()
+                .map(|g| (g.target, g.display_ref))
+                .collect()
+        };
+        let first = key(group_records_by_target(&records));
+        records.reverse();
+        assert_eq!(key(group_records_by_target(&records)), first);
+        records.swap(0, 1);
+        assert_eq!(key(group_records_by_target(&records)), first);
     }
 }
