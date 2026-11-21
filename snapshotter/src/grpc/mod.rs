@@ -484,25 +484,31 @@ impl NydusSnapshotter {
         holder: &str,
     ) -> Result<Option<(NydusMetaInfo, PathBuf)>, SnapshotterError> {
         let store = self.store.as_ref();
-        let mut meta = self
+        // `nydus_meta_info` names the meta layer's image from the memo of
+        // which images claim it. List containerd's images first, so an image
+        // pulled or removed since the last lookup cannot decide it; without a
+        // current listing nothing is served.
+        let meta_key = self
             .overlay
-            .nydus_meta_info(store, parent, call_labels, MetaUse::Serve);
-        // The image-ref cache may just be cold: fill it from containerd's
-        // image store once and retry.
-        if let Err(e) = &meta
-            && let Some(ChainError::NoImageRef(snap)) = e.downcast_ref()
-            && let (Some(chain), Some(lookup)) =
-                (parent_chain_digest(snap), self.overlay.containerd_lookup())
+            .nydus_meta_key(store, parent)
+            .map_err(|e| SnapshotterError::internal(format!("{e:#}")))?;
+        if let Some(meta_key) = meta_key.as_deref()
+            && let (Some(digest), Some(lookup)) = (
+                parent_chain_digest(meta_key),
+                self.overlay.containerd_lookup(),
+            )
+            && let Err(e) = lookup.lookup(digest).await
         {
-            if let Err(e) = lookup.lookup(chain).await {
-                warn!(chain, error = %e, "containerd-lookup refresh failed");
-            }
-            meta = self
-                .overlay
-                .nydus_meta_info(store, parent, call_labels, MetaUse::Serve);
+            warn!(meta_key, error = %format_args!("{e:#}"), "containerd image listing failed; not serving the nydus image");
+            return Err(SnapshotterError::unavailable(format!(
+                "list containerd images for nydus meta layer {meta_key}: {e:#}"
+            )));
         }
-        // A missing ancestor is a broken chain, not a missing `holder`.
-        let meta = meta.map_err(|e| SnapshotterError::internal(format!("{e:#}")))?;
+        let meta = self
+            .overlay
+            .nydus_meta_info(store, parent, call_labels, MetaUse::Serve)
+            // A missing ancestor is a broken chain, not a missing `holder`.
+            .map_err(|e| SnapshotterError::internal(format!("{e:#}")))?;
         let Some(meta) = meta else {
             return Ok(None);
         };
@@ -1518,18 +1524,20 @@ pub async fn serve_with_supervisor(
         profile_store,
         None, // back-filled below once AutoZranManager exists
     );
+    let content_store =
+        crate::content_store::ContentStoreClient::new(&config.snapshotter.containerd)
+            .context("connect to containerd content store")?;
+    // The one record of which images claim which chains, shared by every
+    // consumer so none answers from a memo another has not refreshed. Serving
+    // a nydus meta layer reads it whatever auto_zran says. gRPC-backed: image
+    // walks go over Images.List + Content.Read, never by spawning crictl/ctr
+    // per image — a CLI walk takes ~80 s per refresh on a loaded node and
+    // head-of-line-blocks every other snapshotter call.
+    let containerd_lookup = Arc::new(crate::containerd_lookup::ContainerdLookup::new(
+        content_store.clone(),
+    ));
     let (auto_zran, auto_accel_discovery, containerd_lookup_for_discovery, content_store_for_recon) =
         if config.snapshotter.auto_zran.enable {
-            let content_store =
-                crate::content_store::ContentStoreClient::new(&config.snapshotter.containerd)
-                    .context("connect to containerd content store")?;
-            // gRPC-backed lookup: image walks go over Images.List +
-            // Content.Read, never by spawning crictl/ctr per image — a
-            // CLI walk takes ~80 s per refresh on a loaded node and
-            // head-of-line-blocks every other snapshotter call.
-            let containerd_lookup = Arc::new(crate::containerd_lookup::ContainerdLookup::new(
-                content_store.clone(),
-            ));
             let deps = crate::auto_zran::ConversionDeps {
                 content_store: content_store.clone(),
                 containerd: config.snapshotter.containerd.clone(),
@@ -1576,27 +1584,19 @@ pub async fn serve_with_supervisor(
             (
                 auto_zran,
                 Some(discovery),
-                Some(containerd_lookup),
+                Some(containerd_lookup.clone()),
                 Some(content_store),
             )
         } else {
             (None, None, None, None)
         };
 
-    // The overlay engine shares the gRPC layer's lookup so its sync
-    // `nydus_meta_info` fallback reads the cache the async prepare path
-    // populates (cache-only — sync code never walks the image store). Serving
-    // a nydus meta layer takes its image from there or the call's labels, never
-    // from the ref the chain's first committer stored, so it exists whatever
-    // auto_zran says.
-    let meta_lookup = match containerd_lookup_for_discovery.clone() {
-        Some(lookup) => lookup,
-        None => Arc::new(crate::containerd_lookup::ContainerdLookup::new(
-            crate::content_store::ContentStoreClient::new(&config.snapshotter.containerd)
-                .context("connect to containerd content store")?,
-        )),
-    };
-    let overlay = OverlayEngine::new(config.clone()).with_containerd_lookup(Some(meta_lookup));
+    // The overlay engine reads the lookup's memo only (sync code never walks
+    // the image store); `resolve_nydus_mount` refreshes it before serving.
+    // Serving a nydus meta layer takes its image from there or the call's
+    // labels, never from the ref the chain's first committer stored.
+    let overlay =
+        OverlayEngine::new(config.clone()).with_containerd_lookup(Some(containerd_lookup));
 
     if config.snapshotter.sysctl.enable {
         let sysctl_path = config.snapshotter.sysctl.address.clone();

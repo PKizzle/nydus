@@ -141,6 +141,21 @@ impl OverlayEngine {
         self.containerd_lookup.as_ref()
     }
 
+    /// The key of the nearest nydus meta layer in `parent`'s chain: the
+    /// snapshot [`Self::nydus_meta_info`] resolves an image for.
+    pub fn nydus_meta_key(&self, store: &SnapshotStore, parent: &str) -> Result<Option<String>> {
+        if parent.is_empty() {
+            return Ok(None);
+        }
+        Ok(store
+            .parent_chain(parent)?
+            .into_iter()
+            .find(|snap| {
+                snap.labels.contains_key(NYDUS_META_LAYER) && self.holds_bootstrap(&snap.key)
+            })
+            .map(|snap| snap.key))
+    }
+
     /// Return mounts for an existing active/view snapshot.
     pub fn mounts(&self, store: &SnapshotStore, key: &str) -> Result<Vec<Mount>> {
         let info = store.stat(key)?;
