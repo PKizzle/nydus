@@ -858,10 +858,17 @@ jobs:
       run: |
         sudo NYDUS_IMAGE=$PWD/target/release/nydus-image NYDUSD=$PWD/target/release/nydusd \
           bash misc/fusedev/disk-pressure.sh
+    # File handles reopen after the kernel evicts their dentries (FUSE EXPORT_SUPPORT).
+    - name: File handles after dentry eviction
+      if: ${{ !cancelled() }}
+      run: |
+        sudo NYDUS_IMAGE=$PWD/target/release/nydus-image NYDUSD=$PWD/target/release/nydusd \
+          bash misc/fusedev/file-handles.sh
     - name: Dump nydusd log
       if: failure()
       run: |
         sudo cat /var/tmp/fusedev-disk-pressure/nydusd.log || true
+        sudo cat /var/tmp/fusedev-file-handles/nydusd.log || true
 
   takeover-test:
     runs-on: ${{ vars.RUNNER_OS || 'ubuntu-latest' }}
