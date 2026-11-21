@@ -27,7 +27,7 @@ echo "== case 0: storage unit tests"
 if [ -n "${STORAGE_TEST_BIN:-}" ]; then TEST=("$STORAGE_TEST_BIN"); else TEST=(cargo test -q -p nydus-storage --lib --); fi
 # On ROOT: the hole test needs a filesystem whose SEEK_DATA sees holes.
 OUT=$(TMPDIR="$ROOT/unit" "${TEST[@]}" cache::cachedfile::borrow_tests cache::borrow::tests 2>&1)
-echo "$OUT" | grep -E "panicked" -A2
+echo "$OUT" | grep -E "panicked|error" -A2
 echo "$OUT" | tail -3
 echo "$OUT" | grep -qE "test result: ok\. [1-9][0-9]* passed; 0 failed" || fail "the storage borrow tests failed"
 

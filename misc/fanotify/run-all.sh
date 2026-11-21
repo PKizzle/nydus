@@ -8,6 +8,7 @@
 #                          the snapshotter tests through cargo instead
 #   SERVICE_TEST_BIN       `cargo test -p nydus-service --lib --no-run` binary; unset runs the
 #                          service tests through cargo instead
+#   STORAGE_TEST_BIN       likewise for nydus-storage
 #   IMG                    ext4 image file to create (must not live on tmpfs in a small VM)
 #   MMAP_CAT               optional static build of mmap-cat.c, for dead-chunk-test's mmap reads
 set -u
