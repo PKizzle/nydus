@@ -106,6 +106,23 @@ pub struct Rafs {
     /// The daemon's uid/gid, reported for every inode of an image that does not carry its own.
     owner_override: Option<(u32, u32)>,
     i_time: u64,
+    /// FUSE generation of every inode of this image, from `image_generation`. A file handle
+    /// carries it, so a handle into an index the Vfs has since given to another image fails
+    /// instead of opening that image's inode with the same number.
+    generation: u64,
+}
+
+/// The FUSE generation for an image: the low 32 bits of the bootstrap's BLAKE3 digest, never 0.
+/// The same bytes give the same value in any nydusd build, so a hot-upgrade restore or a remount
+/// of the same bootstrap keeps every handle valid. The kernel keeps 32 bits (`i_generation`) and
+/// treats any other value it is later answered as a stale inode.
+fn image_generation(bootstrap: &[u8]) -> u64 {
+    let digest = nydus_utils::digest::RafsDigest::from_buf(
+        bootstrap,
+        nydus_utils::digest::Algorithm::Blake3,
+    );
+    let low = u32::from_le_bytes(digest.data[..4].try_into().unwrap());
+    u64::from(low.max(1))
 }
 
 impl Rafs {
@@ -135,6 +152,9 @@ impl Rafs {
         }
         let owner_override =
             (!sb.meta.explicit_uidgid()).then(|| (geteuid().into(), getegid().into()));
+        let generation = std::fs::read(metadata_path)
+            .map(|bootstrap| image_generation(&bootstrap))
+            .map_err(|e| RafsError::ReadMetadata(e, metadata_path.display().to_string()))?;
 
         let rafs = Rafs {
             id: mountpoint.to_string(),
@@ -160,6 +180,7 @@ impl Rafs {
                 .duration_since(SystemTime::UNIX_EPOCH)
                 .unwrap()
                 .as_secs(),
+            generation,
         };
 
         // Rafs v6 does must store chunk info into local file cache. So blob cache is required
@@ -295,6 +316,17 @@ impl Rafs {
         Ok(())
     }
 
+    /// The FUSE generation every inode of this image is answered with.
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// Answer `generation` instead of the image's own: a daemon taking over a live mount keeps
+    /// the generation its predecessor gave the kernel, or every cached inode turns stale.
+    pub fn set_generation(&mut self, generation: u64) {
+        self.generation = generation;
+    }
+
     /// Get id of the filesystem instance.
     pub fn id(&self) -> &str {
         &self.id
@@ -372,7 +404,7 @@ impl Rafs {
             }
             .into(),
             inode: 0,
-            generation: 0,
+            generation: self.generation,
             attr_flags: 0,
             attr_timeout: self.sb.meta.attr_timeout,
             entry_timeout: self.sb.meta.entry_timeout,
@@ -410,6 +442,7 @@ impl Rafs {
 
     fn get_inode_entry<I: Deref<Target = dyn RafsInode>>(&self, inode: I) -> Entry {
         let mut entry = inode.get_entry();
+        entry.generation = self.generation;
 
         if let Some((uid, gid)) = self.owner_override {
             entry.attr.st_uid = uid;
@@ -1234,6 +1267,7 @@ mod tests {
             prefetch_bandwidth_limit: 0,
             owner_override: None,
             i_time: 0,
+            generation: 0,
         };
         assert_eq!(rafs.id(), "foo");
         assert!(!rafs.xattr_supported());
@@ -1279,6 +1313,7 @@ mod tests {
             prefetch_bandwidth_limit: 0,
             owner_override: Some((1000, 1000)),
             i_time: 12345678,
+            generation: 0x5eed,
         }
     }
 
@@ -1347,6 +1382,59 @@ mod tests {
         }
     }
 
+    /// Two images get different generations, the same bootstrap bytes the same one, and every
+    /// entry Rafs answers carries it.
+    #[test]
+    fn test_entries_carry_the_image_generation() {
+        let root_dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
+        let texture = root_dir.join("../tests/texture/bootstrap");
+        let v5 = std::fs::read(texture.join("rafs-v5.boot")).unwrap();
+        let v6 = std::fs::read(texture.join("rafs-v6-nested.boot")).unwrap();
+        let (g5, g6) = (image_generation(&v5), image_generation(&v6));
+        assert_ne!(g5, g6);
+        assert_eq!(image_generation(&v6.clone()), g6);
+        for g in [g5, g6] {
+            assert!(g != 0 && g <= u64::from(u32::MAX), "{g:#x}");
+        }
+
+        let (sb, _) = RafsSuper::load_from_file(
+            texture.join("rafs-v6-nested.boot"),
+            crate::test_util::test_config(),
+            false,
+        )
+        .unwrap();
+        let rafs = Rafs {
+            sb: Arc::new(sb),
+            generation: g6,
+            ..make_test_rafs()
+        };
+        let root = rafs.sb.superblock.root_ino();
+        let ctx = Context::default();
+        let lookup = |parent, name: &str| {
+            let name = std::ffi::CString::new(name).unwrap();
+            rafs.lookup(&ctx, parent, &name).unwrap()
+        };
+        let d1 = lookup(root, "d1");
+        for entry in [
+            d1,
+            lookup(d1.inode, "."),
+            lookup(d1.inode, ".."),
+            lookup(root, "top.txt"),
+            lookup(root, "missing"),
+            rafs.mount().unwrap().0,
+        ] {
+            assert_eq!(entry.generation, g6, "inode {}", entry.inode);
+        }
+        let mut plus = Vec::new();
+        rafs.readdirplus(&ctx, root, 0, u32::MAX, 0, &mut |_, entry| {
+            plus.push(entry.generation);
+            Ok(1)
+        })
+        .unwrap();
+        assert!(!plus.is_empty());
+        assert!(plus.iter().all(|&g| g == g6), "{plus:?}");
+    }
+
     #[test]
     fn test_lookup_name_too_long() {
         use std::ffi::CString;
@@ -1406,7 +1494,7 @@ mod tests {
         let rafs = make_test_rafs();
         let ent = rafs.negative_entry();
         assert_eq!(ent.inode, 0);
-        assert_eq!(ent.generation, 0);
+        assert_eq!(ent.generation, rafs.generation);
         // attr_timeout and entry_timeout come from sb.meta (default = 0)
         assert_eq!(ent.attr_timeout, rafs.sb.meta.attr_timeout);
         assert_eq!(ent.entry_timeout, rafs.sb.meta.entry_timeout);
@@ -1433,6 +1521,7 @@ mod tests {
             prefetch_bandwidth_limit: 0,
             owner_override: None,
             i_time: 0,
+            generation: 0,
         };
         assert_eq!(rafs.id(), "my-rafs-instance");
     }
