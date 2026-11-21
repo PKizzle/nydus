@@ -255,7 +255,9 @@ pub(crate) fn find_lenders(
                 continue;
             };
             let id = (md.dev(), md.ino());
+            // An empty cache file (a stale or never-filled one) lends nothing but would fill the cap.
             if !md.is_file()
+                || md.blocks() == 0
                 || md.dev() != own.dev()
                 || md.uid() != own.uid()
                 || id == (own.dev(), own.ino())
@@ -307,6 +309,38 @@ pub(crate) fn has_data(file: &File, offset: u64, len: u64) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Cache files with no allocated data do not take lender slots ahead of one that has data.
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support file-backed mmap")]
+    fn empty_cache_files_take_no_lender_slot() {
+        let root = tempfile::TempDir::new().unwrap();
+        let name = "blob.blob.data";
+        let cache_dir = |path: std::path::PathBuf| {
+            std::fs::create_dir_all(&path).unwrap();
+            std::fs::write(path.join(BORROW_IDENTITY_FILE), "same").unwrap();
+            path
+        };
+        let own_dir = cache_dir(root.path().join("own"));
+        let own = File::create(own_dir.join(name)).unwrap();
+        // Listed first: as many empty (sparse) cache files as there are slots.
+        for i in 0..MAX_LENDERS {
+            let dir = cache_dir(root.path().join("empty").join(i.to_string()));
+            File::create(dir.join(name))
+                .unwrap()
+                .set_len(1 << 20)
+                .unwrap();
+        }
+        let full = cache_dir(root.path().join("full").join("0"));
+        std::fs::write(full.join(name), vec![7u8; 4096]).unwrap();
+        let patterns = [
+            format!("{}/empty/*", root.path().display()),
+            format!("{}/full/*", root.path().display()),
+        ];
+        let lenders = find_lenders(&patterns, &own_dir, name, &own);
+        let paths: Vec<_> = lenders.iter().map(|l| l.path.clone()).collect();
+        assert_eq!(paths, vec![full.join(name)], "empty files took the slots");
+    }
 
     /// An open that fails for a passing reason is no strike, is not tried again before its
     /// backoff ends, is tried again after it, and a success clears the failure count.
