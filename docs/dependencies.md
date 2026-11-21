@@ -134,6 +134,10 @@ cuts a release that lets us switch to a version requirement.
   - `Opcode::from` matches each value instead of transmuting it; an opcode in a
     hole of the enum (0, 7, 19) was undefined behaviour, reachable from a
     `trace!` on a bad request (upstream 074c06c).
+  - `Vfs::forget` for a file system that was unmounted logs at debug instead
+    of warn; the kernel sends one FORGET per inode it had cached below the
+    mountpoint, so a shared daemon unmounting images flooded the log (upstream
+    4d1bb74).
 - **Upstream PR/issue status**: filed,
   https://github.com/cloud-hypervisor/fuse-backend-rs/pull/376 (open).
 - **Drop trigger**: upstream releases the fix (PR #376) together with the
