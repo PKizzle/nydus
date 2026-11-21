@@ -283,6 +283,16 @@ jobs:
       run: |
         export RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}" CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
         bash misc/sudo-env.sh PATH RUSTUP_HOME 'CARGO_*' -- make ut-nextest RUSTUP="$(command -v rustup)"
+    # The vendored fuse-backend-rs is not a workspace member, so `make ut-nextest` skips its tests.
+    # Root, because one of them mounts a FUSE session.
+    - name: Unit Test (vendored fuse-backend-rs)
+      run: |
+        export RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}" CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
+        for features in fusedev fusedev,async-io; do
+          bash misc/sudo-env.sh PATH RUSTUP_HOME 'CARGO_*' -- cargo test \
+            --manifest-path third_party/fuse-backend-rs/Cargo.toml \
+            --target-dir target/fuse-backend-rs --lib --no-default-features --features "$features"
+        done
 
   nydus-unit-test-coverage:
     runs-on: ${{ vars.RUNNER_OS || 'ubuntu-latest' }}

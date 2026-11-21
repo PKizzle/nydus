@@ -27,3 +27,4 @@ pkg/
 /.docker-cargo/
 /target-linux/
 BACKLOG.md
+third_party/fuse-backend-rs/Cargo.lock
