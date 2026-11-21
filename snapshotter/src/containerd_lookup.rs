@@ -12,11 +12,12 @@
 //! digests.
 //!
 //! A chainID names layer content, not an image. A repository is the unit of
-//! trust (its publisher decides what bytes it serves), so each repository
-//! among the claimants' record names is one claimant, and the lookup answers
-//! [`Claim::Ambiguous`] when a digest is claimed from more than one repository
-//! (or by an image known only by its ID); callers serve nothing image-specific
-//! for it.
+//! trust (its publisher decides what its tags point at), so the targets a
+//! repository's tag records name are one claimant. A target only digest records name is a claimant of its own: a
+//! digest names content, not a publisher's choice. The lookup answers
+//! [`Claim::Ambiguous`] when a digest has more than one claimant (or an image
+//! known only by its ID claims it next to a named one); callers serve nothing
+//! image-specific for it.
 //!
 //! Every lookup answers from a listing of the namespace's image records
 //! (`Images.List`, one RPC) started after the lookup was called, so a
@@ -71,16 +72,18 @@ pub fn namespace_of_key(key: &str) -> Option<&str> {
 pub enum Claim {
     /// No image record names a repository for it.
     Unclaimed,
-    /// Every claimant is in one repository.
+    /// One claimant: the tag-named targets of one repository, or one target
+    /// only digest records name.
     One(Claimant),
-    /// Several repositories claim it, or an image known only by its ID does
-    /// next to a named one: the repositories, sorted. Nothing tells which one
-    /// a container was created from.
+    /// Several claimants, or an image known only by its ID next to a named
+    /// one: each claiming repository (`repo@<target>` for a digest-only
+    /// target), sorted. Nothing tells which one a container was created from.
     Ambiguous(Vec<String>),
 }
 
-/// The one repository claiming a digest, with every image in it that does.
-/// All are from one publisher, so any of them may answer for the others.
+/// The one claimant of a digest: the targets one repository's tags name, all
+/// from one publisher, so any of them may answer for the others; or a single
+/// target only digest records name.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Claimant {
     /// `host/repo` of every claiming image record.
@@ -110,6 +113,22 @@ impl Claimant {
     pub fn admits(&self, image_ref: &str) -> bool {
         repository(image_ref) == Some(self.repository.as_str())
     }
+
+    /// Whether the claimant is its repository's tag-named targets (not one
+    /// target only digest records name).
+    fn by_tag(&self) -> bool {
+        is_tag_ref(self.image_ref())
+    }
+}
+
+/// Whether a record name is a tag-form ref (`host/repo:tag`).
+fn is_tag_ref(name: &str) -> bool {
+    ref_name_rank(name) == 3
+}
+
+/// A target whose record names include a tag.
+fn tag_named(names: &[String]) -> bool {
+    names.iter().any(|n| is_tag_ref(n))
 }
 
 /// The repository part of an image ref (`host/repo` of `host/repo:tag` or
@@ -276,10 +295,16 @@ impl ContainerdLookup {
         let state = self.namespace(namespace);
         let memo = lock_cache(&state.memo);
         let claim = claim_of(&memo.walks, digest);
+        // Only another tag-named target of a tag claimant's repository joins
+        // that claimant; any other unwalked target could make it ambiguous.
         if let Claim::One(claimant) = &claim
             && let Some((target, failure)) = memo.failed.iter().find(|(_, f)| {
                 let repos = repositories(&f.names);
-                !f.absent && (repos.len() != 1 || !repos.contains(claimant.repository.as_str()))
+                let joins = claimant.by_tag()
+                    && tag_named(&f.names)
+                    && repos.len() == 1
+                    && repos.contains(claimant.repository.as_str());
+                !f.absent && !joins
             })
         {
             bail!(
@@ -485,38 +510,44 @@ async fn refresh_memo(cs: &ContentStoreClient, memo: &Mutex<Memo>) -> Result<()>
 /// Who claims `digest` among `walks`: see [`Claim`]. Independent of listing
 /// and walk order.
 fn claim_of(walks: &BTreeMap<String, TargetWalk>, digest: &str) -> Claim {
-    let claiming: Vec<(&String, &TargetWalk)> = walks
-        .iter()
-        .filter(|(_, w)| w.digests.contains(digest))
-        .collect();
-    let mut repos = BTreeSet::new();
+    // Claimant key → (repository, its images with their record update time).
+    type Images = Vec<(Updated, ClaimedImage)>;
+    let mut claimants: BTreeMap<String, (String, Images)> = BTreeMap::new();
     let mut unnamed = false;
-    for (_, walk) in &claiming {
-        let own = repositories(&walk.names);
-        unnamed |= own.is_empty();
-        repos.extend(own);
+    for (target, walk) in walks.iter().filter(|(_, w)| w.digests.contains(digest)) {
+        let repos = repositories(&walk.names);
+        unnamed |= repos.is_empty();
+        let tagged = tag_named(&walk.names);
+        for repo in repos {
+            let key = if tagged {
+                repo.to_string()
+            } else {
+                format!("{repo}@{target}")
+            };
+            claimants
+                .entry(key)
+                .or_insert_with(|| (repo.to_string(), Vec::new()))
+                .1
+                .push((
+                    walk.updated,
+                    ClaimedImage {
+                        image_ref: best_name(&walk.names).to_string(),
+                        target: target.clone(),
+                    },
+                ));
+        }
     }
-    match (repos.len(), unnamed) {
+    match (claimants.len(), unnamed) {
         // A bare image-ID record alone names nothing to serve from.
         (0, _) => Claim::Unclaimed,
         (1, false) => {
-            let repository = repos.pop_first().expect("one repository").to_string();
-            let mut images: Vec<(Updated, ClaimedImage)> = claiming
-                .into_iter()
-                .map(|(target, walk)| {
-                    let image_ref = best_name(&walk.names).to_string();
-                    (
-                        walk.updated,
-                        ClaimedImage {
-                            image_ref,
-                            target: target.clone(),
-                        },
-                    )
-                })
-                .collect();
+            let (_, (repository, mut images)) = claimants.pop_first().expect("one claimant");
+            // Tag-named targets first (a claimant never mixes them with a
+            // digest-only one), then the newest record.
             images.sort_by(|(a_time, a), (b_time, b)| {
-                b_time
-                    .cmp(a_time)
+                is_tag_ref(&b.image_ref)
+                    .cmp(&is_tag_ref(&a.image_ref))
+                    .then_with(|| b_time.cmp(a_time))
                     .then_with(|| a.image_ref.cmp(&b.image_ref))
                     .then_with(|| a.target.cmp(&b.target))
             });
@@ -526,7 +557,7 @@ fn claim_of(walks: &BTreeMap<String, TargetWalk>, digest: &str) -> Claim {
             })
         }
         _ => {
-            let mut names: Vec<String> = repos.into_iter().map(str::to_string).collect();
+            let mut names: Vec<String> = claimants.into_keys().collect();
             if unnamed {
                 names.push("<image ID only>".to_string());
             }
@@ -1539,16 +1570,16 @@ mod tests {
         );
     }
 
-    /// Several targets of one repository (a rebuild with the same layers, an
-    /// image pulled by tag and by platform-manifest digest) are one claimant;
-    /// its images are ordered newest record first, then by name.
+    /// The tag-named targets of one repository (a rebuild with the same
+    /// layers, an index and a manifest tagged apart) are one claimant; its
+    /// images are ordered newest record first, then by name.
     #[test]
-    fn targets_of_one_repository_are_one_claimant() {
+    fn tagged_targets_of_one_repository_are_one_claimant() {
         let lookup = seeded(&[
             ("sha256:index", &["reg/app:1"], &["sha256:x"]),
             (
                 "sha256:manifest",
-                &["reg/app@sha256:manifest"],
+                &["reg/app:arch", "reg/app@sha256:manifest"],
                 &["sha256:x"],
             ),
             ("sha256:rebuild", &["reg/app:2"], &["sha256:x"]),
@@ -1560,7 +1591,7 @@ mod tests {
                 "reg/app",
                 &[
                     ("reg/app:2", "sha256:rebuild"),
-                    ("reg/app@sha256:manifest", "sha256:manifest"),
+                    ("reg/app:arch", "sha256:manifest"),
                     ("reg/app:1", "sha256:index"),
                 ]
             )
@@ -1574,8 +1605,41 @@ mod tests {
         assert!(!claimant.admits("sha256:abc"));
     }
 
+    /// A target only digest records name is a claimant of its own, whatever
+    /// repository the records name and however recent they are: alone it is
+    /// the claimant, next to a tag claimant of the same repository the chain is
+    /// ambiguous.
+    #[test]
+    fn a_digest_only_target_is_its_own_claimant() {
+        let alone = seeded(&[("sha256:pinned", &["reg/app@sha256:pinned"], &["sha256:x"])]);
+        assert_eq!(
+            alone.lookup_cached(NS, "sha256:x").unwrap(),
+            one("reg/app", &[("reg/app@sha256:pinned", "sha256:pinned")])
+        );
+        let lookup = seeded(&[
+            ("sha256:tagged", &["reg/app:1"], &["sha256:x"]),
+            ("sha256:pinned", &["reg/app@sha256:pinned"], &["sha256:x"]),
+        ]);
+        assert_eq!(
+            lookup.lookup_cached(NS, "sha256:x").unwrap(),
+            Claim::Ambiguous(vec![
+                "reg/app".to_string(),
+                "reg/app@sha256:pinned".to_string()
+            ])
+        );
+        // Two digest-only targets are two claimants.
+        let two = seeded(&[
+            ("sha256:a", &["reg/app@sha256:a"], &["sha256:x"]),
+            ("sha256:b", &["reg/app@sha256:b"], &["sha256:x"]),
+        ]);
+        assert!(matches!(
+            two.lookup_cached(NS, "sha256:x").unwrap(),
+            Claim::Ambiguous(_)
+        ));
+    }
+
     /// A target whose walk failed might claim anything: it makes a sole
-    /// claimant uncertain unless all its names are in that claimant's
+    /// claimant uncertain unless it is tag-named in that claimant's
     /// repository, and never shrinks the claimant set.
     #[test]
     fn an_unwalked_target_makes_other_repositories_claims_uncertain() {
@@ -1600,6 +1664,7 @@ mod tests {
         ));
         for names in [
             &["other.example/b:1"][..],
+            &["reg/app@sha256:broken"],
             &["reg/app:2", "other.example/b:1"],
             &["sha256:0c0da3558734bbf673448b752bb6c139cbd3ece8060c6589370280b8ba631d9e"],
         ] {

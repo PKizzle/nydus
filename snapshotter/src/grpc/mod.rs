@@ -420,15 +420,16 @@ fn image_is_parent(image_chain: &str, parent: &str) -> bool {
 
 /// The images a container-rootfs prepare serves image-specific content for
 /// (an auto-accel sidecar, a published nydus entry, a referrer): only those
-/// of a repository that alone claims the parent's chain in its namespace.
+/// of the parent chain's sole claimant in its namespace (see [`Claim`]).
 ///
-/// A chainID names layer content, not an image, so when several repositories
-/// claim a chain nothing tells which one the container was created from, and
-/// it gets the plain overlay: the layers containerd applied for the chain,
-/// unaccelerated. A container is created only from an image record containerd
-/// holds, and every lookup lists the records afresh, so a sole claiming
-/// repository is the one the container came from; its images are all one
-/// publisher's, so any of them may answer for the container's.
+/// A chainID names layer content, not an image, so with several claimants
+/// nothing tells which one the container was created from, and it gets the
+/// plain overlay: the layers containerd applied for the chain, unaccelerated.
+/// A container is created from an image record containerd held when CRI
+/// resolved the image, and every lookup lists the records afresh, so a sole
+/// claimant is the one the container came from unless that record was removed
+/// between CRI's image resolution and this prepare. A tag claimant's images
+/// are all one publisher's, so any of them may answer for the container's.
 fn sole_chain_claimant(
     chain: &str,
     claim: Claim,
