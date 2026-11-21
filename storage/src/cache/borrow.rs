@@ -16,11 +16,18 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
+use std::time::{Duration, Instant};
 
 /// Lenders listed per blob cache entry.
 const MAX_LENDERS: usize = 4;
 /// Digest mismatches after which a lender is no longer used by an entry.
 const MAX_STRIKES: u32 = 3;
+/// The longest wait before another open of a lender whose last open failed transiently.
+const MAX_OPEN_BACKOFF: Duration = Duration::from_secs(60);
+
+/// The file in a cache directory naming the backend its caches are filled from, written by
+/// whoever creates the directory. Caches borrow only from directories that name the same one.
+pub const BORROW_IDENTITY_FILE: &str = "borrow-identity";
 
 static BORROWED_CHUNKS: AtomicU64 = AtomicU64::new(0);
 static BORROWED_BYTES: AtomicU64 = AtomicU64::new(0);
@@ -75,6 +82,9 @@ pub(crate) struct Lender {
     path: PathBuf,
     id: (u64, u64),
     strikes: AtomicU32,
+    // Failed opens in a row, and when the next may be tried.
+    open_failures: AtomicU32,
+    next_open: Mutex<Option<Instant>>,
 }
 
 impl Lender {
@@ -82,31 +92,56 @@ impl Lender {
         &self.path
     }
 
-    /// The lender's descriptor, opened on first use. `None` once the lender is dropped: unlinked,
-    /// released, replaced by another file, or struck out.
+    /// The lender's descriptor, opened on first use. `None` once the lender is dropped
+    /// (unlinked, released, replaced by another file, or struck out), and while an open that
+    /// failed for a passing reason waits to be tried again.
     pub(crate) fn file(&self) -> Option<Arc<File>> {
         if self.strikes.load(Ordering::Acquire) >= MAX_STRIKES {
             return None;
         }
-        if let Some((_, file)) = LENDERS.lock().unwrap().get(&self.id)
+        if let Some((path, file)) = LENDERS.lock().unwrap().get(&self.id)
+            && *path == self.path
             && is_linked(file)
         {
             return Some(file.clone());
         }
-        // Opened outside the lock: a quiet open runs a helper thread and may take a while.
-        let file = open_quiet(&self.path).filter(|f| {
-            f.metadata()
-                .is_ok_and(|m| (m.dev(), m.ino()) == self.id && m.nlink() > 0)
-        });
-        let Some(file) = file else {
-            self.strikes.store(MAX_STRIKES, Ordering::Release);
-            LENDERS.lock().unwrap().remove(&self.id);
+        if self
+            .next_open
+            .lock()
+            .unwrap()
+            .is_some_and(|t| Instant::now() < t)
+        {
             return None;
+        }
+        // Opened outside the lock: a quiet open runs a helper thread and may take a while.
+        let file = match open_quiet(&self.path) {
+            Ok(file)
+                if file
+                    .metadata()
+                    .is_ok_and(|m| (m.dev(), m.ino()) == self.id && m.nlink() > 0) =>
+            {
+                file
+            }
+            Err(Open::Transient(e)) => {
+                let failures = self.open_failures.fetch_add(1, Ordering::AcqRel).min(6);
+                let wait = Duration::from_secs(1 << failures).min(MAX_OPEN_BACKOFF);
+                *self.next_open.lock().unwrap() = Some(Instant::now() + wait);
+                debug!(
+                    "lender {}: open failed ({e}), retrying in {wait:?}",
+                    self.path.display()
+                );
+                return None;
+            }
+            _ => {
+                self.strikes.store(MAX_STRIKES, Ordering::Release);
+                return None;
+            }
         };
+        self.open_failures.store(0, Ordering::Release);
         let mut lenders = LENDERS.lock().unwrap();
         match lenders.get(&self.id) {
             // Another entry opened it meanwhile.
-            Some((_, f)) if is_linked(f) => Some(f.clone()),
+            Some((path, f)) if *path == self.path && is_linked(f) => Some(f.clone()),
             _ => {
                 let file = Arc::new(file);
                 lenders.insert(self.id, (self.path.clone(), file.clone()));
@@ -123,20 +158,31 @@ impl Lender {
     }
 }
 
+/// Why a lender could not be opened.
+enum Open {
+    /// The file is gone or is not one to read.
+    Gone,
+    /// A passing condition, such as a descriptor or fanotify group limit.
+    Transient(std::io::Error),
+}
+
 /// Open `path` read-only without following a symlink, through a descriptor that raises no
 /// fanotify events. Where no fanotify permission events are available no pre-content mark can
 /// exist, and a plain descriptor is used.
-fn open_quiet(path: &Path) -> Option<File> {
+fn open_quiet(path: &Path) -> Result<File, Open> {
     let plain = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW)
         .open(path)
-        .ok()?;
+        .map_err(|e| match e.raw_os_error() {
+            Some(libc::ENOENT | libc::ELOOP | libc::ENOTDIR) => Open::Gone,
+            _ => Open::Transient(e),
+        })?;
     #[cfg(target_os = "linux")]
     {
         use std::os::unix::io::AsRawFd;
         match nydus_utils::fanotify::open_without_events(&[plain.as_raw_fd()], false) {
-            Ok(mut fds) => fds.pop().map(File::from),
+            Ok(mut fds) => fds.pop().map(File::from).ok_or(Open::Gone),
             // No fanotify, no permission events, or no right to create a group.
             Err(e)
                 if matches!(
@@ -144,25 +190,44 @@ fn open_quiet(path: &Path) -> Option<File> {
                     Some(libc::ENOSYS | libc::EINVAL | libc::EPERM)
                 ) =>
             {
-                Some(plain)
+                Ok(plain)
             }
-            Err(e) => {
-                warn!("cannot open lender {} without events: {e}", path.display());
-                None
-            }
+            Err(e) => Err(Open::Transient(e)),
         }
     }
     #[cfg(not(target_os = "linux"))]
-    Some(plain)
+    Ok(plain)
 }
 
-/// The lenders of the cache file `own`, named `file_name`: regular files of that name, on the
-/// same filesystem and with the same owner as `own`, in the directories `patterns` match. Each
-/// pattern is a path with one `*` component, which matches directories only, never symlinks.
+/// The backend identity a cache directory names, if its file is a regular file (not a symlink)
+/// owned by `uid`.
+fn identity_of(dir: &Path, uid: u32) -> Option<Vec<u8>> {
+    let path = dir.join(BORROW_IDENTITY_FILE);
+    let md = std::fs::symlink_metadata(&path).ok()?;
+    if !md.is_file() || md.uid() != uid || md.len() > 4096 {
+        return None;
+    }
+    std::fs::read(path).ok().filter(|id| !id.is_empty())
+}
+
+/// The lenders of the cache file `own` in the directory `own_dir`, named `file_name`: regular
+/// files of that name, on the same filesystem and with the same owner as `own`, in the
+/// directories `patterns` match that name the same backend identity as `own_dir`
+/// ([`BORROW_IDENTITY_FILE`]). Each pattern is a path with one `*` component, which matches
+/// directories only, never symlinks.
 // shortcut: lenders are listed once per blob open, so an image that caches the blob later is
-// not seen by entries already open; list again on a miss if that matters.
-pub(crate) fn find_lenders(patterns: &[String], file_name: &str, own: &File) -> Vec<Lender> {
+// not seen by entries already open, and the first four found keep their slots even when they
+// hold little of the blob; list again on a miss if that matters.
+pub(crate) fn find_lenders(
+    patterns: &[String],
+    own_dir: &Path,
+    file_name: &str,
+    own: &File,
+) -> Vec<Lender> {
     let Ok(own) = own.metadata() else {
+        return Vec::new();
+    };
+    let Some(identity) = identity_of(own_dir, own.uid()) else {
         return Vec::new();
     };
     let mut lenders = Vec::new();
@@ -191,6 +256,11 @@ pub(crate) fn find_lenders(patterns: &[String], file_name: &str, own: &File) -> 
                 || md.uid() != own.uid()
                 || id == (own.dev(), own.ino())
                 || lenders.iter().any(|l: &Lender| l.id == id)
+                || path
+                    .parent()
+                    .and_then(|dir| identity_of(dir, own.uid()))
+                    .as_ref()
+                    != Some(&identity)
             {
                 continue;
             }
@@ -198,6 +268,8 @@ pub(crate) fn find_lenders(patterns: &[String], file_name: &str, own: &File) -> 
                 path,
                 id,
                 strikes: AtomicU32::new(0),
+                open_failures: AtomicU32::new(0),
+                next_open: Mutex::new(None),
             });
             if lenders.len() == MAX_LENDERS {
                 return lenders;

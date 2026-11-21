@@ -48,7 +48,7 @@ mod worker;
 
 pub mod state;
 
-pub use borrow::{BorrowCounters, borrow_counters, release_lenders_under};
+pub use borrow::{BORROW_IDENTITY_FILE, BorrowCounters, borrow_counters, release_lenders_under};
 pub use dummycache::DummyCacheMgr;
 pub use filecache::{BLOB_DATA_FILE_SUFFIX, BLOB_RAW_FILE_SUFFIX, FileCacheMgr};
 

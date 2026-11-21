@@ -424,6 +424,7 @@ impl FileCacheEntry {
         } else {
             find_lenders(
                 &mgr.borrow_from,
+                std::path::Path::new(&mgr.work_dir),
                 &format!("{blob_id}{BLOB_DATA_FILE_SUFFIX}"),
                 &file,
             )

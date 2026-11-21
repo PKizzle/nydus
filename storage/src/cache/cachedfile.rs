@@ -1904,7 +1904,11 @@ impl FileCacheEntry {
         {
             return None;
         }
-        let digest = self.expected_chunk_digest(chunk)?;
+        // Chunks from a blob meta without inlined digests carry the default one, which no data
+        // matches: trying it would only strike good lenders.
+        let digest = self
+            .expected_chunk_digest(chunk)
+            .filter(|d| *d != RafsDigest::default())?;
         let offset = chunk.uncompressed_offset();
         let size = chunk.uncompressed_size() as usize;
         let mut buf = alloc_buf(size);
@@ -2060,7 +2064,19 @@ impl FileCacheEntry {
                 .check_ready_and_mark_pending_until(chunk.as_ref(), deadline)
             {
                 Ok(true) => true,
-                Ok(false) => self.borrow_chunk(chunk.as_ref()) == Some(true),
+                Ok(false) => match self.borrow_chunk(chunk.as_ref()) {
+                    None => false,
+                    Some(true) => true,
+                    // The failed write cleared the mark this read held: take it again.
+                    Some(false) => match self
+                        .chunk_map
+                        .check_ready_and_mark_pending_until(chunk.as_ref(), deadline)
+                    {
+                        Ok(ready) => ready,
+                        Err(StorageError::Timeout) => false,
+                        Err(e) => return Err(StorageError::InvalidArgument(e.to_string())),
+                    },
+                },
                 Err(StorageError::Timeout) => false, // Retry if waiting for inflight IO timeouts
                 Err(e) => return Err(StorageError::InvalidArgument(e.to_string())),
             };
@@ -3823,7 +3839,7 @@ mod borrow_tests {
     use super::*;
     use crate::backend::{BackendResult, BlobBackend};
     use crate::cache::borrow::release_lenders_under;
-    use crate::cache::{BLOB_DATA_FILE_SUFFIX, FileCacheMgr};
+    use crate::cache::{BLOB_DATA_FILE_SUFFIX, BORROW_IDENTITY_FILE, FileCacheMgr};
     use crate::device::BlobFeatures;
     use crate::test::MockChunkInfo;
 
@@ -3903,6 +3919,9 @@ mod borrow_tests {
             .collect()
     }
 
+    /// The backend identity of the test images unless a test names another.
+    const IDENTITY: &str = "https://registry.test/app";
+
     /// One image's cache of the blob in `<root>/<name>`, borrowing from `<root>/*`.
     struct Image {
         _mgr: FileCacheMgr,
@@ -3913,10 +3932,23 @@ mod borrow_tests {
 
     impl Image {
         fn open(root: &Path, name: &str, tweak: impl FnOnce(&mut CacheConfigV2)) -> Image {
+            Image::open_as(root, name, Some(IDENTITY), tweak)
+        }
+
+        /// An image whose cache dir names the backend identity `identity`, or none.
+        fn open_as(
+            root: &Path,
+            name: &str,
+            identity: Option<&str>,
+            tweak: impl FnOnce(&mut CacheConfigV2),
+        ) -> Image {
             static IDS: AtomicUsize = AtomicUsize::new(0);
             let id = format!("borrow-test-{}", IDS.fetch_add(1, Ordering::SeqCst));
             let dir = root.join(name);
             std::fs::create_dir_all(&dir).unwrap();
+            if let Some(identity) = identity {
+                std::fs::write(dir.join(BORROW_IDENTITY_FILE), identity).unwrap();
+            }
             let mut config = CacheConfigV2 {
                 cache_type: "filecache".to_string(),
                 file_cache: Some(FileCacheConfig {
@@ -4155,6 +4187,51 @@ mod borrow_tests {
         read(&chunks[1]);
         assert_eq!(b.reads(), 1, "the user read fetched a chunk a holds");
         assert!(b.entry.chunk_map.is_ready(chunks[1].as_ref()).unwrap());
+    }
+
+    /// Only a cache dir naming the same backend identity lends: an image whose own backend is
+    /// another registry, or that names none, borrows nothing even though it can read the blob.
+    #[test]
+    fn only_a_cache_of_the_same_backend_lends() {
+        let root = TempDir::new().unwrap();
+        let chunks = chunks(&blob_info());
+        Image::plain(root.path(), "a").fetch(&chunks);
+        for (name, identity) in [("other", Some("https://attacker.test/app")), ("none", None)] {
+            let b = Image::open_as(root.path(), name, identity, |_| {});
+            assert!(b.entry.lenders.is_empty(), "{name} lists a lender");
+            b.fetch(&chunks[..1]);
+            b.fetch(&chunks[1..2]);
+            assert_eq!(b.reads(), 2, "{name} borrowed");
+        }
+        let b = Image::plain(root.path(), "same");
+        b.fetch(&chunks[..1]);
+        b.fetch(&chunks[1..2]);
+        assert_eq!(b.reads(), 1, "the same backend did not borrow");
+    }
+
+    /// A chunk carrying the default digest (blob meta without inlined digests) is not borrowed,
+    /// and trying it is no strike against the lender.
+    #[test]
+    fn a_default_digest_chunk_is_not_borrowed() {
+        let root = TempDir::new().unwrap();
+        let chunks = chunks(&blob_info());
+        Image::plain(root.path(), "a").fetch(&chunks);
+        let b = Image::plain(root.path(), "b");
+        b.fetch(&chunks[..1]);
+        let undigested = MockChunkInfo {
+            block_id: RafsDigest::default(),
+            index: 1,
+            compress_size: CHUNK as u32,
+            uncompress_size: CHUNK as u32,
+            compress_offset: CHUNK,
+            uncompress_offset: CHUNK,
+            ..Default::default()
+        };
+        for _ in 0..4 {
+            assert_eq!(b.entry.borrow_chunk(&undigested), None);
+        }
+        b.fetch(&chunks[2..3]);
+        assert_eq!(b.reads(), 1, "the default digest struck the lender off");
     }
 
     /// Descriptors of this process open on `path`.
