@@ -3,6 +3,10 @@
 //
 // Usage: fh-reopen <mountpoint> <path>...   (paths relative to the mountpoint; needs root)
 // Prints one line per path and exits non-zero if any handle fails.
+//
+// FH_REOPEN_HOOK, if set, is run through the shell after the caches are dropped and before the
+// first reopen, e.g. to sample the daemon's lookup counter. FH_NO_DROP=1 skips dropping the
+// caches, a control run whose reopens must not reach the daemon.
 #define _GNU_SOURCE
 #include <dirent.h>
 #include <errno.h>
@@ -69,13 +73,20 @@ int main(int argc, char **argv) {
 	}
 
 	// Evict every unused dentry and inode, so each reopen must look the node id up again.
-	sync();
-	int dc = open("/proc/sys/vm/drop_caches", O_WRONLY);
-	if (dc < 0 || write(dc, "2", 1) != 1) {
-		perror("drop_caches");
+	if (!getenv("FH_NO_DROP")) {
+		sync();
+		int dc = open("/proc/sys/vm/drop_caches", O_WRONLY);
+		if (dc < 0 || write(dc, "2", 1) != 1) {
+			perror("drop_caches");
+			return 2;
+		}
+		close(dc);
+	}
+	const char *hook = getenv("FH_REOPEN_HOOK");
+	if (hook && system(hook) != 0) {
+		fprintf(stderr, "FH_REOPEN_HOOK failed\n");
 		return 2;
 	}
-	close(dc);
 
 	for (int i = 0; i < n; i++) {
 		const char *path = argv[i + 2];
