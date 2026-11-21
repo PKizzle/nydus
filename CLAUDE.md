@@ -31,6 +31,7 @@ sudo misc/fanotify/zran-multilayer-test.sh   # node-local zran convert + merge +
 sudo misc/fanotify/ref-layer-formats-test.sh # gzip + tar + multi/single-frame zstd layers, one image
 sudo misc/fanotify/precontent-cases.sh       # fail-closed + strace ground truth + ENOSPC (needs strace)
 sudo misc/fanotify/corrupt-data-test.sh      # corrupt backend byte -> EIO; corrupt cache -> revoked on restart
+sudo misc/fanotify/borrow-test.sh            # cache borrowing: no lender events + two-image e2e
 sudo misc/fanotify/inode-share-test.sh       # EROFS page cache sharing between two images (7.0+; skips below)
 # Any of the image-building checks at another EROFS block size (must not exceed the page size)
 sudo BLOCK_SIZE=16384 NYDUS_IMAGE=... NYDUSD=... misc/fanotify/runtime-test.sh
