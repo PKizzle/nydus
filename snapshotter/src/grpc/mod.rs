@@ -10,7 +10,7 @@
 use crate::auto_zran::AutoZranManager;
 use crate::cache::{CacheGcPolicy, CacheManager, parse_duration};
 use crate::config::SnapshotterConfig;
-use crate::containerd_lookup::Claim;
+use crate::containerd_lookup::{Claim, Claimant, namespace_of_key};
 use crate::daemon::DaemonSupervisor;
 use crate::metrics::SnapshotterMetrics;
 use crate::overlay::{ChainError, MetaUse, NydusMetaInfo, OverlayEngine, PrepareOutcome};
@@ -74,6 +74,12 @@ impl SnapshotterError {
         )))
     }
 
+    fn failed_precondition(message: impl Into<String>) -> Self {
+        Self(Box::new(snapshots::tonic::Status::failed_precondition(
+            message.into(),
+        )))
+    }
+
     fn unavailable(message: impl Into<String>) -> Self {
         Self(Box::new(snapshots::tonic::Status::unavailable(
             message.into(),
@@ -122,6 +128,11 @@ impl From<SnapshotterError> for snapshots::tonic::Status {
 fn grpc_error(e: &anyhow::Error) -> SnapshotterError {
     let message = format!("{:#}", e);
     for cause in e.chain() {
+        // The chain or the image records, not the request or the server, are
+        // what must change before the call can succeed.
+        if cause.downcast_ref::<ChainError>().is_some() {
+            return SnapshotterError::failed_precondition(message);
+        }
         if let Some(store) = cause.downcast_ref::<StoreError>() {
             return match store {
                 StoreError::NotFound(_) => SnapshotterError::not_found(message),
@@ -407,30 +418,59 @@ fn image_is_parent(image_chain: &str, parent: &str) -> bool {
     parent_chain_digest(parent) == Some(image_chain)
 }
 
-/// The image a container-rootfs prepare without an image label serves
-/// image-specific content for (an auto-accel sidecar, a published nydus
-/// entry, a referrer): only one that alone claims the parent's chain.
+/// The images a container-rootfs prepare serves image-specific content for
+/// (an auto-accel sidecar, a published nydus entry, a referrer): only those
+/// of a repository that alone claims the parent's chain in its namespace.
 ///
-/// A chainID names layer content, not an image, so when several images claim
-/// it nothing tells which one the container was created from, and it gets the
-/// plain overlay: the layers containerd applied for the chain, unaccelerated.
-/// A sole claimant is the image the container was created
-/// from: a container is created only from an image record containerd holds,
-/// and every lookup lists the records afresh.
-fn sole_chain_claimant(chain: &str, claim: Claim, metrics: &SnapshotterMetrics) -> Option<String> {
+/// A chainID names layer content, not an image, so when several repositories
+/// claim a chain nothing tells which one the container was created from, and
+/// it gets the plain overlay: the layers containerd applied for the chain,
+/// unaccelerated. A container is created only from an image record containerd
+/// holds, and every lookup lists the records afresh, so a sole claiming
+/// repository is the one the container came from; its images are all one
+/// publisher's, so any of them may answer for the container's.
+fn sole_chain_claimant(
+    chain: &str,
+    claim: Claim,
+    metrics: &SnapshotterMetrics,
+) -> Option<Claimant> {
     match claim {
-        Claim::One(image_ref) => Some(image_ref),
+        Claim::One(claimant) => Some(claimant),
         Claim::Unclaimed => None,
-        Claim::Ambiguous(images) => {
+        Claim::Ambiguous(repositories) => {
             metrics.record_ambiguous_chain();
             debug!(
                 chain,
-                ?images,
-                "several images claim the parent chain; serving the plain overlay"
+                ?repositories,
+                "several repositories claim the parent chain; serving the plain overlay"
             );
             None
         }
     }
+}
+
+/// A daemon decision recorded on a snapshot by `stamp_daemon_ref_label`.
+struct Stamp<'a> {
+    image_ref: &'a str,
+    bootstrap: Option<&'a str>,
+    /// Recorded after a claimant check (see [`labels::NYDUS_DAEMON_CHECKED`]).
+    checked: bool,
+}
+
+fn stamp_of(labels: &HashMap<String, String>) -> Option<Stamp<'_>> {
+    use crate::source::labels::{
+        NYDUS_DAEMON_BOOTSTRAP, NYDUS_DAEMON_CHECKED, NYDUS_DAEMON_IMAGE_REF,
+    };
+    Some(Stamp {
+        image_ref: labels.get(NYDUS_DAEMON_IMAGE_REF)?,
+        bootstrap: labels.get(NYDUS_DAEMON_BOOTSTRAP).map(String::as_str),
+        checked: labels.contains_key(NYDUS_DAEMON_CHECKED),
+    })
+}
+
+/// Whether a `Prepare` is containerd's unpacker extracting a layer.
+fn is_unpack(labels: &HashMap<String, String>) -> bool {
+    labels.contains_key(crate::source::TARGET_SNAPSHOT_REF)
 }
 
 /// The main snapshotter implementation.
@@ -463,8 +503,9 @@ pub struct NydusSnapshotter {
     /// is on (with a containerd content-store client behind it); `None`
     /// otherwise — in which case `resolve_auto_accel_mount` is a no-op.
     auto_accel_discovery: Option<crate::auto_accel_sidecar::AutoAccelDiscovery>,
-    /// Containerd-side state used by `resolve_auto_accel_mount` to resolve
-    /// an image ref to its manifest digest. `None` when auto-accel is off.
+    /// Which images claim a chain (the one lookup the overlay engine shares),
+    /// and the image-ref → manifest resolution of `resolve_auto_accel_mount`.
+    /// `None` only in tests.
     containerd_lookup: Option<Arc<crate::containerd_lookup::ContainerdLookup>>,
     containerd_content_root: Option<PathBuf>,
 }
@@ -476,45 +517,60 @@ impl NydusSnapshotter {
     ///
     /// `holder` is the snapshot key on whose behalf the daemon is resolved; the
     /// supervisor registers it idempotently, so repeated `Mounts` RPCs for a
-    /// key cannot inflate the daemon refcount.
+    /// key cannot inflate the daemon refcount. A `stamp` checked when the
+    /// holder was prepared names the daemon without listing containerd's
+    /// images again (the image the container came from cannot change); any
+    /// other resolution lists them and stamps the holder.
     async fn resolve_nydus_mount(
         &self,
         parent: &str,
-        call_labels: &HashMap<String, String>,
+        labels: &HashMap<String, String>,
         holder: &str,
+        stamp: Option<&Stamp<'_>>,
     ) -> Result<Option<(NydusMetaInfo, PathBuf)>, SnapshotterError> {
         let store = self.store.as_ref();
-        // `nydus_meta_info` names the meta layer's image from the memo of
-        // which images claim it. List containerd's images first, so an image
-        // pulled or removed since the last lookup cannot decide it; without a
-        // current listing nothing is served.
-        let meta_key = self
+        let Some((meta_key, bootstrap)) = self
             .overlay
-            .nydus_meta_key(store, parent)
-            .map_err(|e| SnapshotterError::internal(format!("{e:#}")))?;
-        if let Some(meta_key) = meta_key.as_deref()
-            && let (Some(digest), Some(lookup)) = (
-                parent_chain_digest(meta_key),
-                self.overlay.containerd_lookup(),
-            )
-            && let Err(e) = lookup.lookup(digest).await
-        {
-            warn!(meta_key, error = %format_args!("{e:#}"), "containerd image listing failed; not serving the nydus image");
-            return Err(SnapshotterError::unavailable(format!(
-                "list containerd images for nydus meta layer {meta_key}: {e:#}"
-            )));
-        }
-        let meta = self
-            .overlay
-            .nydus_meta_info(store, parent, call_labels, MetaUse::Serve)
-            // A missing ancestor is a broken chain, not a missing `holder`.
-            .map_err(|e| SnapshotterError::internal(format!("{e:#}")))?;
-        let Some(meta) = meta else {
+            .nydus_meta_layer(store, parent)
+            .map_err(|e| SnapshotterError::internal(format!("{e:#}")))?
+        else {
             return Ok(None);
         };
-        // Per-image driver override from the `nydus-fs-driver` label (e.g.
-        // `tarfs`) supplied on this RPC's call labels.
-        let driver_override = driver_override_from_labels(call_labels);
+        // Per-image driver override from the `nydus-fs-driver` label.
+        let driver_override = driver_override_from_labels(labels);
+        let meta = match stamp {
+            Some(stamp) if stamp.checked && stamp.bootstrap == bootstrap.to_str() => {
+                NydusMetaInfo {
+                    image_ref: stamp.image_ref.to_string(),
+                    bootstrap,
+                }
+            }
+            _ => {
+                // `nydus_meta_info` names the meta layer's image from the memo
+                // of which images claim it. List containerd's images first, so
+                // an image pulled or removed since the last lookup cannot
+                // decide it; without a current listing nothing is served.
+                if let (Some(namespace), Some(digest), Some(lookup)) = (
+                    namespace_of_key(&meta_key),
+                    parent_chain_digest(&meta_key),
+                    self.overlay.containerd_lookup(),
+                ) && let Err(e) = lookup.lookup(namespace, digest).await
+                {
+                    warn!(meta_key, error = %format_args!("{e:#}"), "containerd image claims unknown; not serving the nydus image");
+                    return Err(SnapshotterError::unavailable(format!(
+                        "list containerd images for nydus meta layer {meta_key}: {e:#}"
+                    )));
+                }
+                let Some(meta) = self
+                    .overlay
+                    .nydus_meta_info(store, parent, MetaUse::Serve)
+                    .map_err(|e| grpc_error(&e))?
+                else {
+                    return Ok(None);
+                };
+                meta
+            }
+        };
         let handle = self
             .supervisor
             .ensure_instance(&meta.image_ref, &meta.bootstrap, holder, driver_override)
@@ -523,13 +579,43 @@ impl NydusSnapshotter {
                 warn!(image_ref = %meta.image_ref, error = %e, "failed to start nydus daemon");
                 grpc_error(&e)
             })?;
+        if !stamp.is_some_and(|s| s.checked) {
+            self.stamp_daemon_ref_label(holder, &meta.image_ref, &meta.bootstrap);
+        }
         let mountpoint = handle.mountpoint().to_path_buf();
         Ok(Some((meta, mountpoint)))
     }
 
-    /// The daemons snapshot `key` holds a reference on: the nydus meta layer in
-    /// its parent chain, and the image prepare() stamped on it for auto-accel
-    /// and referrer mounts, which have no meta layer.
+    /// The claimant of `parent`'s chain in its namespace whose images a
+    /// container-rootfs prepare may serve image-specific content for (see
+    /// [`sole_chain_claimant`]). `None` when no such serving is enabled.
+    async fn chain_claimant(&self, parent: &str) -> Option<Claimant> {
+        let features = &self.config.snapshotter.features;
+        if self.auto_zran.is_none() && !features.dual_index_detect && !features.referrer_detect {
+            return None;
+        }
+        let namespace = namespace_of_key(parent)?;
+        let chain = parent_chain_digest(parent)?;
+        match self
+            .containerd_lookup
+            .as_ref()?
+            .lookup(namespace, chain)
+            .await
+        {
+            Ok(claim) => sole_chain_claimant(chain, claim, &self.metrics),
+            Err(e) => {
+                // Logged rather than collapsed into a miss: without an image
+                // auto-accel routing and capture are off, and this is the
+                // only signal that the lookup pipeline itself is broken.
+                warn!(chain, parent, error = %format_args!("{e:#}"), "containerd image claims unknown; serving the plain overlay");
+                None
+            }
+        }
+    }
+
+    /// The daemons snapshot `key` holds a reference on: the one its checked
+    /// stamp names, else (a snapshot prepared by an earlier release) the nydus
+    /// meta layer in its parent chain and the image its stamp names.
     fn daemon_holds(&self, key: &str) -> Vec<String> {
         let store = self.store.as_ref();
         let info = match store.stat(key) {
@@ -544,11 +630,15 @@ impl NydusSnapshotter {
                 return Vec::new();
             }
         };
+        let stamp = stamp_of(&info.labels);
+        if let Some(stamp) = stamp.as_ref().filter(|s| s.checked) {
+            return vec![stamp.image_ref.to_string()];
+        }
         let mut holds = Vec::new();
         if let Some(parent) = info.parent.as_deref() {
             match self
                 .overlay
-                .nydus_meta_info(store, parent, &info.labels, MetaUse::Account)
+                .nydus_meta_info(store, parent, MetaUse::Account)
             {
                 Ok(meta) => holds.extend(meta.map(|meta| meta.image_ref)),
                 Err(e) => {
@@ -557,12 +647,10 @@ impl NydusSnapshotter {
                 }
             }
         }
-        if let Some(stamped) = info
-            .labels
-            .get(crate::source::labels::NYDUS_DAEMON_IMAGE_REF)
-            && !holds.contains(stamped)
+        if let Some(stamp) = stamp
+            && !holds.iter().any(|h| h == stamp.image_ref)
         {
-            holds.push(stamped.clone());
+            holds.push(stamp.image_ref.to_string());
         }
         holds
     }
@@ -596,24 +684,29 @@ impl NydusSnapshotter {
 
     /// Stamp `image_ref` into the [`labels::NYDUS_DAEMON_IMAGE_REF`] label of
     /// snapshot `key`, so `remove(key)` can release the daemon reference the
-    /// key acquired, and `bootstrap` into [`labels::NYDUS_DAEMON_BOOTSTRAP`],
-    /// so `mounts(key)` only reuses a daemon serving the same content.
-    /// Best-effort: on failure the daemon stays referenced and a warning is
-    /// logged.
+    /// key acquired, `bootstrap` into [`labels::NYDUS_DAEMON_BOOTSTRAP`], so
+    /// `mounts(key)` only reuses a daemon serving the same content, and
+    /// [`labels::NYDUS_DAEMON_CHECKED`]: callers stamp only an image checked
+    /// to claim the snapshot's chain. Best-effort: on failure the daemon stays
+    /// referenced and a warning is logged.
     fn stamp_daemon_ref_label(&self, key: &str, image_ref: &str, bootstrap: &Path) {
-        use crate::source::labels::{NYDUS_DAEMON_BOOTSTRAP, NYDUS_DAEMON_IMAGE_REF};
+        use crate::source::labels::{
+            NYDUS_DAEMON_BOOTSTRAP, NYDUS_DAEMON_CHECKED, NYDUS_DAEMON_IMAGE_REF,
+            NYDUS_DAEMON_LABEL_PREFIX,
+        };
         let store = self.store.as_ref();
         let merged = store.stat(key).map(|info| {
             let mut labels: Vec<(String, String)> = info
                 .labels
                 .into_iter()
-                .filter(|(k, _)| k != NYDUS_DAEMON_IMAGE_REF && k != NYDUS_DAEMON_BOOTSTRAP)
+                .filter(|(k, _)| !k.starts_with(NYDUS_DAEMON_LABEL_PREFIX))
                 .collect();
             labels.push((NYDUS_DAEMON_IMAGE_REF.to_string(), image_ref.to_string()));
             labels.push((
                 NYDUS_DAEMON_BOOTSTRAP.to_string(),
                 bootstrap.display().to_string(),
             ));
+            labels.push((NYDUS_DAEMON_CHECKED.to_string(), "true".to_string()));
             labels
         });
         let result = merged.and_then(|labels| store.update(key, &labels));
@@ -730,10 +823,14 @@ impl NydusSnapshotter {
     }
 
     /// Daemon mountpoint for a snapshot `prepare()` routed to a daemon without
-    /// a nydus meta layer in its chain (auto-accel or referrer serving), which
-    /// recorded the serving image in the [`labels::NYDUS_DAEMON_IMAGE_REF`]
-    /// label. containerd starts the task from `Mounts(key)`, so this must
-    /// return the same daemon mount `prepare()` did.
+    /// a nydus meta layer in its chain (auto-accel or published-nydus
+    /// serving), which recorded the serving image in its stamp. containerd
+    /// starts the task from `Mounts(key)`, so this must return the same daemon
+    /// mount `prepare()` did.
+    ///
+    /// A stamp without the checked mark was written by a release that did not
+    /// check the image against the chain's claimants: it is used only while
+    /// the stamped image's repository is the sole claimant of `parent`'s chain.
     ///
     /// Only a daemon serving the stamped `bootstrap` is used: the image ref is
     /// usually a tag, and a daemon for its current content may serve another
@@ -744,11 +841,12 @@ impl NydusSnapshotter {
     /// always carries the snapshot's own image content, unaccelerated.
     async fn resolve_stamped_daemon_mount(
         &self,
-        image_ref: &str,
-        bootstrap: Option<&str>,
+        parent: &str,
+        stamp: &Stamp<'_>,
         key: &str,
     ) -> Result<Option<PathBuf>, SnapshotterError> {
-        let Some(bootstrap) = bootstrap.map(Path::new) else {
+        let image_ref = stamp.image_ref;
+        let Some(bootstrap) = stamp.bootstrap.map(Path::new) else {
             warn!(
                 key,
                 image_ref,
@@ -756,6 +854,26 @@ impl NydusSnapshotter {
             );
             return Ok(None);
         };
+        if !stamp.checked {
+            let namespace = namespace_of_key(parent);
+            let chain = parent_chain_digest(parent);
+            let claim = match (namespace, chain, self.containerd_lookup.as_ref()) {
+                (Some(namespace), Some(chain), Some(lookup)) => {
+                    lookup.lookup(namespace, chain).await.ok()
+                }
+                _ => None,
+            };
+            if !matches!(&claim, Some(Claim::One(c)) if c.admits(image_ref)) {
+                warn!(
+                    key,
+                    image_ref,
+                    ?claim,
+                    "stamped image is not the sole claimant of the snapshot's chain; serving the plain overlay"
+                );
+                return Ok(None);
+            }
+            self.stamp_daemon_ref_label(key, image_ref, bootstrap);
+        }
         if let Some(handle) = self
             .supervisor
             .acquire_live_instance(image_ref, Some(bootstrap), key)
@@ -776,6 +894,117 @@ impl NydusSnapshotter {
             );
         }
         Ok(restarted)
+    }
+
+    /// Serve a published nydus image for `image_ref` (`repo@digest` of a
+    /// record target): a nydus entry of that index or a trusted referrer of
+    /// that digest. On a hit the bootstrap is fetched and digest-verified
+    /// (`materialize_bootstrap_blocking`, which also enforces the trust policy
+    /// and blob binding) and mounted via the shared `ensure_instance` path,
+    /// whose registry backend serves every data blob on demand. Returns the
+    /// daemon mountpoint and the bootstrap.
+    ///
+    /// Best-effort and NON-FATAL: every detection / trust / auth / network /
+    /// materialize / daemon-start failure logs one warning and returns `None`,
+    /// so a pod is NEVER blocked on this. Runs off the gRPC runtime (cyper is
+    /// `!Send`) via the `*_blocking` helpers; detection results are cached
+    /// per image ref and the bootstrap is cached on disk.
+    async fn resolve_published_nydus_mount(
+        &self,
+        image_ref: &str,
+        key: &str,
+    ) -> Option<(PathBuf, PathBuf)> {
+        use crate::source::referrer::ImageType;
+        let info = match crate::source::referrer::detect_referrer_blocking(image_ref, &self.config)
+            .await
+        {
+            Ok(info) => info,
+            Err(e) => {
+                debug!(image = %image_ref, error = %e, "referrer detection failed; falling through to overlay");
+                return None;
+            }
+        };
+        match info.image_type {
+            ImageType::NydusRafs => {}
+            ImageType::OciBlockDevice => {
+                info!(
+                    image = %image_ref,
+                    fs_driver_hint = info.fs_driver_hint.as_deref().unwrap_or("<none>"),
+                    "OCI block-device image detected via OCI referrers; serving not yet wired (see B4b)"
+                );
+                return None;
+            }
+            ImageType::StandardOci => {
+                debug!(image = %image_ref, "referrer detection: standard OCI image (no nydus optimization)");
+                return None;
+            }
+        }
+        let Some(bootstrap_digest) = info.bootstrap_digest.clone() else {
+            warn!(
+                image = %image_ref,
+                "published nydus image detected but it carried no bootstrap digest; falling back to overlay"
+            );
+            return None;
+        };
+        // `materialize_bootstrap_blocking` blocks its thread on the compio
+        // HTTP runtime; offload it so the gRPC reactor is never blocked and no
+        // `block_on` nests inside the running runtime.
+        let materialized = {
+            let image_ref = image_ref.to_string();
+            let info = info.clone();
+            let config = self.config.clone();
+            let root = self.config.snapshotter.root.clone();
+            blocking::unblock(move || {
+                crate::source::referrer::materialize_bootstrap_blocking(
+                    &image_ref, &info, &config, &root,
+                )
+            })
+            .await
+        };
+        let bootstrap = match materialized {
+            Ok(bootstrap) => bootstrap,
+            Err(e) => {
+                warn!(
+                    image = %image_ref,
+                    manifest = %bootstrap_digest,
+                    error = format!("{e:#}"),
+                    "published nydus bootstrap not served; falling back to overlay"
+                );
+                return None;
+            }
+        };
+        // A published nydus image may pin its serving driver via the
+        // referrer's `nydus-fs-driver` annotation (e.g. a tarfs/dm-verity
+        // image).
+        let driver_override = info
+            .fs_driver_hint
+            .as_deref()
+            .and_then(crate::config::FsDriverType::from_hint);
+        match self
+            .supervisor
+            .ensure_instance(image_ref, &bootstrap, key, driver_override)
+            .await
+        {
+            Ok(handle) => {
+                let mountpoint = handle.mountpoint().to_path_buf();
+                info!(
+                    image = %image_ref,
+                    manifest = %bootstrap_digest,
+                    referrer_subject = info.referrer_subject.as_deref().unwrap_or("<own index>"),
+                    mountpoint = %mountpoint.display(),
+                    "serving published nydus image"
+                );
+                Some((mountpoint, bootstrap))
+            }
+            Err(e) => {
+                warn!(
+                    image = %image_ref,
+                    error = format!("{e:#}"),
+                    "published nydus daemon failed to start; falling back to overlay"
+                );
+                None
+            }
+        }
     }
 
     fn rewrite_mounts_with_daemon(
@@ -902,21 +1131,19 @@ impl snapshots::Snapshotter for NydusSnapshotter {
             let parent = info.parent.clone().unwrap_or_default();
             let labels = info.labels.clone();
 
-            if let Some((_, daemon_mnt)) = self.resolve_nydus_mount(&parent, &labels, &key).await? {
+            let stamp = stamp_of(&labels);
+            if let Some((_, daemon_mnt)) = self
+                .resolve_nydus_mount(&parent, &labels, &key, stamp.as_ref())
+                .await?
+            {
                 return Ok(self.rewrite_mounts_with_daemon(&key, &daemon_mnt, readonly));
             }
             // A committed snapshot can inherit the stamp but has no mounts;
             // the overlay engine answers it below.
             if info.kind != "kind_committed"
-                && let Some(image_ref) = labels.get(crate::source::labels::NYDUS_DAEMON_IMAGE_REF)
+                && let Some(stamp) = stamp.as_ref()
                 && let Some(daemon_mnt) = self
-                    .resolve_stamped_daemon_mount(
-                        image_ref,
-                        labels
-                            .get(crate::source::labels::NYDUS_DAEMON_BOOTSTRAP)
-                            .map(String::as_str),
-                        &key,
-                    )
+                    .resolve_stamped_daemon_mount(&parent, stamp, &key)
                     .await?
             {
                 return Ok(self.rewrite_mounts_with_daemon(&key, &daemon_mnt, readonly));
@@ -939,6 +1166,8 @@ impl snapshots::Snapshotter for NydusSnapshotter {
         labels: HashMap<String, String>,
     ) -> Result<Vec<snapshots::api::types::Mount>, Self::Error> {
         let timer = self.metrics.start_snapshot_operation("prepare");
+        let mut labels = labels;
+        crate::source::labels::strip_daemon_labels(&mut labels);
         let result = async {
             info!(
                 %key,
@@ -957,48 +1186,34 @@ impl snapshots::Snapshotter for NydusSnapshotter {
                 })?;
 
             match outcome {
+                // containerd's unpacker applies a layer onto these mounts and
+                // commits the result as a chain every image with it shares,
+                // so they are always the plain overlay of the parent chain.
+                // Their labels come from the image manifest being pulled.
+                PrepareOutcome::Mounts(mounts) if is_unpack(&labels) => Ok(mounts),
                 PrepareOutcome::Mounts(mounts) => {
-                    if let Some((_, daemon_mnt)) = self.resolve_nydus_mount(&parent, &labels, &key).await? {
+                    if let Some((_, daemon_mnt)) =
+                        self.resolve_nydus_mount(&parent, &labels, &key, None).await?
+                    {
                         debug!(key, parent, mountpoint = %daemon_mnt.display(), "prepared nydus rootfs");
                         return Ok(self.rewrite_mounts_with_daemon(&key, &daemon_mnt, false));
                     }
-                    // Resolve the image-ref for this prepare. containerd's
-                    // CRI plugin (v2.x in k3s 1.36+) does not pass
-                    // `cri.image-ref` on the container rootfs prepare —
-                    // labels are empty. Fall back to a chainID lookup against
-                    // containerd's image store via `ContainerdLookup`, and
-                    // name an image only when it alone claims the parent's
-                    // chain (`sole_chain_claimant`).
-                    //
-                    // Unpack prepares (containerd's image-puller extracting
-                    // layers, marked by `containerd.io/snapshot.ref`) are
-                    // skipped outright: their chain digests belong to a
-                    // still-incomplete image that can never be in the cache,
-                    // so each one would trigger a full image walk — during a
-                    // multi-layer pull that turned into one walk PER LAYER
-                    // and minutes of added pull latency.
-                    let is_unpack = labels.contains_key("containerd.io/snapshot.ref");
-                    let mut image_ref = labels.get(crate::source::labels::CRI_IMAGE_REF).cloned();
-                    if image_ref.is_none()
-                        && !is_unpack
-                        && let Some(chain) = parent_chain_digest(&parent)
-                        && let Some(lookup) = self.containerd_lookup.as_ref()
-                    {
-                        image_ref = match lookup.lookup(chain).await {
-                            Ok(claim) => sole_chain_claimant(chain, claim, &self.metrics),
-                            Err(e) => {
-                                // Refresh failure (containerd unreachable,
-                                // JSON parse error, etc.) is loudly logged
-                                // rather than silently collapsed into a miss
-                                // — a missing image-ref disables auto-accel
-                                // routing AND capture, and without the log
-                                // there is no signal that the lookup
-                                // pipeline itself is broken.
-                                warn!(chain, parent, error = %e, "containerd-lookup refresh failed; auto-accel disabled for this prepare");
-                                None
-                            }
-                        };
-                    }
+                    // Name the image for this prepare. containerd's CRI plugin
+                    // sends no image label on the container rootfs prepare,
+                    // and an image ref in a call's labels is whatever its
+                    // sender chose, so the image comes from the chain's
+                    // claimants in the parent's namespace
+                    // (`sole_chain_claimant`).
+                    let claimant = self.chain_claimant(&parent).await;
+                    // Auto-accel (sidecars, conversion, capture) works on the
+                    // configured containerd namespace's images.
+                    let accel_image = claimant
+                        .as_ref()
+                        .filter(|_| {
+                            namespace_of_key(&parent)
+                                == Some(self.config.snapshotter.containerd.namespace.as_str())
+                        })
+                        .map(|c| c.image_ref().to_string());
 
                     // Auto-accel routing: if a sidecar artifact exists for
                     // this image in containerd's content store (locally
@@ -1006,7 +1221,7 @@ impl snapshots::Snapshotter for NydusSnapshotter {
                     // localfs+fanotify daemon mount for the overlay. The
                     // original gzip layers stay where they are; the daemon
                     // serves them on demand from the merged bootstrap.
-                    if let Some(image_ref) = image_ref.as_deref()
+                    if let Some(image_ref) = accel_image.as_deref()
                         && let Some((daemon_mnt, bootstrap)) =
                             self.resolve_auto_accel_mount(image_ref, &key, AccelIdentity::Parent(&parent)).await?
                     {
@@ -1021,127 +1236,24 @@ impl snapshots::Snapshotter for NydusSnapshotter {
                     // index (`features.dual_index_detect`, default on) or an
                     // OCI referrer artifact (`features.referrer_detect`, default
                     // off, served only when `[snapshotter.referrer_trust]`
-                    // accepts its cosign signature -- see `source::trust`). On a
-                    // NydusRafs hit we fetch + digest-verify the bootstrap
-                    // (`materialize_bootstrap_blocking`, which also enforces the
-                    // trust policy and blob binding) and mount the daemon via the
-                    // shared `ensure_instance` path, then substitute the daemon
-                    // mount for the overlay. nydusd's registry backend (built
-                    // from `image_ref`) serves every data blob on demand.
-                    //
-                    // Best-effort and NON-FATAL: every detection / trust / auth /
-                    // network / materialize / daemon-start failure logs one
-                    // warning and falls through to the overlay / access-tracer
-                    // path, so a pod is NEVER blocked on this. Runs off the gRPC
-                    // runtime (cyper is `!Send`) via the `*_blocking` helpers;
-                    // detection results are cached per image ref and the
-                    // bootstrap is cached on disk.
+                    // accepts its cosign signature -- see `source::trust`).
+                    // Each claiming image is looked up by its record target
+                    // (`repo@digest`), whose index containerd holds, so a tag
+                    // repointed in the registry cannot choose the content.
                     let features = &self.config.snapshotter.features;
                     if (features.referrer_detect || features.dual_index_detect)
-                        && let Some(image_ref) = image_ref.as_deref()
+                        && let Some(claimant) = claimant.as_ref()
                     {
-                        use crate::source::referrer::ImageType;
-                        match crate::source::referrer::detect_referrer_blocking(
-                            image_ref,
-                            &self.config,
-                        )
-                        .await
-                        {
-                            Ok(info) => match info.image_type {
-                                ImageType::NydusRafs => {
-                                    if let Some(bootstrap_digest) = info.bootstrap_digest.clone() {
-                                        // `materialize_bootstrap_blocking` is
-                                        // synchronous and blocks its thread on
-                                        // the compio HTTP runtime; offload it
-                                        // via `blocking::unblock` so the gRPC
-                                        // reactor is never blocked and no
-                                        // `block_on` nests inside the running
-                                        // runtime (same model as
-                                        // `detect_referrer_blocking`).
-                                        let materialized = {
-                                            let image_ref = image_ref.to_string();
-                                            let info = info.clone();
-                                            let config = self.config.clone();
-                                            let root = self.config.snapshotter.root.clone();
-                                            blocking::unblock(move || {
-                                                crate::source::referrer::materialize_bootstrap_blocking(
-                                                    &image_ref,
-                                                    &info,
-                                                    &config,
-                                                    &root,
-                                                )
-                                            })
-                                            .await
-                                        };
-                                        // A published nydus image may pin its
-                                        // serving driver via the referrer's
-                                        // `nydus-fs-driver` annotation (e.g. a
-                                        // tarfs/dm-verity image).
-                                        let driver_override = info
-                                            .fs_driver_hint
-                                            .as_deref()
-                                            .and_then(crate::config::FsDriverType::from_hint);
-                                        match materialized {
-                                            Ok(bootstrap) => match self
-                                                .supervisor
-                                                .ensure_instance(image_ref, &bootstrap, &key, driver_override)
-                                                .await
-                                            {
-                                                Ok(handle) => {
-                                                    let mountpoint =
-                                                        handle.mountpoint().to_path_buf();
-                                                    info!(
-                                                        image = %image_ref,
-                                                        manifest = %bootstrap_digest,
-                                                        referrer_subject = info.referrer_subject.as_deref().unwrap_or("<own index>"),
-                                                        mountpoint = %mountpoint.display(),
-                                                        "serving published nydus image"
-                                                    );
-                                                    // Like the auto-accel branch:
-                                                    // no meta layer for remove()
-                                                    // to find the daemon by.
-                                                    self.stamp_daemon_ref_label(&key, image_ref, &bootstrap);
-                                                    return Ok(self.rewrite_mounts_with_daemon(
-                                                        &key,
-                                                        &mountpoint,
-                                                        false,
-                                                    ));
-                                                }
-                                                Err(e) => warn!(
-                                                    image = %image_ref,
-                                                    error = format!("{e:#}"),
-                                                    "referrer nydus daemon failed to start; falling back to overlay"
-                                                ),
-                                            },
-                                            Err(e) => warn!(
-                                                image = %image_ref,
-                                                manifest = %bootstrap_digest,
-                                                error = format!("{e:#}"),
-                                                "published nydus bootstrap not served; falling back to overlay"
-                                            ),
-                                        }
-                                    } else {
-                                        warn!(
-                                            image = %image_ref,
-                                            "published nydus image detected via OCI referrers but referrer carried no bootstrap digest; falling back to overlay"
-                                        );
-                                    }
-                                }
-                                ImageType::OciBlockDevice => info!(
-                                    image = %image_ref,
-                                    fs_driver_hint = info.fs_driver_hint.as_deref().unwrap_or("<none>"),
-                                    "OCI block-device image detected via OCI referrers; serving not yet wired (see B4b)"
-                                ),
-                                ImageType::StandardOci => debug!(
-                                    image = %image_ref,
-                                    "referrer detection: standard OCI image (no nydus optimization)"
-                                ),
-                            },
-                            Err(e) => debug!(
-                                image = %image_ref,
-                                error = %e,
-                                "referrer detection failed; falling through to overlay"
-                            ),
+                        for image in &claimant.images {
+                            let image_ref = format!("{}@{}", claimant.repository, image.target);
+                            if let Some((mountpoint, bootstrap)) =
+                                self.resolve_published_nydus_mount(&image_ref, &key).await
+                            {
+                                // Like the auto-accel branch: no meta layer for
+                                // remove() to find the daemon by.
+                                self.stamp_daemon_ref_label(&key, &image_ref, &bootstrap);
+                                return Ok(self.rewrite_mounts_with_daemon(&key, &mountpoint, false));
+                            }
                         }
                     }
 
@@ -1154,7 +1266,7 @@ impl snapshots::Snapshotter for NydusSnapshotter {
                     // instead of waiting the full pod-start + tracer-settle
                     // (5-60s) + convert window and hitting NotFound → overlay.
                     if let (Some(manager), Some(image_ref)) =
-                        (self.auto_zran.as_ref(), image_ref.as_deref())
+                        (self.auto_zran.as_ref(), accel_image.as_deref())
                     {
                         manager.try_enqueue_base(image_ref);
                     }
@@ -1168,7 +1280,7 @@ impl snapshots::Snapshotter for NydusSnapshotter {
                     // up via the resolve_auto_accel_mount branch above. The
                     // snapshot key is the holder so remove() shrinks tracer
                     // state via detach_holder.
-                    if let Some(image_ref) = image_ref {
+                    if let Some(image_ref) = accel_image {
                         for image_root in all_lowerdirs(&mounts) {
                             if let Err(e) =
                                 self.access_tracer.attach(&image_ref, &image_root, &key)
@@ -1218,6 +1330,8 @@ impl snapshots::Snapshotter for NydusSnapshotter {
         parent: String,
         labels: HashMap<String, String>,
     ) -> Result<Vec<snapshots::api::types::Mount>, Self::Error> {
+        let mut labels = labels;
+        crate::source::labels::strip_daemon_labels(&mut labels);
         let timer = self.metrics.start_snapshot_operation("view");
         let result = async {
             debug!(key, parent, "view snapshot");
@@ -1234,7 +1348,10 @@ impl snapshots::Snapshotter for NydusSnapshotter {
                     grpc_error(&e)
                 })?;
 
-            if let Some((_, daemon_mnt)) = self.resolve_nydus_mount(&parent, &labels, &key).await? {
+            if let Some((_, daemon_mnt)) = self
+                .resolve_nydus_mount(&parent, &labels, &key, None)
+                .await?
+            {
                 return Ok(self.rewrite_mounts_with_daemon(&key, &daemon_mnt, true));
             }
             Ok(mounts)
@@ -1250,6 +1367,8 @@ impl snapshots::Snapshotter for NydusSnapshotter {
         key: String,
         labels: HashMap<String, String>,
     ) -> Result<(), Self::Error> {
+        let mut labels = labels;
+        crate::source::labels::strip_daemon_labels(&mut labels);
         let timer = self.metrics.start_snapshot_operation("commit");
         let result = async {
             info!(name, key, ?labels, "commit snapshot");
@@ -1595,6 +1714,15 @@ pub async fn serve_with_supervisor(
     // the image store); `resolve_nydus_mount` refreshes it before serving.
     // Serving a nydus meta layer takes its image from there or the call's
     // labels, never from the ref the chain's first committer stored.
+    let containerd_lookup_for_prepare = containerd_lookup.clone();
+    // Nydus data layers need containerd 2.3's diff-id label; say so up front.
+    compio::runtime::spawn(crate::containerd_grpc::probe_version(
+        crate::containerd_grpc::ContainerdChannel::new(
+            config.snapshotter.containerd.address(),
+            &config.snapshotter.containerd.namespace,
+        ),
+    ))
+    .detach();
     let overlay =
         OverlayEngine::new(config.clone()).with_containerd_lookup(Some(containerd_lookup));
 
@@ -1694,7 +1822,7 @@ pub async fn serve_with_supervisor(
         access_tracer,
         auto_zran,
         auto_accel_discovery,
-        containerd_lookup: containerd_lookup_for_discovery,
+        containerd_lookup: Some(containerd_lookup_for_prepare),
         containerd_content_root: if config.snapshotter.auto_zran.enable {
             Some(config.snapshotter.containerd.content_root())
         } else {
@@ -2317,22 +2445,353 @@ mod tests {
         std::mem::forget(dir);
     }
 
-    /// A chain several images claim names no image, so the prepare serves
-    /// the plain overlay; the counter records it.
+    /// A snapshotter whose overlay engine and prepare path share `lookup`
+    /// (memo only: no containerd behind it).
+    fn claims_snapshotter(
+        root: &Path,
+        lookup: &Arc<crate::containerd_lookup::ContainerdLookup>,
+    ) -> NydusSnapshotter {
+        let mut snapshotter = test_snapshotter(root);
+        snapshotter.overlay = snapshotter
+            .overlay
+            .clone()
+            .with_containerd_lookup(Some(lookup.clone()));
+        snapshotter.containerd_lookup = Some(lookup.clone());
+        snapshotter
+    }
+
+    /// Commit a nydus image's chain as containerd does: a data layer under its
+    /// bare chain ID, then the meta layer (applied, holding a bootstrap) under
+    /// `k8s.io/<id>/<chain ID>`. Returns the meta layer's key and bootstrap.
+    fn commit_nydus_chain(snapshotter: &NydusSnapshotter) -> (String, PathBuf) {
+        use crate::source::NYDUS_META_LAYER;
+        let store = snapshotter.store.as_ref();
+        let data = "sha256:1111111111111111111111111111111111111111111111111111111111111111";
+        let outcome = snapshotter
+            .overlay
+            .prepare(store, "k8s.io/1/extract-1", "", &nydus_blob_labels(data))
+            .unwrap();
+        let PrepareOutcome::AlreadyExists {
+            target,
+            commit_labels,
+        } = outcome
+        else {
+            panic!("a nydus data layer is committed unapplied");
+        };
+        snapshotter
+            .overlay
+            .commit(store, &target, "k8s.io/1/extract-1", &commit_labels)
+            .unwrap();
+        let meta_chain = "sha256:2222222222222222222222222222222222222222222222222222222222222222";
+        let meta = format!("k8s.io/3/{meta_chain}");
+        let labels = HashMap::from([
+            (TARGET_SNAPSHOT_REF.to_string(), meta_chain.to_string()),
+            (NYDUS_META_LAYER.to_string(), "true".to_string()),
+        ]);
+        snapshotter
+            .overlay
+            .prepare(store, "k8s.io/2/extract-2", data, &labels)
+            .unwrap();
+        snapshotter
+            .overlay
+            .commit(store, &meta, "k8s.io/2/extract-2", &labels)
+            .unwrap();
+        let bootstrap = snapshotter.overlay.nydus_meta_layer(store, &meta).unwrap();
+        assert!(bootstrap.is_none(), "no bootstrap file yet");
+        let dir = snapshotter
+            .config
+            .snapshotter
+            .root
+            .join("snapshots")
+            .join(crate::overlay::snapshot_dir_name(&meta))
+            .join("fs/image");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("image.boot"), b"bootstrap").unwrap();
+        let (_, bootstrap) = snapshotter
+            .overlay
+            .nydus_meta_layer(store, &meta)
+            .unwrap()
+            .expect("the meta layer holds a bootstrap");
+        (meta, bootstrap)
+    }
+
+    fn lowerdir_of(mounts: &[snapshots::api::types::Mount]) -> String {
+        mounts[0]
+            .options
+            .iter()
+            .find(|o| o.starts_with("lowerdir="))
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// A container on a nydus meta layer keeps the daemon `Prepare` chose:
+    /// `Mounts` reuses it after another tag of the image is pulled, a second
+    /// container shares it, and removing both releases it.
+    #[compio::test]
+    async fn nydus_rootfs_keeps_its_daemon_across_tags() {
+        let dir = tempdir().unwrap();
+        let lookup = Arc::new(crate::containerd_lookup::ContainerdLookup::new_cli_only());
+        let snapshotter = claims_snapshotter(dir.path(), &lookup);
+        let (meta, bootstrap) = commit_nydus_chain(&snapshotter);
+        let meta_chain = parent_chain_digest(&meta).unwrap();
+        lookup.seed("k8s.io", "sha256:t1", &["reg/app:v1"], 1, &[meta_chain]);
+        let daemon_mnt = dir.path().join("daemons/app/mnt");
+        snapshotter
+            .supervisor
+            .insert_test_instance_serving("reg/app:v1", daemon_mnt.clone(), &bootstrap)
+            .await;
+        let served = format!("lowerdir={}", daemon_mnt.display());
+
+        let mounts = snapshotter
+            .prepare("k8s.io/4/c1".into(), meta.clone(), HashMap::new())
+            .await
+            .unwrap();
+        assert_eq!(lowerdir_of(&mounts), served);
+        // A newer tag of the same image now sorts first among the claimants.
+        lookup.seed("k8s.io", "sha256:t2", &["reg/app:latest"], 2, &[meta_chain]);
+        let mounts = snapshotter.mounts("k8s.io/4/c1".into()).await.unwrap();
+        assert_eq!(lowerdir_of(&mounts), served);
+        let mounts = snapshotter
+            .prepare("k8s.io/5/c2".into(), meta.clone(), HashMap::new())
+            .await
+            .unwrap();
+        assert_eq!(lowerdir_of(&mounts), served);
+        assert!(
+            snapshotter
+                .supervisor
+                .daemon_record("reg/app:latest")
+                .await
+                .is_none()
+        );
+        let holders = || async {
+            snapshotter
+                .supervisor
+                .daemon_record("reg/app:v1")
+                .await
+                .map_or(0, |r| r.holders)
+        };
+        assert_eq!(holders().await, 2);
+        snapshotter.remove("k8s.io/4/c1".into()).await.unwrap();
+        assert_eq!(holders().await, 1);
+        snapshotter.remove("k8s.io/5/c2".into()).await.unwrap();
+        assert_eq!(holders().await, 0);
+    }
+
+    /// An unpack prepare (containerd applying a layer) gets the plain overlay
+    /// of its parent chain, never a daemon, whatever its labels name.
+    #[compio::test]
+    async fn unpack_prepare_is_never_served_by_a_daemon() {
+        use crate::source::NYDUS_META_LAYER;
+        let dir = tempdir().unwrap();
+        let lookup = Arc::new(crate::containerd_lookup::ContainerdLookup::new_cli_only());
+        let snapshotter = claims_snapshotter(dir.path(), &lookup);
+        let (meta, bootstrap) = commit_nydus_chain(&snapshotter);
+        lookup.seed(
+            "k8s.io",
+            "sha256:t1",
+            &["reg/app:v1"],
+            1,
+            &[parent_chain_digest(&meta).unwrap()],
+        );
+        let daemon_mnt = dir.path().join("daemons/app/mnt");
+        snapshotter
+            .supervisor
+            .insert_test_instance_serving("reg/app:v1", daemon_mnt.clone(), &bootstrap)
+            .await;
+        let labels = HashMap::from([
+            (TARGET_SNAPSHOT_REF.to_string(), "sha256:next".to_string()),
+            (NYDUS_META_LAYER.to_string(), "true".to_string()),
+            (
+                crate::source::CRI_IMAGE_REF.to_string(),
+                "reg/app:v1".to_string(),
+            ),
+        ]);
+        let mounts = snapshotter
+            .prepare("k8s.io/6/extract-3".into(), meta.clone(), labels)
+            .await
+            .unwrap();
+        assert!(!lowerdir_of(&mounts).contains("daemons"), "{mounts:?}");
+        assert_eq!(
+            snapshotter
+                .supervisor
+                .daemon_record("reg/app:v1")
+                .await
+                .unwrap()
+                .holders,
+            0
+        );
+    }
+
+    /// Claims are per namespace: a chain claimed only in `k8s.io` names no
+    /// image for a prepare in `default`, and a nydus meta layer of `default`
+    /// is served from `default`'s claimants.
+    #[compio::test]
+    async fn claims_come_from_the_parent_namespace() {
+        let dir = tempdir().unwrap();
+        let lookup = Arc::new(crate::containerd_lookup::ContainerdLookup::new_cli_only());
+        let snapshotter = claims_snapshotter(dir.path(), &lookup);
+        let chain = "sha256:3333333333333333333333333333333333333333333333333333333333333333";
+        lookup.seed("k8s.io", "sha256:t1", &["reg/app:v1"], 1, &[chain]);
+        assert!(
+            snapshotter
+                .chain_claimant(&format!("default/9/{chain}"))
+                .await
+                .is_none()
+        );
+        let claimant = snapshotter
+            .chain_claimant(&format!("k8s.io/9/{chain}"))
+            .await
+            .unwrap();
+        assert_eq!(claimant.image_ref(), "reg/app:v1");
+    }
+
+    /// Labels under the snapshotter's own stamp prefix in a call (a layer
+    /// annotation containerd passes on) are dropped, so they never name a
+    /// daemon or count as checked.
+    #[compio::test]
+    async fn call_labels_cannot_stamp_a_snapshot() {
+        use crate::source::labels::{NYDUS_DAEMON_CHECKED, NYDUS_DAEMON_IMAGE_REF};
+        let dir = tempdir().unwrap();
+        let snapshotter = plain_prepare_snapshotter(dir.path());
+        let planted = HashMap::from([
+            (
+                NYDUS_DAEMON_IMAGE_REF.to_string(),
+                "reg/other:1".to_string(),
+            ),
+            (NYDUS_DAEMON_CHECKED.to_string(), "true".to_string()),
+            ("containerd.io/snapshot/keep".to_string(), "1".to_string()),
+        ]);
+        snapshotter
+            .prepare("active".into(), String::new(), planted.clone())
+            .await
+            .unwrap();
+        snapshotter
+            .commit("committed".into(), "active".into(), planted.clone())
+            .await
+            .unwrap();
+        snapshotter
+            .view("view".into(), "committed".into(), planted)
+            .await
+            .unwrap();
+        for key in ["committed", "view"] {
+            let labels = snapshotter.store.stat(key).unwrap().labels;
+            assert!(stamp_of(&labels).is_none(), "{key}: {labels:?}");
+            assert!(
+                !labels.contains_key(NYDUS_DAEMON_CHECKED),
+                "{key}: {labels:?}"
+            );
+        }
+        assert!(
+            snapshotter
+                .store
+                .stat("committed")
+                .unwrap()
+                .labels
+                .contains_key("containerd.io/snapshot/keep")
+        );
+    }
+
+    /// A stamp written by a release that did not check claimants is used only
+    /// while its repository is the sole claimant of the chain.
+    #[compio::test]
+    async fn an_unchecked_stamp_is_checked_against_the_claimants() {
+        use crate::source::labels::{NYDUS_DAEMON_BOOTSTRAP, NYDUS_DAEMON_IMAGE_REF};
+        let dir = tempdir().unwrap();
+        let lookup = Arc::new(crate::containerd_lookup::ContainerdLookup::new_cli_only());
+        let snapshotter = claims_snapshotter(dir.path(), &lookup);
+        let chain = "sha256:4444444444444444444444444444444444444444444444444444444444444444";
+        let store = snapshotter.store.as_ref();
+        snapshotter
+            .overlay
+            .prepare(store, "k8s.io/1/x", "", &HashMap::new())
+            .unwrap();
+        let parent = format!("k8s.io/2/{chain}");
+        snapshotter
+            .overlay
+            .commit(store, &parent, "k8s.io/1/x", &HashMap::new())
+            .unwrap();
+        let key = "k8s.io/3/c";
+        let plain = snapshotter
+            .prepare(key.into(), parent.clone(), HashMap::new())
+            .await
+            .unwrap();
+        store
+            .update(
+                key,
+                &[
+                    (
+                        NYDUS_DAEMON_IMAGE_REF.to_string(),
+                        "reg/other:1".to_string(),
+                    ),
+                    (
+                        NYDUS_DAEMON_BOOTSTRAP.to_string(),
+                        "/tmp/bootstrap".to_string(),
+                    ),
+                ],
+            )
+            .unwrap();
+        let daemon_mnt = dir.path().join("daemons/other/mnt");
+        snapshotter
+            .supervisor
+            .insert_test_instance("reg/other:1", daemon_mnt.clone())
+            .await;
+
+        // Unclaimed, or claimed by another repository: the plain overlay.
+        assert_eq!(snapshotter.mounts(key.into()).await.unwrap(), plain);
+        lookup.seed("k8s.io", "sha256:t1", &["reg/app:1"], 1, &[chain]);
+        assert_eq!(snapshotter.mounts(key.into()).await.unwrap(), plain);
+        assert_eq!(
+            snapshotter
+                .supervisor
+                .daemon_record("reg/other:1")
+                .await
+                .unwrap()
+                .holders,
+            0
+        );
+
+        // Its own repository alone: served, and stamped as checked.
+        let lookup = Arc::new(crate::containerd_lookup::ContainerdLookup::new_cli_only());
+        let snapshotter = NydusSnapshotter {
+            containerd_lookup: Some(lookup.clone()),
+            ..snapshotter
+        };
+        lookup.seed("k8s.io", "sha256:t2", &["reg/other:2"], 1, &[chain]);
+        let mounts = snapshotter.mounts(key.into()).await.unwrap();
+        assert_eq!(
+            lowerdir_of(&mounts),
+            format!("lowerdir={}", daemon_mnt.display())
+        );
+        assert!(
+            stamp_of(&snapshotter.store.stat(key).unwrap().labels)
+                .unwrap()
+                .checked
+        );
+    }
+
+    /// A chain several repositories claim names no image, so the prepare
+    /// serves the plain overlay; the counter records it.
     #[test]
     fn ambiguous_chain_names_no_image_and_is_counted() {
-        use crate::containerd_lookup::Claim;
+        use crate::containerd_lookup::{Claim, Claimant, ClaimedImage};
         let metrics = crate::metrics::SnapshotterMetrics::new();
         let chain = "sha256:c";
-        let ambiguous = Claim::Ambiguous(vec!["reg/evil:1".into(), "reg/victim:1".into()]);
+        let ambiguous = Claim::Ambiguous(vec!["reg/claimant-a".into(), "reg/claimant-b".into()]);
         assert_eq!(super::sole_chain_claimant(chain, ambiguous, &metrics), None);
         assert_eq!(
             super::sole_chain_claimant(chain, Claim::Unclaimed, &metrics),
             None
         );
+        let claimant = Claimant {
+            repository: "reg/app".into(),
+            images: vec![ClaimedImage {
+                image_ref: "reg/app:1".into(),
+                target: "sha256:t".into(),
+            }],
+        };
         assert_eq!(
-            super::sole_chain_claimant(chain, Claim::One("reg/victim:1".into()), &metrics),
-            Some("reg/victim:1".to_string())
+            super::sole_chain_claimant(chain, Claim::One(claimant.clone()), &metrics),
+            Some(claimant)
         );
         let rendered = metrics.render_prometheus(Default::default());
         assert!(

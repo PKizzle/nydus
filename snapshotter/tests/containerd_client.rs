@@ -494,10 +494,11 @@ fn incomplete_sidecars_are_detected_and_deletes_honour_the_listed_target() {
 #[test]
 #[ignore = "needs root and containerd; run misc/containerd-grpc/client-test.sh"]
 fn a_lookup_never_answers_from_a_listing_older_than_itself() {
-    use nydus_snapshotter::containerd_lookup::{Claim, ContainerdLookup};
+    use nydus_snapshotter::containerd_lookup::{Claim, Claimant, ClaimedImage, ContainerdLookup};
 
     let dir = tempfile::tempdir().unwrap();
     let containerd = Containerd::start(dir.path());
+    let namespace = containerd.config().namespace;
     let client = ContentStoreClient::new(&containerd.config()).unwrap();
     let lookup = ContainerdLookup::new(client.clone());
 
@@ -544,7 +545,7 @@ fn a_lookup_never_answers_from_a_listing_older_than_itself() {
             .await
             .unwrap();
 
-        let first = lookup.lookup(&diff_id);
+        let first = lookup.lookup(&namespace, &diff_id);
         let second = async {
             compio::time::sleep(Duration::from_millis(5)).await;
             client
@@ -557,15 +558,24 @@ fn a_lookup_never_answers_from_a_listing_older_than_itself() {
                 )
                 .await
                 .unwrap();
-            lookup.lookup(&diff_id).await.unwrap()
+            lookup.lookup(&namespace, &diff_id).await.unwrap()
         };
         let (first, second) = futures::future::join(first, second).await;
-        assert_eq!(first.unwrap(), Claim::One("nydus.test/slow:1".to_string()));
+        assert_eq!(
+            first.unwrap(),
+            Claim::One(Claimant {
+                repository: "nydus.test/slow".to_string(),
+                images: vec![ClaimedImage {
+                    image_ref: "nydus.test/slow:1".to_string(),
+                    target: slow.clone(),
+                }],
+            })
+        );
         assert_eq!(
             second,
             Claim::Ambiguous(vec![
-                "nydus.test/late:1".to_string(),
-                "nydus.test/slow:1".to_string()
+                "nydus.test/late".to_string(),
+                "nydus.test/slow".to_string()
             ])
         );
     });

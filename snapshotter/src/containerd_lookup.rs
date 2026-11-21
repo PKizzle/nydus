@@ -8,27 +8,36 @@
 //! `containerd.io/snapshot/cri.image-ref` label to proxy-plugin snapshotters
 //! at container Prepare time. To still name the image behind a snapshot
 //! chainID (or Nydus bootstrap blob digest) we walk every image containerd
-//! knows and record which images claim which digests.
+//! knows in the snapshot's namespace and record which images claim which
+//! digests.
 //!
-//! A chainID names layer content, not an image, so the lookup keeps the full
-//! set of claimants and answers [`Claim::Ambiguous`] when more than one image
-//! claims a digest; callers serve nothing image-specific for it.
+//! A chainID names layer content, not an image. A repository is the unit of
+//! trust (its publisher decides what bytes it serves), so each repository
+//! among the claimants' record names is one claimant, and the lookup answers
+//! [`Claim::Ambiguous`] when a digest is claimed from more than one repository
+//! (or by an image known only by its ID); callers serve nothing image-specific
+//! for it.
 //!
-//! Every lookup answers from a listing of the image records (`Images.List`,
-//! one RPC) started after the lookup was called, so a claimant pulled before
-//! the call is never missed. Walks are memoized by record target digest: a
-//! target names immutable content, so only targets not seen before cost
-//! `Content.Read`s. Refreshes are single-flight, and lookups that arrive
-//! while one runs share the next listing, so a burst of N lookups costs two
-//! listings rather than N.
+//! Every lookup answers from a listing of the namespace's image records
+//! (`Images.List`, one RPC) started after the lookup was called, so a
+//! claimant pulled before the call is never missed. Walks are memoized by
+//! record target digest: a target names immutable content, so only targets
+//! not seen before cost `Content.Read`s. A target that cannot be walked is
+//! kept as unknown and makes every claim it could change uncertain (an
+//! error), never a smaller claimant set, unless its content is absent (no
+//! container can be created from it). Refreshes are single-flight per
+//! namespace, and lookups that arrive while one runs share the next listing,
+//! success or failure, so a burst of N lookups costs two listings rather than
+//! N.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt::Write as _;
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use tracing::{debug, info, warn};
@@ -44,34 +53,62 @@ fn lock_cache<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 
 const NYDUS_BOOTSTRAP_ANNOTATION: &str = "containerd.io/snapshot/nydus-bootstrap";
 
-/// Which images claim a digest (a chainID or a nydus bootstrap layer digest).
+/// How long a target whose content could not be read is not walked again.
+/// It stays uncertain meanwhile; a transport failure is retried on the next
+/// listing.
+const WALK_RETRY_INTERVAL: Duration = Duration::from_secs(60);
+
+/// The containerd namespace of a proxy-plugin snapshot key
+/// (`<namespace>/<id>/<name>`); `None` for a key without one.
+pub fn namespace_of_key(key: &str) -> Option<&str> {
+    let (namespace, rest) = key.split_once('/')?;
+    (!namespace.is_empty() && rest.contains('/')).then_some(namespace)
+}
+
+/// Which images claim a digest (a chainID or a nydus bootstrap layer digest)
+/// in one containerd namespace.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Claim {
-    /// No image record claims it.
+    /// No image record names a repository for it.
     Unclaimed,
-    /// Exactly one image claims it: its best registry ref.
-    One(String),
-    /// Several images claim it: their refs, sorted. Nothing tells which one a
-    /// container was created from.
+    /// Every claimant is in one repository.
+    One(Claimant),
+    /// Several repositories claim it, or an image known only by its ID does
+    /// next to a named one: the repositories, sorted. Nothing tells which one
+    /// a container was created from.
     Ambiguous(Vec<String>),
 }
 
-impl Claim {
-    /// An image to fetch a nydus image's blobs through: the sole claimant, or
-    /// the first of several that all name one repository. Claimants in
-    /// different repositories name none, since each repository decides what
-    /// bytes it serves for a blob digest; neither does a bare image-ID ref.
-    pub fn image_in_one_repository(&self) -> Option<&str> {
-        let refs = match self {
-            Claim::Unclaimed => return None,
-            Claim::One(image_ref) => std::slice::from_ref(image_ref),
-            Claim::Ambiguous(refs) => refs.as_slice(),
-        };
-        let first = refs.first()?;
-        let repo = repository(first)?;
-        refs.iter()
-            .all(|r| repository(r) == Some(repo))
-            .then_some(first.as_str())
+/// The one repository claiming a digest, with every image in it that does.
+/// All are from one publisher, so any of them may answer for the others.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Claimant {
+    /// `host/repo` of every claiming image record.
+    pub repository: String,
+    /// The claiming images, the most recently updated record first, then by
+    /// name. Never empty.
+    pub images: Vec<ClaimedImage>,
+}
+
+/// One image record target claiming a digest.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClaimedImage {
+    /// Its best record name in the repository (a tag over a digest ref).
+    pub image_ref: String,
+    /// The record's target: the index or manifest digest the image was
+    /// pulled as, which the content store holds.
+    pub target: String,
+}
+
+impl Claimant {
+    /// The name to serve the claimant under: the first image's.
+    pub fn image_ref(&self) -> &str {
+        &self.images[0].image_ref
+    }
+
+    /// Whether `image_ref` names an image of this claimant's repository.
+    pub fn admits(&self, image_ref: &str) -> bool {
+        repository(image_ref) == Some(self.repository.as_str())
     }
 }
 
@@ -90,41 +127,68 @@ fn repository(image_ref: &str) -> Option<&str> {
     })
 }
 
+/// The repositories among an image's record names.
+fn repositories(names: &[String]) -> BTreeSet<&str> {
+    names.iter().filter_map(|n| repository(n)).collect()
+}
+
+/// Record update time (seconds, nanoseconds since the epoch).
+type Updated = (i64, i32);
+
 /// The digests one image record target claims.
 #[derive(Clone, Debug)]
 struct TargetWalk {
-    display_ref: String,
+    /// Every record name pointing at the target, sorted.
+    names: Vec<String>,
+    updated: Updated,
     digests: BTreeSet<String>,
 }
 
+/// A target whose walk failed: what it claims is unknown.
+#[derive(Clone, Debug)]
+struct WalkFailure {
+    names: Vec<String>,
+    /// The record update the walk failed for; a newer one is walked again.
+    updated: Updated,
+    retry_at: Instant,
+    /// Its content is absent from the content store. CRI resolves an image's
+    /// manifest and config from there to create a container, so no container
+    /// being prepared can come from it, and it claims nothing.
+    absent: bool,
+    error: String,
+}
+
+/// The claims memo of one namespace, rebuilt from every listing.
+#[derive(Default)]
+struct Memo {
+    walks: BTreeMap<String, TargetWalk>,
+    failed: BTreeMap<String, WalkFailure>,
+}
+
+/// A finished listing's id and outcome.
+type FinishedListing = (u64, Result<(), Arc<anyhow::Error>>);
+
+/// One namespace's memo and refresh state.
+#[derive(Default)]
+struct NamespaceClaims {
+    memo: Mutex<Memo>,
+    /// Single-flight gate for refreshes.
+    gate: async_lock::Mutex<()>,
+    /// Number of listings started; a listing's id is the count after its start.
+    started: AtomicU64,
+    /// The latest finished listing.
+    finished: Mutex<Option<FinishedListing>>,
+}
+
+#[derive(Default)]
 pub struct ContainerdLookup {
-    /// Record target digest → what its walk found. Rebuilt from `Images.List`
-    /// on every refresh, reusing the walk of a target listed before.
-    walks: Mutex<BTreeMap<String, TargetWalk>>,
+    /// Claims per containerd namespace, created on first use.
+    namespaces: Mutex<HashMap<String, Arc<NamespaceClaims>>>,
     /// gRPC client for containerd's Images + Content services. `None` only
     /// in legacy constructions: chain lookups then find nothing, and
     /// `manifest_info` falls back to the `crictl` / `ctr` CLI.
     content_store: Option<ContentStoreClient>,
-    /// Single-flight gate for refreshes.
-    refresh_gate: async_lock::Mutex<()>,
-    /// Number of listings started; a listing's id is the count after its start.
-    listings_started: AtomicU64,
-    /// Id of the latest listing that brought the memo in line.
-    listing_succeeded: AtomicU64,
 }
-
-impl Default for ContainerdLookup {
-    fn default() -> Self {
-        Self {
-            walks: Mutex::new(BTreeMap::new()),
-            content_store: None,
-            refresh_gate: async_lock::Mutex::new(()),
-            listings_started: AtomicU64::new(0),
-            listing_succeeded: AtomicU64::new(0),
-        }
-    }
-}
-
 #[derive(Deserialize)]
 struct CrictlImages {
     images: Vec<CrictlImage>,
@@ -189,115 +253,80 @@ impl ContainerdLookup {
         Self::default()
     }
 
-    /// Which images claim `digest` (a topmost chainID or a nydus bootstrap
-    /// layer digest), from a listing of the image store taken by this call.
-    /// `Err` means the store could not be read (containerd unreachable, a
-    /// content read failed in transport): callers must not take that for a
-    /// miss, and must not serve anything image-specific either.
-    pub async fn lookup(&self, digest: &str) -> Result<Claim> {
-        self.refresh().await?;
-        let claim = self.claims(digest);
+    /// Which images in `namespace` claim `digest` (a topmost chainID or a
+    /// nydus bootstrap layer digest), from a listing of the namespace's image
+    /// store taken by this call. `Err` means the answer is unknown: the store
+    /// could not be listed, or an image whose content could not be read might
+    /// change it. Callers must not take that for a miss, and must not serve
+    /// anything image-specific either.
+    pub async fn lookup(&self, namespace: &str, digest: &str) -> Result<Claim> {
+        self.refresh(namespace).await?;
+        let claim = self.lookup_cached(namespace, digest)?;
         if claim == Claim::Unclaimed {
-            info!(digest, "no containerd image claims this digest");
+            info!(namespace, digest, "no containerd image claims this digest");
         }
         Ok(claim)
     }
 
-    /// Memo-only lookup for serving a nydus meta layer: never walks
-    /// containerd, never blocks, and answers from what the last [`lookup`]
-    /// learned, so a caller that serves with the answer runs `lookup` first.
-    /// Gives a ref only when the claimants of `digest` agree on one
-    /// repository (see [`Claim::image_in_one_repository`]).
+    /// Memo-only [`lookup`]: never walks containerd and never blocks, so a
+    /// caller that serves with the answer runs `lookup` first.
     ///
     /// [`lookup`]: Self::lookup
-    pub fn lookup_cached(&self, digest: &str) -> Option<String> {
-        self.claims(digest)
-            .image_in_one_repository()
-            .map(str::to_string)
-    }
-
-    /// Claimants of `digest` in the memo. Independent of walk order: targets
-    /// are kept sorted and the refs of several claimants are sorted.
-    fn claims(&self, digest: &str) -> Claim {
-        let walks = lock_cache(&self.walks);
-        let mut refs: Vec<&str> = walks
-            .values()
-            .filter(|w| w.digests.contains(digest))
-            .map(|w| w.display_ref.as_str())
-            .collect();
-        match refs.as_slice() {
-            [] => Claim::Unclaimed,
-            // A bare image-ID record (`sha256:…`) is a claimant, but useless
-            // as a registry ref: see `ref_name_rank`.
-            [only] if ref_name_rank(only) == 0 => Claim::Unclaimed,
-            [only] => Claim::One(only.to_string()),
-            _ => {
-                refs.sort_unstable();
-                Claim::Ambiguous(refs.into_iter().map(str::to_string).collect())
-            }
+    pub fn lookup_cached(&self, namespace: &str, digest: &str) -> Result<Claim> {
+        let state = self.namespace(namespace);
+        let memo = lock_cache(&state.memo);
+        let claim = claim_of(&memo.walks, digest);
+        if let Claim::One(claimant) = &claim
+            && let Some((target, failure)) = memo.failed.iter().find(|(_, f)| {
+                let repos = repositories(&f.names);
+                !f.absent && (repos.len() != 1 || !repos.contains(claimant.repository.as_str()))
+            })
+        {
+            bail!(
+                "image {target} ({}) could not be walked, so it may also claim {digest}: {}",
+                failure.names.join(", "),
+                failure.error
+            );
         }
+        Ok(claim)
     }
 
-    /// List the image records and bring the memo in line with them: walk
-    /// targets not seen before, drop targets no longer listed.
-    async fn refresh(&self) -> Result<()> {
+    fn namespace(&self, namespace: &str) -> Arc<NamespaceClaims> {
+        lock_cache(&self.namespaces)
+            .entry(namespace.to_string())
+            .or_default()
+            .clone()
+    }
+
+    /// List `namespace`'s image records and bring its memo in line with
+    /// them, unless a listing that started after this call already finished:
+    /// its outcome, success or failure, is this call's.
+    async fn refresh(&self, namespace: &str) -> Result<()> {
+        let state = self.namespace(namespace);
         // A listing with a higher id than this started after this call did,
         // so it saw every record this call could need.
-        let arrived = self.listings_started.load(Ordering::SeqCst);
-        let _gate = self.refresh_gate.lock().await;
-        if self.listing_succeeded.load(Ordering::SeqCst) > arrived {
-            return Ok(());
+        let arrived = state.started.load(Ordering::SeqCst);
+        let _gate = state.gate.lock().await;
+        if let Some((id, outcome)) = &*lock_cache(&state.finished)
+            && *id > arrived
+        {
+            return outcome
+                .clone()
+                .map_err(|e| anyhow!("containerd image listing failed: {e:#}"));
         }
         let Some(cs) = &self.content_store else {
             return Ok(());
         };
-        let listing = self.listings_started.fetch_add(1, Ordering::SeqCst) + 1;
-        let records = cs.images_list().await.context("containerd Images.List")?;
-        let mut walked = 0;
-        let mut failed = 0;
-        let mut fresh = BTreeMap::new();
-        for group in group_records_by_target(&records) {
-            let known = lock_cache(&self.walks)
-                .get(&group.target)
-                .map(|w| w.digests.clone());
-            let digests = match known {
-                Some(digests) => digests,
-                None => {
-                    let mut out = HashMap::new();
-                    match walk_manifest_via_grpc(cs, &group.target, &group.display_ref, &mut out)
-                        .await
-                    {
-                        Ok(_) => walked += 1,
-                        // A transport failure leaves this target's claims
-                        // unknown, so no answer can be complete.
-                        Err(e) if is_rpc_failure(&e) => {
-                            return Err(e.context(format!("walk image {}", group.display_ref)));
-                        }
-                        // Unreadable content: no container can be created
-                        // from this record either. Not memoized, so it is
-                        // walked again once its content is complete.
-                        Err(e) => {
-                            failed += 1;
-                            debug!(image = %group.display_ref, error = %format_args!("{e:#}"), "image walk failed");
-                            continue;
-                        }
-                    }
-                    out.into_keys().collect()
-                }
-            };
-            fresh.insert(
-                group.target,
-                TargetWalk {
-                    display_ref: group.display_ref,
-                    digests,
-                },
-            );
-        }
-        let total = fresh.len();
-        *lock_cache(&self.walks) = fresh;
-        self.listing_succeeded.store(listing, Ordering::SeqCst);
-        debug!(walked, failed, total, "containerd image claims refreshed");
-        Ok(())
+        let listing = state.started.fetch_add(1, Ordering::SeqCst) + 1;
+        let result = refresh_memo(&cs.with_namespace(namespace), &state.memo).await;
+        *lock_cache(&state.finished) = Some((
+            listing,
+            match &result {
+                Ok(()) => Ok(()),
+                Err(e) => Err(Arc::new(anyhow!("{e:#}"))),
+            },
+        ));
+        result
     }
 
     /// Forward direction: resolve an image reference to its manifest digest
@@ -358,15 +387,165 @@ impl ContainerdLookup {
 }
 
 /// One containerd image record (name + manifest/index target digest).
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ImageRecord {
     pub name: String,
     pub target_digest: String,
+    /// When the record was last updated (seconds, nanoseconds).
+    pub updated: (i64, i32),
 }
 
+/// The records pointing at one target.
 struct RecordGroup {
     target: String,
-    display_ref: String,
+    /// Every record name, sorted.
+    names: Vec<String>,
+    /// The latest update of any of them.
+    updated: Updated,
+}
+
+/// Bring `memo` in line with `cs`'s image records: walk targets not seen
+/// before, keep the walks of listed targets, drop targets no longer listed.
+/// A target whose walk fails is kept as a failure, retried on the next
+/// listing after a transport error, and otherwise once its record is updated
+/// or [`WALK_RETRY_INTERVAL`] has passed.
+async fn refresh_memo(cs: &ContentStoreClient, memo: &Mutex<Memo>) -> Result<()> {
+    let records = cs.images_list().await.context("containerd Images.List")?;
+    let (mut walked, mut failed) = (0, 0);
+    let mut fresh = Memo::default();
+    for group in group_records_by_target(&records) {
+        let (known, failure) = {
+            let memo = lock_cache(memo);
+            (
+                memo.walks.get(&group.target).map(|w| w.digests.clone()),
+                memo.failed
+                    .get(&group.target)
+                    .filter(|f| f.retry_at > Instant::now() && f.updated == group.updated)
+                    .cloned(),
+            )
+        };
+        let digests = match (known, failure) {
+            (Some(digests), _) => digests,
+            (None, Some(failure)) => {
+                fresh.failed.insert(
+                    group.target,
+                    WalkFailure {
+                        names: group.names,
+                        ..failure
+                    },
+                );
+                continue;
+            }
+            (None, None) => {
+                let mut out = HashMap::new();
+                match walk_manifest_via_grpc(cs, &group.target, &group.names[0], &mut out).await {
+                    Ok(_) => walked += 1,
+                    Err(e) => {
+                        failed += 1;
+                        debug!(image = %group.names[0], error = %format_args!("{e:#}"), "image walk failed");
+                        let retry_at = if is_rpc_failure(&e) {
+                            Instant::now()
+                        } else {
+                            Instant::now() + WALK_RETRY_INTERVAL
+                        };
+                        fresh.failed.insert(
+                            group.target,
+                            WalkFailure {
+                                names: group.names,
+                                updated: group.updated,
+                                retry_at,
+                                absent: is_not_found(&e),
+                                error: format!("{e:#}"),
+                            },
+                        );
+                        continue;
+                    }
+                }
+                out.into_keys().collect()
+            }
+        };
+        fresh.walks.insert(
+            group.target,
+            TargetWalk {
+                names: group.names,
+                updated: group.updated,
+                digests,
+            },
+        );
+    }
+    let (total, unknown) = (fresh.walks.len(), fresh.failed.len());
+    *lock_cache(memo) = fresh;
+    debug!(
+        walked,
+        failed, total, unknown, "containerd image claims refreshed"
+    );
+    Ok(())
+}
+
+/// Who claims `digest` among `walks`: see [`Claim`]. Independent of listing
+/// and walk order.
+fn claim_of(walks: &BTreeMap<String, TargetWalk>, digest: &str) -> Claim {
+    let claiming: Vec<(&String, &TargetWalk)> = walks
+        .iter()
+        .filter(|(_, w)| w.digests.contains(digest))
+        .collect();
+    let mut repos = BTreeSet::new();
+    let mut unnamed = false;
+    for (_, walk) in &claiming {
+        let own = repositories(&walk.names);
+        unnamed |= own.is_empty();
+        repos.extend(own);
+    }
+    match (repos.len(), unnamed) {
+        // A bare image-ID record alone names nothing to serve from.
+        (0, _) => Claim::Unclaimed,
+        (1, false) => {
+            let repository = repos.pop_first().expect("one repository").to_string();
+            let mut images: Vec<(Updated, ClaimedImage)> = claiming
+                .into_iter()
+                .map(|(target, walk)| {
+                    let image_ref = best_name(&walk.names).to_string();
+                    (
+                        walk.updated,
+                        ClaimedImage {
+                            image_ref,
+                            target: target.clone(),
+                        },
+                    )
+                })
+                .collect();
+            images.sort_by(|(a_time, a), (b_time, b)| {
+                b_time
+                    .cmp(a_time)
+                    .then_with(|| a.image_ref.cmp(&b.image_ref))
+                    .then_with(|| a.target.cmp(&b.target))
+            });
+            Claim::One(Claimant {
+                repository,
+                images: images.into_iter().map(|(_, image)| image).collect(),
+            })
+        }
+        _ => {
+            let mut names: Vec<String> = repos.into_iter().map(str::to_string).collect();
+            if unnamed {
+                names.push("<image ID only>".to_string());
+            }
+            Claim::Ambiguous(names)
+        }
+    }
+}
+
+/// The best registry name among an image's record names: the highest
+/// [`ref_name_rank`], then the smallest. `names` is never empty.
+fn best_name(names: &[String]) -> &str {
+    names
+        .iter()
+        .max_by(|a, b| {
+            ref_name_rank(a)
+                .cmp(&ref_name_rank(b))
+                .then_with(|| b.cmp(a))
+        })
+        .expect("a record group has a name")
 }
 
 /// Rank an image-record name by its usefulness as a registry reference.
@@ -394,28 +573,23 @@ fn ref_name_rank(name: &str) -> u8 {
     }
 }
 
-/// Group image records by target digest, choosing the highest-ranked name
-/// (see [`ref_name_rank`]) as the display ref — real tag refs first, then
-/// `repo@digest` refs. A group of bare image-ID records (`sha256:...`) only
-/// is kept: it still claims its chains, but [`ContainerdLookup::claims`]
-/// never answers with its name, since mapping a chain to a bare digest
-/// poisons every consumer downstream (registry backend, auto-accel routing,
-/// capture).
+/// Group image records by target digest. A group of bare image-ID records
+/// (`sha256:...`) only is kept: it still claims its chains, but names no
+/// repository, since mapping a chain to a bare digest poisons every consumer
+/// downstream (registry backend, auto-accel routing, capture).
 fn group_records_by_target(records: &[ImageRecord]) -> Vec<RecordGroup> {
-    let mut by_target: BTreeMap<&str, &str> = BTreeMap::new();
+    let mut by_target: BTreeMap<&str, (BTreeSet<&str>, Updated)> = BTreeMap::new();
     for record in records {
-        let chosen = by_target
-            .entry(record.target_digest.as_str())
-            .or_insert(record.name.as_str());
-        if ref_name_rank(record.name.as_str()) > ref_name_rank(chosen) {
-            *chosen = record.name.as_str();
-        }
+        let (names, updated) = by_target.entry(record.target_digest.as_str()).or_default();
+        names.insert(record.name.as_str());
+        *updated = (*updated).max(record.updated);
     }
     by_target
         .into_iter()
-        .map(|(target, chosen)| RecordGroup {
+        .map(|(target, (names, updated))| RecordGroup {
             target: target.to_string(),
-            display_ref: chosen.to_string(),
+            names: names.into_iter().map(str::to_string).collect(),
+            updated,
         })
         .collect()
 }
@@ -970,6 +1144,28 @@ fn run_first_ok(candidates: &[&[&str]]) -> Result<Vec<u8>> {
 }
 
 #[cfg(test)]
+impl ContainerdLookup {
+    /// Put a walked target into `namespace`'s memo, as a listing would.
+    pub(crate) fn seed(
+        &self,
+        namespace: &str,
+        target: &str,
+        names: &[&str],
+        updated: i64,
+        digests: &[&str],
+    ) {
+        lock_cache(&self.namespace(namespace).memo).walks.insert(
+            target.to_string(),
+            TargetWalk {
+                names: names.iter().map(|n| n.to_string()).collect(),
+                updated: (updated, 0),
+                digests: digests.iter().map(|d| d.to_string()).collect(),
+            },
+        );
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -1180,36 +1376,48 @@ mod tests {
         assert!(err.to_string().contains("sha256:idx"), "{err}");
     }
 
-    /// A lookup seeded with `(target, display ref, claimed digests)` walks,
-    /// inserted in the given order.
-    fn seeded(walks: &[(&str, &str, &[&str])]) -> ContainerdLookup {
+    const NS: &str = "k8s.io";
+
+    /// A lookup seeded in [`NS`] with `(target, record names, claimed
+    /// digests)` walks, updated in the given order.
+    fn seeded(walks: &[(&str, &[&str], &[&str])]) -> ContainerdLookup {
         let lookup = ContainerdLookup::new_cli_only();
-        let mut memo = lock_cache(&lookup.walks);
-        for (target, display_ref, digests) in walks {
-            memo.insert(
-                target.to_string(),
-                TargetWalk {
-                    display_ref: display_ref.to_string(),
-                    digests: digests.iter().map(|d| d.to_string()).collect(),
-                },
-            );
+        for (i, (target, names, digests)) in walks.iter().enumerate() {
+            lookup.seed(NS, target, names, i as i64, digests);
         }
-        drop(memo);
         lookup
+    }
+
+    fn one(repository: &str, images: &[(&str, &str)]) -> Claim {
+        Claim::One(Claimant {
+            repository: repository.to_string(),
+            images: images
+                .iter()
+                .map(|(image_ref, target)| ClaimedImage {
+                    image_ref: image_ref.to_string(),
+                    target: target.to_string(),
+                })
+                .collect(),
+        })
     }
 
     #[test]
     fn one_image_claiming_a_chain_is_named() {
         let lookup = seeded(&[
-            ("sha256:tx", "app:v1", &["sha256:x"]),
-            ("sha256:ty", "app:latest", &["sha256:y"]),
+            ("sha256:tx", &["reg/app:v1"], &["sha256:x"]),
+            ("sha256:ty", &["reg/other:latest"], &["sha256:y"]),
         ]);
-        assert_eq!(lookup.claims("sha256:x"), Claim::One("app:v1".to_string()));
+        let claim = lookup.lookup_cached(NS, "sha256:x").unwrap();
+        assert_eq!(claim, one("reg/app", &[("reg/app:v1", "sha256:tx")]));
         assert_eq!(
-            lookup.lookup_cached("sha256:y").as_deref(),
-            Some("app:latest")
+            lookup.lookup_cached(NS, "sha256:z").unwrap(),
+            Claim::Unclaimed
         );
-        assert_eq!(lookup.claims("sha256:z"), Claim::Unclaimed);
+        // Claims are per namespace.
+        assert_eq!(
+            lookup.lookup_cached("default", "sha256:x").unwrap(),
+            Claim::Unclaimed
+        );
     }
 
     /// A bare image-ID record still claims its chain: alone it names nothing,
@@ -1217,14 +1425,170 @@ mod tests {
     #[test]
     fn image_id_records_claim_but_are_never_named() {
         let id = "sha256:0c0da3558734bbf673448b752bb6c139cbd3ece8060c6589370280b8ba631d9e";
-        let alone = seeded(&[("sha256:t1", id, &["sha256:x"])]);
-        assert_eq!(alone.claims("sha256:x"), Claim::Unclaimed);
+        let alone = seeded(&[("sha256:t1", &[id], &["sha256:x"])]);
+        assert_eq!(
+            alone.lookup_cached(NS, "sha256:x").unwrap(),
+            Claim::Unclaimed
+        );
         let shared = seeded(&[
-            ("sha256:t1", id, &["sha256:x"]),
-            ("sha256:t2", "reg/evil:1", &["sha256:x"]),
+            ("sha256:t1", &[id], &["sha256:x"]),
+            ("sha256:t2", &["reg/claimant-b:1"], &["sha256:x"]),
         ]);
-        assert!(matches!(shared.claims("sha256:x"), Claim::Ambiguous(_)));
-        assert_eq!(shared.lookup_cached("sha256:x"), None);
+        assert!(matches!(
+            shared.lookup_cached(NS, "sha256:x").unwrap(),
+            Claim::Ambiguous(_)
+        ));
+        // The ID record of a named image is just another name of its target.
+        let named = seeded(&[("sha256:t1", &[id, "reg/app:1"], &["sha256:x"])]);
+        assert_eq!(
+            named.lookup_cached(NS, "sha256:x").unwrap(),
+            one("reg/app", &[("reg/app:1", "sha256:t1")])
+        );
+    }
+
+    /// A target named from two repositories (one record of each pointing at
+    /// the same manifest) is two claimants, whatever names rank first.
+    #[test]
+    fn one_target_named_from_two_repositories_is_ambiguous() {
+        let lookup = seeded(&[(
+            "sha256:m",
+            &[
+                "reg/app:1",
+                "reg/app@sha256:m",
+                "other.example/claimant-b:1",
+            ],
+            &["sha256:x"],
+        )]);
+        assert_eq!(
+            lookup.lookup_cached(NS, "sha256:x").unwrap(),
+            Claim::Ambiguous(vec![
+                "other.example/claimant-b".to_string(),
+                "reg/app".to_string()
+            ])
+        );
+    }
+
+    /// Several targets of one repository (a rebuild with the same layers, an
+    /// image pulled by tag and by platform-manifest digest) are one claimant;
+    /// its images are ordered newest record first, then by name.
+    #[test]
+    fn targets_of_one_repository_are_one_claimant() {
+        let lookup = seeded(&[
+            ("sha256:index", &["reg/app:1"], &["sha256:x"]),
+            (
+                "sha256:manifest",
+                &["reg/app@sha256:manifest"],
+                &["sha256:x"],
+            ),
+            ("sha256:rebuild", &["reg/app:2"], &["sha256:x"]),
+        ]);
+        let claim = lookup.lookup_cached(NS, "sha256:x").unwrap();
+        assert_eq!(
+            claim,
+            one(
+                "reg/app",
+                &[
+                    ("reg/app:2", "sha256:rebuild"),
+                    ("reg/app@sha256:manifest", "sha256:manifest"),
+                    ("reg/app:1", "sha256:index"),
+                ]
+            )
+        );
+        let Claim::One(claimant) = claim else {
+            unreachable!()
+        };
+        assert_eq!(claimant.image_ref(), "reg/app:2");
+        assert!(claimant.admits("reg/app@sha256:abc"));
+        assert!(!claimant.admits("reg/app2:1"));
+        assert!(!claimant.admits("sha256:abc"));
+    }
+
+    /// A target whose walk failed might claim anything: it makes a sole
+    /// claimant uncertain unless all its names are in that claimant's
+    /// repository, and never shrinks the claimant set.
+    #[test]
+    fn an_unwalked_target_makes_other_repositories_claims_uncertain() {
+        let lookup = seeded(&[("sha256:t", &["reg/app:1"], &["sha256:x"])]);
+        let fail_as = |names: &[&str], absent: bool| {
+            lock_cache(&lookup.namespace(NS).memo).failed.insert(
+                "sha256:broken".to_string(),
+                WalkFailure {
+                    names: names.iter().map(|n| n.to_string()).collect(),
+                    updated: (0, 0),
+                    retry_at: Instant::now(),
+                    absent,
+                    error: "unreadable".to_string(),
+                },
+            );
+        };
+        let fail = |names: &[&str]| fail_as(names, false);
+        fail(&["reg/app:2"]);
+        assert!(matches!(
+            lookup.lookup_cached(NS, "sha256:x").unwrap(),
+            Claim::One(_)
+        ));
+        for names in [
+            &["other.example/b:1"][..],
+            &["reg/app:2", "other.example/b:1"],
+            &["sha256:0c0da3558734bbf673448b752bb6c139cbd3ece8060c6589370280b8ba631d9e"],
+        ] {
+            fail(names);
+            let err = lookup.lookup_cached(NS, "sha256:x").unwrap_err();
+            assert!(format!("{err:#}").contains("sha256:broken"), "{err:#}");
+        }
+        // A target whose content is absent can be the image of no container.
+        fail_as(&["other.example/b:1"], true);
+        assert!(matches!(
+            lookup.lookup_cached(NS, "sha256:x").unwrap(),
+            Claim::One(_)
+        ));
+        // Claims that serve nothing anyway are unaffected.
+        assert_eq!(
+            lookup.lookup_cached(NS, "sha256:y").unwrap(),
+            Claim::Unclaimed
+        );
+    }
+
+    /// Lookups that arrive while a listing is pending share its outcome,
+    /// failure included, instead of listing once each.
+    #[test]
+    fn waiters_share_a_failed_listing() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = crate::config::ContainerdConfig {
+            address: Some(dir.path().join("absent.sock")),
+            namespace: NS.to_string(),
+            content_root: Some(dir.path().to_path_buf()),
+            hosts_dir: None,
+        };
+        let lookup = ContainerdLookup::new(ContentStoreClient::new(&config).unwrap());
+        let state = lookup.namespace(NS);
+        compio::runtime::Runtime::new().unwrap().block_on(async {
+            let gate = state.gate.lock().await;
+            let waiters =
+                futures::future::join_all((0..8).map(|_| Box::pin(lookup.lookup(NS, "sha256:x"))));
+            let release = async {
+                compio::time::sleep(Duration::from_millis(20)).await;
+                drop(gate);
+            };
+            let (results, ()) = futures::future::join(waiters, release).await;
+            assert!(results.iter().all(Result::is_err));
+        });
+        assert_eq!(state.started.load(Ordering::SeqCst), 1);
+        // A lookup arriving after that listing finished lists again.
+        compio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(lookup.lookup(NS, "sha256:x"))
+            .unwrap_err();
+        assert_eq!(state.started.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn namespace_comes_from_the_snapshot_key() {
+        assert_eq!(namespace_of_key("k8s.io/12/sha256:abc"), Some("k8s.io"));
+        assert_eq!(namespace_of_key("moby/3/container-id"), Some("moby"));
+        assert_eq!(namespace_of_key("sha256:abc"), None);
+        assert_eq!(namespace_of_key("a/b"), None);
+        assert_eq!(namespace_of_key("/1/x"), None);
     }
 
     #[test]
@@ -1349,69 +1713,66 @@ mod tests {
         assert!(!record_matches_ref("localhost:5000/img", "localhost"));
     }
 
-    /// Tag-form names win over digest-form names as the display ref.
+    /// Every name of a target is kept, deduplicated and sorted, with the
+    /// latest update of any of its records, whatever order they are listed in.
     #[test]
-    fn group_records_prefers_tag_form_display_ref() {
-        let records = vec![
-            ImageRecord {
-                name: "docker.io/library/nginx@sha256:abc".to_string(),
-                target_digest: "sha256:abc".to_string(),
-            },
-            ImageRecord {
-                name: "docker.io/library/nginx:1.27".to_string(),
-                target_digest: "sha256:abc".to_string(),
-            },
+    fn group_records_keeps_every_name() {
+        let record = |name: &str, target: &str, updated: i64| ImageRecord {
+            name: name.to_string(),
+            target_digest: target.to_string(),
+            updated: (updated, 0),
+        };
+        let mut records = vec![
+            record("reg/app:1", "sha256:m", 5),
+            record("reg/other:1", "sha256:i", 1),
+            record("reg/app@sha256:m", "sha256:m", 9),
+            record("sha256:0c0da35587", "sha256:m", 2),
         ];
-        let groups = group_records_by_target(&records);
-        assert_eq!(groups.len(), 1);
-        assert_eq!(groups[0].display_ref, "docker.io/library/nginx:1.27");
-        assert_eq!(groups[0].target, "sha256:abc");
+        let key = |groups: Vec<RecordGroup>| -> Vec<(String, Vec<String>, Updated)> {
+            groups
+                .into_iter()
+                .map(|g| (g.target, g.names, g.updated))
+                .collect()
+        };
+        let first = key(group_records_by_target(&records));
+        assert_eq!(
+            first[1],
+            (
+                "sha256:m".to_string(),
+                vec![
+                    "reg/app:1".to_string(),
+                    "reg/app@sha256:m".to_string(),
+                    "sha256:0c0da35587".to_string()
+                ],
+                (9, 0)
+            )
+        );
+        records.reverse();
+        assert_eq!(key(group_records_by_target(&records)), first);
+        records.swap(0, 1);
+        assert_eq!(key(group_records_by_target(&records)), first);
     }
 
     /// REGRESSION (0.2.9-nydus mirrors EIO): containerd's CRI plugin stores a
     /// bare image-ID record (`sha256:<config digest>`) for every pulled
-    /// image. The old `contains('@')` heuristic classified it as "tag form",
-    /// so it could win as the display ref — and a daemon built from it
-    /// fetched blobs from repo "library/sha256" (UNAUTHORIZED → EIO). The
-    /// image-ID record must NEVER win, in either insertion order.
+    /// image, and a daemon built from it fetched blobs from repo
+    /// "library/sha256". The image-ID record is never a served name.
     #[test]
-    fn group_records_never_selects_bare_image_id() {
-        for order in [true, false] {
-            let mut records = vec![
-                ImageRecord {
-                    name: "sha256:0c0da3558734bbf673448b752bb6c139cbd3ece8060c6589370280b8ba631d9e"
-                        .to_string(),
-                    target_digest: "sha256:tgt".to_string(),
-                },
-                ImageRecord {
-                    name: "docker.io/example/app@sha256:2a25".to_string(),
-                    target_digest: "sha256:tgt".to_string(),
-                },
-            ];
-            if order {
-                records.reverse();
-            }
-            let groups = group_records_by_target(&records);
-            assert_eq!(groups.len(), 1);
-            assert_eq!(
-                groups[0].display_ref, "docker.io/example/app@sha256:2a25",
-                "repo@digest ref must beat the image-ID record (order={order})"
-            );
-        }
-    }
-
-    /// A target known ONLY by image-ID records has no usable ref — the group
-    /// is dropped rather than poisoning the chain map with a bare digest.
-    #[test]
-    fn group_records_keeps_image_id_only_groups() {
+    fn best_name_never_selects_bare_image_id() {
+        let names = |n: &[&str]| n.iter().map(|s| s.to_string()).collect::<Vec<_>>();
         let id = "sha256:0c0da3558734bbf673448b752bb6c139cbd3ece8060c6589370280b8ba631d9e";
-        let records = vec![ImageRecord {
-            name: id.to_string(),
-            target_digest: "sha256:tgt".to_string(),
-        }];
-        let groups = group_records_by_target(&records);
-        assert_eq!(groups.len(), 1);
-        assert_eq!(groups[0].display_ref, id);
+        assert_eq!(
+            best_name(&names(&[id, "docker.io/example/app@sha256:2a25"])),
+            "docker.io/example/app@sha256:2a25"
+        );
+        assert_eq!(
+            best_name(&names(&[
+                "docker.io/library/nginx@sha256:abc",
+                "docker.io/library/nginx:1.27"
+            ])),
+            "docker.io/library/nginx:1.27"
+        );
+        assert_eq!(best_name(&names(&["reg/a:2", "reg/a:1"])), "reg/a:1");
     }
 
     #[test]
@@ -1427,93 +1788,53 @@ mod tests {
     }
 
     #[test]
-    fn claimants_in_one_repository_name_an_image() {
-        let refs = |r: &[&str]| Claim::Ambiguous(r.iter().map(|s| s.to_string()).collect());
-        let same = refs(&["localhost:5000/app:1", "localhost:5000/app@sha256:abc"]);
-        assert_eq!(same.image_in_one_repository(), Some("localhost:5000/app:1"));
-        let split = refs(&["reg/evil:1", "reg/victim:1"]);
-        assert_eq!(split.image_in_one_repository(), None);
-        let id = "sha256:0c0da3558734bbf673448b752bb6c139cbd3ece8060c6589370280b8ba631d9e";
-        assert_eq!(refs(&[id, id]).image_in_one_repository(), None);
-        assert_eq!(
-            Claim::One("reg/app:1".into()).image_in_one_repository(),
-            Some("reg/app:1")
-        );
-        assert_eq!(Claim::Unclaimed.image_in_one_repository(), None);
+    fn repository_of_refs() {
         assert_eq!(repository("localhost:5000/app"), Some("localhost:5000/app"));
+        assert_eq!(
+            repository("localhost:5000/app:1"),
+            Some("localhost:5000/app")
+        );
+        assert_eq!(repository("reg/app@sha256:abc"), Some("reg/app"));
+        assert_eq!(repository("sha256:abc"), None);
     }
 
-    /// Two images whose configs share a top chainID: the chain names neither
-    /// image, whatever order the image store lists or walks them in.
+    /// Two images whose configs share a top chainID: the chain names
+    /// neither image, whatever order the image store lists or walks them in.
     #[test]
     fn shared_top_chain_answers_no_single_image() {
         let diff_ids = vec!["sha256:base".to_string(), "sha256:app".to_string()];
         let top = chain_ids(&diff_ids).last().unwrap().clone();
         let images = [
-            ("sha256:victim-manifest", "reg/victim:1"),
-            ("sha256:evil-index", "reg/evil:1"),
+            ("sha256:a-manifest", "reg/claimant-a:1"),
+            ("sha256:b-index", "reg/claimant-b:1"),
             ("sha256:other", "reg/other:2"),
         ];
-        let orders = [
+        for order in [
             [0, 1, 2],
             [0, 2, 1],
             [1, 0, 2],
             [1, 2, 0],
             [2, 0, 1],
             [2, 1, 0],
-        ];
-        for order in orders {
+        ] {
             let lookup = ContainerdLookup::new_cli_only();
-            for i in order {
+            for (updated, i) in order.into_iter().enumerate() {
                 let (target, image_ref) = images[i];
                 let mut out = HashMap::new();
                 if i < 2 {
                     register_chain_ids(image_ref, &diff_ids, &[], &mut out);
                 }
-                lock_cache(&lookup.walks).insert(
-                    target.to_string(),
-                    TargetWalk {
-                        display_ref: image_ref.to_string(),
-                        digests: out.into_keys().collect(),
-                    },
-                );
+                let digests: Vec<&str> = out.keys().map(String::as_str).collect();
+                lookup.seed(NS, target, &[image_ref], updated as i64, &digests);
             }
             assert_eq!(
-                lookup.claims(&top),
-                Claim::Ambiguous(vec!["reg/evil:1".to_string(), "reg/victim:1".to_string()]),
+                lookup.lookup_cached(NS, &top).unwrap(),
+                Claim::Ambiguous(vec![
+                    "reg/claimant-a".to_string(),
+                    "reg/claimant-b".to_string()
+                ]),
                 "order {order:?}"
             );
-            assert_eq!(lookup.lookup_cached(&top), None, "order {order:?}");
         }
-    }
-
-    /// Listing the same records in any order yields the same groups.
-    #[test]
-    fn group_records_is_independent_of_listing_order() {
-        let mut records = vec![
-            ImageRecord {
-                name: "reg/victim:1".to_string(),
-                target_digest: "sha256:m".to_string(),
-            },
-            ImageRecord {
-                name: "reg/evil:1".to_string(),
-                target_digest: "sha256:i".to_string(),
-            },
-            ImageRecord {
-                name: "reg/victim@sha256:m".to_string(),
-                target_digest: "sha256:m".to_string(),
-            },
-        ];
-        let key = |groups: Vec<RecordGroup>| -> Vec<(String, String)> {
-            groups
-                .into_iter()
-                .map(|g| (g.target, g.display_ref))
-                .collect()
-        };
-        let first = key(group_records_by_target(&records));
-        records.reverse();
-        assert_eq!(key(group_records_by_target(&records)), first);
-        records.swap(0, 1);
-        assert_eq!(key(group_records_by_target(&records)), first);
     }
 }

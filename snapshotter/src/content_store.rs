@@ -78,6 +78,15 @@ impl ContentStoreClient {
         })
     }
 
+    /// The same client in another containerd namespace: image records and
+    /// content ownership are per namespace.
+    pub fn with_namespace(&self, namespace: &str) -> Self {
+        Self {
+            channel: ContainerdChannel::new(self.channel.socket(), namespace),
+            content_root: self.content_root.clone(),
+        }
+    }
+
     fn content(&self) -> ContentClient<ContainerdChannel> {
         ContentClient::new(self.channel.clone())
     }
@@ -593,6 +602,7 @@ impl ContentStoreClient {
                 Some(crate::containerd_lookup::ImageRecord {
                     name: image.name,
                     target_digest: target.digest,
+                    updated: image.updated_at.map_or((0, 0), |t| (t.seconds, t.nanos)),
                 })
             })
             .collect())
