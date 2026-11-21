@@ -2588,6 +2588,168 @@ mod tests {
         create_tarfs(&[]).unwrap();
     }
 
+    /// File contents of a small tree: files that share batch chunks and a 3 MiB file that spans
+    /// several 1 MiB chunks. The bytes are pseudo-random so neither compression nor a zero fill
+    /// can produce them by accident.
+    fn unpack_source_files() -> Vec<(String, Vec<u8>)> {
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut bytes = |len: usize| -> Vec<u8> {
+            (0..len)
+                .map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    state as u8
+                })
+                .collect()
+        };
+        let mut files: Vec<_> = (0..20)
+            .map(|i| (format!("dir/file-{i}"), bytes(100 * (i + 1))))
+            .collect();
+        files.push(("empty".to_string(), Vec::new()));
+        // Shorter than one XTS block, so encryption pads it.
+        files.push(("tiny".to_string(), bytes(5)));
+        // Several chunks, the last one partial.
+        files.push(("large".to_string(), bytes((3 << 20) + 1234)));
+        files
+    }
+
+    /// Build a RAFS v6 image of [unpack_source_files] with `extra` create options, then call
+    /// `corrupt` on the blob directory and unpack the image. Returns the unpacked regular files.
+    fn unpack_round_trip(
+        extra: &[&str],
+        corrupt: impl FnOnce(&std::path::Path),
+    ) -> anyhow::Result<std::collections::BTreeMap<String, Vec<u8>>> {
+        let dir = tempfile::TempDir::new().unwrap();
+        let source = dir.path().join("source");
+        for (name, data) in unpack_source_files() {
+            let path = source.join(name);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, data).unwrap();
+        }
+        let blob_dir = dir.path().join("blobs");
+        std::fs::create_dir(&blob_dir).unwrap();
+        let blob_dir = blob_dir.display().to_string();
+        let bootstrap = dir.path().join("bootstrap").display().to_string();
+        let source = source.display().to_string();
+        let mut args = vec![
+            "nydus-image",
+            "create",
+            "--type",
+            "dir-rafs",
+            "--fs-version",
+            "6",
+            "--blob-dir",
+            &blob_dir,
+            "--bootstrap",
+            &bootstrap,
+        ];
+        args.extend_from_slice(extra);
+        args.push(&source);
+        let cmd = super::prepare_cmd_args(super::BTI_STRING.as_str()).get_matches_from(args);
+        register_tracer!(TraceClass::Timing, TimingTracerClass);
+        register_tracer!(TraceClass::Event, EventTracerClass);
+        Command::create(cmd.subcommand_matches("create").unwrap(), &super::BTI).unwrap();
+
+        corrupt(std::path::Path::new(&blob_dir));
+
+        let output = dir.path().join("unpacked.tar").display().to_string();
+        let args = [
+            "nydus-image",
+            "unpack",
+            "--blob-dir",
+            &blob_dir,
+            "--output",
+            &output,
+            &bootstrap,
+        ];
+        let cmd = super::prepare_cmd_args(super::BTI_STRING.as_str()).get_matches_from(args);
+        Command::unpack(cmd.subcommand_matches("unpack").unwrap())?;
+
+        let mut files = std::collections::BTreeMap::new();
+        let mut archive = tar::Archive::new(std::fs::File::open(&output).unwrap());
+        for entry in archive.entries().unwrap() {
+            let mut entry = entry.unwrap();
+            if entry.header().entry_type().is_file() {
+                let path = entry.path().unwrap().display().to_string();
+                let path = path.trim_start_matches("./").to_string();
+                let mut data = Vec::new();
+                std::io::Read::read_to_end(&mut entry, &mut data).unwrap();
+                files.insert(path, data);
+            }
+        }
+        Ok(files)
+    }
+
+    fn assert_unpacked_as_source(extra: &[&str]) {
+        let files = unpack_round_trip(extra, |_| {}).unwrap();
+        let expected: std::collections::BTreeMap<_, _> =
+            unpack_source_files().into_iter().collect();
+        assert_eq!(
+            files.keys().collect::<Vec<_>>(),
+            expected.keys().collect::<Vec<_>>(),
+            "{extra:?}"
+        );
+        for (name, data) in &expected {
+            assert!(files[name] == *data, "{extra:?}: {name} differs");
+        }
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support getegid")]
+    fn test_unpack_batch_chunks() {
+        for compressor in ["none", "zstd"] {
+            assert_unpacked_as_source(&["--compressor", compressor, "--batch-size", "0x100000"]);
+        }
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support getegid")]
+    fn test_unpack_encrypted_blob() {
+        for compressor in ["none", "zstd"] {
+            assert_unpacked_as_source(&["--compressor", compressor, "--encrypt"]);
+            assert_unpacked_as_source(&[
+                "--compressor",
+                compressor,
+                "--encrypt",
+                "--batch-size",
+                "0x100000",
+            ]);
+        }
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support getegid")]
+    fn test_unpack_plain_image() {
+        for compressor in ["none", "zstd"] {
+            assert_unpacked_as_source(&["--compressor", compressor]);
+        }
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support getegid")]
+    fn test_unpack_rejects_truncated_blob() {
+        // Cut the blob inside the data of the large file's last chunk.
+        let truncate = |blob_dir: &std::path::Path| {
+            let mut truncated = 0;
+            for entry in std::fs::read_dir(blob_dir).unwrap() {
+                let file = std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(entry.unwrap().path())
+                    .unwrap();
+                if file.metadata().unwrap().len() > 3 << 20 {
+                    file.set_len((5 << 20) / 2).unwrap();
+                    truncated += 1;
+                }
+            }
+            assert_eq!(truncated, 1);
+        };
+        let Err(err) = unpack_round_trip(&["--compressor", "none"], truncate) else {
+            panic!("unpacked an image whose blob is truncated");
+        };
+        assert!(format!("{err:#}").contains("short read"), "{err:#}");
+    }
+
     #[test]
     fn test_create_tarfs_rejects_explicit_block_size() {
         let err = create_tarfs(&["--block-size", "4096"]).unwrap_err();
