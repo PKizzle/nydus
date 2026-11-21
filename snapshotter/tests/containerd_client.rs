@@ -486,3 +486,87 @@ fn incomplete_sidecars_are_detected_and_deletes_honour_the_listed_target() {
     });
     containerd.stop();
 }
+
+/// A lookup that arrives while another lookup's refresh is in flight does not take that
+/// refresh's answer: its listing may predate an image created since. The first lookup is held
+/// in its walk of a large image config while a second image is created and a second lookup
+/// arrives, which must name the second image.
+#[test]
+#[ignore = "needs root and containerd; run misc/containerd-grpc/client-test.sh"]
+fn a_lookup_never_answers_from_a_listing_older_than_itself() {
+    use nydus_snapshotter::containerd_lookup::{Claim, ContainerdLookup};
+
+    let dir = tempfile::tempdir().unwrap();
+    let containerd = Containerd::start(dir.path());
+    let client = ContentStoreClient::new(&containerd.config()).unwrap();
+    let lookup = ContainerdLookup::new(client.clone());
+
+    compio::runtime::Runtime::new().unwrap().block_on(async {
+        // Both images claim one chain. The first one's config is large, so walking it keeps
+        // the first lookup's refresh in flight long after its listing was taken.
+        let diff_id = digest_of(b"layer");
+        let upload = client.begin_upload("test").await.unwrap();
+        let mut manifests = Vec::new();
+        for (i, padding) in [64 << 20, 0].into_iter().enumerate() {
+            let config = serde_json::json!({
+                "architecture": "amd64", "os": "linux",
+                "rootfs": {"type": "layers", "diff_ids": [diff_id]},
+                "padding": "x".repeat(padding),
+            })
+            .to_string();
+            let config_digest = upload
+                .write_bytes(config.as_bytes(), &format!("config-{i}"), labels())
+                .await
+                .unwrap();
+            let manifest = serde_json::json!({
+                "schemaVersion": 2, "mediaType": OCI_MANIFEST,
+                "config": {"mediaType": "application/vnd.oci.image.config.v1+json",
+                           "digest": config_digest, "size": config.len()},
+                "layers": [],
+            })
+            .to_string();
+            let digest = upload
+                .write_bytes(manifest.as_bytes(), &format!("manifest-{i}"), labels())
+                .await
+                .unwrap();
+            manifests.push((digest, manifest.len() as u64));
+        }
+        let (slow, slow_size) = &manifests[0];
+        let (late, late_size) = &manifests[1];
+        client
+            .images_create(
+                "nydus.test/slow:1",
+                slow,
+                *slow_size,
+                OCI_MANIFEST,
+                labels(),
+            )
+            .await
+            .unwrap();
+
+        let first = lookup.lookup(&diff_id);
+        let second = async {
+            compio::time::sleep(Duration::from_millis(5)).await;
+            client
+                .images_create(
+                    "nydus.test/late:1",
+                    late,
+                    *late_size,
+                    OCI_MANIFEST,
+                    labels(),
+                )
+                .await
+                .unwrap();
+            lookup.lookup(&diff_id).await.unwrap()
+        };
+        let (first, second) = futures::future::join(first, second).await;
+        assert_eq!(first.unwrap(), Claim::One("nydus.test/slow:1".to_string()));
+        assert_eq!(
+            second,
+            Claim::Ambiguous(vec![
+                "nydus.test/late:1".to_string(),
+                "nydus.test/slow:1".to_string()
+            ])
+        );
+    });
+}

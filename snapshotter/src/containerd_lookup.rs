@@ -14,16 +14,18 @@
 //! set of claimants and answers [`Claim::Ambiguous`] when more than one image
 //! claims a digest; callers serve nothing image-specific for it.
 //!
-//! Every lookup lists the image records again (`Images.List`, one RPC), so a
-//! claimant pulled after an earlier lookup is never missed. Walks are
-//! memoized by record target digest: a target names immutable content, so
-//! only targets not seen before cost `Content.Read`s. Refreshes are
-//! single-flight; concurrent lookups queue behind the walk in progress and
-//! each runs its own listing.
+//! Every lookup answers from a listing of the image records (`Images.List`,
+//! one RPC) started after the lookup was called, so a claimant pulled before
+//! the call is never missed. Walks are memoized by record target digest: a
+//! target names immutable content, so only targets not seen before cost
+//! `Content.Read`s. Refreshes are single-flight, and lookups that arrive
+//! while one runs share the next listing, so a burst of N lookups costs two
+//! listings rather than N.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt::Write as _;
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use anyhow::{Context, Result, bail};
@@ -105,6 +107,10 @@ pub struct ContainerdLookup {
     content_store: Option<ContentStoreClient>,
     /// Single-flight gate for refreshes.
     refresh_gate: async_lock::Mutex<()>,
+    /// Number of listings started; a listing's id is the count after its start.
+    listings_started: AtomicU64,
+    /// Id of the latest listing that brought the memo in line.
+    listing_succeeded: AtomicU64,
 }
 
 impl Default for ContainerdLookup {
@@ -113,6 +119,8 @@ impl Default for ContainerdLookup {
             walks: Mutex::new(BTreeMap::new()),
             content_store: None,
             refresh_gate: async_lock::Mutex::new(()),
+            listings_started: AtomicU64::new(0),
+            listing_succeeded: AtomicU64::new(0),
         }
     }
 }
@@ -233,10 +241,17 @@ impl ContainerdLookup {
     /// List the image records and bring the memo in line with them: walk
     /// targets not seen before, drop targets no longer listed.
     async fn refresh(&self) -> Result<()> {
+        // A listing with a higher id than this started after this call did,
+        // so it saw every record this call could need.
+        let arrived = self.listings_started.load(Ordering::SeqCst);
         let _gate = self.refresh_gate.lock().await;
+        if self.listing_succeeded.load(Ordering::SeqCst) > arrived {
+            return Ok(());
+        }
         let Some(cs) = &self.content_store else {
             return Ok(());
         };
+        let listing = self.listings_started.fetch_add(1, Ordering::SeqCst) + 1;
         let records = cs.images_list().await.context("containerd Images.List")?;
         let mut walked = 0;
         let mut failed = 0;
@@ -280,6 +295,7 @@ impl ContainerdLookup {
         }
         let total = fresh.len();
         *lock_cache(&self.walks) = fresh;
+        self.listing_succeeded.store(listing, Ordering::SeqCst);
         debug!(walked, failed, total, "containerd image claims refreshed");
         Ok(())
     }
