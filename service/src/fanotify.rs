@@ -2553,6 +2553,14 @@ mod tests {
     /// fixture bootstrap staged in `stage/`, and a blob cache manager over a fanotify cache there;
     /// `None`, after printing SKIP, without that directory or fanotify pre-content support.
     fn fanotify_fixture(id: &str) -> Option<(tempfile::TempDir, Arc<super::BlobCacheMgr>)> {
+        fanotify_fixture_borrowing(id, &[])
+    }
+
+    /// [`fanotify_fixture`] with a cache that borrows from the cache dirs `borrow_from` matches.
+    fn fanotify_fixture_borrowing(
+        id: &str,
+        borrow_from: &[String],
+    ) -> Option<(tempfile::TempDir, Arc<super::BlobCacheMgr>)> {
         use super::*;
 
         let Some(base) = std::env::var_os("NYDUS_FANOTIFY_TEST_DIR") else {
@@ -2577,10 +2585,11 @@ mod tests {
                 "version": 2, "id": "ID",
                 "backend": { "type": "localfs", "localfs": { "dir": "WORK" } },
                 "cache": { "type": "fanotify", "fanotify": { "work_dir": "STAGE" },
-                           "filecache": { "work_dir": "STAGE" } },
+                           "filecache": { "work_dir": "STAGE", "borrow_from": BORROW } },
                 "metadata_path": "STAGE/bootstrap"
             }
         }"#
+        .replace("BORROW", &serde_json::to_string(borrow_from).unwrap())
         .replace("ID", id)
         .replace("WORK", work.path().to_str().unwrap())
         .replace("STAGE", stage.to_str().unwrap());
@@ -2802,6 +2811,138 @@ mod tests {
 
         second.stop();
         umount(&mnt);
+    }
+
+    /// Borrowing reads a lender through a descriptor that raises no fanotify events, even while
+    /// the lender carries a live `FAN_PRE_ACCESS` mark: a group counting the lender's events
+    /// sees none while a second image fills its cache from it, and none for `SEEK_DATA` through
+    /// an ordinary descriptor, but one for an ordinary read, which shows that it counts.
+    ///
+    /// Needs root, a >= 6.14 kernel and `NYDUS_FANOTIFY_TEST_DIR` on a file system with
+    /// pre-content marks (ext4); prints SKIP otherwise.
+    #[test]
+    fn borrowing_raises_no_event_on_a_marked_lender() {
+        use super::*;
+        use crate::fanotify_sys::{FAN_CLASS_PRE_CONTENT, FAN_PRE_ACCESS};
+        use std::os::unix::fs::FileExt;
+        use std::sync::atomic::AtomicUsize;
+
+        let Some(base) = std::env::var_os("NYDUS_FANOTIFY_TEST_DIR") else {
+            eprintln!("SKIP: set NYDUS_FANOTIFY_TEST_DIR to an ext4 directory and run as root");
+            return;
+        };
+        // Both images' work dirs sit in one directory, so each stage matches `<dir>/*/stage`.
+        let dir = tempfile::TempDir::new_in(base).unwrap();
+        // SAFETY: setting a variable before any thread of this test reads it.
+        unsafe { std::env::set_var("NYDUS_FANOTIFY_TEST_DIR", dir.path()) };
+        let Some((lender_work, lender_mgr)) = fanotify_fixture("borrow-lender") else {
+            return;
+        };
+        let pattern = format!("{}/*/stage", dir.path().display());
+        let (work, mgr) = fanotify_fixture_borrowing("borrow-borrower", &[pattern]).unwrap();
+        let serve = |work: &tempfile::TempDir, mgr: Arc<BlobCacheMgr>| {
+            let (stage, mnt) = (work.path().join("stage"), work.path().join("mnt"));
+            let handler = Arc::new(
+                FanotifyHandler::new(stage.to_str().unwrap(), mnt.to_str().unwrap(), mgr, 1)
+                    .unwrap(),
+            );
+            spawn_worker(&handler);
+            handler.arm().unwrap();
+            handler.mount().unwrap();
+            let files: Vec<_> = read_all_cold(&mnt)
+                .into_iter()
+                .map(|(p, data)| (p.strip_prefix(&mnt).unwrap().to_path_buf(), data))
+                .collect();
+            (handler, mnt, files)
+        };
+        let (lender, lender_mnt, want) = serve(&lender_work, lender_mgr);
+        let lender_file = lender_work
+            .path()
+            .join("stage")
+            .join(format!("{FIXTURE_BLOB}.blob.data"));
+
+        // A group that counts and allows every pre-content event on the lender's cache file.
+        // SAFETY: `fanotify_init` only takes integer flags; the result is checked.
+        let raw = unsafe {
+            libc::fanotify_init(
+                FAN_CLASS_PRE_CONTENT | libc::FAN_CLOEXEC | libc::FAN_NONBLOCK,
+                libc::O_RDONLY as u32,
+            )
+        };
+        assert!(raw >= 0, "{}", std::io::Error::last_os_error());
+        // SAFETY: `raw` is the new group descriptor, owned by nothing else.
+        let group = unsafe { OwnedFd::from_raw_fd(raw) };
+        let path = std::ffi::CString::new(lender_file.to_str().unwrap()).unwrap();
+        // SAFETY: `raw` is the live group and `path` a NUL-terminated path.
+        let marked = unsafe {
+            libc::fanotify_mark(
+                raw,
+                libc::FAN_MARK_ADD,
+                FAN_PRE_ACCESS,
+                libc::AT_FDCWD,
+                path.as_ptr(),
+            )
+        };
+        assert_eq!(marked, 0, "{}", std::io::Error::last_os_error());
+        let events = Arc::new(AtomicUsize::new(0));
+        let done = Arc::new(AtomicBool::new(false));
+        let counter = {
+            let (events, done) = (events.clone(), done.clone());
+            std::thread::spawn(move || {
+                let mut buf = vec![0u8; 4096];
+                while !done.load(Ordering::Acquire) {
+                    // SAFETY: `buf` is writable for its length and `raw` is the live group.
+                    let n = unsafe { libc::read(raw, buf.as_mut_ptr().cast(), buf.len()) };
+                    if n <= 0 {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                        continue;
+                    }
+                    for_each_parsable_event(&buf[..n as usize], |meta, _| {
+                        if meta.fd >= 0 {
+                            events.fetch_add(1, Ordering::SeqCst);
+                            write_response(raw, meta.fd, FAN_ALLOW);
+                            // SAFETY: the event's descriptor is ours to close, once.
+                            drop(unsafe { OwnedFd::from_raw_fd(meta.fd) });
+                        }
+                    });
+                }
+            })
+        };
+
+        let before = nydus_storage::cache::borrow_counters();
+        let (borrower, mnt, got) = serve(&work, mgr);
+        assert_eq!(got, want, "the borrower reads other bytes than the lender");
+        let borrowed = nydus_storage::cache::borrow_counters().chunks - before.chunks;
+        let during = events.load(Ordering::SeqCst);
+
+        let plain = File::open(&lender_file).unwrap();
+        // SAFETY: `lseek` only takes integers; `plain` is open.
+        let data = unsafe { libc::lseek(plain.as_raw_fd(), 0, libc::SEEK_DATA) };
+        assert!(data >= 0);
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let after_seek = events.load(Ordering::SeqCst);
+        let mut byte = [0u8; 1];
+        plain.read_exact_at(&mut byte, data as u64).unwrap();
+        let after_read = events.load(Ordering::SeqCst);
+        println!(
+            "BORROW EVENTS: borrowed {borrowed} chunks, lender events while borrowing \
+             {during}, after SEEK_DATA {after_seek}, after a plain read {after_read}"
+        );
+        done.store(true, Ordering::Release);
+        counter.join().unwrap();
+        drop(group);
+        borrower.stop();
+        umount(&mnt);
+        lender.stop();
+        umount(&lender_mnt);
+
+        assert!(borrowed > 0, "nothing was borrowed");
+        assert_eq!(during, 0, "borrowing raised events on the lender");
+        assert_eq!(after_seek, during, "SEEK_DATA raised an event");
+        assert!(
+            after_read > after_seek,
+            "the counting group sees no events at all"
+        );
     }
 
     #[test]
