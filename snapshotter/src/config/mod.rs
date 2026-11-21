@@ -623,6 +623,10 @@ pub struct CacheConfig {
     /// How long a retained stage may stay idle: `"auto"` or a duration (`"7d"`).
     #[serde(default = "default_retention_idle_limit")]
     pub retention_idle_limit: String,
+    /// Fill a missing chunk from another image's cache of the same blob on this node, after
+    /// checking it against the image's own chunk digest, instead of fetching it again.
+    #[serde(default)]
+    pub borrow: bool,
 }
 
 impl Default for CacheConfig {
@@ -638,6 +642,7 @@ impl Default for CacheConfig {
             retention_max_bytes: default_retention_max_bytes(),
             retention_min_free: default_retention_min_free(),
             retention_idle_limit: default_retention_idle_limit(),
+            borrow: false,
         }
     }
 }

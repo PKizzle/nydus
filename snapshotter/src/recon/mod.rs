@@ -1046,6 +1046,7 @@ fn sweep_stale_daemon_dirs(
             );
             continue;
         }
+        nydus_storage::cache::release_lenders_under(&path);
         match std::fs::remove_dir_all(&path) {
             Ok(()) => {
                 removed += 1;

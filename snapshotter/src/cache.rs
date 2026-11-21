@@ -453,6 +453,9 @@ impl CacheManager {
     }
 
     fn remove_entry(&self, entry: &CacheEntry, dry_run: bool, report: &mut CacheGcReport) {
+        if !dry_run {
+            nydus_storage::cache::release_lenders_under(&entry.path);
+        }
         if !dry_run && let Err(e) = fs::remove_file(&entry.path) {
             warn!(
                 path = %entry.path.display(),

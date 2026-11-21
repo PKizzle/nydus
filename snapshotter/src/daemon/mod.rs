@@ -41,7 +41,7 @@ use tracing::{debug, info, warn};
 
 use crate::config::{FsDriverType, SnapshotterConfig};
 use crate::daemon::config_builder::{
-    build_backend_config, build_blob_cache_entry, build_daemon_config,
+    borrow_patterns, build_backend_config, build_blob_cache_entry, build_daemon_config,
     build_fanotify_blob_cache_entry, inode_share_domain, localfs_backend,
 };
 use crate::daemon::image_ref::{ImageRef, parse_image_ref};
@@ -1215,6 +1215,7 @@ impl DaemonSupervisor {
             }
             // Close cache files a stopped daemon may still hold, or the removal frees nothing.
             nydus_storage::factory::BLOB_FACTORY.gc(None);
+            nydus_storage::cache::release_lenders_under(&dir);
             match fs::remove_dir_all(&dir) {
                 Ok(()) => Ok(true),
                 Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
@@ -1558,6 +1559,7 @@ impl DaemonSupervisor {
             slug,
             &stage_dir.join("bootstrap"),
             domain,
+            borrow_patterns(&self.config),
         )?;
         Ok(serde_json::json!({ "blobs": [entry] }))
     }
@@ -3784,6 +3786,7 @@ fn wipe_stage(stage_dir: &Path, keep: Option<&Path>) -> Result<()> {
         );
     }
     info!(stage = %stage_dir.display(), "removing the stage of another source");
+    nydus_storage::cache::release_lenders_under(stage_dir);
     // The source record and the staged bootstrap go last: until then an interrupted wipe still
     // looks staged from another source, and the next start finishes it.
     let (record, staged) = (
