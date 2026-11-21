@@ -221,6 +221,19 @@ A nydus manifest published as a sibling entry of the image's **own index** (the 
 detected under `[snapshotter.features].dual_index_detect` (default on), needs no signature, and
 gets the same blob-binding check against its own manifest.
 
+CRI sends the container-rootfs `Prepare` no image label, and an image ref in a call's labels is
+never used, so the image is named from the containerd image records of the parent's namespace
+that claim its chain ID, listed again on every lookup and read as containerd's Go decoder reads
+image JSON. Image-specific content (the dual-image, referrer and auto-accel paths) is served only
+for the chain's **sole claimant**: the targets one repository's tag records name, or a single
+target that only digest records name. Otherwise the container gets the plain overlay, which always
+holds the layers containerd applied (`snapshotter_ambiguous_chain_total`). The dual-image and
+referrer paths look the image up by its record target (`repo@digest`), and the nydus sibling must
+be listed in that index as containerd holds it, never in a tag resolved in the registry. An
+auto-accel artifact is built only from layers that decompress to the diff IDs their image config
+lists (`nydus-image create --diff-id`), so it holds the chain's content. An unpack `Prepare`
+(containerd applying a layer) always gets the plain overlay.
+
 On a served hit, `Prepare` downloads and digest-verifies the bootstrap (one priority selector —
 the `nydus-bootstrap` annotation first, then the bootstrap media type — so a data blob can never
 be mistaken for the bootstrap), then mounts it via `DaemonSupervisor::ensure_instance`, with the
