@@ -482,6 +482,8 @@ impl FileCacheEntry {
             digest_mismatches: AtomicU32::new(0),
             lenders,
             backend_served: AtomicBool::new(false),
+            #[cfg(test)]
+            after_failed_borrow: Mutex::new(None),
             own_ctime: AtomicU64::new(0),
             user_io_batch_size: mgr.user_io_batch_size,
             prefetch_config,

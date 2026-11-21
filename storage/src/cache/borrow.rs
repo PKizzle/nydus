@@ -96,6 +96,15 @@ impl Lender {
     /// (unlinked, released, replaced by another file, or struck out), and while an open that
     /// failed for a passing reason waits to be tried again.
     pub(crate) fn file(&self) -> Option<Arc<File>> {
+        self.file_at(Instant::now(), open_quiet)
+    }
+
+    /// [`Self::file`] at the time `now`, opening with `open`.
+    fn file_at(
+        &self,
+        now: Instant,
+        open: impl Fn(&Path) -> Result<File, Open>,
+    ) -> Option<Arc<File>> {
         if self.strikes.load(Ordering::Acquire) >= MAX_STRIKES {
             return None;
         }
@@ -105,16 +114,11 @@ impl Lender {
         {
             return Some(file.clone());
         }
-        if self
-            .next_open
-            .lock()
-            .unwrap()
-            .is_some_and(|t| Instant::now() < t)
-        {
+        if self.next_open.lock().unwrap().is_some_and(|t| now < t) {
             return None;
         }
         // Opened outside the lock: a quiet open runs a helper thread and may take a while.
-        let file = match open_quiet(&self.path) {
+        let file = match open(&self.path) {
             Ok(file)
                 if file
                     .metadata()
@@ -125,7 +129,7 @@ impl Lender {
             Err(Open::Transient(e)) => {
                 let failures = self.open_failures.fetch_add(1, Ordering::AcqRel).min(6);
                 let wait = Duration::from_secs(1 << failures).min(MAX_OPEN_BACKOFF);
-                *self.next_open.lock().unwrap() = Some(Instant::now() + wait);
+                *self.next_open.lock().unwrap() = Some(now + wait);
                 debug!(
                     "lender {}: open failed ({e}), retrying in {wait:?}",
                     self.path.display()
@@ -297,5 +301,72 @@ pub(crate) fn has_data(file: &File, offset: u64, len: u64) -> bool {
     {
         let _ = (file, offset, len);
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An open that fails for a passing reason is no strike, is not tried again before its
+    /// backoff ends, is tried again after it, and a success clears the failure count.
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support file-backed mmap")]
+    fn a_transient_open_failure_backs_off_without_a_strike() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("lender.blob.data");
+        std::fs::write(&path, b"data").unwrap();
+        let md = std::fs::metadata(&path).unwrap();
+        let lender = Lender {
+            path: path.clone(),
+            id: (md.dev(), md.ino()),
+            strikes: AtomicU32::new(0),
+            open_failures: AtomicU32::new(0),
+            next_open: Mutex::new(None),
+        };
+        let opens = std::sync::atomic::AtomicUsize::new(0);
+        let emfile = |_: &Path| {
+            opens.fetch_add(1, Ordering::SeqCst);
+            Err(Open::Transient(std::io::Error::from_raw_os_error(
+                libc::EMFILE,
+            )))
+        };
+        let t0 = Instant::now();
+        let at = |ms| t0 + Duration::from_millis(ms);
+
+        assert!(lender.file_at(at(0), emfile).is_none());
+        assert_eq!(opens.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            lender.strikes.load(Ordering::SeqCst),
+            0,
+            "a passing failure struck"
+        );
+        // Within the first backoff (1 s): not tried again.
+        assert!(lender.file_at(at(900), emfile).is_none());
+        assert_eq!(
+            opens.load(Ordering::SeqCst),
+            1,
+            "retried within the backoff"
+        );
+        // After it: tried again, and the next backoff doubles (2 s).
+        assert!(lender.file_at(at(1_100), emfile).is_none());
+        assert_eq!(opens.load(Ordering::SeqCst), 2);
+        assert!(lender.file_at(at(3_000), emfile).is_none());
+        assert_eq!(
+            opens.load(Ordering::SeqCst),
+            2,
+            "retried within the doubled backoff"
+        );
+        assert_eq!(lender.open_failures.load(Ordering::SeqCst), 2);
+
+        let file = lender.file_at(at(3_200), |p| File::open(p).map_err(|_| Open::Gone));
+        assert!(file.is_some(), "not opened once the backoff ended");
+        assert_eq!(
+            lender.open_failures.load(Ordering::SeqCst),
+            0,
+            "success kept the count"
+        );
+        assert_eq!(lender.strikes.load(Ordering::SeqCst), 0);
+        release_lenders_under(dir.path());
     }
 }

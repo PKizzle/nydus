@@ -321,6 +321,10 @@ pub(crate) struct FileCacheEntry {
     // Whether this entry's own backend has served chunk data: until then nothing is borrowed,
     // so an image that cannot read the blob itself gets no bytes from other images' caches.
     pub(crate) backend_served: AtomicBool,
+    // Runs when persisting a borrowed chunk failed, for tests to act in that window.
+    #[cfg(test)]
+    #[allow(clippy::type_complexity)]
+    pub(crate) after_failed_borrow: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
     // The latest data file change time seen after a write of this entry: a later one at seal
     // time means something else wrote the file.
     pub(crate) own_ctime: AtomicU64,
@@ -1944,6 +1948,10 @@ impl FileCacheEntry {
                     chunk.id(),
                     lender.path().display()
                 );
+            }
+            #[cfg(test)]
+            if !ready && let Some(hook) = self.after_failed_borrow.lock().unwrap().as_ref() {
+                hook();
             }
             return Some(ready);
         }
@@ -3838,6 +3846,7 @@ mod borrow_tests {
 
     use super::*;
     use crate::backend::{BackendResult, BlobBackend};
+    #[cfg(target_os = "linux")]
     use crate::cache::borrow::release_lenders_under;
     use crate::cache::{BLOB_DATA_FILE_SUFFIX, BORROW_IDENTITY_FILE, FileCacheMgr};
     use crate::device::BlobFeatures;
@@ -4009,6 +4018,7 @@ mod borrow_tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support file-backed mmap")]
     fn borrows_what_a_lender_holds_after_one_own_read() {
         let root = TempDir::new().unwrap();
         let chunks = chunks(&blob_info());
@@ -4032,6 +4042,7 @@ mod borrow_tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support file-backed mmap")]
     fn nothing_is_borrowed_before_an_own_backend_read() {
         let root = TempDir::new().unwrap();
         let chunks = chunks(&blob_info());
@@ -4044,6 +4055,7 @@ mod borrow_tests {
 
     /// Holes are skipped before reading, so they are no strike against the lender.
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support file-backed mmap")]
     #[cfg(target_os = "linux")]
     fn a_hole_in_the_lender_is_fetched() {
         let root = TempDir::new().unwrap();
@@ -4065,6 +4077,7 @@ mod borrow_tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support file-backed mmap")]
     fn a_lender_failing_validation_is_dropped_after_three_strikes() {
         let root = TempDir::new().unwrap();
         let chunks = chunks(&blob_info());
@@ -4087,6 +4100,7 @@ mod borrow_tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support file-backed mmap")]
     fn a_chunk_without_a_digest_is_not_borrowed() {
         let root = TempDir::new().unwrap();
         let info = blob_info();
@@ -4119,6 +4133,7 @@ mod borrow_tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support file-backed mmap")]
     fn raw_and_encrypted_caches_do_not_borrow() {
         let root = TempDir::new().unwrap();
         let chunks = chunks(&blob_info());
@@ -4137,6 +4152,7 @@ mod borrow_tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support file-backed mmap")]
     fn an_unlinked_lender_is_dropped() {
         let root = TempDir::new().unwrap();
         let chunks = chunks(&blob_info());
@@ -4154,6 +4170,7 @@ mod borrow_tests {
 
     /// A user read, the FUSE and block device path, borrows too.
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support file-backed mmap")]
     fn a_user_read_borrows() {
         use crate::device::{BlobIoChunk, BlobIoDesc, BlobIoVec};
 
@@ -4192,6 +4209,7 @@ mod borrow_tests {
     /// Only a cache dir naming the same backend identity lends: an image whose own backend is
     /// another registry, or that names none, borrows nothing even though it can read the blob.
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support file-backed mmap")]
     fn only_a_cache_of_the_same_backend_lends() {
         let root = TempDir::new().unwrap();
         let chunks = chunks(&blob_info());
@@ -4212,6 +4230,7 @@ mod borrow_tests {
     /// A chunk carrying the default digest (blob meta without inlined digests) is not borrowed,
     /// and trying it is no strike against the lender.
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support file-backed mmap")]
     fn a_default_digest_chunk_is_not_borrowed() {
         let root = TempDir::new().unwrap();
         let chunks = chunks(&blob_info());
@@ -4234,6 +4253,87 @@ mod borrow_tests {
         assert_eq!(b.reads(), 1, "the default digest struck the lender off");
     }
 
+    /// A user read whose borrowed chunk cannot be written takes the chunk's pending mark again
+    /// before fetching it, so it waits for another reader that marked the chunk meanwhile and
+    /// never clears that reader's mark.
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support file-backed mmap")]
+    fn a_user_read_whose_borrowed_write_fails_holds_its_mark() {
+        use crate::device::{BlobIoChunk, BlobIoDesc, BlobIoVec};
+        use std::os::unix::io::AsRawFd;
+
+        let root = TempDir::new().unwrap();
+        let info = blob_info();
+        let chunks = chunks(&info);
+        Image::plain(root.path(), "a").fetch(&chunks);
+        let b = Image::plain(root.path(), "b");
+        b.fetch(&chunks[..1]);
+        // Every later write of b's cache fails: its descriptor now reads only.
+        let read_only = std::fs::File::open(b.data_file()).unwrap();
+        // SAFETY: both descriptors are open; the cache's number now names a read-only file.
+        assert!(unsafe { libc::dup2(read_only.as_raw_fd(), b.entry.file.as_raw_fd()) } >= 0);
+        // Another reader marks the chunk in the window the failed write opens, and checks its
+        // mark is still its own before giving it up.
+        let other_kept_its_mark = Arc::new(Mutex::new(None));
+        {
+            let (entry, chunk, kept) = (
+                Arc::downgrade(&b.entry),
+                chunks[1].clone(),
+                other_kept_its_mark.clone(),
+            );
+            *b.entry.after_failed_borrow.lock().unwrap() = Some(Box::new(move || {
+                let entry = entry.upgrade().unwrap();
+                assert!(
+                    !entry
+                        .chunk_map
+                        .check_ready_and_mark_pending(chunk.as_ref())
+                        .unwrap()
+                );
+                let (chunk, kept) = (chunk.clone(), kept.clone());
+                std::thread::spawn(move || {
+                    std::thread::sleep(Duration::from_millis(300));
+                    *kept.lock().unwrap() =
+                        Some(entry.chunk_map.is_pending(chunk.as_ref()).unwrap());
+                    entry.chunk_map.clear_pending(chunk.as_ref());
+                });
+            }));
+        }
+        let mut iovec = BlobIoVec::new(info.clone());
+        iovec.push(BlobIoDesc::new(
+            info.clone(),
+            BlobIoChunk::from(chunks[1].clone()),
+            0,
+            CHUNK as u32,
+            true,
+        ));
+        let mut buf = vec![0u8; CHUNK as usize];
+        // SAFETY: `buf` outlives the read and is not otherwise accessed during it.
+        let slice = unsafe { FileVolatileSlice::from_raw_ptr(buf.as_mut_ptr(), buf.len()) };
+        assert_eq!(b.entry.read(&mut iovec, &[slice]).unwrap(), CHUNK as usize);
+        assert!(
+            buf.iter()
+                .enumerate()
+                .all(|(i, v)| *v == byte(CHUNK + i as u64))
+        );
+        assert_eq!(
+            b.reads(),
+            2,
+            "the chunk was not fetched after the failed borrow"
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while other_kept_its_mark.lock().unwrap().is_none()
+            || b.entry.chunk_map.is_pending(chunks[1].as_ref()).unwrap()
+        {
+            assert!(Instant::now() < deadline, "a mark was left pending");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(
+            *other_kept_its_mark.lock().unwrap(),
+            Some(true),
+            "the read cleared another reader's mark"
+        );
+    }
+
     /// Descriptors of this process open on `path`.
     #[cfg(target_os = "linux")]
     fn fds_on(path: &Path) -> usize {
@@ -4245,6 +4345,7 @@ mod borrow_tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support file-backed mmap")]
     #[cfg(target_os = "linux")]
     fn releasing_a_dir_closes_its_lender_descriptors() {
         let root = TempDir::new().unwrap();
