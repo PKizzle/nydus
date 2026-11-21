@@ -5,7 +5,7 @@
 //! fanotify helpers shared by the blob cache and the fanotify pre-content handler.
 
 use std::fs::File;
-use std::io::{ErrorKind, Result};
+use std::io::{self, ErrorKind};
 use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 
 /// How long [`open_without_events`] waits for its own opens to arrive as events.
@@ -15,7 +15,7 @@ const OPEN_WITHOUT_EVENTS_TIMEOUT: std::time::Duration = std::time::Duration::fr
 /// of one private fanotify group, returning one descriptor per input, in order. The kernel opens
 /// event descriptors with `FMODE_NONOTIFY`, so I/O through them raises no fanotify events even
 /// while the inodes carry pre-content marks.
-pub fn open_without_events(fds: &[RawFd], writable: bool) -> Result<Vec<OwnedFd>> {
+pub fn open_without_events(fds: &[RawFd], writable: bool) -> io::Result<Vec<OwnedFd>> {
     open_without_events_via(fds, writable, |path| File::open(path))
 }
 
@@ -26,8 +26,8 @@ pub fn open_without_events(fds: &[RawFd], writable: bool) -> Result<Vec<OwnedFd>
 fn open_without_events_via(
     fds: &[RawFd],
     writable: bool,
-    open: impl Fn(&str) -> Result<File> + Send + 'static,
-) -> Result<Vec<OwnedFd>> {
+    open: impl Fn(&str) -> io::Result<File> + Send + 'static,
+) -> io::Result<Vec<OwnedFd>> {
     if fds.is_empty() {
         return Ok(Vec::new());
     }
@@ -68,7 +68,7 @@ fn open_without_events_via(
     let identities = fds
         .iter()
         .map(|&fd| fd_identity(fd))
-        .collect::<Result<Vec<_>>>()?;
+        .collect::<io::Result<Vec<_>>>()?;
     let paths: Vec<String> = fds.iter().map(|fd| format!("/proc/self/fd/{fd}")).collect();
     let (opened_tx, opened) = std::sync::mpsc::channel();
     let opener = std::thread::spawn(move || {
@@ -151,7 +151,7 @@ fn open_without_events_via(
 /// Get the `(st_dev, st_ino)` identity of an open file descriptor.
 ///
 /// Used to map an event fd back to the file it refers to, without depending on path names.
-pub fn fd_identity(fd: RawFd) -> Result<(u64, u64)> {
+pub fn fd_identity(fd: RawFd) -> io::Result<(u64, u64)> {
     // SAFETY: `stat` is plain-old-data; `fstat` only writes into it.
     let mut st: libc::stat = unsafe { std::mem::zeroed() };
     // SAFETY: `st` is a writable `stat` that outlives the call; a bad fd only makes `fstat` fail.
@@ -168,9 +168,7 @@ pub fn fd_identity(fd: RawFd) -> Result<(u64, u64)> {
 /// is too small or runs past the buffer means the *next* record boundary is guesswork, and a
 /// misread `fd` field would have the caller answer on (or close) an arbitrary descriptor.
 ///
-/// Only used off the hot path (shutdown drain, structural-failure recovery); the serving loop
-/// of the fanotify handler needs per-record error handling and does its
-/// own walk.
+/// The fanotify handler's serving loop does its own walk, with per-record error handling.
 pub fn for_each_parsable_event(
     buf: &[u8],
     mut f: impl FnMut(&libc::fanotify_event_metadata, &[u8]),
