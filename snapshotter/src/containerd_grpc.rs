@@ -21,8 +21,8 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -31,7 +31,7 @@ use http::header::HeaderValue;
 use hyper::body::Incoming;
 use hyper::client::conn::http2::{self, SendRequest};
 use send_wrapper::SendWrapper;
-use tracing::debug;
+use tracing::{debug, info, warn};
 
 /// HTTP/2 PING interval. With `keep_alive_while_idle`, a containerd that went away is noticed
 /// between calls instead of on the next one.
@@ -59,6 +59,59 @@ pub fn containerd_reachable() -> Option<bool> {
         REACHED => Some(true),
         UNREACHED => Some(false),
         _ => None,
+    }
+}
+
+/// containerd's version string, once [`probe_version`] learned it.
+static VERSION: OnceLock<String> = OnceLock::new();
+
+/// containerd's version string; `None` until containerd answered.
+pub fn containerd_version() -> Option<&'static str> {
+    VERSION.get().map(String::as_str)
+}
+
+/// Whether containerd passes each layer's diff ID to `Prepare` (the
+/// `containerd.io/snapshot/diff-id` label, set by 2.3 and later), which the
+/// snapshotter needs to commit a nydus data layer. `None` until the version
+/// is known, or when it does not parse.
+pub fn containerd_passes_diff_id() -> Option<bool> {
+    containerd_version().and_then(version_passes_diff_id)
+}
+
+fn version_passes_diff_id(version: &str) -> Option<bool> {
+    let mut parts = version.trim_start_matches('v').split(['.', '-', '+']);
+    let major: u32 = parts.next()?.parse().ok()?;
+    let minor: u32 = parts.next()?.parse().ok()?;
+    Some((major, minor) >= (2, 3))
+}
+
+/// Ask containerd for its version until it answers (it starts after the
+/// snapshotter), and warn when it is too old to pass diff IDs: pulls of
+/// nydus images fail on such a containerd.
+pub async fn probe_version(channel: ContainerdChannel) {
+    use crate::containerd_api::services::version::v1::version_client::VersionClient;
+    loop {
+        match VersionClient::new(channel.clone()).version(()).await {
+            Ok(response) => {
+                let version = response.into_inner().version;
+                match version_passes_diff_id(&version) {
+                    Some(false) => warn!(
+                        containerd = %version,
+                        "containerd is older than 2.3 and passes no layer diff IDs: pulls of nydus images (nydus-blob layers) are refused"
+                    ),
+                    Some(true) => info!(containerd = %version, "containerd version"),
+                    None => {
+                        info!(containerd = %version, "containerd version not recognised; assuming it passes layer diff IDs")
+                    }
+                }
+                let _ = VERSION.set(version);
+                return;
+            }
+            Err(status) => {
+                debug!(error = %status, "containerd version unknown yet");
+                compio::time::sleep(Duration::from_secs(10)).await;
+            }
+        }
     }
 }
 
@@ -547,6 +600,22 @@ mod tests {
             }
             assert!(found, "no ChannelError::Connect in {status:?}");
         });
+    }
+
+    #[test]
+    fn containerd_2_3_and_later_pass_diff_ids() {
+        for (version, passes) in [
+            ("v2.3.7", Some(true)),
+            ("2.3.0", Some(true)),
+            ("v2.3.7-k3s1", Some(true)),
+            ("v3.0.0", Some(true)),
+            ("v2.2.9", Some(false)),
+            ("v1.7.28", Some(false)),
+            ("v2.1.4+unknown", Some(false)),
+            ("devel", None),
+        ] {
+            assert_eq!(version_passes_diff_id(version), passes, "{version}");
+        }
     }
 
     #[test]

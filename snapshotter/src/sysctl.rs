@@ -854,7 +854,19 @@ fn handle_readyz(controller: &SystemController) -> HttpResponse {
         return error_response(503, "not ready: gRPC socket path not configured");
     };
     match std::os::unix::net::UnixStream::connect(socket) {
-        Ok(_) => json_response(200, serde_json::json!({ "status": "ready" })),
+        // Ready either way: plain images still pull on an older containerd.
+        Ok(_) => json_response(
+            200,
+            serde_json::json!({
+                "status": "ready",
+                "containerd_version": crate::containerd_grpc::containerd_version(),
+                "nydus_image_pulls": match crate::containerd_grpc::containerd_passes_diff_id() {
+                    Some(false) => "refused: containerd older than 2.3 passes no layer diff IDs",
+                    Some(true) => "supported",
+                    None => "unknown",
+                },
+            }),
+        ),
         Err(e) => error_response(
             503,
             format!(

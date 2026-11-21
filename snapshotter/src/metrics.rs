@@ -229,6 +229,10 @@ impl SnapshotterMetrics {
         self.render_ambiguous_chain(&mut out);
         self.render_auto_zran(&mut out);
         render_containerd_reachable(&mut out, crate::containerd_grpc::containerd_reachable());
+        render_containerd_passes_diff_id(
+            &mut out,
+            crate::containerd_grpc::containerd_passes_diff_id(),
+        );
         out
     }
 
@@ -622,6 +626,20 @@ fn render_containerd_reachable(out: &mut String, reachable: Option<bool>) {
             "Whether the latest call to containerd reached it (1) or could not connect (0).",
         );
         push_metric(out, "snapshotter_containerd_reachable", reachable as u64);
+    }
+}
+
+/// `snapshotter_containerd_passes_diff_id`: whether containerd's version (2.3 or later) passes
+/// the layer diff IDs nydus image pulls need; 0 means those pulls are refused. Absent until
+/// containerd's version is known.
+fn render_containerd_passes_diff_id(out: &mut String, passes: Option<bool>) {
+    if let Some(passes) = passes {
+        push_help_gauge(
+            out,
+            "snapshotter_containerd_passes_diff_id",
+            "Whether containerd passes layer diff IDs (2.3 or later); without them nydus image pulls are refused (0).",
+        );
+        push_metric(out, "snapshotter_containerd_passes_diff_id", passes as u64);
     }
 }
 
