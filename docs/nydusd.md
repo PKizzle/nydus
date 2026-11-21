@@ -57,6 +57,18 @@ sudo nydusd \
 
 For registry backend, we can set authorization with environment variable `IMAGE_PULL_AUTH` to avoid loading `auth` from nydusd configuration file.
 
+#### File handles
+
+A RAFS daemon negotiates FUSE `EXPORT_SUPPORT`, so file handles taken with `name_to_handle_at(2)`
+stay valid after the kernel evicts their dentries: `open_by_handle_at(2)`, an NFS export of the
+mountpoint and overlayfs `index=on` over it reopen files and directories by handle. The kernel looks
+an evicted node id up again through "." and ".." lookups, which nydusd answers with the node ids the
+kernel already has (fuse-backend-rs carries a local patch for this, see
+[dependencies.md](dependencies.md)). RAFS inode numbers are fixed by the image, so a handle keeps
+naming the same file while the image stays mounted. A passthrough backend mounted into the same daemon
+answers a handle whose inode it has forgotten with `ESTALE`. `misc/fusedev/file-handles.sh` checks
+this end to end.
+
 ### Run With Virtio-FS
 If no `/path/to/bootstrap` is available, please refer to [nydus-image.md](https://github.com/dragonflyoss/nydus/blob/master/docs/nydus-image.md) for more details.
 
