@@ -138,6 +138,9 @@ cuts a release that lets us switch to a version requirement.
     of warn; the kernel sends one FORGET per inode it had cached below the
     mountpoint, so a shared daemon unmounting images flooded the log (upstream
     4d1bb74).
+  - `Vfs` passes xattr names containing '/' to the file system instead of
+    answering EINVAL; Linux allows '/' in an xattr name, so such an xattr in an
+    image could not be read through nydusd (upstream 53985a0).
 - **Upstream PR/issue status**: filed,
   https://github.com/cloud-hypervisor/fuse-backend-rs/pull/376 (open).
 - **Drop trigger**: upstream releases the fix (PR #376) together with the

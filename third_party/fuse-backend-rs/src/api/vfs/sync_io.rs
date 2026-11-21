@@ -475,8 +475,7 @@ impl FileSystem for Vfs {
         value: &[u8],
         flags: u32,
     ) -> Result<()> {
-        validate_path_component(name)?;
-
+        // NYDUS LOCAL PATCH (upstream 53985a0): an xattr name is not a path component.
         match self.get_real_rootfs(inode)? {
             (Left(fs), idata) => fs.setxattr(ctx, idata.ino(), name, value, flags),
             (Right(fs), idata) => fs.setxattr(ctx, idata.ino(), name, value, flags),
@@ -490,8 +489,7 @@ impl FileSystem for Vfs {
         name: &CStr,
         size: u32,
     ) -> Result<GetxattrReply> {
-        validate_path_component(name)?;
-
+        // NYDUS LOCAL PATCH (upstream 53985a0): an xattr name is not a path component.
         match self.get_real_rootfs(inode)? {
             (Left(fs), idata) => fs.getxattr(ctx, idata.ino(), name, size),
             (Right(fs), idata) => fs.getxattr(ctx, idata.ino(), name, size),
@@ -506,8 +504,7 @@ impl FileSystem for Vfs {
     }
 
     fn removexattr(&self, ctx: &Context, inode: VfsInode, name: &CStr) -> Result<()> {
-        validate_path_component(name)?;
-
+        // NYDUS LOCAL PATCH (upstream 53985a0): an xattr name is not a path component.
         match self.get_real_rootfs(inode)? {
             (Left(fs), idata) => fs.removexattr(ctx, idata.ino(), name),
             (Right(fs), idata) => fs.removexattr(ctx, idata.ino(), name),

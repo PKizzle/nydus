@@ -1964,4 +1964,26 @@ mod tests {
         let (attr, _) = vfs.getattr(&ctx, ROOT_ID.into(), None).unwrap();
         assert_eq!(entry.attr.st_ino, attr.st_ino);
     }
+
+    // NYDUS LOCAL PATCH: ported from upstream 53985a0.
+    #[test]
+    fn test_xattr_name_with_slash() {
+        fn errno<T>(res: Result<T>) -> Option<i32> {
+            res.err().and_then(|e| e.raw_os_error())
+        }
+
+        let vfs = Vfs::new(VfsOptions::default());
+        vfs.mount(Box::new(FakeFileSystemOne {}), "/x").unwrap();
+        let ctx = Context::new();
+        let x = vfs.lookup(&ctx, ROOT_ID.into(), &CString::new("x").unwrap());
+        let inode = x.unwrap().inode.into();
+
+        // Linux allows '/' in xattr names, so the requests reach the file system, whose
+        // default handlers answer ENOSYS.
+        let name = CString::new("user.a/b").unwrap();
+        let enosys = Some(libc::ENOSYS);
+        assert_eq!(errno(vfs.setxattr(&ctx, inode, &name, b"v", 0)), enosys);
+        assert_eq!(errno(vfs.getxattr(&ctx, inode, &name, 0)), enosys);
+        assert_eq!(errno(vfs.removexattr(&ctx, inode, &name)), enosys);
+    }
 }
