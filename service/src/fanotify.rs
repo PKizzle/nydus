@@ -2853,12 +2853,25 @@ mod tests {
         let pattern = format!("{}/*/stage", dir.path().display());
         let (work, mgr) =
             fanotify_fixture_borrowing(dir.path(), "borrow-borrower", &[pattern]).unwrap();
-        let serve = |work: &tempfile::TempDir, mgr: Arc<BlobCacheMgr>| {
+        let serve = |work: &tempfile::TempDir, mgr: Arc<BlobCacheMgr>, prime: bool| {
             let (stage, mnt) = (work.path().join("stage"), work.path().join("mnt"));
             let handler = Arc::new(
                 FanotifyHandler::new(stage.to_str().unwrap(), mnt.to_str().unwrap(), mgr, 1)
                     .unwrap(),
             );
+            if prime {
+                // One chunk from the own backend opens the borrowing gate, so the mount's
+                // reads borrow the rest even where one event spans the whole blob (large pages).
+                let blob = handler.blob_backings[0].blob.blob();
+                let first = blob.get_chunk_info(0).unwrap();
+                blob.get_blob_object()
+                    .unwrap()
+                    .fetch_range_uncompressed(
+                        first.uncompressed_offset(),
+                        first.uncompressed_size() as u64,
+                    )
+                    .unwrap();
+            }
             spawn_worker(&handler);
             handler.arm().unwrap();
             handler.mount().unwrap();
@@ -2868,7 +2881,7 @@ mod tests {
                 .collect();
             (handler, mnt, files)
         };
-        let (lender, lender_mnt, want) = serve(&lender_work, lender_mgr);
+        let (lender, lender_mnt, want) = serve(&lender_work, lender_mgr, false);
         let lender_file = lender_work
             .path()
             .join("stage")
@@ -2923,7 +2936,7 @@ mod tests {
         };
 
         let before = nydus_storage::cache::borrow_counters();
-        let (borrower, mnt, got) = serve(&work, mgr);
+        let (borrower, mnt, got) = serve(&work, mgr, true);
         assert_eq!(got, want, "the borrower reads other bytes than the lender");
         let borrowed = nydus_storage::cache::borrow_counters().chunks - before.chunks;
         let during = events.load(Ordering::SeqCst);
