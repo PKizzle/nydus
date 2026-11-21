@@ -924,6 +924,11 @@ pub struct FileCacheConfig {
     /// Key for data encryption, a heximal representation of [u8; 32].
     #[serde(default)]
     pub encryption_key: RedactedString,
+    /// Cache directories of other images to borrow chunk data from, each a path with one `*`
+    /// component, such as `<cache dir>/*`. A borrowed chunk is checked against this
+    /// cache's own digest before use. Empty turns borrowing off.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub borrow_from: Vec<String>,
 }
 
 impl FileCacheConfig {

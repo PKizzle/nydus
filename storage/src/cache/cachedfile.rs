@@ -31,6 +31,7 @@ use nydus_utils::metrics::{BlobcacheMetrics, Metric};
 use nydus_utils::{DelayType, Delayer, FileRangeReader, compress, round_up_usize};
 
 use crate::backend::BlobReader;
+use crate::cache::borrow::{Lender, count_borrowed, has_data};
 use crate::cache::state::{ChunkMap, RangeMap};
 use crate::cache::worker::{AsyncPrefetchConfig, AsyncPrefetchMessage, AsyncWorkerMgr};
 use crate::cache::{BlobCache, BlobIoMergeState, CasMgr};
@@ -315,6 +316,11 @@ pub(crate) struct FileCacheEntry {
     pub(crate) bootstrap_digests: Option<BootstrapDigests>,
     // Chunks of this blob that failed validation, for escalating the log.
     pub(crate) digest_mismatches: AtomicU32,
+    // Cache files of other images to borrow chunks of this blob from.
+    pub(crate) lenders: Vec<Lender>,
+    // Whether this entry's own backend has served chunk data: until then nothing is borrowed,
+    // so an image that cannot read the blob itself gets no bytes from other images' caches.
+    pub(crate) backend_served: AtomicBool,
     // The latest data file change time seen after a write of this entry: a later one at seal
     // time means something else wrote the file.
     pub(crate) own_ctime: AtomicU64,
@@ -1301,6 +1307,7 @@ impl BlobCache for FileCacheEntry {
                                 }
                                 Some(Ok(v)) => v,
                             };
+                            self.backend_served.store(true, Ordering::Release);
                             let _ = self.persist_chunk_data(chunk.as_ref(), &buf);
                         }
                     }
@@ -1764,6 +1771,11 @@ impl FileCacheEntry {
                 }
             }
         }
+        for (chunk, pending) in chunks.iter().zip(status.pending.iter_mut()) {
+            if *pending && self.borrow_chunk(chunk.as_ref()).is_some() {
+                *pending = false;
+            }
+        }
         let (start_idx, end_idx) = (
             status.pending.iter().position(|p| *p).unwrap_or(usize::MAX),
             status.pending.iter().rposition(|p| *p).unwrap_or(0),
@@ -1821,6 +1833,7 @@ impl FileCacheEntry {
                                 }
                                 Some(Ok(v)) => v,
                             };
+                            self.backend_served.store(true, Ordering::Release);
 
                             if *pending {
                                 if self.dio_enabled {
@@ -1859,6 +1872,7 @@ impl FileCacheEntry {
                         let mark = PendingMarks::new(self.chunk_map.as_ref(), vec![chunk.as_ref()]);
                         let mut buf = alloc_buf(chunk.uncompressed_size() as usize);
                         self.read_chunk_from_backend(chunk.as_ref(), &mut buf)?;
+                        self.backend_served.store(true, Ordering::Release);
                         if self.dio_enabled {
                             self.adjust_buffer_for_dio(&mut buf)
                         }
@@ -1877,6 +1891,59 @@ impl FileCacheEntry {
         }
 
         Ok(())
+    }
+
+    /// Fill `chunk`, which this thread marked pending, from a lender's cache file of this blob,
+    /// if one holds bytes matching this cache's own digest for it. `None` leaves the mark as it
+    /// was; otherwise the mark is resolved and the result says whether the chunk is ready.
+    fn borrow_chunk(&self, chunk: &dyn BlobChunkInfo) -> Option<bool> {
+        if self.lenders.is_empty()
+            || self.is_raw_data
+            || self.is_cache_encrypted
+            || !self.backend_served.load(Ordering::Acquire)
+        {
+            return None;
+        }
+        let digest = self.expected_chunk_digest(chunk)?;
+        let offset = chunk.uncompressed_offset();
+        let size = chunk.uncompressed_size() as usize;
+        let mut buf = alloc_buf(size);
+        for lender in &self.lenders {
+            let Some(file) = lender.file() else {
+                continue;
+            };
+            if !has_data(&file, offset, size as u64)
+                || std::os::unix::fs::FileExt::read_exact_at(file.as_ref(), &mut buf, offset)
+                    .is_err()
+            {
+                continue;
+            }
+            if !crate::utils::check_hash(&buf, &digest, self.blob_digester()) {
+                if lender.strike() {
+                    warn!(
+                        "blob {}: no longer borrowing from {}, whose data fails validation",
+                        self.blob_id,
+                        lender.path().display()
+                    );
+                }
+                continue;
+            }
+            if self.dio_enabled {
+                self.adjust_buffer_for_dio(&mut buf);
+            }
+            let ready = self.persist_chunk_data(chunk, &buf).is_ok();
+            if ready {
+                count_borrowed(size as u64);
+                debug!(
+                    "blob {}: borrowed chunk {} from {}",
+                    self.blob_id,
+                    chunk.id(),
+                    lender.path().display()
+                );
+            }
+            return Some(ready);
+        }
+        None
     }
 
     /// Whether the bytes the data file already holds at `chunk`'s extent match the digest a
@@ -1993,7 +2060,7 @@ impl FileCacheEntry {
                 .check_ready_and_mark_pending_until(chunk.as_ref(), deadline)
             {
                 Ok(true) => true,
-                Ok(false) => false,
+                Ok(false) => self.borrow_chunk(chunk.as_ref()) == Some(true),
                 Err(StorageError::Timeout) => false, // Retry if waiting for inflight IO timeouts
                 Err(e) => return Err(StorageError::InvalidArgument(e.to_string())),
             };
@@ -2233,6 +2300,7 @@ impl FileCacheEntry {
                 Arc::new(DataBuffer::Allocated(v.map_err(|e| {
                     StorageError::cache_io("allocate a chunk buffer", e)
                 })?));
+            self.backend_served.store(true, Ordering::Release);
             if region.tags[i] {
                 buffer_holder.push(d.clone());
             }
@@ -2307,6 +2375,7 @@ impl FileCacheEntry {
                 .inspect_err(|_e| {
                     self.chunk_map.clear_pending(chunk.as_ref());
                 })?;
+            self.backend_served.store(true, Ordering::Release);
             if self.is_raw_data {
                 match c {
                     Some(v) => {
@@ -3738,5 +3807,348 @@ mod tests {
             &file_cache_meta.get_blob_meta().unwrap(),
             &shared,
         ));
+    }
+}
+
+#[cfg(test)]
+mod borrow_tests {
+    use std::os::unix::fs::FileExt;
+    use std::path::Path;
+    use std::sync::atomic::AtomicUsize;
+
+    use nydus_api::{CacheConfigV2, FileCacheConfig, RedactedString};
+    use nydus_utils::metrics::BackendMetrics;
+    use tempfile::TempDir;
+
+    use super::*;
+    use crate::backend::{BackendResult, BlobBackend};
+    use crate::cache::borrow::release_lenders_under;
+    use crate::cache::{BLOB_DATA_FILE_SUFFIX, FileCacheMgr};
+    use crate::device::BlobFeatures;
+    use crate::test::MockChunkInfo;
+
+    const CHUNK: u64 = 4096;
+    const CHUNKS: u32 = 8;
+    const BLOB: &str = "borrowblob";
+
+    fn byte(offset: u64) -> u8 {
+        (offset.wrapping_mul(31) % 251) as u8
+    }
+
+    /// A backend serving `byte(offset)` that counts its reads.
+    #[derive(Clone)]
+    struct CountingBackend {
+        reads: Arc<AtomicUsize>,
+        metrics: Arc<BackendMetrics>,
+    }
+
+    impl BlobReader for CountingBackend {
+        fn blob_size(&self) -> BackendResult<u64> {
+            Ok(CHUNK * CHUNKS as u64)
+        }
+
+        fn try_read(&self, buf: &mut [u8], offset: u64) -> BackendResult<usize> {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            for (i, b) in buf.iter_mut().enumerate() {
+                *b = byte(offset + i as u64);
+            }
+            Ok(buf.len())
+        }
+
+        fn metrics(&self) -> &BackendMetrics {
+            &self.metrics
+        }
+    }
+
+    impl BlobBackend for CountingBackend {
+        fn shutdown(&self) {}
+
+        fn metrics(&self) -> &BackendMetrics {
+            &self.metrics
+        }
+
+        fn get_reader(&self, _blob_id: &str) -> BackendResult<Arc<dyn BlobReader>> {
+            Ok(Arc::new(self.clone()))
+        }
+    }
+
+    fn blob_info() -> Arc<BlobInfo> {
+        let size = CHUNK * CHUNKS as u64;
+        Arc::new(BlobInfo::new(
+            0,
+            BLOB.to_string(),
+            size,
+            size,
+            CHUNK as u32,
+            CHUNKS,
+            BlobFeatures::empty(),
+        ))
+    }
+
+    fn chunks(info: &BlobInfo) -> Vec<Arc<dyn BlobChunkInfo>> {
+        (0..CHUNKS)
+            .map(|i| {
+                let offset = i as u64 * CHUNK;
+                let data: Vec<u8> = (offset..offset + CHUNK).map(byte).collect();
+                Arc::new(MockChunkInfo {
+                    block_id: RafsDigest::from_buf(&data, info.digester()),
+                    index: i,
+                    compress_size: CHUNK as u32,
+                    uncompress_size: CHUNK as u32,
+                    compress_offset: offset,
+                    uncompress_offset: offset,
+                    ..Default::default()
+                }) as Arc<dyn BlobChunkInfo>
+            })
+            .collect()
+    }
+
+    /// One image's cache of the blob in `<root>/<name>`, borrowing from `<root>/*`.
+    struct Image {
+        _mgr: FileCacheMgr,
+        entry: Arc<FileCacheEntry>,
+        reads: Arc<AtomicUsize>,
+        dir: std::path::PathBuf,
+    }
+
+    impl Image {
+        fn open(root: &Path, name: &str, tweak: impl FnOnce(&mut CacheConfigV2)) -> Image {
+            static IDS: AtomicUsize = AtomicUsize::new(0);
+            let id = format!("borrow-test-{}", IDS.fetch_add(1, Ordering::SeqCst));
+            let dir = root.join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            let mut config = CacheConfigV2 {
+                cache_type: "filecache".to_string(),
+                file_cache: Some(FileCacheConfig {
+                    work_dir: dir.display().to_string(),
+                    borrow_from: vec![format!("{}/*", root.display())],
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            tweak(&mut config);
+            let reads = Arc::new(AtomicUsize::new(0));
+            let backend = Arc::new(CountingBackend {
+                reads: reads.clone(),
+                metrics: BackendMetrics::new(&id, "mock"),
+            });
+            let mgr =
+                FileCacheMgr::new(&config, backend, &id, 0, MetadataSource::default()).unwrap();
+            let entry = mgr.get_or_create_cache_entry(&blob_info()).unwrap();
+            Image {
+                _mgr: mgr,
+                entry,
+                reads,
+                dir,
+            }
+        }
+
+        fn plain(root: &Path, name: &str) -> Image {
+            Image::open(root, name, |_| {})
+        }
+
+        fn fetch(&self, chunks: &[Arc<dyn BlobChunkInfo>]) {
+            self.entry.fetch_chunk_run(chunks, false).unwrap();
+        }
+
+        fn reads(&self) -> usize {
+            self.reads.load(Ordering::SeqCst)
+        }
+
+        fn data_file(&self) -> std::path::PathBuf {
+            self.dir.join(format!("{BLOB}{BLOB_DATA_FILE_SUFFIX}"))
+        }
+
+        fn assert_holds(&self, chunks: &[Arc<dyn BlobChunkInfo>]) {
+            let mut buf = vec![0u8; CHUNK as usize];
+            for c in chunks {
+                assert!(self.entry.chunk_map.is_ready(c.as_ref()).unwrap());
+                self.entry
+                    .file
+                    .read_exact_at(&mut buf, c.uncompressed_offset())
+                    .unwrap();
+                assert!(
+                    buf.iter()
+                        .enumerate()
+                        .all(|(i, b)| *b == byte(c.uncompressed_offset() + i as u64))
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn borrows_what_a_lender_holds_after_one_own_read() {
+        let root = TempDir::new().unwrap();
+        let chunks = chunks(&blob_info());
+        let a = Image::plain(root.path(), "a");
+        a.fetch(&chunks);
+        assert_eq!(a.reads(), 1);
+
+        let b = Image::plain(root.path(), "b");
+        assert_eq!(
+            b.entry.lenders.len(),
+            1,
+            "a is b's only lender, b is not its own"
+        );
+        b.fetch(&chunks[..1]);
+        assert_eq!(b.reads(), 1, "the gate needs one read of b's own");
+        for c in &chunks[1..] {
+            b.fetch(std::slice::from_ref(c));
+        }
+        assert_eq!(b.reads(), 1, "b fetched chunks a holds");
+        b.assert_holds(&chunks);
+    }
+
+    #[test]
+    fn nothing_is_borrowed_before_an_own_backend_read() {
+        let root = TempDir::new().unwrap();
+        let chunks = chunks(&blob_info());
+        Image::plain(root.path(), "a").fetch(&chunks);
+        let b = Image::plain(root.path(), "b");
+        b.fetch(&chunks[1..2]);
+        assert_eq!(b.reads(), 1, "b borrowed before its own backend served it");
+        b.assert_holds(&chunks[1..2]);
+    }
+
+    /// Holes are skipped before reading, so they are no strike against the lender.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn a_hole_in_the_lender_is_fetched() {
+        let root = TempDir::new().unwrap();
+        let chunks = chunks(&blob_info());
+        let a = Image::plain(root.path(), "a");
+        a.fetch(&chunks[..2]);
+        a.fetch(&chunks[5..6]);
+        let b = Image::plain(root.path(), "b");
+        b.fetch(&chunks[..1]);
+        b.fetch(&chunks[1..2]);
+        assert_eq!(b.reads(), 1);
+        for c in &chunks[2..5] {
+            b.fetch(std::slice::from_ref(c));
+        }
+        assert_eq!(b.reads(), 4, "chunks 2 to 4 are holes in a");
+        b.fetch(&chunks[5..6]);
+        assert_eq!(b.reads(), 4, "holes struck a off");
+        b.assert_holds(&chunks[..6]);
+    }
+
+    #[test]
+    fn a_lender_failing_validation_is_dropped_after_three_strikes() {
+        let root = TempDir::new().unwrap();
+        let chunks = chunks(&blob_info());
+        let a = Image::plain(root.path(), "a");
+        a.fetch(&chunks);
+        a.entry
+            .file
+            .write_all_at(&[0xa5; CHUNK as usize * 3], CHUNK)
+            .unwrap();
+        let b = Image::plain(root.path(), "b");
+        b.fetch(&chunks[..1]);
+        for (i, c) in chunks[1..4].iter().enumerate() {
+            b.fetch(std::slice::from_ref(c));
+            assert_eq!(b.reads(), 2 + i, "garbage in a was not fetched again");
+        }
+        assert!(b.entry.lenders[0].file().is_none(), "a was not dropped");
+        b.fetch(&chunks[4..5]);
+        assert_eq!(b.reads(), 5, "b borrowed from a dropped lender");
+        b.assert_holds(&chunks[..5]);
+    }
+
+    #[test]
+    fn a_chunk_without_a_digest_is_not_borrowed() {
+        let root = TempDir::new().unwrap();
+        let info = blob_info();
+        let chunks = chunks(&info);
+        Image::plain(root.path(), "a").fetch(&chunks);
+        let fanotify = |c: &mut CacheConfigV2| c.cache_type = "fanotify".to_string();
+        let b = Image::open(root.path(), "b", fanotify);
+        let mut digests: Vec<_> = chunks
+            .iter()
+            .map(|c| {
+                Some(ChunkDigestEntry {
+                    digest: *c.chunk_id(),
+                    uncompressed_offset: c.uncompressed_offset(),
+                    uncompressed_size: c.uncompressed_size(),
+                })
+            })
+            .collect();
+        digests[2] = None;
+        b.entry.add_chunk_digests(&digests).unwrap();
+        b.fetch(&chunks[..1]);
+        b.fetch(&chunks[1..2]);
+        assert_eq!(b.reads(), 1, "a chunk with a digest is borrowed");
+        assert!(
+            b.entry
+                .chunk_map
+                .check_ready_and_mark_pending(chunks[2].as_ref())
+                .is_ok()
+        );
+        assert_eq!(b.entry.borrow_chunk(chunks[2].as_ref()), None);
+    }
+
+    #[test]
+    fn raw_and_encrypted_caches_do_not_borrow() {
+        let root = TempDir::new().unwrap();
+        let chunks = chunks(&blob_info());
+        Image::plain(root.path(), "a").fetch(&chunks);
+        let raw = Image::open(root.path(), "raw", |c| c.cache_compressed = true);
+        let encrypted = Image::open(root.path(), "enc", |c| {
+            let f = c.file_cache.as_mut().unwrap();
+            f.enable_encryption = true;
+            f.encryption_key = RedactedString::new("01".repeat(16) + &"02".repeat(16));
+        });
+        for image in [raw, encrypted] {
+            assert!(image.entry.lenders.is_empty());
+            image.entry.backend_served.store(true, Ordering::Release);
+            assert_eq!(image.entry.borrow_chunk(chunks[1].as_ref()), None);
+        }
+    }
+
+    #[test]
+    fn an_unlinked_lender_is_dropped() {
+        let root = TempDir::new().unwrap();
+        let chunks = chunks(&blob_info());
+        let a = Image::plain(root.path(), "a");
+        a.fetch(&chunks);
+        let b = Image::plain(root.path(), "b");
+        b.fetch(&chunks[..1]);
+        b.fetch(&chunks[1..2]);
+        assert_eq!(b.reads(), 1);
+        std::fs::remove_file(a.data_file()).unwrap();
+        b.fetch(&chunks[2..3]);
+        assert_eq!(b.reads(), 2, "b borrowed from an unlinked file");
+        assert!(b.entry.lenders[0].file().is_none());
+    }
+
+    /// Descriptors of this process open on `path`.
+    #[cfg(target_os = "linux")]
+    fn fds_on(path: &Path) -> usize {
+        std::fs::read_dir("/proc/self/fd")
+            .unwrap()
+            .flatten()
+            .filter(|e| std::fs::read_link(e.path()).is_ok_and(|l| l == path))
+            .count()
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn releasing_a_dir_closes_its_lender_descriptors() {
+        let root = TempDir::new().unwrap();
+        let chunks = chunks(&blob_info());
+        let a = Image::plain(root.path(), "a");
+        a.fetch(&chunks);
+        let path = a.data_file();
+        let own = fds_on(&path);
+        let b = Image::plain(root.path(), "b");
+        b.fetch(&chunks[..2]);
+        b.fetch(&chunks[2..3]);
+        assert_eq!(b.reads(), 1);
+        assert_eq!(fds_on(&path), own + 1, "b holds one descriptor of a");
+        release_lenders_under(&root.path().join("a"));
+        assert_eq!(
+            fds_on(&path),
+            own,
+            "the lender descriptor outlived its release"
+        );
     }
 }

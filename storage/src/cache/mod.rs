@@ -38,6 +38,7 @@ use crate::meta::BlobCompressionContextInfo;
 use crate::utils::{AlignedBuf, alloc_buf, check_crc, check_hash, check_xxh3};
 use crate::{RAFS_MAX_CHUNK_SIZE, StorageError, StorageResult};
 
+mod borrow;
 mod cachedfile;
 #[cfg(feature = "dedup")]
 mod dedup;
@@ -47,6 +48,7 @@ mod worker;
 
 pub mod state;
 
+pub use borrow::{BorrowCounters, borrow_counters, release_lenders_under};
 pub use dummycache::DummyCacheMgr;
 pub use filecache::{BLOB_DATA_FILE_SUFFIX, BLOB_RAW_FILE_SUFFIX, FileCacheMgr};
 

@@ -15,6 +15,7 @@ use nydus_utils::metrics::BlobcacheMetrics;
 use crate::backend::BlobBackend;
 #[cfg(feature = "dedup")]
 use crate::cache::CasMgr;
+use crate::cache::borrow::find_lenders;
 use crate::cache::cachedfile::{BootstrapDigests, FileCacheEntry, FileCacheMeta, data_file_stamp};
 use crate::cache::state::{
     BlobStateMap, ChunkMap, DigestedChunkMap, IndexedChunkMap, NoopChunkMap,
@@ -49,6 +50,7 @@ pub struct FileCacheMgr {
     closed: Arc<AtomicBool>,
     user_io_batch_size: u32,
     metadata_source: MetadataSource,
+    borrow_from: Vec<String>,
 }
 
 impl FileCacheMgr {
@@ -88,6 +90,7 @@ impl FileCacheMgr {
             closed: Arc::new(AtomicBool::new(false)),
             user_io_batch_size,
             metadata_source,
+            borrow_from: blob_cfg.borrow_from.clone(),
         })
     }
 
@@ -98,7 +101,7 @@ impl FileCacheMgr {
 
     // Create a file cache entry for the specified blob object if not present, otherwise
     // return the existing one.
-    fn get_or_create_cache_entry(
+    pub(crate) fn get_or_create_cache_entry(
         &self,
         blob: &Arc<BlobInfo>,
     ) -> StorageResult<Arc<FileCacheEntry>> {
@@ -416,6 +419,16 @@ impl FileCacheEntry {
             (Default::default(), Default::default())
         };
 
+        let lenders = if mgr.cache_encrypted || mgr.cache_raw_data || is_tarfs {
+            Vec::new()
+        } else {
+            find_lenders(
+                &mgr.borrow_from,
+                &format!("{blob_id}{BLOB_DATA_FILE_SUFFIX}"),
+                &file,
+            )
+        };
+
         let mut blob_data_file_path = String::new();
         if cas_mgr.is_some() {
             blob_data_file_path = if let Some(path) = get_path_from_file(&file) {
@@ -466,6 +479,8 @@ impl FileCacheEntry {
             need_validation,
             bootstrap_digests,
             digest_mismatches: AtomicU32::new(0),
+            lenders,
+            backend_served: AtomicBool::new(false),
             own_ctime: AtomicU64::new(0),
             user_io_batch_size: mgr.user_io_batch_size,
             prefetch_config,
