@@ -832,10 +832,12 @@ pub fn create_vfs_backend(
             opts.no_open = true;
             // File handles (`open_by_handle_at`, NFS export, overlayfs `index=on`) survive dentry
             // eviction: the kernel looks a forgotten node id up again through "." and "..". RAFS
-            // inode numbers are fixed by the image, and the Vfs hands out a file system index
-            // again only after 255 further mounts in this daemon, so a node id keeps naming the
-            // same file. Any other backend mounted into this Vfs later answers a node id it has
-            // forgotten with an error, which the kernel reports as ESTALE.
+            // inode numbers are fixed by the image, and every inode carries a generation derived
+            // from the bootstrap, so a handle into a file system index the Vfs has since given to
+            // another image fails ESTALE instead of opening that image's file. Any other backend
+            // mounted into this Vfs later answers a node id it has forgotten with an error, which
+            // `open_by_handle_at` returns as ESTALE or as that error (passthrough: EBADF); it
+            // never opens a different file.
             opts.out_opts |= fuse_backend_rs::api::filesystem::FsOptions::EXPORT_SUPPORT;
         }
     };

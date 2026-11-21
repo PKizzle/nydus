@@ -115,7 +115,7 @@ pub trait FsService: Send + Sync {
         if self.backend_from_mountpoint(&cmd.mountpoint)?.is_some() {
             return Err(Error::AlreadyExists);
         }
-        let backend = fs_backend_factory(&cmd)?;
+        let (backend, generation) = fs_backend_factory(&cmd, None)?;
         let index = self.get_vfs().mount(backend, &cmd.mountpoint)?;
         info!("{} filesystem mounted at {}", &cmd.fs_type, &cmd.mountpoint);
 
@@ -126,7 +126,7 @@ pub trait FsService: Send + Sync {
             );
         }
         if let Some(mut mgr_guard) = self.upgrade_mgr() {
-            mgr_guard.add_mounts_state(cmd, index);
+            mgr_guard.add_mounts_state(cmd, index, generation);
             mgr_guard.save_vfs_stat(self.get_vfs())?;
         }
 
@@ -169,9 +169,10 @@ pub trait FsService: Send + Sync {
         Ok(())
     }
 
-    /// Restore a filesystem instance.
-    fn restore_mount(&self, cmd: &FsBackendMountCmd, vfs_index: u8) -> Result<()> {
-        let backend = fs_backend_factory(cmd)?;
+    /// Restore a filesystem instance that answers the FUSE `generation` its previous daemon
+    /// answered.
+    fn restore_mount(&self, cmd: &FsBackendMountCmd, vfs_index: u8, generation: u64) -> Result<()> {
+        let (backend, _) = fs_backend_factory(cmd, Some(generation))?;
         self.get_vfs()
             .restore_mount(backend, vfs_index, &cmd.mountpoint)
             .map_err(VfsError::RestoreMount)?;
@@ -295,7 +296,12 @@ fn validate_prefetch_file_list(input: &Option<Vec<String>>) -> Result<Option<Vec
     }
 }
 
-fn fs_backend_factory(cmd: &FsBackendMountCmd) -> Result<BackFileSystem> {
+/// Build the backend for `cmd`, with the FUSE generation its inodes are answered with. A RAFS
+/// image answers `generation` when given (a takeover), its own otherwise.
+fn fs_backend_factory(
+    cmd: &FsBackendMountCmd,
+    generation: Option<u64>,
+) -> Result<(BackFileSystem, u64)> {
     let prefetch_files = validate_prefetch_file_list(&cmd.prefetch_files)?;
 
     match cmd.fs_type {
@@ -304,6 +310,10 @@ fn fs_backend_factory(cmd: &FsBackendMountCmd) -> Result<BackFileSystem> {
                 .map_err(|e| RafsError::LoadConfig(e.into()))?;
             let config = Arc::new(config);
             let (mut rafs, reader) = Rafs::new(&config, &cmd.mountpoint, Path::new(&cmd.source))?;
+            if let Some(generation) = generation {
+                rafs.set_generation(generation);
+            }
+            let generation = rafs.generation();
             rafs.import(reader, prefetch_files)?;
 
             // Put a writable upper layer above the rafs to create an OverlayFS with two layers.
@@ -368,12 +378,12 @@ fn fs_backend_factory(cmd: &FsBackendMountCmd) -> Result<BackFileSystem> {
                             .import()
                             .map_err(|e| Error::InvalidConfig(format!("{}", e)))?;
                         info!("Overlay filesystem imported");
-                        Ok(Box::new(overlayfs))
+                        Ok((Box::new(overlayfs), generation))
                     }
                 }
                 None => {
                     info!("RAFS filesystem imported");
-                    Ok(Box::new(rafs))
+                    Ok((Box::new(rafs), generation))
                 }
             }
         }
@@ -399,7 +409,7 @@ fn fs_backend_factory(cmd: &FsBackendMountCmd) -> Result<BackFileSystem> {
                     PassthroughFs::<()>::new(fs_cfg).map_err(Error::PassthroughFs)?;
                 passthrough_fs.import().map_err(Error::PassthroughFs)?;
                 info!("PassthroughFs imported");
-                Ok(Box::new(passthrough_fs))
+                Ok((Box::new(passthrough_fs), 0))
             }
         }
     }
@@ -577,19 +587,23 @@ mod tests {
             }"#
         .replace("BLOB_DIR", blob_dir);
         let bootstrap = "../tests/texture/bootstrap/rafs-v6-2.2.boot";
-        if fs_backend_factory(&FsBackendMountCmd {
+        let cmd = FsBackendMountCmd {
             fs_type: FsBackendType::Rafs,
             config,
             mountpoint: "testmountpoint".to_string(),
             source: bootstrap.to_string(),
             prefetch_files: None,
-        })
-        .unwrap()
-        .as_any()
-        .downcast_ref::<Rafs>()
-        .is_none()
-        {
-            panic!("failed to create rafs backend")
-        }
+        };
+        let generation_of = |restored| {
+            let (fs, generation) = fs_backend_factory(&cmd, restored).unwrap();
+            let rafs = fs.as_any().downcast_ref::<Rafs>().expect("a rafs backend");
+            assert_eq!(rafs.generation(), generation);
+            generation
+        };
+        // A new mount answers the image's own generation; a takeover keeps its predecessor's.
+        let own = generation_of(None);
+        assert_ne!(own, 0);
+        assert_eq!(generation_of(None), own);
+        assert_eq!(generation_of(Some(0)), 0);
     }
 }
