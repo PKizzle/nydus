@@ -345,7 +345,7 @@ fn prepare_cmd_args(bti_string: &'static str) -> App {
                 .arg(
                     Arg::new("diff-id")
                         .long("diff-id")
-                        .help("Diff ID (sha256:<hex> of the uncompressed tar) the source of a ref conversion must have; a mismatch fails with exit status 3")
+                        .help("Diff ID (sha256:<hex> of the uncompressed tar) the source of a targz-ref or estargz-ref conversion must have; a mismatch fails with exit status 3")
                         .value_parser(parse_diff_id),
                 )
                 .arg(
@@ -1118,6 +1118,19 @@ impl Command {
         let prefetch = Self::get_prefetch(matches)?;
         let source_path = PathBuf::from(matches.get_one::<String>("SOURCE").unwrap());
         let conversion_type: ConversionType = matches.get_one::<String>("type").unwrap().parse()?;
+        // Only ref conversions read their source as one tar stream to hash.
+        if matches.contains_id("diff-id")
+            && !matches!(
+                conversion_type,
+                ConversionType::EStargzToRef | ConversionType::TargzToRef
+            )
+        {
+            bail!(
+                "--diff-id only applies to a ref conversion (--type targz-ref or estargz-ref), \
+                 not to conversion type `{}`",
+                conversion_type
+            );
+        }
         let blob_inline_meta = matches.get_flag("blob-inline-meta");
         let repeatable = matches.get_flag("repeatable");
         let version = Self::get_fs_version(matches)?;
@@ -2612,6 +2625,42 @@ mod tests {
     #[cfg_attr(miri, ignore = "Miri does not support getegid")]
     fn test_create_tarfs_with_default_block_size() {
         create_tarfs(&[]).unwrap();
+    }
+
+    #[test]
+    fn test_diff_id_is_rejected_for_conversions_that_do_not_hash_their_source() {
+        let diff_id = format!("sha256:{}", "0".repeat(64));
+        for ty in [
+            "directory",
+            "dir-rafs",
+            "stargz_index",
+            "estargztoc-ref",
+            "estargz-rafs",
+            "tar-rafs",
+            "tar-tarfs",
+            "targz-rafs",
+        ] {
+            let args = [
+                "nydus-image",
+                "create",
+                "--type",
+                ty,
+                "--blob-id",
+                "id",
+                "--bootstrap",
+                "/nonexistent/bootstrap",
+                "--diff-id",
+                &diff_id,
+                "/nonexistent/source",
+            ];
+            let cmd = super::prepare_cmd_args(super::BTI_STRING.as_str()).get_matches_from(args);
+            let err = Command::create(cmd.subcommand_matches("create").unwrap(), &super::BTI)
+                .unwrap_err();
+            assert!(
+                err.to_string().contains("--diff-id only applies"),
+                "{ty}: {err:#}"
+            );
+        }
     }
 
     /// File contents of a small tree: files that share batch chunks and a 3 MiB file that spans

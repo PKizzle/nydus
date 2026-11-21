@@ -101,7 +101,7 @@ zstd seekable format) decode in small units, while a single-frame layer is decod
 its start on demand. A zstd frame may decode to at most 4 GiB. With `--diff-id sha256:<hex>` (the
 layer's diff ID from its image config) the build fails with exit status 3 unless the source
 decompresses to exactly that tar, the bytes after its end-of-archive marker included.
-`targz-ref` keeps every member,
+`--diff-id` is accepted by `targz-ref` and `estargz-ref` only. `targz-ref` keeps every member,
 including paths eStargz reserves (`stargz.index.json`, `.prefetch.landmark`,
 `.no.prefetch.landmark`), which only the `estargz-*` types leave out of the tree.
 ```shell
