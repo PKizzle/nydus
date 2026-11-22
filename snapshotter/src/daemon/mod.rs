@@ -576,6 +576,10 @@ pub struct DaemonSupervisor {
     auth_heals: AtomicU64,
     /// Counters and gauges of stage retention (see `crate::retention`).
     retention: crate::retention::Stats,
+    /// Set by `preserve_for_failover`. Every path that starts daemon workers or parks a group
+    /// checks it while holding the image's start lock or the `instances` write lock, so once
+    /// `preserve_for_failover` has cycled through both, no worker starts in this process again.
+    shutting_down: AtomicBool,
 }
 
 /// A stopped daemon record whose stage is gone is deleted after this long idle. It outlives its
@@ -617,7 +621,17 @@ impl DaemonSupervisor {
             auth_heal_pass: async_lock::Mutex::new(()),
             auth_heals: AtomicU64::new(0),
             retention: crate::retention::Stats::default(),
+            shutting_down: AtomicBool::new(false),
         }
+    }
+
+    /// Refuse to start daemon workers once `preserve_for_failover` has begun (see
+    /// `shutting_down`). Call it at the top of every path that starts workers or parks a group.
+    fn refuse_when_shutting_down(&self) -> Result<()> {
+        if self.shutting_down.load(Ordering::SeqCst) {
+            bail!("the snapshotter is shutting down; not starting a daemon");
+        }
+        Ok(())
     }
 
     /// The retention policy, `None` with retention off (or invalid keys, which
@@ -896,6 +910,7 @@ impl DaemonSupervisor {
         driver_override: Option<FsDriverType>,
         trial_view: Option<BuiltView>,
     ) -> Result<Arc<DaemonInstance>> {
+        self.refuse_when_shutting_down()?;
         let slug = slug_for(image_ref_str);
         let daemon_root = self.config.snapshotter.root.join("daemons").join(&slug);
         let mountpoint = daemon_root.join("mnt");
@@ -1812,6 +1827,10 @@ impl DaemonSupervisor {
 
         let mut instances = self.instances.write().await;
         for image_ref in candidates {
+            // No replacement could start: leave the daemon for the successor process.
+            if self.shutting_down.load(Ordering::SeqCst) {
+                break;
+            }
             // Flap guard: a daemon we just recovered gets a full window to
             // settle before another restart is considered.
             {
@@ -2061,8 +2080,21 @@ impl DaemonSupervisor {
     /// daemon that is NOT armed — leaving an unrecoverable mount held would wedge
     /// any container that touches it in uninterruptible (D) state. The caller
     /// must then exit *without* running destructors so the armed mounts survive.
+    ///
+    /// Parks a token ([`EVENTS_ANSWERED_FDNAME`]) naming every image whose fanotify workers it
+    /// stopped: they answered every event they read, so the successor need not sweep those
+    /// groups for stranded events. No worker starts afterwards (see `shutting_down`): this
+    /// waits out every start, heal, recovery and upgrade already under way, each of which holds
+    /// its image's start lock or the `instances` write lock, before it looks at `instances`.
     pub async fn preserve_for_failover(&self) {
+        self.shutting_down.store(true, Ordering::SeqCst);
+        let start_locks: Vec<_> = self.start_locks.lock().await.values().cloned().collect();
+        for start_lock in start_locks {
+            drop(start_lock.lock().await);
+        }
         let instances = self.instances.read().await;
+        #[cfg(target_os = "linux")]
+        let mut answered = Vec::new();
         for (image_ref, inst) in instances.iter() {
             if inst.failover_armed.load(Ordering::SeqCst) {
                 debug!(image_ref, "leaving mount held for failover takeover");
@@ -2071,15 +2103,17 @@ impl DaemonSupervisor {
                 #[cfg(target_os = "linux")]
                 {
                     let daemon = inst.daemon.clone();
-                    blocking::unblock(move || {
-                        if let Some(controller) = daemon
+                    let sealed = blocking::unblock(move || {
+                        daemon
                             .as_any()
                             .downcast_ref::<nydus_service::ServiceController>()
-                        {
-                            controller.seal_fanotify_handlers();
-                        }
+                            .map(|controller| controller.seal_fanotify_handlers())
+                            .is_some()
                     })
                     .await;
+                    if sealed {
+                        answered.push(slug_for(image_ref));
+                    }
                 }
             } else {
                 info!(
@@ -2091,19 +2125,39 @@ impl DaemonSupervisor {
                 }
             }
         }
-        // Every worker has stopped, so every event this process read is answered.
-        if let Err(e) = fs::write(self.events_answered_marker(), b"") {
-            warn!(error = %e, "failed to record that every fanotify event is answered; the successor sweeps for stranded ones");
+        #[cfg(target_os = "linux")]
+        if let Err(e) = events_answered_token(&answered)
+            .and_then(|token| crate::fdstore::replace_fd(EVENTS_ANSWERED_FDNAME, token.as_raw_fd()))
+        {
+            warn!(
+                error = format!("{e:#}"),
+                "failed to record which fanotify groups have every event answered; the successor sweeps them all"
+            );
         }
     }
 
-    /// Present while the last process to serve the parked fanotify groups answered every event
-    /// it read before it exited. See `restore_from_store`.
-    fn events_answered_marker(&self) -> PathBuf {
-        self.config
-            .snapshotter
-            .root
-            .join("fanotify-events-answered")
+    /// Where each process records its soft `RLIMIT_NOFILE` for its successor's sweep for
+    /// stranded fanotify events (see `restore_from_store`).
+    fn nofile_record(&self) -> PathBuf {
+        self.config.snapshotter.root.join("fanotify-nofile")
+    }
+
+    /// Return the soft `RLIMIT_NOFILE` the predecessor recorded, if any, and record this
+    /// process's in its place, before any of this process's workers read an event.
+    fn swap_nofile_record(&self) -> Option<u64> {
+        let path = self.nofile_record();
+        let predecessor = fs::read_to_string(&path)
+            .ok()
+            .and_then(|text| text.trim().parse::<u64>().ok());
+        let recorded =
+            current_nofile().and_then(|limit| atomic_write(&path, limit.to_string().as_bytes()));
+        if let Err(e) = recorded {
+            // A stale record could understate this process's limit; without one, the successor
+            // assumes the largest limit this process raises itself to.
+            warn!(path = %path.display(), error = %e, "failed to record RLIMIT_NOFILE for the successor");
+            let _ = fs::remove_file(&path);
+        }
+        predecessor
     }
 
     async fn start_instance(
@@ -2112,6 +2166,7 @@ impl DaemonSupervisor {
         bootstrap: &Path,
         driver_override: Option<FsDriverType>,
     ) -> Result<Arc<DaemonInstance>> {
+        self.refuse_when_shutting_down()?;
         let parsed = parse_image_ref(image_ref_str)
             .with_context(|| format!("invalid image reference '{image_ref_str}'"))?;
         let slug = slug_for(image_ref_str);
@@ -2554,16 +2609,19 @@ impl DaemonSupervisor {
                 "extended the sources of live EROFS mounts to the page size"
             );
         }
-        // Consumed whether or not anything was parked: a marker left behind would vouch for a
-        // later process that never wrote one.
-        let answered = fs::remove_file(self.events_answered_marker()).is_ok();
-        let stored = crate::fdstore::take_stored_fds();
+        let predecessor_nofile = self.swap_nofile_record();
+        let mut stored = crate::fdstore::take_stored_fds();
+        // Consumed whether or not anything else was parked: a token left behind would vouch for
+        // a later process that never wrote one.
+        let answered = take_events_answered(&mut stored);
         if stored.is_empty() {
             return 0;
         }
-        if !answered {
-            deny_stranded_events(&stored).await;
-        }
+        deny_stranded_events(
+            groups_to_sweep(&stored, answered.as_ref()),
+            sweep_fd_bound(predecessor_nofile, current_nofile().unwrap_or(0)),
+        )
+        .await;
         let records = self.read_persisted_records();
         let by_slug: HashMap<&str, &DaemonStatusRecord> = records
             .iter()
@@ -3128,6 +3186,8 @@ impl DaemonSupervisor {
 
         #[cfg(target_os = "linux")]
         {
+            // Before the old workers stop: a refused heal must not resume them either.
+            self.refuse_when_shutting_down()?;
             use nydus_service::ServiceController;
             fn controller(daemon: &Arc<dyn NydusDaemon>) -> Result<&ServiceController> {
                 daemon
@@ -3236,6 +3296,10 @@ impl DaemonSupervisor {
 
         let mut instances = self.instances.write().await;
         for image_ref in targets {
+            // No replacement could start: leave the daemon for the successor process.
+            if self.shutting_down.load(Ordering::SeqCst) {
+                break;
+            }
             let Some(old) = instances.remove(&image_ref) else {
                 report.skipped += 1;
                 report.outcomes.push(DaemonUpgradeOutcome {
@@ -4833,25 +4897,121 @@ fn mounted_at(mountpoint: &Path) -> io::Result<bool> {
     }))
 }
 
-/// Stop a daemon's service threads WITHOUT unmounting its mountpoint or
-/// removing the directory. Used when the kernel mount must survive (an EROFS
-/// mount healed in place by an immediate restart) — `stop_instance`'s
-/// `umount()` would tear the mount away under live container overlays.
-/// Deny, in parallel, the events a dead predecessor read from the parked fanotify groups and
-/// never answered (`nydus_service::fanotify::deny_stranded_events`), before any worker reads
-/// them. Parked descriptors that are not fanotify groups are left alone.
-async fn deny_stranded_events(stored: &HashMap<String, Vec<std::os::fd::OwnedFd>>) {
+/// `FDNAME` of the token `preserve_for_failover` parks in systemd's fd store: a memfd listing,
+/// one per line, the slugs whose fanotify workers it stopped after they answered every event they
+/// read. It is never a slug, which starts with 16 hex digits. Releases up to 3.6.0 evict a parked
+/// fd that no daemon record names, so a token never outlives a process that does not consume it.
+const EVENTS_ANSWERED_FDNAME: &str = "fanotify-events-answered";
+
+/// Sweeps never go past this fd number. A reader takes the lowest free fd, so an event fd above
+/// it means more than this many descriptors open at once; this process raises its own limit to at
+/// most `RLIMIT_NOFILE_MAX`, and only an inherited limit (`LimitNOFILE=infinity`) goes above.
+const SWEEP_FD_CAP: u64 = 1 << 20;
+
+/// The memfd behind an [`EVENTS_ANSWERED_FDNAME`] token listing `slugs`.
+#[cfg(target_os = "linux")]
+fn events_answered_token(slugs: &[String]) -> Result<std::os::fd::OwnedFd> {
+    use std::io::Write;
+    use std::os::fd::FromRawFd;
+    // SAFETY: the name is NUL-terminated and the flags are plain integers; the result is checked.
+    let fd = unsafe { libc::memfd_create(c"nydus-events-answered".as_ptr(), libc::MFD_CLOEXEC) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error()).context("memfd_create");
+    }
+    // SAFETY: `fd` is the new memfd, owned by nothing else.
+    let mut file = fs::File::from(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) });
+    file.write_all(slugs.join("\n").as_bytes())
+        .context("write the events-answered token")?;
+    Ok(file.into())
+}
+
+/// Take the [`EVENTS_ANSWERED_FDNAME`] token out of `stored` and out of systemd's store, and
+/// return the slugs it lists. `None` without exactly one readable token, or when it cannot be
+/// evicted from the store: a token left there would vouch for a later process that never
+/// parked one.
+fn take_events_answered(
+    stored: &mut HashMap<String, Vec<std::os::fd::OwnedFd>>,
+) -> Option<HashSet<String>> {
+    use std::io::{Read, Seek};
+    let mut tokens = stored.remove(EVENTS_ANSWERED_FDNAME)?;
+    if let Err(e) = crate::fdstore::remove_fd(EVENTS_ANSWERED_FDNAME) {
+        warn!(
+            error = format!("{e:#}"),
+            "cannot evict the fanotify events-answered token; sweeping every parked group"
+        );
+        return None;
+    }
+    let token = match (tokens.pop(), tokens.is_empty()) {
+        (Some(token), true) => token,
+        _ => {
+            warn!("ignoring a malformed fanotify events-answered token");
+            return None;
+        }
+    };
+    let mut file = fs::File::from(token);
+    let mut text = String::new();
+    if let Err(e) = file.rewind().and_then(|()| file.read_to_string(&mut text)) {
+        warn!(error = %e, "cannot read the fanotify events-answered token; sweeping every parked group");
+        return None;
+    }
+    Some(text.lines().map(str::to_string).collect())
+}
+
+/// The parked descriptors of every slug the predecessor did not vouch for in `answered` (all of
+/// them without a token).
+fn groups_to_sweep(
+    stored: &HashMap<String, Vec<std::os::fd::OwnedFd>>,
+    answered: Option<&HashSet<String>>,
+) -> Vec<(String, std::os::fd::RawFd)> {
+    stored
+        .iter()
+        .filter(|(slug, _)| answered.is_none_or(|answered| !answered.contains(*slug)))
+        .flat_map(|(slug, fds)| fds.iter().map(|fd| (slug.clone(), fd.as_raw_fd())))
+        .collect()
+}
+
+/// This process's soft `RLIMIT_NOFILE`.
+fn current_nofile() -> io::Result<u64> {
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: `limit` is a valid, writable `rlimit`.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(limit.rlim_cur)
+}
+
+/// How many fd numbers to sweep: event fds lie below the soft limit of the dead reader, which
+/// the predecessor recorded (`predecessor`) or, for a predecessor that records none, is at most
+/// the larger of this process's and the limit every release raises itself to.
+fn sweep_fd_bound(predecessor: Option<u64>, current: u64) -> std::os::fd::RawFd {
+    predecessor
+        .unwrap_or(nydus_utils::fd_limit::RLIMIT_NOFILE_MAX)
+        .max(current)
+        .min(SWEEP_FD_CAP) as std::os::fd::RawFd
+}
+
+/// Deny the events a dead predecessor read from `groups` and never answered
+/// (`nydus_service::fanotify::deny_stranded_events`), before any worker reads them: on at most
+/// one thread per CPU, one group at a time each. Descriptors that are not fanotify groups are
+/// left alone.
+async fn deny_stranded_events(
+    groups: Vec<(String, std::os::fd::RawFd)>,
+    fd_limit: std::os::fd::RawFd,
+) {
     #[cfg(target_os = "linux")]
-    {
-        let groups: Vec<(String, std::os::fd::RawFd)> = stored
-            .iter()
-            .flat_map(|(slug, fds)| fds.iter().map(|fd| (slug.clone(), fd.as_raw_fd())))
-            .collect();
-        blocking::unblock(move || {
-            std::thread::scope(|scope| {
-                for (slug, fd) in &groups {
-                    scope.spawn(
-                        move || match nydus_service::fanotify::deny_stranded_events(*fd) {
+    blocking::unblock(move || {
+        let next = AtomicUsize::new(0);
+        let threads = std::thread::available_parallelism()
+            .map_or(1, |n| n.get())
+            .min(groups.len());
+        std::thread::scope(|scope| {
+            for _ in 0..threads {
+                scope.spawn(|| {
+                    while let Some((slug, fd)) = groups.get(next.fetch_add(1, Ordering::Relaxed)) {
+                        match nydus_service::fanotify::deny_stranded_events(*fd, fd_limit) {
                             Ok(0) => {}
                             Ok(denied) => warn!(
                                 slug,
@@ -4863,17 +5023,21 @@ async fn deny_stranded_events(stored: &HashMap<String, Vec<std::os::fd::OwnedFd>
                                 error = %e,
                                 "cannot sweep a parked fanotify group for unanswered events"
                             ),
-                        },
-                    );
-                }
-            })
+                        }
+                    }
+                });
+            }
         })
-        .await;
-    }
+    })
+    .await;
     #[cfg(not(target_os = "linux"))]
-    let _ = stored;
+    let _ = (groups, fd_limit);
 }
 
+/// Stop a daemon's service threads WITHOUT unmounting its mountpoint or
+/// removing the directory. Used when the kernel mount must survive (an EROFS
+/// mount healed in place by an immediate restart) — `stop_instance`'s
+/// `umount()` would tear the mount away under live container overlays.
 fn stop_daemon_keep_mount(inst: &DaemonInstance) {
     debug!(image_ref = %inst.image_ref, "stopping nydus daemon (keeping its mount)");
     if let Err(e) = inst.daemon.trigger_stop() {
@@ -6092,7 +6256,11 @@ mod tests {
     /// processes of this test, which stands in for systemd's fd store and kills
     /// the predecessor with SIGKILL while its marks are live, and strands one event
     /// of a cold read the way a predecessor killed mid-fill does; the successor
-    /// denies it before serving, so the read completes. `NYDUS_E2E_ROOT`
+    /// denies it before serving, so the read completes. With
+    /// `NYDUS_TAKEOVER_GRACEFUL` set, the predecessor instead exits through
+    /// `preserve_for_failover`, whose token vouches for the group: the successor
+    /// consumes the token and leaves the group unswept, so the event stranded
+    /// after the predecessor exited stays unanswered. `NYDUS_E2E_ROOT`
     /// is an ext4 dir holding `artifact/stage/bootstrap` and the localfs
     /// `artifact/backend/` of a zran image, laid out as an auto-accel sidecar.
     /// With `NYDUS_TAKEOVER_STATE_WITHOUT_BLOB_LIST` set, the successor starts
@@ -6119,8 +6287,9 @@ mod tests {
 
         match std::env::var("NYDUS_TAKEOVER_ROLE").as_deref() {
             Ok("predecessor") => {
+                let supervisor = supervisor();
                 let handle = runtime
-                    .block_on(supervisor().ensure_instance_local(
+                    .block_on(supervisor.ensure_instance_local(
                         image_ref,
                         &root.join("artifact/stage/bootstrap"),
                         &root.join("artifact/backend"),
@@ -6128,9 +6297,10 @@ mod tests {
                     ))
                     .unwrap();
                 println!("PREDECESSOR_READY {}", handle.mountpoint().display());
-                loop {
-                    std::thread::sleep(Duration::from_secs(60));
-                }
+                // Stdin closes when the test asks for a graceful exit.
+                let _ = io::Read::read_to_end(&mut io::stdin(), &mut Vec::new());
+                runtime.block_on(supervisor.preserve_for_failover());
+                return;
             }
             Ok("successor") => {
                 // SAFETY: set before anything else in this process reads the environment.
@@ -6138,7 +6308,14 @@ mod tests {
                 let supervisor = supervisor();
                 assert_eq!(runtime.block_on(supervisor.restore_from_store()), 1);
                 let mountpoint = PathBuf::from(std::env::var("NYDUS_TAKEOVER_MNT").unwrap());
-                for file in ["bin/tool", "passwd"] {
+                // After a graceful exit the stranded read stays blocked, holding the pages a
+                // read of the same file would wait for.
+                let files: &[&str] = if std::env::var_os("NYDUS_TAKEOVER_GRACEFUL").is_some() {
+                    &[]
+                } else {
+                    &["bin/tool", "passwd"]
+                };
+                for file in files {
                     assert!(
                         fs::read(mountpoint.join(file)).unwrap()
                             == fs::read(root.join("src").join(file)).unwrap(),
@@ -6159,46 +6336,76 @@ mod tests {
         notify
             .set_read_timeout(Some(Duration::from_secs(120)))
             .unwrap();
+        let graceful = std::env::var_os("NYDUS_TAKEOVER_GRACEFUL").is_some();
         let mut predecessor = Command::new(std::env::current_exe().unwrap())
             .args([NAME, "--exact", "--ignored", "--nocapture"])
             .env("NYDUS_TAKEOVER_ROLE", "predecessor")
             .env("NOTIFY_SOCKET", &notify_path)
+            .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .spawn()
             .unwrap();
 
-        // The FDSTORE message carrying the group fd, as systemd would keep it.
-        let (fd_name, group_fd) = loop {
+        // The next notify message: its text and the fd it carries, as systemd would keep it.
+        let next_message = || loop {
             let mut buf = [0u8; 256];
             let mut fds = [-1; 1];
             let (len, nfds) = match sendfd::RecvWithFd::recv_with_fd(&notify, &mut buf, &mut fds) {
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                r => r.expect("the predecessor parked no fd"),
+                r => r.expect("no notify message"),
             };
             let msg = String::from_utf8_lossy(&buf[..len]).into_owned();
-            if nfds == 1 && msg.contains("FDSTORE=1") {
-                let name = msg
-                    .lines()
-                    .find_map(|l| l.strip_prefix("FDNAME="))
-                    .unwrap()
-                    .to_string();
-                // SAFETY: `nfds == 1`, so `fds[0]` is a descriptor just received over `SCM_RIGHTS`,
-                // owned only by this test, and wrapped exactly once.
-                break (name, unsafe { std::os::fd::OwnedFd::from_raw_fd(fds[0]) });
+            // SAFETY: with `nfds == 1`, `fds[0]` is a descriptor just received over
+            // `SCM_RIGHTS`, owned only by this test, and wrapped exactly once.
+            let fd = (nfds == 1).then(|| unsafe { std::os::fd::OwnedFd::from_raw_fd(fds[0]) });
+            break (msg, fd);
+        };
+        let fd_name_in = |msg: &str| {
+            msg.lines()
+                .find_map(|l| l.strip_prefix("FDNAME="))
+                .unwrap()
+                .to_string()
+        };
+        let (fd_name, group_fd) = loop {
+            if let (msg, Some(fd)) = next_message()
+                && msg.contains("FDSTORE=1")
+            {
+                break (fd_name_in(&msg), fd);
             }
         };
         // Not a line prefix: with one CPU available, libtest runs tests serially and writes
         // "test <name> ... " before the test runs, on the same line as the marker.
-        let mountpoint = BufReader::new(predecessor.stdout.take().unwrap())
-            .lines()
+        let mut lines = BufReader::new(predecessor.stdout.take().unwrap()).lines();
+        let mountpoint = lines
             .find_map(|l| {
                 l.unwrap()
                     .split_once("PREDECESSOR_READY ")
                     .map(|(_, path)| PathBuf::from(path))
             })
             .expect("the predecessor never mounted");
-        predecessor.kill().unwrap();
-        predecessor.wait().unwrap();
+        // A graceful predecessor still writes its test result.
+        std::thread::spawn(move || lines.for_each(drop));
+        let token = if graceful {
+            drop(predecessor.stdin.take());
+            let token = loop {
+                if let (msg, Some(fd)) = next_message()
+                    && fd_name_in(&msg) == EVENTS_ANSWERED_FDNAME
+                {
+                    break fd;
+                }
+            };
+            assert!(predecessor.wait().unwrap().success());
+            let mut listed = String::new();
+            let mut file = fs::File::from(token.try_clone().unwrap());
+            io::Seek::rewind(&mut file).unwrap();
+            io::Read::read_to_string(&mut file, &mut listed).unwrap();
+            assert_eq!(listed, fd_name, "the token lists the group it vouches for");
+            Some(token)
+        } else {
+            predecessor.kill().unwrap();
+            predecessor.wait().unwrap();
+            None
+        };
         assert_eq!(mount_fstype_at(&mountpoint).as_deref(), Some("erofs"));
         // An upgrade from a release whose saved state has no blob list.
         if std::env::var_os("NYDUS_TAKEOVER_STATE_WITHOUT_BLOB_LIST").is_some() {
@@ -6239,17 +6446,27 @@ mod tests {
         assert_eq!(reaped, child);
 
         let raw = group_fd.as_raw_fd();
+        let raw_token = token.as_ref().map(|token| token.as_raw_fd());
         let mut command = Command::new(std::env::current_exe().unwrap());
         command
             .args([NAME, "--exact", "--ignored", "--nocapture"])
             .env("NYDUS_TAKEOVER_ROLE", "successor")
             .env("NYDUS_TAKEOVER_MNT", &mountpoint)
-            .env("LISTEN_FDS", "1")
-            .env("LISTEN_FDNAMES", &fd_name);
-        // SAFETY: dup2 is async-signal-safe; it hands the fd over as LISTEN_FDS fd 3.
+            .env("NOTIFY_SOCKET", &notify_path);
+        match raw_token {
+            Some(_) => command.env("LISTEN_FDS", "2").env(
+                "LISTEN_FDNAMES",
+                format!("{fd_name}:{EVENTS_ANSWERED_FDNAME}"),
+            ),
+            None => command
+                .env("LISTEN_FDS", "1")
+                .env("LISTEN_FDNAMES", &fd_name),
+        };
+        // SAFETY: dup2 is async-signal-safe; it hands the fds over as LISTEN_FDS fds 3 and 4.
         unsafe {
             command.pre_exec(move || {
-                if libc::dup2(raw, 3) < 0 {
+                if libc::dup2(raw, 3) < 0 || raw_token.is_some_and(|token| libc::dup2(token, 4) < 0)
+                {
                     return Err(io::Error::last_os_error());
                 }
                 Ok(())
@@ -6257,6 +6474,25 @@ mod tests {
         }
         let mut successor = command.stdin(Stdio::piped()).spawn().unwrap();
         drop(group_fd);
+        drop(token);
+        if graceful {
+            // The successor evicts the token before it serves, so no later process reuses it.
+            loop {
+                let (msg, _) = next_message();
+                if msg.contains("FDSTOREREMOVE=1") && fd_name_in(&msg) == EVENTS_ANSWERED_FDNAME {
+                    break;
+                }
+            }
+            // A vouched-for group is not swept: the event stranded after the predecessor
+            // exited stays unanswered (it is allowed once the successor closes the group).
+            assert!(
+                stranded.recv_timeout(Duration::from_secs(3)).is_err(),
+                "the successor swept a group the token vouched for"
+            );
+            drop(successor.stdin.take());
+            assert!(successor.wait().unwrap().success());
+            return;
+        }
         // The denied event fails a readahead at most, which the read retries with an event the
         // successor serves; unanswered, it blocks the read for as long as the group lives.
         let stranded = stranded.recv_timeout(Duration::from_secs(30));
@@ -7337,11 +7573,150 @@ mod tests {
         if std::env::var_os("LISTEN_FDS").is_some() {
             return;
         }
-        let supervisor = DaemonSupervisor::new(SnapshotterConfig::default());
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = SnapshotterConfig::default();
+        config.snapshotter.root = tmp.path().to_path_buf();
+        let supervisor = DaemonSupervisor::new(config);
         let restored = compio::runtime::Runtime::new()
             .unwrap()
             .block_on(supervisor.restore_from_store());
         assert_eq!(restored, 0);
+    }
+
+    /// The events-answered token lists the slugs `preserve_for_failover` stopped; the successor
+    /// takes it out of what was parked, once, and sweeps every group it does not list.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_events_answered_token_spares_only_the_groups_it_lists() {
+        use std::os::fd::OwnedFd;
+        if std::env::var_os("NOTIFY_SOCKET").is_some() {
+            return;
+        }
+        let parked = || OwnedFd::from(tempfile::tempfile().unwrap());
+        let token = events_answered_token(&["stopped".to_string(), "gone".to_string()]).unwrap();
+        let mut stored: HashMap<String, Vec<OwnedFd>> = HashMap::from([
+            (EVENTS_ANSWERED_FDNAME.to_string(), vec![token]),
+            ("stopped".to_string(), vec![parked()]),
+            ("running".to_string(), vec![parked(), parked()]),
+        ]);
+
+        let answered = take_events_answered(&mut stored).unwrap();
+        assert_eq!(
+            answered,
+            HashSet::from(["stopped".to_string(), "gone".to_string()])
+        );
+        assert!(!stored.contains_key(EVENTS_ANSWERED_FDNAME));
+        assert_eq!(take_events_answered(&mut stored), None, "consumed twice");
+
+        let swept: Vec<String> = groups_to_sweep(&stored, Some(&answered))
+            .into_iter()
+            .map(|(slug, _)| slug)
+            .collect();
+        assert_eq!(swept, ["running", "running"]);
+        assert_eq!(groups_to_sweep(&stored, None).len(), 3);
+        // An empty list vouches for nothing.
+        let mut stored = HashMap::from([(
+            EVENTS_ANSWERED_FDNAME.to_string(),
+            vec![events_answered_token(&[]).unwrap()],
+        )]);
+        assert_eq!(take_events_answered(&mut stored), Some(HashSet::new()));
+        // Two tokens were never parked by one process: trust neither.
+        let mut stored = HashMap::from([(
+            EVENTS_ANSWERED_FDNAME.to_string(),
+            vec![
+                events_answered_token(&["a".to_string()]).unwrap(),
+                events_answered_token(&["a".to_string()]).unwrap(),
+            ],
+        )]);
+        assert_eq!(take_events_answered(&mut stored), None);
+        assert!(stored.is_empty());
+    }
+
+    /// The sweep covers the predecessor's recorded soft limit, or the largest limit a release
+    /// raises itself to when it recorded none, and at least this process's, up to the cap.
+    #[test]
+    fn the_sweep_bound_covers_the_dead_readers_limit() {
+        use nydus_utils::fd_limit::RLIMIT_NOFILE_MAX;
+        assert_eq!(sweep_fd_bound(None, 1024), RLIMIT_NOFILE_MAX as i32);
+        assert_eq!(sweep_fd_bound(Some(65_536), 1024), 65_536);
+        assert_eq!(sweep_fd_bound(Some(1024), 524_288), 524_288);
+        assert_eq!(sweep_fd_bound(Some(1_000_000_000), 1024), 1 << 20);
+        assert_eq!(sweep_fd_bound(None, 1_000_000_000), 1 << 20);
+    }
+
+    /// Each start records its own soft limit for the successor and returns its predecessor's.
+    #[test]
+    fn the_nofile_record_hands_the_limit_to_the_successor() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = SnapshotterConfig::default();
+        config.snapshotter.root = tmp.path().to_path_buf();
+        let supervisor = DaemonSupervisor::new(config);
+        assert_eq!(supervisor.swap_nofile_record(), None);
+        assert_eq!(
+            supervisor.swap_nofile_record(),
+            Some(current_nofile().unwrap())
+        );
+        fs::write(supervisor.nofile_record(), b"garbage").unwrap();
+        assert_eq!(supervisor.swap_nofile_record(), None);
+    }
+
+    /// `preserve_for_failover` waits for a start already holding its image's start lock, and no
+    /// start, spawn or recovery begins after it.
+    #[compio::test]
+    async fn no_daemon_starts_once_failover_preservation_began() {
+        let tmp = tempfile::tempdir().unwrap();
+        let image_ref = "registry.local/team/app:1";
+        let (supervisor, _, dir) = retained(tmp.path(), image_ref).await;
+        let bootstrap = dir.join("stage/bootstrap");
+
+        let start_lock = supervisor.start_lock(image_ref).await;
+        let starting = start_lock.lock().await;
+        let done = Arc::new(AtomicBool::new(false));
+        let preserving = compio::runtime::spawn({
+            let (supervisor, done) = (supervisor.clone(), done.clone());
+            async move {
+                supervisor.preserve_for_failover().await;
+                done.store(true, Ordering::SeqCst);
+            }
+        });
+        compio::time::sleep(Duration::from_millis(50)).await;
+        assert!(supervisor.shutting_down.load(Ordering::SeqCst));
+        assert!(
+            !done.load(Ordering::SeqCst),
+            "preservation did not wait for the start"
+        );
+        drop(starting);
+        preserving.await.unwrap();
+
+        let refused = supervisor
+            .spawn_instance(image_ref, &bootstrap)
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{refused:#}").contains("shutting down"),
+            "{refused:#}"
+        );
+        let Err(refused) = supervisor
+            .ensure_instance(image_ref, &bootstrap, "k1", None)
+            .await
+        else {
+            panic!("a daemon started after failover preservation began");
+        };
+        assert!(
+            format!("{refused:#}").contains("shutting down"),
+            "{refused:#}"
+        );
+        supervisor
+            .insert_test_instance(image_ref, dir.join("mnt"))
+            .await;
+        supervisor.instances.read().await[image_ref].daemon.stop();
+        let report = supervisor.recover().await.unwrap();
+        assert_eq!(
+            (report.checked, report.restarted, report.failed),
+            (1, 0, 0),
+            "an unhealthy daemon is left for the successor"
+        );
+        assert!(supervisor.instances.read().await.contains_key(image_ref));
     }
 
     #[test]

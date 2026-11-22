@@ -6,6 +6,8 @@
 # plays systemd's fd store and kills the predecessor while its marks are live, once on all CPUs
 # and once pinned to one. Before the successor starts, a child reads an event of a cold read and
 # exits without answering it, as a predecessor killed mid-fill does; the read must complete.
+# After a graceful stop instead, the predecessor's events-answered token spares its group the
+# sweep, and the successor evicts the token from the fd store before it serves.
 #
 # Needs root, Linux >= 6.14, cargo, and ROOT on ext4 (tmpfs has no pre-content marks).
 set -u
@@ -41,8 +43,9 @@ cp "$BOOTSTRAP" "$ROOT/artifact/stage/bootstrap"
 
 # Once as is and once on a single CPU: with one CPU, libtest runs tests serially and its
 # output differs, and the daemon's threads compete for that CPU. A third run starts the
-# successor from a state without the blob list, as releases up to 3.3.0 saved it.
-for run in "" "taskset -c 0" "env NYDUS_TAKEOVER_STATE_WITHOUT_BLOB_LIST=1"; do
+# successor from a state without the blob list, as releases up to 3.3.0 saved it. A fourth
+# stops the predecessor gracefully: its events-answered token spares the group the sweep.
+for run in "" "taskset -c 0" "env NYDUS_TAKEOVER_STATE_WITHOUT_BLOB_LIST=1" "env NYDUS_TAKEOVER_GRACEFUL=1"; do
   rm -rf "$ROOT/snapshotter"
   NYDUS_E2E_ROOT="$ROOT" $run "$CARGO" test -p nydus-snapshotter --lib \
     daemon::tests::fanotify_takeover_serves_uncached_file_data -- --ignored --exact --nocapture

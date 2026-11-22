@@ -275,11 +275,29 @@ A process that dies between reading a permission event and answering it (`kill -
 the OOM killer) leaves the event on the group, which systemd's fd store keeps alive, and its reader
 blocked until killed: the kernel answers such an event only when the group closes, and no
 interface lists it. The kernel matches a response to an event by the event's fd number alone, so
-a successor that finds no `fanotify-events-answered` marker in the snapshotter root (written once
-a stopping snapshotter has stopped every worker) writes a `FAN_DENY_ERRNO(EIO)` response for
-every fd number below `RLIMIT_NOFILE` to each parked group before any worker reads it
-(`nydus_service::fanotify::deny_stranded_events`): those readers fail with `EIO`, and nothing
-else is answered. With `LimitNOFILE=1048576` that is a million writes per group, run in parallel.
+at startup, before any worker reads, the successor writes a `FAN_DENY_ERRNO(EIO)` response for
+every fd number below the sweep bound to each parked group it is not told is clean
+(`nydus_service::fanotify::deny_stranded_events`), repeating a number until no event is left
+under it, since readers in successive dead processes can strand events under the same number.
+Those readers fail with `EIO` (a denied readahead is retried by the read with an event the
+successor serves), and nothing else is answered.
+
+- **Which groups are clean.** A snapshotter stopping with an fd store (`preserve_for_failover`)
+  first refuses every new daemon start, heal, recovery and upgrade, waits out those under way (each
+  holds its image's start lock or the `instances` write lock), stops and joins the workers of every
+  armed daemon, and parks a token in the fd store: a memfd named `fanotify-events-answered` listing
+  those images' slugs. The successor takes the token out of the store before it serves anything
+  and sweeps every parked group the token does not list (all of them without a token). A token
+  lives in the fd store rather than the snapshotter root because releases up to 3.6.0 evict a
+  parked fd that no daemon record names: after a downgrade, the older release drops the token, so
+  a crash of it is swept after the next upgrade.
+- **The sweep bound.** A reader takes event fds below its soft `RLIMIT_NOFILE`. Every start
+  records its own soft limit in `<root>/fanotify-nofile` before any of its workers runs; the
+  successor sweeps below the larger of the recorded limit (`RLIMIT_NOFILE_MAX`, 1,000,000, when
+  there is none) and its own, capped at 2^20: fds are allocated lowest first, and the snapshotter
+  never holds a million descriptors at once. Groups are swept in parallel, one thread per CPU at
+  most. A million writes take about 0.3 s on an Apple-silicon VM, so a crash restart on a Raspberry
+  Pi 4 spends roughly 1–2 s per parked group divided by its four cores.
 
 The fanotify path has no RAFS instance, so `[snapshotter.features] prefetch`, runtime prefetch
 lists and `cache.disable_indexed` apply only to images served over FUSE; a fanotify daemon fetches
