@@ -148,9 +148,9 @@ cuts a release that lets us switch to a version requirement.
 - **Upstream PR/issue status**: filed,
   https://github.com/cloud-hypervisor/fuse-backend-rs/pull/376 (open).
 - **Drop trigger**: upstream releases the fix (PR #376) together with the
-  carried fixes above; bump the workspace's
-  `fuse-backend-rs` requirement to that release and delete
-  `third_party/fuse-backend-rs/` + the `[patch.crates-io]` entry.
+  carried fixes above; bump the workspace's `fuse-backend-rs` requirement to
+  that release and delete `third_party/fuse-backend-rs/` + the
+  `[patch.crates-io]` entry.
 
 ## Git-pinned dependencies (not on crates.io versions)
 
