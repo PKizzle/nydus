@@ -25,8 +25,11 @@ ND="${NYDUSD:-$(command -v nydusd || echo ./target/release/nydusd)}"
 ROOT="${ROOT:-/var/tmp/fusedev-file-handles}"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 
+FAILURES=0
 step() { echo; echo "### $* ###"; }
 note() { echo "  - $*"; }
+case_fail() { echo "  !! FAIL: $*"; FAILURES=$((FAILURES + 1)); }
+case_pass() { echo "  ok: $*"; }
 
 teardown() {
   if [ -n "${NYDUSD_PID:-}" ]; then
@@ -47,7 +50,8 @@ rm -rf "$ROOT"
 mkdir -p "$ROOT"/{src/d1/d2/d3,out,backend,mnt}
 
 step "build the handle helper"
-"${CC:-cc}" -O2 -Wall -o "$ROOT/fh-reopen" "$HERE/fh-reopen.c" || { echo "cannot compile fh-reopen.c"; finish 1; }
+"${CC:-cc}" -O2 -Wall -o "$ROOT/fh-reopen" "$HERE/fh-reopen.c" \
+  || { echo "cannot compile fh-reopen.c"; finish 1; }
 
 step "build source rootfs"
 echo top > "$ROOT/src/top.txt"
@@ -79,7 +83,7 @@ NYDUSD_PID=$!
 for _ in $(seq 50); do mountpoint -q "$ROOT/mnt" && break; sleep 0.2; done
 if ! mountpoint -q "$ROOT/mnt"; then
   echo "--- nydusd.log ---"; tail -30 "$ROOT/nydusd.log"
-  echo "FAIL: FUSE not mounted"; finish 1
+  case_fail "FUSE not mounted"; finish 1
 fi
 note "$(grep " $ROOT/mnt " /proc/mounts)"
 
@@ -95,36 +99,38 @@ chmod +x "$ROOT/lookups.sh"
 step "H1-H3: take handles, drop dentries, reopen"
 HANDLES=(d1/d2/f2.txt d1 d1/d2/d3)
 [ "${CONTROL:-0}" = 1 ] && export FH_NO_DROP=1 && note "CONTROL: caches are not dropped"
-FH_REOPEN_HOOK="'$ROOT/lookups.sh' > '$ROOT/lookups.before'" "$ROOT/fh-reopen" "$ROOT/mnt" "${HANDLES[@]}"
-rc=$?
+FH_REOPEN_HOOK="'$ROOT/lookups.sh' > '$ROOT/lookups.before'" \
+  "$ROOT/fh-reopen" "$ROOT/mnt" "${HANDLES[@]}" \
+  || case_fail "H1-H3: not every handle reopened (fh-reopen exit $?)"
 
 step "H4: the reopens looked the node ids up in nydusd"
 before=$(cat "$ROOT/lookups.before" 2>/dev/null)
 after=$("$ROOT/lookups.sh")
 note "Lookup counter ${before:-?} -> ${after:-?} for ${#HANDLES[@]} handles"
 if [ -z "$before" ] || [ -z "$after" ]; then
-  echo "  !! FAIL: H4: cannot read nydusd's Lookup counter"; rc=1
+  case_fail "H4: cannot read nydusd's Lookup counter"
 elif [ $((after - before)) -lt ${#HANDLES[@]} ]; then
-  echo "  !! FAIL: H4: the reopens did not reach nydusd, so H1-H3 tested cached dentries"; rc=1
+  case_fail "H4: the reopens did not reach nydusd, so H1-H3 tested cached dentries"
 else
-  echo "  ok: H4: $((after - before)) lookups served the reopens"
+  case_pass "H4: $((after - before)) lookups served the reopens"
 fi
 
 step "H5: nydusd exits after umount"
-umount "$ROOT/mnt" || { echo "  !! FAIL: H5: umount failed"; rc=1; }
+umount "$ROOT/mnt" || case_fail "H5: umount failed"
 for _ in $(seq 50); do kill -0 "$NYDUSD_PID" 2>/dev/null || break; sleep 0.2; done
 if kill -0 "$NYDUSD_PID" 2>/dev/null; then
-  echo "  !! FAIL: H5: nydusd still running 10 s after umount"; rc=1
+  case_fail "H5: nydusd still running 10 s after umount"
 else
   wait "$NYDUSD_PID" 2>/dev/null
   NYDUSD_PID=
-  echo "  ok: H5: nydusd exited after umount"
+  case_pass "H5: nydusd exited after umount"
 fi
 
 echo
-if [ "$rc" -eq 0 ]; then
-  echo "PASS: every handle reopened through nydusd after dentry eviction, and nydusd exited on umount"
+if [ "$FAILURES" = 0 ]; then
+  echo "==== FUSEDEV FILE HANDLES: PASS ===="
+  finish 0
 else
-  echo "FAIL: see above"
+  echo "==== FUSEDEV FILE HANDLES: FAIL ($FAILURES failing check(s)) ===="
+  finish 1
 fi
-finish "$rc"
