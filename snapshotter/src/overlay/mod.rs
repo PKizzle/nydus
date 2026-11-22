@@ -49,18 +49,21 @@ pub enum ChainError {
 }
 
 /// Check that `target`, the chain ID a nydus data layer is to be committed
-/// under unapplied, is the one containerd derives from `parent` and the
-/// diff ID it sent in [`SNAPSHOT_DIFF_ID`]. containerd before 2.3 sends no
-/// diff ID; such a layer is refused rather than committed on trust.
+/// under unapplied, is the one derived from `parent` and the diff ID sent in
+/// [`SNAPSHOT_DIFF_ID`]. The label comes from the image's own config, so it
+/// only proves the two agree; trust rests on `validate_parent`. Unpackers that
+/// send no diff ID (containerd before 2.3, client-side unpackers) skip it.
 fn check_claimed_chain(
     target: &str,
     parent: Option<&str>,
     labels: &HashMap<String, String>,
 ) -> Result<()> {
     let Some(diff_id) = labels.get(SNAPSHOT_DIFF_ID) else {
-        bail!(
-            "nydus data layer {target} carries no {SNAPSHOT_DIFF_ID} label (containerd 2.3 or later sets it); refusing to commit it unapplied"
+        debug!(
+            target,
+            "nydus data layer carries no {SNAPSHOT_DIFF_ID} label"
         );
+        return Ok(());
     };
     let expected = match parent {
         None => diff_id.clone(),
@@ -1317,7 +1320,7 @@ mod tests {
     }
 
     #[test]
-    fn nydus_data_layer_needs_a_matching_diff_id() {
+    fn nydus_data_layer_diff_id_must_match_when_sent() {
         use crate::source::{NYDUS_DATA_LAYER, TARGET_SNAPSHOT_REF};
         let dir = tempdir().unwrap();
         let (engine, store) = test_engine(dir.path());
@@ -1328,13 +1331,18 @@ mod tests {
             (NYDUS_DATA_LAYER.to_string(), "true".to_string()),
         ]);
 
-        // containerd before 2.3 sends no diff ID.
-        assert!(engine.prepare(&store, "k1", &base, &labels).is_err());
         labels.insert(SNAPSHOT_DIFF_ID.to_string(), "sha256:other".to_string());
-        assert!(engine.prepare(&store, "k2", &base, &labels).is_err());
+        assert!(engine.prepare(&store, "k1", &base, &labels).is_err());
         assert!(store.list().unwrap().iter().all(|s| s.key == base));
 
         labels.insert(SNAPSHOT_DIFF_ID.to_string(), "sha256:d2".to_string());
+        assert!(matches!(
+            engine.prepare(&store, "k2", &base, &labels).unwrap(),
+            PrepareOutcome::AlreadyExists { .. }
+        ));
+
+        // Unpackers that send no diff ID (containerd before 2.3, client-side).
+        labels.remove(SNAPSHOT_DIFF_ID);
         assert!(matches!(
             engine.prepare(&store, "k3", &base, &labels).unwrap(),
             PrepareOutcome::AlreadyExists { .. }

@@ -1715,7 +1715,7 @@ pub async fn serve_with_supervisor(
     // Serving a nydus meta layer takes its image from there or the call's
     // labels, never from the ref the chain's first committer stored.
     let containerd_lookup_for_prepare = containerd_lookup.clone();
-    // Nydus data layers need containerd 2.3's diff-id label; say so up front.
+    // Learn containerd's version for logs and /readyz.
     compio::runtime::spawn(crate::containerd_grpc::probe_version(
         crate::containerd_grpc::ContainerdChannel::new(
             config.snapshotter.containerd.address(),

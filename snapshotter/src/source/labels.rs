@@ -18,7 +18,7 @@ pub const TARGET_SNAPSHOT_REF: &str = "containerd.io/snapshot.ref";
 
 /// Set by containerd's image unpacker (2.3 and later) on `Prepare`: the diff
 /// ID the image's config declares for the layer, which
-/// [`TARGET_SNAPSHOT_REF`] is derived from.
+/// [`TARGET_SNAPSHOT_REF`] is derived from. Client-side unpackers do not set it.
 pub const SNAPSHOT_DIFF_ID: &str = "containerd.io/snapshot/diff-id";
 
 /// Marks a layer as a Nydus data blob
