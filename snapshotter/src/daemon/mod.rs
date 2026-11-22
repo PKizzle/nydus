@@ -2091,6 +2091,19 @@ impl DaemonSupervisor {
                 }
             }
         }
+        // Every worker has stopped, so every event this process read is answered.
+        if let Err(e) = fs::write(self.events_answered_marker(), b"") {
+            warn!(error = %e, "failed to record that every fanotify event is answered; the successor sweeps for stranded ones");
+        }
+    }
+
+    /// Present while the last process to serve the parked fanotify groups answered every event
+    /// it read before it exited. See `restore_from_store`.
+    fn events_answered_marker(&self) -> PathBuf {
+        self.config
+            .snapshotter
+            .root
+            .join("fanotify-events-answered")
     }
 
     async fn start_instance(
@@ -2541,9 +2554,15 @@ impl DaemonSupervisor {
                 "extended the sources of live EROFS mounts to the page size"
             );
         }
+        // Consumed whether or not anything was parked: a marker left behind would vouch for a
+        // later process that never wrote one.
+        let answered = fs::remove_file(self.events_answered_marker()).is_ok();
         let stored = crate::fdstore::take_stored_fds();
         if stored.is_empty() {
             return 0;
+        }
+        if !answered {
+            deny_stranded_events(&stored).await;
         }
         let records = self.read_persisted_records();
         let by_slug: HashMap<&str, &DaemonStatusRecord> = records
@@ -4818,6 +4837,43 @@ fn mounted_at(mountpoint: &Path) -> io::Result<bool> {
 /// removing the directory. Used when the kernel mount must survive (an EROFS
 /// mount healed in place by an immediate restart) — `stop_instance`'s
 /// `umount()` would tear the mount away under live container overlays.
+/// Deny, in parallel, the events a dead predecessor read from the parked fanotify groups and
+/// never answered (`nydus_service::fanotify::deny_stranded_events`), before any worker reads
+/// them. Parked descriptors that are not fanotify groups are left alone.
+async fn deny_stranded_events(stored: &HashMap<String, Vec<std::os::fd::OwnedFd>>) {
+    #[cfg(target_os = "linux")]
+    {
+        let groups: Vec<(String, std::os::fd::RawFd)> = stored
+            .iter()
+            .flat_map(|(slug, fds)| fds.iter().map(|fd| (slug.clone(), fd.as_raw_fd())))
+            .collect();
+        blocking::unblock(move || {
+            std::thread::scope(|scope| {
+                for (slug, fd) in &groups {
+                    scope.spawn(
+                        move || match nydus_service::fanotify::deny_stranded_events(*fd) {
+                            Ok(0) => {}
+                            Ok(denied) => warn!(
+                                slug,
+                                denied, "denied fanotify events a dead predecessor never answered"
+                            ),
+                            Err(e) if e.kind() == io::ErrorKind::InvalidInput => {}
+                            Err(e) => warn!(
+                                slug,
+                                error = %e,
+                                "cannot sweep a parked fanotify group for unanswered events"
+                            ),
+                        },
+                    );
+                }
+            })
+        })
+        .await;
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = stored;
+}
+
 fn stop_daemon_keep_mount(inst: &DaemonInstance) {
     debug!(image_ref = %inst.image_ref, "stopping nydus daemon (keeping its mount)");
     if let Err(e) = inst.daemon.trigger_stop() {
@@ -6034,7 +6090,9 @@ mod tests {
     /// fanotify group fd parked in systemd's fd store and serves file data the
     /// predecessor never fetched. The predecessor and the successor run as child
     /// processes of this test, which stands in for systemd's fd store and kills
-    /// the predecessor with SIGKILL while its marks are live. `NYDUS_E2E_ROOT`
+    /// the predecessor with SIGKILL while its marks are live, and strands one event
+    /// of a cold read the way a predecessor killed mid-fill does; the successor
+    /// denies it before serving, so the read completes. `NYDUS_E2E_ROOT`
     /// is an ext4 dir holding `artifact/stage/bootstrap` and the localfs
     /// `artifact/backend/` of a zran image, laid out as an auto-accel sidecar.
     /// With `NYDUS_TAKEOVER_STATE_WITHOUT_BLOB_LIST` set, the successor starts
@@ -6088,6 +6146,8 @@ mod tests {
                     );
                 }
                 println!("SUCCESSOR_READ_OK");
+                // Keeps serving until the test has seen the stranded read through.
+                let _ = io::Read::read_to_end(&mut io::stdin(), &mut Vec::new());
                 return;
             }
             _ => {}
@@ -6148,6 +6208,35 @@ mod tests {
                 nydus_service::upgrade::fanotify_upgrade::without_blob_list(&state).unwrap();
             atomic_write(&state_path, &legacy).unwrap();
         }
+        // An event the predecessor read and died before answering, as a SIGKILL during a fill
+        // leaves one: a child reads it off the queue and exits. Unless the successor answers it,
+        // its reader stays blocked for as long as the group lives.
+        let stranded_file = mountpoint.join("bin/tool");
+        let (stranded_tx, stranded) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = stranded_tx.send(fs::read(stranded_file).map_err(|e| e.raw_os_error()));
+        });
+        let mut queued = libc::pollfd {
+            fd: group_fd.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: `queued` is one valid `pollfd`.
+        let polled = unsafe { libc::poll(&mut queued, 1, 10_000) };
+        assert_eq!(polled, 1, "the read raised no event");
+        // SAFETY: the child only reads and exits, both async-signal-safe.
+        let child = unsafe { libc::fork() };
+        if child == 0 {
+            let mut buf = [0u8; 4096];
+            // SAFETY: `buf` is writable for its length; the child exits holding the event.
+            unsafe {
+                libc::read(queued.fd, buf.as_mut_ptr().cast(), buf.len());
+                libc::_exit(0);
+            }
+        }
+        // SAFETY: `child` is this process's own child.
+        let reaped = unsafe { libc::waitpid(child, std::ptr::null_mut(), 0) };
+        assert_eq!(reaped, child);
 
         let raw = group_fd.as_raw_fd();
         let mut command = Command::new(std::env::current_exe().unwrap());
@@ -6166,8 +6255,17 @@ mod tests {
                 Ok(())
             });
         }
-        let mut successor = command.spawn().unwrap();
+        let mut successor = command.stdin(Stdio::piped()).spawn().unwrap();
         drop(group_fd);
+        // The denied event fails a readahead at most, which the read retries with an event the
+        // successor serves; unanswered, it blocks the read for as long as the group lives.
+        let stranded = stranded.recv_timeout(Duration::from_secs(30));
+        drop(successor.stdin.take());
+        if stranded.is_err() {
+            successor.kill().unwrap();
+            successor.wait().unwrap();
+            panic!("the successor left the stranded event unanswered");
+        }
 
         let deadline = std::time::Instant::now() + Duration::from_secs(60);
         let status = loop {
@@ -6198,6 +6296,10 @@ mod tests {
             std::thread::sleep(Duration::from_millis(200));
         };
         assert!(status.success(), "the successor failed: {status}");
+        match stranded.unwrap() {
+            Ok(data) => assert!(data == fs::read(root.join("src/bin/tool")).unwrap()),
+            Err(errno) => assert_eq!(errno, Some(libc::EIO)),
+        }
     }
 
     /// A mount that lists its directories but cannot serve file data is dead:

@@ -271,6 +271,16 @@ does not replace under a live FUSE mount, so a FUSE daemon started without crede
 is restarted. These images get no page cache sharing domain: only bootstraps this node built
 qualify.
 
+A process that dies between reading a permission event and answering it (`kill -9`, an abort,
+the OOM killer) leaves the event on the group, which systemd's fd store keeps alive, and its reader
+blocked until killed: the kernel answers such an event only when the group closes, and no
+interface lists it. The kernel matches a response to an event by the event's fd number alone, so
+a successor that finds no `fanotify-events-answered` marker in the snapshotter root (written once
+a stopping snapshotter has stopped every worker) writes a `FAN_DENY_ERRNO(EIO)` response for
+every fd number below `RLIMIT_NOFILE` to each parked group before any worker reads it
+(`nydus_service::fanotify::deny_stranded_events`): those readers fail with `EIO`, and nothing
+else is answered. With `LimitNOFILE=1048576` that is a million writes per group, run in parallel.
+
 The fanotify path has no RAFS instance, so `[snapshotter.features] prefetch`, runtime prefetch
 lists and `cache.disable_indexed` apply only to images served over FUSE; a fanotify daemon fetches
 on demand only.

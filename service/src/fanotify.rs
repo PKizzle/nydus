@@ -2284,6 +2284,64 @@ fn write_response(group: RawFd, event_fd: RawFd, response: u32) {
     }
 }
 
+/// Deny, with `EIO`, every permission event of the fanotify group `group` that a reader took
+/// off its queue and never answered, and return how many there were.
+///
+/// A process that dies between reading an event and answering it leaves the event on the
+/// group's `access_list` for as long as the group lives: the kernel answers it only when the
+/// group closes, and a group parked in systemd's fd store outlives its reader. Its reader stays
+/// blocked until killed. The kernel matches a response to an event by the event's fd number
+/// alone, never checking that the writer holds that fd, so writing a response for every fd
+/// number the dead reader could have used answers exactly those events. Event fds are allocated
+/// below the reader's `RLIMIT_NOFILE`, which the service manager sets the same for every
+/// generation, so the hard limit bounds the sweep.
+///
+/// Call it only while no process reads `group`, or a live reader's events are denied under it.
+/// Fails with `InvalidInput` if `group` is not a fanotify group.
+pub fn deny_stranded_events(group: RawFd) -> Result<usize> {
+    let link = std::fs::read_link(format!("/proc/self/fd/{group}"))?;
+    if link.as_os_str() != "anon_inode:[fanotify]" {
+        return Err(std::io::Error::new(
+            ErrorKind::InvalidInput,
+            format!("fd {group} is {}, not a fanotify group", link.display()),
+        ));
+    }
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: `limit` is a valid, writable `rlimit`.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let mut denied = 0;
+    for fd in 0..limit.rlim_max.min(RawFd::MAX as libc::rlim_t) as RawFd {
+        let resp = fanotify_response {
+            fd,
+            response: fan_deny_errno(libc::EIO),
+        };
+        // SAFETY: `resp` is a `#[repr(C)]` pair of 32-bit integers, readable for its size.
+        let ret = unsafe {
+            libc::write(
+                group,
+                (&resp as *const fanotify_response).cast(),
+                std::mem::size_of::<fanotify_response>(),
+            )
+        };
+        if ret >= 0 {
+            denied += 1;
+            continue;
+        }
+        let err = std::io::Error::last_os_error();
+        match err.raw_os_error() {
+            // No event was handed out under this fd number.
+            Some(libc::ENOENT) => {}
+            _ => return Err(err),
+        }
+    }
+    Ok(denied)
+}
+
 /// Walk an untrusted event buffer the way the worker does, extracting each record's range, and
 /// return how many records carried one. Entry point for the `fanotify_events` fuzz target.
 #[cfg(feature = "fuzzing")]
@@ -2969,6 +3027,91 @@ mod tests {
             after_read > after_seek,
             "the counting group sees no events at all"
         );
+    }
+
+    /// An event read by a process that died without answering it blocks its reader for as long
+    /// as the group lives; `deny_stranded_events` answers it with `EIO` and refuses a
+    /// descriptor that is not a fanotify group.
+    ///
+    /// Needs root, a >= 6.14 kernel and `NYDUS_FANOTIFY_TEST_DIR` on a file system with
+    /// pre-content marks (ext4); prints SKIP otherwise.
+    #[test]
+    fn a_dead_readers_event_is_denied_by_the_sweep() {
+        use super::*;
+        use crate::fanotify_sys::{FAN_CLASS_PRE_CONTENT, FAN_PRE_ACCESS};
+        use std::time::Duration;
+
+        let Some(base) = fanotify_test_dir() else {
+            return;
+        };
+        let dir = tempfile::TempDir::new_in(base).unwrap();
+        let file = dir.path().join("data");
+        std::fs::write(&file, [7u8; 4096]).unwrap();
+        // SAFETY: `fanotify_init` only takes integer flags; the result is checked.
+        let raw = unsafe {
+            libc::fanotify_init(
+                FAN_CLASS_PRE_CONTENT | libc::FAN_CLOEXEC,
+                libc::O_RDONLY as u32,
+            )
+        };
+        assert!(raw >= 0, "{}", std::io::Error::last_os_error());
+        // SAFETY: `raw` is the new group descriptor, owned by nothing else.
+        let group = unsafe { OwnedFd::from_raw_fd(raw) };
+        let path = std::ffi::CString::new(file.to_str().unwrap()).unwrap();
+        // SAFETY: `raw` is the live group and `path` a NUL-terminated path.
+        let marked = unsafe {
+            libc::fanotify_mark(
+                raw,
+                libc::FAN_MARK_ADD,
+                FAN_PRE_ACCESS,
+                libc::AT_FDCWD,
+                path.as_ptr(),
+            )
+        };
+        assert_eq!(marked, 0, "{}", std::io::Error::last_os_error());
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let read = File::open(&file).and_then(|f| f.read_at(&mut [0u8; 16], 0));
+            let _ = tx.send(read.map_err(|e| e.raw_os_error()));
+        });
+        let mut queued = libc::pollfd {
+            fd: raw,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: `queued` is one valid `pollfd`.
+        assert_eq!(unsafe { libc::poll(&mut queued, 1, 10_000) }, 1, "no event");
+        // SAFETY: the child only reads and exits, both async-signal-safe.
+        let child = unsafe { libc::fork() };
+        if child == 0 {
+            let mut buf = [0u8; 4096];
+            // SAFETY: `buf` is writable for its length; the child dies holding the event.
+            unsafe {
+                libc::read(raw, buf.as_mut_ptr().cast(), buf.len());
+                libc::_exit(0);
+            }
+        }
+        // SAFETY: `child` is our own child process.
+        let reaped = unsafe { libc::waitpid(child, std::ptr::null_mut(), 0) };
+        assert_eq!(reaped, child);
+        assert!(
+            rx.recv_timeout(Duration::from_millis(500)).is_err(),
+            "the reader was answered although its event's reader died"
+        );
+
+        assert_eq!(deny_stranded_events(raw).unwrap(), 1);
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(10)).unwrap(),
+            Err(Some(libc::EIO))
+        );
+        assert_eq!(deny_stranded_events(raw).unwrap(), 0);
+        let plain = File::open(dir.path()).unwrap();
+        assert_eq!(
+            deny_stranded_events(plain.as_raw_fd()).unwrap_err().kind(),
+            ErrorKind::InvalidInput
+        );
+        drop(group);
     }
 
     #[test]

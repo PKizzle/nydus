@@ -4,7 +4,8 @@
 # data the predecessor never fetched. Builds a zran artifact (gzip layer + zran index +
 # bootstrap) and runs the root-only `fanotify_takeover_serves_uncached_file_data` test, which
 # plays systemd's fd store and kills the predecessor while its marks are live, once on all CPUs
-# and once pinned to one.
+# and once pinned to one. Before the successor starts, a child reads an event of a cold read and
+# exits without answering it, as a predecessor killed mid-fill does; the read must complete.
 #
 # Needs root, Linux >= 6.14, cargo, and ROOT on ext4 (tmpfs has no pre-content marks).
 set -u
@@ -15,7 +16,16 @@ ROOT="${ROOT:-/var/tmp/takeover}"
 fail(){ echo "FAIL: $*"; exit 1; }
 
 grep " $ROOT/" /proc/self/mounts | awk '{print $2}' | xargs -r -n1 umount -l
-rm -rf "$ROOT"; mkdir -p "$ROOT"/{src/bin,out,artifact/backend,artifact/stage}
+rm -rf "$ROOT"; mkdir -p "$ROOT"/{src/bin,out,artifact/backend,artifact/stage,unit}
+
+# The sweep on its own (SERVICE_TEST_BIN, the `cargo test -p nydus-service --lib --no-run`
+# binary, or through cargo when unset).
+if [ -n "${SERVICE_TEST_BIN:-}" ]; then TEST=("$SERVICE_TEST_BIN"); else TEST=(cargo test -q -p nydus-service --lib --); fi
+OUT=$(NYDUS_FANOTIFY_TEST_DIR="$ROOT/unit" "${TEST[@]}" \
+  fanotify::tests::a_dead_readers_event_is_denied_by_the_sweep --exact --nocapture 2>&1)
+echo "$OUT" | tail -3
+echo "$OUT" | grep -q SKIP && fail "the stranded event test did not run"
+echo "$OUT" | grep -q "test result: ok. 1 passed" || fail "the stranded event test failed"
 head -c 3000000 /dev/urandom > "$ROOT/src/bin/tool"
 echo "root:x:0:0:root:/root:/bin/sh" > "$ROOT/src/passwd"
 tar -C "$ROOT/src" -czf "$ROOT/layer.tar.gz" .
