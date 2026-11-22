@@ -997,7 +997,7 @@ mod tests {
     /// The generation survives a save and restore, and a state saved before it was recorded
     /// restores as 0, the generation that daemon answered.
     #[test]
-    fn test_fusedev_state_carries_the_generation() {
+    fn the_fusedev_state_carries_the_generation() {
         use versionize::{VersionMap, Versionize, VersionizeResult};
         use versionize_derive::Versionize;
 

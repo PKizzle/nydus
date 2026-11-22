@@ -1321,7 +1321,7 @@ mod tests {
     /// looking up "." on the handle's own node id, a file's included, and reconnects a
     /// directory by looking up ".." up to the root.
     #[test]
-    fn test_lookup_dot_and_dotdot_for_file_handles() {
+    fn dot_and_dotdot_lookups_resolve_file_handles() {
         let root_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap();
         for boot in [
             "bootstrap/rafs-v5.boot",
@@ -1385,7 +1385,7 @@ mod tests {
     /// Two images get different generations, the same bootstrap bytes the same one, and every
     /// entry Rafs answers carries it.
     #[test]
-    fn test_entries_carry_the_image_generation() {
+    fn entries_carry_the_image_generation() {
         let root_dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
         let texture = root_dir.join("../tests/texture/bootstrap");
         let v5 = std::fs::read(texture.join("rafs-v5.boot")).unwrap();

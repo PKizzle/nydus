@@ -859,7 +859,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_only_ebadf_shuts_the_session_down() {
+    fn only_ebadf_shuts_the_session_down() {
         let encode =
             |errno| fuse_backend_rs::Error::EncodeMessage(std::io::Error::from_raw_os_error(errno));
         assert!(session_shut_down(&encode(libc::EBADF)));
@@ -872,7 +872,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn test_vfs_backend_negotiates_export_support_for_rafs_only() {
+    fn only_rafs_negotiates_export_support() {
         use fuse_backend_rs::api::filesystem::{FileSystem, FsOptions};
 
         let negotiated = |fs_type| {

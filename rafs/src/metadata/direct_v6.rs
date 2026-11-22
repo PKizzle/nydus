@@ -2261,7 +2261,7 @@ mod tests {
     /// A v6 non-directory inode records no parent on disk: reached without a lookup through its
     /// directory, `parent()` fails instead of panicking. Reached through the directory, it knows.
     #[test]
-    fn test_parent_of_file_without_lookup() {
+    fn a_file_reached_without_its_directory_has_no_parent() {
         let (path, data) = v6_fixture();
         let sb = load_v6(&data).unwrap();
         let mut dsb = DirectSuperBlockV6::new(&sb.meta, superblocks_of(&path));
