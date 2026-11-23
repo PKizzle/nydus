@@ -1050,12 +1050,13 @@ impl snapshots::Snapshotter for NydusSnapshotter {
             info!(name = %info.name, fieldpaths = ?fieldpaths, labels = ?info.labels, "update snapshot");
             let store = self.store.as_ref();
 
-            // Honor containerd's field-mask. Absent mask (`None`) replaces all
-            // labels; a bare `labels` path does the same; `labels.<key>` paths
+            // Honor containerd's field-mask. An absent or empty mask replaces
+            // all labels (containerd's proxy always sends a mask, empty for
+            // "all"); a bare `labels` path does the same; `labels.<key>` paths
             // merge only those keys, preserving every other existing label so a
             // masked update never clobbers containerd's GC-root labels.
             let mask = match fieldpaths.as_deref() {
-                None => LabelMask::ReplaceAll,
+                None | Some([]) => LabelMask::ReplaceAll,
                 Some(paths) => parse_label_mask(paths).map_err(|path| {
                     warn!(name = %info.name, %path, "update snapshot: unsupported fieldpath");
                     SnapshotterError::invalid_argument(format!(
@@ -1078,9 +1079,27 @@ impl snapshots::Snapshotter for NydusSnapshotter {
                 grpc_error(&e)
             })?;
 
+            // Only this snapshotter writes its stamp labels: an update drops
+            // them from the call, as containerd drops labels a backend does not
+            // own, and keeps the snapshot's own. containerd's metadata store
+            // replays a snapshot's caller labels on every update, so refusing
+            // them would fail every later update of that snapshot.
+            use crate::source::labels::{NYDUS_DAEMON_LABEL_PREFIX, strip_daemon_labels};
+            let mut incoming = info.labels.clone();
+            strip_daemon_labels(&mut incoming);
             let new_labels = match mask {
-                LabelMask::ReplaceAll => info.labels.clone(),
-                LabelMask::Merge(keys) => merge_labels(&existing.labels, &info.labels, &keys),
+                LabelMask::ReplaceAll => {
+                    let stamps = existing
+                        .labels
+                        .iter()
+                        .filter(|(k, _)| k.starts_with(NYDUS_DAEMON_LABEL_PREFIX));
+                    incoming.extend(stamps.map(|(k, v)| (k.clone(), v.clone())));
+                    incoming
+                }
+                LabelMask::Merge(mut keys) => {
+                    keys.retain(|k| !k.starts_with(NYDUS_DAEMON_LABEL_PREFIX));
+                    merge_labels(&existing.labels, &incoming, &keys)
+                }
             };
 
             let labels: Vec<(String, String)> = new_labels.into_iter().collect();
@@ -2646,11 +2665,15 @@ mod tests {
     }
 
     /// Labels under the snapshotter's own stamp prefix in a call (a layer
-    /// annotation containerd passes on) are dropped, so they never name a
-    /// daemon or count as checked.
+    /// annotation containerd passes on, or an `Update` from any containerd API
+    /// client) are dropped, so they never name a daemon or count as checked,
+    /// and an `Update` keeps the stamps the snapshotter wrote.
     #[compio::test]
     async fn call_labels_cannot_stamp_a_snapshot() {
-        use crate::source::labels::{NYDUS_DAEMON_CHECKED, NYDUS_DAEMON_IMAGE_REF};
+        use crate::source::labels::{
+            NYDUS_DAEMON_BOOTSTRAP, NYDUS_DAEMON_CHECKED, NYDUS_DAEMON_IMAGE_REF,
+            NYDUS_DAEMON_LABEL_PREFIX,
+        };
         let dir = tempdir().unwrap();
         let snapshotter = plain_prepare_snapshotter(dir.path());
         let planted = HashMap::from([
@@ -2670,7 +2693,7 @@ mod tests {
             .await
             .unwrap();
         snapshotter
-            .view("view".into(), "committed".into(), planted)
+            .view("view".into(), "committed".into(), planted.clone())
             .await
             .unwrap();
         for key in ["committed", "view"] {
@@ -2689,6 +2712,60 @@ mod tests {
                 .labels
                 .contains_key("containerd.io/snapshot/keep")
         );
+
+        // `committed` carries a stamp the snapshotter wrote; `view` has none.
+        snapshotter.stamp_daemon_ref_label("committed", "reg/app:v1", Path::new("/b/app"));
+        let mut incoming = planted.clone();
+        incoming.insert(NYDUS_DAEMON_BOOTSTRAP.to_string(), "/b/other".to_string());
+        incoming.insert("app".to_string(), "new".to_string());
+        let masks: [Option<Vec<String>>; 4] = [
+            None,
+            Some(Vec::new()),
+            Some(vec!["labels".to_string()]),
+            Some(
+                [
+                    NYDUS_DAEMON_IMAGE_REF,
+                    NYDUS_DAEMON_BOOTSTRAP,
+                    NYDUS_DAEMON_CHECKED,
+                    "app",
+                ]
+                .iter()
+                .map(|k| format!("labels.{k}"))
+                .collect(),
+            ),
+        ];
+        for mask in masks {
+            for key in ["committed", "view"] {
+                let info = Info {
+                    name: key.to_string(),
+                    labels: incoming.clone(),
+                    ..Default::default()
+                };
+                let updated = snapshotter.update(info, mask.clone()).await.unwrap();
+                let labels = snapshotter.store.stat(key).unwrap().labels;
+                assert_eq!(updated.labels, labels, "{key} {mask:?}");
+                assert_eq!(
+                    labels.get("app").map(String::as_str),
+                    Some("new"),
+                    "{key} {mask:?}: {labels:?}"
+                );
+                if key == "committed" {
+                    let stamp = stamp_of(&labels).expect("stamp kept");
+                    assert_eq!(
+                        (stamp.image_ref, stamp.bootstrap, stamp.checked),
+                        ("reg/app:v1", Some("/b/app"), true),
+                        "{key} {mask:?}: {labels:?}"
+                    );
+                } else {
+                    assert!(
+                        !labels
+                            .keys()
+                            .any(|k| k.starts_with(NYDUS_DAEMON_LABEL_PREFIX)),
+                        "{key} {mask:?}: {labels:?}"
+                    );
+                }
+            }
+        }
     }
 
     /// A stamp written by a release that did not check claimants is used only
