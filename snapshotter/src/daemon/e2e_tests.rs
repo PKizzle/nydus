@@ -112,6 +112,8 @@ struct MockRegistry {
     refused: std::sync::atomic::AtomicUsize,
     /// Tokens the realm handed out.
     tokens: std::sync::atomic::AtomicUsize,
+    /// Method and range of every served blob request, in order.
+    log: std::sync::Mutex<Vec<String>>,
 }
 
 impl MockRegistry {
@@ -128,6 +130,7 @@ fn serve_registry(dir: PathBuf, auth: RegistryAuth) -> Arc<MockRegistry> {
         served: Default::default(),
         refused: Default::default(),
         tokens: Default::default(),
+        log: Default::default(),
     });
     let shared = registry.clone();
     std::thread::spawn(move || {
@@ -235,6 +238,11 @@ fn serve_registry_request(
             b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
         );
     };
+    registry
+        .log
+        .lock()
+        .unwrap()
+        .push(format!("{method} {}", range.as_deref().unwrap_or("-")));
     registry.served.fetch_add(1, Ordering::SeqCst);
     let size = fs::metadata(&file)?.len();
     let (status, start, end) = match range.as_deref().and_then(|r| r.strip_prefix("bytes=")) {
@@ -426,15 +434,22 @@ fn a_second_image_borrows_a_shared_blob() {
     let supervisor = DaemonSupervisor::new(config);
     let runtime = compio::runtime::Runtime::new().unwrap();
     let blobs = fs::read_dir(root.join("blobs")).unwrap().count();
-    // Requests made while a daemon starts (its blob meta) are not reads of file data.
-    let settled = || {
+    // Requests made while a daemon starts are not reads of file data. Each blob's metadata is
+    // fetched by a thread of its own that a start does not wait for, so wait for that request
+    // (`at_least`) as well as for the requests to stop, or it can land among the file reads.
+    let settled = |at_least: usize| {
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
         let mut served = registry.served();
         loop {
             std::thread::sleep(Duration::from_millis(300));
             let now = registry.served();
-            if now == served {
+            if now == served && now >= at_least {
                 return served;
             }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the daemon did not fetch its blob meta"
+            );
             served = now;
         }
     };
@@ -443,6 +458,8 @@ fn a_second_image_borrows_a_shared_blob() {
     let mut reads = Vec::new();
     for name in ["app:1", "app:2", "other/app:1"] {
         let image_ref = format!("{}/{name}", registry.addr);
+        // Each image has a cache dir of its own, so it fetches the metadata of every blob.
+        let meta_fetched = registry.served() + blobs;
         let handle = runtime
             .block_on(supervisor.ensure_instance(
                 &image_ref,
@@ -453,7 +470,8 @@ fn a_second_image_borrows_a_shared_blob() {
             .unwrap_or_else(|e| panic!("daemon start of {image_ref}: {e:#}"));
         let mountpoint = handle.mountpoint().to_path_buf();
         assert_eq!(mount_fstype_at(&mountpoint).as_deref(), Some("erofs"));
-        let before = settled();
+        let before = settled(meta_fetched);
+        registry.log.lock().unwrap().push(format!("== {name}"));
         assert_same_files(&root.join("src"), &mountpoint);
         reads.push(registry.served() - before);
         images.push((image_ref, handle));
@@ -464,6 +482,7 @@ fn a_second_image_borrows_a_shared_blob() {
          other repository {}; {borrowed} chunks borrowed",
         reads[0], reads[1], reads[2]
     );
+    println!("BORROW E2E LOG: {:?}", registry.log.lock().unwrap());
     for (image_ref, handle) in images {
         drop(handle);
         runtime
