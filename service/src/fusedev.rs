@@ -807,7 +807,7 @@ pub fn create_fuse_daemon(
 /// Create vfs backend with rafs or passthrough as the fuse filesystem driver
 #[cfg(target_os = "macos")]
 pub fn create_vfs_backend(
-    _fs_type: FsBackendType,
+    _fs_type: Option<FsBackendType>,
     _is_fuse: bool,
     _hybrid_mode: bool,
 ) -> Result<Arc<Vfs>> {
@@ -815,21 +815,32 @@ pub fn create_vfs_backend(
     Ok(Arc::new(vfs))
 }
 
+/// `fs_type` is the file system mounted at the root, or `None` for a daemon whose file systems
+/// all arrive through the API later.
 #[cfg(target_os = "linux")]
 pub fn create_vfs_backend(
-    fs_type: FsBackendType,
+    fs_type: Option<FsBackendType>,
     is_fuse: bool,
     hybrid_mode: bool,
 ) -> Result<Arc<Vfs>> {
     let mut opts = fuse_backend_rs::api::VfsOptions::default();
     match fs_type {
-        FsBackendType::PassthroughFs => {
+        // An API-only daemon mounts RAFS images, and may mount passthrough too, which needs open.
+        // Export support holds as in the Rafs arm. The root is the Vfs pseudo fs, which never
+        // reuses an inode number, so a handle to a directory it has evicted fails ESTALE.
+        None => {
+            opts.no_open = false;
+            opts.no_opendir = false;
+            opts.killpriv_v2 = true;
+            opts.out_opts |= fuse_backend_rs::api::filesystem::FsOptions::EXPORT_SUPPORT;
+        }
+        Some(FsBackendType::PassthroughFs) => {
             // passthroughfs requires !no_open
             opts.no_open = false;
             opts.no_opendir = false;
             opts.killpriv_v2 = true;
         }
-        FsBackendType::Rafs => {
+        Some(FsBackendType::Rafs) => {
             // rafs can be readonly and skip open
             opts.no_open = true;
             // File handles (`open_by_handle_at`, NFS export, overlayfs `index=on`) survive dentry
@@ -872,15 +883,18 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn only_rafs_negotiates_export_support() {
+    fn passthrough_roots_do_not_negotiate_export_support() {
         use fuse_backend_rs::api::filesystem::{FileSystem, FsOptions};
 
         let negotiated = |fs_type| {
             let vfs = create_vfs_backend(fs_type, true, false).unwrap();
             vfs.init(FsOptions::all()).unwrap()
         };
-        assert!(negotiated(FsBackendType::Rafs).contains(FsOptions::EXPORT_SUPPORT));
-        assert!(!negotiated(FsBackendType::PassthroughFs).contains(FsOptions::EXPORT_SUPPORT));
+        assert!(negotiated(Some(FsBackendType::Rafs)).contains(FsOptions::EXPORT_SUPPORT));
+        assert!(negotiated(None).contains(FsOptions::EXPORT_SUPPORT));
+        assert!(
+            !negotiated(Some(FsBackendType::PassthroughFs)).contains(FsOptions::EXPORT_SUPPORT)
+        );
     }
 
     #[test]

@@ -13,8 +13,11 @@
 #   H4  the reopens reached nydusd: its Lookup counter grows by at least one per handle. A
 #       reopen served from a dentry that was never evicted passes H1-H3 without testing the
 #       export path, so H4 is what makes them count. CONTROL=1 skips dropping the caches and
-#       must fail H4.
+#       must fail H4 and H6.
 #   H5  nydusd exits on its own within 10 s of the mount being unmounted.
+#   H6  H1-H4 again on a nydusd started without a bootstrap, with the image mounted at /img
+#       through the API, so the FUSE root is the Vfs pseudo fs and ".." from the image root
+#       answers it.
 #
 # Requirements: root (mount(2), drop_caches), FUSE, a C compiler, curl and python3.
 # Override the binaries via env, e.g. NYDUS_IMAGE=... NYDUSD=... ROOT=... CC=...
@@ -96,24 +99,29 @@ curl -sf --unix-socket "$ROOT/api.sock" http://localhost/api/v1/metrics |
 SH
 chmod +x "$ROOT/lookups.sh"
 
-step "H1-H3: take handles, drop dentries, reopen"
-HANDLES=(d1/d2/f2.txt d1 d1/d2/d3)
-[ "${CONTROL:-0}" = 1 ] && export FH_NO_DROP=1 && note "CONTROL: caches are not dropped"
-FH_REOPEN_HOOK="'$ROOT/lookups.sh' > '$ROOT/lookups.before'" \
-  "$ROOT/fh-reopen" "$ROOT/mnt" "${HANDLES[@]}" \
-  || case_fail "H1-H3: not every handle reopened (fh-reopen exit $?)"
+# Takes a handle for each path under the mount, drops the caches, reopens every handle (H1-H3)
+# and checks that the reopens were looked up in nydusd (H4). $1 labels the checks.
+reopen_handles() {
+  local label=$1; shift
+  FH_REOPEN_HOOK="'$ROOT/lookups.sh' > '$ROOT/lookups.before'" \
+    "$ROOT/fh-reopen" "$ROOT/mnt" "$@" \
+    || case_fail "$label: not every handle reopened (fh-reopen exit $?)"
+  local before after
+  before=$(cat "$ROOT/lookups.before" 2>/dev/null)
+  after=$("$ROOT/lookups.sh")
+  note "Lookup counter ${before:-?} -> ${after:-?} for $# handles"
+  if [ -z "$before" ] || [ -z "$after" ]; then
+    case_fail "$label: cannot read nydusd's Lookup counter"
+  elif [ $((after - before)) -lt $# ]; then
+    case_fail "$label: the reopens did not reach nydusd, so they tested cached dentries"
+  else
+    case_pass "$label: $((after - before)) lookups served the reopens"
+  fi
+}
 
-step "H4: the reopens looked the node ids up in nydusd"
-before=$(cat "$ROOT/lookups.before" 2>/dev/null)
-after=$("$ROOT/lookups.sh")
-note "Lookup counter ${before:-?} -> ${after:-?} for ${#HANDLES[@]} handles"
-if [ -z "$before" ] || [ -z "$after" ]; then
-  case_fail "H4: cannot read nydusd's Lookup counter"
-elif [ $((after - before)) -lt ${#HANDLES[@]} ]; then
-  case_fail "H4: the reopens did not reach nydusd, so H1-H3 tested cached dentries"
-else
-  case_pass "H4: $((after - before)) lookups served the reopens"
-fi
+step "H1-H4: take handles, drop dentries, reopen through nydusd"
+[ "${CONTROL:-0}" = 1 ] && export FH_NO_DROP=1 && note "CONTROL: caches are not dropped"
+reopen_handles H1-H4 d1/d2/f2.txt d1 d1/d2/d3
 
 step "H5: nydusd exits after umount"
 umount "$ROOT/mnt" || case_fail "H5: umount failed"
@@ -125,6 +133,24 @@ else
   NYDUSD_PID=
   case_pass "H5: nydusd exited after umount"
 fi
+
+step "H6: an image mounted through the API of a daemon without a bootstrap"
+rm -f "$ROOT/api.sock"
+"$ND" fuse --mountpoint "$ROOT/mnt" --apisock "$ROOT/api.sock" --log-level info \
+  > "$ROOT/nydusd-api.log" 2>&1 &
+NYDUSD_PID=$!
+for _ in $(seq 50); do [ -S "$ROOT/api.sock" ] && mountpoint -q "$ROOT/mnt" && break; sleep 0.2; done
+python3 -c 'import json, sys; print(json.dumps({"source": sys.argv[1], "fs_type": "rafs",
+  "config": open(sys.argv[2]).read()}))' "$ROOT/out/bootstrap" "$ROOT/config.json" |
+  curl -sf --unix-socket "$ROOT/api.sock" -X POST -H 'Content-Type: application/json' \
+    --data-binary @- "http://localhost/api/v1/mount?mountpoint=/img" >/dev/null
+if [ -f "$ROOT/mnt/img/top.txt" ]; then
+  reopen_handles H6 img/d1/d2/f2.txt img/d1 img/d1/d2/d3
+else
+  echo "--- nydusd-api.log ---"; tail -30 "$ROOT/nydusd-api.log"
+  case_fail "H6: the API mount is not visible at $ROOT/mnt/img"
+fi
+teardown
 
 echo
 if [ "$FAILURES" = 0 ]; then

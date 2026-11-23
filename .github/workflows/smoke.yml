@@ -879,6 +879,7 @@ jobs:
       run: |
         sudo cat /var/tmp/fusedev-disk-pressure/nydusd.log || true
         sudo cat /var/tmp/fusedev-file-handles/nydusd.log || true
+        sudo cat /var/tmp/fusedev-file-handles/nydusd-api.log || true
 
   takeover-test:
     runs-on: ${{ vars.RUNNER_OS || 'ubuntu-latest' }}
