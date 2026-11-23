@@ -2085,12 +2085,13 @@ impl DaemonSupervisor {
     /// restore pairs these records with preserved fds after a crash.
     pub const RECORDS_DIRNAME: &'static str = "records";
 
-    /// Unmount every running instance. Called on graceful shutdown.
+    /// Unmount every running instance. Called on graceful shutdown without an fd store, where
+    /// each fanotify group closes with this process: a mount left up reads unfilled data as zeros.
     pub async fn shutdown_all(&self) {
         let mut instances = self.instances.write().await;
         for (image_ref, inst) in instances.drain() {
             info!(image_ref, "shutting down nydus daemon");
-            if let Err(e) = stop_instance(&inst) {
+            if let Err(e) = stop_unreferenced_instance(&inst) {
                 warn!(image_ref, error = %e, "shutdown_all: failed to stop daemon");
             }
             if let Err(e) = self.persist_instance_record(&inst, false).await {
@@ -2145,7 +2146,7 @@ impl DaemonSupervisor {
                     image_ref,
                     "failover not armed for this image; unmounting to avoid a stuck mount"
                 );
-                if let Err(e) = stop_instance(inst) {
+                if let Err(e) = stop_unreferenced_instance(inst) {
                     warn!(image_ref, error = %e, "failed to unmount un-armed daemon on shutdown");
                 }
             }
@@ -6209,8 +6210,10 @@ mod tests {
     }
 
     /// Releasing the last holder of an auto-accel daemon removes its EROFS
-    /// mount. `NYDUS_E2E_ROOT` is an ext4 dir holding `artifact/bootstrap` and
-    /// the localfs `artifact/backend/` of a zran image.
+    /// mount, and so does a shutdown without an fd store (`shutdown_all`): the
+    /// group closes when the process exits, and a mount left up without it
+    /// reads unfilled data as zeros. `NYDUS_E2E_ROOT` is an ext4 dir holding
+    /// `artifact/bootstrap` and the localfs `artifact/backend/` of a zran image.
     #[cfg(target_os = "linux")]
     #[test]
     #[ignore = "needs root, Linux >= 6.14 and an ext4 work dir; run misc/fanotify/release-unmount-test.sh"]
@@ -6242,6 +6245,18 @@ mod tests {
         assert!(
             !is_mounted_at(&mountpoint),
             "EROFS mount at {} outlived its released daemon",
+            mountpoint.display()
+        );
+
+        let handle = runtime
+            .block_on(supervisor.ensure_instance_local(image_ref, &bootstrap, &backend, "k2"))
+            .unwrap();
+        let mountpoint = handle.mountpoint().to_path_buf();
+        assert_eq!(mount_fstype_at(&mountpoint).as_deref(), Some("erofs"));
+        runtime.block_on(supervisor.shutdown_all());
+        assert!(
+            !is_mounted_at(&mountpoint),
+            "EROFS mount at {} outlived the shutdown of its daemon",
             mountpoint.display()
         );
     }
