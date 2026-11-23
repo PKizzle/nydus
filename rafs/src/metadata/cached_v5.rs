@@ -73,7 +73,7 @@ impl CachedSuperBlockV5 {
                     trace!(
                         "got inode ino {} parent {} size {} child_idx {} child_cnt {}",
                         inode.ino(),
-                        inode.parent(),
+                        inode.i_parent,
                         inode.size(),
                         inode.i_child_idx,
                         inode.i_child_cnt,
@@ -143,7 +143,7 @@ impl CachedSuperBlockV5 {
     }
 
     fn add_into_parent(&mut self, child_inode: Arc<CachedInodeV5>) {
-        if let Ok(parent_inode) = self.get_node_mut(child_inode.parent()) {
+        if let Ok(parent_inode) = self.get_node_mut(child_inode.i_parent) {
             Arc::get_mut(parent_inode).unwrap().add_child(child_inode);
         }
     }
@@ -586,7 +586,7 @@ impl RafsInode for CachedInodeV5 {
         }
 
         if cur_offset == 1 {
-            let parent = if self.ino() == 1 { 1 } else { self.parent() };
+            let parent = if self.ino() == 1 { 1 } else { self.i_parent };
             cur_offset += 1;
             // Safe to unwrap since conversion from DOTDOT to os string can't fail.
             match handler(
@@ -696,7 +696,10 @@ impl RafsInodeExt for CachedInodeV5 {
         }
     }
 
-    impl_getter!(parent, i_parent, u64);
+    #[inline]
+    fn parent(&self) -> RafsResult<u64> {
+        Ok(self.i_parent)
+    }
 }
 
 impl RafsV5InodeChunkOps for CachedInodeV5 {
@@ -1811,7 +1814,7 @@ mod cached_tests {
         assert_eq!(inode.size(), 8192);
         assert_eq!(inode.rdev(), 0x0801);
         assert_eq!(inode.projid(), 1000);
-        assert_eq!(inode.parent(), 1);
+        assert_eq!(inode.parent().unwrap(), 1);
         assert_eq!(inode.name(), OsString::from("test_file"));
         assert_eq!(inode.get_name_size(), "test_file".len() as u16);
         assert_eq!(inode.flags(), RafsInodeFlags::XATTR.bits());
@@ -1861,7 +1864,7 @@ mod cached_tests {
         assert_eq!(inode.size(), 0);
         assert_eq!(inode.rdev(), 0);
         assert_eq!(inode.projid(), 0);
-        assert_eq!(inode.parent(), 0);
+        assert_eq!(inode.parent().unwrap(), 0);
         assert_eq!(inode.flags(), 0);
         assert_eq!(inode.get_name_size(), 0);
         assert!(!inode.has_xattr());

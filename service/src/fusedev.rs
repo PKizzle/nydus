@@ -117,9 +117,6 @@ impl FuseServer {
     }
 
     fn svc_loop(&mut self, metrics_hook: &dyn MetricsHook) -> Result<()> {
-        // Given error EBADF, it means kernel has shut down this session.
-        let _ebadf = std::io::Error::from_raw_os_error(libc::EBADF);
-
         loop {
             if let Some((reader, writer)) = self.ch.get_request().map_err(|e| {
                 NydusError::StartService(format!(
@@ -131,17 +128,13 @@ impl FuseServer {
                     self.server
                         .handle_message(reader, writer.into(), None, Some(metrics_hook))
                 {
-                    match e {
-                        fuse_backend_rs::Error::EncodeMessage(_ebadf) => {
-                            return Err(NydusError::StartService(
-                                "fuse session has been shut down".to_string(),
-                            ));
-                        }
-                        _ => {
-                            error!("Handling fuse message, {}", NydusError::ProcessQueue(e));
-                            continue;
-                        }
+                    if session_shut_down(&e) {
+                        return Err(NydusError::StartService(
+                            "fuse session has been shut down".to_string(),
+                        ));
                     }
+                    error!("Handling fuse message, {}", NydusError::ProcessQueue(e));
+                    continue;
                 }
             } else {
                 info!("fuse server exits");
@@ -151,6 +144,13 @@ impl FuseServer {
 
         Ok(())
     }
+}
+
+/// Whether a failed reply means the kernel has shut down this session (EBADF). Any other failed
+/// write, such as ENOENT for a request the kernel has already interrupted, loses one reply only.
+fn session_shut_down(e: &fuse_backend_rs::Error) -> bool {
+    matches!(e, fuse_backend_rs::Error::EncodeMessage(io)
+        if nydus_utils::source_errno(io) == Some(libc::EBADF))
 }
 
 struct FusedevNotifier<'a> {
@@ -471,11 +471,13 @@ impl FusedevDaemon {
         let thread = thread::Builder::new()
             .name("fuse_server".to_string())
             .spawn(move || {
-                if let Err(_err) = s.svc_loop(&inflight_op) {
-                    // Notify the daemon controller that one working thread has exited.
-                    if let Err(err) = waker.wake() {
-                        error!("fail to exit daemon, error: {:?}", err);
-                    }
+                if let Err(err) = s.svc_loop(&inflight_op) {
+                    warn!("fuse server failed: {}", err);
+                }
+                // A worker leaves its loop only when the session ends, a umount (ENODEV or
+                // ECONNABORTED from the device) included, so the daemon controller must exit too.
+                if let Err(err) = waker.wake() {
+                    error!("fail to exit daemon, error: {:?}", err);
                 }
                 Ok(())
             })
@@ -830,6 +832,15 @@ pub fn create_vfs_backend(
         FsBackendType::Rafs => {
             // rafs can be readonly and skip open
             opts.no_open = true;
+            // File handles (`open_by_handle_at`, NFS export, overlayfs `index=on`) survive dentry
+            // eviction: the kernel looks a forgotten node id up again through "." and "..". RAFS
+            // inode numbers are fixed by the image, and every inode carries a generation derived
+            // from the bootstrap, so a handle into a file system index the Vfs has since given to
+            // another image fails ESTALE instead of opening that image's file. Any other backend
+            // mounted into this Vfs later answers a node id it has forgotten with an error, which
+            // `open_by_handle_at` returns as ESTALE or as that error (passthrough: EBADF); it
+            // never opens a different file.
+            opts.out_opts |= fuse_backend_rs::api::filesystem::FsOptions::EXPORT_SUPPORT;
         }
     };
 
@@ -846,6 +857,31 @@ pub fn create_vfs_backend(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_ebadf_shuts_the_session_down() {
+        let encode =
+            |errno| fuse_backend_rs::Error::EncodeMessage(std::io::Error::from_raw_os_error(errno));
+        assert!(session_shut_down(&encode(libc::EBADF)));
+        assert!(!session_shut_down(&encode(libc::ENOENT)));
+        assert!(!session_shut_down(&encode(libc::EIO)));
+        assert!(!session_shut_down(&fuse_backend_rs::Error::DecodeMessage(
+            std::io::Error::from_raw_os_error(libc::EBADF)
+        )));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn only_rafs_negotiates_export_support() {
+        use fuse_backend_rs::api::filesystem::{FileSystem, FsOptions};
+
+        let negotiated = |fs_type| {
+            let vfs = create_vfs_backend(fs_type, true, false).unwrap();
+            vfs.init(FsOptions::all()).unwrap()
+        };
+        assert!(negotiated(FsBackendType::Rafs).contains(FsOptions::EXPORT_SUPPORT));
+        assert!(!negotiated(FsBackendType::PassthroughFs).contains(FsOptions::EXPORT_SUPPORT));
+    }
 
     #[test]
     fn test_get_possible_base_paths_returns_two_paths() {
