@@ -1324,6 +1324,8 @@ mod tests {
     fn dot_and_dotdot_lookups_resolve_file_handles() {
         let root_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap();
         for boot in [
+            // Walking the whole 11 MiB v5 image takes hours under Miri.
+            #[cfg(not(miri))]
             "bootstrap/rafs-v5.boot",
             // top.txt, d1/f1.txt, d1/d2/f2.txt, d1/d2/d3/f3.txt
             "bootstrap/rafs-v6-nested.boot",
@@ -1388,12 +1390,12 @@ mod tests {
     fn entries_carry_the_image_generation() {
         let root_dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
         let texture = root_dir.join("../tests/texture/bootstrap");
-        let v5 = std::fs::read(texture.join("rafs-v5.boot")).unwrap();
+        let other = std::fs::read(texture.join("rafs-v6-small-files.boot")).unwrap();
         let v6 = std::fs::read(texture.join("rafs-v6-nested.boot")).unwrap();
-        let (g5, g6) = (image_generation(&v5), image_generation(&v6));
-        assert_ne!(g5, g6);
+        let (g_other, g6) = (image_generation(&other), image_generation(&v6));
+        assert_ne!(g_other, g6);
         assert_eq!(image_generation(&v6.clone()), g6);
-        for g in [g5, g6] {
+        for g in [g_other, g6] {
             assert!(g != 0 && g <= u64::from(u32::MAX), "{g:#x}");
         }
 
