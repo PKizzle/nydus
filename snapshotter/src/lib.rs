@@ -65,6 +65,8 @@ pub mod retention;
 pub mod source;
 pub mod store;
 pub mod sysctl;
+#[cfg(test)]
+mod test_containerd;
 
 /// Crate-local result type; all public APIs return `anyhow::Result`.
 pub type Result<T> = anyhow::Result<T>;

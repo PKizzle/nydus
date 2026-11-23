@@ -1154,4 +1154,69 @@ mod tests {
             }
         }
     }
+
+    /// Only a sidecar of the current [`AUTO_ACCEL_MANIFEST_VERSION`] is
+    /// served: one written under another version is ignored, so the image
+    /// falls back to overlay and is converted again.
+    #[test]
+    fn resolve_serves_only_the_current_manifest_version() {
+        use crate::auto_zran::{AutoAccelDescriptor, auto_accel_image_name};
+        use crate::test_containerd::{FakeContainerd, config, image, serve};
+
+        let subject = |n: u32| format!("sha256:{n:064x}");
+        let (old, current) = (subject(1), subject(2));
+        let mut fake = FakeContainerd::default();
+        for (i, (subject, version)) in [
+            (&old, AUTO_ACCEL_MANIFEST_VERSION - 1),
+            (&current, AUTO_ACCEL_MANIFEST_VERSION),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let (wrapper, config_digest) = (
+                format!("sha256:{:064x}", 0x10 + i),
+                format!("sha256:{:064x}", 0x20 + i),
+            );
+            let manifest = AutoAccelManifest {
+                version,
+                subject_manifest_digest: subject.clone(),
+                image_ref: "reg/app:1".to_string(),
+                bootstrap: AutoAccelDescriptor {
+                    digest: format!("sha256:{:064x}", 0x30 + i),
+                    size: 1,
+                },
+                zran_indexes: Vec::new(),
+                prefetch_blob: None,
+                architecture: "amd64".to_string(),
+                os: "linux".to_string(),
+                rootfs: crate::auto_zran::OciConfigRootfs {
+                    kind: "layers".to_string(),
+                    diff_ids: Vec::new(),
+                },
+            };
+            fake.images.push(image(
+                &auto_accel_image_name(subject),
+                OCI_MANIFEST_MEDIATYPE,
+                &wrapper,
+            ));
+            let oci = serde_json::json!({ "config": { "digest": config_digest } });
+            fake.blobs.insert(wrapper, Ok(oci.to_string().into_bytes()));
+            fake.blobs
+                .insert(config_digest, Ok(serde_json::to_vec(&manifest).unwrap()));
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("containerd.sock");
+        serve(&socket, fake);
+        let locator = SidecarLocator::new(
+            ContentStoreClient::new(&config(&socket, dir.path())).unwrap(),
+            dir.path(),
+            &PeerMirrorConfig::default(),
+        );
+        compio::runtime::Runtime::new().unwrap().block_on(async {
+            assert!(locator.resolve_or_pull(&old).await.unwrap().is_none());
+            let served = locator.resolve_or_pull(&current).await.unwrap().unwrap();
+            assert_eq!(served.version, AUTO_ACCEL_MANIFEST_VERSION);
+            assert_eq!(served.subject_manifest_digest, current);
+        });
+    }
 }
