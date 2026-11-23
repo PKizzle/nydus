@@ -1,8 +1,8 @@
 name: Sanitizers
 
-# AddressSanitizer and cargo-careful over the unit tests. Nightly-only and slow, so this
-# is not a required check: it runs on a schedule, on demand, and on pull requests that
-# carry the `sanitizers` label. See docs/sanitizers.md.
+# AddressSanitizer, ThreadSanitizer and cargo-careful over the unit tests. Nightly-only and
+# slow, so this is not a required check: it runs on a schedule, on demand, and on pull
+# requests that carry the `sanitizers` label. See docs/sanitizers.md.
 on:
   schedule:
     - cron: "30 1 * * *"
@@ -27,7 +27,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        tool: [asan, careful]
+        tool: [asan, tsan, careful]
     name: ${{ matrix.tool }}
     steps:
     - name: Checkout
@@ -50,8 +50,8 @@ jobs:
     - name: Install protoc
       run: bash misc/install-protoc.sh
     - name: Install llvm-symbolizer
-      # Without it, LeakSanitizer reports raw addresses and lsan.supp cannot match frames.
-      if: matrix.tool == 'asan'
+      # Without it, reports carry raw addresses and lsan.supp/tsan.supp cannot match frames.
+      if: matrix.tool != 'careful'
       run: |
         sym=$(command -v llvm-symbolizer || ls /usr/bin/llvm-symbolizer-* 2>/dev/null | sort -V | tail -1)
         if [ -z "$sym" ]; then
@@ -59,8 +59,9 @@ jobs:
           sym=$(command -v llvm-symbolizer)
         fi
         echo "ASAN_SYMBOLIZER_PATH=$sym" >> "$GITHUB_ENV"
+        echo "TSAN_SYMBOLIZER_PATH=$sym" >> "$GITHUB_ENV"
     - name: Unit Test with ${{ matrix.tool }}
       run: |
         export RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}" CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
-        bash misc/sudo-env.sh PATH RUSTUP_HOME 'CARGO_*' 'ASAN_*' -- \
+        bash misc/sudo-env.sh PATH RUSTUP_HOME 'CARGO_*' 'ASAN_*' 'TSAN_*' -- \
           make ${{ matrix.tool }}-ut-nextest SANITIZER_TOOLCHAIN="$SANITIZER_TOOLCHAIN" RUSTUP="$(command -v rustup)"

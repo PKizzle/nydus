@@ -22,6 +22,13 @@ MIRI_NEXTEST = $(CARGO_COV_FLAGS) MIRIFLAGS=-Zmiri-disable-isolation TEST_WORKDI
 SANITIZER_TOOLCHAIN ?= nightly
 SANITIZER_TARGET ?= $(UNAME_M)-unknown-linux-gnu
 SANITIZER_NEXTEST_ARGS = --no-fail-fast --filter-expr 'not test(integration)' --workspace $(EXCLUDE_PACKAGES) $(CARGO_COMMON) --target $(SANITIZER_TARGET)
+# worker_panic_denies_the_batch_and_fails_the_handler: the panic's backtrace takes TSan longer
+# than the 5 s the test waits for each response (it passes, race-free, with a longer wait).
+TSAN_FILTER = not test(integration) - test(fanotify::tests::worker_panic_denies_the_batch_and_fails_the_handler)
+# compiler_builtins is left uninstrumented: on aarch64 the TSan runtime calls its outline
+# atomics during its own initialisation, and instrumented ones crash it.
+TSAN_BUILTINS = --config 'profile.dev.package.compiler_builtins.rustflags=["-Cllvm-args=-tsan-instrument-func-entry-exit=false -tsan-instrument-atomics=false -tsan-instrument-memory-accesses=false"]'
+TSAN_NEXTEST_ARGS = -Zbuild-std -Zprofile-rustflags $(TSAN_BUILTINS) --no-fail-fast --lib --filter-expr '$(TSAN_FILTER)' -p nydus-utils -p nydus-storage -p nydus-rafs -p nydus-service --features nydus-service/block-uffd,nydus-service/block-nbd --target $(SANITIZER_TARGET)
 CARGO_BUILD_GEARS = -v ~/.ssh/id_rsa:/root/.ssh/id_rsa -v ~/.cargo/git:/root/.cargo/git -v ~/.cargo/registry:/root/.cargo/registry
 SUDO = $(shell which sudo)
 CARGO_COMMON ?=
@@ -196,6 +203,14 @@ asan-ut-nextest:
 	ASAN_OPTIONS="$${ASAN_OPTIONS:-detect_leaks=1}" \
 	LSAN_OPTIONS="$${LSAN_OPTIONS:-suppressions=$(CURDIR)/misc/sanitizers/lsan.supp:print_suppressions=0}" \
 	TEST_WORKDIR_PREFIX=$(TEST_WORKDIR_PREFIX) RUST_BACKTRACE=1 ${RUSTUP} run $(SANITIZER_TOOLCHAIN) cargo nextest run $(SANITIZER_NEXTEST_ARGS)
+
+# ThreadSanitizer needs std rebuilt with the sanitizer (-Zbuild-std), or every
+# synchronisation inside std is invisible and reads as a race. nydus-snapshotter is out of
+# scope: its compio/io_uring I/O is completed by the kernel, which TSan cannot see.
+tsan-ut-nextest:
+	RUSTFLAGS="-Zsanitizer=thread" RUSTDOCFLAGS="-Zsanitizer=thread" \
+	TSAN_OPTIONS="$${TSAN_OPTIONS:-suppressions=$(CURDIR)/misc/sanitizers/tsan.supp}" \
+	TEST_WORKDIR_PREFIX=$(TEST_WORKDIR_PREFIX) RUST_BACKTRACE=1 ${RUSTUP} run $(SANITIZER_TOOLCHAIN) cargo nextest run $(TSAN_NEXTEST_ARGS)
 
 # cargo-careful rebuilds std with debug assertions, so std's precondition checks
 # (slice::from_raw_parts, ptr::copy_nonoverlapping, ...) fire inside the tests.
