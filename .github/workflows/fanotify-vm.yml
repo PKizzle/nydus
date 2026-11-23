@@ -181,7 +181,7 @@ jobs:
     # build, which the guest runs from the runner's own root file system.
     - name: Build the nydus-service test binary with ASan
       id: asan-build
-      if: ${{ matrix.asan }}
+      if: ${{ !cancelled() && matrix.asan }}
       run: |
         rustup toolchain install "$SANITIZER_TOOLCHAIN" --profile minimal
         # An explicit --target keeps build scripts and proc macros uninstrumented.
