@@ -2263,3 +2263,171 @@ mod tests {
         }
     }
 }
+
+/// How a content-store failure during an image walk is classified, against a
+/// fake containerd (Images.List + Content.Read) served on a Unix socket and
+/// reached through the same `ContainerdChannel` as production.
+#[cfg(test)]
+mod walk_failure_tests {
+    use super::*;
+    use crate::containerd_api::services::content::v1::{ReadContentRequest, ReadContentResponse};
+    use crate::containerd_api::services::images::v1::{
+        Image, ListImagesRequest, ListImagesResponse,
+    };
+    use crate::containerd_api::types::Descriptor;
+    use std::future::{Ready, ready};
+    use tonic::{Request, Response, Status};
+
+    const NS: &str = "k8s.io";
+    const DIFF: &str = "sha256:1111111111111111111111111111111111111111111111111111111111111111";
+    const CONFIG: &str = "sha256:2222222222222222222222222222222222222222222222222222222222222222";
+    const GOOD: &str = "sha256:3333333333333333333333333333333333333333333333333333333333333333";
+    const GONE: &str = "sha256:4444444444444444444444444444444444444444444444444444444444444444";
+    const JUNK: &str = "sha256:5555555555555555555555555555555555555555555555555555555555555555";
+    const DOWN: &str = "sha256:6666666666666666666666666666666666666666666666666666666666666666";
+
+    #[derive(Clone)]
+    struct List;
+
+    impl tonic::server::UnaryService<ListImagesRequest> for List {
+        type Response = ListImagesResponse;
+        type Future = Ready<Result<Response<ListImagesResponse>, Status>>;
+
+        fn call(&mut self, _: Request<ListImagesRequest>) -> Self::Future {
+            let image = |name: &str, digest: &str| Image {
+                name: name.to_string(),
+                target: Some(Descriptor {
+                    media_type: MEDIA_TYPE_OCI_MANIFEST.to_string(),
+                    digest: digest.to_string(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            ready(Ok(Response::new(ListImagesResponse {
+                images: vec![
+                    image("reg/app:1", GOOD),
+                    image("other.example/gone:1", GONE),
+                    image("other.example/junk:1", JUNK),
+                    image("other.example/down:1", DOWN),
+                ],
+            })))
+        }
+    }
+
+    #[derive(Clone)]
+    struct Read;
+
+    type ReadStream =
+        futures::stream::Iter<std::vec::IntoIter<Result<ReadContentResponse, Status>>>;
+
+    impl tonic::server::ServerStreamingService<ReadContentRequest> for Read {
+        type Response = ReadContentResponse;
+        type ResponseStream = ReadStream;
+        type Future = Ready<Result<Response<ReadStream>, Status>>;
+
+        fn call(&mut self, request: Request<ReadContentRequest>) -> Self::Future {
+            let data = match request.into_inner().digest.as_str() {
+                GOOD => serde_json::json!({
+                    "schemaVersion": 2,
+                    "mediaType": MEDIA_TYPE_OCI_MANIFEST,
+                    "config": { "mediaType": "application/vnd.oci.image.config.v1+json", "digest": CONFIG, "size": 1 },
+                    "layers": [],
+                })
+                .to_string(),
+                CONFIG => serde_json::json!({ "rootfs": { "type": "layers", "diff_ids": [DIFF] } })
+                    .to_string(),
+                // A schema 1 manifest: containerd cannot read it either.
+                JUNK => r#"{"schemaVersion":1,"fsLayers":[]}"#.to_string(),
+                GONE => return ready(Err(Status::not_found("content digest not found"))),
+                _ => return ready(Err(Status::unavailable("content store unavailable"))),
+            };
+            let chunk = ReadContentResponse {
+                offset: 0,
+                data: data.into_bytes(),
+            };
+            ready(Ok(Response::new(futures::stream::iter(vec![Ok(chunk)]))))
+        }
+    }
+
+    /// Serve the fake containerd on `socket` from a detached thread.
+    fn serve(socket: &std::path::Path) {
+        use axum::extract::Request as HttpRequest;
+        use axum::routing::post;
+        use tonic::server::Grpc;
+        use tonic_prost::ProstCodec;
+
+        let socket = socket.to_path_buf();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            compio::runtime::Runtime::new()
+                .unwrap()
+                .block_on(async move {
+                    let listener = compio::net::UnixListener::bind(&socket).await.unwrap();
+                    let app = axum::Router::new()
+                        .route(
+                            "/containerd.services.images.v1.Images/List",
+                            post(|req: HttpRequest| async move {
+                                Grpc::new(ProstCodec::default()).unary(List, req).await
+                            }),
+                        )
+                        .route(
+                            "/containerd.services.content.v1.Content/Read",
+                            post(|req: HttpRequest| async move {
+                                Grpc::new(ProstCodec::default())
+                                    .server_streaming(Read, req)
+                                    .await
+                            }),
+                        );
+                    ready_tx.send(()).unwrap();
+                    cyper_axum::serve(listener, app.into_make_service())
+                        .await
+                        .unwrap();
+                });
+        });
+        ready_rx.recv().unwrap();
+    }
+
+    /// NotFound and unparsable content are absent: no container comes from
+    /// them, so they claim nothing. Any other failure leaves what the image
+    /// claims unknown, so a sole claim it could change is uncertain.
+    #[test]
+    fn only_absent_or_unparsable_content_counts_as_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("containerd.sock");
+        serve(&socket);
+        let config = crate::config::ContainerdConfig {
+            address: Some(socket),
+            namespace: NS.to_string(),
+            content_root: Some(dir.path().to_path_buf()),
+            hosts_dir: None,
+        };
+        let lookup = ContainerdLookup::new(ContentStoreClient::new(&config).unwrap());
+        let result = compio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(lookup.lookup(NS, DIFF));
+
+        let state = lookup.namespace(NS);
+        {
+            let memo = lock_cache(&state.memo);
+            assert!(memo.walks.contains_key(GOOD), "{:?}", memo.walks);
+            let absent: BTreeMap<&str, bool> = memo
+                .failed
+                .iter()
+                .map(|(target, f)| (target.as_str(), f.absent))
+                .collect();
+            assert_eq!(
+                absent,
+                BTreeMap::from([(GONE, true), (JUNK, true), (DOWN, false)])
+            );
+        }
+        let err = result.expect_err("an unreadable image makes the sole claim uncertain");
+        assert!(format!("{err:#}").contains(DOWN), "{err:#}");
+
+        // Without it, the absent images leave the claim to its one claimant.
+        lock_cache(&state.memo).failed.remove(DOWN);
+        match lookup.lookup_cached(NS, DIFF).unwrap() {
+            Claim::One(claimant) => assert_eq!(claimant.image_ref(), "reg/app:1"),
+            other => panic!("{other:?}"),
+        }
+    }
+}
