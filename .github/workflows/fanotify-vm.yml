@@ -207,6 +207,8 @@ jobs:
         modprobe erofs
         mkdir -p /var/tmp/asan && mount -o loop '$D/ext4.img' /var/tmp/asan || exit 1
         cd '$GITHUB_WORKSPACE/service'
+        # Fixture paths come from CARGO_MANIFEST_DIR at run time, which cargo test would set.
+        CARGO_MANIFEST_DIR='$GITHUB_WORKSPACE/service' \\
         NYDUS_FANOTIFY_TEST_DIR=/var/tmp/asan TMPDIR=/var/tmp/asan RUST_BACKTRACE=1 \\
         ASAN_OPTIONS=detect_leaks=1 ASAN_SYMBOLIZER_PATH='$ASAN_SYMBOLIZER_PATH' \\
         LSAN_OPTIONS='suppressions=$GITHUB_WORKSPACE/misc/sanitizers/lsan.supp:print_suppressions=0' \\
