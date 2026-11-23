@@ -15,6 +15,10 @@
 #       export path, so H4 is what makes them count. CONTROL=1 skips dropping the caches and
 #       must fail H4.
 #   H5  nydusd exits on its own within 10 s of the mount being unmounted.
+#   H6  a handle stays valid when the same bootstrap is mounted again into the image's file
+#       system index (Vfs indexes are reused once all 255 have been handed out);
+#   H7  a handle fails ESTALE when another image, with the same inode numbers, gets that index:
+#       the generation is what tells the two apart.
 #
 # Requirements: root (mount(2), drop_caches), FUSE, a C compiler, curl and python3.
 # Override the binaries via env, e.g. NYDUS_IMAGE=... NYDUSD=... ROOT=... CC=...
@@ -58,6 +62,9 @@ echo top > "$ROOT/src/top.txt"
 echo one > "$ROOT/src/d1/f1.txt"
 perl -e 'print "FILE_HANDLE_MARKER" x 4096' > "$ROOT/src/d1/d2/f2.txt"
 echo three > "$ROOT/src/d1/d2/d3/f3.txt"
+# The same tree with other bytes of the same length, so the inode numbers match.
+cp -a "$ROOT/src" "$ROOT/src-b"
+perl -e 'print "OTHER_IMAGE_MARKER" x 4096' > "$ROOT/src-b/d1/d2/f2.txt"
 
 step "nydus-image create (RAFS v6)"
 "$NI" create --fs-version 6 -B "$ROOT/out/bootstrap" -D "$ROOT/out" "$ROOT/src" >/dev/null 2>&1 \
@@ -65,6 +72,10 @@ step "nydus-image create (RAFS v6)"
 BLOB=$(ls "$ROOT/out" | grep -vE '^bootstrap' | head -1)
 [ -n "$BLOB" ] || { echo "no data blob produced"; finish 1; }
 cp "$ROOT/out/$BLOB" "$ROOT/backend/$BLOB"
+mkdir -p "$ROOT/out-b"
+"$NI" create --fs-version 6 -B "$ROOT/out-b/bootstrap" -D "$ROOT/out-b" "$ROOT/src-b" >/dev/null 2>&1 \
+  || { echo "nydus-image create (second image) failed"; finish 1; }
+for b in $(ls "$ROOT/out-b" | grep -vE '^bootstrap'); do cp "$ROOT/out-b/$b" "$ROOT/backend/$b"; done
 
 cat > "$ROOT/config.json" <<CFG
 {
@@ -125,6 +136,56 @@ else
   NYDUSD_PID=
   case_pass "H5: nydusd exited after umount"
 fi
+
+# Mounts bootstrap $2 at virtual path $1 through nydusd's API. A script, for reuse.sh below.
+cat > "$ROOT/mount.sh" <<SH
+#!/bin/sh
+python3 -c 'import json, sys; print(json.dumps({"source": sys.argv[1], "fs_type": "rafs",
+  "config": open(sys.argv[2]).read()}))' "\$2" "$ROOT/config.json" |
+  curl -sf --unix-socket "$ROOT/api.sock" -X POST -d @- \
+    "http://localhost/api/v1/mount?mountpoint=\$1" >/dev/null
+SH
+# Umounts /sub, fills every other Vfs index, then mounts bootstrap $1 at /sub, which gets the
+# freed index back. Index 1 is /base and 2 was /sub: 253 fillers take 3-255, the next wraps to 2.
+cat > "$ROOT/reuse.sh" <<SH
+#!/bin/sh
+set -e
+curl -sf --unix-socket "$ROOT/api.sock" -X DELETE "http://localhost/api/v1/mount?mountpoint=/sub"
+for i in \$(seq 253); do "$ROOT/mount.sh" /f\$i "$ROOT/out/bootstrap"; done
+"$ROOT/mount.sh" /sub "\$1"
+stat -c %i "$ROOT/mnt/sub" > "$ROOT/ino.after"
+SH
+chmod +x "$ROOT/mount.sh" "$ROOT/reuse.sh"
+
+# Mounts the image at /sub in a fresh nydusd, takes handles below it, and once the caches are
+# dropped lets reuse.sh put bootstrap $1 into its index. $2 non-empty: the reopens must fail ESTALE.
+reuse_index() {
+  rm -f "$ROOT/api.sock" "$ROOT/ino.after"
+  "$ND" fuse --config "$ROOT/config.json" --bootstrap "$ROOT/out/bootstrap" \
+    --virtual-mountpoint /base --mountpoint "$ROOT/mnt" --apisock "$ROOT/api.sock" \
+    --log-level info > "$ROOT/nydusd.log" 2>&1 &
+  NYDUSD_PID=$!
+  for _ in $(seq 50); do [ -S "$ROOT/api.sock" ] && mountpoint -q "$ROOT/mnt" && break; sleep 0.2; done
+  if ! "$ROOT/mount.sh" /sub "$ROOT/out/bootstrap"; then
+    case_fail "$3: cannot mount /sub"; teardown; return
+  fi
+  stat -c %i "$ROOT/mnt/sub" > "$ROOT/ino.before"
+  if ! env ${2:+FH_EXPECT_STALE=1} FH_REOPEN_HOOK="'$ROOT/reuse.sh' '$1'" \
+    "$ROOT/fh-reopen" "$ROOT/mnt" sub/d1/d2/f2.txt sub/d1/d2/d3; then
+    case_fail "$3"
+  elif ! cmp -s "$ROOT/ino.before" "$ROOT/ino.after"; then
+    case_fail "$3: /sub did not get its file system index back, so nothing was tested"
+  else
+    case_pass "$3"
+  fi
+  teardown
+}
+
+step "H6: the same bootstrap in the reused index keeps the handles valid"
+reuse_index "$ROOT/out/bootstrap" "" "H6: same bootstrap, handles reopen"
+
+step "H7: another image in the reused index makes the handles stale"
+reuse_index "$ROOT/out-b/bootstrap" 1 "H7: other image, handles fail ESTALE"
 
 echo
 if [ "$FAILURES" = 0 ]; then
