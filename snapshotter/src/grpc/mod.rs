@@ -2688,6 +2688,8 @@ mod tests {
             .prepare("active".into(), String::new(), planted.clone())
             .await
             .unwrap();
+        let labels = snapshotter.store.stat("active").unwrap().labels;
+        assert!(stamp_of(&labels).is_none(), "active: {labels:?}");
         snapshotter
             .commit("committed".into(), "active".into(), planted.clone())
             .await

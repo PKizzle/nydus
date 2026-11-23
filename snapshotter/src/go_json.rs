@@ -718,6 +718,7 @@ mod tests {
             r#"{"layers":[01]}"#,
             "{\"x\":\"\u{1}\"}",
             r#"{"x":"\x"}"#,
+            "\u{feff}{}",
             "",
         ] {
             assert!(decode::<Doc>(json.as_bytes()).is_err(), "{json}");

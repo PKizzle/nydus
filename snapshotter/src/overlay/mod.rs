@@ -1143,6 +1143,13 @@ mod tests {
         fs::write(elsewhere.join("image.boot"), b"bootstrap").unwrap();
         std::os::unix::fs::symlink(&elsewhere, engine.fs_dir(&c2).join("image")).unwrap();
         assert_refused(engine.prepare(&store, "container", &c2, &HashMap::new()));
+
+        // So does a symlinked `image.boot`.
+        let image = engine.fs_dir(&c2).join("image");
+        fs::remove_file(&image).unwrap();
+        fs::create_dir(&image).unwrap();
+        std::os::unix::fs::symlink(elsewhere.join("image.boot"), image.join("image.boot")).unwrap();
+        assert_refused(engine.prepare(&store, "container", &c2, &HashMap::new()));
     }
 
     #[test]
