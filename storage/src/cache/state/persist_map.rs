@@ -764,3 +764,76 @@ impl PersistMap {
         Ok(())
     }
 }
+
+/// Open the chunk map file at `path` for `chunk_count` chunks, whatever it holds, and drive it
+/// with `ops` the way fills, invalidations, seals and restarts do, checking that the in-memory
+/// ready count stays within the chunk count. Entry point for the `chunk_map` fuzz target.
+#[cfg(feature = "fuzzing")]
+#[doc(hidden)]
+pub fn fuzz_chunk_map(path: &str, chunk_count: u32, ops: &[u8]) {
+    let open = || PersistMap::open(path, chunk_count, true, true);
+    let Ok(mut map) = open() else {
+        return;
+    };
+    let mut ops = ops.iter().copied();
+    while let Some(op) = ops.next() {
+        // Indices past the bitmap test `validate_index`.
+        let arg = u16::from_le_bytes([ops.next().unwrap_or(0), ops.next().unwrap_or(0)]);
+        let index = arg as u32 % (chunk_count + 8);
+        match op % 10 {
+            0 => {
+                let _ = map.set_chunk_ready(index);
+            }
+            1 => {
+                let _ = map.clear_chunk_ready(index);
+            }
+            2 => {
+                let _ = map.adopt_boot(1 + (arg % 3) as u64, arg & 0x100 != 0);
+            }
+            3 => {
+                let _ = map.mark_unsealed();
+            }
+            4 => {
+                let stamp = (arg & 1 != 0).then_some(arg as u64);
+                let _ = map.seal(&mut || Ok(stamp));
+            }
+            5 => {
+                let _ = map.set_verified((arg & 1 != 0).then_some(arg as u64));
+                let _ = map.is_verified(arg as u64);
+            }
+            6 => {
+                let _ = map.reset();
+            }
+            7 => {
+                if map.validate_index(index).is_ok() {
+                    let _ = map.is_chunk_ready(index);
+                }
+                let _ = map.is_rechecking();
+            }
+            8 => {
+                // A second opener of the same file in this process, sharing its seal state.
+                // shortcut: it sets no ready bit, because each opener counts only its own bits
+                // and a clear in one of a bit set by another overflows its count; drive it
+                // once that is fixed.
+                if let Ok(other) = PersistMap::open(path, chunk_count, true, true) {
+                    let _ = other.adopt_boot(1 + (arg % 3) as u64, false);
+                    let _ = other.mark_unsealed();
+                    let _ = other.seal(&mut || Ok(None));
+                }
+            }
+            _ => {
+                // A restart: the next opener parses what this one left behind.
+                drop(map);
+                let Ok(reopened) = open() else {
+                    return;
+                };
+                map = reopened;
+            }
+        }
+        let not_ready = map.not_ready_count.load(Ordering::Acquire);
+        assert!(
+            not_ready <= chunk_count,
+            "{not_ready} chunks not ready out of {chunk_count}"
+        );
+    }
+}

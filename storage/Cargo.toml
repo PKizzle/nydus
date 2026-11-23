@@ -151,6 +151,8 @@ harness = false
 required-features = ["backend-s3"]
 
 [features]
+# Exposes parser entry points for the cargo-fuzz targets in `fuzz/`.
+fuzzing = []
 backend-localdisk = []
 backend-localdisk-gpt = ["gpt", "backend-localdisk"]
 backend-localfs = []
