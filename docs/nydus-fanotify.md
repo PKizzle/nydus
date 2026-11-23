@@ -306,6 +306,23 @@ event the successor serves. Only a denied synchronous page read fails its reader
   a Raspberry Pi 4 takes 0.53 s per group (about 500 ns a write) and 1.4–1.7 s for the four
   groups, a Raspberry Pi 5 0.21 s and 0.26–0.34 s. Only restarts without a trusted token pay it.
 
+Only `SIGTERM` and `SIGINT` stop the snapshotter gracefully. Every other signal that ends it
+(`SIGHUP`, `SIGUSR1`, `SIGUSR2`, `SIGQUIT`, `SIGABRT` and an uncontained panic, which aborts) is a
+crash as far as its groups go: no token, and the successor sweeps. Rust's stack-overflow handler
+swallows the first `SIGSEGV` or `SIGBUS` sent with `kill`, `SIGPIPE` is ignored, and a stopped
+snapshotter (`SIGSTOP`, a cgroup freeze) blocks its readers until it continues. A core dump keeps
+the dying process, and so its groups, alive until the dump is written; the address space is
+mostly reserved and unpopulated (about 1.9 GB virtual and 40 MB resident on an idle snapshotter),
+but a pipe `core_pattern` such as `systemd-coredump` is sent its holes as zeros.
+
+Without an fd store (a Helm DaemonSet, or a snapshotter run by hand) a group closes with the
+process, and `fanotify_release()` allows every event still queued. A graceful stop therefore
+unmounts each fanotify mount while its group is still open, retrying a busy one for about 10 s.
+A mount still busy after that, a container's overlay holding it, and every mount of a process that
+dies without a graceful stop, stays up without a group: reads of data never fetched return zeros
+until the next start re-arms it (`rebuild_from_records`), and EROFS may keep the zeros it read in its page
+cache. On the fanotify path, run the snapshotter under systemd with an fd store.
+
 The fanotify path has no RAFS instance, so `[snapshotter.features] prefetch`, runtime prefetch
 lists and `cache.disable_indexed` apply only to images served over FUSE; a fanotify daemon fetches
 on demand only.
