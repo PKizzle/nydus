@@ -14,7 +14,6 @@ use nydus_storage::cache::state::fuzz_chunk_map;
 mod common;
 
 const HEADER_SIZE: usize = 4096;
-const MAGIC1: u32 = 0x424D_4150;
 /// Chunks per map; bounds the bitmap walks each open and reset does.
 const MAX_CHUNKS: u32 = 4096;
 
@@ -30,20 +29,6 @@ fuzz_target!(|data: &[u8]| {
     let (contents, ops) = data[4..].split_at(given);
     let mut file = contents.to_vec();
     file.resize(size, 0);
-    // shortcut: the open takes the not-ready count from the header rather than the bitmap for
-    // a version-0 map (every chunk not ready, even after its own fills and a reopen) and an
-    // all-ready one (none), and counts bits past the last chunk; a later revoke or fill then
-    // moves the count out of range. Such maps are made consistent here until the open derives
-    // the count from the bitmap.
-    let pad = (chunk_count.div_ceil(8) * 8 - chunk_count) as u8;
-    *file.last_mut().unwrap() &= !((1u8 << pad) - 1);
-    if file[0..4] == MAGIC1.to_le_bytes() && file[4..8] == [0; 4] {
-        file[4] = 1;
-    }
-    let bits: u32 = file[HEADER_SIZE..].iter().map(|b| b.count_ones()).sum();
-    if bits < chunk_count {
-        file[12..16].fill(0);
-    }
     let path = common::write_input("chunk_map", &file);
     fuzz_chunk_map(path.to_str().unwrap(), chunk_count, ops);
 });

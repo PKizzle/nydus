@@ -15,7 +15,7 @@ backend or a shared cache directory, and event records from the kernel.
 
 `zstd_cursor` also checks a property, not just absence of crashes: every chunk the converter
 recorded must decode back to the bytes it read, through both decoding paths.
-`chunk_map` checks that a map's not-ready count stays within its chunk count.
+`chunk_map` checks that a map's not-ready count matches its bitmap, in every opener of the file.
 
 `fuzz/` is a cargo workspace of its own with its own `Cargo.lock`, so the nightly toolchain and
 sanitizer flags never touch the main workspace. The root `[patch.crates-io]` does not
