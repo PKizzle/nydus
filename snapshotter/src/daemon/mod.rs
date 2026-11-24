@@ -1791,6 +1791,10 @@ impl DaemonSupervisor {
             }
             let start_lock = self.start_lock(&image_ref).await;
             let _guard = start_lock.lock().await;
+            // Before the instance leaves the map: a refused heal must find it there.
+            if self.refuse_when_shutting_down().is_err() {
+                break;
+            }
             let old = {
                 let mut instances = self.instances.write().await;
                 match instances.get(&image_ref) {
