@@ -823,7 +823,8 @@ impl PersistMap {
 
 /// Open the chunk map file at `path` for `chunk_count` chunks, whatever it holds, and drive it
 /// with `ops` the way fills, invalidations, seals and restarts do, checking that the in-memory
-/// not-ready count matches the bitmap. Entry point for the `chunk_map` fuzz target.
+/// not-ready count matches the bitmap, and after each reopen that the header's all-ready marker
+/// does. Entry point for the `chunk_map` fuzz target.
 #[cfg(feature = "fuzzing")]
 #[doc(hidden)]
 pub fn fuzz_chunk_map(path: &str, chunk_count: u32, ops: &[u8]) {
@@ -833,6 +834,7 @@ pub fn fuzz_chunk_map(path: &str, chunk_count: u32, ops: &[u8]) {
     };
     let mut ops = ops.iter().copied();
     while let Some(op) = ops.next() {
+        let mut reopened = false;
         // Indices past the bitmap test `validate_index`.
         let arg = u16::from_le_bytes([ops.next().unwrap_or(0), ops.next().unwrap_or(0)]);
         let index = arg as u32 % (chunk_count + 8);
@@ -883,16 +885,23 @@ pub fn fuzz_chunk_map(path: &str, chunk_count: u32, ops: &[u8]) {
             _ => {
                 // A restart: the next opener parses what this one left behind.
                 drop(map);
-                let Ok(reopened) = open() else {
+                let Ok(next) = open() else {
                     return;
                 };
-                map = reopened;
+                map = next;
+                reopened = true;
             }
         }
         let not_ready = (0..chunk_count)
             .filter(|&idx| !map.is_chunk_ready(idx).0)
             .count() as u32;
         assert_eq!(map.not_ready_count(), not_ready, "out of {chunk_count}");
+        // Version 0 maps have no marker; older releases trust it over the bitmap in the others.
+        let word = |offset| atomic_header_word(&map.filemap, offset).unwrap();
+        if reopened && word(std::mem::offset_of!(Header, version)).load(Ordering::Acquire) >= 1 {
+            let all_ready = word(std::mem::offset_of!(Header, all_ready)).load(Ordering::Acquire);
+            assert_eq!(all_ready == MAGIC_ALL_READY, not_ready == 0);
+        }
     }
 }
 
