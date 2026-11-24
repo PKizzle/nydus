@@ -1046,4 +1046,35 @@ mod tests {
         drop(map);
         assert!(PersistMap::open(&path, 44, true, true).is_ok());
     }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support file-backed mmap")]
+    fn test_open_repairs_the_all_ready_header() {
+        let dir = TempDir::new().unwrap();
+        let all_ready = |path: &str| {
+            let content = std::fs::read(path).unwrap();
+            u32::from_le_bytes(content[12..16].try_into().unwrap())
+        };
+        let (path, map) = open_raw(&dir, 8, 1, MAGIC_ALL_READY, &[0x7f]);
+        drop(map);
+        assert_eq!(all_ready(&path), 0);
+        let (path, map) = open_raw(&dir, 8, 1, 0, &[0xff]);
+        drop(map);
+        assert_eq!(all_ready(&path), MAGIC_ALL_READY);
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support file-backed mmap")]
+    fn test_two_openers_setting_one_chunk_count_it_once() {
+        let dir = TempDir::new().unwrap();
+        let (path, first) = open_raw(&dir, 8, 1, 0, &[0]);
+        let second = PersistMap::open(&path, 8, true, true).unwrap();
+        first.set_chunk_ready(3).unwrap();
+        second.set_chunk_ready(3).unwrap();
+        assert_eq!(first.not_ready_count(), 7);
+        assert_eq!(
+            second.ready_count_word().unwrap().load(Ordering::Acquire),
+            1
+        );
+    }
 }
