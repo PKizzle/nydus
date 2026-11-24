@@ -5094,12 +5094,11 @@ async fn deny_stranded_events(
                 scope.spawn(|| {
                     while let Some((slug, fd)) = groups.get(next.fetch_add(1, Ordering::Relaxed)) {
                         match nydus_service::fanotify::deny_stranded_events(*fd, fd_limit) {
-                            Ok(0) => {}
-                            Ok(denied) => warn!(
+                            Ok(None | Some(0)) => {}
+                            Ok(Some(denied)) => warn!(
                                 slug,
                                 denied, "denied fanotify events a dead predecessor never answered"
                             ),
-                            Err(e) if e.kind() == io::ErrorKind::InvalidInput => {}
                             Err(e) => {
                                 warn!(
                                     slug,
@@ -7755,27 +7754,41 @@ mod tests {
         assert!(stored.is_empty());
     }
 
-    /// The token never vouches for a group whose startup sweep failed, even once a daemon
-    /// adopted it and stopped cleanly.
+    /// The startup sweep reports every group it could not finish, a kernel error included, and
+    /// skips a parked descriptor that is no fanotify group.
     #[cfg(target_os = "linux")]
     #[compio::test]
-    async fn a_group_whose_sweep_failed_is_never_vouched_for() {
-        use std::os::fd::OwnedFd;
+    async fn a_failed_sweep_is_reported_and_a_non_group_skipped() {
+        use std::os::fd::{FromRawFd, OwnedFd};
         // No process holds this fd number, so the group check fails with `ENOENT`.
         let gone = std::os::fd::RawFd::MAX - 1;
         let not_a_group = OwnedFd::from(tempfile::tempfile().unwrap());
-        let failed = deny_stranded_events(
+        // A notification group takes no `FAN_DENY_ERRNO` response: the kernel's own `EINVAL`
+        // fails the sweep like any other error, whereas a descriptor that is no group is skipped.
+        // SAFETY: `fanotify_init` only takes integer flags; the result is checked.
+        let raw = unsafe {
+            libc::fanotify_init(
+                libc::FAN_CLASS_NOTIF | libc::FAN_REPORT_FID | libc::FAN_CLOEXEC,
+                libc::O_RDONLY as u32,
+            )
+        };
+        assert!(raw >= 0, "fanotify_init: {}", io::Error::last_os_error());
+        // SAFETY: `raw` is the new group descriptor, owned by nothing else.
+        let notification_group = unsafe { OwnedFd::from_raw_fd(raw) };
+        let mut failed = deny_stranded_events(
             vec![
                 ("gone".to_string(), gone),
                 ("file".to_string(), not_a_group.as_raw_fd()),
+                ("einval".to_string(), notification_group.as_raw_fd()),
             ],
             16,
         )
         .await;
+        failed.sort();
         assert_eq!(
             failed,
-            ["gone"],
-            "a descriptor that is not a group is skipped, not failed"
+            ["einval", "gone"],
+            "a descriptor that is not a group is skipped, a kernel error fails the sweep"
         );
 
         let tmp = tempfile::tempdir().unwrap();

@@ -2298,14 +2298,12 @@ fn write_response(group: RawFd, event_fd: RawFd, response: u32) {
 /// events under the same fd number, so each number is answered until no event is left under it.
 ///
 /// Call it only while no process reads `group`, or a live reader's events are denied under it.
-/// Fails with `InvalidInput` if `group` is not a fanotify group.
-pub fn deny_stranded_events(group: RawFd, fd_limit: RawFd) -> Result<usize> {
+/// Returns `None`, answering nothing, if `group` is not a fanotify group; every error is the
+/// kernel's, raw.
+pub fn deny_stranded_events(group: RawFd, fd_limit: RawFd) -> Result<Option<usize>> {
     let link = std::fs::read_link(format!("/proc/self/fd/{group}"))?;
     if link.as_os_str() != "anon_inode:[fanotify]" {
-        return Err(std::io::Error::new(
-            ErrorKind::InvalidInput,
-            format!("fd {group} is {}, not a fanotify group", link.display()),
-        ));
+        return Ok(None);
     }
     let mut denied = 0;
     for fd in 0..fd_limit {
@@ -2330,11 +2328,17 @@ pub fn deny_stranded_events(group: RawFd, fd_limit: RawFd) -> Result<usize> {
             match err.raw_os_error() {
                 // No event is left under this fd number.
                 Some(libc::ENOENT) => break,
-                _ => return Err(err),
+                _ => {
+                    warn!(
+                        "fanotify: sweep of group {} failed at fd {} after denying {} stranded event(s): {}",
+                        group, fd, denied, err
+                    );
+                    return Err(err);
+                }
             }
         }
     }
-    Ok(denied)
+    Ok(Some(denied))
 }
 
 /// Walk an untrusted event buffer the way the worker does, extracting each record's range, and
@@ -3026,8 +3030,8 @@ mod tests {
 
     /// An event read by a process that died without answering it blocks its reader for as long
     /// as the group lives; `deny_stranded_events` answers it with `EIO`, including two events
-    /// that dead readers in turn held under the same fd number, and refuses a descriptor that is
-    /// not a fanotify group.
+    /// that dead readers in turn held under the same fd number, and leaves a descriptor that is
+    /// not a fanotify group alone.
     ///
     /// Needs root, a >= 6.14 kernel and `NYDUS_FANOTIFY_TEST_DIR` on a file system with
     /// pre-content marks (ext4); prints SKIP otherwise.
@@ -3125,22 +3129,17 @@ mod tests {
         assert_eq!((first_fd, second_fd), (3, 3));
 
         // A bound at or below the fd number reaches neither event.
-        assert_eq!(deny_stranded_events(raw, first_fd).unwrap(), 0);
-        assert_eq!(deny_stranded_events(raw, first_fd + 1).unwrap(), 2);
+        assert_eq!(deny_stranded_events(raw, first_fd).unwrap(), Some(0));
+        assert_eq!(deny_stranded_events(raw, first_fd + 1).unwrap(), Some(2));
         for stranded in [first, second] {
             assert_eq!(
                 stranded.recv_timeout(Duration::from_secs(10)).unwrap(),
                 Err(Some(libc::EIO))
             );
         }
-        assert_eq!(deny_stranded_events(raw, first_fd + 1).unwrap(), 0);
+        assert_eq!(deny_stranded_events(raw, first_fd + 1).unwrap(), Some(0));
         let plain = File::open(dir.path()).unwrap();
-        assert_eq!(
-            deny_stranded_events(plain.as_raw_fd(), 1)
-                .unwrap_err()
-                .kind(),
-            ErrorKind::InvalidInput
-        );
+        assert_eq!(deny_stranded_events(plain.as_raw_fd(), 1).unwrap(), None);
         drop(group);
     }
 
