@@ -6500,7 +6500,8 @@ mod tests {
     /// `NYDUS_TAKEOVER_GRACEFUL` set, the predecessor instead exits through
     /// `preserve_for_failover`, whose token vouches for the group: the successor
     /// consumes the token and leaves the group unswept, so the event stranded
-    /// after the predecessor exited stays unanswered. `NYDUS_E2E_ROOT`
+    /// after the predecessor exited stays unanswered while the successor serves
+    /// every other file. `NYDUS_E2E_ROOT`
     /// is an ext4 dir holding `artifact/stage/bootstrap` and the localfs
     /// `artifact/backend/` of a zran image, laid out as an auto-accel sidecar.
     /// With `NYDUS_TAKEOVER_STATE_WITHOUT_BLOB_LIST` set, the successor starts
@@ -6551,9 +6552,9 @@ mod tests {
                 assert_eq!(runtime.block_on(supervisor.restore_from_store()), 1);
                 let mountpoint = PathBuf::from(std::env::var("NYDUS_TAKEOVER_MNT").unwrap());
                 // After a graceful exit the stranded read stays blocked, holding the pages a
-                // read of the same file would wait for.
+                // read of the same file would wait for; every other file is served.
                 let files: &[&str] = if std::env::var_os("NYDUS_TAKEOVER_GRACEFUL").is_some() {
-                    &[]
+                    &["passwd"]
                 } else {
                     &["bin/tool", "passwd"]
                 };
@@ -6718,6 +6719,9 @@ mod tests {
                 Ok(())
             });
         }
+        if graceful {
+            command.stdout(Stdio::piped());
+        }
         let mut successor = command.stdin(Stdio::piped()).spawn().unwrap();
         drop(group_fd);
         drop(token);
@@ -6729,10 +6733,28 @@ mod tests {
                     break;
                 }
             }
+            // The successor prints the marker once its startup (and any sweep) is over and it
+            // served file data through the parked group.
+            let (served_tx, served) = std::sync::mpsc::channel();
+            let lines = BufReader::new(successor.stdout.take().unwrap()).lines();
+            std::thread::spawn(move || {
+                for line in lines.map_while(|l| l.ok()) {
+                    println!("successor: {line}");
+                    if line.contains("SUCCESSOR_READ_OK") {
+                        let _ = served_tx.send(());
+                    }
+                }
+            });
+            if served.recv_timeout(Duration::from_secs(60)).is_err() {
+                successor.kill().unwrap();
+                successor.wait().unwrap();
+                panic!("the successor never served file data through the parked group");
+            }
             // A vouched-for group is not swept: the event stranded after the predecessor
-            // exited stays unanswered (it is allowed once the successor closes the group).
+            // exited stays unanswered (it is allowed once the successor closes the group). A
+            // sweep would have answered it before the marker; the wait covers the reader's wakeup.
             assert!(
-                stranded.recv_timeout(Duration::from_secs(3)).is_err(),
+                stranded.recv_timeout(Duration::from_secs(1)).is_err(),
                 "the successor swept a group the token vouched for"
             );
             drop(successor.stdin.take());
