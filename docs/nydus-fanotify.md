@@ -316,12 +316,15 @@ mostly reserved and unpopulated (about 1.9 GB virtual and 40 MB resident on an i
 but a pipe `core_pattern` such as `systemd-coredump` is sent its holes as zeros.
 
 Without an fd store (a Helm DaemonSet, or a snapshotter run by hand) a group closes with the
-process, and `fanotify_release()` allows every event still queued. A graceful stop therefore
-unmounts each fanotify mount while its group is still open, retrying a busy one for about 10 s.
-A mount still busy after that, a container's overlay holding it, and every mount of a process that
-dies without a graceful stop, stays up without a group: reads of data never fetched return zeros
-until the next start re-arms it (`rebuild_from_records`), and EROFS may keep the zeros it read in its page
-cache. On the fanotify path, run the snapshotter under systemd with an fd store.
+process, and `fanotify_release()` allows every event still queued. A graceful stop
+(`shutdown_all`) therefore first refuses new daemon starts and waits out those under way, as a stop
+with an fd store does, then unmounts every fanotify mount at once while its group is still open,
+retrying a busy one for about 10 s, so the stop fits a 30 s termination grace period. A mount
+still busy after that (a container's overlay holding it) keeps its daemon record live, and so does
+every mount of a process that dies without a graceful stop. Such a mount stays up without a group
+until the next start re-arms it in place (`rebuild_from_records`): meanwhile reads of data never
+fetched return zeros, and EROFS may keep the zeros it read in its page cache. On the fanotify path,
+run the snapshotter under systemd with an fd store.
 
 The fanotify path has no RAFS instance, so `[snapshotter.features] prefetch`, runtime prefetch
 lists and `cache.disable_indexed` apply only to images served over FUSE; a fanotify daemon fetches

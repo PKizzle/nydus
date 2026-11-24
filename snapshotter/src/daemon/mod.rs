@@ -37,7 +37,7 @@ use nydus_service::{
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::config::{FsDriverType, SnapshotterConfig};
 use crate::daemon::config_builder::{
@@ -576,14 +576,15 @@ pub struct DaemonSupervisor {
     auth_heals: AtomicU64,
     /// Counters and gauges of stage retention (see `crate::retention`).
     retention: crate::retention::Stats,
-    /// Set by `preserve_for_failover`. Every path that starts daemon workers or parks a group
-    /// checks it while holding the image's start lock or the `instances` write lock, before it
-    /// stops or tears down anything, and then runs to completion: `preserve_for_failover` waits
-    /// for both locks, so once it has cycled through them no worker starts in this process again,
-    /// and a start it waited for never leaves an image torn down without a successor daemon.
-    /// `restore_from_store` and `rebuild_from_records` reach the start paths without either lock
-    /// and without checking; they are safe only because `containerd-nydus` installs the signal
-    /// handler that runs `preserve_for_failover` after both have returned.
+    /// Set by `preserve_for_failover` and `shutdown_all` (`refuse_new_starts`). Every path that
+    /// starts daemon workers or parks a group checks it while holding the image's start lock or
+    /// the `instances` write lock, before it stops or tears down anything, and then runs to
+    /// completion: both shutdowns wait for both locks, so once they have cycled through them no
+    /// worker starts in this process again, and a start they waited for never leaves an image
+    /// torn down without a successor daemon. `restore_from_store` and `rebuild_from_records` reach
+    /// the start paths without either lock and without checking; they are safe only because
+    /// `containerd-nydus` installs the signal handler that runs either shutdown after both have
+    /// returned.
     shutting_down: AtomicBool,
     /// Identifies this process to its successor: recorded in `fanotify-nofile` and written into
     /// the events-answered token, so a token is trusted only by the process that read this
@@ -645,7 +646,7 @@ impl DaemonSupervisor {
         }
     }
 
-    /// Refuse to start daemon workers once `preserve_for_failover` has begun (see
+    /// Refuse to start daemon workers once the shutdown has begun (see
     /// `shutting_down`). Every path that starts workers or parks a group calls it under the
     /// image's start lock or the `instances` write lock, before its first destructive step: a
     /// refusal after an old daemon was stopped would leave the image without one.
@@ -2091,14 +2092,45 @@ impl DaemonSupervisor {
 
     /// Unmount every running instance. Called on graceful shutdown without an fd store, where
     /// each fanotify group closes with this process: a mount left up reads unfilled data as zeros.
+    ///
+    /// Refuses new starts and waits out those under way first, as `preserve_for_failover` does,
+    /// so no daemon starts after the stop. Stops every daemon at once: a busy fanotify mount is
+    /// retried for about 10 s, and all of them together stay well inside a 30 s stop timeout. A
+    /// mount still up afterwards keeps its record live, so the next start re-arms it.
     pub async fn shutdown_all(&self) {
-        let mut instances = self.instances.write().await;
-        for (image_ref, inst) in instances.drain() {
-            info!(image_ref, "shutting down nydus daemon");
-            if let Err(e) = stop_unreferenced_instance(&inst) {
-                warn!(image_ref, error = %e, "shutdown_all: failed to stop daemon");
+        self.refuse_new_starts().await;
+        let drained: Vec<_> = self.instances.write().await.drain().collect();
+        let stopped = blocking::unblock(move || {
+            std::thread::scope(|scope| {
+                let stopping: Vec<_> = drained
+                    .into_iter()
+                    .map(|(image_ref, inst)| {
+                        scope.spawn(move || {
+                            info!(image_ref, "shutting down nydus daemon");
+                            if let Err(e) = stop_unreferenced_instance(&inst) {
+                                warn!(image_ref, error = %e, "shutdown_all: failed to stop daemon");
+                            }
+                            let mounted = is_mounted_at(&inst.mountpoint);
+                            (image_ref, inst, mounted)
+                        })
+                    })
+                    .collect();
+                stopping
+                    .into_iter()
+                    .map(|stop| stop.join().unwrap())
+                    .collect::<Vec<_>>()
+            })
+        })
+        .await;
+        for (image_ref, inst, mounted) in stopped {
+            if mounted {
+                error!(
+                    image_ref,
+                    mountpoint = %inst.mountpoint.display(),
+                    "a mount outlived the shutdown of its daemon; the next start re-arms it"
+                );
             }
-            if let Err(e) = self.persist_instance_record(&inst, false).await {
+            if let Err(e) = self.persist_instance_record(&inst, mounted).await {
                 warn!(image_ref, error = %e, "failed to persist stopped daemon record");
             }
         }
@@ -6280,6 +6312,84 @@ mod tests {
         );
     }
 
+    /// A shutdown without an fd store stops busy fanotify mounts together, well inside a 30 s
+    /// stop timeout, and keeps the record of each mount it could not remove live, so the next
+    /// start re-arms it. `NYDUS_E2E_ROOT` is an ext4 dir holding `artifact/stage/bootstrap` and
+    /// the localfs `artifact/backend/` of a zran image, laid out as an auto-accel sidecar.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "needs root, Linux >= 6.14 and an ext4 work dir; run misc/fanotify/release-unmount-test.sh"]
+    fn shutdown_keeps_busy_fanotify_mounts_live() {
+        let root = PathBuf::from(std::env::var("NYDUS_E2E_ROOT").expect("NYDUS_E2E_ROOT unset"));
+        let bootstrap = root.join("artifact/stage/bootstrap");
+        let backend = root.join("artifact/backend");
+        let mut config = SnapshotterConfig::default();
+        config.snapshotter.root = root.join("snapshotter-busy");
+        let runtime = compio::runtime::Runtime::new().unwrap();
+        let image_refs: Vec<String> = (0..3)
+            .map(|i| format!("e2e.invalid/busy/app:{i}"))
+            .collect();
+        let read_hello = |mountpoint: &Path| {
+            assert!(
+                fs::read_to_string(mountpoint.join("hello.txt"))
+                    .unwrap()
+                    .starts_with("RELEASE_OK_")
+            );
+        };
+
+        let supervisor = DaemonSupervisor::new(config.clone());
+        let mut busy = Vec::new();
+        let mut mountpoints = Vec::new();
+        for image_ref in &image_refs {
+            let handle = runtime
+                .block_on(supervisor.ensure_instance_local(image_ref, &bootstrap, &backend, "k1"))
+                .unwrap();
+            let mountpoint = handle.mountpoint().to_path_buf();
+            read_hello(&mountpoint);
+            // An open file keeps the mount busy: `umount(2)` fails with `EBUSY`.
+            busy.push(fs::File::open(mountpoint.join("hello.txt")).unwrap());
+            mountpoints.push(mountpoint);
+        }
+        let started = Instant::now();
+        runtime.block_on(supervisor.shutdown_all());
+        let took = started.elapsed();
+        // Each busy mount is retried for about 10 s; one after another they would take 30 s.
+        assert!(took < Duration::from_secs(20), "shutdown took {took:?}");
+        for mountpoint in &mountpoints {
+            assert!(
+                is_mounted_at(mountpoint),
+                "{} went away",
+                mountpoint.display()
+            );
+        }
+        let records = supervisor.read_persisted_records();
+        assert_eq!(records.len(), image_refs.len());
+        assert!(
+            records.iter().all(|r| r.live),
+            "a busy mount's record was not kept live"
+        );
+
+        // The next start re-arms them in place.
+        let successor = DaemonSupervisor::new(config);
+        assert_eq!(
+            runtime.block_on(successor.rebuild_from_records()),
+            image_refs.len()
+        );
+        for mountpoint in &mountpoints {
+            read_hello(mountpoint);
+        }
+        drop(busy);
+        runtime.block_on(successor.shutdown_all());
+        for mountpoint in &mountpoints {
+            assert!(
+                !is_mounted_at(mountpoint),
+                "{} outlived the shutdown",
+                mountpoint.display()
+            );
+        }
+        assert!(successor.read_persisted_records().iter().all(|r| !r.live));
+    }
+
     /// Read every regular file under `dir`; returns the file count and the failures.
     #[cfg(target_os = "linux")]
     fn read_every_file(dir: &Path) -> (usize, Vec<String>) {
@@ -7932,6 +8042,56 @@ mod tests {
             "an unhealthy daemon is left for the successor"
         );
         assert!(kept().await, "the recovery tore the old daemon down");
+    }
+
+    /// `shutdown_all` waits for a start already holding its image's start lock, and no start
+    /// begins after it: the process exits right after, and a daemon started meanwhile would leave
+    /// a mount without its group.
+    #[compio::test]
+    async fn no_daemon_starts_once_shutdown_began() {
+        let tmp = tempfile::tempdir().unwrap();
+        let image_ref = "registry.local/team/app:1";
+        let (supervisor, _, dir) = retained(tmp.path(), image_ref).await;
+        let bootstrap = dir.join("stage/bootstrap");
+
+        let start_lock = supervisor.start_lock(image_ref).await;
+        let starting = start_lock.lock().await;
+        let done = Arc::new(AtomicBool::new(false));
+        let shutting_down = compio::runtime::spawn({
+            let (supervisor, done) = (supervisor.clone(), done.clone());
+            async move {
+                supervisor.shutdown_all().await;
+                done.store(true, Ordering::SeqCst);
+            }
+        });
+        compio::time::sleep(Duration::from_millis(50)).await;
+        assert!(supervisor.shutting_down.load(Ordering::SeqCst));
+        assert!(
+            !done.load(Ordering::SeqCst),
+            "the shutdown did not wait for the start"
+        );
+        drop(starting);
+        shutting_down.await.unwrap();
+
+        let refused = supervisor
+            .spawn_instance(image_ref, &bootstrap)
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{refused:#}").contains("shutting down"),
+            "{refused:#}"
+        );
+        let Err(refused) = supervisor
+            .ensure_instance(image_ref, &bootstrap, "k1", None)
+            .await
+        else {
+            panic!("a daemon started after the shutdown began");
+        };
+        assert!(
+            format!("{refused:#}").contains("shutting down"),
+            "{refused:#}"
+        );
+        assert!(supervisor.instances.read().await.is_empty());
     }
 
     /// Once `preserve_for_failover` began, an upgrade leaves every daemon running as it is.
