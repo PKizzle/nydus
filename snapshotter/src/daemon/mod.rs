@@ -2231,7 +2231,15 @@ impl DaemonSupervisor {
             // A stale record could understate this process's limit; without one, the successor
             // assumes the largest limit this process raises itself to.
             warn!(path = %path.display(), error = %e, "failed to record RLIMIT_NOFILE for the successor");
-            let _ = fs::remove_file(&path);
+            if let Err(e) = fs::remove_file(&path)
+                && e.kind() != io::ErrorKind::NotFound
+            {
+                error!(
+                    path = %path.display(),
+                    error = %e,
+                    "failed to remove the predecessor's RLIMIT_NOFILE record; the successor may sweep too few fd numbers and trusts no events-answered token of this process"
+                );
+            }
         }
         predecessor
     }
