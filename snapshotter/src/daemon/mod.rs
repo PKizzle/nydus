@@ -2311,7 +2311,10 @@ impl DaemonSupervisor {
         })
         .await
         .with_context(|| format!("failed to check how to serve {image_ref_str}"))?;
-        if live_fanotify && requested != FsDriverType::Fanotify {
+        if live_fanotify && node_driver != FsDriverType::Fanotify {
+            // Detaching it would break the containers on it; nothing else can serve it.
+            warn!(image_ref = %image_ref_str, node_driver = ?node_driver, "keeping a live fanotify mount on fanotify although the node no longer selects fanotify (no systemd fd store, or not supported); should the snapshotter die, its unfetched data reads as zeros until the next start re-arms it");
+        } else if live_fanotify && requested != FsDriverType::Fanotify {
             info!(image_ref = %image_ref_str, requested = ?requested, "keeping the live fanotify mount on fanotify");
         }
         if let Some(reason) = unfit {
