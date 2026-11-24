@@ -825,14 +825,17 @@ pub fn create_vfs_backend(
 ) -> Result<Arc<Vfs>> {
     let mut opts = fuse_backend_rs::api::VfsOptions::default();
     match fs_type {
-        // An API-only daemon mounts RAFS images, and may mount passthrough too, which needs open.
-        // Export support holds as in the Rafs arm. The root is the Vfs pseudo fs, which never
-        // reuses an inode number, so a handle to a directory it has evicted fails ESTALE.
+        // An API-only daemon keeps the open options a passthrough mount needs. A plain FUSE
+        // daemon offers export support as in the Rafs arm; its root is the Vfs pseudo fs, whose
+        // directories live as long as the daemon and keep their inode numbers. A virtio-fs
+        // daemon (Kata's hybrid mode included) serves passthrough mounts, so it offers none.
         None => {
             opts.no_open = false;
             opts.no_opendir = false;
             opts.killpriv_v2 = true;
-            opts.out_opts |= fuse_backend_rs::api::filesystem::FsOptions::EXPORT_SUPPORT;
+            if is_fuse && !hybrid_mode {
+                opts.out_opts |= fuse_backend_rs::api::filesystem::FsOptions::EXPORT_SUPPORT;
+            }
         }
         Some(FsBackendType::PassthroughFs) => {
             // passthroughfs requires !no_open
@@ -847,10 +850,11 @@ pub fn create_vfs_backend(
             // eviction: the kernel looks a forgotten node id up again through "." and "..". RAFS
             // inode numbers are fixed by the image, and every inode carries a generation derived
             // from the bootstrap, so a handle into a file system index the Vfs has since given to
-            // another image fails ESTALE instead of opening that image's file. Any other backend
-            // mounted into this Vfs later answers a node id it has forgotten with an error, which
-            // `open_by_handle_at` returns as ESTALE or as that error (passthrough: EBADF); it
-            // never opens a different file.
+            // another image fails ESTALE instead of opening that image's file. Passthrough and
+            // overlay inodes carry no generation, and their inode numbers restart with every
+            // instance, so a handle could open a different file once a freed index is reused or
+            // the host reuses an inode: `FsService::mount` refuses them while export support is
+            // negotiated.
             opts.out_opts |= fuse_backend_rs::api::filesystem::FsOptions::EXPORT_SUPPORT;
         }
     };
@@ -859,6 +863,9 @@ pub fn create_vfs_backend(
         opts.no_open = false;
         opts.no_opendir = false;
         opts.killpriv_v2 = true;
+        // Hybrid mode serves passthrough mounts, which export support would refuse.
+        opts.out_opts
+            .remove(fuse_backend_rs::api::filesystem::FsOptions::EXPORT_SUPPORT);
     }
 
     let vfs = fuse_backend_rs::api::Vfs::new(opts);
@@ -883,18 +890,31 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn passthrough_roots_do_not_negotiate_export_support() {
+    fn export_support_by_root_backend() {
         use fuse_backend_rs::api::filesystem::{FileSystem, FsOptions};
 
-        let negotiated = |fs_type| {
-            let vfs = create_vfs_backend(fs_type, true, false).unwrap();
-            vfs.init(FsOptions::all()).unwrap()
+        let negotiated = |fs_type, is_fuse, hybrid_mode| {
+            let vfs = create_vfs_backend(fs_type, is_fuse, hybrid_mode).unwrap();
+            let export = vfs
+                .init(FsOptions::all())
+                .unwrap()
+                .contains(FsOptions::EXPORT_SUPPORT);
+            (export, vfs.options().no_open)
         };
-        assert!(negotiated(Some(FsBackendType::Rafs)).contains(FsOptions::EXPORT_SUPPORT));
-        assert!(negotiated(None).contains(FsOptions::EXPORT_SUPPORT));
-        assert!(
-            !negotiated(Some(FsBackendType::PassthroughFs)).contains(FsOptions::EXPORT_SUPPORT)
+        // FUSE: a RAFS root and an API-only daemon offer export support, a passthrough root
+        // does not, and the API-only daemon keeps open for a later passthrough mount.
+        assert!(negotiated(Some(FsBackendType::Rafs), true, false).0);
+        assert_eq!(negotiated(None, true, false), (true, false));
+        assert!(!negotiated(Some(FsBackendType::PassthroughFs), true, false).0);
+        // virtio-fs: an API-only daemon, with or without hybrid mode, and any hybrid daemon
+        // serve passthrough mounts, so none offers export support.
+        assert_eq!(negotiated(None, false, false), (false, false));
+        assert_eq!(negotiated(None, false, true), (false, false));
+        assert_eq!(
+            negotiated(Some(FsBackendType::Rafs), false, true),
+            (false, false)
         );
+        assert!(negotiated(Some(FsBackendType::Rafs), false, false).0);
     }
 
     #[test]
