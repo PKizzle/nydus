@@ -144,25 +144,49 @@ pub(crate) struct SealState {
     /// fewer. Shared by every opener because each one sets and clears bits the others see;
     /// counted from the bitmap by the open that creates it.
     not_ready: AtomicU32,
+    /// The chunk count every map of the file is opened for.
+    chunk_count: u32,
     /// Fills that reached `lock`, for tests to know one is waiting.
     #[cfg(test)]
     pub(crate) arrived: std::sync::atomic::AtomicUsize,
 }
 
-/// The state of `file`, with `not_ready` as its count if no other map of the file is open or
-/// `fresh` says the open rewrote the whole file.
-fn seal_state_of(file: &File, not_ready: u32, fresh: bool) -> io::Result<Arc<SealState>> {
+/// The state of the map `file` at `filename` for `chunk_count` chunks, with `not_ready` as its
+/// count if no other map of the file is open or `fresh` says the open rewrote the whole file.
+fn seal_state_of(
+    filename: &str,
+    file: &File,
+    chunk_count: u32,
+    not_ready: u32,
+    fresh: bool,
+) -> StorageResult<Arc<SealState>> {
     use std::os::unix::fs::MetadataExt;
     type States = BTreeMap<(u64, u64), Weak<SealState>>;
     static STATES: Mutex<States> = Mutex::new(BTreeMap::new());
 
-    let md = file.metadata()?;
+    let md = file
+        .metadata()
+        .map_err(|e| StorageError::cache_io("stat the chunk map file", e))?;
     let mut states = STATES.lock().unwrap_or_else(|e| e.into_inner());
     states.retain(|_, state| state.strong_count() > 0);
     let key = (md.dev(), md.ino());
     let (state, fresh) = match states.get(&key).and_then(Weak::upgrade) {
+        // Maps for two chunk counts share a file only when their bitmaps have the same size,
+        // and each would count the other's padding bits wrong.
+        Some(state) if state.chunk_count != chunk_count => {
+            return Err(StorageError::InvalidData(format!(
+                "chunk map file {filename:?} is open for {} chunks, not {chunk_count}",
+                state.chunk_count
+            )));
+        }
         Some(state) => (state, fresh),
-        None => (Arc::default(), true),
+        None => (
+            Arc::new(SealState {
+                chunk_count,
+                ..Default::default()
+            }),
+            true,
+        ),
     };
     if fresh {
         state.not_ready.store(not_ready, Ordering::Release);
@@ -320,6 +344,15 @@ impl PersistMap {
             let mask = if chunks >= 8 { 0xff } else { !(0xff >> chunks) };
             ready_count += (byte.load(Ordering::Acquire) & mask).count_ones();
         }
+        // Looked up while the file lock is held, so the count of an opener already filling the
+        // map is kept instead of this bitmap count, which its fills may have overtaken.
+        let seal = seal_state_of(
+            filename,
+            &file,
+            chunk_count,
+            chunk_count - ready_count,
+            new_content,
+        )?;
         let ready = ready_count == chunk_count;
         if version >= 1 && (all_ready == MAGIC_ALL_READY) != ready {
             // Older releases trust this marker over the bitmap, so it must not claim a chunk
@@ -329,10 +362,6 @@ impl PersistMap {
                 .store(if ready { MAGIC_ALL_READY } else { 0 }, Ordering::Release);
             let _ = file.sync_all();
         }
-        // Looked up while the file lock is held, so the count of an opener already filling the
-        // map is kept instead of this bitmap count, which its fills may have overtaken.
-        let seal = seal_state_of(&file, chunk_count - ready_count, new_content)
-            .map_err(|e| StorageError::cache_io("stat the chunk map file", e))?;
 
         // The mapping holds a duplicate of `file`, which shares the lock, so release it explicitly.
         file.unlock()
@@ -1005,5 +1034,16 @@ mod tests {
         race_a_fill(&map, 3, move || other.reset().unwrap());
         assert!(!map.is_chunk_ready(3).0);
         assert_eq!(map.not_ready_count(), 8);
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support file-backed mmap")]
+    fn test_open_with_another_chunk_count_is_refused() {
+        let dir = TempDir::new().unwrap();
+        // 41 and 44 chunks both take six bitmap bytes.
+        let (path, map) = open_raw(&dir, 41, 1, 0, &[0; 6]);
+        assert!(PersistMap::open(&path, 44, true, true).is_err());
+        drop(map);
+        assert!(PersistMap::open(&path, 44, true, true).is_ok());
     }
 }
