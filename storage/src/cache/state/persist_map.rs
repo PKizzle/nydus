@@ -139,8 +139,9 @@ pub(crate) struct SealState {
     /// cleared by a seal since; zero if none. The header word alone can hold a mark whose
     /// flush failed.
     durable: AtomicU64,
-    /// The number of chunks whose ready bit is clear. Shared by every opener because each one
-    /// sets and clears bits the others see; counted from the bitmap by the open that creates it.
+    /// The number of chunks whose ready bit is clear, or more while a revoke races a fill, never
+    /// fewer. Shared by every opener because each one sets and clears bits the others see;
+    /// counted from the bitmap by the open that creates it.
     not_ready: AtomicU32,
     /// Fills that reached `lock`, for tests to know one is waiting.
     #[cfg(test)]
@@ -179,6 +180,9 @@ pub(crate) struct PersistMap {
     /// Makes the next map flush fail, as a full or failing disk would.
     #[cfg(test)]
     pub(crate) fail_next_flush: std::sync::atomic::AtomicBool,
+    /// Runs once between the next fill setting its ready bit and counting it.
+    #[cfg(test)]
+    pub(crate) after_set_bit: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 impl PersistMap {
@@ -345,6 +349,8 @@ impl PersistMap {
             seal,
             #[cfg(test)]
             fail_next_flush: Default::default(),
+            #[cfg(test)]
+            after_set_bit: Default::default(),
         })
     }
 
@@ -505,6 +511,10 @@ impl PersistMap {
             }
 
             if self.write_u8(index, current) {
+                #[cfg(test)]
+                if let Some(hook) = self.after_set_bit.lock().unwrap().take() {
+                    hook();
+                }
                 if let Ok(w) = self.ready_count_word() {
                     w.fetch_add(1, Ordering::AcqRel);
                 }
@@ -537,12 +547,15 @@ impl PersistMap {
         let byte = atomic_byte(&self.filemap, HEADER_SIZE + (index as usize >> 3))
             .map_err(|e| StorageError::cache_io("reach the chunk map contents", e))?;
         let mask = Self::index_to_mask(index);
+        let ready_count = self.ready_count_word()?;
+        // Counted before the bit clears and given back if it was clear already, so the count
+        // never claims fewer missing chunks than the bitmap, whatever fill races with this.
+        let not_ready = &self.seal.not_ready;
+        not_ready.fetch_add(1, Ordering::AcqRel);
         if byte.fetch_and(!mask, Ordering::AcqRel) & mask != 0 {
-            self.ready_count_word()?.fetch_sub(1, Ordering::AcqRel);
-            let count = self.count;
-            let _ = (self.seal.not_ready).fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
-                (n < count).then_some(n + 1)
-            });
+            ready_count.fetch_sub(1, Ordering::AcqRel);
+        } else {
+            not_ready.fetch_sub(1, Ordering::AcqRel);
         }
         self.filemap
             .sync_data()
@@ -564,7 +577,8 @@ impl PersistMap {
     }
 
     pub fn ready_chunks(&self) -> u32 {
-        self.count - self.not_ready_count()
+        // A revoke racing a fill may count a chunk missing twice until the fill counts its bit.
+        self.count.saturating_sub(self.not_ready_count())
     }
 
     fn data_stamp_word(&self) -> StorageResult<&AtomicU64> {
@@ -939,5 +953,39 @@ mod tests {
         assert!(first.is_range_all_ready());
         first.reset().unwrap();
         assert_eq!(second.not_ready_count(), 8);
+    }
+
+    /// Run `race` on another thread while `map` sets chunk `index`'s ready bit, between the bit
+    /// and its count, and let the fill go on once `race` returns or waits too long.
+    fn race_a_fill(map: &PersistMap, index: u32, race: impl FnOnce() + Send + 'static) {
+        let (go, started) = std::sync::mpsc::channel::<()>();
+        let (finished, done) = std::sync::mpsc::channel::<()>();
+        let racer = std::thread::spawn(move || {
+            started.recv().unwrap();
+            race();
+            let _ = finished.send(());
+        });
+        *map.after_set_bit.lock().unwrap() = Some(Box::new(move || {
+            go.send(()).unwrap();
+            // A race that waits for the fill finishes after it instead.
+            let _ = done.recv_timeout(std::time::Duration::from_millis(200));
+        }));
+        map.set_chunk_ready(index).unwrap();
+        racer.join().unwrap();
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support file-backed mmap")]
+    fn test_revoke_racing_a_fill_keeps_the_count() {
+        let dir = TempDir::new().unwrap();
+        let (path, map) = open_raw(&dir, 8, 1, 0, &[0]);
+        let other = PersistMap::open(&path, 8, true, true).unwrap();
+        race_a_fill(&map, 3, move || {
+            other.clear_chunk_ready(3).unwrap();
+            // The fill has not counted its bit yet, so chunk 3 is counted missing twice.
+            assert_eq!(other.ready_chunks(), 0);
+        });
+        assert!(!map.is_chunk_ready(3).0);
+        assert_eq!(map.not_ready_count(), 8);
     }
 }
