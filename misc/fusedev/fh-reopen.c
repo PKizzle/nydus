@@ -6,7 +6,8 @@
 //
 // FH_REOPEN_HOOK, if set, is run through the shell after the caches are dropped and before the
 // first reopen, e.g. to sample the daemon's lookup counter. FH_NO_DROP=1 skips dropping the
-// caches, a control run whose reopens must not reach the daemon.
+// caches, a control run whose reopens must not reach the daemon. FH_EXPECT_STALE=1 inverts the
+// check: every handle must fail with ESTALE, because the object it named is gone.
 #define _GNU_SOURCE
 #include <dirent.h>
 #include <errno.h>
@@ -88,11 +89,28 @@ int main(int argc, char **argv) {
 		return 2;
 	}
 
+	int expect_stale = getenv("FH_EXPECT_STALE") != NULL;
 	for (int i = 0; i < n; i++) {
 		const char *path = argv[i + 2];
 		const char *kind = S_ISDIR(st[i].st_mode) ? "directory" : "file";
 		int fd = open_by_handle_at(mount_fd, fh[i], O_RDONLY);
 		struct stat now;
+		if (expect_stale) {
+			if (fd >= 0) {
+				fstat(fd, &now);
+				printf("FAIL %s %s: reopened inode %lu, expected ESTALE\n", kind, path,
+				       (unsigned long)now.st_ino);
+				close(fd);
+				failures++;
+			} else if (errno != ESTALE) {
+				printf("FAIL %s %s: open_by_handle_at: %s, expected ESTALE\n", kind, path,
+				       strerror(errno));
+				failures++;
+			} else {
+				printf("ok   %s %s: stale\n", kind, path);
+			}
+			continue;
+		}
 		if (fd < 0) {
 			printf("FAIL %s %s: open_by_handle_at: %s\n", kind, path, strerror(errno));
 			failures++;

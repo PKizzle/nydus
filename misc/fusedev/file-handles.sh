@@ -18,6 +18,12 @@
 #   H6  H1-H4 again on a nydusd started without a bootstrap, with the image mounted at /img
 #       through the API, so the FUSE root is the Vfs pseudo fs and ".." from the image root
 #       answers it.
+#   H7  on that daemon, a file handle taken on /img fails ESTALE after /img is unmounted and an
+#       image with the same layout but other content takes its place under the same file
+#       system index (the index is cycled until the Vfs hands it out again). Only the RAFS
+#       generation tells the two images apart; without it the handle opens the other file.
+#   H8  a handle to a directory of the Vfs pseudo fs (`a` above a mount at /a/img) reopens that
+#       directory, without hanging.
 #
 # Requirements: root (mount(2), drop_caches), FUSE, a C compiler, curl and python3.
 # Override the binaries via env, e.g. NYDUS_IMAGE=... NYDUSD=... ROOT=... CC=...
@@ -50,7 +56,7 @@ trap 'finish 1' INT TERM
 step "reset dirs"
 teardown
 rm -rf "$ROOT"
-mkdir -p "$ROOT"/{src/d1/d2/d3,out,backend,mnt}
+mkdir -p "$ROOT"/{src/d1/d2/d3,src2/d1/d2/d3,out,out2,backend,mnt}
 
 step "build the handle helper"
 "${CC:-cc}" -O2 -Wall -o "$ROOT/fh-reopen" "$HERE/fh-reopen.c" \
@@ -61,13 +67,20 @@ echo top > "$ROOT/src/top.txt"
 echo one > "$ROOT/src/d1/f1.txt"
 perl -e 'print "FILE_HANDLE_MARKER" x 4096' > "$ROOT/src/d1/d2/f2.txt"
 echo three > "$ROOT/src/d1/d2/d3/f3.txt"
+# The same tree with f2.txt's content changed but not its size, so both images have one layout.
+cp -a "$ROOT/src/." "$ROOT/src2/"
+perl -e 'print "SECOND_IMAGE_BYTES" x 4096' > "$ROOT/src2/d1/d2/f2.txt"
 
 step "nydus-image create (RAFS v6)"
 "$NI" create --fs-version 6 -B "$ROOT/out/bootstrap" -D "$ROOT/out" "$ROOT/src" >/dev/null 2>&1 \
   || { echo "nydus-image create failed"; finish 1; }
-BLOB=$(ls "$ROOT/out" | grep -vE '^bootstrap' | head -1)
-[ -n "$BLOB" ] || { echo "no data blob produced"; finish 1; }
-cp "$ROOT/out/$BLOB" "$ROOT/backend/$BLOB"
+"$NI" create --fs-version 6 -B "$ROOT/out2/bootstrap" -D "$ROOT/out2" "$ROOT/src2" >/dev/null 2>&1 \
+  || { echo "nydus-image create (second image) failed"; finish 1; }
+for out in out out2; do
+  BLOB=$(ls "$ROOT/$out" | grep -vE '^bootstrap' | head -1)
+  [ -n "$BLOB" ] || { echo "no data blob produced in $out"; finish 1; }
+  cp "$ROOT/$out/$BLOB" "$ROOT/backend/$BLOB"
+done
 
 cat > "$ROOT/config.json" <<CFG
 {
@@ -134,21 +147,62 @@ else
   case_pass "H5: nydusd exited after umount"
 fi
 
+# Mounts bootstrap $1 at Vfs path $2 through the API; api_umount unmounts Vfs path $1.
+api_mount() {
+  python3 -c 'import json, sys; print(json.dumps({"source": sys.argv[1], "fs_type": "rafs",
+    "config": open(sys.argv[2]).read()}))' "$1" "$ROOT/config.json" |
+    curl -sf --unix-socket "$ROOT/api.sock" -X POST -H 'Content-Type: application/json' \
+      --data-binary @- "http://localhost/api/v1/mount?mountpoint=$2" >/dev/null
+}
+api_umount() {
+  curl -sf --unix-socket "$ROOT/api.sock" -X DELETE \
+    "http://localhost/api/v1/mount?mountpoint=$1" >/dev/null
+}
+
 step "H6: an image mounted through the API of a daemon without a bootstrap"
+teardown # a nydusd that failed H5 must not hold the mountpoint
 rm -f "$ROOT/api.sock"
 "$ND" fuse --mountpoint "$ROOT/mnt" --apisock "$ROOT/api.sock" --log-level info \
   > "$ROOT/nydusd-api.log" 2>&1 &
 NYDUSD_PID=$!
 for _ in $(seq 50); do [ -S "$ROOT/api.sock" ] && mountpoint -q "$ROOT/mnt" && break; sleep 0.2; done
-python3 -c 'import json, sys; print(json.dumps({"source": sys.argv[1], "fs_type": "rafs",
-  "config": open(sys.argv[2]).read()}))' "$ROOT/out/bootstrap" "$ROOT/config.json" |
-  curl -sf --unix-socket "$ROOT/api.sock" -X POST -H 'Content-Type: application/json' \
-    --data-binary @- "http://localhost/api/v1/mount?mountpoint=/img" >/dev/null
+api_mount "$ROOT/out/bootstrap" /img
 if [ -f "$ROOT/mnt/img/top.txt" ]; then
   reopen_handles H6 img/d1/d2/f2.txt img/d1 img/d1/d2/d3
 else
   echo "--- nydusd-api.log ---"; tail -30 "$ROOT/nydusd-api.log"
   case_fail "H6: the API mount is not visible at $ROOT/mnt/img"
+fi
+
+step "H7: a handle on an unmounted image never opens its successor's file"
+# The hook runs once the handle is taken: unmount /img (file system index 1), mount and
+# unmount the second image until the Vfs has handed out every other index (2-255) once, mount
+# it at /img, which takes index 1 again, and evict the dentries.
+cat > "$ROOT/swap-image.sh" <<SH
+#!/bin/bash
+set -e
+$(declare -f api_mount api_umount)
+ROOT='$ROOT'
+api_umount /img
+for _ in \$(seq 254); do api_mount "\$ROOT/out2/bootstrap" /cycle; api_umount /cycle; done
+api_mount "\$ROOT/out2/bootstrap" /img
+grep -q SECOND_IMAGE_BYTES "\$ROOT/mnt/img/d1/d2/f2.txt"
+sync; echo 2 > /proc/sys/vm/drop_caches
+SH
+chmod +x "$ROOT/swap-image.sh"
+if FH_NO_DROP=1 FH_EXPECT_STALE=1 FH_REOPEN_HOOK="'$ROOT/swap-image.sh'" \
+    "$ROOT/fh-reopen" "$ROOT/mnt" img/d1/d2/f2.txt; then
+  case_pass "H7: the handle is stale"
+else
+  case_fail "H7: the handle did not fail ESTALE (fh-reopen exit $?)"
+fi
+
+step "H8: a handle to a pseudo fs directory"
+api_mount "$ROOT/out/bootstrap" /a/img
+if timeout 30 "$ROOT/fh-reopen" "$ROOT/mnt" a; then
+  case_pass "H8: the pseudo fs directory reopened"
+else
+  case_fail "H8: the pseudo fs directory did not reopen (fh-reopen exit $?, 124 is a hang)"
 fi
 teardown
 
