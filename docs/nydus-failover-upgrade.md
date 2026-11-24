@@ -57,9 +57,11 @@ KillMode=process
 LimitNOFILE=1048576
 ```
 
-Without a notify socket (`NOTIFY_SOCKET` unset — e.g. running by hand), the snapshotter logs
-that the fd store is unavailable and degrades gracefully: mounts still work, they just do not
-survive a snapshotter restart.
+Without a notify socket (`NOTIFY_SOCKET` unset — e.g. running by hand, or a Helm DaemonSet), the
+snapshotter logs that the fd store is unavailable and degrades gracefully: mounts still work, they
+just do not survive a snapshotter restart. The driver probe then never selects fanotify, whose
+mounts would serve zeros for unfetched data once the process is gone, and serves new images with
+the next viable driver ([nydus-fanotify.md](nydus-fanotify.md)).
 
 ## Upgrading the snapshotter binary
 

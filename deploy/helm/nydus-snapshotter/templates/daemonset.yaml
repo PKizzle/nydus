@@ -86,8 +86,9 @@ spec:
           {{- if .Values.daemonset.probes.enabled }}
           # Exec probes over the sysctl UDS (the image ships no curl/grpc_health_probe;
           # the healthcheck subcommand is built into the binary). Requires
-          # [snapshotter.sysctl] enable = true (the default). A liveness restart hands
-          # the mounts to the successor via the failover records + fd store.
+          # [snapshotter.sysctl] enable = true (the default). A DaemonSet has no systemd
+          # fd store, so a liveness restart drops the FUSE connections: containers reading
+          # through them get ENOTCONN until they restart.
           livenessProbe:
             exec:
               command:
@@ -136,8 +137,8 @@ spec:
               mountPath: {{ .Values.hostPaths.devFuse }}
           # No preStop hook: with hostPID the container shares the host PID namespace, so signalling
           # PID 1 would hit the host's init. Kubernetes SIGTERMs the container's main process on stop;
-          # containerd-nydus unmounts on graceful shutdown (recover_policy=failover re-attaches on
-          # restart, so live container rootfs mounts survive a snapshotter bounce).
+          # containerd-nydus stops its daemons on graceful shutdown. Without systemd's fd store their
+          # mounts do not survive a snapshotter bounce.
       terminationGracePeriodSeconds: 30
       volumes:
         - name: config
