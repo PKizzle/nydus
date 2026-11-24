@@ -2112,16 +2112,13 @@ impl DaemonSupervisor {
     /// waits out every start, heal, recovery and upgrade already under way, each of which holds
     /// its image's start lock or the `instances` write lock, before it looks at `instances`.
     pub async fn preserve_for_failover(&self) {
-        self.shutting_down.store(true, Ordering::SeqCst);
-        let start_locks: Vec<_> = self.start_locks.lock().await.values().cloned().collect();
-        for start_lock in start_locks {
-            drop(start_lock.lock().await);
-        }
+        self.refuse_new_starts().await;
         let instances = self.instances.read().await;
         #[cfg(target_os = "linux")]
-        let mut answered = Vec::new();
+        let mut stopped = Vec::new();
         for (image_ref, inst) in instances.iter() {
-            if inst.failover_armed.load(Ordering::SeqCst) {
+            let armed = inst.failover_armed.load(Ordering::SeqCst);
+            if armed {
                 debug!(image_ref, "leaving mount held for failover takeover");
                 // Its successor runs in a later process, maybe after a reboot: seal the caches
                 // so a clean one keeps them trusted. Fills of the successor unseal them again.
@@ -2136,10 +2133,7 @@ impl DaemonSupervisor {
                             .is_some()
                     })
                     .await;
-                    let slug = slug_for(image_ref);
-                    if sealed && self.vouches_for(&slug) {
-                        answered.push(slug);
-                    }
+                    stopped.push((slug_for(image_ref), armed, sealed));
                 }
             } else {
                 info!(
@@ -2152,6 +2146,8 @@ impl DaemonSupervisor {
             }
         }
         #[cfg(target_os = "linux")]
+        let answered = events_answered_slugs(&stopped, &self.unswept.lock().unwrap());
+        #[cfg(target_os = "linux")]
         if let Err(e) = events_answered_token(self.nonce, &answered)
             .and_then(|token| crate::fdstore::replace_fd(EVENTS_ANSWERED_FDNAME, token.as_raw_fd()))
         {
@@ -2162,10 +2158,14 @@ impl DaemonSupervisor {
         }
     }
 
-    /// Whether the events-answered token may list `slug`: not when this process's startup sweep
-    /// of its group failed, since events a dead predecessor read may still be stranded on it.
-    fn vouches_for(&self, slug: &str) -> bool {
-        !self.unswept.lock().unwrap().contains(slug)
+    /// Refuse every daemon start from now on (see `shutting_down`) and wait out the starts, heals,
+    /// recoveries and upgrades already holding an image's start lock.
+    async fn refuse_new_starts(&self) {
+        self.shutting_down.store(true, Ordering::SeqCst);
+        let start_locks: Vec<_> = self.start_locks.lock().await.values().cloned().collect();
+        for start_lock in start_locks {
+            drop(start_lock.lock().await);
+        }
     }
 
     /// Where each process records its soft `RLIMIT_NOFILE` and its `nonce` for its successor's
@@ -5038,6 +5038,22 @@ fn read_events_answered(
     Some(lines.map(str::to_string).collect())
 }
 
+/// The slugs an events-answered token lists, given `(slug, armed, sealed)` for each daemon
+/// `preserve_for_failover` went through: every armed daemon whose workers it stopped and sealed,
+/// except those whose group this process's startup sweep failed (`unswept`), since events a dead
+/// predecessor read may still be stranded on it.
+#[cfg(target_os = "linux")]
+fn events_answered_slugs(
+    stopped: &[(String, bool, bool)],
+    unswept: &HashSet<String>,
+) -> Vec<String> {
+    stopped
+        .iter()
+        .filter(|(slug, armed, sealed)| *armed && *sealed && !unswept.contains(slug))
+        .map(|(slug, _, _)| slug.clone())
+        .collect()
+}
+
 /// The parked descriptors of every slug the predecessor did not vouch for in `answered` (all of
 /// them without a token).
 fn groups_to_sweep(
@@ -7790,19 +7806,22 @@ mod tests {
             ["einval", "gone"],
             "a descriptor that is not a group is skipped, a kernel error fails the sweep"
         );
+    }
 
-        let tmp = tempfile::tempdir().unwrap();
-        let mut config = SnapshotterConfig::default();
-        config.snapshotter.root = tmp.path().to_path_buf();
-        let supervisor = DaemonSupervisor::new(config);
-        let image_ref = "registry.local/team/app:1";
-        supervisor
-            .unswept
-            .lock()
-            .unwrap()
-            .insert(slug_for(image_ref));
-        assert!(!supervisor.vouches_for(&slug_for(image_ref)));
-        assert!(supervisor.vouches_for(&slug_for("registry.local/team/other:1")));
+    /// The token lists every armed daemon `preserve_for_failover` stopped and sealed, but never
+    /// one whose startup sweep failed (even once a daemon adopted its group and stopped cleanly)
+    /// nor an unarmed one, whose group is not parked.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_token_leaves_out_unswept_and_unarmed_groups() {
+        let stopped = [
+            ("clean".to_string(), true, true),
+            ("unswept".to_string(), true, true),
+            ("unarmed".to_string(), false, true),
+            ("unsealed".to_string(), true, false),
+        ];
+        let unswept = HashSet::from(["unswept".to_string()]);
+        assert_eq!(events_answered_slugs(&stopped, &unswept), ["clean"]);
     }
 
     /// The sweep covers the predecessor's recorded soft limit, or the largest limit a release
