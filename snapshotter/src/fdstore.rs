@@ -171,6 +171,97 @@ pub fn is_available() -> bool {
     std::env::var_os("NOTIFY_SOCKET").is_some_and(|s| !s.is_empty())
 }
 
+/// Whether systemd keeps a file-descriptor store for this process, and how that was decided.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FdStoreCheck {
+    pub present: bool,
+    pub reason: String,
+}
+
+/// Find out whether systemd holds an fd store for this process.
+///
+/// Without one, nothing keeps a fanotify group open when the process dies, and the kernel
+/// then allows every queued and future read of its marked files: containers read the sparse
+/// cache files' zeros. `$FDSTORE` (systemd >= 254 sets it to `FileDescriptorStoreMax=`) answers
+/// directly; under an older systemd with a notify socket, the unit is asked through
+/// `systemctl show`. Anything that cannot be confirmed counts as no store.
+pub fn detect() -> FdStoreCheck {
+    detect_with(
+        |key| std::env::var(key).ok(),
+        || std::fs::read_to_string("/proc/self/cgroup").ok(),
+        |unit| {
+            let out = std::process::Command::new("systemctl")
+                .args(["show", "-p", "FileDescriptorStoreMax", "--value", unit])
+                .output()
+                .context("failed to run systemctl")?;
+            if !out.status.success() {
+                bail!(
+                    "systemctl show {unit} failed: {}",
+                    String::from_utf8_lossy(&out.stderr).trim()
+                );
+            }
+            Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+        },
+    )
+}
+
+/// [`detect`] over injected sources: the environment, the contents of `/proc/self/cgroup`, and
+/// the output of `systemctl show -p FileDescriptorStoreMax --value <unit>`.
+fn detect_with(
+    env: impl Fn(&str) -> Option<String>,
+    cgroup: impl FnOnce() -> Option<String>,
+    store_max: impl FnOnce(&str) -> Result<String>,
+) -> FdStoreCheck {
+    let check = |present, reason: String| FdStoreCheck { present, reason };
+    if let Some(max) = env("FDSTORE").and_then(|v| v.trim().parse::<u64>().ok())
+        && max > 0
+    {
+        return check(true, format!("FDSTORE={max}"));
+    }
+    if env("NOTIFY_SOCKET").is_none_or(|s| s.is_empty()) {
+        return check(
+            false,
+            "not started by systemd (no FDSTORE or NOTIFY_SOCKET)".into(),
+        );
+    }
+    let Some(unit) = cgroup().as_deref().and_then(service_unit) else {
+        return check(
+            false,
+            "NOTIFY_SOCKET is set but no .service unit was found in /proc/self/cgroup".into(),
+        );
+    };
+    match store_max(&unit) {
+        Ok(out) => match out.trim().parse::<u64>() {
+            Ok(max) if max > 0 => check(true, format!("{unit} has FileDescriptorStoreMax={max}")),
+            Ok(_) => check(false, format!("{unit} has FileDescriptorStoreMax=0")),
+            Err(_) => check(
+                false,
+                format!(
+                    "unexpected FileDescriptorStoreMax of {unit}: {:?}",
+                    out.trim()
+                ),
+            ),
+        },
+        Err(e) => check(false, format!("could not ask systemd about {unit}: {e:#}")),
+    }
+}
+
+/// The systemd service unit in `/proc/self/cgroup`: the last path component ending in
+/// `.service`, from the cgroup v1 `name=systemd` hierarchy if there is one, else the v2 one.
+fn service_unit(cgroup: &str) -> Option<String> {
+    let path = |want: fn(&str) -> bool| {
+        cgroup.lines().find_map(|line| {
+            let mut fields = line.splitn(3, ':');
+            let (id, controllers, path) = (fields.next()?, fields.next()?, fields.next()?);
+            want(&format!("{id}:{controllers}")).then_some(path)
+        })
+    };
+    let path = path(|h| h.ends_with(":name=systemd")).or_else(|| path(|h| h == "0:"))?;
+    path.rsplit('/')
+        .find(|c| c.ends_with(".service") && c.len() > ".service".len())
+        .map(str::to_string)
+}
+
 fn set_cloexec(fd: RawFd) {
     // SAFETY: fd is a valid descriptor we are about to take ownership of.
     unsafe {
@@ -247,6 +338,87 @@ fn connect_dgram(addr: &[u8]) -> Result<UnixDatagram> {
 mod tests {
     use super::*;
     use std::os::fd::AsRawFd;
+
+    /// [`detect_with`] over a fixed environment, cgroup file and `systemctl` answer.
+    fn detect_in(
+        vars: &[(&str, &str)],
+        cgroup: Option<&str>,
+        systemctl: Option<&str>,
+    ) -> FdStoreCheck {
+        let env = |key: &str| {
+            vars.iter()
+                .find(|(k, _)| *k == key)
+                .map(|(_, v)| v.to_string())
+        };
+        detect_with(
+            env,
+            || cgroup.map(str::to_string),
+            |unit| {
+                assert_eq!(unit, "nydus-snapshotter.service");
+                systemctl
+                    .map(str::to_string)
+                    .ok_or_else(|| anyhow::anyhow!("No such file or directory"))
+            },
+        )
+    }
+
+    const V2: &str = "0::/system.slice/nydus-snapshotter.service\n";
+    const V1: &str = "12:pids:/system.slice/nydus-snapshotter.service\n\
+        1:name=systemd:/system.slice/nydus-snapshotter.service/payload\n0::/\n";
+
+    #[test]
+    fn fd_store_detection_table() {
+        let notify = ("NOTIFY_SOCKET", "/run/systemd/notify");
+        /// Environment, cgroup file, systemctl output, and whether a store is present.
+        type Case<'a> = (
+            &'a [(&'a str, &'a str)],
+            Option<&'a str>,
+            Option<&'a str>,
+            bool,
+        );
+        let cases: &[Case] = &[
+            (&[("FDSTORE", "512")], None, None, true),
+            (&[("FDSTORE", "0")], None, None, false),
+            (&[("FDSTORE", "many")], None, None, false),
+            (&[], Some(V2), Some("512\n"), false),
+            (&[notify], Some(V2), Some("512\n"), true),
+            (&[notify], Some(V1), Some("128\n"), true),
+            (&[("FDSTORE", "0"), notify], Some(V2), Some("4\n"), true),
+            (&[notify], Some(V2), Some("0\n"), false),
+            (&[notify], Some(V2), Some("\n"), false),
+            (&[notify], Some(V2), None, false),
+            (
+                &[notify],
+                Some("0::/user.slice/session-3.scope\n"),
+                Some("512\n"),
+                false,
+            ),
+            (&[notify], None, Some("512\n"), false),
+            (&[("NOTIFY_SOCKET", "")], Some(V2), Some("512\n"), false),
+        ];
+        for (vars, cgroup, systemctl, present) in cases {
+            let check = detect_in(vars, *cgroup, *systemctl);
+            assert_eq!(
+                check.present, *present,
+                "{vars:?} {cgroup:?} {systemctl:?}: {}",
+                check.reason
+            );
+        }
+    }
+
+    #[test]
+    fn service_unit_reads_v1_and_v2_cgroups() {
+        assert_eq!(
+            service_unit(V2).as_deref(),
+            Some("nydus-snapshotter.service")
+        );
+        assert_eq!(
+            service_unit(V1).as_deref(),
+            Some("nydus-snapshotter.service")
+        );
+        assert_eq!(service_unit("0::/\n"), None);
+        assert_eq!(service_unit("0::/system.slice/.service\n"), None);
+    }
 
     #[test]
     fn store_fd_without_notify_socket_is_noop() {
