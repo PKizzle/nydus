@@ -398,7 +398,7 @@ async fn run(nofile: std::io::Result<(u64, u64)>) -> Result<()> {
 
     // When systemd is preserving our descriptors, leave the kernel mounts up
     // and let Rust destructors run normally: nothing in the supervisor or
-    // overlay engine drops the FUSE mounts (only `stop_instance()` does, and
+    // overlay engine drops the mounts (only stopping an instance does, and
     // that's called explicitly from `shutdown_all` / `preserve_for_failover`).
     // Returning Ok(()) here lets fjall's worker pool flush + drop cleanly,
     // which an earlier `std::process::exit(0)` skipped.
