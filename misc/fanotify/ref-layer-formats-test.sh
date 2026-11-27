@@ -59,6 +59,13 @@ for layer in gz.tar.gz plain.tar zmulti.tar.zst zdedup.tar.zst zsingle.tar.zst; 
   n=$((n + 1)); mv "$R/$layer" "$R/layers/$n-$layer"
 done
 for tree in gz tar zmulti zdedup zsingle; do cp -a "$R/src/$tree/." "$R/expected/"; done
+# Each layer's diff ID, from the reference decoders: the conversion must reproduce it.
+mkdir -p "$R/diff-ids"
+for layer in "$R"/layers/*; do
+  case "$layer" in
+    *.gz) gzip -dc "$layer" ;; *.zst) zstd -dcq "$layer" ;; *) cat "$layer" ;;
+  esac | sha256sum | awk '{print "sha256:" $1}' > "$R/diff-ids/$(basename "$layer")"
+done
 
 NYDUS_IMAGE="$NI" NYDUS_E2E_ROOT="$R" "$CARGO" test -p nydus-snapshotter --lib \
   daemon::e2e_tests::auto_accel_sidecar_serves_converted_layers -- --ignored --exact --nocapture \

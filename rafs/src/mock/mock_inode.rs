@@ -291,7 +291,9 @@ impl RafsInodeExt for MockInode {
         self
     }
 
-    impl_getter!(parent, i_parent, u64);
+    fn parent(&self) -> RafsResult<u64> {
+        Ok(self.i_parent)
+    }
 }
 
 impl RafsV5InodeChunkOps for MockInode {
@@ -367,7 +369,7 @@ mod tests {
         assert_eq!(node.get_name_size(), "foo".len() as u16);
         assert!(node.get_chunk_info(0).is_ok());
         assert!(node.get_chunk_info_v5(0).is_ok());
-        assert_eq!(node.parent(), RAFS_V5_ROOT_INODE);
+        assert_eq!(node.parent().unwrap(), RAFS_V5_ROOT_INODE);
         assert!(node.get_blob_by_index(0).is_ok());
         assert_eq!(node.get_chunk_size(), CHUNK_SIZE);
         assert!(!node.has_hole());

@@ -106,6 +106,23 @@ pub struct Rafs {
     /// The daemon's uid/gid, reported for every inode of an image that does not carry its own.
     owner_override: Option<(u32, u32)>,
     i_time: u64,
+    /// FUSE generation of every inode of this image, from `image_generation`. A file handle
+    /// carries it, so a handle into an index the Vfs has since given to another image fails
+    /// instead of opening that image's inode with the same number.
+    generation: u64,
+}
+
+/// The FUSE generation for an image: the low 32 bits of the bootstrap's BLAKE3 digest, never 0.
+/// The same bytes give the same value in any nydusd build, so a hot-upgrade restore or a remount
+/// of the same bootstrap keeps every handle valid. The kernel keeps 32 bits (`i_generation`) and
+/// treats any other value it is later answered as a stale inode.
+fn image_generation(bootstrap: &[u8]) -> u64 {
+    let digest = nydus_utils::digest::RafsDigest::from_buf(
+        bootstrap,
+        nydus_utils::digest::Algorithm::Blake3,
+    );
+    let low = u32::from_le_bytes(digest.data[..4].try_into().unwrap());
+    u64::from(low.max(1))
 }
 
 impl Rafs {
@@ -135,6 +152,9 @@ impl Rafs {
         }
         let owner_override =
             (!sb.meta.explicit_uidgid()).then(|| (geteuid().into(), getegid().into()));
+        let generation = std::fs::read(metadata_path)
+            .map(|bootstrap| image_generation(&bootstrap))
+            .map_err(|e| RafsError::ReadMetadata(e, metadata_path.display().to_string()))?;
 
         let rafs = Rafs {
             id: mountpoint.to_string(),
@@ -160,6 +180,7 @@ impl Rafs {
                 .duration_since(SystemTime::UNIX_EPOCH)
                 .unwrap()
                 .as_secs(),
+            generation,
         };
 
         // Rafs v6 does must store chunk info into local file cache. So blob cache is required
@@ -295,6 +316,17 @@ impl Rafs {
         Ok(())
     }
 
+    /// The FUSE generation every inode of this image is answered with.
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// Answer `generation` instead of the image's own: a daemon taking over a live mount keeps
+    /// the generation its predecessor gave the kernel, or every cached inode turns stale.
+    pub fn set_generation(&mut self, generation: u64) {
+        self.generation = generation;
+    }
+
     /// Get id of the filesystem instance.
     pub fn id(&self) -> &str {
         &self.id
@@ -372,7 +404,7 @@ impl Rafs {
             }
             .into(),
             inode: 0,
-            generation: 0,
+            generation: self.generation,
             attr_flags: 0,
             attr_timeout: self.sb.meta.attr_timeout,
             entry_timeout: self.sb.meta.entry_timeout,
@@ -410,6 +442,7 @@ impl Rafs {
 
     fn get_inode_entry<I: Deref<Target = dyn RafsInode>>(&self, inode: I) -> Entry {
         let mut entry = inode.get_entry();
+        entry.generation = self.generation;
 
         if let Some((uid, gid)) = self.owner_override {
             entry.attr.st_uid = uid;
@@ -666,20 +699,24 @@ impl FileSystem for Rafs {
             ))));
         }
         let parent = self.sb.get_inode(ino, self.digest_validate)?;
+        // The kernel resolves a file handle by looking up "." on the handle's own inode, which
+        // need not be a directory (FUSE `EXPORT_SUPPORT`).
+        if target == DOT || (ino == ROOT_ID && target == DOTDOT) {
+            rec.mark_success(0);
+            let mut entry = self.get_inode_entry(parent);
+            entry.inode = ino;
+            return Ok(entry);
+        }
         if !parent.is_dir() {
             return Err(Error::from_raw_os_error(libc::ENOTDIR));
         }
 
         rec.mark_success(0);
-        if target == DOT || (ino == ROOT_ID && target == DOTDOT) {
-            let mut entry = self.get_inode_entry(parent);
-            entry.inode = ino;
-            Ok(entry)
-        } else if target == DOTDOT {
+        if target == DOTDOT {
             let parent = self.sb.get_extended_inode(parent.ino(), false)?;
             Ok(self
                 .sb
-                .get_inode(parent.parent(), self.digest_validate)
+                .get_inode(parent.parent()?, self.digest_validate)
                 .map(|i| self.get_inode_entry(i))
                 .unwrap_or_else(|_| self.negative_entry()))
         } else {
@@ -1230,6 +1267,7 @@ mod tests {
             prefetch_bandwidth_limit: 0,
             owner_override: None,
             i_time: 0,
+            generation: 0,
         };
         assert_eq!(rafs.id(), "foo");
         assert!(!rafs.xattr_supported());
@@ -1275,7 +1313,128 @@ mod tests {
             prefetch_bandwidth_limit: 0,
             owner_override: Some((1000, 1000)),
             i_time: 12345678,
+            generation: 0x5eed,
         }
+    }
+
+    /// The kernel resolves a file handle whose dentry was evicted (FUSE `EXPORT_SUPPORT`) by
+    /// looking up "." on the handle's own node id, a file's included, and reconnects a
+    /// directory by looking up ".." up to the root.
+    #[test]
+    fn dot_and_dotdot_lookups_resolve_file_handles() {
+        let root_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap();
+        for boot in [
+            // Walking the whole 11 MiB v5 image takes hours under Miri.
+            #[cfg(not(miri))]
+            "bootstrap/rafs-v5.boot",
+            // top.txt, d1/f1.txt, d1/d2/f2.txt, d1/d2/d3/f3.txt
+            "bootstrap/rafs-v6-nested.boot",
+        ] {
+            let path = PathBuf::from(&root_dir).join("../tests/texture").join(boot);
+            let (sb, _) =
+                RafsSuper::load_from_file(path, crate::test_util::test_config(), false).unwrap();
+            let rafs = Rafs {
+                sb: Arc::new(sb),
+                ..make_test_rafs()
+            };
+            let root = rafs.sb.superblock.root_ino();
+            let lookup = |parent: u64, name: &str| {
+                let name = std::ffi::CString::new(name).unwrap();
+                match rafs.lookup(&Context::default(), parent, &name) {
+                    Ok(entry) => entry.inode,
+                    Err(e) => panic!("{boot}: lookup({parent}, {name:?}): {e}"),
+                }
+            };
+
+            assert_eq!(lookup(root, "."), root, "{boot}");
+            assert_eq!(lookup(root, ".."), root, "{boot}");
+
+            // (inode, parent, depth) of every node below the root, breadth first.
+            let (mut dirs, mut files) = (Vec::new(), Vec::new());
+            let mut queue = std::collections::VecDeque::from([(root, 0)]);
+            while let Some((dir, depth)) = queue.pop_front() {
+                rafs.do_readdir(dir, u32::MAX, 0, &mut |entry| {
+                    if entry.name != DOT.as_bytes() && entry.name != DOTDOT.as_bytes() {
+                        if entry.type_ == u32::from(libc::DT_DIR) {
+                            dirs.push((entry.ino, dir, depth + 1));
+                            queue.push_back((entry.ino, depth + 1));
+                        } else {
+                            files.push(entry.ino);
+                        }
+                    }
+                    Ok(1)
+                })
+                .unwrap();
+            }
+            assert!(!files.is_empty(), "{boot}: no file");
+            assert!(dirs.iter().any(|d| d.2 == 1), "{boot}: no directory");
+            assert!(dirs.iter().any(|d| d.2 > 1), "{boot}: no nested directory");
+
+            for &file in &files {
+                assert_eq!(lookup(file, "."), file, "{boot}: \".\" on file {file}");
+            }
+            for &(dir, parent, _) in &dirs {
+                assert_eq!(lookup(dir, "."), dir, "{boot}: \".\" on directory {dir}");
+                assert_eq!(
+                    lookup(dir, ".."),
+                    parent,
+                    "{boot}: \"..\" on directory {dir}"
+                );
+            }
+        }
+    }
+
+    /// Two images get different generations, the same bootstrap bytes the same one, and every
+    /// entry Rafs answers carries it.
+    #[test]
+    fn entries_carry_the_image_generation() {
+        let root_dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
+        let texture = root_dir.join("../tests/texture/bootstrap");
+        let other = std::fs::read(texture.join("rafs-v6-small-files.boot")).unwrap();
+        let v6 = std::fs::read(texture.join("rafs-v6-nested.boot")).unwrap();
+        let (g_other, g6) = (image_generation(&other), image_generation(&v6));
+        assert_ne!(g_other, g6);
+        assert_eq!(image_generation(&v6.clone()), g6);
+        for g in [g_other, g6] {
+            assert!(g != 0 && g <= u64::from(u32::MAX), "{g:#x}");
+        }
+
+        let (sb, _) = RafsSuper::load_from_file(
+            texture.join("rafs-v6-nested.boot"),
+            crate::test_util::test_config(),
+            false,
+        )
+        .unwrap();
+        let rafs = Rafs {
+            sb: Arc::new(sb),
+            generation: g6,
+            ..make_test_rafs()
+        };
+        let root = rafs.sb.superblock.root_ino();
+        let ctx = Context::default();
+        let lookup = |parent, name: &str| {
+            let name = std::ffi::CString::new(name).unwrap();
+            rafs.lookup(&ctx, parent, &name).unwrap()
+        };
+        let d1 = lookup(root, "d1");
+        for entry in [
+            d1,
+            lookup(d1.inode, "."),
+            lookup(d1.inode, ".."),
+            lookup(root, "top.txt"),
+            lookup(root, "missing"),
+            rafs.mount().unwrap().0,
+        ] {
+            assert_eq!(entry.generation, g6, "inode {}", entry.inode);
+        }
+        let mut plus = Vec::new();
+        rafs.readdirplus(&ctx, root, 0, u32::MAX, 0, &mut |_, entry| {
+            plus.push(entry.generation);
+            Ok(1)
+        })
+        .unwrap();
+        assert!(!plus.is_empty());
+        assert!(plus.iter().all(|&g| g == g6), "{plus:?}");
     }
 
     #[test]
@@ -1337,7 +1496,7 @@ mod tests {
         let rafs = make_test_rafs();
         let ent = rafs.negative_entry();
         assert_eq!(ent.inode, 0);
-        assert_eq!(ent.generation, 0);
+        assert_eq!(ent.generation, rafs.generation);
         // attr_timeout and entry_timeout come from sb.meta (default = 0)
         assert_eq!(ent.attr_timeout, rafs.sb.meta.attr_timeout);
         assert_eq!(ent.entry_timeout, rafs.sb.meta.entry_timeout);
@@ -1364,6 +1523,7 @@ mod tests {
             prefetch_bandwidth_limit: 0,
             owner_override: None,
             i_time: 0,
+            generation: 0,
         };
         assert_eq!(rafs.id(), "my-rafs-instance");
     }

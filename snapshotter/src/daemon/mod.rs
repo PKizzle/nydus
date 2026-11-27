@@ -2515,7 +2515,7 @@ impl DaemonSupervisor {
         let cfg_json =
             serde_json::to_string(&cfg_v2).context("failed to serialise ConfigV2 for nydusd")?;
 
-        let vfs = create_vfs_backend(FsBackendType::Rafs, true, false)
+        let vfs = create_vfs_backend(Some(FsBackendType::Rafs), true, false)
             .context("failed to create RAFS VFS backend")?;
 
         let mount_cmd = FsBackendMountCmd {
@@ -3014,7 +3014,7 @@ impl DaemonSupervisor {
 
         let cfg_v2 = build_daemon_config(&self.config, &parsed, &cache_dir, auth, slug)?;
         let cfg_json = serde_json::to_string(&cfg_v2).context("serialise ConfigV2 for nydusd")?;
-        let vfs = create_vfs_backend(FsBackendType::Rafs, true, false)
+        let vfs = create_vfs_backend(Some(FsBackendType::Rafs), true, false)
             .context("create RAFS VFS backend")?;
         let mount_cmd = FsBackendMountCmd {
             fs_type: FsBackendType::Rafs,
@@ -5009,8 +5009,16 @@ struct PredecessorRecord {
 fn events_answered_token(nonce: u64, slugs: &[String]) -> Result<std::os::fd::OwnedFd> {
     use std::io::Write;
     use std::os::fd::FromRawFd;
+    // The raw syscall, not glibc's wrapper: the cross toolchains link against a glibc older than
+    // 2.27, which has no `memfd_create` symbol.
     // SAFETY: the name is NUL-terminated and the flags are plain integers; the result is checked.
-    let fd = unsafe { libc::memfd_create(c"nydus-events-answered".as_ptr(), libc::MFD_CLOEXEC) };
+    let fd = unsafe {
+        libc::syscall(
+            libc::SYS_memfd_create,
+            c"nydus-events-answered".as_ptr(),
+            libc::MFD_CLOEXEC,
+        )
+    } as libc::c_int;
     if fd < 0 {
         return Err(io::Error::last_os_error()).context("memfd_create");
     }
@@ -5368,6 +5376,21 @@ impl DaemonSupervisor {
             image_ref.to_string(),
             Arc::new(test_daemon_instance(image_ref, mountpoint)),
         );
+    }
+
+    /// Register a live test instance for `image_ref` serving `bootstrap`.
+    pub(crate) async fn insert_test_instance_serving(
+        &self,
+        image_ref: &str,
+        mountpoint: PathBuf,
+        bootstrap: &Path,
+    ) {
+        let mut instance = test_daemon_instance(image_ref, mountpoint);
+        instance.bootstrap = bootstrap.to_path_buf();
+        self.instances
+            .write()
+            .await
+            .insert(image_ref.to_string(), Arc::new(instance));
     }
 }
 
@@ -7529,6 +7552,21 @@ mod tests {
         let mut forged = supervisor.read_persisted_records().pop().unwrap();
         forged.slug = "..".to_string();
         assert!(!supervisor.evict_retained(&forged).await.unwrap());
+        assert!(dir.join("stage/bootstrap").exists());
+    }
+
+    /// A daemon serving the image keeps its stage even while the record still reads stopped,
+    /// as after a start whose record write failed.
+    #[compio::test]
+    async fn an_eviction_skips_an_image_a_daemon_serves() {
+        let tmp = tempfile::tempdir().unwrap();
+        let image_ref = "registry.local/team/app:1";
+        let (supervisor, _, dir) = retained(tmp.path(), image_ref).await;
+        let stopped = supervisor.read_persisted_records().pop().unwrap();
+        supervisor
+            .insert_test_instance(image_ref, dir.join("mnt"))
+            .await;
+        assert!(!supervisor.evict_retained(&stopped).await.unwrap());
         assert!(dir.join("stage/bootstrap").exists());
     }
 

@@ -1,0 +1,2 @@
+# ThreadSanitizer suppressions for `make tsan-ut-nextest`. Each entry names a frame of
+# the reported race and says why it is not a data race in nydus.

@@ -13,6 +13,9 @@ nydus-api = { path = "../api" }
 nydus-rafs = { path = "../rafs" }
 nydus-storage = { path = "../storage", features = ["backend-localfs"] }
 nydus-utils = { path = "../utils", features = ["zran"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 nydus-service = { path = "../service", features = ["fuzzing"] }
@@ -61,6 +64,13 @@ bench = false
 [[bin]]
 name = "fanotify_events"
 path = "fuzz_targets/fanotify_events.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "go_json"
+path = "fuzz_targets/go_json.rs"
 test = false
 doc = false
 bench = false

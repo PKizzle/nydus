@@ -167,7 +167,7 @@ nydus/
    snapshot), raising the ceiling to ~200 layers. Never put the long `snapshots/<name>/fs` paths
    back into overlay mount specs; consumers that need real paths must `canonicalize()` (the access
    tracer already does).
-10. **Nydus blob layers bypass stream processors**: `application/vnd.oci.image.layer.nydus.blob.v1` layers are NOT routed through a containerd stream processor. On `Prepare`, the snapshotter classifies the layer via `containerd.io/snapshot/nydus-blob`, commits the target snapshot directly, and returns gRPC `AlreadyExists` so containerd's image-unpacker skips extraction. See [snapshotter/src/source/labels.rs](snapshotter/src/source/labels.rs) and `OverlayEngine::prepare`.
+10. **Nydus blob layers bypass stream processors**: `application/vnd.oci.image.layer.nydus.blob.v1` layers are NOT routed through a containerd stream processor. On `Prepare`, the snapshotter classifies the layer via `containerd.io/snapshot/nydus-blob`, commits the target snapshot directly, and returns gRPC `AlreadyExists` so containerd's image-unpacker skips extraction. Rules: when containerd's `containerd.io/snapshot/diff-id` label is present (containerd ≥ 2.3; client-side unpackers and older containerd send none) it must derive the target chain ID with the parent, else the skip is refused; the label comes from the image's own config, so trust never rests on it; on a chain holding a data layer `OverlayEngine::validate_parent` lets an unpack add only nydus data/bootstrap layers, and anything else needs a meta layer holding a real `image/image.boot` above every data layer; a meta layer counts only if it holds a bootstrap. A serving daemon's image ref comes only from the meta layer's sole claimant in its key's namespace (`resolve_nydus_mount` refreshes the listing first; `OverlayEngine::serving_image_ref`): the stored ref while it names the claimant's repository (one bootstrap, one daemon), else the claimant's; never a call label; none is `ChainError::NoImageRef` (gRPC `FailedPrecondition`), never an overlay. Its blobs are digest-checked, so targets that could not be walked do not block it. An unpack `Prepare` always returns the plain overlay (never a daemon, never enqueue/trace). Refusals are a node-local pull denial until the claiming image is removed (`snapshotter_unapplied_chain_refused_total`). Never let a non-nydus snapshot stack on an unapplied data layer. See [snapshotter/src/source/labels.rs](snapshotter/src/source/labels.rs) and `OverlayEngine::prepare`.
 11. **Layer merge emulates containerd's overlay apply path**: a directory synthesized for a missing tar
     parent is marked `IMPLICIT_DIR` (v5 inode flag; v6 nid table referenced from the extended
     superblock) and the merge keeps a lower directory's metadata under it, while an explicit directory
@@ -195,6 +195,26 @@ nydus/
     references, which 4K-page hosts never show. The gate is the `erofs-folio-arm64` job in
     `.github/workflows/fanotify-vm.yml` (64K pages under QEMU, `misc/erofs-folio/qemu-test.sh`
     with `FANOTIFY_TESTS`); canary releases on a 16K-page host as well as a 4K one.
+15. **A chain ID does not name an image**: CRI sends a container-rootfs `Prepare` no image label,
+    so the snapshotter names the image from which containerd image records of the parent key's
+    namespace claim the parent chain (`ContainerdLookup`, one instance shared by every consumer,
+    one memo per namespace). A claimant is a **repository's tag-named targets** (its several
+    targets count as one publisher, newest record first), or a single target only digest records
+    name. Image-specific content (an auto-accel sidecar, a dual image's nydus entry, a referrer)
+    is served only for a sole claimant (`sole_chain_claimant`); several claimants, or an
+    image-ID-only record next to a named one, get the plain overlay
+    (`snapshotter_ambiguous_chain_total`). Image JSON is parsed as containerd's Go decoder parses
+    it (`go_json`: last duplicate key wins); JSON it rejects claims nothing. A target that cannot
+    be read makes a claim it could change an error, never a smaller claimant set. Dual-index and
+    referrer detection use `repo@<record target>` and read the index from the local content store,
+    never a tag from the registry. Auto-accel serves only the configured namespace, and converts
+    an image only if every layer decompresses to its config's diff ID (`nydus-image create
+    --diff-id`, checked in the stream the build reads; `DiffIdMismatch`,
+    `snapshotter_auto_zran_jobs_total{event="diff_id_mismatch"}`); `AUTO_ACCEL_MANIFEST_VERSION` 4
+    marks sidecars built that way, so never lower it or serve an older one. `Mounts` reuses the
+    decision `Prepare` stamped (`nydus-daemon-checked`); an unchecked stamp from an older release
+    is re-checked against the claimants. Every lookup lists the image records again, so never
+    answer a serving decision from a claim memo that may predate a pull.
 
 ## Node-local acceleration (transparent, no tag change)
 
@@ -217,6 +237,8 @@ tag, no pushed artifact, `original:tag` is served faster than the original. Mech
    so a context larger than `RAFS_MAX_CHUNK_SIZE` (single-frame layers) is served by a per-blob
    forward decoding cursor (`ZstdStreamCursor`) instead of being read into memory; a read behind
    the cursor restarts at the frame start.
+   Each `create` gets the layer's config diff ID (`--diff-id`) and fails unless the stream it
+   indexes decompresses to exactly that tar, so the artifact holds the chain's content.
 3. The artifact is served on demand through the fanotify path (compressed ranges decoded lazily into
    the cache), so the container starts before the image is fully materialised.
 

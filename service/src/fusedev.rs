@@ -117,9 +117,6 @@ impl FuseServer {
     }
 
     fn svc_loop(&mut self, metrics_hook: &dyn MetricsHook) -> Result<()> {
-        // Given error EBADF, it means kernel has shut down this session.
-        let _ebadf = std::io::Error::from_raw_os_error(libc::EBADF);
-
         loop {
             if let Some((reader, writer)) = self.ch.get_request().map_err(|e| {
                 NydusError::StartService(format!(
@@ -131,17 +128,13 @@ impl FuseServer {
                     self.server
                         .handle_message(reader, writer.into(), None, Some(metrics_hook))
                 {
-                    match e {
-                        fuse_backend_rs::Error::EncodeMessage(_ebadf) => {
-                            return Err(NydusError::StartService(
-                                "fuse session has been shut down".to_string(),
-                            ));
-                        }
-                        _ => {
-                            error!("Handling fuse message, {}", NydusError::ProcessQueue(e));
-                            continue;
-                        }
+                    if session_shut_down(&e) {
+                        return Err(NydusError::StartService(
+                            "fuse session has been shut down".to_string(),
+                        ));
                     }
+                    error!("Handling fuse message, {}", NydusError::ProcessQueue(e));
+                    continue;
                 }
             } else {
                 info!("fuse server exits");
@@ -151,6 +144,13 @@ impl FuseServer {
 
         Ok(())
     }
+}
+
+/// Whether a failed reply means the kernel has shut down this session (EBADF). Any other failed
+/// write, such as ENOENT for a request the kernel has already interrupted, loses one reply only.
+fn session_shut_down(e: &fuse_backend_rs::Error) -> bool {
+    matches!(e, fuse_backend_rs::Error::EncodeMessage(io)
+        if nydus_utils::source_errno(io) == Some(libc::EBADF))
 }
 
 struct FusedevNotifier<'a> {
@@ -471,11 +471,13 @@ impl FusedevDaemon {
         let thread = thread::Builder::new()
             .name("fuse_server".to_string())
             .spawn(move || {
-                if let Err(_err) = s.svc_loop(&inflight_op) {
-                    // Notify the daemon controller that one working thread has exited.
-                    if let Err(err) = waker.wake() {
-                        error!("fail to exit daemon, error: {:?}", err);
-                    }
+                if let Err(err) = s.svc_loop(&inflight_op) {
+                    warn!("fuse server failed: {}", err);
+                }
+                // A worker leaves its loop only when the session ends, a umount (ENODEV or
+                // ECONNABORTED from the device) included, so the daemon controller must exit too.
+                if let Err(err) = waker.wake() {
+                    error!("fail to exit daemon, error: {:?}", err);
                 }
                 Ok(())
             })
@@ -805,7 +807,7 @@ pub fn create_fuse_daemon(
 /// Create vfs backend with rafs or passthrough as the fuse filesystem driver
 #[cfg(target_os = "macos")]
 pub fn create_vfs_backend(
-    _fs_type: FsBackendType,
+    _fs_type: Option<FsBackendType>,
     _is_fuse: bool,
     _hybrid_mode: bool,
 ) -> Result<Arc<Vfs>> {
@@ -813,23 +815,47 @@ pub fn create_vfs_backend(
     Ok(Arc::new(vfs))
 }
 
+/// `fs_type` is the file system mounted at the root, or `None` for a daemon whose file systems
+/// all arrive through the API later.
 #[cfg(target_os = "linux")]
 pub fn create_vfs_backend(
-    fs_type: FsBackendType,
+    fs_type: Option<FsBackendType>,
     is_fuse: bool,
     hybrid_mode: bool,
 ) -> Result<Arc<Vfs>> {
     let mut opts = fuse_backend_rs::api::VfsOptions::default();
     match fs_type {
-        FsBackendType::PassthroughFs => {
+        // An API-only daemon keeps the open options a passthrough mount needs. A plain FUSE
+        // daemon offers export support as in the Rafs arm; its root is the Vfs pseudo fs, whose
+        // directories live as long as the daemon and keep their inode numbers. A virtio-fs
+        // daemon (Kata's hybrid mode included) serves passthrough mounts, so it offers none.
+        None => {
+            opts.no_open = false;
+            opts.no_opendir = false;
+            opts.killpriv_v2 = true;
+            if is_fuse && !hybrid_mode {
+                opts.out_opts |= fuse_backend_rs::api::filesystem::FsOptions::EXPORT_SUPPORT;
+            }
+        }
+        Some(FsBackendType::PassthroughFs) => {
             // passthroughfs requires !no_open
             opts.no_open = false;
             opts.no_opendir = false;
             opts.killpriv_v2 = true;
         }
-        FsBackendType::Rafs => {
+        Some(FsBackendType::Rafs) => {
             // rafs can be readonly and skip open
             opts.no_open = true;
+            // File handles (`open_by_handle_at`, NFS export, overlayfs `index=on`) survive dentry
+            // eviction: the kernel looks a forgotten node id up again through "." and "..". RAFS
+            // inode numbers are fixed by the image, and every inode carries a generation derived
+            // from the bootstrap, so a handle into a file system index the Vfs has since given to
+            // another image fails ESTALE instead of opening that image's file. Passthrough and
+            // overlay inodes carry no generation, and their inode numbers restart with every
+            // instance, so a handle could open a different file once a freed index is reused or
+            // the host reuses an inode: `FsService::mount` refuses them while export support is
+            // negotiated.
+            opts.out_opts |= fuse_backend_rs::api::filesystem::FsOptions::EXPORT_SUPPORT;
         }
     };
 
@@ -837,6 +863,9 @@ pub fn create_vfs_backend(
         opts.no_open = false;
         opts.no_opendir = false;
         opts.killpriv_v2 = true;
+        // Hybrid mode serves passthrough mounts, which export support would refuse.
+        opts.out_opts
+            .remove(fuse_backend_rs::api::filesystem::FsOptions::EXPORT_SUPPORT);
     }
 
     let vfs = fuse_backend_rs::api::Vfs::new(opts);
@@ -846,6 +875,76 @@ pub fn create_vfs_backend(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_ebadf_shuts_the_session_down() {
+        let encode =
+            |errno| fuse_backend_rs::Error::EncodeMessage(std::io::Error::from_raw_os_error(errno));
+        assert!(session_shut_down(&encode(libc::EBADF)));
+        assert!(!session_shut_down(&encode(libc::ENOENT)));
+        assert!(!session_shut_down(&encode(libc::EIO)));
+        assert!(!session_shut_down(&fuse_backend_rs::Error::DecodeMessage(
+            std::io::Error::from_raw_os_error(libc::EBADF)
+        )));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn export_support_by_root_backend() {
+        use fuse_backend_rs::api::filesystem::{FileSystem, FsOptions};
+
+        let negotiated = |fs_type, is_fuse, hybrid_mode| {
+            let vfs = create_vfs_backend(fs_type, is_fuse, hybrid_mode).unwrap();
+            let export = vfs
+                .init(FsOptions::all())
+                .unwrap()
+                .contains(FsOptions::EXPORT_SUPPORT);
+            (export, vfs.options().no_open)
+        };
+        // FUSE: a RAFS root and an API-only daemon offer export support, a passthrough root
+        // does not, and the API-only daemon keeps open for a later passthrough mount.
+        assert!(negotiated(Some(FsBackendType::Rafs), true, false).0);
+        assert_eq!(negotiated(None, true, false), (true, false));
+        assert!(!negotiated(Some(FsBackendType::PassthroughFs), true, false).0);
+        // virtio-fs: an API-only daemon, with or without hybrid mode, and any hybrid daemon
+        // serve passthrough mounts, so none offers export support.
+        assert_eq!(negotiated(None, false, false), (false, false));
+        assert_eq!(negotiated(None, false, true), (false, false));
+        assert_eq!(
+            negotiated(Some(FsBackendType::Rafs), false, true),
+            (false, false)
+        );
+        assert!(negotiated(Some(FsBackendType::Rafs), false, false).0);
+    }
+
+    /// A takeover restores each mount with the generation its predecessor answered, not the
+    /// image's own: a predecessor that answered 0 left the kernel caching inodes with 0.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support readahead")]
+    fn a_restored_mount_answers_the_saved_generation() {
+        let work_dir = tempfile::TempDir::new().unwrap();
+        let config = serde_json::json!({
+            "version": 2,
+            "backend": { "type": "localfs", "localfs": { "dir": "../tests/texture/blobs" } },
+            "cache": { "type": "filecache", "filecache": { "work_dir": work_dir.path() } },
+            "rafs": { "mode": "direct" }
+        });
+        let cmd = FsBackendMountCmd {
+            fs_type: FsBackendType::Rafs,
+            config: config.to_string(),
+            mountpoint: "/".to_string(),
+            source: "../tests/texture/bootstrap/rafs-v6-2.2.boot".to_string(),
+            prefetch_files: None,
+        };
+        let vfs = create_vfs_backend(Some(FsBackendType::Rafs), true, false).unwrap();
+        let svc =
+            FusedevFsService::new(vfs, work_dir.path(), None, FailoverPolicy::None, true).unwrap();
+        svc.restore_mount(&cmd, 1, 0).unwrap();
+        let (fs, _) = svc.backend_from_mountpoint("/").unwrap().unwrap();
+        let rafs = fs.as_any().downcast_ref::<nydus_rafs::fs::Rafs>();
+        assert_eq!(rafs.unwrap().generation(), 0);
+    }
 
     #[test]
     fn test_get_possible_base_paths_returns_two_paths() {

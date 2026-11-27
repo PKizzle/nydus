@@ -109,6 +109,49 @@ cuts a release that lets us switch to a version requirement.
   entry (this also removes the need to git-pin cyper-core in
   `storage/Cargo.toml`, see below).
 
+### fuse-backend-rs (patches 0.14.0)
+
+- **Upstream**: https://github.com/cloud-hypervisor/fuse-backend-rs
+- **Local copy**: `third_party/fuse-backend-rs/`
+- **Patch target**: `[patch.crates-io]` in `Cargo.toml` (root). The vendored
+  `version` must track the workspace requirement (same [[patch.unused]] trap
+  as compio-executor); `cargo tree -i fuse-backend-rs` must show the
+  `third_party/` path crate.
+- **Bug fixed**: `Vfs::lookup` answers "." and ".." with node ids the kernel
+  does not have. At the root of a file system mounted at "/" it returns the
+  backend's hashed node id instead of `ROOT_ID`, and ".." in the root of a file
+  system mounted below "/" is passed to the backend, which cannot know the
+  mountpoint's parent. With FUSE `EXPORT_SUPPORT`, the kernel resolves a file
+  handle whose dentry was evicted by looking up "." on its node id and
+  reconnects a directory by looking up ".." up to the root, so every directory
+  handle fails with `ESTALE`. The vendored copy ports the fix and its tests
+  (`convert_lookup_entry`, `lookup_mount_root_parent`, `dot_lookup_cases`;
+  see the "NYDUS LOCAL PATCH" comments in `third_party/fuse-backend-rs/src/api/vfs/`).
+  Upstream master tags node ids with a per-index generation; 0.14.0 has none,
+  so the port answers generation 0 throughout.
+- **Also carried** (released upstream after 0.14.0, each its own "NYDUS LOCAL
+  PATCH" region):
+  - `Opcode::from` matches each value instead of transmuting it; an opcode in a
+    hole of the enum (0, 7, 19) was undefined behaviour, reachable from a
+    `trace!` on a bad request (upstream 074c06c).
+  - `Vfs::forget` for a file system that was unmounted logs at debug instead
+    of warn; the kernel sends one FORGET per inode it had cached below the
+    mountpoint, so a shared daemon unmounting images flooded the log (upstream
+    4d1bb74).
+  - `Vfs` passes xattr names containing '/' to the file system instead of
+    answering EINVAL; Linux allows '/' in an xattr name, so such an xattr in an
+    image could not be read through nydusd (upstream 53985a0).
+  - A fusedev worker ends cleanly on umount: an epoll error state on the FUSE
+    device is read like readiness, so the read reports ENODEV, and ECONNABORTED
+    (a read racing the connection abort) is treated like ENODEV. Unpatched,
+    both end the worker as a session failure (upstream b226095, 8ead687).
+- **Upstream PR/issue status**: filed,
+  https://github.com/cloud-hypervisor/fuse-backend-rs/pull/376 (open).
+- **Drop trigger**: upstream releases the fix (PR #376) together with the
+  carried fixes above; bump the workspace's `fuse-backend-rs` requirement to
+  that release and delete `third_party/fuse-backend-rs/` + the
+  `[patch.crates-io]` entry.
+
 ## Git-pinned dependencies (not on crates.io versions)
 
 ### containerd-snapshots

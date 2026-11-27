@@ -16,6 +16,11 @@ use std::collections::HashMap;
 /// committed snapshot name (chain ID) for a layer extraction.
 pub const TARGET_SNAPSHOT_REF: &str = "containerd.io/snapshot.ref";
 
+/// Set by containerd's image unpacker (2.3 and later) on `Prepare`: the diff
+/// ID the image's config declares for the layer, which
+/// [`TARGET_SNAPSHOT_REF`] is derived from. Client-side unpackers do not set it.
+pub const SNAPSHOT_DIFF_ID: &str = "containerd.io/snapshot/diff-id";
+
 /// Marks a layer as a Nydus data blob
 /// (`application/vnd.oci.image.layer.nydus.blob.v1`).
 pub const NYDUS_DATA_LAYER: &str = "containerd.io/snapshot/nydus-blob";
@@ -58,6 +63,22 @@ pub const NYDUS_DAEMON_IMAGE_REF: &str = "containerd.io/snapshot/nydus-daemon-im
 /// repointed; the bootstrap path is per-content (keyed by manifest or
 /// bootstrap digest), so `Mounts` only reuses a daemon serving this one.
 pub const NYDUS_DAEMON_BOOTSTRAP: &str = "containerd.io/snapshot/nydus-daemon-bootstrap";
+
+/// Stamped next to [`NYDUS_DAEMON_IMAGE_REF`] once the image was checked to
+/// be the sole claimant of the snapshot's chain, so `Mounts` reuses the
+/// decision without listing containerd's images again. Stamps without it come
+/// from releases that did not check, and are checked before use.
+pub const NYDUS_DAEMON_CHECKED: &str = "containerd.io/snapshot/nydus-daemon-checked";
+
+/// Prefix of the labels only this snapshotter sets. containerd passes a layer
+/// descriptor's `containerd.io/snapshot/*` annotations to `Prepare` and
+/// `Commit` as labels, so labels under it in a call are dropped.
+pub const NYDUS_DAEMON_LABEL_PREFIX: &str = "containerd.io/snapshot/nydus-daemon-";
+
+/// Drop the labels under [`NYDUS_DAEMON_LABEL_PREFIX`] from a call's labels.
+pub fn strip_daemon_labels(labels: &mut HashMap<String, String>) {
+    labels.retain(|k, _| !k.starts_with(NYDUS_DAEMON_LABEL_PREFIX));
+}
 
 /// Classification of a snapshot's underlying layer based on its labels.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

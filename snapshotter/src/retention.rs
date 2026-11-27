@@ -567,4 +567,200 @@ mod tests {
             assert_eq!(got, want, "{name}");
         }
     }
+
+    mod properties {
+        use proptest::prelude::*;
+
+        use super::*;
+
+        const UNITS: [(&str, u64); 9] = [
+            ("", 1),
+            ("B", 1),
+            ("K", 1_000),
+            ("M", 1_000_000),
+            ("G", 1_000_000_000),
+            ("Ki", 1 << 10),
+            ("Mi", 1 << 20),
+            ("Gi", 1 << 30),
+            ("Ti", 1 << 40),
+        ];
+
+        fn stages() -> impl Strategy<Value = Vec<Stage>> {
+            // Whole hours and GiB alongside arbitrary values, so ties in the ordering occur.
+            let stage = (
+                prop_oneof![0..64 * GIB, (0..8u64).prop_map(|g| g * GIB)],
+                // Up to 40 days idle, or up to a day in the future (the clock stepped back).
+                prop_oneof![-86_400i64..40 * 86_400, (-2i64..60).prop_map(|h| h * 3600)],
+                proptest::option::of(prop_oneof![
+                    0..60 * 86_400u64,
+                    (0..48u64).prop_map(|h| h * 3600)
+                ]),
+                proptest::bool::weighted(0.2),
+            );
+            proptest::collection::vec(stage, 0..12).prop_map(|stages| {
+                stages
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, (bytes, idle, gap, pinned))| Stage {
+                        slug: format!("s{i}"),
+                        bytes,
+                        stopped_at: NOW - idle,
+                        gap,
+                        pinned,
+                    })
+                    .collect()
+            })
+        }
+
+        fn sizes() -> impl Strategy<Value = Size> {
+            prop_oneof![
+                (0..256 * GIB).prop_map(Size::Bytes),
+                (0.0..=100.0f64).prop_map(Size::Percent),
+            ]
+        }
+
+        fn policies() -> impl Strategy<Value = Policy> {
+            let idle_limit = prop_oneof![
+                Just(IdleLimit::Auto),
+                prop_oneof![0..30 * 86_400u64, (0..96u64).prop_map(|h| h * 3600)]
+                    .prop_map(|s| IdleLimit::Fixed(Duration::from_secs(s))),
+            ];
+            (sizes(), sizes(), idle_limit).prop_map(|(max_bytes, min_free, idle_limit)| Policy {
+                max_bytes,
+                min_free,
+                idle_limit,
+            })
+        }
+
+        fn filesystems() -> impl Strategy<Value = Filesystem> {
+            (0..1024 * GIB)
+                .prop_flat_map(|total| (Just(total), 0..=total))
+                .prop_map(|(total, available)| Filesystem { total, available })
+        }
+
+        proptest! {
+            /// Each eviction names a stage once and never a pinned one; an eviction for a reason
+            /// other than idleness happens only while a deficit remains, and then meets it if
+            /// the unpinned stages hold enough bytes.
+            #[test]
+            fn plan_evicts_only_what_a_deficit_or_the_idle_limit_asks_for(
+                policy in policies(),
+                stages in stages(),
+                fs in filesystems(),
+                cache_excess in 0..64 * GIB,
+            ) {
+                let limit = |s: &Stage| policy.idle_limit.secs(s.gap).max(1);
+                let idle = |s: &Stage| NOW.saturating_sub(s.stopped_at).max(0) as u64;
+                let by_slug = |slug: &str| stages.iter().find(|s| s.slug == slug).unwrap();
+                let retained: u64 = stages.iter().map(|s| s.bytes).sum();
+                let deficit = retained
+                    .saturating_sub(policy.max_bytes.bytes(fs.total))
+                    .max(policy.min_free.bytes(fs.total).saturating_sub(fs.available))
+                    .max(cache_excess);
+
+                let evict = plan(&policy, &stages, fs, cache_excess, NOW);
+                let mut freed = 0u64;
+                let mut seen = std::collections::HashSet::new();
+                for (slug, reason) in &evict {
+                    let stage = by_slug(slug);
+                    prop_assert!(seen.insert(slug.clone()), "{slug} evicted twice");
+                    prop_assert!(!stage.pinned, "pinned {slug} evicted");
+                    if *reason == Reason::Idle {
+                        prop_assert!(idle(stage) >= limit(stage));
+                    } else {
+                        prop_assert!(freed < deficit, "{slug} evicted with the deficit met");
+                    }
+                    freed = freed.saturating_add(stage.bytes);
+                }
+                let evictable: u64 = stages.iter().filter(|s| !s.pinned).map(|s| s.bytes).sum();
+                if evictable >= deficit {
+                    prop_assert!(freed >= deficit, "freed {freed} of a {deficit} deficit");
+                }
+                for stage in stages.iter().filter(|s| !s.pinned && !seen.contains(&s.slug)) {
+                    prop_assert!(idle(stage) < limit(stage), "{} kept past its limit", stage.slug);
+                }
+            }
+
+            /// Stages past their limit go first; then the highest idle time relative to the
+            /// limit, the larger stage first on a tie.
+            #[test]
+            fn plan_orders_evictions(
+                policy in policies(),
+                stages in stages(),
+                fs in filesystems(),
+                cache_excess in 0..64 * GIB,
+            ) {
+                let limit = |s: &Stage| u128::from(policy.idle_limit.secs(s.gap).max(1));
+                let idle = |s: &Stage| u128::from(NOW.saturating_sub(s.stopped_at).max(0) as u64);
+                let by_slug = |slug: &str| stages.iter().find(|s| s.slug == slug).unwrap();
+                let evict = plan(&policy, &stages, fs, cache_excess, NOW);
+                for pair in evict.windows(2) {
+                    let (a, b) = (by_slug(&pair[0].0), by_slug(&pair[1].0));
+                    prop_assert!(pair[0].1 == Reason::Idle || pair[1].1 != Reason::Idle);
+                    let (ra, rb) = (idle(a) * limit(b), idle(b) * limit(a));
+                    prop_assert!(ra >= rb, "{} before the more idle {}", a.slug, b.slug);
+                    prop_assert!(ra > rb || a.bytes >= b.bytes, "{} before the larger {}", a.slug, b.slug);
+                }
+            }
+
+            /// A learned limit stays within its clamp whatever the starts and stops, the clock
+            /// stepping back included, and a stop in the future teaches nothing.
+            #[test]
+            fn learned_idle_limits_stay_clamped(
+                events in proptest::collection::vec((any::<i64>(), any::<i64>()), 1..20),
+            ) {
+                let mut gap = None;
+                for (stopped_at, now) in events {
+                    let previous = gap;
+                    gap = learn_gap(gap, stopped_at, now);
+                    if now < stopped_at {
+                        prop_assert_eq!(gap, previous);
+                    } else if let Some(p) = previous {
+                        prop_assert!(gap.unwrap() >= p - p / 4);
+                    }
+                    let secs = IdleLimit::Auto.secs(gap);
+                    if gap.is_none() {
+                        prop_assert_eq!(secs, AUTO_IDLE_LIMIT.as_secs());
+                    }
+                    prop_assert!((AUTO_MIN_LIMIT.as_secs()..=AUTO_MAX_LIMIT.as_secs()).contains(&secs));
+                }
+            }
+
+            /// Byte counts round-trip with every unit, in any case and with surrounding spaces.
+            #[test]
+            fn byte_sizes_round_trip(
+                n in prop_oneof![0..1u64 << 24, any::<u64>()],
+                unit in 0..UNITS.len(), upper in any::<bool>()) {
+                let (suffix, multiplier) = UNITS[unit];
+                let suffix = if upper { suffix.to_uppercase() } else { suffix.to_lowercase() };
+                let parsed = Size::parse(&format!(" {n}{suffix} "));
+                match n.checked_mul(multiplier) {
+                    Some(bytes) => prop_assert_eq!(parsed, Ok(Size::Bytes(bytes))),
+                    None => prop_assert!(parsed.is_err()),
+                }
+            }
+
+            /// A percentage parses back exactly within 0%..=100%, is refused outside it, and
+            /// never claims more than the filesystem.
+            #[test]
+            fn percent_sizes_round_trip(p in -1e3..1e3f64, total in any::<u64>()) {
+                let parsed = Size::parse(&format!("{p}%"));
+                if (0.0..=100.0).contains(&p) {
+                    prop_assert_eq!(parsed, Ok(Size::Percent(p)));
+                    prop_assert!(Size::Percent(p).bytes(total) <= total);
+                } else {
+                    prop_assert!(parsed.is_err());
+                }
+            }
+
+            /// Arbitrary input is refused or parsed, never a panic, and a parsed percentage is
+            /// within bounds.
+            #[test]
+            fn sizes_reject_garbage(value in "\\PC*|[0-9 .eE+-]*[%a-zA-Z]{0,4}") {
+                if let Ok(Size::Percent(p)) = Size::parse(&value) {
+                    prop_assert!((0.0..=100.0).contains(&p), "{value:?} gave {p}%");
+                }
+            }
+        }
+    }
 }

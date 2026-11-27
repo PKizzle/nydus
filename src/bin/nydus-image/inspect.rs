@@ -198,7 +198,7 @@ impl RafsInspector {
         // Stat current directory
         if file_name == "." {
             let inode = self.rafs_meta.get_extended_inode(self.cur_dir_ino, false)?;
-            let inode_parent = self.rafs_meta.get_extended_inode(inode.parent(), false)?;
+            let inode_parent = self.rafs_meta.get_extended_inode(inode.parent()?, false)?;
             return self.stat_single_file(Some(inode_parent.as_ref()), inode.as_inode());
         }
 
@@ -452,7 +452,7 @@ RAFS Blob Size:         {rafs_size}
                 for idx in 0..chunk_count {
                     let cur_chunk = inode.get_chunk_info(idx)?;
                     if cur_chunk.compressed_offset() == offset_in_blob {
-                        let path = self.rafs_meta.path_from_ino(inode.parent()).unwrap();
+                        let path = self.rafs_meta.path_from_ino(inode.parent()?).unwrap();
                         let block_id = if let Ok(blob_id) =
                             self.get_blob_id_by_index(cur_chunk.blob_index())
                         {

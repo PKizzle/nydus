@@ -39,6 +39,9 @@ pub struct SourceLayer {
     /// OCI digest of the layer (`sha256:...` or bare hex). This is also the nydus data blob id
     /// and the content-store key.
     pub digest: String,
+    /// The diff ID the image config lists for the layer: the conversion fails unless the
+    /// layer decompresses to exactly the tar it names ([`DiffIdMismatch`]).
+    pub diff_id: String,
     /// Path to the layer blob in the content store.
     pub path: PathBuf,
 }
@@ -126,6 +129,10 @@ pub struct NodeLocalArtifact {
     pub work_dir: PathBuf,
     /// Original gzip-layer blob ids, lower→upper, in device-table order.
     pub layer_blob_ids: Vec<String>,
+    /// The diff ID each layer was checked against, same order. A persisted artifact is reused
+    /// only for the same layers with the same diff IDs.
+    #[serde(default)]
+    pub layer_diff_ids: Vec<String>,
     /// Per-layer zran index blob ids (one entry per gzip layer, same order as
     /// `layer_blob_ids`). Each blob lives at `backend_dir.join(id)`. `None`
     /// marks a layer with no data chunks (directory/whiteout/metadata-only
@@ -142,14 +149,43 @@ pub struct NodeLocalArtifact {
     pub format_version: u32,
 }
 
-/// Build the args for a per-layer `nydus-image create --type targz-ref` conversion.
+/// A source layer does not decompress to the tar its diff ID names: its blob is not the layer
+/// containerd applied for the chain, so no artifact may be built from it.
+#[derive(Debug, thiserror::Error)]
+#[error("layer {digest} does not decompress to its diff ID {diff_id}")]
+pub struct DiffIdMismatch {
+    pub digest: String,
+    pub diff_id: String,
+}
+
+/// `nydus-image create` exit status for a source that does not match `--diff-id`.
+const DIFF_ID_MISMATCH_STATUS: i32 = 3;
+
+/// `nydus-image` exited unsuccessfully.
+#[derive(Debug, thiserror::Error)]
+#[error("nydus-image {what} failed ({status}): {stderr}")]
+struct RunFailed {
+    what: String,
+    status: std::process::ExitStatus,
+    stderr: String,
+}
+
+/// Build the args for a per-layer `nydus-image create --type targz-ref` conversion, which
+/// fails unless `layer` decompresses to the tar `diff_id` names.
 ///
 /// `bootstrap_out` receives the per-layer bootstrap; `blob_out_dir` receives the zran index blob.
-pub fn targz_ref_args(layer: &Path, bootstrap_out: &Path, blob_out_dir: &Path) -> Vec<OsString> {
+pub fn targz_ref_args(
+    layer: &Path,
+    diff_id: &str,
+    bootstrap_out: &Path,
+    blob_out_dir: &Path,
+) -> Vec<OsString> {
     vec![
         "create".into(),
         "--type".into(),
         "targz-ref".into(),
+        // One argument, so a diff ID from an image config can never read as an option.
+        format!("--diff-id={diff_id}").into(),
         "--fs-version".into(),
         "6".into(),
         "-B".into(),
@@ -218,11 +254,12 @@ fn run(config: &LocalAccelConfig, args: &[OsString], reads: &[&Path], what: &str
         .output()
         .with_context(|| format!("failed to spawn nydus-image for {what}"))?;
     if !output.status.success() {
-        bail!(
-            "nydus-image {what} failed ({}): {}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr)
-        );
+        return Err(RunFailed {
+            what: what.to_string(),
+            status: output.status,
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        }
+        .into());
     }
     Ok(())
 }
@@ -313,8 +350,18 @@ pub fn convert(config: &LocalAccelConfig, layers: &[SourceLayer]) -> Result<Node
         let out_dir = convert_root.join(layer_invocation_dir(i, layer.blob_id()));
         fresh_dir(&out_dir)?;
         let bootstrap = out_dir.join("bootstrap");
-        let args = targz_ref_args(&layer.path, &bootstrap, &out_dir);
-        run(config, &args, &[&layer.path], "targz-ref convert")?;
+        let args = targz_ref_args(&layer.path, &layer.diff_id, &bootstrap, &out_dir);
+        if let Err(e) = run(config, &args, &[&layer.path], "targz-ref convert") {
+            if e.downcast_ref::<RunFailed>()
+                .is_some_and(|f| f.status.code() == Some(DIFF_ID_MISMATCH_STATUS))
+            {
+                return Err(e.context(DiffIdMismatch {
+                    digest: layer.digest.clone(),
+                    diff_id: layer.diff_id.clone(),
+                }));
+            }
+            return Err(e);
+        }
         let index = expect_at_most_one_output(&out_dir, Some(&bootstrap))
             .context("locating zran index blob")?;
 
@@ -360,6 +407,7 @@ pub fn convert(config: &LocalAccelConfig, layers: &[SourceLayer]) -> Result<Node
         backend_dir: backend,
         work_dir: stage.clone(),
         layer_blob_ids: blob_ids,
+        layer_diff_ids: layers.iter().map(|l| l.diff_id.clone()).collect(),
         zran_index_blob_ids,
         prefetch_blob_id: None,
         format_version: AUTO_ACCEL_MANIFEST_VERSION,
@@ -590,11 +638,13 @@ mod tests {
     fn blob_id_strips_algorithm_prefix() {
         let l = SourceLayer {
             digest: "sha256:deadbeef".into(),
+            diff_id: String::new(),
             path: "/x".into(),
         };
         assert_eq!(l.blob_id(), "deadbeef");
         let l2 = SourceLayer {
             digest: "cafef00d".into(),
+            diff_id: String::new(),
             path: "/x".into(),
         };
         assert_eq!(l2.blob_id(), "cafef00d");
@@ -632,11 +682,13 @@ mod tests {
     fn targz_ref_args_are_well_formed() {
         let args = targz_ref_args(
             Path::new("/cs/layer.tar.gz"),
+            "sha256:d",
             Path::new("/w/l0/bootstrap"),
             Path::new("/w/l0"),
         );
         let s: Vec<String> = args.iter().map(|a| a.to_string_lossy().into()).collect();
         assert_eq!(s[0], "create");
+        assert!(s.iter().any(|a| a == "--diff-id=sha256:d"));
         assert!(s.windows(2).any(|w| w == ["--type", "targz-ref"]));
         assert!(s.windows(2).any(|w| w == ["--fs-version", "6"]));
         assert!(s.windows(2).any(|w| w == ["-B", "/w/l0/bootstrap"]));
@@ -814,6 +866,14 @@ mod tests {
         let layer = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../tests/texture/zran/zran-two-streams.tar.gz");
         let digest = hex::encode(sha2::Sha256::digest(std::fs::read(&layer).unwrap()));
+        // containerd decompresses every gzip member, as Go's reader does by default.
+        let mut tar = Vec::new();
+        std::io::Read::read_to_end(
+            &mut flate2::read::MultiGzDecoder::new(std::fs::File::open(&layer).unwrap()),
+            &mut tar,
+        )
+        .unwrap();
+        let diff_id = format!("sha256:{}", hex::encode(sha2::Sha256::digest(&tar)));
         let config = LocalAccelConfig {
             nydus_image: wrapper,
             work_dir: work,
@@ -825,10 +885,21 @@ mod tests {
             &config,
             &[SourceLayer {
                 digest: format!("sha256:{digest}"),
-                path: layer,
+                diff_id: diff_id.clone(),
+                path: layer.clone(),
             }],
         )
         .unwrap();
+        let err = convert(
+            &config,
+            &[SourceLayer {
+                digest: format!("sha256:{digest}"),
+                diff_id: format!("sha256:{}", "0".repeat(64)),
+                path: layer,
+            }],
+        )
+        .unwrap_err();
+        assert!(err.downcast_ref::<DiffIdMismatch>().is_some(), "{err:#}");
 
         assert!(artifact.bootstrap.is_file());
         assert_eq!(artifact.zran_index_blob_ids.len(), 1);

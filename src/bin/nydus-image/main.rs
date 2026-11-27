@@ -41,8 +41,8 @@ use nydus_api::{BuildTimeInfo, ConfigV2, LocalFsConfig};
 use nydus_builder::{
     ArtifactStorage, BlobCacheGenerator, BlobCompactor, BlobManager, BootstrapManager,
     BuildContext, BuildOutput, Builder, ChunkdictBlobInfo, ChunkdictChunkInfo, ConversionType,
-    DirectoryBuilder, Feature, Features, Generator, HashChunkDict, Merger, OptimizePrefetch,
-    Prefetch, PrefetchPolicy, StargzBuilder, TarballBuilder, Tree, WhiteoutSpec,
+    DiffIdMismatch, DirectoryBuilder, Feature, Features, Generator, HashChunkDict, Merger,
+    OptimizePrefetch, Prefetch, PrefetchPolicy, StargzBuilder, TarballBuilder, Tree, WhiteoutSpec,
     attributes::Attributes, build_node_view, generate_prefetch_file_info, parse_chunk_dict_arg,
     update_ctx_from_bootstrap,
 };
@@ -216,6 +216,18 @@ impl OutputSerializer {
     }
 }
 
+/// A diff ID as an image config spells it: `sha256:` and 64 lowercase hex digits.
+fn parse_diff_id(s: &str) -> std::result::Result<String, String> {
+    match s.strip_prefix("sha256:") {
+        Some(hex)
+            if hex.len() == 64 && hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) =>
+        {
+            Ok(s.to_string())
+        }
+        _ => Err(format!("{s} is not a sha256:<64 lowercase hex> digest")),
+    }
+}
+
 fn prepare_cmd_args(bti_string: &'static str) -> App {
     let arg_chunk_dict = Arg::new("chunk-dict")
         .long("chunk-dict")
@@ -329,6 +341,12 @@ fn prepare_cmd_args(bti_string: &'static str) -> App {
                         .long("blob-id")
                         .required_if_eq_any([("type", "estargztoc-ref"), ("type", "stargz_index")])
                         .help("OSS object id for the generated RAFS data blob")
+                )
+                .arg(
+                    Arg::new("diff-id")
+                        .long("diff-id")
+                        .help("Diff ID (sha256:<hex> of the uncompressed tar) the source of a targz-ref or estargz-ref conversion must have; a mismatch fails with exit status 3")
+                        .value_parser(parse_diff_id),
                 )
                 .arg(
                     Arg::new("blob-data-size")
@@ -1032,7 +1050,14 @@ fn main() -> Result<()> {
     register_tracer!(TraceClass::Event, EventTracerClass);
 
     if let Some(matches) = cmd.subcommand_matches("create") {
-        Command::create(matches, &build_info)
+        let result = Command::create(matches, &build_info);
+        if let Err(ref err) = result
+            && err.chain().any(|c| c.is::<DiffIdMismatch>())
+        {
+            error!("{err:#}");
+            std::process::exit(3);
+        }
+        result
     } else if let Some(matches) = cmd.subcommand_matches("chunkdict") {
         match matches.subcommand_name() {
             Some("generate") => Command::chunkdict_generate(
@@ -1093,6 +1118,19 @@ impl Command {
         let prefetch = Self::get_prefetch(matches)?;
         let source_path = PathBuf::from(matches.get_one::<String>("SOURCE").unwrap());
         let conversion_type: ConversionType = matches.get_one::<String>("type").unwrap().parse()?;
+        // Only ref conversions read their source as one tar stream to hash.
+        if matches.contains_id("diff-id")
+            && !matches!(
+                conversion_type,
+                ConversionType::EStargzToRef | ConversionType::TargzToRef
+            )
+        {
+            bail!(
+                "--diff-id only applies to a ref conversion (--type targz-ref or estargz-ref), \
+                 not to conversion type `{}`",
+                conversion_type
+            );
+        }
         let blob_inline_meta = matches.get_flag("blob-inline-meta");
         let repeatable = matches.get_flag("repeatable");
         let version = Self::get_fs_version(matches)?;
@@ -1374,6 +1412,7 @@ impl Command {
         build_ctx.set_chunk_size(chunk_size);
         build_ctx.set_batch_size(batch_size);
         build_ctx.set_blob_block_size(block_size);
+        build_ctx.source_diff_id = matches.get_one::<String>("diff-id").cloned();
 
         if let Some(excludes) = matches.get_many::<PathBuf>("exclude") {
             let excludes: Vec<PathBuf> = excludes.cloned().collect();
@@ -2586,6 +2625,42 @@ mod tests {
     #[cfg_attr(miri, ignore = "Miri does not support getegid")]
     fn test_create_tarfs_with_default_block_size() {
         create_tarfs(&[]).unwrap();
+    }
+
+    #[test]
+    fn test_diff_id_is_rejected_for_conversions_that_do_not_hash_their_source() {
+        let diff_id = format!("sha256:{}", "0".repeat(64));
+        for ty in [
+            "directory",
+            "dir-rafs",
+            "stargz_index",
+            "estargztoc-ref",
+            "estargz-rafs",
+            "tar-rafs",
+            "tar-tarfs",
+            "targz-rafs",
+        ] {
+            let args = [
+                "nydus-image",
+                "create",
+                "--type",
+                ty,
+                "--blob-id",
+                "id",
+                "--bootstrap",
+                "/nonexistent/bootstrap",
+                "--diff-id",
+                &diff_id,
+                "/nonexistent/source",
+            ];
+            let cmd = super::prepare_cmd_args(super::BTI_STRING.as_str()).get_matches_from(args);
+            let err = Command::create(cmd.subcommand_matches("create").unwrap(), &super::BTI)
+                .unwrap_err();
+            assert!(
+                err.to_string().contains("--diff-id only applies"),
+                "{ty}: {err:#}"
+            );
+        }
     }
 
     /// File contents of a small tree: files that share batch chunks and a 3 MiB file that spans

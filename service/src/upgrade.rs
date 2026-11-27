@@ -112,6 +112,17 @@ struct FanotifyState {
 struct MountStateWrapper {
     cmd: FsBackendMountCmd,
     vfs_index: u8,
+    /// FUSE generation the image's inodes were answered with. The kernel marks a cached inode
+    /// stale when a lookup answers another one, so the daemon taking over must keep it.
+    #[version(start = 2, default_fn = "legacy_generation")]
+    generation: u64,
+}
+
+impl MountStateWrapper {
+    /// A state saved before the generation was recorded comes from a daemon that answered 0.
+    fn legacy_generation(_: u16) -> u64 {
+        0
+    }
 }
 
 struct FusedevState {
@@ -252,10 +263,11 @@ impl UpgradeManager {
     }
 
     /// Add a filesystem instance into the upgrade manager.
-    pub fn add_mounts_state(&mut self, cmd: FsBackendMountCmd, vfs_index: u8) {
+    pub fn add_mounts_state(&mut self, cmd: FsBackendMountCmd, vfs_index: u8, generation: u64) {
         let cmd_wrapper = MountStateWrapper {
             cmd: redact_mount_cmd_secrets(cmd.clone()),
             vfs_index,
+            generation,
         };
         self.fuse_deamon_stat
             .fs_mount_cmd_map
@@ -581,7 +593,8 @@ pub mod fusedev_upgrade {
             vec![
                 // version 1
                 HashMap::from([(FusedevBackendState::type_id(), 1)]),
-                // more versions for the future
+                // version 2: MountStateWrapper records the FUSE generation
+                HashMap::from([(MountStateWrapper::type_id(), 2)]),
             ]
         }
     }
@@ -680,7 +693,11 @@ pub mod fusedev_upgrade {
             .fs_mount_cmd_map
             .iter()
             .try_for_each(|(_, mount_wrapper)| -> Result<()> {
-                svc.restore_mount(&mount_wrapper.cmd, mount_wrapper.vfs_index)?;
+                svc.restore_mount(
+                    &mount_wrapper.cmd,
+                    mount_wrapper.vfs_index,
+                    mount_wrapper.generation,
+                )?;
                 // as we are in upgrade stage and obtain the lock, `unwrap` is safe here
                 //mgr.add_mounts_state(cmd.clone(), *vfs_idx);
                 Ok(())
@@ -888,7 +905,7 @@ mod tests {
 
         upgrade_mgr.save_fuse_cid(10);
         assert_eq!(upgrade_mgr.fuse_deamon_stat.fuse_conn_id, 10);
-        upgrade_mgr.add_mounts_state(cmd.clone(), 5);
+        upgrade_mgr.add_mounts_state(cmd.clone(), 5, 0x5eed);
         assert!(
             upgrade_mgr
                 .fuse_deamon_stat
@@ -948,7 +965,7 @@ mod tests {
             prefetch_files: None,
         };
 
-        upgrade_mgr.add_mounts_state(cmd, 1);
+        upgrade_mgr.add_mounts_state(cmd, 1, 0);
         let saved = upgrade_mgr
             .fuse_deamon_stat
             .fs_mount_cmd_map
@@ -975,6 +992,67 @@ mod tests {
                 .encryption_key
                 .is_empty()
         );
+    }
+
+    /// The generation survives a save and restore, and a state saved before it was recorded
+    /// restores as 0, the generation that daemon answered.
+    #[test]
+    fn the_fusedev_state_carries_the_generation() {
+        use versionize::{VersionMap, Versionize, VersionizeResult};
+        use versionize_derive::Versionize;
+
+        let cmd = FsBackendMountCmd {
+            fs_type: FsBackendType::Rafs,
+            config: "{}".to_string(),
+            mountpoint: "/mnt".to_string(),
+            source: "bootstrap".to_string(),
+            prefetch_files: None,
+        };
+        let mut upgrade_mgr = UpgradeManager::new("dummy_socket".into());
+        upgrade_mgr.add_mounts_state(cmd.clone(), 3, 0x5eed);
+        let mut buf = FusedevBackendState::from(&upgrade_mgr.fuse_deamon_stat)
+            .save()
+            .unwrap();
+        let restored = FusedevState::from(&FusedevBackendState::restore(&mut buf).unwrap());
+        assert_eq!(restored.fs_mount_cmd_map["/mnt"].generation, 0x5eed);
+
+        // The layout a daemon without the field saved.
+        #[derive(Versionize, Clone, Debug)]
+        struct MountStateWrapperV1 {
+            cmd: FsBackendMountCmd,
+            vfs_index: u8,
+        }
+        #[derive(Versionize, Clone, Debug)]
+        struct FusedevBackendStateV1 {
+            fs_mount_cmd_list: Vec<(String, MountStateWrapperV1)>,
+            vfs_state_data: Vec<u8>,
+            fuse_conn_id: u64,
+        }
+        impl Snapshotter for FusedevBackendStateV1 {
+            fn get_versions() -> Vec<HashMap<std::any::TypeId, u16>> {
+                vec![HashMap::from([(FusedevBackendStateV1::type_id(), 1)])]
+            }
+        }
+        let old = FusedevBackendStateV1 {
+            fs_mount_cmd_list: vec![(
+                "/mnt".to_string(),
+                MountStateWrapperV1 { cmd, vfs_index: 3 },
+            )],
+            vfs_state_data: Vec::new(),
+            fuse_conn_id: 7,
+        };
+        let mut buf = old.save().unwrap();
+        let restored = FusedevState::from(&FusedevBackendState::restore(&mut buf).unwrap());
+        let mount = &restored.fs_mount_cmd_map["/mnt"];
+        assert_eq!((mount.vfs_index, mount.generation), (3, 0));
+        assert_eq!(restored.fuse_conn_id, 7);
+
+        // A release that knows only version 1 refuses this state instead of restoring the mount
+        // with its own generation; its snapshotter then detaches the mount.
+        let mut buf = FusedevBackendState::from(&upgrade_mgr.fuse_deamon_stat)
+            .save()
+            .unwrap();
+        assert!(FusedevBackendStateV1::restore(&mut buf).is_err());
     }
 
     #[test]
