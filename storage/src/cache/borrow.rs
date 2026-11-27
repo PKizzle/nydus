@@ -310,17 +310,18 @@ pub(crate) fn has_data(file: &File, offset: u64, len: u64) -> bool {
 mod tests {
     use super::*;
 
+    fn cache_dir(path: PathBuf) -> PathBuf {
+        std::fs::create_dir_all(&path).unwrap();
+        std::fs::write(path.join(BORROW_IDENTITY_FILE), "same").unwrap();
+        path
+    }
+
     /// Cache files with no allocated data do not take lender slots ahead of one that has data.
     #[test]
     #[cfg_attr(miri, ignore = "Miri does not support file-backed mmap")]
     fn empty_cache_files_take_no_lender_slot() {
         let root = tempfile::TempDir::new().unwrap();
         let name = "blob.blob.data";
-        let cache_dir = |path: std::path::PathBuf| {
-            std::fs::create_dir_all(&path).unwrap();
-            std::fs::write(path.join(BORROW_IDENTITY_FILE), "same").unwrap();
-            path
-        };
         let own_dir = cache_dir(root.path().join("own"));
         let own = File::create(own_dir.join(name)).unwrap();
         // Listed first: as many empty (sparse) cache files as there are slots.
@@ -340,6 +341,25 @@ mod tests {
         let lenders = find_lenders(&patterns, &own_dir, name, &own);
         let paths: Vec<_> = lenders.iter().map(|l| l.path.clone()).collect();
         assert_eq!(paths, vec![full.join(name)], "empty files took the slots");
+    }
+
+    /// However many caches hold the blob, an entry lists at most `MAX_LENDERS` of them.
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support file-backed mmap")]
+    fn at_most_max_lenders_are_listed() {
+        let root = tempfile::TempDir::new().unwrap();
+        let name = "blob.blob.data";
+        let own_dir = cache_dir(root.path().join("own"));
+        let own = File::create(own_dir.join(name)).unwrap();
+        for i in 0..MAX_LENDERS + 2 {
+            let dir = cache_dir(root.path().join("full").join(i.to_string()));
+            std::fs::write(dir.join(name), vec![7u8; 4096]).unwrap();
+        }
+        let patterns = [format!("{}/full/*", root.path().display())];
+        assert_eq!(
+            find_lenders(&patterns, &own_dir, name, &own).len(),
+            MAX_LENDERS
+        );
     }
 
     /// An open that fails for a passing reason is no strike, is not tried again before its

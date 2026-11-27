@@ -4168,6 +4168,61 @@ mod borrow_tests {
         assert!(b.entry.lenders[0].file().is_none());
     }
 
+    /// A lender shrunk, or with a hole punched, after it was listed lends nothing there: those
+    /// chunks are fetched, and what b holds is right.
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support file-backed mmap")]
+    #[cfg(target_os = "linux")]
+    fn a_truncated_or_punched_lender_is_fetched() {
+        use std::os::unix::io::AsRawFd;
+
+        let root = TempDir::new().unwrap();
+        let chunks = chunks(&blob_info());
+        let a = Image::plain(root.path(), "a");
+        a.fetch(&chunks);
+        let b = Image::plain(root.path(), "b");
+        b.fetch(&chunks[..1]);
+        b.fetch(&chunks[1..2]);
+        assert_eq!(b.reads(), 1);
+        // Chunk 2 punched out, chunk 3 cut short, the rest gone.
+        // SAFETY: `fallocate` only takes integers; the file is open for the call.
+        let punched = unsafe {
+            libc::fallocate(
+                a.entry.file.as_raw_fd(),
+                libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
+                2 * CHUNK as libc::off_t,
+                CHUNK as libc::off_t,
+            )
+        };
+        assert_eq!(punched, 0, "{}", std::io::Error::last_os_error());
+        a.entry.file.set_len(3 * CHUNK + 100).unwrap();
+        for c in &chunks[2..] {
+            b.fetch(std::slice::from_ref(c));
+        }
+        assert_eq!(b.reads(), 1 + chunks.len() - 2, "b borrowed what a lost");
+        b.assert_holds(&chunks);
+    }
+
+    /// Borrowing reads a lender through a descriptor that cannot write it.
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support file-backed mmap")]
+    fn a_lender_is_opened_read_only() {
+        use std::os::unix::io::AsRawFd;
+
+        let root = TempDir::new().unwrap();
+        let chunks = chunks(&blob_info());
+        Image::plain(root.path(), "a").fetch(&chunks);
+        let b = Image::plain(root.path(), "b");
+        b.fetch(&chunks[..1]);
+        b.fetch(&chunks[1..2]);
+        assert_eq!(b.reads(), 1);
+        let file = b.entry.lenders[0].file().unwrap();
+        // SAFETY: `fcntl(F_GETFL)` only reads the flags of the open descriptor.
+        let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
+        assert!(flags >= 0, "{}", std::io::Error::last_os_error());
+        assert_eq!(flags & libc::O_ACCMODE, libc::O_RDONLY);
+    }
+
     /// A user read, the FUSE and block device path, borrows too.
     #[test]
     #[cfg_attr(miri, ignore = "Miri does not support file-backed mmap")]

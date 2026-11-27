@@ -15,6 +15,16 @@ CI runs them in `.github/workflows/sanitizers.yml`: nightly at 01:30 UTC, on
 `workflow_dispatch`, and on pull requests labelled `sanitizers`. The job is not a required
 check. The nightly toolchain is pinned in the workflow's `SANITIZER_TOOLCHAIN`.
 
+The hosted runners have no >= 6.14 kernel, so there the nydus-service tests that need one (the
+`NYDUS_FANOTIFY_TEST_DIR` fixtures, which print SKIP, and the root-only EROFS mounts) pass
+without running. `.github/workflows/fanotify-vm.yml` builds the nydus-service test binary with
+ASan on the same pinned nightly and runs it as root in the virtme-ng VM of the kernel marked
+`asan` in its matrix, with `NYDUS_FANOTIFY_TEST_DIR` on an ext4 loopback. That step fails on
+an ASan or LSan report, on any SKIP, and on a run without a passing test summary.
+
+Miri (`.github/workflows/miri.yml`) runs daily, on pushes to the long-lived branches, and on
+pull requests labelled `miri`.
+
 ## Running locally
 
 Linux x86_64 or aarch64 only (ASan's Rust support and the runtime paths under test are Linux).

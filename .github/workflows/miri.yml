@@ -1,5 +1,7 @@
 name: Miri Test
 
+# Miri takes close to an hour, so pull requests run it only when they carry the `miri` label;
+# pushes to the long-lived branches and the daily schedule always run it.
 on:
   # `push` covers long-lived branches only; a feature branch runs through its pull request,
   # so one push to a branch with an open pull request runs the suite once.
@@ -7,6 +9,7 @@ on:
     branches: [master, production, "stable/**"]
     paths-ignore: [ '**.md', '**.png', '**.jpg', '**.svg', '**/docs/**' ]
   pull_request:
+    types: [labeled, synchronize, opened, reopened]
     branches: ["**", "stable/**"]
     paths-ignore: [ '**.md', '**.png', '**.jpg', '**.svg', '**/docs/**' ]
   schedule:
@@ -14,11 +17,18 @@ on:
     - cron: "0 03 * * *"
   workflow_dispatch:
 
+# Pull requests only: a later label or push supersedes a running pull request run. Every other
+# event gets its own group, so pushes to production never cancel each other.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
   nydus-unit-test-with-miri:
+    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'miri')
     runs-on: ${{ vars.RUNNER_OS || 'ubuntu-latest' }}
     steps:
     - name: Checkout

@@ -3,6 +3,9 @@
 # backend read; a cache another boot left unsealed keeps its bytes, which the next daemon checks
 # against their digests before it serves them, fetching only what fails.
 #
+#   0. The root-only nydus-service seal tests, from SERVICE_TEST_BIN (the `cargo test -p
+#      nydus-service --lib --no-run` binary) or through cargo: a cache stays verified across
+#      handlers, and a failed handler leaves its caches unsealed.
 #   1. Serve a fresh image, read every file, stop nydusd with SIGTERM: the chunk map is sealed.
 #   2. Replace the backend blob with zeros and serve again: every file reads intact, so nothing
 #      was fetched; on a kernel with EROFS page cache sharing the mount joins its domain.
@@ -97,6 +100,17 @@ check() { # <label>
 unsealed_boot() { od -An -tx1 -j32 -N8 "$MAP" | tr -d ' \n'; }
 foreign_boot() { printf '\001\002\003\004\005\006\007\010' | dd of="$MAP" bs=1 seek=32 conv=notrunc 2>/dev/null; }
 denied() { grep -E "failed to serve pre-content|no digest" "$R/log"; }
+
+echo "### 0. seal across handlers (nydus-service root tests)"
+if [ -n "${SERVICE_TEST_BIN:-}" ]; then TEST=("$SERVICE_TEST_BIN"); else TEST=(cargo test -q -p nydus-service --lib --); fi
+mkdir -p "$R/kernel"
+for t in a_verified_cache_stays_verified_across_handlers a_failed_handler_leaves_its_caches_unsealed; do
+  OUT=$(NYDUS_FANOTIFY_TEST_DIR="$R/kernel" "${TEST[@]}" "fanotify::tests::$t" --exact --nocapture 2>&1)
+  echo "$OUT" | tail -3
+  # The test prints SKIP and passes when it cannot run; here it must run.
+  echo "$OUT" | grep -q SKIP && fail "$t did not run"
+  echo "$OUT" | grep -q "test result: ok. 1 passed" || fail "$t failed"
+done
 
 echo "### 1. fresh cache, clean stop"
 serve
