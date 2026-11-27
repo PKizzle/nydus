@@ -3,7 +3,8 @@ name: nydus-snapshotter
 description: >-
   Rust nydus v3 containerd remote snapshotter (single binary containerd-nydus) with
   fanotify/EROFS on-demand mounting, FUSE fallback, and node-local zran acceleration.
-  Deploys a privileged DaemonSet; does NOT edit host containerd config by default.
+  Deploys a privileged DaemonSet that runs the snapshotter or installs it as a host systemd
+  service; does NOT edit host containerd config by default.
 type: application
 version: 0.1.1
 appVersion: "3.6.1"

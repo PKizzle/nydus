@@ -18,10 +18,13 @@ spec:
       annotations:
         # Roll the pods when the config changes.
         checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        checksum/host-systemd: {{ include (print $.Template.BasePath "/host-systemd-configmap.yaml") . | sha256sum }}
         {{- with .Values.podAnnotations }}{{- toYaml . | nindent 8 }}{{- end }}
     spec:
+      {{- $hostSystemd := eq .Values.deploymentMode "hostSystemd" }}
       serviceAccountName: {{ include "nydus-snapshotter.serviceAccountName" . }}
-      hostPID: {{ .Values.daemonset.hostPID }}
+      {{- /* hostSystemd reaches the host's systemd through PID 1's namespaces. */}}
+      hostPID: {{ or $hostSystemd .Values.daemonset.hostPID }}
       hostNetwork: {{ .Values.daemonset.hostNetwork }}
       {{- if .Values.daemonset.hostNetwork }}
       dnsPolicy: ClusterFirstWithHostNet
@@ -44,10 +47,25 @@ spec:
         {{- toYaml . | nindent 8 }}
       {{- end }}
 
-      {{- if .Values.containerd.install.enable }}
-      # OPT-IN: additive containerd config (proxy_plugins + nydus runtime handler) + restart.
-      # Disabled by default — see README. Runs once per node, idempotent.
+      {{- $removeHostService := and (not $hostSystemd) .Values.daemonset.hostPID }}
+      {{- if or .Values.containerd.install.enable $removeHostService }}
       initContainers:
+      {{- end }}
+      {{- if $removeHostService }}
+        # Stops and removes a host unit a hostSystemd release installed on this node, so the
+        # snapshotter never runs twice; a no-op on nodes without one.
+        - name: remove-host-service
+          image: {{ include "nydus-snapshotter.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            privileged: true
+          command: ["/bin/sh", "/host-systemd/host-systemd.sh", "uninstall"]
+          volumeMounts:
+            - { name: host-systemd, mountPath: /host-systemd }
+      {{- end }}
+      {{- if .Values.containerd.install.enable }}
+        # OPT-IN: additive containerd config (proxy_plugins + nydus runtime handler) + restart.
+        # Disabled by default — see README. Runs once per node, idempotent.
         - name: containerd-config-installer
           image: {{ include "nydus-snapshotter.image" . }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
@@ -72,6 +90,45 @@ spec:
       {{- end }}
 
       containers:
+      {{- if $hostSystemd }}
+        # Installs containerd-nydus as a host systemd unit, then shows the unit's journal. The
+        # snapshotter itself runs on the host, so this pod's restarts do not touch it.
+        - name: host-systemd
+          image: {{ include "nydus-snapshotter.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["/bin/sh", "/host-systemd/host-systemd.sh", "run"]
+          env:
+            - { name: HOST_SYSTEMD_ACTION, value: install }
+            - { name: RUN_DIR, value: {{ .Values.hostPaths.run | quote }} }
+          securityContext:
+            privileged: true     # nsenter into PID 1's namespaces
+          {{- if .Values.daemonset.probes.enabled }}
+          # The same healthcheck as pod mode, against the host unit's sysctl socket.
+          livenessProbe:
+            exec:
+              command: ["/bin/sh", "/host-systemd/host-systemd.sh", "probe"]
+            initialDelaySeconds: 10
+            periodSeconds: {{ .Values.daemonset.probes.livenessPeriodSeconds }}
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            exec:
+              command: ["/bin/sh", "/host-systemd/host-systemd.sh", "probe", "ready"]
+            initialDelaySeconds: 5
+            periodSeconds: {{ .Values.daemonset.probes.readinessPeriodSeconds }}
+            timeoutSeconds: 5
+            failureThreshold: 3
+          {{- end }}
+          resources:
+            {{- toYaml .Values.hostSystemd.installerResources | nindent 12 }}
+          volumeMounts:
+            - name: config
+              mountPath: /etc/nydus
+              readOnly: true
+            - { name: host-systemd, mountPath: /host-systemd }
+            - name: nydus-run
+              mountPath: {{ .Values.hostPaths.run }}
+      {{- else }}
         - name: containerd-nydus
           image: {{ include "nydus-snapshotter.image" . }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
@@ -139,15 +196,22 @@ spec:
           # PID 1 would hit the host's init. Kubernetes SIGTERMs the container's main process on stop;
           # containerd-nydus stops its daemons on graceful shutdown. Without systemd's fd store their
           # mounts do not survive a snapshotter bounce.
+      {{- end }}
       terminationGracePeriodSeconds: 30
       volumes:
         - name: config
           configMap:
             name: {{ include "nydus-snapshotter.fullname" . }}-config
+        {{- if or $hostSystemd $removeHostService }}
+        - name: host-systemd
+          configMap:
+            name: {{ include "nydus-snapshotter.fullname" . }}-host-systemd
+        {{- end }}
         - name: nydus-run
           hostPath:
             path: {{ .Values.hostPaths.run }}
             type: DirectoryOrCreate
+        {{- if not $hostSystemd }}
         - name: nydus-root
           hostPath:
             path: {{ .Values.hostPaths.root }}
@@ -160,6 +224,7 @@ spec:
           hostPath:
             path: {{ .Values.hostPaths.devFuse }}
             type: CharDevice
+        {{- end }}
         {{- if .Values.containerd.install.enable }}
         - name: installer
           configMap:

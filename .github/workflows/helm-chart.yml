@@ -1,0 +1,30 @@
+# Renders the Helm chart in both deployment modes and runs its hostSystemd installer against a real
+# systemd (a privileged container running systemd as PID 1), with the binaries of the image the
+# chart's appVersion names.
+name: helm-chart
+
+on:
+  push:
+    branches: [master, production]
+    paths: ["deploy/helm/**", "misc/helm/**", ".github/workflows/helm-chart.yml"]
+  pull_request:
+    paths: ["deploy/helm/**", "misc/helm/**", ".github/workflows/helm-chart.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  chart:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+      - name: Shellcheck
+        run: shellcheck deploy/helm/nydus-snapshotter/files/host-systemd.sh misc/helm/*.sh
+      - name: Lint and render
+        run: misc/helm/chart-test.sh
+      - name: hostSystemd installer against systemd
+        run: |
+          IMAGE="ghcr.io/pkizzle/nydus:v$(yq .appVersion deploy/helm/nydus-snapshotter/Chart.yaml)" \
+            misc/helm/host-systemd-test.sh

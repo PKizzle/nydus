@@ -14,6 +14,8 @@ data:
     # is true (otherwise prints the command). Distros it cannot safely configure (Bottlerocket, EKS-
     # managed, GKE/AKS) are detected and print manual guidance with exit 0 — never crash-loop.
     set -eu
+    # The hostSystemd uninstall hook rolls the DaemonSet into removal mode; leave containerd alone.
+    [ "${HOST_SYSTEMD_ACTION:-}" = uninstall ] && exit 0
     BEGIN='# BEGIN nydus-snapshotter (managed by helm)'
     END='# END nydus-snapshotter (managed by helm)'
     : "${RUNTIME:=auto}"

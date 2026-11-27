@@ -1,0 +1,51 @@
+{{- if or (eq .Values.deploymentMode "hostSystemd") .Values.daemonset.hostPID }}
+{{- /* Pod mode carries the script too: its init container removes a unit a hostSystemd release left behind. */}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "nydus-snapshotter.fullname" . }}-host-systemd
+  labels:
+    {{- include "nydus-snapshotter.labels" . | nindent 4 }}
+data:
+  host-systemd.sh: |
+    {{- .Files.Get "files/host-systemd.sh" | nindent 4 }}
+  nydus-snapshotter.service: |
+    [Unit]
+    {{- /* The owner tag must match OWNER_TAG in files/host-systemd.sh. */}}
+    # Managed by the nydus-snapshotter Helm chart (deploymentMode: hostSystemd).
+    # Release {{ .Release.Namespace }}/{{ .Release.Name }}; edits are overwritten on the next pod start.
+    Description=nydus snapshotter
+    After=network.target
+    {{- with .Values.hostSystemd.before }}
+    Before={{ join " " . }}
+    {{- end }}
+
+    [Service]
+    # Type=notify + an fd store let the in-process snapshotter park each daemon's fanotify group
+    # and /dev/fuse fd in PID 1 and take them back after a restart or crash.
+    Type=notify
+    NotifyAccess=main
+    FileDescriptorStoreMax=512
+    # Keep stored fds across a restart, drop them on a real stop (systemd 254+).
+    FileDescriptorStorePreserve=restart
+    Environment=HOME=/root
+    Environment=RUST_BACKTRACE=1
+    {{- range .Values.daemonset.env }}
+    {{- if hasKey . "value" }}
+    Environment={{ printf "%s=%v" .name .value | quote }}
+    {{- end }}
+    {{- end }}
+    ExecStart=/usr/local/bin/containerd-nydus --config /etc/nydus/config.toml --log-level={{ .Values.config.logLevel }}
+    Restart=always
+    RestartSec=1
+    KillMode=process
+    # Every mounted image holds blob, cache and content-store fds; the 1024 default soft limit runs out.
+    LimitNOFILE=1048576
+    OOMScoreAdjust={{ .Values.daemonset.oomScoreAdj }}
+    {{- with .Values.hostSystemd.serviceExtra }}
+    {{- . | nindent 4 }}
+    {{- end }}
+
+    [Install]
+    WantedBy=multi-user.target
+{{- end }}

@@ -1,8 +1,9 @@
 # nydus-snapshotter
 
 A Helm chart that deploys the Rust nydus v3 containerd remote snapshotter (`containerd-nydus`) as a
-privileged DaemonSet. The snapshotter provides fanotify/EROFS on-demand image mounting, a FUSE
-fallback, and node-local zran acceleration.
+privileged DaemonSet, either inside the pod or as a host systemd service the pod installs. The
+snapshotter provides fanotify/EROFS on-demand image mounting, a FUSE fallback, and node-local zran
+acceleration.
 
 ## Contents
 
@@ -13,18 +14,21 @@ fallback, and node-local zran acceleration.
    1. [Build the image](#1-build-the-image)
    2. [Integrate with containerd](#2-integrate-with-containerd)
    3. [Install the chart](#3-install-the-chart)
-5. [Snapshotter selection modes](#snapshotter-selection-modes)
-6. [Default RuntimeClass injection](#default-runtimeclass-injection)
-7. [Verification](#verification)
-8. [Configuration reference](#configuration-reference)
-9. [Limitations](#limitations)
+5. [Deployment modes](#deployment-modes)
+6. [Snapshotter selection modes](#snapshotter-selection-modes)
+7. [Default RuntimeClass injection](#default-runtimeclass-injection)
+8. [Verification](#verification)
+9. [Configuration reference](#configuration-reference)
+10. [Limitations](#limitations)
 
 ## Overview
 
 The chart deploys:
 
-- A privileged DaemonSet running `containerd-nydus` (with `nydus-image` bundled for node-local
-  conversion), exposing the snapshotter's gRPC socket and persistent state on the host.
+- A privileged DaemonSet that either runs `containerd-nydus` itself (with `nydus-image` bundled for
+  node-local conversion) or installs it as a host systemd service; see
+  [Deployment modes](#deployment-modes). Either way the snapshotter's gRPC socket and persistent
+  state live on the host.
 - A `nydus` RuntimeClass for opt-in workload routing (created in `runtime-handler` mode).
 - Optionally, a mutating admission policy (Kyverno or OPA Gatekeeper) to apply the RuntimeClass
   cluster-wide, and an opt-in installer that integrates the snapshotter with the host containerd.
@@ -195,6 +199,72 @@ helm install nydus deploy/helm/nydus-snapshotter \
 
 Set `hostPaths.containerdSock` to `/run/containerd/containerd.sock` for vanilla containerd.
 
+## Deployment modes
+
+`deploymentMode` sets where the snapshotter process runs.
+
+| | `pod` (default) | `hostSystemd` |
+| --- | --- | --- |
+| Snapshotter process | in the DaemonSet pod | host unit `nydus-snapshotter.service`; the pod installs and watches it |
+| fanotify/EROFS driver | never selected (no fd store); falls back to blockdev or FUSE | selected where the kernel allows (6.14+, ext4 work dir) |
+| Snapshotter crash or restart | FUSE mounts of running containers fail with `ENOTCONN` until those containers restart | fanotify groups and FUSE fds survive in systemd's fd store and the next process takes them over |
+| Pod replacement (chart upgrade, eviction, liveness restart) | restarts the snapshotter | does not touch the service; the unit restarts only when its binary, config or unit file changed |
+| Logs | `kubectl logs` | host journal (`journalctl -u nydus-snapshotter`); the pod follows it, so `kubectl logs` shows it too |
+| Resource limits | `daemonset.resources` | `hostSystemd.serviceExtra` (`MemoryMax=`, `CPUWeight=`, …); `daemonset.resources` does not apply |
+| Node requirements | any node that allows privileged pods | systemd (254+ for `FileDescriptorStorePreserve=`), writable `/usr/local/bin`, `/etc/nydus` and `/etc/systemd/system` |
+
+`pod` mode works everywhere, including immutable OSes without systemd. On those it serves images over
+FUSE or a block device; fanotify needs an fd store.
+
+### hostSystemd
+
+Each node's pod reaches the host through PID 1's namespaces (`hostPID`, `nsenter`) and uses the
+host's own `systemctl` and `journalctl`. On start it:
+
+1. writes `/etc/systemd/system/nydus-snapshotter.service`, `/etc/nydus/config.toml` (the same TOML
+   as `pod` mode) and `/usr/local/bin/{containerd-nydus,nydus-image}` from the image, each only if
+   its content differs. A file is written beside its target and renamed over it, so the running
+   service keeps its old binary until it restarts. A binary that does not run on the host is not
+   installed;
+2. runs `systemctl daemon-reload`, enables the unit, and restarts it if any file changed (with
+   `FileDescriptorStorePreserve=restart` this is the fd-store takeover path), or otherwise only
+   starts it if it is not running;
+3. follows the unit's journal.
+
+The probes run `containerd-nydus healthcheck` against the host unit's sysctl socket, so the pod's
+readiness reflects the service. A failing probe restarts only the pod; systemd restarts the service
+when it exits (`Restart=always`). The unit is ordered before containerd, k3s and RKE2
+(`hostSystemd.before`), which also removes the `global-default` bootstrap-ordering hazard after a
+node reboot.
+
+The release images ship static musl binaries, which run on any Linux host of the same architecture. An image built from
+`deploy/docker/Dockerfile` links glibc dynamically, and its binaries run only on hosts with a
+compatible glibc; the installer refuses binaries that do not run.
+
+The installer owns the four files above. It refuses to replace a `nydus-snapshotter.service` it did
+not write (a unit without its `# Managed by the nydus-snapshotter Helm chart` line); remove such a
+unit first. Hosts with a read-only `/usr/local/bin` (Flatcar, for example) cannot use this mode.
+
+**Uninstall.** `helm uninstall` runs a pre-delete hook Job (image `hostSystemd.uninstall.image`,
+`registry.k8s.io/kubectl` by default; mirror it for air-gapped clusters). The Job patches the
+release's DaemonSet into removal mode on every node at once and waits up to
+`hostSystemd.uninstall.timeoutSeconds` for that rollout: each node's pod stops and disables the unit
+and deletes the unit, binaries and config, then reports Ready. Only then does Helm delete the
+DaemonSet. A hook Job alone runs on a single node, which is why the DaemonSet does the work. If a
+node cannot finish (NotReady, image pull failure), the hook times out and the uninstall fails;
+`helm uninstall --no-hooks` skips the hook and leaves the units running on every node (remove them
+with `systemctl disable --now nydus-snapshotter` and the four files). Snapshotter state under
+`hostPaths.root` stays, as in `pod` mode, and so does the containerd `proxy_plugins` config.
+
+Stopping the service stops the daemons that serve its images, so containers still running on
+fanotify or FUSE images break, as they do when a `pod` mode release is deleted. Drain the nydus workloads
+before uninstalling.
+
+**Switching modes.** `pod` → `hostSystemd`: the rolling update stops each in-pod snapshotter before
+the new pod installs the unit. `hostSystemd` → `pod`: an init container of the `pod` mode DaemonSet
+stops and removes the unit before the in-pod snapshotter starts, so the two never run at once. Both
+switches restart the snapshotter, and the FUSE mounts of running containers do not survive them.
+
 ## Snapshotter selection modes
 
 `snapshotterMode` controls how workloads are routed to nydus.
@@ -234,12 +304,12 @@ which produces a node-level deadlock.
 
 Mitigations:
 
-- Prefer `runtime-handler` mode for DaemonSet deployments, where the default snapshotter is unchanged
+- Prefer `runtime-handler` mode for `pod` mode deployments, where the default snapshotter is unchanged
   and no ordering constraint exists.
-- For `global-default` mode, ensure the snapshotter starts before the runtime. A host-managed
-  snapshotter (systemd) can express this with `Wants=`/`After=` ordering against the runtime unit. A
-  DaemonSet has no equivalent guarantee, so the opt-in installer does not auto-restart the runtime in
-  this mode; restart it manually only after confirming the snapshotter is Ready.
+- For `global-default` mode, ensure the snapshotter starts before the runtime. `deploymentMode:
+  hostSystemd` orders its unit `Before=` the runtime units, which covers node reboots. In `pod` mode
+  there is no equivalent guarantee, so the opt-in installer does not auto-restart the runtime in
+  `global-default` mode; restart it manually only after confirming the snapshotter is Ready.
 
 ## Default RuntimeClass injection
 
@@ -277,6 +347,10 @@ crictl info | grep -i snapshotter
 kubectl -n nydus-system get pods -o wide
 kubectl -n nydus-system logs ds/nydus-nydus-snapshotter
 
+# hostSystemd: the host unit, and which driver its probe selected:
+systemctl status nydus-snapshotter
+journalctl -u nydus-snapshotter | grep -E 'driver probe result|selected filesystem driver'
+
 # A pod using runtimeClassName: nydus starts and its rootfs is a nydus mount on the node:
 mount | grep -E 'erofs|fuse.*nydus'
 ```
@@ -294,6 +368,11 @@ underlying config lives at
 | `snapshotterMode` | `runtime-handler` | `runtime-handler` (per-pod RuntimeClass) or `global-default` (CRI default). |
 | `config.profile` | `k3s` | Deployment profile stamped into the config TOML: `auto`, `k3s`, or `containerd`. Overridable at runtime via `NYDUS_SNAPSHOTTER_PROFILE` / `--profile`. |
 | `config.peerMirror.preset` | `k3s-spegel` | Peer-mirror preset: `k3s-spegel`, `spegel`, or `none`. Canonical key `peer_mirror` (old `spegel_mirror` is a serde alias). |
+| `deploymentMode` | `pod` | `pod` (snapshotter in the pod) or `hostSystemd` (host systemd unit installed by the pod); see [Deployment modes](#deployment-modes). |
+| `hostSystemd.before` | containerd, k3s, k3s-agent, rke2-server, rke2-agent units | Units the host service is ordered before. |
+| `hostSystemd.serviceExtra` | `""` | Extra `[Service]` lines for the host unit, such as resource limits. |
+| `hostSystemd.installerResources` | 10m / 32Mi, limit 128Mi | Resources of the installer pod. |
+| `hostSystemd.uninstall.image` / `.timeoutSeconds` | `registry.k8s.io/kubectl:v1.34.2` / `600` | Image and deadline of the pre-delete uninstall hook. |
 | `daemonset.privileged` | `true` | Required; see [Overview](#overview). |
 | `daemonset.probes.enabled` | `true` | Liveness/readiness exec probes via `containerd-nydus healthcheck` over the sysctl socket. |
 | `hostPaths.containerdSock` | `/run/k3s/containerd/containerd.sock` | Host containerd socket. |
@@ -307,6 +386,7 @@ underlying config lives at
 ## Limitations
 
 - The privileged requirement cannot be removed on current stable Kubernetes or k3s.
+- fanotify needs `deploymentMode: hostSystemd`; `pod` mode falls back to blockdev or FUSE.
 - Node-local zran acceleration: the serving path is verified end-to-end (`misc/fanotify/*.sh`) and
   the binaries are bundled, but the snapshotter `Prepare`/commit lifecycle wiring is not yet merged.
   The `config.localAccel` block is therefore emitted commented out. The chart serves pre-built

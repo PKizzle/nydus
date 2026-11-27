@@ -323,17 +323,19 @@ the dying process, and so its groups, alive until the dump is written; the addre
 mostly reserved and unpopulated (about 1.9 GB virtual and 40 MB resident on an idle snapshotter),
 but a pipe `core_pattern` such as `systemd-coredump` is sent its holes as zeros.
 
-Without an fd store (a Helm DaemonSet, or a snapshotter run by hand) a group closes with the
-process, and `fanotify_release()` allows every event still queued and every read after it:
-containers read zeros for data never fetched. FUSE without its daemon fails reads with
-`ENOTCONN` instead. So the driver probe selects fanotify only when an fd store is present, and
+Without an fd store (the Helm chart's default `deploymentMode: pod`, or a snapshotter run by hand) a
+group closes with the process, and `fanotify_release()` allows every event still queued and every
+read after it: containers read zeros for data never fetched. FUSE without its daemon fails reads
+with `ENOTCONN` instead. So the driver probe selects fanotify only when an fd store is present, and
 otherwise takes the next viable driver in `fs_drivers` (blockdev or fusedev in the default list).
 There is no setting to override this. The store counts as present when `$FDSTORE` is above zero
 (systemd 254 and later set it to `FileDescriptorStoreMax=`), or, with `$NOTIFY_SOCKET` set, when
 `systemctl show -p FileDescriptorStoreMax` reports more than zero for the service unit named in
 `/proc/self/cgroup` (`nydus_snapshotter::fdstore::detect`). The unit needs `Type=notify` and
-`FileDescriptorStoreMax=` above zero (`misc/performance/nydus-snapshotter.service`). The startup
-log names the reason in the fanotify `driver probe result` line.
+`FileDescriptorStoreMax=` above zero (`misc/performance/nydus-snapshotter.service`). Under
+Kubernetes the chart's `deploymentMode: hostSystemd` installs such a unit on each node
+(deploy/helm/nydus-snapshotter/README.md, "Deployment modes"). The startup log names the reason in
+the fanotify `driver probe result` line.
 
 Fanotify mounts already live when such a start finds no fd store (an upgrade from a release
 without this rule, or a unit that lost its fd store) are still re-armed on fanotify
