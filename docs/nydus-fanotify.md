@@ -415,6 +415,75 @@ A retained cache is trusted no more than any cache a stopped daemon left behind 
 validation](#fill-validation)): unless it still reads as verified, its ready chunks are checked
 again while serving goes on.
 
+## Borrowing
+
+Every image keeps its own cache file per data blob: `daemons/<slug>/stage/<blob id>.blob.data` on
+the fanotify path, `<cache.work_dir>/<slug>/<blob id>.blob.data` for FUSE and block devices. Two
+images using one blob would each fetch and decompress the same chunks. With borrowing on, a cache
+that misses a chunk first looks for the same byte range in another image's cache file of the same
+blob on the node (a lender), and fetches from its backend only if that fails. Borrowing saves
+fetches and decompression, not disk: the borrower writes the chunk into its own cache file.
+
+```toml
+[snapshotter.cache]
+borrow = false   # default
+```
+
+The snapshotter passes every daemon, whatever its driver, the patterns
+`<root>/daemons/*/stage` and `<cache.work_dir>/*` (`borrow_from` in the file cache config). When a
+blob cache opens, it lists up to four lenders there: regular files named like its own cache file,
+not symlinks, on the same filesystem, with the same owner, and not its own file. The list is made
+once per open, so a cache opened before another image cached the blob does not see it.
+
+**Trust.** A lender is untrusted data. An image can make its own cache hold anything while passing
+its own validation, by naming the bytes it wants in its own bootstrap. So the borrower reads the
+chunk's range at its own offset and length into memory, checks it against its own digest for the
+chunk (the bootstrap's on the fanotify path, the chunk's own elsewhere), and only then writes it
+into its own cache file and marks it ready, the way a fetched chunk is written, unsealed-boot mark
+and verified stamp included. Nothing else the lender holds is used: not its chunk map, digests,
+size or anything it asserts. A lender range that is a hole (`SEEK_DATA`/`SEEK_HOLE`) is skipped
+without reading. A lender is never written, and unverified bytes never reach the borrower's file,
+which on the fanotify path is the EROFS device the kernel reads. A chunk without a digest, a raw
+(compressed) or encrypted cache, and a tarfs blob never borrow. A lender whose bytes fail the
+digest three times is no longer used by that cache; a lender being filled at the same time can
+fail once, a corrupt or hostile one fails every time.
+
+**Authorization.** Two rules decide who may borrow from whom:
+
+- *Same backend.* With borrowing on, the snapshotter writes the backend a cache dir is filled
+  from into `borrow-identity` in that dir when it starts the image there, once: `registry
+  <scheme>://<host>/<repository>` for a registry, `content-store <root>` for the auto-accel
+  backend, which reads containerd's content store. Other backends (object stores, HTTP proxy)
+  get no identity. A cache borrows only from dirs whose identity file is a regular file with the
+  same owner and the same contents as its own; a dir without one neither lends nor borrows. An
+  image whose bootstrap names another image's blob but whose backend is a registry or repository
+  of its own choosing therefore gets nothing from that image's cache.
+- *Own read first.* A cache borrows only after its own backend has served it chunk data at least
+  once, so an image whose backend is the same repository but which cannot read the blob there
+  (no credentials for it) gets nothing either.
+
+Not covered: an image of the same repository whose own backend serves the blob gets the bytes,
+as it could have fetched them. Within one repository, images are not told apart by tag or
+credentials beyond that first read. All auto-accel images share one identity, the content store,
+whose layers containerd shares between the images of the node anyway. Timing is a side channel:
+a borrowed read is faster than a fetch, which tells an image that another image on the node holds
+the blob and which of its chunks that image has read.
+
+**Event-free descriptors.** A lender may be another image's live EROFS device, carrying that
+image's `FAN_PRE_ACCESS` mark. An ordinary read of it would raise events in the other image's
+handler, which would fetch the range, answer `EIO` if it has failed, or deadlock with a handler
+borrowing back. Every lender is therefore opened once, through `open_without_events`
+(`FMODE_NONOTIFY` via a private `FAN_OPEN_PERM` group), and shared by all caches of the process
+for as long as the file is linked. Where fanotify permission events are unavailable (no fanotify,
+a kernel without them, or no privilege to create a group) no pre-content mark can exist, and the
+lender is opened plainly. `misc/fanotify/borrow-test.sh` checks that borrowing from a marked file,
+and `SEEK_DATA` on it, raise no event on the marking group.
+
+**Retention and eviction.** A retained stage lends like a live one. Before the snapshotter removes
+a stage (retention eviction, the stale daemon-dir sweep, a wipe on a source change) or a cache
+file (cache GC), it closes the lender descriptors under it, so a borrower does not keep the
+deleted file's space allocated. A lender found unlinked is closed before use.
+
 ## Cache eviction
 
 `FanotifyHandler::cull_cache(blob_id)` punches holes

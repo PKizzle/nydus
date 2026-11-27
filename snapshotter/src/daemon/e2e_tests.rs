@@ -112,6 +112,8 @@ struct MockRegistry {
     refused: std::sync::atomic::AtomicUsize,
     /// Tokens the realm handed out.
     tokens: std::sync::atomic::AtomicUsize,
+    /// Method and range of every served blob request, in order.
+    log: std::sync::Mutex<Vec<String>>,
 }
 
 impl MockRegistry {
@@ -128,6 +130,7 @@ fn serve_registry(dir: PathBuf, auth: RegistryAuth) -> Arc<MockRegistry> {
         served: Default::default(),
         refused: Default::default(),
         tokens: Default::default(),
+        log: Default::default(),
     });
     let shared = registry.clone();
     std::thread::spawn(move || {
@@ -235,6 +238,11 @@ fn serve_registry_request(
             b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
         );
     };
+    registry
+        .log
+        .lock()
+        .unwrap()
+        .push(format!("{method} {}", range.as_deref().unwrap_or("-")));
     registry.served.fetch_add(1, Ordering::SeqCst);
     let size = fs::metadata(&file)?.len();
     let (status, start, end) = match range.as_deref().and_then(|r| r.strip_prefix("bytes=")) {
@@ -369,6 +377,25 @@ fn released_stage_starts_warm() {
             .block_on(supervisor.release(&image_ref, "k1"))
             .unwrap();
         assert!(!is_mounted_at(&mountpoint), "mount outlived its release");
+        // The release sealed every cache: the chunk map's `unsealed_boot` word is zero, so a
+        // clean reboot keeps the retained stage trusted.
+        let stage = mountpoint.with_file_name("stage");
+        let maps: Vec<_> = fs::read_dir(&stage)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.to_string_lossy().ends_with(".chunk_map"))
+            .collect();
+        assert!(!maps.is_empty(), "no chunk map in {}", stage.display());
+        for map in maps {
+            let mut word = [0u8; 8];
+            std::os::unix::fs::FileExt::read_exact_at(
+                &fs::File::open(&map).unwrap(),
+                &mut word,
+                32,
+            )
+            .unwrap();
+            assert_eq!(u64::from_ne_bytes(word), 0, "{} not sealed", map.display());
+        }
         let _ = runtime.block_on(reconciler.run_once());
         let view = fs::metadata(mountpoint.with_file_name("stage").join("bootstrap"))
             .expect("the released stage was swept");
@@ -396,6 +423,104 @@ fn released_stage_starts_warm() {
         fetched,
         "the warm start fetched data the first start had cached"
     );
+}
+
+/// Three images sharing a blob, with borrowing on: once the first has read every file, the
+/// second, another tag of the same repository, reads them all with at most one registry request
+/// of its own per blob, the one that lets it borrow, and fills everything else from the first
+/// image's cache. The third, from another repository, borrows nothing.
+/// `NYDUS_E2E_ROOT` holds `src/`, `bootstrap` and `blobs/` of an image with small chunks;
+/// `NYDUS_IMAGE` is the `nydus-image` binary.
+#[test]
+#[ignore = "needs root, Linux >= 6.14 and an ext4 work dir; run misc/fanotify/borrow-test.sh"]
+fn a_second_image_borrows_a_shared_blob() {
+    let root = e2e_root();
+    let registry = serve_registry(root.join("blobs"), RegistryAuth::None);
+    let mut config: SnapshotterConfig =
+        toml::from_str("[snapshotter.cache]\nborrow = true\n").unwrap();
+    config.snapshotter.root = root.join("snapshotter");
+    config.snapshotter.cache.work_dir = root.join("cache");
+    config.snapshotter.auto_zran.nydus_image = nydus_image();
+    // Off, so the second image's reads reach its own cache rather than the first one's pages.
+    config.snapshotter.features.erofs_inode_share = ErofsInodeShare::Off;
+    config.backends.registry = Some(RegistryBackendConfig {
+        mirrors: Vec::new(),
+        skip_verify: false,
+        ca_cert_files: Vec::new(),
+        plain_http: true,
+        request_timeout: "10s".to_string(),
+    });
+    let supervisor = DaemonSupervisor::new(config);
+    let runtime = compio::runtime::Runtime::new().unwrap();
+    let blobs = fs::read_dir(root.join("blobs")).unwrap().count();
+    // Requests made while a daemon starts are not reads of file data. Each blob's metadata is
+    // fetched by a thread of its own that a start does not wait for, so wait for that request
+    // (`at_least`) as well as for the requests to stop, or it can land among the file reads.
+    let settled = |at_least: usize| {
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        let mut served = registry.served();
+        loop {
+            std::thread::sleep(Duration::from_millis(300));
+            let now = registry.served();
+            if now == served && now >= at_least {
+                return served;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the daemon did not fetch its blob meta"
+            );
+            served = now;
+        }
+    };
+    let borrowed = nydus_storage::cache::borrow_counters().chunks;
+    let mut images = Vec::new();
+    let mut reads = Vec::new();
+    for name in ["app:1", "app:2", "other/app:1"] {
+        let image_ref = format!("{}/{name}", registry.addr);
+        // Each image has a cache dir of its own, so it fetches the metadata of every blob.
+        let meta_fetched = registry.served() + blobs;
+        let handle = runtime
+            .block_on(supervisor.ensure_instance(
+                &image_ref,
+                &root.join("bootstrap"),
+                "k1",
+                Some(FsDriverType::Fanotify),
+            ))
+            .unwrap_or_else(|e| panic!("daemon start of {image_ref}: {e:#}"));
+        let mountpoint = handle.mountpoint().to_path_buf();
+        assert_eq!(mount_fstype_at(&mountpoint).as_deref(), Some("erofs"));
+        let before = settled(meta_fetched);
+        registry.log.lock().unwrap().push(format!("== {name}"));
+        assert_same_files(&root.join("src"), &mountpoint);
+        reads.push(registry.served() - before);
+        images.push((image_ref, handle));
+    }
+    let borrowed = nydus_storage::cache::borrow_counters().chunks - borrowed;
+    println!(
+        "BORROW E2E: {blobs} blobs; registry reads of file data: first image {}, second {}, \
+         other repository {}; {borrowed} chunks borrowed",
+        reads[0], reads[1], reads[2]
+    );
+    println!("BORROW E2E LOG: {:?}", registry.log.lock().unwrap());
+    for (image_ref, handle) in images {
+        drop(handle);
+        runtime
+            .block_on(supervisor.release(&image_ref, "k1"))
+            .unwrap();
+    }
+    assert!(
+        reads[0] > blobs,
+        "the first image read too few ranges to show borrowing"
+    );
+    assert!(
+        reads[1] <= blobs,
+        "the second image fetched chunks the first had cached"
+    );
+    assert_eq!(
+        reads[2], reads[0],
+        "an image from another repository borrowed"
+    );
+    assert!(borrowed > 0);
 }
 
 /// The auto-accel path from conversion to data: `local_accel::convert` builds the

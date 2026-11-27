@@ -57,6 +57,19 @@ fn rafs_prefetch_config(cfg: &SnapshotterConfig) -> PrefetchConfigV2 {
     }
 }
 
+/// The cache directories a daemon borrows chunk data from when `[snapshotter.cache] borrow` is
+/// on: every fanotify stage and every FUSE or block device cache dir of this node.
+pub fn borrow_patterns(cfg: &SnapshotterConfig) -> Vec<String> {
+    if !cfg.snapshotter.cache.borrow {
+        return Vec::new();
+    }
+    let any = |dir: &Path| dir.join("*").display().to_string();
+    vec![
+        any(&cfg.snapshotter.root.join("daemons")) + "/stage",
+        any(&cfg.snapshotter.cache.work_dir),
+    ]
+}
+
 /// Build a `ConfigV2` for the daemon pull path: the storage backend selected
 /// from the unified `[backends.*]` TOML config, paired with a filecache.
 ///
@@ -87,6 +100,7 @@ pub fn build_daemon_config(
             enable_encryption: false,
             enable_convergent_encryption: false,
             encryption_key: Default::default(),
+            borrow_from: borrow_patterns(cfg),
         }),
         fanotify: None,
     };
@@ -394,6 +408,7 @@ pub fn build_fanotify_config(
     daemon_mountpoint: &Path,
     daemon_id: &str,
     inode_share_domain: Option<String>,
+    borrow_from: Vec<String>,
 ) -> ConfigV2 {
     let cache = CacheConfigV2 {
         cache_type: "fanotify".to_string(),
@@ -403,6 +418,7 @@ pub fn build_fanotify_config(
         // The fanotify cache is a file cache whose `.blob.data` files are the EROFS devices.
         file_cache: Some(FileCacheConfig {
             work_dir: stage_dir.display().to_string(),
+            borrow_from,
             ..Default::default()
         }),
         fanotify: Some(FanotifyConfig {
@@ -446,6 +462,7 @@ pub fn build_fanotify_blob_cache_entry(
     daemon_id: &str,
     bootstrap: &Path,
     inode_share_domain: Option<String>,
+    borrow_from: Vec<String>,
 ) -> anyhow::Result<BlobCacheEntry> {
     let cfg_v2 = build_fanotify_config(
         backend,
@@ -453,6 +470,7 @@ pub fn build_fanotify_blob_cache_entry(
         daemon_mountpoint,
         daemon_id,
         inode_share_domain,
+        borrow_from,
     );
     let entry_config = BlobCacheEntryConfigV2 {
         version: cfg_v2.version,
@@ -567,6 +585,43 @@ mod tests {
             "/var/lib/containerd-nydus/cache/nginx"
         );
         assert!(cv2.validate());
+    }
+
+    /// Borrowing is off by default; on, every driver's cache borrows from every stage and
+    /// cache dir of the node.
+    #[test]
+    fn borrowing_reaches_every_driver_config() {
+        let image = parse_image_ref("docker.io/library/nginx:latest").unwrap();
+        let mut cfg = SnapshotterConfig::default();
+        let fuse = |cfg: &SnapshotterConfig| {
+            build_daemon_config(cfg, &image, Path::new("/c/x"), None, "x")
+                .unwrap()
+                .cache
+                .unwrap()
+                .file_cache
+                .unwrap()
+                .borrow_from
+        };
+        assert!(fuse(&cfg).is_empty());
+        cfg.snapshotter.root = PathBuf::from("/r");
+        cfg.snapshotter.cache.work_dir = PathBuf::from("/c");
+        cfg.snapshotter.cache.borrow = true;
+        let patterns = vec!["/r/daemons/*/stage".to_string(), "/c/*".to_string()];
+        assert_eq!(borrow_patterns(&cfg), patterns);
+        assert_eq!(fuse(&cfg), patterns);
+        let dir = PathBuf::from("/r/daemons/x/stage");
+        let fanotify = build_fanotify_config(
+            localfs_backend(&dir),
+            &dir,
+            &dir,
+            "x",
+            None,
+            borrow_patterns(&cfg),
+        );
+        assert_eq!(
+            fanotify.cache.unwrap().file_cache.unwrap().borrow_from,
+            patterns
+        );
     }
 
     #[test]
@@ -1047,7 +1102,8 @@ mod tests {
                 &dir,
                 &dir,
                 "d",
-                shared
+                shared,
+                Vec::new()
             ))
             .as_deref(),
             Some(NODE_LOCAL_INODE_SHARE_DOMAIN)
@@ -1065,7 +1121,7 @@ mod tests {
         let backend =
             build_backend_config(&cfg, &dummy_image(), Some("dXNlcjpwYXNz".to_string())).unwrap();
         let dir = PathBuf::from("/tmp/x");
-        let fanotify = build_fanotify_config(backend.clone(), &dir, &dir, "d", None);
+        let fanotify = build_fanotify_config(backend.clone(), &dir, &dir, "d", None, Vec::new());
         assert_eq!(fanotify.backend.as_ref(), Some(&backend));
         let registry = fanotify.backend.unwrap().registry.unwrap();
         assert_eq!(

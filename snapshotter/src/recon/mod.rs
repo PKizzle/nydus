@@ -1046,7 +1046,11 @@ fn sweep_stale_daemon_dirs(
             );
             continue;
         }
-        match std::fs::remove_dir_all(&path) {
+        nydus_storage::cache::release_lenders_under(&path);
+        let result = std::fs::remove_dir_all(&path);
+        // Again, for a lender a borrower opened while the dir was being removed.
+        nydus_storage::cache::release_lenders_under(&path);
+        match result {
             Ok(()) => {
                 removed += 1;
                 info!(dir = %path.display(), "recon: removed stale daemon dir");

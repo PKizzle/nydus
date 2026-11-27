@@ -37,6 +37,7 @@ use nydus_rafs::metadata::RafsSuper;
 use nydus_rafs::metadata::kernel_layout::chunk_digest_tables;
 use nydus_rafs::metadata::layout::v6::{EROFS_SUPER_OFFSET, RafsV6Device, RafsV6SuperBlock};
 use nydus_storage::device::BlobChunkInfo;
+use nydus_utils::fanotify::{fd_identity, for_each_parsable_event, open_without_events};
 
 use crate::blob_cache::{BlobCacheMgr, DataBlob};
 use crate::fanotify_sys::{
@@ -63,156 +64,6 @@ const FAN_ALLOW: u32 = 0x01;
 struct fanotify_response {
     fd: i32,
     response: u32,
-}
-
-/// How long [`open_without_events`] waits for its own opens to arrive as events.
-const OPEN_WITHOUT_EVENTS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
-
-/// Open the inodes behind `fds` again, read-write, through `FAN_OPEN_PERM` events of one
-/// private fanotify group, returning one descriptor per input, in order. The kernel opens
-/// event descriptors with `FMODE_NONOTIFY`, so I/O through them raises no fanotify events even
-/// while the inodes carry pre-content marks.
-fn open_without_events(fds: &[RawFd]) -> Result<Vec<OwnedFd>> {
-    open_without_events_via(fds, |path| File::open(path))
-}
-
-/// [`open_without_events`] with the opener supplied, so a failing open can be tested.
-///
-/// A failed open raises no event, so the opener reports each result and the group is polled
-/// with a deadline: either failure ends the wait with an error instead of blocking forever.
-fn open_without_events_via(
-    fds: &[RawFd],
-    open: impl Fn(&str) -> Result<File> + Send + 'static,
-) -> Result<Vec<OwnedFd>> {
-    if fds.is_empty() {
-        return Ok(Vec::new());
-    }
-    // SAFETY: `fanotify_init` only takes integer flags; the result is checked below.
-    let raw = unsafe {
-        libc::fanotify_init(
-            libc::FAN_CLASS_CONTENT | libc::FAN_CLOEXEC | libc::FAN_NONBLOCK,
-            libc::O_RDWR as u32,
-        )
-    };
-    if raw < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    // SAFETY: `raw` is the new group descriptor (checked non-negative above) and nothing else owns
-    // it. Dropping the group on any return answers whatever is still queued, so the opener below
-    // cannot be left blocked.
-    let group = unsafe { OwnedFd::from_raw_fd(raw) };
-    for &fd in fds {
-        // SAFETY: `raw` is the live group fd owned by `group`, `fd` is a descriptor the caller
-        // keeps open for this call, and a NULL path marks `fd` itself.
-        if unsafe {
-            libc::fanotify_mark(
-                raw,
-                libc::FAN_MARK_ADD,
-                libc::FAN_OPEN_PERM,
-                fd,
-                std::ptr::null(),
-            )
-        } != 0
-        {
-            return Err(std::io::Error::last_os_error());
-        }
-    }
-    let identities = fds
-        .iter()
-        .map(|&fd| fd_identity(fd))
-        .collect::<Result<Vec<_>>>()?;
-    let paths: Vec<String> = fds.iter().map(|fd| format!("/proc/self/fd/{fd}")).collect();
-    let (opened_tx, opened) = std::sync::mpsc::channel();
-    let opener = std::thread::spawn(move || {
-        for path in paths {
-            let failed = opened_tx.send(open(&path).map(drop)).is_err();
-            if failed {
-                return;
-            }
-        }
-    });
-
-    let deadline = std::time::Instant::now() + OPEN_WITHOUT_EVENTS_TIMEOUT;
-    let mut buf = vec![0u8; 4096];
-    let mut found: Vec<Option<OwnedFd>> = fds.iter().map(|_| None).collect();
-    let result = loop {
-        if found.iter().all(Option::is_some) {
-            break Ok(found.into_iter().flatten().collect());
-        }
-        // An open returns only once its event is answered, so only a failed one is news.
-        if let Ok(Err(e)) = opened.try_recv() {
-            break Err(e);
-        }
-        let left = deadline.saturating_duration_since(std::time::Instant::now());
-        if left.is_zero() {
-            break Err(std::io::Error::from_raw_os_error(libc::ETIMEDOUT));
-        }
-        let mut pfd = libc::pollfd {
-            fd: raw,
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        // Short slices, so an opener failure is noticed without waiting out the deadline.
-        let slice = left.min(std::time::Duration::from_millis(20)).as_millis() as libc::c_int;
-        // SAFETY: `pfd` is a live, initialized `pollfd` and the count is 1.
-        if unsafe { libc::poll(&mut pfd, 1, slice) } < 0 {
-            let e = std::io::Error::last_os_error();
-            if e.kind() == ErrorKind::Interrupted {
-                continue;
-            }
-            break Err(e);
-        }
-        // SAFETY: `buf` is writable for `buf.len()` bytes and `raw` is the live group fd.
-        let n = unsafe { libc::read(raw, buf.as_mut_ptr().cast(), buf.len()) };
-        if n < 0 {
-            let e = std::io::Error::last_os_error();
-            if matches!(e.raw_os_error(), Some(libc::EAGAIN) | Some(libc::EINTR)) {
-                continue;
-            }
-            break Err(e);
-        }
-        for_each_parsable_event(&buf[..n as usize], |meta, _| {
-            if meta.fd < 0 {
-                return;
-            }
-            // Every opener of the inodes is allowed; only our own opens' descriptors are kept.
-            write_response(raw, meta.fd, FAN_ALLOW);
-            // SAFETY: every event with `fd >= 0` carries a fresh descriptor the kernel installed
-            // for this process, owned by whoever reads the event; it is wrapped exactly once.
-            let event_fd = unsafe { OwnedFd::from_raw_fd(meta.fd) };
-            if meta.pid as u32 != std::process::id() {
-                return;
-            }
-            let Ok(identity) = fd_identity(event_fd.as_raw_fd()) else {
-                return;
-            };
-            if let Some(slot) = identities
-                .iter()
-                .zip(found.iter_mut())
-                .find_map(|(id, slot)| (*id == identity && slot.is_none()).then_some(slot))
-            {
-                *slot = Some(event_fd);
-            }
-        });
-    };
-    drop(group);
-    let _ = opener.join();
-    result
-}
-
-/// Get the `(st_dev, st_ino)` identity of an open file descriptor.
-///
-/// Used to map a `FAN_PRE_ACCESS` event fd back to the [`DataBlob`] whose sparse backing file
-/// it refers to, without depending on path names.
-fn fd_identity(fd: RawFd) -> Result<(u64, u64)> {
-    // SAFETY: `stat` is plain-old-data; `fstat` only writes into it.
-    let mut st: libc::stat = unsafe { std::mem::zeroed() };
-    // SAFETY: `st` is a writable `stat` that outlives the call; a bad fd only makes `fstat` fail.
-    let ret = unsafe { libc::fstat(fd, &mut st) };
-    if ret != 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    Ok((st.st_dev as u64, st.st_ino as u64))
 }
 
 /// Scoped thread-safety assertion for [`DataBlob`].
@@ -1043,7 +894,7 @@ impl FanotifyHandler {
             .iter()
             .map(|backing| backing.blob.file().as_raw_fd())
             .collect();
-        let quiet_fds = open_without_events(&file_fds)?;
+        let quiet_fds = open_without_events(&file_fds, true)?;
         for (backing, quiet) in blob_backings.iter().zip(&quiet_fds) {
             let cache_fd = backing
                 .blob
@@ -2433,37 +2284,6 @@ fn write_response(group: RawFd, event_fd: RawFd, response: u32) {
     }
 }
 
-/// Walk a raw fanotify event buffer, invoking `f` for every record that can be trusted.
-///
-/// Stops at the first unparsable record — an unknown metadata version or an `event_len` that
-/// is too small or runs past the buffer means the *next* record boundary is guesswork, and a
-/// misread `fd` field would have the caller answer on (or close) an arbitrary descriptor.
-///
-/// Only used off the hot path (shutdown drain, structural-failure recovery); the serving loop
-/// in [`FanotifyHandler::process_event_buffer`] needs per-record error handling and does its
-/// own walk.
-fn for_each_parsable_event(buf: &[u8], mut f: impl FnMut(&libc::fanotify_event_metadata, &[u8])) {
-    let mut offset = 0usize;
-    while offset + std::mem::size_of::<libc::fanotify_event_metadata>() <= buf.len() {
-        // SAFETY: we verified the buffer has enough bytes; the event buffer is a `Vec<u8>` with no
-        // alignment guarantee, so the record is copied out rather than referenced.
-        let meta = unsafe {
-            std::ptr::read_unaligned(
-                buf.as_ptr().add(offset) as *const libc::fanotify_event_metadata
-            )
-        };
-        let meta_len = meta.event_len as usize;
-        if meta.vers != libc::FANOTIFY_METADATA_VERSION
-            || meta_len < std::mem::size_of::<libc::fanotify_event_metadata>()
-            || offset + meta_len > buf.len()
-        {
-            break;
-        }
-        f(&meta, &buf[offset..offset + meta_len]);
-        offset += meta_len;
-    }
-}
-
 /// Walk an untrusted event buffer the way the worker does, extracting each record's range, and
 /// return how many records carried one. Entry point for the `fanotify_events` fuzz target.
 #[cfg(feature = "fuzzing")]
@@ -2733,16 +2553,37 @@ mod tests {
     /// fixture bootstrap staged in `stage/`, and a blob cache manager over a fanotify cache there;
     /// `None`, after printing SKIP, without that directory or fanotify pre-content support.
     fn fanotify_fixture(id: &str) -> Option<(tempfile::TempDir, Arc<super::BlobCacheMgr>)> {
+        let base = fanotify_test_dir()?;
+        fanotify_fixture_borrowing(base.as_ref(), id, &[])
+    }
+
+    /// `NYDUS_FANOTIFY_TEST_DIR`, or `None` after printing SKIP.
+    fn fanotify_test_dir() -> Option<std::ffi::OsString> {
+        let base = std::env::var_os("NYDUS_FANOTIFY_TEST_DIR");
+        if base.is_none() {
+            eprintln!("SKIP: set NYDUS_FANOTIFY_TEST_DIR to an ext4 directory and run as root");
+        }
+        base
+    }
+
+    /// [`fanotify_fixture`] in a work dir under `base`, with a cache that borrows from the
+    /// cache dirs `borrow_from` matches. Every fixture stage names one backend identity.
+    fn fanotify_fixture_borrowing(
+        base: &std::path::Path,
+        id: &str,
+        borrow_from: &[String],
+    ) -> Option<(tempfile::TempDir, Arc<super::BlobCacheMgr>)> {
         use super::*;
 
-        let Some(base) = std::env::var_os("NYDUS_FANOTIFY_TEST_DIR") else {
-            eprintln!("SKIP: set NYDUS_FANOTIFY_TEST_DIR to an ext4 directory and run as root");
-            return None;
-        };
         let root = env!("CARGO_MANIFEST_DIR");
         let work = tempfile::TempDir::new_in(base).unwrap();
         let stage = work.path().join("stage");
         std::fs::create_dir_all(&stage).unwrap();
+        std::fs::write(
+            stage.join(nydus_storage::cache::BORROW_IDENTITY_FILE),
+            "fanotify-fixture",
+        )
+        .unwrap();
         std::fs::copy(
             format!("{root}/../tests/texture/blobs/{FIXTURE_BLOB}"),
             work.path().join(FIXTURE_BLOB),
@@ -2757,10 +2598,11 @@ mod tests {
                 "version": 2, "id": "ID",
                 "backend": { "type": "localfs", "localfs": { "dir": "WORK" } },
                 "cache": { "type": "fanotify", "fanotify": { "work_dir": "STAGE" },
-                           "filecache": { "work_dir": "STAGE" } },
+                           "filecache": { "work_dir": "STAGE", "borrow_from": BORROW } },
                 "metadata_path": "STAGE/bootstrap"
             }
         }"#
+        .replace("BORROW", &serde_json::to_string(borrow_from).unwrap())
         .replace("ID", id)
         .replace("WORK", work.path().to_str().unwrap())
         .replace("STAGE", stage.to_str().unwrap());
@@ -2913,6 +2755,39 @@ mod tests {
         umount(&mnt);
     }
 
+    /// A failed handler seals nothing: whatever failed may have left its caches half-updated,
+    /// so they stay unsealed and are rechecked after a reboot.
+    #[test]
+    fn a_failed_handler_leaves_its_caches_unsealed() {
+        use super::*;
+
+        let Some((work, mgr)) = fanotify_fixture("failed-seal") else {
+            return;
+        };
+        let (stage, mnt) = (work.path().join("stage"), work.path().join("mnt"));
+        let handler =
+            FanotifyHandler::new(stage.to_str().unwrap(), mnt.to_str().unwrap(), mgr, 1).unwrap();
+        let backing = &handler.blob_backings[0];
+        backing
+            .blob
+            .blob()
+            .get_blob_object()
+            .unwrap()
+            .fetch_range_uncompressed(0, backing.blob.blob_info().uncompressed_size())
+            .unwrap();
+        let cache = backing.cache_path.clone();
+        assert_ne!(chunk_map_word(&cache, 32), 0, "filled without unsealing");
+        handler.fail(&"test");
+        handler.seal();
+        assert_ne!(
+            chunk_map_word(&cache, 32),
+            0,
+            "a failed handler sealed its cache"
+        );
+        drop(handler);
+        nydus_storage::factory::BLOB_FACTORY.forget("failed-seal");
+    }
+
     /// A successor that takes over a live mount which opened the blob marked revokes a cached
     /// chunk found corrupt, and readers of the mount get the right bytes again; over a mount
     /// that opened it unmarked the chunk is reported and left, and the blob stays unverified.
@@ -2982,6 +2857,151 @@ mod tests {
 
         second.stop();
         umount(&mnt);
+    }
+
+    /// Borrowing reads a lender through a descriptor that raises no fanotify events, even while
+    /// the lender carries a live `FAN_PRE_ACCESS` mark: a group counting the lender's events
+    /// sees none while a second image fills its cache from it, and none for `SEEK_DATA` through
+    /// an ordinary descriptor, but one for an ordinary read, which shows that it counts.
+    ///
+    /// Needs root, a >= 6.14 kernel and `NYDUS_FANOTIFY_TEST_DIR` on a file system with
+    /// pre-content marks (ext4); prints SKIP otherwise.
+    #[test]
+    fn borrowing_raises_no_event_on_a_marked_lender() {
+        use super::*;
+        use crate::fanotify_sys::{FAN_CLASS_PRE_CONTENT, FAN_PRE_ACCESS};
+        use std::os::unix::fs::FileExt;
+        use std::sync::atomic::AtomicUsize;
+
+        let Some(base) = fanotify_test_dir() else {
+            return;
+        };
+        // Both images' work dirs sit in one directory, so each stage matches `<dir>/*/stage`.
+        let dir = tempfile::TempDir::new_in(base).unwrap();
+        let Some((lender_work, lender_mgr)) =
+            fanotify_fixture_borrowing(dir.path(), "borrow-lender", &[])
+        else {
+            return;
+        };
+        let pattern = format!("{}/*/stage", dir.path().display());
+        let (work, mgr) =
+            fanotify_fixture_borrowing(dir.path(), "borrow-borrower", &[pattern]).unwrap();
+        let serve = |work: &tempfile::TempDir, mgr: Arc<BlobCacheMgr>, prime: bool| {
+            let (stage, mnt) = (work.path().join("stage"), work.path().join("mnt"));
+            let handler = Arc::new(
+                FanotifyHandler::new(stage.to_str().unwrap(), mnt.to_str().unwrap(), mgr, 1)
+                    .unwrap(),
+            );
+            if prime {
+                // One chunk from the own backend opens the borrowing gate, so the mount's
+                // reads borrow the rest even where one event spans the whole blob (large pages).
+                let blob = handler.blob_backings[0].blob.blob();
+                let first = blob.get_chunk_info(0).unwrap();
+                blob.get_blob_object()
+                    .unwrap()
+                    .fetch_range_uncompressed(
+                        first.uncompressed_offset(),
+                        first.uncompressed_size() as u64,
+                    )
+                    .unwrap();
+            }
+            spawn_worker(&handler);
+            handler.arm().unwrap();
+            handler.mount().unwrap();
+            let files: Vec<_> = read_all_cold(&mnt)
+                .into_iter()
+                .map(|(p, data)| (p.strip_prefix(&mnt).unwrap().to_path_buf(), data))
+                .collect();
+            (handler, mnt, files)
+        };
+        let (lender, lender_mnt, want) = serve(&lender_work, lender_mgr, false);
+        let lender_file = lender_work
+            .path()
+            .join("stage")
+            .join(format!("{FIXTURE_BLOB}.blob.data"));
+
+        // A group that counts and allows every pre-content event on the lender's cache file.
+        // SAFETY: `fanotify_init` only takes integer flags; the result is checked.
+        let raw = unsafe {
+            libc::fanotify_init(
+                FAN_CLASS_PRE_CONTENT | libc::FAN_CLOEXEC | libc::FAN_NONBLOCK,
+                libc::O_RDONLY as u32,
+            )
+        };
+        assert!(raw >= 0, "{}", std::io::Error::last_os_error());
+        // SAFETY: `raw` is the new group descriptor, owned by nothing else.
+        let group = unsafe { OwnedFd::from_raw_fd(raw) };
+        let path = std::ffi::CString::new(lender_file.to_str().unwrap()).unwrap();
+        // SAFETY: `raw` is the live group and `path` a NUL-terminated path.
+        let marked = unsafe {
+            libc::fanotify_mark(
+                raw,
+                libc::FAN_MARK_ADD,
+                FAN_PRE_ACCESS,
+                libc::AT_FDCWD,
+                path.as_ptr(),
+            )
+        };
+        assert_eq!(marked, 0, "{}", std::io::Error::last_os_error());
+        let events = Arc::new(AtomicUsize::new(0));
+        let done = Arc::new(AtomicBool::new(false));
+        let counter = {
+            let (events, done) = (events.clone(), done.clone());
+            std::thread::spawn(move || {
+                let mut buf = vec![0u8; 4096];
+                while !done.load(Ordering::Acquire) {
+                    // SAFETY: `buf` is writable for its length and `raw` is the live group.
+                    let n = unsafe { libc::read(raw, buf.as_mut_ptr().cast(), buf.len()) };
+                    if n <= 0 {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                        continue;
+                    }
+                    for_each_parsable_event(&buf[..n as usize], |meta, _| {
+                        if meta.fd >= 0 {
+                            events.fetch_add(1, Ordering::SeqCst);
+                            write_response(raw, meta.fd, FAN_ALLOW);
+                            // SAFETY: the event's descriptor is ours to close, once.
+                            drop(unsafe { OwnedFd::from_raw_fd(meta.fd) });
+                        }
+                    });
+                }
+            })
+        };
+
+        let before = nydus_storage::cache::borrow_counters();
+        let (borrower, mnt, got) = serve(&work, mgr, true);
+        assert_eq!(got, want, "the borrower reads other bytes than the lender");
+        let borrowed = nydus_storage::cache::borrow_counters().chunks - before.chunks;
+        let during = events.load(Ordering::SeqCst);
+
+        let plain = File::open(&lender_file).unwrap();
+        // SAFETY: `lseek` only takes integers; `plain` is open.
+        let data = unsafe { libc::lseek(plain.as_raw_fd(), 0, libc::SEEK_DATA) };
+        assert!(data >= 0);
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let after_seek = events.load(Ordering::SeqCst);
+        let mut byte = [0u8; 1];
+        plain.read_exact_at(&mut byte, data as u64).unwrap();
+        let after_read = events.load(Ordering::SeqCst);
+        println!(
+            "BORROW EVENTS: borrowed {borrowed} chunks, lender events while borrowing \
+             {during}, after SEEK_DATA {after_seek}, after a plain read {after_read}"
+        );
+        done.store(true, Ordering::Release);
+        counter.join().unwrap();
+        drop(group);
+        borrower.stop();
+        umount(&mnt);
+        lender.stop();
+        umount(&lender_mnt);
+
+        assert!(borrowed > 0, "nothing was borrowed");
+        assert_eq!(during, 0, "borrowing raised events on the lender");
+        assert_eq!(after_seek, during, "SEEK_DATA raised an event");
+        assert!(
+            after_read > after_seek,
+            "the counting group sees no events at all"
+        );
     }
 
     #[test]
@@ -3570,44 +3590,6 @@ mod tests {
             "bytes were discarded despite a failed revoke"
         );
         assert!(err.to_string().contains("read-only"), "unexpected: {err}");
-    }
-
-    /// A reopen that fails raises no open event; waiting for one would block forever, and with
-    /// it a takeover at startup. The opener's own error, errno intact, comes back instead.
-    #[test]
-    #[ignore = "needs CAP_SYS_ADMIN for fanotify_init"]
-    fn open_without_events_reports_a_failed_open() {
-        let files = [(); 2].map(|_| vmm_sys_util::tempfile::TempFile::new().unwrap());
-        let fds = files.each_ref().map(|f| f.as_file().as_raw_fd());
-        let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let _ = tx.send(super::open_without_events_via(&fds, |_| {
-                Err(std::io::Error::from_raw_os_error(libc::EMFILE))
-            }));
-        });
-        let result = rx
-            .recv_timeout(std::time::Duration::from_secs(5))
-            .expect("open_without_events hung on a failed open");
-        assert_eq!(
-            result.err().and_then(|e| e.raw_os_error()),
-            Some(libc::EMFILE)
-        );
-    }
-
-    /// One group reopens every inode, and each descriptor comes back in its input's place.
-    #[test]
-    #[ignore = "needs CAP_SYS_ADMIN for fanotify_init"]
-    fn open_without_events_reopens_each_inode_in_order() {
-        let files = [(); 3].map(|_| vmm_sys_util::tempfile::TempFile::new().unwrap());
-        let fds = files.each_ref().map(|f| f.as_file().as_raw_fd());
-        let reopened = super::open_without_events(&fds).unwrap();
-        assert_eq!(reopened.len(), fds.len());
-        for (fd, quiet) in fds.iter().zip(&reopened) {
-            assert_eq!(
-                super::fd_identity(quiet.as_raw_fd()).unwrap(),
-                super::fd_identity(*fd).unwrap()
-            );
-        }
     }
 
     #[test]
