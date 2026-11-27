@@ -49,7 +49,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [rafs_bootstrap, erofs_metadata, zran_meta, zstd_cursor, fanotify_events]
+        target: [rafs_bootstrap, erofs_metadata, zran_meta, zstd_cursor, fanotify_events, go_json]
     steps:
       - uses: actions/checkout@v6
       - name: Install nightly

@@ -854,7 +854,13 @@ fn handle_readyz(controller: &SystemController) -> HttpResponse {
         return error_response(503, "not ready: gRPC socket path not configured");
     };
     match std::os::unix::net::UnixStream::connect(socket) {
-        Ok(_) => json_response(200, serde_json::json!({ "status": "ready" })),
+        Ok(_) => json_response(
+            200,
+            serde_json::json!({
+                "status": "ready",
+                "containerd_version": crate::containerd_grpc::containerd_version(),
+            }),
+        ),
         Err(e) => error_response(
             503,
             format!(

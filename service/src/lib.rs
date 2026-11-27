@@ -128,6 +128,11 @@ pub enum Error {
     #[error("failed to wait daemon, {0}")]
     WaitDaemon(#[source] io::Error),
 
+    /// The Vfs negotiated FUSE export support, and the backend's inodes carry no generation.
+    #[error(
+        "cannot mount {0}: FUSE export support is negotiated and its inodes carry no generation, so an old file handle could open a different file"
+    )]
+    ExportWithoutGeneration(&'static str),
     #[error("filesystem type mismatch, expect {0}")]
     FsTypeMismatch(String),
     #[error("passthroughfs failed to handle request, {0}")]
@@ -196,7 +201,7 @@ impl From<Error> for io::Error {
         let kind = match &e {
             Error::NotFound => io::ErrorKind::NotFound,
             Error::AlreadyExists => io::ErrorKind::AlreadyExists,
-            Error::Unsupported => io::ErrorKind::Unsupported,
+            Error::Unsupported | Error::ExportWithoutGeneration(_) => io::ErrorKind::Unsupported,
             Error::Busy(_) => io::ErrorKind::ResourceBusy,
             Error::InvalidArguments(_)
             | Error::InvalidConfig(_)

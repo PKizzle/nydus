@@ -38,8 +38,10 @@ use tracing::{debug, error, info, warn};
 
 /// Version of `AutoAccelManifest`. A sidecar whose manifest carries another version is treated as
 /// absent and reconverted; bump it when the artifact's content changes for every image (such as
-/// the layer merge rules), since the record name does not change.
-pub const AUTO_ACCEL_MANIFEST_VERSION: u32 = 3;
+/// the layer merge rules), since the record name does not change. Since version 4 every sidecar
+/// comes from a build that checked each layer against its diff ID, so an older one, from this
+/// node or a peer, is never served.
+pub const AUTO_ACCEL_MANIFEST_VERSION: u32 = 4;
 
 /// Auto-accel sidecar manifest written into containerd's content store
 /// alongside the bootstrap + zran index + prefetch blobs. The whole JSON is
@@ -243,6 +245,9 @@ pub struct AutoZranStatus {
     pub started_total: u64,
     pub succeeded_total: u64,
     pub failed_total: u64,
+    /// Failed jobs whose image had a layer that does not decompress to its diff ID.
+    #[serde(default)]
+    pub diff_id_mismatch_total: u64,
     /// Attempts put off because containerd was unreachable (no failure strike).
     pub deferred_total: u64,
     /// Jobs given up after waiting [`OUTAGE_WAIT_BUDGET`] for containerd (no failure strike).
@@ -325,6 +330,7 @@ struct AutoZranMetrics {
     started_total: AtomicU64,
     succeeded_total: AtomicU64,
     failed_total: AtomicU64,
+    diff_id_mismatch_total: AtomicU64,
     deferred_total: AtomicU64,
     abandoned_total: AtomicU64,
     running_jobs: AtomicU64,
@@ -519,6 +525,7 @@ impl AutoZranState {
             started_total: self.metrics.started_total.load(Ordering::Relaxed),
             succeeded_total: self.metrics.succeeded_total.load(Ordering::Relaxed),
             failed_total: self.metrics.failed_total.load(Ordering::Relaxed),
+            diff_id_mismatch_total: self.metrics.diff_id_mismatch_total.load(Ordering::Relaxed),
             deferred_total: self.metrics.deferred_total.load(Ordering::Relaxed),
             abandoned_total: self.metrics.abandoned_total.load(Ordering::Relaxed),
             // Filled in by the manager, which owns the queue.
@@ -890,6 +897,19 @@ async fn worker_loop(
                 }
                 fault => {
                     state.mark_finished(&job, false);
+                    if let Some(mismatch) = e.downcast_ref::<local_accel::DiffIdMismatch>() {
+                        state
+                            .metrics
+                            .diff_id_mismatch_total
+                            .fetch_add(1, Ordering::Relaxed);
+                        warn!(
+                            image = %job.image,
+                            layer = %mismatch.digest,
+                            diff_id = %mismatch.diff_id,
+                            "auto-zran refused the image: a layer does not decompress to the diff ID its config lists; no sidecar is built"
+                        );
+                        continue;
+                    }
                     if let Some(ContainerdFault::Misconfigured(socket)) = fault
                         && !MISCONFIGURED_SOCKET_REPORTED.swap(true, Ordering::Relaxed)
                     {
@@ -1230,7 +1250,7 @@ fn write_base_artifact(work_dir: &Path, artifact: &NodeLocalArtifact) -> Result<
     std::fs::write(&path, bytes).with_context(|| format!("write {}", path.display()))
 }
 
-/// Load a persisted base artifact IF it was built from exactly `layers`, its
+/// Load a persisted base artifact IF it was built from exactly `layers` (blobs and diff IDs), its
 /// on-disk inputs (merged bootstrap + backend dir, plus the prefetch blob when
 /// the artifact claims one) are still present and its `format_version` is
 /// [`AUTO_ACCEL_MANIFEST_VERSION`]. The work dir is keyed by image ref, so a
@@ -1248,6 +1268,10 @@ fn load_reusable_base_artifact(
             .iter()
             .map(String::as_str)
             .eq(layers.iter().map(local_accel::SourceLayer::blob_id))
+        || !artifact
+            .layer_diff_ids
+            .iter()
+            .eq(layers.iter().map(|l| &l.diff_id))
     {
         return None;
     }
@@ -1761,10 +1785,28 @@ mod tests {
         }
     }
 
+    /// The worker tells a diff ID mismatch from other failures through the context the
+    /// conversion adds.
+    #[test]
+    fn a_diff_id_mismatch_is_found_through_the_conversion_context() {
+        let e = anyhow::anyhow!("nydus-image targz-ref convert failed (exit status: 3)")
+            .context(local_accel::DiffIdMismatch {
+                digest: "sha256:l".to_string(),
+                diff_id: "sha256:d".to_string(),
+            })
+            .context("local_accel::convert (base) failed");
+        assert_eq!(
+            e.downcast_ref::<local_accel::DiffIdMismatch>()
+                .map(|m| m.digest.as_str()),
+            Some("sha256:l")
+        );
+    }
+
     /// The source layers the `layer_blob_ids: ["deadbeef"]` fixtures were built from.
     fn layers() -> Vec<local_accel::SourceLayer> {
         vec![local_accel::SourceLayer {
             digest: "sha256:deadbeef".to_string(),
+            diff_id: "sha256:d".to_string(),
             path: PathBuf::from("/nonexistent"),
         }]
     }
@@ -2188,6 +2230,7 @@ mod tests {
             backend_dir: backend.clone(),
             work_dir: work_dir.to_path_buf(),
             layer_blob_ids: vec!["deadbeef".to_string()],
+            layer_diff_ids: vec!["sha256:d".to_string()],
             zran_index_blob_ids: vec![Some("cafef00d".to_string())],
             prefetch_blob_id: None,
             format_version: AUTO_ACCEL_MANIFEST_VERSION,
@@ -2228,6 +2271,7 @@ mod tests {
             backend_dir: backend,
             work_dir: work_dir.to_path_buf(),
             layer_blob_ids: vec!["deadbeef".to_string()],
+            layer_diff_ids: vec!["sha256:d".to_string()],
             zran_index_blob_ids: vec![Some("cafef00d".to_string())],
             prefetch_blob_id: None,
             format_version: AUTO_ACCEL_MANIFEST_VERSION,
@@ -2263,6 +2307,7 @@ mod tests {
             backend_dir: backend,
             work_dir: work_dir.to_path_buf(),
             layer_blob_ids: vec!["deadbeef".to_string()],
+            layer_diff_ids: vec!["sha256:d".to_string()],
             zran_index_blob_ids: vec![Some("cafef00d".to_string())],
             prefetch_blob_id: None,
             format_version: AUTO_ACCEL_MANIFEST_VERSION,
@@ -2272,9 +2317,15 @@ mod tests {
 
         let layer = |digest: &str| local_accel::SourceLayer {
             digest: digest.to_string(),
+            diff_id: "sha256:d".to_string(),
             path: PathBuf::from("/nonexistent"),
         };
         let repointed = [layer("sha256:0ddba11")];
+        let other_diff_id = [local_accel::SourceLayer {
+            diff_id: "sha256:other".to_string(),
+            ..layer("sha256:deadbeef")
+        }];
+        assert!(load_reusable_base_artifact(work_dir, &other_diff_id).is_none());
         assert!(load_reusable_base_artifact(work_dir, &repointed).is_none());
         let extra_layer = [layer("sha256:deadbeef"), layer("sha256:0ddba11")];
         assert!(load_reusable_base_artifact(work_dir, &extra_layer).is_none());
@@ -2299,6 +2350,7 @@ mod tests {
             backend_dir: backend.clone(),
             work_dir: work_dir.to_path_buf(),
             layer_blob_ids: vec!["deadbeef".to_string()],
+            layer_diff_ids: vec!["sha256:d".to_string()],
             zran_index_blob_ids: vec![Some("cafef00d".to_string())],
             prefetch_blob_id: Some("prefetch01".to_string()),
             format_version: AUTO_ACCEL_MANIFEST_VERSION,

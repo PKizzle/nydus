@@ -47,6 +47,7 @@ pub mod content_store;
 pub mod daemon;
 pub mod failover;
 pub mod fdstore;
+pub(crate) mod go_json;
 pub mod grpc;
 pub mod local_accel;
 pub mod metrics;
@@ -64,6 +65,8 @@ pub mod retention;
 pub mod source;
 pub mod store;
 pub mod sysctl;
+#[cfg(test)]
+mod test_containerd;
 
 /// Crate-local result type; all public APIs return `anyhow::Result`.
 pub type Result<T> = anyhow::Result<T>;

@@ -555,9 +555,14 @@ fn auto_accel_sidecar_serves_converted_layers() {
         .iter()
         .map(|path| {
             let digest = store(path).digest;
+            let diff_id = fs::read_to_string(root.join("diff-ids").join(path.file_name().unwrap()))
+                .unwrap()
+                .trim()
+                .to_string();
             SourceLayer {
                 path: content_root.join("blobs/sha256").join(&digest[7..]),
                 digest,
+                diff_id,
             }
         })
         .collect();

@@ -1398,6 +1398,9 @@ pub struct BuildContext {
     /// - Directory: `source_path` should be a directory path
     /// - StargzIndex: `source_path` should be a stargz index json file path
     pub source_path: PathBuf,
+    /// Diff ID (`sha256:<hex>` of the uncompressed tar) the source of a ref conversion must
+    /// have; the build fails with [`crate::DiffIdMismatch`] otherwise.
+    pub source_diff_id: Option<String>,
 
     /// Track file/chunk prefetch state.
     pub prefetch: Prefetch,
@@ -1491,6 +1494,7 @@ impl BuildContext {
 
             conversion_type,
             source_path,
+            source_diff_id: None,
 
             prefetch,
             blob_storage,
@@ -1609,6 +1613,7 @@ impl Default for BuildContext {
 
             conversion_type: ConversionType::default(),
             source_path: PathBuf::new(),
+            source_diff_id: None,
 
             prefetch: Prefetch::default(),
             blob_storage: None,

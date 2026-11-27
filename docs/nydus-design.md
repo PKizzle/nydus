@@ -370,6 +370,16 @@ This layer refers to the metadata part of files and directories in the image, in
 
 This layer refers to the data part, please note that the data layers of an image can be owned solely by this image or shared by others, similarly, each data layer is annotated with `"containerd.io/snapshot/nydus-blob": "true"`, which can be used to tell containerd's snapshotter to skip downloading them.
 
+The snapshotter applies these rules to this annotation and to `containerd.io/snapshot/nydus-bootstrap`:
+
+- When containerd's `containerd.io/snapshot/diff-id` label (set by containerd 2.3 and later) is present, a data layer is committed without containerd applying it only if the label, with the parent, derives exactly the target chain ID. Unpackers that send no such label (older containerd, client-side unpackers such as nerdctl and Docker) skip that check. The label comes from the image's own config, so it proves only that the two agree; the rules below carry the trust.
+- On a chain holding a data layer, an unpack `Prepare` (one carrying `containerd.io/snapshot.ref`) may add only layers labelled as nydus data or bootstrap, and any other `Prepare` or `View` needs, above every data layer, a meta layer that holds an `image/image.boot` file. Everything else on such a chain is refused, logged with the chain and counted in `snapshotter_unapplied_chain_refused_total`.
+- A nydus meta layer counts only if it is labelled as one and holds a bootstrap.
+- The image a nydus daemon fetches blobs through is the chain's sole claimant among the containerd image records of the meta layer's namespace, listed again before the daemon is resolved; the image reference stored on the shared snapshot is kept while it names the claimant's repository, so one bootstrap keeps one daemon. An image reference in a call's labels is never used. A meta layer whose image cannot be named this way is an error (`FailedPrecondition`), never a plain overlay over the empty data layers.
+- An unpack `Prepare` always gets the plain overlay of its parent chain, never a daemon mount, and labels under `containerd.io/snapshot/nydus-daemon-` in a call are dropped: only the snapshotter sets them.
+
+A refusal lasts while the image that committed the data layer is on the node; removing it, and any image pulled onto its chain, clears it.
+
 The manifest is designed to be compatible with the dependency architect and garbage collection algorithm widely used by containerd and registry.
 
 ```json

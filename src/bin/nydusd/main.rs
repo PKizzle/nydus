@@ -354,7 +354,6 @@ fn process_fs_service(
     // safe as virtual_mountpoint default to "/"
     let virtual_mnt = args.value_of("virtual-mountpoint").unwrap();
 
-    let mut fs_type = FsBackendType::PassthroughFs;
     let mount_cmd = if let Some(shared_dir) = shared_dir {
         let cmd = FsBackendMountCmd {
             fs_type: FsBackendType::PassthroughFs,
@@ -447,13 +446,12 @@ fn process_fs_service(
             prefetch_files,
         };
 
-        fs_type = FsBackendType::Rafs;
-
         Some(cmd)
     } else {
         None
     };
 
+    let fs_type = mount_cmd.as_ref().map(|cmd| cmd.fs_type.clone());
     let vfs = create_vfs_backend(fs_type, is_fuse, args.is_present("hybrid-mode"))?;
     // Basically, below two arguments are essential for live-upgrade/failover/ and external management.
     let daemon_id = args.value_of("id").map(|id| id.to_string());
