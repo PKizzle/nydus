@@ -152,6 +152,11 @@ impl<R: Read + Seek> Members<R> {
         }
     }
 
+    /// The reader, positioned after everything [`Self::next_member`] has consumed.
+    pub fn into_inner(self) -> R {
+        self.inner
+    }
+
     /// Reader over the data of the member last returned by [`Self::next_member`].
     pub fn data(&mut self) -> MemberData<'_, R> {
         MemberData {

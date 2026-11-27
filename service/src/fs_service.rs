@@ -115,6 +115,8 @@ pub trait FsService: Send + Sync {
         if self.backend_from_mountpoint(&cmd.mountpoint)?.is_some() {
             return Err(Error::AlreadyExists);
         }
+        #[cfg(target_os = "linux")]
+        refuse_without_generation(self.get_vfs(), &cmd)?;
         let (backend, generation) = fs_backend_factory(&cmd, None)?;
         let index = self.get_vfs().mount(backend, &cmd.mountpoint)?;
         info!("{} filesystem mounted at {}", &cmd.fs_type, &cmd.mountpoint);
@@ -274,6 +276,28 @@ fn mountpoint_invalidation_target<'a>(vfs: &Vfs, mountpoint: &'a str) -> Result<
     let parent_ino = root_pseudofs.get_parent_inode(ino).ok_or(Error::NotFound)?;
 
     Ok((parent_ino, name))
+}
+
+/// Refuse a backend whose inodes carry no FUSE generation into a Vfs whose kernel accepted
+/// export support. Passthrough and overlay inode numbers restart with every instance, and a
+/// freed file system index is reused, so a file handle taken before an unmount could reopen a
+/// different file. The mount at the root precedes FUSE init and is not checked here.
+#[cfg(target_os = "linux")]
+fn refuse_without_generation(vfs: &Vfs, cmd: &FsBackendMountCmd) -> Result<()> {
+    if !vfs.initialized() || !vfs.options().out_opts.contains(FsOptions::EXPORT_SUPPORT) {
+        return Ok(());
+    }
+    let backend = match cmd.fs_type {
+        FsBackendType::PassthroughFs => "passthroughfs",
+        // An unparsable config is left to `fs_backend_factory` to report.
+        FsBackendType::Rafs
+            if ConfigV2::from_str(&cmd.config).is_ok_and(|cfg| cfg.overlay.is_some()) =>
+        {
+            "overlayfs"
+        }
+        FsBackendType::Rafs => return Ok(()),
+    };
+    Err(Error::ExportWithoutGeneration(backend))
 }
 
 /// Validate prefetch file list from user input.
@@ -456,6 +480,76 @@ mod tests {
 
         col.del("test");
         assert_eq!(col.0.len(), 0);
+    }
+
+    #[cfg(target_os = "linux")]
+    struct VfsOnly(Arc<Vfs>, std::sync::Mutex<FsBackendCollection>);
+
+    #[cfg(target_os = "linux")]
+    impl FsService for VfsOnly {
+        fn get_vfs(&self) -> &Vfs {
+            &self.0
+        }
+        fn upgrade_mgr(&self) -> Option<MutexGuard<'_, UpgradeManager>> {
+            None
+        }
+        fn backend_collection(&self) -> MutexGuard<'_, FsBackendCollection> {
+            self.1.lock().unwrap()
+        }
+        fn export_inflight_ops(&self) -> Result<Option<String>> {
+            Ok(None)
+        }
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+    }
+
+    /// Passthrough and overlay mounts are refused once the kernel accepted export support, and
+    /// only then: before FUSE init (the root mount), and on a daemon without export support.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn generationless_mounts_are_refused_under_export_support() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let svc = |fs_type, init| {
+            let vfs = crate::fusedev::create_vfs_backend(fs_type, true, false).unwrap();
+            if init {
+                vfs.init(FsOptions::all()).unwrap();
+            }
+            VfsOnly(vfs, Default::default())
+        };
+        let passthrough = |mountpoint: &str| FsBackendMountCmd {
+            fs_type: FsBackendType::PassthroughFs,
+            source: dir.path().to_str().unwrap().to_string(),
+            config: String::new(),
+            mountpoint: mountpoint.to_string(),
+            prefetch_files: None,
+        };
+        let overlay = FsBackendMountCmd {
+            fs_type: FsBackendType::Rafs,
+            source: "/nonexistent/bootstrap".to_string(),
+            config: r#"{"version": 2, "backend": {"type": "localfs", "localfs": {"dir": "/nonexistent"}},
+                "overlay": {"upper_dir": "/nonexistent/upper", "work_dir": "/nonexistent/work"}}"#
+                .to_string(),
+            mountpoint: "/ovl".to_string(),
+            prefetch_files: None,
+        };
+        let refused = |r: Result<()>| matches!(r, Err(Error::ExportWithoutGeneration(_)));
+
+        let exported = svc(None, true);
+        assert!(refused(exported.mount(passthrough("/pt"))));
+        assert!(refused(exported.mount(overlay.clone())));
+        // A plain RAFS mount gets past the check (and fails on the missing bootstrap).
+        let rafs = FsBackendMountCmd {
+            config: r#"{"version": 2, "backend": {"type": "localfs", "localfs": {"dir": "/nonexistent"}}}"#
+                .to_string(),
+            ..overlay.clone()
+        };
+        assert!(!refused(exported.mount(rafs)));
+
+        svc(None, false).mount(passthrough("/")).unwrap();
+        svc(Some(FsBackendType::PassthroughFs), true)
+            .mount(passthrough("/pt"))
+            .unwrap();
     }
 
     #[test]

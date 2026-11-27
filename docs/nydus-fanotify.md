@@ -239,6 +239,14 @@ on fanotify, whatever the label or check says: overlays may already sit on it, a
 top would leave them reading unfilled holes. If fanotify cannot start there, the start fails and
 the mount is detached. The FUSE path refuses to mount over any kernel mount.
 
+An auto-accel sidecar's merged bootstrap is served as its producer built it: the snapshotter
+checks that a sidecar names the image and that each blob matches its digest, but does not rebuild
+the bootstrap from the image's layers. Every node that writes the sidecar image record
+`nydus.auto-accel.local/sidecar:<subject manifest hex>` or serves it on the peer mirror is
+trusted to produce sidecars for every image; containers cannot create that record through CRI.
+The rules and deployment constraints are in "Sidecar trust model" in
+[ARCHITECTURE.md](../ARCHITECTURE.md).
+
 The cache of a fanotify daemon lives in its `daemons/<slug>/stage` dir, next to the staged
 bootstrap. Cache GC and the cache-bytes metric count it (each inode once: the `blob_<i>` device
 files are hardlinks to the `.blob.data` files) against `gc_max_bytes`, but never evict it; a dead
@@ -270,6 +278,61 @@ equivalent: their registry credentials are part of the RAFS mount command, which
 does not replace under a live FUSE mount, so a FUSE daemon started without credentials keeps failing until it
 is restarted. These images get no page cache sharing domain: only bootstraps this node built
 qualify.
+
+A process that dies between reading a permission event and answering it (`kill -9`, an abort,
+the OOM killer) leaves the event on the group, which systemd's fd store keeps alive, and its reader
+blocked until killed: the kernel answers such an event only when the group closes, and no
+interface lists it. The kernel matches a response to an event by the event's fd number alone, so
+at startup, before any worker reads, the successor writes a `FAN_DENY_ERRNO(EIO)` response for
+every fd number below the sweep bound to each parked group it is not told is clean
+(`nydus_service::fanotify::deny_stranded_events`), repeating a number until no event is left
+under it, since readers in successive dead processes can strand events under the same number.
+Nothing else is answered. A stranded reader usually completes with correct data: most stranded
+events come from EROFS readahead, and a denied readahead is retried by the read itself with an
+event the successor serves. Only a denied synchronous page read fails its reader with `EIO`.
+
+- **Which groups are clean.** A snapshotter stopping with an fd store (`preserve_for_failover`)
+  first refuses every new daemon start, heal, recovery and upgrade, waits out those under way (each
+  checks before it stops anything, holding its image's start lock or the `instances` write lock,
+  and then runs to completion), stops and joins the workers of every armed daemon, and parks a
+  token in the fd store: a memfd named `fanotify-events-answered` holding the process's nonce and
+  those images' slugs, minus any whose group its own startup sweep failed. The successor takes
+  the token out of the store before it serves anything and sweeps every parked group the token
+  does not list. It trusts no token it cannot evict (no fd store) and none whose nonce differs
+  from the one the predecessor recorded in `<root>/fanotify-nofile`, so a token an earlier
+  process left behind never vouches for groups a later one read; without a trusted token it
+  sweeps every parked group. A token lives in the fd store rather than the snapshotter root
+  because releases v3.0.1 through v3.6.0 evict a parked fd that no daemon record names: after a
+  downgrade, the older release drops the token, so a crash of it is swept after the next upgrade.
+- **The sweep bound.** A reader takes event fds below its soft `RLIMIT_NOFILE`. Every start
+  records its own soft limit and nonce in `<root>/fanotify-nofile` before any of its workers
+  runs; the
+  successor sweeps below the larger of the recorded limit (`RLIMIT_NOFILE_MAX`, 1,000,000, when
+  there is none) and its own, capped at 2^20: fds are allocated lowest first, and the snapshotter
+  never holds a million descriptors at once. Groups are swept in parallel, one thread per CPU at
+  most. Measured on Linux 7.3 with 2^20 writes to one group and on four groups in four threads:
+  a Raspberry Pi 4 takes 0.53 s per group (about 500 ns a write) and 1.4–1.7 s for the four
+  groups, a Raspberry Pi 5 0.21 s and 0.26–0.34 s. Only restarts without a trusted token pay it.
+
+Only `SIGTERM` and `SIGINT` stop the snapshotter gracefully. Every other signal that ends it
+(`SIGHUP`, `SIGUSR1`, `SIGUSR2`, `SIGQUIT`, `SIGABRT` and an uncontained panic, which aborts) is a
+crash as far as its groups go: no token, and the successor sweeps. Rust's stack-overflow handler
+swallows the first `SIGSEGV` or `SIGBUS` sent with `kill`, `SIGPIPE` is ignored, and a stopped
+snapshotter (`SIGSTOP`, a cgroup freeze) blocks its readers until it continues. A core dump keeps
+the dying process, and so its groups, alive until the dump is written; the address space is
+mostly reserved and unpopulated (about 1.9 GB virtual and 40 MB resident on an idle snapshotter),
+but a pipe `core_pattern` such as `systemd-coredump` is sent its holes as zeros.
+
+Without an fd store (a Helm DaemonSet, or a snapshotter run by hand) a group closes with the
+process, and `fanotify_release()` allows every event still queued. A graceful stop
+(`shutdown_all`) therefore first refuses new daemon starts and waits out those under way, as a stop
+with an fd store does, then unmounts every fanotify mount at once while its group is still open,
+retrying a busy one for about 10 s, so the stop fits a 30 s termination grace period. A mount
+still busy after that (a container's overlay holding it) keeps its daemon record live, and so does
+every mount of a process that dies without a graceful stop. Such a mount stays up without a group
+until the next start re-arms it in place (`rebuild_from_records`): meanwhile reads of data never
+fetched return zeros, and EROFS may keep the zeros it read in its page cache. On the fanotify path,
+run the snapshotter under systemd with an fd store.
 
 The fanotify path has no RAFS instance, so `[snapshotter.features] prefetch`, runtime prefetch
 lists and `cache.disable_indexed` apply only to images served over FUSE; a fanotify daemon fetches

@@ -508,7 +508,14 @@ mod tests {
         let work = tempfile::tempdir().unwrap();
         let (boot, out) = (work.path().join("bootstrap"), work.path().join("out"));
         std::fs::create_dir_all(&out).unwrap();
-        let args = crate::local_accel::targz_ref_args(&layer, &boot, &out);
+        let mut tar = Vec::new();
+        std::io::Read::read_to_end(
+            &mut flate2::read::MultiGzDecoder::new(std::fs::File::open(&layer).unwrap()),
+            &mut tar,
+        )
+        .unwrap();
+        let diff_id = format!("sha256:{}", hex::encode(sha2::Sha256::digest(&tar)));
+        let args = crate::local_accel::targz_ref_args(&layer, &diff_id, &boot, &out);
         let status = std::process::Command::new(nydus_image)
             .args(args)
             .status()

@@ -350,7 +350,7 @@ impl Reconciler {
                     Some(image_ref) => Some(image_ref),
                     None => match snap.parent.as_deref() {
                         Some(parent) => overlay
-                            .nydus_meta_info(&store, parent, &snap.labels)
+                            .nydus_meta_info(&store, parent, crate::overlay::MetaUse::Account)
                             .with_context(|| format!("resolve daemon for snapshot {}", snap.key))?
                             .map(|meta| meta.image_ref),
                         None => None,

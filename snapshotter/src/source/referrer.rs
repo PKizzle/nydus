@@ -273,38 +273,26 @@ async fn detect(image_ref: &str, config: &SnapshotterConfig) -> Result<Option<Re
     // computes the digest locally from the body bytes, so registries that
     // omit the optional Docker-Content-Digest header resolve correctly too
     // (they once classified every image as StandardOci).
-    let mut top_bytes: Option<Vec<u8>> = None;
+    //
+    // A nydus sibling is looked for only in a top-level index containerd
+    // holds, read from its content store by digest: the snapshotter names an
+    // image by its record target (`repo@digest`), the object the container
+    // came from, and a tag resolved in the registry now may name another.
+    let mut local_top: Option<Vec<u8>> = None;
     let digest = if let Some(digest) = parsed.digest.clone() {
-        // kubelet resolves tags to digests before CRI ever pulls, so production image refs
-        // arrive digest-pinned -- and that digest names the top-level object (the dual index
-        // itself, verified against a live pull). Without fetching it here, dual-manifest
-        // detection would only ever fire for tag-form refs (ctr, tests), never for a pod.
-        // containerd has already stored this exact object -- it resolved the
-        // ref before CRI pulled -- so read it off disk first. Skipping the
-        // round-trip matters: kubelet digest-pins every production ref, so
-        // otherwise EVERY image pays an extra registry GET on the Prepare path,
-        // and a transient failure means paying it again on the next Prepare
-        // (only resolved outcomes are cached).
         match read_content_store_blob(&config.snapshotter.containerd.content_root(), &digest) {
             Some(bytes) => {
                 debug!(%digest, "read pinned top-level manifest from the content store");
-                top_bytes = Some(bytes);
+                local_top = Some(bytes);
             }
-            None => match client.get_manifest(repo, &digest).await {
-                Ok(fetched) => top_bytes = Some(fetched.bytes),
-                Err(e) => {
-                    debug!(%digest, error = %e, "could not fetch pinned top-level manifest; skipping dual-index detection");
-                }
-            },
+            None => {
+                debug!(%digest, "pinned top-level manifest not in the content store; skipping dual-index detection");
+            }
         }
         digest
     } else if let Some(tag) = parsed.tag.as_deref() {
         match client.get_manifest(repo, tag).await {
-            Ok(fetched) => {
-                let digest = fetched.digest;
-                top_bytes = Some(fetched.bytes);
-                digest
-            }
+            Ok(fetched) => fetched.digest,
             Err(RegistryError::NotFound { .. }) => return Ok(None),
             Err(e) => return Err(e).context("resolve subject manifest digest"),
         }
@@ -317,9 +305,10 @@ async fn detect(image_ref: &str, config: &SnapshotterConfig) -> Result<Option<Re
     // or the legacy os.features. More authoritative than any referrer -- it is part of the
     // image -- and this is the only place it gets noticed: containerd resolves the OCI half
     // (first platform match), so Prepare alone would ride the plain-OCI path and the
-    // pre-built nydus artifact would go unused.
+    // pre-built nydus artifact would go unused. The sibling manifest and its bootstrap are
+    // fetched by the digests this index names, which bind them.
     if config.snapshotter.features.dual_index_detect
-        && let Some(bytes) = top_bytes.as_deref()
+        && let Some(bytes) = local_top.as_deref()
         && let Some(info) = classify_dual_index(bytes)
     {
         return Ok(Some(info));
