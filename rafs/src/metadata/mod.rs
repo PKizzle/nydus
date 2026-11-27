@@ -271,7 +271,10 @@ pub trait RafsInodeExt: RafsInode {
     fn as_inode(&self) -> &dyn RafsInode;
 
     /// Posix: get inode number of the parent inode.
-    fn parent(&self) -> u64;
+    ///
+    /// A RAFS v6 non-directory inode records no parent on disk; it knows its parent only when it
+    /// was reached through a directory, and fails otherwise.
+    fn parent(&self) -> RafsResult<u64>;
 
     /// Posix: get file name.
     fn name(&self) -> OsString;
@@ -1116,7 +1119,7 @@ impl RafsSuper {
             if inode.ino() == self.superblock.root_ino() {
                 break;
             } else {
-                cur_ino = inode.parent();
+                cur_ino = inode.parent()?;
             }
         }
 

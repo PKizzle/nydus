@@ -1111,7 +1111,9 @@ impl From<&dyn RafsInodeExt> for RafsV5Inode {
 
         RafsV5Inode {
             i_digest: inode.get_digest(),
-            i_parent: inode.parent(),
+            // RAFS v5 inodes always record their parent; only a v6 inode (converted here for
+            // `Debug`) can lack one.
+            i_parent: inode.parent().unwrap_or_default(),
             i_ino: attr.ino,
             i_uid: attr.uid,
             i_gid: attr.gid,

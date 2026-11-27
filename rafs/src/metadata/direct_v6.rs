@@ -975,7 +975,7 @@ impl OndiskInodeWrapper {
         if cur_ino == self.mapping.info.root_ino {
             self.name = Some(OsString::from(""));
         } else {
-            let parent = self.mapping.inode_wrapper(state, self.parent())?;
+            let parent = self.mapping.inode_wrapper(state, self.parent()?)?;
             parent.walk_children_inodes(
                 0,
                 &mut |_inode: Option<Arc<dyn RafsInode>>, name: OsString, ino, _offset| {
@@ -1529,8 +1529,13 @@ impl RafsInodeExt for OndiskInodeWrapper {
     }
 
     /// Get inode number of the parent directory.
-    fn parent(&self) -> u64 {
-        self.parent_inode.unwrap()
+    fn parent(&self) -> RafsResult<u64> {
+        self.parent_inode.ok_or_else(|| {
+            RafsError::NotFound(format!(
+                "v6: parent of inode {} is unknown, it was not reached through a directory",
+                self.ino()
+            ))
+        })
     }
 
     /// Get name of the inode.
@@ -2251,6 +2256,27 @@ mod tests {
         }
         assert!(patched >= 2, "blob table and device table");
         assert!(matches!(load_v6(&data), Err(RafsError::InvalidMetadata(_))));
+    }
+
+    /// A v6 non-directory inode records no parent on disk: reached without a lookup through its
+    /// directory, `parent()` fails instead of panicking. Reached through the directory, it knows.
+    #[test]
+    fn a_file_reached_without_its_directory_has_no_parent() {
+        let (path, data) = v6_fixture();
+        let sb = load_v6(&data).unwrap();
+        let mut dsb = DirectSuperBlockV6::new(&sb.meta, superblocks_of(&path));
+        dsb.load(&mut open_bootstrap(&path)).unwrap();
+        let root_nid = sb.meta.root_nid as u64;
+        let root = dsb.get_extended_inode(root_nid, false).unwrap();
+        let file = (0..root.get_child_count())
+            .map(|i| root.get_child_by_index(i).unwrap())
+            .find(|c| !c.is_dir())
+            .expect("the fixture holds a file");
+        assert_eq!(file.parent().unwrap(), root_nid);
+
+        let state = dsb.state.load();
+        let bare = dsb.inode_wrapper(&state, file.ino()).unwrap();
+        assert!(matches!(bare.parent(), Err(RafsError::NotFound(_))));
     }
 
     /// A directory block whose first dirent claims `e_nameoff == 0` holds zero entries; a lookup

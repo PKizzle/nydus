@@ -302,7 +302,7 @@ impl InodeWrapper {
             InodeWrapper::V6(_i) => unimplemented!(),
             InodeWrapper::Ref(i) => {
                 if self.is_v5() {
-                    i.parent()
+                    i.parent().expect("a RAFS v5 inode records its parent")
                 } else {
                     unimplemented!()
                 }
