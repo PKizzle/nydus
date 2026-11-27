@@ -33,6 +33,8 @@ on:
 env:
   CARGO_TERM_COLOR: always
   VIRTME_NG_VERSION: "1.41"
+  # Keep in step with SANITIZER_TOOLCHAIN in sanitizers.yml.
+  SANITIZER_TOOLCHAIN: nightly-2026-10-20
 
 jobs:
   fanotify-vm:
@@ -48,7 +50,8 @@ jobs:
       # Ubuntu mainline builds: 6.18.y is the supported floor, 7.3.y the newest release, 7.4-rc the
       # first with the EROFS partial-folio fix (52dceb88082b), which 7.3.1 lacks. `erofs_folio` is
       # the self-test verdict on 4K pages, where 512-byte-block images trigger the bug.
-      # Per entry, bump all five together (sha256 from the release's CHECKSUMS file).
+      # Per entry, bump all five together (sha256 from the release's CHECKSUMS file). `asan` marks
+      # the one kernel that also runs the nydus-service tests under AddressSanitizer.
       matrix:
         include:
         - kernel: 6.18.55
@@ -60,6 +63,7 @@ jobs:
             0f532598e00ba37515288eda4b53426ee7ce53abb99d949c911873c679d6aaf5  linux-modules-6.18.55-061855-generic_6.18.55-061855.202610031245_amd64.deb
         - kernel: 7.3.1
           erofs_folio: affected
+          asan: true
           image_deb: linux-image-unsigned-7.3.1-070301-generic_7.3.1-070301.202610301300_amd64.deb
           modules_deb: linux-modules-7.3.1-070301-generic_7.3.1-070301.202610301300_amd64.deb
           sha256: |
@@ -171,6 +175,54 @@ jobs:
         EOF
         cat "$RUNNER_TEMP/guest.sh"
         vng --run "$VMLINUZ" --user root --cpus 4 --memory 6G --rwdir "$RUNNER_TEMP" --exec "bash $RUNNER_TEMP/guest.sh"
+    # The sanitizer jobs have no >= 6.14 kernel, so the nydus-service tests that need one (the
+    # NYDUS_FANOTIFY_TEST_DIR fixtures, the root-only EROFS mounts) print SKIP or return early
+    # there; here they run as root under ASan, the way `make asan-ut-nextest` builds them. A glibc
+    # build, which the guest runs from the runner's own root file system.
+    - name: Build the nydus-service test binary with ASan
+      id: asan-build
+      if: ${{ !cancelled() && matrix.asan }}
+      run: |
+        rustup toolchain install "$SANITIZER_TOOLCHAIN" --profile minimal
+        # An explicit --target keeps build scripts and proc macros uninstrumented.
+        BIN=$(RUSTFLAGS=-Zsanitizer=address rustup run "$SANITIZER_TOOLCHAIN" cargo test -p nydus-service \
+          --lib --no-run --target x86_64-unknown-linux-gnu --message-format=json \
+          | jq -r 'select(.profile.test and .executable != null and (.target.kind | index("lib"))) | .executable' | tail -1)
+        test -x "$BIN"
+        echo "ASAN_SERVICE_TEST_BIN=$BIN" >> "$GITHUB_ENV"
+        # Without it, LeakSanitizer reports raw addresses and lsan.supp cannot match frames.
+        sym=$(command -v llvm-symbolizer || ls /usr/bin/llvm-symbolizer-* 2>/dev/null | sort -V | tail -1)
+        if [ -z "$sym" ]; then
+          sudo apt-get install -y -qq llvm
+          sym=$(command -v llvm-symbolizer)
+        fi
+        echo "ASAN_SYMBOLIZER_PATH=$sym" >> "$GITHUB_ENV"
+    - name: Run the nydus-service tests under ASan in the VM
+      if: ${{ matrix.asan && !cancelled() && steps.fetch.outcome == 'success' && steps.asan-build.outcome == 'success' }}
+      run: |
+        D="$RUNNER_TEMP/asan"; mkdir -p "$D"
+        # The fixtures need pre-content marks, which the shared runner directories lack.
+        truncate -s 2G "$D/ext4.img"; mkfs.ext4 -q -F "$D/ext4.img"
+        cat > "$D/guest.sh" <<EOF
+        modprobe erofs
+        mkdir -p /var/tmp/asan && mount -o loop '$D/ext4.img' /var/tmp/asan || exit 1
+        cd '$GITHUB_WORKSPACE/service'
+        # Fixture paths come from CARGO_MANIFEST_DIR at run time, which cargo test would set.
+        CARGO_MANIFEST_DIR='$GITHUB_WORKSPACE/service' \\
+        NYDUS_FANOTIFY_TEST_DIR=/var/tmp/asan TMPDIR=/var/tmp/asan RUST_BACKTRACE=1 \\
+        ASAN_OPTIONS=detect_leaks=1 ASAN_SYMBOLIZER_PATH='$ASAN_SYMBOLIZER_PATH' \\
+        LSAN_OPTIONS='suppressions=$GITHUB_WORKSPACE/misc/sanitizers/lsan.supp:print_suppressions=0' \\
+          '$ASAN_SERVICE_TEST_BIN' --test-threads=4 > '$D/test.log' 2>&1
+        echo "exit status \$?" >> '$D/test.log'
+        EOF
+        vng --run "$VMLINUZ" --user root --cpus 4 --memory 6G --rwdir "$RUNNER_TEMP" --exec "bash $D/guest.sh"
+        cat "$D/test.log"
+        # ASan exits non-zero on a report; the greps also catch one a test swallowed, a test
+        # that skipped instead of running, and a binary that never ran.
+        ! grep -E 'ERROR: (Address|Leak)Sanitizer' "$D/test.log" || { echo "::error::ASan reported an error"; exit 1; }
+        ! grep 'SKIP' "$D/test.log" || { echo "::error::a kernel-fixture test skipped"; exit 1; }
+        grep -qE '^test result: ok\. [1-9][0-9]* passed; 0 failed' "$D/test.log" || { echo "::error::the tests failed or did not run"; exit 1; }
+        grep -qx 'exit status 0' "$D/test.log"
 
   # Large pages: 4K-block images on a 64K-page kernel, the partial-folio bug's common trigger, and
   # the fanotify fill path, whose events then span several chunks (dead chunks of a lower layer

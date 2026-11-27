@@ -6923,6 +6923,21 @@ mod tests {
         assert!(dir.join("stage/bootstrap").exists());
     }
 
+    /// A daemon serving the image keeps its stage even while the record still reads stopped,
+    /// as after a start whose record write failed.
+    #[compio::test]
+    async fn an_eviction_skips_an_image_a_daemon_serves() {
+        let tmp = tempfile::tempdir().unwrap();
+        let image_ref = "registry.local/team/app:1";
+        let (supervisor, _, dir) = retained(tmp.path(), image_ref).await;
+        let stopped = supervisor.read_persisted_records().pop().unwrap();
+        supervisor
+            .insert_test_instance(image_ref, dir.join("mnt"))
+            .await;
+        assert!(!supervisor.evict_retained(&stopped).await.unwrap());
+        assert!(dir.join("stage/bootstrap").exists());
+    }
+
     /// Stopped records outlive their stage until they are idle too long or too many.
     #[compio::test]
     async fn stopped_records_are_pruned_by_age_and_count() {
