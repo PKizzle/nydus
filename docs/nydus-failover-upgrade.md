@@ -57,11 +57,14 @@ KillMode=process
 LimitNOFILE=1048576
 ```
 
-Without a notify socket (`NOTIFY_SOCKET` unset — e.g. running by hand, or a Helm DaemonSet), the
-snapshotter logs that the fd store is unavailable and degrades gracefully: mounts still work, they
-just do not survive a snapshotter restart. The driver probe then never selects fanotify, whose
-mounts would serve zeros for unfetched data once the process is gone, and serves new images with
-the next viable driver ([nydus-fanotify.md](nydus-fanotify.md)).
+Without a notify socket (`NOTIFY_SOCKET` unset — e.g. running by hand, or the Helm chart's default
+`deploymentMode: pod`), the snapshotter logs that the fd store is unavailable and degrades
+gracefully: mounts still work, they just do not survive a snapshotter restart. The driver probe then
+never selects fanotify, whose mounts would serve zeros for unfetched data once the process is gone,
+and serves new images with the next viable driver ([nydus-fanotify.md](nydus-fanotify.md)). The
+chart's `deploymentMode: hostSystemd` installs the unit above on each node from a DaemonSet, which
+brings the fd store to Kubernetes deployments (deploy/helm/nydus-snapshotter/README.md, "Deployment
+modes").
 
 ## Upgrading the snapshotter binary
 
