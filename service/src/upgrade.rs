@@ -1046,6 +1046,13 @@ mod tests {
         let mount = &restored.fs_mount_cmd_map["/mnt"];
         assert_eq!((mount.vfs_index, mount.generation), (3, 0));
         assert_eq!(restored.fuse_conn_id, 7);
+
+        // A release that knows only version 1 refuses this state instead of restoring the mount
+        // with its own generation; its snapshotter then detaches the mount.
+        let mut buf = FusedevBackendState::from(&upgrade_mgr.fuse_deamon_stat)
+            .save()
+            .unwrap();
+        assert!(FusedevBackendStateV1::restore(&mut buf).is_err());
     }
 
     #[test]

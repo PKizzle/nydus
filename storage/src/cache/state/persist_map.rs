@@ -1087,3 +1087,230 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod properties {
+    use std::collections::BTreeSet;
+    use std::os::unix::fs::FileExt;
+
+    use proptest::prelude::*;
+    use tempfile::TempDir;
+
+    use super::*;
+
+    const CHUNKS: u32 = 13;
+
+    fn word<T: Arbitrary + Clone + std::fmt::Debug + 'static>(special: &[T]) -> BoxedStrategy<T> {
+        prop_oneof![proptest::sample::select(special.to_vec()), any::<T>()].boxed()
+    }
+
+    /// Header bytes biased towards the values the opener branches on.
+    fn headers() -> impl Strategy<Value = Vec<u8>> {
+        (
+            (
+                word(&[MAGIC1, 0]),
+                word(&[0u32, 1, 2]),
+                word(&[MAGIC2, 0]),
+                word(&[MAGIC_ALL_READY, 0]),
+                word(&[MAGIC_VERIFIED, 0]),
+                word(&[0u32, 1, CHUNKS]),
+            ),
+            (
+                word(&[0u64]),
+                word(&[0u64, 1, 2]),
+                word(&[0u64, 1]),
+                word(&[MAGIC_TRACKED, 0]),
+            ),
+            proptest::collection::vec(any::<u8>(), 0..16),
+        )
+            .prop_map(
+                |((m1, v, m2, all, ver, rc), (stamp, boot, recheck, tracked), tail)| {
+                    let mut h = Vec::with_capacity(HEADER_SIZE);
+                    for w in [m1, v, m2, all, ver, rc] {
+                        h.extend_from_slice(&w.to_ne_bytes());
+                    }
+                    for w in [stamp, boot, recheck, tracked] {
+                        h.extend_from_slice(&w.to_ne_bytes());
+                    }
+                    h.extend_from_slice(&tail);
+                    h.resize(HEADER_SIZE, 0);
+                    h
+                },
+            )
+    }
+
+    fn header_u32(h: &[u8], offset: usize) -> u32 {
+        u32::from_ne_bytes(h[offset..offset + 4].try_into().unwrap())
+    }
+
+    fn header_u64(path: &str, offset: usize) -> u64 {
+        let mut word = [0u8; 8];
+        File::open(path)
+            .unwrap()
+            .read_exact_at(&mut word, offset as u64)
+            .unwrap();
+        u64::from_ne_bytes(word)
+    }
+
+    proptest! {
+        /// Any header opens as a map or, when the opener may create one, a damaged one is
+        /// replaced by an empty map; never a panic.
+        #[test]
+        #[cfg_attr(miri, ignore = "Miri does not support file-backed mmap")]
+        fn any_header_opens_or_is_recreated(
+            header in headers(),
+            bitmap in proptest::collection::vec(any::<u8>(), CHUNKS.div_ceil(8) as usize),
+            create in any::<bool>(),
+        ) {
+            let dir = TempDir::new().unwrap();
+            let path = dir.path().join("map").to_str().unwrap().to_string();
+            // Chunk 0 is the high bit; padding bits past the last chunk count for nothing.
+            let ready_bits = (0..CHUNKS)
+                .filter(|&i| bitmap[(i / 8) as usize] & (0x80 >> (i % 8)) != 0)
+                .count() as u32;
+            std::fs::write(&path, [header.as_slice(), &bitmap].concat()).unwrap();
+
+            let zero = header.iter().chain(&bitmap).all(|b| *b == 0);
+            let damaged = !zero
+                && (header_u32(&header, 0) != MAGIC1
+                    || (header_u32(&header, 4) >= 1 && header_u32(&header, 8) != MAGIC2));
+            let fresh = zero || damaged;
+            let map = PersistMap::open(&path, CHUNKS, create, true);
+            if !create {
+                prop_assert!(!fresh || map.is_err());
+                return Ok(());
+            }
+            let map = map.unwrap();
+            prop_assert!(map.ready_chunks() <= CHUNKS);
+            if fresh {
+                prop_assert_eq!(map.ready_chunks(), 0);
+                prop_assert!(!map.is_rechecking());
+                prop_assert_eq!(
+                    header_u64(&path, std::mem::offset_of!(Header, tracked)),
+                    MAGIC_TRACKED
+                );
+            } else {
+                prop_assert_eq!(map.ready_chunks(), ready_bits);
+            }
+            // Whatever the header held, adopting a boot with `forget_untrusted` leaves nothing
+            // ready unless the map vouches for its ready bits.
+            let unsealed = header_u64(&path, std::mem::offset_of!(Header, unsealed_boot));
+            let tracked = header_u64(&path, std::mem::offset_of!(Header, tracked));
+            let forgot = map.adopt_boot(1, true).unwrap();
+            prop_assert_eq!(forgot, (unsealed != 0 && unsealed != 1) || tracked != MAGIC_TRACKED);
+            if forgot {
+                prop_assert_eq!(map.ready_chunks(), 0);
+                prop_assert!(map.is_rechecking() && !map.is_verified(0));
+            }
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    enum Op {
+        SetReady(u32),
+        /// Set every chunk ready in turn.
+        Fill,
+        ClearReady(u32),
+        MarkUnsealed,
+        /// Seal with a flush that succeeds or fails.
+        Seal(bool),
+        Reset,
+        /// Reopen as this boot.
+        Reopen(u64),
+    }
+
+    fn ops() -> impl Strategy<Value = Vec<Op>> {
+        let op = prop_oneof![
+            4 => (0..CHUNKS).prop_map(Op::SetReady),
+            1 => Just(Op::Fill),
+            1 => (0..CHUNKS).prop_map(Op::ClearReady),
+            1 => Just(Op::MarkUnsealed),
+            2 => any::<bool>().prop_map(Op::Seal),
+            1 => Just(Op::Reset),
+            2 => (1..4u64).prop_map(Op::Reopen),
+        ];
+        proptest::collection::vec(op, 1..40)
+    }
+
+    proptest! {
+        /// Against a model of the header: a ready bit is preceded by the boot's mark, a
+        /// successful seal clears the mark and a failed one keeps it, a map another boot left
+        /// unsealed forgets its ready bits and rechecks, and the recheck ends once every chunk
+        /// is ready.
+        #[test]
+        #[cfg_attr(miri, ignore = "Miri does not support file-backed mmap")]
+        fn seal_transitions_follow_the_model(ops in ops()) {
+            let dir = TempDir::new().unwrap();
+            let path = dir.path().join("map").to_str().unwrap().to_string();
+            let unsealed_on_disk = || header_u64(&path, std::mem::offset_of!(Header, unsealed_boot));
+            let mut map = PersistMap::open(&path, CHUNKS, true, true).unwrap();
+            map.adopt_boot(1, true).unwrap();
+            let (mut boot, mut ready, mut unsealed, mut recheck) = (1u64, BTreeSet::new(), 0u64, false);
+
+            for op in ops {
+                let set = match op {
+                    Op::SetReady(i) => i..i + 1,
+                    Op::Fill => 0..CHUNKS,
+                    _ => 0..0,
+                };
+                for i in set {
+                    map.set_chunk_ready(i).unwrap();
+                    if ready.insert(i) {
+                        unsealed = boot;
+                        if ready.len() == CHUNKS as usize {
+                            recheck = false;
+                        }
+                    }
+                }
+                match op {
+                    Op::SetReady(_) | Op::Fill => {}
+                    Op::ClearReady(i) => {
+                        map.clear_chunk_ready(i).unwrap();
+                        ready.remove(&i);
+                    }
+                    Op::MarkUnsealed => {
+                        map.mark_unsealed().unwrap();
+                        unsealed = boot;
+                    }
+                    Op::Seal(ok) => {
+                        let mut flushed = false;
+                        let result = map.seal(&mut || {
+                            flushed = true;
+                            if ok { Ok(None) } else { Err(StorageError::Unsupported) }
+                        });
+                        prop_assert_eq!(flushed, unsealed != 0);
+                        match (unsealed, ok) {
+                            (0, _) => prop_assert!(!result.unwrap()),
+                            (_, true) => {
+                                prop_assert!(result.unwrap());
+                                unsealed = 0;
+                            }
+                            (_, false) => prop_assert!(result.is_err()),
+                        }
+                    }
+                    Op::Reset => {
+                        map.reset().unwrap();
+                        ready.clear();
+                    }
+                    Op::Reopen(next) => {
+                        drop(map);
+                        map = PersistMap::open(&path, CHUNKS, true, true).unwrap();
+                        let forget = unsealed != 0 && unsealed != next;
+                        prop_assert_eq!(map.adopt_boot(next, true).unwrap(), forget);
+                        if forget {
+                            ready.clear();
+                            recheck = true;
+                        }
+                        boot = next;
+                    }
+                }
+                prop_assert_eq!(unsealed_on_disk(), unsealed);
+                prop_assert_eq!(map.is_rechecking(), recheck);
+                prop_assert_eq!(map.ready_chunks() as usize, ready.len());
+                for i in 0..CHUNKS {
+                    prop_assert_eq!(map.is_chunk_ready(i).0, ready.contains(&i));
+                }
+            }
+        }
+    }
+}

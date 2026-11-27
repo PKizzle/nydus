@@ -917,6 +917,35 @@ mod tests {
         assert!(negotiated(Some(FsBackendType::Rafs), false, false).0);
     }
 
+    /// A takeover restores each mount with the generation its predecessor answered, not the
+    /// image's own: a predecessor that answered 0 left the kernel caching inodes with 0.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support readahead")]
+    fn a_restored_mount_answers_the_saved_generation() {
+        let work_dir = tempfile::TempDir::new().unwrap();
+        let config = serde_json::json!({
+            "version": 2,
+            "backend": { "type": "localfs", "localfs": { "dir": "../tests/texture/blobs" } },
+            "cache": { "type": "filecache", "filecache": { "work_dir": work_dir.path() } },
+            "rafs": { "mode": "direct" }
+        });
+        let cmd = FsBackendMountCmd {
+            fs_type: FsBackendType::Rafs,
+            config: config.to_string(),
+            mountpoint: "/".to_string(),
+            source: "../tests/texture/bootstrap/rafs-v6-2.2.boot".to_string(),
+            prefetch_files: None,
+        };
+        let vfs = create_vfs_backend(Some(FsBackendType::Rafs), true, false).unwrap();
+        let svc =
+            FusedevFsService::new(vfs, work_dir.path(), None, FailoverPolicy::None, true).unwrap();
+        svc.restore_mount(&cmd, 1, 0).unwrap();
+        let (fs, _) = svc.backend_from_mountpoint("/").unwrap().unwrap();
+        let rafs = fs.as_any().downcast_ref::<nydus_rafs::fs::Rafs>();
+        assert_eq!(rafs.unwrap().generation(), 0);
+    }
+
     #[test]
     fn test_get_possible_base_paths_returns_two_paths() {
         let paths = FuseSysfsNotifier::get_possible_base_paths();
