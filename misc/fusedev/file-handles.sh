@@ -24,6 +24,11 @@
 #       generation tells the two images apart; without it the handle opens the other file.
 #   H8  a handle to a directory of the Vfs pseudo fs (`a` above a mount at /a/img) reopens that
 #       directory, without hanging.
+#   H9  on a daemon with a bootstrap, a handle below an image mounted at /sub through the API
+#       stays valid when the same bootstrap is mounted again into that image's file system index
+#       (Vfs indexes are reused once all 255 have been handed out);
+#   H10 a handle there fails ESTALE when another image, with the same inode numbers, gets that
+#       index: the generation is what tells the two apart.
 #
 # Requirements: root (mount(2), drop_caches), FUSE, a C compiler, curl and python3.
 # Override the binaries via env, e.g. NYDUS_IMAGE=... NYDUSD=... ROOT=... CC=...
@@ -205,6 +210,50 @@ else
   case_fail "H8: the pseudo fs directory did not reopen (fh-reopen exit $?, 124 is a hang)"
 fi
 teardown
+
+# Umounts /sub, fills every other Vfs index, then mounts bootstrap $1 at /sub, which gets the
+# freed index back. Index 1 is /base and 2 was /sub: 253 fillers take 3-255, the next wraps to 2.
+cat > "$ROOT/reuse.sh" <<SH
+#!/bin/bash
+set -e
+$(declare -f api_mount api_umount)
+ROOT='$ROOT'
+api_umount /sub
+for i in \$(seq 253); do api_mount "\$ROOT/out/bootstrap" /f\$i; done
+api_mount "\$1" /sub
+stat -c %i "\$ROOT/mnt/sub" > "\$ROOT/ino.after"
+SH
+chmod +x "$ROOT/reuse.sh"
+
+# Mounts the image at /sub in a fresh nydusd, takes handles below it, and once the caches are
+# dropped lets reuse.sh put bootstrap $1 into its index. $2 non-empty: the reopens must fail ESTALE.
+reuse_index() {
+  rm -f "$ROOT/api.sock" "$ROOT/ino.after"
+  "$ND" fuse --config "$ROOT/config.json" --bootstrap "$ROOT/out/bootstrap" \
+    --virtual-mountpoint /base --mountpoint "$ROOT/mnt" --apisock "$ROOT/api.sock" \
+    --log-level info > "$ROOT/nydusd.log" 2>&1 &
+  NYDUSD_PID=$!
+  for _ in $(seq 50); do [ -S "$ROOT/api.sock" ] && mountpoint -q "$ROOT/mnt" && break; sleep 0.2; done
+  if ! api_mount "$ROOT/out/bootstrap" /sub; then
+    case_fail "$3: cannot mount /sub"; teardown; return
+  fi
+  stat -c %i "$ROOT/mnt/sub" > "$ROOT/ino.before"
+  if ! env ${2:+FH_EXPECT_STALE=1} FH_REOPEN_HOOK="'$ROOT/reuse.sh' '$1'" \
+    "$ROOT/fh-reopen" "$ROOT/mnt" sub/d1/d2/f2.txt sub/d1/d2/d3; then
+    case_fail "$3"
+  elif ! cmp -s "$ROOT/ino.before" "$ROOT/ino.after"; then
+    case_fail "$3: /sub did not get its file system index back, so nothing was tested"
+  else
+    case_pass "$3"
+  fi
+  teardown
+}
+
+step "H9: the same bootstrap in the reused index keeps the handles valid"
+reuse_index "$ROOT/out/bootstrap" "" "H9: same bootstrap, handles reopen"
+
+step "H10: another image in the reused index makes the handles stale"
+reuse_index "$ROOT/out2/bootstrap" 1 "H10: other image, handles fail ESTALE"
 
 echo
 if [ "$FAILURES" = 0 ]; then
