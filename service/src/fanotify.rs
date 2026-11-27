@@ -2755,6 +2755,39 @@ mod tests {
         umount(&mnt);
     }
 
+    /// A failed handler seals nothing: whatever failed may have left its caches half-updated,
+    /// so they stay unsealed and are rechecked after a reboot.
+    #[test]
+    fn a_failed_handler_leaves_its_caches_unsealed() {
+        use super::*;
+
+        let Some((work, mgr)) = fanotify_fixture("failed-seal") else {
+            return;
+        };
+        let (stage, mnt) = (work.path().join("stage"), work.path().join("mnt"));
+        let handler =
+            FanotifyHandler::new(stage.to_str().unwrap(), mnt.to_str().unwrap(), mgr, 1).unwrap();
+        let backing = &handler.blob_backings[0];
+        backing
+            .blob
+            .blob()
+            .get_blob_object()
+            .unwrap()
+            .fetch_range_uncompressed(0, backing.blob.blob_info().uncompressed_size())
+            .unwrap();
+        let cache = backing.cache_path.clone();
+        assert_ne!(chunk_map_word(&cache, 32), 0, "filled without unsealing");
+        handler.fail(&"test");
+        handler.seal();
+        assert_ne!(
+            chunk_map_word(&cache, 32),
+            0,
+            "a failed handler sealed its cache"
+        );
+        drop(handler);
+        nydus_storage::factory::BLOB_FACTORY.forget("failed-seal");
+    }
+
     /// A successor that takes over a live mount which opened the blob marked revokes a cached
     /// chunk found corrupt, and readers of the mount get the right bytes again; over a mount
     /// that opened it unmarked the chunk is reported and left, and the blob stays unverified.

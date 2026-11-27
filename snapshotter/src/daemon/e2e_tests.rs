@@ -377,6 +377,25 @@ fn released_stage_starts_warm() {
             .block_on(supervisor.release(&image_ref, "k1"))
             .unwrap();
         assert!(!is_mounted_at(&mountpoint), "mount outlived its release");
+        // The release sealed every cache: the chunk map's `unsealed_boot` word is zero, so a
+        // clean reboot keeps the retained stage trusted.
+        let stage = mountpoint.with_file_name("stage");
+        let maps: Vec<_> = fs::read_dir(&stage)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.to_string_lossy().ends_with(".chunk_map"))
+            .collect();
+        assert!(!maps.is_empty(), "no chunk map in {}", stage.display());
+        for map in maps {
+            let mut word = [0u8; 8];
+            std::os::unix::fs::FileExt::read_exact_at(
+                &fs::File::open(&map).unwrap(),
+                &mut word,
+                32,
+            )
+            .unwrap();
+            assert_eq!(u64::from_ne_bytes(word), 0, "{} not sealed", map.display());
+        }
         let _ = runtime.block_on(reconciler.run_once());
         let view = fs::metadata(mountpoint.with_file_name("stage").join("bootstrap"))
             .expect("the released stage was swept");
