@@ -245,7 +245,7 @@ mod tests {
         assert_eq!(chunk.id(), 0);
 
         let map = IndexedChunkMap::new(&blob_path, 1, true).unwrap();
-        assert_eq!(map.map.not_ready_count.load(Ordering::Acquire), 1);
+        assert_eq!(map.map.not_ready_count(), 1);
         assert_eq!(map.map.count, 1);
         assert_eq!(map.map.size(), 0x1001);
         assert!(!map.is_range_all_ready());
@@ -283,7 +283,7 @@ mod tests {
         assert_eq!(chunk.id(), 0);
 
         let map = IndexedChunkMap::new(&blob_path, 1, true).unwrap();
-        assert_eq!(map.map.not_ready_count.load(Ordering::Acquire), 1);
+        assert_eq!(map.map.not_ready_count(), 1);
         assert_eq!(map.map.count, 1);
         assert_eq!(map.map.size(), 0x1001);
         assert!(!map.is_range_all_ready());
@@ -331,7 +331,7 @@ mod tests {
 
         // write file header and sync to disk.
         file.write_all(header.as_slice()).unwrap();
-        file.write_all(&[0x0u8]).unwrap();
+        file.write_all(&[0x80u8]).unwrap();
 
         let chunk = MockChunkInfo::new();
         assert_eq!(chunk.id(), 0);
@@ -390,7 +390,7 @@ mod tests {
         assert_eq!(chunk.id(), 0);
 
         let map = IndexedChunkMap::new(&blob_path, 1, true).unwrap();
-        assert_eq!(map.map.not_ready_count.load(Ordering::Acquire), 1);
+        assert_eq!(map.map.not_ready_count(), 1);
         assert_eq!(map.map.count, 1);
         assert_eq!(map.map.size(), 0x1001);
         assert!(!map.is_range_all_ready());
@@ -415,7 +415,7 @@ mod tests {
             map.set_ready_and_clear_pending(chunk.as_base()).unwrap();
         }
         assert!(map.is_range_all_ready());
-        assert_eq!(map.map.not_ready_count.load(Ordering::Acquire), 0);
+        assert_eq!(map.map.not_ready_count(), 0);
 
         map.reset_range_ready().unwrap();
 
@@ -423,7 +423,7 @@ mod tests {
         // per-chunk bits. Clearing only the header would leave `is_ready(i)` answering true
         // for a chunk whose bytes are gone.
         assert!(!map.is_range_all_ready());
-        assert_eq!(map.map.not_ready_count.load(Ordering::Acquire), 16);
+        assert_eq!(map.map.not_ready_count(), 16);
         for idx in 0..16u32 {
             let chunk = MockChunkInfo {
                 index: idx,
@@ -468,7 +468,7 @@ mod tests {
         // discarded bytes would be served as zeros after a restart.
         let reopened = IndexedChunkMap::new(&blob_path, 8, true).unwrap();
         assert!(!reopened.is_range_all_ready());
-        assert_eq!(reopened.map.not_ready_count.load(Ordering::Acquire), 8);
+        assert_eq!(reopened.map.not_ready_count(), 8);
     }
 
     #[test]
@@ -496,7 +496,7 @@ mod tests {
             assert!(map.is_ready(chunk(4).as_base()).unwrap());
             // Clearing a chunk that is not ready changes nothing.
             map.clear_ready(5).unwrap();
-            assert_eq!(map.map.not_ready_count.load(Ordering::Acquire), 1);
+            assert_eq!(map.map.not_ready_count(), 1);
             map.set_verified(Some(7)).unwrap();
         }
 
@@ -505,7 +505,7 @@ mod tests {
         // A data file changed since, by anyone, is not verified.
         assert!(!reopened.is_verified(8));
         assert!(!reopened.is_ready(chunk(5).as_base()).unwrap());
-        assert_eq!(reopened.map.not_ready_count.load(Ordering::Acquire), 1);
+        assert_eq!(reopened.map.not_ready_count(), 1);
         reopened.set_verified(None).unwrap();
         assert!(
             !IndexedChunkMap::new(&blob_path, 8, true)

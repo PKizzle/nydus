@@ -133,34 +133,70 @@ fn atomic_header_u64(filemap: &FileMapState, offset: usize) -> StorageResult<&At
 /// supported: nothing orders one's seal against the other's ready bits.
 #[derive(Default)]
 pub(crate) struct SealState {
-    /// Held shared from a fill finding the map marked to its ready bit, exclusively by a seal.
+    /// Held shared from a fill finding the map marked to its ready bit and count, and by a revoke
+    /// over its bit and count; exclusively by a seal, and by a reset.
     lock: RwLock<()>,
     /// The boot whose mark in [Header::unsealed_boot] was flushed successfully and not
     /// cleared by a seal since; zero if none. The header word alone can hold a mark whose
     /// flush failed.
     durable: AtomicU64,
+    /// The number of chunks whose ready bit is clear, or more while a revoke races a fill, never
+    /// fewer. Shared by every opener because each one sets and clears bits the others see;
+    /// counted from the bitmap by the open that creates it.
+    not_ready: AtomicU32,
+    /// The chunk count every map of the file is opened for.
+    chunk_count: u32,
     /// Fills that reached `lock`, for tests to know one is waiting.
     #[cfg(test)]
     pub(crate) arrived: std::sync::atomic::AtomicUsize,
 }
 
-fn seal_state_of(file: &File) -> io::Result<Arc<SealState>> {
+/// The state of the map `file` at `filename` for `chunk_count` chunks, with `not_ready` as its
+/// count if no other map of the file is open or `fresh` says the open rewrote the whole file.
+fn seal_state_of(
+    filename: &str,
+    file: &File,
+    chunk_count: u32,
+    not_ready: u32,
+    fresh: bool,
+) -> StorageResult<Arc<SealState>> {
     use std::os::unix::fs::MetadataExt;
     type States = BTreeMap<(u64, u64), Weak<SealState>>;
     static STATES: Mutex<States> = Mutex::new(BTreeMap::new());
 
-    let md = file.metadata()?;
+    let md = file
+        .metadata()
+        .map_err(|e| StorageError::cache_io("stat the chunk map file", e))?;
     let mut states = STATES.lock().unwrap_or_else(|e| e.into_inner());
     states.retain(|_, state| state.strong_count() > 0);
     let key = (md.dev(), md.ino());
-    let state = states.get(&key).and_then(Weak::upgrade).unwrap_or_default();
+    let (state, fresh) = match states.get(&key).and_then(Weak::upgrade) {
+        // Maps for two chunk counts share a file only when their bitmaps have the same size,
+        // and each would count the other's padding bits wrong.
+        Some(state) if state.chunk_count != chunk_count => {
+            return Err(StorageError::InvalidData(format!(
+                "chunk map file {filename:?} is open for {} chunks, not {chunk_count}",
+                state.chunk_count
+            )));
+        }
+        Some(state) => (state, fresh),
+        None => (
+            Arc::new(SealState {
+                chunk_count,
+                ..Default::default()
+            }),
+            true,
+        ),
+    };
+    if fresh {
+        state.not_ready.store(not_ready, Ordering::Release);
+    }
     states.insert(key, Arc::downgrade(&state));
     Ok(state)
 }
 
 pub(crate) struct PersistMap {
     pub count: u32,
-    pub not_ready_count: AtomicU32,
     filemap: FileMapState,
     /// The boot recorded in [Header::unsealed_boot] before a ready bit is set; zero until the
     /// opener names one.
@@ -169,6 +205,9 @@ pub(crate) struct PersistMap {
     /// Makes the next map flush fail, as a full or failing disk would.
     #[cfg(test)]
     pub(crate) fail_next_flush: std::sync::atomic::AtomicBool,
+    /// Runs once between the next fill setting its ready bit and counting it.
+    #[cfg(test)]
+    pub(crate) after_set_bit: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 impl PersistMap {
@@ -290,40 +329,38 @@ impl PersistMap {
         // anyone else while this process holds the file lock.
         let header = unsafe { filemap.get_mut::<Header>(0) }
             .map_err(|e| StorageError::cache_io("reach the chunk map contents", e))?;
-        let mut not_ready_count = chunk_count;
-        if header.version >= 1 {
-            if header.magic2 != MAGIC2 {
-                drop(filemap);
-                return damaged(&file, "bad second magic");
-            }
-            if header.all_ready == MAGIC_ALL_READY {
-                not_ready_count = 0;
-            } else if new_content {
-                not_ready_count = chunk_count;
-            } else {
-                let mut ready_count = 0;
-                for idx in HEADER_SIZE..expected_size as usize {
-                    let current = atomic_byte(&filemap, idx)
-                        .map_err(|e| StorageError::cache_io("reach the chunk map contents", e))?;
-                    let val = current.load(Ordering::Acquire);
-                    ready_count += val.count_ones() as u32;
-                }
-
-                if ready_count >= chunk_count {
-                    // SAFETY: NOT fully established. The file lock keeps other openers out of this
-                    // function, but a process that already opened the map may `store` to
-                    // `all_ready` atomically (see `invalidate`) while this plain `&mut` write runs;
-                    // it relies on `all_ready` being set only once every chunk is ready, after
-                    // which nothing clears it except invalidation.
-                    let header = unsafe { filemap.get_mut::<Header>(0) }
-                        .map_err(|e| StorageError::cache_io("reach the chunk map contents", e))?;
-                    header.all_ready = MAGIC_ALL_READY;
-                    let _ = file.sync_all();
-                    not_ready_count = 0;
-                } else {
-                    not_ready_count = chunk_count - ready_count;
-                }
-            }
+        let (version, all_ready) = (header.version, header.all_ready);
+        if version >= 1 && header.magic2 != MAGIC2 {
+            drop(filemap);
+            return damaged(&file, "bad second magic");
+        }
+        // The bitmap is what readiness checks read, so the count comes from it whatever the
+        // header claims. Bits past the last chunk are not chunks.
+        let mut ready_count = 0;
+        for idx in 0..bitmap_size as usize {
+            let byte = atomic_byte(&filemap, HEADER_SIZE + idx)
+                .map_err(|e| StorageError::cache_io("reach the chunk map contents", e))?;
+            let chunks = chunk_count as usize - idx * 8;
+            let mask = if chunks >= 8 { 0xff } else { !(0xff >> chunks) };
+            ready_count += (byte.load(Ordering::Acquire) & mask).count_ones();
+        }
+        // Looked up while the file lock is held, so the count of an opener already filling the
+        // map is kept instead of this bitmap count, which its fills may have overtaken.
+        let seal = seal_state_of(
+            filename,
+            &file,
+            chunk_count,
+            chunk_count - ready_count,
+            new_content,
+        )?;
+        let ready = ready_count == chunk_count;
+        if version >= 1 && (all_ready == MAGIC_ALL_READY) != ready {
+            // Older releases trust this marker over the bitmap, so it must not claim a chunk
+            // that is not ready.
+            atomic_all_ready(&filemap)
+                .map_err(|e| StorageError::cache_io("reach the chunk map contents", e))?
+                .store(if ready { MAGIC_ALL_READY } else { 0 }, Ordering::Release);
+            let _ = file.sync_all();
         }
 
         // The mapping holds a duplicate of `file`, which shares the lock, so release it explicitly.
@@ -331,20 +368,19 @@ impl PersistMap {
             .map_err(|e| StorageError::cache_io("unlock the chunk map file", e))?;
 
         readahead(file.as_raw_fd(), 0, expected_size);
-        let seal = seal_state_of(&file)
-            .map_err(|e| StorageError::cache_io("stat the chunk map file", e))?;
         if !persist {
             let _ = std::fs::remove_file(filename);
         }
 
         Ok(Self {
             count: chunk_count,
-            not_ready_count: AtomicU32::new(not_ready_count),
             filemap,
             boot: AtomicU64::new(0),
             seal,
             #[cfg(test)]
             fail_next_flush: Default::default(),
+            #[cfg(test)]
+            after_set_bit: Default::default(),
         })
     }
 
@@ -505,11 +541,18 @@ impl PersistMap {
             }
 
             if self.write_u8(index, current) {
+                #[cfg(test)]
+                if let Some(hook) = self.after_set_bit.lock().unwrap().take() {
+                    hook();
+                }
                 if let Ok(w) = self.ready_count_word() {
                     w.fetch_add(1, Ordering::AcqRel);
                 }
                 // Flush the map once its last chunk is ready; nothing is left to recheck.
-                if self.not_ready_count.fetch_sub(1, Ordering::AcqRel) == 1 {
+                let not_ready = &self.seal.not_ready;
+                if not_ready.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1))
+                    == Ok(1)
+                {
                     if let Ok(w) = self.recheck_word() {
                         w.store(0, Ordering::Release);
                     }
@@ -527,21 +570,25 @@ impl PersistMap {
     /// Clear one chunk's ready state, persisted before returning.
     pub fn clear_chunk_ready(&self, index: u32) -> StorageResult<()> {
         let index = self.validate_index(index)?;
-        // The header marker short-circuits readiness checks, so it goes first.
+        // Older releases trust the header marker over the bitmap, so it goes first.
         let all_ready = atomic_all_ready(&self.filemap)
             .map_err(|e| StorageError::cache_io("reach the chunk map contents", e))?;
         all_ready.store(0, Ordering::Release);
         let byte = atomic_byte(&self.filemap, HEADER_SIZE + (index as usize >> 3))
             .map_err(|e| StorageError::cache_io("reach the chunk map contents", e))?;
         let mask = Self::index_to_mask(index);
-        // A count of zero claims every chunk ready whatever the bitmap says, so it must move too.
-        let was_ready = byte.fetch_and(!mask, Ordering::AcqRel) & mask != 0;
-        if was_ready {
-            self.ready_count_word()?.fetch_sub(1, Ordering::AcqRel);
+        let ready_count = self.ready_count_word()?;
+        let revoke = self.seal.lock.read().unwrap_or_else(|e| e.into_inner());
+        // Counted before the bit clears and given back if it was clear already, so the count
+        // never claims fewer missing chunks than the bitmap, whatever fill races with this.
+        let not_ready = &self.seal.not_ready;
+        not_ready.fetch_add(1, Ordering::AcqRel);
+        if byte.fetch_and(!mask, Ordering::AcqRel) & mask != 0 {
+            ready_count.fetch_sub(1, Ordering::AcqRel);
+        } else {
+            not_ready.fetch_sub(1, Ordering::AcqRel);
         }
-        if was_ready || self.not_ready_count.load(Ordering::Acquire) == 0 {
-            self.not_ready_count.fetch_add(1, Ordering::AcqRel);
-        }
+        drop(revoke);
         self.filemap
             .sync_data()
             .map_err(|e| StorageError::cache_io("flush the chunk map", e))
@@ -557,8 +604,13 @@ impl PersistMap {
             .map_err(|e| StorageError::cache_io("reach the chunk map contents", e))
     }
 
+    pub fn not_ready_count(&self) -> u32 {
+        self.seal.not_ready.load(Ordering::Acquire)
+    }
+
     pub fn ready_chunks(&self) -> u32 {
-        self.count - self.not_ready_count.load(Ordering::Acquire)
+        // A revoke racing a fill may count a chunk missing twice until the fill counts its bit.
+        self.count.saturating_sub(self.not_ready_count())
     }
 
     fn data_stamp_word(&self) -> StorageResult<&AtomicU64> {
@@ -721,7 +773,7 @@ impl PersistMap {
 
     #[inline]
     pub fn is_range_all_ready(&self) -> bool {
-        self.not_ready_count.load(Ordering::Acquire) == 0
+        self.not_ready_count() == 0
     }
 
     /// Revoke every chunk's ready state, returning the map to "nothing cached".
@@ -737,8 +789,8 @@ impl PersistMap {
     pub fn reset(&self) -> StorageResult<()> {
         let size = self.filemap.size();
 
-        // Clear the header marker first: it short-circuits `is_range_all_ready`, so while the
-        // bitmap is being zeroed a concurrent reader must not still see "all ready".
+        // Clear the header marker first: older releases trust it over the bitmap, so while the
+        // bitmap is being zeroed one sharing the file must not still see "all ready".
         //
         // Written through an `AtomicU32` rather than `get_mut::<Header>`, which needs `&mut
         // self` the `Arc<dyn ChunkMap>` this hangs off cannot provide. `atomic_all_ready` uses
@@ -747,13 +799,17 @@ impl PersistMap {
             .map_err(|e| StorageError::cache_io("reach the chunk map contents", e))?;
         all_ready.store(0, Ordering::Release);
 
+        // Exclusive, so no fill or revoke sits between its bit and its count while both restart.
+        let reset = self.seal.lock.write().unwrap_or_else(|e| e.into_inner());
+        // Counted before the bits clear, so the count never calls ready a chunk whose bit is clear.
+        self.seal.not_ready.store(self.count, Ordering::Release);
+        self.ready_count_word()?.store(0, Ordering::Release);
         for idx in HEADER_SIZE..size {
             let byte = atomic_byte(&self.filemap, idx)
                 .map_err(|e| StorageError::cache_io("reach the chunk map contents", e))?;
             byte.store(0, Ordering::Release);
         }
-        self.not_ready_count.store(self.count, Ordering::Release);
-        self.ready_count_word()?.store(0, Ordering::Release);
+        drop(reset);
 
         // Persist before returning: if the process dies between the punch and a later flush,
         // a stale on-disk bitmap would claim the discarded chunks are present.
@@ -762,6 +818,273 @@ impl PersistMap {
             .map_err(|e| StorageError::cache_io("flush the chunk map", e))?;
 
         Ok(())
+    }
+}
+
+/// Open the chunk map file at `path` for `chunk_count` chunks, whatever it holds, and drive it
+/// with `ops` the way fills, invalidations, seals and restarts do, checking that the in-memory
+/// not-ready count matches the bitmap, and after each reopen that the header's all-ready marker
+/// does. Entry point for the `chunk_map` fuzz target.
+#[cfg(feature = "fuzzing")]
+#[doc(hidden)]
+pub fn fuzz_chunk_map(path: &str, chunk_count: u32, ops: &[u8]) {
+    let open = || PersistMap::open(path, chunk_count, true, true);
+    let Ok(mut map) = open() else {
+        return;
+    };
+    let mut ops = ops.iter().copied();
+    while let Some(op) = ops.next() {
+        let mut reopened = false;
+        // Indices past the bitmap test `validate_index`.
+        let arg = u16::from_le_bytes([ops.next().unwrap_or(0), ops.next().unwrap_or(0)]);
+        let index = arg as u32 % (chunk_count + 8);
+        match op % 10 {
+            0 => {
+                let _ = map.set_chunk_ready(index);
+            }
+            1 => {
+                let _ = map.clear_chunk_ready(index);
+            }
+            2 => {
+                let _ = map.adopt_boot(1 + (arg % 3) as u64, arg & 0x100 != 0);
+            }
+            3 => {
+                let _ = map.mark_unsealed();
+            }
+            4 => {
+                let stamp = (arg & 1 != 0).then_some(arg as u64);
+                let _ = map.seal(&mut || Ok(stamp));
+            }
+            5 => {
+                let _ = map.set_verified((arg & 1 != 0).then_some(arg as u64));
+                let _ = map.is_verified(arg as u64);
+            }
+            6 => {
+                let _ = map.reset();
+            }
+            7 => {
+                if map.validate_index(index).is_ok() {
+                    let _ = map.is_chunk_ready(index);
+                }
+                let _ = map.is_rechecking();
+            }
+            8 => {
+                // A second opener of the same file in this process, sharing its seal state.
+                if let Ok(other) = PersistMap::open(path, chunk_count, true, true) {
+                    let _ = other.adopt_boot(1 + (arg % 3) as u64, false);
+                    let _ = other.mark_unsealed();
+                    if arg & 0x200 != 0 {
+                        let _ = other.set_chunk_ready(index);
+                    } else {
+                        let _ = other.clear_chunk_ready(index);
+                    }
+                    let _ = other.seal(&mut || Ok(None));
+                    assert_eq!(other.not_ready_count(), map.not_ready_count());
+                }
+            }
+            _ => {
+                // A restart: the next opener parses what this one left behind.
+                drop(map);
+                let Ok(next) = open() else {
+                    return;
+                };
+                map = next;
+                reopened = true;
+            }
+        }
+        let not_ready = (0..chunk_count)
+            .filter(|&idx| !map.is_chunk_ready(idx).0)
+            .count() as u32;
+        assert_eq!(map.not_ready_count(), not_ready, "out of {chunk_count}");
+        // Version 0 maps have no marker; older releases trust it over the bitmap in the others.
+        let word = |offset| atomic_header_word(&map.filemap, offset).unwrap();
+        if reopened && word(std::mem::offset_of!(Header, version)).load(Ordering::Acquire) >= 1 {
+            let all_ready = word(std::mem::offset_of!(Header, all_ready)).load(Ordering::Acquire);
+            assert_eq!(all_ready == MAGIC_ALL_READY, not_ready == 0);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    /// Write a map for `chunk_count` chunks with the given header words and bitmap, and open it.
+    fn open_raw(
+        dir: &TempDir,
+        chunk_count: u32,
+        version: u32,
+        all_ready: u32,
+        bitmap: &[u8],
+    ) -> (String, PersistMap) {
+        let path = dir.path().join("blob.chunk_map");
+        let path = path.to_str().unwrap().to_string();
+        let mut content = vec![0u8; HEADER_SIZE];
+        content[0..4].copy_from_slice(&MAGIC1.to_le_bytes());
+        content[4..8].copy_from_slice(&version.to_le_bytes());
+        content[8..12].copy_from_slice(&MAGIC2.to_le_bytes());
+        content[12..16].copy_from_slice(&all_ready.to_le_bytes());
+        content.extend_from_slice(bitmap);
+        assert_eq!(
+            content.len(),
+            HEADER_SIZE + chunk_count.div_ceil(8) as usize
+        );
+        std::fs::write(&path, content).unwrap();
+        let map = PersistMap::open(&path, chunk_count, true, true).unwrap();
+        (path, map)
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support file-backed mmap")]
+    fn test_v0_map_counts_its_ready_bits() {
+        let dir = TempDir::new().unwrap();
+        let mut bitmap = [0u8; 6];
+        bitmap[0] = 0x80;
+        let (_, map) = open_raw(&dir, 41, 0, 0, &bitmap);
+        assert_eq!(map.ready_chunks(), 1);
+        map.clear_chunk_ready(0).unwrap();
+        assert_eq!(map.not_ready_count(), 41);
+        assert_eq!(map.ready_chunks(), 0);
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support file-backed mmap")]
+    fn test_all_ready_header_over_a_clear_bit() {
+        let dir = TempDir::new().unwrap();
+        let (path, map) = open_raw(&dir, 8, 1, MAGIC_ALL_READY, &[0x7f]);
+        assert!(!map.is_range_all_ready());
+        assert!(!map.is_chunk_ready(0).0);
+        map.set_chunk_ready(0).unwrap();
+        assert_eq!(map.not_ready_count(), 0);
+        assert!(map.is_range_all_ready());
+        drop(map);
+        assert!(
+            PersistMap::open(&path, 8, true, true)
+                .unwrap()
+                .is_range_all_ready()
+        );
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support file-backed mmap")]
+    fn test_padding_bits_are_not_chunks() {
+        let dir = TempDir::new().unwrap();
+        // Chunk 0 is not ready; the last byte holds chunk 40 and seven padding bits.
+        let bitmap = [0x7f, 0xff, 0xff, 0xff, 0xff, 0xff];
+        let (_, map) = open_raw(&dir, 41, 1, 0, &bitmap);
+        assert_eq!(map.not_ready_count(), 1);
+        assert!(!map.is_range_all_ready());
+        map.set_chunk_ready(0).unwrap();
+        assert!(map.is_range_all_ready());
+        map.clear_chunk_ready(40).unwrap();
+        assert_eq!(map.not_ready_count(), 1);
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support file-backed mmap")]
+    fn test_second_opener_shares_the_count() {
+        let dir = TempDir::new().unwrap();
+        let (path, first) = open_raw(&dir, 8, 1, 0, &[0]);
+        let second = PersistMap::open(&path, 8, true, true).unwrap();
+        first.set_chunk_ready(3).unwrap();
+        assert_eq!(second.ready_chunks(), 1);
+        second.clear_chunk_ready(3).unwrap();
+        assert_eq!(first.not_ready_count(), 8);
+        assert_eq!(second.not_ready_count(), 8);
+        for idx in 0..8 {
+            second.set_chunk_ready(idx).unwrap();
+        }
+        assert!(first.is_range_all_ready());
+        first.reset().unwrap();
+        assert_eq!(second.not_ready_count(), 8);
+    }
+
+    /// Run `race` on another thread while `map` sets chunk `index`'s ready bit, between the bit
+    /// and its count, and let the fill go on once `race` returns or waits too long.
+    fn race_a_fill(map: &PersistMap, index: u32, race: impl FnOnce() + Send + 'static) {
+        let (go, started) = std::sync::mpsc::channel::<()>();
+        let (finished, done) = std::sync::mpsc::channel::<()>();
+        let racer = std::thread::spawn(move || {
+            started.recv().unwrap();
+            race();
+            let _ = finished.send(());
+        });
+        *map.after_set_bit.lock().unwrap() = Some(Box::new(move || {
+            go.send(()).unwrap();
+            // A race that waits for the fill finishes after it instead.
+            let _ = done.recv_timeout(std::time::Duration::from_millis(200));
+        }));
+        map.set_chunk_ready(index).unwrap();
+        racer.join().unwrap();
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support file-backed mmap")]
+    fn test_revoke_racing_a_fill_keeps_the_count() {
+        let dir = TempDir::new().unwrap();
+        let (path, map) = open_raw(&dir, 8, 1, 0, &[0]);
+        let other = PersistMap::open(&path, 8, true, true).unwrap();
+        race_a_fill(&map, 3, move || {
+            other.clear_chunk_ready(3).unwrap();
+            // The fill has not counted its bit yet, so chunk 3 is counted missing twice.
+            assert_eq!(other.ready_chunks(), 0);
+        });
+        assert!(!map.is_chunk_ready(3).0);
+        assert_eq!(map.not_ready_count(), 8);
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support file-backed mmap")]
+    fn test_reset_racing_a_fill_keeps_the_count() {
+        let dir = TempDir::new().unwrap();
+        let (path, map) = open_raw(&dir, 8, 1, 0, &[0]);
+        let other = PersistMap::open(&path, 8, true, true).unwrap();
+        race_a_fill(&map, 3, move || other.reset().unwrap());
+        assert!(!map.is_chunk_ready(3).0);
+        assert_eq!(map.not_ready_count(), 8);
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support file-backed mmap")]
+    fn test_open_with_another_chunk_count_is_refused() {
+        let dir = TempDir::new().unwrap();
+        // 41 and 44 chunks both take six bitmap bytes.
+        let (path, map) = open_raw(&dir, 41, 1, 0, &[0; 6]);
+        assert!(PersistMap::open(&path, 44, true, true).is_err());
+        drop(map);
+        assert!(PersistMap::open(&path, 44, true, true).is_ok());
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support file-backed mmap")]
+    fn test_open_repairs_the_all_ready_header() {
+        let dir = TempDir::new().unwrap();
+        let all_ready = |path: &str| {
+            let content = std::fs::read(path).unwrap();
+            u32::from_le_bytes(content[12..16].try_into().unwrap())
+        };
+        let (path, map) = open_raw(&dir, 8, 1, MAGIC_ALL_READY, &[0x7f]);
+        drop(map);
+        assert_eq!(all_ready(&path), 0);
+        let (path, map) = open_raw(&dir, 8, 1, 0, &[0xff]);
+        drop(map);
+        assert_eq!(all_ready(&path), MAGIC_ALL_READY);
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support file-backed mmap")]
+    fn test_two_openers_setting_one_chunk_count_it_once() {
+        let dir = TempDir::new().unwrap();
+        let (path, first) = open_raw(&dir, 8, 1, 0, &[0]);
+        let second = PersistMap::open(&path, 8, true, true).unwrap();
+        first.set_chunk_ready(3).unwrap();
+        second.set_chunk_ready(3).unwrap();
+        assert_eq!(first.not_ready_count(), 7);
+        assert_eq!(
+            second.ready_count_word().unwrap().load(Ordering::Acquire),
+            1
+        );
     }
 }
 
@@ -841,11 +1164,10 @@ mod properties {
         ) {
             let dir = TempDir::new().unwrap();
             let path = dir.path().join("map").to_str().unwrap().to_string();
-            // shortcut: padding bits stay clear and `not_ready_count` is only bounded, not compared
-            // with the bitmap, because `open` miscounts it on version-0 maps with ready bits, on
-            // `all_ready` over a clear bit and on padding bits; check it once `open` counts the bitmap.
-            let mut bitmap = bitmap;
-            *bitmap.last_mut().unwrap() &= !((1u8 << (8 - CHUNKS % 8)) - 1);
+            // Chunk 0 is the high bit; padding bits past the last chunk count for nothing.
+            let ready_bits = (0..CHUNKS)
+                .filter(|&i| bitmap[(i / 8) as usize] & (0x80 >> (i % 8)) != 0)
+                .count() as u32;
             std::fs::write(&path, [header.as_slice(), &bitmap].concat()).unwrap();
 
             let zero = header.iter().chain(&bitmap).all(|b| *b == 0);
@@ -867,6 +1189,8 @@ mod properties {
                     header_u64(&path, std::mem::offset_of!(Header, tracked)),
                     MAGIC_TRACKED
                 );
+            } else {
+                prop_assert_eq!(map.ready_chunks(), ready_bits);
             }
             // Whatever the header held, adopting a boot with `forget_untrusted` leaves nothing
             // ready unless the map vouches for its ready bits.

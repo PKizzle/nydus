@@ -6,6 +6,7 @@ on:
       - "fuzz/**"
       - "rafs/**"
       - "storage/src/meta/**"
+      - "storage/src/cache/state/**"
       - "utils/src/compress/**"
       - "service/src/fanotify*.rs"
       - ".github/workflows/fuzz.yml"
@@ -49,7 +50,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [rafs_bootstrap, erofs_metadata, zran_meta, zstd_cursor, fanotify_events, go_json]
+        target: [rafs_bootstrap, erofs_metadata, zran_meta, zstd_cursor, fanotify_events, chunk_map, go_json]
     steps:
       - uses: actions/checkout@v6
       - name: Install nightly

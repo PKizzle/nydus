@@ -44,6 +44,10 @@ pub use indexed_chunk_map::IndexedChunkMap;
 pub use noop_chunk_map::NoopChunkMap;
 pub use range_map::BlobRangeMap;
 
+#[cfg(feature = "fuzzing")]
+#[doc(hidden)]
+pub use persist_map::fuzz_chunk_map;
+
 mod blob_state_map;
 mod digested_chunk_map;
 mod indexed_chunk_map;

@@ -11,9 +11,11 @@ backend or a shared cache directory, and event records from the kernel.
 | `zran_meta` | `<blob>.blob.meta`: chunk-info array, zran inflate contexts and dictionary table, then inflating each context | `BlobCompressionContextInfo::new`, `ZranDecoder::uncompress` |
 | `zstd_cursor` | zstd frame-boundary tracking during conversion, and context decoding through the streaming cursor and the in-memory path | `ZstdFrameGenerator`, `ZstdStreamCursor::read`, `decompress_context` |
 | `fanotify_events` | fanotify event buffers: metadata records and info records, including `FAN_EVENT_INFO_TYPE_RANGE` (Linux only) | `nydus_service::fanotify::fuzz_event_buffer` |
+| `chunk_map` | `<blob>.chunk_map` as a restart finds it: header words (all-ready, verified, ready count, data stamp, unsealed boot, recheck, tracked) and bitmap, then fills, revokes, seals, boot adoptions, a second opener and reopens over it | `nydus_storage::cache::state::fuzz_chunk_map` |
 
 `zstd_cursor` also checks a property, not just absence of crashes: every chunk the converter
 recorded must decode back to the bytes it read, through both decoding paths.
+`chunk_map` checks that a map's not-ready count matches its bitmap, in every opener of the file.
 
 `fuzz/` is a cargo workspace of its own with its own `Cargo.lock`, so the nightly toolchain and
 sanitizer flags never touch the main workspace. The root `[patch.crates-io]` does not
