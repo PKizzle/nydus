@@ -1,5 +1,12 @@
 nydus-snapshotter ({{ .Chart.AppVersion }}) installed as DaemonSet "{{ include "nydus-snapshotter.fullname" . }}".
 
+{{- if eq .Values.deploymentMode "hostSystemd" }}
+   deploymentMode=hostSystemd: each pod installs the host unit nydus-snapshotter.service and follows
+   its journal. Check a node with: systemctl status nydus-snapshotter
+   helm uninstall stops and removes the unit on every node through a pre-delete hook; with
+   --no-hooks the units keep running. Containers still on nydus images break when it stops.
+{{- end }}
+
 1. The snapshotter gRPC socket is at: {{ .Values.config.address }}
 
 {{ if not .Values.containerd.install.enable -}}

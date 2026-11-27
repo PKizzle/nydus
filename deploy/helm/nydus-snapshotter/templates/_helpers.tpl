@@ -34,3 +34,13 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- define "nydus-snapshotter.image" -}}
 {{- printf "%s:%s" .Values.image.repository (default .Chart.AppVersion .Values.image.tag) -}}
 {{- end -}}
+
+{{- /* Strategic merge patch that turns the hostSystemd DaemonSet into its removal mode. */}}
+{{- define "nydus-snapshotter.uninstallPatch" -}}
+{{- $env := list (dict "name" "HOST_SYSTEMD_ACTION" "value" "uninstall") -}}
+{{- $spec := dict "containers" (list (dict "name" "host-systemd" "env" $env)) -}}
+{{- if .Values.containerd.install.enable -}}
+{{- $_ := set $spec "initContainers" (list (dict "name" "containerd-config-installer" "env" $env)) -}}
+{{- end -}}
+{{- dict "spec" (dict "updateStrategy" (dict "type" "RollingUpdate" "rollingUpdate" (dict "maxUnavailable" "100%")) "template" (dict "spec" $spec)) | toJson -}}
+{{- end -}}

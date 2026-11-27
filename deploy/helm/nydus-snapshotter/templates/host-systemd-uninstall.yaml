@@ -1,0 +1,105 @@
+{{- if eq .Values.deploymentMode "hostSystemd" }}
+{{- /*
+helm uninstall: a hook Job runs on one node only, so it does not remove the units itself. It rolls
+the release's own DaemonSet, which already reaches every node, into removal mode
+(HOST_SYSTEMD_ACTION=uninstall, all pods at once) and waits for that rollout; each new pod stops,
+disables and deletes its node's unit and files, then reports Ready. Only then does Helm delete the
+DaemonSet. Pod replacement on upgrades and drains never removes anything.
+*/}}
+{{- $name := printf "%s-uninstall" (include "nydus-snapshotter.fullname" .) }}
+{{- $ds := include "nydus-snapshotter.fullname" . }}
+{{- $hook := dict "helm.sh/hook" "pre-delete" "helm.sh/hook-delete-policy" "before-hook-creation,hook-succeeded" }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "nydus-snapshotter.labels" . | nindent 4 }}
+  annotations:
+    {{- toYaml $hook | nindent 4 }}
+    helm.sh/hook-weight: "-10"
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "nydus-snapshotter.labels" . | nindent 4 }}
+  annotations:
+    {{- toYaml $hook | nindent 4 }}
+    helm.sh/hook-weight: "-10"
+rules:
+  - apiGroups: ["apps"]
+    resources: ["daemonsets"]
+    verbs: ["get", "list", "watch", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "nydus-snapshotter.labels" . | nindent 4 }}
+  annotations:
+    {{- toYaml $hook | nindent 4 }}
+    helm.sh/hook-weight: "-9"
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ $name }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ $name }}
+    namespace: {{ .Release.Namespace }}
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "nydus-snapshotter.labels" . | nindent 4 }}
+  annotations:
+    {{- toYaml $hook | nindent 4 }}
+    helm.sh/hook-weight: "0"
+spec:
+  backoffLimit: 2
+  activeDeadlineSeconds: {{ .Values.hostSystemd.uninstall.timeoutSeconds }}
+  template:
+    metadata:
+      labels:
+        {{- /* Not the selector labels: the DaemonSet must not match these pods. */}}
+        app.kubernetes.io/name: {{ $name }}
+        app.kubernetes.io/instance: {{ .Release.Name }}
+    spec:
+      serviceAccountName: {{ $name }}
+      restartPolicy: Never
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.daemonset.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+      initContainers:
+        - name: set-uninstall-mode
+          image: {{ .Values.hostSystemd.uninstall.image }}
+          args:
+            - patch
+            - daemonset/{{ $ds }}
+            - --namespace={{ .Release.Namespace }}
+            - --type=strategic
+            - --patch
+            - {{ include "nydus-snapshotter.uninstallPatch" . | quote }}
+      containers:
+        - name: wait-for-removal
+          image: {{ .Values.hostSystemd.uninstall.image }}
+          args:
+            - rollout
+            - status
+            - daemonset/{{ $ds }}
+            - --namespace={{ .Release.Namespace }}
+            - --timeout={{ .Values.hostSystemd.uninstall.timeoutSeconds }}s
+{{- end }}
