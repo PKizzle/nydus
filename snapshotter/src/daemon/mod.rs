@@ -5006,8 +5006,16 @@ struct PredecessorRecord {
 fn events_answered_token(nonce: u64, slugs: &[String]) -> Result<std::os::fd::OwnedFd> {
     use std::io::Write;
     use std::os::fd::FromRawFd;
+    // The raw syscall, not glibc's wrapper: the cross toolchains link against a glibc older than
+    // 2.27, which has no `memfd_create` symbol.
     // SAFETY: the name is NUL-terminated and the flags are plain integers; the result is checked.
-    let fd = unsafe { libc::memfd_create(c"nydus-events-answered".as_ptr(), libc::MFD_CLOEXEC) };
+    let fd = unsafe {
+        libc::syscall(
+            libc::SYS_memfd_create,
+            c"nydus-events-answered".as_ptr(),
+            libc::MFD_CLOEXEC,
+        )
+    } as libc::c_int;
     if fd < 0 {
         return Err(io::Error::last_os_error()).context("memfd_create");
     }
