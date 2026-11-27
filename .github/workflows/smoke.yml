@@ -127,16 +127,13 @@ jobs:
           containerd-nydus
 
   nydusd-build-macos:
-    runs-on: ${{ matrix.runner }}
+    # Both targets build on the Intel runner, arm64 cross-compiled: hosted macOS arm64 runners
+    # are capacity-limited, and a job that no runner picks up is cancelled after ~15 minutes.
+    runs-on: macos-15-intel
     timeout-minutes: 60
     strategy:
       matrix:
-        include:
-          # Native runner per arch: macos-15 is arm64-only.
-          - arch: amd64
-            runner: macos-15-intel
-          - arch: arm64
-            runner: macos-15
+        arch: [amd64, arm64]
     steps:
     - uses: actions/checkout@v6
     - name: Cache cargo
@@ -147,7 +144,7 @@ jobs:
         save-if: ${{ github.ref == 'refs/heads/production' }}
     - uses: dsherret/rust-toolchain-file@v1
     - name: Install protoc
-      run: bash misc/install-protoc.sh ${{matrix.arch}} osx
+      run: bash misc/install-protoc.sh
     - name: build
       run: |
         if [[ "${{matrix.arch}}" == "amd64" ]]; then
