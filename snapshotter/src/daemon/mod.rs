@@ -2512,7 +2512,7 @@ impl DaemonSupervisor {
         let cfg_json =
             serde_json::to_string(&cfg_v2).context("failed to serialise ConfigV2 for nydusd")?;
 
-        let vfs = create_vfs_backend(FsBackendType::Rafs, true, false)
+        let vfs = create_vfs_backend(Some(FsBackendType::Rafs), true, false)
             .context("failed to create RAFS VFS backend")?;
 
         let mount_cmd = FsBackendMountCmd {
@@ -3011,7 +3011,7 @@ impl DaemonSupervisor {
 
         let cfg_v2 = build_daemon_config(&self.config, &parsed, &cache_dir, auth, slug)?;
         let cfg_json = serde_json::to_string(&cfg_v2).context("serialise ConfigV2 for nydusd")?;
-        let vfs = create_vfs_backend(FsBackendType::Rafs, true, false)
+        let vfs = create_vfs_backend(Some(FsBackendType::Rafs), true, false)
             .context("create RAFS VFS backend")?;
         let mount_cmd = FsBackendMountCmd {
             fs_type: FsBackendType::Rafs,
