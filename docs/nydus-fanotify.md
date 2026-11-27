@@ -324,15 +324,32 @@ mostly reserved and unpopulated (about 1.9 GB virtual and 40 MB resident on an i
 but a pipe `core_pattern` such as `systemd-coredump` is sent its holes as zeros.
 
 Without an fd store (a Helm DaemonSet, or a snapshotter run by hand) a group closes with the
-process, and `fanotify_release()` allows every event still queued. A graceful stop
-(`shutdown_all`) therefore first refuses new daemon starts and waits out those under way, as a stop
-with an fd store does, then unmounts every fanotify mount at once while its group is still open,
-retrying a busy one for about 10 s, so the stop fits a 30 s termination grace period. A mount
-still busy after that (a container's overlay holding it) keeps its daemon record live, and so does
-every mount of a process that dies without a graceful stop. Such a mount stays up without a group
-until the next start re-arms it in place (`rebuild_from_records`): meanwhile reads of data never
-fetched return zeros, and EROFS may keep the zeros it read in its page cache. On the fanotify path,
-run the snapshotter under systemd with an fd store.
+process, and `fanotify_release()` allows every event still queued and every read after it:
+containers read zeros for data never fetched. FUSE without its daemon fails reads with
+`ENOTCONN` instead. So the driver probe selects fanotify only when an fd store is present, and
+otherwise takes the next viable driver in `fs_drivers` (blockdev or fusedev in the default list).
+There is no setting to override this. The store counts as present when `$FDSTORE` is above zero
+(systemd 254 and later set it to `FileDescriptorStoreMax=`), or, with `$NOTIFY_SOCKET` set, when
+`systemctl show -p FileDescriptorStoreMax` reports more than zero for the service unit named in
+`/proc/self/cgroup` (`nydus_snapshotter::fdstore::detect`). The unit needs `Type=notify` and
+`FileDescriptorStoreMax=` above zero (`misc/performance/nydus-snapshotter.service`). The startup
+log names the reason in the fanotify `driver probe result` line.
+
+Fanotify mounts already live when such a start finds no fd store (an upgrade from a release
+without this rule, or a unit that lost its fd store) are still re-armed on fanotify
+(`rebuild_from_records`, which keeps a live fanotify mount on fanotify whatever the node now
+selects): detaching them would break the containers on them, and no other driver can serve them.
+Each start of such a mount logs a warning; new images go to the selected driver, and the mount
+leaves fanotify once its last container is gone.
+
+A graceful stop without an fd store (`shutdown_all`) first refuses new daemon starts and waits out
+those under way, as a stop with an fd store does, then unmounts every fanotify mount at once while
+its group is still open, retrying a busy one for about 10 s, so the stop fits a 30 s termination
+grace period. A mount still busy after that (a container's overlay holding it) keeps its daemon
+record live, and so does every mount of a process that dies without a graceful stop. Such a mount
+stays up without a group until the next start re-arms it in place (`rebuild_from_records`):
+meanwhile reads of data never fetched return zeros, and EROFS may keep the zeros it read in its
+page cache.
 
 The fanotify path has no RAFS instance, so `[snapshotter.features] prefetch`, runtime prefetch
 lists and `cache.disable_indexed` apply only to images served over FUSE; a fanotify daemon fetches

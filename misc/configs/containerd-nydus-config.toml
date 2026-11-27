@@ -32,7 +32,8 @@ threads = 4
 log_level = "info"
 
 # Filesystem driver candidates. Omitted on purpose: the built-in auto-ranking
-# probes fanotify (kernel >= 6.14 + EROFS, the on-demand fast path) ->
+# probes fanotify (kernel >= 6.14 + EROFS + a systemd fd store, the on-demand
+# fast path; without the fd store a crash would let containers read zeros) ->
 # blockdev (loop/EROFS) -> fusedev (works everywhere with /dev/fuse) and
 # picks the first viable one. Uncomment to pin a driver for testing:
 # [[snapshotter.fs_drivers]]

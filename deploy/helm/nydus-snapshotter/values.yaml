@@ -43,8 +43,8 @@ daemonset:
   # overrides sysctl.address, the probe socket path no longer matches and
   # probes must be disabled here. Liveness proves the compio event loop is
   # responsive; readiness additionally proves the containerd proxy-plugin
-  # gRPC socket accepts connections. A liveness restart is safe: failover
-  # records + the systemd/fd-store takeover re-attach live mounts.
+  # gRPC socket accepts connections. A DaemonSet has no systemd fd store, so a
+  # liveness restart drops the FUSE connections of running containers.
   probes:
     enabled: true
     livenessPeriodSeconds: 30
@@ -87,7 +87,9 @@ config:
   # Fill a chunk an image misses from another image's cache of the same blob on the node,
   # checked against the image's own chunk digest (docs/nydus-fanotify.md, "Borrowing").
   borrow: false
-  # Ordered fallback chain; the probe picks the first viable driver. fanotify needs kernel >= 6.14.
+  # Ordered fallback chain; the probe picks the first viable driver. fanotify needs kernel >= 6.14
+  # and a systemd unit with an fd store (Type=notify, FileDescriptorStoreMax= > 0), which a
+  # DaemonSet does not have: under Helm the probe always skips it and falls back to the next driver.
   fsDrivers:
     - { type: fanotify, minKernel: "6.14", requireCaps: ["CAP_SYS_ADMIN"] }
     - { type: blockdev, mode: loop, requireCaps: ["CAP_SYS_ADMIN"] }

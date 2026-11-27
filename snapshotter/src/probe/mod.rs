@@ -72,7 +72,8 @@ pub fn probe_and_promote_driver(
     work_dir: Option<&Path>,
 ) -> (Vec<ProbeResult>, Option<FsDriverType>) {
     apply_driver_selection_policy(drivers, policy);
-    let results = probe_drivers(drivers, work_dir);
+    let mut results = probe_drivers(drivers, work_dir);
+    require_fd_store_for_fanotify(&mut results, crate::fdstore::detect);
     // Report-only, so startup does not wait for its mounts.
     #[cfg(target_os = "linux")]
     if let Some(dir) = work_dir
@@ -88,6 +89,40 @@ pub fn probe_and_promote_driver(
     }
     let selected = promote_selected_driver(drivers, &results);
     (results, selected)
+}
+
+/// Take fanotify out of the selection when no systemd fd store holds its group.
+///
+/// When the process dies and nothing holds its fanotify group, the kernel allows every queued
+/// and future read of the marked cache files, and containers read zeros for data never
+/// fetched. FUSE without its daemon fails reads with `ENOTCONN` instead. So fanotify is chosen
+/// only under a `Type=notify` unit with `FileDescriptorStoreMax=` > 0, and otherwise the next
+/// viable driver serves. `fd_store` runs only when fanotify passed its other probes.
+fn require_fd_store_for_fanotify(
+    results: &mut [ProbeResult],
+    fd_store: impl FnOnce() -> crate::fdstore::FdStoreCheck,
+) {
+    let Some(fanotify) = results
+        .iter_mut()
+        .find(|r| r.driver_type == FsDriverType::Fanotify && r.available)
+    else {
+        return;
+    };
+    let store = fd_store();
+    if store.present {
+        info!(reason = %store.reason, "systemd fd store present; fanotify can be selected");
+        return;
+    }
+    warn!(
+        reason = %store.reason,
+        "fanotify needs systemd's fd store to keep its group across a crash, or containers read zeros; \
+         run the snapshotter as a Type=notify unit with FileDescriptorStoreMax= > 0. Using the next driver"
+    );
+    fanotify.available = false;
+    fanotify.reason = format!(
+        "no systemd fd store holds the fanotify group: {}",
+        store.reason
+    );
 }
 
 /// Normalize the configured candidate list before probing.
@@ -970,6 +1005,77 @@ mod tests {
         assert_eq!(drivers[0].driver_type, FsDriverType::Fusedev);
         assert_eq!(drivers[1].driver_type, FsDriverType::Fanotify);
         assert_eq!(drivers[2].driver_type, FsDriverType::Blockdev);
+    }
+
+    #[test]
+    fn fanotify_is_selected_only_with_an_fd_store() {
+        let available = |driver_type| ProbeResult {
+            driver_type,
+            available: true,
+            reason: "all probes passed".to_string(),
+        };
+        let store = |present| {
+            move || crate::fdstore::FdStoreCheck {
+                present,
+                reason: "test".to_string(),
+            }
+        };
+        for (present, expected) in [
+            (false, FsDriverType::Fusedev),
+            (true, FsDriverType::Fanotify),
+        ] {
+            let mut drivers = crate::config::SnapshotterSection::default().fs_drivers;
+            drivers.retain(|d| d.driver_type != FsDriverType::Blockdev);
+            let mut results = vec![
+                available(FsDriverType::Fanotify),
+                available(FsDriverType::Fusedev),
+            ];
+            require_fd_store_for_fanotify(&mut results, store(present));
+            assert_eq!(
+                promote_selected_driver(&mut drivers, &results),
+                Some(expected)
+            );
+            assert_eq!(drivers[0].driver_type, expected);
+        }
+    }
+
+    /// Root-only, on a >= 6.14 kernel with `NYDUS_E2E_ROOT` on ext4: the full probe over
+    /// fanotify and fusedev selects `NYDUS_EXPECT_DRIVER`. `misc/fanotify/takeover-test.sh` runs
+    /// it with `FDSTORE` set, as systemd sets it, and without.
+    #[test]
+    #[ignore]
+    fn probe_selects_the_expected_driver() {
+        let (Some(root), Some(expect)) = (
+            std::env::var_os("NYDUS_E2E_ROOT"),
+            std::env::var("NYDUS_EXPECT_DRIVER").ok(),
+        ) else {
+            eprintln!("SKIP: NYDUS_E2E_ROOT and NYDUS_EXPECT_DRIVER are not set");
+            return;
+        };
+        let mut drivers = crate::config::SnapshotterSection::default().fs_drivers;
+        drivers.retain(|d| d.driver_type != FsDriverType::Blockdev);
+        let (results, selected) = probe_and_promote_driver(
+            &mut drivers,
+            FsDriverSelectionPolicy::Auto,
+            Some(Path::new(&root)),
+        );
+        assert_eq!(
+            selected.map(|d| d.as_str()),
+            Some(expect.as_str()),
+            "{results:?}"
+        );
+        println!("selected driver: {expect}");
+    }
+
+    #[test]
+    fn fd_store_is_not_asked_when_fanotify_is_unavailable() {
+        let mut results = vec![ProbeResult {
+            driver_type: FsDriverType::Fanotify,
+            available: false,
+            reason: "kernel too old".to_string(),
+        }];
+        require_fd_store_for_fanotify(&mut results, || panic!("asked for the fd store"));
+        assert_eq!(results[0].reason, "kernel too old");
     }
 
     #[test]

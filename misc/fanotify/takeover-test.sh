@@ -7,7 +7,8 @@
 # and once pinned to one. Before the successor starts, a child reads an event of a cold read and
 # exits without answering it, as a predecessor killed mid-fill does; the read must complete.
 # After a graceful stop instead, the predecessor's events-answered token spares its group the
-# sweep, and the successor evicts the token from the fd store before it serves.
+# sweep, and the successor evicts the token from the fd store before it serves. First, the
+# driver probe must select fanotify with an fd store and FUSE without one.
 #
 # Needs root, Linux >= 6.14, cargo, and ROOT on ext4 (tmpfs has no pre-content marks).
 set -u
@@ -28,6 +29,16 @@ OUT=$(NYDUS_FANOTIFY_TEST_DIR="$ROOT/unit" "${TEST[@]}" \
 echo "$OUT" | tail -3
 echo "$OUT" | grep -q SKIP && fail "the stranded event test did not run"
 echo "$OUT" | grep -q "test result: ok. 1 passed" || fail "the stranded event test failed"
+# The driver probe selects fanotify only when systemd's fd store would hold its group: with
+# FDSTORE set, as systemd >= 254 sets it for a unit with FileDescriptorStoreMax=, and FUSE
+# without. The tests below play the fd store themselves and construct fanotify daemons directly.
+for case in "fanotify env FDSTORE=16" "fusedev env -u FDSTORE -u NOTIFY_SOCKET"; do
+  read -r expect launcher <<<"$case"
+  OUT=$(NYDUS_E2E_ROOT="$ROOT" NYDUS_EXPECT_DRIVER="$expect" $launcher "$CARGO" test -p nydus-snapshotter --lib \
+    probe::tests::probe_selects_the_expected_driver -- --ignored --exact --nocapture 2>&1)
+  echo "$OUT" | grep -q "selected driver: $expect" || { echo "$OUT" | tail -20; fail "the probe did not select $expect"; }
+  echo "the probe selected $expect"
+done
 head -c 3000000 /dev/urandom > "$ROOT/src/bin/tool"
 echo "root:x:0:0:root:/root:/bin/sh" > "$ROOT/src/passwd"
 tar -C "$ROOT/src" -czf "$ROOT/layer.tar.gz" .
