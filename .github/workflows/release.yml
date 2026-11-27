@@ -94,7 +94,8 @@ jobs:
         path: release-artifacts/*
 
   nydus-macos:
-    runs-on: macos-15
+    # Intel runner, arm64 cross-compiled: hosted macOS arm64 runners are capacity-limited.
+    runs-on: macos-15-intel
     strategy:
       matrix:
         arch: [amd64, arm64]
