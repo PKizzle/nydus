@@ -921,6 +921,7 @@ mod tests {
     /// image's own: a predecessor that answered 0 left the kernel caching inodes with 0.
     #[cfg(target_os = "linux")]
     #[test]
+    #[cfg_attr(miri, ignore = "Miri does not support readahead")]
     fn a_restored_mount_answers_the_saved_generation() {
         let work_dir = tempfile::TempDir::new().unwrap();
         let config = serde_json::json!({
