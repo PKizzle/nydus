@@ -239,6 +239,14 @@ on fanotify, whatever the label or check says: overlays may already sit on it, a
 top would leave them reading unfilled holes. If fanotify cannot start there, the start fails and
 the mount is detached. The FUSE path refuses to mount over any kernel mount.
 
+An auto-accel sidecar's merged bootstrap is served as its producer built it: the snapshotter
+checks that a sidecar names the image and that each blob matches its digest, but does not rebuild
+the bootstrap from the image's layers. Every node that writes the sidecar image record
+`nydus.auto-accel.local/sidecar:<subject manifest hex>` or serves it on the peer mirror is
+trusted to produce sidecars for every image; containers cannot create that record through CRI.
+The rules and deployment constraints are in "Sidecar trust model" in
+[ARCHITECTURE.md](../ARCHITECTURE.md).
+
 The cache of a fanotify daemon lives in its `daemons/<slug>/stage` dir, next to the staged
 bootstrap. Cache GC and the cache-bytes metric count it (each inode once: the `blob_<i>` device
 files are hardlinks to the `.blob.data` files) against `gc_max_bytes`, but never evict it; a dead

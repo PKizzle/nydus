@@ -78,6 +78,15 @@ impl ContentStoreClient {
         })
     }
 
+    /// The same client in another containerd namespace: image records and
+    /// content ownership are per namespace.
+    pub fn with_namespace(&self, namespace: &str) -> Self {
+        Self {
+            channel: ContainerdChannel::new(self.channel.socket(), namespace),
+            content_root: self.content_root.clone(),
+        }
+    }
+
     fn content(&self) -> ContentClient<ContainerdChannel> {
         ContentClient::new(self.channel.clone())
     }
@@ -575,7 +584,7 @@ impl ContentStoreClient {
     }
 
     /// List all containerd Image records (name + target digest). Used by
-    /// `containerd_lookup` to build the chainID → image-ref cache without
+    /// `containerd_lookup` to learn which images claim which chainIDs without
     /// shelling out to `crictl images`.
     #[instrument(level = "debug", skip(self), err)]
     pub async fn images_list(&self) -> Result<Vec<crate::containerd_lookup::ImageRecord>> {
@@ -593,6 +602,8 @@ impl ContentStoreClient {
                 Some(crate::containerd_lookup::ImageRecord {
                     name: image.name,
                     target_digest: target.digest,
+                    target_media_type: target.media_type,
+                    updated: image.updated_at.map_or((0, 0), |t| (t.seconds, t.nanos)),
                 })
             })
             .collect())

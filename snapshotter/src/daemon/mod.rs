@@ -4998,6 +4998,21 @@ impl DaemonSupervisor {
             Arc::new(test_daemon_instance(image_ref, mountpoint)),
         );
     }
+
+    /// Register a live test instance for `image_ref` serving `bootstrap`.
+    pub(crate) async fn insert_test_instance_serving(
+        &self,
+        image_ref: &str,
+        mountpoint: PathBuf,
+        bootstrap: &Path,
+    ) {
+        let mut instance = test_daemon_instance(image_ref, mountpoint);
+        instance.bootstrap = bootstrap.to_path_buf();
+        self.instances
+            .write()
+            .await
+            .insert(image_ref.to_string(), Arc::new(instance));
+    }
 }
 
 #[cfg(all(test, target_os = "linux"))]

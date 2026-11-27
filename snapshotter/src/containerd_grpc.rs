@@ -21,8 +21,8 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -31,7 +31,7 @@ use http::header::HeaderValue;
 use hyper::body::Incoming;
 use hyper::client::conn::http2::{self, SendRequest};
 use send_wrapper::SendWrapper;
-use tracing::debug;
+use tracing::{debug, info};
 
 /// HTTP/2 PING interval. With `keep_alive_while_idle`, a containerd that went away is noticed
 /// between calls instead of on the next one.
@@ -59,6 +59,34 @@ pub fn containerd_reachable() -> Option<bool> {
         REACHED => Some(true),
         UNREACHED => Some(false),
         _ => None,
+    }
+}
+
+/// containerd's version string, once [`probe_version`] learned it.
+static VERSION: OnceLock<String> = OnceLock::new();
+
+/// containerd's version string; `None` until containerd answered.
+pub fn containerd_version() -> Option<&'static str> {
+    VERSION.get().map(String::as_str)
+}
+
+/// Ask containerd for its version until it answers (it starts after the
+/// snapshotter), for logs and `/readyz`.
+pub async fn probe_version(channel: ContainerdChannel) {
+    use crate::containerd_api::services::version::v1::version_client::VersionClient;
+    loop {
+        match VersionClient::new(channel.clone()).version(()).await {
+            Ok(response) => {
+                let version = response.into_inner().version;
+                info!(containerd = %version, "containerd version");
+                let _ = VERSION.set(version);
+                return;
+            }
+            Err(status) => {
+                debug!(error = %status, "containerd version unknown yet");
+                compio::time::sleep(Duration::from_secs(10)).await;
+            }
+        }
     }
 }
 

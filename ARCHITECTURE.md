@@ -153,13 +153,31 @@ it's set) — kept only because a misconfigured or unhealthy Spegel instance (e.
 content, and the fan-out routed around that class of failure during the same testing. It is
 scheduled for removal after a production soak of default-off.
 
-Peers are untrusted, and a sidecar pull runs inside `Prepare`. The pull
-(`fetch_peer_sidecar` in `snapshotter/src/auto_accel_sidecar.rs`) fetches the whole sidecar before
-writing anything to the content store. The sidecar tag is synthetic, so no manifest digest is known
-in advance. The manifest is bound to the image by its subject annotation and its config's
+A sidecar pull runs inside `Prepare`. The pull (`fetch_peer_sidecar` in
+`snapshotter/src/auto_accel_sidecar.rs`) fetches the whole sidecar before writing anything to the
+content store. The sidecar tag is synthetic, so no manifest digest is known in advance. The
+manifest is bound to the image by its subject annotation and its config's
 `subject_manifest_digest`, and each blob by its descriptor digest. Each request attempt (send plus
 body read) gets `request_timeout`. The whole pull gets three of those across all endpoints. A body
 longer than its descriptor size (4 MiB for a manifest) is rejected while it streams.
+
+**Sidecar trust model.** These checks bind a sidecar to its image and to its blobs. They do not
+re-derive the merged bootstrap from the image's layers, and that bootstrap defines the container's
+whole file tree, so a sidecar is trusted as its producer built it. A sidecar is read from exactly
+two places: the image record `nydus.auto-accel.local/sidecar:<subject manifest hex>`
+(`auto_accel_image_name`, looked up by exact name in the snapshotter's containerd namespace, with
+content labelled `containerd.io/snapshot/nydus.auto-accel.role` as the fallback), and the peer
+mirror, which answers that tag from another node's record of the same name. Every node that can
+write image records or content labels in that namespace, or serve on the peer mirror (for k3s's
+embedded Spegel: the libp2p pre-shared key and a client certificate of the cluster CA), is
+therefore trusted to produce sidecars for every image on every node that pulls from it. Workloads
+are not in this set: CRI names a record after the reference it pulled (a reference carrying a
+digest yields only `repo@digest`), a pull of the sidecar tag resolves only through the peer mirror
+or the host `nydus.auto-accel.local` itself (DNS for that name plus a certificate containerd
+trusts for it), and CRI sets no `nydus.auto-accel.role` content label. Two deployment rules keep
+it that way: never configure a mirror or `hosts.toml` entry that serves `nydus.auto-accel.local`
+from another registry, and set `[snapshotter.peer_mirror].enable = false` on nodes that must not
+trust their peers' sidecars.
 
 **Peer-mirror self-check.** When peer_mirror is enabled, `PeerMirrorSelfCheck`
 (`snapshotter/src/peer_mirror_selfcheck.rs`) periodically probes the *local* mirror endpoint for a
@@ -220,6 +238,19 @@ A nydus manifest published as a sibling entry of the image's **own index** (the 
 `nydusify --attach-oci-manifest`) is not a referrer: the image digest already names it. It is
 detected under `[snapshotter.features].dual_index_detect` (default on), needs no signature, and
 gets the same blob-binding check against its own manifest.
+
+CRI sends the container-rootfs `Prepare` no image label, and an image ref in a call's labels is
+never used, so the image is named from the containerd image records of the parent's namespace
+that claim its chain ID, listed again on every lookup and read as containerd's Go decoder reads
+image JSON. Image-specific content (the dual-image, referrer and auto-accel paths) is served only
+for the chain's **sole claimant**: the targets one repository's tag records name, or a single
+target that only digest records name. Otherwise the container gets the plain overlay, which always
+holds the layers containerd applied (`snapshotter_ambiguous_chain_total`). The dual-image and
+referrer paths look the image up by its record target (`repo@digest`), and the nydus sibling must
+be listed in that index as containerd holds it, never in a tag resolved in the registry. An
+auto-accel artifact is built only from layers that decompress to the diff IDs their image config
+lists (`nydus-image create --diff-id`), so it holds the chain's content. An unpack `Prepare`
+(containerd applying a layer) always gets the plain overlay.
 
 On a served hit, `Prepare` downloads and digest-verifies the bootstrap (one priority selector —
 the `nydus-bootstrap` annotation first, then the bootstrap media type — so a data blob can never
