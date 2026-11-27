@@ -1,15 +1,17 @@
 # Sanitizer test runs
 
-Two nightly-toolchain runs complement Miri (`.github/workflows/miri.yml`) over the unit tests.
-Miri cannot run the snapshotter (io_uring, FFI); these runs cover the whole workspace,
-`nydus-snapshotter` included, at native speed.
+Three nightly-toolchain runs complement Miri (`.github/workflows/miri.yml`) over the unit tests.
+Miri cannot run the snapshotter (io_uring, FFI); the ASan and careful runs cover the whole
+workspace, `nydus-snapshotter` included, at native speed.
 
 | Make target          | Tool                                   | Catches                                                     |
 |----------------------|----------------------------------------|-------------------------------------------------------------|
 | `asan-ut-nextest`    | `-Zsanitizer=address` (ASan + LSan)    | heap/stack overflows, use-after-free, double free, leaks    |
+| `tsan-ut-nextest`    | `-Zsanitizer=thread` (TSan)            | data races between threads, including through `unsafe` shared memory such as the chunk-map mapping |
 | `careful-ut-nextest` | [cargo-careful](https://github.com/RalfJung/cargo-careful) | std precondition violations (`from_raw_parts`, `copy_nonoverlapping`, unchecked arithmetic in std, ...) |
 
-Both use the `ut-nextest` filter (`not test(integration)`) and the Linux feature set.
+ASan and careful use the `ut-nextest` filter (`not test(integration)`) and the Linux feature
+set. TSan has its own scope, below.
 
 CI runs them in `.github/workflows/sanitizers.yml`: nightly at 01:30 UTC, on
 `workflow_dispatch`, and on pull requests labelled `sanitizers`. The job is not a required
@@ -58,6 +60,42 @@ Pass nextest arguments through `SANITIZER_NEXTEST_ARGS` to narrow a run, for exa
   `misc/sanitizers/lsan.supp`; override with `LSAN_OPTIONS=...` when investigating. CI installs
   `llvm-symbolizer` (`ASAN_SYMBOLIZER_PATH`); without it reports carry raw addresses and the
   suppressions, which match on function names, do not apply.
+
+## ThreadSanitizer
+
+`make tsan-ut-nextest` runs the library unit tests of `nydus-utils`, `nydus-storage`,
+`nydus-rafs` and `nydus-service` (with `block-uffd` and `block-nbd`) under
+`-Zsanitizer=thread`:
+
+```bash
+docker run --rm --privileged -v "$PWD":/work -w /work rust:1.96-bookworm bash -c '
+  apt-get update -qq && apt-get install -y -qq pkg-config liblz4-dev uuid-dev cmake protobuf-compiler llvm
+  TC=nightly-2026-10-20   # keep in step with SANITIZER_TOOLCHAIN in the workflow
+  rustup toolchain install $TC --profile minimal --component rust-src
+  curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C /usr/local/cargo/bin
+  make tsan-ut-nextest SANITIZER_TOOLCHAIN=$TC'
+```
+
+(`linux-arm` in the nextest URL on aarch64.) A test with a report fails: TSan exits with
+status 66 after printing it.
+
+- **`-Zbuild-std`.** The target makes cargo rebuild std with the sanitizer (hence the
+  `rust-src` component). An uninstrumented std hides the synchronisation inside `Mutex`,
+  `Arc` and channels, and TSan reports races that are not there. `compiler_builtins` alone
+  is compiled without TSan instrumentation (`TSAN_BUILTINS`, through `-Zprofile-rustflags`):
+  on aarch64 the TSan runtime calls its outline atomics while it initialises, and an
+  instrumented copy crashes every test binary before `main`.
+- **Scope.** `nydus-snapshotter` is not run: it does its I/O on compio/io_uring, whose
+  completions the kernel writes, so TSan sees neither those writes nor the ordering they
+  carry. Binaries and integration tests are out of scope too; `TSAN_FILTER` holds the
+  test exclusions, each with its reason in the Makefile.
+- **Suppressions.** `misc/sanitizers/tsan.supp` lists each suppressed report with a reason.
+  Override with `TSAN_OPTIONS=...` when investigating; reports need `llvm-symbolizer` on
+  `PATH` (or `TSAN_SYMBOLIZER_PATH`) for the suppressions to match.
+- **Cost.** Rebuilding std and every dependency with TSan is most of the run: about
+  45 minutes on 3 cores, against about 5 minutes for the 840-odd tests themselves.
+  TSan slows code 5-15x and multiplies its memory 5-10x, so a time-boxed test can
+  outrun its own deadline; such tests are excluded in `TSAN_FILTER`.
 
 ## Miri and read-only metadata
 

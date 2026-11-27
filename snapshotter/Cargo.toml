@@ -209,6 +209,7 @@ landlock = "0.4"
 nydus-service = { version = "0.5.0", path = "../service", features = ["fault-injection"] }
 tempfile = "3"
 assert_cmd = "2"
+proptest = { workspace = true }
 
 [build-dependencies]
 # Generates tonic 0.14 gRPC client bindings for containerd's Content service
